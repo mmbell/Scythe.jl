@@ -24,6 +24,7 @@ const uint = UInt64
     l_q::real = 2.0
     BCL::Dict = R0
     BCR::Dict = R0
+    variables::Dict = Dict("u" => 1)
     equation_set = "1dLinearAdvection"
     initial_conditions = "ic.csv"
 end
@@ -114,20 +115,7 @@ function write_output(spline::Spline1D, model::ModelParameters, t::int)
     close(ufile)
 end
 
-function initialize()
-    
-    model = ModelParameters(
-        ts = 0.1,
-        num_ts = 500,
-        output_interval = 25,
-        xmin = -48.0,
-        xmax = 48.0,
-        num_nodes = 192,
-        BCL = R0,
-        BCR = R0,
-        equation_set = "1dNonlinearAdvection",
-        initial_conditions = "testcase.csv"
-    )
+function initialize(model::ModelParameters)
         
     spline = Spline1D(SplineParameters(xmin = model.xmin, xmax = model.xmax,
             num_nodes = model.num_nodes, BCL = model.BCL, BCR = model.BCR))
@@ -148,7 +136,7 @@ function initialize()
     SItransform!(spline)
     write_output(spline, model, 0)
     
-    return spline, model
+    return spline
 end
 
 function run(spline::Spline1D, model::ModelParameters)
@@ -183,8 +171,21 @@ function finalize(spline::Spline1D, model::ModelParameters)
 end
 
 function integrate_model()
+    
+    model = ModelParameters(
+    ts = 0.1,
+    num_ts = 500,
+    output_interval = 25,
+    xmin = -48.0,
+    xmax = 48.0,
+    num_nodes = 192,
+    BCL = R0,
+    BCR = R0,
+    equation_set = "1dNonlinearAdvection",
+    initial_conditions = "testcase.csv"
+    )
    
-    spline, model = initialize()
+    spline = initialize(model)
     spline = run(spline, model)
     finalize(spline, model)
 end
