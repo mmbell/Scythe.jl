@@ -176,13 +176,13 @@ function calcPQfactor(sp::SplineParameters, gammaBC::Matrix{real})
                 end
                 for mu = 1:mubar
                     i = mu + (mubar * mc)
-                    x = sp.xmin + (mc * sp.DX) + ((mu/2.0 - 1.0) * sqrt35) + 0.5
+                    x = sp.xmin + (mc * sp.DX) + sp.DX * ((mu/2.0 - 1.0) * sqrt35) + sp.DX * 0.5
                     pm1 = basis(sp, m1, x, 0)
                     qm1 = basis(sp, m1, x, 3)
                     pm2 = basis(sp, m2, x, 0)
                     qm2 = basis(sp, m2, x, 3)
-                    P[mi1,mi2] += gaussweight[mu] * pm1 * pm2
-                    Q[mi1,mi2] += gaussweight[mu] * eps_q * qm1 * qm2
+                    P[mi1,mi2] += sp.DX * gaussweight[mu] * pm1 * pm2
+                    Q[mi1,mi2] += sp.DX * gaussweight[mu] * eps_q * qm1 * qm2
                 end
             end
         end
@@ -200,7 +200,7 @@ function calcMishPoints(sp::SplineParameters)
     for mc = 0:(sp.num_nodes-1)
         for mu = 1:mubar
             i = mu + (mubar * mc)
-            x[i] = sp.xmin + (mc * sp.DX) + ((mu/2.0 - 1.0) * sqrt35) + 0.5
+            x[i] = sp.xmin + (mc * sp.DX) + sp.DX * ((mu/2.0 - 1.0) * sqrt35) + sp.DX * 0.5
         end
     end
     return x
@@ -242,9 +242,9 @@ function SBtransform(sp::SplineParameters, gammaBC::Matrix{real}, uMish::Vector{
             end
             for mu = 1:mubar
                 i = mu + (mubar * mc)
-                x = sp.xmin + (mc * sp.DX) + ((mu/2.0 - 1.0) * sqrt35) + 0.5
+                x = sp.xmin + (mc * sp.DX) + sp.DX * ((mu/2.0 - 1.0) * sqrt35) + sp.DX * 0.5
                 bm = basis(sp, m, x, 0)
-                b[mi] += gaussweight[mu] * bm * uMish[i]
+                b[mi] += sp.DX * gaussweight[mu] * bm * uMish[i]
             end
         end
     end
@@ -280,9 +280,9 @@ function SBxtransform(sp::SplineParameters, gammaBC::Matrix{real}, uMish::Vector
             end
             for mu = 1:mubar
                 i = mu + (mubar * mc)
-                x = sp.xmin + (mc * sp.DX) + ((mu/2.0 - 1.0) * sqrt35) + 0.5
+                x = sp.xmin + (mc * sp.DX) + sp.DX * ((mu/2.0 - 1.0) * sqrt35) + sp.DX * 0.5
                 bm = basis(sp, m, x, 1)
-                b[mi] += gaussweight[mu] * bm * uMish[i]
+                b[mi] += sp.DX * gaussweight[mu] * bm * uMish[i]
             end
         end
         
@@ -317,7 +317,7 @@ end
 function SItransform(sp::SplineParameters, a::Vector{real}, x::real, derivative::int = 0)
 
     u = 0.0
-    xm = ceil(int,x - (2.0 * sp.DX))
+    xm = ceil(int,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
     for m = xm:(xm + 3)
         if (m >= -1) && (m <= (sp.num_nodes+1))
             mi = m + 2
@@ -333,7 +333,7 @@ function SItransform(sp::SplineParameters, a::Vector{real}, derivative::int = 0)
     for mc = 0:(sp.num_nodes-1)
         for mu = 1:mubar
             i = mu + (mubar * mc)
-            x = sp.xmin + (mc * sp.DX) + ((mu/2.0 - 1.0) * sqrt35) + 0.5
+            x = sp.xmin + (mc * sp.DX) + sp.DX * ((mu/2.0 - 1.0) * sqrt35) + sp.DX * 0.5
             for m = (mc-1):(mc+2)
                 if (m >= -1) && (m <= (sp.num_nodes+1))
                     mi = m + 2
@@ -349,7 +349,7 @@ function SItransform(sp::SplineParameters, a::Vector{real}, points::Vector{real}
 
     u = zeros(real,length(points))
     for i in eachindex(points)
-        xm = ceil(int,points[i] - sp.xmin - (2.0 * sp.DX))
+        xm = ceil(int,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
         for m = xm:(xm + 3)
             if (m >= -1) && (m <= (sp.num_nodes+1))
                 mi = m + 2
