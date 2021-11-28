@@ -5,7 +5,7 @@ using SparseArrays
 using Parameters
 
 export SplineParameters, Spline1D
-export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3
+export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
 export SBtransform, SBtransform!, SAtransform!, SItransform!
 export SBxtransform, SIxtransform, SIxxtransform
 export setMishValues
@@ -27,6 +27,7 @@ const R1T2 = Dict("α1" =>  2.0, "β1" => -1.0)
 const R2T10 = Dict("α2" => 1.0, "β2" => -0.5)
 const R2T20 = Dict("α2" => -1.0, "β2" => 0.0)
 const R3 = Dict("R3" => 0)
+const PERIODIC = Dict("PERIODIC" => 0)
 
 # Fix the mish to 3 points
 const mubar = 3
@@ -112,6 +113,8 @@ function calcGammaBC(sp::SplineParameters)
         rankL = 0
     elseif sp.BCL == R3
         rankL = 3
+    elseif sp.BCL == PERIODIC
+        rankL = 1
     end
 
     if haskey(sp.BCR,"α1")
@@ -122,6 +125,8 @@ function calcGammaBC(sp::SplineParameters)
         rankR = 0
     elseif sp.BCR == R3
         rankR = 3
+    elseif sp.BCR == PERIODIC
+        rankR = 2
     end
 
     Mdim = sp.num_nodes + 3
@@ -137,6 +142,9 @@ function calcGammaBC(sp::SplineParameters)
         gammaBC[1,1] = sp.BCL["α2"]
         gammaBC[1,2] = sp.BCL["β2"]
         gammaBC[:,3:(Mdim-rankR)] = Matrix(1.0I, Minterior_dim, Minterior_dim)
+    elseif sp.BCL == PERIODIC
+        gammaBC[Minterior_dim,1] = 1.0
+        gammaBC[:,2:(Mdim-rankR)] = Matrix(1.0I, Minterior_dim, Minterior_dim)
     else
         gammaBC[:,1:(Mdim-rankR)] = Matrix(1.0I, Minterior_dim, Minterior_dim)
     end
@@ -147,6 +155,9 @@ function calcGammaBC(sp::SplineParameters)
     elseif haskey(sp.BCR,"α2")
         gammaBC[Minterior_dim,Mdim] = sp.BCR["α2"]
         gammaBC[Minterior_dim,Mdim-1] = sp.BCR["β2"]
+    elseif sp.BCR == PERIODIC
+        gammaBC[1,Mdim-1] = 1.0
+        gammaBC[2,Mdim] = 1.0
     end
     return gammaBC
 end

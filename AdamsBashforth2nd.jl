@@ -76,8 +76,9 @@ function physical_model(model::ModelParameters,u::Vector{real},ux::Vector{real},
     if model.equation_set == "1dLinearAdvection"
         #1D Linear advection to test
         c_0 = 1.0
-    
-        udot = -c_0 .* ux
+        K = 0.003
+        
+        udot = -c_0 .* ux + (K .* uxx)
         F = 0
     elseif model.equation_set == "1dNonlinearAdvection"
         c_0 = 1.0
@@ -173,15 +174,15 @@ end
 function integrate_model()
     
     model = ModelParameters(
-    ts = 0.1,
-    num_ts = 500,
+    ts = 0.2,
+    num_ts = 480,
     output_interval = 25,
     xmin = -48.0,
     xmax = 48.0,
-    num_nodes = 192,
-    BCL = R0,
-    BCR = R0,
-    equation_set = "1dNonlinearAdvection",
+    num_nodes = 96,
+    BCL = PERIODIC,
+    BCR = PERIODIC,
+    equation_set = "1dLinearAdvection",
     initial_conditions = "testcase.csv"
     )
    
