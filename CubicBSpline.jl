@@ -226,7 +226,7 @@ function Spline1D(sp::SplineParameters)
     mishPoints = calcMishPoints(sp)
     uMish = zeros(real,sp.num_nodes*mubar)
 
-    bDim = length(gammaBC[:,1])
+    bDim = sp.num_nodes + 3
     aDim = sp.num_nodes + 3
     b = zeros(real,bDim)
     a = zeros(real,aDim)
@@ -260,9 +260,8 @@ function SBtransform(sp::SplineParameters, gammaBC::Matrix{real}, uMish::Vector{
         end
     end
 
-    # Border fold it
-    btilde = gammaBC * b
-    return btilde
+    # Don't border fold it here, only in SA
+    return b
 end
 
 function SBtransform(spline::Spline1D, uMish::Vector{real})
@@ -302,9 +301,8 @@ function SBxtransform(sp::SplineParameters, gammaBC::Matrix{real}, uMish::Vector
         b[mi] = border - b[mi]
     end
     
-    # Border fold it
-    btilde = gammaBC * b
-    return btilde
+    # Don't border fold it here, only in SA
+    return b
 end
 
 function SBxtransform(spline::Spline1D, uMish::Vector{real}, BCL, BCR)
@@ -315,13 +313,13 @@ end
 
 function SAtransform(sp::SplineParameters, gammaBC::Matrix{Float64}, pqFactor, b::Vector{real})
 
-    a = gammaBC' * (pqFactor \ b)
+    a = gammaBC' * (pqFactor \ (gammaBC * b))
     return a
 end
 
 function SAtransform!(spline::Spline1D)
 
-    a = spline.gammaBC' * (spline.pqFactor \ spline.b)
+    a = spline.gammaBC' * (spline.pqFactor \ (spline.gammaBC * spline.b))
     spline.a .= a
 end
 
