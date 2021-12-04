@@ -1,33 +1,4 @@
-# 2nd order Adams-Bashforth implementation
-
-module AdamsBashforth_1D_multivar_O2
-
-using CubicBSpline
-using Parameters
-using CSV
-using DataFrames
-
-export initialize, run, finalize, integrate_model
-
-#Define some convenient aliases
-const real = Float64
-const int = Int64
-const uint = UInt64
-
-@with_kw struct ModelParameters
-    ts::real = 0.0
-    num_ts::int = 1
-    output_interval::int = 1
-    xmin::real = 0.0
-    xmax::real = 0.0
-    num_nodes::int = 1
-    l_q::real = 2.0
-    BCL::Dict = R0
-    BCR::Dict = R0
-    vars::Dict = Dict("u" => 1)
-    equation_set = "1dLinearAdvection"
-    initial_conditions = "ic.csv"
-end
+# 2nd order Adams-Bashforth implementation 1D multivar methods
 
 function first_timestep(splines::Vector{Spline1D}, bdot::Matrix{real}, ts::real)
    
@@ -212,7 +183,7 @@ function write_output(splines::Vector{Spline1D}, model::ModelParameters, t::int)
     end
 end
 
-function initialize(model::ModelParameters)
+function initialize(model::ModelParameters, numvars::int)
     
     splines = Vector{Spline1D}(undef,length(values(model.vars)))
     for key in keys(model.vars)
@@ -220,25 +191,30 @@ function initialize(model::ModelParameters)
                 num_nodes = model.num_nodes, BCL = model.BCL[key], BCR = model.BCR[key]))
     end
     
-    #ic = CSV.read(model.initial_conditions, DataFrame, "x", "u")
-    #if (spline.mishPoints ≉ ic.x)
-    #    throw(DomainError(ic.x[1], "mish from IC does not match model parameters"))
-    #end
+    initialconditions = CSV.read(model.initial_conditions, DataFrame, header=1)
+    if splines[1].mishDim != length(initialconditions.i)
+        throw(DomainError(length(initialconditions.i), "mish from IC does not match model parameters"))
+    end
+    
+    splines[model.vars["vgr"]].uMish .= initialconditions.vgr
+    splines[model.vars["u"]].uMish .= 0.0
+    splines[model.vars["v"]].uMish .= initialconditions.vgr
+    splines[model.vars["w"]].uMish .= 0.0
     
     # Hard-code IC for testing
-    V0 = 50.0 / 20000.0
-    for i = 1:splines[1].mishDim
-        splines[model.vars["u"]].uMish[i] = 0
-        #splines[model.vars["h"]].uMish[i] = exp(-(splines[1].mishPoints[i])^2 / (2 * 4^2))
-        if (splines[1].mishPoints[i] < 20000.0)
-            splines[model.vars["vgr"]].uMish[i] = V0 * splines[1].mishPoints[i]
-            splines[model.vars["v"]].uMish[i] = V0 * splines[1].mishPoints[i]
-        else
-            splines[model.vars["vgr"]].uMish[i] = 4.0e8 * V0 / (splines[1].mishPoints[i])
-            splines[model.vars["v"]].uMish[i] = 4.0e8 * V0 / (splines[1].mishPoints[i])
-        end
-        splines[model.vars["w"]].uMish[i] = 0
-    end
+    #V0 = 50.0 / 20000.0
+    #for i = 1:splines[1].mishDim
+    #    splines[model.vars["u"]].uMish[i] = 0
+    #    #splines[model.vars["h"]].uMish[i] = exp(-(splines[1].mishPoints[i])^2 / (2 * 4^2))
+    #    if (splines[1].mishPoints[i] < 20000.0)
+    #        splines[model.vars["vgr"]].uMish[i] = V0 * splines[1].mishPoints[i]
+    #        splines[model.vars["v"]].uMish[i] = V0 * splines[1].mishPoints[i]
+    #    else
+    #        splines[model.vars["vgr"]].uMish[i] = 4.0e8 * V0 / (splines[1].mishPoints[i])
+    #        splines[model.vars["v"]].uMish[i] = 4.0e8 * V0 / (splines[1].mishPoints[i])
+    #    end
+    #    splines[model.vars["w"]].uMish[i] = 0
+    #end
     #setMishValues(spline,ic.u)
 
     for spline in splines
@@ -296,15 +272,15 @@ function integrate_model()
     
     model = ModelParameters(
         ts = 1.0,
-        num_ts = 10800,
-        output_interval = 3600,
+        num_ts = 100,
+        output_interval = 50,
         xmin = 0.0,
         xmax = 1.0e6,
         num_nodes = 2000,
         BCL = Dict("vgr" => R0, "u" => R1T0, "v" => R1T0, "w" => R1T0),
         BCR = Dict("vgr" => R0, "u" => R1T1, "v" => R1T1, "w" => R1T1),
         equation_set = "Williams2013_TCBL",
-        initial_conditions = "testcase.csv",
+        initial_conditions = "rankine_ic.csv",
         vars = Dict("vgr" => 1, "u" => 2, "v" => 3, "w" => 4)    
     )
    
@@ -313,42 +289,3 @@ function integrate_model()
     finalize(splines, model)
 end
 
-function Williams2013_TBCL(model::ModelParameters,x::Vector{real},
-        var::Matrix{real},varx::Matrix{real},varxx::Matrix{real})
-
-    K = 1500.0
-    Cd = 2.4e-3
-    h = 1000.0
-    f = 5.0e-5
-
-    udot = zeros(real,length(x))
-    vdot = zeros(real,length(x))
-    vgrdot = zeros(real,length(x))
-    F = zeros(real,length(x),4)
-    
-    vgr = var[:,model.vars["vgr"]]
-    u = var[:,model.vars["u"]]
-    v = var[:,model.vars["v"]]
-    r = x
-    U = 0.78 * sqrt.(u .* u + v .* v)
-    
-    ur = varx[:,model.vars["u"]]
-    vr = varx[:,model.vars["v"]]
-    
-    urr = varxx[:,model.vars["u"]]
-    vrr = varxx[:,model.vars["v"]]
-    
-    w = -h * ((u ./ r) .+ ur)
-    w_ = 0.5 * abs.(w) - w
-    
-    udot = (-u .* ur) .- (w_ .* (u ./ h)) .+ (f .+ (v .+ vgr) ./ r) .* (v .- vgr) 
-        .- (Cd .* U .* u ./ h) .+ K .* ((ur ./ r) .+ (u ./ (r .* r)) .+ urr)
-        
-    vdot = (w_ .* (vgr - v) ./ h) .- (f .+ (v ./ r) .+ vr) .* u
-        .- (Cd .* U .* v ./ h) .+ K .* ((vr ./ r) .+ (v ./ (r .* r)) .+ vrr)
-    
-    tendency = [vgrdot udot vdot w]
-    return tendency, F
-end
-
-end
