@@ -1,3 +1,4 @@
+__precompile__()
 module AdamsBashforth
 
 using CubicBSpline
@@ -54,8 +55,8 @@ function integrate_WilliamsSlabTCBL(ics_csv::String)
     
     model = ModelParameters(
         ts = 1.0,
-        num_ts = 100,
-        output_interval = 50,
+        num_ts = 10800,
+        output_interval = 3600,
         xmin = 0.0,
         xmax = 1.0e6,
         num_nodes = 2000,
