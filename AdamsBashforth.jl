@@ -29,7 +29,7 @@ end
 include("AdamsBashforth_1D_1var_O2.jl")
 include("AdamsBashforth_1D_multivar_O2.jl")
 
-export initialize, run, finalize, integrate_1dLinearAdvection, integrate_WilliamsSlabTCBL
+export initialize, run, finalize, integrate_1dLinearAdvection, integrate_WilliamsSlabTCBL, integrate_model
 
 function integrate_1dLinearAdvection()
     

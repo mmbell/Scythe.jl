@@ -181,6 +181,29 @@ function write_output(splines::Vector{Spline1D}, model::ModelParameters, t::int)
         close(afile)
         close(ufile)
     end
+    
+    # Write nodes to a single file, including vorticity
+    outfilename = string(model.equation_set , "_output_", t, ".csv")
+    outfile = open(outfilename,"w")
+    r = zeros(real,splines[1].aDim)
+    vort = zeros(real,splines[1].aDim)
+    for i = 1:splines[1].params.num_nodes
+        r[i] = splines[1].params.xmin + (splines[1].params.DX * (i-1))
+    end
+    
+    vgr = CubicBSpline.SItransform(splines[model.vars["vgr"]].params,splines[model.vars["vgr"]].a,r,0)
+    u = CubicBSpline.SItransform(splines[model.vars["u"]].params,splines[model.vars["u"]].a,r,0)
+    v = CubicBSpline.SItransform(splines[model.vars["v"]].params,splines[model.vars["v"]].a,r,0)
+    dvdr = CubicBSpline.SItransform(splines[model.vars["v"]].params,splines[model.vars["v"]].a,r,1)
+    w = CubicBSpline.SItransform(splines[model.vars["w"]].params,splines[model.vars["w"]].a,r,0)
+    vort .= dvdr .+ (v ./ r)
+    
+    write(outfile,"r,vgr,u,v,w,vort\n")
+    for i = 1:splines[1].params.num_nodes
+        data = string(r[i], ",", vgr[i], ",", u[i], ",", v[i], ",", w[i], ",", vort[i])
+        write(outfile,"$data\n")
+    end        
+    close(outfile)
 end
 
 function initialize(model::ModelParameters, numvars::int)
@@ -277,14 +300,14 @@ function integrate_model()
         xmin = 0.0,
         xmax = 1.0e6,
         num_nodes = 2000,
-        BCL = Dict("vgr" => R0, "u" => R1T0, "v" => R1T0, "w" => R1T0),
+        BCL = Dict("vgr" => R0, "u" => R1T0, "v" => R1T0, "w" => R1T1),
         BCR = Dict("vgr" => R0, "u" => R1T1, "v" => R1T1, "w" => R1T1),
         equation_set = "Williams2013_TCBL",
-        initial_conditions = "rankine_ic.csv",
+        initial_conditions = "rankine_test_ic.csv",
         vars = Dict("vgr" => 1, "u" => 2, "v" => 3, "w" => 4)    
     )
    
-    splines = initialize(model)
+    splines = initialize(model, 4)
     splines = run(splines, model)
     finalize(splines, model)
 end
