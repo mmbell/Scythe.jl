@@ -80,10 +80,8 @@ function calcMishPoints(cp::ChebyshevParameters)
 
     Nbasis = cp.zDim - rankB - rankT
     z = zeros(real,cp.zDim)
-    #scale = 0.5 * (cp.zmax - cp.zmin)
-    #offset = 0.5 * (cp.zmin + cp.zmax)
-    scale = 1.0
-    offset = 0.0
+    scale = -0.5 * (cp.zmax - cp.zmin)
+    offset = 0.5 * (cp.zmin + cp.zmax)
     z[1] = 1.0 * scale + offset
     for n = 2:Nbasis
         z[n] = cos((n-1) * π / (Nbasis - 1)) * scale + offset
@@ -122,7 +120,7 @@ function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real})
     for k = (cp.zDim-1):-1:2
         ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
     end
-    return ax
+    return ax ./ (-0.5 * (cp.zmax - cp.zmin))
 end
 
 function CIxtransform(cp::ChebyshevParameters, a::Vector{real})
@@ -134,6 +132,7 @@ function CIxtransform(cp::ChebyshevParameters, a::Vector{real})
     for k = (cp.zDim-1):-1:2
         ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
     end
+    ax = ax ./ (-0.5 * (cp.zmax - cp.zmin))
     
     # Do the inverse transform to get back physical values
     ux = FFTW.r2r(ax, FFTW.REDFT00) 
