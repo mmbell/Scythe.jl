@@ -121,7 +121,7 @@ function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real})
     ax[k-1] = (2.0 * (k-1) * a[k])
     for k = (cp.zDim-1):-1:2
         ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
-    end    
+    end
     return ax
 end
 
@@ -139,6 +139,5 @@ function CIxtransform(cp::ChebyshevParameters, a::Vector{real})
     ux = FFTW.r2r(ax, FFTW.REDFT00) 
     return ux
 end
-
 
 end
