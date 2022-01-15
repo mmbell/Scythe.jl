@@ -17,11 +17,11 @@ const uint = UInt64
 # Define homogeneous boundary conditions
 # Inhomgoneous conditions to be implemented later
 const R0 = Dict("R0" => 0)
-const R1T0 = Dict("α1" => 0.0, "β1" => 0.0)
-const R1T1 = Dict("α1" =>  0.0, "β1" =>  1.0)
-const R1T2 = Dict("α1" =>  2.0, "β1" => -1.0)
-const R2T10 = Dict("α2" => 1.0, "β2" => -0.5)
-const R2T20 = Dict("α2" => -1.0, "β2" => 0.0)
+const R1T0 = Dict("α0" =>  0.0)
+const R1T1 = Dict("α1" =>  0.0) 
+const R1T2 = Dict("α2" =>  0.0)
+const R2T10 = Dict("β1" => 0.0, "β2" => 0.0)
+const R2T20 = Dict("β1" => 0.0, "β2" => 0.0)
 const R3 = Dict("R3" => 0)
 
 # Define the spline parameters
@@ -36,7 +36,8 @@ end
 struct Chebyshev1D
     params::ChebyshevParameters
     mishPoints::Vector{real}
-
+    gammaBC::Matrix{real}
+    
     # In this context, uMish is the physical values
     # b is the Chebyshev coefficients without BCs
     # a is the Chebyshev coefficients with BCs
@@ -48,45 +49,28 @@ end
 function Chebyshev1D(cp::ChebyshevParameters)
 
     mishPoints = calcMishPoints(cp)
+    gammaBC = calcGammaBC(cp)
+
     uMish = zeros(real,cp.zDim)
     b = zeros(real,cp.zDim)
     a = zeros(real,cp.zDim)
 
-    column = Chebyshev1D(cp,mishPoints,uMish,b,a)
+    
+    column = Chebyshev1D(cp,mishPoints,gammaBC,uMish,b,a)
     return column
 end
 
 function calcMishPoints(cp::ChebyshevParameters)
     
-    if haskey(cp.BCB,"α1")
-        rankB = 1
-    elseif haskey(cp.BCB,"α2")
-        rankB = 2
-    elseif cp.BCB == R0
-        rankB = 0
-    elseif cp.BCB == R3
-        rankB = 3
-    end
-
-    if haskey(cp.BCT,"α1")
-        rankT = 1
-    elseif haskey(cp.BCT,"α2")
-        rankT = 2
-    elseif cp.BCT == R0
-        rankT = 0
-    elseif cp.BCT == R3
-        rankT = 3
-    end
-
-    Nbasis = cp.zDim - rankB - rankT
-    z = zeros(real,cp.zDim)
+    Nbasis = cp.zDim
+    z = zeros(real,Nbasis)
     scale = -0.5 * (cp.zmax - cp.zmin)
     offset = 0.5 * (cp.zmin + cp.zmax)
     z[1] = 1.0 * scale + offset
     for n = 2:Nbasis
         z[n] = cos((n-1) * π / (Nbasis - 1)) * scale + offset
     end
-    z[cp.zDim] = -1.0 * scale + offset
+    z[Nbasis] = -1.0 * scale + offset
     return z
 end
 
@@ -97,10 +81,10 @@ function CBtransform(cp::ChebyshevParameters, uMish::Vector{real})
     return b
 end
 
-function CAtransform(cp::ChebyshevParameters, b::Vector{real})
+function CAtransform(cp::ChebyshevParameters, gammaBC::Matrix{real}, b::Vector{real})
 
-    # Apply the BCs (to do)
-    a = b
+    # Apply the BCs
+    a = gammaBC * b
     return a
 end
 
@@ -138,5 +122,46 @@ function CIxtransform(cp::ChebyshevParameters, a::Vector{real})
     ux = FFTW.r2r(ax, FFTW.REDFT00) 
     return ux
 end
+
+function calcDCTmatrix(Nbasis::Int64)
+    
+    # Create a matrix with the DCT as basis functions for boundary conditions
+    dct = zeros(Float64,Nbasis,Nbasis)
+    for i = 1:Nbasis
+        t = (i-1) * π / (Nbasis - 1)
+        for j = 1:Nbasis
+            dct[i,j] = 2*cos((j-1)*t)
+        end
+    end
+    dct[:,1] *= 0.5
+    dct[:,Nbasis] *= 0.5
+    return dct
+end
+
+function calcGammaBC(cp::ChebyshevParameters)
+
+    Ndim = cp.zDim
+    
+    # Create the BC matrix
+    dctMatrix = calcDCTmatrix(Ndim)
+    dctBC = calcDCTmatrix(Ndim)
+    
+    if haskey(cp.BCB,"α0")
+        dctBC[:,1] .= cp.BCB["α0"]
+    elseif haskey(cp.BCB,"α1")
+        #Not implemented yet
+    end
+
+    if haskey(cp.BCT,"α0")
+        dctBC[:,Ndim] .= cp.BCT["α0"]
+    elseif haskey(cp.BCT,"α2")
+        #Not implemented yet
+    end
+    
+    gammaBC = dctMatrix' \ dctBC'
+    return gammaBC'
+    
+end
+
 
 end
