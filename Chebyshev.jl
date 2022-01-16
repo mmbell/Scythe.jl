@@ -36,7 +36,7 @@ end
 struct Chebyshev1D
     params::ChebyshevParameters
     mishPoints::Vector{real}
-    gammaBC::Matrix{real}
+    gammaBC
     
     # In this context, uMish is the physical values
     # b is the Chebyshev coefficients without BCs
@@ -81,7 +81,7 @@ function CBtransform(cp::ChebyshevParameters, uMish::Vector{real})
     return b
 end
 
-function CAtransform(cp::ChebyshevParameters, gammaBC::Matrix{real}, b::Vector{real})
+function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
 
     # Apply the BCs
     a = gammaBC * b
@@ -105,6 +105,22 @@ function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real})
         ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
     end
     return ax ./ (-0.5 * (cp.zmax - cp.zmin))
+end
+
+function CIIntcoefficients(cp::ChebyshevParameters, a::Vector{real}, C0::real = 0.0)
+
+    # Recursive relationship for integral coefficients
+    aInt = zeros(real,cp.zDim)
+    sum = 0.0
+    interval = -0.25 * (cp.zmax - cp.zmin)
+    for k = 2:(cp.zDim-1)
+        aInt[k] = interval * (a[k-1] - a[k+1]) / (k-1)
+        sum += aInt[k]
+    end
+    aInt[cp.zDim] = a[cp.zDim-1]/(cp.zDim-1)
+    sum += aInt[cp.zDim]
+    aInt[1] = C0 - (2.0 * sum)
+    return aInt
 end
 
 function CIxtransform(cp::ChebyshevParameters, a::Vector{real})
@@ -142,6 +158,12 @@ function calcGammaBC(cp::ChebyshevParameters)
 
     Ndim = cp.zDim
     
+    if (cp.BCB == R0) && (cp.BCT == R0)
+        # Identity matrix
+        gammaBC = Matrix(1.0I, Ndim, Ndim)
+        return factorize(gammaBC)
+    end
+    
     # Create the BC matrix
     dctMatrix = calcDCTmatrix(Ndim)
     dctBC = calcDCTmatrix(Ndim)
@@ -158,8 +180,10 @@ function calcGammaBC(cp::ChebyshevParameters)
         #Not implemented yet
     end
     
-    gammaBC = dctMatrix' \ dctBC'
-    return gammaBC'
+    gammaTranspose = dctMatrix' \ dctBC'    
+    gammaBC = Matrix{Float64}(undef,25,25)
+    gammaBC .= gammaTranspose'
+    return gammaBC
     
 end
 
