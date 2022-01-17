@@ -66,11 +66,11 @@ function calcMishPoints(cp::ChebyshevParameters)
     z = zeros(real,Nbasis)
     scale = -0.5 * (cp.zmax - cp.zmin)
     offset = 0.5 * (cp.zmin + cp.zmax)
-    z[1] = 1.0 * scale + offset
-    for n = 2:Nbasis
+    #z[1] = 1.0 * scale + offset
+    for n = 1:Nbasis
         z[n] = cos((n-1) * π / (Nbasis - 1)) * scale + offset
     end
-    z[Nbasis] = -1.0 * scale + offset
+    #z[Nbasis] = -1.0 * scale + offset
     return z
 end
 
@@ -84,7 +84,7 @@ end
 function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
 
     # Apply the BCs
-    a = gammaBC * b
+    a = b .+ (gammaBC' * b)
     return a
 end
 
@@ -154,7 +154,7 @@ function calcDCTmatrix(Nbasis::Int64)
     return dct
 end
 
-function calcGammaBC(cp::ChebyshevParameters)
+function calcGammaBCalt(cp::ChebyshevParameters)
 
     Ndim = cp.zDim
     
@@ -176,7 +176,7 @@ function calcGammaBC(cp::ChebyshevParameters)
 
     if haskey(cp.BCT,"α0")
         dctBC[:,Ndim] .= cp.BCT["α0"]
-    elseif haskey(cp.BCT,"α2")
+    elseif haskey(cp.BCT,"α1")
         #Not implemented yet
     end
     
@@ -184,8 +184,44 @@ function calcGammaBC(cp::ChebyshevParameters)
     gammaBC = Matrix{Float64}(undef,25,25)
     gammaBC .= gammaTranspose'
     return gammaBC
-    
 end
 
+function calcGammaBC(cp::ChebyshevParameters)
+    
+    Ndim = cp.zDim
+    
+    if (cp.BCB == R0) && (cp.BCT == R0)
+        # No BCs
+        gammaBC = 0.0
+        return gammaBC
+    end
+    
+    if haskey(cp.BCB,"α0")
+        gammaBC = ones(Float64,Ndim)
+        gammaBC[2:Ndim-1] *= 2.0
+        gammaBC *= (-0.5 / (Ndim-1))
+        return gammaBC   
+        
+    elseif haskey(cp.BCB,"α1")    
+        # Global coefficient method (Wang et al. 1993) for Neumann BCs
+        # https://doi.org/10.1006/jcph.1993.1133
+        scaleFactor = 0.0
+        gammaBC = zeros(Float64,Ndim,Ndim)
+        c = ones(Float64,Ndim)
+        c[1] *= 2.0
+        c[Ndim] *= 2.0
+        for i = 1:Ndim
+            n = i-1
+            scaleFactor += -(n * n) / (c[i] * (Ndim-1))
+        end
+        for i = 1:Ndim
+            n = i -1
+            for j = 1:Ndim
+                gammaBC[i,j] = n * n / (scaleFactor * c[j] * (Ndim-1))
+            end
+        end
+        return gammaBC
+    end    
+end
 
 end
