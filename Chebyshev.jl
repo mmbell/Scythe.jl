@@ -194,15 +194,16 @@ function calcGammaBC(cp::ChebyshevParameters)
         # No BCs
         gammaBC = 0.0
         return gammaBC
-    end
     
-    if haskey(cp.BCB,"α0")
+    elseif (cp.BCB == R1T0) && (cp.BCT == R0)
+        #R1T0 bottom
         gammaBC = ones(Float64,Ndim)
         gammaBC[2:Ndim-1] *= 2.0
         gammaBC *= (-0.5 / (Ndim-1))
-        return gammaBC   
+        return gammaBC
         
-    elseif haskey(cp.BCB,"α1")    
+    elseif (cp.BCB == R1T1) && (cp.BCT == R0)
+        #R1T1 bottom
         # Global coefficient method (Wang et al. 1993) for Neumann BCs
         # https://doi.org/10.1006/jcph.1993.1133
         scaleFactor = 0.0
@@ -221,7 +222,117 @@ function calcGammaBC(cp::ChebyshevParameters)
             end
         end
         return gammaBC
-    end    
+    
+    elseif (cp.BCB == R0) && (cp.BCT == R1T0)
+        gammaBC = ones(Float64,Ndim,Ndim)
+        for i = 1:Ndim
+            for j = 1:Ndim
+                gammaBC[i,j] *= -1.0* (-1.0)^(i-1) * (-1.0)^(j-1) / (Ndim-1)
+            end
+        end
+        gammaBC[1,:] *= 0.5
+        gammaBC[Ndim,:] *= 0.5
+        return gammaBC
+        
+    elseif (cp.BCB == R0) && (cp.BCT == R1T1)    
+        scaleFactor = 0.0
+        gammaBC = zeros(Float64,Ndim,Ndim)
+        c = ones(Float64,Ndim)
+        c[1] *= 2.0
+        c[Ndim] *= 2.0
+        for i = 1:Ndim
+            n = i-1
+            scaleFactor += -(n * n) * (-1.0)^n * (-1.0)^(n+1) / (c[i] * (Ndim-1))
+        end
+        for i = 1:Ndim
+            n = i -1
+            for j = 1:Ndim
+                gammaBC[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
+            end
+        end
+        return gammaBC
+        
+    elseif (cp.BCB == R1T0) && (cp.BCT == R1T0)
+        gammaBC = ones(Float64,Ndim,Ndim)
+        for i = 1:Ndim
+            for j = 1:Ndim
+                gammaBC[i,j] *= -1.0* (-1.0)^(i-1) * (-1.0)^(j-1) / (Ndim-1)
+            end
+        end
+        gammaBC[1,:] *= 0.5
+        gammaBC[Ndim,:] *= 0.5
+
+        gammaL = ones(Float64,Ndim)
+        gammaL[2:Ndim-1] *= 2.0
+        gammaL *= (-0.5 / (Ndim-1))
+
+        for j = 1:Ndim
+            gammaBC[:,j] += gammaL
+        end
+        return gammaBC  
+        
+    elseif (cp.BCB == R1T1) && (cp.BCT == R1T1)
+        # Mixed conditions unclear if this will work
+        scaleFactor = 0.0
+        gammaL = zeros(Float64,Ndim,Ndim)
+        c = ones(Float64,Ndim)
+        c[1] *= 2.0
+        c[Ndim] *= 2.0
+        for i = 1:Ndim
+            n = i-1
+            scaleFactor += -(n * n) / (c[i] * (Ndim-1))
+        end
+        for i = 1:Ndim
+            n = i -1
+            for j = 1:Ndim
+                gammaL[i,j] = n * n / (scaleFactor * c[j] * (Ndim-1))
+            end
+        end
+        
+        scaleFactor = 0.0
+        gammaR = zeros(Float64,Ndim,Ndim)
+        for i = 1:Ndim
+            n = i-1
+            scaleFactor += -(n * n) * (-1.0)^n * (-1.0)^(n+1) / (c[i] * (Ndim-1))
+        end
+        for i = 1:Ndim
+            n = i -1
+            for j = 1:Ndim
+                gammaR[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
+            end
+        end
+    
+        gammaBC = gammaL + gammaR
+        return gammaBC
+    
+    elseif (cp.BCB == R1T0) && (cp.BCT == R1T1)
+        # Mixed conditions unclear if this will work
+        c = ones(Float64,Ndim)
+        c[1] *= 2.0
+        c[Ndim] *= 2.0
+        scaleFactor = 0.0
+        gammaBC = zeros(Float64,Ndim,Ndim)
+        for i = 1:Ndim
+            n = i-1
+            scaleFactor += -(n * n) * (-1.0)^n * (-1.0)^(n+1) / (c[i] * (Ndim-1))
+        end
+        for i = 1:Ndim
+            n = i -1
+            for j = 1:Ndim
+                gammaBC[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
+            end
+        end
+        
+        gammaL = ones(Float64,Ndim)
+        gammaL[2:Ndim-1] *= 2.0
+        gammaL *= (-0.5 / (Ndim-1))
+
+        for j = 1:Ndim
+            gammaBC[:,j] += gammaL
+        end
+        return gammaBC
+    end
+    
 end
 
 end
