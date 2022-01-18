@@ -272,9 +272,9 @@ function calcGammaBC(cp::ChebyshevParameters)
         return gammaBC  
         
     elseif (cp.BCB == R1T1) && (cp.BCT == R1T1)
-        # Mixed conditions unclear if this will work
+        # Requires two-step application (not yet implemented)
         scaleFactor = 0.0
-        gammaL = zeros(Float64,Ndim,Ndim)
+        gammaBCB = zeros(Float64,Ndim,Ndim)
         c = ones(Float64,Ndim)
         c[1] *= 2.0
         c[Ndim] *= 2.0
@@ -285,12 +285,12 @@ function calcGammaBC(cp::ChebyshevParameters)
         for i = 1:Ndim
             n = i -1
             for j = 1:Ndim
-                gammaL[i,j] = n * n / (scaleFactor * c[j] * (Ndim-1))
+                gammaBCB[i,j] = n * n / (scaleFactor * c[j] * (Ndim-1))
             end
         end
         
         scaleFactor = 0.0
-        gammaR = zeros(Float64,Ndim,Ndim)
+        gammaBCT = zeros(Float64,Ndim,Ndim)
         for i = 1:Ndim
             n = i-1
             scaleFactor += -(n * n) * (-1.0)^n * (-1.0)^(n+1) / (c[i] * (Ndim-1))
@@ -298,20 +298,19 @@ function calcGammaBC(cp::ChebyshevParameters)
         for i = 1:Ndim
             n = i -1
             for j = 1:Ndim
-                gammaR[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
+                gammaBCT[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
             end
         end
     
-        gammaBC = gammaL + gammaR
-        return gammaBC
+        return gammaBCB, gammaBCT
     
     elseif (cp.BCB == R1T0) && (cp.BCT == R1T1)
-        # Mixed conditions unclear if this will work
+        # Requires two-step application (not yet implemented)
         c = ones(Float64,Ndim)
         c[1] *= 2.0
         c[Ndim] *= 2.0
         scaleFactor = 0.0
-        gammaBC = zeros(Float64,Ndim,Ndim)
+        gammaBCT = zeros(Float64,Ndim,Ndim)
         for i = 1:Ndim
             n = i-1
             scaleFactor += -(n * n) * (-1.0)^n * (-1.0)^(n+1) / (c[i] * (Ndim-1))
@@ -319,18 +318,15 @@ function calcGammaBC(cp::ChebyshevParameters)
         for i = 1:Ndim
             n = i -1
             for j = 1:Ndim
-                gammaBC[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
+                gammaBCT[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
             end
         end
         
-        gammaL = ones(Float64,Ndim)
-        gammaL[2:Ndim-1] *= 2.0
-        gammaL *= (-0.5 / (Ndim-1))
+        gammaBCB = ones(Float64,Ndim)
+        gammaBCB[2:Ndim-1] *= 2.0
+        gammaBCB *= (-0.5 / (Ndim-1))
 
-        for j = 1:Ndim
-            gammaBC[:,j] += gammaL
-        end
-        return gammaBC
+        return gammaBCB, gammaBCT
     end
     
 end
