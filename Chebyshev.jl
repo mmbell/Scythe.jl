@@ -34,11 +34,19 @@ const R3 = Dict("R3" => 0)
 end
 
 struct Chebyshev1D
+    # Parameters for the column
     params::ChebyshevParameters
+    
+    # Pre-calculated Chebyshev–Gauss–Lobatto points (extrema of Chebyshev polynomials)
     mishPoints::Vector{real}
+    
+    # Scalar, vector, or matrix that enforces boundary conditions
     gammaBC
     
-    # In this context, uMish is the physical values
+    # Measured FFTW Plan
+    fftPlan
+    
+    # uMish is the physical values
     # b is the Chebyshev coefficients without BCs
     # a is the Chebyshev coefficients with BCs
     uMish::Vector{real}
@@ -55,8 +63,10 @@ function Chebyshev1D(cp::ChebyshevParameters)
     b = zeros(real,cp.zDim)
     a = zeros(real,cp.zDim)
 
+    # Plan the FFT
+    fftPlan = FFTW.plan_r2r(a, FFTW.REDFT00, flags=FFTW.PATIENT)
     
-    column = Chebyshev1D(cp,mishPoints,gammaBC,uMish,b,a)
+    column = Chebyshev1D(cp,mishPoints,gammaBC,fftPlan,uMish,b,a)
     return column
 end
 
@@ -66,19 +76,24 @@ function calcMishPoints(cp::ChebyshevParameters)
     z = zeros(real,Nbasis)
     scale = -0.5 * (cp.zmax - cp.zmin)
     offset = 0.5 * (cp.zmin + cp.zmax)
-    #z[1] = 1.0 * scale + offset
     for n = 1:Nbasis
         z[n] = cos((n-1) * π / (Nbasis - 1)) * scale + offset
     end
-    #z[Nbasis] = -1.0 * scale + offset
     return z
 end
 
-function CBtransform(cp::ChebyshevParameters, uMish::Vector{real})
+function CBtransform(cp::ChebyshevParameters, fftPlan, uMish::Vector{real})
 
-    # Do the Fourier transform and pre-scale
-    b = FFTW.r2r(uMish, FFTW.REDFT00) ./ (2 * (cp.zDim -1))
+    # Do the DCT transform and pre-scale
+    b = (fftPlan * uMish) ./ (2 * (cp.zDim -1))
     return b
+end
+
+function CBtransform!(column::Chebyshev1D)
+
+    # Do the DCT transform and pre-scale
+    b = (column.fftPlan * column.uMish) ./ (2 * (column.params.zDim -1))
+    column.b .= b
 end
 
 function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
@@ -88,24 +103,27 @@ function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
     return a
 end
 
-function CItransform(cp::ChebyshevParameters, a::Vector{real})
+function CAtransform!(column::Chebyshev1D)
 
-    # Do the inverse transform to get back physical values
-    uMish = FFTW.r2r(a, FFTW.REDFT00)
+    # Apply the BCs
+    a = column.b .+ (column.gammaBC' * column.b)
+    column.a .= a
+end
+    
+function CItransform(cp::ChebyshevParameters, fftPlan, a::Vector{real})
+
+    # Do the inverse DCT transform to get back physical values
+    uMish = fftPlan * a
     return uMish
 end
 
-function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real})
-
-    # Recursive relationship for derivative coefficients
-    ax = zeros(real,cp.zDim)
-    k = cp.zDim
-    ax[k-1] = (2.0 * (k-1) * a[k])
-    for k = (cp.zDim-1):-1:2
-        ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
-    end
-    return ax ./ (-0.5 * (cp.zmax - cp.zmin))
+function CItransform!(column::Chebyshev1D)
+    
+    # Do the inverse DCT transform to get back physical values
+    uMish = column.fftPlan * column.a
+    column.uMish .= uMish
 end
+
 
 function CIIntcoefficients(cp::ChebyshevParameters, a::Vector{real}, C0::real = 0.0)
 
@@ -123,7 +141,32 @@ function CIIntcoefficients(cp::ChebyshevParameters, a::Vector{real}, C0::real = 
     return aInt
 end
 
-function CIxtransform(cp::ChebyshevParameters, a::Vector{real})
+function CIInttransform(cp::ChebyshevParameters, fftPlan, a::Vector{real}, C0::real = 0.0)
+
+    aInt = CIIntcoefficients(cp,a,C0)
+    uInt = fftPlan * aInt
+    return uInt
+end
+
+function CIInttransform(column::Chebyshev1D, C0::real = 0.0)
+    
+    uInt = CIInttransform(column.params, column.fftPlan, column.a, C0)
+    return uInt
+end
+
+function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real})
+
+    # Recursive relationship for derivative coefficients
+    ax = zeros(real,cp.zDim)
+    k = cp.zDim
+    ax[k-1] = (2.0 * (k-1) * a[k])
+    for k = (cp.zDim-1):-1:2
+        ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
+    end
+    return ax ./ (-0.5 * (cp.zmax - cp.zmin))
+end
+
+function CIxtransform(cp::ChebyshevParameters, fftPlan, a::Vector{real})
 
     # Recursive relationship for derivative coefficients
     ax = zeros(real,cp.zDim)
@@ -135,9 +178,23 @@ function CIxtransform(cp::ChebyshevParameters, a::Vector{real})
     ax = ax ./ (-0.5 * (cp.zmax - cp.zmin))
     
     # Do the inverse transform to get back physical values
-    ux = FFTW.r2r(ax, FFTW.REDFT00) 
+    ux = fftPlan * ax
     return ux
 end
+
+function CIxtransform(column::Chebyshev1D)
+    
+    ux = CIxtransform(column.params, column.fftPlan, column.a)
+    return ux
+end
+
+function CIxxtransform(column::Chebyshev1D)
+    
+    ax = CIxcoefficients(column.params, column.a)
+    uxx = CIxtransform(column.params, column.fftPlan, ax)
+    return uxx
+end
+
 
 function calcDCTmatrix(Nbasis::Int64)
     
@@ -155,7 +212,9 @@ function calcDCTmatrix(Nbasis::Int64)
 end
 
 function calcGammaBCalt(cp::ChebyshevParameters)
-
+    
+    # This works for Dirichelet BCs, but not for Neumann
+    # It's also less efficient than the other methods, but not ready to delete this code yet
     Ndim = cp.zDim
     
     if (cp.BCB == R0) && (cp.BCT == R0)
