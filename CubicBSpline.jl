@@ -5,7 +5,7 @@ using SparseArrays
 using Parameters
 
 export SplineParameters, Spline1D
-export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
+#export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
 export SBtransform, SBtransform!, SAtransform!, SItransform!
 export SBxtransform, SIxtransform, SIxxtransform
 export setMishValues

@@ -301,7 +301,7 @@ function integrate_model()
 end
 
 function Williams2013_TBCL(model,x,var,varx,varxx)
-    
+
         K = 1500.0
         Cd = 2.4e-3
         h = 1000.0
@@ -327,7 +327,7 @@ function Williams2013_TBCL(model,x,var,varx,varxx)
         w_ = 0.5 .* abs.(w) .- w
 
         vardot[:,1] .= vgrdot
-        
+
         UADV = -(u .* ur)
         UDRAG = -(Cd .* U .* u ./ h)
         UCOR = ((f .* v) .+ ((v .* v) ./ r))
@@ -337,15 +337,14 @@ function Williams2013_TBCL(model,x,var,varx,varxx)
         vardot[:,2] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW
         F[:,2] .= UKDIFF
 
-        
         VADV = -u .* (f .+ (v ./ r) .+ vr)
         VDRAG = -(Cd .* U .* v ./ h)
         VW = w_ .* (vgr - v) ./ h
         VKDIFF = K .* ((v ./ r) .+ vr)
         vardot[:,3] .= VADV .+ VDRAG .+ UW
         F[:,3] .= VKDIFF
-        
+
         vardot[:,4] .= w
-    
+
         return vardot, F
 end
