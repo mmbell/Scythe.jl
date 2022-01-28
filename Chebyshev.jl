@@ -29,6 +29,7 @@ const R3 = Dict("R3" => 0)
     zmin::real = 0.0
     zmax::real = 0.0
     zDim::int = 1
+    bDim::int = 1
     BCB::Dict = R0
     BCT::Dict = R0
 end
@@ -47,8 +48,8 @@ struct Chebyshev1D
     fftPlan
     
     # uMish is the physical values
-    # b is the Chebyshev coefficients without BCs
-    # a is the Chebyshev coefficients with BCs
+    # b is the filtered Chebyshev coefficients without BCs
+    # a is the padded Chebyshev coefficients with BCs
     uMish::Vector{real}
     b::Vector{real}
     a::Vector{real}
@@ -60,7 +61,7 @@ function Chebyshev1D(cp::ChebyshevParameters)
     gammaBC = calcGammaBC(cp)
 
     uMish = zeros(real,cp.zDim)
-    b = zeros(real,cp.zDim)
+    b = zeros(real,cp.bDim)
     a = zeros(real,cp.zDim)
 
     # Plan the FFT
@@ -86,27 +87,29 @@ function CBtransform(cp::ChebyshevParameters, fftPlan, uMish::Vector{real})
 
     # Do the DCT transform and pre-scale
     b = (fftPlan * uMish) ./ (2 * (cp.zDim -1))
-    return b
+    return b[1:cp.bDim]
 end
 
 function CBtransform!(column::Chebyshev1D)
 
     # Do the DCT transform and pre-scale
     b = (column.fftPlan * column.uMish) ./ (2 * (column.params.zDim -1))
-    column.b .= b
+    column.b .= b[1:column.params.bDim]
 end
 
 function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
 
     # Apply the BCs
-    a = b .+ (gammaBC' * b)
+    bfill = [b ; zeros(Float64, cp.Zdim-cp.bDim)]
+    a = bfill .+ (gammaBC' * bfill)
     return a
 end
 
 function CAtransform!(column::Chebyshev1D)
 
     # Apply the BCs
-    a = column.b .+ (column.gammaBC' * column.b)
+    bfill = [column.b ; zeros(Float64, column.params.zDim-column.params.bDim)]
+    a = bfill .+ (column.gammaBC' * bfill)
     column.a .= a
 end
     
