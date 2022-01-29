@@ -100,7 +100,7 @@ end
 function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
 
     # Apply the BCs
-    bfill = [b ; zeros(Float64, cp.Zdim-cp.bDim)]
+    bfill = [b ; zeros(Float64, cp.zDim-cp.bDim)]
     a = bfill .+ (gammaBC' * bfill)
     return a
 end
@@ -123,8 +123,7 @@ end
 function CItransform!(column::Chebyshev1D)
     
     # Do the inverse DCT transform to get back physical values
-    uMish = column.fftPlan * column.a
-    column.uMish .= uMish
+    column.uMish .= column.fftPlan * column.a
 end
 
 
