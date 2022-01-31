@@ -13,8 +13,8 @@ const uint = UInt64
 
 @with_kw struct ModelParameters
     ts::real = 0.0
-    num_ts::int = 1
-    output_interval::int = 1
+    integration_time::real = 1.0
+    output_interval::real = 1.0
     xmin::real = 0.0
     xmax::real = 0.0
     num_nodes::int = 1
@@ -35,8 +35,8 @@ function integrate_1dLinearAdvection()
     
     model = ModelParameters(
     ts = 0.2,
-    num_ts = 480,
-    output_interval = 25,
+    integration_time = 480.0,
+    output_interval = 25.0,
     xmin = -48.0,
     xmax = 48.0,
     num_nodes = 96,
@@ -54,14 +54,20 @@ end
 function integrate_WilliamsSlabTCBL(ics_csv::String)
     
     model = ModelParameters(
-        ts = 1.0,
-        num_ts = 10800,
-        output_interval = 3600,
+        ts = 2.0,
+        integration_time = 7200.0,
+        output_interval = 3600.0,
         xmin = 0.0,
         xmax = 1.0e6,
         num_nodes = 2000,
-        BCL = Dict("vgr" => R0, "u" => R1T0, "v" => R1T0, "w" => R1T0),
-        BCR = Dict("vgr" => R0, "u" => R1T1, "v" => R1T1, "w" => R1T1),
+        BCL = Dict("vgr" => CubicBSpline.R0, 
+            "u" => CubicBSpline.R1T0, 
+            "v" => CubicBSpline.R1T0, 
+            "w" => CubicBSpline.R1T0),
+        BCR = Dict("vgr" => CubicBSpline.R0, 
+            "u" => CubicBSpline.R1T1, 
+            "v" => CubicBSpline.R1T1, 
+            "w" => CubicBSpline.R1T1),
         equation_set = "Williams2013_TCBL",
         initial_conditions = ics_csv,
         vars = Dict("vgr" => 1, "u" => 2, "v" => 3, "w" => 4)    

@@ -55,20 +55,11 @@ function calcTendency(splines::Vector{Spline1D}, model::ModelParameters, t::int)
     bdot = Matrix{real}(undef,splines[1].bDim,length(splines))
     
     for v in eachindex(splines)
-        a = SItransform!(splines[v])
-
-        u[:,v] = SItransform!(splines[v])
+        u[:,v] = splines[v].uMish
         ux[:,v] = SIxtransform(splines[v])
         uxx[:,v] = SIxxtransform(splines[v])
-
-        #b_now is held in place
-        SBtransform!(splines[v])
     end
-    
-    if mod(t,model.output_interval) == 0
-        write_output(splines, model, t)
-    end
-    
+        
     # Feed physical matrices to physical equations
     udot, F = physical_model(model,splines[1].mishPoints,u,ux,uxx)
 
@@ -79,7 +70,7 @@ function calcTendency(splines::Vector{Spline1D}, model::ModelParameters, t::int)
     
     # Do something with F. May need to be a new spline because of BCs?
     Fspline = Spline1D(SplineParameters(xmin = model.xmin, xmax = model.xmax,
-            num_nodes = model.num_nodes, BCL = R0, BCR = R0))
+            num_nodes = model.num_nodes, BCL = CubicBSpline.R0, BCR = CubicBSpline.R0))
     # SBxtransform(spline,F,BCL,BCR) not working
     Fspline.uMish .= F[:,2]
     SBtransform!(Fspline)
@@ -129,13 +120,14 @@ function physical_model(model::ModelParameters,x::Vector{real},var::Matrix{real}
     return vardot, F 
 end
 
-function write_output(splines::Vector{Spline1D}, model::ModelParameters, t::int)
+function write_output(splines::Vector{Spline1D}, model::ModelParameters, t::real)
     
-    println("Writing output at time $t")
+    time = round(t; digits=2)
+    println("Writing output at time $time")
     for var in keys(model.vars)
         v = model.vars[var]
-        afilename = string("model_a_", var , "_", t, ".csv")
-        ufilename = string("model_", var , "_", t, ".csv")
+        afilename = string("model_a_", var , "_", time, ".csv")
+        ufilename = string("model_", var , "_", time, ".csv")
         afile = open(afilename,"w")
         ufile = open(ufilename,"w")
 
@@ -145,8 +137,7 @@ function write_output(splines::Vector{Spline1D}, model::ModelParameters, t::int)
             write(afile,"$i, $a_i\n")
         end        
 
-        SItransform!(splines[v])
-        u = splines[v].uMish
+        u = SItransform!(splines[v])
         mishPoints = splines[v].mishPoints
         for i = 1:splines[v].mishDim
             mp_i = mishPoints[i]
@@ -158,7 +149,7 @@ function write_output(splines::Vector{Spline1D}, model::ModelParameters, t::int)
     end
     
     # Write nodes to a single file, including vorticity
-    outfilename = string(model.equation_set , "_output_", t, ".csv")
+    outfilename = string(model.equation_set , "_output_", time, ".csv")
     outfile = open(outfilename,"w")
     r = zeros(real,splines[1].aDim)
     vort = zeros(real,splines[1].aDim)
@@ -223,9 +214,11 @@ function initialize(model::ModelParameters, numvars::int)
         SBtransform!(spline)
         SAtransform!(spline)
         SItransform!(spline)
+        #b_now is held in place
+        SBtransform!(spline)
     end
     
-    write_output(splines, model, 0)
+    write_output(splines, model, 0.0)
     
     return splines
 end
@@ -234,13 +227,18 @@ function run(splines::Vector{Spline1D}, model::ModelParameters)
     
     println("Model starting up...")
 
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    
     # Advance the first timestep
-    bdot,bdot_delay = calcTendency(splines, model, 1)
+    bdot,bdot_delay = calcTendency(splines, model, 1)    
     b_nxt, bdot_n1 = first_timestep(splines, bdot, model.ts)
     for v in Base.OneTo(length(splines)-1)
         splines[v].b .= b_nxt[:,v]
         SAtransform!(splines[v])
         SItransform!(splines[v])
+        #b_now is held in place
+        SBtransform!(splines[v])
     end
     
     # Advance the second timestep
@@ -250,22 +248,29 @@ function run(splines::Vector{Spline1D}, model::ModelParameters)
         splines[v].b .= b_nxt[:,v]
         SAtransform!(splines[v])
         SItransform!(splines[v])
+        #b_now is held in place
+        SBtransform!(splines[v])
     end
     
     # Keep going!
-    for t = 2:model.num_ts
+    for t = 3:num_ts
         bdot,bdot_delay = calcTendency(splines, model, t)
-                
         b_nxt, bdot_n1, bdot_n2 = timestep(splines, bdot, bdot_n1, bdot_n2, bdot_delay, model.ts)
         for v in Base.OneTo(length(splines)-1)
             splines[v].b .= b_nxt[:,v]
             SAtransform!(splines[v])
             SItransform!(splines[v])
+            #b_now is held in place
+            SBtransform!(splines[v])
         end
         # Override diagnostic variables
         splines[4].b .= bdot[:,4]
         SAtransform!(splines[4])
         SItransform!(splines[4])
+        
+        if mod(t,output_int) == 0
+            write_output(splines, model, (t*model.ts))
+        end
     end
     
     println("Done with time integration")
@@ -275,7 +280,7 @@ end
 
 function finalize(splines::Vector{Spline1D}, model::ModelParameters)
     
-    write_output(splines, model, model.num_ts)
+    write_output(splines, model, model.integration_time)
     println("Model complete!")
 end
 
@@ -283,13 +288,19 @@ function integrate_model()
     
     model = ModelParameters(
         ts = 1.0,
-        num_ts = 100,
+        integration_time = 100,
         output_interval = 50,
         xmin = 0.0,
         xmax = 1.0e6,
         num_nodes = 2000,
-        BCL = Dict("vgr" => R0, "u" => R1T0, "v" => R1T0, "w" => R1T1),
-        BCR = Dict("vgr" => R0, "u" => R1T1, "v" => R1T1, "w" => R1T1),
+        BCL = Dict("vgr" => CubicBSpline.R0, 
+            "u" => CubicBSpline.R1T0, 
+            "v" => CubicBSpline.R1T0, 
+            "w" => CubicBSpline.R1T1),
+        BCR = Dict("vgr" => CubicBSpline.R0, 
+            "u" => CubicBSpline.R1T1, 
+            "v" => CubicBSpline.R1T1, 
+            "w" => CubicBSpline.R1T1),
         equation_set = "Williams2013_TCBL",
         initial_conditions = "rankine_test_ic.csv",
         vars = Dict("vgr" => 1, "u" => 2, "v" => 3, "w" => 4)    
