@@ -100,13 +100,13 @@ function createGrid(gp::GridParameters)
         elseif gp.lDim == 0 && gp.zDim > 0
             # RZ grid
             
-            splines = Array{Spline1D}(undef,gp.b_zDim,length(values(gp.vars)))
-            columns = Array{Chebyshev1D}(undef,gp.rDim,length(values(gp.vars)))
+            splines = Array{Spline1D}(undef,gp.zDim,length(values(gp.vars)))
+            columns = Array{Chebyshev1D}(undef,length(values(gp.vars)))
             spectral = zeros(Float64, gp.b_zDim * gp.b_rDim, length(values(gp.vars)))
-            physical = zeros(Float64, gp.zDim * gp.rDim, length(values(gp.vars)), 3)
+            physical = zeros(Float64, gp.zDim * gp.rDim, length(values(gp.vars)), 5)
             grid = RZ_Grid(gp, splines, columns, spectral, physical)
             for key in keys(gp.vars)
-                for z = 1:gp.b_zDim
+                for z = 1:gp.zDim
                     grid.splines[z,gp.vars[key]] = Spline1D(SplineParameters(
                         xmin = gp.xmin,
                         xmax = gp.xmax,
@@ -114,15 +114,13 @@ function createGrid(gp::GridParameters)
                         BCL = gp.BCL[key], 
                         BCR = gp.BCR[key]))
                 end
-                for r = 1:(gp.num_nodes*3)
-                    grid.columns[r,gp.vars[key]] = Chebyshev1D(ChebyshevParameters(
-                        zmin = gp.zmin,
-                        zmax = gp.zmax,
-                        zDim = gp.zDim,
-                        bDim = gp.b_zDim,
-                        BCB = gp.BCB[key],
-                        BCT = gp.BCT[key]))
-                end
+                grid.columns[gp.vars[key]] = Chebyshev1D(ChebyshevParameters(
+                    zmin = gp.zmin,
+                    zmax = gp.zmax,
+                    zDim = gp.zDim,
+                    bDim = gp.b_zDim,
+                    BCB = gp.BCB[key],
+                    BCT = gp.BCT[key]))
             end
             return grid
             
@@ -197,21 +195,20 @@ function spectralTransform!(grid::RZ_Grid)
     # Transform from the RZ grid to spectral space
     # For RZ grid, varying dimensions are R, Z, and variable
     for v in values(grid.params.vars)
-        for r = 1:grid.params.rDim
-            CBtransform!(grid.columns[r,v])
-
-            for z = 1:grid.params.b_zDim
-                grid.splines[z,v].uMish[r] = grid.columns[r,v].b[z]
-            end
-        end
-        
-        for z = 1:grid.params.b_zDim
+        for z = 1:grid.params.zDim
             SBtransform!(grid.splines[z,v])
-        
+        end
+
+        for r = 1:grid.params.b_rDim
+            for z = 1:grid.params.zDim
+                grid.columns[v].uMish[z] = grid.splines[z,v].b[r]
+            end
+            CBtransform!(grid.columns[v])
+
             # Assign the spectral array
-            z1 = ((z-1)*grid.params.b_rDim)+1
-            z2 = z*grid.params.b_rDim
-            grid.spectral[z1:z2,v] .= grid.splines[z,v].b
+            z1 = ((r-1)*grid.params.b_zDim)+1
+            z2 = r*grid.params.b_zDim
+            grid.spectral[z1:z2,v] .= grid.columns[v].b
         end
     end
 
@@ -223,26 +220,47 @@ function gridTransform!(grid::RZ_Grid)
     # Transform from the spectral to grid space
     # For RZ grid, varying dimensions are R, Z, and variable
     for v in values(grid.params.vars)
-        for z = 1:grid.params.b_zDim
+        for r = 1:grid.params.b_rDim
+            z1 = ((r-1)*grid.params.b_zDim)+1
+            z2 = r*grid.params.b_zDim
+            grid.columns[v].b .= grid.spectral[z1:z2,v]
+            CAtransform!(grid.columns[v])
+            CItransform!(grid.columns[v])
+            
+            for z = 1:grid.params.zDim
+                grid.splines[z,v].b[r] = grid.columns[v].uMish[z]
+            end    
+        end
+        
+        for z = 1:grid.params.zDim
             SAtransform!(grid.splines[z,v])
             SItransform!(grid.splines[z,v])
             
-            for r = 1:grid.params.rDim
-                grid.columns[r,v].b[z] = grid.splines[z,v].uMish[r]
+            # Assign the grid array
+            r1 = ((z-1)*grid.params.rDim)+1
+            r2 = z*grid.params.rDim
+            grid.physical[r1:r2,v,1] .= grid.splines[z,v].uMish
+            grid.physical[r1:r2,v,2] .= SIxtransform(grid.splines[z,v])
+            grid.physical[r1:r2,v,3] .= SIxxtransform(grid.splines[z,v])
+        end
+        
+        # Get the vertical derivatives
+        var = reshape(grid.physical[:,v,1],grid.params.rDim,grid.params.zDim)
+        for r = 1:grid.params.rDim
+            grid.columns[v].uMish .= var[r,:]
+            CBtransform!(grid.columns[v])
+            CAtransform!(grid.columns[v])
+            varz = CIxtransform(grid.columns[v])
+            varzz = CIxxtransform(grid.columns[v])
+
+            # Assign the grid array
+            for z = 1:grid.params.zDim
+                ri = (z-1)*grid.params.rDim + r
+                grid.physical[ri,v,4] = varz[z]
+                grid.physical[ri,v,5] = varzz[z]
             end
         end
         
-        for r = 1:grid.params.rDim
-            CAtransform!(grid.columns[r,v])
-            CItransform!(grid.columns[r,v])
-        
-            # Assign the grid array
-            r1 = ((r-1)*grid.params.zDim)+1
-            r2 = r*grid.params.zDim
-            grid.physical[r1:r2,v,1] .= grid.columns[r,v].uMish
-            grid.physical[r1:r2,v,2] .= CIxtransform(grid.columns[r,v])
-            grid.physical[r1:r2,v,3] .= CIxxtransform(grid.columns[r,v])
-        end
     end
     
     return grid.physical 
@@ -253,10 +271,10 @@ function getGridpoints(grid::RZ_Grid)
     # Return an array of the gridpoint locations
     gridpoints = zeros(Float64, grid.params.rDim * grid.params.zDim,2)
     g = 1
-    for r = 1:grid.params.rDim
-        for z = 1:grid.params.zDim
+    for z = 1:grid.params.zDim
+        for r = 1:grid.params.rDim
             r_m = grid.splines[1,1].mishPoints[r]
-            z_m = grid.columns[1,1].mishPoints[z]
+            z_m = grid.columns[1].mishPoints[z]
             gridpoints[g,1] = r_m
             gridpoints[g,2] = z_m
             g += 1
