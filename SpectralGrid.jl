@@ -206,7 +206,7 @@ function spectralTransform!(grid::RZ_Grid)
         end
         
         for z = 1:grid.params.b_zDim
-             SBtransform!(grid.splines[z,v])
+            SBtransform!(grid.splines[z,v])
         
             # Assign the spectral array
             z1 = ((z-1)*grid.params.b_rDim)+1
@@ -248,5 +248,21 @@ function gridTransform!(grid::RZ_Grid)
     return grid.physical 
 end
 
+function getGridpoints(grid::RZ_Grid)
+
+    # Return an array of the gridpoint locations
+    gridpoints = zeros(Float64, grid.params.rDim * grid.params.zDim,2)
+    g = 1
+    for r = 1:grid.params.rDim
+        for z = 1:grid.params.zDim
+            r_m = grid.splines[1,1].mishPoints[r]
+            z_m = grid.columns[1,1].mishPoints[z]
+            gridpoints[g,1] = r_m
+            gridpoints[g,2] = z_m
+            g += 1
+        end
+    end
+    return gridpoints
+end
 
 end
