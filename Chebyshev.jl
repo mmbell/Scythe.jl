@@ -28,8 +28,8 @@ const R3 = Dict("R3" => 0)
 @with_kw struct ChebyshevParameters
     zmin::real = 0.0
     zmax::real = 0.0
-    zDim::int = 1
-    bDim::int = 1
+    zDim::int = 0
+    bDim::int = 0
     BCB::Dict = R0
     BCT::Dict = R0
 end
@@ -42,10 +42,10 @@ struct Chebyshev1D
     mishPoints::Vector{real}
     
     # Scalar, vector, or matrix that enforces boundary conditions
-    gammaBC
+    gammaBC::Array{real}
     
     # Measured FFTW Plan
-    fftPlan
+    fftPlan::FFTW.r2rFFTWPlan{Float64, (3,), false, 1, UnitRange{Int64}}
     
     # uMish is the physical values
     # b is the filtered Chebyshev coefficients without BCs
@@ -253,7 +253,7 @@ function calcGammaBC(cp::ChebyshevParameters)
     
     if (cp.BCB == R0) && (cp.BCT == R0)
         # No BCs
-        gammaBC = 0.0
+        gammaBC = zeros(Float64,Ndim)
         return gammaBC
     
     elseif (cp.BCB == R1T0) && (cp.BCT == R0)

@@ -2,12 +2,13 @@ module CubicBSpline
 
 using LinearAlgebra
 using SparseArrays
+using SuiteSparse
 using Parameters
 
 export SplineParameters, Spline1D
 #export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
 export SBtransform, SBtransform!, SAtransform!, SItransform!
-export SBxtransform, SIxtransform, SIxxtransform
+export SAtransform, SBxtransform, SIxtransform, SIxxtransform
 export setMishValues
 
 #Define some convenient aliases
@@ -48,8 +49,7 @@ end
 struct Spline1D
     params::SplineParameters
     gammaBC::Matrix{real}
-    #Can't seem to explicitly type pqFactor as SuiteSparse.CHOLMOD.Factor{Float64}, but it works
-    pqFactor
+    pqFactor::SuiteSparse.CHOLMOD.Factor{Float64}
     mishDim::int
     bDim::int
     aDim::int
@@ -317,6 +317,12 @@ function SAtransform(sp::SplineParameters, gammaBC::Matrix{Float64}, pqFactor, b
     return a
 end
 
+function SAtransform(spline::Spline1D, b::Vector{real})
+
+    a = spline.gammaBC' * (spline.pqFactor \ (spline.gammaBC * b))
+    return a
+end
+
 function SAtransform!(spline::Spline1D)
 
     a = spline.gammaBC' * (spline.pqFactor \ (spline.gammaBC * spline.b))
@@ -384,6 +390,12 @@ end
 function SIxtransform(spline::Spline1D)
 
     uprime = SItransform(spline.params,spline.a,spline.mishPoints,1)
+    return uprime
+end
+
+function SIxtransform(spline::Spline1D, a::Vector{real})
+
+    uprime = SItransform(spline.params,a,spline.mishPoints,1)
     return uprime
 end
 
