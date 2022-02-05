@@ -15,11 +15,10 @@ const uint = UInt64
 
 # Define the ring parameters
 @with_kw struct FourierParameters
-    ymin::real = 0.0
-    ymax::real = 0.0
-    yDim::int = 1
-    bDim::int = 1
-    kmax::int = 1
+    lmin::real = 0.0
+    kmax::int = 0
+    yDim::int = 0
+    bDim::int = 0
 end
 
 struct Fourier1D
@@ -30,8 +29,8 @@ struct Fourier1D
     mishPoints::Vector{real}
         
     # Measured FFTW Plan
-    fftPlan
-    ifftPlan
+    fftPlan::FFTW.r2rFFTWPlan{Float64, (0,), false, 1, UnitRange{Int64}}
+    ifftPlan::FFTW.r2rFFTWPlan{Float64, (1,), false, 1, UnitRange{Int64}}
     
     # In this context, uMish is the physical values
     # b is the filtered Fourier coefficients 
@@ -62,7 +61,7 @@ function calcMishPoints(fp::FourierParameters)
     Nbasis = fp.yDim
     y = zeros(real,Nbasis)
     for n = 1:Nbasis
-        y[n] = fp.ymin + (2 * π * (n-1) / Nbasis)  
+        y[n] = fp.lmin + (2 * π * (n-1) / Nbasis)
     end
     return y
 end
