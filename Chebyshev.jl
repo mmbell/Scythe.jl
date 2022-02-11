@@ -7,7 +7,7 @@ using FFTW
 export ChebyshevParameters, Chebyshev1D
 #export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
 export CBtransform, CBtransform!, CAtransform!, CItransform!
-export CBxtransform, CIxtransform, CIxxtransform
+export CBxtransform, CIxtransform, CIxxtransform, CIInttransform
 
 #Define some convenient aliases
 const real = Float64
@@ -95,6 +95,13 @@ function CBtransform!(column::Chebyshev1D)
     # Do the DCT transform and pre-scale
     b = (column.fftPlan * column.uMish) ./ (2 * (column.params.zDim -1))
     column.b .= b[1:column.params.bDim]
+end
+
+function CBtransform(column::Chebyshev1D, uMish::Vector{real})
+
+    # Do the DCT transform and pre-scale
+    b = (column.fftPlan * uMish) ./ (2 * (column.params.zDim -1))
+    return b[1:column.params.bDim]
 end
 
 function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
