@@ -240,7 +240,7 @@ function setMishValues(spline::Spline1D, uMish::Vector{real})
     spline.uMish .= uMish
 end
 
-function SBtransform(sp::SplineParameters, gammaBC::Matrix{real}, uMish::Vector{real})
+function SBtransform(sp::SplineParameters, uMish::Vector{real})
 
     Mdim = sp.num_nodes + 3
     b = zeros(real,Mdim)
@@ -266,22 +266,22 @@ end
 
 function SBtransform(spline::Spline1D, uMish::Vector{real})
 
-    b = SBtransform(spline.params,spline.gammaBC,uMish)
+    b = SBtransform(spline.params,uMish)
     return b
 end
 
 function SBtransform!(spline::Spline1D)
 
-    b = SBtransform(spline.params,spline.gammaBC,spline.uMish)
+    b = SBtransform(spline.params,spline.uMish)
     spline.b .= b
 end
 
-function SBxtransform(sp::SplineParameters, gammaBC::Matrix{real}, uMish::Vector{real}, BCL, BCR)
+function SBxtransform(sp::SplineParameters, uMish::Vector{real}, BCL, BCR)
 
     # Integration by parts, but still not working
     Mdim = sp.num_nodes + 3
     b = zeros(real,Mdim)
-    
+
     for mi = 1:Mdim
         m = mi - 2
         for mc = 0:(sp.num_nodes-1)
@@ -295,19 +295,17 @@ function SBxtransform(sp::SplineParameters, gammaBC::Matrix{real}, uMish::Vector
                 b[mi] += sp.DX * gaussweight[mu] * bm * uMish[i]
             end
         end
-        
-        #Border value
-        border = basis(sp, m, sp.xmax, 0)*BCR - basis(sp, m, sp.xmin, 0)*BCL
-        b[mi] = border - b[mi]
+        bl = basis(sp, m, sp.xmin, 0) * BCL
+        br = basis(sp, m, sp.xmax, 0) * BCR
+        b[mi] = br - bl - b[mi] 
     end
     
-    # Don't border fold it here, only in SA
     return b
 end
 
 function SBxtransform(spline::Spline1D, uMish::Vector{real}, BCL, BCR)
 
-    bx = SBxtransform(spline.params,spline.gammaBC,uMish,BCL,BCR)
+    bx = SBxtransform(spline.params,uMish,BCL,BCR)
     return bx
 end
 
