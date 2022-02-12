@@ -70,8 +70,7 @@ function integrate_WilliamsSlabTCBL(ics_csv::String)
                 "vgr" => 1, 
                 "u" => 2, 
                 "v" => 3, 
-                "w" => 4),
-            diagnostic_flag = Dict("w" => 4)))
+                "w" => 4)))
 
     grid = initialize_model(model)
     run_model(grid, model)
@@ -82,7 +81,9 @@ function initialize_model(model::ModelParameters)
     
     gp = model.grid_params
     grid = createGrid(gp)
-
+    println("$model")
+    println("$(model.grid_params)")
+    
     read_initialconditions(model.initial_conditions, grid)    
     spectralTransform!(grid)
     gridTransform!(grid)
