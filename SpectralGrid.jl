@@ -17,7 +17,7 @@ const mubar = 3
 
 export GridParameters, createGrid, getGridpoints
 export spectralTransform!, gridTransform!, spectralTransform 
-export spectralxTransform, gridTransform_noBCs, integralTransform
+export spectralxTransform, gridTransform_noBCs, integrateUp
 export R_Grid, RZ_Grid, RL_Grid
 
 @with_kw struct GridParameters
@@ -445,7 +445,7 @@ function gridTransform_noBCs(grid::RZ_Grid, physical::Array{real}, spectral::Arr
     return physical 
 end
 
-function integralTransform(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
+function integrateUp(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
     
     # Transform from the spectral to grid space
     # For RZ grid, varying dimensions are R, Z, and variable
