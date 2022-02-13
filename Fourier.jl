@@ -15,7 +15,7 @@ const uint = UInt64
 
 # Define the ring parameters
 @with_kw struct FourierParameters
-    lmin::real = 0.0
+    ymin::real = 0.0
     kmax::int = 0
     yDim::int = 0
     bDim::int = 0
@@ -61,7 +61,7 @@ function calcMishPoints(fp::FourierParameters)
     Nbasis = fp.yDim
     y = zeros(real,Nbasis)
     for n = 1:Nbasis
-        y[n] = fp.lmin + (2 * π * (n-1) / Nbasis)
+        y[n] = fp.ymin + (2 * π * (n-1) / Nbasis)
     end
     return y
 end
