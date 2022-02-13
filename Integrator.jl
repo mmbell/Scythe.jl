@@ -179,6 +179,7 @@ function run_model(grid, model::ModelParameters)
 
     # Advance the first timestep
     first_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, model.ts)
+    println("ts: $(model.ts)")
     
     # Assign b_nxt and b_now
     grid.spectral .= b_nxt
@@ -187,6 +188,7 @@ function run_model(grid, model::ModelParameters)
     spectralTransform!(grid)
     
     if mod(1,output_int) == 0
+        checkCFL(grid)
         write_output(grid, model, (model.ts))
     end
     
@@ -197,8 +199,10 @@ function run_model(grid, model::ModelParameters)
     grid.spectral .= b_nxt
     gridTransform!(grid)
     spectralTransform!(grid)
+    println("ts: $(2*model.ts)")
     
     if mod(2,output_int) == 0
+        checkCFL(grid)
         write_output(grid, model, (2*model.ts))
     end
     
@@ -210,8 +214,10 @@ function run_model(grid, model::ModelParameters)
         grid.spectral .= b_nxt
         gridTransform!(grid)
         spectralTransform!(grid)
+        println("ts: $(t*model.ts)")
         
         if mod(t,output_int) == 0
+            checkCFL(grid)
             write_output(grid, model, (t*model.ts))
         end
     end
@@ -490,5 +496,21 @@ function integrate_model()
     finalize(splines, model)
 end
 
+function checkCFL(grid)
+    
+    # Check to see if CFL condition may have been violated 
+    for var in keys(grid.params.vars)
+        v = grid.params.vars[var]
+        testvar = grid.physical[:,v,1]
+        for i in eachindex(testvar)
+            if (isnan(testvar[i]))
+                error("NaN found in variable $var at index$(i) ! CFL condition likely violated")
+            end
+            # Can do more extensive checks here to see if collapse is impending
+            #TBD
+        end
+    end
+end
 
+# Module end
 end
