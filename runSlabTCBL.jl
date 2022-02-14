@@ -1,6 +1,6 @@
 push!(LOAD_PATH, pwd())
 using ArgParse
-using AdamsBashforth
+using Integrator
 s = ArgParseSettings()
 @add_arg_table s begin
     "icfile"

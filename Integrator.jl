@@ -44,18 +44,20 @@ end
 
 function integrate_WilliamsSlabTCBL(ics_csv::String)
     
+    nodes = 400
     model = ModelParameters(
         ts = 2.0,
-        integration_time = 7200.0,
+        integration_time = 10800.0,
         output_interval = 3600.0,
-        equation_set = "Williams2013_TCBL",
+        equation_set = "Williams2013_slabTCBL",
+        output_dir = "./slabout/",
         initial_conditions = ics_csv,
         grid_params = GridParameters(
             xmin = 0.0,
-            xmax = 1.0e6,
-            num_nodes = 2000,
-            rDim = 2000*3,
-            b_rDim = 2000+3,
+            xmax = 4.0e5,
+            num_nodes = nodes,
+            rDim = nodes*3,
+            b_rDim = nodes+3,
             BCL = Dict(
                 "vgr" => CubicBSpline.R0, 
                 "u" => CubicBSpline.R1T0, 
@@ -97,8 +99,8 @@ function read_initialconditions(ic::String, grid::R_Grid)
     initialconditions = CSV.read(ic, DataFrame, header=1)
     
     # Check for match to grid
-    if grid.params.rDim != length(initialconditions.i)
-        throw(DomainError(length(initialconditions.i), 
+    if grid.params.rDim != length(initialconditions.r)
+        throw(DomainError(length(initialconditions.r), 
                 "IC radius dimension does not match model parameters"))
     end
     
@@ -152,6 +154,36 @@ function read_initialconditions(ic::String, grid::RZ_Grid)
 
 end
 
+function read_initialconditions(ic::String, grid::RL_Grid)
+    
+    # 2D radius-lambda grid
+    initialconditions = CSV.read(ic, DataFrame, header=1)
+    
+    # Check for match to grid
+    # Can be more sophisticated here, just checking matching dimensions for now
+    if (grid.params.lDim) != length(initialconditions.r)
+        throw(DomainError(length(initialconditions.r), 
+                "IC dimensions do not match model parameters"))
+    end
+    
+    for key in keys(grid.params.vars)
+        foundkey = false
+        for name in names(initialconditions)
+            if (name == key)
+                foundkey = true
+            end
+        end
+        if foundkey == false
+            throw(DomainError(key, "IC missing data"))
+        end
+    end
+    
+    # Assign variables
+    for (key, value) in pairs(grid.params.vars)
+        grid.physical[:,value,1] .= select(initialconditions, key)
+    end
+
+end
 
 function run_model(grid, model::ModelParameters)
     
@@ -338,7 +370,7 @@ function calcTendency(grid,
     spectralTransform(grid, udot, bdot)
     
     # Transform F to bdot_delay
-    # This does nothing for RZ grid currently
+    # This does nothing for RZ or RL grid currently
     spectralxTransform(grid, F, bdot_delay)
     
 end
@@ -467,6 +499,102 @@ function write_output(grid::RZ_Grid, model::ModelParameters, t::real)
         end
     end
     close(ufile)
+end
+
+function write_output(grid::RL_Grid, model::ModelParameters, t::real)
+    
+    time = round(t; digits=2)
+    if !isdir(model.output_dir)
+        mkdir(model.output_dir)
+    end
+    
+    println("Writing output to $(model.output_dir) at time $time")
+    dir = model.output_dir
+    afilename = string(dir, "spectral_out_", time, ".csv")
+    ufilename = string(dir, "physical_out_", time, ".csv")
+    #cfilename = string(dir, "cartesian_out_", time, ".csv")
+    afile = open(afilename,"w")
+    ufile = open(ufilename,"w")
+    #cfile = open(cfilename,"w")
+
+    aheader = "r,k,"
+    uheader = "r,l,x,y,"
+    suffix = ["","_r","_rr","_l","_ll"]
+    for d = 1:5
+        for var in keys(grid.params.vars)
+            if (d == 1)
+                aheader *= "$var,"
+            end
+            varout = var * suffix[d]
+            uheader *= "$varout,"
+        end
+    end
+    aheader = chop(aheader) * "\n"
+    uheader = chop(uheader) * "\n"
+    write(afile,aheader)
+    write(ufile,uheader)
+    
+    # Wave 0
+    for r = 1:grid.params.b_rDim
+        astring = "$r,0,"
+        for var in keys(grid.params.vars)
+            v = grid.params.vars[var]
+            a = grid.spectral[r,v]
+            astring *= "$(a),"
+        end
+        astring = chop(astring) * "\n"
+        write(afile,astring)
+    end
+    
+    # Higher wavenumbers
+    for k = 1:grid.params.rDim
+        for r = 1:grid.params.b_rDim
+            astring = "$r,$(k)r,"
+            kr = ((k*2-1)*grid.params.b_rDim)+r
+            for var in keys(grid.params.vars)
+                v = grid.params.vars[var]
+                a = grid.spectral[kr,v]
+                astring *= "$(a),"
+            end
+            astring = chop(astring) * "\n"
+            write(afile,astring)
+        end
+        for r = 1:grid.params.b_rDim
+            astring = "$r,$(k)i,"
+            ki = ((k*2+1)*grid.params.b_rDim)+r
+            for var in keys(grid.params.vars)
+                v = grid.params.vars[var]
+                a = grid.spectral[ki,v]
+                astring *= "$(a),"
+            end
+            astring = chop(astring) * "\n"
+            write(afile,astring)
+        end
+    end
+    close(afile)
+    
+    l1 = 0
+    l2 = 0
+    gridpoints = getGridpoints(grid)
+    cartesianpoints = getCartesianGridpoints(grid)
+    for r = 1:grid.params.rDim
+        l1 = l2 + 1
+        l2 = l1 + 3 + (4*r)
+        for l = l1:l2
+            ustring = "$(gridpoints[l,1]),$(gridpoints[l,2]),$(cartesianpoints[l,1]),$(cartesianpoints[l,2]),"
+            for d = 1:5
+                for var in keys(grid.params.vars)
+                    v = grid.params.vars[var]
+                    u = grid.physical[l,v,d]
+                    ustring *= "$u,"
+                end
+            end
+            ustring = chop(ustring) * "\n"
+            write(ufile,ustring)
+        end
+    end
+    close(ufile)
+    
 end
 
 function integrate_model()
