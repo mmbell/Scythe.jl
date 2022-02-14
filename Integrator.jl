@@ -18,7 +18,7 @@ const uint = UInt64
 
 export initialize_model, run_model, finalize_model 
 export integrate_LinearAdvection1D, integrate_WilliamsSlabTCBL, integrate_model
-
+export integrate_Kepert2017_TCBL
 
 function integrate_LinearAdvection1D()
     
@@ -74,6 +74,56 @@ function integrate_WilliamsSlabTCBL(ics_csv::String)
                 "v" => 3, 
                 "w" => 4)))
 
+    grid = initialize_model(model)
+    run_model(grid, model)
+    finalize_model(grid, model)
+end
+
+function integrate_Kepert2017_TCBL(ics_csv::String)
+
+    nodes = 400
+    model = ModelParameters(
+        ts = 2.0,
+        integration_time = 10800.0,
+        output_interval = 3600.0,
+        equation_set = "Kepert2017_TCBL",
+        initial_conditions = ics_csv,
+        output_dir = "./tcblout/",
+        grid_params = GridParameters(xmin = 0.0,
+            xmax = 4.0e5,
+            num_nodes = nodes,
+            rDim = nodes*3,
+            b_rDim = nodes+3,
+            BCL = Dict(
+                "vgr" => CubicBSpline.R0, 
+                "u" => CubicBSpline.R1T0, 
+                "v" => CubicBSpline.R1T0, 
+                "w" => CubicBSpline.R1T0),
+            BCR = Dict(
+                "vgr" => CubicBSpline.R0, 
+                "u" => CubicBSpline.R1T1, 
+                "v" => CubicBSpline.R1T1, 
+                "w" => CubicBSpline.R1T1),
+            zmin = 0.0,
+            zmax = 2350.0,
+            zDim = 25,
+            b_zDim = 17,
+            BCB = Dict(
+                "vgr" => Chebyshev.R0, 
+                "u" => Chebyshev.R0, 
+                "v" => Chebyshev.R0, 
+                "w" => Chebyshev.R0),
+            BCT = Dict(
+                "vgr" => Chebyshev.R0, 
+                "u" => Chebyshev.R1T1, 
+                "v" => Chebyshev.R1T1, 
+                "w" => Chebyshev.R1T1),
+            vars = Dict(
+                "vgr" => 1, 
+                "u" => 2, 
+                "v" => 3, 
+                "w" => 4)))
+    
     grid = initialize_model(model)
     run_model(grid, model)
     finalize_model(grid, model)
