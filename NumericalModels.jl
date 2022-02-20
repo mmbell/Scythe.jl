@@ -56,10 +56,17 @@ function LinearAdvectionRL(grid::RL_Grid,
    
     #1D Linear advection to test
     c_0 = 5.0
-    #K = 0.003
-    K = 0.0
-
-    vardot[:,1] .= -c_0 .* grid.physical[:,1,4] .+ (K .* grid.physical[:,1,5])        
+    K = 0.003
+    
+    r = gridpoints[:,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    u = grid.physical[:,2,1]
+    v = grid.physical[:,3,1]
+    
+    vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))   
     # F = 0
 end
 

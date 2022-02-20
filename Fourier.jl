@@ -32,6 +32,10 @@ struct Fourier1D
     fftPlan::FFTW.r2rFFTWPlan{Float64, (0,), false, 1, UnitRange{Int64}}
     ifftPlan::FFTW.r2rFFTWPlan{Float64, (1,), false, 1, UnitRange{Int64}}
     
+    # Phase-shift and filter matrix
+    phasefilter::Matrix{real}
+    invphasefilter::Matrix{real}
+    
     # In this context, uMish is the physical values
     # b is the filtered Fourier coefficients 
     # a is the Fourier coefficients with padding
@@ -51,9 +55,41 @@ function Fourier1D(fp::FourierParameters)
     # Plan the FFT
     fftPlan = FFTW.plan_r2r(a, FFTW.FFTW.R2HC, flags=FFTW.PATIENT)
     ifftPlan = FFTW.plan_r2r(a, FFTW.FFTW.HC2R, flags=FFTW.PATIENT)
-
-    ring = Fourier1D(fp,mishPoints,fftPlan,ifftPlan,uMish,b,a)
+    
+    # Pre-calculate the phase filter matrix
+    phasefilter = calcPhaseFilter(fp)
+    invphasefilter = calcInvPhaseFilter(fp)
+    
+    ring = Fourier1D(fp,mishPoints,fftPlan,ifftPlan,phasefilter,invphasefilter,uMish,b,a)
     return ring
+end
+
+function calcPhaseFilter(fp::FourierParameters)
+    
+    phasefilter = zeros(real, fp.yDim, fp.bDim)
+    phasefilter[1,1] = 1.0
+    for k in 1:fp.kmax
+        phasefilter[k+1,k+1] = cos(-k * fp.ymin)
+        phasefilter[fp.yDim-k+1,k+1] = -sin(-k * fp.ymin)
+        phasefilter[k+1,fp.bDim-k+1] = sin(-k * fp.ymin)
+        phasefilter[fp.yDim-k+1,fp.bDim-k+1] = cos(-k * fp.ymin)
+    end
+    return phasefilter
+
+end
+
+function calcInvPhaseFilter(fp::FourierParameters)
+    
+    invphasefilter = zeros(real, fp.bDim, fp.yDim)
+    invphasefilter[1,1] = 1.0
+    for k in 1:fp.kmax
+        invphasefilter[k+1,k+1] = cos(k * fp.ymin)
+        invphasefilter[fp.bDim-k+1,k+1] = -sin(k * fp.ymin)
+        invphasefilter[k+1,fp.yDim-k+1] = sin(k * fp.ymin)
+        invphasefilter[fp.bDim-k+1,fp.yDim-k+1] = cos(k * fp.ymin)
+    end
+    return invphasefilter
+
 end
 
 function calcMishPoints(fp::FourierParameters)
@@ -66,41 +102,32 @@ function calcMishPoints(fp::FourierParameters)
     return y
 end
 
-function FBtransform(fp::FourierParameters, fftPlan, uMish::Vector{real})
+function FBtransform(fp::FourierParameters, fftPlan, phasefilter::Matrix{real}, uMish::Vector{real})
 
     # Do the Fourier transform, scale, and filter
-    bfilter = zeros(Float64, fp.bDim)
     b = (fftPlan * uMish) ./ fp.yDim
-    bfilter[1] = b[1]
-    for k in 1:fp.kmax
-        bfilter[k+1] = b[k+1]
-        bfilter[fp.bDim-k+1] = b[fp.yDim-k+1]
-    end
+    bfilter = (b' * phasefilter)'
     return bfilter
 end
 
 function FBtransform!(ring::Fourier1D)
 
     # Do the Fourier transform, scale, and filter
-    b = FBtransform(ring.params, ring.fftPlan, ring.uMish)
-    ring.b .= b
+    b = (ring.fftPlan * ring.uMish) ./ ring.params.yDim
+    ring.b .= (b' * ring.phasefilter)'
 end
 
-function FAtransform(fp::FourierParameters, b::Vector{real})
+function FAtransform(fp::FourierParameters, invphasefilter::Matrix{real}, b::Vector{real})
 
-    # Apply the padding
-    a = [ b[1:fp.kmax+1] ; 
-        zeros(Float64, fp.yDim-fp.bDim) ; 
-        b[fp.kmax+2:fp.bDim] ]
+    # Apply the inverse phasefilter
+    a = (b' * invphasefilter)'
     return a
 end
 
 function FAtransform!(ring::Fourier1D)
 
-    # Apply the padding
-    ring.a .= [ ring.b[1:ring.params.kmax+1] ; 
-        zeros(Float64, ring.params.yDim-ring.params.bDim) ; 
-        ring.b[ring.params.kmax+2:ring.params.bDim] ]
+    # Apply the inverse phasefilter
+    ring.a .= (ring.b' * ring.invphasefilter)'
 end
 
 function FItransform(fp::FourierParameters, ifftPlan, a::Vector{real})

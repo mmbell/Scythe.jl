@@ -18,6 +18,7 @@ const mubar = 3
 export GridParameters, createGrid, getGridpoints, getCartesianGridpoints
 export spectralTransform!, gridTransform!, spectralTransform 
 export spectralxTransform, gridTransform_noBCs, integrateUp
+export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export R_Grid, RZ_Grid, RL_Grid
 
 @with_kw struct GridParameters
@@ -140,7 +141,7 @@ function createGrid(gp::GridParameters)
                 
                 # Need different BCs at r = 0 for wavenumber zero winds
                 for i = 1:3
-                    if (i == 1 && (key == "u" || key == "v"))
+                    if (i == 1 && (key == "u" || key == "v" || key == "vgr"))
                         grid.splines[1,gp.vars[key]] = Spline1D(SplineParameters(
                             xmin = gp.xmin,
                             xmax = gp.xmax,
@@ -613,7 +614,7 @@ end
 
 function spectralTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{real})
     
-        # Transform from the RL grid to spectral space
+    # Transform from the RL grid to spectral space
     # For RL grid, varying dimensions are R, L, and variable
     for v in values(grid.params.vars)
         i = 1
@@ -946,6 +947,137 @@ end
 
 function spectralxTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{real})
     #To be implemented for delayed diffusion
+end
+
+function regularGridTransform(grid::RL_Grid)
+    
+    # Output on regular grid
+    # Transform from the spectral to grid space
+    # For RZ grid, varying dimensions are R, Z, and variable
+    spline = zeros(Float64, grid.params.num_nodes, grid.params.rDim*2+1)
+    spline_r = zeros(Float64, grid.params.num_nodes, grid.params.rDim*2+1)
+    spline_rr = zeros(Float64, grid.params.num_nodes, grid.params.rDim*2+1)
+    
+    physical = zeros(Float64, grid.params.num_nodes, 
+        grid.params.rDim*2+1, 
+        length(values(grid.params.vars)),5)
+
+    # Generic ring of maximum size
+    ring = Fourier1D(FourierParameters(
+        ymin = 0.0,
+        yDim = grid.params.rDim*2 + 1,
+        bDim = grid.params.rDim*2 + 1,
+        kmax = grid.params.rDim))
+
+    # Output on the nodes
+    rpoints = zeros(Float64, grid.params.num_nodes)
+    for r = 1:grid.params.num_nodes
+        rpoints[r] = grid.params.xmin + (r-1)*grid.splines[1,1].params.DX
+    end
+    
+    for v in values(grid.params.vars)
+        # Wavenumber zero
+        k1 = 1
+        k2 = grid.params.b_rDim
+        a = SAtransform(grid.splines[1,v], grid.spectral[k1:k2,v])
+        spline[:,1] = SItransform(grid.splines[1,v], a, rpoints)
+        spline_r[:,1] = SIxtransform(grid.splines[1,v], a, rpoints)
+        spline_rr[:,1] = SIxtransform(grid.splines[1,v], a, rpoints)
+        
+        # Higher wavenumbers
+        for k = 1:grid.params.rDim
+            p = k*2
+            p1 = ((p-1)*grid.params.b_rDim)+1
+            p2 = p*grid.params.b_rDim
+            a = SAtransform(grid.splines[2,v], grid.spectral[p1:p2,v])
+            spline[:,p] = SItransform(grid.splines[2,v], a, rpoints)
+            spline_r[:,p] = SIxtransform(grid.splines[2,v], a, rpoints)
+            spline_rr[:,p] = SIxtransform(grid.splines[2,v], a, rpoints)
+            
+            p1 = (p*grid.params.b_rDim)+1
+            p2 = (p+1)*grid.params.b_rDim
+            a = SAtransform(grid.splines[3,v], grid.spectral[p1:p2,v])
+            spline[:,p+1] = SItransform(grid.splines[3,v], a, rpoints)
+            spline_r[:,p+1] = SIxtransform(grid.splines[3,v], a, rpoints)
+            spline_rr[:,p+1] = SIxtransform(grid.splines[3,v], a, rpoints)
+        end
+        
+        for r = 1:grid.params.num_nodes
+            # Value
+            ring.b .= 0.0
+            ring.b[1] = spline[r,1]
+            for k = 1:grid.params.rDim
+                # Real part
+                rk = k+1
+                # Imaginary part
+                ik = ring.params.bDim-k+1
+                p = k*2
+                ring.b[rk] = spline[r,p]
+                ring.b[ik] = spline[r,p+1]
+            end
+            FAtransform!(ring)
+            l1 = 1
+            l2 = ring.params.yDim
+            physical[r,l1:l2,v,1] .= FItransform!(ring)
+            physical[r,l1:l2,v,4] .= FIxtransform(ring)
+            physical[r,l1:l2,v,5] .= FIxxtransform(ring)
+            
+            # dr
+            ring.b .= 0.0
+            ring.b[1] = spline_r[r,1]
+            for k = 1:grid.params.rDim
+                # Real part
+                rk = k+1
+                # Imaginary part
+                ik = ring.params.bDim-k+1
+                p = k*2
+                ring.b[rk] = spline_r[r,p]
+                ring.b[ik] = spline_r[r,p+1]
+            end
+            FAtransform!(ring)
+            l1 = 1
+            l2 = ring.params.yDim
+            physical[r,l1:l2,v,2] .= FItransform!(ring)
+            
+            #drr
+            ring.b .= 0.0
+            ring.b[1] = spline_rr[r,1]
+            for k = 1:grid.params.rDim
+                # Real part
+                rk = k+1
+                # Imaginary part
+                ik = ring.params.bDim-k+1
+                p = k*2
+                ring.b[rk] = spline_rr[r,p]
+                ring.b[ik] = spline_rr[r,p+1]
+            end
+            FAtransform!(ring)
+            l1 = 1
+            l2 = ring.params.yDim
+            physical[r,l1:l2,v,3] .= FItransform!(ring)
+
+        end
+    end
+    
+    
+    return physical
+end
+
+function getRegularGridpoints(grid::RL_Grid)
+
+    # Return an array of the gridpoint locations
+    gridpoints = zeros(Float64, grid.params.num_nodes, (grid.params.rDim*2+1), 4)
+    for r = 1:grid.params.num_nodes
+        r_m = grid.params.xmin + (r-1)*grid.splines[1,1].params.DX
+        for l = 1:(grid.params.rDim*2+1)
+            l_m = 2 * π * (l-1) / (grid.params.rDim*2+1)
+            gridpoints[r,l,1] = r_m
+            gridpoints[r,l,2] = l_m
+            gridpoints[r,l,3] = r_m * cos(l_m)
+            gridpoints[r,l,4] = r_m * sin(l_m)
+        end
+    end
+    return gridpoints
 end
 
 # Module end

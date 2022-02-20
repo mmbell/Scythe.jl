@@ -562,13 +562,14 @@ function write_output(grid::RL_Grid, model::ModelParameters, t::real)
     dir = model.output_dir
     afilename = string(dir, "spectral_out_", time, ".csv")
     ufilename = string(dir, "physical_out_", time, ".csv")
-    #cfilename = string(dir, "cartesian_out_", time, ".csv")
+    rfilename = string(dir, "gridded_out_", time, ".csv")
     afile = open(afilename,"w")
     ufile = open(ufilename,"w")
-    #cfile = open(cfilename,"w")
+    rfile = open(rfilename,"w")
 
     aheader = "r,k,"
     uheader = "r,l,x,y,"
+    rheader = "r,l,x,y,"
     suffix = ["","_r","_rr","_l","_ll"]
     for d = 1:5
         for var in keys(grid.params.vars)
@@ -577,13 +578,16 @@ function write_output(grid::RL_Grid, model::ModelParameters, t::real)
             end
             varout = var * suffix[d]
             uheader *= "$varout,"
+            rheader *= "$varout,"
         end
     end
     aheader = chop(aheader) * "\n"
     uheader = chop(uheader) * "\n"
+    rheader = chop(rheader) * "\n"
     write(afile,aheader)
     write(ufile,uheader)
-    
+    write(rfile,rheader)
+        
     # Wave 0
     for r = 1:grid.params.b_rDim
         astring = "$r,0,"
@@ -644,6 +648,25 @@ function write_output(grid::RL_Grid, model::ModelParameters, t::real)
         end
     end
     close(ufile)
+    
+    # Get regular grid
+    regular_grid = regularGridTransform(grid)
+    gridpoints = getRegularGridpoints(grid)
+    for r = 1:grid.params.num_nodes
+        for l = 1:(grid.params.rDim*2+1)
+            rstring = "$(gridpoints[r,l,1]),$(gridpoints[r,l,2]),$(gridpoints[r,l,3]),$(gridpoints[r,l,4]),"
+            for d = 1:5
+                for var in keys(grid.params.vars)
+                    v = grid.params.vars[var]
+                    u = regular_grid[r,l,v,d]
+                    rstring *= "$u,"
+                end
+            end
+            rstring = chop(rstring) * "\n"
+            write(rfile,rstring)
+        end
+    end
+    close(rfile)
     
 end
 

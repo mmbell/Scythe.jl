@@ -8,7 +8,7 @@ using Parameters
 export SplineParameters, Spline1D
 #export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
 export SBtransform, SBtransform!, SAtransform!, SItransform!
-export SAtransform, SBxtransform, SIxtransform, SIxxtransform
+export SAtransform, SBxtransform, SItransform, SIxtransform, SIxxtransform
 export setMishValues
 
 #Define some convenient aliases
@@ -379,6 +379,12 @@ function SItransform!(spline::Spline1D)
     spline.uMish .= u
 end
 
+function SItransform(spline::Spline1D, a::Vector{real}, points::Vector{real})
+
+    u = SItransform(spline.params,a,points)
+    return u
+end
+
 function SIxtransform(sp::SplineParameters, a::Vector{real}, points::Vector{real})
 
     uprime = SItransform(sp,a,points,1)
@@ -394,6 +400,12 @@ end
 function SIxtransform(spline::Spline1D, a::Vector{real})
 
     uprime = SItransform(spline.params,a,spline.mishPoints,1)
+    return uprime
+end
+
+function SIxtransform(spline::Spline1D, a::Vector{real}, points::Vector{real})
+
+    uprime = SItransform(spline.params,a,points,1)
     return uprime
 end
 
