@@ -49,7 +49,8 @@ function physical_model(model::ModelParameters,u::Vector{real},ux::Vector{real},
     if model.equation_set == "1dLinearAdvection"
         #1D Linear advection to test
         c_0 = 1.0
-        K = 0.003
+        #K = 0.003
+        K = 0.0
         
         udot = -c_0 .* ux + (K .* uxx)
         F = 0

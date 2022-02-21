@@ -241,6 +241,10 @@ function run(splines::Vector{Spline1D}, model::ModelParameters)
         SBtransform!(splines[v])
     end
     
+    if mod(1,output_int) == 0
+        write_output(splines, model, (1*model.ts))
+    end
+    
     # Advance the second timestep
     bdot,bdot_delay = calcTendency(splines, model, 1)
     b_nxt, bdot_n1, bdot_n2 = second_timestep(splines, bdot, bdot_n1, bdot_delay, model.ts)
@@ -250,6 +254,10 @@ function run(splines::Vector{Spline1D}, model::ModelParameters)
         SItransform!(splines[v])
         #b_now is held in place
         SBtransform!(splines[v])
+    end
+    
+    if mod(2,output_int) == 0
+        write_output(splines, model, (2*model.ts))
     end
     
     # Keep going!
@@ -288,8 +296,8 @@ function integrate_model()
     
     model = ModelParameters(
         ts = 1.0,
-        integration_time = 100,
-        output_interval = 50,
+        integration_time = 10.0,
+        output_interval = 1.0,
         xmin = 0.0,
         xmax = 1.0e6,
         num_nodes = 2000,
