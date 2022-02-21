@@ -34,42 +34,6 @@ function LinearAdvection1D(physical::Array{real},
     # F = 0
 end
 
-function LinearAdvectionRZ(physical::Array{real}, 
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-   
-    #1D Linear advection to test
-    c_0 = 5.0
-    K = 0.003
-
-    vardot[:,1] .= -c_0 .* physical[:,1,2] .+ (K .* physical[:,1,3])        
-    # F = 0
-end
-
-function LinearAdvectionRL(grid::RL_Grid, 
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-   
-    #1D Linear advection to test
-    c_0 = 5.0
-    K = 0.003
-    
-    r = gridpoints[:,1]
-    hr = grid.physical[:,1,2]
-    hrr = grid.physical[:,1,3]
-    hl = grid.physical[:,1,4]
-    hll = grid.physical[:,1,5]
-    u = grid.physical[:,2,1]
-    v = grid.physical[:,3,1]
-    
-    vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))   
-    # F = 0
-end
-
 function Williams2013_slabTCBL(grid::R_Grid, 
             gridpoints::Array{real},
             vardot::Array{real},
@@ -119,6 +83,20 @@ function Williams2013_slabTCBL(grid::R_Grid,
     vardot[:,3] .= VADV .+ VDRAG .+ UW
     F[:,3] .= VKDIFF
 
+end
+
+function LinearAdvectionRZ(physical::Array{real}, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+   
+    #1D Linear advection to test
+    c_0 = 5.0
+    K = 0.003
+
+    vardot[:,1] .= -c_0 .* physical[:,1,2] .+ (K .* physical[:,1,3])        
+    # F = 0
 end
 
 function Kepert2017_TCBL(grid::RZ_Grid, 
@@ -212,55 +190,105 @@ function Kepert2017_TCBL(grid::RZ_Grid,
 
 end
 
+function LinearAdvectionRL(grid::RL_Grid, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+   
+    #1D Linear advection to test
+    c_0 = 5.0
+    K = 0.003
+    
+    r = gridpoints[:,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    u = grid.physical[:,2,1]
+    v = grid.physical[:,3,1]
+    
+    vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))   
+    # F = 0
+end
 
+function LinearShallowWaterRL(grid::RL_Grid, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+   
+    #Linear shallow water equations
+    g = 9.81
+    H = 1000.0
+    K = 0.003
+    
+    r = gridpoints[:,1]
+    h = grid.physical[:,1,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    u = grid.physical[:,2,1]
+    ur = grid.physical[:,2,2]
+    urr = grid.physical[:,2,3]
+    ul = grid.physical[:,2,4]
+    ull = grid.physical[:,2,5]
+    v = grid.physical[:,3,1]
+    vr = grid.physical[:,3,2]
+    vrr = grid.physical[:,3,3]
+    vl = grid.physical[:,3,4]
+    vll = grid.physical[:,3,5]
+    
+    vardot[:,1] .= -H * ((u ./ r) .+ ur .+ (vl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))
+    vardot[:,2] .= (-g .* hr) .+ (K .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)))) 
+    vardot[:,3] .= (-g .* (hl ./ r)) .+ (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r))))
+    # F = 0
+end
 
-function Williams2013_old(model,x,var,varx,varxx)
-
-        K = 1500.0
-        Cd = 2.4e-3
-        h = 1000.0
-        f = 5.0e-5
-
-        vgrdot = zeros(real,length(x))
-        vardot = zeros(real,length(x),4)
-        F = zeros(real,length(x),4)
-
-        vgr = var[:,1]
-        u = var[:,2]
-        v = var[:,3]
-        r = x
-        U = 0.78 * sqrt.((u .* u) .+ (v .* v))
-
-        ur = varx[:,2]
-        vr = varx[:,3]
-
-        urr = varxx[:,2]
-        vrr = varxx[:,3]
-
-        w = -h .* ((u ./ r) .+ ur)
-        w_ = 0.5 .* abs.(w) .- w
-
-        vardot[:,1] .= vgrdot
-
-        UADV = -(u .* ur)
-        UDRAG = -(Cd .* U .* u ./ h)
-        UCOR = ((f .* v) .+ ((v .* v) ./ r))
-        UPGF = -((f .* vgr) .+ ((vgr .* vgr) ./ r))
-        UW = -(w_ .* (u ./ h))
-        UKDIFF = K .* ((u ./ r) .+ ur)
-        vardot[:,2] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW
-        F[:,2] .= UKDIFF
-
-        VADV = -u .* (f .+ (v ./ r) .+ vr)
-        VDRAG = -(Cd .* U .* v ./ h)
-        VW = w_ .* (vgr - v) ./ h
-        VKDIFF = K .* ((v ./ r) .+ vr)
-        vardot[:,3] .= VADV .+ VDRAG .+ UW
-        F[:,3] .= VKDIFF
-
-        vardot[:,4] .= w
-
-        return vardot, F
+function ShallowWaterRL(grid::RL_Grid, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+   
+    #Nonlinear shallow water equations
+    g = 9.81
+    f = 5.0e-5
+    H = 1000.0
+    K = 0.003
+    
+    r = gridpoints[:,1]
+    h = grid.physical[:,1,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    u = grid.physical[:,2,1]
+    ur = grid.physical[:,2,2]
+    urr = grid.physical[:,2,3]
+    ul = grid.physical[:,2,4]
+    ull = grid.physical[:,2,5]
+    v = grid.physical[:,3,1]
+    vr = grid.physical[:,3,2]
+    vrr = grid.physical[:,3,3]
+    vl = grid.physical[:,3,4]
+    vll = grid.physical[:,3,5]
+    
+    vardot[:,1] .= ((-v .* hl ./ r) .+ (-u .* hr) .+
+        (-(H .+ h) .* ((u ./ r) .+ ur .+ (vl ./ r))) .+
+        (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))))
+    
+    vardot[:,2] .= ((-v .* ul ./ r) .+ (-u .* ur) .+
+        (-g .* hr) .+
+        (v .* (f .+ (v ./ r))) .+
+        (K .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)))))
+    
+    vardot[:,3] .= ((-v .* vl ./ r) .+ (-u .* vr) .+
+        (-g .* (hl ./ r)) .+
+        (-u .* (f .+ (v ./ r))) .+
+        (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r)))))
+    # F = 0
 end
 
 # Module end
