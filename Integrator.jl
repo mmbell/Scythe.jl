@@ -129,6 +129,47 @@ function integrate_Kepert2017_TCBL(ics_csv::String)
     finalize_model(grid, model)
 end
 
+function integrate_RL_ShallowWater(ics_csv::String)
+    
+    nodes = 100
+    lpoints = 0
+    blpoints = 0
+    for r = 1:(nodes*3)
+        lpoints += 4 + 4*r
+        blpoints += 1 + 2*r
+    end
+    model = ModelParameters(
+        ts = 1.0,
+        integration_time = 1800.0,
+        output_interval = 120.0,
+        equation_set = "ShallowWaterRL",
+        initial_conditions = ics_csv::String,
+        output_dir = "./SW_output/",
+        grid_params = GridParameters(xmin = 0.0,
+            xmax = 2.0e5,
+            num_nodes = nodes,
+            rDim = nodes*3,
+            b_rDim = nodes+3,
+            BCL = Dict(
+                "h" => CubicBSpline.R0, 
+                "u" => CubicBSpline.R1T0, 
+                "v" => CubicBSpline.R1T0),
+            BCR = Dict(
+                "h" => CubicBSpline.R0, 
+                "u" => CubicBSpline.R0, 
+                "v" => CubicBSpline.R0), 
+            lDim = lpoints,
+            b_lDim = blpoints,
+            vars = Dict(
+                "h" => 1, 
+                "u" => 2, 
+                "v" => 3)))
+    grid = initialize_model(model)
+    run_model(grid, model)
+    finalize_model(grid, model)
+    
+end
+
 function initialize_model(model::ModelParameters)
     
     gp = model.grid_params
