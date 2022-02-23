@@ -19,6 +19,7 @@ const uint = UInt64
 export initialize_model, run_model, finalize_model 
 export integrate_LinearAdvection1D, integrate_WilliamsSlabTCBL, integrate_model
 export integrate_Kepert2017_TCBL
+export integrate_RL_ShallowWater
 
 function integrate_LinearAdvection1D()
     
