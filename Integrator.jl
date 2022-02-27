@@ -462,7 +462,8 @@ function calcTendency(grid,
     spectralTransform(grid, udot, bdot)
     
     # Transform F to bdot_delay
-    # This does nothing for RZ or RL grid currently
+    # This does nothing for RZ grid currently
+    # RL is clone of spectralTransform for constant diffusion coefficient
     spectralxTransform(grid, F, bdot_delay)
     
 end

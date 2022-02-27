@@ -139,9 +139,10 @@ function createGrid(gp::GridParameters)
             grid = RL_Grid(gp, splines, rings, spectral, physical)
             for key in keys(gp.vars)
                 
-                # Need different BCs at r = 0 for wavenumber zero winds
+                # Need different BCs for wa number zero winds since they are undefined at r = 0
                 for i = 1:3
-                    if (i == 1 && (key == "u" || key == "v" || key == "vgr"))
+                    if (i == 1 && (key == "u" || key == "v" || key == "vgr"
+                                || key == "ub" || key == "vb"))
                         grid.splines[1,gp.vars[key]] = Spline1D(SplineParameters(
                             xmin = gp.xmin,
                             xmax = gp.xmax,
@@ -153,7 +154,7 @@ function createGrid(gp::GridParameters)
                             xmin = gp.xmin,
                             xmax = gp.xmax,
                             num_nodes = gp.num_nodes,
-                            BCL = CubicBSpline.R1T1, 
+                            BCL = gp.BCL[key], 
                             BCR = gp.BCR[key]))
                     end
                 end
@@ -946,7 +947,10 @@ function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{rea
 end
 
 function spectralxTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{real})
-    #To be implemented for delayed diffusion
+    
+    #Currently just a clone to test out delayed diffusion
+    spectralTransform(grid, physical, spectral)
+
 end
 
 function regularGridTransform(grid::RL_Grid)

@@ -2,6 +2,7 @@ module NumericalModels
 
 using SpectralGrid
 using Parameters
+using LoopVectorization
 
 export ModelParameters
 
@@ -80,7 +81,7 @@ function Williams2013_slabTCBL(grid::R_Grid,
     VDRAG = -(Cd .* U .* v ./ h)
     VW = w_ .* (vgr - v) ./ h
     VKDIFF = K .* ((v ./ r) .+ vr)
-    vardot[:,3] .= VADV .+ VDRAG .+ UW
+    vardot[:,3] .= VADV .+ VDRAG .+ VW
     F[:,3] .= VKDIFF
 
 end
@@ -255,8 +256,7 @@ function ShallowWaterRL(grid::RL_Grid,
     #Nonlinear shallow water equations
     g = 9.81
     f = 5.0e-5
-    H = 1000.0
-    K = 0.003
+    H = 2000.0
     
     r = gridpoints[:,1]
     h = grid.physical[:,1,1]
@@ -275,6 +275,8 @@ function ShallowWaterRL(grid::RL_Grid,
     vl = grid.physical[:,3,4]
     vll = grid.physical[:,3,5]
     
+    K = 0.0
+    
     vardot[:,1] .= ((-v .* hl ./ r) .+ (-u .* hr) .+
         (-(H .+ h) .* ((u ./ r) .+ ur .+ (vl ./ r))) .+
         (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))))
@@ -289,6 +291,97 @@ function ShallowWaterRL(grid::RL_Grid,
         (-u .* (f .+ (v ./ r))) .+
         (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r)))))
     # F = 0
+end
+
+function Oneway_ShallowWater_Slab(grid::RL_Grid, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+   
+    #Nonlinear shallow water equations
+    g = 9.81
+    f = 5.0e-5
+    Cd = 2.4e-3
+    Hfree = 2000.0
+    Kfree = 0.0
+    
+    Hblayer = 500.0
+    
+    r = gridpoints[:,1]
+    h = grid.physical[:,1,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    
+    u = grid.physical[:,2,1]
+    ur = grid.physical[:,2,2]
+    urr = grid.physical[:,2,3]
+    ul = grid.physical[:,2,4]
+    ull = grid.physical[:,2,5]
+    
+    v = grid.physical[:,3,1]
+    vr = grid.physical[:,3,2]
+    vrr = grid.physical[:,3,3]
+    vl = grid.physical[:,3,4]
+    vll = grid.physical[:,3,5]
+    
+    ub = grid.physical[:,4,1]
+    ubr = grid.physical[:,4,2]
+    ubrr = grid.physical[:,4,3]
+    ubl = grid.physical[:,4,4]
+    ubll = grid.physical[:,4,5]
+    
+    vb = grid.physical[:,5,1]
+    vbr = grid.physical[:,5,2]
+    vbrr = grid.physical[:,5,3]
+    vbl = grid.physical[:,5,4]
+    vbll = grid.physical[:,5,5]
+    
+    U = 0.78 * sqrt.((ub .* ub) .+ (vb .* vb))
+    Kblayer = 1.0
+    
+    # w in boundary layer
+    w = -Hblayer .* ((ub ./ r) .+ ubr .+ (vbl ./ r))
+    w_ = 0.5 .* abs.(w) .- w
+    # W is diagnostic
+    grid.physical[:,6,1] .= w
+    vardot[:,6] .= 0.0
+    
+    # h in free atmosphere
+    @turbo vardot[:,1] .= ((-v .* hl ./ r) .+ (-u .* hr) .+
+        (-(Hfree .+ h) .* ((u ./ r) .+ ur .+ (vl ./ r))))# .+
+        #(Kfree .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))))
+    
+    # u in free atmosphere
+    @turbo vardot[:,2] .= ((-v .* ul ./ r) .+ (-u .* ur) .+
+        (-g .* hr) .+
+        (v .* (f .+ (v ./ r)))) #.+
+        #(Kfree .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)))))
+    
+    # v in free atmosphere
+    @turbo vardot[:,3] .= ((-v .* vl ./ r) .+ (-u .* vr) .+
+        (-g .* (hl ./ r)) .+
+        (-u .* (f .+ (v ./ r))))# .+
+        #(Kfree .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r)))))
+    
+    # u in boundary layer
+    @turbo vardot[:,4] .= ((-vb .* ubl ./ r) .+ (-ub .* ubr) .+
+        (-g .* hr) .+
+        (-Cd .* U .* ub ./ Hblayer) .+
+        (-w_ .* (u .- ub) ./ Hblayer) .+
+        (vb .* (f .+ (vb ./ r))))
+    @turbo F[:,4] = Kblayer .* ((ubr ./ r) .+ ubrr .+ (ubll ./ (r .* r)))
+    
+    # v in boundary layer
+    @turbo vardot[:,5] .= ((-vb .* vbl ./ r) .+ (-ub .* vbr) .+
+        (-g .* (hl ./ r)) .+
+        (-Cd .* U .* vb ./ Hblayer) .+
+        (-w_ .* (v .- vb) ./ Hblayer) .+
+        (-ub .* (f .+ (vb ./ r))))
+    @turbo F[:,5] = Kblayer .* ((vbr ./ r) .+ vbrr .+ (vbll ./ (r .* r)))
+    
 end
 
 # Module end
