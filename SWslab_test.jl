@@ -4,7 +4,7 @@ using CubicBSpline
 using SpectralGrid
 using NumericalModels
 
-nodes = 150
+nodes = 100
 lpoints = 0
 blpoints = 0
 for r = 1:(nodes*3)
@@ -14,12 +14,12 @@ end
 model = ModelParameters(
     ts = 3.0,
     integration_time = 10800.0,
-    output_interval = 120.0,
+    output_interval = 900.0,
     equation_set = "Oneway_ShallowWater_Slab",
-    initial_conditions = "./SWslab_test_ics.csv",
+    initial_conditions = "./SWslab_rankine_ics.csv",
     output_dir = "./SWslab_test/",
     grid_params = GridParameters(xmin = 0.0,
-        xmax = 4.5e5,
+        xmax = 3.0e5,
         num_nodes = nodes,
         rDim = nodes*3,
         b_rDim = nodes+3,
@@ -31,12 +31,12 @@ model = ModelParameters(
             "vb" => CubicBSpline.R1T0,
             "wb" => CubicBSpline.R1T1),
         BCR = Dict(
-            "h" => CubicBSpline.R1T2,
-            "u" => CubicBSpline.R1T2,
-            "v" => CubicBSpline.R1T2,
-            "ub" => CubicBSpline.R1T2,
-            "vb" => CubicBSpline.R1T2,
-            "wb" => CubicBSpline.R1T2),
+            "h" => CubicBSpline.R0,
+            "u" => CubicBSpline.R0,
+            "v" => CubicBSpline.R0,
+            "ub" => CubicBSpline.R0,
+            "vb" => CubicBSpline.R0,
+            "wb" => CubicBSpline.R0),
         lDim = lpoints,
         b_lDim = blpoints,
         vars = Dict(

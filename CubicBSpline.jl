@@ -422,4 +422,17 @@ function SIxxtransform(spline::Spline1D)
     return uprime2
 end
 
+function SIxxtransform(spline::Spline1D, a::Vector{real})
+
+    uprime2 = SItransform(spline.params,a,spline.mishPoints,2)
+    return uprime2
+end
+
+function SIxxtransform(spline::Spline1D, a::Vector{real}, points::Vector{real})
+
+    uprime2 = SItransform(spline.params,a,points,2)
+    return uprime2
+end
+
+#Module end
 end

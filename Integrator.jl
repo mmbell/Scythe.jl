@@ -468,7 +468,7 @@ function calcTendency(grid,
     
 end
 
-function write_output(grid::R_Grid, model::ModelParameters, t::real)
+function write_output_old(grid::R_Grid, model::ModelParameters, t::real)
     
     time = round(t; digits=2)
     if !isdir(model.output_dir)
@@ -526,6 +526,65 @@ function write_output(grid::R_Grid, model::ModelParameters, t::real)
     #    write(outfile,"$data\n")
     #end        
     #close(outfile)
+end
+
+function write_output(grid::R_Grid, model::ModelParameters, t::real)
+    
+    time = round(t; digits=2)
+    if !isdir(model.output_dir)
+        mkdir(model.output_dir)
+    end
+    
+    println("Writing output to $(model.output_dir) at time $time")
+    dir = model.output_dir
+    afilename = string(dir, "spectral_out_", time, ".csv")
+    ufilename = string(dir, "physical_out_", time, ".csv")
+    afile = open(afilename,"w")
+    ufile = open(ufilename,"w")
+
+    aheader = "r,"
+    uheader = "r,"
+    suffix = ["","_r","_rr"]
+    for d = 1:3
+        for var in keys(grid.params.vars)
+            if (d == 1)
+                aheader *= "$var,"
+            end
+            varout = var * suffix[d]
+            uheader *= "$varout,"
+        end
+    end
+    aheader = chop(aheader) * "\n"
+    uheader = chop(uheader) * "\n"
+    write(afile,aheader)
+    write(ufile,uheader)
+    
+    for r = 1:grid.params.b_rDim
+        astring = "$r,"
+        for var in keys(grid.params.vars)
+            v = grid.params.vars[var]
+            a = grid.spectral[r,v]
+            astring *= "$(a),"
+        end
+        astring = chop(astring) * "\n"
+        write(afile,astring)
+    end
+    close(afile)
+    
+    for r = 1:grid.params.rDim
+        radii = grid.splines[1].mishPoints
+        ustring = "$(radii[r]),"
+        for d = 1:3
+            for var in keys(grid.params.vars)
+                v = grid.params.vars[var]
+                u = grid.physical[r,v,d]
+                ustring *= "$u,"
+            end
+        end
+        ustring = chop(ustring) * "\n"
+        write(ufile,ustring)
+    end
+    close(ufile)
 end
 
 function write_output(grid::RZ_Grid, model::ModelParameters, t::real)

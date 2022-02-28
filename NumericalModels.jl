@@ -73,16 +73,20 @@ function Williams2013_slabTCBL(grid::R_Grid,
     UCOR = ((f .* v) .+ ((v .* v) ./ r))
     UPGF = -((f .* vgr) .+ ((vgr .* vgr) ./ r))
     UW = -(w_ .* (u ./ h))
-    UKDIFF = K .* ((u ./ r) .+ ur)
-    vardot[:,2] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW
-    F[:,2] .= UKDIFF
-
+    #UKDIFF = K .* ((u ./ r) .+ ur)
+    UKDIFF = K .* ((ur ./ r) .+ urr .- (u ./ (r .* r)))
+    vardot[:,2] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW .+ UKDIFF
+    #F[:,2] .= UKDIFF
+    F[:,2] .= 0.0
+    
     VADV = -u .* (f .+ (v ./ r) .+ vr)
     VDRAG = -(Cd .* U .* v ./ h)
     VW = w_ .* (vgr - v) ./ h
-    VKDIFF = K .* ((v ./ r) .+ vr)
-    vardot[:,3] .= VADV .+ VDRAG .+ VW
-    F[:,3] .= VKDIFF
+    #VKDIFF = K .* ((v ./ r) .+ vr)
+    VKDIFF = K .* ((vr ./ r) .+ vrr .- (v ./ (r .* r)))
+    vardot[:,3] .= VADV .+ VDRAG .+ VW .+ UKDIFF
+    #F[:,3] .= VKDIFF
+    F[:,3] .= 0.0
 
 end
 
@@ -241,7 +245,7 @@ function LinearShallowWaterRL(grid::RL_Grid,
     vl = grid.physical[:,3,4]
     vll = grid.physical[:,3,5]
     
-    vardot[:,1] .= -H * ((u ./ r) .+ ur .+ (vl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))
+    vardot[:,1] .= -H * ((u ./ r) .+ ur .+ (vl ./ r))
     vardot[:,2] .= (-g .* hr) .+ (K .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)))) 
     vardot[:,3] .= (-g .* (hl ./ r)) .+ (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r))))
     # F = 0
@@ -275,21 +279,20 @@ function ShallowWaterRL(grid::RL_Grid,
     vl = grid.physical[:,3,4]
     vll = grid.physical[:,3,5]
     
-    K = 0.0
+    K = 1500.0
     
     vardot[:,1] .= ((-v .* hl ./ r) .+ (-u .* hr) .+
-        (-(H .+ h) .* ((u ./ r) .+ ur .+ (vl ./ r))) .+
-        (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))))
-    
+        (-(H .+ h) .* ((u ./ r) .+ ur .+ (vl ./ r))))
+
     vardot[:,2] .= ((-v .* ul ./ r) .+ (-u .* ur) .+
         (-g .* hr) .+
         (v .* (f .+ (v ./ r))) .+
-        (K .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)))))
+        (K .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)) .- (u ./ (r .* r)))))
     
     vardot[:,3] .= ((-v .* vl ./ r) .+ (-u .* vr) .+
         (-g .* (hl ./ r)) .+
         (-u .* (f .+ (v ./ r))) .+
-        (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r)))))
+        (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r)) .- (v ./ (r .* r)))))
     # F = 0
 end
 
@@ -340,7 +343,7 @@ function Oneway_ShallowWater_Slab(grid::RL_Grid,
     vbll = grid.physical[:,5,5]
     
     U = 0.78 * sqrt.((ub .* ub) .+ (vb .* vb))
-    Kblayer = 1.0
+    Kblayer = 1500.0
     
     # w in boundary layer
     w = -Hblayer .* ((ub ./ r) .+ ubr .+ (vbl ./ r))
@@ -381,6 +384,61 @@ function Oneway_ShallowWater_Slab(grid::RL_Grid,
         (-w_ .* (v .- vb) ./ Hblayer) .+
         (-ub .* (f .+ (vb ./ r))))
     @turbo F[:,5] = Kblayer .* ((vbr ./ r) .+ vbrr .+ (vbll ./ (r .* r)))
+    
+end
+
+function RL_SlabTCBL(grid::RL_Grid, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+   
+    # Need to figure out how to assign these with symbols
+    K = 1500.0
+    Cd = 2.4e-3
+    h = 1000.0
+    f = 5.0e-5
+
+    vgr = grid.physical[:,1,1]
+    vardot[:,1] .= 0.0
+    F[:,1] .= 0.0
+    
+    u = grid.physical[:,2,1]
+    ur = grid.physical[:,2,2]
+    urr = grid.physical[:,2,3]
+    v = grid.physical[:,3,1]
+    vr = grid.physical[:,3,2]
+    vrr = grid.physical[:,3,3]
+    r = gridpoints[:,1]
+
+    U = 0.78 * sqrt.((u .* u) .+ (v .* v))
+
+    w = -h .* ((u ./ r) .+ ur)
+    w_ = 0.5 .* abs.(w) .- w
+    # W is diagnostic
+    grid.physical[:,4,1] .= w
+    vardot[:,4] .= 0.0
+    F[:,4] .= 0.0
+
+    UADV = -(u .* ur)
+    UDRAG = -(Cd .* U .* u ./ h)
+    UCOR = ((f .* v) .+ ((v .* v) ./ r))
+    UPGF = -((f .* vgr) .+ ((vgr .* vgr) ./ r))
+    UW = -(w_ .* (u ./ h))
+    #UKDIFF = K .* ((u ./ r) .+ ur)
+    UKDIFF = K .* ((ur ./ r) .+ urr .- (u ./ (r .* r)))
+    vardot[:,2] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW .+ UKDIFF
+    #F[:,2] .= UKDIFF
+    F[:,2] .= 0.0
+    
+    VADV = -u .* (f .+ (v ./ r) .+ vr)
+    VDRAG = -(Cd .* U .* v ./ h)
+    VW = w_ .* (vgr - v) ./ h
+    #VKDIFF = K .* ((v ./ r) .+ vr)
+    VKDIFF = K .* ((vr ./ r) .+ vrr .- (v ./ (r .* r)))
+    vardot[:,3] .= VADV .+ VDRAG .+ VW .+ UKDIFF
+    #F[:,3] .= VKDIFF
+    F[:,3] .= 0.0
     
 end
 
