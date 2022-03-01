@@ -512,7 +512,7 @@ function Oneway_ShallowWater_Slab(grid::RL_Grid,
     UADV = (-(u .* ur)) .+ (-v .* ul ./ r)
     UDRAG = -(Cd .* U .* u ./ Hb)
     UCOR = ((f .* v) .+ ((v .* v) ./ r))
-    UPGF = (-9.81 .* hr)
+    UPGF = (-g .* hr)
     UW = -(w_ .* (u ./ Hb))
     UKDIFF = K .* ((ur ./ r) .+ urr .- (u ./ (r .* r)) .+ (ull ./ (r .* r)) .- (2.0 .* vl ./ (r .* r)))
     vardot[:,4] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW .+ UKDIFF
@@ -520,9 +520,10 @@ function Oneway_ShallowWater_Slab(grid::RL_Grid,
     
     VADV = (-u .* (f .+ (v ./ r) .+ vr)) .+ (-v .* vl ./ r)
     VDRAG = -(Cd .* U .* v ./ Hb)
+    VPGF = (-g .* (hl ./ r))
     VW = w_ .* (vg - v) ./ Hb
     VKDIFF = K .* ((vr ./ r) .+ vrr .- (v ./ (r .* r)) .+ (vll ./ (r .* r)) .+ (2.0 .* ul ./ (r .* r)))
-    vardot[:,5] .= VADV .+ VDRAG .+ VW .+ VKDIFF
+    vardot[:,5] .= VADV .+ VDRAG .+ VPGF .+ VW .+ VKDIFF
     F[:,5] .= 0.0
     
 end
