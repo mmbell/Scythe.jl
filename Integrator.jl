@@ -17,9 +17,9 @@ const int = Int64
 const uint = UInt64
 
 export initialize_model, run_model, finalize_model 
-export integrate_LinearAdvection1D, integrate_WilliamsSlabTCBL, integrate_model
+export integrate_LinearAdvection1D, integrate_WilliamsSlabTCBL
 export integrate_Kepert2017_TCBL
-export integrate_RL_ShallowWater
+export integrate_RL_ShallowWater, integrate_Oneway_ShallowWater_Slab
 
 function integrate_LinearAdvection1D()
     
@@ -140,14 +140,14 @@ function integrate_RL_ShallowWater(ics_csv::String)
         blpoints += 1 + 2*r
     end
     model = ModelParameters(
-        ts = 1.0,
-        integration_time = 1800.0,
-        output_interval = 120.0,
+        ts = 3.0,
+        integration_time = 900.0,
+        output_interval = 60.0,
         equation_set = "ShallowWaterRL",
         initial_conditions = ics_csv::String,
         output_dir = "./SW_output/",
         grid_params = GridParameters(xmin = 0.0,
-            xmax = 2.0e5,
+            xmax = 3.0e5,
             num_nodes = nodes,
             rDim = nodes*3,
             b_rDim = nodes+3,
@@ -157,7 +157,7 @@ function integrate_RL_ShallowWater(ics_csv::String)
                 "v" => CubicBSpline.R1T0),
             BCR = Dict(
                 "h" => CubicBSpline.R0, 
-                "u" => CubicBSpline.R0, 
+                "u" => CubicBSpline.R1T1, 
                 "v" => CubicBSpline.R0), 
             lDim = lpoints,
             b_lDim = blpoints,
@@ -168,8 +168,58 @@ function integrate_RL_ShallowWater(ics_csv::String)
     grid = initialize_model(model)
     run_model(grid, model)
     finalize_model(grid, model)
-    
 end
+
+function integrate_Oneway_ShallowWater_Slab(ics_csv::String)
+    
+    nodes = 100
+    lpoints = 0
+    blpoints = 0
+    for r = 1:(nodes*3)
+        lpoints += 4 + 4*r
+        blpoints += 1 + 2*r
+    end
+    model = ModelParameters(
+        ts = 3.0,
+        integration_time = 10800.0,
+        output_interval = 900.0,
+        equation_set = "Oneway_ShallowWater_Slab",
+        initial_conditions = ics_csv::String,
+        output_dir = "./SWslab_output/",
+        grid_params = GridParameters(xmin = 0.0,
+            xmax = 3.0e5,
+            num_nodes = nodes,
+            rDim = nodes*3,
+            b_rDim = nodes+3,
+            BCL = Dict(
+                "h" => CubicBSpline.R1T1,
+                "u" => CubicBSpline.R1T0,
+                "v" => CubicBSpline.R1T0,
+                "ub" => CubicBSpline.R1T0,
+                "vb" => CubicBSpline.R1T0,
+                "wb" => CubicBSpline.R1T1),
+            BCR = Dict(
+                "h" => CubicBSpline.R0,
+                "u" => CubicBSpline.R1T1,
+                "v" => CubicBSpline.R0,
+                "ub" => CubicBSpline.R1T1,
+                "vb" => CubicBSpline.R0,
+                "wb" => CubicBSpline.R0),
+            lDim = lpoints,
+            b_lDim = blpoints,
+            vars = Dict(
+                "h" => 1,
+                "u" => 2,
+                "v" => 3,
+                "ub" => 4,
+                "vb" => 5,
+                "wb" => 6)))
+    grid = initialize_model(model);
+    run_model(grid, model)
+    finalize_model(grid,model)
+end
+    
+    
 
 function initialize_model(model::ModelParameters)
     
@@ -770,33 +820,6 @@ function write_output(grid::RL_Grid, model::ModelParameters, t::real)
     end
     close(rfile)
     
-end
-
-function integrate_model()
-    
-    model = ModelParameters(
-        ts = 1.0,
-        integration_time = 100,
-        output_interval = 50,
-        xmin = 0.0,
-        xmax = 1.0e6,
-        num_nodes = 2000,
-        BCL = Dict("vgr" => CubicBSpline.R0, 
-            "u" => CubicBSpline.R1T0, 
-            "v" => CubicBSpline.R1T0, 
-            "w" => CubicBSpline.R1T1),
-        BCR = Dict("vgr" => CubicBSpline.R0, 
-            "u" => CubicBSpline.R1T1, 
-            "v" => CubicBSpline.R1T1, 
-            "w" => CubicBSpline.R1T1),
-        equation_set = "Williams2013_TCBL",
-        initial_conditions = "rankine_test_ic.csv",
-        vars = Dict("vgr" => 1, "u" => 2, "v" => 3, "w" => 4)    
-    )
-   
-    splines = initialize(model, 4)
-    splines = run(splines, model)
-    finalize(splines, model)
 end
 
 function checkCFL(grid)
