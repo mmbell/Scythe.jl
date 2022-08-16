@@ -133,13 +133,13 @@ function createGrid(gp::GridParameters)
             # RL grid
             
             splines = Array{Spline1D}(undef,3,length(values(gp.vars)))
-            rings = Array{Chebyshev1D}(undef,gp.rDim,length(values(gp.vars)))
+            rings = Array{Fourier1D}(undef,gp.rDim,length(values(gp.vars)))
             spectral = zeros(Float64, gp.b_lDim, length(values(gp.vars)))
             physical = zeros(Float64, gp.lDim, length(values(gp.vars)), 5)
             grid = RL_Grid(gp, splines, rings, spectral, physical)
             for key in keys(gp.vars)
                 
-                # Need different BCs for wa number zero winds since they are undefined at r = 0
+                # Need different BCs for wavenumber zero winds since they are undefined at r = 0
                 for i = 1:3
                     if (i == 1 && (key == "u" || key == "v" || key == "vgr"
                                 || key == "ub" || key == "vb"))

@@ -296,97 +296,6 @@ function ShallowWaterRL(grid::RL_Grid,
     # F = 0
 end
 
-function Oneway_ShallowWater_Slab_broken(grid::RL_Grid, 
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-   
-    #Nonlinear shallow water equations
-    g = 9.81
-    f = 0.0
-    Cd = 2.4e-3
-    Hfree = 2000.0
-    Kfree = 0.0
-    
-    Hblayer = 500.0
-    
-    r = gridpoints[:,1]
-    h = grid.physical[:,1,1]
-    hr = grid.physical[:,1,2]
-    hrr = grid.physical[:,1,3]
-    hl = grid.physical[:,1,4]
-    hll = grid.physical[:,1,5]
-    
-    u = grid.physical[:,2,1]
-    ur = grid.physical[:,2,2]
-    urr = grid.physical[:,2,3]
-    ul = grid.physical[:,2,4]
-    ull = grid.physical[:,2,5]
-    
-    v = grid.physical[:,3,1]
-    vr = grid.physical[:,3,2]
-    vrr = grid.physical[:,3,3]
-    vl = grid.physical[:,3,4]
-    vll = grid.physical[:,3,5]
-    
-    ub = grid.physical[:,4,1]
-    ubr = grid.physical[:,4,2]
-    ubrr = grid.physical[:,4,3]
-    ubl = grid.physical[:,4,4]
-    ubll = grid.physical[:,4,5]
-    
-    vb = grid.physical[:,5,1]
-    vbr = grid.physical[:,5,2]
-    vbrr = grid.physical[:,5,3]
-    vbl = grid.physical[:,5,4]
-    vbll = grid.physical[:,5,5]
-    
-    U = 0.78 * sqrt.((ub .* ub) .+ (vb .* vb))
-    Kblayer = 1500.0
-    
-    # w in boundary layer
-    w = -Hblayer .* ((ub ./ r) .+ ubr .+ (vbl ./ r))
-    w_ = 0.5 .* abs.(w) .- w
-    # W is diagnostic
-    grid.physical[:,6,1] .= w
-    vardot[:,6] .= 0.0
-    
-    # h in free atmosphere
-    @turbo vardot[:,1] .= ((-v .* hl ./ r) .+ (-u .* hr) .+
-        (-(Hfree .+ h) .* ((u ./ r) .+ ur .+ (vl ./ r))))# .+
-        #(Kfree .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))))
-    
-    # u in free atmosphere
-    @turbo vardot[:,2] .= ((-v .* ul ./ r) .+ (-u .* ur) .+
-        (-g .* hr) .+
-        (v .* (f .+ (v ./ r)))) #.+
-        #(Kfree .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)))))
-    
-    # v in free atmosphere
-    @turbo vardot[:,3] .= ((-v .* vl ./ r) .+ (-u .* vr) .+
-        (-g .* (hl ./ r)) .+
-        (-u .* (f .+ (v ./ r))))# .+
-        #(Kfree .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r)))))
-    
-    # u in boundary layer
-    @turbo vardot[:,4] .= ((-vb .* ubl ./ r) .+ (-ub .* ubr) .+
-        (-g .* hr) .+
-        (-Cd .* U .* ub ./ Hblayer) .+
-        (-w_ .* (u .- ub) ./ Hblayer) .+
-        (vb .* (f .+ (vb ./ r))) .+
-        (Kblayer .* ((ubr ./ r) .+ ubrr .+ (ubll ./ (r .* r)) .- (ubr ./ (r .* r)))))
-    
-    # v in boundary layer
-    @turbo vardot[:,5] .= ((-vb .* vbl ./ r) .+ (-ub .* vbr) .+
-        (-g .* (hl ./ r)) .+
-        (-Cd .* U .* vb ./ Hblayer) .+
-        (w_ .* (v .- vb) ./ Hblayer) .+
-        (-ub .* (f .+ (vb ./ r))) .+
-        (Kblayer .* ((vbr ./ r) .+ vbrr .+ (vbll ./ (r .* r)) .- (vbr ./ (r .* r)))))
-    
-end
-
 function RL_SlabTCBL(grid::RL_Grid, 
             gridpoints::Array{real},
             vardot::Array{real},
@@ -509,6 +418,100 @@ function Oneway_ShallowWater_Slab(grid::RL_Grid,
     vardot[:,6] .= 0.0
     F[:,6] .= 0.0
 
+    UADV = (-(u .* ur)) .+ (-v .* ul ./ r)
+    UDRAG = -(Cd .* U .* u ./ Hb)
+    UCOR = ((f .* v) .+ ((v .* v) ./ r))
+    UPGF = (-g .* hr)
+    UW = -(w_ .* (u ./ Hb))
+    UKDIFF = K .* ((ur ./ r) .+ urr .- (u ./ (r .* r)) .+ (ull ./ (r .* r)) .- (2.0 .* vl ./ (r .* r)))
+    vardot[:,4] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW .+ UKDIFF
+    F[:,4] .= 0.0
+    
+    VADV = (-u .* (f .+ (v ./ r) .+ vr)) .+ (-v .* vl ./ r)
+    VDRAG = -(Cd .* U .* v ./ Hb)
+    VPGF = (-g .* (hl ./ r))
+    VW = w_ .* (vg - v) ./ Hb
+    VKDIFF = K .* ((vr ./ r) .+ vrr .- (v ./ (r .* r)) .+ (vll ./ (r .* r)) .+ (2.0 .* ul ./ (r .* r)))
+    vardot[:,5] .= VADV .+ VDRAG .+ VPGF .+ VW .+ VKDIFF
+    F[:,5] .= 0.0
+    
+end
+
+function Twoway_ShallowWater_Slab(grid::RL_Grid, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+   
+    # Need to figure out how to assign these with symbols
+    g = 9.81
+    K = 1500.0
+    Cd = 2.4e-3
+    Hfree = 2000.0
+    Hb = 1000.0
+    f = 5.0e-5
+    S1 = 1.0e-5
+    
+    r = gridpoints[:,1]
+
+    h = grid.physical[:,1,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    
+    ug = grid.physical[:,2,1]
+    ugr = grid.physical[:,2,2]
+    ugrr = grid.physical[:,2,3]
+    ugl = grid.physical[:,2,4]
+    ugll = grid.physical[:,2,5]
+        
+    vg = grid.physical[:,3,1]
+    vgr = grid.physical[:,3,2]
+    vgrr = grid.physical[:,3,3]
+    vgl = grid.physical[:,3,4]
+    vgll = grid.physical[:,3,5]
+    
+    # ug tendency
+    vardot[:,2] .= ((-vg .* ugl ./ r) .+ (-ug .* ugr) .+
+        (-g .* hr) .+
+        (vg .* (f .+ (vg ./ r))))
+    F[:,2] .= 0.0
+    
+    # vg tendency
+    vardot[:,3] .= ((-vg .* vgl ./ r) .+ (-ug .* vgr) .+
+        (-g .* (hl ./ r)) .+
+        (-ug .* (f .+ (vg ./ r))))
+    F[:,3] .= 0.0
+    
+    u = grid.physical[:,4,1]
+    ur = grid.physical[:,4,2]
+    urr = grid.physical[:,4,3]
+    ul = grid.physical[:,4,4]
+    ull = grid.physical[:,4,5]
+    
+    v = grid.physical[:,5,1]
+    vr = grid.physical[:,5,2]
+    vrr = grid.physical[:,5,3]
+    vl = grid.physical[:,5,4]
+    vll = grid.physical[:,5,5]
+
+    U = 0.78 * sqrt.((u .* u) .+ (v .* v))
+
+    # W is diagnostic
+    w = -Hb .* ((u ./ r) .+ ur)
+    w_ = 0.5 .* abs.(w) .- w
+    grid.physical[:,6,1] .= w
+    vardot[:,6] .= 0.0
+    F[:,6] .= 0.0
+
+    # h tendency includes W as mass sink/source
+    S = w * S1
+    vardot[:,1] .= ((-vg .* hl ./ r) .+ (-ug .* hr) .+
+        (-(Hfree .+ h) .* ((ug ./ r) .+ ugr .+ (vgl ./ r)))) .+
+        -(Hfree .+ h) .* S
+    F[:,1] .= 0.0
+    
     UADV = (-(u .* ur)) .+ (-v .* ul ./ r)
     UDRAG = -(Cd .* U .* u ./ Hb)
     UCOR = ((f .* v) .+ ((v .* v) ./ r))

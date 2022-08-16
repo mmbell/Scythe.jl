@@ -20,6 +20,7 @@ export initialize_model, run_model, finalize_model
 export integrate_LinearAdvection1D, integrate_WilliamsSlabTCBL
 export integrate_Kepert2017_TCBL
 export integrate_RL_ShallowWater, integrate_Oneway_ShallowWater_Slab
+export integrate_Twoway_ShallowWater_Slab
 
 function integrate_LinearAdvection1D()
     
@@ -219,7 +220,54 @@ function integrate_Oneway_ShallowWater_Slab(ics_csv::String)
     finalize_model(grid,model)
 end
     
+function integrate_Twoway_ShallowWater_Slab(ics_csv::String)
     
+    nodes = 100
+    lpoints = 0
+    blpoints = 0
+    for r = 1:(nodes*3)
+        lpoints += 4 + 4*r
+        blpoints += 1 + 2*r
+    end
+    model = ModelParameters(
+        ts = 3.0,
+        integration_time = 10800.0,
+        output_interval = 900.0,
+        equation_set = "Twoway_ShallowWater_Slab",
+        initial_conditions = ics_csv::String,
+        output_dir = "./Twoway_SWslab_output/",
+        grid_params = GridParameters(xmin = 0.0,
+            xmax = 3.0e5,
+            num_nodes = nodes,
+            rDim = nodes*3,
+            b_rDim = nodes+3,
+            BCL = Dict(
+                "h" => CubicBSpline.R1T1,
+                "u" => CubicBSpline.R1T0,
+                "v" => CubicBSpline.R1T0,
+                "ub" => CubicBSpline.R1T0,
+                "vb" => CubicBSpline.R1T0,
+                "wb" => CubicBSpline.R1T1),
+            BCR = Dict(
+                "h" => CubicBSpline.R0,
+                "u" => CubicBSpline.R1T1,
+                "v" => CubicBSpline.R0,
+                "ub" => CubicBSpline.R1T1,
+                "vb" => CubicBSpline.R0,
+                "wb" => CubicBSpline.R0),
+            lDim = lpoints,
+            b_lDim = blpoints,
+            vars = Dict(
+                "h" => 1,
+                "u" => 2,
+                "v" => 3,
+                "ub" => 4,
+                "vb" => 5,
+                "wb" => 6)))
+    grid = initialize_model(model);
+    run_model(grid, model)
+    finalize_model(grid,model)
+end  
 
 function initialize_model(model::ModelParameters)
     
@@ -415,36 +463,6 @@ function physical_model(grid,
     equation_call = getfield(NumericalModels, equation_set)
     equation_call(grid, gridpoints, vardot, F, model)
     return
-    
-    if model.equation_set == "1dLinearAdvection"
-        #1D Linear advection to test
-        c_0 = 1.0
-        K = 0.003
-        #K = 0.0
-        
-        vardot[:,1] .= -c_0 .* physical[:,1,2] .+ (K .* physical[:,1,3])
-        
-        # F = 0
-    elseif model.equation_set == "1dNonlinearAdvection"
-        c_0 = 1.0
-        K = 0.048
-        
-        udot[:,1] = -(c_0 .+ var[:,1]) .* varx[:,1] + (K .* varxx[:,1])
-        F = 0
-    elseif model.equation_set == "1dLinearShallowWater"
-        K = 0.003
-        g = 9.81
-        H = 1.0
-        
-        vardot[:,1] = -g .* varx[:,2]
-        vardot[:,2] = -H .* varx[:,1]
-        F = 0
-    elseif model.equation_set == "Williams2013_TCBL"
-        
-        vardot, F = Williams2013_TBCL(model,x,var,varx,varxx)
-    else
-        error("Selected equation set not implemented")
-    end
     
 end
 
