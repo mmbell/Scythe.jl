@@ -49,6 +49,7 @@ end
 struct Spline1D
     params::SplineParameters
     gammaBC::Matrix{real}
+    pq
     pqFactor::SuiteSparse.CHOLMOD.Factor{Float64}
     mishDim::int
     bDim::int
@@ -145,6 +146,8 @@ function calcGammaBC(sp::SplineParameters)
     elseif sp.BCL == PERIODIC
         gammaBC[Minterior_dim,1] = 1.0
         gammaBC[:,2:(Mdim-rankR)] = Matrix(1.0I, Minterior_dim, Minterior_dim)
+    elseif sp.BCL == R3
+        gammaBC[:,4:(Mdim-rankR)] = Matrix(1.0I, Minterior_dim, Minterior_dim)
     else
         gammaBC[:,1:(Mdim-rankR)] = Matrix(1.0I, Minterior_dim, Minterior_dim)
     end
@@ -200,10 +203,11 @@ function calcPQfactor(sp::SplineParameters, gammaBC::Matrix{real})
     end
 
     # Fold in the BCs to get open form
-    PQ = Symmetric((gammaBC * P * gammaBC') + (gammaBC * Q * gammaBC'))
-    PQsparse = sparse(PQ)
+    PQ = Symmetric(P + Q)
+    PQopen = Symmetric((gammaBC * P * gammaBC') + (gammaBC * Q * gammaBC'))
+    PQsparse = sparse(PQopen)
     PQfactor = (cholesky(PQsparse))
-    return PQfactor
+    return PQ, PQfactor
 end
 
 function calcMishPoints(sp::SplineParameters)
@@ -220,7 +224,7 @@ end
 function Spline1D(sp::SplineParameters)
 
     gammaBC = calcGammaBC(sp)
-    pqFactor = calcPQfactor(sp, gammaBC)
+    pq, pqFactor = calcPQfactor(sp, gammaBC)
 
     mishDim = sp.num_nodes*mubar
     mishPoints = calcMishPoints(sp)
@@ -231,7 +235,7 @@ function Spline1D(sp::SplineParameters)
     b = zeros(real,bDim)
     a = zeros(real,aDim)
 
-    spline = Spline1D(sp,gammaBC,pqFactor,mishDim,bDim,aDim,mishPoints,uMish,b,a)
+    spline = Spline1D(sp,gammaBC,pq,pqFactor,mishDim,bDim,aDim,mishPoints,uMish,b,a)
     return spline
 end
 
@@ -327,10 +331,18 @@ function SAtransform!(spline::Spline1D)
     spline.a .= a
 end
 
+function SAtransform(spline::Spline1D, b::Vector{real}, ahat::Vector{real})
+
+    btilde = spline.gammaBC * (b - (spline.pq * ahat))
+    a = (spline.gammaBC' * (spline.pqFactor \ btilde)) + ahat
+    return a
+end
+
+
 function SItransform(sp::SplineParameters, a::Vector{real}, x::real, derivative::int = 0)
 
     u = 0.0
-    xm = ceil(int,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
+    xm = ceil(int,(x - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
     for m = xm:(xm + 3)
         if (m >= -1) && (m <= (sp.num_nodes+1))
             mi = m + 2
