@@ -499,7 +499,7 @@ function Twoway_ShallowWater_Slab(grid::RL_Grid,
     U = 0.78 * sqrt.((u .* u) .+ (v .* v))
 
     # W is diagnostic
-    w = -Hb .* ((u ./ r) .+ ur)
+    w = -Hb .* ((u ./ r) .+ ur .+ (vl ./ r))
     w_ = 0.5 .* abs.(w) .- w
     grid.physical[:,6,1] .= w
     vardot[:,6] .= 0.0
