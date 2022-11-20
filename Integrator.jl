@@ -25,19 +25,26 @@ export integrate_Twoway_ShallowWater_Slab
 function integrate_LinearAdvection1D()
     
     model = ModelParameters(
-        ts = 0.2,
-        integration_time = 480.0,
-        output_interval = 25.0,
+        ts = 0.05,
+        integration_time = 100.0,
+        output_interval = 100.0,
         equation_set = "LinearAdvection1D",
-        initial_conditions = "testcase.csv",
+        initial_conditions = "1d_linear_advection_test_ics.csv",
         grid_params = GridParameters(
-            xmin = -48.0,
-            xmax = 48.0,
-            num_nodes = 96,
-            rDim = 96*3,
-            b_rDim = 96+3,
-            BCL = CubicBSpline.PERIODIC,
-            BCR = CubicBSpline.PERIODIC))
+            xmin = -50.0,
+            xmax = 50.0,
+            num_nodes = 100,
+            rDim = 100*3,
+            b_rDim = 100+3,
+            BCL = Dict(
+                "u" => CubicBSpline.PERIODIC),
+            BCR = Dict(
+                "u" => CubicBSpline.PERIODIC),
+            vars = Dict(
+                "u" => 1)),
+        physical_params = Dict(
+            :c_0 => 1.0,
+            :K => 0.0))
    
     grid = initialize_model(model)
     run_model(grid, model)

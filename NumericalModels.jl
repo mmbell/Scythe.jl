@@ -1,7 +1,6 @@
 module NumericalModels
 
 using SpectralGrid
-using Parameters
 using LoopVectorization
 
 export ModelParameters
@@ -11,7 +10,7 @@ const real = Float64
 const int = Int64
 const uint = UInt64
 
-@with_kw struct ModelParameters
+Base.@kwdef struct ModelParameters
     ts::Float64 = 0.0
     integration_time::Float64 = 1.0
     output_interval::Float64 = 1.0
@@ -19,20 +18,25 @@ const uint = UInt64
     initial_conditions = "ic.csv"
     output_dir = "./output/"
     grid_params::GridParameters
+    physical_params::Dict
 end
 
-function LinearAdvection1D(physical::Array{real}, 
+function LinearAdvection1D(grid::R_Grid,
             gridpoints::Array{real},
             vardot::Array{real},
             F::Array{real},
             model::ModelParameters)
    
     #1D Linear advection to test
-    c_0 = 1.0
-    K = 0.003
+    c_0 = model.physical_params[:c_0]
+    K = model.physical_params[:K]
 
-    vardot[:,1] .= -c_0 .* physical[:,1,2] .+ (K .* physical[:,1,3])        
-    # F = 0
+    u = grid.physical[:,1,1]
+    ur = grid.physical[:,1,2]
+    urr = grid.physical[:,1,3]
+
+    vardot[:,1] .= -(c_0 .* ur) .+ (K .* urr)
+
 end
 
 function Williams2013_slabTCBL(grid::R_Grid, 
