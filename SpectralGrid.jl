@@ -83,137 +83,137 @@ struct RLZ_Grid
 end
 
 function createGrid(gp::GridParameters)
-    
-    if gp.num_cells > 0
-        # R, RZ, RL, or RLZ grid
         
-        if gp.geometry == "R"
-            # R grid
-            
-            splines = Array{Spline1D}(undef,1,length(values(gp.vars)))
-            spectral = zeros(Float64, gp.b_rDim, length(values(gp.vars)))
-            physical = zeros(Float64, gp.rDim, length(values(gp.vars)), 3)
-            grid = R_Grid(gp, splines, spectral, physical)
-            for key in keys(gp.vars)
-                grid.splines[1,gp.vars[key]] = Spline1D(SplineParameters(
-                    xmin = gp.xmin,
-                    xmax = gp.xmax,
-                    num_cells = gp.num_cells,
-                    BCL = gp.BCL[key],
-                    BCR = gp.BCR[key]))
-            end
-            return grid
-            
-        elseif gp.geometry == "RZ"
-            # RZ grid
-            
-            splines = Array{Spline1D}(undef,gp.zDim,length(values(gp.vars)))
-            columns = Array{Chebyshev1D}(undef,length(values(gp.vars)))
-            spectral = zeros(Float64, gp.b_zDim * gp.b_rDim, length(values(gp.vars)))
-            physical = zeros(Float64, gp.zDim * gp.rDim, length(values(gp.vars)), 5)
-            grid = RZ_Grid(gp, splines, columns, spectral, physical)
-            for key in keys(gp.vars)
-                for z = 1:gp.zDim
-                    grid.splines[z,gp.vars[key]] = Spline1D(SplineParameters(
-                        xmin = gp.xmin,
-                        xmax = gp.xmax,
-                        num_cells = gp.num_cells,
-                        BCL = gp.BCL[key], 
-                        BCR = gp.BCR[key]))
-                end
-                grid.columns[gp.vars[key]] = Chebyshev1D(ChebyshevParameters(
-                    zmin = gp.zmin,
-                    zmax = gp.zmax,
-                    zDim = gp.zDim,
-                    bDim = gp.b_zDim,
-                    BCB = gp.BCB[key],
-                    BCT = gp.BCT[key]))
-            end
-            return grid
-            
-        elseif gp.geometry == "RL"
-            # RL grid
-            
-            # Calculate the number of points in the grid
-            lpoints = 0
-            blpoints = 0
-            for r = 1:gp.rDim
-                ri = r + gp.rDim_offset
-                lpoints += 4 + 4*ri
-                blpoints += 1 + 2*ri
-            end
-            
-            # Have to create a new immutable structure for the parameters
-            gp2 = GridParameters(
-                geometry = gp.geometry,
+    if gp.geometry == "R"
+        # R grid
+
+        splines = Array{Spline1D}(undef,1,length(values(gp.vars)))
+        spectral = zeros(Float64, gp.b_rDim, length(values(gp.vars)))
+        physical = zeros(Float64, gp.rDim, length(values(gp.vars)), 3)
+        grid = R_Grid(gp, splines, spectral, physical)
+        for key in keys(gp.vars)
+            grid.splines[1,gp.vars[key]] = Spline1D(SplineParameters(
                 xmin = gp.xmin,
                 xmax = gp.xmax,
                 num_cells = gp.num_cells,
-                rDim = gp.rDim,
-                b_rDim = gp.b_rDim,
-                rDim_offset = gp.rDim_offset,
-                l_q = gp.l_q,
-                BCL = gp.BCL,
-                BCR = gp.BCR,
-                lDim = lpoints,
-                b_lDim = blpoints,
+                BCL = gp.BCL[key],
+                BCR = gp.BCR[key]))
+        end
+        return grid
+
+    elseif gp.geometry == "RZ"
+        # RZ grid
+
+        splines = Array{Spline1D}(undef,gp.zDim,length(values(gp.vars)))
+        columns = Array{Chebyshev1D}(undef,length(values(gp.vars)))
+        spectral = zeros(Float64, gp.b_zDim * gp.b_rDim, length(values(gp.vars)))
+        physical = zeros(Float64, gp.zDim * gp.rDim, length(values(gp.vars)), 5)
+        grid = RZ_Grid(gp, splines, columns, spectral, physical)
+        for key in keys(gp.vars)
+            for z = 1:gp.zDim
+                grid.splines[z,gp.vars[key]] = Spline1D(SplineParameters(
+                    xmin = gp.xmin,
+                    xmax = gp.xmax,
+                    num_cells = gp.num_cells,
+                    BCL = gp.BCL[key], 
+                    BCR = gp.BCR[key]))
+            end
+            grid.columns[gp.vars[key]] = Chebyshev1D(ChebyshevParameters(
                 zmin = gp.zmin,
                 zmax = gp.zmax,
                 zDim = gp.zDim,
-                b_zDim = gp.b_zDim,
-                BCB = gp.BCB,
-                BCT = gp.BCT,
-                vars = gp.vars)
-            
-            splines = Array{Spline1D}(undef,3,length(values(gp2.vars)))
-            rings = Array{Fourier1D}(undef,gp2.rDim,length(values(gp2.vars)))
-            spectral = zeros(Float64, gp2.b_lDim, length(values(gp2.vars)))
-            physical = zeros(Float64, gp2.lDim, length(values(gp2.vars)), 5)
-            grid = RL_Grid(gp2, splines, rings, spectral, physical)
-            for key in keys(gp2.vars)
-                
-                # Need different BCs for wavenumber zero winds since they are undefined at r = 0
-                for i = 1:3
-                    if (i == 1 && (key == "u" || key == "v" || key == "vgr"
-                                || key == "ub" || key == "vb"))
-                        grid.splines[1,gp2.vars[key]] = Spline1D(SplineParameters(
-                            xmin = gp2.xmin,
-                            xmax = gp2.xmax,
-                            num_cells = gp2.num_cells,
-                            BCL = CubicBSpline.R1T0, 
-                            BCR = gp2.BCR[key]))
-                    else
-                        grid.splines[i,gp.vars[key]] = Spline1D(SplineParameters(
-                            xmin = gp2.xmin,
-                            xmax = gp2.xmax,
-                            num_cells = gp2.num_cells,
-                            BCL = gp2.BCL[key], 
-                            BCR = gp2.BCR[key]))
-                    end
-                end
+                bDim = gp.b_zDim,
+                BCB = gp.BCB[key],
+                BCT = gp.BCT[key]))
+        end
+        return grid
 
-                for r = 1:gp2.rDim
-                    ri = r + gp2.rDim_offset
-                    lpoints = 4 + 4*ri
-                    dl = 2 * π / lpoints
-                    offset = 0.5 * dl * (ri-1)
-                    grid.rings[r,gp2.vars[key]] = Fourier1D(FourierParameters(
-                        ymin = offset,
-                        # ymax = offset + (2 * π) - dl,
-                        yDim = lpoints,
-                        bDim = ri*2 + 1,
-                        kmax = ri))
+    elseif gp.geometry == "RL"
+        # RL grid
+
+        # Calculate the number of points in the grid
+        lpoints = 0
+        blpoints = 0
+        for r = 1:gp.rDim
+            ri = r + gp.rDim_offset
+            lpoints += 4 + 4*ri
+            blpoints += 1 + 2*ri
+        end
+
+        # Have to create a new immutable structure for the parameters
+        gp2 = GridParameters(
+            geometry = gp.geometry,
+            xmin = gp.xmin,
+            xmax = gp.xmax,
+            num_cells = gp.num_cells,
+            rDim = gp.rDim,
+            b_rDim = gp.b_rDim,
+            rDim_offset = gp.rDim_offset,
+            l_q = gp.l_q,
+            BCL = gp.BCL,
+            BCR = gp.BCR,
+            lDim = lpoints,
+            b_lDim = blpoints,
+            zmin = gp.zmin,
+            zmax = gp.zmax,
+            zDim = gp.zDim,
+            b_zDim = gp.b_zDim,
+            BCB = gp.BCB,
+            BCT = gp.BCT,
+            vars = gp.vars)
+
+        splines = Array{Spline1D}(undef,3,length(values(gp2.vars)))
+        rings = Array{Fourier1D}(undef,gp2.rDim,length(values(gp2.vars)))
+        spectral = zeros(Float64, gp2.b_lDim, length(values(gp2.vars)))
+        physical = zeros(Float64, gp2.lDim, length(values(gp2.vars)), 5)
+        grid = RL_Grid(gp2, splines, rings, spectral, physical)
+        for key in keys(gp2.vars)
+
+            # Need different BCs for wavenumber zero winds since they are undefined at r = 0
+            for i = 1:3
+                if (i == 1 && (key == "u" || key == "v" || key == "vgr"
+                            || key == "ub" || key == "vb"))
+                    grid.splines[1,gp2.vars[key]] = Spline1D(SplineParameters(
+                        xmin = gp2.xmin,
+                        xmax = gp2.xmax,
+                        num_cells = gp2.num_cells,
+                        BCL = CubicBSpline.R1T0, 
+                        BCR = gp2.BCR[key]))
+                else
+                    grid.splines[i,gp.vars[key]] = Spline1D(SplineParameters(
+                        xmin = gp2.xmin,
+                        xmax = gp2.xmax,
+                        num_cells = gp2.num_cells,
+                        BCL = gp2.BCL[key], 
+                        BCR = gp2.BCR[key]))
                 end
             end
-            return grid
-            
-        elseif gp.geometry == "RLZ"
-            # RLZ grid
-            throw(DomainError(0, "RLZ not implemented yet"))
+
+            for r = 1:gp2.rDim
+                ri = r + gp2.rDim_offset
+                lpoints = 4 + 4*ri
+                dl = 2 * π / lpoints
+                offset = 0.5 * dl * (ri-1)
+                grid.rings[r,gp2.vars[key]] = Fourier1D(FourierParameters(
+                    ymin = offset,
+                    # ymax = offset + (2 * π) - dl,
+                    yDim = lpoints,
+                    bDim = ri*2 + 1,
+                    kmax = ri))
+            end
         end
-    else
+        return grid
+
+    elseif gp.geometry == "RLZ"
+        # RLZ grid
+        throw(DomainError(0, "RLZ not implemented yet"))
+        
+    elseif gp.geometry == "Z"
         # Z grid
         throw(DomainError(0, "Z column model not implemented yet"))
+    else
+        # Unknown grid
+        throw(DomainError(0, "Unknown geometry"))
     end
     
 end
@@ -280,15 +280,8 @@ function spectralTransform!(grid::R_Grid)
     
     # Transform from the grid to spectral space
     # For R grid, the only varying dimension is the variable name
-    for i in eachindex(grid.splines)
-        grid.splines[i].uMish .= grid.physical[:,i,1]
-        SBtransform!(grid.splines[i])
-        
-        # Assign the spectral array
-        grid.spectral[:,i] .= grid.splines[i].b
-    end
-    
-    return grid.spectral
+    spectral = spectralTransform(grid, grid.physical, grid.spectral)
+    return spectral
 end
 
 function spectralTransform(grid::R_Grid, physical::Array{real}, spectral::Array{real})
@@ -329,21 +322,37 @@ function gridTransform!(grid::R_Grid)
     
     # Transform from the spectral to grid space
     # For R grid, the only varying dimension is the variable name
+    physical = gridTransform(grid, grid.physical, grid.spectral)
+    return physical
+end
+
+function gridTransform(grid::R_Grid, physical::Array{real}, spectral::Array{real})
+    
+    # Transform from the spectral to grid space
+    # For R grid, the only varying dimension is the variable name
     for i in eachindex(grid.splines)
-        grid.splines[i].b .= grid.spectral[:,i]
+        grid.splines[i].b .= spectral[:,i]
         SAtransform!(grid.splines[i])
         SItransform!(grid.splines[i])
         
         # Assign the grid array
-        grid.physical[:,i,1] .= grid.splines[i].uMish
-        grid.physical[:,i,2] .= SIxtransform(grid.splines[i])
-        grid.physical[:,i,3] .= SIxxtransform(grid.splines[i])
+        physical[:,i,1] .= grid.splines[i].uMish
+        physical[:,i,2] .= SIxtransform(grid.splines[i])
+        physical[:,i,3] .= SIxxtransform(grid.splines[i])
     end
     
-    return grid.physical 
+    return physical 
 end
 
 function spectralTransform!(grid::RZ_Grid)
+    
+    # Transform from the RZ grid to spectral space
+    # For RZ grid, varying dimensions are R, Z, and variable
+    spectral = spectralTransform(grid, grid.physical, grid.spectral)
+    return spectral
+end
+
+function spectralTransform(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
     
     # Transform from the RZ grid to spectral space
     # For RZ grid, varying dimensions are R, Z, and variable
@@ -351,7 +360,7 @@ function spectralTransform!(grid::RZ_Grid)
         i = 1
         for z = 1:grid.params.zDim
             for r = 1:grid.params.rDim
-                grid.splines[z,v].uMish[r] = grid.physical[i,v,1]
+                grid.splines[z,v].uMish[r] = physical[i,v,1]
                 i += 1
             end
             SBtransform!(grid.splines[z,v])
@@ -366,14 +375,22 @@ function spectralTransform!(grid::RZ_Grid)
             # Assign the spectral array
             z1 = ((r-1)*grid.params.b_zDim)+1
             z2 = r*grid.params.b_zDim
-            grid.spectral[z1:z2,v] .= grid.columns[v].b
+            spectral[z1:z2,v] .= grid.columns[v].b
         end
     end
 
-    return grid.spectral
+    return spectral
 end
 
 function gridTransform!(grid::RZ_Grid)
+    
+    # Transform from the spectral to grid space
+    # For RZ grid, varying dimensions are R, Z, and variable
+    physical = gridTransform(grid, grid.physical, grid.spectral)
+    return physical
+end
+
+function gridTransform(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
     
     # Transform from the spectral to grid space
     # For RZ grid, varying dimensions are R, Z, and variable
@@ -381,7 +398,7 @@ function gridTransform!(grid::RZ_Grid)
         for r = 1:grid.params.b_rDim
             z1 = ((r-1)*grid.params.b_zDim)+1
             z2 = r*grid.params.b_zDim
-            grid.columns[v].b .= grid.spectral[z1:z2,v]
+            grid.columns[v].b .= spectral[z1:z2,v]
             CAtransform!(grid.columns[v])
             CItransform!(grid.columns[v])
             
@@ -397,13 +414,13 @@ function gridTransform!(grid::RZ_Grid)
             # Assign the grid array
             r1 = ((z-1)*grid.params.rDim)+1
             r2 = z*grid.params.rDim
-            grid.physical[r1:r2,v,1] .= grid.splines[z,v].uMish
-            grid.physical[r1:r2,v,2] .= SIxtransform(grid.splines[z,v])
-            grid.physical[r1:r2,v,3] .= SIxxtransform(grid.splines[z,v])
+            physical[r1:r2,v,1] .= grid.splines[z,v].uMish
+            physical[r1:r2,v,2] .= SIxtransform(grid.splines[z,v])
+            physical[r1:r2,v,3] .= SIxxtransform(grid.splines[z,v])
         end
         
         # Get the vertical derivatives
-        var = reshape(grid.physical[:,v,1],grid.params.rDim,grid.params.zDim)
+        var = reshape(physical[:,v,1],grid.params.rDim,grid.params.zDim)
         for r = 1:grid.params.rDim
             grid.columns[v].uMish .= var[r,:]
             CBtransform!(grid.columns[v])
@@ -414,8 +431,8 @@ function gridTransform!(grid::RZ_Grid)
             # Assign the grid array
             for z = 1:grid.params.zDim
                 ri = (z-1)*grid.params.rDim + r
-                grid.physical[ri,v,4] = varz[z]
-                grid.physical[ri,v,5] = varzz[z]
+                physical[ri,v,4] = varz[z]
+                physical[ri,v,5] = varzz[z]
             end
         end
         
@@ -424,7 +441,7 @@ function gridTransform!(grid::RZ_Grid)
     return grid.physical 
 end
 
-function spectralTransform(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
+function spectralTransform_old(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
     
     # Transform from the RZ grid to spectral space
     # For RZ grid, varying dimensions are R, Z, and variable
@@ -591,62 +608,8 @@ function spectralTransform!(grid::RL_Grid)
     
     # Transform from the RL grid to spectral space
     # For RL grid, varying dimensions are R, L, and variable
-    for v in values(grid.params.vars)
-        i = 1
-        for r = 1:grid.params.rDim
-            ri = r + grid.params.rDim_offset
-            lpoints = 4 + 4*ri
-            for l = 1:lpoints
-                grid.rings[r,v].uMish[l] = grid.physical[i,v,1]
-                i += 1
-            end
-            FBtransform!(grid.rings[r,v])
-        end
-
-        # Clear the wavenumber zero spline
-        grid.splines[1,v].uMish .= 0.0
-        for r = 1:grid.params.rDim
-            # Wavenumber zero
-            grid.splines[1,v].uMish[r] = grid.rings[r,v].b[1]
-        end
-        SBtransform!(grid.splines[1,v])
-        
-        # Assign the spectral array
-        k1 = 1
-        k2 = grid.params.b_rDim
-        grid.spectral[k1:k2,v] .= grid.splines[1,v].b
-
-        for k = 1:grid.params.rDim
-            # Clear the splines
-            grid.splines[2,v].uMish .= 0.0
-            grid.splines[3,v].uMish .= 0.0
-            for r = 1:grid.params.rDim
-                if (k <= r)
-                    # Real part
-                    rk = k+1
-                    # Imaginary part
-                    ik = grid.rings[r,v].params.bDim-k+1
-                    grid.splines[2,v].uMish[r] = grid.rings[r,v].b[rk]
-                    grid.splines[3,v].uMish[r] = grid.rings[r,v].b[ik]
-                end
-            end
-            SBtransform!(grid.splines[2,v])
-            SBtransform!(grid.splines[3,v])
-            
-            # Assign the spectral array
-            # For simplicity, just stack the real and imaginary parts one after the other
-            p = k*2
-            p1 = ((p-1)*grid.params.b_rDim)+1
-            p2 = p*grid.params.b_rDim
-            grid.spectral[p1:p2,v] .= grid.splines[2,v].b
-            
-            p1 = (p*grid.params.b_rDim)+1
-            p2 = (p+1)*grid.params.b_rDim
-            grid.spectral[p1:p2,v] .= grid.splines[3,v].b
-        end
-    end
-
-    return grid.spectral
+    spectral = spectralTransform(grid, grid.physical, grid.spectral)
+    return spectral
 end
 
 function spectralTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{real})
@@ -715,139 +678,8 @@ function gridTransform!(grid::RL_Grid)
     
     # Transform from the spectral to grid space
     # For RZ grid, varying dimensions are R, Z, and variable
-    spline_r = zeros(Float64, grid.params.rDim, grid.params.rDim*2+1)
-    spline_rr = zeros(Float64, grid.params.rDim, grid.params.rDim*2+1)
-    
-    for v in values(grid.params.vars)
-        # Wavenumber zero
-        k1 = 1
-        k2 = grid.params.b_rDim
-        grid.splines[1,v].b .= grid.spectral[k1:k2,v]
-        SAtransform!(grid.splines[1,v])
-        SItransform!(grid.splines[1,v])
-        spline_r[:,1] = SIxtransform(grid.splines[1,v])
-        spline_rr[:,1] = SIxxtransform(grid.splines[1,v])
-        
-        for r = 1:grid.params.rDim
-            grid.rings[r,v].b[1] = grid.splines[1,v].uMish[r]
-        end
-        
-        # Higher wavenumbers
-        for k = 1:grid.params.rDim
-            p = k*2
-            p1 = ((p-1)*grid.params.b_rDim)+1
-            p2 = p*grid.params.b_rDim
-            grid.splines[2,v].b .= grid.spectral[p1:p2,v]
-            SAtransform!(grid.splines[2,v])
-            SItransform!(grid.splines[2,v])
-            spline_r[:,p] = SIxtransform(grid.splines[2,v])
-            spline_rr[:,p] = SIxxtransform(grid.splines[2,v])
-            
-            p1 = (p*grid.params.b_rDim)+1
-            p2 = (p+1)*grid.params.b_rDim
-            grid.splines[3,v].b .= grid.spectral[p1:p2,v]
-            SAtransform!(grid.splines[3,v])
-            SItransform!(grid.splines[3,v])
-            spline_r[:,p+1] = SIxtransform(grid.splines[3,v])
-            spline_rr[:,p+1] = SIxxtransform(grid.splines[3,v])
-            
-            for r = 1:grid.params.rDim
-                if (k <= r)
-                    # Real part
-                    rk = k+1
-                    # Imaginary part
-                    ik = grid.rings[r,v].params.bDim-k+1
-                    grid.rings[r,v].b[rk] = grid.splines[2,v].uMish[r]
-                    grid.rings[r,v].b[ik] = grid.splines[3,v].uMish[r]
-                end
-            end
-        end
-        
-        l1 = 0
-        l2 = 0
-        for r = 1:grid.params.rDim
-            FAtransform!(grid.rings[r,v])
-            FItransform!(grid.rings[r,v])
-            
-            # Assign the grid array
-            ri = r + grid.params.rDim_offset
-            l1 = l2 + 1
-            l2 = l1 + 3 + (4*ri)
-            grid.physical[l1:l2,v,1] .= grid.rings[r,v].uMish
-            grid.physical[l1:l2,v,4] .= FIxtransform(grid.rings[r,v])
-            grid.physical[l1:l2,v,5] .= FIxxtransform(grid.rings[r,v])
-        end
-
-        # 1st radial derivative
-        # Wavenumber zero
-        for r = 1:grid.params.rDim
-            grid.rings[r,v].b[1] = spline_r[r,1]
-        end
-        
-        # Higher wavenumbers
-        for k = 1:grid.params.rDim
-            p = k*2
-            for r = 1:grid.params.rDim
-                if (k <= r)
-                    # Real part
-                    rk = k+1
-                    # Imaginary part
-                    ik = grid.rings[r,v].params.bDim-k+1
-                    grid.rings[r,v].b[rk] = spline_r[r,p]
-                    grid.rings[r,v].b[ik] = spline_r[r,p+1]
-                end
-            end
-        end
-        
-        l1 = 0
-        l2 = 0
-        for r = 1:grid.params.rDim
-            FAtransform!(grid.rings[r,v])
-            FItransform!(grid.rings[r,v])
-            
-            # Assign the grid array
-            ri = r + grid.params.rDim_offset
-            l1 = l2 + 1
-            l2 = l1 + 3 + (4*ri)
-            grid.physical[l1:l2,v,2] .= grid.rings[r,v].uMish
-        end
-        
-        # 2nd radial derivative
-        # Wavenumber zero
-        for r = 1:grid.params.rDim
-            grid.rings[r,v].b[1] = spline_rr[r,1]
-        end
-        
-        # Higher wavenumbers
-        for k = 1:grid.params.rDim
-            p = k*2
-            for r = 1:grid.params.rDim
-                if (k <= r)
-                    # Real part
-                    rk = k+1
-                    # Imaginary part
-                    ik = grid.rings[r,v].params.bDim-k+1
-                    grid.rings[r,v].b[rk] = spline_rr[r,p]
-                    grid.rings[r,v].b[ik] = spline_rr[r,p+1]
-                end
-            end
-        end
-        
-        l1 = 0
-        l2 = 0
-        for r = 1:grid.params.rDim
-            FAtransform!(grid.rings[r,v])
-            FItransform!(grid.rings[r,v])
-            
-            # Assign the grid array
-            ri = r + grid.params.rDim_offset
-            l1 = l2 + 1
-            l2 = l1 + 3 + (4*ri)
-            grid.physical[l1:l2,v,3] .= grid.rings[r,v].uMish
-        end
-
-    end    
-    return grid.physical 
+    physical = gridTransform(grid, grid.physical, grid.spectral)
+    return physical 
 end
 
 function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{real})
