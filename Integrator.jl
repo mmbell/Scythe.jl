@@ -31,11 +31,10 @@ function integrate_LinearAdvection1D()
         equation_set = "LinearAdvection1D",
         initial_conditions = "1d_linear_advection_test_ics.csv",
         grid_params = GridParameters(
+            geometry = "R",
             xmin = -50.0,
             xmax = 50.0,
-            num_nodes = 100,
-            rDim = 100*3,
-            b_rDim = 100+3,
+            num_cells = 100,
             BCL = Dict(
                 "u" => CubicBSpline.PERIODIC),
             BCR = Dict(
@@ -64,7 +63,7 @@ function integrate_WilliamsSlabTCBL(ics_csv::String)
         grid_params = GridParameters(
             xmin = 0.0,
             xmax = 4.0e5,
-            num_nodes = nodes,
+            num_cells = nodes,
             rDim = nodes*3,
             b_rDim = nodes+3,
             BCL = Dict(
@@ -100,7 +99,7 @@ function integrate_Kepert2017_TCBL(ics_csv::String)
         output_dir = "./tcblout/",
         grid_params = GridParameters(xmin = 0.0,
             xmax = 4.0e5,
-            num_nodes = nodes,
+            num_cells = nodes,
             rDim = nodes*3,
             b_rDim = nodes+3,
             BCL = Dict(
@@ -156,7 +155,7 @@ function integrate_RL_ShallowWater(ics_csv::String)
         output_dir = "./SW_output/",
         grid_params = GridParameters(xmin = 0.0,
             xmax = 3.0e5,
-            num_nodes = nodes,
+            num_cells = nodes,
             rDim = nodes*3,
             b_rDim = nodes+3,
             BCL = Dict(
@@ -196,7 +195,7 @@ function integrate_Oneway_ShallowWater_Slab(ics_csv::String)
         output_dir = "./SWslab_output/",
         grid_params = GridParameters(xmin = 0.0,
             xmax = 3.0e5,
-            num_nodes = nodes,
+            num_cells = nodes,
             rDim = nodes*3,
             b_rDim = nodes+3,
             BCL = Dict(
@@ -245,7 +244,7 @@ function integrate_Twoway_ShallowWater_Slab(ics_csv::String)
         output_dir = "./Twoway_SWslab_output/",
         grid_params = GridParameters(xmin = 0.0,
             xmax = 3.0e5,
-            num_nodes = nodes,
+            num_cells = nodes,
             rDim = nodes*3,
             b_rDim = nodes+3,
             BCL = Dict(
@@ -580,7 +579,7 @@ function write_output_old(grid::R_Grid, model::ModelParameters, t::real)
     #outfile = open(outfilename,"w")
     #r = zeros(real,splines[1].aDim)
     #vort = zeros(real,splines[1].aDim)
-    #for i = 1:splines[1].params.num_nodes
+    #for i = 1:splines[1].params.num_cells
     #    r[i] = splines[1].params.xmin + (splines[1].params.DX * (i-1))
     #end
     #
@@ -596,7 +595,7 @@ function write_output_old(grid::R_Grid, model::ModelParameters, t::real)
     #end
     #
     #write(outfile,"r,vgr,u,v,w,vort\n")
-    #for i = 1:splines[1].params.num_nodes
+    #for i = 1:splines[1].params.num_cells
     #    data = string(r[i], ",", vgr[i], ",", u[i], ",", v[i], ",", w[i], ",", vort[i])
     #    write(outfile,"$data\n")
     #end        
@@ -829,7 +828,7 @@ function write_output(grid::RL_Grid, model::ModelParameters, t::real)
     # Get regular grid
     regular_grid = regularGridTransform(grid)
     gridpoints = getRegularGridpoints(grid)
-    for r = 1:grid.params.num_nodes
+    for r = 1:grid.params.num_cells
         for l = 1:(grid.params.rDim*2+1)
             rstring = "$(gridpoints[r,l,1]),$(gridpoints[r,l,2]),$(gridpoints[r,l,3]),$(gridpoints[r,l,4]),"
             for d = 1:5

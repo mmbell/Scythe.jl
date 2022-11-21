@@ -22,11 +22,13 @@ export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export R_Grid, RZ_Grid, RL_Grid
 
 @with_kw struct GridParameters
+    geometry::String = "R"
     xmin::real = 0.0
     xmax::real = 0.0
-    num_nodes::int = 0
-    rDim::int = 0
-    b_rDim::int = 0
+    num_cells::int = 0
+    rDim::int = num_cells * mubar
+    b_rDim::int = num_cells + 3
+    rDim_offset::int = 0
     l_q::real = 2.0
     BCL::Dict = CubicBSpline.R0
     BCR::Dict = CubicBSpline.R0
@@ -82,10 +84,10 @@ end
 
 function createGrid(gp::GridParameters)
     
-    if gp.num_nodes > 0
+    if gp.num_cells > 0
         # R, RZ, RL, or RLZ grid
         
-        if gp.lDim == 0 && gp.zDim == 0
+        if gp.geometry == "R"
             # R grid
             
             splines = Array{Spline1D}(undef,1,length(values(gp.vars)))
@@ -96,13 +98,13 @@ function createGrid(gp::GridParameters)
                 grid.splines[1,gp.vars[key]] = Spline1D(SplineParameters(
                     xmin = gp.xmin,
                     xmax = gp.xmax,
-                    num_nodes = gp.num_nodes,
+                    num_cells = gp.num_cells,
                     BCL = gp.BCL[key],
                     BCR = gp.BCR[key]))
             end
             return grid
             
-        elseif gp.lDim == 0 && gp.zDim > 0
+        elseif gp.geometry == "RZ"
             # RZ grid
             
             splines = Array{Spline1D}(undef,gp.zDim,length(values(gp.vars)))
@@ -115,7 +117,7 @@ function createGrid(gp::GridParameters)
                     grid.splines[z,gp.vars[key]] = Spline1D(SplineParameters(
                         xmin = gp.xmin,
                         xmax = gp.xmax,
-                        num_nodes = gp.num_nodes,
+                        num_cells = gp.num_cells,
                         BCL = gp.BCL[key], 
                         BCR = gp.BCR[key]))
                 end
@@ -129,51 +131,83 @@ function createGrid(gp::GridParameters)
             end
             return grid
             
-        elseif gp.lDim > 0 && gp.zDim == 0
+        elseif gp.geometry == "RL"
             # RL grid
             
-            splines = Array{Spline1D}(undef,3,length(values(gp.vars)))
-            rings = Array{Fourier1D}(undef,gp.rDim,length(values(gp.vars)))
-            spectral = zeros(Float64, gp.b_lDim, length(values(gp.vars)))
-            physical = zeros(Float64, gp.lDim, length(values(gp.vars)), 5)
-            grid = RL_Grid(gp, splines, rings, spectral, physical)
-            for key in keys(gp.vars)
+            # Calculate the number of points in the grid
+            lpoints = 0
+            blpoints = 0
+            for r = 1:gp.rDim
+                ri = r + gp.rDim_offset
+                lpoints += 4 + 4*ri
+                blpoints += 1 + 2*ri
+            end
+            
+            # Have to create a new immutable structure for the parameters
+            gp2 = GridParameters(
+                geometry = gp.geometry,
+                xmin = gp.xmin,
+                xmax = gp.xmax,
+                num_cells = gp.num_cells,
+                rDim = gp.rDim,
+                b_rDim = gp.b_rDim,
+                rDim_offset = gp.rDim_offset,
+                l_q = gp.l_q,
+                BCL = gp.BCL,
+                BCR = gp.BCR,
+                lDim = lpoints,
+                b_lDim = blpoints,
+                zmin = gp.zmin,
+                zmax = gp.zmax,
+                zDim = gp.zDim,
+                b_zDim = gp.b_zDim,
+                BCB = gp.BCB,
+                BCT = gp.BCT,
+                vars = gp.vars)
+            
+            splines = Array{Spline1D}(undef,3,length(values(gp2.vars)))
+            rings = Array{Fourier1D}(undef,gp2.rDim,length(values(gp2.vars)))
+            spectral = zeros(Float64, gp2.b_lDim, length(values(gp2.vars)))
+            physical = zeros(Float64, gp2.lDim, length(values(gp2.vars)), 5)
+            grid = RL_Grid(gp2, splines, rings, spectral, physical)
+            for key in keys(gp2.vars)
                 
                 # Need different BCs for wavenumber zero winds since they are undefined at r = 0
                 for i = 1:3
                     if (i == 1 && (key == "u" || key == "v" || key == "vgr"
                                 || key == "ub" || key == "vb"))
-                        grid.splines[1,gp.vars[key]] = Spline1D(SplineParameters(
-                            xmin = gp.xmin,
-                            xmax = gp.xmax,
-                            num_nodes = gp.num_nodes,
+                        grid.splines[1,gp2.vars[key]] = Spline1D(SplineParameters(
+                            xmin = gp2.xmin,
+                            xmax = gp2.xmax,
+                            num_cells = gp2.num_cells,
                             BCL = CubicBSpline.R1T0, 
-                            BCR = gp.BCR[key]))
+                            BCR = gp2.BCR[key]))
                     else
                         grid.splines[i,gp.vars[key]] = Spline1D(SplineParameters(
-                            xmin = gp.xmin,
-                            xmax = gp.xmax,
-                            num_nodes = gp.num_nodes,
-                            BCL = gp.BCL[key], 
-                            BCR = gp.BCR[key]))
+                            xmin = gp2.xmin,
+                            xmax = gp2.xmax,
+                            num_cells = gp2.num_cells,
+                            BCL = gp2.BCL[key], 
+                            BCR = gp2.BCR[key]))
                     end
                 end
 
-                for r = 1:gp.rDim
-                    lpoints = 4 + 4*r
+                for r = 1:gp2.rDim
+                    ri = r + gp2.rDim_offset
+                    lpoints = 4 + 4*ri
                     dl = 2 * π / lpoints
-                    offset = 0.5 * dl * (r-1)
-                    grid.rings[r,gp.vars[key]] = Fourier1D(FourierParameters(
+                    offset = 0.5 * dl * (ri-1)
+                    grid.rings[r,gp2.vars[key]] = Fourier1D(FourierParameters(
                         ymin = offset,
                         # ymax = offset + (2 * π) - dl,
                         yDim = lpoints,
-                        bDim = r*2 + 1,
-                        kmax = r))
+                        bDim = ri*2 + 1,
+                        kmax = ri))
                 end
             end
             return grid
             
-        elseif gp.lDim > 0 && gp.zDim > 0
+        elseif gp.geometry == "RLZ"
             # RLZ grid
             throw(DomainError(0, "RLZ not implemented yet"))
         end
@@ -214,7 +248,8 @@ function getGridpoints(grid::RL_Grid)
     g = 1
     for r = 1:grid.params.rDim
         r_m = grid.splines[1,1].mishPoints[r]
-        lpoints = 4 + 4*r
+        ri = r + grid.params.rDim_offset
+        lpoints = 4 + 4*ri
         for l = 1:lpoints
             l_m = grid.rings[r,1].mishPoints[l]
             gridpoints[g,1] = r_m
@@ -275,7 +310,7 @@ function spectralxTransform(grid::R_Grid, physical::Array{real}, spectral::Array
     # Need to use a R0 BC for this!
     Fspline = Spline1D(SplineParameters(xmin = grid.params.xmin, 
             xmax = grid.params.xmax,
-            num_nodes = grid.params.num_nodes, 
+            num_cells = grid.params.num_cells, 
             BCL = CubicBSpline.R0, 
             BCR = CubicBSpline.R0))
 
@@ -443,7 +478,7 @@ function gridTransform_noBCs(grid::RZ_Grid, physical::Array{real}, spectral::Arr
         splines[z] = Spline1D(SplineParameters(
             xmin = grid.params.xmin, 
             xmax = grid.params.xmax,
-            num_nodes = grid.params.num_nodes, 
+            num_cells = grid.params.num_cells, 
             BCL = CubicBSpline.R0, 
             BCR = CubicBSpline.R0))
     end
@@ -511,7 +546,7 @@ function integrateUp(grid::RZ_Grid, physical::Array{real}, spectral::Array{real}
         splines[z] = Spline1D(SplineParameters(
             xmin = grid.params.xmin, 
             xmax = grid.params.xmax,
-            num_nodes = grid.params.num_nodes, 
+            num_cells = grid.params.num_cells, 
             BCL = CubicBSpline.R0, 
             BCR = CubicBSpline.R0))
     end
@@ -559,7 +594,8 @@ function spectralTransform!(grid::RL_Grid)
     for v in values(grid.params.vars)
         i = 1
         for r = 1:grid.params.rDim
-            lpoints = 4 + 4*r
+            ri = r + grid.params.rDim_offset
+            lpoints = 4 + 4*ri
             for l = 1:lpoints
                 grid.rings[r,v].uMish[l] = grid.physical[i,v,1]
                 i += 1
@@ -620,7 +656,8 @@ function spectralTransform(grid::RL_Grid, physical::Array{real}, spectral::Array
     for v in values(grid.params.vars)
         i = 1
         for r = 1:grid.params.rDim
-            lpoints = 4 + 4*r
+            ri = r + grid.params.rDim_offset
+            lpoints = 4 + 4*ri
             for l = 1:lpoints
                 grid.rings[r,v].uMish[l] = physical[i,v,1]
                 i += 1
@@ -733,8 +770,9 @@ function gridTransform!(grid::RL_Grid)
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
+            ri = r + grid.params.rDim_offset
             l1 = l2 + 1
-            l2 = l1 + 3 + (4*r)
+            l2 = l1 + 3 + (4*ri)
             grid.physical[l1:l2,v,1] .= grid.rings[r,v].uMish
             grid.physical[l1:l2,v,4] .= FIxtransform(grid.rings[r,v])
             grid.physical[l1:l2,v,5] .= FIxxtransform(grid.rings[r,v])
@@ -768,8 +806,9 @@ function gridTransform!(grid::RL_Grid)
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
+            ri = r + grid.params.rDim_offset
             l1 = l2 + 1
-            l2 = l1 + 3 + (4*r)
+            l2 = l1 + 3 + (4*ri)
             grid.physical[l1:l2,v,2] .= grid.rings[r,v].uMish
         end
         
@@ -801,8 +840,9 @@ function gridTransform!(grid::RL_Grid)
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
+            ri = r + grid.params.rDim_offset
             l1 = l2 + 1
-            l2 = l1 + 3 + (4*r)
+            l2 = l1 + 3 + (4*ri)
             grid.physical[l1:l2,v,3] .= grid.rings[r,v].uMish
         end
 
@@ -869,8 +909,9 @@ function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{rea
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
+            ri = r + grid.params.rDim_offset
             l1 = l2 + 1
-            l2 = l1 + 3 + (4*r)
+            l2 = l1 + 3 + (4*ri)
             physical[l1:l2,v,1] .= grid.rings[r,v].uMish
             physical[l1:l2,v,4] .= FIxtransform(grid.rings[r,v])
             physical[l1:l2,v,5] .= FIxxtransform(grid.rings[r,v])
@@ -904,8 +945,9 @@ function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{rea
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
+            ri = r + grid.params.rDim_offset
             l1 = l2 + 1
-            l2 = l1 + 3 + (4*r)
+            l2 = l1 + 3 + (4*ri)
             physical[l1:l2,v,2] .= grid.rings[r,v].uMish
         end
         
@@ -937,8 +979,9 @@ function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{rea
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
+            ri = r + grid.params.rDim_offset
             l1 = l2 + 1
-            l2 = l1 + 3 + (4*r)
+            l2 = l1 + 3 + (4*ri)
             physical[l1:l2,v,3] .= grid.rings[r,v].uMish
         end
 
@@ -958,11 +1001,11 @@ function regularGridTransform(grid::RL_Grid)
     # Output on regular grid
     # Transform from the spectral to grid space
     # For RZ grid, varying dimensions are R, Z, and variable
-    spline = zeros(Float64, grid.params.num_nodes, grid.params.rDim*2+1)
-    spline_r = zeros(Float64, grid.params.num_nodes, grid.params.rDim*2+1)
-    spline_rr = zeros(Float64, grid.params.num_nodes, grid.params.rDim*2+1)
+    spline = zeros(Float64, grid.params.num_cells, grid.params.rDim*2+1)
+    spline_r = zeros(Float64, grid.params.num_cells, grid.params.rDim*2+1)
+    spline_rr = zeros(Float64, grid.params.num_cells, grid.params.rDim*2+1)
     
-    physical = zeros(Float64, grid.params.num_nodes, 
+    physical = zeros(Float64, grid.params.num_cells, 
         grid.params.rDim*2+1, 
         length(values(grid.params.vars)),5)
 
@@ -974,8 +1017,8 @@ function regularGridTransform(grid::RL_Grid)
         kmax = grid.params.rDim))
 
     # Output on the nodes
-    rpoints = zeros(Float64, grid.params.num_nodes)
-    for r = 1:grid.params.num_nodes
+    rpoints = zeros(Float64, grid.params.num_cells)
+    for r = 1:grid.params.num_cells
         rpoints[r] = grid.params.xmin + (r-1)*grid.splines[1,1].params.DX
     end
     
@@ -1006,7 +1049,7 @@ function regularGridTransform(grid::RL_Grid)
             spline_rr[:,p+1] = SIxxtransform(grid.splines[3,v], a, rpoints)
         end
         
-        for r = 1:grid.params.num_nodes
+        for r = 1:grid.params.num_cells
             # Value
             ring.b .= 0.0
             ring.b[1] = spline[r,1]
@@ -1070,8 +1113,8 @@ end
 function getRegularGridpoints(grid::RL_Grid)
 
     # Return an array of the gridpoint locations
-    gridpoints = zeros(Float64, grid.params.num_nodes, (grid.params.rDim*2+1), 4)
-    for r = 1:grid.params.num_nodes
+    gridpoints = zeros(Float64, grid.params.num_cells, (grid.params.rDim*2+1), 4)
+    for r = 1:grid.params.num_cells
         r_m = grid.params.xmin + (r-1)*grid.splines[1,1].params.DX
         for l = 1:(grid.params.rDim*2+1)
             l_m = 2 * π * (l-1) / (grid.params.rDim*2+1)

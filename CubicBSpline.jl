@@ -38,11 +38,11 @@ const gaussweight = [8.0/18.0, 5.0/18.0, 8.0/18.0]
 @with_kw struct SplineParameters
     xmin::real = 0.0
     xmax::real = 0.0
-    num_nodes::int = 1
+    num_cells::int = 1
     l_q::real = 2.0
     BCL::Dict = R0
     BCR::Dict = R0
-    DX::real = (xmax - xmin) / num_nodes
+    DX::real = (xmax - xmin) / num_cells
     DXrecip::real = 1.0/DX
 end
 
@@ -130,7 +130,7 @@ function calcGammaBC(sp::SplineParameters)
         rankR = 2
     end
 
-    Mdim = sp.num_nodes + 3
+    Mdim = sp.num_cells + 3
     Minterior_dim = Mdim - rankL - rankR
 
     # Create the BC matrix
@@ -168,7 +168,7 @@ end
 function calcPQfactor(sp::SplineParameters, gammaBC::Matrix{real})
 
     eps_q = ((sp.l_q*sp.DX)/(2*π))^6
-    Mdim = sp.num_nodes + 3
+    Mdim = sp.num_cells + 3
 
     # Create the P and Q matrices
     P = zeros(real, Mdim, Mdim)
@@ -181,7 +181,7 @@ function calcPQfactor(sp::SplineParameters, gammaBC::Matrix{real})
             end
             m1 = mi1 - 2
             m2 = mi2 - 2
-            for mc = 0:(sp.num_nodes-1)
+            for mc = 0:(sp.num_cells-1)
                 if (mc < (m1 - 2)) || (mc > (m1 + 1))
                     continue
                 end
@@ -211,8 +211,8 @@ function calcPQfactor(sp::SplineParameters, gammaBC::Matrix{real})
 end
 
 function calcMishPoints(sp::SplineParameters)
-    x = zeros(real,sp.num_nodes*mubar)
-    for mc = 0:(sp.num_nodes-1)
+    x = zeros(real,sp.num_cells*mubar)
+    for mc = 0:(sp.num_cells-1)
         for mu = 1:mubar
             i = mu + (mubar * mc)
             x[i] = sp.xmin + (mc * sp.DX) + sp.DX * ((mu/2.0 - 1.0) * sqrt35) + sp.DX * 0.5
@@ -226,12 +226,12 @@ function Spline1D(sp::SplineParameters)
     gammaBC = calcGammaBC(sp)
     pq, pqFactor = calcPQfactor(sp, gammaBC)
 
-    mishDim = sp.num_nodes*mubar
+    mishDim = sp.num_cells*mubar
     mishPoints = calcMishPoints(sp)
-    uMish = zeros(real,sp.num_nodes*mubar)
+    uMish = zeros(real,sp.num_cells*mubar)
 
-    bDim = sp.num_nodes + 3
-    aDim = sp.num_nodes + 3
+    bDim = sp.num_cells + 3
+    aDim = sp.num_cells + 3
     b = zeros(real,bDim)
     a = zeros(real,aDim)
 
@@ -246,12 +246,12 @@ end
 
 function SBtransform(sp::SplineParameters, uMish::Vector{real})
 
-    Mdim = sp.num_nodes + 3
+    Mdim = sp.num_cells + 3
     b = zeros(real,Mdim)
 
     for mi = 1:Mdim
         m = mi - 2
-        for mc = 0:(sp.num_nodes-1)
+        for mc = 0:(sp.num_cells-1)
             if (mc < (m - 2)) || (mc > (m + 1))
                 continue
             end
@@ -283,12 +283,12 @@ end
 function SBxtransform(sp::SplineParameters, uMish::Vector{real}, BCL, BCR)
 
     # Integration by parts, but still not working
-    Mdim = sp.num_nodes + 3
+    Mdim = sp.num_cells + 3
     b = zeros(real,Mdim)
 
     for mi = 1:Mdim
         m = mi - 2
-        for mc = 0:(sp.num_nodes-1)
+        for mc = 0:(sp.num_cells-1)
             if (mc < (m - 2)) || (mc > (m + 1))
                 continue
             end
@@ -344,7 +344,7 @@ function SItransform(sp::SplineParameters, a::Vector{real}, x::real, derivative:
     u = 0.0
     xm = ceil(int,(x - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
     for m = xm:(xm + 3)
-        if (m >= -1) && (m <= (sp.num_nodes+1))
+        if (m >= -1) && (m <= (sp.num_cells+1))
             mi = m + 2
             u += basis(sp, m, x, derivative) * a[mi]
         end
@@ -354,13 +354,13 @@ end
 
 function SItransform(sp::SplineParameters, a::Vector{real}, derivative::int = 0)
 
-    u = zeros(real,sp.num_nodes*mubar)
-    for mc = 0:(sp.num_nodes-1)
+    u = zeros(real,sp.num_cells*mubar)
+    for mc = 0:(sp.num_cells-1)
         for mu = 1:mubar
             i = mu + (mubar * mc)
             x = sp.xmin + (mc * sp.DX) + sp.DX * ((mu/2.0 - 1.0) * sqrt35) + sp.DX * 0.5
             for m = (mc-1):(mc+2)
-                if (m >= -1) && (m <= (sp.num_nodes+1))
+                if (m >= -1) && (m <= (sp.num_cells+1))
                     mi = m + 2
                     u[i] += basis(sp, m, x, derivative) * a[mi]
                 end
@@ -376,7 +376,7 @@ function SItransform(sp::SplineParameters, a::Vector{real}, points::Vector{real}
     for i in eachindex(points)
         xm = ceil(int,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
         for m = xm:(xm + 3)
-            if (m >= -1) && (m <= (sp.num_nodes+1))
+            if (m >= -1) && (m <= (sp.num_cells+1))
                 mi = m + 2
                 u[i] += basis(sp, m, points[i], derivative) * a[mi]
             end

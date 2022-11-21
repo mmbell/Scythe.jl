@@ -205,9 +205,8 @@ function LinearAdvectionRL(grid::RL_Grid,
             F::Array{real},
             model::ModelParameters)
    
-    #1D Linear advection to test
-    c_0 = 5.0
-    K = 0.003
+    #2D Linear advection to test
+    K = model.physical_params[:K]
     
     r = gridpoints[:,1]
     hr = grid.physical[:,1,2]
