@@ -3,7 +3,6 @@ module SpectralGrid
 using CubicBSpline
 using Chebyshev
 using Fourier
-using Parameters
 using CSV
 using DataFrames
 
@@ -21,14 +20,13 @@ export spectralxTransform, gridTransform_noBCs, integrateUp
 export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export R_Grid, RZ_Grid, RL_Grid
 
-@with_kw struct GridParameters
+Base.@kwdef struct GridParameters
     geometry::String = "R"
     xmin::real = 0.0
     xmax::real = 0.0
     num_cells::int = 0
     rDim::int = num_cells * mubar
     b_rDim::int = num_cells + 3
-    rDim_offset::int = 0
     l_q::real = 2.0
     BCL::Dict = CubicBSpline.R0
     BCR::Dict = CubicBSpline.R0
@@ -41,6 +39,12 @@ export R_Grid, RZ_Grid, RL_Grid
     BCB::Dict = Chebyshev.R0
     BCT::Dict = Chebyshev.R0
     vars::Dict = Dict("u" => 1)
+    # Patch indices
+    spectralIndexL::int = 1
+    spectralIndexR::int = spectralIndexL + b_rDim - 1
+    patchOffsetL::int = (spectralIndexL - 1) * 3
+    patchOffsetR::int = patchOffsetL + rDim
+    tile_num::int = 0
 end
 
 struct R_Grid
@@ -135,7 +139,7 @@ function createGrid(gp::GridParameters)
         lpoints = 0
         blpoints = 0
         for r = 1:gp.rDim
-            ri = r + gp.rDim_offset
+            ri = r + gp.patchOffsetL
             lpoints += 4 + 4*ri
             blpoints += 1 + 2*ri
         end
@@ -148,7 +152,6 @@ function createGrid(gp::GridParameters)
             num_cells = gp.num_cells,
             rDim = gp.rDim,
             b_rDim = gp.b_rDim,
-            rDim_offset = gp.rDim_offset,
             l_q = gp.l_q,
             BCL = gp.BCL,
             BCR = gp.BCR,
@@ -160,7 +163,9 @@ function createGrid(gp::GridParameters)
             b_zDim = gp.b_zDim,
             BCB = gp.BCB,
             BCT = gp.BCT,
-            vars = gp.vars)
+            vars = gp.vars,
+            spectralIndexL = gp.spectralIndexL,
+            tile_num = gp.tile_num)
 
         splines = Array{Spline1D}(undef,3,length(values(gp2.vars)))
         rings = Array{Fourier1D}(undef,gp2.rDim,length(values(gp2.vars)))
@@ -190,7 +195,7 @@ function createGrid(gp::GridParameters)
             end
 
             for r = 1:gp2.rDim
-                ri = r + gp2.rDim_offset
+                ri = r + gp2.patchOffsetL
                 lpoints = 4 + 4*ri
                 dl = 2 * π / lpoints
                 offset = 0.5 * dl * (ri-1)
@@ -248,7 +253,7 @@ function getGridpoints(grid::RL_Grid)
     g = 1
     for r = 1:grid.params.rDim
         r_m = grid.splines[1,1].mishPoints[r]
-        ri = r + grid.params.rDim_offset
+        ri = r + grid.params.patchOffsetL
         lpoints = 4 + 4*ri
         for l = 1:lpoints
             l_m = grid.rings[r,1].mishPoints[l]
@@ -342,6 +347,42 @@ function gridTransform(grid::R_Grid, physical::Array{real}, spectral::Array{real
     end
     
     return physical 
+end
+
+function gridTransform!(patch::R_Grid, tile::R_Grid)
+
+    # Transform from the spectral to grid space
+    # For R grid, the only varying dimension is the variable name
+    # Have to use the patch spline and spectral array
+    for i in eachindex(patch.splines)
+        patch.splines[i].b .= patch.spectral[:,i]
+        SAtransform!(patch.splines[i])
+        SItransform!(patch.splines[i])
+
+        # Assign to the tile grid
+        u1 = tile.params.patchOffsetL + 1
+        u2 = tile.params.patchOffsetR
+        tile.physical[:,i,1] .= patch.splines[i].uMish[u1:u2]
+        tile.physical[:,i,2] .= SIxtransform(patch.splines[i])[u1:u2]
+        tile.physical[:,i,3] .= SIxxtransform(patch.splines[i])[u1:u2]
+    end
+
+    return tile.physical
+end
+
+function sumSpectralTile!(patch::R_Grid, tile::R_Grid)
+
+    spectral = sumSpectralTile(patch.spectral, tile.spectral, tile.params.spectralIndexL, tile.params.spectralIndexR)
+    return spectral
+end
+
+function sumSpectralTile(spectral_patch::Array{real}, spectral_tile::Array{real},
+                         spectralIndexL::int, spectralIndexR::int)
+
+    # Add the tile b's to the patch
+    spectral_patch[spectralIndexL:spectralIndexR,:] =
+        spectral_patch[spectralIndexL:spectralIndexR,:] .+ spectral_tile[:,:]
+    return spectral_patch
 end
 
 function spectralTransform!(grid::RZ_Grid)
@@ -619,7 +660,7 @@ function spectralTransform(grid::RL_Grid, physical::Array{real}, spectral::Array
     for v in values(grid.params.vars)
         i = 1
         for r = 1:grid.params.rDim
-            ri = r + grid.params.rDim_offset
+            ri = r + grid.params.patchOffsetL
             lpoints = 4 + 4*ri
             for l = 1:lpoints
                 grid.rings[r,v].uMish[l] = physical[i,v,1]
@@ -741,7 +782,7 @@ function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{rea
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
-            ri = r + grid.params.rDim_offset
+            ri = r + grid.params.patchOffsetL
             l1 = l2 + 1
             l2 = l1 + 3 + (4*ri)
             physical[l1:l2,v,1] .= grid.rings[r,v].uMish
@@ -777,7 +818,7 @@ function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{rea
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
-            ri = r + grid.params.rDim_offset
+            ri = r + grid.params.patchOffsetL
             l1 = l2 + 1
             l2 = l1 + 3 + (4*ri)
             physical[l1:l2,v,2] .= grid.rings[r,v].uMish
@@ -811,7 +852,7 @@ function gridTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{rea
             FItransform!(grid.rings[r,v])
             
             # Assign the grid array
-            ri = r + grid.params.rDim_offset
+            ri = r + grid.params.patchOffsetL
             l1 = l2 + 1
             l2 = l1 + 3 + (4*ri)
             physical[l1:l2,v,3] .= grid.rings[r,v].uMish
