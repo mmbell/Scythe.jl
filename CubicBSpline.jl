@@ -3,7 +3,6 @@ module CubicBSpline
 using LinearAlgebra
 using SparseArrays
 using SuiteSparse
-using Parameters
 
 export SplineParameters, Spline1D
 #export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
@@ -35,7 +34,7 @@ const mubar = 3
 const gaussweight = [8.0/18.0, 5.0/18.0, 8.0/18.0]
 
 # Define the spline parameters
-@with_kw struct SplineParameters
+Base.@kwdef struct SplineParameters
     xmin::real = 0.0
     xmax::real = 0.0
     num_cells::int = 1
