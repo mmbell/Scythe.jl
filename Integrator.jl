@@ -289,6 +289,43 @@ function initialize_model(model::ModelParameters)
     return grid
 end
 
+function initialize_model(model::ModelParameters, num_tiles::int)
+
+    println("Initializing with $(num_tiles) tiles")
+    patch = createGrid(model.grid_params)
+    println("$model")
+    println("$(model.grid_params)")
+
+    # Initialize the patch
+    read_initialconditions(model.initial_conditions, patch)
+    spectralTransform!(patch)
+    gridTransform!(patch)
+    write_output(patch, model, 0.0)
+
+    # Distribute the tiles
+    tile_params = calcTileSizes(patch, num_tiles)
+    tiles = Array{typeof(patch)}(undef,num_tiles)
+    for t in 1:num_tiles
+        tiles[t] = createGrid(GridParameters(
+        geometry = patch.params.geometry,
+        xmin = tile_params[1,t],
+        xmax = tile_params[2,t],
+        num_cells = tile_params[3,t],
+        BCL = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
+        BCR = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
+        vars = patch.params.vars,
+        spectralIndexL = tile_params[4,t],
+        tile_num = t))
+    end
+
+    for t in 1:num_tiles
+        gridTransform!(patch,tiles[t])
+        spectralTransform!(tiles[t])
+    end
+
+    return patch, tiles
+end
+
 function read_initialconditions(ic::String, grid::R_Grid)
     
     # 1D radius grid
@@ -412,6 +449,7 @@ function run_model(grid, model::ModelParameters)
     # Assign b_nxt and b_now
     grid.spectral .= b_nxt
     gridTransform!(grid)
+
     #b_now is held in grid.spectral
     spectralTransform!(grid)
     
