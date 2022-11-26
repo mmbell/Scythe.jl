@@ -223,6 +223,47 @@ function createGrid(gp::GridParameters)
     
 end
 
+function calcTileSizes(patch::R_Grid, num_tiles::int)
+
+    # Calculate the appropriate tile size for the given patch
+    num_gridpoints = patch.params.rDim
+    q,r = divrem(num_gridpoints, num_tiles)
+    tile_sizes = [i <= r ? q+1 : q for i = 1:num_tiles]
+    if any(x->x<15, tile_sizes)
+        throw(DomainError(0, "Too many tiles for this grid (need at least 5 cells in R direction)"))
+    end
+
+    # Calculate the dimensions and set the parameters
+    DX = (patch.params.xmax - patch.params.xmin) / patch.params.num_cells
+
+    xmins = zeros(Float64,num_tiles)
+    xmaxs = zeros(Float64,num_tiles)
+    num_cells = zeros(Int64,num_tiles)
+    spectralIndicesL = ones(Int64,num_tiles)
+
+    # First tile starts on the patch boundary
+    xmins[1] = patch.params.xmin
+    num_cells[1] = Int64(ceil(tile_sizes[1] / 3))
+    xmaxs[1] = (num_cells[1] * DX) + xmins[1]
+    # Implicit spectralIndicesL = 1
+
+    for i = 2:num_tiles-1
+        xmins[i] = xmaxs[i-1]
+        num_cells[i] = Int64(ceil(tile_sizes[i] / 3))
+        xmaxs[i] = (num_cells[i] * DX) + xmins[i]
+        spectralIndicesL[i] = num_cells[i-1] + spectralIndicesL[i-1]
+    end
+
+    # Last tile ends on the patch boundary
+    xmins[num_tiles] = xmaxs[num_tiles-1]
+    xmaxs[num_tiles] = patch.params.xmax
+    spectralIndicesL[num_tiles] = num_cells[num_tiles-1] + spectralIndicesL[num_tiles-1]
+    num_cells[num_tiles] = patch.params.num_cells - spectralIndicesL[num_tiles] + 1
+
+    tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL')
+    return tile_params
+end
+
 function getGridpoints(grid::R_Grid)
 
     # Return an array of the gridpoint locations
