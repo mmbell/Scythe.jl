@@ -419,8 +419,12 @@ function read_initialconditions(ic::String, grid::RL_Grid)
 end
 
 function run_model(grid, model::ModelParameters)
-    
-    println("Model starting up...")
+
+    println("Model starting up with single tile...")
+
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
 
     # Declare these here to avoid excessive allocations
     udot = zeros(Float64,size(grid.physical,1),size(grid.physical,2))
@@ -431,63 +435,96 @@ function run_model(grid, model::ModelParameters)
     bdot_n1 = zeros(Float64,size(grid.spectral))
     bdot_n2 = zeros(Float64,size(grid.spectral))
 
-    num_ts = round(Int,model.integration_time / model.ts)
-    output_int = round(Int,model.output_interval / model.ts)
-    
     gridpoints = getGridpoints(grid)
-    
-    # Feed physical matrices to physical equations
-    physical_model(grid,gridpoints,udot,fluxes,model)
-    
-    # Convert to spectral tendencies
-    calcTendency(grid,udot,fluxes,bdot,bdot_delay)    
 
-    # Advance the first timestep
-    first_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, model.ts)
-    println("ts: $(model.ts)")
-    
-    # Assign b_nxt and b_now
-    grid.spectral .= b_nxt
-    gridTransform!(grid)
+    for t = 1:num_ts
+        println("ts: $(t*model.ts)")
 
-    #b_now is held in grid.spectral
-    spectralTransform!(grid)
-    
-    if mod(1,output_int) == 0
-        checkCFL(grid)
-        write_output(grid, model, (model.ts))
-    end
-    
-    # Advance the second timestep
-    physical_model(grid,gridpoints,udot,fluxes,model)
-    calcTendency(grid,udot,fluxes,bdot,bdot_delay) 
-    second_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
-    grid.spectral .= b_nxt
-    gridTransform!(grid)
-    spectralTransform!(grid)
-    println("ts: $(2*model.ts)")
-    
-    if mod(2,output_int) == 0
-        checkCFL(grid)
-        write_output(grid, model, (2*model.ts))
-    end
-    
-    # Keep going!
-    for t = 3:num_ts
+        # Feed physical matrices to physical equations
         physical_model(grid,gridpoints,udot,fluxes,model)
-        calcTendency(grid,udot,fluxes,bdot,bdot_delay) 
-        timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
+
+        # Convert to spectral tendencies
+        calcTendency(grid,udot,fluxes,bdot,bdot_delay)
+
+        # Advance the timestep
+        if t > 2
+            timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
+        elseif t == 2
+            second_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
+        else
+            first_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, model.ts)
+        end
+
+        # Assign b_nxt and b_now
         grid.spectral .= b_nxt
         gridTransform!(grid)
+
+        #b_now is held in grid.spectral
         spectralTransform!(grid)
-        println("ts: $(t*model.ts)")
-        
+
         if mod(t,output_int) == 0
             checkCFL(grid)
             write_output(grid, model, (t*model.ts))
         end
     end
+
+    println("Done with time integration")
+end
+
+function run_model(patch, tiles, model::ModelParameters)
     
+    num_tiles = length(tiles)
+    println("Model starting up with $(num_tiles) tiles...")
+    
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+
+    #Initial test with just the patch
+    grid = patch
+    
+    # Declare these here to avoid excessive allocations
+    udot = zeros(Float64,size(grid.physical,1),size(grid.physical,2))
+    fluxes = zeros(Float64,size(grid.physical,1),size(grid.physical,2))
+    bdot = zeros(Float64,size(grid.spectral))
+    bdot_delay = zeros(Float64,size(grid.spectral))
+    b_nxt = zeros(Float64,size(grid.spectral))
+    bdot_n1 = zeros(Float64,size(grid.spectral))
+    bdot_n2 = zeros(Float64,size(grid.spectral))
+
+    gridpoints = getGridpoints(grid)
+
+    for t = 1:num_ts
+        println("ts: $(t*model.ts)")
+
+        # Feed physical matrices to physical equations
+        physical_model(grid,gridpoints,udot,fluxes,model)
+
+        # Convert to spectral tendencies
+        calcTendency(grid,udot,fluxes,bdot,bdot_delay)
+
+        # Advance the timestep
+        if t > 2
+            timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
+        elseif t == 2
+            second_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
+        else
+            first_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, model.ts)
+        end
+
+        # Assign b_nxt and b_now
+        grid.spectral .= b_nxt
+        gridTransform!(grid)
+
+        #b_now is held in grid.spectral
+        spectralTransform!(grid)
+
+        if mod(t,output_int) == 0
+            checkCFL(grid)
+            write_output(grid, model, (t*model.ts))
+        end
+    end
+
     println("Done with time integration")
 end
 
