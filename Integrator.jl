@@ -10,6 +10,7 @@ using NumericalModels
 using Parameters
 using CSV
 using DataFrames
+using MPI
 
 #Define some convenient aliases
 const real = Float64
@@ -326,6 +327,43 @@ function initialize_model(model::ModelParameters, num_tiles::int)
     return patch, tiles
 end
 
+function initialize_model(model::ModelParameters, num_tiles::int, tile_num::int)
+
+    println("Initializing with tile $(tile_num)")
+    if tile_num == 0
+        println("$model")
+        println("$(model.grid_params)")
+    end
+
+    # Initialize the patch
+    patch = createGrid(model.grid_params)
+    read_initialconditions(model.initial_conditions, patch)
+    spectralTransform!(patch)
+    gridTransform!(patch)
+    if tile_num == 0
+        write_output(patch, model, 0.0)
+    end
+
+    # Initialize the tile
+    tile_params = calcTileSizes(patch, num_tiles)
+    i = tile_num + 1
+    tile = createGrid(GridParameters(
+        geometry = patch.params.geometry,
+        xmin = tile_params[1,i],
+        xmax = tile_params[2,i],
+        num_cells = tile_params[3,i],
+        BCL = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
+        BCR = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
+        vars = patch.params.vars,
+        spectralIndexL = tile_params[4,i],
+        tile_num = tile_num))
+
+    gridTransform!(patch,tile)
+    spectralTransform!(tile)
+
+    return patch, tile
+end
+
 function read_initialconditions(ic::String, grid::R_Grid)
     
     # 1D radius grid
@@ -471,57 +509,75 @@ function run_model(grid, model::ModelParameters)
     println("Done with time integration")
 end
 
-function run_model(patch, tiles, model::ModelParameters)
+function run_model(patch, tile, model::ModelParameters, comm::MPI.Comm)
+
+    rank = MPI.Comm_rank(comm)
+    comm_size = MPI.Comm_size(comm)
+    root = 0
     
-    num_tiles = length(tiles)
-    println("Model starting up with $(num_tiles) tiles...")
+    println("Model starting up for tile $(rank)...")
     
     num_ts = round(Int,model.integration_time / model.ts)
     output_int = round(Int,model.output_interval / model.ts)
-    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+    if rank == root
+        println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+    end
 
-    #Initial test with just the patch
-    grid = patch
-    
     # Declare these here to avoid excessive allocations
-    udot = zeros(Float64,size(grid.physical,1),size(grid.physical,2))
-    fluxes = zeros(Float64,size(grid.physical,1),size(grid.physical,2))
-    bdot = zeros(Float64,size(grid.spectral))
-    bdot_delay = zeros(Float64,size(grid.spectral))
-    b_nxt = zeros(Float64,size(grid.spectral))
-    bdot_n1 = zeros(Float64,size(grid.spectral))
-    bdot_n2 = zeros(Float64,size(grid.spectral))
+    udot = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    fluxes = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    bdot = zeros(Float64,size(tile.spectral))
+    bdot_delay = zeros(Float64,size(tile.spectral))
+    b_nxt = zeros(Float64,size(tile.spectral))
+    bdot_n1 = zeros(Float64,size(tile.spectral))
+    bdot_n2 = zeros(Float64,size(tile.spectral))
 
-    gridpoints = getGridpoints(grid)
+    tilepoints = getGridpoints(tile)
 
     for t = 1:num_ts
-        println("ts: $(t*model.ts)")
+        if rank == root
+            println("ts: $(t*model.ts)")
+        end
 
         # Feed physical matrices to physical equations
-        physical_model(grid,gridpoints,udot,fluxes,model)
+        physical_model(tile,tilepoints,udot,fluxes,model)
 
         # Convert to spectral tendencies
-        calcTendency(grid,udot,fluxes,bdot,bdot_delay)
+        calcTendency(tile,udot,fluxes,bdot,bdot_delay)
 
         # Advance the timestep
         if t > 2
-            timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
+            timestep(tile.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
         elseif t == 2
-            second_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
+            second_timestep(tile.spectral, bdot, bdot_delay, b_nxt, bdot_n1, bdot_n2, model.ts)
         else
-            first_timestep(grid.spectral, bdot, bdot_delay, b_nxt, bdot_n1, model.ts)
+            first_timestep(tile.spectral, bdot, bdot_delay, b_nxt, bdot_n1, model.ts)
         end
 
         # Assign b_nxt and b_now
-        grid.spectral .= b_nxt
-        gridTransform!(grid)
+        tile.spectral .= b_nxt
 
-        #b_now is held in grid.spectral
-        spectralTransform!(grid)
+        # Sync up with other tiles
+        # Clear and set the local patch spectral array
+        setSpectralTile!(patch, tile)
 
-        if mod(t,output_int) == 0
-            checkCFL(grid)
-            write_output(grid, model, (t*model.ts))
+        # Reduce the tiles to the patch
+        MPI.Barrier(comm)
+        MPI.Allreduce!(patch.spectral, +, comm)
+
+        # Transform back to local physical tile
+        gridTransform!(patch, tile)
+
+        #b_now is held in tile.spectral
+        spectralTransform!(tile)
+
+        if rank == root
+            if mod(t,output_int) == 0
+                gridTransform!(patch)
+                spectralTransform!(patch)
+                checkCFL(patch)
+                write_output(patch, model, (t*model.ts))
+            end
         end
     end
 
@@ -532,6 +588,19 @@ function finalize_model(grid, model::ModelParameters)
     
     write_output(grid, model, model.integration_time)
     println("Model complete!")
+end
+
+function finalize_model(grid, model::ModelParameters, comm::MPI.Comm)
+
+    rank = MPI.Comm_rank(comm)
+    root = 0
+    gridTransform!(grid)
+    spectralTransform!(grid)
+    if rank == root
+        write_output(grid, model, model.integration_time)
+        println("Model complete!")
+    end
+    MPI.Finalize()
 end
 
 function physical_model(grid, 

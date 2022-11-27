@@ -19,6 +19,7 @@ export spectralTransform!, gridTransform!, spectralTransform
 export spectralxTransform, gridTransform_noBCs, integrateUp
 export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export R_Grid, RZ_Grid, RL_Grid
+export calcTileSizes, setSpectralTile!
 
 Base.@kwdef struct GridParameters
     geometry::String = "R"
@@ -255,10 +256,12 @@ function calcTileSizes(patch::R_Grid, num_tiles::int)
     end
 
     # Last tile ends on the patch boundary
-    xmins[num_tiles] = xmaxs[num_tiles-1]
-    xmaxs[num_tiles] = patch.params.xmax
-    spectralIndicesL[num_tiles] = num_cells[num_tiles-1] + spectralIndicesL[num_tiles-1]
-    num_cells[num_tiles] = patch.params.num_cells - spectralIndicesL[num_tiles] + 1
+    if num_tiles > 1
+        xmins[num_tiles] = xmaxs[num_tiles-1]
+        xmaxs[num_tiles] = patch.params.xmax
+        spectralIndicesL[num_tiles] = num_cells[num_tiles-1] + spectralIndicesL[num_tiles-1]
+        num_cells[num_tiles] = patch.params.num_cells - spectralIndicesL[num_tiles] + 1
+    end
 
     tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL')
     return tile_params
@@ -423,6 +426,23 @@ function sumSpectralTile(spectral_patch::Array{real}, spectral_tile::Array{real}
     # Add the tile b's to the patch
     spectral_patch[spectralIndexL:spectralIndexR,:] =
         spectral_patch[spectralIndexL:spectralIndexR,:] .+ spectral_tile[:,:]
+    return spectral_patch
+end
+
+function setSpectralTile!(patch::R_Grid, tile::R_Grid)
+
+    spectral = setSpectralTile(patch.spectral, tile.spectral, tile.params.spectralIndexL, tile.params.spectralIndexR)
+    return spectral
+end
+
+function setSpectralTile(spectral_patch::Array{real}, spectral_tile::Array{real},
+                         spectralIndexL::int, spectralIndexR::int)
+
+    # Clear the patch
+    spectral_patch[:] .= 0.0
+
+    # Add the tile b's to the patch
+    spectral_patch[spectralIndexL:spectralIndexR,:] .= spectral_tile[:,:]
     return spectral_patch
 end
 
