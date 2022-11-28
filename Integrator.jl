@@ -329,7 +329,7 @@ end
 
 function initialize_model(model::ModelParameters, num_tiles::int, tile_num::int)
 
-    println("Initializing with tile $(tile_num)")
+    println("Initializing tile $(tile_num)")
     if tile_num == 0
         println("$model")
         println("$(model.grid_params)")
@@ -562,7 +562,7 @@ function run_model(patch, tile, model::ModelParameters, comm::MPI.Comm)
         setSpectralTile!(patch, tile)
 
         # Reduce the tiles to the patch
-        MPI.Barrier(comm)
+        #MPI.Barrier(comm) # Looks like this is not required
         MPI.Allreduce!(patch.spectral, +, comm)
 
         # Transform back to local physical tile
@@ -581,7 +581,7 @@ function run_model(patch, tile, model::ModelParameters, comm::MPI.Comm)
         end
     end
 
-    println("Done with time integration")
+    println("Done with time integration on rank $(rank)")
 end
 
 function finalize_model(grid, model::ModelParameters)

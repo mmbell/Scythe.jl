@@ -293,8 +293,8 @@ function calcTileSizes(patch::RL_Grid, num_tiles::int)
 
     # Find the first R that has enough points
     lpoints = 0
-    blpoints = 0
-    r_thresh = 0
+    # Set the threshold to the end just in case it is only 1 tile
+    r_thresh = patch.params.rDim
     for r = 1:patch.params.rDim
         lpoints += 4 + 4*r
         if lpoints >= tile_sizes[1] && (r-1) % 3 == 0
@@ -309,8 +309,7 @@ function calcTileSizes(patch::RL_Grid, num_tiles::int)
     for i = 2:num_tiles-1
         xmins[i] = xmaxs[i-1]
         lpoints = 0
-        blpoints = 0
-        r_thresh = 0
+        r_thresh = patch.params.rDim
         spectralIndicesL[i] = num_cells[i-1] + spectralIndicesL[i-1]
         patchOffsetsL[i] = (spectralIndicesL[i] - 1) * 3
         for r = (patchOffsetsL[i] + 1):patch.params.rDim
