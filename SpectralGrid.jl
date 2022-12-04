@@ -18,8 +18,8 @@ export GridParameters, createGrid, getGridpoints, getCartesianGridpoints
 export spectralTransform!, gridTransform!, spectralTransform 
 export spectralxTransform, gridTransform_noBCs, integrateUp
 export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
-export R_Grid, RZ_Grid, RL_Grid
-export calcTileSizes, setSpectralTile!
+export AbstractGrid, R_Grid, RZ_Grid, RL_Grid
+export calcTileSizes, setSpectralTile!, setSpectralTile
 
 Base.@kwdef struct GridParameters
     geometry::String = "R"
@@ -48,21 +48,23 @@ Base.@kwdef struct GridParameters
     tile_num::int = 0
 end
 
-struct R_Grid
+abstract type AbstractGrid end
+
+struct R_Grid <: AbstractGrid
     params::GridParameters
     splines::Array{Spline1D}
     spectral::Array{Float64}
     physical::Array{Float64}
 end
 
-struct Z_Grid
+struct Z_Grid <: AbstractGrid
     params::GridParameters
     columns::Array{Chebyshev1D}
     spectral::Array{Float64}
     physical::Array{Float64}
 end
 
-struct RZ_Grid
+struct RZ_Grid <: AbstractGrid
     params::GridParameters
     splines::Array{Spline1D}
     columns::Array{Chebyshev1D}
@@ -70,7 +72,7 @@ struct RZ_Grid
     physical::Array{Float64}
 end
 
-struct RL_Grid
+struct RL_Grid <: AbstractGrid
     params::GridParameters
     splines::Array{Spline1D}
     rings::Array{Fourier1D}
@@ -78,7 +80,7 @@ struct RL_Grid
     physical::Array{Float64}
 end
 
-struct RLZ_Grid
+struct RLZ_Grid <: AbstractGrid
     params::GridParameters
     splines::Array{Spline1D}
     columns::Array{Chebyshev1D}
@@ -486,6 +488,31 @@ function gridTransform!(patch::R_Grid, tile::R_Grid)
     return tile.physical
 end
 
+function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::R_Grid)
+
+    # Transform from the spectral to grid space
+    # For R grid, the only varying dimension is the variable name
+    # Have to use the patch spline and spectral array
+
+    # pp::GridParameters is patch parameters, but this is not needed for 1D case
+    # It is retained for compatibility with calling function for more complex cases
+
+    for i in eachindex(patchSplines)
+        patchSplines[i].b .= patchSpectral[:,i]
+        SAtransform!(patchSplines[i])
+        SItransform!(patchSplines[i])
+
+        # Assign to the tile grid
+        u1 = tile.params.patchOffsetL + 1
+        u2 = tile.params.patchOffsetR
+        tile.physical[:,i,1] .= patchSplines[i].uMish[u1:u2]
+        tile.physical[:,i,2] .= SIxtransform(patchSplines[i])[u1:u2]
+        tile.physical[:,i,3] .= SIxxtransform(patchSplines[i])[u1:u2]
+    end
+
+    return tile.physical
+end
+
 function sumSpectralTile!(patch::R_Grid, tile::R_Grid)
 
     spectral = sumSpectralTile(patch.spectral, tile.spectral, tile.params.spectralIndexL, tile.params.spectralIndexR)
@@ -507,15 +534,20 @@ function setSpectralTile!(patch::R_Grid, tile::R_Grid)
     return spectral
 end
 
-function setSpectralTile(spectral_patch::Array{real}, spectral_tile::Array{real},
-                         spectralIndexL::int, spectralIndexR::int)
+function setSpectralTile(patchSpectral::Array{real}, pp::GridParameters, tile::R_Grid)
+
+    # pp::GridParameters is patch parameters, but this is not needed for 1D case
+    # It is retained for compatibility with calling function for more complex cases
 
     # Clear the patch
-    spectral_patch[:] .= 0.0
+    patchSpectral[:] .= 0.0
+
+    spectralIndexL = tile.params.spectralIndexL
+    spectralIndexR = tile.params.spectralIndexR
 
     # Add the tile b's to the patch
-    spectral_patch[spectralIndexL:spectralIndexR,:] .= spectral_tile[:,:]
-    return spectral_patch
+    patchSpectral[spectralIndexL:spectralIndexR,:] .= tile.spectral[:,:]
+    return patchSpectral
 end
 
 function spectralTransform!(grid::RZ_Grid)
@@ -1153,6 +1185,157 @@ function gridTransform!(patch::RL_Grid, tile::RL_Grid)
     return tile.physical
 end
 
+function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::RL_Grid)
+
+    # Transform from the spectral to grid space
+    # For RL grid, varying dimensions are R, L, and variable
+    spline_r = zeros(Float64, pp.rDim, pp.rDim*2+1)
+    spline_rr = zeros(Float64, pp.rDim, pp.rDim*2+1)
+
+    for v in values(pp.vars)
+        # Wavenumber zero
+        k1 = 1
+        k2 = pp.b_rDim
+        patchSplines[1,v].b .= patchSpectral[k1:k2,v]
+        SAtransform!(patchSplines[1,v])
+        SItransform!(patchSplines[1,v])
+        spline_r[:,1] = SIxtransform(patchSplines[1,v])
+        spline_rr[:,1] = SIxxtransform(patchSplines[1,v])
+
+        for r = 1:tile.params.rDim
+            # Offset physical index
+            r1 = r + tile.params.patchOffsetL
+            tile.rings[r,v].b[1] = patchSplines[1,v].uMish[r1]
+        end
+
+        # Higher wavenumbers
+        for k = 1:pp.rDim
+            p = k*2
+            p1 = ((p-1)*pp.b_rDim)+1
+            p2 = p*pp.b_rDim
+            patchSplines[2,v].b .= patchSpectral[p1:p2,v]
+            SAtransform!(patchSplines[2,v])
+            SItransform!(patchSplines[2,v])
+            spline_r[:,p] = SIxtransform(patchSplines[2,v])
+            spline_rr[:,p] = SIxxtransform(patchSplines[2,v])
+
+            p1 = (p*pp.b_rDim)+1
+            p2 = (p+1)*pp.b_rDim
+            patchSplines[3,v].b .= patchSpectral[p1:p2,v]
+            SAtransform!(patchSplines[3,v])
+            SItransform!(patchSplines[3,v])
+            spline_r[:,p+1] = SIxtransform(patchSplines[3,v])
+            spline_rr[:,p+1] = SIxxtransform(patchSplines[3,v])
+
+            for r = 1:tile.params.rDim
+                if (k <= r + tile.params.patchOffsetL)
+                    # Real part
+                    rk = k+1
+                    # Imaginary part
+                    ik = tile.rings[r,v].params.bDim-k+1
+                    # Offset physical index
+                    r1 = r + tile.params.patchOffsetL
+                    tile.rings[r,v].b[rk] = patchSplines[2,v].uMish[r1]
+                    tile.rings[r,v].b[ik] = patchSplines[3,v].uMish[r1]
+                end
+            end
+        end
+
+        l1 = 0
+        l2 = 0
+        for r = 1:tile.params.rDim
+            FAtransform!(tile.rings[r,v])
+            FItransform!(tile.rings[r,v])
+
+            # Assign the grid array
+            ri = r + tile.params.patchOffsetL
+            l1 = l2 + 1
+            l2 = l1 + 3 + (4*ri)
+            tile.physical[l1:l2,v,1] .= tile.rings[r,v].uMish
+            tile.physical[l1:l2,v,4] .= FIxtransform(tile.rings[r,v])
+            tile.physical[l1:l2,v,5] .= FIxxtransform(tile.rings[r,v])
+        end
+
+        # 1st radial derivative
+        # Wavenumber zero
+        for r = 1:tile.params.rDim
+            # Offset physical index
+            r1 = r + tile.params.patchOffsetL
+            tile.rings[r,v].b[1] = spline_r[r1,1]
+        end
+
+        # Higher wavenumbers
+        for k = 1:pp.rDim
+            p = k*2
+            for r = 1:tile.params.rDim
+                if (k <= r + tile.params.patchOffsetL)
+                    # Real part
+                    rk = k+1
+                    # Imaginary part
+                    ik = tile.rings[r,v].params.bDim-k+1
+                    # Offset physical index
+                    r1 = r + tile.params.patchOffsetL
+                    tile.rings[r,v].b[rk] = spline_r[r1,p]
+                    tile.rings[r,v].b[ik] = spline_r[r1,p+1]
+                end
+            end
+        end
+
+        l1 = 0
+        l2 = 0
+        for r = 1:tile.params.rDim
+            FAtransform!(tile.rings[r,v])
+            FItransform!(tile.rings[r,v])
+
+            # Assign the grid array
+            ri = r + tile.params.patchOffsetL
+            l1 = l2 + 1
+            l2 = l1 + 3 + (4*ri)
+            tile.physical[l1:l2,v,2] .= tile.rings[r,v].uMish
+        end
+
+        # 2nd radial derivative
+        # Wavenumber zero
+        for r = 1:tile.params.rDim
+            # Offset physical index
+            r1 = r + tile.params.patchOffsetL
+            tile.rings[r,v].b[1] = spline_rr[r1,1]
+        end
+
+        # Higher wavenumbers
+        for k = 1:pp.rDim
+            p = k*2
+            for r = 1:tile.params.rDim
+                if (k <= r + tile.params.patchOffsetL)
+                    # Real part
+                    rk = k+1
+                    # Imaginary part
+                    ik = tile.rings[r,v].params.bDim-k+1
+                    # Offset physical index
+                    r1 = r + tile.params.patchOffsetL
+                    tile.rings[r,v].b[rk] = spline_rr[r1,p]
+                    tile.rings[r,v].b[ik] = spline_rr[r1,p+1]
+                end
+            end
+        end
+
+        l1 = 0
+        l2 = 0
+        for r = 1:tile.params.rDim
+            FAtransform!(tile.rings[r,v])
+            FItransform!(tile.rings[r,v])
+
+            # Assign the grid array
+            ri = r + tile.params.patchOffsetL
+            l1 = l2 + 1
+            l2 = l1 + 3 + (4*ri)
+            tile.physical[l1:l2,v,3] .= tile.rings[r,v].uMish
+        end
+
+    end
+    return tile.physical
+end
+
 function spectralxTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{real})
     
     #Currently just a clone to test out delayed diffusion
@@ -1241,6 +1424,49 @@ function setSpectralTile!(patch::RL_Grid, tile::RL_Grid)
     end
 
     return patch.spectral
+end
+
+function setSpectralTile(patchSpectral::Array{real}, pp::GridParameters, tile::RL_Grid)
+
+    # Clear the patch
+    patchSpectral[:] .= 0.0
+
+    # Get the appropriate dimensions
+    kDim = tile.params.rDim + tile.params.patchOffsetL
+    spectralIndexL = tile.params.spectralIndexL
+    spectralIndexR = tile.params.spectralIndexR
+
+    # Add the tile b's to the patch
+
+    # Wavenumber 0
+    p1 = spectralIndexL
+    p2 = spectralIndexR
+    t1 = 1
+    t2 = tile.params.b_rDim
+    patchSpectral[p1:p2,:] .= tile.spectral[t1:t2,:]
+
+    # Higher wavenumbers
+    for k in 1:kDim
+        p = k*2
+        t = k*2
+
+        # Real part
+        p1 = ((p-1)*pp.b_rDim) + spectralIndexL
+        p2 = p1 + tile.params.b_rDim - 1
+        t1 = ((t-1)*tile.params.b_rDim)+1
+        t2 = t*tile.params.b_rDim
+        #@show k p1 p2 t1 t2
+        patchSpectral[p1:p2,:] .= tile.spectral[t1:t2,:]
+
+        # Imaginary part
+        p1 = (p*pp.b_rDim) + spectralIndexL
+        p2 = p1 + tile.params.b_rDim - 1
+        t1 = (t*tile.params.b_rDim)+1
+        t2 = (t+1)*tile.params.b_rDim
+        patchSpectral[p1:p2,:] .= tile.spectral[t1:t2,:]
+    end
+
+    return patchSpectral
 end
 
 function regularGridTransform(grid::RL_Grid)

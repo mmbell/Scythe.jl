@@ -2,6 +2,9 @@
 __precompile__()
 module Integrator
 
+using Distributed
+using DistributedData
+using SharedArrays
 using SpectralGrid
 using CubicBSpline
 using Chebyshev
@@ -11,17 +14,37 @@ using Parameters
 using CSV
 using DataFrames
 using MPI
+import Base.Threads.@spawn
 
 #Define some convenient aliases
 const real = Float64
 const int = Int64
 const uint = UInt64
 
-export initialize_model, run_model, finalize_model 
+# Need to move these to a driver module
 export integrate_LinearAdvection1D, integrate_WilliamsSlabTCBL
 export integrate_Kepert2017_TCBL
 export integrate_RL_ShallowWater, integrate_Oneway_ShallowWater_Slab
 export integrate_Twoway_ShallowWater_Slab
+
+export ModelTile, createModelTile
+export initialize_model, run_model, finalize_model
+export read_initialconditions, advanceTimestep
+
+struct ModelTile
+    model::ModelParameters
+    tile::Grid
+    udot::Array{Float64}
+    fluxes::Array{Float64}
+    bdot::Array{Float64}
+    bdot_delay::Array{Float64}
+    b_nxt::Array{Float64}
+    bdot_n1::Array{Float64}
+    bdot_n2::Array{Float64}
+    tilepoints::Array{Float64}
+    patchSplines::Array{Spline1D}
+    patchSpectral::Array{Float64}
+end
 
 function integrate_LinearAdvection1D()
     
@@ -327,7 +350,7 @@ function initialize_model(model::ModelParameters, num_tiles::int)
     return patch, tiles
 end
 
-function initialize_model(model::ModelParameters, num_tiles::int, tile_num::int)
+function initialize_tile(model::ModelParameters, num_tiles::int, tile_num::int)
 
     println("Initializing tile $(tile_num)")
     if tile_num == 0
@@ -340,9 +363,9 @@ function initialize_model(model::ModelParameters, num_tiles::int, tile_num::int)
     read_initialconditions(model.initial_conditions, patch)
     spectralTransform!(patch)
     gridTransform!(patch)
-    if tile_num == 0
-        write_output(patch, model, 0.0)
-    end
+    #if tile_num == 0
+    #    write_output(patch, model, 0.0)
+    #end
 
     # Initialize the tile
     tile_params = calcTileSizes(patch, num_tiles)
@@ -361,7 +384,77 @@ function initialize_model(model::ModelParameters, num_tiles::int, tile_num::int)
     gridTransform!(patch,tile)
     spectralTransform!(tile)
 
-    return patch, tile
+    return tile
+end
+
+function initialize_model(model::ModelParameters, workerids::Vector{Int64})
+
+    num_workers = length(workerids)
+    println("Initializing with $(num_workers) workers and tiles")
+    patch = createGrid(model.grid_params)
+    println("$model")
+
+    # Initialize the patch locally on master process
+    read_initialconditions(model.initial_conditions, patch)
+    spectralTransform!(patch)
+    gridTransform!(patch)
+    write_output(patch, model, 0.0)
+
+    # Transfer the model and patch/tile info to each worker
+    # Running serial
+    println("Initializing workers")
+    for w in workerids
+        wait(save_at(w, :model, model))
+        wait(save_at(w, :workerids, workerids))
+        wait(save_at(w, :num_workers, num_workers))
+        wait(save_at(w, :patch, :(createGrid(model.grid_params))))
+        wait(save_at(w, :tile_params, :(calcTileSizes(patch, num_workers))))
+    end
+
+    # Distribute the tiles
+    println("Initializing tiles on workers")
+    map(wait, [save_at(w, :tile, :(createGrid(GridParameters(
+            geometry = patch.params.geometry,
+            xmin = tile_params[1,myid()-1],
+            xmax = tile_params[2,myid()-1],
+            num_cells = tile_params[3,myid()-1],
+            BCL = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
+            BCR = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
+            vars = patch.params.vars,
+            spectralIndexL = tile_params[4,myid()-1],
+            tile_num = myid())))) for w in workerids])
+
+    # Create the model tiles
+    println("Initializing modelTiles on workers")
+    map(wait, [save_at(w, :mtile, :(createModelTile(patch,tile,model))) for w in workerids])
+    map(wait, [get_from(w, :(read_initialconditions(patch, mtile))) for w in workerids])
+
+    # Delete the patch from the workers since the relevant info is already in the modelTile
+    map(wait, [remove_from(w, :patch) for w in workerids])
+
+    # Transform the patch and return to the main process
+    spectralTransform!(patch)
+
+    println("Ready for time integration!")
+    return patch
+end
+
+function read_initialconditions(patch::Grid, mtile::ModelTile)
+
+    # Initialize the patch on each process
+    read_initialconditions(mtile.model.initial_conditions, patch)
+    spectralTransform!(patch)
+    gridTransform!(patch)
+
+    # Transform to local physical tile
+    gridTransform!(patch.splines, patch.spectral, mtile.model.grid_params, mtile.tile)
+
+    #b_now is held in tile.spectral
+    spectralTransform!(mtile.tile)
+
+    # Clear and set the local patch spectral array
+    setSpectralTile(mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
+
 end
 
 function read_initialconditions(ic::String, grid::R_Grid)
@@ -582,6 +675,249 @@ function run_model(patch, tile, model::ModelParameters, comm::MPI.Comm)
     end
 
     println("Done with time integration on rank $(rank)")
+end
+
+function run_model(patch, tiles, model::ModelParameters, num_tiles::int)
+
+    println("Model starting up with $(num_tiles) tiles serially...")
+
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+
+    # Create the model tiles
+    modelTiles = Array{ModelTile}(undef,num_tiles)
+    spectralParts = zeros(Float64,size(patch.spectral,1),size(patch.spectral,2), num_tiles)
+
+    for i = 1:num_tiles
+        modelTiles[i] = createModelTile(patch,tiles[i])
+    end
+
+    for t = 1:num_ts
+        println("ts: $(t*model.ts)")
+
+        # Advance each tile
+        for i = 1:num_tiles
+            spectralParts[:,:,i] .= advanceTimestep(modelTiles[i], t)
+        end
+
+        # Reduce the tiles to the patch
+        patch.spectral[:,:] .= 0.0
+        for i = 1:num_tiles
+            patch.spectral[:,:] .= patch.spectral[:,:] .+ spectralParts[:,:,i]
+        end
+
+        # Broadcast the spectral patch to the tiles
+        for i = 1:num_tiles
+            modelTiles[i].patchSpectral[:,:] .= patch.spectral[:,:]
+        end
+
+        if mod(t,output_int) == 0
+            gridTransform!(patch)
+            spectralTransform!(patch)
+            checkCFL(patch)
+            write_output(patch, model, (t*model.ts))
+        end
+    end
+
+    println("Done with time integration")
+end
+
+function run_model(patch, tiles, model::ModelParameters)
+
+    num_threads = Threads.nthreads()
+    num_tiles = length(tiles)
+    println("Model starting up with $(num_threads) threads and $(num_tiles) tiles...")
+
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+
+    # Create the model tiles
+    modelTiles = Array{ModelTile}(undef,num_tiles)
+    spectralParts = zeros(Float64,size(patch.spectral,1),size(patch.spectral,2), num_tiles)
+
+    for i = 1:num_tiles
+        modelTiles[i] = createModelTile(patch,tiles[i],model)
+    end
+
+    for t = 1:num_ts
+        println("ts: $(t*model.ts)")
+
+        # Advance each tile
+        results = Array{Task}(undef,num_tiles)
+        #@sync begin
+            for i in 1:num_tiles
+                results[i] = @spawn advanceTimestep(modelTiles[i], t)
+            end
+        #end
+
+        # Reduce the tiles to the patch
+        patch.spectral[:,:] .= 0.0
+        for i = 1:num_tiles
+            patch.spectral[:,:] .= patch.spectral[:,:] .+ fetch(results[i])
+        end
+
+        # Broadcast the spectral patch to the tiles
+        for i = 1:num_tiles
+            modelTiles[i].patchSpectral[:,:] .= patch.spectral[:,:]
+        end
+
+        if mod(t,output_int) == 0
+            gridTransform!(patch)
+            spectralTransform!(patch)
+            checkCFL(patch)
+            write_output(patch, model, (t*model.ts))
+        end
+    end
+
+    println("Done with time integration")
+end
+
+function run_model(patch::Grid, model::ModelParameters, workerids::Vector{Int64})
+
+    num_workers = length(workerids)
+    println("Model starting up with $(num_workers) workers and tiles...")
+
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+
+    # Create a shared array for the spectral sum
+    sharedSpectral = SharedArray{Float64,2}((size(patch.spectral,1),size(patch.spectral,2)))
+    results = Array{Future}(undef,num_workers+1)
+
+    # Initialize at time zero
+    sharedSpectral[:] .= patch.spectral[:]
+    for w in workerids
+        save_at(w, :sharedSpectral, sharedSpectral)
+    end
+    map(wait, [get_from(w, :(mtile.patchSpectral[:] .= sharedSpectral[:])) for w in workerids])
+
+    for t = 1:num_ts
+        println("ts: $(t*model.ts)")
+
+        # Advance each tile
+        for w in workerids
+            results[w] = get_from(w, :(advanceTimestep(mtile, $(t))))
+        end
+
+        # Reduce the tiles to the patch
+        sharedSpectral[:] .= 0.0
+        sharedSpectral[:, :] .= sum([ fetch(results[w]) for w in workerids ])
+
+        # Broadcast the spectral patch to the tiles
+        map(wait, [get_from(w, :(mtile.patchSpectral[:,:] .= sharedSpectral[:,:])) for w in workerids])
+
+        # Output if on time interval
+        if mod(t,output_int) == 0
+            patch.spectral[:] .= sharedSpectral[:]
+            gridTransform!(patch)
+            spectralTransform!(patch)
+            checkCFL(patch)
+            write_output(patch, model, (t*model.ts))
+        end
+    end
+
+    # Reassemble to the patch
+    patch.spectral[:] .= sharedSpectral[:]
+    gridTransform!(patch)
+    spectralTransform!(patch)
+    println("Done with time integration")
+    return true
+
+end
+
+function advanceTimestep(mtile::ModelTile, t::int)
+
+    # Transform to local physical tile
+    gridTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
+
+    #b_now is held in tile.spectral
+    spectralTransform!(mtile.tile)
+
+    # Feed physical matrices to physical equations
+    physical_model(mtile.tile,mtile.tilepoints,mtile.udot,mtile.fluxes,mtile.model)
+
+    # Convert to spectral tendencies
+    calcTendency(mtile.tile,mtile.udot,mtile.fluxes,mtile.bdot,mtile.bdot_delay)
+
+    # Advance the timestep
+    if t > 2
+        timestep(mtile.tile.spectral, mtile.bdot, mtile.bdot_delay, mtile.b_nxt, mtile.bdot_n1, mtile.bdot_n2, mtile.model.ts)
+    elseif t == 2
+        second_timestep(mtile.tile.spectral, mtile.bdot, mtile.bdot_delay, mtile.b_nxt, mtile.bdot_n1, mtile.bdot_n2, mtile.model.ts)
+    else
+        first_timestep(mtile.tile.spectral, mtile.bdot, mtile.bdot_delay, mtile.b_nxt, mtile.bdot_n1, mtile.model.ts)
+    end
+
+    # Assign b_nxt and b_now
+    mtile.tile.spectral .= mtile.b_nxt
+
+    # Sync up with other tiles
+    # Clear and set the local patch spectral array
+    patchSpectral = setSpectralTile(mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
+    return patchSpectral
+end
+
+function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray, t::int)
+
+    # Transform to local physical tile
+    gridTransform!(mtile.patchSplines, sdata(sharedSpectral), mtile.model.grid_params, mtile.tile)
+
+    #b_now is held in tile.spectral
+    spectralTransform!(mtile.tile)
+
+    # Feed physical matrices to physical equations
+    physical_model(mtile.tile,mtile.tilepoints,mtile.udot,mtile.fluxes,mtile.model)
+
+    # Convert to spectral tendencies
+    calcTendency(mtile.tile,mtile.udot,mtile.fluxes,mtile.bdot,mtile.bdot_delay)
+
+    # Advance the timestep
+    if t > 2
+        timestep(mtile.tile.spectral, mtile.bdot, mtile.bdot_delay, mtile.b_nxt, mtile.bdot_n1, mtile.bdot_n2, mtile.model.ts)
+    elseif t == 2
+        second_timestep(mtile.tile.spectral, mtile.bdot, mtile.bdot_delay, mtile.b_nxt, mtile.bdot_n1, mtile.bdot_n2, mtile.model.ts)
+    else
+        first_timestep(mtile.tile.spectral, mtile.bdot, mtile.bdot_delay, mtile.b_nxt, mtile.bdot_n1, mtile.model.ts)
+    end
+
+    # Assign b_nxt and b_now
+    mtile.tile.spectral .= mtile.b_nxt
+
+    # Sync up with other tiles
+    # Clear and set the local patch spectral array
+    patchSpectral = setSpectralTile(mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
+    return patchSpectral
+end
+
+function createModelTile(patch::Grid, tile::Grid, model::ModelParameters)
+
+    udot = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    fluxes = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    bdot = zeros(Float64,size(tile.spectral))
+    bdot_delay = zeros(Float64,size(tile.spectral))
+    b_nxt = zeros(Float64,size(tile.spectral))
+    bdot_n1 = zeros(Float64,size(tile.spectral))
+    bdot_n2 = zeros(Float64,size(tile.spectral))
+    tilepoints = getGridpoints(tile)
+    patchSplines = copy(patch.splines)
+    patchSpectral = copy(patch.spectral)
+    mtile = ModelTile(
+        model,
+        tile,
+        udot,
+        fluxes,
+        bdot,
+        bdot_delay,
+        b_nxt,
+        bdot_n1,
+        bdot_n2,
+        tilepoints,
+        patchSplines,
+        patchSpectral)
+    return mtile
 end
 
 function finalize_model(grid, model::ModelParameters)
