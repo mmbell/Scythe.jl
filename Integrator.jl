@@ -33,7 +33,7 @@ export read_initialconditions, advanceTimestep
 
 struct ModelTile
     model::ModelParameters
-    tile::Grid
+    tile::AbstractGrid
     udot::Array{Float64}
     fluxes::Array{Float64}
     bdot::Array{Float64}
@@ -439,7 +439,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     return patch
 end
 
-function read_initialconditions(patch::Grid, mtile::ModelTile)
+function read_initialconditions(patch::AbstractGrid, mtile::ModelTile)
 
     # Initialize the patch on each process
     read_initialconditions(mtile.model.initial_conditions, patch)
@@ -549,7 +549,7 @@ function read_initialconditions(ic::String, grid::RL_Grid)
 
 end
 
-function run_model(grid, model::ModelParameters)
+function run_model(grid::AbstractGrid, model::ModelParameters)
 
     println("Model starting up with single tile...")
 
@@ -602,7 +602,7 @@ function run_model(grid, model::ModelParameters)
     println("Done with time integration")
 end
 
-function run_model(patch, tile, model::ModelParameters, comm::MPI.Comm)
+function run_model(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters, comm::MPI.Comm)
 
     rank = MPI.Comm_rank(comm)
     comm_size = MPI.Comm_size(comm)
@@ -677,7 +677,7 @@ function run_model(patch, tile, model::ModelParameters, comm::MPI.Comm)
     println("Done with time integration on rank $(rank)")
 end
 
-function run_model(patch, tiles, model::ModelParameters, num_tiles::int)
+function run_model(patch::AbstractGrid, tiles, model::ModelParameters, num_tiles::int)
 
     println("Model starting up with $(num_tiles) tiles serially...")
 
@@ -723,7 +723,7 @@ function run_model(patch, tiles, model::ModelParameters, num_tiles::int)
     println("Done with time integration")
 end
 
-function run_model(patch, tiles, model::ModelParameters)
+function run_model(patch::AbstractGrid, tiles, model::ModelParameters)
 
     num_threads = Threads.nthreads()
     num_tiles = length(tiles)
@@ -774,7 +774,7 @@ function run_model(patch, tiles, model::ModelParameters)
     println("Done with time integration")
 end
 
-function run_model(patch::Grid, model::ModelParameters, workerids::Vector{Int64})
+function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64})
 
     num_workers = length(workerids)
     println("Model starting up with $(num_workers) workers and tiles...")
@@ -892,7 +892,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray, t::int)
     return patchSpectral
 end
 
-function createModelTile(patch::Grid, tile::Grid, model::ModelParameters)
+function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters)
 
     udot = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     fluxes = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
@@ -920,13 +920,13 @@ function createModelTile(patch::Grid, tile::Grid, model::ModelParameters)
     return mtile
 end
 
-function finalize_model(grid, model::ModelParameters)
+function finalize_model(grid::AbstractGrid, model::ModelParameters)
     
     write_output(grid, model, model.integration_time)
     println("Model complete!")
 end
 
-function finalize_model(grid, model::ModelParameters, comm::MPI.Comm)
+function finalize_model(grid::AbstractGrid, model::ModelParameters, comm::MPI.Comm)
 
     rank = MPI.Comm_rank(comm)
     root = 0
@@ -939,7 +939,7 @@ function finalize_model(grid, model::ModelParameters, comm::MPI.Comm)
     MPI.Finalize()
 end
 
-function physical_model(grid, 
+function physical_model(grid::AbstractGrid,
             gridpoints::Array{real},
             vardot::Array{real},
             F::Array{real},
@@ -1003,7 +1003,7 @@ function timestep(spectral::Array{real},
     # TBD
 end
 
-function calcTendency(grid,
+function calcTendency(grid::AbstractGrid,
         udot::Array{real},
         F::Array{real},
         bdot::Array{real},
