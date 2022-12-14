@@ -5,6 +5,8 @@ using Chebyshev
 using Fourier
 using CSV
 using DataFrames
+using SharedArrays
+using SparseArrays
 
 #Define some convenient aliases
 const real = Float64
@@ -20,6 +22,7 @@ export spectralxTransform, gridTransform_noBCs, integrateUp
 export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export AbstractGrid, R_Grid, RZ_Grid, RL_Grid
 export calcTileSizes, setSpectralTile!, setSpectralTile
+export sumSharedSpectral, getBorderSpectral
 
 Base.@kwdef struct GridParameters
     geometry::String = "R"
@@ -234,8 +237,8 @@ function calcTileSizes(patch::R_Grid, num_tiles::int)
     num_gridpoints = patch.params.rDim
     q,r = divrem(num_gridpoints, num_tiles)
     tile_sizes = [i <= r ? q+1 : q for i = 1:num_tiles]
-    if any(x->x<15, tile_sizes)
-        throw(DomainError(0, "Too many tiles for this grid (need at least 5 cells in R direction)"))
+    if any(x->x<9, tile_sizes)
+        throw(DomainError(0, "Too many tiles for this grid (need at least 3 cells in R direction)"))
     end
 
     # Calculate the dimensions and set the parameters
@@ -267,7 +270,7 @@ function calcTileSizes(patch::R_Grid, num_tiles::int)
         num_cells[num_tiles] = patch.params.num_cells - spectralIndicesL[num_tiles] + 1
     end
 
-    tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL')
+    tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
     return tile_params
 end
 
@@ -333,11 +336,11 @@ function calcTileSizes(patch::RL_Grid, num_tiles::int)
         num_cells[num_tiles] = patch.params.num_cells - spectralIndicesL[num_tiles] + 1
     end
 
-    if any(x->x<5, num_cells)
-        throw(DomainError(0, "Too many tiles for this grid (need at least 5 cells in R direction)"))
+    if any(x->x<3, num_cells)
+        throw(DomainError(0, "Too many tiles for this grid (need at least 3 cells in R direction)"))
     end
 
-    tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL')
+    tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
     return tile_params
 end
 
@@ -547,6 +550,52 @@ function setSpectralTile(patchSpectral::Array{real}, pp::GridParameters, tile::R
 
     # Add the tile b's to the patch
     patchSpectral[spectralIndexL:spectralIndexR,:] .= tile.spectral[:,:]
+    return patchSpectral
+end
+
+function sumSharedSpectral(sharedSpectral::SharedArray{real}, borderSpectral::SparseArrays.SparseMatrixCSC{Float64, Int64}, pp::GridParameters, tile::R_Grid)
+
+    # pp::GridParameters is patch parameters, but this is not needed for 1D case
+    # It is retained for compatibility with calling function for more complex cases
+
+    # Indices of sharedArray that won't be touched by other workers
+    siL = tile.params.spectralIndexL
+    siR = tile.params.spectralIndexR - 3
+
+    # Indices of tile spectral that map to shared
+    tiL = 1
+    tiR = tile.params.b_rDim-3
+
+    # Indices of border matrix
+    biL = tile.params.spectralIndexL
+    biR = biL + 2
+
+    # Sum the tile b's in the shared array with the border values
+    sharedSpectral[siL:siR,:] .= tile.spectral[tiL:tiR,:]
+    sharedSpectral[biL:biR,:] .= sharedSpectral[biL:biR,:] + borderSpectral[biL:biR,:]
+
+    return nothing
+end
+
+function getBorderSpectral(pp::GridParameters, tile::R_Grid, patchSpectral::Array{Float64})
+
+    # pp::GridParameters is patch parameters, but this is not needed for 1D case
+    # It is retained for compatibility with calling function for more complex cases
+
+    # Clear the local border matrix that will be sent to other workers
+    patchSpectral[:] .= 0.0
+
+    # Indices of border matrix
+    biL = tile.params.spectralIndexR - 2
+    biR = biL + 2
+
+    # Indices of tile to shared
+    tiL = tile.params.b_rDim-2
+    tiR = tile.params.b_rDim
+
+    # Add the b's to the border matrix
+    patchSpectral[biL:biR,:] .= tile.spectral[tiL:tiR,:]
+
     return patchSpectral
 end
 
@@ -1464,6 +1513,46 @@ function setSpectralTile(patchSpectral::Array{real}, pp::GridParameters, tile::R
         t1 = (t*tile.params.b_rDim)+1
         t2 = (t+1)*tile.params.b_rDim
         patchSpectral[p1:p2,:] .= tile.spectral[t1:t2,:]
+    end
+
+    return patchSpectral
+end
+
+function sumSpectralTile(patchSpectral::SharedArray{Float64}, pp::GridParameters, tile::RL_Grid)
+
+    # Get the appropriate dimensions
+    kDim = tile.params.rDim + tile.params.patchOffsetL
+    spectralIndexL = tile.params.spectralIndexL
+    spectralIndexR = tile.params.spectralIndexR
+
+    # Add the tile b's to the patch
+
+    # Wavenumber 0
+    p1 = spectralIndexL
+    p2 = spectralIndexR
+    t1 = 1
+    t2 = tile.params.b_rDim
+    patchSpectral[p1:p2,:] .= patchSpectral[p1:p2,:] .+ tile.spectral[t1:t2,:]
+
+    # Higher wavenumbers
+    for k in 1:kDim
+        p = k*2
+        t = k*2
+
+        # Real part
+        p1 = ((p-1)*pp.b_rDim) + spectralIndexL
+        p2 = p1 + tile.params.b_rDim - 1
+        t1 = ((t-1)*tile.params.b_rDim)+1
+        t2 = t*tile.params.b_rDim
+        #@show k p1 p2 t1 t2
+        patchSpectral[p1:p2,:] .= patchSpectral[p1:p2,:] .+ tile.spectral[t1:t2,:]
+
+        # Imaginary part
+        p1 = (p*pp.b_rDim) + spectralIndexL
+        p2 = p1 + tile.params.b_rDim - 1
+        t1 = (t*tile.params.b_rDim)+1
+        t2 = (t+1)*tile.params.b_rDim
+        patchSpectral[p1:p2,:] .= patchSpectral[p1:p2,:] .+ tile.spectral[t1:t2,:]
     end
 
     return patchSpectral

@@ -15,17 +15,13 @@ using CSV
 using DataFrames
 using MPI
 import Base.Threads.@spawn
+using SparseArrays
+using SuiteSparse
 
 #Define some convenient aliases
 const real = Float64
 const int = Int64
 const uint = UInt64
-
-# Need to move these to a driver module
-export integrate_LinearAdvection1D, integrate_WilliamsSlabTCBL
-export integrate_Kepert2017_TCBL
-export integrate_RL_ShallowWater, integrate_Oneway_ShallowWater_Slab
-export integrate_Twoway_ShallowWater_Slab
 
 export ModelTile, createModelTile
 export initialize_model, run_model, finalize_model
@@ -46,258 +42,33 @@ struct ModelTile
     patchSpectral::Array{Float64}
 end
 
-function integrate_LinearAdvection1D()
-    
-    model = ModelParameters(
-        ts = 0.05,
-        integration_time = 100.0,
-        output_interval = 100.0,
-        equation_set = "LinearAdvection1D",
-        initial_conditions = "1d_linear_advection_test_ics.csv",
-        grid_params = GridParameters(
-            geometry = "R",
-            xmin = -50.0,
-            xmax = 50.0,
-            num_cells = 100,
-            BCL = Dict(
-                "u" => CubicBSpline.PERIODIC),
-            BCR = Dict(
-                "u" => CubicBSpline.PERIODIC),
-            vars = Dict(
-                "u" => 1)),
-        physical_params = Dict(
-            :c_0 => 1.0,
-            :K => 0.0))
-   
-    grid = initialize_model(model)
-    run_model(grid, model)
-    finalize_model(grid, model)
+function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters)
+
+    udot = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    fluxes = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    bdot = zeros(Float64,size(tile.spectral))
+    bdot_delay = zeros(Float64,size(tile.spectral))
+    b_nxt = zeros(Float64,size(tile.spectral))
+    bdot_n1 = zeros(Float64,size(tile.spectral))
+    bdot_n2 = zeros(Float64,size(tile.spectral))
+    tilepoints = getGridpoints(tile)
+    patchSplines = copy(patch.splines)
+    patchSpectral = copy(patch.spectral)
+    mtile = ModelTile(
+        model,
+        tile,
+        udot,
+        fluxes,
+        bdot,
+        bdot_delay,
+        b_nxt,
+        bdot_n1,
+        bdot_n2,
+        tilepoints,
+        patchSplines,
+        patchSpectral)
+    return mtile
 end
-
-function integrate_WilliamsSlabTCBL(ics_csv::String)
-    
-    nodes = 400
-    model = ModelParameters(
-        ts = 2.0,
-        integration_time = 10800.0,
-        output_interval = 3600.0,
-        equation_set = "Williams2013_slabTCBL",
-        output_dir = "./slabout/",
-        initial_conditions = ics_csv,
-        grid_params = GridParameters(
-            xmin = 0.0,
-            xmax = 4.0e5,
-            num_cells = nodes,
-            rDim = nodes*3,
-            b_rDim = nodes+3,
-            BCL = Dict(
-                "vgr" => CubicBSpline.R0, 
-                "u" => CubicBSpline.R1T0, 
-                "v" => CubicBSpline.R1T0, 
-                "w" => CubicBSpline.R1T0),
-            BCR = Dict(
-                "vgr" => CubicBSpline.R0, 
-                "u" => CubicBSpline.R1T1, 
-                "v" => CubicBSpline.R1T1, 
-                "w" => CubicBSpline.R1T1),
-            vars = Dict(
-                "vgr" => 1, 
-                "u" => 2, 
-                "v" => 3, 
-                "w" => 4)))
-
-    grid = initialize_model(model)
-    run_model(grid, model)
-    finalize_model(grid, model)
-end
-
-function integrate_Kepert2017_TCBL(ics_csv::String)
-
-    nodes = 400
-    model = ModelParameters(
-        ts = 2.0,
-        integration_time = 10800.0,
-        output_interval = 3600.0,
-        equation_set = "Kepert2017_TCBL",
-        initial_conditions = ics_csv,
-        output_dir = "./tcblout/",
-        grid_params = GridParameters(xmin = 0.0,
-            xmax = 4.0e5,
-            num_cells = nodes,
-            rDim = nodes*3,
-            b_rDim = nodes+3,
-            BCL = Dict(
-                "vgr" => CubicBSpline.R0, 
-                "u" => CubicBSpline.R1T0, 
-                "v" => CubicBSpline.R1T0, 
-                "w" => CubicBSpline.R1T0),
-            BCR = Dict(
-                "vgr" => CubicBSpline.R0, 
-                "u" => CubicBSpline.R1T1, 
-                "v" => CubicBSpline.R1T1, 
-                "w" => CubicBSpline.R1T1),
-            zmin = 0.0,
-            zmax = 2350.0,
-            zDim = 25,
-            b_zDim = 17,
-            BCB = Dict(
-                "vgr" => Chebyshev.R0, 
-                "u" => Chebyshev.R0, 
-                "v" => Chebyshev.R0, 
-                "w" => Chebyshev.R0),
-            BCT = Dict(
-                "vgr" => Chebyshev.R0, 
-                "u" => Chebyshev.R1T1, 
-                "v" => Chebyshev.R1T1, 
-                "w" => Chebyshev.R1T1),
-            vars = Dict(
-                "vgr" => 1, 
-                "u" => 2, 
-                "v" => 3, 
-                "w" => 4)))
-    
-    grid = initialize_model(model)
-    run_model(grid, model)
-    finalize_model(grid, model)
-end
-
-function integrate_RL_ShallowWater(ics_csv::String)
-    
-    nodes = 100
-    lpoints = 0
-    blpoints = 0
-    for r = 1:(nodes*3)
-        lpoints += 4 + 4*r
-        blpoints += 1 + 2*r
-    end
-    model = ModelParameters(
-        ts = 3.0,
-        integration_time = 900.0,
-        output_interval = 60.0,
-        equation_set = "ShallowWaterRL",
-        initial_conditions = ics_csv::String,
-        output_dir = "./SW_output/",
-        grid_params = GridParameters(xmin = 0.0,
-            xmax = 3.0e5,
-            num_cells = nodes,
-            rDim = nodes*3,
-            b_rDim = nodes+3,
-            BCL = Dict(
-                "h" => CubicBSpline.R0, 
-                "u" => CubicBSpline.R1T0, 
-                "v" => CubicBSpline.R1T0),
-            BCR = Dict(
-                "h" => CubicBSpline.R0, 
-                "u" => CubicBSpline.R1T1, 
-                "v" => CubicBSpline.R0), 
-            lDim = lpoints,
-            b_lDim = blpoints,
-            vars = Dict(
-                "h" => 1, 
-                "u" => 2, 
-                "v" => 3)))
-    grid = initialize_model(model)
-    run_model(grid, model)
-    finalize_model(grid, model)
-end
-
-function integrate_Oneway_ShallowWater_Slab(ics_csv::String)
-    
-    nodes = 100
-    lpoints = 0
-    blpoints = 0
-    for r = 1:(nodes*3)
-        lpoints += 4 + 4*r
-        blpoints += 1 + 2*r
-    end
-    model = ModelParameters(
-        ts = 3.0,
-        integration_time = 10800.0,
-        output_interval = 900.0,
-        equation_set = "Oneway_ShallowWater_Slab",
-        initial_conditions = ics_csv::String,
-        output_dir = "./SWslab_output/",
-        grid_params = GridParameters(xmin = 0.0,
-            xmax = 3.0e5,
-            num_cells = nodes,
-            rDim = nodes*3,
-            b_rDim = nodes+3,
-            BCL = Dict(
-                "h" => CubicBSpline.R1T1,
-                "u" => CubicBSpline.R1T0,
-                "v" => CubicBSpline.R1T0,
-                "ub" => CubicBSpline.R1T0,
-                "vb" => CubicBSpline.R1T0,
-                "wb" => CubicBSpline.R1T1),
-            BCR = Dict(
-                "h" => CubicBSpline.R0,
-                "u" => CubicBSpline.R1T1,
-                "v" => CubicBSpline.R0,
-                "ub" => CubicBSpline.R1T1,
-                "vb" => CubicBSpline.R0,
-                "wb" => CubicBSpline.R0),
-            lDim = lpoints,
-            b_lDim = blpoints,
-            vars = Dict(
-                "h" => 1,
-                "u" => 2,
-                "v" => 3,
-                "ub" => 4,
-                "vb" => 5,
-                "wb" => 6)))
-    grid = initialize_model(model);
-    run_model(grid, model)
-    finalize_model(grid,model)
-end
-    
-function integrate_Twoway_ShallowWater_Slab(ics_csv::String)
-    
-    nodes = 100
-    lpoints = 0
-    blpoints = 0
-    for r = 1:(nodes*3)
-        lpoints += 4 + 4*r
-        blpoints += 1 + 2*r
-    end
-    model = ModelParameters(
-        ts = 3.0,
-        integration_time = 10800.0,
-        output_interval = 900.0,
-        equation_set = "Twoway_ShallowWater_Slab",
-        initial_conditions = ics_csv::String,
-        output_dir = "./Twoway_SWslab_output/",
-        grid_params = GridParameters(xmin = 0.0,
-            xmax = 3.0e5,
-            num_cells = nodes,
-            rDim = nodes*3,
-            b_rDim = nodes+3,
-            BCL = Dict(
-                "h" => CubicBSpline.R1T1,
-                "u" => CubicBSpline.R1T0,
-                "v" => CubicBSpline.R1T0,
-                "ub" => CubicBSpline.R1T0,
-                "vb" => CubicBSpline.R1T0,
-                "wb" => CubicBSpline.R1T1),
-            BCR = Dict(
-                "h" => CubicBSpline.R0,
-                "u" => CubicBSpline.R1T1,
-                "v" => CubicBSpline.R0,
-                "ub" => CubicBSpline.R1T1,
-                "vb" => CubicBSpline.R0,
-                "wb" => CubicBSpline.R0),
-            lDim = lpoints,
-            b_lDim = blpoints,
-            vars = Dict(
-                "h" => 1,
-                "u" => 2,
-                "v" => 3,
-                "ub" => 4,
-                "vb" => 5,
-                "wb" => 6)))
-    grid = initialize_model(model);
-    run_model(grid, model)
-    finalize_model(grid,model)
-end  
 
 function initialize_model(model::ModelParameters)
     
@@ -401,7 +172,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     write_output(patch, model, 0.0)
 
     # Transfer the model and patch/tile info to each worker
-    # Running serial
+    # This loop is serial to make sure each variable is available for the next calculation
     println("Initializing workers")
     for w in workerids
         wait(save_at(w, :model, model))
@@ -409,6 +180,12 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
         wait(save_at(w, :num_workers, num_workers))
         wait(save_at(w, :patch, :(createGrid(model.grid_params))))
         wait(save_at(w, :tile_params, :(calcTileSizes(patch, num_workers))))
+    end
+
+    # Show the tiles
+    tile_params = calcTileSizes(patch, num_workers)
+    for w in workerids
+        println("Worker $w: $(tile_params[5,w-1]) gridpoints in $(tile_params[3,w-1]) cells from $(tile_params[1,w-1]) to $(tile_params[2,w-1]) starting at index $(tile_params[4,w-1])")
     end
 
     # Distribute the tiles
@@ -774,7 +551,7 @@ function run_model(patch::AbstractGrid, tiles, model::ModelParameters)
     println("Done with time integration")
 end
 
-function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64})
+function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64}, allreduce::Bool)
 
     num_workers = length(workerids)
     println("Model starting up with $(num_workers) workers and tiles...")
@@ -828,6 +605,73 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
 end
 
+function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64})
+
+    num_workers = length(workerids)
+    println("Model starting up with $(num_workers) workers and tiles...")
+
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+
+    # Create a shared array for the spectral sum
+    sharedSpectral = SharedArray{Float64,2}((size(patch.spectral,1),size(patch.spectral,2)))
+    results = Array{Future}(undef,num_workers+1)
+
+    # Initialize at time zero
+    sharedSpectral[:] .= patch.spectral[:]
+    for w in workerids
+        save_at(w, :sharedSpectral, sharedSpectral)
+    end
+    map(wait, [get_from(w, :(mtile.patchSpectral[:] .= sharedSpectral[:])) for w in workerids])
+
+    for t = 1:num_ts
+        println("ts: $(t*model.ts)")
+
+        # Master process clear the shared array and get an empty halo for the first worker
+        results[1] = @spawnat 1 clearSharedSpectral(sharedSpectral)
+
+        # Advance each tile
+        for w in workerids
+            save_at(w, :halo, results[w-1])
+            results[w] = get_from(w, :(advanceTimestep(mtile, sharedSpectral, halo, $(t))))
+        end
+
+        # Add border from last tile to complete sharedSpectral
+        sharedSpectral[:, :] .= sum([sharedSpectral, fetch(results[last(workerids)]) ])
+
+        # Broadcast the spectral patch to the tiles
+        map(wait, [get_from(w, :(mtile.patchSpectral[:,:] .= sharedSpectral[:,:])) for w in workerids])
+
+        # Output if on time interval
+        if mod(t,output_int) == 0
+            patch.spectral[:] .= sharedSpectral[:]
+            gridTransform!(patch)
+            spectralTransform!(patch)
+            checkCFL(patch)
+            write_output(patch, model, (t*model.ts))
+        end
+    end
+
+    # Reassemble to the patch
+    patch.spectral[:] .= sharedSpectral[:]
+    gridTransform!(patch)
+    spectralTransform!(patch)
+    println("Done with time integration")
+    return true
+
+end
+
+function clearSharedSpectral(sharedSpectral::SharedArray{Float64})
+
+    # Clear it out
+    sharedSpectral[:] .= 0.0
+
+    # Return a copy of the empty border matrix
+    #return zeros(Float64,sizeof(sharedSpectral))
+    return sparse(sdata(sharedSpectral))
+end
+
 function advanceTimestep(mtile::ModelTile, t::int)
 
     # Transform to local physical tile
@@ -857,13 +701,14 @@ function advanceTimestep(mtile::ModelTile, t::int)
     # Sync up with other tiles
     # Clear and set the local patch spectral array
     patchSpectral = setSpectralTile(mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
+    #return sparse(patchSpectral)
     return patchSpectral
 end
 
-function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray, t::int)
+function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64}, halo::Future, t::int)
 
     # Transform to local physical tile
-    gridTransform!(mtile.patchSplines, sdata(sharedSpectral), mtile.model.grid_params, mtile.tile)
+    gridTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
 
     #b_now is held in tile.spectral
     spectralTransform!(mtile.tile)
@@ -887,37 +732,15 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray, t::int)
     mtile.tile.spectral .= mtile.b_nxt
 
     # Sync up with other tiles
-    # Clear and set the local patch spectral array
-    patchSpectral = setSpectralTile(mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
-    return patchSpectral
-end
+    borderSpectral = fetch(halo)
 
-function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters)
+    # Set the sharedArray this tile is responsible for
+    sumSharedSpectral(sharedSpectral, borderSpectral, mtile.model.grid_params, mtile.tile)
 
-    udot = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
-    fluxes = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
-    bdot = zeros(Float64,size(tile.spectral))
-    bdot_delay = zeros(Float64,size(tile.spectral))
-    b_nxt = zeros(Float64,size(tile.spectral))
-    bdot_n1 = zeros(Float64,size(tile.spectral))
-    bdot_n2 = zeros(Float64,size(tile.spectral))
-    tilepoints = getGridpoints(tile)
-    patchSplines = copy(patch.splines)
-    patchSpectral = copy(patch.spectral)
-    mtile = ModelTile(
-        model,
-        tile,
-        udot,
-        fluxes,
-        bdot,
-        bdot_delay,
-        b_nxt,
-        bdot_n1,
-        bdot_n2,
-        tilepoints,
-        patchSplines,
-        patchSpectral)
-    return mtile
+    # Clear and set the border spectral array to share with the next tile
+    borderSpectral = getBorderSpectral(mtile.model.grid_params, mtile.tile, mtile.patchSpectral)
+
+    return sparse(borderSpectral)
 end
 
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
@@ -1020,66 +843,6 @@ function calcTendency(grid::AbstractGrid,
     # RL is clone of spectralTransform for constant diffusion coefficient
     spectralxTransform(grid, F, bdot_delay)
     
-end
-
-function write_output_old(grid::R_Grid, model::ModelParameters, t::real)
-    
-    time = round(t; digits=2)
-    if !isdir(model.output_dir)
-        mkdir(model.output_dir)
-    end
-    
-    println("Writing output to $(model.output_dir) at time $time")
-    for var in keys(model.grid_params.vars)
-        v = model.grid_params.vars[var]
-        dir = model.output_dir
-        afilename = string(dir, "model_a_", var , "_", time, ".csv")
-        ufilename = string(dir, "model_", var , "_", time, ".csv")
-        afile = open(afilename,"w")
-        ufile = open(ufilename,"w")
-
-        a = grid.splines[v].a    
-        for i = 1:grid.splines[v].aDim
-            a_i = a[i]
-            write(afile,"$i, $a_i\n")
-        end        
-
-        mishPoints = grid.splines[v].mishPoints
-        for i = 1:grid.splines[v].mishDim
-            mp_i = mishPoints[i]
-            u_i = grid.splines[v].uMish[i]
-            write(ufile,"$i, $mp_i, $u_i\n")
-        end
-        close(afile)
-        close(ufile)
-    end
-    
-    # Write nodes to a single file, including vorticity
-    #outfilename = string(model.equation_set , "_output_", time, ".csv")
-    #outfile = open(outfilename,"w")
-    #r = zeros(real,splines[1].aDim)
-    #vort = zeros(real,splines[1].aDim)
-    #for i = 1:splines[1].params.num_cells
-    #    r[i] = splines[1].params.xmin + (splines[1].params.DX * (i-1))
-    #end
-    #
-    #vgr = CubicBSpline.SItransform(splines[model.vars["vgr"]].params,splines[model.vars["vgr"]].a,r,0)
-    #u = CubicBSpline.SItransform(splines[model.vars["u"]].params,splines[model.vars["u"]].a,r,0)
-    #v = CubicBSpline.SItransform(splines[model.vars["v"]].params,splines[model.vars["v"]].a,r,0)
-    #dvdr = CubicBSpline.SItransform(splines[model.vars["v"]].params,splines[model.vars["v"]].a,r,1)
-    #w = CubicBSpline.SItransform(splines[model.vars["w"]].params,splines[model.vars["w"]].a,r,0)
-    #vort .= dvdr .+ (v ./ r)
-    #
-    #if r[1] == 0.0
-    #    vort[1] = 0.0
-    #end
-    #
-    #write(outfile,"r,vgr,u,v,w,vort\n")
-    #for i = 1:splines[1].params.num_cells
-    #    data = string(r[i], ",", vgr[i], ",", u[i], ",", v[i], ",", w[i], ",", vort[i])
-    #    write(outfile,"$data\n")
-    #end        
-    #close(outfile)
 end
 
 function write_output(grid::R_Grid, model::ModelParameters, t::real)
