@@ -648,6 +648,97 @@ function spectralxTransform(grid::RL_Grid, physical::Array{real}, spectral::Arra
 
 end
 
+function calcPatchMap(patch::RL_Grid, tile::RL_Grid)
+
+    patchMap = falses(size(patch.spectral))
+    tileView = falses(size(tile.spectral))
+
+    # Indices of sharedArray that won't be touched by other workers
+    # Get the appropriate dimensions
+    kDim = tile.params.rDim + tile.params.patchOffsetL
+    spectralIndexL = tile.params.spectralIndexL
+    patchStride = patch.params.b_rDim
+    tileStride = tile.params.b_rDim
+    tileShare = tileStride - 4
+
+    # Wavenumber 0
+    p1 = spectralIndexL
+    p2 = p1 + tileShare
+    t1 = 1
+    t2 = t1 + tileShare
+    patchMap[p1:p2,:] .= true
+    tileView[t1:t2,:] .= true
+
+    # Higher wavenumbers
+    for k in 1:kDim
+        i = k*2
+
+        # Real part
+        p1 = ((i-1)*patchStride) + spectralIndexL
+        p2 = p1 + tileShare
+        t1 = ((i-1)*tileStride) + 1
+        t2 = t1 + tileShare
+        patchMap[p1:p2,:] .= true
+        tileView[t1:t2,:] .= true
+
+        # Imaginary part
+        p1 = (i*patchStride) + spectralIndexL
+        p2 = p1 + tileShare
+        t1 = (i*tileStride) + 1
+        t2 = t1 + tileShare
+        patchMap[p1:p2,:] .= true
+        tileView[t1:t2,:] .= true
+    end
+
+    return patchMap, view(tile.spectral, tileView)
+end
+
+function calcHaloMap(patch::RL_Grid, tile::RL_Grid)
+
+    patchMap = falses(size(patch.spectral))
+    tileView = falses(size(tile.spectral))
+
+    # Indices of sharedArray that won't be touched by other workers
+    # Get the appropriate dimensions
+    kDim = tile.params.rDim + tile.params.patchOffsetL
+    spectralIndexL = tile.params.spectralIndexL
+    patchStride = patch.params.b_rDim
+    tileStride = tile.params.b_rDim
+    # Index is 1 more than shared map
+    tileShare = tileStride - 3
+
+    # Wavenumber 0
+    p1 = spectralIndexL + tileShare
+    p2 = p1 + 2
+    t1 = 1 + tileShare
+    t2 = t1 + 2
+    patchMap[p1:p2,:] .= true
+    tileView[t1:t2,:] .= true
+
+    # Higher wavenumbers
+    for k in 1:kDim
+        i = k*2
+
+        # Real part
+        p1 = ((i-1)*patchStride) + spectralIndexL + tileShare
+        p2 = p1 + 2
+        t1 = ((i-1)*tileStride) + 1 + tileShare
+        t2 = t1 + 2
+        patchMap[p1:p2,:] .= true
+        tileView[t1:t2,:] .= true
+
+        # Imaginary part
+        p1 = (i*patchStride) + spectralIndexL + tileShare
+        p2 = p1 + 2
+        t1 = (i*tileStride) + 1 + tileShare
+        t2 = t1 + 2
+        patchMap[p1:p2,:] .= true
+        tileView[t1:t2,:] .= true
+    end
+
+    return patchMap, view(tile.spectral, tileView)
+end
+
 function sumSpectralTile!(patch::RL_Grid, tile::RL_Grid)
 
     # Get the appropriate dimensions

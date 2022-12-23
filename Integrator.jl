@@ -48,7 +48,8 @@ struct ModelTile
     haloReceiveBuffer::Array{Float64}
 end
 
-function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters)
+function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters,
+        haloReceiveIndexMap::BitMatrix)
 
     # Allocate some needed arrays
     udot = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
@@ -75,8 +76,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     haloMap = calcHaloMap(patch, tile)
     haloSendIndexMap = haloMap[1]
     haloSendView = haloMap[2]
-    haloReceiveIndexMap = falses(size(patch.spectral))
-    haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloSendIndexMap]))
+
+    # Set up the receiver buffer
+    haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
 
     mtile = ModelTile(
         model,
@@ -234,8 +236,17 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     # Create the model tiles
     println("Initializing modelTiles on workers")
 
+    # First tile receives an empty halo from master to simplify later loops
+    firstMap = falses(size(patch.spectral))
+    firstMap[1] = true
+
     # Precalculate indices and allocate buffers for shared and border transfers
-    map(wait, [save_at(w, :mtile, :(createModelTile(patch,tile,model))) for w in workerids])
+    wait(save_at(2, :mtile, :(createModelTile(patch,tile,model,$(firstMap)))))    
+    for w in workerids[1:length(workerids)-1]
+        send_index = w + 1
+        sendMap = get_val_from(w, :(mtile.haloSendIndexMap))
+        wait(save_at(send_index, :mtile, :(createModelTile(patch,tile,model,$(sendMap)))))
+    end
 
     # Read in the initial conditions
     map(wait, [get_from(w, :(read_initialconditions(patch, mtile))) for w in workerids])
@@ -666,18 +677,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     haloReceive = get_val_from(last(workerids), :haloSend)
 
     # First tile receives an empty halo from master to simplify later loops
-    firstMap = falses(size(patch.spectral))
-    bufferIndices = get_val_from(2, :(LinearIndices(mtile.haloReceiveBuffer)))
-    firstMap[bufferIndices] .= true
-    wait(get_from(2, :(mtile.haloReceiveIndexMap .= $(firstMap))))
-    haloSendBuffer = zeros(Float64,size(patch.spectral[firstMap]))
-
-    # Finalize connections for receivers
-    for w in workerids[1:length(workerids)-1]
-        send_index = w + 1
-        sendMap = get_val_from(w, :(mtile.haloSendIndexMap))
-        wait(get_from(send_index, :(mtile.haloReceiveIndexMap .= $(sendMap))))
-    end
+    haloSendBuffer = zeros(Float64,1)
 
     # Last tile is received by master process
     haloReceiveIndexMap = get_val_from(last(workerids), :(mtile.haloSendIndexMap))
