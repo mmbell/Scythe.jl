@@ -23,6 +23,7 @@ export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export AbstractGrid, R_Grid, RZ_Grid, RL_Grid
 export calcTileSizes, setSpectralTile!, setSpectralTile
 export sumSharedSpectral, getBorderSpectral
+export calcPatchMap, calcHaloMap
 
 Base.@kwdef struct GridParameters
     geometry::String = "R"
@@ -570,8 +571,11 @@ function sumSharedSpectral(sharedSpectral::SharedArray{real}, borderSpectral::Sp
     biL = tile.params.spectralIndexL
     biR = biL + 2
 
-    # Sum the tile b's in the shared array with the border values
+    # Set the tile b's in the shared array with the local values
     sharedSpectral[siL:siR,:] .= tile.spectral[tiL:tiR,:]
+
+    # Sum with the border values
+    #sharedSpectral[:,:] .= sum([sharedSpectral, borderSpectral])
     sharedSpectral[biL:biR,:] .= sharedSpectral[biL:biR,:] + borderSpectral[biL:biR,:]
 
     return nothing
@@ -596,7 +600,47 @@ function getBorderSpectral(pp::GridParameters, tile::R_Grid, patchSpectral::Arra
     # Add the b's to the border matrix
     patchSpectral[biL:biR,:] .= tile.spectral[tiL:tiR,:]
 
-    return patchSpectral
+    return sparse(patchSpectral)
+end
+
+function calcPatchMap(patch::R_Grid, tile::R_Grid)
+
+    patchMap = falses(size(patch.spectral))
+    tileView = falses(size(tile.spectral))
+
+    # Indices of sharedArray that won't be touched by other workers
+    siL = tile.params.spectralIndexL
+    siR = tile.params.spectralIndexR - 3
+
+    patchMap[siL:siR,:] .= true
+
+    # Indices of tile spectral that map to shared
+    tiL = 1
+    tiR = tile.params.b_rDim-3
+
+    tileView[tiL:tiR, :] .= true
+
+    return patchMap, view(tile.spectral, tileView)
+end
+
+function calcHaloMap(patch::R_Grid, tile::R_Grid)
+
+    haloMap = falses(size(patch.spectral))
+    haloView = falses(size(tile.spectral))
+
+    # Indices of border matrix
+    hiL = tile.params.spectralIndexR - 2
+    hiR = hiL + 2
+
+    haloMap[hiL:hiR,:] .= true
+
+    # Indices of tile to shared
+    tiL = tile.params.b_rDim-2
+    tiR = tile.params.b_rDim
+
+    haloView[tiL:tiR,:] .= true
+
+    return haloMap, view(tile.spectral, haloView)
 end
 
 function spectralTransform!(grid::RZ_Grid)

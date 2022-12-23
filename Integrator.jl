@@ -40,11 +40,17 @@ struct ModelTile
     tilepoints::Array{Float64}
     patchSplines::Array{Spline1D}
     patchSpectral::Array{Float64}
-    haloBuffer::SparseMatrixCSC{Float64,Int64}
+    patchIndexMap::BitMatrix
+    tileView::AbstractArray
+    haloSendIndexMap::BitMatrix
+    haloSendView::AbstractArray
+    haloReceiveIndexMap::BitMatrix
+    haloReceiveBuffer::Array{Float64}
 end
 
 function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters)
 
+    # Allocate some needed arrays
     udot = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     fluxes = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     bdot = zeros(Float64,size(tile.spectral))
@@ -52,10 +58,26 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     b_nxt = zeros(Float64,size(tile.spectral))
     bdot_n1 = zeros(Float64,size(tile.spectral))
     bdot_n2 = zeros(Float64,size(tile.spectral))
+
+    # Get the local gridpoints
     tilepoints = getGridpoints(tile)
+
+    # Copy over the patch information
     patchSplines = copy(patch.splines)
     patchSpectral = copy(patch.spectral)
-    haloBuffer = spzeros(Float64,size(patchSpectral))
+
+    # Set up the map between the tile and the patch
+    patchMap = calcPatchMap(patch, tile)
+    patchIndexMap = patchMap[1]
+    tileView = patchMap[2]
+
+    # Set up the map between the tile and its neighbor
+    haloMap = calcHaloMap(patch, tile)
+    haloSendIndexMap = haloMap[1]
+    haloSendView = haloMap[2]
+    haloReceiveIndexMap = falses(size(patch.spectral))
+    haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloSendIndexMap]))
+
     mtile = ModelTile(
         model,
         tile,
@@ -69,7 +91,12 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         tilepoints,
         patchSplines,
         patchSpectral,
-        haloBuffer)
+        patchIndexMap,
+        tileView,
+        haloSendIndexMap,
+        haloSendView,
+        haloReceiveIndexMap,
+        haloReceiveBuffer)
     return mtile
 end
 
@@ -206,7 +233,11 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     # Create the model tiles
     println("Initializing modelTiles on workers")
+
+    # Precalculate indices and allocate buffers for shared and border transfers
     map(wait, [save_at(w, :mtile, :(createModelTile(patch,tile,model))) for w in workerids])
+
+    # Read in the initial conditions
     map(wait, [get_from(w, :(read_initialconditions(patch, mtile))) for w in workerids])
 
     # Delete the patch from the workers since the relevant info is already in the modelTile
@@ -615,20 +646,44 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
     # Establish RemoteChannel connections between workers
     println("Connecting workers")
-    # Master sends to first worker and gets from last
-    haloSend = RemoteChannel(()->Channel{SparseMatrixCSC{Float64, Int64}}(1),2)
+
+    # Master sends to first worker
+    haloSend = RemoteChannel(()->Channel{Array{Float64}}(1),2)
     wait(save_at(2, :haloReceive, :($(haloSend))))
+
+    # Each worker passes information up the chain
     for w in workerids[1:length(workerids)-1]
         send_index = w + 1
         wait(save_at(w, :haloSend,
-                :(RemoteChannel(()->Channel{SparseMatrixCSC{Float64, Int64}}(1),$(send_index)))))
+                :(RemoteChannel(()->Channel{Array{Float64}}(1),$(send_index)))))
         receiver = get_val_from(w, :haloSend)
         wait(save_at(send_index, :haloReceive, :($(receiver))))
     end
+
+    # Master receives from the last worker
     wait(save_at(last(workerids), :haloSend,
-            :(RemoteChannel(()->Channel{SparseMatrixCSC{Float64, Int64}}(1),1))))
+            :(RemoteChannel(()->Channel{Array{Float64}}(1),1))))
     haloReceive = get_val_from(last(workerids), :haloSend)
 
+    # First tile receives an empty halo from master to simplify later loops
+    firstMap = falses(size(patch.spectral))
+    bufferIndices = get_val_from(2, :(LinearIndices(mtile.haloReceiveBuffer)))
+    firstMap[bufferIndices] .= true
+    wait(get_from(2, :(mtile.haloReceiveIndexMap .= $(firstMap))))
+    haloSendBuffer = zeros(Float64,size(patch.spectral[firstMap]))
+
+    # Finalize connections for receivers
+    for w in workerids[1:length(workerids)-1]
+        send_index = w + 1
+        sendMap = get_val_from(w, :(mtile.haloSendIndexMap))
+        wait(get_from(send_index, :(mtile.haloReceiveIndexMap .= $(sendMap))))
+    end
+
+    # Last tile is received by master process
+    haloReceiveIndexMap = get_val_from(last(workerids), :(mtile.haloSendIndexMap))
+    haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
+
+    # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
     output_int = round(Int,model.output_interval / model.ts)
     println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
@@ -642,52 +697,47 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     for w in workerids
         save_at(w, :sharedSpectral, sharedSpectral)
     end
-    map(wait, [get_from(w, :(mtile.patchSpectral[:] .= sharedSpectral[:])) for w in workerids])
+    map(wait, [get_from(w, :(mtile.patchSpectral .= sharedSpectral)) for w in workerids])
 
+    # Loop throug the timesteps
     for t = 1:num_ts
         println("ts: $(t*model.ts)")
 
-        # Master process clear the shared array and get an empty halo for the first worker
-        clearSharedSpectral(sharedSpectral, haloSend)
+        # Master process clears the shared array and sends an empty halo to the first worker
+        sharedSpectral[:] .= 0.0
+        put!(haloSend, haloSendBuffer)
 
         # Advance each tile
         map(wait, [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids])
 
-        # Add border from last tile to complete sharedSpectral
-        borderSpectral = take!(haloReceive)
-        sharedSpectral[:, :] .= sum([sharedSpectral, borderSpectral])
+        # Get halo from previous tile
+        haloReceiveBuffer .= take!(haloReceive)
 
-        # Broadcast the spectral patch to the tiles
-        map(wait, [get_from(w, :(mtile.patchSpectral[:,:] .= sharedSpectral[:,:])) for w in workerids])
+        # Add it to the sharedArray
+        sharedSpectral[haloReceiveIndexMap] .+= haloReceiveBuffer
 
-        # Output if on time interval
+        # Reset the shared spectral patch to the tiles
+        map(wait, [get_from(w, :(mtile.patchSpectral .= sharedSpectral)) for w in workerids])
+
+        # Output if on specified time interval
         if mod(t,output_int) == 0
-            patch.spectral[:] .= sharedSpectral[:]
+            patch.spectral .= sharedSpectral
             gridTransform!(patch)
             spectralTransform!(patch)
             checkCFL(patch)
-            write_output(patch, model, (t*model.ts))
+            @async write_output(patch, model, (t*model.ts))
         end
+
+        # Done with this timestep
     end
 
-    # Reassemble to the patch
-    patch.spectral[:] .= sharedSpectral[:]
+    # Integration complete! Finalize the patch
+    patch.spectral .= sharedSpectral
     gridTransform!(patch)
     spectralTransform!(patch)
     println("Done with time integration")
     return true
 
-end
-
-function clearSharedSpectral(sharedSpectral::SharedArray{Float64}, haloSend::RemoteChannel)
-
-    # Clear it out
-    sharedSpectral[:] .= 0.0
-
-    # Send an empty border matrix to the first worker
-    put!(haloSend, spzeros(Float64,size(sharedSpectral)))
-
-    return nothing
 end
 
 function advanceTimestep(mtile::ModelTile, t::int)
@@ -750,15 +800,17 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # Assign b_nxt and b_now
     mtile.tile.spectral .= mtile.b_nxt
 
-    # Clear and set the border spectral array to share with the next tile
-    borderSpectral = getBorderSpectral(mtile.model.grid_params, mtile.tile, mtile.patchSpectral)
-
-    # Sync up with other tiles
-    put!(haloSend, borderSpectral)
-    borderSpectral = take!(haloReceive)
+    # Send halo to next tile
+    put!(haloSend, mtile.haloSendView)
 
     # Set the sharedArray this tile is responsible for
-    sumSharedSpectral(sharedSpectral, borderSpectral, mtile.model.grid_params, mtile.tile)
+    sharedSpectral[mtile.patchIndexMap] .= mtile.tileView
+
+    # Get halo from previous tile
+    mtile.haloReceiveBuffer .= take!(haloReceive)
+
+    # Add it to the sharedArray
+    sharedSpectral[mtile.haloReceiveIndexMap] .+= mtile.haloReceiveBuffer
 
     return nothing
 end
