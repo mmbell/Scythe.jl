@@ -145,14 +145,15 @@ function gridTransform!(patch::R_Grid, tile::R_Grid)
     return tile.physical
 end
 
-function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::R_Grid)
+function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::R_Grid, splineBuffer::Array{Float64})
 
     # Transform from the spectral to grid space
     # For R grid, the only varying dimension is the variable name
     # Have to use the patch spline and spectral array
 
     # pp::GridParameters is patch parameters, but this is not needed for 1D case
-    # It is retained for compatibility with calling function for more complex cases
+    # SplineBuffer holds radial derivatives, but this is not needed for 1D case
+    # They are retained for compatibility with calling function for more complex cases
 
     for i in eachindex(patchSplines)
         patchSplines[i].b .= patchSpectral[:,i]
@@ -294,4 +295,10 @@ function calcHaloMap(patch::R_Grid, tile::R_Grid)
     haloView[tiL:tiR,:] .= true
 
     return haloMap, view(tile.spectral, haloView)
+end
+
+function allocateSplineBuffer(grid::R_Grid)
+
+    # Not needed for R Grid
+    return zeros()
 end

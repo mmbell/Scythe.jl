@@ -490,12 +490,12 @@ function gridTransform!(patch::RL_Grid, tile::RL_Grid)
     return tile.physical
 end
 
-function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::RL_Grid)
+function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::RL_Grid, splineBuffer::Array{Float64})
 
     # Transform from the spectral to grid space
     # For RL grid, varying dimensions are R, L, and variable
-    spline_r = zeros(Float64, pp.rDim, pp.rDim*2+1)
-    spline_rr = zeros(Float64, pp.rDim, pp.rDim*2+1)
+    #spline_r = zeros(Float64, pp.rDim, pp.rDim*2+1)
+    #spline_rr = zeros(Float64, pp.rDim, pp.rDim*2+1)
 
     for v in values(pp.vars)
         # Wavenumber zero
@@ -504,8 +504,8 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
         patchSplines[1,v].b .= patchSpectral[k1:k2,v]
         SAtransform!(patchSplines[1,v])
         SItransform!(patchSplines[1,v])
-        spline_r[:,1] = SIxtransform(patchSplines[1,v])
-        spline_rr[:,1] = SIxxtransform(patchSplines[1,v])
+        splineBuffer[:,1,1] = SIxtransform(patchSplines[1,v])
+        splineBuffer[:,1,2] = SIxxtransform(patchSplines[1,v])
 
         for r = 1:tile.params.rDim
             # Offset physical index
@@ -521,16 +521,16 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
             patchSplines[2,v].b .= patchSpectral[p1:p2,v]
             SAtransform!(patchSplines[2,v])
             SItransform!(patchSplines[2,v])
-            spline_r[:,p] = SIxtransform(patchSplines[2,v])
-            spline_rr[:,p] = SIxxtransform(patchSplines[2,v])
+            splineBuffer[:,p,1] = SIxtransform(patchSplines[2,v])
+            splineBuffer[:,p,2] = SIxxtransform(patchSplines[2,v])
 
             p1 = (p*pp.b_rDim)+1
             p2 = (p+1)*pp.b_rDim
             patchSplines[3,v].b .= patchSpectral[p1:p2,v]
             SAtransform!(patchSplines[3,v])
             SItransform!(patchSplines[3,v])
-            spline_r[:,p+1] = SIxtransform(patchSplines[3,v])
-            spline_rr[:,p+1] = SIxxtransform(patchSplines[3,v])
+            splineBuffer[:,p+1,1] = SIxtransform(patchSplines[3,v])
+            splineBuffer[:,p+1,2] = SIxxtransform(patchSplines[3,v])
 
             for r = 1:tile.params.rDim
                 if (k <= r + tile.params.patchOffsetL)
@@ -566,7 +566,7 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
         for r = 1:tile.params.rDim
             # Offset physical index
             r1 = r + tile.params.patchOffsetL
-            tile.rings[r,v].b[1] = spline_r[r1,1]
+            tile.rings[r,v].b[1] = splineBuffer[r1,1,1]
         end
 
         # Higher wavenumbers
@@ -580,8 +580,8 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
                     ik = tile.rings[r,v].params.bDim-k+1
                     # Offset physical index
                     r1 = r + tile.params.patchOffsetL
-                    tile.rings[r,v].b[rk] = spline_r[r1,p]
-                    tile.rings[r,v].b[ik] = spline_r[r1,p+1]
+                    tile.rings[r,v].b[rk] = splineBuffer[r1,p,1]
+                    tile.rings[r,v].b[ik] = splineBuffer[r1,p+1,1]
                 end
             end
         end
@@ -604,7 +604,7 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
         for r = 1:tile.params.rDim
             # Offset physical index
             r1 = r + tile.params.patchOffsetL
-            tile.rings[r,v].b[1] = spline_rr[r1,1]
+            tile.rings[r,v].b[1] = splineBuffer[r1,1,2]
         end
 
         # Higher wavenumbers
@@ -618,8 +618,8 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
                     ik = tile.rings[r,v].params.bDim-k+1
                     # Offset physical index
                     r1 = r + tile.params.patchOffsetL
-                    tile.rings[r,v].b[rk] = spline_rr[r1,p]
-                    tile.rings[r,v].b[ik] = spline_rr[r1,p+1]
+                    tile.rings[r,v].b[rk] = splineBuffer[r1,p,2]
+                    tile.rings[r,v].b[ik] = splineBuffer[r1,p+1,2]
                 end
             end
         end
@@ -1034,4 +1034,9 @@ function getRegularGridpoints(grid::RL_Grid)
         end
     end
     return gridpoints
+end
+
+function allocateSplineBuffer(grid::RL_Grid)
+
+    return zeros(Float64, grid.params.rDim, grid.params.rDim*2+1, 2)
 end

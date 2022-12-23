@@ -46,6 +46,7 @@ struct ModelTile
     haloSendView::AbstractArray
     haloReceiveIndexMap::BitMatrix
     haloReceiveBuffer::Array{Float64}
+    splineBuffer::Array{Float64}
 end
 
 function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters,
@@ -77,8 +78,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     haloSendIndexMap = haloMap[1]
     haloSendView = haloMap[2]
 
-    # Set up the receiver buffer
+    # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
+    splineBuffer =  allocateSplineBuffer(patch)
 
     mtile = ModelTile(
         model,
@@ -98,7 +100,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         haloSendIndexMap,
         haloSendView,
         haloReceiveIndexMap,
-        haloReceiveBuffer)
+        haloReceiveBuffer,
+        splineBuffer)
     return mtile
 end
 
@@ -269,7 +272,7 @@ function read_initialconditions(patch::AbstractGrid, mtile::ModelTile)
     gridTransform!(patch)
 
     # Transform to local physical tile
-    gridTransform!(patch.splines, patch.spectral, mtile.model.grid_params, mtile.tile)
+    gridTransform!(patch.splines, patch.spectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
     #b_now is held in tile.spectral
     spectralTransform!(mtile.tile)
@@ -683,11 +686,6 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     haloReceiveIndexMap = get_val_from(last(workerids), :(mtile.haloSendIndexMap))
     haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
 
-    # Set up the timesteps
-    num_ts = round(Int,model.integration_time / model.ts)
-    output_int = round(Int,model.output_interval / model.ts)
-    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
-
     # Create a shared array for the spectral sum
     sharedSpectral = SharedArray{Float64,2}((size(patch.spectral,1),size(patch.spectral,2)))
     results = Array{Future}(undef,num_workers+1)
@@ -699,7 +697,29 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     end
     map(wait, [get_from(w, :(mtile.patchSpectral .= sharedSpectral)) for w in workerids])
 
-    # Loop throug the timesteps
+    # Loop through the model timestepps
+    @time model_loop(patch, model, workerids, sharedSpectral, haloSend, haloReceive,
+        haloSendBuffer, haloReceiveBuffer, haloReceiveIndexMap)
+
+    # Integration complete! Finalize the patch
+    patch.spectral .= sharedSpectral
+    gridTransform!(patch)
+    spectralTransform!(patch)
+    println("Done with time integration")
+    return true
+
+end
+
+function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
+        sharedSpectral::SharedArray{Float64}, haloSend::RemoteChannel, haloReceive::RemoteChannel,
+        haloSendBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveIndexMap::BitMatrix)
+
+    # Set up the timesteps
+    num_ts = round(Int,model.integration_time / model.ts)
+    output_int = round(Int,model.output_interval / model.ts)
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+
+    # Loop through the timesteps
     for t = 1:num_ts
         println("ts: $(t*model.ts)")
 
@@ -730,14 +750,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
         # Done with this timestep
     end
-
-    # Integration complete! Finalize the patch
-    patch.spectral .= sharedSpectral
-    gridTransform!(patch)
-    spectralTransform!(patch)
-    println("Done with time integration")
-    return true
-
+    return nothing
 end
 
 function advanceTimestep(mtile::ModelTile, t::int)
@@ -777,7 +790,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         haloSend::RemoteChannel, haloReceive::RemoteChannel, t::int)
 
     # Transform to local physical tile
-    gridTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
+    gridTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
     #b_now is held in tile.spectral
     spectralTransform!(mtile.tile)

@@ -23,7 +23,7 @@ export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export AbstractGrid, R_Grid, RZ_Grid, RL_Grid
 export calcTileSizes, setSpectralTile!, setSpectralTile
 export sumSharedSpectral, getBorderSpectral
-export calcPatchMap, calcHaloMap
+export calcPatchMap, calcHaloMap, allocateSplineBuffer
 
 Base.@kwdef struct GridParameters
     geometry::String = "R"
