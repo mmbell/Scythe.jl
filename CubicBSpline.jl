@@ -326,8 +326,7 @@ end
 
 function SAtransform!(spline::Spline1D)
 
-    a = spline.gammaBC' * (spline.pqFactor \ (spline.gammaBC * spline.b))
-    spline.a .= a
+    spline.a .= spline.gammaBC' * (spline.pqFactor \ (spline.gammaBC * spline.b))
 end
 
 function SAtransform(spline::Spline1D, b::Vector{real}, ahat::Vector{real})
@@ -384,22 +383,37 @@ function SItransform(sp::SplineParameters, a::Vector{real}, points::Vector{real}
     return u
 end
 
-function SItransform!(spline::Spline1D)
+function SItransform(sp::SplineParameters, a::Vector{real}, points::Vector{real}, u::AbstractVector, derivative::int = 0)
 
-    u = SItransform(spline.params,spline.a,spline.mishPoints)
-    spline.uMish .= u
-end
-
-function SItransform(spline::Spline1D, a::Vector{real}, points::Vector{real})
-
-    u = SItransform(spline.params,a,points)
+    for i in eachindex(points)
+        u[i] = 0.0
+        xm = ceil(int,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
+        for m = xm:(xm + 3)
+            if (m >= -1) && (m <= (sp.num_cells+1))
+                mi = m + 2
+                u[i] += basis(sp, m, points[i], derivative) * a[mi]
+            end
+        end
+    end
     return u
 end
 
-function SIxtransform(sp::SplineParameters, a::Vector{real}, points::Vector{real})
+function SItransform!(spline::Spline1D)
 
-    uprime = SItransform(sp,a,points,1)
-    return uprime 
+    u = SItransform(spline.params,spline.a,spline.mishPoints,spline.uMish)
+    return u
+end
+
+function SItransform(spline::Spline1D, u::AbstractVector)
+
+    u = SItransform(spline.params,spline.a,spline.mishPoints,u)
+    return u
+end
+
+function SItransform(spline::Spline1D, points::Vector{real}, u::AbstractVector)
+
+    u = SItransform(spline.params,spline.a,points,u)
+    return u
 end
 
 function SIxtransform(spline::Spline1D)
@@ -408,23 +422,22 @@ function SIxtransform(spline::Spline1D)
     return uprime
 end
 
-function SIxtransform(spline::Spline1D, a::Vector{real})
+function SIxtransform(spline::Spline1D, uprime::AbstractVector)
 
-    uprime = SItransform(spline.params,a,spline.mishPoints,1)
+    uprime = SItransform(spline.params,spline.a,spline.mishPoints,uprime,1)
     return uprime
 end
 
-function SIxtransform(spline::Spline1D, a::Vector{real}, points::Vector{real})
+function SIxtransform(spline::Spline1D, points::Vector{real}, uprime::AbstractVector)
 
-    uprime = SItransform(spline.params,a,points,1)
+    uprime = SItransform(spline.params,spline.a,points,uprime,1)
     return uprime
 end
 
-function SIxxtransform(sp::SplineParameters, a::Vector{real}, points::Vector{real})
+function SIxtransform(sp::SplineParameters, a::Vector{real}, points::AbstractVector)
 
-    uprime2 = SItransform(sp,a,points,2)
-    return uprime2
-    
+    uprime = SItransform(sp,a,points,1)
+    return uprime
 end
 
 function SIxxtransform(spline::Spline1D)
@@ -433,15 +446,21 @@ function SIxxtransform(spline::Spline1D)
     return uprime2
 end
 
-function SIxxtransform(spline::Spline1D, a::Vector{real})
+function SIxxtransform(spline::Spline1D, uprime2::AbstractVector)
 
-    uprime2 = SItransform(spline.params,a,spline.mishPoints,2)
+    uprime2 = SItransform(spline.params,spline.a,spline.mishPoints,uprime2,2)
     return uprime2
 end
 
-function SIxxtransform(spline::Spline1D, a::Vector{real}, points::Vector{real})
+function SIxxtransform(spline::Spline1D, points::Vector{real}, uprime2::AbstractVector)
 
-    uprime2 = SItransform(spline.params,a,points,2)
+    uprime2 = SItransform(spline.params,spline.a,points,uprime2,2)
+    return uprime2
+end
+
+function SIxxtransform(sp::SplineParameters, a::Vector{real}, points::Vector{real})
+
+    uprime2 = SItransform(sp,a,points,2)
     return uprime2
 end
 

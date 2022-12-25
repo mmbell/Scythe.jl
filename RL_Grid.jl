@@ -936,9 +936,9 @@ function regularGridTransform(grid::RL_Grid)
         k1 = 1
         k2 = grid.params.b_rDim
         a = SAtransform(grid.splines[1,v], grid.spectral[k1:k2,v])
-        spline[:,1] = SItransform(grid.splines[1,v], a, rpoints)
-        spline_r[:,1] = SIxtransform(grid.splines[1,v], a, rpoints)
-        spline_rr[:,1] = SIxxtransform(grid.splines[1,v], a, rpoints)
+        spline[:,1] = SItransform(grid.splines[1,v].params, a, rpoints)
+        spline_r[:,1] = SIxtransform(grid.splines[1,v].params, a, rpoints)
+        spline_rr[:,1] = SIxxtransform(grid.splines[1,v].params, a, rpoints)
         
         # Higher wavenumbers
         for k = 1:grid.params.rDim
@@ -946,16 +946,16 @@ function regularGridTransform(grid::RL_Grid)
             p1 = ((p-1)*grid.params.b_rDim)+1
             p2 = p*grid.params.b_rDim
             a = SAtransform(grid.splines[2,v], grid.spectral[p1:p2,v])
-            spline[:,p] = SItransform(grid.splines[2,v], a, rpoints)
-            spline_r[:,p] = SIxtransform(grid.splines[2,v], a, rpoints)
-            spline_rr[:,p] = SIxxtransform(grid.splines[2,v], a, rpoints)
+            spline[:,p] = SItransform(grid.splines[2,v].params, a, rpoints)
+            spline_r[:,p] = SIxtransform(grid.splines[2,v].params, a, rpoints)
+            spline_rr[:,p] = SIxxtransform(grid.splines[2,v].params, a, rpoints)
             
             p1 = (p*grid.params.b_rDim)+1
             p2 = (p+1)*grid.params.b_rDim
             a = SAtransform(grid.splines[3,v], grid.spectral[p1:p2,v])
-            spline[:,p+1] = SItransform(grid.splines[3,v], a, rpoints)
-            spline_r[:,p+1] = SIxtransform(grid.splines[3,v], a, rpoints)
-            spline_rr[:,p+1] = SIxxtransform(grid.splines[3,v], a, rpoints)
+            spline[:,p+1] = SItransform(grid.splines[3,v].params, a, rpoints)
+            spline_r[:,p+1] = SIxtransform(grid.splines[3,v].params, a, rpoints)
+            spline_rr[:,p+1] = SIxxtransform(grid.splines[3,v].params, a, rpoints)
         end
         
         for r = 1:grid.params.num_cells

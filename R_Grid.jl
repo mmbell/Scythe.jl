@@ -76,26 +76,32 @@ function spectralTransform(grid::R_Grid, physical::Array{real}, spectral::Array{
     end
 end
 
-function spectralxTransform(grid::R_Grid, physical::Array{real}, spectral::Array{real})
-    
-    # Transform from the grid to spectral space
-    # For R grid, the only varying dimension is the variable name
-    # Need to use a R0 BC for this!
-    Fspline = Spline1D(SplineParameters(xmin = grid.params.xmin, 
-            xmax = grid.params.xmax,
-            num_cells = grid.params.num_cells, 
-            BCL = CubicBSpline.R0, 
-            BCR = CubicBSpline.R0))
+#function spectralxTransform(grid::R_Grid, physical::Array{real}, spectral::Array{real})
+#    
+#    # Transform from the grid to spectral space
+#    # For R grid, the only varying dimension is the variable name
+#    # Need to use a R0 BC for this!
+#    Fspline = Spline1D(SplineParameters(xmin = grid.params.xmin, 
+#            xmax = grid.params.xmax,
+#            num_cells = grid.params.num_cells, 
+#            BCL = CubicBSpline.R0, 
+#            BCR = CubicBSpline.R0))
+#
+#    for i in eachindex(grid.splines)
+#        b = SBtransform(Fspline, physical[:,i,1])
+#        a = SAtransform(Fspline, b)
+#        Fx = SIxtransform(Fspline, a)
+#        bx = SBtransform(Fspline, Fx)
+#        
+#        # Assign the spectral array
+#        spectral[:,i] .= bx
+#    end
+#end
 
-    for i in eachindex(grid.splines)
-        b = SBtransform(Fspline, physical[:,i,1])
-        a = SAtransform(Fspline, b)
-        Fx = SIxtransform(Fspline, a)
-        bx = SBtransform(Fspline, Fx)
-        
-        # Assign the spectral array
-        spectral[:,i] .= bx
-    end
+function spectralxTransform(grid::R_Grid, physical::Array{real}, spectral::Array{real})
+
+    # Not implemented
+
 end
 
 function gridTransform!(grid::R_Grid)
@@ -107,18 +113,17 @@ function gridTransform!(grid::R_Grid)
 end
 
 function gridTransform(grid::R_Grid, physical::Array{real}, spectral::Array{real})
-    
+
     # Transform from the spectral to grid space
     # For R grid, the only varying dimension is the variable name
     for i in eachindex(grid.splines)
-        grid.splines[i].b .= spectral[:,i]
+        grid.splines[i].b .= view(spectral,:,i)
         SAtransform!(grid.splines[i])
-        SItransform!(grid.splines[i])
         
         # Assign the grid array
-        physical[:,i,1] .= grid.splines[i].uMish
-        physical[:,i,2] .= SIxtransform(grid.splines[i])
-        physical[:,i,3] .= SIxxtransform(grid.splines[i])
+        SItransform(grid.splines[i],getGridpoints(grid),view(physical,:,i,1))
+        SIxtransform(grid.splines[i],getGridpoints(grid),view(physical,:,i,2))
+        SIxxtransform(grid.splines[i],getGridpoints(grid),view(physical,:,i,3))
     end
     
     return physical 
@@ -130,16 +135,13 @@ function gridTransform!(patch::R_Grid, tile::R_Grid)
     # For R grid, the only varying dimension is the variable name
     # Have to use the patch spline and spectral array
     for i in eachindex(patch.splines)
-        patch.splines[i].b .= patch.spectral[:,i]
+        patch.splines[i].b .= view(patch.spectral,:,i)
         SAtransform!(patch.splines[i])
-        SItransform!(patch.splines[i])
 
         # Assign to the tile grid
-        u1 = tile.params.patchOffsetL + 1
-        u2 = tile.params.patchOffsetR
-        tile.physical[:,i,1] .= patch.splines[i].uMish[u1:u2]
-        tile.physical[:,i,2] .= SIxtransform(patch.splines[i])[u1:u2]
-        tile.physical[:,i,3] .= SIxxtransform(patch.splines[i])[u1:u2]
+        SItransform(patch.splines[i],getGridpoints(tile),view(tile.physical,:,i,1))
+        SIxtransform(patch.splines[i],getGridpoints(tile),view(tile.physical,:,i,2))
+        SIxxtransform(patch.splines[i],getGridpoints(tile),view(tile.physical,:,i,3))
     end
 
     return tile.physical
@@ -156,16 +158,13 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
     # They are retained for compatibility with calling function for more complex cases
 
     for i in eachindex(patchSplines)
-        patchSplines[i].b .= patchSpectral[:,i]
+        patchSplines[i].b .= view(patchSpectral,:,i)
         SAtransform!(patchSplines[i])
-        SItransform!(patchSplines[i])
 
         # Assign to the tile grid
-        u1 = tile.params.patchOffsetL + 1
-        u2 = tile.params.patchOffsetR
-        tile.physical[:,i,1] .= patchSplines[i].uMish[u1:u2]
-        tile.physical[:,i,2] .= SIxtransform(patchSplines[i])[u1:u2]
-        tile.physical[:,i,3] .= SIxxtransform(patchSplines[i])[u1:u2]
+        SItransform(patchSplines[i],getGridpoints(tile),view(tile.physical,:,1,1))
+        SIxtransform(patchSplines[i],getGridpoints(tile),view(tile.physical,:,1,2))
+        SIxxtransform(patchSplines[i],getGridpoints(tile),view(tile.physical,:,1,3))
     end
 
     return tile.physical
