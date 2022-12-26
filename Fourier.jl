@@ -39,9 +39,11 @@ struct Fourier1D
     # In this context, uMish is the physical values
     # b is the filtered Fourier coefficients 
     # a is the Fourier coefficients with padding
+    # ax is a buffer for derivative and integral coefficients
     uMish::Vector{real}
     b::Vector{real}
     a::Vector{real}
+    ax::Vector{real}
 end
 
 function Fourier1D(fp::FourierParameters)
@@ -51,6 +53,7 @@ function Fourier1D(fp::FourierParameters)
     uMish = zeros(real,fp.yDim)
     b = zeros(real,fp.bDim)
     a = zeros(real,fp.yDim)
+    ax = zeros(real,fp.yDim)
     
     # Plan the FFT
     fftPlan = FFTW.plan_r2r(a, FFTW.FFTW.R2HC, flags=FFTW.PATIENT)
@@ -60,7 +63,7 @@ function Fourier1D(fp::FourierParameters)
     phasefilter = calcPhaseFilter(fp)
     invphasefilter = calcInvPhaseFilter(fp)
     
-    ring = Fourier1D(fp,mishPoints,fftPlan,ifftPlan,phasefilter,invphasefilter,uMish,b,a)
+    ring = Fourier1D(fp,mishPoints,fftPlan,ifftPlan,phasefilter,invphasefilter,uMish,b,a,ax)
     return ring
 end
 
@@ -143,9 +146,8 @@ function FItransform!(ring::Fourier1D)
     ring.uMish .= ring.ifftPlan * ring.a
 end
 
-function FIxcoefficients(fp::FourierParameters, a::Vector{real})
+function FIxcoefficients(fp::FourierParameters, a::Vector{real}, ax::Vector{real})
 
-    ax = zeros(Float64, fp.yDim)
     for k = 1:fp.kmax
         ax[k+1] = -k * a[fp.yDim-k+1]
         ax[fp.yDim-k+1] = k * a[k+1]
@@ -153,33 +155,37 @@ function FIxcoefficients(fp::FourierParameters, a::Vector{real})
     return ax
 end
 
-function FIxtransform(fp::FourierParameters, ifftPlan, a::Vector{real})
+function FIxtransform(fp::FourierParameters, ifftPlan, a::Vector{real}, ax::Vector{real})
 
     # Do the inverse transform with derivative coefficients to get back physical values
-    ax = FIxcoefficients(fp,a)
-    ux = ifftPlan * ax
+    ux = ifftPlan * FIxcoefficients(fp,a,ax)
     return ux
 end
 
 function FIxtransform(ring::Fourier1D)
 
     # Do the inverse transform with derivative coefficients to get back physical values
-    ax = FIxcoefficients(ring.params,ring.a)
-    ux = ring.ifftPlan * ax
+    ux = ring.ifftPlan * FIxcoefficients(ring.params,ring.a,ring.ax)
+    return ux
+end
+
+function FIxtransform(ring::Fourier1D, ux::AbstractVector)
+
+    # Do the inverse transform with derivative coefficients to get back physical values
+    ux .= ring.ifftPlan * FIxcoefficients(ring.params,ring.a,ring.ax)
     return ux
 end
 
 function FIxxtransform(ring::Fourier1D)
 
     # Do the inverse transform with derivative coefficients to get back physical values
-    ax = FIxcoefficients(ring.params,ring.a)
-    uxx = FIxtransform(ring.params, ring.ifftPlan, ax)
+    ax = copy(FIxcoefficients(ring.params,ring.a,ring.ax))
+    uxx = FIxtransform(ring.params, ring.ifftPlan, ax, ring.ax)
     return uxx
 end
 
-function FIIntcoefficients(fp::FourierParameters, a::Vector{real}, C0::real = 0.0)
-    
-    aInt = zeros(Float64, fp.yDim)
+function FIIntcoefficients(fp::FourierParameters, a::Vector{real}, aInt::Vector{real}, C0::real = 0.0)
+
     aInt[1] = C0
     for k = 1:fp.kmax
         aInt[k+1] = a[fp.yDim-k+1] / k
@@ -188,19 +194,16 @@ function FIIntcoefficients(fp::FourierParameters, a::Vector{real}, C0::real = 0.
     return aInt
 end
 
-function FIInttransform(fp::FourierParameters, ifftPlan, a::Vector{real}, C0::real = 0.0)
+function FIInttransform(fp::FourierParameters, ifftPlan, a::Vector{real}, aInt::Vector{real}, C0::real = 0.0)
 
     # Do the inverse transform with derivative coefficients to get back physical values
-    aInt = FIIntcoefficients(fp,a,C0)
-    uInt = ifftPlan * aInt
-    return uInt
+    return ifftPlan * FIIntcoefficients(fp,a,aInt,C0)
 end
 
 function FIInttransform(ring::Fourier1D, C0::real = 0.0)
 
     # Do the inverse transform with derivative coefficients to get back physical values
-    uInt = FIInttransform(ring.params,ring.ifftPlan,ring.a,C0)
-    return ux
+    return FIInttransform(ring.params,ring.ifftPlan,ring.a,ring.ax,C0)
 end
 
 
