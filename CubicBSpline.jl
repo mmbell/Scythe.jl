@@ -52,7 +52,6 @@ struct Spline1D
     pqFactor::SuiteSparse.CHOLMOD.Factor{Float64}
     mishDim::int
     bDim::int
-    aDim::int
     mishPoints::Vector{real}
     uMish::Vector{real}
     b::Vector{real}
@@ -230,11 +229,10 @@ function Spline1D(sp::SplineParameters)
     uMish = zeros(real,sp.num_cells*mubar)
 
     bDim = sp.num_cells + 3
-    aDim = sp.num_cells + 3
     b = zeros(real,bDim)
-    a = zeros(real,aDim)
+    a = zeros(real,bDim)
 
-    spline = Spline1D(sp,gammaBC,pq,pqFactor,mishDim,bDim,aDim,mishPoints,uMish,b,a)
+    spline = Spline1D(sp,gammaBC,pq,pqFactor,mishDim,bDim,mishPoints,uMish,b,a)
     return spline
 end
 
