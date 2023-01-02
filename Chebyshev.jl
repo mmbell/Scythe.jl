@@ -5,7 +5,6 @@ using Parameters
 using FFTW
 
 export ChebyshevParameters, Chebyshev1D
-#export R0, R1T0, R1T1, R1T2, R2T10, R2T20, R3, PERIODIC
 export CBtransform, CBtransform!, CAtransform!, CItransform!
 export CBxtransform, CIxtransform, CIxxtransform, CIInttransform
 
@@ -56,6 +55,7 @@ struct Chebyshev1D
     uMish::Vector{real}
     b::Vector{real}
     a::Vector{real}
+    ax::Vector{real}
 end
 
 function Chebyshev1D(cp::ChebyshevParameters)
@@ -66,13 +66,14 @@ function Chebyshev1D(cp::ChebyshevParameters)
     uMish = zeros(real,cp.zDim)
     b = zeros(real,cp.bDim)
     a = zeros(real,cp.zDim)
+    ax = zeros(real,cp.zDim)
 
     # Plan the FFT
     fftPlan = FFTW.plan_r2r(a, FFTW.REDFT00, flags=FFTW.PATIENT)
     
     filter = calcFilterMatrix(cp)
 
-    column = Chebyshev1D(cp,mishPoints,gammaBC,fftPlan,filter,uMish,b,a)
+    column = Chebyshev1D(cp,mishPoints,gammaBC,fftPlan,filter,uMish,b,a,ax)
     return column
 end
 
@@ -174,44 +175,35 @@ function CIInttransform(column::Chebyshev1D, C0::real = 0.0)
     return uInt
 end
 
-function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real})
+function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real}, ax::Vector{real})
 
     # Recursive relationship for derivative coefficients
-    ax = zeros(real,cp.zDim)
     k = cp.zDim
     ax[k-1] = (2.0 * (k-1) * a[k])
     for k = (cp.zDim-1):-1:2
         ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
     end
-    return ax ./ (-0.5 * (cp.zmax - cp.zmin))
+    ax ./= (-0.5 * (cp.zmax - cp.zmin))
+    return ax
 end
 
-function CIxtransform(cp::ChebyshevParameters, fftPlan, a::Vector{real})
-
-    # Recursive relationship for derivative coefficients
-    ax = zeros(real,cp.zDim)
-    k = cp.zDim
-    ax[k-1] = (2.0 * (k-1) * a[k])
-    for k = (cp.zDim-1):-1:2
-        ax[k-1] = (2.0 * (k-1) * a[k]) + ax[k+1]
-    end
-    ax = ax ./ (-0.5 * (cp.zmax - cp.zmin))
+function CIxtransform(cp::ChebyshevParameters, fftPlan, a::Vector{real}, ax::Vector{real})
     
     # Do the inverse transform to get back physical values
-    ux = fftPlan * ax
+    ux = fftPlan * CIxcoefficients(cp,a,ax)
     return ux
 end
 
 function CIxtransform(column::Chebyshev1D)
     
-    ux = CIxtransform(column.params, column.fftPlan, column.a)
+    ux = CIxtransform(column.params, column.fftPlan, column.a, column.ax)
     return ux
 end
 
 function CIxxtransform(column::Chebyshev1D)
     
-    ax = CIxcoefficients(column.params, column.a)
-    uxx = CIxtransform(column.params, column.fftPlan, ax)
+    ax = copy(CIxcoefficients(column.params, column.a, column.ax))
+    uxx = CIxtransform(column.params, column.fftPlan, ax, column.ax)
     return uxx
 end
 
