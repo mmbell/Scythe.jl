@@ -7,6 +7,24 @@ struct R_Grid <: AbstractGrid
     physical::Array{Float64}
 end
 
+function create_R_Grid(gp::GridParameters)
+
+    # Create a 1-D grid with bSplines as basis
+    splines = Array{Spline1D}(undef,1,length(values(gp.vars)))
+    spectral = zeros(Float64, gp.b_rDim, length(values(gp.vars)))
+    physical = zeros(Float64, gp.rDim, length(values(gp.vars)), 3)
+    grid = R_Grid(gp, splines, spectral, physical)
+    for key in keys(gp.vars)
+        grid.splines[1,gp.vars[key]] = Spline1D(SplineParameters(
+            xmin = gp.xmin,
+            xmax = gp.xmax,
+            num_cells = gp.num_cells,
+            BCL = gp.BCL[key],
+            BCR = gp.BCR[key]))
+    end
+    return grid
+end
+
 function calcTileSizes(patch::R_Grid, num_tiles::int)
 
     # Calculate the appropriate tile size for the given patch

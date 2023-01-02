@@ -47,6 +47,9 @@ struct Chebyshev1D
     # Measured FFTW Plan
     fftPlan::FFTW.r2rFFTWPlan{Float64, (3,), false, 1, UnitRange{Int64}}
     
+    # Filter matrix
+    filter::Matrix{real}
+
     # uMish is the physical values
     # b is the filtered Chebyshev coefficients without BCs
     # a is the padded Chebyshev coefficients with BCs
@@ -67,7 +70,9 @@ function Chebyshev1D(cp::ChebyshevParameters)
     # Plan the FFT
     fftPlan = FFTW.plan_r2r(a, FFTW.REDFT00, flags=FFTW.PATIENT)
     
-    column = Chebyshev1D(cp,mishPoints,gammaBC,fftPlan,uMish,b,a)
+    filter = calcFilterMatrix(cp)
+
+    column = Chebyshev1D(cp,mishPoints,gammaBC,fftPlan,filter,uMish,b,a)
     return column
 end
 
@@ -83,6 +88,12 @@ function calcMishPoints(cp::ChebyshevParameters)
     return z
 end
 
+function calcFilterMatrix(cp::ChebyshevParameters)
+
+    filter = Matrix(1.0I, cp.bDim, cp.zDim)
+    return filter
+end
+
 function CBtransform(cp::ChebyshevParameters, fftPlan, uMish::Vector{real})
 
     # Do the DCT transform and pre-scale
@@ -94,14 +105,14 @@ function CBtransform!(column::Chebyshev1D)
 
     # Do the DCT transform and pre-scale
     b = (column.fftPlan * column.uMish) ./ (2 * (column.params.zDim -1))
-    column.b .= b[1:column.params.bDim]
+    column.b .= column.filter * b
 end
 
 function CBtransform(column::Chebyshev1D, uMish::Vector{real})
 
     # Do the DCT transform and pre-scale
     b = (column.fftPlan * uMish) ./ (2 * (column.params.zDim -1))
-    return b[1:column.params.bDim]
+    return column.filter * b
 end
 
 function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
@@ -115,7 +126,7 @@ end
 function CAtransform!(column::Chebyshev1D)
 
     # Apply the BCs
-    bfill = [column.b ; zeros(Float64, column.params.zDim-column.params.bDim)]
+    bfill = column.filter' * column.b
     a = bfill .+ (column.gammaBC' * bfill)
     column.a .= a
 end

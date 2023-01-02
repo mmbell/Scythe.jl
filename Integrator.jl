@@ -230,8 +230,13 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
             xmin = tile_params[1,myid()-1],
             xmax = tile_params[2,myid()-1],
             num_cells = tile_params[3,myid()-1],
+            zmin = patch.params.zmin,
+            zmax = patch.params.zmax,
+            zDim = patch.params.zDim,
             BCL = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
             BCR = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
+            BCB = patch.params.BCB,
+            BCT = patch.params.BCT,
             vars = patch.params.vars,
             spectralIndexL = tile_params[4,myid()-1],
             tile_num = myid())))) for w in workerids])
@@ -276,10 +281,6 @@ function read_initialconditions(patch::AbstractGrid, mtile::ModelTile)
 
     #b_now is held in tile.spectral
     spectralTransform!(mtile.tile)
-
-    # Clear and set the local patch spectral array
-    setSpectralTile(mtile.patchSpectral, mtile.model.grid_params, mtile.tile)
-
 end
 
 function read_initialconditions(ic::String, grid::R_Grid)
@@ -367,6 +368,37 @@ function read_initialconditions(ic::String, grid::RL_Grid)
         end
     end
     
+    # Assign variables
+    for (key, value) in pairs(grid.params.vars)
+        grid.physical[:,value,1] .= select(initialconditions, key)
+    end
+
+end
+
+function read_initialconditions(ic::String, grid::RLZ_Grid)
+
+    # 3D radius-lambda-height grid
+    initialconditions = CSV.read(ic, DataFrame, header=1)
+
+    # Check for match to grid
+    # Can be more sophisticated here, just checking matching dimensions for now
+    if (grid.params.zDim * grid.params.lDim) != length(initialconditions.r)
+        throw(DomainError(length(initialconditions.r), 
+                "IC dimensions do not match model parameters"))
+    end
+
+    for key in keys(grid.params.vars)
+        foundkey = false
+        for name in names(initialconditions)
+            if (name == key)
+                foundkey = true
+            end
+        end
+        if foundkey == false
+            throw(DomainError(key, "IC missing data"))
+        end
+    end
+
     # Assign variables
     for (key, value) in pairs(grid.params.vars)
         grid.physical[:,value,1] .= select(initialconditions, key)
@@ -1172,6 +1204,132 @@ function write_output(grid::RL_Grid, model::ModelParameters, t::real)
     end
     close(rfile)
     
+end
+
+function write_output(grid::RLZ_Grid, model::ModelParameters, t::real)
+
+    time = round(t; digits=2)
+    if !isdir(model.output_dir)
+        mkdir(model.output_dir)
+    end
+
+    println("Writing output to $(model.output_dir) at time $time")
+    dir = model.output_dir
+    afilename = string(dir, "spectral_out_", time, ".csv")
+    ufilename = string(dir, "physical_out_", time, ".csv")
+    rfilename = string(dir, "gridded_out_", time, ".csv")
+    afile = open(afilename,"w")
+    ufile = open(ufilename,"w")
+    rfile = open(rfilename,"w")
+
+    aheader = "z,r,k,"
+    uheader = "r,l,z,x,y,"
+    rheader = "r,l,z,x,y,"
+    suffix = ["","_r","_rr","_l","_ll","_z","_zz"]
+    for d = 1:7
+        for var in keys(grid.params.vars)
+            if (d == 1)
+                aheader *= "$var,"
+            end
+            varout = var * suffix[d]
+            uheader *= "$varout,"
+            rheader *= "$varout,"
+        end
+    end
+    aheader = chop(aheader) * "\n"
+    uheader = chop(uheader) * "\n"
+    rheader = chop(rheader) * "\n"
+    write(afile,aheader)
+    write(ufile,uheader)
+    write(rfile,rheader)
+
+    kDim = grid.params.rDim + grid.params.patchOffsetL
+
+    for z = 1:grid.params.b_zDim
+        r1 = ((z-1) * grid.params.b_rDim * (1 + (kDim * 2))) + 1
+        r2 = r1 + grid.params.b_rDim - 1
+        # Wave 0
+        r = 1
+        for ri = r1:r2
+            astring = "$z,$r,0,"
+            for var in keys(grid.params.vars)
+                v = grid.params.vars[var]
+                a = grid.spectral[ri,v]
+                astring *= "$(a),"
+            end
+            astring = chop(astring) * "\n"
+            write(afile,astring)
+            r += 1
+        end
+
+        # Higher wavenumbers
+        for k = 1:kDim
+            p = (k-1)*2
+            p1 = r2 + 1 + (p*grid.params.b_rDim)
+            p2 = p1 + grid.params.b_rDim - 1
+            r = 1
+            for kr = p1:p2
+                astring = "$z,$r,$(k)r,"
+                for var in keys(grid.params.vars)
+                    v = grid.params.vars[var]
+                    a = grid.spectral[kr,v]
+                    astring *= "$(a),"
+                end
+                astring = chop(astring) * "\n"
+                write(afile,astring)
+                r += 1
+            end
+            p1 = p2 + 1
+            p2 = p1 + grid.params.b_rDim - 1
+            r = 1
+            for ki = p1:p2
+                astring = "$z,$ki,$(k)i,"
+                for var in keys(grid.params.vars)
+                    v = grid.params.vars[var]
+                    a = grid.spectral[ki,v]
+                    astring *= "$(a),"
+                end
+                astring = chop(astring) * "\n"
+                write(afile,astring)
+                r += 1
+            end
+        end
+    end
+    close(afile)
+
+    gridpoints = getGridpoints(grid)
+    cartesianpoints = getCartesianGridpoints(grid)
+    for i in eachindex(gridpoints[:,1])
+        ustring = "$(gridpoints[i,1]),$(gridpoints[i,2]),$(gridpoints[i,3]),$(cartesianpoints[i,1]),$(cartesianpoints[i,2]),"
+        for d = 1:7
+            for var in keys(grid.params.vars)
+                v = grid.params.vars[var]
+                u = grid.physical[i,v,d]
+                ustring *= "$u,"
+            end
+        end
+        ustring = chop(ustring) * "\n"
+        write(ufile,ustring)
+    end
+    close(ufile)
+
+    # Get regular grid
+    regular_grid = regularGridTransform(grid)
+    gridpoints = getRegularGridpoints(grid)
+    for i in eachindex(gridpoints[:,1])
+        rstring = "$(gridpoints[i,1]),$(gridpoints[i,2]),$(gridpoints[i,3]),$(gridpoints[i,4]),$(gridpoints[i,5]),"
+        for d = 1:7
+            for var in keys(grid.params.vars)
+                v = grid.params.vars[var]
+                u = regular_grid[i,v,d]
+                rstring *= "$u,"
+            end
+        end
+        rstring = chop(rstring) * "\n"
+        write(rfile,rstring)
+    end
+    close(rfile)
+
 end
 
 function checkCFL(grid)

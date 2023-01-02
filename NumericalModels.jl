@@ -220,6 +220,28 @@ function LinearAdvectionRL(grid::RL_Grid,
     # F = 0
 end
 
+function LinearAdvectionRLZ(grid::RLZ_Grid, 
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+
+    #2D Linear advection to test
+    K = model.physical_params[:K]
+
+    r = gridpoints[:,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    u = grid.physical[:,2,1]
+    v = grid.physical[:,3,1]
+
+    vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))) 
+
+    # F = 0
+end
+
 function LinearShallowWaterRL(grid::RL_Grid, 
             gridpoints::Array{real},
             vardot::Array{real},

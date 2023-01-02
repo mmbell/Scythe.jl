@@ -8,6 +8,85 @@ struct RL_Grid <: AbstractGrid
     physical::Array{Float64}
 end
 
+function create_RL_Grid(gp::GridParameters)
+
+    # RL is 2-D grid with splines and Fourier basis
+    # Calculate the number of points in the grid
+    lpoints = 0
+    blpoints = 0
+    for r = 1:gp.rDim
+        ri = r + gp.patchOffsetL
+        lpoints += 4 + 4*ri
+        blpoints += 1 + 2*ri
+    end
+
+    # Have to create a new immutable structure for the parameters
+    gp2 = GridParameters(
+        geometry = gp.geometry,
+        xmin = gp.xmin,
+        xmax = gp.xmax,
+        num_cells = gp.num_cells,
+        rDim = gp.rDim,
+        b_rDim = gp.b_rDim,
+        l_q = gp.l_q,
+        BCL = gp.BCL,
+        BCR = gp.BCR,
+        lDim = lpoints,
+        b_lDim = blpoints,
+        zmin = gp.zmin,
+        zmax = gp.zmax,
+        zDim = gp.zDim,
+        b_zDim = gp.b_zDim,
+        BCB = gp.BCB,
+        BCT = gp.BCT,
+        vars = gp.vars,
+        spectralIndexL = gp.spectralIndexL,
+        spectralIndexR = gp.spectralIndexR,
+        patchOffsetL = gp.patchOffsetL,
+        tile_num = gp.tile_num)
+
+    splines = Array{Spline1D}(undef,3,length(values(gp2.vars)))
+    rings = Array{Fourier1D}(undef,gp2.rDim,length(values(gp2.vars)))
+    spectral = zeros(Float64, gp2.b_lDim, length(values(gp2.vars)))
+    physical = zeros(Float64, gp2.lDim, length(values(gp2.vars)), 5)
+    grid = RL_Grid(gp2, splines, rings, spectral, physical)
+    for key in keys(gp2.vars)
+
+        # Need different BCs for wavenumber zero winds since they are undefined at r = 0
+        for i = 1:3
+            if (i == 1 && (key == "u" || key == "v" || key == "vgr"
+                        || key == "ub" || key == "vb"))
+                grid.splines[1,gp2.vars[key]] = Spline1D(SplineParameters(
+                    xmin = gp2.xmin,
+                    xmax = gp2.xmax,
+                    num_cells = gp2.num_cells,
+                    BCL = CubicBSpline.R1T0,
+                    BCR = gp2.BCR[key]))
+            else
+                grid.splines[i,gp.vars[key]] = Spline1D(SplineParameters(
+                    xmin = gp2.xmin,
+                    xmax = gp2.xmax,
+                    num_cells = gp2.num_cells,
+                    BCL = gp2.BCL[key],
+                    BCR = gp2.BCR[key]))
+            end
+        end
+
+        for r = 1:gp2.rDim
+            ri = r + gp2.patchOffsetL
+            lpoints = 4 + 4*ri
+            dl = 2 * π / lpoints
+            offset = 0.5 * dl * (ri-1)
+            grid.rings[r,gp2.vars[key]] = Fourier1D(FourierParameters(
+                ymin = offset,
+                # ymax = offset + (2 * π) - dl,
+                yDim = lpoints,
+                bDim = ri*2 + 1,
+                kmax = ri))
+        end
+    end
+    return grid
+end
 
 function calcTileSizes(patch::RL_Grid, num_tiles::int)
 
@@ -644,7 +723,7 @@ end
 function spectralxTransform(grid::RL_Grid, physical::Array{real}, spectral::Array{real})
     
     #Currently just a clone to test out delayed diffusion
-    spectralTransform(grid, physical, spectral)
+    #spectralTransform(grid, physical, spectral)
 
 end
 

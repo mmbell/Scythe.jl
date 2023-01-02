@@ -8,6 +8,34 @@ struct RZ_Grid <: AbstractGrid
     physical::Array{Float64}
 end
 
+function create_RZ_Grid(gp::GridParameters)
+
+    # Create a 2-D grid with bSplines and Chebyshev as basis
+    splines = Array{Spline1D}(undef,gp.zDim,length(values(gp.vars)))
+    columns = Array{Chebyshev1D}(undef,length(values(gp.vars)))
+    spectral = zeros(Float64, gp.b_zDim * gp.b_rDim, length(values(gp.vars)))
+    physical = zeros(Float64, gp.zDim * gp.rDim, length(values(gp.vars)), 5)
+    grid = RZ_Grid(gp, splines, columns, spectral, physical)
+    for key in keys(gp.vars)
+        for z = 1:gp.zDim
+            grid.splines[z,gp.vars[key]] = Spline1D(SplineParameters(
+                xmin = gp.xmin,
+                xmax = gp.xmax,
+                num_cells = gp.num_cells,
+                BCL = gp.BCL[key],
+                BCR = gp.BCR[key]))
+        end
+        grid.columns[gp.vars[key]] = Chebyshev1D(ChebyshevParameters(
+            zmin = gp.zmin,
+            zmax = gp.zmax,
+            zDim = gp.zDim,
+            bDim = gp.b_zDim,
+            BCB = gp.BCB[key],
+            BCT = gp.BCT[key]))
+    end
+    return grid
+end
+
 function getGridpoints(grid::RZ_Grid)
 
     # Return an array of the gridpoint locations
