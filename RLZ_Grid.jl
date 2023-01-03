@@ -669,9 +669,9 @@ function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
                     if (dr == 0)
                         SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
                     elseif (dr == 1)
-                        SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
+                        SIxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
                     else
-                        SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
+                        SIxxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
                     end
 
                     for r = 1:tile.params.rDim
