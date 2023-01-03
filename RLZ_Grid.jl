@@ -109,9 +109,14 @@ function calcTileSizes(patch::RLZ_Grid, num_tiles::int)
 
     # Calculate the appropriate tile size for the given patch
     num_gridpoints = patch.params.lDim
+    if patch.params.num_cells / num_tiles < 3.0
+        throw(DomainError(num_tiles, "Too many tiles for this grid (need at least 3 cells in R direction)"))
+    end
+
+    # Target an even number of gridpoints per tile
     q,r = divrem(num_gridpoints, num_tiles)
-    tile_sizes = [i <= r ? q+1 : q for i = 1:num_tiles]
-    #@show tile_sizes
+    tile_targets = [i <= r ? q+1 : q for i = 1:num_tiles]
+    tile_min = zeros(Int64,num_tiles)
 
     # Calculate the dimensions and set the parameters
     DX = (patch.params.xmax - patch.params.xmin) / patch.params.num_cells
@@ -121,60 +126,87 @@ function calcTileSizes(patch::RLZ_Grid, num_tiles::int)
     num_cells = zeros(Int64,num_tiles)
     spectralIndicesL = ones(Int64,num_tiles)
     patchOffsetsL = zeros(Int64,num_tiles)
+    tile_sizes = zeros(Int64,num_tiles)
+
+    # Check for the special case of only 1 tile
+    if num_tiles == 1
+        xmins[1] = patch.params.xmin
+        xmaxs[1] = patch.params.xmax
+        num_cells[1] = patch.params.num_cells
+        spectralIndicesL[1] = 1
+        tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
+        return tile_params
+    end
+
+    # Get the number of points per ring
+    lpoints = zeros(Int64,patch.params.rDim)
+    for r = 1:patch.params.rDim
+        lpoints[r] = 4 + 4*r
+    end
+
+    # Try to balance the tiles
+    tile_count = zeros(Int64, num_tiles)
+    target = 1.0
+    while (any(num_cells .< 3)) && target > 0.1
+        t = num_tiles
+        cell_count = 0
+        target -= 0.1
+        tile_count[:] .= 0
+        num_cells[:] .= 0
+        tile_min = Int64(floor(target * tile_targets[1]))
+        for r in patch.params.rDim:-1:1
+            tile_count[t] += lpoints[r]
+            if (r % 3 == 0)
+                cell_count += 1
+                if cell_count >= 3 && tile_count[t] >= tile_min
+                    num_cells[t] = cell_count
+                    cell_count = 0
+                    t -= 1
+                end
+            end
+            if t == 0
+                break
+            end
+        end
+        num_cells[1] = patch.params.num_cells - sum(num_cells[2:num_tiles])
+    end
 
     # First tile starts on the patch boundary
+    # Make sure each tile has at least 3 cells and 50% of the target gridpoints
     xmins[1] = patch.params.xmin
+    xmaxs[1] = (num_cells[1] * DX) + xmins[1]
+    tile_sizes[1] = sum(lpoints[1:num_cells[1]*3])
     # Implicit spectralIndicesL = 1
     # Implicit patchOffsetsL = 0
-
-    # Find the first R that has enough points
-    lpoints = 0
-    # Set the threshold to the end just in case it is only 1 tile
-    r_thresh = patch.params.rDim
-    for r = 1:patch.params.rDim
-        lpoints += 4 + 4*r
-        if lpoints >= tile_sizes[1] && (r-1) % 3 == 0
-            r_thresh = r-1
-            break
-        end
-    end
-    num_cells[1] = Int64(floor(r_thresh / 3))
-    xmaxs[1] = (num_cells[1] * DX) + xmins[1]
-    tile_sizes[1] = lpoints - (4 + 4*r_thresh)
 
     # Loop through other tiles
     for i = 2:num_tiles-1
         xmins[i] = xmaxs[i-1]
-        lpoints = 0
-        r_thresh = patch.params.rDim
-        spectralIndicesL[i] = num_cells[i-1] + spectralIndicesL[i-1]
-        patchOffsetsL[i] = (spectralIndicesL[i] - 1) * 3
-        for r = (patchOffsetsL[i] + 1):patch.params.rDim
-            lpoints += 4 + 4*r
-            if lpoints >= tile_sizes[i] && (r-1) % 3 == 0
-                r_thresh = r-1
-                break
-            end
-        end
-        num_cells[i] = Int64(floor(r_thresh / 3)) - spectralIndicesL[i] + 1
         xmaxs[i] = (num_cells[i] * DX) + xmins[i]
-        tile_sizes[i] = lpoints - (4 + 4*r_thresh)
+        spectralIndicesL[i] = num_cells[i-1] + spectralIndicesL[i-1]
+        ri = 1+(spectralIndicesL[i] - 1) * 3
+        tile_sizes[i] = sum(lpoints[ri:ri+num_cells[i]*3-1])
     end
 
     # Last tile ends on the patch boundary
     if num_tiles > 1
         xmins[num_tiles] = xmaxs[num_tiles-1]
         xmaxs[num_tiles] = patch.params.xmax
+        num_cells[num_tiles] = patch.params.num_cells - sum(num_cells[1:num_tiles-1])
         spectralIndicesL[num_tiles] = num_cells[num_tiles-1] + spectralIndicesL[num_tiles-1]
-        num_cells[num_tiles] = patch.params.num_cells - spectralIndicesL[num_tiles] + 1
-        tile_sizes[num_tiles] = patch.params.lDim - sum(tile_sizes[1:num_tiles-1])
-    end
-
-    if any(x->x<3, num_cells)
-        throw(DomainError(0, "Too many tiles for this grid (need at least 3 cells in R direction)"))
+        ri = 1+(spectralIndicesL[num_tiles] - 1) * 3
+        tile_sizes[num_tiles] = sum(lpoints[ri:ri+num_cells[num_tiles]*3-1])
     end
 
     tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
+
+    if any(x->x<3, num_cells)
+        for w in 1:num_tiles
+            println("Tile $w: $(tile_params[5,w]) gridpoints in $(tile_params[3,w]) cells from $(tile_params[1,w]) to $(tile_params[2,w]) starting at index $(tile_params[4,w])")
+        end
+        throw(DomainError(num_tiles, "Too many tiles for this grid (need at least 3 cells in R direction)"))
+    end
+
     return tile_params
 end
 
@@ -577,6 +609,145 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
     return tile.physical 
 end
 
+function splineTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, sharedSpectral::SharedArray{Float64},tile::RLZ_Grid)
+
+    # Do a partial transform from B to A for splines only
+    for v in values(pp.vars)
+        k1 = 1
+        for z in 1:pp.b_zDim
+            for k in 1:(pp.rDim + 1)
+                k2 = k1 + pp.b_rDim - 1
+                patchSpectral[k1:k2,v] .= SAtransform(patchSplines[1,v], view(sharedSpectral,k1:k2,v))
+                k1 = k2 + 1
+            end
+        end
+    end
+end
+
+function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::RLZ_Grid, splineBuffer::Array{Float64})
+
+    # Transform from the spectral to grid space
+    # Need to include patchOffset to get all available wavenumbers
+    kDim = pp.rDim
+
+    for v in values(pp.vars)
+        for dr in 0:2
+            for z = 1:pp.b_zDim
+                # Wavenumber zero
+                r1 = ((z-1) * pp.b_rDim * (1 + (kDim * 2))) + 1
+                r2 = r1 + pp.b_rDim - 1
+                patchSplines[1,v].a .= view(patchSpectral,r1:r2,v)
+                if (dr == 0)
+                    SItransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1))
+                elseif (dr == 1)
+                    SIxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1))
+                else
+                    SIxxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1))
+                end
+
+                for r = 1:tile.params.rDim
+                    tile.rings[r,z].b[1] = splineBuffer[r,1]
+                end
+
+                # Higher wavenumbers
+                for k = 1:kDim
+                    p = (k-1)*2
+                    p1 = r2 + 1 + (p*pp.b_rDim)
+                    p2 = p1 + pp.b_rDim - 1
+                    patchSplines[2,v].a .= view(patchSpectral,p1:p2,v)
+                    if (dr == 0)
+                        SItransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,2))
+                    elseif (dr == 1)
+                        SIxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,2))
+                    else
+                        SIxxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,2))
+                    end
+
+                    p1 = p2 + 1
+                    p2 = p1 + pp.b_rDim - 1
+                    patchSplines[3,v].a .= view(patchSpectral,p1:p2,v)
+                    if (dr == 0)
+                        SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
+                    elseif (dr == 1)
+                        SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
+                    else
+                        SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
+                    end
+
+                    for r = 1:tile.params.rDim
+                        if (k <= r + tile.params.patchOffsetL)
+                            # Real part
+                            rk = k+1
+                            # Imaginary part
+                            ik = tile.rings[r,z].params.bDim-k+1
+                            tile.rings[r,z].b[rk] = splineBuffer[r,2]
+                            tile.rings[r,z].b[ik] = splineBuffer[r,3]
+                        end
+                    end
+                end
+
+                for r = 1:tile.params.rDim
+                    FAtransform!(tile.rings[r,z])
+                end
+            end
+
+            zi = 1
+            for r = 1:tile.params.rDim
+                ri = r + tile.params.patchOffsetL
+                lpoints = 4 + 4*ri
+                ringBuffer = zeros(Float64, lpoints, pp.b_zDim)
+                for dl in 0:2
+                    if (dr > 0) && (dl > 0)
+                        # No mixed derivatives
+                        continue
+                    end
+                    for z = 1:pp.b_zDim
+                        if (dr == 0)
+                            if (dl == 0)
+                                ringBuffer[:,z] .= FItransform!(tile.rings[r,z])
+                            elseif (dl == 1)
+                                ringBuffer[:,z] .= FIxtransform(tile.rings[r,z])
+                            else
+                                ringBuffer[:,z] .= FIxxtransform(tile.rings[r,z])
+                            end
+                        else
+                            ringBuffer[:,z] .= FItransform!(tile.rings[r,z])
+                        end
+                    end
+                    for l = 1:lpoints
+                        for z = 1:pp.b_zDim
+                            tile.columns[v].b[z] = ringBuffer[l,z]
+                        end
+                        CAtransform!(tile.columns[v])
+                        CItransform!(tile.columns[v])
+
+                        # Assign the grid array
+                        z1 = zi + (l-1)*pp.zDim
+                        z2 = z1 + pp.zDim - 1
+                        if (dr == 0) && (dl == 0)
+                            tile.physical[z1:z2,v,1] .= tile.columns[v].uMish
+                            tile.physical[z1:z2,v,6] .= CIxtransform(tile.columns[v])
+                            tile.physical[z1:z2,v,7] .= CIxxtransform(tile.columns[v])
+                        elseif (dr == 0) && (dl == 1)
+                            tile.physical[z1:z2,v,4] .= tile.columns[v].uMish
+                        elseif (dr == 0) && (dl == 2)
+                            tile.physical[z1:z2,v,5] .= tile.columns[v].uMish
+                        elseif (dr == 1)
+                            tile.physical[z1:z2,v,2] .= tile.columns[v].uMish
+                        elseif (dr == 2)
+                            tile.physical[z1:z2,v,3] .= tile.columns[v].uMish
+                        end
+                    end
+                end
+                # Increment the outer index
+                zi += lpoints * pp.zDim
+            end
+        end
+    end
+
+    return tile.physical
+end
+
 function spectralxTransform(grid::RLZ_Grid, physical::Array{real}, spectral::Array{real})
     
     # Not yet implemented
@@ -863,7 +1034,7 @@ function getRegularGridpoints(grid::RLZ_Grid)
     return gridpoints
 end
 
-function allocateSplineBuffer(grid::RLZ_Grid)
+function allocateSplineBuffer(patch::RLZ_Grid, tile::RLZ_Grid)
 
-    return zeros(Float64, grid.params.rDim, 3)
+    return zeros(Float64, tile.params.rDim, 3)
 end

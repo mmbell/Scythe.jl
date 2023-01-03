@@ -316,7 +316,7 @@ function SAtransform(sp::SplineParameters, gammaBC::Matrix{Float64}, pqFactor, b
     return a
 end
 
-function SAtransform(spline::Spline1D, b::Vector{real})
+function SAtransform(spline::Spline1D, b::AbstractVector)
 
     a = spline.gammaBC' * (spline.pqFactor \ (spline.gammaBC * b))
     return a

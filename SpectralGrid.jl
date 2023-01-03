@@ -17,13 +17,12 @@ const uint = UInt64
 const mubar = 3
 
 export GridParameters, createGrid, getGridpoints, getCartesianGridpoints
-export spectralTransform!, gridTransform!, spectralTransform 
+export spectralTransform!, gridTransform!, spectralTransform
+export splineTransform!, tileTransform!
 export spectralxTransform, gridTransform_noBCs, integrateUp
 export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
 export AbstractGrid, R_Grid, RZ_Grid, RL_Grid, RLZ_Grid
-export calcTileSizes, setSpectralTile!, setSpectralTile
-export sumSharedSpectral, getBorderSpectral
-export calcPatchMap, calcHaloMap, allocateSplineBuffer
+export calcTileSizes, calcPatchMap, calcHaloMap, allocateSplineBuffer
 
 Base.@kwdef struct GridParameters
     geometry::String = "R"

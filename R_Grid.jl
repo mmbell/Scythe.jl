@@ -188,6 +188,36 @@ function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
     return tile.physical
 end
 
+function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::R_Grid, splineBuffer::Array{Float64})
+
+    # Transform from the spectral to grid space
+    # For R grid, the only varying dimension is the variable name
+    # Have to use the patch spline and spectral array
+
+    # pp::GridParameters is patch parameters, but this is not needed for 1D case
+    # SplineBuffer holds radial derivatives, but this is not needed for 1D case
+    # They are retained for compatibility with calling function for more complex cases
+
+    for i in eachindex(patchSplines)
+        patchSplines[i].a .= view(patchSpectral,:,i)
+
+        # Assign to the tile grid
+        SItransform(patchSplines[i],getGridpoints(tile),view(tile.physical,:,1,1))
+        SIxtransform(patchSplines[i],getGridpoints(tile),view(tile.physical,:,1,2))
+        SIxxtransform(patchSplines[i],getGridpoints(tile),view(tile.physical,:,1,3))
+    end
+
+    return tile.physical
+end
+
+function splineTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, sharedSpectral::SharedArray{Float64},tile::R_Grid)
+
+    # Do a partial transform from B to A for splines only
+    for i in eachindex(patchSplines)
+        patchSpectral[:,i] .= SAtransform(patchSplines[i], view(sharedSpectral,:,i))
+    end
+end
+
 function sumSpectralTile!(patch::R_Grid, tile::R_Grid)
 
     spectral = sumSpectralTile(patch.spectral, tile.spectral, tile.params.spectralIndexL, tile.params.spectralIndexR)
@@ -314,7 +344,7 @@ function calcHaloMap(patch::R_Grid, tile::R_Grid)
     return haloMap, view(tile.spectral, haloView)
 end
 
-function allocateSplineBuffer(grid::R_Grid)
+function allocateSplineBuffer(patch::R_Grid, tile::R_Grid)
 
     # Not needed for R Grid
     return zeros()

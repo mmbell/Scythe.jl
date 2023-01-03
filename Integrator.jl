@@ -80,7 +80,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
 
     # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
-    splineBuffer =  allocateSplineBuffer(patch)
+    splineBuffer =  allocateSplineBuffer(patch,tile)
 
     mtile = ModelTile(
         model,
@@ -209,18 +209,18 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     # Transfer the model and patch/tile info to each worker
     # This loop is serial to make sure each variable is available for the next calculation
     println("Initializing workers")
+    # Show the tiles
+    tile_params = calcTileSizes(patch, num_workers)
+    for w in workerids
+        println("Worker $w: $(tile_params[5,w-1]) gridpoints in $(tile_params[3,w-1]) cells from $(tile_params[1,w-1]) to $(tile_params[2,w-1]) starting at index $(tile_params[4,w-1])")
+    end
+
     for w in workerids
         wait(save_at(w, :model, model))
         wait(save_at(w, :workerids, workerids))
         wait(save_at(w, :num_workers, num_workers))
         wait(save_at(w, :patch, :(createGrid(model.grid_params))))
         wait(save_at(w, :tile_params, :(calcTileSizes(patch, num_workers))))
-    end
-
-    # Show the tiles
-    tile_params = calcTileSizes(patch, num_workers)
-    for w in workerids
-        println("Worker $w: $(tile_params[5,w-1]) gridpoints in $(tile_params[3,w-1]) cells from $(tile_params[1,w-1]) to $(tile_params[2,w-1]) starting at index $(tile_params[4,w-1])")
     end
 
     # Distribute the tiles
@@ -257,7 +257,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     end
 
     # Read in the initial conditions
-    map(wait, [get_from(w, :(read_initialconditions(patch, mtile))) for w in workerids])
+    #map(wait, [get_from(w, :(read_initialconditions(patch, mtile))) for w in workerids])
 
     # Delete the patch from the workers since the relevant info is already in the modelTile
     map(wait, [remove_from(w, :patch) for w in workerids])
@@ -276,11 +276,12 @@ function read_initialconditions(patch::AbstractGrid, mtile::ModelTile)
     spectralTransform!(patch)
     gridTransform!(patch)
 
+    # Just do the patch, tiles handled later
     # Transform to local physical tile
-    gridTransform!(patch.splines, patch.spectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
+    #gridTransform!(patch.splines, patch.spectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
     #b_now is held in tile.spectral
-    spectralTransform!(mtile.tile)
+    #spectralTransform!(mtile.tile)
 end
 
 function read_initialconditions(ic::String, grid::R_Grid)
@@ -727,7 +728,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     for w in workerids
         save_at(w, :sharedSpectral, sharedSpectral)
     end
-    map(wait, [get_from(w, :(mtile.patchSpectral .= sharedSpectral)) for w in workerids])
+    map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
 
     # Loop through the model timestepps
     @time model_loop(patch, model, workerids, sharedSpectral, haloSend, haloReceive,
@@ -768,9 +769,6 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         # Add it to the sharedArray
         sharedSpectral[haloReceiveIndexMap] .+= haloReceiveBuffer
 
-        # Reset the shared spectral patch to the tiles
-        map(wait, [get_from(w, :(mtile.patchSpectral .= sharedSpectral)) for w in workerids])
-
         # Output if on specified time interval
         if mod(t,output_int) == 0
             patch.spectral .= sharedSpectral
@@ -779,6 +777,9 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
             checkCFL(patch)
             @async write_output(patch, model, (t*model.ts))
         end
+
+        # Reset the shared spectral patch to the tiles
+        map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
 
         # Done with this timestep
     end
@@ -822,7 +823,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         haloSend::RemoteChannel, haloReceive::RemoteChannel, t::int)
 
     # Transform to local physical tile
-    gridTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
+    tileTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
     #b_now is held in tile.spectral
     spectralTransform!(mtile.tile)
