@@ -207,21 +207,18 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     write_output(patch, model, 0.0)
 
     # Transfer the model and patch/tile info to each worker
-    # This loop is serial to make sure each variable is available for the next calculation
     println("Initializing workers")
-    # Show the tiles
+    # Print the tile information
     tile_params = calcTileSizes(patch, num_workers)
     for w in workerids
         println("Worker $w: $(tile_params[5,w-1]) gridpoints in $(tile_params[3,w-1]) cells from $(tile_params[1,w-1]) to $(tile_params[2,w-1]) starting at index $(tile_params[4,w-1])")
     end
 
-    for w in workerids
-        wait(save_at(w, :model, model))
-        wait(save_at(w, :workerids, workerids))
-        wait(save_at(w, :num_workers, num_workers))
-        wait(save_at(w, :patch, :(createGrid(model.grid_params))))
-        wait(save_at(w, :tile_params, :(calcTileSizes(patch, num_workers))))
-    end
+    map(wait, [save_at(w, :model, model) for w in workerids])
+    map(wait, [save_at(w, :workerids, workerids) for w in workerids])
+    map(wait, [save_at(w, :num_workers, num_workers) for w in workerids])
+    map(wait, [save_at(w, :patch, :(createGrid(model.grid_params))) for w in workerids])
+    map(wait, [save_at(w, :tile_params, :(calcTileSizes(patch, num_workers))) for w in workerids])
 
     # Distribute the tiles
     println("Initializing tiles on workers")
@@ -249,18 +246,16 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     firstMap[1] = true
 
     # Precalculate indices and allocate buffers for shared and border transfers
-    wait(save_at(2, :mtile, :(createModelTile(patch,tile,model,$(firstMap)))))    
+    wait(save_at(workerids[1], :mtile, :(createModelTile(patch,tile,model,$(firstMap)))))
     for w in workerids[1:length(workerids)-1]
         send_index = w + 1
         sendMap = get_val_from(w, :(mtile.haloSendIndexMap))
         wait(save_at(send_index, :mtile, :(createModelTile(patch,tile,model,$(sendMap)))))
     end
 
-    # Read in the initial conditions
-    #map(wait, [get_from(w, :(read_initialconditions(patch, mtile))) for w in workerids])
-
     # Delete the patch from the workers since the relevant info is already in the modelTile
-    map(wait, [remove_from(w, :patch) for w in workerids])
+    # Don't delete from the first worker in case they are also the master
+    map(wait, [remove_from(w, :patch) for w in workerids[2:length(workerids)]])
 
     # Transform the patch and return to the main process
     spectralTransform!(patch)
@@ -694,9 +689,9 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     # Establish RemoteChannel connections between workers
     println("Connecting workers")
 
-    # Master sends to first worker
-    haloSend = RemoteChannel(()->Channel{Array{Float64}}(1),2)
-    wait(save_at(2, :haloReceive, :($(haloSend))))
+    # Master sends to first worker (itself)
+    haloInit = RemoteChannel(()->Channel{Array{Float64}}(1),workerids[1])
+    wait(save_at(workerids[1], :haloReceive, :($(haloInit))))
 
     # Each worker passes information up the chain
     for w in workerids[1:length(workerids)-1]
@@ -709,11 +704,11 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
     # Master receives from the last worker
     wait(save_at(last(workerids), :haloSend,
-            :(RemoteChannel(()->Channel{Array{Float64}}(1),1))))
+            :(RemoteChannel(()->Channel{Array{Float64}}(1),workerids[1]))))
     haloReceive = get_val_from(last(workerids), :haloSend)
 
     # First tile receives an empty halo from master to simplify later loops
-    haloSendBuffer = zeros(Float64,1)
+    haloInitBuffer = zeros(Float64,1)
 
     # Last tile is received by master process
     haloReceiveIndexMap = get_val_from(last(workerids), :(mtile.haloSendIndexMap))
@@ -731,8 +726,8 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
 
     # Loop through the model timestepps
-    @time model_loop(patch, model, workerids, sharedSpectral, haloSend, haloReceive,
-        haloSendBuffer, haloReceiveBuffer, haloReceiveIndexMap)
+    @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
+        haloInitBuffer, haloReceiveBuffer, haloReceiveIndexMap)
 
     # Integration complete! Finalize the patch
     patch.spectral .= sharedSpectral
@@ -744,8 +739,8 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 end
 
 function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
-        sharedSpectral::SharedArray{Float64}, haloSend::RemoteChannel, haloReceive::RemoteChannel,
-        haloSendBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveIndexMap::BitMatrix)
+        sharedSpectral::SharedArray{Float64}, haloInit::RemoteChannel, haloReceive::RemoteChannel,
+        haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveIndexMap::BitMatrix)
 
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
@@ -758,7 +753,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
 
         # Master process clears the shared array and sends an empty halo to the first worker
         sharedSpectral[:] .= 0.0
-        put!(haloSend, haloSendBuffer)
+        put!(haloInit, haloInitBuffer)
 
         # Advance each tile
         map(wait, [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids])
