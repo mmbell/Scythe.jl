@@ -772,132 +772,84 @@ function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
     # Transform from the spectral to grid space
     # For RL grid, varying dimensions are R, L, and variable
     #splineBuffer = zeros(Float64, tile.params.rDim, patch.params.rDim*2+1, 3)
+    kDim = pp.rDim
 
-    for v in values(pp.vars)
-        # Wavenumber zero
-        k1 = 1
-        k2 = pp.b_rDim
-        patchSplines[1,v].a .= view(patchSpectral,k1:k2,v)
-        SItransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,1))
-        SIxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,2))
-        SIxxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,3))
-
-        for r = 1:tile.params.rDim
-            tile.rings[r,v].b[1] = splineBuffer[r,1,1]
-        end
-
-        # Higher wavenumbers
-        for k = 1:pp.rDim
-            p = k*2
-            p1 = ((p-1)*pp.b_rDim)+1
-            p2 = p*pp.b_rDim
-            patchSplines[2,v].a .= view(patchSpectral,p1:p2,v)
-            SItransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,p,1))
-            SIxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,p,2))
-            SIxxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,p,3))
-
-            p1 = (p*pp.b_rDim)+1
-            p2 = (p+1)*pp.b_rDim
-            patchSplines[3,v].a .= view(patchSpectral,p1:p2,v)
-            SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,p+1,1))
-            SIxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,p+1,2))
-            SIxxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,p+1,3))
+    Threads.@threads for v in 1:length(pp.vars)
+        for dr in 0:2
+            # Wavenumber zero
+            k1 = 1
+            k2 = pp.b_rDim
+            patchSplines[1,v].a .= view(patchSpectral,k1:k2,v)
+            if (dr == 0)
+                SItransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,v))
+            elseif (dr == 1)
+                SIxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,v))
+            else
+                SIxxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,v))
+            end
 
             for r = 1:tile.params.rDim
-                if (k <= r + tile.params.patchOffsetL)
-                    # Real part
-                    rk = k+1
-                    # Imaginary part
-                    ik = tile.rings[r,v].params.bDim-k+1
-                    tile.rings[r,v].b[rk] = splineBuffer[r,p,1]
-                    tile.rings[r,v].b[ik] = splineBuffer[r,p+1,1]
+                tile.rings[r,v].b[1] = splineBuffer[r,1,v]
+            end
+
+            # Higher wavenumbers
+            for k = 1:kDim
+                p = k*2
+                p1 = ((p-1)*pp.b_rDim)+1
+                p2 = p*pp.b_rDim
+                patchSplines[2,v].a .= view(patchSpectral,p1:p2,v)
+                if (dr == 0)
+                    SItransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,v))
+                elseif (dr == 1)
+                    SIxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,v))
+                else
+                    SIxxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,1,v))
+                end
+
+                p1 = (p*pp.b_rDim)+1
+                p2 = (p+1)*pp.b_rDim
+                patchSplines[3,v].a .= view(patchSpectral,p1:p2,v)
+                if (dr == 0)
+                    SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,2,v))
+                elseif (dr == 1)
+                    SIxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,2,v))
+                else
+                    SIxxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,2,v))
+                end
+
+                for r = 1:tile.params.rDim
+                    if (k <= r + tile.params.patchOffsetL)
+                        # Real part
+                        rk = k+1
+                        # Imaginary part
+                        ik = tile.rings[r,v].params.bDim-k+1
+                        tile.rings[r,v].b[rk] = splineBuffer[r,1,v]
+                        tile.rings[r,v].b[ik] = splineBuffer[r,2,v]
+                    end
+                end
+            end
+
+            l1 = 0
+            l2 = 0
+            for r = 1:tile.params.rDim
+                FAtransform!(tile.rings[r,v])
+                FItransform!(tile.rings[r,v])
+
+                # Assign the grid array
+                ri = r + tile.params.patchOffsetL
+                l1 = l2 + 1
+                l2 = l1 + 3 + (4*ri)
+                if (dr == 0)
+                    tile.physical[l1:l2,v,1] .= tile.rings[r,v].uMish
+                    tile.physical[l1:l2,v,4] .= FIxtransform(tile.rings[r,v])
+                    tile.physical[l1:l2,v,5] .= FIxxtransform(tile.rings[r,v])
+                elseif (dr == 1)
+                    tile.physical[l1:l2,v,2] .= tile.rings[r,v].uMish
+                else
+                    tile.physical[l1:l2,v,3] .= tile.rings[r,v].uMish
                 end
             end
         end
-
-        l1 = 0
-        l2 = 0
-        for r = 1:tile.params.rDim
-            FAtransform!(tile.rings[r,v])
-            FItransform!(tile.rings[r,v])
-
-            # Assign the grid array
-            ri = r + tile.params.patchOffsetL
-            l1 = l2 + 1
-            l2 = l1 + 3 + (4*ri)
-            tile.physical[l1:l2,v,1] .= tile.rings[r,v].uMish
-            tile.physical[l1:l2,v,4] .= FIxtransform(tile.rings[r,v])
-            tile.physical[l1:l2,v,5] .= FIxxtransform(tile.rings[r,v])
-        end
-
-        # 1st radial derivative
-        # Wavenumber zero
-        for r = 1:tile.params.rDim
-            tile.rings[r,v].b[1] = splineBuffer[r,1,2]
-        end
-
-        # Higher wavenumbers
-        for k = 1:pp.rDim
-            p = k*2
-            for r = 1:tile.params.rDim
-                if (k <= r + tile.params.patchOffsetL)
-                    # Real part
-                    rk = k+1
-                    # Imaginary part
-                    ik = tile.rings[r,v].params.bDim-k+1
-                    tile.rings[r,v].b[rk] = splineBuffer[r,p,2]
-                    tile.rings[r,v].b[ik] = splineBuffer[r,p+1,2]
-                end
-            end
-        end
-
-        l1 = 0
-        l2 = 0
-        for r = 1:tile.params.rDim
-            FAtransform!(tile.rings[r,v])
-            FItransform!(tile.rings[r,v])
-
-            # Assign the grid array
-            ri = r + tile.params.patchOffsetL
-            l1 = l2 + 1
-            l2 = l1 + 3 + (4*ri)
-            tile.physical[l1:l2,v,2] .= tile.rings[r,v].uMish
-        end
-
-        # 2nd radial derivative
-        # Wavenumber zero
-        for r = 1:tile.params.rDim
-            tile.rings[r,v].b[1] = splineBuffer[r,1,3]
-        end
-
-        # Higher wavenumbers
-        for k = 1:pp.rDim
-            p = k*2
-            for r = 1:tile.params.rDim
-                if (k <= r + tile.params.patchOffsetL)
-                    # Real part
-                    rk = k+1
-                    # Imaginary part
-                    ik = tile.rings[r,v].params.bDim-k+1
-                    tile.rings[r,v].b[rk] = splineBuffer[r,p,3]
-                    tile.rings[r,v].b[ik] = splineBuffer[r,p+1,3]
-                end
-            end
-        end
-
-        l1 = 0
-        l2 = 0
-        for r = 1:tile.params.rDim
-            FAtransform!(tile.rings[r,v])
-            FItransform!(tile.rings[r,v])
-
-            # Assign the grid array
-            ri = r + tile.params.patchOffsetL
-            l1 = l2 + 1
-            l2 = l1 + 3 + (4*ri)
-            tile.physical[l1:l2,v,3] .= tile.rings[r,v].uMish
-        end
-
     end
     return tile.physical
 end
