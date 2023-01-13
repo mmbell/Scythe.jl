@@ -14,6 +14,7 @@ using Parameters
 using CSV
 using DataFrames
 using MPI
+using LoopVectorization
 import Base.Threads.@spawn
 using SparseArrays
 using SuiteSparse
@@ -752,7 +753,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         println("ts: $(t*model.ts)")
 
         # Master process clears the shared array and sends an empty halo to the first worker
-        sharedSpectral[:] .= 0.0
+        @turbo sharedSpectral .= 0.0
         put!(haloInit, haloInitBuffer)
 
         # Advance each tile
@@ -762,7 +763,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         haloReceiveBuffer .= take!(haloReceive)
 
         # Add it to the sharedArray
-        sharedSpectral[haloReceiveIndexMap] .+= haloReceiveBuffer
+        @inbounds sharedSpectral[haloReceiveIndexMap] .+= haloReceiveBuffer
 
         # Output if on specified time interval
         if mod(t,output_int) == 0
@@ -896,12 +897,8 @@ function first_timestep(spectral::Array{real},
         ts::real)    
 
     # Use Euler method for first step
-    b_nxt .= spectral .+ (ts .* bdot) .+ (ts .* bdot_delay)
+    b_nxt .= @. spectral + (ts * bdot) + (ts * bdot_delay)
     bdot_n1 .= bdot
-    
-    # Override diagnostic variables with diagnostic_flag
-    # TBD
-    
 end
 
 function second_timestep(spectral::Array{real}, 
@@ -913,12 +910,9 @@ function second_timestep(spectral::Array{real},
         ts::real) 
     
     # Use 2nd order A-B method for second step
-    b_nxt .= spectral .+ (0.5 * ts) .* ((3.0 .* bdot) .- bdot_n1) .+ (ts .* bdot_delay)
+    b_nxt .= @. spectral + (0.5 * ts) * ((3.0 * bdot) - bdot_n1) + (ts * bdot_delay)
     bdot_n1 .= bdot
     bdot_n2 .= bdot_n1
-    
-    # Override diagnostic variables with diagnostic_flag
-    # TBD
 end
 
 function timestep(spectral::Array{real}, 
@@ -931,12 +925,9 @@ function timestep(spectral::Array{real},
 
     # Use 3rd order A-B method for subsequent steps
     onetwelvets = ts/12.0
-    b_nxt .= spectral .+ (onetwelvets .* ((23.0 .* bdot) - (16.0 .* bdot_n1) + (5.0 .* bdot_n2))) .+ (ts .* bdot_delay)
+    @turbo b_nxt .= @. spectral + (onetwelvets * ((23.0 * bdot) - (16.0 * bdot_n1) + (5.0 * bdot_n2))) + (ts * bdot_delay)
     bdot_n1 .= bdot
     bdot_n2 .= bdot_n1
-    
-    # Override diagnostic variables with diagnostic_flag
-    # TBD
 end
 
 function calcTendency(grid::AbstractGrid,
