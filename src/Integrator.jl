@@ -3,7 +3,6 @@
 using Distributed
 using DistributedData
 using SharedArrays
-using Parameters
 using CSV
 using DataFrames
 using MPI

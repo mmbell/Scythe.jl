@@ -1,7 +1,6 @@
 module Chebyshev
 
 using LinearAlgebra
-using Parameters
 using FFTW
 
 export ChebyshevParameters, Chebyshev1D
@@ -24,7 +23,7 @@ const R2T20 = Dict("β1" => 0.0, "β2" => 0.0)
 const R3 = Dict("R3" => 0)
 
 # Define the spline parameters
-@with_kw struct ChebyshevParameters
+Base.@kwdef struct ChebyshevParameters
     zmin::real = 0.0
     zmax::real = 0.0
     zDim::int = 0

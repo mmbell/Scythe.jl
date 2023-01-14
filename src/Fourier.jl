@@ -1,7 +1,6 @@
 module Fourier
 
 using LinearAlgebra
-using Parameters
 using FFTW
 
 export FourierParameters, Fourier1D
@@ -14,7 +13,7 @@ const int = Int64
 const uint = UInt64
 
 # Define the ring parameters
-@with_kw struct FourierParameters
+Base.@kwdef struct FourierParameters
     ymin::real = 0.0
     kmax::int = 0
     yDim::int = 0

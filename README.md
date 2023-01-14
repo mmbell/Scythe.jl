@@ -8,7 +8,7 @@ The model uses a mixture of cubic B-spline (radial), Fourier (azimuthal), and Ch
 
 To run a simulation, you first need to specify a `model` ModelParameters structure that contains the relevant information to construct a grid, a set of physical equations, time step, and initial conditions. Some examples are provided, and more will be added in the future.
 
-After creating a model, you can integrate it with `integrate_model(model)`. The resulting output will be directed to `scythe_out.log` and `scythe_err.log`.
+After creating a model, you can integrate it with `integrate_model(model)`. The diagnostics will be directed to `scythe_out.log` and `scythe_err.log`, and the output will be directed to the specified directory in the model parameters. The current I/O is CSV format, which will be changed to CF-compliant NetCDF in future releases.
 
 Scythe has parallel capabilities using the Julia Distributed package, and limited support for multi-threading. Grids are decomposed in the radial direction according to the number of processors specified. Currently only shared memory parallelization is supported, so run it on a single node.
 
