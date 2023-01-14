@@ -1,35 +1,28 @@
-module SpectralGrid
+# Functions to define the spectral grid
 
-using CubicBSpline
-using Chebyshev
-using Fourier
 using CSV
 using DataFrames
 using SharedArrays
 using SparseArrays
+
+# These are declared as submodules to avoid namespace clashes with each other and other packages
+using .CubicBSpline, .Fourier, .Chebyshev
 
 #Define some convenient aliases
 const real = Float64
 const int = Int64
 const uint = UInt64
 
-# Fix the spline mish to 3 points
-const mubar = 3
-
-export GridParameters, createGrid, getGridpoints, getCartesianGridpoints
-export spectralTransform!, gridTransform!, spectralTransform
+export GridParameters
+export createGrid, calcTileSizes
 export splineTransform!, tileTransform!
-export spectralxTransform, gridTransform_noBCs, integrateUp
-export regularGridTransform, getRegularGridpoints, getRegularCartesianGridpoints
-export AbstractGrid, R_Grid, RZ_Grid, RL_Grid, RLZ_Grid
-export calcTileSizes, calcPatchMap, calcHaloMap, allocateSplineBuffer
 
 Base.@kwdef struct GridParameters
     geometry::String = "R"
     xmin::real = 0.0
     xmax::real = 0.0
     num_cells::int = 0
-    rDim::int = num_cells * mubar
+    rDim::int = num_cells * CubicBSpline.mubar
     b_rDim::int = num_cells + 3
     l_q::real = 2.0
     BCL::Dict = CubicBSpline.R0
@@ -101,4 +94,4 @@ function createGrid(gp::GridParameters)
 end
 
 # Module end
-end
+#end

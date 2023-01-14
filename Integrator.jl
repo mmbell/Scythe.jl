@@ -1,15 +1,8 @@
-# 3rd order Adams-Bashforth implementation multiple variables and dimensions method
-__precompile__()
-module Integrator
+# Functions for model integration
 
 using Distributed
 using DistributedData
 using SharedArrays
-using SpectralGrid
-using CubicBSpline
-using Chebyshev
-using Fourier
-using NumericalModels
 using Parameters
 using CSV
 using DataFrames
@@ -24,9 +17,9 @@ const real = Float64
 const int = Int64
 const uint = UInt64
 
-export ModelTile, createModelTile
+# Need to export these for distributed operations in Main namespace
+export createModelTile, advanceTimestep
 export initialize_model, run_model, finalize_model
-export read_initialconditions, advanceTimestep
 
 struct ModelTile
     model::ModelParameters
@@ -883,7 +876,7 @@ function physical_model(grid::AbstractGrid,
             model::ModelParameters)
     
     equation_set = Symbol(model.equation_set)
-    equation_call = getfield(NumericalModels, equation_set)
+    equation_call = getfield(Scythe, equation_set)
     equation_call(grid, gridpoints, vardot, F, model)
     return
     
@@ -1333,7 +1326,4 @@ function checkCFL(grid)
             #TBD
         end
     end
-end
-
-# Module end
 end

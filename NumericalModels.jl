@@ -1,6 +1,5 @@
-module NumericalModels
+# Functions that define the model parameters and physical models
 
-using SpectralGrid
 using LoopVectorization
 
 export ModelParameters
@@ -786,4 +785,4 @@ function Twoway_ShallowWater_Slab_old(grid::RL_Grid,
 end
 
 # Module end
-end
+#end
