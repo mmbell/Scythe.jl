@@ -21,13 +21,21 @@ function integrate_model(model::ModelParameters)
     end
     
     println("Starting model...")
-    wait(save_at(workers()[1], :out, :(open("scythe_out.log","w"))))
-    wait(save_at(workers()[1], :err, :(open("scythe_err.log","w"))))
+    
+    if !isdir(model.output_dir)
+        mkdir(model.output_dir)
+    end
+    outfile = model.output_dir * "/scythe_out.log"
+    errfile = model.output_dir * "/scythe_err.log"
+    wait(save_at(workers()[1], :out, :(open($(outfile),"w"))))
+    wait(save_at(workers()[1], :err, :(open($(errfile),"w"))))
     wait(get_from(workers()[1], :(redirect_stdout(out))))
     wait(get_from(workers()[1], :(redirect_stderr(err))))
+    
     wait(save_at(workers()[1], :patch, :(initialize_model($(model),workers()))))
     wait(get_from(workers()[1], :(@time run_model(patch, model, workers()))))
     wait(get_from(workers()[1], :(finalize_model(patch,model))))
+    
     wait(get_from(workers()[1], :(close(out))))
     wait(get_from(workers()[1], :(close(err))))
     println("All done!")
