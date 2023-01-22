@@ -54,22 +54,12 @@ function create_RL_Grid(gp::GridParameters)
 
         # Need different BCs for wavenumber zero winds since they are undefined at r = 0
         for i = 1:3
-            if (i == 1 && (key == "u" || key == "v" || key == "vgr"
-                        || key == "ub" || key == "vb"))
-                grid.splines[1,gp2.vars[key]] = Spline1D(SplineParameters(
-                    xmin = gp2.xmin,
-                    xmax = gp2.xmax,
-                    num_cells = gp2.num_cells,
-                    BCL = CubicBSpline.R1T0,
-                    BCR = gp2.BCR[key]))
-            else
-                grid.splines[i,gp.vars[key]] = Spline1D(SplineParameters(
-                    xmin = gp2.xmin,
-                    xmax = gp2.xmax,
-                    num_cells = gp2.num_cells,
-                    BCL = gp2.BCL[key],
-                    BCR = gp2.BCR[key]))
-            end
+            grid.splines[i,gp.vars[key]] = Spline1D(SplineParameters(
+                xmin = gp2.xmin,
+                xmax = gp2.xmax,
+                num_cells = gp2.num_cells,
+                BCL = gp2.BCL[key],
+                BCR = gp2.BCR[key]))
         end
 
         for r = 1:gp2.rDim
@@ -117,6 +107,7 @@ function calcTileSizes(patch::RL_Grid, num_tiles::int)
         xmaxs[1] = patch.params.xmax
         num_cells[1] = patch.params.num_cells
         spectralIndicesL[1] = 1
+        tile_sizes[1] = patch.params.lDim
         tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
         return tile_params
     end
@@ -759,7 +750,7 @@ function splineTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Fl
     # Do a partial transform from B to A for splines only
     for v in values(pp.vars)
         k1 = 1
-        for k in 1:(pp.rDim + 1)
+        for k in 1:(pp.rDim*2 + 1)
             k2 = k1 + pp.b_rDim - 1
             patchSpectral[k1:k2,v] .= SAtransform(patchSplines[1,v], view(sharedSpectral,k1:k2,v))
             k1 = k2 + 1

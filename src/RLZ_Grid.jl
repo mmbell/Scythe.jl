@@ -46,7 +46,7 @@ function create_RLZ_Grid(gp::GridParameters)
         patchOffsetL = gp.patchOffsetL,
         tile_num = gp.tile_num)
 
-    splines = Array{Spline1D}(undef,3,length(values(gp2.vars)))
+    splines = Array{Spline1D}(undef,gp2.b_zDim,length(values(gp2.vars)))
     rings = Array{Fourier1D}(undef,gp2.rDim, gp2.b_zDim)
     columns = Array{Chebyshev1D}(undef,length(values(gp2.vars)))
     
@@ -59,23 +59,13 @@ function create_RLZ_Grid(gp::GridParameters)
     for key in keys(gp2.vars)
 
         # Need different BCs for wavenumber zero winds since they are undefined at r = 0
-        for i = 1:3
-            if (i == 1 && (key == "u" || key == "v" || key == "vgr"
-                        || key == "ub" || key == "vb"))
-                grid.splines[1,gp2.vars[key]] = Spline1D(SplineParameters(
-                    xmin = gp2.xmin,
-                    xmax = gp2.xmax,
-                    num_cells = gp2.num_cells,
-                    BCL = CubicBSpline.R1T0, 
-                    BCR = gp2.BCR[key]))
-            else
-                grid.splines[i,gp2.vars[key]] = Spline1D(SplineParameters(
+        for i = 1:gp2.b_zDim
+            grid.splines[i,gp2.vars[key]] = Spline1D(SplineParameters(
                     xmin = gp2.xmin,
                     xmax = gp2.xmax,
                     num_cells = gp2.num_cells,
                     BCL = gp2.BCL[key], 
                     BCR = gp2.BCR[key]))
-            end
         end
         
         grid.columns[gp2.vars[key]] = Chebyshev1D(ChebyshevParameters(
@@ -134,6 +124,7 @@ function calcTileSizes(patch::RLZ_Grid, num_tiles::int)
         xmaxs[1] = patch.params.xmax
         num_cells[1] = patch.params.num_cells
         spectralIndicesL[1] = 1
+        tile_sizes[1] = patch.params.lDim
         tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
         return tile_params
     end
@@ -615,9 +606,9 @@ function splineTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Fl
     for v in values(pp.vars)
         k1 = 1
         for z in 1:pp.b_zDim
-            for k in 1:(pp.rDim + 1)
+            for k in 1:(pp.rDim*2 + 1)
                 k2 = k1 + pp.b_rDim - 1
-                patchSpectral[k1:k2,v] .= SAtransform(patchSplines[1,v], view(sharedSpectral,k1:k2,v))
+                patchSpectral[k1:k2,v] .= SAtransform(patchSplines[z,v], view(sharedSpectral,k1:k2,v))
                 k1 = k2 + 1
             end
         end
@@ -628,6 +619,7 @@ function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
 
     # Transform from the spectral to grid space
     # Need to include patchOffset to get all available wavenumbers
+    #splineBuffer = zeros(Float64, tile.params.rDim, pp.b_zDim)
     kDim = pp.rDim
 
     for v in values(pp.vars)
@@ -636,17 +628,17 @@ function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
                 # Wavenumber zero
                 r1 = ((z-1) * pp.b_rDim * (1 + (kDim * 2))) + 1
                 r2 = r1 + pp.b_rDim - 1
-                patchSplines[1,v].a .= view(patchSpectral,r1:r2,v)
+                patchSplines[z,v].a .= view(patchSpectral,r1:r2,v)
                 if (dr == 0)
-                    SItransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1))
+                    SItransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
                 elseif (dr == 1)
-                    SIxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1))
+                    SIxtransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
                 else
-                    SIxxtransform(patchSplines[1,v],tile.splines[1].mishPoints,view(splineBuffer,:,1))
+                    SIxxtransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
                 end
 
                 for r = 1:tile.params.rDim
-                    tile.rings[r,z].b[1] = splineBuffer[r,1]
+                    tile.rings[r,z].b[1] = splineBuffer[r,z]
                 end
 
                 # Higher wavenumbers
@@ -654,34 +646,38 @@ function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
                     p = (k-1)*2
                     p1 = r2 + 1 + (p*pp.b_rDim)
                     p2 = p1 + pp.b_rDim - 1
-                    patchSplines[2,v].a .= view(patchSpectral,p1:p2,v)
+                    patchSplines[z,v].a .= view(patchSpectral,p1:p2,v)
                     if (dr == 0)
-                        SItransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,2))
+                        SItransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
                     elseif (dr == 1)
-                        SIxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,2))
+                        SIxtransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
                     else
-                        SIxxtransform(patchSplines[2,v],tile.splines[1].mishPoints,view(splineBuffer,:,2))
+                        SIxxtransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
                     end
-
-                    p1 = p2 + 1
-                    p2 = p1 + pp.b_rDim - 1
-                    patchSplines[3,v].a .= view(patchSpectral,p1:p2,v)
-                    if (dr == 0)
-                        SItransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
-                    elseif (dr == 1)
-                        SIxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
-                    else
-                        SIxxtransform(patchSplines[3,v],tile.splines[1].mishPoints,view(splineBuffer,:,3))
-                    end
-
                     for r = 1:tile.params.rDim
                         if (k <= r + tile.params.patchOffsetL)
                             # Real part
                             rk = k+1
+                            tile.rings[r,z].b[rk] = splineBuffer[r,z]
+                        end
+                    end
+
+                    p1 = p2 + 1
+                    p2 = p1 + pp.b_rDim - 1
+                    patchSplines[z,v].a .= view(patchSpectral,p1:p2,v)
+                    if (dr == 0)
+                        SItransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
+                    elseif (dr == 1)
+                        SIxtransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
+                    else
+                        SIxxtransform(patchSplines[z,v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
+                    end
+
+                    for r = 1:tile.params.rDim
+                        if (k <= r + tile.params.patchOffsetL)
                             # Imaginary part
                             ik = tile.rings[r,z].params.bDim-k+1
-                            tile.rings[r,z].b[rk] = splineBuffer[r,2]
-                            tile.rings[r,z].b[ik] = splineBuffer[r,3]
+                            tile.rings[r,z].b[ik] = splineBuffer[r,z]
                         end
                     end
                 end
