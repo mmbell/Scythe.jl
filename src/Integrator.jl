@@ -1031,34 +1031,37 @@ function write_output(grid::RZ_Grid, model::ModelParameters, t::real)
     write(afile,aheader)
     write(ufile,uheader)
     
-    for r = 1:grid.params.b_rDim
-        for z = 1:grid.params.b_zDim
+    i = 1
+    for z = 1:grid.params.b_zDim
+        for r = 1:grid.params.b_rDim
             astring = "$r,$z,"
             for var in keys(grid.params.vars)
                 v = grid.params.vars[var]
                 z1 = ((r-1)*grid.params.b_zDim)
-                a = grid.spectral[z1+z,v]
+                a = grid.spectral[i,v]
                 astring *= "$(a),"
             end
+            i += 1
             astring = chop(astring) * "\n"
             write(afile,astring)
         end
     end
     close(afile)
     
-    for z = 1:grid.params.zDim
-        radii = grid.splines[z,1].mishPoints
-        levels = grid.columns[1].mishPoints
-        for r = 1:grid.params.rDim
+    i = 1
+    for r = 1:grid.params.rDim
+        for z = 1:grid.params.zDim
+            radii = grid.splines[1].mishPoints
+            levels = grid.columns[1].mishPoints
             ustring = "$(radii[r]),$(levels[z]),"
-            r1 = ((z-1)*grid.params.rDim)
             for d = 1:5
                 for var in keys(grid.params.vars)
                     v = grid.params.vars[var]
-                    u = grid.physical[r1+r,v,d]
+                    u = grid.physical[i,v,d]
                     ustring *= "$u,"
                 end
             end
+            i += 1
             ustring = chop(ustring) * "\n"
             write(ufile,ustring)
         end

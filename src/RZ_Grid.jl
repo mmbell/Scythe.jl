@@ -1,4 +1,4 @@
-# Functions for RZ Grid
+#Functions for RZ Grid
 
 struct RZ_Grid <: AbstractGrid
     params::GridParameters
@@ -10,21 +10,24 @@ end
 
 function create_RZ_Grid(gp::GridParameters)
 
-    # Create a 2-D grid with bSplines and Chebyshev as basis
-    splines = Array{Spline1D}(undef,gp.zDim,length(values(gp.vars)))
+    # RZ is 2-D grid with splines and Chebyshev basis
+    splines = Array{Spline1D}(undef,gp.b_zDim,length(values(gp.vars)))
     columns = Array{Chebyshev1D}(undef,length(values(gp.vars)))
-    spectral = zeros(Float64, gp.b_zDim * gp.b_rDim, length(values(gp.vars)))
+
+    spectralDim = gp.b_zDim * gp.b_rDim
+    spectral = zeros(Float64, spectralDim, length(values(gp.vars)))
+
     physical = zeros(Float64, gp.zDim * gp.rDim, length(values(gp.vars)), 5)
     grid = RZ_Grid(gp, splines, columns, spectral, physical)
     for key in keys(gp.vars)
-        for z = 1:gp.zDim
-            grid.splines[z,gp.vars[key]] = Spline1D(SplineParameters(
-                xmin = gp.xmin,
-                xmax = gp.xmax,
-                num_cells = gp.num_cells,
-                BCL = gp.BCL[key],
-                BCR = gp.BCR[key]))
-        end
+
+        grid.splines[gp.vars[key]] = Spline1D(SplineParameters(
+            xmin = gp.xmin,
+            xmax = gp.xmax,
+            num_cells = gp.num_cells,
+            BCL = gp.BCL[key],
+            BCR = gp.BCR[key]))
+
         grid.columns[gp.vars[key]] = Chebyshev1D(ChebyshevParameters(
             zmin = gp.zmin,
             zmax = gp.zmax,
@@ -33,7 +36,71 @@ function create_RZ_Grid(gp::GridParameters)
             BCB = gp.BCB[key],
             BCT = gp.BCT[key]))
     end
+
     return grid
+end
+
+function calcTileSizes(patch::RZ_Grid, num_tiles::int)
+
+    # Calculate the appropriate tile size for the given patch
+    num_gridpoints = patch.params.rDim
+    if patch.params.num_cells / num_tiles < 3.0
+        throw(DomainError(num_tiles, "Too many tiles for this grid (need at least 3 cells in R direction)"))
+    end
+
+    q,r = divrem(num_gridpoints, num_tiles)
+    tile_sizes = [i <= r ? q+1 : q for i = 1:num_tiles]
+
+    # Calculate the dimensions and set the parameters
+    DX = (patch.params.xmax - patch.params.xmin) / patch.params.num_cells
+
+    xmins = zeros(Float64,num_tiles)
+    xmaxs = zeros(Float64,num_tiles)
+    num_cells = zeros(Int64,num_tiles)
+    spectralIndicesL = ones(Int64,num_tiles)
+
+    # Check for the special case of only 1 tile
+    if num_tiles == 1
+        xmins[1] = patch.params.xmin
+        xmaxs[1] = patch.params.xmax
+        num_cells[1] = patch.params.num_cells
+        spectralIndicesL[1] = 1
+        tile_sizes[1] = patch.params.rDim
+        tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
+        return tile_params
+    end
+
+    # First tile starts on the patch boundary
+    xmins[1] = patch.params.xmin
+    num_cells[1] = Int64(ceil(tile_sizes[1] / 3))
+    xmaxs[1] = (num_cells[1] * DX) + xmins[1]
+    # Implicit spectralIndicesL = 1
+
+    for i = 2:num_tiles-1
+        xmins[i] = xmaxs[i-1]
+        num_cells[i] = Int64(ceil(tile_sizes[i] / 3))
+        xmaxs[i] = (num_cells[i] * DX) + xmins[i]
+        spectralIndicesL[i] = num_cells[i-1] + spectralIndicesL[i-1]
+    end
+
+    # Last tile ends on the patch boundary
+    if num_tiles > 1
+        xmins[num_tiles] = xmaxs[num_tiles-1]
+        xmaxs[num_tiles] = patch.params.xmax
+        spectralIndicesL[num_tiles] = num_cells[num_tiles-1] + spectralIndicesL[num_tiles-1]
+        num_cells[num_tiles] = patch.params.num_cells - spectralIndicesL[num_tiles] + 1
+    end
+
+    tile_params = vcat(xmins', xmaxs', num_cells', spectralIndicesL', tile_sizes')
+
+    if any(x->x<3, num_cells)
+        for w in 1:num_tiles
+            println("Tile $w: $(tile_params[5,w]) gridpoints in $(tile_params[3,w]) cells from $(tile_params[1,w]) to $(tile_params[2,w]) starting at index $(tile_params[4,w])")
+        end
+        throw(DomainError(num_tiles, "Too many tiles for this grid (need at least 3 cells in R direction)"))
+    end
+
+    return tile_params
 end
 
 function getGridpoints(grid::RZ_Grid)
@@ -41,8 +108,8 @@ function getGridpoints(grid::RZ_Grid)
     # Return an array of the gridpoint locations
     gridpoints = zeros(Float64, grid.params.rDim * grid.params.zDim,2)
     g = 1
-    for z = 1:grid.params.zDim
-        for r = 1:grid.params.rDim
+    for r = 1:grid.params.rDim
+        for z = 1:grid.params.zDim
             r_m = grid.splines[1,1].mishPoints[r]
             z_m = grid.columns[1].mishPoints[z]
             gridpoints[g,1] = r_m
@@ -65,26 +132,30 @@ function spectralTransform(grid::RZ_Grid, physical::Array{real}, spectral::Array
     
     # Transform from the RZ grid to spectral space
     # For RZ grid, varying dimensions are R, Z, and variable
+    tempcb = zeros(Float64, grid.params.b_zDim, grid.params.rDim)
+
     for v in values(grid.params.vars)
         i = 1
-        for z = 1:grid.params.zDim
-            for r = 1:grid.params.rDim
-                grid.splines[z,v].uMish[r] = physical[i,v,1]
+        for r = 1:grid.params.rDim
+            for z = 1:grid.params.zDim
+                grid.columns[v].uMish[z] = physical[i,v,1]
                 i += 1
             end
-            SBtransform!(grid.splines[z,v])
+            tempcb[:,r] .= CBtransform!(grid.columns[v])
         end
 
-        for r = 1:grid.params.b_rDim
-            for z = 1:grid.params.zDim
-                grid.columns[v].uMish[z] = grid.splines[z,v].b[r]
+        for z = 1:grid.params.b_zDim
+            # Clear the spline
+            grid.splines[v].uMish .= 0.0
+            for r = 1:grid.params.rDim
+                grid.splines[v].uMish[r] = tempcb[z,r]
             end
-            CBtransform!(grid.columns[v])
+            SBtransform!(grid.splines[v])
 
             # Assign the spectral array
-            z1 = ((r-1)*grid.params.b_zDim)+1
-            z2 = r*grid.params.b_zDim
-            spectral[z1:z2,v] .= grid.columns[v].b
+            r1 = (z-1) * grid.params.b_rDim + 1
+            r2 = r1 + grid.params.b_rDim - 1
+            spectral[r1:r2,v] .= grid.splines[v].b
         end
     end
 
@@ -94,7 +165,6 @@ end
 function gridTransform!(grid::RZ_Grid)
     
     # Transform from the spectral to grid space
-    # For RZ grid, varying dimensions are R, Z, and variable
     physical = gridTransform(grid, grid.physical, grid.spectral)
     return physical
 end
@@ -102,212 +172,241 @@ end
 function gridTransform(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
     
     # Transform from the spectral to grid space
-    # For RZ grid, varying dimensions are R, Z, and variable
-    for v in values(grid.params.vars)
-        for r = 1:grid.params.b_rDim
-            z1 = ((r-1)*grid.params.b_zDim)+1
-            z2 = r*grid.params.b_zDim
-            grid.columns[v].b .= spectral[z1:z2,v]
-            CAtransform!(grid.columns[v])
-            CItransform!(grid.columns[v])
-            
-            for z = 1:grid.params.zDim
-                grid.splines[z,v].b[r] = grid.columns[v].uMish[z]
-            end    
-        end
-        
-        for z = 1:grid.params.zDim
-            SAtransform!(grid.splines[z,v])
-            SItransform!(grid.splines[z,v])
-            
-            # Assign the grid array
-            r1 = ((z-1)*grid.params.rDim)+1
-            r2 = z*grid.params.rDim
-            physical[r1:r2,v,1] .= grid.splines[z,v].uMish
-            physical[r1:r2,v,2] .= SIxtransform(grid.splines[z,v])
-            physical[r1:r2,v,3] .= SIxxtransform(grid.splines[z,v])
-        end
-        
-        # Get the vertical derivatives
-        var = reshape(physical[:,v,1],grid.params.rDim,grid.params.zDim)
-        for r = 1:grid.params.rDim
-            grid.columns[v].uMish .= var[r,:]
-            CBtransform!(grid.columns[v])
-            CAtransform!(grid.columns[v])
-            varz = CIxtransform(grid.columns[v])
-            varzz = CIxxtransform(grid.columns[v])
+    splineBuffer = zeros(Float64, grid.params.rDim, grid.params.b_zDim)
 
-            # Assign the grid array
-            for z = 1:grid.params.zDim
-                ri = (z-1)*grid.params.rDim + r
-                physical[ri,v,4] = varz[z]
-                physical[ri,v,5] = varzz[z]
+    for v in values(grid.params.vars)
+        for dr in 0:2
+            for z = 1:grid.params.b_zDim
+                # Wavenumber zero only
+                r1 = (z-1) * grid.params.b_rDim + 1
+                r2 = r1 + grid.params.b_rDim - 1
+                grid.splines[v].b .= spectral[r1:r2,v]
+                SAtransform!(grid.splines[v])
+                if (dr == 0)
+                    splineBuffer[:,z] .= SItransform!(grid.splines[v])
+                elseif (dr == 1)
+                    splineBuffer[:,z] .= SIxtransform(grid.splines[v])
+                else
+                    splineBuffer[:,z] .= SIxxtransform(grid.splines[v])
+                end
             end
-        end
-        
-    end
-    
-    return grid.physical 
-end
 
-function spectralTransform_old(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
-    
-    # Transform from the RZ grid to spectral space
-    # For RZ grid, varying dimensions are R, Z, and variable
-    
-    # Regular splines are OK here since BCs are only applied on grid transform
-    
-    varRtmp = zeros(Float64,grid.params.rDim)
-    varZtmp = zeros(Float64,grid.params.zDim)
-    spectraltmp = zeros(Float64,grid.params.zDim * grid.params.b_rDim,
-        length(values(grid.params.vars)))
-    for v in values(grid.params.vars)
-        i = 1
-        for z = 1:grid.params.zDim
             for r = 1:grid.params.rDim
-                varRtmp[r] = physical[i,v,1]
-                i += 1
-            end
-            b = SBtransform(grid.splines[z,v],varRtmp)
-            
-            # Assign a temporary spectral array
-            r1 = ((z-1)*grid.params.b_rDim)+1
-            r2 = z*grid.params.b_rDim
-            spectraltmp[r1:r2,v] .= b
-        end
+                for z = 1:grid.params.b_zDim
+                    grid.columns[v].b[z] = splineBuffer[r,z]
+                end
+                CAtransform!(grid.columns[v])
+                CItransform!(grid.columns[v])
 
-        for r = 1:grid.params.b_rDim
-            for z = 1:grid.params.zDim
-                ri = ((z-1)*grid.params.b_rDim)+r
-                varZtmp[z] = spectraltmp[ri,v]
+                # Assign the grid array
+                z1 = (r-1)*grid.params.zDim + 1
+                z2 = z1 + grid.params.zDim - 1
+                if (dr == 0)
+                    physical[z1:z2,v,1] .= grid.columns[v].uMish
+                    physical[z1:z2,v,4] .= CIxtransform(grid.columns[v])
+                    physical[z1:z2,v,5] .= CIxxtransform(grid.columns[v])
+                elseif (dr == 1)
+                    physical[z1:z2,v,2] .= grid.columns[v].uMish
+                elseif (dr == 2)
+                    physical[z1:z2,v,3] .= grid.columns[v].uMish
+                end
             end
-            b = CBtransform(grid.columns[v], varZtmp)
-            
-            # Assign the spectral array
-            z1 = ((r-1)*grid.params.b_zDim)+1
-            z2 = r*grid.params.b_zDim
-            spectral[z1:z2,v] .= b
         end
     end
 
-    return spectral
+    return physical
 end
 
-function gridTransform_noBCs(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
-    
+function gridTransform!(patch::RZ_Grid, tile::RZ_Grid)
+
+    splineBuffer = zeros(Float64, patch.params.rDim, grid.params.b_zDim)
+    physical = gridTransform(patch.splines, patch.spectral, patch.params, tile, splineBuffer)
+    return physical
+end
+
+function gridTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::RZ_Grid, splineBuffer::Array{Float64})
+
     # Transform from the spectral to grid space
-    # For RZ grid, varying dimensions are R, Z, and variable
-    # Need to use a R0 BC for this since there is no guarantee 
-    # that tendencies should match the underlying variable 
-    splines = Array{Spline1D}(undef,grid.params.zDim)
-    for z = 1:grid.params.zDim
-        splines[z] = Spline1D(SplineParameters(
-            xmin = grid.params.xmin, 
-            xmax = grid.params.xmax,
-            num_cells = grid.params.num_cells, 
-            BCL = CubicBSpline.R0, 
-            BCR = CubicBSpline.R0))
-    end
-    column = Chebyshev1D(ChebyshevParameters(
-            zmin = grid.params.zmin,
-            zmax = grid.params.zmax,
-            zDim = grid.params.zDim,
-            bDim = grid.params.b_zDim,
-            BCB = Chebyshev.R0,
-            BCT = Chebyshev.R0))
+    #splineBuffer = zeros(Float64, grid.params.rDim, grid.params.b_zDim)
+    
     for v in values(grid.params.vars)
-        for r = 1:grid.params.b_rDim
-            z1 = ((r-1)*grid.params.b_zDim)+1
-            z2 = r*grid.params.b_zDim
-            column.b .= spectral[z1:z2,v]
-            CAtransform!(column)
-            CItransform!(column)
-            
-            for z = 1:grid.params.zDim
-                splines[z].b[r] = column.uMish[z]
-            end    
-        end
-        
-        for z = 1:grid.params.zDim
-            SAtransform!(splines[z])
-            SItransform!(splines[z])
-            
-            # Assign the grid array
-            r1 = ((z-1)*grid.params.rDim)+1
-            r2 = z*grid.params.rDim
-            physical[r1:r2,v,1] .= splines[z].uMish
-            physical[r1:r2,v,2] .= SIxtransform(splines[z])
-            physical[r1:r2,v,3] .= SIxxtransform(splines[z])
-        end
-        
-        # Get the vertical derivatives
-        var = reshape(physical[:,v,1],grid.params.rDim,grid.params.zDim)
-        for r = 1:grid.params.rDim
-            column.uMish .= var[r,:]
-            CBtransform!(column)
-            CAtransform!(column)
-            varz = CIxtransform(column)
-            varzz = CIxxtransform(column)
+        for dr in 0:2
+            for z = 1:pp.b_zDim
+                # Wavenumber zero only
+                r1 = (z-1) * pp.b_rDim + 1
+                r2 = r1 + pp.b_rDim - 1
+                patchSplines[v].b .= patchSpectral[r1:r2,v]
+                SAtransform!(patchSplines[v])
+                if (dr == 0)
+                    splineBuffer[:,z] .= SItransform!(patchSplines[v])
+                elseif (dr == 1)
+                    splineBuffer[:,z] .= SIxtransform(patchSplines[v])
+                else
+                    splineBuffer[:,z] .= SIxxtransform(patchSplines[v])
+                end
+            end
 
-            # Assign the grid array
-            for z = 1:grid.params.zDim
-                ri = (z-1)*grid.params.rDim + r
-                physical[ri,v,4] = varz[z]
-                physical[ri,v,5] = varzz[z]
+            for r = 1:tile.params.rDim
+                ri = r + tile.params.patchOffsetL
+                for z = 1:pp.b_zDim
+                    tile.columns[v].b[z] = splineBuffer[ri,z]
+                end
+                CAtransform!(tile.columns[v])
+                CItransform!(tile.columns[v])
+
+                # Assign the grid array
+                z1 = (r-1)*pp.zDim + 1
+                z2 = z1 + pp.zDim - 1
+                if (dr == 0)
+                    tile.physical[z1:z2,v,1] .= tile.columns[v].uMish
+                    tile.physical[z1:z2,v,4] .= CIxtransform(tile.columns[v])
+                    tile.physical[z1:z2,v,5] .= CIxxtransform(tile.columns[v])
+                elseif (dr == 1)
+                    tile.physical[z1:z2,v,2] .= tile.columns[v].uMish
+                elseif (dr == 2)
+                    tile.physical[z1:z2,v,3] .= tile.columns[v].uMish
+                end
             end
         end
     end
-    
-    return physical 
+
+    return tile.physical
 end
 
-function integrateUp(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
-    
+function splineTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, sharedSpectral::SharedArray{Float64},tile::RZ_Grid)
+
+    # Do a partial transform from B to A for splines only
+    for v in values(pp.vars)
+        r1 = 1
+        for z in 1:pp.b_zDim
+            r2 = r1 + pp.b_rDim - 1
+            patchSpectral[r1:r2,v] .= SAtransform(patchSplines[v], view(sharedSpectral,r1:r2,v))
+            r1 = r2 + 1
+        end
+    end
+end
+
+function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Float64}, pp::GridParameters, tile::RZ_Grid, splineBuffer::Array{Float64})
+
     # Transform from the spectral to grid space
-    # For RZ grid, varying dimensions are R, Z, and variable
-    # Need to use a R0 BC for this since there is no guarantee 
-    # that tendencies should match the underlying variable 
-    splines = Array{Spline1D}(undef,grid.params.zDim)
-    for z = 1:grid.params.zDim
-        splines[z] = Spline1D(SplineParameters(
-            xmin = grid.params.xmin, 
-            xmax = grid.params.xmax,
-            num_cells = grid.params.num_cells, 
-            BCL = CubicBSpline.R0, 
-            BCR = CubicBSpline.R0))
-    end
-    column = Chebyshev1D(ChebyshevParameters(
-            zmin = grid.params.zmin,
-            zmax = grid.params.zmax,
-            zDim = grid.params.zDim,
-            bDim = grid.params.b_zDim,
-            BCB = Chebyshev.R0,
-            BCT = Chebyshev.R0))
-    for r = 1:grid.params.b_rDim
-        z1 = ((r-1)*grid.params.b_zDim)+1
-        z2 = r*grid.params.b_zDim
-        column.b .= spectral[z1:z2]
-        CAtransform!(column)
-        w = CIInttransform(column)
+    #splineBuffer = zeros(Float64, tile.params.rDim, pp.b_zDim)
 
-        for z = 1:grid.params.zDim
-            splines[z].b[r] = w[z]
-        end    
+    for v in values(pp.vars)
+        for dr in 0:2
+            for z = 1:pp.b_zDim
+                # Wavenumber zero
+                r1 = (z-1) * pp.b_rDim + 1
+                r2 = r1 + pp.b_rDim - 1
+                patchSplines[v].a .= view(patchSpectral,r1:r2,v)
+                if (dr == 0)
+                    SItransform(patchSplines[v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
+                elseif (dr == 1)
+                    SIxtransform(patchSplines[v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
+                else
+                    SIxxtransform(patchSplines[v],tile.splines[1].mishPoints,view(splineBuffer,:,z))
+                end
+            end
+
+            for r = 1:tile.params.rDim
+                for z = 1:pp.b_zDim
+                    tile.columns[v].b[z] = splineBuffer[r,z]
+                end
+                CAtransform!(tile.columns[v])
+                CItransform!(tile.columns[v])
+
+                # Assign the grid array
+                z1 = (r-1)*pp.zDim + 1
+                z2 = z1 + pp.zDim - 1
+                if (dr == 0)
+                    tile.physical[z1:z2,v,1] .= tile.columns[v].uMish
+                    tile.physical[z1:z2,v,4] .= CIxtransform(tile.columns[v])
+                    tile.physical[z1:z2,v,5] .= CIxxtransform(tile.columns[v])
+                elseif (dr == 1)
+                    tile.physical[z1:z2,v,2] .= tile.columns[v].uMish
+                elseif (dr == 2)
+                    tile.physical[z1:z2,v,3] .= tile.columns[v].uMish
+                end
+            end
+        end
     end
 
-    for z = 1:grid.params.zDim
-        SAtransform!(splines[z])
-        SItransform!(splines[z])
-
-        # Assign the grid array
-        r1 = ((z-1)*grid.params.rDim)+1
-        r2 = z*grid.params.rDim
-        physical[r1:r2] .= splines[z].uMish
-    end
-    
-    return physical 
+    return tile.physical
 end
 
 function spectralxTransform(grid::RZ_Grid, physical::Array{real}, spectral::Array{real})
-    #To be implemented for delayed diffusion
+    
+    # Not yet implemented
+
+end
+
+function calcPatchMap(patch::RZ_Grid, tile::RZ_Grid)
+
+    patchMap = falses(size(patch.spectral))
+    tileView = falses(size(tile.spectral))
+
+    # Indices of sharedArray that won't be touched by other workers
+    spectralIndexL = tile.params.spectralIndexL
+    patchRstride = patch.params.b_rDim
+    tileRstride = tile.params.b_rDim
+    tileShare = tileRstride - 4
+
+    for z = 1:tile.params.b_zDim
+        p0 = spectralIndexL + (z-1)*patchRstride
+        p1 = p0
+        p2 = p1 + tileShare
+        patchMap[p1:p2,:] .= true
+
+        t0 = 1 + (z-1)*tileRstride
+        t1 = t0
+        t2 = t1 + tileShare
+        tileView[t1:t2, :] .= true
+    end
+
+    return patchMap, view(tile.spectral, tileView)
+end
+
+function calcHaloMap(patch::RZ_Grid, tile::RZ_Grid)
+
+    patchMap = falses(size(patch.spectral))
+    tileView = falses(size(tile.spectral))
+
+    # Indices of sharedArray that won't be touched by other workers
+    spectralIndexL = tile.params.spectralIndexL
+    patchRstride = patch.params.b_rDim
+    tileRstride = tile.params.b_rDim
+    # Index is 1 more than shared map
+    tileShare = tileRstride - 3
+
+    for z = 1:tile.params.b_zDim
+        p0 = spectralIndexL + (z-1)*patchRstride
+        p1 = p0 + tileShare
+        p2 = p1 + 2
+        patchMap[p1:p2,:] .= true
+
+        t0 = 1 + (z-1)*tileRstride
+        t1 = t0 + tileShare
+        t2 = t1 + 2
+        tileView[t1:t2, :] .= true
+    end
+
+    return patchMap, view(tile.spectral, tileView)
+end
+
+
+function regularGridTransform(grid::RZ_Grid)
+    
+    # Output on regular grid
+    # Output on the nodes and on even levels
+    # TBD
+end
+
+function getRegularGridpoints(grid::RZ_Grid)
+
+    # Return an array of regular gridpoint locations
+    # TBD
+end
+
+function allocateSplineBuffer(patch::RZ_Grid, tile::RZ_Grid)
+
+    splineBuffer = zeros(Float64, tile.params.rDim, tile.params.b_zDim)
 end

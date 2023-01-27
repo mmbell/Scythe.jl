@@ -1032,5 +1032,5 @@ end
 
 function allocateSplineBuffer(patch::RLZ_Grid, tile::RLZ_Grid)
 
-    return zeros(Float64, tile.params.rDim, 3)
+    return zeros(Float64, tile.params.rDim, tile.params.b_zDim)
 end

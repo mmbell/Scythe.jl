@@ -38,6 +38,75 @@ function LinearAdvection1D(grid::R_Grid,
 
 end
 
+function LinearAdvectionRZ(grid::RZ_Grid,
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+
+    #Simple Linear advection to test
+    K = model.physical_params[:K]
+
+    r = gridpoints[:,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hz = grid.physical[:,1,4]
+    hzz = grid.physical[:,1,5]
+    u = grid.physical[:,2,1]
+    v = grid.physical[:,3,1]
+    w = grid.physical[:,4,1]
+
+    @turbo vardot[:,1] .= @. (-u * hr) + (-w * hz) + (K * ((hr / r) + hrr + hzz))
+
+    # F = 0
+end
+
+function LinearAdvectionRL(grid::RL_Grid,
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+
+    #2D Linear advection to test
+    K = model.physical_params[:K]
+    r = view(gridpoints,:,1)
+    hr = view(grid.physical,:,1,2)
+    hl = view(grid.physical,:,1,4)
+    u = view(grid.physical,:,2,1)
+    v = view(grid.physical,:,3,1)
+
+    #@turbo vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))
+    if K > 0.0
+        hrr = view(grid.physical,:,1,3)
+        hll = view(grid.physical,:,1,5)
+        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r)) + (K * ((hr / r) + hrr + (hll / (r * r))))
+    else
+        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r))
+    end
+    # F = 0
+end
+
+            gridpoints::Array{real},
+            vardot::Array{real},
+            F::Array{real},
+            model::ModelParameters)
+
+    #2D Linear advection to test
+    K = model.physical_params[:K]
+
+    r = gridpoints[:,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    u = grid.physical[:,2,1]
+    v = grid.physical[:,3,1]
+
+    vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))) 
+
+    # F = 0
+end
+
 function Williams2013_slabTCBL(grid::R_Grid, 
             gridpoints::Array{real},
             vardot::Array{real},
@@ -91,20 +160,6 @@ function Williams2013_slabTCBL(grid::R_Grid,
     #F[:,3] .= VKDIFF
     F[:,3] .= 0.0
 
-end
-
-function LinearAdvectionRZ(physical::Array{real}, 
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-   
-    #1D Linear advection to test
-    c_0 = 5.0
-    K = 0.003
-
-    vardot[:,1] .= -c_0 .* physical[:,1,2] .+ (K .* physical[:,1,3])        
-    # F = 0
 end
 
 function Kepert2017_TCBL(grid::RZ_Grid, 
@@ -196,53 +251,6 @@ function Kepert2017_TCBL(grid::RZ_Grid,
     VVDIFF = Kv[:,2,4]
     udot[:,3] .= VADV .+ UW .+ VHDIFF .+ VVDIFF
 
-end
-
-function LinearAdvectionRL(grid::RL_Grid, 
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-   
-    #2D Linear advection to test
-    K = model.physical_params[:K]
-    r = view(gridpoints,:,1)
-    hr = view(grid.physical,:,1,2)
-    hl = view(grid.physical,:,1,4)
-    u = view(grid.physical,:,2,1)
-    v = view(grid.physical,:,3,1)
-
-    #@turbo vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))
-    if K > 0.0
-        hrr = view(grid.physical,:,1,3)
-        hll = view(grid.physical,:,1,5)
-        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r)) + (K * ((hr / r) + hrr + (hll / (r * r))))
-    else
-        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r))
-    end
-    # F = 0
-end
-
-function LinearAdvectionRLZ(grid::RLZ_Grid, 
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-
-    #2D Linear advection to test
-    K = model.physical_params[:K]
-
-    r = gridpoints[:,1]
-    hr = grid.physical[:,1,2]
-    hrr = grid.physical[:,1,3]
-    hl = grid.physical[:,1,4]
-    hll = grid.physical[:,1,5]
-    u = grid.physical[:,2,1]
-    v = grid.physical[:,3,1]
-
-    vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))) 
-
-    # F = 0
 end
 
 function LinearShallowWaterRL(grid::RL_Grid, 
