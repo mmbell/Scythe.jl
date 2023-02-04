@@ -86,6 +86,7 @@ function LinearAdvectionRL(grid::RL_Grid,
     # F = 0
 end
 
+function LinearAdvectionRLZ(grid::RLZ_Grid,
             gridpoints::Array{real},
             vardot::Array{real},
             F::Array{real},
@@ -588,7 +589,7 @@ function Twoway_ShallowWater_Slab(grid::RL_Grid,
             F::Array{Float64},
             model::ModelParameters)
 
-    # Need to figure out how to assign these with symbols
+    # Physical parameters
     g = model.physical_params[:g]
     K = model.physical_params[:K]
     Cd = model.physical_params[:Cd]
@@ -790,6 +791,81 @@ function Twoway_ShallowWater_Slab_old(grid::RL_Grid,
     vardot[:,5] .= VADV .+ VDRAG .+ VPGF .+ VW .+ VKDIFF
     F[:,5] .= 0.0
     
+end
+
+function Straka_test(grid::RZ_Grid,
+            gridpoints::Array{Float64},
+            vardot::Array{Float64},
+            F::Array{Float64},
+            model::ModelParameters)
+
+    # Physical parameters
+    Cp = model.physical_params[:Cp]
+    Rd = model.physical_params[:Rd]
+    Cv = model.physical_params[:Cv]
+    p0 = model.physical_params[:p0]
+    g = model.physical_params[:g]
+    K = model.physical_params[:K]
+    Ts = model.physical_params[:Ts]
+
+    x = view(gridpoints,:,1)
+    z = view(gridpoints,:,2)
+
+    # Basic state
+    theta0 = Ts
+    T0 = @. Ts - (g / Cp) * z
+    #pbar = p0 * (Tbar / Ts)^(Rd / Cp)
+    exner0 = T0 ./ theta0
+    
+    # Variables
+    u = view(grid.physical,:,1,1)
+    ux = view(grid.physical,:,1,2)
+    uxx = view(grid.physical,:,1,3)
+    uz = view(grid.physical,:,1,4)
+    uzz = view(grid.physical,:,1,5)
+
+    w = view(grid.physical,:,2,1)
+    wx = view(grid.physical,:,2,2)
+    wxx = view(grid.physical,:,2,3)
+    wz = view(grid.physical,:,2,4)
+    wzz = view(grid.physical,:,2,5)
+
+    theta = view(grid.physical,:,3,1)
+    thetax = view(grid.physical,:,3,2)
+    thetaxx = view(grid.physical,:,3,3)
+    thetaz = view(grid.physical,:,3,4)
+    thetazz = view(grid.physical,:,3,5)
+    
+    exner = view(grid.physical,:,4,1)
+    exnerx = view(grid.physical,:,4,2)
+    exnerxx = view(grid.physical,:,4,3)
+    exnerz = view(grid.physical,:,4,4)
+    exnerzz = view(grid.physical,:,4,5)
+    
+    ADV = similar(x)
+    PGF = similar(x)
+    KDIFF = similar(x)
+    
+    @turbo ADV .= @. (-u * ux) + (-w * uz) #UADV
+    @turbo PGF .= @. -Cp * (theta + theta0) * exnerx #UPGF
+    @turbo KDIFF .= @. K * (uxx + uzz)
+    @turbo vardot[:,1] .= @. ADV + PGF + KDIFF
+
+    @turbo ADV .= @. (-u * wx) + (-w * wz) #WADV
+    @turbo PGF .= @. (-Cp * (theta + theta0) * exnerz) + (g * theta / theta0)  #WPGF
+    @turbo KDIFF .= @. K * (wxx + wzz)
+    @turbo vardot[:,2] .= @. ADV + PGF + KDIFF
+
+    @turbo ADV .= @. (-u * thetax) + (-w * thetaz) #THETAADV
+    #@turbo PGF .= 0.0
+    @turbo KDIFF .= @. K * (thetaxx + thetazz)
+    @turbo vardot[:,3] .= @. ADV + KDIFF
+    
+    @turbo ADV .= @. (-u * exnerx) + (-w * exnerz) #SADV
+    @turbo PGF .= @. -(exner + exner0) * (Rd / Cv) * (ux + wz)
+    #@turbo KDIFF .= 0.0
+    @turbo vardot[:,4] .= @. ADV + PGF
+
 end
 
 # Module end

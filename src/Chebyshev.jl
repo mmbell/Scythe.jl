@@ -342,7 +342,6 @@ function calcGammaBC(cp::ChebyshevParameters)
         return gammaBC  
         
     elseif (cp.BCB == R1T1) && (cp.BCT == R1T1)
-        # Requires two-step application (not yet implemented)
         scaleFactor = 0.0
         gammaBCB = zeros(Float64,Ndim,Ndim)
         c = ones(Float64,Ndim)
@@ -371,11 +370,12 @@ function calcGammaBC(cp::ChebyshevParameters)
                 gammaBCT[i,j] = (-1.0)^(j+1) * (-1.0)^(n+1) * n * n / (scaleFactor * c[j] * (Ndim-1))
             end
         end
-    
-        return gammaBCB, gammaBCT
+
+        gammaBC = zeros(Float64,Ndim,Ndim)
+        gammaBC .= gammaBCB + gammaBCT
+        return gammaBC
     
     elseif (cp.BCB == R1T0) && (cp.BCT == R1T1)
-        # Requires two-step application (not yet implemented)
         c = ones(Float64,Ndim)
         c[1] *= 2.0
         c[Ndim] *= 2.0
@@ -396,9 +396,47 @@ function calcGammaBC(cp::ChebyshevParameters)
         gammaBCB[2:Ndim-1] *= 2.0
         gammaBCB *= (-0.5 / (Ndim-1))
 
-        return gammaBCB, gammaBCT
+        gammaBC = zeros(Float64,Ndim,Ndim)
+        gammaBC .= gammaBCB .+ gammaBCT
+        return gammaBC
+
+    elseif (cp.BCB == R1T1) && (cp.BCT == R1T0)
+        c = ones(Float64,Ndim)
+        c[1] *= 2.0
+        c[Ndim] *= 2.0
+        scaleFactor = 0.0
+        gammaBCB = zeros(Float64,Ndim,Ndim)
+        c = ones(Float64,Ndim)
+        c[1] *= 2.0
+        c[Ndim] *= 2.0
+        for i = 1:Ndim
+            n = i-1
+            scaleFactor += -(n * n) / (c[i] * (Ndim-1))
+        end
+        for i = 1:Ndim
+            n = i -1
+            for j = 1:Ndim
+                gammaBCB[i,j] = n * n / (scaleFactor * c[j] * (Ndim-1))
+            end
+        end
+
+        gammaBCT = ones(Float64,Ndim,Ndim)
+        for i = 1:Ndim
+            for j = 1:Ndim
+                gammaBCT[i,j] *= -1.0* (-1.0)^(i-1) * (-1.0)^(j-1) / (Ndim-1)
+            end
+        end
+        gammaBCT[1,:] *= 0.5
+        gammaBCT[Ndim,:] *= 0.5
+
+        gammaBC = zeros(Float64,Ndim,Ndim)
+        gammaBC .= gammaBCB .+ gammaBCT
+        return gammaBC
+    else
+        bcs = "$(cp.BCB), $(cp.BCT)"
+        throw(DomainError(bcs, "Chebyshev boundary condition combination not implemented"))
     end
-    
+
 end
 
 end
