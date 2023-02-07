@@ -7,9 +7,9 @@ using DistributedData
 include("CubicBSpline.jl")
 include("Fourier.jl")
 include("Chebyshev.jl")
-include("SpectralGrid.jl")
-include("NumericalModels.jl")
-include("Integrator.jl")
+include("spectralGrid.jl")
+include("numericalModels.jl")
+include("integrator.jl")
 
 export integrate_model
 export CubicBSpline, Chebyshev
