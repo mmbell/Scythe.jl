@@ -813,10 +813,12 @@ function Straka_test(grid::RZ_Grid,
 
     # Basic state
     theta0 = Ts
+    theta0z = 0.0
     T0 = @. Ts - (g / Cp) * z
     #pbar = p0 * (Tbar / Ts)^(Rd / Cp)
     exner0 = T0 ./ theta0
-    
+    exner0z = -(g / Cp) / theta0
+
     # Variables
     u = view(grid.physical,:,1,1)
     ux = view(grid.physical,:,1,2)
@@ -856,12 +858,12 @@ function Straka_test(grid::RZ_Grid,
     @turbo KDIFF .= @. K * (wxx + wzz)
     @turbo vardot[:,2] .= @. ADV + PGF + KDIFF
 
-    @turbo ADV .= @. (-u * thetax) + (-w * thetaz) #THETAADV
+    @turbo ADV .= @. (-u * thetax) + (-w * (thetaz + theta0z)) #THETAADV 
     #@turbo PGF .= 0.0
     @turbo KDIFF .= @. K * (thetaxx + thetazz)
     @turbo vardot[:,3] .= @. ADV + KDIFF
     
-    @turbo ADV .= @. (-u * exnerx) + (-w * exnerz) #SADV
+    @turbo ADV .= @. (-u * exnerx) + (-w * (exnerz + exner0z)) #SADV
     @turbo PGF .= @. -(exner + exner0) * (Rd / Cv) * (ux + wz)
     #@turbo KDIFF .= 0.0
     @turbo vardot[:,4] .= @. ADV + PGF
