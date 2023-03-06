@@ -47,10 +47,10 @@ end
 abstract type AbstractGrid end
 
 # Include functions for implemented grids
-include("R_Grid.jl")
-include("RZ_Grid.jl")
-include("RL_Grid.jl")
-include("RLZ_Grid.jl")
+include("r_grid.jl")
+include("rz_grid.jl")
+include("rl_grid.jl")
+include("rlz_grid.jl")
 
 # Not yet implemented
 struct Z_Grid <: AbstractGrid
