@@ -16,6 +16,7 @@ Base.@kwdef struct ModelParameters
     equation_set = "LinearAdvection1D"
     initial_conditions = "ic.csv"
     output_dir = "./output/"
+    ref_state_file = ""
     grid_params::GridParameters
     physical_params::Dict
 end
@@ -793,7 +794,7 @@ function Twoway_ShallowWater_Slab_old(grid::RL_Grid,
     
 end
 
-function Straka_test(grid::RZ_Grid,
+function Straka_old(grid::RZ_Grid,
             gridpoints::Array{Float64},
             vardot::Array{Float64},
             F::Array{Float64},

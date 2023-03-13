@@ -334,6 +334,21 @@ function SAtransform(spline::Spline1D, b::Vector{real}, ahat::Vector{real})
     return a
 end
 
+function SItransform_matrix(spline::Spline1D, points::Vector{Float64}, derivative::Int64 = 0)
+
+    sp = spline.params
+    u = zeros(Float64,sp.num_cells*mubar,spline.bDim)
+    for i in eachindex(points)
+        xm = ceil(Int64,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
+        for m = xm:(xm + 3)
+            if (m >= -1) && (m <= (sp.num_cells+1))
+                mi = m + 2
+                u[i,mi] = basis(sp, m, points[i], derivative)
+            end
+        end
+    end
+    return u
+end
 
 function SItransform(sp::SplineParameters, a::Vector{real}, x::real, derivative::int = 0)
 

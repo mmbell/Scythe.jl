@@ -43,7 +43,7 @@ struct Chebyshev1D
     gammaBC::Array{real}
     
     # Measured FFTW Plan
-    fftPlan::FFTW.r2rFFTWPlan{Float64, (3,), false, 1, UnitRange{Int64}}
+    fftPlan::FFTW.r2rFFTWPlan{Float64, Tuple{Int32}, false, 1, Tuple{Int64}}
     
     # Filter matrix
     filter::Matrix{real}
@@ -207,7 +207,7 @@ function CIxxtransform(column::Chebyshev1D)
 end
 
 
-function calcDCTmatrix(Nbasis::Int64)
+function dct_matrix(Nbasis::Int64)
     
     # Create a matrix with the DCT as basis functions for boundary conditions
     dct = zeros(Float64,Nbasis,Nbasis)
@@ -219,7 +219,50 @@ function calcDCTmatrix(Nbasis::Int64)
     end
     dct[:,1] *= 0.5
     dct[:,Nbasis] *= 0.5
+    #dct = dct ./ (2 * (Nbasis -1))
     return dct
+end
+
+function dct_1st_derivative(Nbasis::Int64)
+
+    # Create a matrix with the DCT as basis functions for boundary conditions
+    dct = zeros(Float64,Nbasis,Nbasis)
+    for i = 1:Nbasis
+        t = (i-1) * π / (Nbasis - 1)
+        for j = 1:Nbasis
+            N = j-1
+            if (i == 1)
+                dct[i,j] = -N*N
+            elseif (i == Nbasis)
+                dct[i,j] = -N*N*(-1.0)^(N+1)
+            else
+                dct[i,j] = -N*sin(N*t)/sin(t)
+            end
+        end
+    end
+    return dct ./ (Nbasis/4)
+end
+
+function dct_2nd_derivative(Nbasis::Int64)
+
+    # Create a matrix with the DCT as basis functions for boundary conditions
+    dct = zeros(Float64,Nbasis,Nbasis)
+    for i = 1:Nbasis
+        t = (i-1) * π / (Nbasis - 1)
+        ct = cos(t)
+        st = sin(t)
+        for j = 1:Nbasis
+            N = j-1
+            if (i == 1)
+                dct[i,j] = (N^4 - N^2)/3
+            elseif (i == Nbasis)
+                dct[i,j] = ((-1.0)^N)*(N^4 - N^2)/3
+            else
+                dct[i,j] = -N*N*cos(N*t)/(st*st) + N*sin(N*t)*ct/(st*st*st)
+            end
+        end
+    end
+    return dct ./ (Nbasis*Nbasis/8)
 end
 
 function calcGammaBCalt(cp::ChebyshevParameters)

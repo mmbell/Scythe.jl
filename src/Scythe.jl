@@ -9,8 +9,12 @@ include("Fourier.jl")
 include("Chebyshev.jl")
 include("spectralGrid.jl")
 include("numericalModels.jl")
+include("thermodynamics.jl")
+include("reference_state.jl")
+#include("integrator.jl")
 include("semiimplicit.jl")
 include("io.jl")
+include("euler.jl")
 
 export integrate_model
 export CubicBSpline, Chebyshev

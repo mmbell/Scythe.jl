@@ -26,6 +26,7 @@ struct ModelTile
     impdot_n::Array{Float64}
     impdot_nm1::Array{Float64}
     tilepoints::Array{Float64}
+    ref_state::ReferenceState
     patchSplines::Array{Spline1D}
     patchSpectral::Array{Float64}
     patchIndexMap::BitMatrix
@@ -51,6 +52,11 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     
     # Get the local gridpoints
     tilepoints = getGridpoints(tile)
+
+    # Set up the reference file
+    zdim = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
+    ref_state = interpolate_reference_file(model.ref_state_file, zdim)
+    transform_reference_state!(model, ref_state)
 
     # Copy over the patch information
     patchSplines = copy(patch.splines)
@@ -81,6 +87,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         impdot_n,
         impdot_nm1,
         tilepoints,
+        ref_state,
         patchSplines,
         patchSpectral,
         patchIndexMap,
@@ -307,7 +314,7 @@ function physical_model(mtile::ModelTile)
         
     equation_set = Symbol(mtile.model.equation_set)
     equation_call = getfield(Scythe, equation_set)
-    equation_call(mtile.tile, mtile.tilepoints, mtile.expdot_n, mtile.impdot_n, mtile.model)
+    equation_call(mtile)
     return
 end
 
@@ -324,20 +331,24 @@ function timestep(mtile::ModelTile,t::Int64)
 
     if (t == 1)
         # Use Euler method and trapezoidal method (AM2) for first step
-        mtile.var_nxt .= @. physical + 
+        mtile.var_nxt .= @. physical +
             (ts * mtile.expdot_n) +
             (0.5 * ts * (mtile.impdot_np1 + mtile.impdot_n))
         mtile.expdot_nm1 .= mtile.expdot_n
         mtile.impdot_nm1 .= mtile.impdot_n
     elseif (t == 2) 
         # Use 2nd order A-B method and AI2* for second step
-        mtile.var_nxt .= @. physical + (0.5 * ts) * ((3.0 * mtile.expdot_n) - mtile.expdot_n) + (0.25 * ts * ((5.0 * mtile.impdot_np1) - (4.0 * mtile.impdot_n) + (3.0 * mtile.impdot_nm1)))
+        mtile.var_nxt .= @. physical +
+            (0.5 * ts) * ((3.0 * mtile.expdot_n) - mtile.expdot_n) +
+            (0.25 * ts * ((5.0 * mtile.impdot_np1) - (4.0 * mtile.impdot_n) + (3.0 * mtile.impdot_nm1)))
         mtile.expdot_nm1 .= mtile.expdot_n
         mtile.expdot_nm2 .= mtile.expdot_nm1
         mtile.impdot_nm1 .= mtile.impdot_n
     else
         # Use AI2*–AB3 implicit-explicit scheme (Durran and Blossey 2012)
-        mtile.var_nxt .= @. physical + ((ts / 12.0) * ((23.0 * mtile.expdot_n) - (16.0 * mtile.expdot_n) + (5.0 * mtile.expdot_nm2))) + (0.25 * ts * ((5.0 * mtile.impdot_np1) - (4.0 * mtile.impdot_n) + (3.0 * mtile.impdot_nm1)))
+        mtile.var_nxt .= @. physical +
+            ((ts / 12.0) * ((23.0 * mtile.expdot_n) - (16.0 * mtile.expdot_n) + (5.0 * mtile.expdot_nm2))) +
+              (0.25 * ts * ((5.0 * mtile.impdot_np1) - (4.0 * mtile.impdot_n) + (3.0 * mtile.impdot_nm1)))
         mtile.expdot_nm1 .= mtile.expdot_n
         mtile.expdot_nm2 .= mtile.expdot_nm1
         mtile.impdot_nm1 .= mtile.impdot_n
