@@ -277,14 +277,10 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # Transform to local physical tile
     tileTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
-    # Feed physical matrices to physical equations
-    physical_model(mtile)
-    
-    # Solve for semi-implicit n+1 terms
-    semiimplicit_solver(mtile)
-
-    # Advance the timestep
-    timestep(mtile, t)
+    Threads.@threads for c in 1:num_columns(mtile.tile)
+        # Advance each column
+        advance_column(mtile, c, t)
+    end
 
     # Convert current timestep to spectral tendencies
     calcTendency(mtile)
@@ -304,54 +300,77 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     return nothing
 end
 
+function advance_column(mtile::ModelTile, c::Int64, t::Int64)
+
+    # Grab a column of indices
+    colstart = (c-1) * mtile.model.grid_params.zDim + 1
+    colend = colstart + mtile.model.grid_params.zDim - 1
+
+    # Feed physical matrices to physical equations
+    physical_model(mtile, colstart, colend)
+
+    # Solve for semi-implicit n+1 terms
+    semiimplicit_solver(mtile, colstart, colend)
+
+    # Advance the timestep
+    timestep(mtile, colstart, colend, t)
+end
+
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
     
     write_output(grid, model, model.integration_time)
     println("Model complete!")
 end
 
-function physical_model(mtile::ModelTile)
+function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64)
         
     equation_set = Symbol(mtile.model.equation_set)
     equation_call = getfield(Scythe, equation_set)
-    equation_call(mtile)
+    equation_call(mtile, colstart, colend)
     return
 end
 
-function semiimplicit_solver(mtile::ModelTile)
+function semiimplicit_solver(mtile::ModelTile, colstart::Int64, colend::Int64)
     
     # Do something here
     
 end
 
-function timestep(mtile::ModelTile,t::Int64)
+function timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
-    physical = view(mtile.tile.physical,:,:,1)
+    physical = view(mtile.tile.physical,colstart:colend,:,1)
+    var_nxt = view(mtile.var_nxt,colstart:colend,:)
+    expdot_n = view(mtile.expdot_n,colstart:colend,:)
+    expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,:)
+    expdot_nm2 = view(mtile.expdot_nm2,colstart:colend,:)
+    impdot_np1 = view(mtile.impdot_np1,colstart:colend,:)
+    impdot_n = view(mtile.impdot_n,colstart:colend,:)
+    impdot_nm1 = view(mtile.impdot_nm1,colstart:colend,:)
     ts = mtile.model.ts 
 
     if (t == 1)
         # Use Euler method and trapezoidal method (AM2) for first step
-        mtile.var_nxt .= @. physical +
-            (ts * mtile.expdot_n) +
-            (0.5 * ts * (mtile.impdot_np1 + mtile.impdot_n))
-        mtile.expdot_nm1 .= mtile.expdot_n
-        mtile.impdot_nm1 .= mtile.impdot_n
+        var_nxt .= @. physical +
+            (ts * expdot_n) +
+            (0.5 * ts * (impdot_np1 + impdot_n))
+        expdot_nm1 .= expdot_n
+        impdot_nm1 .= impdot_n
     elseif (t == 2) 
         # Use 2nd order A-B method and AI2* for second step
-        mtile.var_nxt .= @. physical +
-            (0.5 * ts) * ((3.0 * mtile.expdot_n) - mtile.expdot_n) +
-            (0.25 * ts * ((5.0 * mtile.impdot_np1) - (4.0 * mtile.impdot_n) + (3.0 * mtile.impdot_nm1)))
-        mtile.expdot_nm1 .= mtile.expdot_n
-        mtile.expdot_nm2 .= mtile.expdot_nm1
-        mtile.impdot_nm1 .= mtile.impdot_n
+        var_nxt .= @. physical +
+            (0.5 * ts) * ((3.0 * expdot_n) - expdot_nm1) +
+            (0.25 * ts * ((5.0 * impdot_np1) - (4.0 * impdot_n) + (3.0 * impdot_nm1)))
+        expdot_nm1 .= expdot_n
+        expdot_nm2 .= expdot_nm1
+        impdot_nm1 .= impdot_n
     else
         # Use AI2*–AB3 implicit-explicit scheme (Durran and Blossey 2012)
-        mtile.var_nxt .= @. physical +
-            ((ts / 12.0) * ((23.0 * mtile.expdot_n) - (16.0 * mtile.expdot_n) + (5.0 * mtile.expdot_nm2))) +
-              (0.25 * ts * ((5.0 * mtile.impdot_np1) - (4.0 * mtile.impdot_n) + (3.0 * mtile.impdot_nm1)))
-        mtile.expdot_nm1 .= mtile.expdot_n
-        mtile.expdot_nm2 .= mtile.expdot_nm1
-        mtile.impdot_nm1 .= mtile.impdot_n
+        var_nxt .= @. physical +
+            ((ts / 12.0) * ((23.0 * expdot_n) - (16.0 * expdot_nm1) + (5.0 * expdot_nm2))) +
+              (0.25 * ts * ((5.0 * impdot_np1) - (4.0 * impdot_n) + (3.0 * impdot_nm1)))
+        expdot_nm1 .= expdot_n
+        expdot_nm2 .= expdot_nm1
+        impdot_nm1 .= impdot_n
     end
 end
 

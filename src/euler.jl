@@ -1,4 +1,4 @@
-function Euler_test(mtile::ModelTile)
+function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     
     grid = mtile.tile
     gridpoints = mtile.tilepoints
@@ -11,53 +11,53 @@ function Euler_test(mtile::ModelTile)
     K = model.physical_params[:K]
 
     # Gridpoints
-    x = view(gridpoints,:,1)
-    z = view(gridpoints,:,2)    
+    x = view(gridpoints,colstart:colend,1)
+    z = view(gridpoints,colstart:colend,2)
 
     # Variables
-    s = view(grid.physical,:,1,1)
-    s_x = view(grid.physical,:,1,2)
-    s_xx = view(grid.physical,:,1,3)
-    s_z = view(grid.physical,:,1,4)
-    s_zz = view(grid.physical,:,1,5)
+    s = view(grid.physical,colstart:colend,1,1)
+    s_x = view(grid.physical,colstart:colend,1,2)
+    s_xx = view(grid.physical,colstart:colend,1,3)
+    s_z = view(grid.physical,colstart:colend,1,4)
+    s_zz = view(grid.physical,colstart:colend,1,5)
     
-    xi = view(grid.physical,:,2,1)
-    xi_x = view(grid.physical,:,2,2)
-    xi_xx = view(grid.physical,:,2,3)
-    xi_z = view(grid.physical,:,2,4)
-    xi_zz = view(grid.physical,:,2,5)
+    xi = view(grid.physical,colstart:colend,2,1)
+    xi_x = view(grid.physical,colstart:colend,2,2)
+    xi_xx = view(grid.physical,colstart:colend,2,3)
+    xi_z = view(grid.physical,colstart:colend,2,4)
+    xi_zz = view(grid.physical,colstart:colend,2,5)
     
-    mu = view(grid.physical,:,3,1)
-    mu_x = view(grid.physical,:,3,2)
-    mu_xx = view(grid.physical,:,3,3)
-    mu_z = view(grid.physical,:,3,4)
-    mu_zz = view(grid.physical,:,3,5)
+    mu = view(grid.physical,colstart:colend,3,1)
+    mu_x = view(grid.physical,colstart:colend,3,2)
+    mu_xx = view(grid.physical,colstart:colend,3,3)
+    mu_z = view(grid.physical,colstart:colend,3,4)
+    mu_zz = view(grid.physical,colstart:colend,3,5)
     
-    u = view(grid.physical,:,4,1)
-    u_x = view(grid.physical,:,4,2)
-    u_xx = view(grid.physical,:,4,3)
-    u_z = view(grid.physical,:,4,4)
-    u_zz = view(grid.physical,:,4,5)
+    u = view(grid.physical,colstart:colend,4,1)
+    u_x = view(grid.physical,colstart:colend,4,2)
+    u_xx = view(grid.physical,colstart:colend,4,3)
+    u_z = view(grid.physical,colstart:colend,4,4)
+    u_zz = view(grid.physical,colstart:colend,4,5)
 
-    w = view(grid.physical,:,5,1)
-    w_x = view(grid.physical,:,5,2)
-    w_xx = view(grid.physical,:,5,3)
-    w_z = view(grid.physical,:,5,4)
-    w_zz = view(grid.physical,:,5,5)
+    w = view(grid.physical,colstart:colend,5,1)
+    w_x = view(grid.physical,colstart:colend,5,2)
+    w_xx = view(grid.physical,colstart:colend,5,3)
+    w_z = view(grid.physical,colstart:colend,5,4)
+    w_zz = view(grid.physical,colstart:colend,5,5)
     
-    # Get reference state (need to better optimize this memory allocation
+    # Get reference state
     num_columns = Int64(size(gridpoints,1) / model.grid_params.zDim)
-    sbar = repeat(refstate.sbar[:,1],num_columns)
-    sbar_z = repeat(refstate.sbar[:,2],num_columns)
-    sbar_zz = repeat(refstate.sbar[:,3],num_columns)
+    sbar = refstate.sbar[:,1]
+    sbar_z = refstate.sbar[:,2]
+    sbar_zz = refstate.sbar[:,3]
 
-    xibar = repeat(refstate.xibar[:,1],num_columns)
-    xibar_z = repeat(refstate.xibar[:,2],num_columns)
-    xibar_zz = repeat(refstate.xibar[:,3],num_columns)
+    xibar = refstate.xibar[:,1]
+    xibar_z = refstate.xibar[:,2]
+    xibar_zz = refstate.xibar[:,3]
 
-    mubar = repeat(refstate.mubar[:,1],num_columns)
-    mubar_z = repeat(refstate.mubar[:,2],num_columns)
-    mubar_zz = repeat(refstate.mubar[:,3],num_columns)    
+    mubar = refstate.mubar[:,1]
+    mubar_z = refstate.mubar[:,2]
+    mubar_zz = refstate.mubar[:,3]
     
     # Fundamental thermodynamic quantities derived from model variables
     thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu .+ mubar)
@@ -80,28 +80,28 @@ function Euler_test(mtile::ModelTile)
     @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
     #No PGF
     @turbo KDIFF .= @. K * (s_xx + s_zz)
-    @turbo expdot[:,1] .= @. ADV + KDIFF
+    @turbo expdot[colstart:colend,1] .= @. ADV + KDIFF
     
     @turbo ADV .= @. (-u * xi_x) + (-w * (xi_z + xibar_z)) #XI ADV
     @turbo PGF .= @. -u_x - w_z
     # No mass diffusion
-    @turbo expdot[:,2] .= @. ADV + PGF
+    @turbo expdot[colstart:colend,2] .= @. ADV + PGF
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #SADV
     #No PGF
     @turbo KDIFF .= @. K * (mu_xx + mu_zz)
-    @turbo expdot[:,3] .= @. ADV + KDIFF
+    @turbo expdot[colstart:colend,3] .= @. ADV + KDIFF
     
     @turbo ADV .= @. (-u * u_x) + (-w * u_z) #UADV
     PGF .= @. -(pressure_gradient(Tk, rho_d, q_v, s_x, xi_x, qvp_x) / rho_t) #UPGF
     @turbo KDIFF .= @. K * (u_xx + u_zz)
-    @turbo expdot[:,4] .= @. ADV + PGF + KDIFF
+    @turbo expdot[colstart:colend,4] .= @. ADV + PGF + KDIFF
 
     @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
     PGF .= @. -(pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z) / rho_t) -
          (g * rho_p / rho_t) #WPGF
     @turbo KDIFF .= @. K * (w_xx + w_zz)
-    @turbo expdot[:,5] .= @. ADV + PGF + KDIFF
+    @turbo expdot[colstart:colend,5] .= @. ADV + PGF + KDIFF
     
 end
 

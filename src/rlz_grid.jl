@@ -245,6 +245,11 @@ function getCartesianGridpoints(grid::RLZ_Grid)
     return gridpoints
 end
 
+function num_columns(grid::RLZ_Grid)
+
+    return grid.params.lDim
+end
+
 function spectralTransform!(grid::RLZ_Grid)
     
     # Transform from the RLZ grid to spectral space

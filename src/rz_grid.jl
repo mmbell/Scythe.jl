@@ -120,6 +120,11 @@ function getGridpoints(grid::RZ_Grid)
     return gridpoints
 end
 
+function num_columns(grid::RZ_Grid)
+
+    return grid.params.rDim
+end
+
 function spectralTransform!(grid::RZ_Grid)
     
     # Transform from the RZ grid to spectral space
