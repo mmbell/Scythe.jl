@@ -3,6 +3,7 @@ module Scythe
 
 using Distributed
 using DistributedData
+using Statistics
 
 include("CubicBSpline.jl")
 include("Fourier.jl")

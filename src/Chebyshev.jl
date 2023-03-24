@@ -223,7 +223,7 @@ function dct_matrix(Nbasis::Int64)
     return dct
 end
 
-function dct_1st_derivative(Nbasis::Int64)
+function dct_1st_derivative(Nbasis::Int64, physical_length::Float64)
 
     # Create a matrix with the DCT as basis functions for boundary conditions
     dct = zeros(Float64,Nbasis,Nbasis)
@@ -240,10 +240,10 @@ function dct_1st_derivative(Nbasis::Int64)
             end
         end
     end
-    return dct ./ (Nbasis/4)
+    return dct ./ (physical_length/4.0)
 end
 
-function dct_2nd_derivative(Nbasis::Int64)
+function dct_2nd_derivative(Nbasis::Int64, physical_length::Float64)
 
     # Create a matrix with the DCT as basis functions for boundary conditions
     dct = zeros(Float64,Nbasis,Nbasis)
@@ -262,7 +262,7 @@ function dct_2nd_derivative(Nbasis::Int64)
             end
         end
     end
-    return dct ./ (Nbasis*Nbasis/8)
+    return dct ./ (physical_length^2/8.0)
 end
 
 function calcGammaBCalt(cp::ChebyshevParameters)
@@ -482,4 +482,159 @@ function calcGammaBC(cp::ChebyshevParameters)
 
 end
 
+function bvp(N::Int64, u::Array{Float64}, ux::Array{Float64}, uxx::Array{Float64},
+        f::Array{Float64}, d0::Array{Float64}, d1::Array{Float64}, d2::Array{Float64},
+        scale::Float64 = 1.0, alpha::Float64 = 0.0, beta::Float64 = 0.0)
+
+    # Modified Chebyshev boundary value problem solver from Boyd (2000)
+    nbasis = N-2
+    xi = zeros(Float64, nbasis)
+    g = zeros(Float64, nbasis)
+    phi = zeros(Float64, nbasis)
+    phix = zeros(Float64, nbasis)
+    phixx = zeros(Float64, nbasis)
+    h = zeros(Float64, nbasis, nbasis)
+    # Compute the interior collocation points and forcing vector G
+    for i in 1:nbasis
+        xi[i] = cos(π*i/(nbasis+1))
+        x = xi[i]
+        b = alpha*(1-x)/2.0 + beta*(1+x)/2.0
+        bx = (-alpha + beta)/2.0
+        g[i] = f[i+1] - d0[i+1]*b - d1[i+1]*bx
+    end
+
+    # Compute the LHS square matrix
+    for i in 1:nbasis
+        x = xi[i]
+        phi, phix, phixx = bvp_modified_basis(x, nbasis, phi, phix, phixx, scale)
+        for j in 1:nbasis
+            h[i,j] = d2[i+1]*phixx[j] + d1[i+1]*phix[j] + d0[i+1]*phi[j]
+        end
+    end
+
+    # Solve the linear equation set
+    aphi = h \ g
+
+    # Transform back to physical space
+    u[1] = beta
+    u[N] = alpha
+    ux[1] = (-alpha + beta)/2.0
+    ux[N] = (-alpha + beta)/2.0
+    uxx[1] = 0.0
+    uxx[N] = 0.0
+    x = 1.0
+    phi, phix, phixx = bvp_modified_basis(x, nbasis, phi, phix, phixx, scale)
+    for j in 1:nbasis
+        u[1] = u[1] + (aphi[j] * phi[j])
+        ux[1] = ux[1] + (aphi[j] * phix[j])
+        uxx[1] = uxx[1] + (aphi[j] * phixx[j])
+    end
+    x = -1.0
+    phi, phix, phixx = bvp_modified_basis(x, nbasis, phi, phix, phixx, scale)
+    for j in 1:nbasis
+        u[N] = u[N] + (aphi[j] * phi[j])
+        ux[N] = ux[N] + (aphi[j] * phix[j])
+        uxx[N] = uxx[N] + (aphi[j] * phixx[j])
+    end
+    for i in 1:nbasis
+        x = xi[i]
+        phi, phix, phixx = bvp_modified_basis(x, nbasis, phi, phix, phixx, scale)
+        u[i+1] = alpha*(1-x)/2.0 + beta*(1+x)/2.0
+        ux[i+1] = (-alpha + beta)/2.0
+        uxx[i+1] = 0.0
+        for j in 1:nbasis
+            u[i+1] = u[i+1] + (aphi[j] * phi[j])
+            ux[i+1] = ux[i+1] + (aphi[j] * phix[j])
+            uxx[i+1] = uxx[i+1] + (aphi[j] * phixx[j])
+        end
+    end
+
+    return u
 end
+
+function bvp_modified_basis(x::Float64, nbasis::Int64, phi::Array{Float64}, phix::Array{Float64}, phixx::Array{Float64}, scale::Float64)
+
+    if abs(x) < 1.0 # Avoid singularities at the endpoints
+        t = acos(x)
+        c = cos(t)
+        s = sin(t)
+        for i in 1:nbasis
+            n = i+1
+            tn = cos(n*t)
+            tnt = -n * sin(n*t)
+            tntt = -n * n * tn
+
+            # Convert t-derivatives into x-derivatives
+            tnx = -tnt/s
+            tnxx = tntt/(s*s) - tnt*c/(s*s*s)
+
+            # Convert to modified basis functions to enforce BCs
+            if mod(n,2) == 0
+                phi[i] = tn - 1.0
+                phix[i] = tnx / scale
+            else
+                phi[i] = tn - x
+                phix[i] = (tnx - 1.0) / scale
+            end
+            phixx[i] = tnxx / (scale * scale)
+        end
+    else
+        for i in 1:nbasis
+            phi[i] = 0.0
+            n = i+1
+            if mod(n,2) == 0
+                phix[i] = sign(x)*n*n / scale
+            else
+                phix[i] = (n*n - 1) / scale
+            end
+            phixx[i] = sign(x)^n * n * n * ((n * n - 1.0)/3.0) / (scale * scale)
+        end
+    end
+
+    return phi, phix, phixx
+end
+
+function bvp_basis(x::Float64, nbasis::Int64, phi::Array{Float64}, phix::Array{Float64}, phixx::Array{Float64})
+
+    if abs(x) < 1.0 # Avoid singularities at the endpoints
+        t = acos(x)
+        c = cos(t)
+        s = sin(t)
+        for i in 1:nbasis
+            n = i-1
+            tn = cos(n*t)
+            tnt = -n * sin(n*t)
+            tntt = -n * n * tn
+
+            # Convert t-derivatives into x-derivatives
+            tnx = -tnt/s
+            tnxx = tntt/(s*s) - tnt*c/(s*s*s)
+
+            # Convert to modified basis functions to enforce BCs
+            if mod(n,2) == 0
+                phi[i] = tn #- 1.0
+                phix[i] = tnx
+            else
+                phi[i] = tn #- x
+                phix[i] = tnx #- 1.0
+            end
+            phixx[i] = tnxx
+        end
+    else
+        t = acos(x)
+        for i in 1:nbasis
+            n = i-1
+            phi[i] = cos(n*t)
+            if x > 0.0
+                phix[i] = -n*n
+            else
+                phix[i] = -n*n*(-1.0)^(n+1)
+            end
+            phixx[i] = ((-1.0)^n)*(n^4 - n^2)/3
+        end
+    end
+
+    return phi, phix, phixx
+end
+
+end #module

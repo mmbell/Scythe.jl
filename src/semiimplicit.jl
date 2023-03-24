@@ -25,6 +25,7 @@ struct ModelTile
     impdot_np1::Array{Float64}
     impdot_n::Array{Float64}
     impdot_nm1::Array{Float64}
+    impdot_nm2::Array{Float64}
     tilepoints::Array{Float64}
     ref_state::ReferenceState
     patchSplines::Array{Spline1D}
@@ -49,6 +50,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     impdot_np1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     
     # Get the local gridpoints
     tilepoints = getGridpoints(tile)
@@ -86,6 +88,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         impdot_np1,
         impdot_n,
         impdot_nm1,
+        impdot_nm2,
         tilepoints,
         ref_state,
         patchSplines,
@@ -277,7 +280,8 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # Transform to local physical tile
     tileTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
-    Threads.@threads for c in 1:num_columns(mtile.tile)
+    #Threads.@threads for still needs some work to avoid race condition
+    for c in 1:num_columns(mtile.tile)
         # Advance each column
         advance_column(mtile, c, t)
     end
@@ -309,11 +313,12 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
     # Feed physical matrices to physical equations
     physical_model(mtile, colstart, colend)
 
-    # Solve for semi-implicit n+1 terms
-    semiimplicit_solver(mtile, colstart, colend)
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
 
-    # Advance the timestep
-    timestep(mtile, colstart, colend, t)
+    # Solve for semi-implicit n+1 terms
+    semiimplicit_adjustment(mtile, colstart, colend, t)
+
 end
 
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
@@ -330,47 +335,114 @@ function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64)
     return
 end
 
-function semiimplicit_solver(mtile::ModelTile, colstart::Int64, colend::Int64)
+function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    w_index = mtile.model.grid_params.vars["w"]
+    xi_index = mtile.model.grid_params.vars["xi"]
+    ts = mtile.model.ts
+
+    # Calculate xi_nstar
+    xi_nstar = view(mtile.var_nxt,colstart:colend,xi_index)
+    wdot_n = view(mtile.impdot_n,colstart:colend,xi_index)
+    wdot_nm1 = view(mtile.impdot_nm1,colstart:colend,xi_index)
+    wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,xi_index)
+
+    # Calculate w_nstar
+    w_nstar = view(mtile.var_nxt,colstart:colend,w_index)
+    xidot_n = view(mtile.impdot_n,colstart:colend,w_index)
+    xidot_nm1 = view(mtile.impdot_nm1,colstart:colend,w_index)
+    xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
+
+    # Get the mean speed of sound squared
+    Pxi =  P_xi_from_s.(mtile.ref_state.sbar[:,1], mtile.ref_state.xibar[:,1], mtile.ref_state.mubar[:,1])
+    rho_bar = dry_density.(mtile.ref_state.xibar[:,1])
+    q_bar = ahyp.(mtile.ref_state.mubar[:,1])
+    Pxi_bar = Pxi ./ (rho_bar .* (1.0 .+ q_bar))
+
+    # Correction term for explicit xi
+    xi_corr = @. ts * ( (35.0/12.0)*xidot_n - (25.0/12.0)*xidot_nm1 + (5.0/12.0)*xidot_nm2 )
+    xidot_nm2 .= xidot_nm1
+    xidot_nm1 .= xidot_n
+
+    # Correction term for explicit w
+    w_corr = @. ts * ( (35.0/12.0)*wdot_n - (25.0/12.0)*wdot_nm1 + (5.0/12.0)*wdot_nm2 )
+    wdot_nm2 .= wdot_nm1
+    wdot_nm1 .= wdot_n
+
+    ts_term = 0.0
+    if (t == 1)
+        # Use trapezoidal method (AM2) for first step
+        ts_term = 0.5 * ts
+    else
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts
+    end
+
+    # Take the vertical derivative of xi_corr and multiply by ts term
+    xi_col = mtile.tile.columns[mtile.model.grid_params.vars["xi"]]
+    xi_col.uMish .= xi_corr
+    CBtransform!(xi_col)
+    CAtransform!(xi_col)
+    xi_corr_z = ts_term .* CIxtransform(xi_col)
+
+    # Take the vertical derivative of w_corr and multiply by ts term
+    w_col = mtile.tile.columns[mtile.model.grid_params.vars["w"]]
+    w_col.uMish .= w_nstar
+    CBtransform!(w_col)
+    CAtransform!(w_col)
+    w_nstar_z = ts_term .* CIxtransform(w_col)
+
+    # Set up the matrix problem
+    nz = mtile.model.grid_params.zDim
+    nbasis = mtile.model.grid_params.b_zDim
+    g = xi_nstar .+ w_corr .- w_nstar_z .- xi_corr_z
+
+    # Calculate the Helmholtz matrix
+    dct = Chebyshev.dct_matrix(nz)
+    column_length = mtile.model.grid_params.zmax - mtile.model.grid_params.zmin
+    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
+    h = (-ts_term .* ts_term .* Pxi_bar) .* dct2 .+ dct
+    #h_b = [dct[1,:]'; dct[nz,:]'; h[2:nz-1,:]]
+    h = h[:,1:nbasis]
     
-    # Do something here
-    
+    # Solve for the coefficients
+    xi_b = h \ g
+
+    # Set xi_n+1
+    xi_col.b .= xi_b
+    CAtransform!(xi_col)
+    xi_nstar .= CItransform!(xi_col)
+
+    # Set w_n+1
+    w_nstar .= w_nstar .+ xi_corr .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
+
 end
 
-function timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
-    physical = view(mtile.tile.physical,colstart:colend,:,1)
-    var_nxt = view(mtile.var_nxt,colstart:colend,:)
-    expdot_n = view(mtile.expdot_n,colstart:colend,:)
-    expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,:)
-    expdot_nm2 = view(mtile.expdot_nm2,colstart:colend,:)
-    impdot_np1 = view(mtile.impdot_np1,colstart:colend,:)
-    impdot_n = view(mtile.impdot_n,colstart:colend,:)
-    impdot_nm1 = view(mtile.impdot_nm1,colstart:colend,:)
-    ts = mtile.model.ts 
+    for v in 1:length(mtile.model.grid_params.vars)
+        physical = view(mtile.tile.physical,colstart:colend,v,1)
+        var_nxt = view(mtile.var_nxt,colstart:colend,v)
+        expdot_n = view(mtile.expdot_n,colstart:colend,v)
+        expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,v)
+        expdot_nm2 = view(mtile.expdot_nm2,colstart:colend,v)
+        ts = mtile.model.ts
 
-    if (t == 1)
-        # Use Euler method and trapezoidal method (AM2) for first step
-        var_nxt .= @. physical +
-            (ts * expdot_n) +
-            (0.5 * ts * (impdot_np1 + impdot_n))
-        expdot_nm1 .= expdot_n
-        impdot_nm1 .= impdot_n
-    elseif (t == 2) 
-        # Use 2nd order A-B method and AI2* for second step
-        var_nxt .= @. physical +
-            (0.5 * ts) * ((3.0 * expdot_n) - expdot_nm1) +
-            (0.25 * ts * ((5.0 * impdot_np1) - (4.0 * impdot_n) + (3.0 * impdot_nm1)))
-        expdot_nm1 .= expdot_n
-        expdot_nm2 .= expdot_nm1
-        impdot_nm1 .= impdot_n
-    else
-        # Use AI2*–AB3 implicit-explicit scheme (Durran and Blossey 2012)
-        var_nxt .= @. physical +
-            ((ts / 12.0) * ((23.0 * expdot_n) - (16.0 * expdot_nm1) + (5.0 * expdot_nm2))) +
-              (0.25 * ts * ((5.0 * impdot_np1) - (4.0 * impdot_n) + (3.0 * impdot_nm1)))
-        expdot_nm1 .= expdot_n
-        expdot_nm2 .= expdot_nm1
-        impdot_nm1 .= impdot_n
+        if (t == 1)
+            # Use Euler method and trapezoidal method (AM2) for first step
+            var_nxt .= @. physical + (ts * expdot_n)
+            expdot_nm1 .= expdot_n
+        elseif (t == 2)
+            # Use 2nd order A-B method and AI2* for second step
+            var_nxt .= @. physical + (0.5 * ts) * ((3.0 * expdot_n) - expdot_nm1)
+            expdot_nm2 .= expdot_nm1
+            expdot_nm1 .= expdot_n
+        else
+            # Use AI2*–AB3 implicit-explicit scheme (Durran and Blossey 2012)
+            var_nxt .= @. physical + ((ts / 12.0) * ((23.0 * expdot_n) - (16.0 * expdot_nm1) + (5.0 * expdot_nm2)))
+            expdot_nm2 .= expdot_nm1
+            expdot_nm1 .= expdot_n
+        end
     end
 end
 

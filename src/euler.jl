@@ -46,7 +46,6 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     w_zz = view(grid.physical,colstart:colend,5,5)
     
     # Get reference state
-    num_columns = Int64(size(gridpoints,1) / model.grid_params.zDim)
     sbar = refstate.sbar[:,1]
     sbar_z = refstate.sbar[:,2]
     sbar_zz = refstate.sbar[:,3]
@@ -72,6 +71,12 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
     
+    # Mean speed of sound
+    Pxi =  P_xi_from_s.(sbar, xibar, mubar)
+    rho_bar = dry_density.(xibar)
+    q_bar = ahyp.(mubar)
+    Pxi_bar = Pxi ./ (rho_bar .* (1.0 .+ q_bar))
+
     # Placeholders for intermediate calculations
     ADV = similar(s)
     PGF = similar(s)
@@ -83,9 +88,9 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     @turbo expdot[colstart:colend,1] .= @. ADV + KDIFF
     
     @turbo ADV .= @. (-u * xi_x) + (-w * (xi_z + xibar_z)) #XI ADV
-    @turbo PGF .= @. -u_x - w_z
-    # No mass diffusion
-    @turbo expdot[colstart:colend,2] .= @. ADV + PGF
+    # No PGF or mass diffusion
+    @turbo expdot[colstart:colend,2] .= @. ADV - u_x - w_z
+    impdot[colstart:colend,2] .= @. w_z
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #SADV
     #No PGF
@@ -98,10 +103,10 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     @turbo expdot[colstart:colend,4] .= @. ADV + PGF + KDIFF
 
     @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
-    PGF .= @. -(pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z) / rho_t) -
-         (g * rho_p / rho_t) #WPGF
+    PGF .= @.  -(g * rho_p / rho_t) - (pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z) / rho_t)
     @turbo KDIFF .= @. K * (w_xx + w_zz)
     @turbo expdot[colstart:colend,5] .= @. ADV + PGF + KDIFF
-    
+    impdot[colstart:colend,5] .= @. (Pxi_bar * xi_z)
+
 end
 
