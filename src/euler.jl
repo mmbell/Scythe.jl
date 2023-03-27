@@ -89,8 +89,8 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     
     @turbo ADV .= @. (-u * xi_x) + (-w * (xi_z + xibar_z)) #XI ADV
     # No PGF or mass diffusion
-    @turbo expdot[colstart:colend,2] .= @. ADV - u_x - w_z
-    impdot[colstart:colend,2] .= @. w_z
+    @turbo expdot[colstart:colend,2] .= @. ADV - u_x
+    impdot[colstart:colend,2] .= @. -w_z
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #SADV
     #No PGF
@@ -103,10 +103,10 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     @turbo expdot[colstart:colend,4] .= @. ADV + PGF + KDIFF
 
     @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
-    PGF .= @.  -(g * rho_p / rho_t) - (pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z) / rho_t)
+    PGF .= @.  -(g * rho_p / rho_t) - (pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z) / rho_t) + (Pxi_bar * xi_z)
     @turbo KDIFF .= @. K * (w_xx + w_zz)
     @turbo expdot[colstart:colend,5] .= @. ADV + PGF + KDIFF
-    impdot[colstart:colend,5] .= @. (Pxi_bar * xi_z)
+    impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
 end
 
