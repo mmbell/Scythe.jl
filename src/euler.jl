@@ -75,7 +75,7 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     Pxi =  P_xi_from_s.(sbar, xibar, mubar)
     rho_bar = dry_density.(xibar)
     q_bar = ahyp.(mubar)
-    Pxi_bar = Pxi ./ (rho_bar .* (1.0 .+ q_bar))
+    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
     # Placeholders for intermediate calculations
     ADV = similar(s)

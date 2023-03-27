@@ -357,7 +357,7 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     Pxi =  P_xi_from_s.(mtile.ref_state.sbar[:,1], mtile.ref_state.xibar[:,1], mtile.ref_state.mubar[:,1])
     rho_bar = dry_density.(mtile.ref_state.xibar[:,1])
     q_bar = ahyp.(mtile.ref_state.mubar[:,1])
-    Pxi_bar = Pxi ./ (rho_bar .* (1.0 .+ q_bar))
+    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
     # Add the implicit terms
     ts_term = 0.0
@@ -402,16 +402,14 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     h = (-ts_term .* ts_term .* Pxi_bar) .* dct2 .+ dct
     bc1 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[1,:]
     bc2 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[nz,:]
-    h_b = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
-    h = h_b[:,1:nbasis]
+    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     
     # Solve for the coefficients
-    xi_b = h \ g
+    xi_a = h_a \ g
 
     # Set xi_n+1
     xi_col = mtile.tile.columns[mtile.model.grid_params.vars["xi"]]
-    xi_col.b .= xi_b
-    CAtransform!(xi_col)
+    xi_col.a .= xi_a
     view(mtile.var_nxt,colstart:colend,xi_index) .= CItransform!(xi_col)
 
     # Set w_n+1
