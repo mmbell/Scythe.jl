@@ -317,7 +317,7 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    semiimplicit_timestep(mtile, colstart, colend, t)
+    semiimplicit_adjustment(mtile, colstart, colend, t)
 
 end
 
@@ -416,7 +416,91 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     view(mtile.var_nxt,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
 end
 
+function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
+    w_index = mtile.model.grid_params.vars["w"]
+    xi_index = mtile.model.grid_params.vars["xi"]
+    ts = mtile.model.ts
+
+    # Calculate xi_nstar
+    xi_nstar = mtile.var_nxt[colstart:colend,xi_index]
+    wdot_n = view(mtile.impdot_n,colstart:colend,xi_index)
+    wdot_nm1 = view(mtile.impdot_nm1,colstart:colend,xi_index)
+    wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,xi_index)
+
+    # Calculate w_nstar
+    w_nstar = mtile.var_nxt[colstart:colend,w_index]
+    xidot_n = view(mtile.impdot_n,colstart:colend,w_index)
+    xidot_nm1 = view(mtile.impdot_nm1,colstart:colend,w_index)
+    xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
+
+    # Get the mean speed of sound squared
+    Pxi =  P_xi_from_s.(mtile.ref_state.sbar[:,1], mtile.ref_state.xibar[:,1], mtile.ref_state.mubar[:,1])
+    rho_bar = dry_density.(mtile.ref_state.xibar[:,1])
+    q_bar = ahyp.(mtile.ref_state.mubar[:,1])
+    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
+
+    # Subtract the explicit terms and add the implicit terms
+    ts_term = 0.0
+    if (t == 1)
+        # Use trapezoidal method (AM2) for first step
+        ts_term = 0.5 * ts
+        w_nstar .= @. w_nstar - (ts * xidot_n) + (ts * 0.5 * xidot_n)
+        xi_nstar .= @. xi_nstar - (ts * wdot_n) + (ts * 0.5 * wdot_n)
+    elseif (t == 2)
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts
+        w_nstar .= @. w_nstar - (0.5 * ts) * ((3.0 * xidot_n) - xidot_nm1) - (ts * xidot_n) + (ts * 0.75 * xidot_nm1)
+        xi_nstar .= @. xi_nstar - (0.5 * ts) * ((3.0 * wdot_n) - wdot_nm1) - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+    else
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts
+        w_nstar .= @. w_nstar - ((ts / 12.0) * ((23.0 * xidot_n) - (16.0 * xidot_nm1) + (5.0 * xidot_nm2))) - (ts * xidot_n) + (ts * 0.75 * xidot_nm1)
+        xi_nstar .= @. xi_nstar - ((ts / 12.0) * ((23.0 * wdot_n) - (16.0 * wdot_nm1) + (5.0 * wdot_nm2))) - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+    end
+
+    # Set the n-1 and n-2 terms
+    xidot_nm2 .= xidot_nm1
+    xidot_nm1 .= xidot_n
+
+    wdot_nm2 .= wdot_nm1
+    wdot_nm1 .= wdot_n
+
+    # Take the vertical derivative of w_nstar and multiply by ts term
+    w_col = mtile.tile.columns[mtile.model.grid_params.vars["w"]]
+    w_col.uMish .= w_nstar
+    CBtransform!(w_col)
+    CAtransform!(w_col)
+    w_nstar = CItransform!(w_col)
+    w_nstar_z = ts_term .* CIxtransform(w_col)
+
+    # Set up the matrix problem
+    nz = mtile.model.grid_params.zDim
+    nbasis = mtile.model.grid_params.b_zDim
+    g = xi_nstar .- w_nstar_z
+    g = [0.0 ; 0.0; g[2:nz-1]]
+
+    # Calculate the Helmholtz matrix
+    dct = Chebyshev.dct_matrix(nz)
+    column_length = mtile.model.grid_params.zmax - mtile.model.grid_params.zmin
+    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
+    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
+    h = (-ts_term .* ts_term .* Pxi_bar) .* dct2 .+ dct
+    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[1,:]
+    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[nz,:]
+    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
+
+    # Solve for the coefficients
+    xi_a = h_a \ g
+
+    # Set xi_n+1
+    xi_col = mtile.tile.columns[mtile.model.grid_params.vars["xi"]]
+    xi_col.a .= xi_a
+    view(mtile.var_nxt,colstart:colend,xi_index) .= CItransform!(xi_col)
+
+    # Set w_n+1
+    view(mtile.var_nxt,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
+end
 
 function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
