@@ -118,7 +118,6 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     read_initialconditions(model.initial_conditions, patch)
     spectralTransform!(patch)
     gridTransform!(patch)
-    write_output(patch, model, 0.0)
 
     # Transfer the model and patch/tile info to each worker
     println("Initializing workers")
@@ -222,14 +221,19 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     end
     map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
 
+    # Output initial time
+    patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
+    tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
+    checkCFL(patch)
+    @async write_output(patch, model, 0.0)
+
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
         haloInitBuffer, haloReceiveBuffer, haloReceiveIndexMap)
 
     # Integration complete! Finalize the patch
-    patch.spectral .= sharedSpectral
-    gridTransform!(patch)
-    spectralTransform!(patch)
+    patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
+    tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
     println("Done with time integration")
     return true
 
@@ -261,17 +265,16 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         # Add it to the sharedArray
         @inbounds sharedSpectral[haloReceiveIndexMap] .+= haloReceiveBuffer
 
+        # Reset the shared spectral patch to the tiles
+        map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
+
         # Output if on specified time interval
         if mod(t,output_int) == 0
-            patch.spectral .= sharedSpectral
-            gridTransform!(patch)
-            spectralTransform!(patch)
+            patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
+            tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
             checkCFL(patch)
             @async write_output(patch, model, (t*model.ts))
         end
-
-        # Reset the shared spectral patch to the tiles
-        map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
 
         # Done with this timestep
     end
