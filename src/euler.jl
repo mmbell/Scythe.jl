@@ -71,11 +71,8 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
     
-    # Mean speed of sound
-    Pxi =  P_xi_from_s.(sbar, xibar, mubar)
-    rho_bar = dry_density.(xibar)
-    q_bar = ahyp.(mubar)
-    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
+    # Get the mean speed of sound squared from the reference state
+    Pxi_bar = mtile.ref_state.Pxi_bar
 
     # Placeholders for intermediate calculations
     ADV = similar(s)

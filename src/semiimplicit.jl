@@ -5,8 +5,8 @@ using DistributedData
 using SharedArrays
 using CSV
 using DataFrames
-using MPI
 using LoopVectorization
+using LinearAlgebra
 import Base.Threads.@spawn
 using SparseArrays
 using SuiteSparse
@@ -37,6 +37,7 @@ struct ModelTile
     haloReceiveIndexMap::BitMatrix
     haloReceiveBuffer::Array{Float64}
     splineBuffer::Array{Float64}
+    h_matrix::LU{Float64, Matrix{Float64}, Vector{Int64}}
 end
 
 function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters,
@@ -57,8 +58,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
 
     # Set up the reference file
     zdim = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
-    ref_state = interpolate_reference_file(model.ref_state_file, zdim)
-    transform_reference_state!(model, ref_state)
+    ref_state = interpolate_reference_file(model, zdim)
 
     # Copy over the patch information
     patchSplines = copy(patch.splines)
@@ -77,6 +77,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
     splineBuffer =  allocateSplineBuffer(patch,tile)
+
+    # Pre-calculate the Helmholtz matrix for semi-implicit adjustment
+    h_matrix = calc_Helmholtz_semiimplicit_matrix(model, ref_state.Pxi_bar, 1.25 * model.ts)
 
     mtile = ModelTile(
         model,
@@ -99,7 +102,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         haloSendView,
         haloReceiveIndexMap,
         haloReceiveBuffer,
-        splineBuffer)
+        splineBuffer,
+        h_matrix)
     return mtile
 end
 
@@ -281,7 +285,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     tileTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
     #Threads.@threads for still needs some work to avoid race condition
-    for c in 1:num_columns(mtile.tile)
+    Threads.@threads for c in 1:num_columns(mtile.tile)
         # Advance each column
         advance_column(mtile, c, t)
     end
@@ -353,11 +357,8 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     xidot_nm1 = view(mtile.impdot_nm1,colstart:colend,w_index)
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
-    # Get the mean speed of sound squared
-    Pxi =  P_xi_from_s.(mtile.ref_state.sbar[:,1], mtile.ref_state.xibar[:,1], mtile.ref_state.mubar[:,1])
-    rho_bar = dry_density.(mtile.ref_state.xibar[:,1])
-    q_bar = ahyp.(mtile.ref_state.mubar[:,1])
-    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
+    # Get the mean speed of sound squared from the reference state
+    Pxi_bar = mtile.ref_state.Pxi_bar
 
     # Add the implicit terms
     ts_term = 0.0
@@ -435,10 +436,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared
-    Pxi =  P_xi_from_s.(mtile.ref_state.sbar[:,1], mtile.ref_state.xibar[:,1], mtile.ref_state.mubar[:,1])
-    rho_bar = dry_density.(mtile.ref_state.xibar[:,1])
-    q_bar = ahyp.(mtile.ref_state.mubar[:,1])
-    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
+    Pxi_bar = mtile.ref_state.Pxi_bar
 
     # Subtract the explicit terms and add the implicit terms
     ts_term = 0.0
@@ -467,7 +465,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     wdot_nm1 .= wdot_n
 
     # Take the vertical derivative of w_nstar and multiply by ts term
-    w_col = mtile.tile.columns[mtile.model.grid_params.vars["w"]]
+    w_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["w"]])
     w_col.uMish .= w_nstar
     CBtransform!(w_col)
     CAtransform!(w_col)
@@ -476,26 +474,21 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
 
     # Set up the matrix problem
     nz = mtile.model.grid_params.zDim
-    nbasis = mtile.model.grid_params.b_zDim
     g = xi_nstar .- w_nstar_z
     g = [0.0 ; 0.0; g[2:nz-1]]
 
-    # Calculate the Helmholtz matrix
-    dct = Chebyshev.dct_matrix(nz)
-    column_length = mtile.model.grid_params.zmax - mtile.model.grid_params.zmin
-    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
-    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
-    h = (-ts_term .* ts_term .* Pxi_bar) .* dct2 .+ dct
-    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[1,:]
-    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[nz,:]
-    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
-
+    xi_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["xi"]])
     # Solve for the coefficients
-    xi_a = h_a \ g
+    if t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.model, Pxi_bar, ts_term)
+        xi_col.a .= h_a \ g
+    else
+        # Use the pre-calculated one
+        xi_col.a .= mtile.h_matrix \ g
+    end
 
     # Set xi_n+1
-    xi_col = mtile.tile.columns[mtile.model.grid_params.vars["xi"]]
-    xi_col.a .= xi_a
     view(mtile.var_nxt,colstart:colend,xi_index) .= CItransform!(xi_col)
 
     # Set w_n+1
@@ -553,4 +546,19 @@ function checkCFL(grid)
             #TBD
         end
     end
+end
+
+function calc_Helmholtz_semiimplicit_matrix(model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
+
+    # Calculate the Helmholtz matrix
+    nz = model.grid_params.zDim
+    dct = Chebyshev.dct_matrix(nz)
+    column_length = model.grid_params.zmax - model.grid_params.zmin
+    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
+    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
+    h = (-ts_term .* ts_term .* Pxi_bar) .* dct2 .+ dct
+    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[1,:]
+    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[nz,:]
+    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
+    return factorize(h_a)
 end

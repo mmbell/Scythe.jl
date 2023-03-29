@@ -1,18 +1,16 @@
 # Reference state functions
-    #Tbar = Ts - (g / Cpd) * z[i]
-    #pbar = p_0/(Ts/Tbar)^(Cpd/Rd)
-    #rhobar = 100.0 * pbar / (Tbar * Rd)
 
 struct ReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
     mubar::Array{Float64}
+    Pxi_bar::Float64
 end
 
-function interpolate_reference_file(ref_file::String, z::Array{Float64})
+function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
 
     # Open the file with sounding information
-    ref = open(ref_file,"r")
+    ref = open(model.ref_state_file,"r")
     
     # Allocate some empty arrays
     alt = Vector{Float64}(undef,0)
@@ -77,11 +75,22 @@ function interpolate_reference_file(ref_file::String, z::Array{Float64})
         end
     end
     
-    ref_state = ReferenceState(sbar, xibar, mubar)
+    # Calculate the derivatives
+    transform_reference_state!(model, sbar)
+    transform_reference_state!(model, xibar)
+    transform_reference_state!(model, mubar)
+
+    # Get the mean speed of sound squared
+    Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
+    rho_bar = dry_density.(xibar[:,1])
+    q_bar = ahyp.(mubar[:,1])
+    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
+
+    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
     return ref_state
 end
 
-function transform_reference_state!(model::ModelParameters, ref::ReferenceState)
+function transform_reference_state!(model::ModelParameters, ref::Array{Float64})
 
     # Calculate vertical derivatives without BCs
     cp = ChebyshevParameters(
@@ -93,27 +102,17 @@ function transform_reference_state!(model::ModelParameters, ref::ReferenceState)
         BCT = Chebyshev.R0)
     column = Chebyshev1D(cp)
     
-    column.uMish[:] .= ref.sbar[:,1]
+    column.uMish[:] .= ref[:,1]
     CBtransform!(column)
     CAtransform!(column)
-    ref.sbar[:,1] .= CItransform!(column)
-    ref.sbar[:,2] .= CIxtransform(column)
-    ref.sbar[:,3] .= CIxxtransform(column)
+    ref[:,1] .= CItransform!(column)
+    ref[:,2] .= CIxtransform(column)
+    ref[:,3] .= CIxxtransform(column)
+    return ref
+end
 
-    column.uMish[:] .= ref.xibar[:,1]
-    CBtransform!(column)
-    CAtransform!(column)
-    ref.xibar[:,1] .= CItransform!(column)
-    ref.xibar[:,2] .= CIxtransform(column)
-    ref.xibar[:,3] .= CIxxtransform(column)
+function adjust_reference_state!(model::ModelParameters, ref::ReferenceState)
 
-    column.uMish[:] .= ref.mubar[:,1]
-    CBtransform!(column)
-    CAtransform!(column)
-    ref.mubar[:,1] .= CItransform!(column)
-    ref.mubar[:,2] .= CIxtransform(column)
-    ref.mubar[:,3] .= CIxxtransform(column)
-    
     # Adjust to maintain hydrostatic balance - requires more complicated approach than below
     #for z in 1:model.grid_params.zDim
     #    q_v, rho_d, Tk, p = Scythe.thermodynamic_tuple.(ref.sbar[z,1], ref.xibar[z,1], ref.mubar[z,1])
@@ -129,4 +128,3 @@ function transform_reference_state!(model::ModelParameters, ref::ReferenceState)
     #ref.xibar[:,2] .= CIxtransform(column)
     #ref.xibar[:,3] .= CIxxtransform(column)
 end
-
