@@ -2,42 +2,10 @@
 
 using LoopVectorization
 
-export ModelParameters
-
 #Define some convenient aliases
 const real = Float64
 const int = Int64
 const uint = UInt64
-
-Base.@kwdef struct ModelParameters
-    ts::Float64 = 0.0
-    integration_time::Float64 = 1.0
-    output_interval::Float64 = 1.0
-    equation_set = "LinearAdvection1D"
-    initial_conditions = "ic.csv"
-    output_dir = "./output/"
-    ref_state_file = ""
-    grid_params::GridParameters
-    physical_params::Dict
-end
-
-function LinearAdvection1D(grid::R_Grid,
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-   
-    #1D Linear advection to test
-    c_0 = model.physical_params[:c_0]
-    K = model.physical_params[:K]
-
-    u = grid.physical[:,1,1]
-    ur = grid.physical[:,1,2]
-    urr = grid.physical[:,1,3]
-
-    vardot[:,1] .= -(c_0 .* ur) .+ (K .* urr)
-
-end
 
 function LinearAdvectionRZ(grid::RZ_Grid,
             gridpoints::Array{real},
@@ -84,28 +52,6 @@ function LinearAdvectionRL(grid::RL_Grid,
     else
         @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r))
     end
-    # F = 0
-end
-
-function LinearAdvectionRLZ(grid::RLZ_Grid,
-            gridpoints::Array{real},
-            vardot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
-
-    #2D Linear advection to test
-    K = model.physical_params[:K]
-
-    r = gridpoints[:,1]
-    hr = grid.physical[:,1,2]
-    hrr = grid.physical[:,1,3]
-    hl = grid.physical[:,1,4]
-    hll = grid.physical[:,1,5]
-    u = grid.physical[:,2,1]
-    v = grid.physical[:,3,1]
-
-    vardot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r)))) 
-
     # F = 0
 end
 
