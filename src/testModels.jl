@@ -1,3 +1,43 @@
+function LinearAdvection1D(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    #1D Linear advection to test
+    grid = mtile.tile
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    c_0 = model.physical_params[:c_0]
+    K = model.physical_params[:K]
+
+    u = view(grid.physical,:,1,1)
+    ur = view(grid.physical,:,1,2)
+    urr = view(grid.physical,:,1,3)
+
+    expdot[:,1] .= -(c_0 .* ur) .+ (K .* urr)
+
+end
+
+function LinearAdvectionRLZ(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    #3D Linear advection to test
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+    K = model.physical_params[:K]
+
+    r = gridpoints[:,1]
+    h = view(grid.physical,:,1,1)
+    hr = view(grid.physical,:,1,2)
+    hrr = view(grid.physical,:,1,3)
+    hl = view(grid.physical,:,1,4)
+    hll = view(grid.physical,:,1,5)
+    u = view(grid.physical,:,2,1)
+    v = view(grid.physical,:,3,1)
+
+    expdot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))
+
+end
+
 function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64)
     
     grid = mtile.tile

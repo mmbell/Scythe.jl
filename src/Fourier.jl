@@ -28,8 +28,8 @@ struct Fourier1D
     mishPoints::Vector{real}
         
     # Measured FFTW Plan
-    fftPlan::FFTW.r2rFFTWPlan{Float64, (0,), false, 1, UnitRange{Int64}}
-    ifftPlan::FFTW.r2rFFTWPlan{Float64, (1,), false, 1, UnitRange{Int64}}
+    fftPlan::FFTW.r2rFFTWPlan
+    ifftPlan::FFTW.r2rFFTWPlan
     
     # Phase-shift and filter matrix
     phasefilter::Matrix{real}

@@ -1,24 +1,36 @@
 __precompile__()
 module Scythe
 
-using Distributed
-using DistributedData
-using Statistics
-
+# Files for model grid representation
 include("CubicBSpline.jl")
 include("Fourier.jl")
 include("Chebyshev.jl")
 include("spectralGrid.jl")
-include("numericalModels.jl")
+
+# Structure to define model parameters
+Base.@kwdef struct ModelParameters
+    ts::Float64 = 0.0
+    integration_time::Float64 = 1.0
+    output_interval::Float64 = 1.0
+    equation_set = "LinearAdvection1D"
+    initial_conditions = "ic.csv"
+    output_dir = "./output/"
+    ref_state_file = ""
+    semiimplicit = false
+    grid_params::GridParameters
+    physical_params::Dict
+end
+
+# Files for model integration
 include("thermodynamics.jl")
 include("reference_state.jl")
-#include("integrator.jl")
 include("semiimplicit.jl")
 include("io.jl")
-include("euler.jl")
+include("testModels.jl")
 
 export integrate_model
 export CubicBSpline, Chebyshev
+export ModelParameters
 
 function integrate_model(model::ModelParameters)
 

@@ -1,10 +1,16 @@
 # Reference state functions
+using Statistics
 
 struct ReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
     mubar::Array{Float64}
     Pxi_bar::Float64
+end
+
+function empty_reference_state()
+
+    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
 end
 
 function interpolate_reference_file(model::ModelParameters, z::Array{Float64})

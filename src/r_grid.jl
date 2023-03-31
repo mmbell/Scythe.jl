@@ -349,3 +349,8 @@ function allocateSplineBuffer(patch::R_Grid, tile::R_Grid)
     # Not needed for R Grid
     return zeros()
 end
+
+function num_columns(grid::R_Grid)
+
+    return 0
+end

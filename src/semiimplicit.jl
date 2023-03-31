@@ -37,7 +37,7 @@ struct ModelTile
     haloReceiveIndexMap::BitMatrix
     haloReceiveBuffer::Array{Float64}
     splineBuffer::Array{Float64}
-    h_matrix::LU{Float64, Matrix{Float64}, Vector{Int64}}
+    h_matrix::Factorization
 end
 
 function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters,
@@ -57,8 +57,11 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     tilepoints = getGridpoints(tile)
 
     # Set up the reference file
-    zdim = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
-    ref_state = interpolate_reference_file(model, zdim)
+    ref_state = empty_reference_state()
+    if !isempty(model.ref_state_file)
+        zdim = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
+        ref_state = interpolate_reference_file(model, zdim)
+    end
 
     # Copy over the patch information
     patchSplines = copy(patch.splines)
@@ -79,7 +82,11 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     splineBuffer =  allocateSplineBuffer(patch,tile)
 
     # Pre-calculate the Helmholtz matrix for semi-implicit adjustment
-    h_matrix = calc_Helmholtz_semiimplicit_matrix(model, ref_state.Pxi_bar, 1.25 * model.ts)
+    # Declare a basic factorization for the structure if semiimplicit integration is not used
+    h_matrix = factorize([1 2; 2 1])
+    if model.semiimplicit
+        h_matrix = calc_Helmholtz_semiimplicit_matrix(model, ref_state.Pxi_bar, 1.25 * model.ts)
+    end
 
     mtile = ModelTile(
         model,
@@ -287,10 +294,13 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # Transform to local physical tile
     tileTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
 
-    #Threads.@threads for still needs some work to avoid race condition
-    Threads.@threads for c in 1:num_columns(mtile.tile)
-        # Advance each column
-        advance_column(mtile, c, t)
+    # Advance each column
+    if num_columns(mtile.tile) > 0
+        Threads.@threads for c in 1:num_columns(mtile.tile)
+            advance_column(mtile, c, t)
+        end
+    else
+        advance_column(mtile, -1, t)
     end
 
     # Convert current timestep to spectral tendencies
@@ -317,6 +327,12 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
     colstart = (c-1) * mtile.model.grid_params.zDim + 1
     colend = colstart + mtile.model.grid_params.zDim - 1
 
+    # If R or RL grid then set to the maximum dimensions
+    if c == -1
+        colstart = 1
+        colend = size(mtile.tile.physical,1)
+    end
+
     # Feed physical matrices to physical equations
     physical_model(mtile, colstart, colend)
 
@@ -324,8 +340,9 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    semiimplicit_adjustment(mtile, colstart, colend, t)
-
+    if mtile.model.semiimplicit
+        semiimplicit_adjustment(mtile, colstart, colend, t)
+    end
 end
 
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
