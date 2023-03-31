@@ -16,6 +16,53 @@ function LinearAdvection1D(mtile::ModelTile, colstart::Int64, colend::Int64)
 
 end
 
+function LinearAdvectionRZ(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    #2D RZ Linear advection to test
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    K = model.physical_params[:K]
+
+    r = view(gridpoints,:,1)
+    hr = view(grid.physical,:,1,2)
+    hrr = view(grid.physical,:,1,3)
+    hz = view(grid.physical,:,1,4)
+    hzz = view(grid.physical,:,1,5)
+    u = view(grid.physical,:,2,1)
+    w = view(grid.physical,:,4,1)
+
+    @turbo expdot[:,1] .= @. (-u * hr) + (-w * hz) + (K * ((hr / r) + hrr + hzz))
+
+end
+
+function LinearAdvectionRL(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    #2D Linear advection to test
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    K = model.physical_params[:K]
+    r = view(gridpoints,:,1)
+    hr = view(grid.physical,:,1,2)
+    hl = view(grid.physical,:,1,4)
+    u = view(grid.physical,:,2,1)
+    v = view(grid.physical,:,3,1)
+
+    if K > 0.0
+        hrr = view(grid.physical,:,1,3)
+        hll = view(grid.physical,:,1,5)
+        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r)) + (K * ((hr / r) + hrr + (hll / (r * r))))
+    else
+        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r))
+    end
+
+end
+
 function LinearAdvectionRLZ(mtile::ModelTile, colstart::Int64, colend::Int64)
 
     #3D Linear advection to test
@@ -34,7 +81,7 @@ function LinearAdvectionRLZ(mtile::ModelTile, colstart::Int64, colend::Int64)
     u = view(grid.physical,:,2,1)
     v = view(grid.physical,:,3,1)
 
-    expdot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))
+    @turbo expdot[:,1] .= (-u .* hr) .- (v .* (hl ./ r)) .+ (K .* ((hr ./ r) .+ hrr .+ (hll ./ (r .* r))))
 
 end
 

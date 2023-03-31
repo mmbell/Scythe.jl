@@ -27,6 +27,8 @@ include("reference_state.jl")
 include("semiimplicit.jl")
 include("io.jl")
 include("testModels.jl")
+include("shallowWaterModels.jl")
+include("tcblModels.jl")
 
 export integrate_model
 export CubicBSpline, Chebyshev
