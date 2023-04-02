@@ -71,13 +71,25 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     xibar[1,1] = xi[1]
     mubar[1,1] = mu[1]
     for i = 2:length(z)
+        found = false
         for j = 2:nlevels
             if (alt[j-1] < z[i]) && (alt[j] > z[i])
                 # Found the interpolating levels
                 sbar[i,1] = s[j-1] + (z[i] - alt[j-1]) * (s[j] - s[j-1])/(alt[j] - alt[j-1])
                 xibar[i,1] = xi[j-1] + (z[i] - alt[j-1]) * (xi[j] - xi[j-1])/(alt[j] - alt[j-1])
                 mubar[i,1] = mu[j-1] + (z[i] - alt[j-1]) * (mu[j] - mu[j-1])/(alt[j] - alt[j-1])
+                found = true
+            elseif alt[j] == z[i]
+                # Model level and reference level are the same
+                sbar[i,1] = s[j]
+                xibar[i,1] = xi[j]
+                mubar[i,1] = mu[j]
+                found = true
             end
+        end
+        if !found
+            # Can't find the level
+            throw(DomainError(i, "Can't find an interpolating level for reference state"))
         end
     end
     
