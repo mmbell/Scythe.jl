@@ -334,15 +334,8 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
     end
 
     # Feed physical matrices to physical equations
-    physical_model(mtile, colstart, colend)
+    physical_model(mtile, colstart, colend, t)
 
-    # Advance the explicit terms
-    explicit_timestep(mtile, colstart, colend, t)
-
-    # Solve for semi-implicit n+1 terms
-    if mtile.model.semiimplicit
-        semiimplicit_adjustment(mtile, colstart, colend, t)
-    end
 end
 
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
@@ -351,11 +344,11 @@ function finalize_model(grid::AbstractGrid, model::ModelParameters)
     println("Model complete!")
 end
 
-function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64)
+function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
         
     equation_set = Symbol(mtile.model.equation_set)
     equation_call = getfield(Scythe, equation_set)
-    equation_call(mtile, colstart, colend)
+    equation_call(mtile, colstart, colend, t)
     return
 end
 
