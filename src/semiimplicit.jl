@@ -130,6 +130,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     println("Initializing workers")
     # Print the tile information
     tile_params = calcTileSizes(patch, num_workers)
+    # This throws a bug if there is only one worker, probably other bugs too related to that
     for w in workerids
         println("Worker $w: $(tile_params[5,w-1]) gridpoints in $(tile_params[3,w-1]) cells from $(tile_params[1,w-1]) to $(tile_params[2,w-1]) starting at index $(tile_params[4,w-1])")
     end
@@ -181,6 +182,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     spectralTransform!(patch)
 
     println("Ready for time integration!")
+    flush(stdout)
     return patch
 end
 
@@ -233,6 +235,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
     checkCFL(patch)
     @async write_output(patch, model, 0.0)
+    flush(stdout)
 
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
@@ -284,6 +287,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         end
 
         # Done with this timestep
+        flush(stdout)
     end
     return nothing
 end
