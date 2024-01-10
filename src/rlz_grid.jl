@@ -902,13 +902,13 @@ function regularGridTransform(grid::RLZ_Grid)
                 # Wavenumber zero
                 r1 = ((z-1) * grid.params.b_rDim * (1 + (kDim * 2))) + 1
                 r2 = r1 + grid.params.b_rDim - 1
-                a = SAtransform(grid.splines[1,v], grid.spectral[r1:r2,v])
+                grid.splines[1,v].a .= view(grid.spectral,r1:r2,v)
                 if (dr == 0)
-                    splineBuffer[:,1] .= SItransform(grid.splines[1,v].params, a, rpoints)
+                    SItransform(grid.splines[1,v], rpoints, view(splineBuffer,:,1))
                 elseif (dr == 1)
-                    splineBuffer[:,1] .= SIxtransform(grid.splines[1,v].params, a, rpoints)
+                    SIxtransform(grid.splines[1,v], rpoints, view(splineBuffer,:,1))
                 else
-                    splineBuffer[:,1] .= SIxxtransform(grid.splines[1,v].params, a, rpoints)
+                    SIxxtransform(grid.splines[1,v], rpoints, view(splineBuffer,:,1))
                 end
 
                 # Reset the ring
@@ -922,24 +922,24 @@ function regularGridTransform(grid::RLZ_Grid)
                     p = (k-1)*2
                     p1 = r2 + 1 + (p*grid.params.b_rDim)
                     p2 = p1 + grid.params.b_rDim - 1
-                    a = SAtransform(grid.splines[2,v], grid.spectral[p1:p2,v])
+                    grid.splines[2,v].a .= view(grid.spectral,p1:p2,v)
                     if (dr == 0)
-                        splineBuffer[:,2] .= SItransform(grid.splines[2,v].params, a, rpoints)
+                        SItransform(grid.splines[2,v], rpoints, view(splineBuffer,:,2))
                     elseif (dr == 1)
-                        splineBuffer[:,2] .= SIxtransform(grid.splines[2,v].params, a, rpoints)
+                        SIxtransform(grid.splines[2,v], rpoints, view(splineBuffer,:,2))
                     else
-                        splineBuffer[:,2] .= SIxxtransform(grid.splines[2,v].params, a, rpoints)
+                        SIxxtransform(grid.splines[2,v], rpoints, view(splineBuffer,:,2))
                     end
 
                     p1 = p2 + 1
                     p2 = p1 + grid.params.b_rDim - 1
-                    a = SAtransform(grid.splines[3,v], grid.spectral[p1:p2,v])
+                    grid.splines[3,v].a .= view(grid.spectral,p1:p2,v)
                     if (dr == 0)
-                        splineBuffer[:,3] .= SItransform(grid.splines[3,v].params, a, rpoints)
+                        SItransform(grid.splines[3,v], rpoints, view(splineBuffer,:,3))
                     elseif (dr == 1)
-                        splineBuffer[:,3] .= SIxtransform(grid.splines[3,v].params, a, rpoints)
+                        SIxtransform(grid.splines[3,v], rpoints, view(splineBuffer,:,3))
                     else
-                        splineBuffer[:,3] .= SIxxtransform(grid.splines[3,v].params, a, rpoints)
+                        SIxxtransform(grid.splines[3,v], rpoints, view(splineBuffer,:,3))
                     end
 
                     for r in eachindex(rpoints)
