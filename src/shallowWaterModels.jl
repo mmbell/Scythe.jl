@@ -1,6 +1,8 @@
-function Oneway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int64)
+function Oneway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # One-way Shallow Water model on top of slab BL
+
+    # Local helper variables
     grid = mtile.tile
     gridpoints = mtile.tilepoints
     expdot = mtile.expdot_n
@@ -14,6 +16,7 @@ function Oneway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
     Hb = model.physical_params[:Hb]
     f = model.physical_params[:f]
 
+    # Assign local variables with views
     r = view(gridpoints,:,1)
 
     h = view(grid.physical,:,1,1)
@@ -34,6 +37,19 @@ function Oneway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
     vgl = view(grid.physical,:,3,4)
     vgll = view(grid.physical,:,3,5)
 
+    ub = view(grid.physical,:,4,1)
+    ubr = view(grid.physical,:,4,2)
+    ubrr = view(grid.physical,:,4,3)
+    ubl = view(grid.physical,:,4,4)
+    ubll = view(grid.physical,:,4,5)
+
+    vb = view(grid.physical,:,5,1)
+    vbr = view(grid.physical,:,5,2)
+    vbrr = view(grid.physical,:,5,3)
+    vbl = view(grid.physical,:,5,4)
+    vbll = view(grid.physical,:,5,5)
+
+    # Helper arrays to reduce memory allocations
     ADV = similar(r)
     DRAG = similar(r)
     COR = similar(r)
@@ -41,70 +57,67 @@ function Oneway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
     W_ = similar(r)
     KDIFF = similar(r)
 
-    @turbo ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
-    @turbo PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r))) #HPGF (actually just divergence but use PGF array)
-
-    # h tendency
-    @turbo expdot[:,1] .= @. ADV + PGF
-
-    @turbo ADV .= @. (-vg * ugl / r) + (-ug * ugr) #UGADV
-    @turbo PGF .= @. (-g * hr) #UGPGF
-    @turbo COR .= @. (vg * (f + (vg / r))) #COR
-
-    # ug tendency
-    expdot[:,2] .= @. ADV + PGF + COR
-
-    @turbo ADV .= @. (-vg * vgl / r) + (-ug * vgr) #UGADV
-    @turbo PGF .= @. (-g * (hl / r)) #UGPGF
-    @turbo COR .= @. (-ug * (f + (vg / r))) #COR
-
-    # vg tendency
-    @turbo expdot[:,3] .= @. ADV + PGF + COR
-
-    u = view(grid.physical,:,4,1)
-    ur = view(grid.physical,:,4,2)
-    urr = view(grid.physical,:,4,3)
-    ul = view(grid.physical,:,4,4)
-    ull = view(grid.physical,:,4,5)
-
-    v = view(grid.physical,:,5,1)
-    vr = view(grid.physical,:,5,2)
-    vrr = view(grid.physical,:,5,3)
-    vl = view(grid.physical,:,5,4)
-    vll = view(grid.physical,:,5,5)
-
+    # Parameterized surface wind speed
     sfc_factor = 0.78
-    U = similar(u)
-    @turbo U .= @. sfc_factor * sqrt((u * u) + (v * v))
+    U = similar(ub)
+    @turbo U .= @. sfc_factor * sqrt((ub * ub) + (vb * vb))
 
-    # W is diagnostic
+    # W is diagnostic and is needed first for other calculations
     w = view(grid.physical,:,6,1)
-    @turbo w .= @. -Hb * ((u / r) + ur)
+    @turbo w .= @. -Hb * ((ub / r) + ubr + (vbl / r))
     w_ = @. 0.5 * abs(w) - w
     @turbo expdot[:,6] .= 0.0
 
-    @turbo ADV .= @. (-(u * ur)) + (-v * ul / r) #UADV
-    @turbo DRAG .= @. -(Cd * U * u / Hb) #UDRAG
-    @turbo COR .= @. ((f * v) + ((v * v) / r)) #UCOR
-    @turbo PGF .= @. (-g * hr) #UPGF
-    @turbo W_ .= @. -(w_ * (u / Hb)) #UW
-    @turbo KDIFF .= @. K * ((ur / r) + urr - (u / (r * r)) + (ull / (r * r)) - (2.0 * vl / (r * r))) #UKDIFF
+    # h tendency
+    @turbo ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
+    @turbo PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r))) # Divergence but use PGF array to reduce memory allocations
+    @turbo expdot[:,1] .= @. ADV + PGF
 
-    @turbo expdot[:,4] .= @. ADV + DRAG + COR + PGF + W_ + KDIFF
+    # ug tendency
+    @turbo ADV .= @. (-vg * ugl / r) + (-ug * ugr) #UGADV
+    @turbo PGF .= @. (-g * hr) #UGPGF
+    @turbo COR .= @. (vg * (f + (vg / r))) #UCOR
+    @turbo expdot[:,2] .= @. ADV + PGF + COR
 
-    @turbo ADV .= @. (-u * (f + (v / r) + vr)) + (-v * vl / r) #VADV
-    @turbo DRAG .= @. -(Cd * U * v / Hb) #VDRAG
-    @turbo COR .= @. ((f * u) + ((u * v) / r)) #UCOR
-    @turbo PGF .= @. (-g * (hl / r)) #VPGF
-    @turbo W_ .= @. w_ * (vg - v) / Hb #VW
-    @turbo KDIFF .= @. K * ((vr / r) + vrr - (v / (r * r)) + (vll / (r * r)) + (2.0 * ul / (r * r))) #VKDIFF
+    # vg tendency
+    @turbo ADV .= @. (-vg * vgl / r) + (-ug * vgr) #VGADV
+    @turbo PGF .= @. (-g * (hl / r)) #VGPGF
+    @turbo COR .= @. (-ug * (f + (vg / r))) #VCOR
+    @turbo expdot[:,3] .= @. ADV + PGF + COR
 
-    @turbo expdot[:,5] .= @. ADV + COR + DRAG + PGF + W_ + KDIFF
+    # ub tendency
+    @turbo ADV .= @. (-vb * ubl / r) + (-ub * ubr) #UBADV
+    @turbo PGF .= @. (-g * hr) #UBPGF
+    @turbo COR .= @. (vb * (f + (vb / r))) #UBCOR
+    @turbo DRAG .= @. -(Cd * U * ub / Hb) #UDRAG
+    @turbo W_ .= @. w_ * (ug - ub) / Hb #UW
+    @turbo KDIFF .= @. K * ((ubr / r) + ubrr - (ub / (r * r)) + (ubll / (r * r)) - (2.0 * vbl / (r * r))) #UKDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #@turbo KDIFF .= @. K * ((ur / r) + urr + (ull / (r * r))) #UKDIFF
+    @turbo expdot[:,4] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # vb tendency
+    @turbo ADV .= @. (-vb * vbl / r) + (-ub * vbr) #VBADV
+    @turbo PGF .= @. (-g * (hl / r)) #VBPGF
+    @turbo COR .= @. (-ub * (f + (vb / r))) #VBCOR
+    @turbo DRAG .= @. -(Cd * U * vb / Hb) #VDRAG
+    @turbo W_ .= @. w_ * (vg - vb) / Hb #VW
+    @turbo KDIFF .= @. K * ((vbr / r) + vbrr - (vb / (r * r)) + (vbll / (r * r)) + (2.0 * ubl / (r * r))) #VKDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #@turbo KDIFF .= @. K * ((vr / r) + vrr + (vll / (r * r))) #VKDIFF
+    @turbo expdot[:,5] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
 end
 
-function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int64)
+function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Two-way Shallow Water model on top of slab BL
+    # This equation set includes feedbacks back to SWM via the mass sink/source
+
+    # Local helper variables
     grid = mtile.tile
     gridpoints = mtile.tilepoints
     expdot = mtile.expdot_n
@@ -119,6 +132,7 @@ function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
     f = model.physical_params[:f]
     S1 = model.physical_params[:S1]
 
+    # Assign local variables with views
     r = view(gridpoints,:,1)
 
     h = view(grid.physical,:,1,1)
@@ -139,6 +153,19 @@ function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
     vgl = view(grid.physical,:,3,4)
     vgll = view(grid.physical,:,3,5)
 
+    ub = view(grid.physical,:,4,1)
+    ubr = view(grid.physical,:,4,2)
+    ubrr = view(grid.physical,:,4,3)
+    ubl = view(grid.physical,:,4,4)
+    ubll = view(grid.physical,:,4,5)
+
+    vb = view(grid.physical,:,5,1)
+    vbr = view(grid.physical,:,5,2)
+    vbrr = view(grid.physical,:,5,3)
+    vbl = view(grid.physical,:,5,4)
+    vbll = view(grid.physical,:,5,5)
+
+    # Helper arrays to reduce memory allocations
     ADV = similar(r)
     DRAG = similar(r)
     COR = similar(r)
@@ -146,75 +173,66 @@ function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
     W_ = similar(r)
     KDIFF = similar(r)
 
-    @turbo ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
-
-    #Divergence but use PGF array to reduce memory allocations
-    @turbo PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r)))
-
-    # h tendency includes W as mass sink/source
-    # S = w * S1
-    # Use COR array to reduce memory allocations
-    @turbo COR .= @. -(Hfree + h) * w * S1
-
-    @turbo expdot[:,1] .= @. ADV + PGF + COR
-
-    @turbo ADV .= @. (-vg * ugl / r) + (-ug * ugr) #UGADV
-    @turbo PGF .= @. (-g * hr) #UGPGF
-    @turbo COR .= @. (vg * (f + (vg / r))) #COR
-
-    # ug tendency
-    expdot[:,2] .= @. ADV + PGF + COR
-
-    @turbo ADV .= @. (-vg * vgl / r) + (-ug * vgr) #UGADV
-    @turbo PGF .= @. (-g * (hl / r)) #UGPGF
-    @turbo COR .= @. (-ug * (f + (vg / r))) #COR
-
-    # vg tendency
-    @turbo expdot[:,3] .= @. ADV + PGF + COR
-
-    u = view(grid.physical,:,4,1)
-    ur = view(grid.physical,:,4,2)
-    urr = view(grid.physical,:,4,3)
-    ul = view(grid.physical,:,4,4)
-    ull = view(grid.physical,:,4,5)
-
-    v = view(grid.physical,:,5,1)
-    vr = view(grid.physical,:,5,2)
-    vrr = view(grid.physical,:,5,3)
-    vl = view(grid.physical,:,5,4)
-    vll = view(grid.physical,:,5,5)
-
+    # Parameterized surface wind speed
     sfc_factor = 0.78
-    U = similar(u)
-    @turbo U .= @. sfc_factor * sqrt((u * u) + (v * v))
+    U = similar(ub)
+    @turbo U .= @. sfc_factor * sqrt((ub * ub) + (vb * vb))
 
-    # W is diagnostic
+    # W is diagnostic and is needed first for other calculations
     w = view(grid.physical,:,6,1)
-    @turbo w .= @. -Hb * ((u / r) + ur)
+    @turbo w .= @. -Hb * ((ub / r) + ubr + (vbl / r))
     w_ = @. 0.5 * abs(w) - w
     @turbo expdot[:,6] .= 0.0
 
-    @turbo ADV .= @. (-(u * ur)) + (-v * ul / r) #UADV
-    @turbo DRAG .= @. -(Cd * U * u / Hb) #UDRAG
-    @turbo COR .= @. ((f * v) + ((v * v) / r)) #UCOR
-    @turbo PGF .= @. (-g * hr) #UPGF
-    @turbo W_ .= @. -(w_ * (u / Hb)) #UW
-    @turbo KDIFF .= @. K * ((ur / r) + urr - (u / (r * r)) + (ull / (r * r)) - (2.0 * vl / (r * r))) #UKDIFF
+    # h tendency
+    @turbo ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
+    @turbo PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r))) # Divergence but use PGF array 
+    # In two-way case, h tendency includes W as mass sink/source
+    # S = w * S1
+    # Use COR array to reduce memory allocations
+    @turbo COR .= @. -(Hfree + h) * w * S1
+    @turbo expdot[:,1] .= @. ADV + PGF + COR
 
-    @turbo expdot[:,4] .= @. ADV + DRAG + COR + PGF + W_ + KDIFF
+    # ug tendency
+    @turbo ADV .= @. (-vg * ugl / r) + (-ug * ugr) #UGADV
+    @turbo PGF .= @. (-g * hr) #UGPGF
+    @turbo COR .= @. (vg * (f + (vg / r))) #UCOR
+    @turbo expdot[:,2] .= @. ADV + PGF + COR
 
-    @turbo ADV .= @. (-u * (f + (v / r) + vr)) + (-v * vl / r) #VADV
-    @turbo DRAG .= @. -(Cd * U * v / Hb) #VDRAG
-    @turbo COR .= @. ((f * u) + ((u * v) / r)) #UCOR
-    @turbo PGF .= @. (-g * (hl / r)) #VPGF
-    @turbo W_ .= @. w_ * (vg - v) / Hb #VW
-    @turbo KDIFF .= @. K * ((vr / r) + vrr - (v / (r * r)) + (vll / (r * r)) + (2.0 * ul / (r * r))) #VKDIFF
+    # vg tendency
+    @turbo ADV .= @. (-vg * vgl / r) + (-ug * vgr) #VGADV
+    @turbo PGF .= @. (-g * (hl / r)) #VGPGF
+    @turbo COR .= @. (-ug * (f + (vg / r))) #VCOR
+    @turbo expdot[:,3] .= @. ADV + PGF + COR
 
-    @turbo expdot[:,5] .= @. ADV + COR + DRAG + PGF + W_ + KDIFF
+    # ub tendency
+    @turbo ADV .= @. (-vb * ubl / r) + (-ub * ubr) #UBADV
+    @turbo PGF .= @. (-g * hr) #UBPGF
+    @turbo COR .= @. (vb * (f + (vb / r))) #UBCOR
+    @turbo DRAG .= @. -(Cd * U * ub / Hb) #UBDRAG
+    @turbo W_ .= @. w_ * (ug - ub) / Hb #UW
+    @turbo KDIFF .= @. K * ((ubr / r) + ubrr - (ub / (r * r)) + (ubll / (r * r)) - (2.0 * vbl / (r * r))) #UKDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #@turbo KDIFF .= @. K * ((ur / r) + urr + (ull / (r * r))) #UKDIFF
+    @turbo expdot[:,4] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # vb tendency
+    @turbo ADV .= @. (-vb * vbl / r) + (-ub * vbr) #VBADV
+    @turbo PGF .= @. (-g * (hl / r)) #VBPGF
+    @turbo COR .= @. (-ub * (f + (vb / r))) #VBCOR
+    @turbo DRAG .= @. -(Cd * U * vb / Hb) #VDRAG
+    @turbo W_ .= @. w_ * (vg - vb) / Hb #VW
+    @turbo KDIFF .= @. K * ((vbr / r) + vbrr - (vb / (r * r)) + (vbll / (r * r)) + (2.0 * ubl / (r * r))) #VKDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #@turbo KDIFF .= @. K * ((vr / r) + vrr + (vll / (r * r))) #VKDIFF
+    @turbo expdot[:,5] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
 
 end
 
-function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64)
+function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #Linear shallow water equations
     grid = mtile.tile
@@ -247,6 +265,9 @@ function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64)
     expdot[:,1] .= -H * ((u ./ r) .+ ur .+ (vl ./ r))
     expdot[:,2] .= (-g .* hr) .+ (K .* ((ur ./ r) .+ urr .+ (ull ./ (r .* r)))) 
     expdot[:,3] .= (-g .* (hl ./ r)) .+ (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r))))
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
 
 end
 
@@ -297,5 +318,96 @@ function ShallowWaterRL(grid::RL_Grid,
         (-g .* (hl ./ r)) .+
         (-u .* (f .+ (v ./ r))) .+
         (K .* ((vr ./ r) .+ vrr .+ (vll ./ (r .* r)) .- (v ./ (r .* r)))))
+
+end
+
+function Oneway_ShallowWater_Slab_old(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # One-way Shallow Water model on top of slab BL
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+   
+    # Need to figure out how to assign these with symbols
+    g = 9.81
+    K = 1500.0
+    Cd = 2.4e-3
+    Hfree = 2000.0
+    Hb = 1000.0
+    f = 5.0e-5
+
+    r = gridpoints[:,1]
+
+    h = grid.physical[:,1,1]
+    hr = grid.physical[:,1,2]
+    hrr = grid.physical[:,1,3]
+    hl = grid.physical[:,1,4]
+    hll = grid.physical[:,1,5]
+    
+    ug = grid.physical[:,2,1]
+    ugr = grid.physical[:,2,2]
+    ugrr = grid.physical[:,2,3]
+    ugl = grid.physical[:,2,4]
+    ugll = grid.physical[:,2,5]
+        
+    vg = grid.physical[:,3,1]
+    vgr = grid.physical[:,3,2]
+    vgrr = grid.physical[:,3,3]
+    vgl = grid.physical[:,3,4]
+    vgll = grid.physical[:,3,5]
+    
+    # h tendency
+    expdot[:,1] .= ((-vg .* hl ./ r) .+ (-ug .* hr) .+
+        (-(Hfree .+ h) .* ((ug ./ r) .+ ugr .+ (vgl ./ r))))
+
+    # ug tendency
+    expdot[:,2] .= ((-vg .* ugl ./ r) .+ (-ug .* ugr) .+
+        (-g .* hr) .+
+        (vg .* (f .+ (vg ./ r))))
+    
+    # vg tendency
+    expdot[:,3] .= ((-vg .* vgl ./ r) .+ (-ug .* vgr) .+
+        (-g .* (hl ./ r)) .+
+        (-ug .* (f .+ (vg ./ r))))
+    
+    u = grid.physical[:,4,1]
+    ur = grid.physical[:,4,2]
+    urr = grid.physical[:,4,3]
+    ul = grid.physical[:,4,4]
+    ull = grid.physical[:,4,5]
+    
+    v = grid.physical[:,5,1]
+    vr = grid.physical[:,5,2]
+    vrr = grid.physical[:,5,3]
+    vl = grid.physical[:,5,4]
+    vll = grid.physical[:,5,5]
+
+    U = 0.78 * sqrt.((u .* u) .+ (v .* v))
+
+    # W is diagnostic
+    w = -Hb .* ((u ./ r) .+ ur .+ (vl ./ r))
+    w_ = 0.5 .* abs.(w) .- w
+    grid.physical[:,6,1] .= w
+    expdot[:,6] .= 0.0
+
+    UADV = (-u .* ur) .+ (-v .* ul ./ r)
+    UDRAG = -(Cd .* U .* u ./ Hb)
+    UCOR = ((f .* v) .+ ((v .* v) ./ r))
+    UPGF = (-g .* hr)
+    UW = (w_ .* ((ug .- u) ./ Hb))
+    UKDIFF = K .* ((ur ./ r) .+ urr .- (u ./ (r .* r)) .+ (ull ./ (r .* r)) .- (2.0 .* vl ./ (r .* r)))
+    expdot[:,4] .= UADV .+ UDRAG .+ UCOR .+ UPGF .+ UW .+ UKDIFF
+    
+    VADV = (-u .* vr) .+ (-v .* vl ./ r)
+    VDRAG = -(Cd .* U .* v ./ Hb)
+    VPGF = (-g .* (hl ./ r))
+    VCOR = -((f .* u) .+ ((u .* v) ./ r)) 
+    VW = (w_ .* (vg .- v) ./ Hb)
+    VKDIFF = K .* ((vr ./ r) .+ vrr .- (v ./ (r .* r)) .+ (vll ./ (r .* r)) .+ (2.0 .* ul ./ (r .* r)))
+    expdot[:,5] .= VADV .+ VDRAG .+ VCOR .+ VPGF .+ VW .+ VKDIFF
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
 
 end

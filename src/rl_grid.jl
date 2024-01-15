@@ -767,7 +767,7 @@ function tileTransform!(patchSplines::Array{Spline1D}, patchSpectral::Array{Floa
 
     # Transform from the spectral to grid space
     # For RL grid, varying dimensions are R, L, and variable
-    #splineBuffer = zeros(Float64, tile.params.rDim, patch.params.rDim*2+1, 3)
+    #splineBuffer = zeros(Float64, tile.params.rDim, 2, length(tile.params.vars))
     kDim = pp.rDim
 
     Threads.@threads for v in 1:length(pp.vars)

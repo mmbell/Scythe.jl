@@ -18,7 +18,8 @@ export initialize_model, run_model, finalize_model
 struct ModelTile
     model::ModelParameters
     tile::AbstractGrid
-    var_nxt::Array{Float64}
+    var_np1::Array{Float64}
+    var_nm1::Array{Float64}
     expdot_n::Array{Float64}
     expdot_nm1::Array{Float64}
     expdot_nm2::Array{Float64}
@@ -44,7 +45,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         haloReceiveIndexMap::BitMatrix)
 
     # Allocate some needed arrays
-    var_nxt = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    var_np1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    var_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
@@ -91,7 +93,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     mtile = ModelTile(
         model,
         tile,
-        var_nxt,
+        var_np1,
+        var_nm1,
         expdot_n,
         expdot_nm1,
         expdot_nm2,
@@ -179,7 +182,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     map(wait, [remove_from(w, :patch) for w in workerids[2:length(workerids)]])
 
     # Transform the patch and return to the main process
-    spectralTransform!(patch)
+    #spectralTransform!(patch)
 
     println("Ready for time integration!")
     flush(stdout)
@@ -276,7 +279,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         @inbounds sharedSpectral[haloReceiveIndexMap] .+= haloReceiveBuffer
 
         # Reset the shared spectral patch to the tiles
-        map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
+        map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral, mtile.tile))) for w in workerids])
 
         # Output if on specified time interval
         if mod(t,output_int) == 0
@@ -363,13 +366,13 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     ts = mtile.model.ts
 
     # Calculate xi_nstar
-    xi_nstar = mtile.var_nxt[colstart:colend,xi_index]
+    xi_nstar = mtile.var_np1[colstart:colend,xi_index]
     wdot_n = view(mtile.impdot_n,colstart:colend,xi_index)
     wdot_nm1 = view(mtile.impdot_nm1,colstart:colend,xi_index)
     wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,xi_index)
 
     # Calculate w_nstar
-    w_nstar = mtile.var_nxt[colstart:colend,w_index]
+    w_nstar = mtile.var_np1[colstart:colend,w_index]
     xidot_n = view(mtile.impdot_n,colstart:colend,w_index)
     xidot_nm1 = view(mtile.impdot_nm1,colstart:colend,w_index)
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
@@ -428,10 +431,10 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Set xi_n+1
     xi_col = mtile.tile.columns[mtile.model.grid_params.vars["xi"]]
     xi_col.a .= xi_a
-    view(mtile.var_nxt,colstart:colend,xi_index) .= CItransform!(xi_col)
+    view(mtile.var_np1,colstart:colend,xi_index) .= CItransform!(xi_col)
 
     # Set w_n+1
-    view(mtile.var_nxt,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
+    view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
 end
 
 function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
@@ -441,13 +444,13 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     ts = mtile.model.ts
 
     # Calculate xi_nstar
-    xi_nstar = mtile.var_nxt[colstart:colend,xi_index]
+    xi_nstar = mtile.var_np1[colstart:colend,xi_index]
     wdot_n = view(mtile.impdot_n,colstart:colend,xi_index)
     wdot_nm1 = view(mtile.impdot_nm1,colstart:colend,xi_index)
     wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,xi_index)
 
     # Calculate w_nstar
-    w_nstar = mtile.var_nxt[colstart:colend,w_index]
+    w_nstar = mtile.var_np1[colstart:colend,w_index]
     xidot_n = view(mtile.impdot_n,colstart:colend,w_index)
     xidot_nm1 = view(mtile.impdot_nm1,colstart:colend,w_index)
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
@@ -506,17 +509,18 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     end
 
     # Set xi_n+1
-    view(mtile.var_nxt,colstart:colend,xi_index) .= CItransform!(xi_col)
+    view(mtile.var_np1,colstart:colend,xi_index) .= CItransform!(xi_col)
 
     # Set w_n+1
-    view(mtile.var_nxt,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
+    view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
 end
 
 function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     for v in 1:length(mtile.model.grid_params.vars)
         physical = view(mtile.tile.physical,colstart:colend,v,1)
-        var_nxt = view(mtile.var_nxt,colstart:colend,v)
+        var_np1 = view(mtile.var_np1,colstart:colend,v)
+        var_nm1 = view(mtile.var_nm1,colstart:colend,v)
         expdot_n = view(mtile.expdot_n,colstart:colend,v)
         expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,v)
         expdot_nm2 = view(mtile.expdot_nm2,colstart:colend,v)
@@ -524,16 +528,22 @@ function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::
 
         if (t == 1)
             # Use Euler method and trapezoidal method (AM2) for first step
-            var_nxt .= @. physical + (ts * expdot_n)
+            var_np1 .= @. physical + (ts * expdot_n)
             expdot_nm1 .= expdot_n
         elseif (t == 2)
             # Use 2nd order A-B method and AI2* for second step
-            var_nxt .= @. physical + (0.5 * ts) * ((3.0 * expdot_n) - expdot_nm1)
+            var_np1 .= @. physical + (0.5 * ts) * ((3.0 * expdot_n) - expdot_nm1)
+            #var_nm1 .= physical
             expdot_nm2 .= expdot_nm1
             expdot_nm1 .= expdot_n
         else
             # Use AI2*–AB3 implicit-explicit scheme (Durran and Blossey 2012)
-            var_nxt .= @. physical + ((ts / 12.0) * ((23.0 * expdot_n) - (16.0 * expdot_nm1) + (5.0 * expdot_nm2)))
+            var_np1 .= @. physical + ((ts / 12.0) * ((23.0 * expdot_n) - (16.0 * expdot_nm1) + (5.0 * expdot_nm2)))
+
+            # Use BI2*-BX3* implicit-explicit scheme
+            #var_np1 .= @. (2.0/3.0) * ((2.0 * physical) + (-0.5 * var_nm1) + ((ts / 3.0) * ((8.0 * expdot_n) + (-7.0 * expdot_nm1) + (2.0 * expdot_nm2))))
+            #var_nm1 .= physical
+
             expdot_nm2 .= expdot_nm1
             expdot_nm1 .= expdot_n
         end
@@ -543,7 +553,7 @@ end
 function calcTendency(mtile::ModelTile)
 
     # Set the current time
-    mtile.tile.physical .= mtile.var_nxt
+    mtile.tile.physical .= mtile.var_np1
     
     # Transform to spectral space
     spectralTransform!(mtile.tile)    

@@ -62,9 +62,9 @@ function LinearAdvectionRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::
     if K > 0.0
         hrr = view(grid.physical,:,1,3)
         hll = view(grid.physical,:,1,5)
-        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r)) + (K * ((hr / r) + hrr + (hll / (r * r))))
+        @turbo expdot[:,1] .= @. (-u * hr) - (v * (hl / r)) + (K * ((hr / r) + hrr + (hll / (r * r))))
     else
-        @turbo vardot[:,1] .= @. (-u * hr) - (v * (hl / r))
+        @turbo expdot[:,1] .= @. (-u * hr) - (v * (hl / r))
     end
 
     # Advance the explicit terms
