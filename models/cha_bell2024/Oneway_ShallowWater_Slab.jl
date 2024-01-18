@@ -1,7 +1,7 @@
 model = ModelParameters(
     ts = 3.0,
-    integration_time = 60.0,
-    output_interval = 60.0,
+    integration_time = 86400.0,
+    output_interval = 120.0,
     equation_set = "Oneway_ShallowWater_Slab",
     initial_conditions = "./Oneway_SWslab_wave2/SWslab_wave2.csv",
     output_dir = "./Oneway_SWslab_wave2/",

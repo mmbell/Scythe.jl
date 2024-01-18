@@ -1,10 +1,10 @@
 model = ModelParameters(
     ts = 3.0,
-    integration_time = 60.0,
-    output_interval = 60.0,
+    integration_time = 86400.0,
+    output_interval = 120.0,
     equation_set = "Twoway_ShallowWater_Slab",
-    initial_conditions = "./Twoway_SWslab_output/SWslab_wave2.csv",
-    output_dir = "./Twoway_SWslab_output/",
+    initial_conditions = "./Twoway_SWslab_wave2/SWslab_wave2.csv",
+    output_dir = "./Twoway_SWslab_wave2/",
     grid_params = GridParameters(
         geometry="RL",
         xmin = 0.0,
