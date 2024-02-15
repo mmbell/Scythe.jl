@@ -1,5 +1,8 @@
 module CubicBSpline
 
+#= This module holds the functions for manipulating cubic B-splines.
+The math and terminology closely follow Ooyama, K. V., 2002: The cubic-spline transform method: Basic definitions and tests in a 1d single domain. Mon. Wea. Rev., 130, 2392–2415. =#
+
 using LinearAlgebra
 using SparseArrays
 using SuiteSparse
@@ -45,6 +48,7 @@ Base.@kwdef struct SplineParameters
     DXrecip::real = 1.0/DX
 end
 
+# This structure holds a 1D Cubic B-spline type
 struct Spline1D
     params::SplineParameters
     gammaBC::Matrix{real}
@@ -59,6 +63,12 @@ struct Spline1D
 end
 
 function basis(sp::SplineParameters, m::int, x::real, derivative::int)
+
+    # Calculate the cubic b-spline basis function for a given set of spline parameters
+    # m = node index
+    # x = physical location
+    # derivative = 0, 1, or 2 for none, first, or second derivative
+    
     b = 0.0
     if (x < sp.xmin) || (x > sp.xmax)
         throw(DomainError(x, "x outside spline domain"))
@@ -104,6 +114,7 @@ end
 
 function calcGammaBC(sp::SplineParameters)
 
+    # Calculate the boundary condition matrix
     if haskey(sp.BCL,"α1")
         rankL = 1
     elseif haskey(sp.BCL,"α2")
@@ -165,6 +176,8 @@ end
 
 function calcPQfactor(sp::SplineParameters, gammaBC::Matrix{real})
 
+    # Calculate the P + Q matrix, convert to sparse representation, 
+    # and factor with Cholesky decomposition
     eps_q = ((sp.l_q*sp.DX)/(2*π))^6
     Mdim = sp.num_cells + 3
 
@@ -209,6 +222,8 @@ function calcPQfactor(sp::SplineParameters, gammaBC::Matrix{real})
 end
 
 function calcMishPoints(sp::SplineParameters)
+
+    # Calculate the Gaussian quadrature "mish" points in between the nodes
     x = zeros(real,sp.num_cells*mubar)
     for mc = 0:(sp.num_cells-1)
         for mu = 1:mubar
@@ -221,6 +236,7 @@ end
 
 function Spline1D(sp::SplineParameters)
 
+    # Constructor for the 1D Spline structure
     gammaBC = calcGammaBC(sp)
     pq, pqFactor = calcPQfactor(sp, gammaBC)
 
@@ -238,11 +254,14 @@ end
 
 function setMishValues(spline::Spline1D, uMish::Vector{real})
 
+    # Convenience function to assign a vector to the spline mish values
     spline.uMish .= uMish
 end
 
 function SBtransform(sp::SplineParameters, uMish::Vector{real})
 
+    # SB transform from physical space (u) to B vector
+    # The various versions of this function take different type inputs, which is useful for different calling scenarios
     Mdim = sp.num_cells + 3
     b = zeros(real,Mdim)
 
@@ -277,9 +296,11 @@ function SBtransform!(spline::Spline1D)
     spline.b .= b
 end
 
-function SBxtransform(sp::SplineParameters, uMish::Vector{real}, BCL, BCR)
+#= function SBxtransform(sp::SplineParameters, uMish::Vector{real}, BCL, BCR)
 
-    # Integration by parts, but still not working
+    # This function does the SBx transform but is not working
+    # It is essentially integration by parts, but still needs some bug fixes evidently
+    # Do not use at this time!
     Mdim = sp.num_cells + 3
     b = zeros(real,Mdim)
 
@@ -302,16 +323,18 @@ function SBxtransform(sp::SplineParameters, uMish::Vector{real}, BCL, BCR)
     end
     
     return b
-end
+end 
 
 function SBxtransform(spline::Spline1D, uMish::Vector{real}, BCL, BCR)
 
     bx = SBxtransform(spline.params,uMish,BCL,BCR)
     return bx
-end
+end =#
 
 function SAtransform(sp::SplineParameters, gammaBC::Matrix{Float64}, pqFactor, b::Vector{real})
 
+    # The SA transform converts a B matrix into A coefficients, applying the boundary conditions
+    # The various versions of this function take different type inputs, which is useful for different calling scenarios
     a = gammaBC' * (pqFactor \ (gammaBC * b))
     return a
 end
@@ -324,6 +347,7 @@ end
 
 function SAtransform!(spline::Spline1D)
 
+    # In-place version of the SA transform
     spline.a .= spline.gammaBC' * (spline.pqFactor \ (spline.gammaBC * spline.b))
 end
 
@@ -334,24 +358,10 @@ function SAtransform(spline::Spline1D, b::Vector{real}, ahat::Vector{real})
     return a
 end
 
-function SItransform_matrix(spline::Spline1D, points::Vector{Float64}, derivative::Int64 = 0)
-
-    sp = spline.params
-    u = zeros(Float64,sp.num_cells*mubar,spline.bDim)
-    for i in eachindex(points)
-        xm = ceil(Int64,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
-        for m = xm:(xm + 3)
-            if (m >= -1) && (m <= (sp.num_cells+1))
-                mi = m + 2
-                u[i,mi] = basis(sp, m, points[i], derivative)
-            end
-        end
-    end
-    return u
-end
-
 function SItransform(sp::SplineParameters, a::Vector{real}, x::real, derivative::int = 0)
 
+    # The SI transform converts A coefficients back to physical space (u)
+    # The various versions of this function take different type inputs, which is useful for different calling scenarios
     u = 0.0
     xm = ceil(int,(x - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
     for m = xm:(xm + 3)
@@ -413,6 +423,7 @@ end
 
 function SItransform!(spline::Spline1D)
 
+    # In-place SI transform
     u = SItransform(spline.params,spline.a,spline.mishPoints,spline.uMish)
     return u
 end
@@ -429,8 +440,27 @@ function SItransform(spline::Spline1D, points::Vector{real}, u::AbstractVector)
     return u
 end
 
+function SItransform_matrix(spline::Spline1D, points::Vector{Float64}, derivative::Int64 = 0)
+
+    # This function creates a matrix for the SI transform, which is mostly useful for debugging
+    # but could have value in linear equation solutions later on
+    sp = spline.params
+    u = zeros(Float64,sp.num_cells*mubar,spline.bDim)
+    for i in eachindex(points)
+        xm = ceil(Int64,(points[i] - sp.xmin - (2.0 * sp.DX)) * sp.DXrecip)
+        for m = xm:(xm + 3)
+            if (m >= -1) && (m <= (sp.num_cells+1))
+                mi = m + 2
+                u[i,mi] = basis(sp, m, points[i], derivative)
+            end
+        end
+    end
+    return u
+end
+
 function SIxtransform(spline::Spline1D)
 
+    # SIx transform gives back the 1st derivative of the function in physical space
     uprime = SItransform(spline.params,spline.a,spline.mishPoints,1)
     return uprime
 end
@@ -455,6 +485,7 @@ end
 
 function SIxxtransform(spline::Spline1D)
 
+    # SIxx transform gives back the 2nd derivative of the function in physical space
     uprime2 = SItransform(spline.params,spline.a,spline.mishPoints,2)
     return uprime2
 end
