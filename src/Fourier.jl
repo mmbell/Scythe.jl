@@ -23,18 +23,18 @@ end
 struct Fourier1D
     # Parameters for the ring
     params::FourierParameters
-    
+
     # Pre-calculated angular points
     mishPoints::Vector{real}
-        
+
     # Measured FFTW Plan
     fftPlan::FFTW.r2rFFTWPlan
     ifftPlan::FFTW.r2rFFTWPlan
-    
+
     # Phase-shift and filter matrix
     phasefilter::Matrix{real}
     invphasefilter::Matrix{real}
-    
+
     # In this context, uMish is the physical values
     # b is the filtered Fourier coefficients 
     # a is the Fourier coefficients with zeros padding up to physical size
