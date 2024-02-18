@@ -24,12 +24,12 @@ const R3 = Dict("R3" => 0)
 
 # Define the spline parameters
 Base.@kwdef struct ChebyshevParameters
-    zmin::real = 0.0
-    zmax::real = 0.0
-    zDim::int = 0
-    bDim::int = 0
-    BCB::Dict = R0
-    BCT::Dict = R0
+    zmin::real = 0.0   # Minimum z in meters
+    zmax::real = 0.0   # Maximum z in meters
+    zDim::int = 0      # Nodal dimension
+    bDim::int = 0      # Spectral dimension
+    BCB::Dict = R0     # Bottom boundary condition
+    BCT::Dict = R0     # Top boundary condition
 end
 
 struct Chebyshev1D
@@ -43,7 +43,7 @@ struct Chebyshev1D
     gammaBC::Array{real}
     
     # Measured FFTW Plan
-    fftPlan::FFTW.r2rFFTWPlan{Float64, Tuple{Int32}, false, 1, Tuple{Int64}}
+    fftPlan::FFTW.r2rFFTWPlan
     
     # Filter matrix
     filter::Matrix{real}
@@ -51,6 +51,7 @@ struct Chebyshev1D
     # uMish is the physical values
     # b is the filtered Chebyshev coefficients without BCs
     # a is the padded Chebyshev coefficients with BCs
+    # ax is a buffer for derivative and integral coefficients
     uMish::Vector{real}
     b::Vector{real}
     a::Vector{real}
@@ -59,25 +60,35 @@ end
 
 function Chebyshev1D(cp::ChebyshevParameters)
 
+    # Constructor for 1D Chebsyshev structure
     mishPoints = calcMishPoints(cp)
     gammaBC = calcGammaBC(cp)
 
+    # Initialize the arrays
     uMish = zeros(real,cp.zDim)
     b = zeros(real,cp.bDim)
     a = zeros(real,cp.zDim)
     ax = zeros(real,cp.zDim)
 
     # Plan the FFT
+    # From the FFTW documentation: FFTW_REDFT00 (DCT-I): even around j=0 and even around j=n-1.
+    # If you specify a size-5 REDFT00 (DCT-I) of the data abcde, it corresponds to the DFT of the logical even array abcdedcb of size 8
     fftPlan = FFTW.plan_r2r(a, FFTW.REDFT00, flags=FFTW.PATIENT)
-    
+
+    # Pre-calculate the filter matrix
     filter = calcFilterMatrix(cp)
 
+    # Construct a 1D Chebyshev column
     column = Chebyshev1D(cp,mishPoints,gammaBC,fftPlan,filter,uMish,b,a,ax)
     return column
 end
 
 function calcMishPoints(cp::ChebyshevParameters)
-    
+
+    # Calculate the physical Chebyshev points
+    # The points are evenly spaced in the interval (0,π)
+    # which are then mapped to the physical interval (-1,1) via the cosine function
+    # and then scaled and offset to match the physical domain from zmin to zmax
     Nbasis = cp.zDim
     z = zeros(real,Nbasis)
     scale = -0.5 * (cp.zmax - cp.zmin)
@@ -90,34 +101,35 @@ end
 
 function calcFilterMatrix(cp::ChebyshevParameters)
 
+    # Create a matrix to truncate the coefficients to bDim after Fourier transformation
     filter = Matrix(1.0I, cp.bDim, cp.zDim)
     return filter
 end
 
 function CBtransform(cp::ChebyshevParameters, fftPlan, uMish::Vector{real})
 
-    # Do the DCT transform and pre-scale
+    # Do the DCT transform and pre-scale the output based on the physical length
     b = (fftPlan * uMish) ./ (2 * (cp.zDim -1))
     return b[1:cp.bDim]
 end
 
 function CBtransform!(column::Chebyshev1D)
 
-    # Do the DCT transform and pre-scale
+    # Do an in-place DCT transform
     b = (column.fftPlan * column.uMish) ./ (2 * (column.params.zDim -1))
     column.b .= column.filter * b
 end
 
 function CBtransform(column::Chebyshev1D, uMish::Vector{real})
 
-    # Do the DCT transform and pre-scale
+    # Do the DCT transform and pre-scale the output based on the physical length
     b = (column.fftPlan * uMish) ./ (2 * (column.params.zDim -1))
     return column.filter * b
 end
 
 function CAtransform(cp::ChebyshevParameters, gammaBC, b::Vector{real})
 
-    # Apply the BCs
+    # Apply the boundary conditions and pad the coefficients with zeros back to zDim
     bfill = [b ; zeros(Float64, cp.zDim-cp.bDim)]
     a = bfill .+ (gammaBC' * bfill)
     return a
@@ -125,7 +137,7 @@ end
 
 function CAtransform!(column::Chebyshev1D)
 
-    # Apply the BCs
+    # In place CA transform
     bfill = column.filter' * column.b
     a = bfill .+ (column.gammaBC' * bfill)
     column.a .= a
@@ -140,14 +152,15 @@ end
 
 function CItransform!(column::Chebyshev1D)
     
-    # Do the inverse DCT transform to get back physical values
+    # In-place inverse DCT transform to get back physical values
     column.uMish .= column.fftPlan * column.a
 end
 
 
 function CIIntcoefficients(cp::ChebyshevParameters, a::Vector{real}, C0::real = 0.0)
 
-    # Recursive relationship for integral coefficients
+    # Calculate the integral coefficients using a recursive relationship
+    # C0 is an optional constant of integration
     aInt = zeros(real,cp.zDim)
     sum = 0.0
     interval = -0.25 * (cp.zmax - cp.zmin)
@@ -163,20 +176,23 @@ end
 
 function CIInttransform(cp::ChebyshevParameters, fftPlan, a::Vector{real}, C0::real = 0.0)
 
+    # Do a transform to get the integral of the column values
+    # C0 is an optional constant of integration
     aInt = CIIntcoefficients(cp,a,C0)
     uInt = fftPlan * aInt
     return uInt
 end
 
 function CIInttransform(column::Chebyshev1D, C0::real = 0.0)
-    
+
+    # Do a transform to get the integral of the column values
     uInt = CIInttransform(column.params, column.fftPlan, column.a, C0)
     return uInt
 end
 
 function CIxcoefficients(cp::ChebyshevParameters, a::Vector{real}, ax::Vector{real})
 
-    # Recursive relationship for derivative coefficients
+    # Calculate the derivative coefficients using a recursive relationship
     k = cp.zDim
     ax[k-1] = (2.0 * (k-1) * a[k])
     for k = (cp.zDim-1):-1:2
@@ -188,19 +204,21 @@ end
 
 function CIxtransform(cp::ChebyshevParameters, fftPlan, a::Vector{real}, ax::Vector{real})
     
-    # Do the inverse transform to get back physical values
+    # Do the inverse transform to get back the first derivative in physical space
     ux = fftPlan * CIxcoefficients(cp,a,ax)
     return ux
 end
 
 function CIxtransform(column::Chebyshev1D)
-    
+
+    # Do the inverse transform to get back the first derivative in physical space
     ux = CIxtransform(column.params, column.fftPlan, column.a, column.ax)
     return ux
 end
 
 function CIxxtransform(column::Chebyshev1D)
-    
+
+    # Do the inverse transform to get back the second derivative in physical space
     ax = copy(CIxcoefficients(column.params, column.a, column.ax))
     uxx = CIxtransform(column.params, column.fftPlan, ax, column.ax)
     return uxx
@@ -209,7 +227,8 @@ end
 
 function dct_matrix(Nbasis::Int64)
     
-    # Create a matrix with the DCT as basis functions for boundary conditions
+    # Create a matrix with the DCT as basis functions
+    # This function is used for debugging and also for linear solvers
     dct = zeros(Float64,Nbasis,Nbasis)
     for i = 1:Nbasis
         t = (i-1) * π / (Nbasis - 1)
@@ -219,13 +238,13 @@ function dct_matrix(Nbasis::Int64)
     end
     dct[:,1] *= 0.5
     dct[:,Nbasis] *= 0.5
-    #dct = dct ./ (2 * (Nbasis -1))
     return dct
 end
 
 function dct_1st_derivative(Nbasis::Int64, physical_length::Float64)
 
-    # Create a matrix with the DCT as basis functions for boundary conditions
+    # Create a 1st derivative matrix with the DCT as basis functions
+    # This function is used for debugging and also for linear solvers
     dct = zeros(Float64,Nbasis,Nbasis)
     for i = 1:Nbasis
         t = (i-1) * π / (Nbasis - 1)
@@ -245,7 +264,8 @@ end
 
 function dct_2nd_derivative(Nbasis::Int64, physical_length::Float64)
 
-    # Create a matrix with the DCT as basis functions for boundary conditions
+    # Create a 2nd derivative matrix with the DCT as basis functions
+    # This function is used for debugging and also for linear solvers
     dct = zeros(Float64,Nbasis,Nbasis)
     for i = 1:Nbasis
         t = (i-1) * π / (Nbasis - 1)
@@ -300,7 +320,9 @@ function calcGammaBCalt(cp::ChebyshevParameters)
 end
 
 function calcGammaBC(cp::ChebyshevParameters)
-    
+
+    # Calculate a matrix to apply the Neumann and Dirichelet BCs
+    # The nomenclature follows Ooyama (2002) to match the cubic b-spline designations
     Ndim = cp.zDim
     
     if (cp.BCB == R0) && (cp.BCT == R0)
@@ -487,6 +509,7 @@ function bvp(N::Int64, u::Array{Float64}, ux::Array{Float64}, uxx::Array{Float64
         scale::Float64 = 1.0, alpha::Float64 = 0.0, beta::Float64 = 0.0)
 
     # Modified Chebyshev boundary value problem solver from Boyd (2000)
+    # Useful for testing the DCT matrices defined above
     nbasis = N-2
     xi = zeros(Float64, nbasis)
     g = zeros(Float64, nbasis)
