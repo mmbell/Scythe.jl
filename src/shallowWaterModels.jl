@@ -321,3 +321,169 @@ function ShallowWaterRL(grid::RL_Grid,
 
 end
 
+function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # Height resolved boundary layer with fixed pressure gradient from shallow water layer
+
+    # Local helper variables
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    # Physical parameters
+    g = model.physical_params[:g]
+    Kh = model.physical_params[:Kh]
+    Cd = model.physical_params[:Cd]
+    Hfree = model.physical_params[:Hfree]
+    f = model.physical_params[:f]
+    Um = model.physical_params[:Um]
+    Vm = model.physical_params[:Vm]
+
+    # Assign local variables with views
+    r = view(gridpoints,colstart:colend,1)
+    lambda = view(gridpoints,colstart:colend,2)
+    z = view(gridpoints,colstart:colend,3)
+    
+    h = view(grid.physical,colstart:colend,1,1)
+    hr = view(grid.physical,colstart:colend,1,2)
+    hrr = view(grid.physical,colstart:colend,1,3)
+    hl = view(grid.physical,colstart:colend,1,4)
+    hll = view(grid.physical,colstart:colend,1,5)
+
+    ug = view(grid.physical,colstart:colend,2,1)
+    ugr = view(grid.physical,colstart:colend,2,2)
+    ugrr = view(grid.physical,colstart:colend,2,3)
+    ugl = view(grid.physical,colstart:colend,2,4)
+    ugll = view(grid.physical,colstart:colend,2,5)
+
+    vg = view(grid.physical,colstart:colend,3,1)
+    vgr = view(grid.physical,colstart:colend,3,2)
+    vgrr = view(grid.physical,colstart:colend,3,3)
+    vgl = view(grid.physical,colstart:colend,3,4)
+    vgll = view(grid.physical,colstart:colend,3,5)
+
+    ub = view(grid.physical,colstart:colend,4,1)
+    ubr = view(grid.physical,colstart:colend,4,2)
+    ubrr = view(grid.physical,colstart:colend,4,3)
+    ubl = view(grid.physical,colstart:colend,4,4)
+    ubll = view(grid.physical,colstart:colend,4,5)
+    ubz = view(grid.physical,colstart:colend,4,6)
+    ubzz = view(grid.physical,colstart:colend,4,7)
+
+    vb = view(grid.physical,colstart:colend,5,1)
+    vbr = view(grid.physical,colstart:colend,5,2)
+    vbrr = view(grid.physical,colstart:colend,5,3)
+    vbl = view(grid.physical,colstart:colend,5,4)
+    vbll = view(grid.physical,colstart:colend,5,5)
+    vbz = view(grid.physical,colstart:colend,5,6)
+    vbzz = view(grid.physical,colstart:colend,5,7)
+
+    # Helper arrays to reduce memory allocations
+    zDim = mtile.model.grid_params.zDim
+    ADV = similar(r)
+    COR = similar(r)
+    PGF = similar(r)
+    HDIFF = similar(r)
+    VDIFF = similar(r)
+    
+    # Calculate the vertical diffusivity
+    # Mixing length based on Louis parameterization
+    S = sqrt.((ubz .* ubz) .+ (vbz .* vbz))
+    l = 1.0 ./ ((1.0 ./ (0.4 .* z)) .+ (1.0 ./ 80.0))
+    Kv = (l.^2) .* S
+
+    # W is diagnostic and is needed first for other calculations
+    wb = view(grid.physical,colstart:colend,6,1)
+
+    # Integrate divergence to get W
+    # Use h since it doesn't have any boundary conditions in the vertical
+    h_col = mtile.tile.columns[mtile.model.grid_params.vars["h"]]
+    col = Chebyshev1D(h_col.params,h_col.mishPoints,h_col.gammaBC,
+        h_col.fftPlan,h_col.filter,h_col.uMish,h_col.b,h_col.a,h_col.ax)
+    col.uMish .= @. -((ub / r) + ubr + (vbl / r))
+    CBtransform!(col)
+    CAtransform!(col)
+    wb .= CIInttransform(col)
+    expdot[colstart:colend,6] .= 0.0
+
+    # h tendency
+    ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
+    PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r))) # Divergence but use PGF array to reduce memory allocations
+    expdot[colstart:colend,1] .= @. ADV + PGF
+
+    # ug tendency
+    ADV .= @. (-vg * ugl / r) + (-ug * ugr) #UGADV
+    PGF .= @. (-g * hr) #UGPGF
+    COR .= @. (vg * (f + (vg / r))) #UCOR
+    expdot[colstart:colend,2] .= @. ADV + PGF + COR
+
+    # vg tendency
+    ADV .= @. (-vg * vgl / r) + (-ug * vgr) #VGADV
+    PGF .= @. (-g * (hl / r)) #VGPGF
+    COR .= @. (-ug * (f + (vg / r))) #VCOR
+    expdot[colstart:colend,3] .= @. ADV + PGF + COR
+
+    # ub tendency
+    ADV .= @. (-vb * ubl / r) + (-ub * ubr) + (-wb * ubz) #UBADV
+    PGF .= @. (-g * hr) #UBPGF
+    COR .= @. (vb * (f + (vb / r))) #UBCOR
+
+    # Horizontal diffusion
+    HDIFF .= @. Kh * ((ubr / r) + ubrr - (ub / (r * r)) + (ubll / (r * r)) - (2.0 * vbl / (r * r))) #UHDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #HDIFF .= @. K * ((ur / r) + urr + (ull / (r * r))) #UKDIFF
+
+    # Surface wind speed based on storm motion
+    sfcu = (Um * cos(lambda[1])) + (Vm * sin(lambda[1]))
+    sfcv = (Vm * cos(lambda[1])) - (Um * sin(lambda[1]))
+
+    # Get the 10 meter wind (assuming 10 m @ z == 2)
+    u10 = ub[2] + sfcu
+    v10 = vb[2] + sfcv
+    U10 = sqrt(u10^2 + v10^2)
+
+    # Differentiate Kv * du/dz
+    col.uMish .= Kv .* ubz
+    
+    # Drag applies at z = 0
+    # Use a wind speed dependent drag
+    if U10 < 5.2
+        Cd = 1.0e-3
+    elseif U10 < 33.6
+        Cd = 4.4e-4 * U10^0.5
+    end
+    col.uMish[1] = Cd * U10 * u10 #UDRAG
+
+    CBtransform!(col)
+    CAtransform!(col)
+    VDIFF .= CIxtransform(col)
+
+    expdot[colstart:colend,4] .= @. ADV + PGF + COR + VDIFF + HDIFF
+
+    # vb tendency
+    ADV .= @. (-vb * vbl / r) + (-ub * vbr) + (-wb * vbz)#VBADV
+    PGF .= @. (-g * (hl / r)) #VBPGF
+    COR .= @. (-ub * (f + (vb / r))) #VBCOR
+
+    # Horizontal diffusion
+    HDIFF .= @. Kh * ((vbr / r) + vbrr - (vb / (r * r)) + (vbll / (r * r)) + (2.0 * ubl / (r * r))) #VHDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #HDIFF .= @. K * ((vr / r) + vrr + (vll / (r * r))) #VKDIFF
+
+    # Differentiate Kv * dv/dz
+    col.uMish .= Kv .* vbz
+
+    # Drag only applies at z = 0
+    col.uMish[1] = Cd * U10 * v10 #VDRAG
+
+    CBtransform!(col)
+    CAtransform!(col)
+    VDIFF .= CIxtransform(col)
+    
+    expdot[colstart:colend,5] .= @. ADV + PGF + COR + VDIFF + HDIFF
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
+end
