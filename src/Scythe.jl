@@ -1,11 +1,8 @@
 __precompile__()
 module Scythe
 
-# Files for model grid representation
-include("CubicBSpline.jl")
-include("Fourier.jl")
-include("Chebyshev.jl")
-include("spectralGrid.jl")
+# Infrastructure for model grid representation
+using Springsteel
 
 # Structure to define model parameters
 Base.@kwdef struct ModelParameters
@@ -25,13 +22,13 @@ end
 include("thermodynamics.jl")
 include("reference_state.jl")
 include("semiimplicit.jl")
-include("io.jl")
 include("testModels.jl")
 include("shallowWaterModels.jl")
 include("tcblModels.jl")
+include("io.jl")
 
+# Export the primary driver function and the ModelParameters
 export integrate_model
-export CubicBSpline, Chebyshev
 export ModelParameters
 
 function integrate_model(model::ModelParameters)

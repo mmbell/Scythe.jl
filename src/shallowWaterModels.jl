@@ -271,11 +271,7 @@ function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, 
 
 end
 
-function ShallowWaterRL(grid::RL_Grid, 
-            gridpoints::Array{real},
-            expdot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
+function ShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
    
     #Nonlinear shallow water equations
     grid = mtile.tile

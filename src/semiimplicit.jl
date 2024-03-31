@@ -125,7 +125,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     println("$model")
 
     # Initialize the patch locally on master process
-    read_initialconditions(model.initial_conditions, patch)
+    read_physical_grid(model.initial_conditions, patch)
     spectralTransform!(patch)
     gridTransform!(patch)
 
@@ -296,7 +296,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
 end
 
 function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64}, 
-        haloSend::RemoteChannel, haloReceive::RemoteChannel, t::int)
+        haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64)
 
     # Transform to local physical tile
     tileTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
