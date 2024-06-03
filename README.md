@@ -16,7 +16,7 @@ To install a static version of Scythe, in the REPL, go into Package mode by pres
 
 If you are actively developing or modifying Scythe then you can install the module using `dev /path/to/Scythe.jl` in `pkg` mode. This will update the module as changes are made to the code. You should see the dependencies being installed, and then the Scythe package will be precompiled. Exit Package mode with ctrl-C.
 
-If you wish to just install a static version of the latest release, run `activate` to activate the package environment. Then, run `instantiate` to install the necessary dependencies. Exit Package mode with ctrl-C.
+If you wish to just install a static version of the latest release, run `activate .` to activate the package environment. Then, run `instantiate` to install the necessary dependencies. Exit Package mode with ctrl-C.
 
 Test to make sure the precompilation was successful by running `using Scythe` in the REPL. If everything is successful then you should get no errors and it will just move to a new line.
 
