@@ -1,7 +1,7 @@
 name = "Scythe"
 uuid = "d55642f6-1d05-468f-911d-cecaa5a3b3bf"
 authors = ["Michael Bell <mmbell@colostate.edu> and contributors"]
-version = "0.2.0"
+version = "1.0.1"
 
 [deps]
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"

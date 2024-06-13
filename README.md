@@ -2,23 +2,21 @@
 
 Scythe is a numerical weather prediction model written in Julia based on the spectral transform method. The model is semi-spectral as it uses a mixture of cubic B-spline (radial), Fourier (azimuthal), and Chebyshev (vertical) basis functions to represent physical variables and their spatial derivatives. Scythe currently supports 1-D radius (R), 2-D polar radius-azimuth (RL, where L denotes azimuthal angle lamba), 2-D radius-height (RZ), and 3-D cylindrical radius-azimuth-height (RLZ) grids. 
 
-The current version is primarily a dynamical core with only limited physics options. Three example models are provided, along with two Jupyter notebooks. For a quick start after installation, check out `notebooks/LinearAdvection_example.ipynb` which provides a very simple model to test that everything is working. The other well-tested models are two-layer shallow water/slab boundary layer models with one-way and two-way feedback options. Other models are still experimental.
+The current version 1.0.1 is primarily a dynamical core with only limited physics options. Three example models are provided, along with two Jupyter notebooks. For a quick start after installation, check out `notebooks/LinearAdvection_example.ipynb` which provides a very simple model to test that everything is working. The other well-tested models are two-layer shallow water/slab boundary layer models with one-way and two-way feedback options. Other models are still experimental.
 
 Scythe has some limited multi-processing capabilities using both the Julia Distributed package and multi-threading. The current code supports only shared memory parallelization on a single compute node. The grid is represented as a "patch" with a shared spectral array, which can be decomposed in the radial direction into "tiles" according to the number of workers specified. Within each tile, individual threads are utilized for concurrency. 
 
 ### Installation
 
-After cloning this repository, start Julia using Scythe.jl as the project directory. This can be done on the command line using `julia --project` or set the JULIA_PROJECT environmental variable:
+To install Scythe, in the Julia REPL, go into Package mode by pressing `]`. You will see the REPL change color and indicate `pkg` mode. 
 
-`export JULIA_PROJECT=/path/to/Scythe.jl`
+If you would like to just install a static version of the latest release, you can get it directly from this repository with `add https://github.com/mmbell/Scythe.jl`
 
-To install a static version of Scythe, in the REPL, go into Package mode by pressing `]`. You will see the REPL change color and indicate `pkg` mode. 
+Alternatively, clone the repository and run `add /path/to/Scythe.jl` to add the package to your local registry. With both of these options you will need to manually update to new releases via `update Scythe` in the package manager.
 
-If you are actively developing or modifying Scythe then you can install the module using `dev /path/to/Scythe.jl` in `pkg` mode. This will update the module as changes are made to the code. You should see the dependencies being installed, and then the Scythe package will be precompiled. Exit Package mode with ctrl-C.
+If you are actively developing or modifying Scythe then you can install after cloning by using `dev /path/to/Scythe.jl` in `pkg` mode. This will update the module as changes are made to the code. You should see the dependencies being installed, and then the Scythe package will be precompiled. Everytime you make local changes to the code the package will update in this mode.
 
-If you wish to just install a static version of the latest release, run `activate .` to activate the package environment. Then, run `instantiate` to install the necessary dependencies. Exit Package mode with ctrl-C.
-
-Test to make sure the precompilation was successful by running `using Scythe` in the REPL. If everything is successful then you should get no errors and it will just move to a new line.
+Exit Package mode with ctrl-C and test to make sure the precompilation was successful by running `using Scythe` in the REPL. If everything is successful then you should get no errors and it will just move to a new line.
 
 ### Running Scythe
 
@@ -34,10 +32,14 @@ Email of job completion is supported with the `--email` flag, but currently it s
 
 An example of the above commands would be:
 ```
-nohup time  julia --threads 2 run_Scythe.jl -w 8 --sge /path/to/model_file.jl &> scythe_run.log &
+nohup time  julia --threads 2 run_Scythe.jl -w 8 /path/to/model_file.jl &> scythe_run.log &
 ```
 
 The above command includes `time` to get an overall wall clock time, and pipes the overarching output and errors to scythe_run.log. Note that the model diagnostics themselves are put in the directory containing model output. This log is for Julia errors and some limited status information.
 
 ### Future plans
 Support for CF-compliant NetCDF input and output will be added in the near future. Future releases will include fully distributed parallelization for use on multi-node clusters. Future versions will also support different geometries that can be constructed from the underlying basis functions (e.g. Cartesian and spherical). Support for grid nesting using the cubic B-splines will be added in future versions. Future releases will also improve the cluster options for HPC use. Interested users are welcome to contribute to improve the model. Stay tuned for more functionality!
+
+### Publications using Scythe
+
+Cha, T.-Y. and Bell, M. M.: Tropical Cyclone Asymmetric Eyewall Evolution and Intensification in a Two-Layer Model, EGUsphere [preprint], https://doi.org/10.5194/egusphere-2024-505, 2024.
