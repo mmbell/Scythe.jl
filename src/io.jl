@@ -7,6 +7,7 @@ function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64)
         mkdir(model.output_dir)
     end
 
+    # Calls Springsteel grid functions
     write_grid(grid, model.output_dir, time)
 
 end

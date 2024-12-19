@@ -181,9 +181,6 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     # Don't delete from the first worker in case they are also the master
     map(wait, [remove_from(w, :patch) for w in workerids[2:length(workerids)]])
 
-    # Transform the patch and return to the main process
-    #spectralTransform!(patch)
-
     println("Ready for time integration!")
     flush(stdout)
     return patch
