@@ -32,8 +32,7 @@ const rho_v0 = 100.0 * sat_pressure_liquid(T_0) / (T_0 * Rv)
 
 function L_v(Tk::Float64)
 
-    L = L_v0 + ((Cpv - Cl) * (Tk - 273.16))
-    return L
+    return L_v0 + ((Cpv - Cl) * (Tk - 273.16))
 end
 
 function entropy(Tk::Float64, rho_d::Float64, q_v::Float64)
@@ -246,5 +245,5 @@ function theta_rho(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 = 0.0)
     q_l = ahyp(mu_l)
     q_t = q_v + q_l
     theta = potential_temperature(s, xi, mu)
-    return theta * (1 + (q_v / Eps)) / (1 + q_t)
+    return theta * (1.0 + (q_v / Eps)) / (1.0 + q_t)
 end

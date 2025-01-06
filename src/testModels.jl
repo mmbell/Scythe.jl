@@ -281,7 +281,8 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     mubar_zz = refstate.mubar[:,3]
 
     # Fundamental thermodynamic quantities derived from model variables
-    thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu .+ mubar)
+    mu_total = mu .+ mubar
+    thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
@@ -289,8 +290,9 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     q_l = ahyp.(mu_l)               # Liquid mixing ratio
     rho_t = rho_d .* (1.0 .+ q_v .+ q_l)   # Total air density
     qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
-    qvp_x = mu_x ./ dmudq.(mu, q_v) # Perturbation vapor gradient in x
-    qvp_z = mu_z ./ dmudq.(mu, q_v) # Perturbation vapor gradient in z
+    mu_factor = 1.0 ./ dmudq.(mu_total, q_v)
+    qvp_x = mu_x .* mu_factor # Perturbation vapor gradient in x
+    qvp_z = mu_z .* mu_factor # Perturbation vapor gradient in z
     rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
 
@@ -323,7 +325,7 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     @turbo expdot[colstart:colend,4] .= @. ADV + PGF + KDIFF
 
     @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
-    PGF .= @.  -(g * rho_p / rho_t) - (pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z) / rho_t)
+    PGF .= @.  ((-g * rho_p) - pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z)) / rho_t
     @turbo KDIFF .= @. K * (w_xx + w_zz)
     @turbo expdot[colstart:colend,5] .= @. ADV + PGF + KDIFF
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
@@ -331,7 +333,7 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     @turbo ADV .= @. (-u * mu_l_x) + (-w * mu_l_z) #Q_L ADV
     #No PGF
     @turbo KDIFF .= @. K * (mu_l_xx + mu_l_zz)
-    @turbo expdot[colstart:colend,3] .= @. ADV + KDIFF
+    @turbo expdot[colstart:colend,6] .= @. ADV + KDIFF
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
