@@ -30,6 +30,13 @@ end
 const rho_d0 = 100.0 * p_0 / (T_0 * Rd)
 const rho_v0 = 100.0 * sat_pressure_liquid(T_0) / (T_0 * Rv)
 
+function dewpoint(p::Float64, q_v::Float64)
+
+    e = vapor_pressure(p, q_v)
+    Tc = 243.5 * log(e/6.112) / (17.67 - log(e/6.112))
+    return Tc + 273.15
+end
+
 function L_v(Tk::Float64)
 
     return L_v0 + ((Cpv - Cl) * (Tk - 273.16))
