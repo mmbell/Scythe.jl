@@ -623,13 +623,26 @@ function explicit_increment(mtile::ModelTile, colstart::Int64, colend::Int64, t:
     for v in 1:length(mtile.model.grid_params.vars)
         var_np1 = view(mtile.var_np1,colstart:colend,v)
         expdot_incr = view(mtile.expdot_incr,colstart:colend,v)
-        #expdot_n = view(mtile.expdot_n,colstart:colend,v)
-        #expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,v)
+        expdot_n = view(mtile.expdot_n,colstart:colend,v)
+        expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,v)
         ts = mtile.model.ts
 
-        var_np1 .= @. var_np1 + (0.5 * ts * expdot_incr)
-        #expdot_n .= expdot_n .+ expdot_incr
-        #expdot_nm1 .= expdot_n
+        if (t == 1)
+            # Use Euler method and trapezoidal method (AM2) for first step
+            var_np1 .= @. var_np1 + (ts * expdot_incr)
+            expdot_n .= expdot_n .+ expdot_incr
+            expdot_nm1 .= expdot_n
+        elseif (t == 2)
+            # Use 2nd order A-B method and AI2* for second step
+            var_np1 .= @. var_np1 + ((0.5 * ts) * (3.0 * expdot_incr))
+            expdot_n .= expdot_n .+ expdot_incr
+            expdot_nm1 .= expdot_n
+        else
+            # Use AI2*–AB3 implicit-explicit scheme (Durran and Blossey 2012)
+            var_np1 .= @. var_np1 + ((ts / 12.0) * (23.0 * expdot_incr))
+            expdot_n .= expdot_n .+ expdot_incr
+            expdot_nm1 .= expdot_n
+        end
     end
 end
 

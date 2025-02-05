@@ -189,10 +189,12 @@ function condensation(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64
     e = vapor_pressure.(p,q_v)
     sat_e = sat_pressure_liquid.(Tk)
     RH = e ./ sat_e
-    dq = saturation_adjustment.(s_total, xi_total, mu_total, mu_l) #./ mtile.model.ts
+    dq = saturation_adjustment.(s_total, xi_total, mu_total, mu_l)
+    ts = mtile.model.ts
 
-    mtile.expdot_incr[colstart:colend,1] .= dq .* ((Cl .* log.(Tk ./ T_0)) .- (Rv .* log.(RH)))
-    mtile.expdot_incr[colstart:colend,3] .= dmudq.(mu_total, q_v) .* dq
-    mtile.expdot_incr[colstart:colend,6] .= -dmudq.(mu_l, q_l) .* dq
+    # Do the increment directly using implicit timestep assuming saturation at the end of the timestep
+    s .= @. s + (0.5 * ts * dq * ((Cl * log(Tk / T_0)) - (Rv * log(RH))))
+    mu .= @. mu + (0.5 * ts * dq * dmudq(mu_total, q_v))
+    mu_l .= @. mu_l - (0.5 * ts * dq * dmudq(mu_l, q_l))
 
 end

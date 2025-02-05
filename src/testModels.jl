@@ -347,6 +347,6 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     condensation(mtile, colstart, colend, t)
 
     # Increment the explicit timestep terms with the condensation rate
-    explicit_increment(mtile, colstart, colend, t)
+    #explicit_increment(mtile, colstart, colend, t)
 
 end
