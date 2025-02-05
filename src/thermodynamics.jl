@@ -128,7 +128,7 @@ function q_sat_liquid(Tk::Float64, phPa::Float64)
 
     # Saturation mixing ratio over liquid
     # T in K, p in hPa
-    ew = sat_pressure_liquid(Tk)
+    ew = sat_pressure_liquid_buck(Tk,phPa)
     q_sat = Eps * ew / (phPa - ew)
     return q_sat
 end
@@ -137,7 +137,7 @@ function q_sat_ice(Tk::Float64, phPa::Float64)
 
     # Saturation mixing ratio over ice
     # T in K, p in hPa
-    ei = sat_pressure_ice(Tk)
+    ei = sat_pressure_ice_buck(Tk,phPa)
     q_sat = Eps * ei / (phPa - ei)
     return q_sat
 end
@@ -239,7 +239,7 @@ function reversible_theta_e(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 
     q_l = ahyp(mu_l)
     q_t = q_v + q_l
     e = vapor_pressure(p, q_v)
-    es = sat_pressure_liquid(Tk)
+    es = sat_pressure_liquid_buck(Tk, p)
     theta_term = Tk * (p_0 / (p-e))^(Rd/(Cpd + (Cl * q_t)))
     H_term = (e/es)^((-Rv * q_v)/(Cpd + (Cl * q_t)))
     exp_term = exp(L_v(Tk) * q_v / ((Cpd + (Cl * q_t)) * Tk))

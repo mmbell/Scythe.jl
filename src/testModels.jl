@@ -314,7 +314,7 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     @turbo expdot[colstart:colend,2] .= @. ADV - u_x - w_z
     impdot[colstart:colend,2] .= @. -w_z
 
-    @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #SADV
+    @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
     #No PGF
     @turbo KDIFF .= @. K * (mu_xx + mu_zz)
     @turbo expdot[colstart:colend,3] .= @. ADV + KDIFF
@@ -342,5 +342,11 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     if mtile.model.semiimplicit
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
+
+    # Calculate the condensation rate from the advected variables
+    condensation(mtile, colstart, colend, t)
+
+    # Increment the explicit timestep terms with the condensation rate
+    explicit_increment(mtile, colstart, colend, t)
 
 end

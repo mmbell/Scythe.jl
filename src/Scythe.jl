@@ -26,6 +26,7 @@ include("testModels.jl")
 include("shallowWaterModels.jl")
 include("tcblModels.jl")
 include("io.jl")
+include("microphysics.jl")
 
 # Export the primary driver function and the ModelParameters
 export integrate_model

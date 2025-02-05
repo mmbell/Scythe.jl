@@ -19,7 +19,7 @@ struct ModelTile
     model::ModelParameters
     tile::AbstractGrid
     var_np1::Array{Float64}
-    var_nm1::Array{Float64}
+    expdot_incr::Array{Float64}
     expdot_n::Array{Float64}
     expdot_nm1::Array{Float64}
     expdot_nm2::Array{Float64}
@@ -46,7 +46,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
 
     # Allocate some needed arrays
     var_np1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
-    var_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    expdot_incr = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
@@ -94,7 +94,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         model,
         tile,
         var_np1,
-        var_nm1,
+        expdot_incr,
         expdot_n,
         expdot_nm1,
         expdot_nm2,
@@ -595,7 +595,6 @@ function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::
     for v in 1:length(mtile.model.grid_params.vars)
         physical = view(mtile.tile.physical,colstart:colend,v,1)
         var_np1 = view(mtile.var_np1,colstart:colend,v)
-        var_nm1 = view(mtile.var_nm1,colstart:colend,v)
         expdot_n = view(mtile.expdot_n,colstart:colend,v)
         expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,v)
         expdot_nm2 = view(mtile.expdot_nm2,colstart:colend,v)
@@ -608,20 +607,29 @@ function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::
         elseif (t == 2)
             # Use 2nd order A-B method and AI2* for second step
             var_np1 .= @. physical + (0.5 * ts) * ((3.0 * expdot_n) - expdot_nm1)
-            #var_nm1 .= physical
             expdot_nm2 .= expdot_nm1
             expdot_nm1 .= expdot_n
         else
             # Use AI2*–AB3 implicit-explicit scheme (Durran and Blossey 2012)
             var_np1 .= @. physical + ((ts / 12.0) * ((23.0 * expdot_n) - (16.0 * expdot_nm1) + (5.0 * expdot_nm2)))
-
-            # Use BI2*-BX3* implicit-explicit scheme
-            #var_np1 .= @. (2.0/3.0) * ((2.0 * physical) + (-0.5 * var_nm1) + ((ts / 3.0) * ((8.0 * expdot_n) + (-7.0 * expdot_nm1) + (2.0 * expdot_nm2))))
-            #var_nm1 .= physical
-
             expdot_nm2 .= expdot_nm1
             expdot_nm1 .= expdot_n
         end
+    end
+end
+
+function explicit_increment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    for v in 1:length(mtile.model.grid_params.vars)
+        var_np1 = view(mtile.var_np1,colstart:colend,v)
+        expdot_incr = view(mtile.expdot_incr,colstart:colend,v)
+        #expdot_n = view(mtile.expdot_n,colstart:colend,v)
+        #expdot_nm1 = view(mtile.expdot_nm1,colstart:colend,v)
+        ts = mtile.model.ts
+
+        var_np1 .= @. var_np1 + (0.5 * ts * expdot_incr)
+        #expdot_n .= expdot_n .+ expdot_incr
+        #expdot_nm1 .= expdot_n
     end
 end
 
