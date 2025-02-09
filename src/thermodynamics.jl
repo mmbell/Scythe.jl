@@ -11,7 +11,7 @@ const g = 9.81
 const L_v0 = 2.501e6
 
 # Entropy function constants
-const T_0 = 273.15
+const T_0 = 273.16
 const p_0 = 1000.0
 const q0 = 1.0e-7
 
@@ -39,7 +39,7 @@ end
 
 function L_v(Tk::Float64)
 
-    return L_v0 + ((Cpv - Cl) * (Tk - 273.16))
+    return L_v0 + ((Cpv - Cl) * (Tk - T_0))
 end
 
 function entropy(Tk::Float64, rho_d::Float64, q_v::Float64)
@@ -52,6 +52,15 @@ function entropy(Tk::Float64, rho_d::Float64, q_v::Float64)
     Cfactor = Cvd + (q_v * Cvv)
     s = (Cfactor * log(Tk/T_0)) - (Rd * log(rho_d/rho_d0)) - qfactor
     return s
+end
+
+function vapor_entropy(Tk::Float64, rho_d::Float64, q_v::Float64)
+
+    if q_v > 0.0
+        return (Cvv * log(Tk/T_0)) - (Rv * log(q_v * rho_d / rho_v0)) + (L_v(T_0)/T_0)
+    else
+        return 0.0
+    end
 end
 
 function temperature(s::Float64, rho_d::Float64, q_v::Float64)
@@ -223,7 +232,9 @@ function thermodynamic_tuple(s::Float64, xi::Float64, mu::Float64)
     q_v = ahyp(mu)
     rho_d = dry_density(xi)
     Tk = temperature(s, rho_d, q_v)
-    p = pressure(s, rho_d, q_v)
+    pd = 0.01 * Rd * Tk * rho_d
+    e = 0.01 * Rv * Tk * rho_d * q_v
+    p = pd + e
     return (q_v, rho_d, Tk, p)
 end
 
