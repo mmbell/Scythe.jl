@@ -13,9 +13,11 @@ Base.@kwdef struct ModelParameters
     initial_conditions = "ic.csv"
     output_dir = "./output/"
     ref_state_file = ""
-    semiimplicit = false
     grid_params::GridParameters
-    physical_params::Dict
+    physical_params::Dict = Dict()
+    options::Dict = Dict(
+        :semiimplicit => false,
+        :exact_reference_state => false)
 end
 
 # Files for model integration

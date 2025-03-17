@@ -5,12 +5,13 @@ struct ReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
     mubar::Array{Float64}
+    mu_lbar::Array{Float64}
     Pxi_bar::Float64
 end
 
 function empty_reference_state()
 
-    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
+    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
 end
 
 function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
@@ -81,7 +82,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     Tk[1] = theta[1]/(p_0/p[1])^(Rd/Cpd)
     rho_d[1] = 100.0 * (p[1] - e) / (Tk[1] * Rd)
     rho_t[1] = rho_d[1] * (1.0 + q_v[1])
-    dlnpdz = -g * rho_t[1] / (p[1] * 100.0)
+    dlnpdz = -gravity * rho_t[1] / (p[1] * 100.0)
     for i = 2:nlevels
         lnp = log(p[i-1]) + (dlnpdz * (z[i] - z[i-1]))
         p[i] = exp(lnp)
@@ -89,7 +90,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
         e = vapor_pressure(p[i],q_v[i])
         rho_d[i] = 100.0 * (p[i] - e)/ (Tk[i] * Rd)
         rho_t[i] = rho_d[i] * (1.0 + q_v[i])
-        dlnpdz = -g * rho_t[i] / (p[i] * 100.0)
+        dlnpdz = -gravity * rho_t[i] / (p[i] * 100.0)
     end
 
     # Re-integrate with Chebyshev column to adjust T
@@ -102,7 +103,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
         BCT = Chebyshev.R0)
     column = Chebyshev1D(cp)
     for n in 1:10
-        column.uMish[:] .= -Scythe.g .* rho_t[:]
+        column.uMish[:] .= -gravity .* rho_t[:]
         CBtransform!(column)
         CAtransform!(column)
         p_new = CIInttransform(column, sfc_pressure * 100.0) ./ 100.0
@@ -115,6 +116,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     sbar = zeros(Float64,length(z),3)
     xibar = zeros(Float64,length(z),3)
     mubar = zeros(Float64,length(z),3)
+    mu_lbar = zeros(Float64,length(z),3)
 
     sbar[:,1] = entropy.(Tk, rho_d, q_v)
     xibar[:,1] = log_dry_density.(rho_d)
@@ -131,7 +133,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     q_bar = ahyp.(mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
-    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
+    ref_state = ReferenceState(sbar, xibar, mubar, mu_lbar, Pxi_bar)
     return ref_state
 end
 
@@ -156,20 +158,44 @@ function transform_reference_state!(model::ModelParameters, ref::Array{Float64})
     return ref
 end
 
-function adjust_reference_state!(model::ModelParameters, ref::ReferenceState)
+function exact_reference_state(model::ModelParameters, z::Array{Float64})
 
-    # Adjust to maintain hydrostatic balance - requires more complicated approach than below
-    #for z in 1:model.grid_params.zDim
-    #    q_v, rho_d, Tk, p = Scythe.thermodynamic_tuple.(ref.sbar[z,1], ref.xibar[z,1], ref.mubar[z,1])
-    #    pg = Scythe.pressure_gradient(Tk, rho_d, q_v, ref.sbar[z,2],ref.xibar[z,2],ref.mubar[z,2])
-    #    adj = (pg + (rho_d * 9.81))/9.81
-    #    ref.xibar[z,1] = Scythe.log_dry_density(rho_d + adj)
-    #end
-    #
-    #column.uMish[:] .= ref.xibar[:,1]
-    #CBtransform!(column)
-    #CAtransform!(column)
-    #ref.xibar[:,1] .= CItransform!(column)
-    #ref.xibar[:,2] .= CIxtransform(column)
-    #ref.xibar[:,3] .= CIxxtransform(column)
+    # Read a reference state file that has already been adjusted to hydrostatic balance
+    # This function is useful for highly idealized simulations and benchmarking
+
+    # Open the file with sounding information
+    ref = open(model.ref_state_file,"r")
+
+    # Allocate some empty arrays
+    sbar = zeros(Float64,length(z),3)
+    xibar = zeros(Float64,length(z),3)
+    mubar = zeros(Float64,length(z),3)
+    mu_lbar = zeros(Float64,length(z),3)
+
+    # Read the file
+    for i = 1:length(z)
+        lineparts = split(readline(ref))
+        if lineparts[1] != string(z[i])
+            throw(DomainError(i, "Model level does not match reference level"))
+        end
+        sbar[i,1] = parse(Float64,lineparts[2])
+        xibar[i,1] = parse(Float64,lineparts[3])
+        mubar[i,1] = parse(Float64,lineparts[4])
+        mu_lbar[i,1] = parse(Float64,lineparts[5])
+    end
+
+    # Calculate the derivatives
+    transform_reference_state!(model, sbar)
+    transform_reference_state!(model, xibar)
+    transform_reference_state!(model, mubar)
+    transform_reference_state!(model, mu_lbar)
+
+    # Get the mean speed of sound squared
+    Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
+    rho_bar = dry_density.(xibar[:,1])
+    q_bar = ahyp.(mubar[:,1])
+    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
+
+    ref_state = ReferenceState(sbar, xibar, mubar, mu_lbar, Pxi_bar)
+    return ref_state
 end

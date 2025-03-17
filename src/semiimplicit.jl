@@ -61,8 +61,14 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Set up the reference file
     ref_state = empty_reference_state()
     if !isempty(model.ref_state_file)
-        zdim = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
-        ref_state = interpolate_reference_file(model, zdim)
+        z_values = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
+
+        if (model.options[:exact_reference_state])
+            # Use an pre-calculated exact state rather than interpolate
+            ref_state = exact_reference_state(model, z_values)
+        else
+            ref_state = interpolate_reference_file(model, z_values)
+        end
     end
 
     # Copy over the patch information
@@ -86,7 +92,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Pre-calculate the Helmholtz matrix for semi-implicit adjustment
     # Declare a basic factorization for the structure if semiimplicit integration is not used
     h_matrix = factorize([1 2; 2 1])
-    if model.semiimplicit
+    if model.options[:semiimplicit]
         h_matrix = calc_Helmholtz_semiimplicit_matrix(model, ref_state.Pxi_bar, 1.25 * model.ts)
     end
 
@@ -356,7 +362,7 @@ function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int
     return
 end
 
-function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     w_index = mtile.model.grid_params.vars["w"]
     xi_index = mtile.model.grid_params.vars["xi"]
@@ -550,6 +556,79 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
         ts_term = 1.25 * ts
         w_nstar .= @. w_nstar - ((ts / 12.0) * ((23.0 * xidot_n) - (16.0 * xidot_nm1) + (5.0 * xidot_nm2))) - (ts * xidot_n) + (ts * 0.75 * xidot_nm1)
         xi_nstar .= @. xi_nstar - ((ts / 12.0) * ((23.0 * wdot_n) - (16.0 * wdot_nm1) + (5.0 * wdot_nm2))) - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+    end
+
+    # Set the n-1 and n-2 terms
+    xidot_nm2 .= xidot_nm1
+    xidot_nm1 .= xidot_n
+
+    wdot_nm2 .= wdot_nm1
+    wdot_nm1 .= wdot_n
+
+    # Take the vertical derivative of xi_nstar and multiply by ts term
+    xi_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["xi"]])
+    xi_col.uMish .= xi_nstar
+    CBtransform!(xi_col)
+    CAtransform!(xi_col)
+    xi_nstar = CItransform!(xi_col)
+    xi_nstar_z = ts_term .* Pxi_bar .* CIxtransform(xi_col)
+
+    # Set up the matrix problem
+    nz = mtile.model.grid_params.zDim
+    g = xi_nstar_z .- w_nstar
+    g = [0.0 ; 0.0; g[2:nz-1]]
+
+    w_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["w"]])
+    # Solve for the coefficients
+    if t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.model, Pxi_bar, ts_term)
+        w_col.a .= h_a \ g
+    else
+        # Use the pre-calculated one
+        w_col.a .= mtile.h_matrix \ g
+    end
+
+    # Set w_n+1
+    view(mtile.var_np1,colstart:colend,w_index) .= CItransform!(w_col)
+
+    # Set xi_n+1
+    view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* CIxtransform(w_col))
+end
+
+function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    w_index = mtile.model.grid_params.vars["w"]
+    xi_index = mtile.model.grid_params.vars["xi"]
+    ts = mtile.model.ts
+
+    # Calculate xi_nstar
+    xi_nstar = mtile.var_np1[colstart:colend,xi_index]
+    wdot_n = view(mtile.impdot_n,colstart:colend,xi_index)
+    wdot_nm1 = view(mtile.impdot_nm1,colstart:colend,xi_index)
+    wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,xi_index)
+
+    # Calculate w_nstar
+    w_nstar = mtile.var_np1[colstart:colend,w_index]
+    xidot_n = view(mtile.impdot_n,colstart:colend,w_index)
+    xidot_nm1 = view(mtile.impdot_nm1,colstart:colend,w_index)
+    xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
+
+    # Get the mean speed of sound squared
+    Pxi_bar = mtile.ref_state.Pxi_bar
+
+    # Subtract the explicit terms and add the implicit terms
+    ts_term = 0.0
+    if (t == 1)
+        # Use trapezoidal method (AM2) for first step
+        ts_term = 0.5 * ts
+        w_nstar .= @. w_nstar + (ts * 0.5 * xidot_n)
+        xi_nstar .= @. xi_nstar + (ts * 0.5 * wdot_n)
+    else
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts
+        w_nstar .= @. w_nstar - (ts * xidot_n) + (ts * 0.75 * xidot_nm1)
+        xi_nstar .= @. xi_nstar - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
     end
 
     # Set the n-1 and n-2 terms
