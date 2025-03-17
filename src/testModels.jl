@@ -267,6 +267,12 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     mu_l_z = view(grid.physical,colstart:colend,6,4)
     mu_l_zz = view(grid.physical,colstart:colend,6,5)
 
+    qss = view(grid.physical,colstart:colend,7,1)
+    qss_x = view(grid.physical,colstart:colend,7,2)
+    qss_xx = view(grid.physical,colstart:colend,7,3)
+    qss_z = view(grid.physical,colstart:colend,7,4)
+    qss_zz = view(grid.physical,colstart:colend,7,5)
+
     # Get reference state
     sbar = refstate.sbar[:,1]
     sbar_z = refstate.sbar[:,2]
@@ -280,6 +286,10 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     mubar_z = refstate.mubar[:,2]
     mubar_zz = refstate.mubar[:,3]
 
+    mu_lbar = refstate.mu_lbar[:,1]
+    mu_lbar_z = refstate.mu_lbar[:,2]
+    mu_lbar_zz = refstate.mu_lbar[:,3]
+
     # Fundamental thermodynamic quantities derived from model variables
     mu_total = mu .+ mubar
     thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu_total)
@@ -287,66 +297,89 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_l = ahyp.(mu_l)               # Liquid mixing ratio
+    q_l = ahyp.(mu_l .+ mu_lbar)               # Liquid mixing ratio
     rho_t = rho_d .* (1.0 .+ q_v .+ q_l)   # Total air density
     qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
-    mu_factor = 1.0 ./ dmudq.(mu_total, q_v)
-    qvp_x = mu_x .* mu_factor # Perturbation vapor gradient in x
-    qvp_z = mu_z .* mu_factor # Perturbation vapor gradient in z
+    mu_factor = dmudq.(mu_total, q_v)
+    qvp_x = mu_x ./ mu_factor # Perturbation vapor gradient in x
+    qvp_z = mu_z ./ mu_factor # Perturbation vapor gradient in z
     rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
     Pxi_bar = mtile.ref_state.Pxi_bar
 
+    # Pressure gradients
+    dpdx = pressure_gradient.(Tk, rho_d, q_v, s_x, xi_x, qvp_x)
+    dpdz = pressure_gradient.(Tk, rho_d, q_v, s_z, xi_z, qvp_z)
+
     # Placeholders for intermediate calculations
     ADV = similar(s)
-    PGF = similar(s)
+    FORCING = similar(s)
     KDIFF = similar(s)
 
+    # Entropy divergence forcing
+    Cm = @. (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
+    s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
+
+    # Condensation rate
+    N_c = 500.0
+    r_c = 10.0
+    q_cond = q_condensation.(qss, Tk, p, q_v, q_l, N_c, r_c)
+    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p)
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+    invtau = invtau_condensation.(Tk, p, N_c, r_c)
+    qss_cond = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity))) - qss * invtau
+
     @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
-    #No PGF
+    FORCING .= @. s_cond + s_div
     @turbo KDIFF .= @. K * (s_xx + s_zz)
-    @turbo expdot[colstart:colend,1] .= @. ADV + KDIFF
+    @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF
 
     @turbo ADV .= @. (-u * xi_x) + (-w * (xi_z + xibar_z)) #XI ADV
-    # No PGF or mass diffusion
-    @turbo expdot[colstart:colend,2] .= @. ADV - u_x - w_z
+    @turbo FORCING .= @. - u_x - w_z
+    @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
     impdot[colstart:colend,2] .= @. -w_z
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
-    #No PGF
+    FORCING .= @. -q_cond * mu_factor
     @turbo KDIFF .= @. K * (mu_xx + mu_zz)
-    @turbo expdot[colstart:colend,3] .= @. ADV + KDIFF
+    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF
+    @turbo impdot[colstart:colend,3] .= @. q_v
 
     @turbo ADV .= @. (-u * u_x) + (-w * u_z) #UADV
-    PGF .= @. -(pressure_gradient(Tk, rho_d, q_v, s_x, xi_x, qvp_x) / rho_t) #UPGF
+    @turbo FORCING .= @. -dpdx / rho_t #UPGF
     @turbo KDIFF .= @. K * (u_xx + u_zz)
-    @turbo expdot[colstart:colend,4] .= @. ADV + PGF + KDIFF
+    @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF
 
     @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
-    PGF .= @.  ((-g * rho_p) - pressure_gradient(Tk, rho_d, q_v, s_z, xi_z, qvp_z)) / rho_t
+    @turbo FORCING .= @.  ((-gravity * rho_p) - dpdz) / rho_t
     @turbo KDIFF .= @. K * (w_xx + w_zz)
-    @turbo expdot[colstart:colend,5] .= @. ADV + PGF + KDIFF
+    @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
-    @turbo ADV .= @. (-u * mu_l_x) + (-w * mu_l_z) #Q_L ADV
-    #No PGF
+    @turbo ADV .= @. (-u * mu_l_x) + (-w * (mu_l_z + mu_lbar_z)) #Q_L ADV
+    FORCING .= @. q_cond * dmudq.(mu_l, q_l)
     @turbo KDIFF .= @. K * (mu_l_xx + mu_l_zz)
-    @turbo expdot[colstart:colend,6] .= @. ADV + KDIFF
+    @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
+
+    @turbo ADV .= @. (-u * qss_x) + (-w * qss_z) #QSS ADV
+    FORCING .= @. qss_cond 
+    @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
+    @turbo impdot[colstart:colend,7] .= @. qss
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    if mtile.model.semiimplicit
+    if mtile.model.options[:semiimplicit]
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
 
-    # Calculate the condensation rate from the advected variables
-    condensation(mtile, colstart, colend, t)
+    # Adjust the condensation rate from the advected supersaturation
+    condensation_adjustment(mtile, colstart, colend, t)
 
-    # Increment the explicit timestep terms with the condensation rate
+    # Increment the explicit timestep terms with other forcings
     #explicit_increment(mtile, colstart, colend, t)
 
 end

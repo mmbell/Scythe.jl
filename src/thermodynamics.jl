@@ -7,7 +7,7 @@ const Cvv = 1410.0
 const Cpd = Cvd + Rd
 const Cpv = Cvv + Rv
 const Cl = 4186.0
-const g = 9.81
+const gravity = 9.81
 const L_v0 = 2.501e6
 
 # Entropy function constants
@@ -111,6 +111,30 @@ function sat_pressure_liquid_buck(Tk::Float64, phPa::Float64)
     ew4 = a * exp( (b - (Tc / d)) * Tc / (Tc + c) )
 
     return fw4 * ew4
+end
+
+function sat_pressure_liquid_buck_dT(Tk::Float64, phPa::Float64)
+
+    # T in K, p in hPa
+    # Formula from Buck JAM (1981) derivative with respect to T at constant p
+    Tc = Tk - 273.15
+
+    A = 7.2e-4
+    B = 3.20e-6
+    C = 5.9e-10
+    fw4 = 1.0 + A + (phPa * (B + (C * Tc^2)))
+    d_fw4 = 2.0 * phPa * C * Tc
+
+    a = 6.1121
+    b = 18.729
+    c = 257.87
+    d = 227.3
+    ew4 = a * exp( (b - (Tc / d)) * Tc / (Tc + c) )
+    T1 = (d * b - (2.0 * Tc)) * (d * (Tc + c)) - d* ((d * b * Tc) - Tc^2)
+    T2 =  (d * (Tc + c))^2
+    d_ew4 = ew4 * T1 / T2
+
+    return ew4 * d_fw4 + fw4 * d_ew4
 end
 
 function sat_pressure_ice_buck(Tk::Float64, phPa::Float64)
