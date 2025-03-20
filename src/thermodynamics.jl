@@ -7,6 +7,7 @@ const Cvv = 1410.0
 const Cpd = Cvd + Rd
 const Cpv = Cvv + Rv
 const Cl = 4186.0
+const Ci = 2106.0 # Ice heat capacity
 const gravity = 9.81
 const L_v0 = 2.501e6
 
@@ -91,6 +92,11 @@ function vapor_pressure(p::Float64, q_v::Float64)
     # Input is total pressure in hPa, and mixing ratio in kg/kg
     # Output is vapor pressure in hPa
     e = (p * q_v)/(Eps + q_v)
+end
+
+function mixing_ratio(p::Float64, e::Float64)
+
+    q_v = (Eps * e)/(p-e)
 end
 
 function sat_pressure_liquid_buck(Tk::Float64, phPa::Float64)
