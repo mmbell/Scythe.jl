@@ -102,16 +102,14 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
         BCB = Chebyshev.R0,
         BCT = Chebyshev.R0)
     column = Chebyshev1D(cp)
-    for n in 1:10
-        column.uMish[:] .= -gravity .* rho_t[:]
-        CBtransform!(column)
-        CAtransform!(column)
-        p_new = CIInttransform(column, sfc_pressure * 100.0) ./ 100.0
-        Tk = theta ./ (p_0 ./ p_new).^(Rd./Cpd)
-        e = vapor_pressure.(p_new,q_v)
-        rho_d = 100.0 .* (p_new .- e) ./ (Tk .* Rd)
-        rho_t = rho_d .* (1.0 .+ q_v)
-    end
+    column.uMish[:] .= -gravity .* rho_t[:]
+    CBtransform!(column)
+    CAtransform!(column)
+    p_new = CIInttransform(column, sfc_pressure * 100.0) ./ 100.0
+    Tk = theta ./ (p_0 ./ p_new).^(Rd./Cpd)
+    e = vapor_pressure.(p_new,q_v)
+    rho_d = 100.0 .* (p_new .- e) ./ (Tk .* Rd)
+    rho_t = rho_d .* (1.0 .+ q_v)
     
     sbar = zeros(Float64,length(z),3)
     xibar = zeros(Float64,length(z),3)
