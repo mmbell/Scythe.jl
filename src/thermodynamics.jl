@@ -1,13 +1,83 @@
 # Constants from Emanuel (1994)
 const Rd = 287.04
 const Rv = 461.50
+const Eps = Rd / Rv
 const Cvd = 716.96
 const Cvv = 1410.0
 const Cpd = Cvd + Rd
 const Cpv = Cvv + Rv
 const Cl = 4186.0
-const g = 9.81
+const Ci = 2106.0 # Ice heat capacity
+const gravity = 9.81
 const L_v0 = 2.501e6
+
+# Entropy function constants
+const T_0 = 273.16
+const p_0 = 1000.0
+const q0 = 1.0e-7
+
+function sat_pressure_liquid(Tk::Float64)
+
+    Tc = Tk - 273.15
+    return 6.112 * exp(17.67 * Tc / (Tc + 243.5))
+end
+
+function sat_pressure_ice(Tk::Float64)
+
+    Tc = Tk - 273.15
+    return 6.112 * exp(21.8745584 * Tc / (Tc + 265.49))
+end
+
+const rho_d0 = 100.0 * p_0 / (T_0 * Rd)
+const rho_v0 = 100.0 * sat_pressure_liquid(T_0) / (T_0 * Rv)
+
+function dewpoint(p::Float64, q_v::Float64)
+
+    e = vapor_pressure(p, q_v)
+    Tc = 243.5 * log(e/6.112) / (17.67 - log(e/6.112))
+    return Tc + 273.15
+end
+
+function L_v(Tk::Float64)
+
+    return L_v0 + ((Cpv - Cl) * (Tk - T_0))
+end
+
+function entropy(Tk::Float64, rho_d::Float64, q_v::Float64)
+
+    qfactor = 0.0
+    if (q_v != 0.0)
+        qfactor = q_v * (Rv * log(q_v * rho_d / rho_v0) - (L_v(T_0)/T_0))
+    end
+
+    Cfactor = Cvd + (q_v * Cvv)
+    s = (Cfactor * log(Tk/T_0)) - (Rd * log(rho_d/rho_d0)) - qfactor
+    return s
+end
+
+function vapor_entropy(Tk::Float64, rho_d::Float64, q_v::Float64)
+
+    if q_v > 0.0
+        return (Cvv * log(Tk/T_0)) - (Rv * log(q_v * rho_d / rho_v0)) + (L_v(T_0)/T_0)
+    else
+        return 0.0
+    end
+end
+
+function temperature(s::Float64, rho_d::Float64, q_v::Float64)
+
+    Cfactor = Cvd + (q_v * Cvv)
+    qfactor = 1.0
+    if (q_v != 0.0)
+        qfactor = (rho_d * q_v / rho_v0)^((q_v * Rv) / Cfactor)
+    end
+
+    rhofactor = (rho_d / rho_d0)^(Rd / Cfactor)
+    Tfactor = exp((s - (q_v * L_v(T_0)/T_0)) / Cfactor)
+
+    T = T_0 * Tfactor * rhofactor * qfactor
+    return T
+end
 
 function pressure(s::Float64, rho_d::Float64, q_v::Float64)
 
@@ -21,19 +91,12 @@ function vapor_pressure(p::Float64, q_v::Float64)
 
     # Input is total pressure in hPa, and mixing ratio in kg/kg
     # Output is vapor pressure in hPa
-    e = (p * q_v)/(0.622 + q_v)
+    e = (p * q_v)/(Eps + q_v)
 end
 
-function sat_pressure_liquid(Tk::Float64)
+function mixing_ratio(p::Float64, e::Float64)
 
-    Tc = Tk - 273.15
-    return 6.112 * exp(17.67 * Tc / (Tc + 243.5))
-end
-
-function sat_pressure_ice(Tk::Float64)
-
-    Tc = Tk - 273.15
-    return 6.112 * exp(21.8745584 * Tc / (Tc + 265.49))
+    q_v = (Eps * e)/(p-e)
 end
 
 function sat_pressure_liquid_buck(Tk::Float64, phPa::Float64)
@@ -54,6 +117,30 @@ function sat_pressure_liquid_buck(Tk::Float64, phPa::Float64)
     ew4 = a * exp( (b - (Tc / d)) * Tc / (Tc + c) )
 
     return fw4 * ew4
+end
+
+function sat_pressure_liquid_buck_dT(Tk::Float64, phPa::Float64)
+
+    # T in K, p in hPa
+    # Formula from Buck JAM (1981) derivative with respect to T at constant p
+    Tc = Tk - 273.15
+
+    A = 7.2e-4
+    B = 3.20e-6
+    C = 5.9e-10
+    fw4 = 1.0 + A + (phPa * (B + (C * Tc^2)))
+    d_fw4 = 2.0 * phPa * C * Tc
+
+    a = 6.1121
+    b = 18.729
+    c = 257.87
+    d = 227.3
+    ew4 = a * exp( (b - (Tc / d)) * Tc / (Tc + c) )
+    T1 = (d * b - (2.0 * Tc)) * (d * (Tc + c)) - d* ((d * b * Tc) - Tc^2)
+    T2 =  (d * (Tc + c))^2
+    d_ew4 = ew4 * T1 / T2
+
+    return ew4 * d_fw4 + fw4 * d_ew4
 end
 
 function sat_pressure_ice_buck(Tk::Float64, phPa::Float64)
@@ -80,8 +167,8 @@ function q_sat_liquid(Tk::Float64, phPa::Float64)
 
     # Saturation mixing ratio over liquid
     # T in K, p in hPa
-    ew = sat_pressure_liquid(Tk)
-    q_sat = 0.622 * ew / (phPa - ew)
+    ew = sat_pressure_liquid_buck(Tk,phPa)
+    q_sat = Eps * ew / (phPa - ew)
     return q_sat
 end
 
@@ -89,86 +176,9 @@ function q_sat_ice(Tk::Float64, phPa::Float64)
 
     # Saturation mixing ratio over ice
     # T in K, p in hPa
-    ei = sat_pressure_ice(Tk)
-    q_sat = 0.622 * ei / (phPa - ei)
+    ei = sat_pressure_ice_buck(Tk,phPa)
+    q_sat = Eps * ei / (phPa - ei)
     return q_sat
-end
-
-# Entropy functions require constants
-const T_0 = 273.15
-const p_0 = 1000.0
-const rho_d0 = 100.0 * p_0 / (T_0 * Rd)
-const rho_v0 = 100.0 * sat_pressure_liquid(T_0) / (T_0 * Rv)
-const q0 = 1.0e-7
-
-function entropy_new(Tk::Float64, rho_d::Float64, q_v::Float64)
-    
-    qfactor = 0.0
-    if (q_v != 0.0)
-        p = 0.01 * Rd * (Tk * (1.0 + (0.61*q_v))) * (rho_d * (1.0 + q_v))
-        q_vs = q_sat_liquid(Tk)
-        qfactor = q_v * ((L_v(Tk)/Tk) - (Rv * log(q_v / q_vs)))
-    end
-    
-    Cfactor = Cvd + (q_v * Cl)
-    s = (Cfactor * log(Tk/T_0)) - (Rd * log(rho_d/rho_d0)) + qfactor
-    return s
-end
-
-function temperature_new(s::Float64, rho_d::Float64, q_v::Float64)
-    
-    oldT = 1000.0
-    newT = T_0 * exp((s + (Rd * log(rho_d/rho_d0)) - (L_v(T_0) * q_v / T_0))/(Cvd + (q_v * Cl)))
-    n = 0
-    while n < 10
-        f = s - entropy(newT, rho_d, q_v)
-        Tp1 = newT + 0.1
-        dfdT = -entropy(Tp1,rho_d,q_v)
-
-        Tm1 = newT - 0.1
-        dfdT = dfdT + entropy(Tm1,rho_d,q_v)
-        dfdT = dfdT / 0.2
-
-        newT = newT - f/dfdT
-        if abs(newT - oldT) < 1.0e-5
-            break
-        else
-            oldT = newT
-        end
-        n += 1
-    end
-    if n == 10
-        throw(DomainError(res, "Temperature calculation failed to converge"))
-    else
-        return newT
-    end
-end
-
-function entropy(Tk::Float64, rho_d::Float64, q_v::Float64)
-    
-    qfactor = 0.0
-    if (q_v != 0.0)
-        qfactor = q_v * (Rv * log(q_v * rho_d / rho_v0) - (L_v(T_0)/T_0))
-    end
-    
-    Cfactor = Cvd + (q_v * Cvv)
-    s = (Cfactor * log(Tk/T_0)) - (Rd * log(rho_d/rho_d0)) - qfactor
-    return s
-end
-
-function temperature(s::Float64, rho_d::Float64, q_v::Float64)
-
-    Cfactor = Cvd + (q_v * Cvv)
-    qfactor = 1.0
-    if (q_v != 0.0)
-        qfactor = (rho_d * q_v / rho_v0)^((q_v * Rv) / Cfactor)
-    end
-
-    rhofactor = (rho_d / rho_d0)^(Rd / Cfactor)
-    Tfactor = exp((s - (q_v * L_v(T_0)/T_0)) / Cfactor)
-    
-    T = T_0 * Tfactor * rhofactor * qfactor
-    return T
 end
 
 function bhyp(q_v::Float64)
@@ -210,7 +220,7 @@ end
 
 function P_xi(Tk::Float64, rho_d::Float64, q_v::Float64)
 
-    return ((rho_d * Rd) + (q_v * rho_d * Rv)) * (Tk + P_s(Tk, rho_d, q_v))
+    return (Rd + (q_v * rho_d * Rv)) * ((rho_d * Tk) + P_s(Tk, rho_d, q_v))
 end
 
 function P_xi_from_s(s::Float64, xi::Float64, mu::Float64)
@@ -252,7 +262,9 @@ function thermodynamic_tuple(s::Float64, xi::Float64, mu::Float64)
     q_v = ahyp(mu)
     rho_d = dry_density(xi)
     Tk = temperature(s, rho_d, q_v)
-    p = pressure(s, rho_d, q_v)
+    pd = 0.01 * Rd * Tk * rho_d
+    e = 0.01 * Rv * Tk * rho_d * q_v
+    p = pd + e
     return (q_v, rho_d, Tk, p)
 end
 
@@ -268,15 +280,18 @@ function reversible_theta_e(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 
     q_l = ahyp(mu_l)
     q_t = q_v + q_l
     e = vapor_pressure(p, q_v)
-    es = sat_pressure_liquid(Tk)
+    es = sat_pressure_liquid_buck(Tk, p)
     theta_term = Tk * (p_0 / (p-e))^(Rd/(Cpd + (Cl * q_t)))
     H_term = (e/es)^((-Rv * q_v)/(Cpd + (Cl * q_t)))
     exp_term = exp(L_v(Tk) * q_v / ((Cpd + (Cl * q_t)) * Tk))
     return theta_term * H_term * exp_term
 end
 
-function L_v(Tk::Float64)
-   
-    L_v0 + ((Cpv - Cl) * (Tk - 273.16))
+function theta_rho(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 = 0.0)
     
+    q_v, rho_d, Tk, p = thermodynamic_tuple(s, xi, mu)
+    q_l = ahyp(mu_l)
+    q_t = q_v + q_l
+    theta = potential_temperature(s, xi, mu)
+    return theta * (1.0 + (q_v / Eps)) / (1.0 + q_t)
 end

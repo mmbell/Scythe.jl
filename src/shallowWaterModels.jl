@@ -232,6 +232,32 @@ function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
 
 end
 
+function LinearShallowWater1D(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    #Linear shallow water equations in 1D
+    grid = mtile.tile
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    g = model.physical_params[:g]
+    K = model.physical_params[:K]
+    H = model.physical_params[:H]
+
+    #h = view(grid.physical,:,1,1)
+    h_r = view(grid.physical,:,1,2)
+    #hrr = view(grid.physical,:,1,3)
+    #u = view(grid.physical,:,2,1)
+    u_r = view(grid.physical,:,2,2)
+    u_rr = view(grid.physical,:,2,3)
+
+    expdot[:,1] .= @. -H * u_r
+    expdot[:,2] .= @. (-g * h_r) + (K * u_rr)
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
+end
+
 function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #Linear shallow water equations
@@ -271,11 +297,7 @@ function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, 
 
 end
 
-function ShallowWaterRL(grid::RL_Grid, 
-            gridpoints::Array{real},
-            expdot::Array{real},
-            F::Array{real},
-            model::ModelParameters)
+function ShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
    
     #Nonlinear shallow water equations
     grid = mtile.tile
