@@ -67,7 +67,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
             # Use an pre-calculated exact state rather than interpolate
             ref_state = exact_reference_state(model, z_values)
         else
-            ref_state = interpolate_reference_file(model, z_values)
+            ref_state = calculate_reference_state(model, z_values)
         end
     end
 
@@ -239,9 +239,10 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     # Output initial time
     patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
     tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
-    checkCFL(patch)
     @async write_output(patch, model, 0.0)
     flush(stdout)
+    # Check for NaNs and quit if found
+    checkCFL(patch)
 
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
@@ -288,8 +289,8 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         if mod(t,output_int) == 0
             patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
             tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
-            checkCFL(patch)
             @async write_output(patch, model, (t*model.ts))
+            checkCFL(patch)
         end
 
         # Done with this timestep

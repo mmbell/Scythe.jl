@@ -10,11 +10,13 @@ const Cl = 4186.0
 const Ci = 2106.0 # Ice heat capacity
 const gravity = 9.81
 const L_v0 = 2.501e6
+const rho_l = 1000.0 # Density of liquid water in kg/m^3
+const rho_i = 917.0 # Density of ice in kg/m^3
 
 # Entropy function constants
 const T_0 = 273.16
 const p_0 = 1000.0
-const q0 = 1.0e-7
+const q0 = 1.0e-8
 
 function sat_pressure_liquid(Tk::Float64)
 
@@ -294,4 +296,30 @@ function theta_rho(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 = 0.0)
     q_t = q_v + q_l
     theta = potential_temperature(s, xi, mu)
     return theta * (1.0 + (q_v / Eps)) / (1.0 + q_t)
+end
+
+function Rayleigh_damping(alpha::Float64, z::Float64, z_d::Float64, z_t::Float64)
+
+    # From Durran and Klemp (1983)
+    if (z <= z_d)
+        return 0.0
+    end
+
+    norm_z = (z - z_d)/(z_t - z_d)
+    tau = 0.0
+
+    if (norm_z < 0.5)
+        tau = -0.5 * alpha * (1.0 - cos(norm_z * pi))
+    else
+        tau = -0.5 * alpha * (1.0 + (norm_z - 0.5) * pi)
+    end
+    return tau
+end
+
+function thermal_conductivity(Tk::Float64)
+
+    # From Pruppacher and Klett p. 418
+    # T in K, k in W/(m*K)
+    Tc = Tk - 273.15
+    k = (5.69 + 0.017 * Tc) * 4.184e-3
 end

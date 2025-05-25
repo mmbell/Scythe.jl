@@ -1,17 +1,181 @@
 # Reference state functions
 using Statistics
+using LsqFit
 
 struct ReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
     mubar::Array{Float64}
-    mu_lbar::Array{Float64}
     Pxi_bar::Float64
 end
 
 function empty_reference_state()
 
-    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
+    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
+end
+
+function calculate_reference_state(model::ModelParameters, z::Array{Float64}, max_wavenumber::Int64 =-1)
+
+    # Open the file with sounding information
+    ref = open(model.ref_state_file,"r")
+    
+    # Allocate some empty arrays
+    alt = Vector{Float64}(undef,0)
+    theta_in = Vector{Float64}(undef,0)
+    q_v_in = Vector{Float64}(undef,0)
+    
+    # Read the file
+    surface = readline(ref)
+    sfc_pressure = parse(Float64,split(surface)[1])
+    pushfirst!(alt, 0.0)
+    pushfirst!(theta_in, parse(Float64,split(surface)[2]))
+    pushfirst!(q_v_in, parse(Float64,split(surface)[3]))
+    while(true)
+        level = readline(ref)
+        if isempty(level)
+            break
+        end
+        push!(alt, parse(Float64,split(level)[1]))
+        push!(theta_in, parse(Float64,split(level)[2]))
+        push!(q_v_in, parse(Float64,split(level)[3]))
+    end
+
+    # Interpolate to model levels
+    theta = zeros(Float64,length(z))
+    q_v = zeros(Float64,length(z))
+
+    # Assumes first level in both cases is the surface
+    theta[1] = theta_in[1]
+    q_v[1] = q_v_in[1]
+
+    for i = 2:length(z)
+        found = false
+        for j = 2:length(alt)
+            if (alt[j-1] < z[i]) && (alt[j] > z[i])
+                # Found the interpolating levels
+                theta[i] = theta_in[j-1] + (z[i] - alt[j-1]) * (theta_in[j] - theta_in[j-1])/(alt[j] - alt[j-1])
+                q_v[i] = q_v_in[j-1] + (z[i] - alt[j-1]) * (q_v_in[j] - q_v_in[j-1])/(alt[j] - alt[j-1])
+                found = true
+            elseif alt[j] == z[i]
+                # Model level and reference level are the same
+                theta[i] = theta_in[j]
+                q_v[i] = q_v_in[j]
+                found = true
+            end
+        end
+        if !found
+            # Can't find the level
+            throw(DomainError(i, "Can't find an interpolating level for reference state"))
+        end
+    end
+
+    # Re-integrate with Chebyshev column to get hydrostatic balance
+    # If max_wavenumber is specified then use that, otherwise use the model configuration
+    if (max_wavenumber > 0)
+        b_zDim = max_wavenumber
+    else
+        b_zDim = model.grid_params.b_zDim
+    end
+    cp = ChebyshevParameters(
+        zmin = model.grid_params.zmin,
+        zmax = model.grid_params.zmax,
+        zDim = model.grid_params.zDim,
+        bDim = b_zDim,
+        BCB = Chebyshev.R0,
+        BCT = Chebyshev.R0)
+    column = Chebyshev1D(cp)
+
+    # Fit the interpolated theta to a Chebyshev column
+    column.uMish[:] .= theta[:]
+    CBtransform!(column)
+    CAtransform!(column)
+    theta_new = zeros(Float64, cp.zDim)
+    theta_new .= CItransform!(column)
+
+    # Fit the water vapor
+    q_v = q_v .* 1.0e-3
+    mu = bhyp.(q_v)
+    column.uMish[:] .= mu[:]
+    CBtransform!(column)
+    CAtransform!(column)
+    mu_new = zeros(Float64, cp.zDim)
+    mu_new .= CItransform!(column)
+    mu_new_z = CIxtransform(column)
+    mu_new_zz = CIxtransform(column)
+    q_v_new = ahyp.(mu_new)
+    q_v_new_z = mu_new_z ./ dmudq.(mu_new, q_v_new)
+
+    # Combine theta and q_v to get hydrostatic pressure and density
+    theta_rho = @. theta_new * (1.0 + (q_v_new / Eps)) / (1.0 + q_v_new)
+    dexnerdz = -gravity ./ (Cpd .* theta_rho)
+    column.uMish[:] .= dexnerdz
+    CBtransform!(column)
+    CAtransform!(column)
+    sfc_exner = (sfc_pressure/1000.0)^(Rd/Cpd)
+    exner = CIInttransform(column, sfc_exner)
+    pressure = @. (exner^(Cpd/Rd))*1000.0
+    rho_t_new = @. ((pressure * 100.0/(Rd * theta_rho))*(1000.0/pressure)^(Rd/Cpd))
+    rho_d_new = rho_t_new./(1.0 .+ q_v_new)
+    xi_new = log_dry_density.(rho_d_new)
+    sfc_xi = xi_new[1]
+    column.uMish[:] .= xi_new
+    CBtransform!(column)
+    CAtransform!(column)
+    xi_new_z = CIxtransform(column)
+    xi_new_zz = CIxxtransform(column)
+
+    # Calculate the moist entropy
+    Tk_new = @. (pressure - vapor_pressure(pressure, q_v_new))*100.0/(rho_d_new * Rd)
+    s_new = entropy.(Tk_new, rho_d_new, q_v_new)
+    column.uMish[:] .= s_new
+    CBtransform!(column)
+    CAtransform!(column)
+    s_new .= CItransform!(column)
+    s_new_z = CIxtransform(column)
+    s_new_zz = CIxtransform(column)
+    Tk_new = temperature.(s_new, rho_d_new, q_v_new)
+
+    # Adjust density and temperature to refine hydrostatic balance
+    for n in 1:10
+        Ps = P_s.(Tk_new, rho_d_new, q_v_new)
+        Pxi = P_xi.(Tk_new, rho_d_new, q_v_new)
+        Pqv = P_qv.(Tk_new, rho_d_new, q_v_new)
+    
+        xi_new_z = ((-gravity .* rho_t_new) .- (Ps .* s_new_z) .- (Pqv .* q_v_new_z)) ./ Pxi
+        column.uMish[:] .= xi_new_z[:]
+        CBtransform!(column)
+        CAtransform!(column)
+        xi_new = CIInttransform(column, sfc_xi)
+        xi_new_zz = CIxtransform(column)
+        rho_d_new = dry_density.(xi_new)
+        rho_t_new = rho_d_new .* (1.0 .+ q_v_new)
+        Tk_new = temperature.(s_new, rho_d_new, q_v_new)
+        #res = -Scythe.pressure_gradient.(Tk_new, rho_d_new, q_v_new, s_new_z, xi_new_z, q_v_new_z) .+ (-Scythe.gravity .* rho_t_new)
+        #println("$(Tk_new[1]), $(s_new[1]), $(res[1]) : $(Tk_new[50]), $(s_new[50]), $(res[50])")
+    end
+
+    sbar = zeros(Float64,length(z),3)
+    xibar = zeros(Float64,length(z),3)
+    mubar = zeros(Float64,length(z),3)
+
+    sbar[:,1] .= s_new
+    sbar[:,2] .= s_new_z
+    sbar[:,3] .= s_new_zz
+
+    xibar[:,1] .= xi_new
+    xibar[:,2] .= xi_new_z
+    xibar[:,3] .= xi_new_zz
+
+    mubar[:,1] .= mu_new
+    mubar[:,2] .= mu_new_z
+    mubar[:,3] .= mu_new_zz
+
+    # Get the mean speed of sound squared
+    Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
+    Pxi_bar = mean(Pxi ./ (rho_d_new .* (1.0 .+ q_v_new)))
+
+    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
+    return ref_state
 end
 
 function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
@@ -94,27 +258,26 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     end
 
     # Re-integrate with Chebyshev column to adjust T
-    cp = ChebyshevParameters(
-        zmin = model.grid_params.zmin,
-        zmax = model.grid_params.zmax,
-        zDim = model.grid_params.zDim,
-        bDim = model.grid_params.b_zDim,
-        BCB = Chebyshev.R0,
-        BCT = Chebyshev.R0)
-    column = Chebyshev1D(cp)
-    column.uMish[:] .= -gravity .* rho_t[:]
-    CBtransform!(column)
-    CAtransform!(column)
-    p_new = CIInttransform(column, sfc_pressure * 100.0) ./ 100.0
-    Tk = theta ./ (p_0 ./ p_new).^(Rd./Cpd)
-    e = vapor_pressure.(p_new,q_v)
-    rho_d = 100.0 .* (p_new .- e) ./ (Tk .* Rd)
-    rho_t = rho_d .* (1.0 .+ q_v)
+    #cp = ChebyshevParameters(
+    #    zmin = model.grid_params.zmin,
+    #    zmax = model.grid_params.zmax,
+    #    zDim = model.grid_params.zDim,
+    #    bDim = model.grid_params.b_zDim,
+    #    BCB = Chebyshev.R0,
+    #    BCT = Chebyshev.R0)
+    #column = Chebyshev1D(cp)
+    #column.uMish[:] .= -gravity .* rho_t[:]
+    #CBtransform!(column)
+    #CAtransform!(column)
+    #p_new = CIInttransform(column, sfc_pressure * 100.0) ./ 100.0
+    #Tk = theta ./ (p_0 ./ p_new).^(Rd./Cpd)
+    #e = vapor_pressure.(p_new,q_v)
+    #rho_d = 100.0 .* (p_new .- e) ./ (Tk .* Rd)
+    #rho_t = rho_d .* (1.0 .+ q_v)
     
     sbar = zeros(Float64,length(z),3)
     xibar = zeros(Float64,length(z),3)
     mubar = zeros(Float64,length(z),3)
-    mu_lbar = zeros(Float64,length(z),3)
 
     sbar[:,1] = entropy.(Tk, rho_d, q_v)
     xibar[:,1] = log_dry_density.(rho_d)
@@ -131,7 +294,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     q_bar = ahyp.(mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
-    ref_state = ReferenceState(sbar, xibar, mubar, mu_lbar, Pxi_bar)
+    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
     return ref_state
 end
 
