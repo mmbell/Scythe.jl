@@ -16,7 +16,7 @@ const rho_i = 917.0 # Density of ice in kg/m^3
 # Entropy function constants
 const T_0 = 273.16
 const p_0 = 1000.0
-const q0 = 1.0e-8
+const q0 = eps()
 
 function sat_pressure_liquid(Tk::Float64)
 
@@ -191,17 +191,22 @@ end
 
 function ahyp(mu::Float64)
 
-    if (mu < 0.0)
-        return 0.0
-    else
+    #if (mu < 0.0)
+    #    return 0.0
+    #else
         q_v = sqrt(mu*mu + q0*q0) + mu - q0
         return q_v
-    end
+    #end
 end
 
 function dmudq(mu::Float64, q_v::Float64)
 
-    return ((q_v + q0) - mu)/(q_v + q0)
+    #return ((q_v + q0) - mu)/(q_v + q0)
+    if (abs(q_v) < eps())
+        return 0.5
+    else
+        return (q_v - mu)/q_v
+    end
 end
 
 function dry_density(xi::Float64)
@@ -212,6 +217,22 @@ end
 function log_dry_density(rho_d::Float64)
     
     return log(rho_d/rho_d0)
+end
+
+function inv_mu_transform(mu::Float64)
+    
+    return sqrt(mu*mu + q0*q0) + mu
+    #return q0 * exp(mu) - 1.0
+end
+
+function mu_transform(q::Float64)
+    
+    if (abs(q) < eps())
+        return -5.0e-8
+    else
+        return 0.5 * (q - (q0*q0/q) )
+    end
+    #return log((1.0 + q)/q0)
 end
 
 function P_s(Tk::Float64, rho_d::Float64, q_v::Float64)
@@ -245,7 +266,7 @@ end
 
 function P_mu(Tk::Float64, rho_d::Float64, mu::Float64)
 
-    q_v = ahyp(mu)
+    q_v = inv_mu_transform(mu)
     return P_qv(Tk, rho_d, q_v) / dmudq(mu, q_v)
 end
 
@@ -261,7 +282,7 @@ end
 
 function thermodynamic_tuple(s::Float64, xi::Float64, mu::Float64)
 
-    q_v = ahyp(mu)
+    q_v = inv_mu_transform(mu)
     rho_d = dry_density(xi)
     Tk = temperature(s, rho_d, q_v)
     pd = 0.01 * Rd * Tk * rho_d
@@ -279,7 +300,7 @@ end
 function reversible_theta_e(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 = 0.0)
     
     q_v, rho_d, Tk, p = thermodynamic_tuple(s, xi, mu)
-    q_l = ahyp(mu_l)
+    q_l = inv_mu_transform(mu_l)
     q_t = q_v + q_l
     e = vapor_pressure(p, q_v)
     es = sat_pressure_liquid_buck(Tk, p)
@@ -292,7 +313,7 @@ end
 function theta_rho(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 = 0.0)
     
     q_v, rho_d, Tk, p = thermodynamic_tuple(s, xi, mu)
-    q_l = ahyp(mu_l)
+    q_l = inv_mu_transform(mu_l)
     q_t = q_v + q_l
     theta = potential_temperature(s, xi, mu)
     return theta * (1.0 + (q_v / Eps)) / (1.0 + q_t)

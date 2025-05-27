@@ -437,11 +437,11 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     mu_c_z = view(grid.physical,colstart:colend,6,4)
     mu_c_zz = view(grid.physical,colstart:colend,6,5)
 
-    lqss = view(grid.physical,colstart:colend,7,1)
-    lqss_x = view(grid.physical,colstart:colend,7,2)
-    lqss_xx = view(grid.physical,colstart:colend,7,3)
-    lqss_z = view(grid.physical,colstart:colend,7,4)
-    lqss_zz = view(grid.physical,colstart:colend,7,5)
+    mu_sat = view(grid.physical,colstart:colend,7,1)
+    mu_sat_x = view(grid.physical,colstart:colend,7,2)
+    mu_sat_xx = view(grid.physical,colstart:colend,7,3)
+    mu_sat_z = view(grid.physical,colstart:colend,7,4)
+    mu_sat_zz = view(grid.physical,colstart:colend,7,5)
 
     # Get reference state
     sbar = refstate.sbar[:,1]
@@ -463,16 +463,16 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c = ahyp.(mu_c)               # Cloud water mixing ratio
+    q_c = inv_mu_transform.(mu_c)               # Cloud water mixing ratio
     q_r = 0.0
     q_l = q_c .+ q_r                # Liquid mixing ratio
     q_t = q_v .+ q_l                # Total water mixing ratio
     rho_t = rho_d .* (1.0 .+ q_v .+ q_l)   # Total air density
-    qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
+    #qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
     mu_factor = dmudq.(mu_total, q_v)
     qvp_x = mu_x ./ mu_factor # Perturbation vapor gradient in x
     qvp_z = mu_z ./ mu_factor # Perturbation vapor gradient in z
-    rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
+    rhobar = dry_density.(xibar) .* (1.0 .+ inv_mu_transform.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
@@ -492,14 +492,17 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
 
     # Condensation rate
+    sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
+    sat_ratio = max.(sat_ratio, 1.0e-6)
     q_sat = q_sat_liquid.(Tk, p)
-    qss = (q_sat .* exp.(lqss)) .- q_sat
-    N_c = 100.0
+    #sat_ratio = exp.(mu_sat)
+    qss = (q_sat .* sat_ratio) .- q_sat
+    #qss = q_sat .* (sat_ratio .- 1.0) # qss / q_sat = (q_v .- q_sat)/q_sat
+    max_N_c = 100.0
 
     # Condensation and nucleation
-    condensation = q_condensation.(qss, Tk, p, rho_d, q_v, q_c, q_r, N_c)
-    q_cond = [x[1] for x in condensation]    # Condensation rate amount
-    cloudtau = [x[2] for x in condensation]  # Cloud condensation time scale
+    q_cond = q_condensation.(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
+    #q_cond = q_condensation_qss.(qss, Tk, p, rho_d, q_v, q_c, q_r, max_N_c)
     for i in 1:length(q_cond)
         if isnan(q_cond[i])
             println("q_cond is NaN at index $i")
@@ -508,7 +511,7 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
             println("qss: $(qss[i])")
             println("q_sat: $(q_sat[i])")
             println("q_v: $(q_v[i])")
-            println("cloudtau: $(cloudtau[i])")
+            #println("cloudtau: $(cloudtau[i])")
             error("NaN found at time $(t)!")
         end
     end
@@ -518,24 +521,27 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Enforce a minimum value for q_v to avoid blowup
     invq = 1.0 ./ max.(q_v, q0)
-    qss_cond = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))/q_sat - (qss * (cloudtau + raintau) * invq)
-    for i in 1:length(qss_cond)
-        if isnan(qss_cond[i]) || abs(qss_cond[i]) > 1.0 || t == 4
-            q_sat_alt = q_sat_liquid(Tk[i], p[i])
-            println("qss_cond is $(qss_cond[i]) at index $i")
-            println("lqss: $(lqss[i])")
-            println("qss: $(qss[i])")
-            println("q_sat_alt: $(q_sat_alt)")
-            println("q_v: $(q_v[i])")
-            println("mu_total: $(mu_total[i])")
-            println("cloudtau: $(cloudtau[i])")
-            println("dqsdp: $(dqsdp(Tk[i], p[i], rho_d[i], q_v[i], q_l[i]))")
-            #error("NaN found at time $(t)!")
-        end
-    end
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (-q_cond* (1.0 + Q_s)))/q_sat
+    #qss_cond = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))/q_sat - (qss * (cloudtau + raintau) * invq)
+    #sat_forcing = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))/q_sat + (-q_cond * (1.0 + Q_s) * invq)
+    #for i in 1:length(qss_cond)
+    #    if isnan(qss_cond[i]) || abs(qss_cond[i]) > 1.0 || t == 4
+    #        q_sat_alt = q_sat_liquid(Tk[i], p[i])
+    #        println("qss_cond is $(qss_cond[i]) at index $i")
+    #        println("lqss: $(lqss[i])")
+    #        println("qss: $(qss[i])")
+    #        println("q_sat_alt: $(q_sat_alt)")
+    #        println("q_v: $(q_v[i])")
+    #        println("mu_total: $(mu_total[i])")
+    #        println("cloudtau: $(cloudtau[i])")
+    #        println("dqsdp: $(dqsdp(Tk[i], p[i], rho_d[i], q_v[i], q_l[i]))")
+    #        #error("NaN found at time $(t)!")
+    #    end
+    #end
 
     # Entropy change due to condensation
-    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p, lqss)
+    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p, sat_ratio)
     for i in 1:length(s_cond)
         if isnan(s_cond[i])
             println("s_cond is NaN at index $i")
@@ -544,21 +550,6 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
             error("NaN found at time $(t)!")
         end
     end
-
-    # Condensation rate
-    #q_s = (exp.(-lqss) .* q_v)
-    #qss = q_v .- q_s
-    #N_c = 100.0
-    #r_c = cloud_droplet_radius.(N_c, q_c, rho_d)
-    #cloudtau = invtau_condensation.(Tk, p, N_c, r_c)
-
-    # Condensation and nucleation
-    #q_cond = q_condensation.(qss, Tk, p, q_v, q_c, N_c, r_c, cloudtau)
-
-    #qss_cond = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))/q_s - (qss * cloudtau / q_v)
-
-    # Entropy change due to condensation
-    #s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p)
 
     @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
     FORCING .= @. s_cond + s_div
@@ -592,8 +583,8 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     @turbo KDIFF .= @. K * (mu_c_xx + mu_c_zz)
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
 
-    @turbo ADV .= @. (-u * lqss_x) + (-w * lqss_z) #QSS ADV
-    FORCING .= @. qss_cond 
+    @turbo ADV .= @. (-u * mu_sat_x) + (-w * mu_sat_z) #QSS ADV
+    FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
     @turbo impdot[colstart:colend,7] .= @. qss
 
@@ -606,7 +597,7 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     end
 
     # Adjust the condensation rate from the advected supersaturation
-    condensation_adjustment(mtile, colstart, colend, t)
+    condensation_adjustment_BF02(mtile, colstart, colend, t)
 
     # Increment the explicit timestep terms with other forcings
     #explicit_increment(mtile, colstart, colend, t)
@@ -700,15 +691,19 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c = ahyp.(mu_c .- mu)         # Condensate mixing ratio
-    q_r = ahyp.(mu_r .- mu_c)       # Precipitation mixing ratio
+    q_c = inv_mu_transform.(mu_c .- mu)   # Condensate mixing ratio
+    q_c[q_c .< 1.0e-12] .= 0.0
+    q_r = inv_mu_transform.(mu_r .- mu_c)   # Precipitation mixing ratio
+    q_r[q_r .< 1.0e-12] .= 0.0
     q_l = q_c .+ q_r                # Liquid mixing ratio
     q_t = q_v .+ q_l                # Total water mixing ratio
     rho_t = rho_d .* (1.0 .+ q_t)   # Total air density
+    q_bar = inv_mu_transform.(mubar) # Reference mixing ratio
+    #qvp = q_v .- q_bar # Perturbation mixing ratio
     mu_factor = dmudq.(mu_v, q_v)
     qvp_x = mu_x ./ mu_factor       # Perturbation vapor gradient in x
     qvp_z = mu_z ./ mu_factor       # Perturbation vapor gradient in z
-    rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
+    rhobar = dry_density.(xibar) .* (1.0 .+ q_bar) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
@@ -728,18 +723,18 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
 
     # Condensation rate
-    sat_ratio = ahyp.(mu_sat)
-    sat_ratio = max.(sat_ratio, q0)
+    sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
+    sat_ratio = max.(sat_ratio, 1.0e-6)
     q_sat = q_sat_liquid.(Tk, p)
     qss = q_sat .* (sat_ratio .- 1.0) # qss / q_sat = (q_v .- q_sat)/q_sat
     max_N_c = 100.0
 
     # Condensation and nucleation
-    q_cond = q_condensation.(sat_ratio, Tk, p, rho_d, q_v, q_c, q_r, max_N_c)
+    q_cond = q_condensation.(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
     #q_cond = [x[1] for x in condensation]    # Condensation rate amount
     #cloudtau = [x[2] for x in condensation]  # Cloud condensation time scale
     for i in 1:length(q_cond) 
-        if isnan(q_cond[i]) #|| cloudtau[i] > 10.0
+        if isnan(q_cond[i]) || abs(q_cond[i]) > 1.0
             println("q_cond is NaN at index $i")
             println("Tk: $(Tk[i]), P: $(p[i]), rho_d: $(rho_d[i])")
             println("q_cond: $(q_cond[i])")
@@ -758,11 +753,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Enforce a minimum value for q_v to avoid blowup
     #invq = 1.0 ./ max.(q_v, q0)
-    qss_cond = @. (sat_ratio *(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) -q_cond + q_evap)/q_sat
-    for i in 1:length(qss_cond)
-        if isnan(qss_cond[i]) #|| abs(qss_cond[i]) > 10.0 #|| t == 4
-            q_sat_alt = q_sat_liquid(Tk[i], p[i])
-            println("qss_cond is $(qss_cond[i]) at index $i time $(t)")
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (q_evap -q_cond)*(1.0 + Q_s))/q_sat
+    for i in 1:length(sat_forcing)
+        if isnan(sat_forcing[i]) #|| abs(qss_cond[i]) > 10.0 #|| t == 4
+            println("sat_forcing is $(sat_forcing[i]) at index $i time $(t)")
             println("sat_ratio: $(sat_ratio[i])")
             println("Tk: $(Tk[i]), P: $(p[i]), rho_d: $(rho_d[i])")
             println("qss: $(qss[i])")
@@ -772,7 +767,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
             println("q_c: $(q_c[i])")
             #println("cloudtau: $(cloudtau[i])")
             println("dqsdp: $(dqsdp(Tk[i], p[i], rho_d[i], q_v[i], q_l[i]))")
-            error("$(qss_cond[i]) found at time $(t)!")
+            error("$(sat_forcing[i]) found at time $(t)!")
         end
     end
 
@@ -817,7 +812,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     impdot[colstart:colend,2] .= @. -w_z
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
-    FORCING .= @. mu_factor * (q_evap - q_cond)
+    FORCING .= @. (q_evap - q_cond) * mu_factor
     @turbo KDIFF .= @. K * (mu_xx + mu_zz) + rayleigh_coeff * mu
     @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF
     @turbo impdot[colstart:colend,3] .= @. q_v
@@ -834,17 +829,17 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
     @turbo ADV .= @. (-u * mu_c_x) + (-w * (mu_c_z + mubar_z)) #Q_C ADV
-    FORCING .= @. dmudq(mu_c, q_v + q_c) * (-q_auto - q_coll) 
+    FORCING .= @. (-q_auto -q_coll) * dmudq.(mu_c, q_v .+ q_c)
     @turbo KDIFF .= @. K * (mu_c_xx + mu_c_zz) + rayleigh_coeff * mu_c
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
 
     @turbo ADV .= @. (-u * mu_r_x) + (-w * (mu_r_z + mubar_z)) #Q_R ADV
-    FORCING .= @. dmudq(mu_r, q_v + q_c + q_r) * (-Vt_flux)
+    FORCING .= @. (-Vt_flux) * dmudq.(mu_r, q_v .+ q_c .+ q_r)
     @turbo KDIFF .= @. K * (mu_r_xx + mu_r_zz) + rayleigh_coeff * mu_r
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF
 
     @turbo ADV .= @. (-u * mu_sat_x) + (-w * mu_sat_z) #QSS ADV
-    FORCING .= @. dmudq(mu_sat, sat_ratio) * qss_cond
+    FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
     @turbo impdot[colstart:colend,8] .= @. qss
 

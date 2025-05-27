@@ -102,30 +102,44 @@ function q_condensation_qss(qss, Tk, p, rho_d, q_v, q_c, q_r, N_c)
     q_cond = min(q_v, q_cond)
     q_cond = max(-q_c, q_cond)
     q_cond = q_cond * cloudtau
-    return q_cond, cloudtau
+    return q_cond #, cloudtau
 end
 
-function q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, q_r, N_c)
+function q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
 
-    q_l = q_c + q_r
+    q_cond = 0.0
+    N_c = max_N_c
     r_c = cloud_droplet_radius.(N_c, q_c, rho_d)
-    G = droplet_growth_rate(Tk, p)
     if q_c > 0.0
-        if r_c < 1.0
-            # Get the number of 1 micron cloud droplets
-            r_c = 1.0 # Set a minimum radius
-            N_c = cloud_droplet_number(r_c, q_c, rho_d)
+        if sat_ratio < 1.0
+            # Evaporation is possible
+            if r_c < 1.0
+                # Get the number of 1 micron cloud droplets
+                r_c = 1.0 # Set a minimum radius
+                N_c = cloud_droplet_number(r_c, q_c, rho_d)
+                if N_c < 1.0
+                    # Not enough cloud droplets to evaporate
+                    N_c = 0.0
+                end
+            else
+                # Fully activated
+                N_c = max_N_c
+            end
         end
-    else
+    elseif sat_ratio > 1.0001
         # Check for nucleation
-        if sat_ratio > 1.0001
+        if r_c < 1.0
             # No cloud droplets, so set to 1 micron
             r_c = 1.0
             # Linear interpolation of Twomey relationship
-            N_c = max(1.0e4 * N_c * (sat_ratio - 1.0), N_c)
+            N_c = min(1.0e4 * N_c * (sat_ratio - 1.0), max_N_c)
         end
     end
-    q_cond = 4.0 * pi * rho_l * G * (sat_ratio - 1.0) * N_c * r_c 
+    if N_c > 0.0 && r_c > 0.0
+        # Calculate the condensation rate
+        G = droplet_growth_rate(Tk, p)
+        q_cond = 4.0 * pi * rho_l * G * (sat_ratio - 1.0) * N_c * r_c 
+    end
 
     # Adjust to ensure no negative water
     q_cond = min(q_v, q_cond)
@@ -237,8 +251,8 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     
     mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
     mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
-    sat_ratio = ahyp.(mu_sat)
-    sat_ratio = max.(sat_ratio, q0)
+    sat_ratio = inv_mu_transform.(mu_sat)
+    sat_ratio = max.(sat_ratio, 1.0e-6)
 
     # Store absolute qss in implicit forcing
     qss = view(mtile.impdot_n,colstart:colend,mu_sat_index)
@@ -254,8 +268,8 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c = ahyp.(mu_c .- mu)                # Condensate mixing ratio
-    q_r = ahyp.(mu_r .- mu_c)               # Precipitation mixing ratio
+    q_c = inv_mu_transform.(mu_c .- mu)                # Condensate mixing ratio
+    q_r = inv_mu_transform.(mu_r .- mu_c)               # Precipitation mixing ratio
     q_l = q_c .+ q_r                # Liquid mixing ratio
     q_sat = q_sat_liquid.(Tk, p)
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
@@ -280,6 +294,80 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
 
     mu .= @. mu - tau_r * dmudq(mu_total, q_v) * q_cond
     #mu_c .= @. mu_c + tau_r * dmudq(mu_c, q_c) * q_cond
+    s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p, sat_ratio)
+
+    # Incorrect implicit method
+    #dq = @. tau_r * ( ((2.0 * Q_s - 1.0) * q_v) - (0.75 * Q_s * qv_n) + q_sat + qss) / (1.0 + (1.25 * Q_s * tau_r))
+
+end
+
+function condensation_adjustment_BF02(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # Calculate the condensation rate from the advected variables
+    s_index = mtile.model.grid_params.vars["s"]
+    s = view(mtile.var_np1,colstart:colend,s_index)
+
+    # Xi is not modified
+    xi_index = mtile.model.grid_params.vars["xi"]
+    xi = view(mtile.var_np1,colstart:colend,xi_index)
+
+    mu_index = mtile.model.grid_params.vars["mu"]
+    mu = view(mtile.var_np1,colstart:colend,mu_index)
+    # Using mu implicit as placeholder for untransformed q_v
+    qv_n = view(mtile.impdot_n,colstart:colend,mu_index)
+    qv_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_index)
+
+    mu_c_index = mtile.model.grid_params.vars["mu_c"]
+    mu_c = view(mtile.var_np1,colstart:colend,mu_c_index)
+
+    #mu_r_index = mtile.model.grid_params.vars["mu_r"]
+    #mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
+    
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
+    sat_ratio = inv_mu_transform.(mu_sat)
+    sat_ratio = max.(sat_ratio, 1.0e-6)
+
+    # Store absolute qss in implicit forcing
+    qss = view(mtile.impdot_n,colstart:colend,mu_sat_index)
+    qss_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
+
+    # Get reference state
+    s_total = s .+ mtile.ref_state.sbar[:,1]
+    xi_total = xi .+ mtile.ref_state.xibar[:,1]
+    mu_total = mu .+ mtile.ref_state.mubar[:,1]
+
+    thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
+    q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
+    rho_d = [x[2] for x in thermo]  # Dry air density
+    Tk = [x[3] for x in thermo]     # Temperature in K
+    p = [x[4] for x in thermo]      # Total air pressure
+    q_c = inv_mu_transform.(mu_c)                # Condensate mixing ratio
+    q_r = 0.0 #inv_mu_transform.(mu_r .- mu_c)               # Precipitation mixing ratio
+    q_l = q_c .+ q_r                # Liquid mixing ratio
+    q_sat = q_sat_liquid.(Tk, p)
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+ 
+    # Do the increment using explicit Euler integration
+    tau_r = 0.25
+    q_cond = (q_v .- q_sat .- qss) ./ (1.0 .+ Q_s)
+    for i in 1:length(q_cond)
+        if qss[i] < 0.0
+            # Restrict spurious condensation if qss is negative
+            if q_cond[i] > 0.0
+                q_cond[i] = 0.0
+            else
+                # Restrict adjustment to available condensate
+                q_cond[i] = max(-q_c[i], q_cond[i])
+            end
+        else
+            # Restrict condensation to available water vapor
+            q_cond[i] = min(q_v[i], q_cond[i])
+        end
+    end
+
+    mu .= @. mu - tau_r * dmudq(mu_total, q_v) * q_cond
+    mu_c .= @. mu_c + tau_r * dmudq(mu_c, q_c) * q_cond
     s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p, sat_ratio)
 
     # Incorrect implicit method
@@ -319,6 +407,10 @@ end
 
 function rain_evaporation(q_r, rho_d, Tk, p)
 
+    # Set the minimum cloud liquid mixing ratio for evaporation to occur
+    if q_r < 1.0e-12
+        return 0.0
+    end
     # From Ooyama (2001)
     e_s = sat_pressure_liquid_buck(Tk, p)
     rho_vs = e_s / (Rv * Tk)

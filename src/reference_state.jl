@@ -94,7 +94,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
 
     # Fit the water vapor
     q_v = q_v .* 1.0e-3
-    mu = bhyp.(q_v)
+    mu = mu_transform.(q_v)
     column.uMish[:] .= mu[:]
     CBtransform!(column)
     CAtransform!(column)
@@ -102,7 +102,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     mu_new .= CItransform!(column)
     mu_new_z = CIxtransform(column)
     mu_new_zz = CIxtransform(column)
-    q_v_new = ahyp.(mu_new)
+    q_v_new = inv_mu_transform.(mu_new)
     q_v_new_z = mu_new_z ./ dmudq.(mu_new, q_v_new)
 
     # Combine theta and q_v to get hydrostatic pressure and density
@@ -281,7 +281,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
 
     sbar[:,1] = entropy.(Tk, rho_d, q_v)
     xibar[:,1] = log_dry_density.(rho_d)
-    mubar[:,1] = bhyp.(q_v)
+    mubar[:,1] = mu_transform.(q_v)
 
     # Calculate the derivatives
     transform_reference_state!(model, sbar)
@@ -291,7 +291,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
     rho_bar = dry_density.(xibar[:,1])
-    q_bar = ahyp.(mubar[:,1])
+    q_bar = inv_mu_transform.(mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
     ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
@@ -354,7 +354,7 @@ function exact_reference_state(model::ModelParameters, z::Array{Float64})
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
     rho_bar = dry_density.(xibar[:,1])
-    q_bar = ahyp.(mubar[:,1])
+    q_bar = inv_mu_transform.(mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
     ref_state = ReferenceState(sbar, xibar, mubar, mu_lbar, Pxi_bar)
