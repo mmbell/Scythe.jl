@@ -495,7 +495,7 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
     sat_ratio = max.(sat_ratio, 1.0e-6)
     q_sat = q_sat_liquid.(Tk, p)
-    #sat_ratio = exp.(mu_sat)
+    #qss = q_v .- q_sat # Supersaturation mixing ratio
     qss = (q_sat .* sat_ratio) .- q_sat
     #qss = q_sat .* (sat_ratio .- 1.0) # qss / q_sat = (q_v .- q_sat)/q_sat
     max_N_c = 100.0
@@ -506,7 +506,7 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     for i in 1:length(q_cond)
         if isnan(q_cond[i])
             println("q_cond is NaN at index $i")
-            println("lqss: $(lqss[i])")
+            println("sat_ratio: $(sat_ratio[i])")
             println("q_cond: $(q_cond[i])")
             println("qss: $(qss[i])")
             println("q_sat: $(q_sat[i])")
@@ -665,11 +665,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     mu_r_z = view(grid.physical,colstart:colend,7,4)
     mu_r_zz = view(grid.physical,colstart:colend,7,5)
 
-    mu_sat = view(grid.physical,colstart:colend,8,1)
-    mu_sat_x = view(grid.physical,colstart:colend,8,2)
-    mu_sat_xx = view(grid.physical,colstart:colend,8,3)
-    mu_sat_z = view(grid.physical,colstart:colend,8,4)
-    mu_sat_zz = view(grid.physical,colstart:colend,8,5)
+    sat_ratio = view(grid.physical,colstart:colend,8,1)
+    sat_ratio_x = view(grid.physical,colstart:colend,8,2)
+    sat_ratio_xx = view(grid.physical,colstart:colend,8,3)
+    sat_ratio_z = view(grid.physical,colstart:colend,8,4)
+    sat_ratio_zz = view(grid.physical,colstart:colend,8,5)
 
     # Get reference state
     sbar = refstate.sbar[:,1]
@@ -685,22 +685,24 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     mubar_zz = refstate.mubar[:,3]
 
     # Fundamental thermodynamic quantities derived from model variables
-    mu_v = mu .+ mubar
-    thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu_v)
+    mu_v_total = mu .+ mubar
+    thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu_v_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c = inv_mu_transform.(mu_c .- mu)   # Condensate mixing ratio
-    q_c[q_c .< 1.0e-12] .= 0.0
-    q_r = inv_mu_transform.(mu_r .- mu_c)   # Precipitation mixing ratio
-    q_r[q_r .< 1.0e-12] .= 0.0
+    q_c_total = inv_mu_transform.(mu_c .+ mubar)
+    q_c = q_c_total .- q_v  # Condensate mixing ratio
+    q_c[q_c .<= 1.0e-8] .= 0.0       # 4.1e-9 is a threshold for 1 micron drop per cm^3 at 1 kg/m^3
+    q_r_total = inv_mu_transform.(mu_r .+ mubar)
+    q_r = q_r_total .- q_c_total # Precipitation mixing ratio
+    q_r[q_r .<= 1.0e-8] .= 0.0
     q_l = q_c .+ q_r                # Liquid mixing ratio
     q_t = q_v .+ q_l                # Total water mixing ratio
     rho_t = rho_d .* (1.0 .+ q_t)   # Total air density
     q_bar = inv_mu_transform.(mubar) # Reference mixing ratio
     #qvp = q_v .- q_bar # Perturbation mixing ratio
-    mu_factor = dmudq.(mu_v, q_v)
+    mu_factor = dmudq.(mu_v_total, q_v)
     qvp_x = mu_x ./ mu_factor       # Perturbation vapor gradient in x
     qvp_z = mu_z ./ mu_factor       # Perturbation vapor gradient in z
     rhobar = dry_density.(xibar) .* (1.0 .+ q_bar) # Ref. air density
@@ -723,14 +725,16 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
 
     # Condensation rate
-    sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
-    sat_ratio = max.(sat_ratio, 1.0e-6)
+    #sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
     q_sat = q_sat_liquid.(Tk, p)
-    qss = q_sat .* (sat_ratio .- 1.0) # qss / q_sat = (q_v .- q_sat)/q_sat
+    #sat_ratio = q_v ./ q_sat
+    #sat_ratio = max.(sat_ratio, 1.0e-6)    
+    qss = q_sat .* (sat_ratio .+ 1.0) .- q_sat # qss / q_sat = (q_v .- q_sat)/q_sat
     max_N_c = 100.0
 
     # Condensation and nucleation
     q_cond = q_condensation.(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
+    #q_cond = q_condensation_qss.(qss, Tk, p, rho_d, q_v, q_c, q_r, max_N_c)
     #q_cond = [x[1] for x in condensation]    # Condensation rate amount
     #cloudtau = [x[2] for x in condensation]  # Cloud condensation time scale
     for i in 1:length(q_cond) 
@@ -749,12 +753,12 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     # Rain evaporation rate
     # Fixed to be >=0 so that condensation only goes to cloud droplets
     raintau = rain_evaporation.(q_r, rho_d, Tk, p)
-    q_evap = -qss .* raintau
+    q_evap = -qss .* raintau 
 
     # Enforce a minimum value for q_v to avoid blowup
-    #invq = 1.0 ./ max.(q_v, q0)
+    invq = 1.0 ./ max.(q_v, eps())
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
-    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (q_evap -q_cond)*(1.0 + Q_s))/q_sat
+    sat_forcing = @. ((sat_ratio + 1.0)*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (q_evap -q_cond)*(1.0 + Q_s))/q_sat
     for i in 1:length(sat_forcing)
         if isnan(sat_forcing[i]) #|| abs(qss_cond[i]) > 10.0 #|| t == 4
             println("sat_forcing is $(sat_forcing[i]) at index $i time $(t)")
@@ -763,7 +767,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
             println("qss: $(qss[i])")
             println("q_sat: $(q_sat[i])")
             println("q_v: $(q_v[i])")
-            println("mu_v: $(mu_v[i])")
+            println("mu_v_total: $(mu_v_total[i])")
             println("q_c: $(q_c[i])")
             #println("cloudtau: $(cloudtau[i])")
             println("dqsdp: $(dqsdp(Tk[i], p[i], rho_d[i], q_v[i], q_l[i]))")
@@ -772,21 +776,22 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     end
 
     # Entropy change due to condensation
-    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p, sat_ratio)
+    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p)
     for i in 1:length(s_cond)
         if isnan(s_cond[i])
-            println("s_cond is NaN at index $i")
+            println("s_cond is NaN at index $i time $(t)")
             println("sat_ratio: $(sat_ratio[i])")
             println("qcond: $(q_cond[i])")
+            println("q_v: $(q_v[i])")
             error("NaN found at time $(t)!")
         end
     end
 
     # Autoconversion rate
-    q_auto = autoconversion.(q_c, rho_d)
+    q_auto = autoconversion.(q_c, rho_d) 
 
     # Collection rate
-    q_coll = collection.(q_c, q_r, rho_d, Tk)
+    q_coll = collection.(q_c, q_r, rho_d, Tk) 
 
     # Sedimentation rate
     Vt = sedimentation.(q_r, rho_d, Tk)
@@ -829,17 +834,31 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
     @turbo ADV .= @. (-u * mu_c_x) + (-w * (mu_c_z + mubar_z)) #Q_C ADV
-    FORCING .= @. (-q_auto -q_coll) * dmudq.(mu_c, q_v .+ q_c)
-    @turbo KDIFF .= @. K * (mu_c_xx + mu_c_zz) + rayleigh_coeff * mu_c
+    FORCING .= @. (-q_auto -q_coll) .* dmudq(mu_c, q_c_total) # Condensation forcing
+    for i in 1:length(FORCING)
+        if isnan(FORCING[i]) || abs(FORCING[i]) > 100.0
+            println("FORCING is large at index $i, $colstart")
+            println("q_cond: $(q_cond[i])")
+            println("q_auto: $(q_auto[i])")
+            println("q_coll: $(q_coll[i])")
+            println("mu_c: $(mu_c[i])")
+            println("inv_mu: $(inv_mu_transform.(mu_c[i]))")
+            println("q_c: $(q_c[i])")
+            println("dmudq: $(dmudq.(mu_c[i], q_c[i]))")
+            println("FORCING: $(FORCING[i])")
+            error("NaN found at time $(t)!")
+        end
+    end
+    @turbo KDIFF .= @. K * (mu_c_xx + mu_c_zz) #+ rayleigh_coeff * mu_c
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
 
     @turbo ADV .= @. (-u * mu_r_x) + (-w * (mu_r_z + mubar_z)) #Q_R ADV
-    FORCING .= @. (-Vt_flux) * dmudq.(mu_r, q_v .+ q_c .+ q_r)
-    @turbo KDIFF .= @. K * (mu_r_xx + mu_r_zz) + rayleigh_coeff * mu_r
+    FORCING .= @. (-Vt_flux) .* dmudq(mu_r, q_r_total) # Precipitation forcing
+    @turbo KDIFF .= @. K * (mu_r_xx + mu_r_zz) #+ rayleigh_coeff * mu_r
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF
 
-    @turbo ADV .= @. (-u * mu_sat_x) + (-w * mu_sat_z) #QSS ADV
-    FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
+    @turbo ADV .= @. (-u * sat_ratio_x) + (-w * sat_ratio_z) #QSS ADV
+    FORCING .= @. sat_forcing
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
     @turbo impdot[colstart:colend,8] .= @. qss
 

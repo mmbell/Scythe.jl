@@ -16,7 +16,7 @@ const rho_i = 917.0 # Density of ice in kg/m^3
 # Entropy function constants
 const T_0 = 273.16
 const p_0 = 1000.0
-const q0 = eps()
+const q0 = 1.0e-7
 
 function sat_pressure_liquid(Tk::Float64)
 
@@ -191,21 +191,11 @@ end
 
 function ahyp(mu::Float64)
 
-    #if (mu < 0.0)
-    #    return 0.0
-    #else
+    if (mu < 0.0)
+        return 0.0
+    else
         q_v = sqrt(mu*mu + q0*q0) + mu - q0
         return q_v
-    #end
-end
-
-function dmudq(mu::Float64, q_v::Float64)
-
-    #return ((q_v + q0) - mu)/(q_v + q0)
-    if (abs(q_v) < eps())
-        return 0.5
-    else
-        return (q_v - mu)/q_v
     end
 end
 
@@ -221,18 +211,44 @@ end
 
 function inv_mu_transform(mu::Float64)
     
-    return sqrt(mu*mu + q0*q0) + mu
-    #return q0 * exp(mu) - 1.0
+    return ahyp(mu)
+    #return sqrt(mu*mu + q0*q0) + mu
+    
+    # new
+    return q0 * exp(mu)
 end
 
 function mu_transform(q::Float64)
     
-    if (abs(q) < eps())
-        return -5.0e-8
-    else
-        return 0.5 * (q - (q0*q0/q) )
-    end
-    #return log((1.0 + q)/q0)
+    return bhyp(q)
+    #if (abs(q) < eps())
+    #    return -5.0e-8
+    #else
+    #    return 0.5 * (q - (q0*q0/q) )
+    #end
+
+    #new
+    #if (abs(q) < eps())
+    #    q = eps()
+    #end
+    #return log(q/q0)
+end
+
+function dmudq(mu::Float64, q_v::Float64)
+
+    return ((q_v + q0) - mu)/(q_v + q0) #bhyp
+
+    # hyp 
+    #if (abs(q_v) < eps())
+    #    return 0.5
+    #else
+    #    return (q_v - mu)/q_v
+    #end
+
+    #if (abs(q_v) < eps())
+    #    q_v = eps()
+    #end
+    #return 1.0 / q_v
 end
 
 function P_s(Tk::Float64, rho_d::Float64, q_v::Float64)

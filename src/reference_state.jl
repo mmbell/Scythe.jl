@@ -40,6 +40,9 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
         push!(q_v_in, parse(Float64,split(level)[3]))
     end
 
+    # Convert q_v_in to log form
+    q_v_in = mu_transform.(q_v_in * 1.0e-3)  # Convert to kg/kg
+
     # Interpolate to model levels
     theta = zeros(Float64,length(z))
     q_v = zeros(Float64,length(z))
@@ -93,9 +96,9 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     theta_new .= CItransform!(column)
 
     # Fit the water vapor
-    q_v = q_v .* 1.0e-3
-    mu = mu_transform.(q_v)
-    column.uMish[:] .= mu[:]
+    #q_v = q_v .* 1.0e-3
+    #mu = mu_transform.(q_v)
+    column.uMish[:] .= q_v[:]
     CBtransform!(column)
     CAtransform!(column)
     mu_new = zeros(Float64, cp.zDim)
@@ -331,7 +334,6 @@ function exact_reference_state(model::ModelParameters, z::Array{Float64})
     sbar = zeros(Float64,length(z),3)
     xibar = zeros(Float64,length(z),3)
     mubar = zeros(Float64,length(z),3)
-    mu_lbar = zeros(Float64,length(z),3)
 
     # Read the file
     for i = 1:length(z)
@@ -342,14 +344,12 @@ function exact_reference_state(model::ModelParameters, z::Array{Float64})
         sbar[i,1] = parse(Float64,lineparts[2])
         xibar[i,1] = parse(Float64,lineparts[3])
         mubar[i,1] = parse(Float64,lineparts[4])
-        mu_lbar[i,1] = parse(Float64,lineparts[5])
     end
 
     # Calculate the derivatives
     transform_reference_state!(model, sbar)
     transform_reference_state!(model, xibar)
     transform_reference_state!(model, mubar)
-    transform_reference_state!(model, mu_lbar)
 
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
@@ -357,6 +357,6 @@ function exact_reference_state(model::ModelParameters, z::Array{Float64})
     q_bar = inv_mu_transform.(mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
-    ref_state = ReferenceState(sbar, xibar, mubar, mu_lbar, Pxi_bar)
+    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
     return ref_state
 end
