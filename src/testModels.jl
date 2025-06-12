@@ -671,11 +671,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     mu_r_z = view(grid.physical,colstart:colend,7,4)
     mu_r_zz = view(grid.physical,colstart:colend,7,5)
 
-    mu_sat = view(grid.physical,colstart:colend,8,1)
-    mu_sat_x = view(grid.physical,colstart:colend,8,2)
-    mu_sat_xx = view(grid.physical,colstart:colend,8,3)
-    mu_sat_z = view(grid.physical,colstart:colend,8,4)
-    mu_sat_zz = view(grid.physical,colstart:colend,8,5)
+    sat_ratio = view(grid.physical,colstart:colend,8,1)
+    sat_ratio_x = view(grid.physical,colstart:colend,8,2)
+    sat_ratio_xx = view(grid.physical,colstart:colend,8,3)
+    sat_ratio_z = view(grid.physical,colstart:colend,8,4)
+    sat_ratio_zz = view(grid.physical,colstart:colend,8,5)
 
     # Get reference state
     sbar = refstate.sbar[:,1]
@@ -697,12 +697,15 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c_total = inv_mu_transform.(mu_c .+ mubar)
-    q_c = q_c_total .- q_v  # Condensate mixing ratio
+    q_c_total = inv_mu_transform.(mu_c .+ mubar) # Cloud mixing ratio
+    q_c = q_c_total .- q_v # Condensate mixing ratio
+    mu_c_factor = dmudq.(mu_c, q_c_total)
     q_c[q_c .<= 1.0e-8] .= 0.0       # 4.1e-9 is a threshold for 1 micron drop per cm^3 at 1 kg/m^3
-    q_r_total = inv_mu_transform.(mu_r .+ mubar)
+    q_r_total = inv_mu_transform.(mu_r .+ mubar) # Rain mixing ratio
     q_r = q_r_total .- q_c_total # Precipitation mixing ratio
     q_r[q_r .<= 1.0e-8] .= 0.0
+    mu_r_factor = dmudq.(mu_r, q_r_total)
+    q_r_z = mu_r_z ./ mu_r_factor # Perturbation rain gradient in z
     q_l = q_c .+ q_r                # Liquid mixing ratio
     q_t = q_v .+ q_l                # Total water mixing ratio
     rho_t = rho_d .* (1.0 .+ q_t)   # Total air density
@@ -731,15 +734,14 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
 
     # Condensation rate
-    sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
+    #sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
     q_sat = q_sat_liquid.(Tk, p)
-    #sat_ratio = q_v ./ q_sat
-    #sat_ratio = max.(sat_ratio, 1.0e-6)
-    qss = (q_sat .* sat_ratio) .- q_sat # qss / q_sat = (q_v .- q_sat)/q_sat
+    sat_ratio_adj = max.(sat_ratio, 1.0e-6)
+    qss = (q_sat .* sat_ratio_adj) .- q_sat # qss / q_sat = (q_v .- q_sat)/q_sat
     max_N_c = 100.0
 
     # Condensation and nucleation
-    q_cond = q_condensation.(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
+    q_cond = q_condensation.(sat_ratio_adj, Tk, p, rho_d, q_v, q_c, max_N_c)
     #q_cond = q_condensation_qss.(qss, Tk, p, rho_d, q_v, q_c, q_r, max_N_c)
     #q_cond = [x[1] for x in condensation]    # Condensation rate amount
     #cloudtau = [x[2] for x in condensation]  # Cloud condensation time scale
@@ -764,11 +766,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     # Enforce a minimum value for q_v to avoid blowup
     invq = 1.0 ./ max.(q_v, eps())
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
-    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (q_evap -q_cond)*(1.0 + Q_s))/q_sat
+    sat_forcing = @. (sat_ratio_adj*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (q_evap -q_cond)*(1.0 + Q_s))/q_sat
     for i in 1:length(sat_forcing)
         if isnan(sat_forcing[i]) #|| abs(qss_cond[i]) > 10.0 #|| t == 4
             println("sat_forcing is $(sat_forcing[i]) at index $i time $(t)")
-            println("sat_ratio: $(sat_ratio[i])")
+            println("sat_ratio_adj: $(sat_ratio_adj[i])")
             println("Tk: $(Tk[i]), P: $(p[i]), rho_d: $(rho_d[i])")
             println("qss: $(qss[i])")
             println("q_sat: $(q_sat[i])")
@@ -804,10 +806,13 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Calculate the flux divergence of the falling precipitation
     col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu_r"]])
-    col.uMish .= q_r .* Vt
+    #rho_r = q_r .* rho_d 
+    col.uMish .= q_r .* rho_d .* Vt
     CBtransform!(col)
     CAtransform!(col)
+    #Vt .= CItransform!(col)
     Vt_flux = CIxtransform(col) ./ rho_d
+    #Vt_flux = 0.0 #((q_r .* Vt_z) .+ (Vt .* q_r_z)) ./ rho_d
 
     # Rayleigh damping
     rayleigh_coeff = Rayleigh_damping.(alpha, z, z_damp, z[end])
@@ -840,7 +845,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
     @turbo ADV .= @. (-u * mu_c_x) + (-w * (mu_c_z + mubar_z)) #Q_C ADV
-    FORCING .= @. (-q_auto -q_coll) .* dmudq(mu_c, q_c_total) # Condensation forcing
+    FORCING .= @. (-q_auto -q_coll) * mu_c_factor # Condensation forcing
     for i in 1:length(FORCING)
         if isnan(FORCING[i]) || abs(FORCING[i]) > 100.0
             println("FORCING is large at index $i, $colstart")
@@ -859,12 +864,12 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
 
     @turbo ADV .= @. (-u * mu_r_x) + (-w * (mu_r_z + mubar_z)) #Q_R ADV
-    FORCING .= @. (-Vt_flux) .* dmudq(mu_r, q_r_total) # Precipitation forcing
+    FORCING .= @. (-Vt_flux) * mu_r_factor # Precipitation forcing
     @turbo KDIFF .= @. K * (mu_r_xx + mu_r_zz) #+ rayleigh_coeff * mu_r
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF
 
-    @turbo ADV .= @. (-u * mu_sat_x) + (-w * mu_sat_z) #QSS ADV
-    FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
+    @turbo ADV .= @. (-u * sat_ratio_x) + (-w * sat_ratio_z) #QSS ADV
+    FORCING .= @. sat_forcing #* dmudq.(mu_sat, sat_ratio)
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
     @turbo impdot[colstart:colend,8] .= @. qss
 
@@ -880,7 +885,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     condensation_adjustment(mtile, colstart, colend, t)
 
     # Remove rain from the surface
-    rain_adjustment(mtile, colstart, colend, t)
+    #rain_adjustment(mtile, colstart, colend, t)
 
     # Increment the explicit timestep terms with other forcings
     #explicit_increment(mtile, colstart, colend, t)

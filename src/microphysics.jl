@@ -243,29 +243,31 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     mu_r_index = mtile.model.grid_params.vars["mu_r"]
     mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
     
-    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
-    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
-    sat_ratio = inv_mu_transform.(mu_sat)
+    sat_ratio_index = mtile.model.grid_params.vars["sat_ratio"]
+    sat_ratio = view(mtile.var_np1,colstart:colend,sat_ratio_index)
+    #sat_ratio = inv_mu_transform.(mu_sat)
     #sat_ratio = max.(sat_ratio, 1.0e-6)
 
     # Store absolute qss in implicit forcing
-    qss = view(mtile.impdot_n,colstart:colend,mu_sat_index)
-    qss_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
+    qss = view(mtile.impdot_n,colstart:colend,sat_ratio_index)
+    qss_nm1 = view(mtile.impdot_nm1,colstart:colend,sat_ratio_index)
 
     # Get reference state
     s_total = s .+ mtile.ref_state.sbar[:,1]
     xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
+    mubar = mtile.ref_state.mubar[:,1]
+    mu_total = mu .+ mubar
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c_total = inv_mu_transform.(mu_c .+ mtile.ref_state.mubar[:,1]) # Condensate mixing ratio
-    q_c = q_c_total .- q_v  # Condensate mixing ratio
+    q_c_total = inv_mu_transform.(mu_c .+ mubar) # Cloud mixing ratio
+    q_c = q_c_total .- q_v # Condensate mixing ratio
+    mu_c_factor = dmudq.(mu_c, q_c_total)
     q_c[q_c .<= 1.0e-8] .= 0.0       # 4.1e-9 is a threshold for 1 micron drop per cm^3 at 1 kg/m^3
-    q_r_total = inv_mu_transform.(mu_r .+ mtile.ref_state.mubar[:,1])
+    q_r_total = inv_mu_transform.(mu_r .+ mubar) # Rain mixing ratio
     q_r = q_r_total .- q_c_total # Precipitation mixing ratio
     q_r[q_r .<= 1.0e-8] .= 0.0
     q_l = q_c .+ q_r                # Liquid mixing ratio
@@ -291,7 +293,7 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     end
 
     mu .= @. mu - tau_r * dmudq(mu_total, q_v) * q_cond
-    #mu_c .= @. mu_c + tau_r * dmudq(mu_c, q_c) * q_cond
+    #mu_c .= @. mu_c + tau_r * dmudq(mu_c, q_c_total) * q_cond
     s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
     # Adjust the condensate and precipitation mixing ratios
@@ -470,9 +472,10 @@ function rain_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::In
     mu_r_index = mtile.model.grid_params.vars["mu_r"]
     mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
 
-    q_c_total = inv_mu_transform(mu_c[1] + mtile.ref_state.mubar[1,1])
-    q_r_total = inv_mu_transform(mu_r[1] + mtile.ref_state.mubar[1,1])
-    q_r = q_r_total - q_c_total # Precipitation mixing ratio    
+    mubar = mtile.ref_state.mubar[1,1]
+    q_c_total = inv_mu_transform(mu_c[1] + mubar) # Cloud mixing ratio
+    q_r_total = inv_mu_transform(mu_r[1] + mubar) # Rain mixing ratio
+    q_r = q_r_total - q_c_total # Precipitation mixing ratio
 
     if q_r <= 1.0e-8
         # No rain to remove
