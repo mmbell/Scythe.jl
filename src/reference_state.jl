@@ -40,29 +40,41 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
         push!(q_v_in, parse(Float64,split(level)[3]))
     end
 
+    # Calculate the vertical derivative
+    qvdz = zeros(Float64,length(alt))
+    thetadz = zeros(Float64,length(alt))
+    qvdz[1] = (q_v_in[2] - q_v_in[1]) / alt[2]
+    thetadz[1] = (theta_in[2] - theta_in[1]) / alt[2]
+    for i = 2:(length(alt)-1)
+        qvdz[i] = (q_v_in[i+1] - q_v_in[i-1]) / (alt[i+1] - alt[i-1])
+        thetadz[i] = (theta_in[i+1] - theta_in[i-1]) / (alt[i+1] - alt[i-1])
+    end
+    qvdz[end] = (q_v_in[end] - q_v_in[end-1]) / (alt[end] - alt[end-1])
+    thetadz[end] = (theta_in[end] - theta_in[end-1]) / (alt[end] - alt[end-1])
+
     # Convert q_v_in to log form
-    q_v_in = mu_transform.(q_v_in * 1.0e-3)  # Convert to kg/kg
+    #q_v_in = mu_transform.(q_v_in * 1.0e-3)  # Convert to kg/kg
 
     # Interpolate to model levels
     theta = zeros(Float64,length(z))
     q_v = zeros(Float64,length(z))
 
     # Assumes first level in both cases is the surface
-    theta[1] = theta_in[1]
-    q_v[1] = q_v_in[1]
+    theta[1] = thetadz[1]
+    q_v[1] = qvdz[1]
 
     for i = 2:length(z)
         found = false
         for j = 2:length(alt)
             if (alt[j-1] < z[i]) && (alt[j] > z[i])
                 # Found the interpolating levels
-                theta[i] = theta_in[j-1] + (z[i] - alt[j-1]) * (theta_in[j] - theta_in[j-1])/(alt[j] - alt[j-1])
-                q_v[i] = q_v_in[j-1] + (z[i] - alt[j-1]) * (q_v_in[j] - q_v_in[j-1])/(alt[j] - alt[j-1])
+                theta[i] = thetadz[j-1] + (z[i] - alt[j-1]) * (thetadz[j] - thetadz[j-1])/(alt[j] - alt[j-1])
+                q_v[i] = qvdz[j-1] + (z[i] - alt[j-1]) * (qvdz[j] - qvdz[j-1])/(alt[j] - alt[j-1])
                 found = true
             elseif alt[j] == z[i]
                 # Model level and reference level are the same
-                theta[i] = theta_in[j]
-                q_v[i] = q_v_in[j]
+                theta[i] = thetadz[j]
+                q_v[i] = qvdz[j]
                 found = true
             end
         end
@@ -71,6 +83,27 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
             throw(DomainError(i, "Can't find an interpolating level for reference state"))
         end
     end
+
+    #for i = 2:length(z)
+    #    found = false
+    #    for j = 2:length(alt)
+    #        if (alt[j-1] < z[i]) && (alt[j] > z[i])
+    #            # Found the interpolating levels
+    #            theta[i] = theta_in[j-1] + (z[i] - alt[j-1]) * (theta_in[j] - theta_in[j-1])/(alt[j] - alt[j-1])
+    ##            q_v[i] = q_v_in[j-1] + (z[i] - alt[j-1]) * (q_v_in[j] - q_v_in[j-1])/(alt[j] - alt[j-1])
+    #            found = true
+    #        elseif alt[j] == z[i]
+    #            # Model level and reference level are the same
+    #            theta[i] = theta_in[j]
+    #            q_v[i] = q_v_in[j]
+    #            found = true
+    ##        end
+    #    end
+    #    if !found
+    #        # Can't find the level
+    #        throw(DomainError(i, "Can't find an interpolating level for reference state"))
+    #    end
+    #end
 
     # Re-integrate with Chebyshev column to get hydrostatic balance
     # If max_wavenumber is specified then use that, otherwise use the model configuration
@@ -88,20 +121,27 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
         BCT = Chebyshev.R0)
     column = Chebyshev1D(cp)
 
-    # Fit the interpolated theta to a Chebyshev column
+    # Fit the interpolated dtheta/dz to a Chebyshev column and integrate it
     column.uMish[:] .= theta[:]
     CBtransform!(column)
     CAtransform!(column)
     theta_new = zeros(Float64, cp.zDim)
-    theta_new .= CItransform!(column)
+    #theta_new .= CItransform!(column)
+    theta_new .= CIInttransform(column, theta_in[1])
 
     # Fit the water vapor
-    #q_v = q_v .* 1.0e-3
+    q_v = q_v .* 1.0e-3
     #mu = mu_transform.(q_v)
     column.uMish[:] .= q_v[:]
     CBtransform!(column)
     CAtransform!(column)
+    q_v_new = zeros(Float64, cp.zDim)
+    q_v_new .= CIInttransform(column, q_v_in[1]*1.0e-3)
+
     mu_new = zeros(Float64, cp.zDim)
+    column.uMish[:] = mu_transform.(q_v_new)
+    CBtransform!(column)
+    CAtransform!(column)
     mu_new .= CItransform!(column)
     mu_new_z = CIxtransform(column)
     mu_new_zz = CIxtransform(column)
@@ -176,7 +216,6 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_d_new .* (1.0 .+ q_v_new)))
-
     ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
     return ref_state
 end

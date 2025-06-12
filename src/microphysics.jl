@@ -111,8 +111,8 @@ function q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
     # N_c in #/cm^3, r_c in microns, which cancel out the units in the calculation
     N_c = max_N_c
     r_c = cloud_droplet_radius.(N_c, q_c, rho_d)
-    if q_c > 0.0
-        if sat_ratio < 0.0
+    if q_c > 1.0e-8
+        if sat_ratio < 1.0
             # Evaporation is possible
             if r_c < 1.0
                 # Get the number of 1 micron cloud droplets
@@ -127,19 +127,19 @@ function q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
                 N_c = max_N_c
             end
         end
-    elseif sat_ratio > 0.0001
+    elseif sat_ratio > 1.0001
         # Check for nucleation
         if r_c < 1.0
             # No cloud droplets, so set to 1 micron
             r_c = 1.0
             # Linear interpolation of Twomey relationship
-            N_c = min(1.0e4 * N_c * sat_ratio, max_N_c)
+            N_c = min(1.0e4 * N_c * (sat_ratio - 1.0), max_N_c)
         end
     end
     if N_c > 0.0 && r_c > 0.0
         # Calculate the condensation rate
         G = droplet_growth_rate(Tk, p)
-        q_cond = 4.0 * pi * rho_l * G * sat_ratio * N_c * r_c 
+        q_cond = 4.0 * pi * rho_l * G * (sat_ratio - 1.0) * N_c * r_c 
     end
 
     # Adjust to ensure no negative water
@@ -153,7 +153,11 @@ function s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
     Cm = (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
     e = vapor_pressure(p, q_v)
     sat_e = sat_pressure_liquid_buck(Tk, p)
-    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(e/sat_e)) )
+    RH = e / sat_e
+    if RH <= 0.0
+        RH = 1.0e-6
+    end
+    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(RH)) )
     return ds
 end
 
@@ -239,14 +243,14 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     mu_r_index = mtile.model.grid_params.vars["mu_r"]
     mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
     
-    sat_ratio_index = mtile.model.grid_params.vars["sat_ratio"]
-    sat_ratio = view(mtile.var_np1,colstart:colend,sat_ratio_index)
-    #sat_ratio = inv_mu_transform.(mu_sat)
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
+    sat_ratio = inv_mu_transform.(mu_sat)
     #sat_ratio = max.(sat_ratio, 1.0e-6)
 
     # Store absolute qss in implicit forcing
-    qss = view(mtile.impdot_n,colstart:colend,sat_ratio_index)
-    qss_nm1 = view(mtile.impdot_nm1,colstart:colend,sat_ratio_index)
+    qss = view(mtile.impdot_n,colstart:colend,mu_sat_index)
+    qss_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
 
     # Get reference state
     s_total = s .+ mtile.ref_state.sbar[:,1]
@@ -258,7 +262,7 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c_total = inv_mu_transform.(mu_c .+ mtile.ref_state.mubar[:,1])
+    q_c_total = inv_mu_transform.(mu_c .+ mtile.ref_state.mubar[:,1]) # Condensate mixing ratio
     q_c = q_c_total .- q_v  # Condensate mixing ratio
     q_c[q_c .<= 1.0e-8] .= 0.0       # 4.1e-9 is a threshold for 1 micron drop per cm^3 at 1 kg/m^3
     q_r_total = inv_mu_transform.(mu_r .+ mtile.ref_state.mubar[:,1])
@@ -287,15 +291,15 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     end
 
     mu .= @. mu - tau_r * dmudq(mu_total, q_v) * q_cond
-    #mu_c .= @. mu_c + tau_r * q_cond / inv_mu_transform.(mu_c)
+    #mu_c .= @. mu_c + tau_r * dmudq(mu_c, q_c) * q_cond
     s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
     # Adjust the condensate and precipitation mixing ratios
-    mu_c_adjust = mu_transform.(q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
-    mu_c .= @. mu_c + tau_r * (mu_c_adjust - mu_c)
+    #mu_c_adjust = mu_transform.(q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
+    #mu_c .= @. mu_c + tau_r * (mu_c_adjust - mu_c)
 
-    mu_r_adjust = mu_transform.(q_r .+ q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
-    mu_r .= @. mu_r + tau_r * (mu_r_adjust - mu_r)
+    #mu_r_adjust = mu_transform.(q_r .+ q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
+    #mu_r .= @. mu_r + tau_r * (mu_r_adjust - mu_r)
 
     # Incorrect implicit method
     #dq = @. tau_r * ( ((2.0 * Q_s - 1.0) * q_v) - (0.75 * Q_s * qv_n) + q_sat + qss) / (1.0 + (1.25 * Q_s * tau_r))
@@ -371,7 +375,7 @@ function condensation_adjustment_BF02(mtile::ModelTile, colstart::Int64, colend:
 
     mu .= @. mu - tau_r * dmudq(mu_total, q_v) * q_cond
     mu_c .= @. mu_c + tau_r * dmudq(mu_c, q_c) * q_cond
-    s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p, sat_ratio)
+    s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
     # Incorrect implicit method
     #dq = @. tau_r * ( ((2.0 * Q_s - 1.0) * q_v) - (0.75 * Q_s * qv_n) + q_sat + qss) / (1.0 + (1.25 * Q_s * tau_r))
@@ -411,7 +415,7 @@ end
 function rain_evaporation(q_r, rho_d, Tk, p)
 
     # Set the minimum cloud liquid mixing ratio for evaporation to occur
-    if q_r < 1.0e-12
+    if q_r < 1.0e-8
         return 0.0
     end
     # From Ooyama (2001)
@@ -442,9 +446,6 @@ function sedimentation(q_r, rho_d, Tk)
     # From Ooyama (2001)
     rho_r = q_r * rho_d
     Vt = -14.164 * rho_r^0.1364 * (rho_d0/rho_d)^0.5 * f_ice(Tk)
-    if Vt < 0.0
-        Vt = 0.0
-    end
     return Vt
 end
 
@@ -458,4 +459,27 @@ function droplet_growth_rate(Tk::Float64, p::Float64)
     conductivity = rho_l * L_c^2 / (k * Rv * Tk^2)
     G = 1.0 / (diffusivity + conductivity)
     return G
+end
+
+function rain_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # Remove rain from the surface
+    mu_c_index = mtile.model.grid_params.vars["mu_c"]
+    mu_c = view(mtile.var_np1,colstart:colend,mu_c_index)
+
+    mu_r_index = mtile.model.grid_params.vars["mu_r"]
+    mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
+
+    q_c_total = inv_mu_transform(mu_c[1] + mtile.ref_state.mubar[1,1])
+    q_r_total = inv_mu_transform(mu_r[1] + mtile.ref_state.mubar[1,1])
+    q_r = q_r_total - q_c_total # Precipitation mixing ratio    
+
+    if q_r <= 1.0e-8
+        # No rain to remove
+        return
+    end
+
+    # Instantaneous rain removal at the end of each time step
+    mu_r[1] = mu_r[1] - (dmudq(mu_r[1], q_r_total) * q_r)
+
 end

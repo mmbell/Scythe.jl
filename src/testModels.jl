@@ -541,12 +541,18 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     #end
 
     # Entropy change due to condensation
-    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p, sat_ratio)
+    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p)
     for i in 1:length(s_cond)
         if isnan(s_cond[i])
             println("s_cond is NaN at index $i")
-            println("lqss: $(lqss[i])")
+            #println("lqss: $(lqss[i])")
             println("qcond: $(q_cond[i])")
+            println("q_v: $(q_v[i])")
+            println("q_l: $(q_l[i])")
+            println("q_sat: $(q_sat[i])")
+            println("Tk: $(Tk[i])")
+            println("rho_d: $(rho_d[i])")
+            println("p: $(p[i])")
             error("NaN found at time $(t)!")
         end
     end
@@ -665,11 +671,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     mu_r_z = view(grid.physical,colstart:colend,7,4)
     mu_r_zz = view(grid.physical,colstart:colend,7,5)
 
-    sat_ratio = view(grid.physical,colstart:colend,8,1)
-    sat_ratio_x = view(grid.physical,colstart:colend,8,2)
-    sat_ratio_xx = view(grid.physical,colstart:colend,8,3)
-    sat_ratio_z = view(grid.physical,colstart:colend,8,4)
-    sat_ratio_zz = view(grid.physical,colstart:colend,8,5)
+    mu_sat = view(grid.physical,colstart:colend,8,1)
+    mu_sat_x = view(grid.physical,colstart:colend,8,2)
+    mu_sat_xx = view(grid.physical,colstart:colend,8,3)
+    mu_sat_z = view(grid.physical,colstart:colend,8,4)
+    mu_sat_zz = view(grid.physical,colstart:colend,8,5)
 
     # Get reference state
     sbar = refstate.sbar[:,1]
@@ -725,11 +731,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
 
     # Condensation rate
-    #sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
+    sat_ratio = inv_mu_transform.(mu_sat) # Saturation ratio
     q_sat = q_sat_liquid.(Tk, p)
     #sat_ratio = q_v ./ q_sat
-    #sat_ratio = max.(sat_ratio, 1.0e-6)    
-    qss = q_sat .* (sat_ratio .+ 1.0) .- q_sat # qss / q_sat = (q_v .- q_sat)/q_sat
+    #sat_ratio = max.(sat_ratio, 1.0e-6)
+    qss = (q_sat .* sat_ratio) .- q_sat # qss / q_sat = (q_v .- q_sat)/q_sat
     max_N_c = 100.0
 
     # Condensation and nucleation
@@ -758,7 +764,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     # Enforce a minimum value for q_v to avoid blowup
     invq = 1.0 ./ max.(q_v, eps())
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
-    sat_forcing = @. ((sat_ratio + 1.0)*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (q_evap -q_cond)*(1.0 + Q_s))/q_sat
+    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + (q_evap -q_cond)*(1.0 + Q_s))/q_sat
     for i in 1:length(sat_forcing)
         if isnan(sat_forcing[i]) #|| abs(qss_cond[i]) > 10.0 #|| t == 4
             println("sat_forcing is $(sat_forcing[i]) at index $i time $(t)")
@@ -857,8 +863,8 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     @turbo KDIFF .= @. K * (mu_r_xx + mu_r_zz) #+ rayleigh_coeff * mu_r
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF
 
-    @turbo ADV .= @. (-u * sat_ratio_x) + (-w * sat_ratio_z) #QSS ADV
-    FORCING .= @. sat_forcing
+    @turbo ADV .= @. (-u * mu_sat_x) + (-w * mu_sat_z) #QSS ADV
+    FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
     @turbo impdot[colstart:colend,8] .= @. qss
 
@@ -872,6 +878,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Adjust the condensation rate from the advected supersaturation
     condensation_adjustment(mtile, colstart, colend, t)
+
+    # Remove rain from the surface
+    rain_adjustment(mtile, colstart, colend, t)
 
     # Increment the explicit timestep terms with other forcings
     #explicit_increment(mtile, colstart, colend, t)

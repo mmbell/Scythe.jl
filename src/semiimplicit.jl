@@ -160,6 +160,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
             zmin = patch.params.zmin,
             zmax = patch.params.zmax,
             zDim = patch.params.zDim,
+            b_zDim = patch.params.b_zDim,
             BCL = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
             BCR = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
             BCB = patch.params.BCB,

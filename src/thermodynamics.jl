@@ -215,7 +215,7 @@ function inv_mu_transform(mu::Float64)
     #return sqrt(mu*mu + q0*q0) + mu
     
     # new
-    return q0 * exp(mu)
+    #return q0 * exp(mu)
 end
 
 function mu_transform(q::Float64)
