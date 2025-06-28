@@ -202,4 +202,151 @@ function Kepert2017_TCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
 
 end
 
+function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # Equation set for an axisymmetric, height-resolved TC boundary layer model reproduced 
+    # from Williams (2017): Time and Space Scales in the Tropical Cyclone Boundary Layer,
+    # and the Location of the Eyewall Updraft
+    
+    # Local helper variables
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    # Physical parameters
+    g = model.physical_params[:g]
+    Kh = model.physical_params[:Kh]
+    Cd = model.physical_params[:Cd]
+    Hfree = model.physical_params[:Hfree]
+    f = model.physical_params[:f]
+
+    # Assign local variables with views
+    r = view(gridpoints,colstart:colend,1)
+    z = view(gridpoints,colstart:colend,2)   
+    h = view(grid.physical,colstart:colend,1,1)
+    hr = view(grid.physical,colstart:colend,1,2)
+    hrr = view(grid.physical,colstart:colend,1,3)
+    ug = view(grid.physical,colstart:colend,2,1)
+    ugr = view(grid.physical,colstart:colend,2,2)
+    ugrr = view(grid.physical,colstart:colend,2,3)
+
+    vg = view(grid.physical,colstart:colend,3,1)
+    vgr = view(grid.physical,colstart:colend,3,2)
+    vgrr = view(grid.physical,colstart:colend,3,3)
+    
+    ub = view(grid.physical,colstart:colend,4,1)
+    ubr = view(grid.physical,colstart:colend,4,2)
+    ubrr = view(grid.physical,colstart:colend,4,3)
+    ubz = view(grid.physical,colstart:colend,4,4)
+    ubzz = view(grid.physical,colstart:colend,4,5)
+    vb = view(grid.physical,colstart:colend,5,1)
+    vbr = view(grid.physical,colstart:colend,5,2)
+    vbrr = view(grid.physical,colstart:colend,5,3)
+    vbz = view(grid.physical,colstart:colend,5,4)
+    vbzz = view(grid.physical,colstart:colend,5,5)
+
+    # Helper arrays to reduce memory allocations
+    zDim = mtile.model.grid_params.zDim
+    ADV = similar(r)
+    COR = similar(r)
+    PGF = similar(r)
+    HDIFF = similar(r)
+    VDIFF = similar(r)
+    
+    # Calculate the vertical diffusivity
+    # Mixing length based on Louis parameterization
+    S = sqrt.((ubz .* ubz) .+ (vbz .* vbz))
+    l = 1.0 ./ ((1.0 ./ (0.4 .* z)) .+ (1.0 ./ 80.0))
+    Kv = (l.^2) .* S
+
+    # W is diagnostic and is needed first for other calculations
+    wb = view(grid.physical,colstart:colend,6,1)
+
+    # Integrate divergence to get W
+    # Use h since it doesn't have any boundary conditions in the vertical
+    h_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["h"]])
+    col = Chebyshev1D(h_col.params,h_col.mishPoints,h_col.gammaBC,
+        h_col.fftPlan,h_col.filter,h_col.uMish,h_col.b,h_col.a,h_col.ax)
+    col.uMish .= @. -((ub / r) + ubr)
+    CBtransform!(col)
+    CAtransform!(col)
+    wb .= CIInttransform(col)
+    expdot[colstart:colend,6] .= 0.0 # TB: wb tendency = 0 because wb is diagnostic
+
+    # h tendency
+    expdot[colstart:colend,1] .= 0.0 
+    # ug tendency
+    expdot[colstart:colend,2] .= 0.0 
+    # vg tendency
+    expdot[colstart:colend,3] .= 0.0 
+
+    # ub tendency
+    ADV .= @. (-ub * ubr) + (-wb * ubz) #UBADV
+    # PGF .= @. (-g * hr) # TB: UBPGF using h 
+    PGF .= @. (-vg * (f + (vg / r))) # TB: UBPGF using v
+    COR .= @. (vb * (f + (vb / r))) #UBCOR
+
+    # Horizontal diffusion
+    HDIFF .= @. Kh * ((ubr / r) + ubrr - (ub / (r * r))) #UHDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #HDIFF .= @. K * ((ur / r) + urr + (ull / (r * r))) #UKDIFF
+
+    # Get the 10 meter wind (assuming 10 m @ z == 2)
+    u10 = ub[2]
+    v10 = vb[2]
+    U10 = sqrt(u10^2 + v10^2)
+
+    # Differentiate Kv * du/dz
+    col.uMish .= Kv .* ubz
+    
+    # Drag applies at z = 0
+    if Cd < 0.0
+        # Negative parameter so use a wind speed dependent drag
+        # From Komori et al. (2018)
+        if U10 < 5.2
+            Cd = 1.0e-3
+        elseif U10 < 33.6
+            Cd = 4.4e-4 * U10^0.5
+        else
+            Cd = 2.55e-3
+        end
+    end
+    col.uMish[1] = Cd * U10 * u10 #UDRAG
+
+    CBtransform!(col)
+    CAtransform!(col)
+    VDIFF .= CIxtransform(col)
+
+    expdot[colstart:colend,4] .= @. ADV + PGF + COR + VDIFF + HDIFF
+
+    # vb tendency
+    ADV .= @. (-ub * vbr) + (-wb * vbz) #VBADV
+    PGF .= 0.0 #VBPGF # TB: there is no L pressure gradient in an axisymmetric storm
+    COR .= @. (-ub * (f + (vb / r))) #VBCOR
+
+    # Horizontal diffusion
+    HDIFF .= @. Kh * ((vbr / r) + vbrr - (vb / (r * r))) #VHDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #HDIFF .= @. K * ((vr / r) + vrr + (vll / (r * r))) #VKDIFF
+
+    # TB: Vertical diffusion
+    # TB: Kv * vbz is differentiated wrt z in the TCBL equations
+    # TB: First assign to col and then do the transform, then assign to VDIFF variable
+    # Differentiate Kv * dv/dz
+    col.uMish .= Kv .* vbz
+
+    # Drag only applies at z = 0
+    col.uMish[1] = Cd * U10 * v10 #VDRAG
+
+    CBtransform!(col)
+    CAtransform!(col)
+    VDIFF .= CIxtransform(col)
+    
+    expdot[colstart:colend,5] .= @. ADV + PGF + COR + VDIFF + HDIFF
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
+end
 
