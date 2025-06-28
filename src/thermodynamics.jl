@@ -16,7 +16,7 @@ const rho_i = 917.0 # Density of ice in kg/m^3
 # Entropy function constants
 const T_0 = 273.16
 const p_0 = 1000.0
-const q0 = 1.0e-7
+const q0 = 1.0e-5
 
 function sat_pressure_liquid(Tk::Float64)
 
@@ -209,9 +209,36 @@ function log_dry_density(rho_d::Float64)
     return log(rho_d/rho_d0)
 end
 
+function inv_xi_transform(xi::Float64)
+
+    return log(xi)
+
+end
+
+function xi_transform(q::Float64)
+
+    return exp(q)
+
+end
+
+function dxidq(q::Float64)
+
+    # Derivative of xi with respect to Q
+    return exp(q) #
+    #return 1.0 / sqrt(q^2 + (1.0e-5)^2)
+
+end
+
 function inv_mu_transform(mu::Float64)
     
-    return ahyp(mu)
+    if (mu < 0.0)
+        return 0.0
+    else
+        q = mu * 1.0e-5
+        return q
+    end
+    #return ahyp(mu)
+
     #return sqrt(mu*mu + q0*q0) + mu
     
     # new
@@ -220,7 +247,10 @@ end
 
 function mu_transform(q::Float64)
     
-    return bhyp(q)
+    return q*1.0e5
+    #return bhyp(q)
+
+
     #if (abs(q) < eps())
     #    return -5.0e-8
     #else
@@ -236,7 +266,8 @@ end
 
 function dmudq(mu::Float64, q_v::Float64)
 
-    return ((q_v + q0) - mu)/(q_v + q0) #bhyp
+    return 1.0e5
+    #return ((q_v + q0) - mu)/(q_v + q0) #bhyp
 
     # hyp 
     #if (abs(q_v) < eps())

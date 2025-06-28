@@ -6,12 +6,13 @@ struct ReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
     mubar::Array{Float64}
+    satbar::Array{Float64}
     Pxi_bar::Float64
 end
 
 function empty_reference_state()
 
-    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
+    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
 end
 
 function calculate_reference_state(model::ModelParameters, z::Array{Float64}, max_wavenumber::Int64 =-1)
@@ -156,8 +157,8 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     CAtransform!(column)
     sfc_exner = (sfc_pressure/1000.0)^(Rd/Cpd)
     exner = CIInttransform(column, sfc_exner)
-    pressure = @. (exner^(Cpd/Rd))*1000.0
-    rho_t_new = @. ((pressure * 100.0/(Rd * theta_rho))*(1000.0/pressure)^(Rd/Cpd))
+    p_new = @. (exner^(Cpd/Rd))*1000.0
+    rho_t_new = @. ((p_new * 100.0/(Rd * theta_rho))*(1000.0/p_new)^(Rd/Cpd))
     rho_d_new = rho_t_new./(1.0 .+ q_v_new)
     xi_new = log_dry_density.(rho_d_new)
     sfc_xi = xi_new[1]
@@ -168,7 +169,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     xi_new_zz = CIxxtransform(column)
 
     # Calculate the moist entropy
-    Tk_new = @. (pressure - vapor_pressure(pressure, q_v_new))*100.0/(rho_d_new * Rd)
+    Tk_new = @. (p_new - vapor_pressure(p_new, q_v_new))*100.0/(rho_d_new * Rd)
     s_new = entropy.(Tk_new, rho_d_new, q_v_new)
     column.uMish[:] .= s_new
     CBtransform!(column)
@@ -200,6 +201,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     sbar = zeros(Float64,length(z),3)
     xibar = zeros(Float64,length(z),3)
     mubar = zeros(Float64,length(z),3)
+    satbar = zeros(Float64,length(z),3)
 
     sbar[:,1] .= s_new
     sbar[:,2] .= s_new_z
@@ -213,10 +215,27 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     mubar[:,2] .= mu_new_z
     mubar[:,3] .= mu_new_zz
 
+    # Calculate the saturation ratio
+    thermo = thermodynamic_tuple.(sbar[:,1], xibar[:,1], mubar[:,1])
+    T_bar = [x[3] for x in thermo]     # Temperature in K
+    p_bar = [x[4] for x in thermo]      # Total air pressure
+    q_bar = [x[1] for x in thermo]
+    q_sat = q_sat_liquid.(T_bar, p_bar)
+    column.uMish[:] .= q_bar ./ q_sat
+    CBtransform!(column)
+    CAtransform!(column)
+    sat_ratio = CItransform!(column)
+    sat_ratio_z = CIxtransform(column)
+    sat_ratio_zz = CIxxtransform(column)
+
+    satbar[:,1] .= sat_ratio
+    satbar[:,2] .= sat_ratio_z
+    satbar[:,3] .= sat_ratio_zz
+
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_d_new .* (1.0 .+ q_v_new)))
-    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
+    ref_state = ReferenceState(sbar, xibar, mubar, satbar, Pxi_bar)
     return ref_state
 end
 

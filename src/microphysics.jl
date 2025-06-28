@@ -243,14 +243,14 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     mu_r_index = mtile.model.grid_params.vars["mu_r"]
     mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
     
-    sat_ratio_index = mtile.model.grid_params.vars["sat_ratio"]
-    sat_ratio = view(mtile.var_np1,colstart:colend,sat_ratio_index)
+    sat_prime_index = mtile.model.grid_params.vars["sat_prime"]
+    sat_prime = view(mtile.var_np1,colstart:colend,sat_prime_index)
     #sat_ratio = inv_mu_transform.(mu_sat)
     #sat_ratio = max.(sat_ratio, 1.0e-6)
 
     # Store absolute qss in implicit forcing
-    qss = view(mtile.impdot_n,colstart:colend,sat_ratio_index)
-    qss_nm1 = view(mtile.impdot_nm1,colstart:colend,sat_ratio_index)
+    qss = view(mtile.impdot_n,colstart:colend,sat_prime_index)
+    qss_nm1 = view(mtile.impdot_nm1,colstart:colend,sat_prime_index)
 
     # Get reference state
     s_total = s .+ mtile.ref_state.sbar[:,1]
@@ -266,10 +266,10 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     q_c_total = inv_mu_transform.(mu_c .+ mubar) # Cloud mixing ratio
     q_c = q_c_total .- q_v # Condensate mixing ratio
     mu_c_factor = dmudq.(mu_c, q_c_total)
-    q_c[q_c .<= 1.0e-8] .= 0.0       # 4.1e-9 is a threshold for 1 micron drop per cm^3 at 1 kg/m^3
+    q_c[q_c .<= 1.0e-12] .= 0.0       # 4.1e-9 is a threshold for 1 micron drop per cm^3 at 1 kg/m^3
     q_r_total = inv_mu_transform.(mu_r .+ mubar) # Rain mixing ratio
     q_r = q_r_total .- q_c_total # Precipitation mixing ratio
-    q_r[q_r .<= 1.0e-8] .= 0.0
+    q_r[q_r .<= 1.0e-12] .= 0.0
     q_l = q_c .+ q_r                # Liquid mixing ratio
     q_sat = q_sat_liquid.(Tk, p)
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
@@ -414,12 +414,24 @@ function f_ice(Tk)
     end
 end
 
+function df_icedz(Tk)
+
+    # From Ooyama (2001)
+    if Tk < 273.15
+        df_ice = -0.16 * (273.15 - Tk) * sech((273.15 - Tk)/5.0) * tanh((273.15 - Tk)/5.0)
+        # Should account for the temperature gradient as well but neglecting it for now
+        return df_ice
+    else
+        return 0.0
+    end
+end
+
 function rain_evaporation(q_r, rho_d, Tk, p)
 
     # Set the minimum cloud liquid mixing ratio for evaporation to occur
-    if q_r < 1.0e-8
-        return 0.0
-    end
+    #if q_r < 1.0e-8
+    #    return 0.0
+    #end
     # From Ooyama (2001)
     e_s = sat_pressure_liquid_buck(Tk, p)
     rho_vs = e_s / (Rv * Tk)
@@ -429,6 +441,26 @@ function rain_evaporation(q_r, rho_d, Tk, p)
         q_evap = 0.0
     end
     # This is multiplied by qss so the 1/rho_d factor is already included
+    return q_evap
+end
+
+function q_evaporation(sat_ratio, Tk, p, rho_d, q_v, q_r, mean_r)
+
+    q_evap = 0.0
+    # N_r in #/cm^3, r_r in microns, which cancel out the units in the calculation
+    if q_r > 1.0e-8 && sat_ratio < 1.0
+        # Evaporation is possible
+        r_r = mean_r # Mean radius of the rain drops in microns
+        N_r = cloud_droplet_number(r_r, q_r, rho_d)
+        if N_r > 0.0 && r_r > 0.0
+            # Calculate the evaporation rate
+            G = droplet_growth_rate(Tk, p)
+            q_evap = -4.0 * pi * rho_l * G * (sat_ratio - 1.0) * N_r * r_r
+           # Adjust to ensure no negative water
+            q_evap = max(q_r, q_evap)
+        end
+    end
+
     return q_evap
 end
 
@@ -449,6 +481,17 @@ function sedimentation(q_r, rho_d, Tk)
     rho_r = q_r * rho_d
     Vt = -14.164 * rho_r^0.1364 * (rho_d0/rho_d)^0.5 * f_ice(Tk)
     return Vt
+end
+
+function precipitation_flux(q_r, rho_d, Tk, q_r_z, xi_z)
+
+    # From Ooyama (2001)
+    f_ice_term = f_ice(Tk)
+    term1 = 0.6364 * rho_d^(-0.3636) * xi_z * q_r^(1.1364) * f_ice_term
+    term2 = 1.1364 * rho_d^(-0.3636) * q_r^(0.1364) * q_r_z * f_ice_term
+    #term3 = rho_d^(-0.3636) * q_r^(0.1364) * df_icedz(Tk)
+    Vt_flux = -14.164 * rho_d0^0.5 * (term1 + term2)
+    return Vt_flux
 end
 
 function droplet_growth_rate(Tk::Float64, p::Float64)
