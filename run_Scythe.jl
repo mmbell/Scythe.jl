@@ -40,6 +40,7 @@ else
     addprocs(num_workers)
 end
 
+@everywhere using Springsteel
 @everywhere using Scythe
 include(modelfile)
 integrate_model(model)
