@@ -39,6 +39,7 @@ struct ModelTile
     haloReceiveBuffer::Array{Float64}
     splineBuffer::Array{Float64}
     h_matrix::Factorization
+    diffusion_matrix::Factorization
 end
 
 function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters,
@@ -67,7 +68,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
             # Use an pre-calculated exact state rather than interpolate
             ref_state = exact_reference_state(model, z_values)
         else
-            ref_state = calculate_reference_state(model, z_values)
+            # Use the exponential filter instead of boxcar to maximize resolution in reference state
+            ref_state = calculate_reference_state(model, z_values, model.grid_params.zDim)
         end
     end
 
@@ -89,10 +91,12 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
     splineBuffer =  allocateSplineBuffer(patch,tile)
 
-    # Pre-calculate the Helmholtz matrix for semi-implicit adjustment
+    # Pre-calculate the Helmholtz matrices for semi-implicit adjustment
     # Declare a basic factorization for the structure if semiimplicit integration is not used
     h_matrix = factorize([1 2; 2 1])
+    diffusion_matrix = factorize([1 2; 2 1])
     if model.options[:semiimplicit]
+        diffusion_matrix = calc_Helmholtz_diffusion_matrix(model, 1.25 * model.ts * model.physical_params[:Kvdiff] )
         h_matrix = calc_Helmholtz_semiimplicit_matrix(model, ref_state.Pxi_bar, 1.25 * model.ts)
     end
 
@@ -119,7 +123,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         haloReceiveIndexMap,
         haloReceiveBuffer,
         splineBuffer,
-        h_matrix)
+        h_matrix,
+        diffusion_matrix)
     return mtile
 end
 
@@ -671,6 +676,130 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* CIxtransform(w_col))
 end
 
+function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    s_index = mtile.model.grid_params.vars["s"]
+    s = view(mtile.var_np1,colstart:colend,s_index)
+
+    mu_index = mtile.model.grid_params.vars["mu"]
+    mu = view(mtile.var_np1,colstart:colend,mu_index)
+
+    mu_c_index = mtile.model.grid_params.vars["mu_c"]
+    mu_c = view(mtile.var_np1,colstart:colend,mu_c_index)
+
+    mu_r_index = mtile.model.grid_params.vars["mu_r"]
+    mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
+    
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
+
+    ts = mtile.model.ts
+
+    # Calculate s_nstar
+    s_nstar = mtile.var_np1[colstart:colend,s_index]
+    sdot_n = view(mtile.impdot_n,colstart:colend,s_index)
+    sdot_nm1 = view(mtile.impdot_nm1,colstart:colend,s_index)
+    sdot_nm2 = view(mtile.impdot_nm2,colstart:colend,s_index)
+
+    # Calculate mu_nstar
+    mu_nstar = mtile.var_np1[colstart:colend,mu_index]
+    mudot_n = view(mtile.impdot_n,colstart:colend,mu_index)
+    mudot_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_index)
+    mudot_nm2 = view(mtile.impdot_nm2,colstart:colend,mu_index)
+
+    # Calculate mu_c_nstar
+    mu_c_nstar = mtile.var_np1[colstart:colend,mu_c_index]
+    mu_cdot_n = view(mtile.impdot_n,colstart:colend,mu_c_index)
+    mu_cdot_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_c_index)
+    mu_cdot_nm2 = view(mtile.impdot_nm2,colstart:colend,mu_c_index)
+
+    # Calculate mu_r_nstar
+    mu_r_nstar = mtile.var_np1[colstart:colend,mu_r_index]
+    mu_rdot_n = view(mtile.impdot_n,colstart:colend,mu_r_index)
+    mu_rdot_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_r_index)
+    mu_rdot_nm2 = view(mtile.impdot_nm2,colstart:colend,mu_r_index)
+
+    # Calculate mu_sat_nstar
+    mu_sat_nstar = mtile.var_np1[colstart:colend,mu_sat_index]
+    mu_sat_dot_n = view(mtile.impdot_n,colstart:colend,mu_sat_index)
+    mu_sat_dot_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
+    mu_sat_dot_nm2 = view(mtile.impdot_nm2,colstart:colend,mu_sat_index)
+
+    # Add the implicit terms
+    ts_term = 0.0
+    if (t == 1)
+        # Use trapezoidal method (AM2) for first step
+        ts_term = 0.5 * ts * mtile.model.physical_params[:Kvdiff]
+        s_nstar .= @. s_nstar + (ts * 0.5 * sdot_n)
+        mu_nstar .= @. mu_nstar + (ts * 0.5 * mudot_n)
+        mu_c_nstar .= @. mu_c_nstar + (ts * 0.5 * mu_cdot_n)
+        mu_r_nstar .= @. mu_r_nstar + (ts * 0.5 * mu_rdot_n)
+        mu_sat_nstar .= @. mu_sat_nstar + (ts * 0.5 * mu_sat_dot_n)
+    else
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts * mtile.model.physical_params[:Kvdiff]
+        s_nstar .= @. s_nstar - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
+        mu_nstar .= @. mu_nstar - (ts * mudot_n) + (ts * 0.75 * mudot_nm1)
+        mu_c_nstar .= @. mu_c_nstar - (ts * mu_cdot_n) + (ts * 0.75 * mu_cdot_nm1)
+        mu_r_nstar .= @. mu_r_nstar - (ts * mu_rdot_n) + (ts * 0.75 * mu_rdot_nm1)
+        mu_sat_nstar .= @. mu_sat_nstar - (ts * mu_sat_dot_n) + (ts * 0.75 * mu_sat_dot_nm1)
+    end
+
+    # Set the n-1 and n-2 terms
+    sdot_nm2 .= sdot_nm1
+    sdot_nm1 .= sdot_n
+    mudot_nm2 .= mudot_nm1
+    mudot_nm1 .= mudot_n
+    mu_cdot_nm2 .= mu_cdot_nm1
+    mu_cdot_nm1 .= mu_cdot_n
+    mu_rdot_nm2 .= mu_rdot_nm1
+    mu_rdot_nm1 .= mu_rdot_n
+    mu_sat_dot_nm2 .= mu_sat_dot_nm1
+    mu_sat_dot_nm1 .= mu_sat_dot_n
+
+    # Set up the matrix problem
+    nz = mtile.model.grid_params.zDim
+    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["s"]])
+
+    # Solve for the coefficients
+    h_a = mtile.diffusion_matrix
+    if t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_diffusion_matrix(mtile.model, ts_term)
+    end
+
+    # Set s_n+1
+    g = s_nstar
+    g = [0.0 ; 0.0; g[2:nz-1]]
+    col.a .= h_a \ g
+    view(mtile.var_np1,colstart:colend,s_index) .= CItransform!(col)
+
+    # Set mu_n+1
+    g = mu_nstar
+    g = [0.0 ; 0.0; g[2:nz-1]]
+    col.a .= h_a \ g
+    view(mtile.var_np1,colstart:colend,mu_index) .= CItransform!(col)
+
+    # Set mu_c_n+1
+    g = mu_c_nstar
+    g = [0.0 ; 0.0; g[2:nz-1]]
+    col.a .= h_a \ g
+    view(mtile.var_np1,colstart:colend,mu_c_index) .= CItransform!(col)
+
+    # Set mu_r_n+1
+    g = mu_r_nstar
+    g = [0.0 ; 0.0; g[2:nz-1]]
+    col.a .= h_a \ g
+    view(mtile.var_np1,colstart:colend,mu_r_index) .= CItransform!(col)
+
+    # Set mu_sat_n+1
+    g = mu_sat_nstar
+    g = [0.0 ; 0.0; g[2:nz-1]]
+    col.a .= h_a \ g
+    view(mtile.var_np1,colstart:colend,mu_sat_index) .= CItransform!(col)
+
+end
+
 function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     for v in 1:length(mtile.model.grid_params.vars)
@@ -774,10 +903,25 @@ function calc_Helmholtz_semiimplicit_matrix(model::ModelParameters, Pxi_bar::Flo
     dct = Chebyshev.dct_matrix(nz)
     column_length = model.grid_params.zmax - model.grid_params.zmin
     dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
-    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
+    #dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
     h = (ts_term .* ts_term .* Pxi_bar) .* dct2 .- dct
     bc1 = (ts_term .* ts_term .* Pxi_bar) .* dct[1,:]
     bc2 = (ts_term .* ts_term .* Pxi_bar) .* dct[nz,:]
+    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
+    return factorize(h_a)
+end
+
+function calc_Helmholtz_diffusion_matrix(model::ModelParameters, ts_term::Float64)
+
+    # Calculate the Helmholtz matrix
+    nz = model.grid_params.zDim
+    dct = Chebyshev.dct_matrix(nz)
+    column_length = model.grid_params.zmax - model.grid_params.zmin
+    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
+    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
+    h = dct .- (ts_term .* dct2)
+    bc1 = dct1[1,:]
+    bc2 = dct1[nz,:]
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     return factorize(h_a)
 end

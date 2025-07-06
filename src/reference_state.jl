@@ -85,27 +85,6 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
         end
     end
 
-    #for i = 2:length(z)
-    #    found = false
-    #    for j = 2:length(alt)
-    #        if (alt[j-1] < z[i]) && (alt[j] > z[i])
-    #            # Found the interpolating levels
-    #            theta[i] = theta_in[j-1] + (z[i] - alt[j-1]) * (theta_in[j] - theta_in[j-1])/(alt[j] - alt[j-1])
-    ##            q_v[i] = q_v_in[j-1] + (z[i] - alt[j-1]) * (q_v_in[j] - q_v_in[j-1])/(alt[j] - alt[j-1])
-    #            found = true
-    #        elseif alt[j] == z[i]
-    #            # Model level and reference level are the same
-    #            theta[i] = theta_in[j]
-    #            q_v[i] = q_v_in[j]
-    #            found = true
-    ##        end
-    #    end
-    #    if !found
-    #        # Can't find the level
-    #        throw(DomainError(i, "Can't find an interpolating level for reference state"))
-    #    end
-    #end
-
     # Re-integrate with Chebyshev column to get hydrostatic balance
     # If max_wavenumber is specified then use that, otherwise use the model configuration
     if (max_wavenumber > 0)
@@ -221,7 +200,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     p_bar = [x[4] for x in thermo]      # Total air pressure
     q_bar = [x[1] for x in thermo]
     q_sat = q_sat_liquid.(T_bar, p_bar)
-    column.uMish[:] .= q_bar ./ q_sat
+    column.uMish[:] .= mu_transform.(q_bar ./ q_sat)
     CBtransform!(column)
     CAtransform!(column)
     sat_ratio = CItransform!(column)

@@ -672,11 +672,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     mu_r_z = view(grid.physical,colstart:colend,7,4)
     mu_r_zz = view(grid.physical,colstart:colend,7,5)
 
-    sat_prime = view(grid.physical,colstart:colend,8,1)
-    sat_prime_x = view(grid.physical,colstart:colend,8,2)
-    sat_prime_xx = view(grid.physical,colstart:colend,8,3)
-    sat_prime_z = view(grid.physical,colstart:colend,8,4)
-    sat_prime_zz = view(grid.physical,colstart:colend,8,5)
+    sat_ratio = view(grid.physical,colstart:colend,8,1)
+    sat_ratio_x = view(grid.physical,colstart:colend,8,2)
+    sat_ratio_xx = view(grid.physical,colstart:colend,8,3)
+    sat_ratio_z = view(grid.physical,colstart:colend,8,4)
+    sat_ratio_zz = view(grid.physical,colstart:colend,8,5)
 
     # Get reference state
     sbar = refstate.sbar[:,1]
@@ -702,15 +702,15 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_c_total = inv_mu_transform.(mu_c .+ mubar) # Cloud mixing ratio
-    q_c = q_c_total .- q_v # Condensate mixing ratio
+    q_c_total = inv_mu_transform.(mu_c) # Cloud mixing ratio
+    q_c = q_c_total #.- q_v # Condensate mixing ratio
     mu_c_factor = dmudq.(mu_c, q_c_total)
     q_c[q_c .<= 1.0e-12] .= 0.0       # 4.1e-9 is a threshold for 1 micron drop per cm^3 at 1 kg/m^3
-    q_r_total = inv_mu_transform.(mu_r .+ mubar) # Rain mixing ratio
-    q_r = q_r_total .- q_c_total # Precipitation mixing ratio
+    q_r_total = inv_mu_transform.(mu_r) # Rain mixing ratio
+    q_r = q_r_total #.- q_c_total # Precipitation mixing ratio
     q_r[q_r .<= 1.0e-12] .= 0.0
     mu_r_factor = dmudq.(mu_r, q_r_total)
-    q_r_z = (mu_r_z ./ mu_r_factor) .- (mu_c_z ./ mu_c_factor) # Perturbation rain gradient in z
+    q_r_z = (mu_r_z ./ mu_r_factor) #.- (mu_c_z ./ mu_c_factor) # Perturbation rain gradient in z
     q_l = q_c .+ q_r                # Liquid mixing ratio
     q_t = q_v .+ q_l                # Total water mixing ratio
     rho_t = rho_d .* (1.0 .+ q_t)   # Total air density
@@ -740,9 +740,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
 
     # Condensation rate
-    sat_ratio = sat_prime .+ satbar # Saturation ratio
+    #sat_ratio = inv_mu_transform.(sat_ratio .+ satbar) # Saturation ratio
+    #mu_sat_factor = dmudq.(sat_ratio, sat_ratio)
     q_sat = q_sat_liquid.(Tk, p)
-    sat_ratio_adj = max.(sat_ratio, 1.0e-6)
+    #sat_ratio = q_v ./ q_sat # Saturation ratio
+    sat_ratio_adj = sat_ratio #max.(sat_ratio, 1.0e-6)
     qss = (q_sat .* sat_ratio_adj) .- q_sat # qss / q_sat = (q_v .- q_sat)/q_sat
     max_N_c = 100.0
 
@@ -763,7 +765,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     end
     # Rain evaporation rate
     mean_r = 250.0 # Mean radius of rain drops in microns
-    q_evap = q_evaporation.(sat_ratio_adj, Tk, p, rho_d, q_v, q_r, mean_r)
+    q_evap = 0.0 #q_evaporation.(sat_ratio_adj, Tk, p, rho_d, q_v, q_r, mean_r)
     for i in 1:length(q_evap)
         if isnan(q_evap[i]) || abs(q_evap[i]) > 1.0
             println("q_evap is NaN at index $i")
@@ -807,13 +809,13 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     end
 
     # Autoconversion rate
-    q_auto = autoconversion.(q_c, rho_d) 
+    q_auto = 0.0 #autoconversion.(q_c, rho_d) 
 
     # Collection rate
-    q_coll = collection.(q_c, q_r, rho_d, Tk) 
+    q_coll = 0.0 #collection.(q_c, q_r, rho_d, Tk) 
 
     # Sedimentation rate
-    Vt = sedimentation.(q_r, rho_d, Tk)
+    Vt = 0.0 #sedimentation.(q_r, rho_d, Tk)
 
     # Calculate the flux divergence of the falling precipitation
 
@@ -835,7 +837,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     # Mixing length based on Louis parameterization
     Sv = sqrt.((u_z .* u_z))
     lv = 1.0 ./ ((1.0 ./ (0.4 .* z)) .+ (1.0 ./ 80.0))
-    Kv = (lv.^2) .* Sv
+    Kv = 0.0 #(lv.^2) .* Sv
 
     # Smagorsinski length scale
     #lh = 100.0
@@ -850,8 +852,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
     FORCING .= @. s_cond + s_div 
-    @turbo KDIFF .= @. Khdiff * s_xx + Kvdiff * s_zz + rayleigh_coeff * s
-    @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo KDIFF .= @. Khdiff * s_xx + rayleigh_coeff * s
+    @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF #+ VDIFF
+    impdot[colstart:colend,1] .= @. Kvdiff * s_zz
 
     @turbo ADV .= @. (-u * xi_x) + (-w * (xi_z + xibar_z)) #XI ADV
     @turbo FORCING .= @. - u_x - w_z
@@ -866,9 +869,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
     FORCING .= @. (q_evap - q_cond) * mu_factor
-    @turbo KDIFF .= @. Khdiff * mu_xx + Kvdiff * mu_zz + rayleigh_coeff * mu
-    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,3] .= @. q_v
+    @turbo KDIFF .= @. Khdiff * mu_xx + rayleigh_coeff * mu
+    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF #+ VDIFF
+    impdot[colstart:colend,3] .= @. Kvdiff * mu_zz
 
     # Differentiate u turbulent flux
     col.uMish .= rho_d .* Kv .* u_z
@@ -878,8 +881,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     @turbo ADV .= @. (-u * u_x) + (-w * u_z) #UADV
     @turbo FORCING .= @. -dpdx / rho_t  #UPGF
-    @turbo KDIFF .= @. Khdiff * u_xx + Kvdiff * u_zz + rayleigh_coeff * u
-    @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo KDIFF .= @. Khdiff * u_xx + rayleigh_coeff * u
+    @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF #+ VDIFF
+    impdot[colstart:colend,4] .= @. Kvdiff * u_zz
 
     # Differentiate w turbulent flux
     col.uMish .= rho_d .* Kv .* w_z
@@ -889,8 +893,8 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
     @turbo FORCING .= @.  ((-gravity * rho_p) - dpdz) / rho_t
-    @turbo KDIFF .= @. Khdiff * w_xx + Kvdiff * w_zz + rayleigh_coeff * w
-    @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo KDIFF .= @. Khdiff * w_xx + rayleigh_coeff * w
+    @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF #+ VDIFF
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
     # Differentiate Kv * du/dz
@@ -900,7 +904,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     VDIFF .= (CIxtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_c_x) + (-w * (mu_c_z + mubar_z)) #Q_C ADV
-    FORCING .= @. (-q_auto -q_coll + q_evap) * mu_c_factor # Condensation forcing
+    FORCING .= @. (q_cond -q_auto -q_coll) * mu_c_factor # Condensation forcing
     for i in 1:length(FORCING)
         if isnan(FORCING[i]) #|| abs(FORCING[i]) > 100.0
             println("FORCING is large at index $i, $colstart")
@@ -915,8 +919,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
             error("NaN found at time $(t)!")
         end
     end
-    @turbo KDIFF .= @. Khdiff * mu_c_xx + Kvdiff * mu_c_zz + rayleigh_coeff * mu_c
-    @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo KDIFF .= @. Khdiff * mu_c_xx + rayleigh_coeff * mu_c
+    @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF #+ VDIFF
+    impdot[colstart:colend,6] .= @. Kvdiff * mu_c_zz
 
     # Differentiate Kv * du/dz
     col.uMish .= rho_d .* Kv .* (mu_r_z)
@@ -925,21 +930,22 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     VDIFF .= (CIxtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_r_x) + (-w * (mu_r_z + mubar_z)) #Q_R ADV
-    FORCING .= @. 0.0 #(-Vt_flux) * mu_r_factor # Precipitation forcing
+    FORCING .= @. (q_auto +q_coll -q_evap -Vt_flux) * mu_r_factor # Precipitation forcing
     @turbo KDIFF .= @. Khdiff * mu_r_xx + Kvdiff * mu_r_zz + rayleigh_coeff * mu_r
-    @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo expdot[colstart:colend,7] .= @. 0.0 #ADV + FORCING + KDIFF + VDIFF
+    impdot[colstart:colend,7] .= @. Kvdiff * mu_r_zz
 
     # Differentiate Kv * du/dz
-    col.uMish .= rho_d .* Kv .* (sat_prime_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    #col.uMish .= rho_d .* Kv .* (sat_ratio_z)
+    #CBtransform!(col)
+    #CAtransform!(col)
+    #VDIFF .= (CIxtransform(col)) ./ rho_d
 
-    @turbo ADV .= @. (-u * sat_prime_x) + (-w * (sat_prime_z + satbar_z)) #QSS ADV
-    FORCING .= @. sat_forcing #* dmudq.(mu_sat, sat_ratio)
-    @turbo KDIFF .= @. Khdiff * sat_prime_xx + Kvdiff * sat_prime_zz + rayleigh_coeff * sat_prime
-    @turbo expdot[colstart:colend,8] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,8] .= @. qss
+    @turbo ADV .= @. (-u * sat_ratio_x) + (-w * sat_ratio_z) #QSS ADV
+    FORCING .= @. sat_forcing #* mu_sat_factor
+    @turbo KDIFF .= @. Khdiff * sat_ratio_xx + rayleigh_coeff * sat_ratio
+    @turbo expdot[colstart:colend,8] .= @. ADV + FORCING + KDIFF #+ VDIFF
+    @turbo impdot[colstart:colend,8] .= @. Kvdiff * sat_ratio_zz 
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
@@ -951,6 +957,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Adjust the condensation rate from the advected supersaturation
     condensation_adjustment(mtile, colstart, colend, t)
+
+    # Use implicit timestep for diffusion
+    #diffusion_timestep(mtile, colstart, colend, t)
 
     # Remove rain from the surface
     #rain_adjustment(mtile, colstart, colend, t)

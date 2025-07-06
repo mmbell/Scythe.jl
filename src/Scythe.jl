@@ -27,6 +27,7 @@ include("semiimplicit.jl")
 include("testModels.jl")
 include("shallowWaterModels.jl")
 include("tcblModels.jl")
+include("primitive_equations.jl")
 include("io.jl")
 include("microphysics.jl")
 
