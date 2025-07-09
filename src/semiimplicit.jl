@@ -905,8 +905,8 @@ function calc_Helmholtz_semiimplicit_matrix(model::ModelParameters, Pxi_bar::Flo
     dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
     #dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
     h = (ts_term .* ts_term .* Pxi_bar) .* dct2 .- dct
-    bc1 = (ts_term .* ts_term .* Pxi_bar) .* dct[1,:]
-    bc2 = (ts_term .* ts_term .* Pxi_bar) .* dct[nz,:]
+    bc1 = dct[1,:]
+    bc2 = dct[nz,:]
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     return factorize(h_a)
 end

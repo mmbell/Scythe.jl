@@ -177,7 +177,7 @@ function s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
     if RH <= 0.0
         RH = 1.0e-6
     end
-    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(RH)) )
+    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*(log(RH)+1.0)) )
     return ds
 end
 
@@ -190,7 +190,7 @@ function s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
     if RH <= 0.0
         RH = 1.0e-6
     end
-    ds = (q_cond - q_evap) * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(RH)) )
+    ds = (q_cond - q_evap) * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*(log(RH)+1.0)) )
     return ds
 end
 
@@ -456,7 +456,7 @@ function condensation_adjustment_new(mtile::ModelTile, colstart::Int64, colend::
     q_sat = q_sat_liquid.(Tk, p)
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
  
-    sat_ratio = inv_mu_transform.(mu_sat)# .+ satbar)
+    sat_ratio = inv_mu_transform.(mu_sat .+ satbar)
     #sat_ratio = max.(sat_ratio, 1.0e-6)
     q_sat = q_sat_liquid.(Tk, p)
     #qss = q_v .- q_sat
@@ -508,12 +508,15 @@ end
 
 function f_ice(Tk)
 
+    # Turn this off for now
+    return 1.0
+
     # From Ooyama (2001)
-    if Tk < 273.15
-        return 0.2 + 0.8 * sech((273.15 - Tk)/5.0)
-    else
-        return 1.0
-    end
+    #if Tk < 273.15
+    #    return 0.2 + 0.8 * sech((273.15 - Tk)/5.0)
+    #else
+    #    return 1.0
+    #end
 end
 
 function df_icedz(Tk)
