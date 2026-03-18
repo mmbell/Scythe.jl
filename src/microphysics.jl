@@ -1,3 +1,19 @@
+"""
+    saturation_adjustment(s, xi, mu, mu_l, tol)
+
+Iteratively adjust the vapor and liquid water mixing ratios to achieve thermodynamic
+equilibrium at saturation using a Newton-Raphson method at constant pressure.
+
+# Arguments
+- `s`: Entropy variable
+- `xi`: Mass variable (related to dry air density)
+- `mu`: Total water variable (transformed mixing ratio)
+- `mu_l`: Liquid water variable (transformed mixing ratio)
+- `tol`: Convergence tolerance for the supersaturation residual [kg/kg]
+
+# Returns
+- `(dq, dT)`: Tuple of the change in vapor mixing ratio [kg/kg] and temperature adjustment [K]
+"""
 function saturation_adjustment(s, xi, mu, mu_l, tol)
 
     incr = 1.0e-6
@@ -63,6 +79,22 @@ function saturation_adjustment(s, xi, mu, mu_l, tol)
     return (dq, dT)
 end
 
+"""
+    linear_saturation_adjustment(qss, Tk, p, q_v, q_l)
+
+Compute a linearized saturation adjustment for the vapor mixing ratio, accounting for
+the dependence of saturation on temperature via the `Q_s` factor.
+
+# Arguments
+- `qss`: Supersaturation mixing ratio (q_v - q_sat) [kg/kg]
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_l`: Liquid water mixing ratio [kg/kg]
+
+# Returns
+- `dq`: Change in vapor mixing ratio due to condensation or evaporation [kg/kg]
+"""
 function linear_saturation_adjustment(qss, Tk, p, q_v, q_l)
 
     # Check to see if evaporation or condensation are possible
@@ -81,6 +113,28 @@ function linear_saturation_adjustment(qss, Tk, p, q_v, q_l)
     return dq
 end
 
+"""
+    q_condensation_qss(qss, Tk, p, rho_d, q_v, q_c, q_r, N_c)
+
+Compute the condensation rate scaled by the condensation timescale, using the
+supersaturation mixing ratio and cloud droplet properties.
+
+# Arguments
+- `qss`: Supersaturation mixing ratio (q_v - q_sat) [kg/kg]
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_c`: Cloud water mixing ratio [kg/kg]
+- `q_r`: Rain water mixing ratio [kg/kg]
+- `N_c`: Cloud droplet number concentration [#/cm³]
+
+# Returns
+- `q_cond`: Condensation rate scaled by the inverse condensation timescale [kg/kg/s]
+
+# References
+- Ooyama (2001)
+"""
 function q_condensation_qss(qss, Tk, p, rho_d, q_v, q_c, q_r, N_c)
 
     q_l = q_c + q_r
@@ -105,6 +159,28 @@ function q_condensation_qss(qss, Tk, p, rho_d, q_v, q_c, q_r, N_c)
     return q_cond #, cloudtau
 end
 
+"""
+    q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
+
+Compute the condensation or evaporation rate for cloud droplets using explicit
+droplet growth physics, including nucleation via a Twomey-type activation and
+a minimum droplet radius threshold.
+
+# Arguments
+- `sat_ratio`: Saturation ratio (q_v / q_sat) [dimensionless]
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_c`: Cloud water mixing ratio [kg/kg]
+- `max_N_c`: Maximum cloud droplet number concentration [#/cm³]
+
+# Returns
+- `q_cond`: Condensation rate [kg/kg/s]
+
+# References
+- Ooyama (2001)
+"""
 function q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
 
     q_cond = 0.0
@@ -148,6 +224,27 @@ function q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
     return q_cond
 end
 
+"""
+    q_evaporation(sat_ratio, Tk, p, rho_d, q_v, q_r, mean_r)
+
+Compute the evaporation rate of rain drops using explicit droplet growth physics.
+Evaporation occurs only when the environment is subsaturated and rain water is present.
+
+# Arguments
+- `sat_ratio`: Saturation ratio (q_v / q_sat) [dimensionless]
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_r`: Rain water mixing ratio [kg/kg]
+- `mean_r`: Mean radius of rain drops [μm]
+
+# Returns
+- `q_evap`: Evaporation rate (positive definite, vapor source) [kg/kg/s]
+
+# References
+- Ooyama (2001)
+"""
 function q_evaporation(sat_ratio, Tk, p, rho_d, q_v, q_r, mean_r)
 
     q_evap = 0.0
@@ -168,6 +265,24 @@ function q_evaporation(sat_ratio, Tk, p, rho_d, q_v, q_r, mean_r)
     return q_evap
 end
 
+"""
+    s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
+
+Compute the entropy source/sink due to condensation or evaporation of cloud water.
+The entropy change accounts for latent heating, liquid heat capacity, and vapor
+pressure contributions.
+
+# Arguments
+- `q_cond`: Condensation rate (positive for condensation, negative for evaporation) [kg/kg/s]
+- `Tk`: Temperature [K]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_l`: Total liquid water mixing ratio [kg/kg]
+- `p`: Pressure [hPa]
+
+# Returns
+- `ds`: Entropy tendency due to condensation [J/(kg·K·s)]
+"""
 function s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
     Cm = (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
@@ -181,6 +296,25 @@ function s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
     return ds
 end
 
+"""
+    s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
+
+Compute the entropy source/sink due to the net effect of condensation and evaporation.
+This method accepts separate condensation and evaporation rates and computes the
+entropy change from their difference.
+
+# Arguments
+- `q_evap`: Evaporation rate (positive definite) [kg/kg/s]
+- `q_cond`: Condensation rate (positive for condensation) [kg/kg/s]
+- `Tk`: Temperature [K]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_l`: Total liquid water mixing ratio [kg/kg]
+- `p`: Pressure [hPa]
+
+# Returns
+- `ds`: Entropy tendency due to net phase change [J/(kg·K·s)]
+"""
 function s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
 
     Cm = (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
@@ -194,6 +328,22 @@ function s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
     return ds
 end
 
+"""
+    s_vapor_mixing(q_flux, Tk, rho_d, q_v)
+
+Compute the entropy change due to external addition or removal of water vapor
+without phase change (e.g., turbulent mixing or surface fluxes). The heating terms
+are zero, so only the vapor entropy contribution remains.
+
+# Arguments
+- `q_flux`: Rate of vapor mixing ratio change from external sources [kg/kg/s]
+- `Tk`: Temperature [K]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+
+# Returns
+- `ds`: Entropy tendency due to vapor mixing [J/(kg·K·s)]
+"""
 function s_vapor_mixing(q_flux, Tk, rho_d, q_v)
 
     # If vapor is mixed or externally added or removed without condensation
@@ -202,6 +352,22 @@ function s_vapor_mixing(q_flux, Tk, rho_d, q_v)
     return ds
 end
 
+"""
+    Q_s_factor(Tk, p, q_v, q_l)
+
+Compute the thermodynamic factor Q_s that accounts for the temperature dependence
+of the saturation mixing ratio in the linearized condensation equation. This factor
+appears in the denominator of the saturation adjustment (1 + Q_s).
+
+# Arguments
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_l`: Liquid water mixing ratio [kg/kg]
+
+# Returns
+- `Q_s`: Dimensionless thermodynamic factor [dimensionless]
+"""
 function Q_s_factor(Tk, p, q_v, q_l)
 
     q_sat = q_sat_liquid(Tk, p)
@@ -210,6 +376,23 @@ function Q_s_factor(Tk, p, q_v, q_l)
     Q_s = L_v(Tk) * dqsdT /(Cpd + ((q_v) * Cpv) + ((q_l) * Cl))
 end
 
+"""
+    dqsdp(Tk, p, rho_d, q_v, q_l)
+
+Compute the derivative of the saturation mixing ratio with respect to pressure,
+accounting for both the direct pressure dependence and the indirect effect through
+temperature changes at constant entropy.
+
+# Arguments
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_l`: Liquid water mixing ratio [kg/kg]
+
+# Returns
+- `dqsdp`: Pressure derivative of saturation mixing ratio [kg/kg/hPa]
+"""
 function dqsdp(Tk, p, rho_d, q_v, q_l)
 
     q_sat = q_sat_liquid(Tk, p)
@@ -219,6 +402,21 @@ function dqsdp(Tk, p, rho_d, q_v, q_l)
     return dqsdp
 end
 
+"""
+    invtau_condensation(Tk, p, N_c, r_c)
+
+Compute the inverse condensation timescale (1/τ) based on vapor diffusivity and
+cloud droplet properties. A larger value indicates faster relaxation toward saturation.
+
+# Arguments
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `N_c`: Cloud droplet number concentration [#/cm³]
+- `r_c`: Cloud droplet radius [μm]
+
+# Returns
+- `invtau`: Inverse condensation timescale [1/s]
+"""
 function invtau_condensation(Tk, p, N_c, r_c)
 
     Dv = vapor_diffusivity(Tk, p)
@@ -227,6 +425,20 @@ function invtau_condensation(Tk, p, N_c, r_c)
     return invtau
 end
 
+"""
+    cloud_droplet_radius(N_c, q_c, rho_d)
+
+Compute the mean cloud droplet radius assuming a monodisperse distribution of
+spherical liquid water droplets.
+
+# Arguments
+- `N_c`: Cloud droplet number concentration [#/cm³]
+- `q_c`: Cloud water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+
+# Returns
+- `r_c`: Mean cloud droplet radius [μm]
+"""
 function cloud_droplet_radius(N_c, q_c, rho_d)
 
     # Nc in #/cm^3, r_c in microns
@@ -241,6 +453,21 @@ function cloud_droplet_radius(N_c, q_c, rho_d)
     return r_c
 end
 
+"""
+    cloud_droplet_number(r_c, q_c, rho_d)
+
+Compute the cloud droplet number concentration given a known droplet radius and
+cloud water content, assuming a monodisperse distribution of spherical droplets.
+This is the inverse of [`cloud_droplet_radius`](@ref).
+
+# Arguments
+- `r_c`: Cloud droplet radius [μm]
+- `q_c`: Cloud water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+
+# Returns
+- `N_c`: Cloud droplet number concentration [#/cm³]
+"""
 function cloud_droplet_number(r_c, q_c, rho_d)
 
     if r_c == 0.0
@@ -254,6 +481,21 @@ function cloud_droplet_number(r_c, q_c, rho_d)
     return N_c * 1.0e-6 # Convert to #/cm^3
 end
 
+"""
+    vapor_diffusivity(Tk, p)
+
+Compute the diffusivity of water vapor in air as a function of temperature and pressure.
+
+# Arguments
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+
+# Returns
+- `Dv`: Vapor diffusivity [cm²/s]
+
+# References
+- Pruppacher & Klett (1997)
+"""
 function vapor_diffusivity(Tk, p)
 
     # From Pruppacher and Klett, 1997
@@ -262,6 +504,20 @@ function vapor_diffusivity(Tk, p)
     return 0.211 * (Tk/273.15)^1.94 * (1013.25/p)
 end
 
+"""
+    condensation_adjustment(mtile, colstart, colend, t)
+
+Perform a saturation adjustment on the model tile columns, updating entropy (`s`),
+total water (`mu`), and cloud water (`mu_c`) in place. Uses an explicit Euler method
+with a relaxation timescale factor of 0.25. The supersaturation is diagnosed from
+an advected saturation ratio variable.
+
+# Arguments
+- `mtile::ModelTile`: Model tile containing prognostic and reference state variables
+- `colstart::Int64`: Starting index of the column range to adjust
+- `colend::Int64`: Ending index of the column range to adjust
+- `t::Int64`: Current time step index
+"""
 function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Calculate the condensation rate from the advected variables
@@ -349,6 +605,20 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
 
 end
 
+"""
+    condensation_adjustment_BF02(mtile, colstart, colend, t)
+
+Perform a saturation adjustment using the Bryan & Fritsch (2002) approach, updating
+entropy (`s`), total water (`mu`), and cloud water (`mu_c`) in place. The supersaturation
+is diagnosed directly from the thermodynamic state (q_v - q_sat) rather than an
+advected saturation variable. Uses untransformed q_v stored in implicit forcing arrays.
+
+# Arguments
+- `mtile::ModelTile`: Model tile containing prognostic and reference state variables
+- `colstart::Int64`: Starting index of the column range to adjust
+- `colend::Int64`: Ending index of the column range to adjust
+- `t::Int64`: Current time step index
+"""
 function condensation_adjustment_BF02(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Calculate the condensation rate from the advected variables
@@ -425,6 +695,19 @@ function condensation_adjustment_BF02(mtile::ModelTile, colstart::Int64, colend:
 
 end
 
+"""
+    condensation_adjustment_new(mtile, colstart, colend, t)
+
+Perform a saturation adjustment using an advected saturation ratio variable with
+reference state separation. Updates entropy (`s`), total water (`mu`), and cloud
+water (`mu_c`) in place. Includes both cloud and rain water in the liquid budget.
+
+# Arguments
+- `mtile::ModelTile`: Model tile containing prognostic and reference state variables
+- `colstart::Int64`: Starting index of the column range to adjust
+- `colend::Int64`: Ending index of the column range to adjust
+- `t::Int64`: Current time step index
+"""
 function condensation_adjustment_new(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Calculate the condensation rate from the advected variables
@@ -494,6 +777,22 @@ function condensation_adjustment_new(mtile::ModelTile, colstart::Int64, colend::
 
 end
 
+"""
+    autoconversion(q_c, rho_d)
+
+Compute the autoconversion rate of cloud water to rain water. Cloud water exceeding
+a threshold of 1 g/kg is converted to rain at a rate of 0.001 per second.
+
+# Arguments
+- `q_c`: Cloud water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+
+# Returns
+- `q_auto`: Autoconversion rate [kg/kg/s]
+
+# References
+- Ooyama (2001)
+"""
 function autoconversion(q_c, rho_d)
 
     # From Ooyama (2001)
@@ -504,6 +803,24 @@ function autoconversion(q_c, rho_d)
     return q_auto
 end
 
+"""
+    collection(q_c, q_r, rho_d, Tk)
+
+Compute the collection (accretion) rate at which rain drops collect cloud droplets,
+modulated by the ice fraction factor.
+
+# Arguments
+- `q_c`: Cloud water mixing ratio [kg/kg]
+- `q_r`: Rain water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+- `Tk`: Temperature [K]
+
+# Returns
+- `q_coll`: Collection rate [kg/kg/s]
+
+# References
+- Ooyama (2001)
+"""
 function collection(q_c, q_r, rho_d, Tk)
 
     # From Ooyama (2001)
@@ -514,6 +831,21 @@ function collection(q_c, q_r, rho_d, Tk)
     return q_coll
 end
 
+"""
+    f_ice(Tk)
+
+Compute the ice fraction factor that modulates microphysical process rates at
+subfreezing temperatures. Currently returns 1.0 (ice effects disabled).
+
+# Arguments
+- `Tk`: Temperature [K]
+
+# Returns
+- Ice fraction factor [dimensionless], currently always 1.0
+
+# References
+- Ooyama (2001)
+"""
 function f_ice(Tk)
 
     # Turn this off for now
@@ -527,6 +859,22 @@ function f_ice(Tk)
     #end
 end
 
+"""
+    df_icedz(Tk)
+
+Compute the vertical derivative of the ice fraction factor with respect to height.
+Used in the sedimentation flux divergence calculation. Returns zero for temperatures
+at or above freezing.
+
+# Arguments
+- `Tk`: Temperature [K]
+
+# Returns
+- Vertical derivative of the ice fraction [1/m]
+
+# References
+- Ooyama (2001)
+"""
 function df_icedz(Tk)
 
     # From Ooyama (2001)
@@ -539,6 +887,25 @@ function df_icedz(Tk)
     end
 end
 
+"""
+    rain_evaporation(q_r, rho_d, Tk, p)
+
+Compute the rain evaporation coefficient, which is multiplied by the supersaturation
+(qss) to obtain the actual evaporation rate. Accounts for ventilation effects and
+thermodynamic constraints from vapor diffusivity and thermal conductivity.
+
+# Arguments
+- `q_r`: Rain water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+
+# Returns
+- `q_evap`: Rain evaporation coefficient [1/s] (multiply by qss to get rate)
+
+# References
+- Ooyama (2001)
+"""
 function rain_evaporation(q_r, rho_d, Tk, p)
 
     # Set the minimum cloud liquid mixing ratio for evaporation to occur
@@ -557,6 +924,24 @@ function rain_evaporation(q_r, rho_d, Tk, p)
     return q_evap
 end
 
+"""
+    f_ventilation(q_r, rho_d, Tk)
+
+Compute the ventilation factor for rain drops, which enhances the evaporation rate
+due to air flow around falling drops. Depends on the rain water content and the
+ice fraction factor.
+
+# Arguments
+- `q_r`: Rain water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+- `Tk`: Temperature [K]
+
+# Returns
+- `f_vent`: Ventilation factor [dimensionless]
+
+# References
+- Ooyama (2001)
+"""
 function f_ventilation(q_r, rho_d, Tk)
 
     # From Ooyama (2001)
@@ -568,6 +953,24 @@ function f_ventilation(q_r, rho_d, Tk)
     return f_vent
 end
 
+"""
+    sedimentation(q_r, rho_d, Tk)
+
+Compute the mass-weighted terminal fall velocity of rain drops. The velocity is
+negative (downward) and depends on rain water content, air density, and the ice
+fraction factor.
+
+# Arguments
+- `q_r`: Rain water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+- `Tk`: Temperature [K]
+
+# Returns
+- `Vt`: Mass-weighted terminal velocity [m/s] (negative downward)
+
+# References
+- Ooyama (2001)
+"""
 function sedimentation(q_r, rho_d, Tk)
 
     # From Ooyama (2001)
@@ -576,6 +979,26 @@ function sedimentation(q_r, rho_d, Tk)
     return Vt
 end
 
+"""
+    precipitation_flux(q_r, rho_d, Tk, q_r_z, xi_z)
+
+Compute the vertical flux divergence of precipitation due to sedimentation. This
+includes contributions from the vertical gradients of rain mixing ratio and dry
+air density (via xi).
+
+# Arguments
+- `q_r`: Rain water mixing ratio [kg/kg]
+- `rho_d`: Dry air density [kg/m³]
+- `Tk`: Temperature [K]
+- `q_r_z`: Vertical gradient of rain mixing ratio [kg/kg/m]
+- `xi_z`: Vertical gradient of the mass variable xi [1/m]
+
+# Returns
+- `Vt_flux`: Precipitation flux divergence tendency [kg/kg/s]
+
+# References
+- Ooyama (2001)
+"""
 function precipitation_flux(q_r, rho_d, Tk, q_r_z, xi_z)
 
     # From Ooyama (2001)
@@ -587,6 +1010,23 @@ function precipitation_flux(q_r, rho_d, Tk, q_r_z, xi_z)
     return Vt_flux
 end
 
+"""
+    droplet_growth_rate(Tk, p)
+
+Compute the droplet growth rate factor G, which combines the effects of vapor
+diffusivity and thermal conductivity on condensational growth. The growth rate
+of a droplet is dr/dt = G * (S - 1) / r, where S is the saturation ratio.
+
+# Arguments
+- `Tk::Float64`: Temperature [K]
+- `p::Float64`: Pressure [hPa]
+
+# Returns
+- `G`: Droplet growth rate factor [m²/s]
+
+# References
+- Pruppacher & Klett (1997) for vapor diffusivity
+"""
 function droplet_growth_rate(Tk::Float64, p::Float64)
 
     # Tk in K, p in hPa
@@ -599,6 +1039,19 @@ function droplet_growth_rate(Tk::Float64, p::Float64)
     return G
 end
 
+"""
+    rain_adjustment(mtile, colstart, colend, t)
+
+Remove accumulated rain from the lowest model level by adjusting the rain water
+variable (`mu_r`) at the surface. This represents instantaneous precipitation
+removal at the end of each time step.
+
+# Arguments
+- `mtile::ModelTile`: Model tile containing prognostic and reference state variables
+- `colstart::Int64`: Starting index of the column range to adjust
+- `colend::Int64`: Ending index of the column range to adjust
+- `t::Int64`: Current time step index
+"""
 function rain_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Remove rain from the surface

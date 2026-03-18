@@ -2,6 +2,19 @@
 using Statistics
 using LsqFit
 
+"""
+    ReferenceState
+
+Holds the thermodynamic reference (base) state for the model, including vertical profiles
+and their first and second derivatives.
+
+# Fields
+- `sbar::Array{Float64}`: moist entropy profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative [J/(kg K)]
+- `xibar::Array{Float64}`: log dry air density profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative [log(kg/m^3)]
+- `mubar::Array{Float64}`: transformed water vapor mixing ratio profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative
+- `satbar::Array{Float64}`: transformed saturation ratio profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative
+- `Pxi_bar::Float64`: domain-mean speed of sound squared [m^2/s^2]
+"""
 struct ReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
@@ -10,11 +23,38 @@ struct ReferenceState
     Pxi_bar::Float64
 end
 
+"""
+    empty_reference_state()
+
+Create an empty [`ReferenceState`](@ref) with undefined arrays and `Pxi_bar = 0.0`.
+
+Useful as a placeholder when a reference state is not needed (e.g., for simple test models).
+
+# Returns
+- `ReferenceState`: a reference state with uninitialized array fields.
+"""
 function empty_reference_state()
 
     ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
 end
 
+"""
+    calculate_reference_state(model::ModelParameters, z::Array{Float64}, max_wavenumber::Int64=-1)
+
+Calculate a hydrostatic reference state from a sounding file specified in `model.ref_state_file`.
+
+The sounding file is interpolated to model levels, then re-integrated using Chebyshev spectral
+methods to obtain a hydrostatically balanced base state. Iteratively adjusts density and
+temperature to refine the balance.
+
+# Arguments
+- `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
+- `z::Array{Float64}`: vertical coordinate array of model levels [m].
+- `max_wavenumber::Int64`: maximum Chebyshev wavenumber for spectral integration; uses `model.grid_params.b_zDim` if not specified (default: `-1`).
+
+# Returns
+- `ReferenceState`: the computed hydrostatic reference state with entropy, log density, transformed moisture, saturation ratio profiles and their vertical derivatives.
+"""
 function calculate_reference_state(model::ModelParameters, z::Array{Float64}, max_wavenumber::Int64 =-1)
 
     # Open the file with sounding information
@@ -124,7 +164,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     CAtransform!(column)
     mu_new .= CItransform!(column)
     mu_new_z = CIxtransform(column)
-    mu_new_zz = CIxtransform(column)
+    mu_new_zz = CIxxtransform(column)
     q_v_new = inv_mu_transform.(mu_new)
     q_v_new_z = mu_new_z ./ dmudq.(mu_new, q_v_new)
 
@@ -155,7 +195,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     CAtransform!(column)
     s_new .= CItransform!(column)
     s_new_z = CIxtransform(column)
-    s_new_zz = CIxtransform(column)
+    s_new_zz = CIxxtransform(column)
     Tk_new = temperature.(s_new, rho_d_new, q_v_new)
 
     # Adjust density and temperature to refine hydrostatic balance
@@ -218,6 +258,21 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     return ref_state
 end
 
+"""
+    interpolate_reference_file(model::ModelParameters, z::Array{Float64})
+
+Interpolate a sounding file to model levels and compute a reference state using simple
+hydrostatic integration (without Chebyshev spectral re-integration of the raw profiles).
+
+Vertical derivatives are computed afterwards via [`transform_reference_state!`](@ref).
+
+# Arguments
+- `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
+- `z::Array{Float64}`: vertical coordinate array of model levels [m].
+
+# Returns
+- `ReferenceState`: the interpolated reference state with entropy, log density, transformed moisture, and saturation ratio profiles.
+"""
 function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
 
     # Open the file with sounding information
@@ -334,10 +389,27 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     q_bar = inv_mu_transform.(mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
-    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
+    satbar = zeros(Float64,length(z),3)
+    ref_state = ReferenceState(sbar, xibar, mubar, satbar, Pxi_bar)
     return ref_state
 end
 
+"""
+    transform_reference_state!(model::ModelParameters, ref::Array{Float64})
+
+Compute vertical derivatives of a reference state variable in-place using Chebyshev spectral transforms.
+
+Fits the values in `ref[:, 1]` to a Chebyshev polynomial basis, then overwrites
+`ref[:, 1]` with the filtered values, `ref[:, 2]` with the first vertical derivative,
+and `ref[:, 3]` with the second vertical derivative.
+
+# Arguments
+- `model::ModelParameters`: model configuration providing grid parameters for the Chebyshev column.
+- `ref::Array{Float64}`: array of size `(nlevels, 3)` where column 1 holds the variable values; columns 2 and 3 are overwritten with derivatives.
+
+# Returns
+- `ref::Array{Float64}`: the modified array (also mutated in-place).
+"""
 function transform_reference_state!(model::ModelParameters, ref::Array{Float64})
 
     # Calculate vertical derivatives without BCs
@@ -359,6 +431,25 @@ function transform_reference_state!(model::ModelParameters, ref::Array{Float64})
     return ref
 end
 
+"""
+    exact_reference_state(model::ModelParameters, z::Array{Float64})
+
+Read a pre-computed reference state from a file that has already been adjusted to
+hydrostatic balance. Useful for highly idealized simulations and benchmarking.
+
+The file must contain one line per model level with columns: altitude, entropy, log density,
+and transformed moisture. Vertical derivatives are computed via [`transform_reference_state!`](@ref).
+
+# Arguments
+- `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
+- `z::Array{Float64}`: vertical coordinate array of model levels [m].
+
+# Returns
+- `ReferenceState`: the reference state read from file with computed vertical derivatives.
+
+# Throws
+- `DomainError` if a model level does not match the corresponding level in the file.
+"""
 function exact_reference_state(model::ModelParameters, z::Array{Float64})
 
     # Read a reference state file that has already been adjusted to hydrostatic balance
@@ -394,6 +485,7 @@ function exact_reference_state(model::ModelParameters, z::Array{Float64})
     q_bar = inv_mu_transform.(mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
-    ref_state = ReferenceState(sbar, xibar, mubar, Pxi_bar)
+    satbar = zeros(Float64,length(z),3)
+    ref_state = ReferenceState(sbar, xibar, mubar, satbar, Pxi_bar)
     return ref_state
 end

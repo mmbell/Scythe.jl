@@ -1,3 +1,8 @@
+"""
+    LinearAdvection1D(mtile, colstart, colend, t)
+
+1D linear advection equation with constant advection speed and diffusion.
+"""
 function LinearAdvection1D(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #1D Linear advection to test
@@ -19,6 +24,11 @@ function LinearAdvection1D(mtile::ModelTile, colstart::Int64, colend::Int64, t::
 
 end
 
+"""
+    LinearAdvectionRZ(mtile, colstart, colend, t)
+
+2D linear advection test in r-z cylindrical coordinates with diffusion.
+"""
 function LinearAdvectionRZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #2D RZ Linear advection to test
@@ -44,6 +54,11 @@ function LinearAdvectionRZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::
 
 end
 
+"""
+    LinearAdvectionRL(mtile, colstart, colend, t)
+
+2D linear advection test in r-lambda polar coordinates with optional diffusion.
+"""
 function LinearAdvectionRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #2D Linear advection to test
@@ -72,6 +87,11 @@ function LinearAdvectionRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::
 
 end
 
+"""
+    LinearAdvectionRLZ(mtile, colstart, colend, t)
+
+3D linear advection test in r-lambda-z coordinates with diffusion.
+"""
 function LinearAdvectionRLZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #3D Linear advection to test
@@ -97,6 +117,12 @@ function LinearAdvectionRLZ(mtile::ModelTile, colstart::Int64, colend::Int64, t:
 
 end
 
+"""
+    Euler_test(mtile, colstart, colend, t)
+
+Compressible Euler equations in XZ Cartesian coordinates using entropy, log-density, and
+moisture variables. Supports semi-implicit treatment of acoustic modes.
+"""
 function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     
     grid = mtile.tile
@@ -214,7 +240,15 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
 end
 
+"""
+    BF02_test(mtile, colstart, colend, t)
+
+Bryan & Fritsch (2002) moist benchmark test in XZ with condensation and cloud water.
+Deprecated: may produce incorrect results.
+"""
 function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    @warn "BF02_test is deprecated and may produce incorrect results" maxlog=1
 
     grid = mtile.tile
     gridpoints = mtile.tilepoints
@@ -384,6 +418,12 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
 end
 
+"""
+    BF02_test_alt(mtile, colstart, colend, t)
+
+Alternative Bryan & Fritsch (2002) formulation that tracks saturation ratio instead of
+supersaturation mixing ratio. Includes condensation adjustment.
+"""
 function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     grid = mtile.tile
@@ -610,6 +650,12 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
 end
 
+"""
+    rainfall_test(mtile, colstart, colend, t)
+
+Full microphysics test in XZ with cloud water, rain, condensation, autoconversion,
+collection, sedimentation, and Rayleigh damping. Supports semi-implicit acoustic modes.
+"""
 function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     grid = mtile.tile

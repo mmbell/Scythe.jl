@@ -1,3 +1,10 @@
+"""
+    Oneway_ShallowWater_Slab(mtile, colstart, colend, t)
+
+One-way coupled shallow water model with a slab boundary layer in r-lambda coordinates.
+The free-atmosphere shallow water layer provides the pressure gradient to the BL, but
+the BL does not feed back to the shallow water layer.
+"""
 function Oneway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # One-way Shallow Water model on top of slab BL
@@ -112,6 +119,12 @@ function Oneway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
 
 end
 
+"""
+    Twoway_ShallowWater_Slab(mtile, colstart, colend, t)
+
+Two-way coupled shallow water model with a slab boundary layer in r-lambda coordinates.
+Includes mass sink/source feedback from the BL vertical velocity back to the shallow water layer.
+"""
 function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Two-way Shallow Water model on top of slab BL
@@ -232,6 +245,11 @@ function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
 
 end
 
+"""
+    LinearShallowWater1D(mtile, colstart, colend, t)
+
+1D linear shallow water equations with diffusion in the radial direction.
+"""
 function LinearShallowWater1D(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #Linear shallow water equations in 1D
@@ -258,6 +276,11 @@ function LinearShallowWater1D(mtile::ModelTile, colstart::Int64, colend::Int64, 
 
 end
 
+"""
+    LinearShallowWaterRL(mtile, colstart, colend, t)
+
+2D linear shallow water equations in r-lambda polar coordinates with diffusion.
+"""
 function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     #Linear shallow water equations
@@ -297,6 +320,12 @@ function LinearShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, 
 
 end
 
+"""
+    ShallowWaterRL(mtile, colstart, colend, t)
+
+Nonlinear shallow water equations in r-lambda polar coordinates with Coriolis, nonlinear
+advection, and diffusion.
+"""
 function ShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
    
     #Nonlinear shallow water equations
@@ -343,6 +372,13 @@ function ShallowWaterRL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int
 
 end
 
+"""
+    Oneway_ShallowWater_HeightResolvedBL(mtile, colstart, colend, t)
+
+One-way coupled shallow water model with a height-resolved boundary layer in r-lambda-z
+coordinates. Uses Louis mixing length parameterization for vertical diffusivity and
+wind-speed-dependent surface drag.
+"""
 function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Height resolved boundary layer with fixed pressure gradient from shallow water layer
@@ -510,6 +546,12 @@ function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64,
 
 end
 
+"""
+    Oneway_ShallowWater_Slab_Uniform_Flow(mtile, colstart, colend, t)
+
+One-way coupled shallow water model with a slab boundary layer in r-lambda coordinates,
+including a uniform environmental flow specified by storm motion parameters (Um, Vm).
+"""
 function Oneway_ShallowWater_Slab_Uniform_Flow(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # One-way Shallow Water model on top of slab BL

@@ -1,3 +1,10 @@
+"""
+    primitive_equation_XZ(mtile, colstart, colend, t)
+
+Primitive equations in XZ Cartesian coordinates with full microphysics including
+condensation, autoconversion, collection, sedimentation, and turbulent mixing.
+Supports semi-implicit acoustic modes and implicit vertical diffusion.
+"""
 function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     grid = mtile.tile
@@ -311,6 +318,13 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
 end
 
+"""
+    primitive_equation_RZ(mtile, colstart, colend, t)
+
+Primitive equations in axisymmetric r-z cylindrical coordinates with full microphysics,
+surface fluxes (drag, enthalpy), Coriolis force, and turbulent mixing.
+Supports semi-implicit acoustic modes and implicit vertical diffusion.
+"""
 function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     grid = mtile.tile
@@ -383,7 +397,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     mu_r_r = view(grid.physical,colstart:colend,8,2)
     mu_r_rr = view(grid.physical,colstart:colend,8,3)
     mu_r_z = view(grid.physical,colstart:colend,8,4)
-    mu_r_zz = view(grid.physical,colstart:colend,7,5)
+    mu_r_zz = view(grid.physical,colstart:colend,8,5)
 
     mu_sat = view(grid.physical,colstart:colend,9,1)
     mu_sat_r = view(grid.physical,colstart:colend,9,2)
@@ -425,8 +439,8 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     q_r_z = (mu_r_z ./ mu_r_factor)
     #qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
     mu_v_factor = dmudq.(mu_v_total, q_v)
-    qvp_r = mu_r ./ mu_v_factor # Perturbation vapor gradient in x
-    qvp_z = mu_z ./ mu_v_factor # Perturbation vapor gradient in z
+    qvp_r = mu_v_r ./ mu_v_factor # Perturbation vapor gradient in r
+    qvp_z = mu_v_z ./ mu_v_factor # Perturbation vapor gradient in z
     rhobar = dry_density.(xibar) .* (1.0 .+ inv_mu_transform.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
 
@@ -434,7 +448,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Pxi_bar = mtile.ref_state.Pxi_bar
 
     # Pressure gradients
-    dpdr = pressure_gradient.(Tk, rho_d, q_v, s_x, xi_x, qvp_r)
+    dpdr = pressure_gradient.(Tk, rho_d, q_v, s_r, xi_r, qvp_r)
     dpdz = pressure_gradient.(Tk, rho_d, q_v, s_z, xi_z, qvp_z)
 
     # Get relevant surface variables
@@ -556,7 +570,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Calculate vapor mixing first since it is needed for entropy and saturation ratio
     q10 = q_v[z_ref_level]
     col.uMish .= rho_d .* Kv .* (mu_v_z .+ mubar_z)
-    col.uMish[1] = rho_d * Ck * U10 * (q_sfc - q10) * mu_v_factor # Q FLUX
+    col.uMish[1] = rho_d[1] * Ck * U10 * (q_sfc - q10) * mu_v_factor[z_ref_level] # Q FLUX
     CBtransform!(col)
     CAtransform!(col)
     VDIFF .= (CIxtransform(col)) ./ rho_d
@@ -574,7 +588,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Entropy mixing
     s10 = s[z_ref_level]
     col.uMish .= rho_d .* Kv .* (s_z .+ sbar_z)
-    col.uMish[1] = rho_d * Ck * U10 * (s_sfc - s10) # S FLUX
+    col.uMish[1] = rho_d[1] * Ck * U10 * (s_sfc - s10) # S FLUX
     CBtransform!(col)
     CAtransform!(col)
     VDIFF .= (CIxtransform(col)) ./ rho_d
@@ -591,7 +605,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     impdot[colstart:colend,2] .= @. -w_z
 
     col.uMish .= rho_d .* Kv .* u_z
-    col.uMish[1] = rho_d * Cd * U10 * u10 #UDRAG
+    col.uMish[1] = rho_d[1] * Cd * U10 * u10 #UDRAG
     CBtransform!(col)
     CAtransform!(col)
     VDIFF .= (CIxtransform(col)) ./ rho_d
@@ -604,11 +618,11 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo impdot[colstart:colend,4] .= @. Kvdiff * u_zz
 
     col.uMish .= rho_d .* Kv .* v_z
-    col.uMish[1] = Cd * U10 * v10 #VDRAG
+    col.uMish[1] = rho_d[1] * Cd * U10 * v10 #VDRAG
     CBtransform!(col)
     CAtransform!(col)
     VDIFF .= CIxtransform(col)
-    
+
     @turbo ADV .= @. (-u * v_r) + (-w * v_z) #VBADV
     @turbo FORCING .= 0.0 #VBPGF # There is no L pressure gradient in an axisymmetric storm
     COR .= @. (-u * (f + (v / r))) #VBCOR
@@ -655,7 +669,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     @turbo ADV .= @. (-u * mu_sat_r) + (-w * (mu_sat_z + satbar_z)) #QSS ADV
     FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
-    @turbo KDIFF .= @. Khdiff * ((mu_sat/r) + mu_sat_rr)
+    @turbo KDIFF .= @. Khdiff * ((mu_sat_r/r) + mu_sat_rr)
     @turbo expdot[colstart:colend,9] .= @. ADV + FORCING + KDIFF + VDIFF
     @turbo impdot[colstart:colend,9] .= @. Kv_mudiff * mu_sat_zz
 
@@ -678,7 +692,15 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
 end
 
+"""
+    primitive_equation_cylindrical(mtile, colstart, colend, t)
+
+Primitive equations in full r-lambda-z cylindrical coordinates with thermodynamics and
+vertical diffusion. Deprecated: incomplete and should not be used.
+"""
 function primitive_equation_cylindrical(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    @warn "primitive_equation_cylindrical is incomplete and should not be used" maxlog=1
 
     grid = mtile.tile
     gridpoints = mtile.tilepoints

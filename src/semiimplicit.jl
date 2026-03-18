@@ -15,6 +15,12 @@ using SuiteSparse
 export createModelTile, advanceTimestep
 export initialize_model, run_model, finalize_model
 
+"""
+    ModelTile
+
+Fundamental computational unit holding model state, tendencies, reference state,
+and spectral transform infrastructure for a single tile in the domain decomposition.
+"""
 struct ModelTile
     model::ModelParameters
     tile::AbstractGrid
@@ -42,6 +48,12 @@ struct ModelTile
     diffusion_matrix::Factorization
 end
 
+"""
+    createModelTile(patch, tile, model, haloReceiveIndexMap)
+
+Create and initialize a [`ModelTile`](@ref) with allocated state arrays, reference state,
+patch-to-tile mappings, halo exchange buffers, and pre-computed Helmholtz matrices.
+"""
 function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters,
         haloReceiveIndexMap::BitMatrix)
 
@@ -128,6 +140,13 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     return mtile
 end
 
+"""
+    initialize_model(model, workerids)
+
+Set up the distributed model infrastructure by creating the grid patch, distributing
+tiles across workers, initializing halo exchange maps, and preparing for time integration.
+Returns the initialized patch grid.
+"""
 function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     num_workers = length(workerids)
@@ -198,6 +217,12 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     return patch
 end
 
+"""
+    run_model(patch, model, workerids)
+
+Main time integration loop. Establishes `RemoteChannel` connections between workers,
+creates the shared spectral array, and drives the model forward through all timesteps.
+"""
 function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64})
 
     num_workers = length(workerids)
@@ -262,6 +287,12 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
 end
 
+"""
+    model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive, haloInitBuffer, haloReceiveBuffer, haloReceiveIndexMap)
+
+Inner time stepping loop that advances all tiles each timestep, performs halo exchanges
+via `RemoteChannel`s, accumulates spectral contributions, and writes periodic output.
+"""
 function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
         sharedSpectral::SharedArray{Float64}, haloInit::RemoteChannel, haloReceive::RemoteChannel,
         haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveIndexMap::BitMatrix)
@@ -305,7 +336,13 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
     return nothing
 end
 
-function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64}, 
+"""
+    advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, t)
+
+Advance one tile by one timestep: transform to physical space, advance all columns,
+compute spectral tendencies, and exchange halo data with neighboring tiles.
+"""
+function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64)
 
     # Transform to local physical tile
@@ -338,6 +375,12 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     return nothing
 end
 
+"""
+    advance_column(mtile, c, t)
+
+Advance a single column `c` by dispatching to the configured physical model equation set.
+A column index of -1 indicates an R or RL grid where all points are treated as one column.
+"""
 function advance_column(mtile::ModelTile, c::Int64, t::Int64)
 
     # Grab a column of indices
@@ -355,12 +398,23 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
 
 end
 
+"""
+    finalize_model(grid, model)
+
+Write final model output at the end of the integration period.
+"""
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
     
     write_output(grid, model, model.integration_time)
     println("Model complete!")
 end
 
+"""
+    physical_model(mtile, colstart, colend, t)
+
+Dispatch to the appropriate equation set by looking up the function named
+by `mtile.model.equation_set` in the `Scythe` module and calling it on the column range.
+"""
 function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
         
     equation_set = Symbol(mtile.model.equation_set)
@@ -369,6 +423,12 @@ function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int
     return
 end
 
+"""
+    semiimplicit_timestep_old(mtile, colstart, colend, t)
+
+Deprecated semi-implicit timestep variant that solves a Helmholtz equation for xi
+using a direct matrix solve each timestep. Superseded by [`semiimplicit_timestep`](@ref).
+"""
 function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     w_index = mtile.model.grid_params.vars["w"]
@@ -447,6 +507,12 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
 end
 
+"""
+    semiimplicit_adjustment_xi(mtile, colstart, colend, t)
+
+Semi-implicit adjustment that solves a Chebyshev-collocation Helmholtz problem for xi,
+using AB3 explicit extrapolation and AI2* implicit treatment of acoustic modes.
+"""
 function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     w_index = mtile.model.grid_params.vars["w"]
@@ -525,6 +591,12 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
 end
 
+"""
+    semiimplicit_adjustment(mtile, colstart, colend, t)
+
+Semi-implicit adjustment that solves a Chebyshev-collocation Helmholtz problem for w,
+using AB3 explicit extrapolation and AI2* implicit treatment of acoustic modes.
+"""
 function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     w_index = mtile.model.grid_params.vars["w"]
@@ -603,6 +675,12 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* CIxtransform(w_col))
 end
 
+"""
+    semiimplicit_timestep(mtile, colstart, colend, t)
+
+Combined explicit-implicit split timestep for acoustic modes. Applies AI2*-AB3
+time integration with a Helmholtz solve for w to handle the implicit part.
+"""
 function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     w_index = mtile.model.grid_params.vars["w"]
@@ -676,6 +754,12 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* CIxtransform(w_col))
 end
 
+"""
+    diffusion_timestep(mtile, colstart, colend, t)
+
+Implicit vertical diffusion timestep for thermodynamic and moisture variables (s, mu,
+mu_c, mu_r, mu_sat) using a pre-factored Helmholtz matrix and AI2* time integration.
+"""
 function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     s_index = mtile.model.grid_params.vars["s"]
@@ -800,6 +884,12 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
 
 end
 
+"""
+    explicit_timestep(mtile, colstart, colend, t)
+
+Advance all variables one timestep using AB3 explicit time stepping (Euler for t=1,
+second-order AB for t=2, third-order AB3 thereafter per Durran and Blossey 2012).
+"""
 function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     for v in 1:length(mtile.model.grid_params.vars)
@@ -828,6 +918,12 @@ function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::
     end
 end
 
+"""
+    explicit_increment(mtile, colstart, colend, t)
+
+Apply an incremental explicit forcing to the current solution using AB3-consistent
+weighting, and accumulate it into the stored explicit tendencies.
+"""
 function explicit_increment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     for v in 1:length(mtile.model.grid_params.vars)
@@ -856,6 +952,12 @@ function explicit_increment(mtile::ModelTile, colstart::Int64, colend::Int64, t:
     end
 end
 
+"""
+    calcTendency(mtile)
+
+Transform the updated physical-space state in `var_np1` to spectral space,
+storing the result in the tile's spectral array for inter-tile communication.
+"""
 function calcTendency(mtile::ModelTile)
 
     # Set the current time
@@ -865,6 +967,12 @@ function calcTendency(mtile::ModelTile)
     spectralTransform!(mtile.tile)    
 end
 
+"""
+    checkCFL(grid)
+
+Check all physical variables for NaN values, which indicate a likely CFL violation.
+Throws an error if any NaN is found.
+"""
 function checkCFL(grid)
     
     # Check to see if CFL condition may have been violated 
@@ -881,6 +989,12 @@ function checkCFL(grid)
     end
 end
 
+"""
+    calc_Helmholtz_semiimplicit_matrix_xi(model, Pxi_bar, ts_term)
+
+Build and factorize the Chebyshev-collocation Helmholtz matrix for the xi-form
+semi-implicit solve, with derivative boundary conditions at top and bottom.
+"""
 function calc_Helmholtz_semiimplicit_matrix_xi(model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
 
     # Calculate the Helmholtz matrix
@@ -896,6 +1010,12 @@ function calc_Helmholtz_semiimplicit_matrix_xi(model::ModelParameters, Pxi_bar::
     return factorize(h_a)
 end
 
+"""
+    calc_Helmholtz_semiimplicit_matrix(model, Pxi_bar, ts_term)
+
+Build and factorize the Chebyshev-collocation Helmholtz matrix for the w-form
+semi-implicit solve, with Dirichlet boundary conditions at top and bottom.
+"""
 function calc_Helmholtz_semiimplicit_matrix(model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
 
     # Calculate the Helmholtz matrix
@@ -911,6 +1031,12 @@ function calc_Helmholtz_semiimplicit_matrix(model::ModelParameters, Pxi_bar::Flo
     return factorize(h_a)
 end
 
+"""
+    calc_Helmholtz_diffusion_matrix(model, ts_term)
+
+Build and factorize the Chebyshev-collocation Helmholtz matrix for implicit vertical
+diffusion, with Neumann (zero-flux) boundary conditions at top and bottom.
+"""
 function calc_Helmholtz_diffusion_matrix(model::ModelParameters, ts_term::Float64)
 
     # Calculate the Helmholtz matrix

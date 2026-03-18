@@ -4,7 +4,23 @@ module Scythe
 # Infrastructure for model grid representation
 using Springsteel
 
-# Structure to define model parameters
+"""
+    ModelParameters
+
+Main configuration struct for Scythe model runs. Uses `Base.@kwdef` for keyword construction.
+
+# Fields
+- `ts::Float64`: simulation start time [s] (default: `0.0`)
+- `integration_time::Float64`: total integration duration [s] (default: `1.0`)
+- `output_interval::Float64`: time between output writes [s] (default: `1.0`)
+- `equation_set`: name of the equation set to solve (default: `"LinearAdvection1D"`)
+- `initial_conditions`: path to the initial conditions file (default: `"ic.csv"`)
+- `output_dir`: path to the output directory (default: `"./output/"`)
+- `ref_state_file`: path to the reference state sounding file (default: `""`)
+- `grid_params::GridParameters`: Springsteel grid configuration (required, no default)
+- `physical_params::Dict`: dictionary of physical parameters for the equation set (default: empty `Dict`)
+- `options::Dict`: dictionary of solver options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`)
+"""
 Base.@kwdef struct ModelParameters
     ts::Float64 = 0.0
     integration_time::Float64 = 1.0
@@ -35,6 +51,21 @@ include("microphysics.jl")
 export integrate_model
 export ModelParameters
 
+"""
+    integrate_model(model::ModelParameters)
+
+Main entry point for running a Scythe simulation. Initializes worker processes,
+redirects stdout/stderr to log files in the output directory, then runs the model
+through its initialize, run, and finalize stages.
+
+Requires at least one additional Julia worker process (added via `addprocs`).
+
+# Arguments
+- `model::ModelParameters`: the model configuration specifying equation set, grid, timing, and output options.
+
+# Throws
+- `ErrorException` if no worker processes are available.
+"""
 function integrate_model(model::ModelParameters)
 
     if workers()[1] == 1

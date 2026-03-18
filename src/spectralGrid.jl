@@ -8,7 +8,9 @@ using SparseArrays
 # These are declared as submodules to avoid namespace clashes with each other and other packages
 using .CubicBSpline, .Fourier, .Chebyshev
 
-#Define some convenient aliases
+"""
+Type aliases for convenience: `real = Float64`, `int = Int64`, `uint = UInt64`.
+"""
 const real = Float64
 const int = Int64
 const uint = UInt64
@@ -17,6 +19,29 @@ export GridParameters
 export createGrid, calcTileSizes
 export splineTransform!, tileTransform!
 
+"""
+    GridParameters(; kwargs...)
+
+Configuration for the spectral grid used by Scythe models.
+
+# Key fields
+- `geometry::String`: Grid geometry type (`"R"`, `"RZ"`, `"RL"`, `"RLZ"`, or `"Z"`).
+- `xmin::real`, `xmax::real`: Horizontal domain bounds.
+- `num_cells::int`: Number of cubic B-spline cells in the radial/horizontal dimension.
+- `zmin::real`, `zmax::real`: Vertical domain bounds (used by `"RZ"`, `"RLZ"`, and `"Z"` geometries).
+- `zDim::int`: Number of Chebyshev collocation points in the vertical dimension.
+- `vars::Dict`: Dictionary mapping variable names to integer indices.
+- `BCL::Dict`, `BCR::Dict`: Left and right boundary condition dictionaries for the radial dimension.
+- `BCB::Dict`, `BCT::Dict`: Bottom and top boundary condition dictionaries for the vertical dimension.
+- `lDim::int`, `b_lDim::int`: Fourier dimension sizes (used by `"RL"` and `"RLZ"` geometries).
+
+# Derived fields (computed automatically)
+- `rDim`: Physical radial dimension, derived from `num_cells`.
+- `b_rDim`: Spectral radial dimension (`num_cells + 3`).
+- `b_zDim`: Spectral vertical dimension, derived from `zDim`.
+- `spectralIndexL`, `spectralIndexR`: Left and right spectral patch indices.
+- `patchOffsetL`, `patchOffsetR`: Left and right physical patch offsets.
+"""
 Base.@kwdef struct GridParameters
     geometry::String = "R"
     xmin::real = 0.0
@@ -60,6 +85,20 @@ struct Z_Grid <: AbstractGrid
     physical::Array{Float64}
 end
 
+"""
+    createGrid(gp::GridParameters) -> AbstractGrid
+
+Factory function that creates the appropriate grid subtype based on `gp.geometry`.
+
+# Supported geometries
+- `"R"`: 1-D radial/horizontal grid (cubic B-spline).
+- `"RZ"`: 2-D radial–vertical grid (cubic B-spline × Chebyshev).
+- `"RL"`: 2-D radial–azimuthal grid (cubic B-spline × Fourier).
+- `"RLZ"`: 3-D radial–azimuthal–vertical grid (cubic B-spline × Fourier × Chebyshev).
+- `"Z"`: 1-D vertical column grid (not yet implemented).
+
+Throws a `DomainError` for unrecognized or unimplemented geometry strings.
+"""
 function createGrid(gp::GridParameters)
 
     # Call the respective grid factory

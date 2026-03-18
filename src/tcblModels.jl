@@ -1,6 +1,14 @@
 # TCBL models
 
+"""
+    Williams2013_slabTCBL(mtile, colstart, colend)
+
+Williams (2013) slab tropical cyclone boundary layer model in radial coordinates.
+Deprecated: may produce incorrect results.
+"""
 function Williams2013_slabTCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    @warn "Williams2013_slabTCBL is deprecated and may produce incorrect results" maxlog=1
 
     # Williams (2013) slab TCBL
     grid = mtile.tile
@@ -57,7 +65,15 @@ function Williams2013_slabTCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
 
 end
 
+"""
+    RL_SlabTCBL(mtile, colstart, colend)
+
+Slab TCBL in r-lambda polar coordinates based on Williams (2013).
+Deprecated: may produce incorrect results.
+"""
 function RL_SlabTCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    @warn "RL_SlabTCBL is deprecated and may produce incorrect results" maxlog=1
 
     # Williams (2013) slab TCBL in polar coordinates
     grid = mtile.tile
@@ -105,7 +121,15 @@ function RL_SlabTCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
     
 end
 
+"""
+    Kepert2017_TCBL(mtile, colstart, colend)
+
+Kepert (2017) height-resolved TCBL in r-z coordinates with Louis mixing length.
+Deprecated: incomplete, differentiation and integration of K and W need rework.
+"""
 function Kepert2017_TCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    @warn "Kepert2017_TCBL is deprecated and may produce incorrect results" maxlog=1
 
     # This code won't work now! Need to re-do the differentiation and integration of K and W
     
@@ -202,6 +226,12 @@ function Kepert2017_TCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
 
 end
 
+"""
+    Kepert2017_HeightResolvedTCBL(mtile, colstart, colend, t)
+
+Height-resolved axisymmetric TC boundary layer model from Williams (2017) with Louis
+mixing length vertical diffusivity and wind-speed-dependent surface drag.
+"""
 function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Equation set for an axisymmetric, height-resolved TC boundary layer model reproduced 
@@ -350,6 +380,12 @@ function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend
 
 end
 
+"""
+    RLZ_HeightResolvedBL(mtile, colstart, colend, t)
+
+Height-resolved boundary layer in r-lambda-z coordinates with fixed pressure gradient
+from the gradient wind. Uses Louis mixing length and wind-speed-dependent drag.
+"""
 function RLZ_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
     # Height resolved boundary layer with fixed pressure gradient from shallow water layer
