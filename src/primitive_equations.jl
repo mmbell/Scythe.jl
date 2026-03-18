@@ -10,6 +10,7 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Physical parameters
     Khdiff = model.physical_params[:Khdiff]
     Kvdiff = model.physical_params[:Kvdiff]
+    Kv_mudiff = model.physical_params[:Kv_mudiff]
     alpha = model.physical_params[:alpha]
     z_damp = model.physical_params[:z_damp]
 
@@ -99,9 +100,9 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     mu_r_factor = dmudq.(mu_r, q_r) # Factor for perturbation rain mixing ratio
     q_r_z = (mu_r_z ./ mu_r_factor)
     #qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
-    mu_factor = dmudq.(mu_total, q_v)
-    qvp_x = mu_x ./ mu_factor # Perturbation vapor gradient in x
-    qvp_z = mu_z ./ mu_factor # Perturbation vapor gradient in z
+    mu_v_factor = dmudq.(mu_total, q_v)
+    qvp_x = mu_x ./ mu_v_factor # Perturbation vapor gradient in x
+    qvp_z = mu_z ./ mu_v_factor # Perturbation vapor gradient in z
     rhobar = dry_density.(xibar) .* (1.0 .+ inv_mu_transform.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
 
@@ -158,11 +159,6 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
         end
     end
 
-    # Enforce a minimum value for q_v to avoid blowup
-    invq = 1.0 ./ max.(q_v, q0)
-    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
-    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + ((q_evap - q_cond) * (1.0 + Q_s)))/q_sat
-
     # Entropy change due to condensation and evaporation
     s_cond = s_condensation.(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
     for i in 1:length(s_cond)
@@ -209,13 +205,30 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     lv = 1.0 ./ ((1.0 ./ (0.4 .* z)) .+ (1.0 ./ 80.0))
     Kv = (lv.^2) .* Sv
 
+    # Calculate vapor mixing first since it is needed for entropy and saturation ratio
+    col.uMish .= rho_d .* Kv .* (mu_z .+ mubar_z)
+    CBtransform!(col)
+    CAtransform!(col)
+    VDIFF .= CIxtransform(col) ./ rho_d
+    q_flux = VDIFF ./ mu_v_factor
+
+    @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
+    FORCING .= @. (q_evap -q_cond) * mu_v_factor
+    @turbo KDIFF .= @. Khdiff * mu_xx
+    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,3] .= @. Kvdiff * mu_zz
+
+    # Apply the subgrid vapor flux to the entropy
+    s_v_mix = s_vapor_mixing.(q_flux, Tk, rho_d, q_v)
+
+    # Entropy mixing
     col.uMish .= rho_d .* Kv .* (s_z .+ sbar_z)
     CBtransform!(col)
     CAtransform!(col)
     VDIFF .= (CIxtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
-    FORCING .= @. s_cond + s_div
+    FORCING .= @. s_cond + s_div + s_v_mix
     @turbo KDIFF .= @. Khdiff * s_xx
     @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF + VDIFF
     @turbo impdot[colstart:colend,1] .= @. Kvdiff * s_zz
@@ -224,17 +237,6 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo FORCING .= @. - u_x - w_z
     @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
     impdot[colstart:colend,2] .= @. -w_z
-
-    col.uMish .= rho_d .* Kv .* (mu_z .+ mubar_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
-
-    @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
-    FORCING .= @. (q_evap -q_cond) * mu_factor
-    @turbo KDIFF .= @. Khdiff * mu_xx
-    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,3] .= @. Kvdiff * mu_zz
 
     col.uMish .= rho_d .* Kv .* u_z
     CBtransform!(col)
@@ -262,7 +264,7 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     FORCING .= @. (q_cond -q_auto -q_coll) * mu_c_factor
     @turbo KDIFF .= @. Khdiff * mu_c_xx
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,6] .= @. Kvdiff * mu_c_zz
+    @turbo impdot[colstart:colend,6] .= @. Kv_mudiff * mu_c_zz
 
     col.uMish .= rho_d .* Kv .* mu_r_z
     CBtransform!(col)
@@ -273,18 +275,22 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     FORCING .= @. (q_auto +q_coll -q_evap -Vt_flux) * mu_r_factor
     @turbo KDIFF .= @. Khdiff * mu_r_xx
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,7] .= @. Kvdiff * mu_r_zz
+    @turbo impdot[colstart:colend,7] .= @. Kv_mudiff * mu_r_zz
 
     col.uMish .= rho_d .* Kv .* (mu_sat_z + satbar_z)
     CBtransform!(col)
     CAtransform!(col)
     VDIFF .= (CIxtransform(col)) ./ rho_d
 
+    # Saturation forcing
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + q_flux + ((q_evap - q_cond) * (1.0 + Q_s)))/q_sat
+
     @turbo ADV .= @. (-u * mu_sat_x) + (-w * (mu_sat_z + satbar_z)) #QSS ADV
     FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
     @turbo KDIFF .= @. Khdiff * mu_sat_xx
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,8] .= @. Kvdiff * mu_sat_zz
+    @turbo impdot[colstart:colend,8] .= @. Kv_mudiff * mu_sat_zz
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
@@ -317,6 +323,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Physical parameters
     Khdiff = model.physical_params[:Khdiff]
     Kvdiff = model.physical_params[:Kvdiff]
+    Kv_mudiff = model.physical_params[:Kv_mudiff]
     alpha = model.physical_params[:alpha]
     z_damp = model.physical_params[:z_damp]
     Cd = model.physical_params[:Cd]
@@ -430,6 +437,11 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     dpdr = pressure_gradient.(Tk, rho_d, q_v, s_x, xi_x, qvp_r)
     dpdz = pressure_gradient.(Tk, rho_d, q_v, s_z, xi_z, qvp_z)
 
+    # Get relevant surface variables
+    q_sfc = q_sat_liquid(sst, p[1])
+    # Use the near surface density and water vapor so that this is sensible heat flux
+    s_sfc = entropy(sst, rho_d[1], q_v[1])
+
     # Placeholders for intermediate calculations
     ADV = similar(s)
     FORCING = similar(s)
@@ -476,11 +488,6 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
             error("NaN found at time $(t)!")
         end
     end
-
-    # Enforce a minimum value for q_v to avoid blowup
-    invq = 1.0 ./ max.(q_v, q0)
-    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
-    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdr) + (w * (dpdz - rhobar*gravity)))) + ((q_evap - q_cond) * (1.0 + Q_s)))/q_sat
 
     # Entropy change due to condensation and evaporation
     s_cond = s_condensation.(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
@@ -546,15 +553,34 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
         end
     end
 
+    # Calculate vapor mixing first since it is needed for entropy and saturation ratio
+    q10 = q_v[z_ref_level]
+    col.uMish .= rho_d .* Kv .* (mu_v_z .+ mubar_z)
+    col.uMish[1] = rho_d * Ck * U10 * (q_sfc - q10) * mu_v_factor # Q FLUX
+    CBtransform!(col)
+    CAtransform!(col)
+    VDIFF .= (CIxtransform(col)) ./ rho_d
+    q_flux = VDIFF ./ mu_v_factor
+
+    @turbo ADV .= @. (-u * mu_v_r) + (-w * (mu_v_z + mubar_z)) #MUADV
+    FORCING .= @. (q_evap -q_cond) * mu_v_factor
+    @turbo KDIFF .= @. Khdiff * ((mu_v_r / r) + mu_v_rr)
+    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,3] .= @. Kvdiff * mu_v_zz
+
+    # Apply the subgrid vapor flux to the entropy
+    s_v_mix = s_vapor_mixing.(q_flux, Tk, rho_d, q_v)
+
+    # Entropy mixing
     s10 = s[z_ref_level]
     col.uMish .= rho_d .* Kv .* (s_z .+ sbar_z)
-    col.uMish[1] = rho_d * Ck * U10 * (s10 - s_sfc) # S FLUX
+    col.uMish[1] = rho_d * Ck * U10 * (s_sfc - s10) # S FLUX
     CBtransform!(col)
     CAtransform!(col)
     VDIFF .= (CIxtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * s_r) + (-w * (s_z + sbar_z)) #SADV
-    FORCING .= @. s_cond + s_div
+    FORCING .= @. s_cond + s_div + s_v_mix
     @turbo KDIFF .= @. Khdiff * ((s_r/r) + s_rr)
     @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF + VDIFF
     @turbo impdot[colstart:colend,1] .= @. Kvdiff * s_zz
@@ -563,19 +589,6 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo FORCING .= @. - u_r - w_z
     @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
     impdot[colstart:colend,2] .= @. -w_z
-
-    q10 = q_v[z_ref_level]
-    col.uMish .= rho_d .* Kv .* (mu_v_z .+ mubar_z)
-    col.uMish[1] = rho_d * Ck * U10 * (q10 - q_sfc) # Q FLUX
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
-
-    @turbo ADV .= @. (-u * mu_v_r) + (-w * (mu_v_z + mubar_z)) #MUADV
-    FORCING .= @. (q_evap -q_cond) * mu_v_factor
-    @turbo KDIFF .= @. Khdiff * ((mu_v_r / r) + mu_v_rr)
-    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,3] .= @. Kvdiff * mu_v_zz
 
     col.uMish .= rho_d .* Kv .* u_z
     col.uMish[1] = rho_d * Cd * U10 * u10 #UDRAG
@@ -618,7 +631,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     FORCING .= @. (q_cond -q_auto -q_coll) * mu_c_factor
     @turbo KDIFF .= @. Khdiff * ((mu_c_r/r) + mu_c_rr)
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,7] .= @. Kvdiff * mu_c_zz
+    @turbo impdot[colstart:colend,7] .= @. Kv_mudiff * mu_c_zz
 
     col.uMish .= rho_d .* Kv .* mu_r_z
     CBtransform!(col)
@@ -629,7 +642,11 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     FORCING .= @. (q_auto +q_coll -q_evap -Vt_flux) * mu_r_factor
     @turbo KDIFF .= @. Khdiff * ((mu_r_r/r) + mu_r_rr)
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,8] .= @. Kvdiff * mu_r_zz
+    @turbo impdot[colstart:colend,8] .= @. Kv_mudiff * mu_r_zz
+
+    # Saturation forcing
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + q_flux + ((q_evap - q_cond) * (1.0 + Q_s)))/q_sat
 
     col.uMish .= rho_d .* Kv .* (mu_sat_z + satbar_z)
     CBtransform!(col)
@@ -640,7 +657,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
     @turbo KDIFF .= @. Khdiff * ((mu_sat/r) + mu_sat_rr)
     @turbo expdot[colstart:colend,9] .= @. ADV + FORCING + KDIFF + VDIFF
-    @turbo impdot[colstart:colend,9] .= @. Kvdiff * mu_sat_zz
+    @turbo impdot[colstart:colend,9] .= @. Kv_mudiff * mu_sat_zz
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
@@ -658,293 +675,6 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     # Increment the explicit timestep terms with other forcings
     #explicit_increment(mtile, colstart, colend, t)
-
-end
-
-function primitive_equation_axisymmetric(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
-
-    grid = mtile.tile
-    gridpoints = mtile.tilepoints
-    expdot = mtile.expdot_n
-    impdot = mtile.impdot_n
-    model = mtile.model
-    refstate = mtile.ref_state
-
-    # Physical parameters
-    Kh_l = model.physical_params[:Kh_l]
-    f = model.physical_params[:f]
-
-    # Gridpoints
-    r = view(gridpoints,colstart:colend,1)
-    z = view(gridpoints,colstart:colend,2)
-
-    # Variables
-    s = view(grid.physical,colstart:colend,1,1)
-    s_r = view(grid.physical,colstart:colend,1,2)
-    s_rr = view(grid.physical,colstart:colend,1,3)
-    s_z = view(grid.physical,colstart:colend,1,4)
-    s_zz = view(grid.physical,colstart:colend,1,5)
-
-    xi = view(grid.physical,colstart:colend,2,1)
-    xi_r = view(grid.physical,colstart:colend,2,2)
-    xi_rr = view(grid.physical,colstart:colend,2,3)
-    xi_z = view(grid.physical,colstart:colend,2,4)
-    xi_zz = view(grid.physical,colstart:colend,2,5)
-    
-    mu = view(grid.physical,colstart:colend,3,1)
-    mu_r = view(grid.physical,colstart:colend,3,2)
-    mu_rr = view(grid.physical,colstart:colend,3,3)
-    mu_z = view(grid.physical,colstart:colend,3,4)
-    mu_zz = view(grid.physical,colstart:colend,3,5)
-
-    u = view(grid.physical,colstart:colend,4,1)
-    u_r = view(grid.physical,colstart:colend,4,2)
-    u_rr = view(grid.physical,colstart:colend,4,3)
-    u_z = view(grid.physical,colstart:colend,4,4)
-    u_zz = view(grid.physical,colstart:colend,4,5)
-
-    v = view(grid.physical,colstart:colend,5,1)
-    v_r = view(grid.physical,colstart:colend,5,2)
-    v_rr = view(grid.physical,colstart:colend,5,3)
-    v_z = view(grid.physical,colstart:colend,5,4)
-    v_zz = view(grid.physical,colstart:colend,5,5)
-
-    w = view(grid.physical,colstart:colend,6,1)
-    w_r = view(grid.physical,colstart:colend,6,2)
-    w_rr = view(grid.physical,colstart:colend,6,3)
-    w_z = view(grid.physical,colstart:colend,6,4)
-    w_zz = view(grid.physical,colstart:colend,6,5)
-
-    mu_c = view(grid.physical,colstart:colend,7,1)
-    mu_c_r = view(grid.physical,colstart:colend,7,2)
-    mu_c_rr = view(grid.physical,colstart:colend,7,3)
-    mu_c_z = view(grid.physical,colstart:colend,7,4)
-    mu_c_zz = view(grid.physical,colstart:colend,7,5)
-
-    mu_p = view(grid.physical,colstart:colend,8,1)
-    mu_p_r = view(grid.physical,colstart:colend,8,2)
-    mu_p_rr = view(grid.physical,colstart:colend,8,3)
-    mu_p_z = view(grid.physical,colstart:colend,8,4)
-    mu_p_zz = view(grid.physical,colstart:colend,8,5)
-
-    # Get reference state
-    sbar = refstate.sbar[:,1]
-    sbar_z = refstate.sbar[:,2]
-    sbar_zz = refstate.sbar[:,3]
-
-    xibar = refstate.xibar[:,1]
-    xibar_z = refstate.xibar[:,2]
-    xibar_zz = refstate.xibar[:,3]
-
-    mubar = refstate.mubar[:,1]
-    mubar_z = refstate.mubar[:,2]
-    mubar_zz = refstate.mubar[:,3]
-
-    # Fundamental thermodynamic quantities derived from model variables
-    thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu .+ mubar)
-    q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
-    rho_d = [x[2] for x in thermo]  # Dry air density
-    Tk = [x[3] for x in thermo]     # Temperature in K
-    p = [x[4] for x in thermo]      # Total air pressure
-    q_c = ahyp.(mu_c)               # Condensate mixing ratio
-    q_p = ahyp.(mu_p)               # Precipitation mixing ratio
-    q_l = q_c .+ q_p                # Liquid mixing ratio
-    rho_t = rho_d .* (1.0 .+ q_v .+ q_c .+ q_p)   # Total air density
-    #qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
-    mu_total = mu .+ mubar
-    mu_factor = dmudq.(mu_total, q_v)
-    qvp_r = mu_r ./ mu_factor # Perturbation vapor gradient in r
-    qvp_z = mu_z ./ mu_factor # Perturbation vapor gradient in z
-    rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
-    rho_p = rho_t .- rhobar         # Perturbation air density
-
-    # Get the mean speed of sound squared from the reference state
-    Pxi_bar = mtile.ref_state.Pxi_bar
-
-    # Pressure gradients
-    dpdr = pressure_gradient.(Tk, rho_d, q_v, s_r, xi_r, qvp_r)
-    dpdz = pressure_gradient.(Tk, rho_d, q_v, s_z, xi_z, qvp_z)
-
-    # Entropy divergence forcing
-    Cm = @. ((q_l) * Cl)/(Cvd + (q_v * Cvv) + ((q_l) * Cl))
-    s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
-
-    # Condensation rate
-    N_c = 100.0
-    r_c = 10.0
-    q_cond = q_condensation.(qss, Tk, p, q_v, q_l, N_c, r_c)
-    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p)
-    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
-    cloudtau = invtau_condensation.(Tk, p, N_c, r_c)
-
-    # Rain evaporation rate
-    # Fixed to be >=0 so that condensation only goes to cloud droplets
-    raintau = rain_evaporation.(q_r, rho_d, Tk, p)
-    q_evap = -qss .* raintau
-
-    qss_cond = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity))) - qss * (cloudtau + raintau)
-
-    # Autoconversion rate
-    q_auto = autoconversion.(q_c, rho_d)
-
-    # Collection rate
-    q_coll = collection.(q_c, q_r, rho_d, Tk)
-
-    # Sedimentation rate
-    Vt = sedimentation.(q_r, rho_d, Tk)
-
-    # Calculate the flux divergence of the falling precipitation
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu_p"]])
-    col.uMish .= q_r .* Vt
-    CBtransform!(col)
-    CAtransform!(col)
-    Vt_flux = CIxtransform(col) ./ rho_d
-
-    # Entropy divergence forcing
-    Cm = @. ((q_l) * Cl)/(Cvd + (q_v * Cvv) + ((q_l) * Cl))
-    s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
-
-    # Condensation rate
-    N_c = 100.0
-    r_c = 10.0
-    q_cond = q_condensation.(qss, Tk, p, q_v, q_l, N_c, r_c)
-    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p)
-    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
-    cloudtau = invtau_condensation.(Tk, p, N_c, r_c)
-
-    # Rain evaporation rate
-    # Fixed to be >=0 so that condensation only goes to cloud droplets
-    raintau = rain_evaporation.(q_r, rho_d, Tk, p)
-    q_evap = -qss .* raintau
-
-    qss_cond = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity))) - qss * (cloudtau + raintau)
-
-    # Autoconversion rate
-    q_auto = autoconversion.(q_c, rho_d)
-
-    # Collection rate
-    q_coll = collection.(q_c, q_r, rho_d, Tk)
-
-    # Sedimentation rate
-    Vt = sedimentation.(q_r, rho_d, Tk)
-
-    # Calculate the flux divergence of the falling precipitation
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu_r"]])
-    col.uMish .= q_r .* Vt
-    CBtransform!(col)
-    CAtransform!(col)
-    Vt_flux = CIxtransform(col) ./ rho_d
-
-    # Placeholders for intermediate calculations
-    ADV = similar(s)
-    FORCING = similar(s)
-    HDIFF = similar(s)
-    VDIFF = similar(s)
-    COR = similar(s)
-
-    # Calculate the vertical diffusivity
-    # Mixing length based on Louis parameterization
-    Sv = sqrt.((u_z .* u_z) .+ (v_z .* v_z))
-    lv = 1.0 ./ ((1.0 ./ (0.4 .* z)) .+ (1.0 ./ 80.0))
-    Kv = (l.^2) .* S
-
-    #Sh = @. sqrt(2*u_r .* u_z) .+ (w_z .* w_z))
-
-    @turbo ADV .= @. (-u * s_r) + (-w * (s_z + sbar_z)) #SADV
-    FORCING .= @. s_cond + s_div
-    @turbo HDIFF .= @. Kh * ((s_r / r) + s_rr)
-    @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + HDIFF
-
-    @turbo ADV .= @. (-u * xi_r) + (-w * (xi_z + xibar_z)) #XI ADV
-    @turbo FORCING .= @. - u_x - w_z
-    @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
-    impdot[colstart:colend,2] .= @. -w_z
-
-    @turbo ADV .= @. (-u * mu_x) + (-v * mu_l / r) + (-w * (mu_z + mubar_z)) #MU_ADV
-    FORCING .= @. -q_cond * mu_factor
-    @turbo HDIFF .= @. K * ((mu_r / r) + mu_rr + (mu_ll / (r * r)))
-    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + HDIFF
-
-    @turbo ADV .= @. (-u * u_r) + (-v * u_l / r) + (-w * u_z) #UADV
-    @turbo FORCING .= @. -dpdr / rho_t #UPGF
-    @turbo HDIFF .= @. K * ((u_r / r) + u_rr + (u_ll / (r * r)))
-    @turbo COR .= @. (v * (f + (v / r))) #UCOR
-
-    # Surface wind speed based on storm motion
-    #sfcu = (Um * cos(lambda[1])) + (Vm * sin(lambda[1]))
-    #sfcv = (Vm * cos(lambda[1])) - (Um * sin(lambda[1]))
-
-    # Get the 10 meter wind (assuming 10 m @ z == 2)
-    u10 = u[2]
-    v10 = v[2]
-    U10 = sqrt(u10^2 + v10^2)
-
-    # Differentiate Kv * du/dz
-    col.uMish .= Kv .* u_z
-    
-    # Drag applies at z = 0
-    # Use a wind speed dependent drag
-    if U10 < 5.2
-        Cd = 1.0e-3
-    elseif U10 < 33.6
-        Cd = 4.4e-4 * U10^0.5
-    end
-    col.uMish[1] = Cd * U10 * u10 #UDRAG
-
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
-    
-    @turbo expdot[colstart:colend,4] .= @. ADV + PGF + HDIFF + VDIFF + COR
-
-    @turbo ADV .= @. (-v * v_r) + (-v * v_l / r) + (-w * v_z) #VADV
-    PGF .= @. -(pressure_gradient(Tk, rho_d, q_v, s_l, xi_l, qvp_l) / rho_t) #VPGF
-    @turbo KDIFF .= @. K * ((v_r / r) + v_rr + (v_ll / (r * r)))
-    @turbo COR .= @. (-u * (f + (v / r))) #VCOR
-
-    # Differentiate Kv * dv/dz
-    col.uMish .= Kv .* v_z
-
-    # Drag only applies at z = 0
-    col.uMish[1] = Cd * U10 * v10 #VDRAG
-
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
-    
-    @turbo expdot[colstart:colend,5] .= @. ADV + PGF + HDIFF + VDIFF + COR
-
-    @turbo ADV .= @. (-u * w_r) + (-v * w_l / r) + (-w * w_z) #WADV
-    PGF .= @.  -(gravity * rho_p / rho_t) - (dpdz / rho_t)
-    @turbo KDIFF .= @. K * ((w_r / r) + w_rr + (w_ll / (r * r)))
-    # Differentiate Kv * dv/dz
-    col.uMish .= Kv .* v_z
-
-    # Drag only applies at z = 0
-    col.uMish[1] = Cd * U10 * v10 #VDRAG
-
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
-
-    @turbo expdot[colstart:colend,6] .= @. ADV + PGF + HDIFF
-    impdot[colstart:colend,6] .= @. -(Pxi_bar * xi_z)
-
-    @turbo ADV .= @. (-u * mu_c_r) + (-v * mu_c_l / r) + (-w * mu_c_z) #Q_C ADV
-    #No PGF or diffusion
-    @turbo expdot[colstart:colend,7] .= @. ADV
-
-    @turbo ADV .= @. (-u * mu_p_r) + (-v * mu_p_l / r) + (-w * mu_p_z) #Q_P ADV
-    #No PGF or diffusion
-    @turbo expdot[colstart:colend,8] .= @. ADV
-
-    # Advance the explicit terms
-    explicit_timestep(mtile, colstart, colend, t)
-
-    # Solve for semi-implicit n+1 terms
-    if mtile.model.semiimplicit
-        semiimplicit_adjustment(mtile, colstart, colend, t)
-    end
 
 end
 
