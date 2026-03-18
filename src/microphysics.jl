@@ -194,6 +194,14 @@ function s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
     return ds
 end
 
+function s_vapor_mixing(q_flux, Tk, rho_d, q_v)
+
+    # If vapor is mixed or externally added or removed without condensation
+    # then the heating terms are zero and this is the entropy change
+    ds = q_flux * ( vapor_entropy(Tk, rho_d, q_v) - Rv )
+    return ds
+end
+
 function Q_s_factor(Tk, p, q_v, q_l)
 
     q_sat = q_sat_liquid(Tk, p)
