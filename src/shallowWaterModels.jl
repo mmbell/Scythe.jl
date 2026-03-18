@@ -509,3 +509,132 @@ function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64,
     explicit_timestep(mtile, colstart, colend, t)
 
 end
+
+function Oneway_ShallowWater_Slab_Uniform_Flow(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # One-way Shallow Water model on top of slab BL
+
+    # Local helper variables
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    # Physical parameters
+    g = model.physical_params[:g]
+    K = model.physical_params[:K]
+    Cd = model.physical_params[:Cd]
+    Hfree = model.physical_params[:Hfree]
+    Hb = model.physical_params[:Hb]
+    f = model.physical_params[:f]
+    Um = model.physical_params[:Um]
+    Vm = model.physical_params[:Vm]
+
+    # Assign local variables with views
+    r = view(gridpoints,:,1)
+    lambda = view(gridpoints,:,2)
+
+    h = view(grid.physical,:,1,1)
+    hr = view(grid.physical,:,1,2)
+    hrr = view(grid.physical,:,1,3)
+    hl = view(grid.physical,:,1,4)
+    hll = view(grid.physical,:,1,5)
+
+    ug = view(grid.physical,:,2,1)
+    ugr = view(grid.physical,:,2,2)
+    ugrr = view(grid.physical,:,2,3)
+    ugl = view(grid.physical,:,2,4)
+    ugll = view(grid.physical,:,2,5)
+
+    vg = view(grid.physical,:,3,1)
+    vgr = view(grid.physical,:,3,2)
+    vgrr = view(grid.physical,:,3,3)
+    vgl = view(grid.physical,:,3,4)
+    vgll = view(grid.physical,:,3,5)
+
+    ub = view(grid.physical,:,4,1)
+    ubr = view(grid.physical,:,4,2)
+    ubrr = view(grid.physical,:,4,3)
+    ubl = view(grid.physical,:,4,4)
+    ubll = view(grid.physical,:,4,5)
+
+    vb = view(grid.physical,:,5,1)
+    vbr = view(grid.physical,:,5,2)
+    vbrr = view(grid.physical,:,5,3)
+    vbl = view(grid.physical,:,5,4)
+    vbll = view(grid.physical,:,5,5)
+
+    # Helper arrays to reduce memory allocations
+    ADV = similar(r)
+    DRAG = similar(r)
+    COR = similar(r)
+    PGF = similar(r)
+    W_ = similar(r)
+    KDIFF = similar(r)
+
+    # Environmental wind speed based on storm motion
+    u_env = @. (Um * cos(lambda)) + (Vm * sin(lambda))
+    v_env = @. (Vm * cos(lambda)) - (Um * sin(lambda))
+
+    # Parameterized 10-m surface wind speed
+    sfc_factor = 0.78
+    U10 = similar(ub)
+    u10 = ub #+ u_env
+    v10 = vb #+ v_env
+    @turbo U10 .= @. sfc_factor *  sqrt(u10^2 + v10^2)
+
+    # Parameterized surface wind speed
+    #sfc_factor = 0.78
+    #U = similar(ub)
+    #@turbo U .= @. sfc_factor * sqrt((ub * ub) + (vb * vb))
+
+    # W is diagnostic and is needed first for other calculations
+    w = view(grid.physical,:,6,1)
+    @turbo w .= @. -Hb * ((ub / r) + ubr + (vbl / r))
+    w_ = @. 0.5 * abs(w) - w
+    @turbo expdot[:,6] .= 0.0
+
+    # h tendency
+    @turbo ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
+    @turbo PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r))) # Divergence but use PGF array to reduce memory allocations
+    @turbo expdot[:,1] .= @. ADV + PGF
+
+    # ug tendency
+    @turbo ADV .= @. (-vg * ugl / r) + (-ug * ugr) #UGADV
+    @turbo PGF .= @. (-g * hr) #UGPGF
+    @turbo COR .= @. (vg * (f + (vg / r))) - v_env * f #UCOR
+    @turbo expdot[:,2] .= @. ADV + PGF + COR
+
+    # vg tendency
+    @turbo ADV .= @. (-vg * vgl / r) + (-ug * vgr) #VGADV
+    @turbo PGF .= @. (-g * (hl / r)) #VGPGF
+    @turbo COR .= @. (-ug * (f + (vg / r))) + u_env * f #VCOR
+    @turbo expdot[:,3] .= @. ADV + PGF + COR
+
+    # ub tendency
+    @turbo ADV .= @. (-vb * ubl / r) + (-ub * ubr) #UBADV
+    @turbo PGF .= @. (-g * hr) #UBPGF
+    @turbo COR .= @. (vb * (f + (vb / r))) - v_env * f #UBCOR
+    @turbo DRAG .= @. -(Cd * U10 * ub / Hb) #UDRAG
+    @turbo W_ .= @. w_ * (ug - ub) / Hb #UW
+    @turbo KDIFF .= @. K * ((ubr / r) + ubrr - (ub / (r * r)) + (ubll / (r * r)) - (2.0 * vbl / (r * r))) #UKDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #@turbo KDIFF .= @. K * ((ur / r) + urr + (ull / (r * r))) #UKDIFF
+    @turbo expdot[:,4] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # vb tendency
+    @turbo ADV .= @. (-vb * vbl / r) + (-ub * vbr) #VBADV
+    @turbo PGF .= @. (-g * (hl / r)) #VBPGF
+    @turbo COR .= @. (-ub * (f + (vb / r))) + u_env * f #VBCOR
+    @turbo DRAG .= @. -(Cd * U10 * vb / Hb) #VDRAG
+    @turbo W_ .= @. w_ * (vg - vb) / Hb #VW
+    @turbo KDIFF .= @. K * ((vbr / r) + vbrr - (vb / (r * r)) + (vbll / (r * r)) + (2.0 * ubl / (r * r))) #VKDIFF
+    # The following is just the Laplacian term without the curvature terms from Batchelor (1967) and Shapiro (1983)
+    #@turbo KDIFF .= @. K * ((vr / r) + vrr + (vll / (r * r))) #VKDIFF
+    @turbo expdot[:,5] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
+end
+
