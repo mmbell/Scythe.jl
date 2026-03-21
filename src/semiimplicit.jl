@@ -40,6 +40,7 @@ struct ModelTile
     haloReceiveMap::SparseMatrixCSC{Float64, Int64}
     haloReceiveBuffer::Array{Float64}
     splineBuffer::Array{Float64}
+    patch_b_iDim::Int64
     h_matrix::Factorization
     diffusion_matrix::Factorization
 end
@@ -123,6 +124,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         haloReceiveMap,
         haloReceiveBuffer,
         splineBuffer,
+        patch.params.b_iDim,
         h_matrix,
         diffusion_matrix)
     return mtile
@@ -134,22 +136,94 @@ function sparse_indices(map::SparseMatrixCSC)
     return CartesianIndex.(rows, cols)
 end
 
-"""Extract spectral values at sparse map locations."""
-function extract_at_map(spectral::AbstractArray, map::SparseMatrixCSC)
-    idx = sparse_indices(map)
-    return spectral[idx]
+"""Extract nonzero values from a sparse matrix as a dense vector."""
+function sparse_values(map::SparseMatrixCSC)
+    _, _, vals = findnz(map)
+    return vals
 end
 
-"""Write spectral values at sparse map locations."""
-function write_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
-    idx = sparse_indices(map)
-    spectral[idx] .= values
+"""
+    extract_halo_values(tile)
+
+Extract the 3-row halo (right boundary) from each wavenumber block of the tile's spectral
+array as a dense vector. The ordering matches the structure of `calcHaloMap` so the result
+can be directly accumulated into the shared spectral via `accumulate_at_map!`.
+"""
+function extract_halo_values(tile::AbstractGrid)
+    b_iDim = tile.params.b_iDim
+    nvars = size(tile.spectral, 2)
+
+    if size(tile.spectral, 1) > b_iDim
+        # RL/SL grid: extract from each wavenumber block
+        kDim = tile.params.iDim + tile.params.patchOffsetL
+        nblocks = 1 + 2 * kDim
+        result = zeros(Float64, 3 * nvars * nblocks)
+        pos = 1
+        for v in 1:nvars
+            # k=0 block: last 3 rows
+            result[pos:pos+2] .= tile.spectral[b_iDim-2:b_iDim, v]
+            pos += 3
+            for k in 1:kDim
+                p = k * 2
+                # Real part: last 3 rows of block
+                te = (p - 1) * b_iDim + b_iDim
+                result[pos:pos+2] .= tile.spectral[te-2:te, v]
+                pos += 3
+                # Imaginary part: last 3 rows of block
+                te = p * b_iDim + b_iDim
+                result[pos:pos+2] .= tile.spectral[te-2:te, v]
+                pos += 3
+            end
+        end
+        return result
+    else
+        # Cartesian 1D: just the last 3 rows
+        result = zeros(Float64, 3 * nvars)
+        for v in 1:nvars
+            result[(v-1)*3+1:v*3] .= tile.spectral[b_iDim-2:b_iDim, v]
+        end
+        return result
+    end
 end
 
-"""Accumulate (add) spectral values at sparse map locations."""
+"""Accumulate (add) spectral values at sparse map locations in a patch-sized array."""
 function accumulate_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
     idx = sparse_indices(map)
     spectral[idx] .+= values
+end
+
+"""
+    write_tile_to_shared!(sharedSpectral, tile, b_iDim_patch)
+
+Copy the tile's inner (non-halo) spectral coefficients to the correct positions in the
+patch-level shared spectral array. The tile→patch index mapping accounts for different
+spectral strides per wavenumber block (b_iDim_tile vs b_iDim_patch).
+"""
+function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::AbstractGrid,
+                                b_iDim_patch::Int64)
+    siL = tile.params.spectralIndexL
+    b_iDim_tile = tile.params.b_iDim
+    inner_rows = b_iDim_tile - 4  # inner region excludes 3-row halo
+
+    # k=0 block (spline coefficients): patch rows siL:(siL+inner_rows) ← tile rows 1:(1+inner_rows)
+    sharedSpectral[siL:siL+inner_rows, :] .= tile.spectral[1:1+inner_rows, :]
+
+    # k>=1 Fourier wavenumber blocks only exist for RL/SL grids
+    # Detect by checking if the tile spectral has more rows than a single spline block
+    if size(tile.spectral, 1) > b_iDim_tile
+        kDim = tile.params.iDim + tile.params.patchOffsetL
+        for k in 1:kDim
+            p = k * 2
+            # Real part
+            pp1 = (p - 1) * b_iDim_patch + siL
+            tp1 = (p - 1) * b_iDim_tile + 1
+            sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
+            # Imaginary part
+            pp1 = p * b_iDim_patch + siL
+            tp1 = p * b_iDim_tile + 1
+            sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
+        end
+    end
 end
 
 """
@@ -186,9 +260,10 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     # Create patch on each worker for calcPatchMap/calcHaloMap
     map(wait, [save_at(w, :patch, :(createGrid(model.grid_params))) for w in workerids])
 
-    # Send pre-built tiles directly to workers (serialization works in Julia 1.12)
+    # Send tile parameters and create grids on workers to avoid serializing CHOLMOD factors
     println("Initializing tiles on workers")
-    map(wait, [save_at(w, :tile, tiles[w-1]) for w in workerids])
+    map(wait, [save_at(w, :tile_params, tiles[w-1].params) for w in workerids])
+    map(wait, [save_at(w, :tile, :(createGrid(tile_params))) for w in workerids])
 
     # Create the model tiles
     println("Initializing modelTiles on workers")
@@ -204,8 +279,9 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
         wait(save_at(send_index, :mtile, :(createModelTile(patch,tile,model,$(sendMap)))))
     end
 
-    # Delete the patch from the workers since the relevant info is already in the modelTile
+    # Delete the patch and tile_params from the workers since the relevant info is already in the modelTile
     # Don't delete from the first worker in case they are also the master
+    map(wait, [remove_from(w, :tile_params) for w in workerids[2:length(workerids)]])
     map(wait, [remove_from(w, :patch) for w in workerids[2:length(workerids)]])
 
     println("Ready for time integration!")
@@ -356,11 +432,11 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # Convert current timestep to spectral tendencies
     calcTendency(mtile)
 
-    # Send halo to next tile
-    put!(haloSend, extract_at_map(mtile.tile.spectral, mtile.haloSendMap))
+    # Send halo to next tile (extract border spectral values in tile-local coordinates)
+    put!(haloSend, extract_halo_values(mtile.tile))
 
-    # Set the sharedArray this tile is responsible for
-    write_at_map!(sharedSpectral, mtile.patchMap, extract_at_map(mtile.tile.spectral, mtile.patchMap))
+    # Set the sharedArray this tile is responsible for (tile→patch index mapping)
+    write_tile_to_shared!(sharedSpectral, mtile.tile, mtile.patch_b_iDim)
 
     # Get halo from previous tile
     mtile.haloReceiveBuffer .= take!(haloReceive)
@@ -379,14 +455,17 @@ A column index of -1 indicates an R or RL grid where all points are treated as o
 """
 function advance_column(mtile::ModelTile, c::Int64, t::Int64)
 
-    # Grab a column of indices
-    colstart = (c-1) * mtile.model.grid_params.zDim + 1
-    colend = colstart + mtile.model.grid_params.zDim - 1
-
-    # If R or RL grid then set to the maximum dimensions
+    # Set column index range
     if c == -1
+        # R or RL grid: all points are treated as one column
         colstart = 1
         colend = size(mtile.tile.physical,1)
+    else
+        # RZ or RLZ grid: use the vertical dimension to stride columns
+        gp = mtile.model.grid_params
+        vdim = gp isa GridParameters ? gp.zDim : gp.kDim
+        colstart = (c-1) * vdim + 1
+        colend = colstart + vdim - 1
     end
 
     # Feed physical matrices to physical equations
@@ -400,7 +479,7 @@ end
 Write final model output at the end of the integration period.
 """
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
-    
+
     write_output(grid, model, model.integration_time)
     println("Model complete!")
 end
@@ -412,7 +491,7 @@ Dispatch to the appropriate equation set by looking up the function named
 by `mtile.model.equation_set` in the `Scythe` module and calling it on the column range.
 """
 function physical_model(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
-        
+
     equation_set = Symbol(mtile.model.equation_set)
     equation_call = getfield(Scythe, equation_set)
     equation_call(mtile, colstart, colend, t)
@@ -490,7 +569,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     bc1 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[1,:]
     bc2 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[nz,:]
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
-    
+
     # Solve for the coefficients
     xi_a = h_a \ g
 
@@ -769,7 +848,7 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
 
     mu_r_index = mtile.model.grid_params.vars["mu_r"]
     mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
-    
+
     mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
     mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
 
@@ -958,9 +1037,9 @@ function calcTendency(mtile::ModelTile)
 
     # Set the current time
     mtile.tile.physical .= mtile.var_np1
-    
+
     # Transform to spectral space
-    spectralTransform!(mtile.tile)    
+    spectralTransform!(mtile.tile)
 end
 
 """
@@ -970,8 +1049,8 @@ Check all physical variables for NaN values, which indicate a likely CFL violati
 Throws an error if any NaN is found.
 """
 function checkCFL(grid)
-    
-    # Check to see if CFL condition may have been violated 
+
+    # Check to see if CFL condition may have been violated
     for var in keys(grid.params.vars)
         v = grid.params.vars[var]
         testvar = grid.physical[:,v,1]

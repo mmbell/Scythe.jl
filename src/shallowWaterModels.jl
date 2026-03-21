@@ -246,6 +246,153 @@ function Twoway_ShallowWater_Slab(mtile::ModelTile, colstart::Int64, colend::Int
 end
 
 """
+    Twoway_PV_mixing(mtile, colstart, colend, t)
+
+Two-way shallow water model on top of a slab boundary layer with Smagorinsky-style
+turbulent diffusion in both layers. Extends [`Twoway_ShallowWater_Slab`](@ref) by adding
+flow-dependent horizontal diffusion to the free-atmosphere winds (ug, vg) and replacing
+the constant-K diffusion in the boundary layer with a Smagorinsky parameterization.
+
+The diffusion coefficient is ``K = L_s^2 \\, |S|`` where ``L_s`` is a configurable
+length scale and ``|S| = \\sqrt{2 S_{ij} S_{ij}}`` is the strain rate magnitude
+computed from the full cylindrical strain rate tensor.
+
+# Required physical parameters
+- `:Ls_free`: Smagorinsky length scale for the free-atmosphere (SW) layer (m).
+- `:Ls_bl`: Smagorinsky length scale for the boundary layer (m).
+- `:g`, `:Cd`, `:Hfree`, `:Hb`, `:f`, `:S1`: same as `Twoway_ShallowWater_Slab`.
+"""
+function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # Local helper variables
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    model = mtile.model
+
+    # Physical parameters
+    g = model.physical_params[:g]
+    Ls_free = model.physical_params[:Ls_free]
+    Ls_bl = model.physical_params[:Ls_bl]
+    Cd = model.physical_params[:Cd]
+    Hfree = model.physical_params[:Hfree]
+    Hb = model.physical_params[:Hb]
+    f = model.physical_params[:f]
+    S1 = model.physical_params[:S1]
+
+    # Assign local variables with views
+    r = view(gridpoints,:,1)
+
+    h = view(grid.physical,:,1,1)
+    hr = view(grid.physical,:,1,2)
+    hrr = view(grid.physical,:,1,3)
+    hl = view(grid.physical,:,1,4)
+    hll = view(grid.physical,:,1,5)
+
+    ug = view(grid.physical,:,2,1)
+    ugr = view(grid.physical,:,2,2)
+    ugrr = view(grid.physical,:,2,3)
+    ugl = view(grid.physical,:,2,4)
+    ugll = view(grid.physical,:,2,5)
+
+    vg = view(grid.physical,:,3,1)
+    vgr = view(grid.physical,:,3,2)
+    vgrr = view(grid.physical,:,3,3)
+    vgl = view(grid.physical,:,3,4)
+    vgll = view(grid.physical,:,3,5)
+
+    ub = view(grid.physical,:,4,1)
+    ubr = view(grid.physical,:,4,2)
+    ubrr = view(grid.physical,:,4,3)
+    ubl = view(grid.physical,:,4,4)
+    ubll = view(grid.physical,:,4,5)
+
+    vb = view(grid.physical,:,5,1)
+    vbr = view(grid.physical,:,5,2)
+    vbrr = view(grid.physical,:,5,3)
+    vbl = view(grid.physical,:,5,4)
+    vbll = view(grid.physical,:,5,5)
+
+    # Helper arrays to reduce memory allocations
+    ADV = similar(r)
+    DRAG = similar(r)
+    COR = similar(r)
+    PGF = similar(r)
+    W_ = similar(r)
+    KDIFF = similar(r)
+    S_rr = similar(r)
+    S_ll = similar(r)
+    S_rl = similar(r)
+
+    # Compute Smagorinsky diffusion coefficient for the free-atmosphere layer
+    # Full cylindrical strain rate tensor using (ug, vg)
+    @turbo S_rr .= ugr
+    @turbo S_ll .= @. (vgl / r) + (ug / r)
+    @turbo S_rl .= @. 0.5 * ((ugl / r) + vgr - (vg / r))
+    K_free = @. max(Ls_free * Ls_free * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), 1000.0)
+
+    # Compute Smagorinsky diffusion coefficient for the boundary layer
+    # Full cylindrical strain rate tensor using (ub, vb)
+    @turbo S_rr .= ubr
+    @turbo S_ll .= @. (vbl / r) + (ub / r)
+    @turbo S_rl .= @. 0.5 * ((ubl / r) + vbr - (vb / r))
+    K_bl = @. max(Ls_bl * Ls_bl * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), 1000.0)
+
+    # Parameterized surface wind speed
+    sfc_factor = 0.78
+    U = similar(ub)
+    @turbo U .= @. sfc_factor * sqrt((ub * ub) + (vb * vb))
+
+    # W is diagnostic and is needed first for other calculations
+    w = view(grid.physical,:,6,1)
+    @turbo w .= @. -Hb * ((ub / r) + ubr + (vbl / r))
+    w_ = @. 0.5 * abs(w) - w
+    @turbo expdot[:,6] .= 0.0
+
+    # h tendency (no diffusion on height field)
+    @turbo ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
+    @turbo PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r))) # Divergence but use PGF array
+    @turbo COR .= @. -(Hfree + h) * w * S1
+    @turbo expdot[:,1] .= @. ADV + PGF + COR
+
+    # ug tendency (with Smagorinsky diffusion)
+    @turbo ADV .= @. (-vg * ugl / r) + (-ug * ugr) #UGADV
+    @turbo PGF .= @. (-g * hr) #UGPGF
+    @turbo COR .= @. (vg * (f + (vg / r))) #UCOR
+    @turbo KDIFF .= @. K_free * ((ugr / r) + ugrr - (ug / (r * r)) + (ugll / (r * r)) - (2.0 * vgl / (r * r)))
+    @turbo expdot[:,2] .= @. ADV + PGF + COR + KDIFF
+
+    # vg tendency (with Smagorinsky diffusion)
+    @turbo ADV .= @. (-vg * vgl / r) + (-ug * vgr) #VGADV
+    @turbo PGF .= @. (-g * (hl / r)) #VGPGF
+    @turbo COR .= @. (-ug * (f + (vg / r))) #VCOR
+    @turbo KDIFF .= @. K_free * ((vgr / r) + vgrr - (vg / (r * r)) + (vgll / (r * r)) + (2.0 * ugl / (r * r)))
+    @turbo expdot[:,3] .= @. ADV + PGF + COR + KDIFF
+
+    # ub tendency (with Smagorinsky diffusion)
+    @turbo ADV .= @. (-vb * ubl / r) + (-ub * ubr) #UBADV
+    @turbo PGF .= @. (-g * hr) #UBPGF
+    @turbo COR .= @. (vb * (f + (vb / r))) #UBCOR
+    @turbo DRAG .= @. -(Cd * U * ub / Hb) #UBDRAG
+    @turbo W_ .= @. w_ * (ug - ub) / Hb #UW
+    @turbo KDIFF .= @. K_bl * ((ubr / r) + ubrr - (ub / (r * r)) + (ubll / (r * r)) - (2.0 * vbl / (r * r)))
+    @turbo expdot[:,4] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # vb tendency (with Smagorinsky diffusion)
+    @turbo ADV .= @. (-vb * vbl / r) + (-ub * vbr) #VBADV
+    @turbo PGF .= @. (-g * (hl / r)) #VBPGF
+    @turbo COR .= @. (-ub * (f + (vb / r))) #VBCOR
+    @turbo DRAG .= @. -(Cd * U * vb / Hb) #VDRAG
+    @turbo W_ .= @. w_ * (vg - vb) / Hb #VW
+    @turbo KDIFF .= @. K_bl * ((vbr / r) + vbrr - (vb / (r * r)) + (vbll / (r * r)) + (2.0 * ubl / (r * r)))
+    @turbo expdot[:,5] .= @. ADV + PGF + COR + DRAG + W_ + KDIFF
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
+end
+
+"""
     LinearShallowWater1D(mtile, colstart, colend, t)
 
 1D linear shallow water equations with diffusion in the radial direction.
