@@ -865,7 +865,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Calculate the flux divergence of the falling precipitation
 
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu_r"]]) 
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]])
     col.uMish .= Vt
     #col.uMish .= q_r .* rho_d .* Vt
     CBtransform!(col)

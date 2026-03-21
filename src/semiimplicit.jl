@@ -35,13 +35,9 @@ struct ModelTile
     impdot_nm2::Array{Float64}
     tilepoints::Array{Float64}
     ref_state::ReferenceState
-    patchSplines::Array{Spline1D}
-    patchSpectral::Array{Float64}
-    patchIndexMap::BitMatrix
-    tileView::AbstractArray
-    haloSendIndexMap::BitMatrix
-    haloSendView::AbstractArray
-    haloReceiveIndexMap::BitMatrix
+    patchMap::SparseMatrixCSC{Float64, Int64}
+    haloSendMap::SparseMatrixCSC{Float64, Int64}
+    haloReceiveMap::SparseMatrixCSC{Float64, Int64}
     haloReceiveBuffer::Array{Float64}
     splineBuffer::Array{Float64}
     h_matrix::Factorization
@@ -49,13 +45,19 @@ struct ModelTile
 end
 
 """
-    createModelTile(patch, tile, model, haloReceiveIndexMap)
+    createModelTile(patch, tile, model, haloReceiveMap)
 
 Create and initialize a [`ModelTile`](@ref) with allocated state arrays, reference state,
 patch-to-tile mappings, halo exchange buffers, and pre-computed Helmholtz matrices.
+
+# Arguments
+- `patch::AbstractGrid`: the full domain grid (SpringsteelGrid).
+- `tile::AbstractGrid`: the tile grid for this worker (SpringsteelGrid).
+- `model::ModelParameters`: model configuration.
+- `haloReceiveMap::SparseMatrixCSC{Float64, Int64}`: sparse map for halo receive locations.
 """
 function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelParameters,
-        haloReceiveIndexMap::BitMatrix)
+        haloReceiveMap::SparseMatrixCSC{Float64, Int64})
 
     # Allocate some needed arrays
     var_np1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
@@ -67,7 +69,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     impdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
-    
+
     # Get the local gridpoints
     tilepoints = getGridpoints(tile)
 
@@ -77,31 +79,21 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         z_values = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
 
         if (model.options[:exact_reference_state])
-            # Use an pre-calculated exact state rather than interpolate
             ref_state = exact_reference_state(model, z_values)
         else
-            # Use the exponential filter instead of boxcar to maximize resolution in reference state
             ref_state = calculate_reference_state(model, z_values, model.grid_params.zDim)
         end
     end
 
-    # Copy over the patch information
-    patchSplines = copy(patch.splines)
-    patchSpectral = copy(patch.spectral)
-
-    # Set up the map between the tile and the patch
+    # Set up the map between the tile and the patch (returns SparseMatrixCSC directly)
     patchMap = calcPatchMap(patch, tile)
-    patchIndexMap = patchMap[1]
-    tileView = patchMap[2]
 
-    # Set up the map between the tile and its neighbor
-    haloMap = calcHaloMap(patch, tile)
-    haloSendIndexMap = haloMap[1]
-    haloSendView = haloMap[2]
+    # Set up the map between the tile and its neighbor (returns SparseMatrixCSC directly)
+    haloSendMap = calcHaloMap(patch, tile)
 
     # Set up some buffers to avoid excessive allocations
-    haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
-    splineBuffer =  allocateSplineBuffer(patch,tile)
+    haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
+    splineBuffer = allocateSplineBuffer(tile)
 
     # Pre-calculate the Helmholtz matrices for semi-implicit adjustment
     # Declare a basic factorization for the structure if semiimplicit integration is not used
@@ -126,18 +118,38 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         impdot_nm2,
         tilepoints,
         ref_state,
-        patchSplines,
-        patchSpectral,
-        patchIndexMap,
-        tileView,
-        haloSendIndexMap,
-        haloSendView,
-        haloReceiveIndexMap,
+        patchMap,
+        haloSendMap,
+        haloReceiveMap,
         haloReceiveBuffer,
         splineBuffer,
         h_matrix,
         diffusion_matrix)
     return mtile
+end
+
+"""Extract nonzero row/col indices from a sparse map for SharedArray indexing."""
+function sparse_indices(map::SparseMatrixCSC)
+    rows, cols, _ = findnz(map)
+    return CartesianIndex.(rows, cols)
+end
+
+"""Extract spectral values at sparse map locations."""
+function extract_at_map(spectral::AbstractArray, map::SparseMatrixCSC)
+    idx = sparse_indices(map)
+    return spectral[idx]
+end
+
+"""Write spectral values at sparse map locations."""
+function write_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
+    idx = sparse_indices(map)
+    spectral[idx] .= values
+end
+
+"""Accumulate (add) spectral values at sparse map locations."""
+function accumulate_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
+    idx = sparse_indices(map)
+    spectral[idx] .+= values
 end
 
 """
@@ -161,50 +173,34 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     # Transfer the model and patch/tile info to each worker
     println("Initializing workers")
-    # Print the tile information
-    tile_params = calcTileSizes(patch, num_workers)
-    # This throws a bug if there is only one worker, probably other bugs too related to that
+    # Print the tile information — calcTileSizes now returns Vector{SpringsteelGrid}
+    tiles = calcTileSizes(patch, num_workers)
     for w in workerids
-        println("Worker $w: $(tile_params[5,w-1]) gridpoints in $(tile_params[3,w-1]) cells from $(tile_params[1,w-1]) to $(tile_params[2,w-1]) starting at index $(tile_params[4,w-1])")
+        t = tiles[w-1]
+        println("Worker $w: $(t.params.iDim) gridpoints in $(t.params.num_cells) cells from $(t.params.iMin) to $(t.params.iMax) starting at index $(t.params.spectralIndexL)")
     end
 
     map(wait, [save_at(w, :model, model) for w in workerids])
     map(wait, [save_at(w, :workerids, workerids) for w in workerids])
     map(wait, [save_at(w, :num_workers, num_workers) for w in workerids])
+    # Create patch on each worker for calcPatchMap/calcHaloMap
     map(wait, [save_at(w, :patch, :(createGrid(model.grid_params))) for w in workerids])
-    map(wait, [save_at(w, :tile_params, :(calcTileSizes(patch, num_workers))) for w in workerids])
 
-    # Distribute the tiles
+    # Send pre-built tiles directly to workers (serialization works in Julia 1.12)
     println("Initializing tiles on workers")
-    map(wait, [save_at(w, :tile, :(createGrid(GridParameters(
-            geometry = patch.params.geometry,
-            xmin = tile_params[1,myid()-1],
-            xmax = tile_params[2,myid()-1],
-            num_cells = tile_params[3,myid()-1],
-            zmin = patch.params.zmin,
-            zmax = patch.params.zmax,
-            zDim = patch.params.zDim,
-            b_zDim = patch.params.b_zDim,
-            BCL = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
-            BCR = Dict(key => CubicBSpline.R0 for key in keys(patch.params.vars)),
-            BCB = patch.params.BCB,
-            BCT = patch.params.BCT,
-            vars = patch.params.vars,
-            spectralIndexL = tile_params[4,myid()-1],
-            tile_num = myid())))) for w in workerids])
+    map(wait, [save_at(w, :tile, tiles[w-1]) for w in workerids])
 
     # Create the model tiles
     println("Initializing modelTiles on workers")
 
-    # First tile receives an empty halo from master to simplify later loops
-    firstMap = falses(size(patch.spectral))
-    firstMap[1] = true
+    # First tile receives a trivial sparse halo map from master to simplify later loops
+    firstMap = sparse([1], [1], [1.0], size(patch.spectral, 1), size(patch.spectral, 2))
 
     # Precalculate indices and allocate buffers for shared and border transfers
     wait(save_at(workerids[1], :mtile, :(createModelTile(patch,tile,model,$(firstMap)))))
     for w in workerids[1:length(workerids)-1]
         send_index = w + 1
-        sendMap = get_val_from(w, :(mtile.haloSendIndexMap))
+        sendMap = get_val_from(w, :(mtile.haloSendMap))
         wait(save_at(send_index, :mtile, :(createModelTile(patch,tile,model,$(sendMap)))))
     end
 
@@ -253,8 +249,8 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     haloInitBuffer = zeros(Float64,1)
 
     # Last tile is received by master process
-    haloReceiveIndexMap = get_val_from(last(workerids), :(mtile.haloSendIndexMap))
-    haloReceiveBuffer = zeros(Float64,size(patch.spectral[haloReceiveIndexMap]))
+    haloReceiveMap = get_val_from(last(workerids), :(mtile.haloSendMap))
+    haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
 
     # Create a shared array for the spectral sum
     sharedSpectral = SharedArray{Float64,2}((size(patch.spectral,1),size(patch.spectral,2)))
@@ -265,11 +261,11 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     for w in workerids
         save_at(w, :sharedSpectral, sharedSpectral)
     end
-    map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral,mtile.tile))) for w in workerids])
+    map(wait, [get_from(w, :(splineTransform!(sharedSpectral, mtile.tile))) for w in workerids])
 
     # Output initial time
-    patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
-    tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
+    patch.spectral .= sharedSpectral
+    gridTransform!(patch)
     @async write_output(patch, model, 0.0)
     flush(stdout)
     # Check for NaNs and quit if found
@@ -277,25 +273,25 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
-        haloInitBuffer, haloReceiveBuffer, haloReceiveIndexMap)
+        haloInitBuffer, haloReceiveBuffer, haloReceiveMap)
 
     # Integration complete! Finalize the patch
-    patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
-    tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
+    patch.spectral .= sharedSpectral
+    gridTransform!(patch)
     println("Done with time integration")
     return true
 
 end
 
 """
-    model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive, haloInitBuffer, haloReceiveBuffer, haloReceiveIndexMap)
+    model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive, haloInitBuffer, haloReceiveBuffer, haloReceiveMap)
 
 Inner time stepping loop that advances all tiles each timestep, performs halo exchanges
 via `RemoteChannel`s, accumulates spectral contributions, and writes periodic output.
 """
 function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
         sharedSpectral::SharedArray{Float64}, haloInit::RemoteChannel, haloReceive::RemoteChannel,
-        haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveIndexMap::BitMatrix)
+        haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveMap::SparseMatrixCSC{Float64, Int64})
 
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
@@ -317,15 +313,15 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         haloReceiveBuffer .= take!(haloReceive)
 
         # Add it to the sharedArray
-        @inbounds sharedSpectral[haloReceiveIndexMap] .+= haloReceiveBuffer
+        accumulate_at_map!(sharedSpectral, haloReceiveMap, haloReceiveBuffer)
 
         # Reset the shared spectral patch to the tiles
-        map(wait, [get_from(w, :(splineTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, sharedSpectral, mtile.tile))) for w in workerids])
+        map(wait, [get_from(w, :(splineTransform!(sharedSpectral, mtile.tile))) for w in workerids])
 
         # Output if on specified time interval
         if mod(t,output_int) == 0
-            patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
-            tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
+            patch.spectral .= sharedSpectral
+            gridTransform!(patch)
             @async write_output(patch, model, (t*model.ts))
             checkCFL(patch)
         end
@@ -346,7 +342,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64)
 
     # Transform to local physical tile
-    tileTransform!(mtile.patchSplines, mtile.patchSpectral, mtile.model.grid_params, mtile.tile, mtile.splineBuffer)
+    tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
 
     # Advance each column
     if num_columns(mtile.tile) > 0
@@ -361,16 +357,16 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     calcTendency(mtile)
 
     # Send halo to next tile
-    put!(haloSend, mtile.haloSendView)
+    put!(haloSend, extract_at_map(mtile.tile.spectral, mtile.haloSendMap))
 
     # Set the sharedArray this tile is responsible for
-    sharedSpectral[mtile.patchIndexMap] .= mtile.tileView
+    write_at_map!(sharedSpectral, mtile.patchMap, extract_at_map(mtile.tile.spectral, mtile.patchMap))
 
     # Get halo from previous tile
     mtile.haloReceiveBuffer .= take!(haloReceive)
 
     # Add it to the sharedArray
-    sharedSpectral[mtile.haloReceiveIndexMap] .+= mtile.haloReceiveBuffer
+    accumulate_at_map!(sharedSpectral, mtile.haloReceiveMap, mtile.haloReceiveBuffer)
 
     return nothing
 end
@@ -472,7 +468,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     wdot_nm1 .= wdot_n
 
     # Take the vertical derivative of w_nstar and multiply by ts term
-    w_col = mtile.tile.columns[mtile.model.grid_params.vars["w"]]
+    w_col = mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]]
     w_col.uMish .= w_nstar
     CBtransform!(w_col)
     CAtransform!(w_col)
@@ -499,7 +495,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     xi_a = h_a \ g
 
     # Set xi_n+1
-    xi_col = mtile.tile.columns[mtile.model.grid_params.vars["xi"]]
+    xi_col = mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]]
     xi_col.a .= xi_a
     view(mtile.var_np1,colstart:colend,xi_index) .= CItransform!(xi_col)
 
@@ -561,7 +557,7 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     wdot_nm1 .= wdot_n
 
     # Take the vertical derivative of w_nstar and multiply by ts term
-    w_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["w"]])
+    w_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
     w_col.uMish .= w_nstar
     CBtransform!(w_col)
     CAtransform!(w_col)
@@ -573,7 +569,7 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     g = xi_nstar .- w_nstar_z
     g = [0.0 ; 0.0; g[2:nz-1]]
 
-    xi_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["xi"]])
+    xi_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]])
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
@@ -645,7 +641,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     wdot_nm1 .= wdot_n
 
     # Take the vertical derivative of xi_nstar and multiply by ts term
-    xi_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["xi"]])
+    xi_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]])
     xi_col.uMish .= xi_nstar
     CBtransform!(xi_col)
     CAtransform!(xi_col)
@@ -657,7 +653,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     g = xi_nstar_z .- w_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
 
-    w_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["w"]])
+    w_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
@@ -724,7 +720,7 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     wdot_nm1 .= wdot_n
 
     # Take the vertical derivative of xi_nstar and multiply by ts term
-    xi_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["xi"]])
+    xi_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]])
     xi_col.uMish .= xi_nstar
     CBtransform!(xi_col)
     CAtransform!(xi_col)
@@ -736,7 +732,7 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     g = xi_nstar_z .- w_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
 
-    w_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["w"]])
+    w_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
@@ -843,7 +839,7 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
 
     # Set up the matrix problem
     nz = mtile.model.grid_params.zDim
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["s"]])
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["s"]])
 
     # Solve for the coefficients
     h_a = mtile.diffusion_matrix

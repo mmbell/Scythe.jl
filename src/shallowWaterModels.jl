@@ -456,9 +456,7 @@ function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64,
 
     # Integrate divergence to get W
     # Use h since it doesn't have any boundary conditions in the vertical
-    h_col = mtile.tile.columns[mtile.model.grid_params.vars["h"]]
-    col = Chebyshev1D(h_col.params,h_col.mishPoints,h_col.gammaBC,
-        h_col.fftPlan,h_col.filter,h_col.uMish,h_col.b,h_col.a,h_col.ax)
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["h"]])
     col.uMish .= @. -((ub / r) + ubr + (vbl / r))
     CBtransform!(col)
     CAtransform!(col)

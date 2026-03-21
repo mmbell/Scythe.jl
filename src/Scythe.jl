@@ -29,7 +29,7 @@ Base.@kwdef struct ModelParameters
     initial_conditions = "ic.csv"
     output_dir = "./output/"
     ref_state_file = ""
-    grid_params::GridParameters
+    grid_params::Union{GridParameters, SpringsteelGridParameters}
     physical_params::Dict = Dict()
     options::Dict = Dict(
         :semiimplicit => false,

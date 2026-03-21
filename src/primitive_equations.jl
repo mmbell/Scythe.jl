@@ -196,7 +196,7 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Vt = sedimentation.(q_r, rho_d, Tk)
 
     # Calculate the flux divergence of the falling precipitation
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu_r"]]) 
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]]) 
     col.uMish .= Vt
     CBtransform!(col)
     CAtransform!(col)
@@ -205,7 +205,7 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
 
     # Calculate the vertical diffusivity
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu"]])
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu"]])
 
     # Vertical mixing length based on Louis parameterization
     Sv = sqrt.(u_z.^2)
@@ -533,7 +533,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Vt = sedimentation.(q_r, rho_d, Tk)
 
     # Calculate the flux divergence of the falling precipitation
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu_r"]]) 
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]]) 
     col.uMish .= Vt
     CBtransform!(col)
     CAtransform!(col)
@@ -542,7 +542,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
 
     # Calculate the vertical diffusivity
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu"]])
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu"]])
 
     # Vertical mixing length based on Louis parameterization
     Sv = sqrt.((u_z .* u_z) .+ (v_z .* v_z))

@@ -169,31 +169,31 @@ function Kepert2017_TCBL(mtile::ModelTile, colstart::Int64, colend::Int64)
     z = gridpoints[:,2]
 
     # Get the 10 meter wind (assuming 10 m @ z == 2)
-    r1 = grid.params.rDim+1
-    r2 = 2*grid.params.rDim
+    r1 = grid.params.iDim+1
+    r2 = 2*grid.params.iDim
     u10 = grid.physical[r1:r2,2,1]
     v10 = grid.physical[r1:r2,3,1]
     U10 = sqrt.((u10 .* u10) .+ (v10 .* v10))
-    
+
     # Calculate the vertical diffusivity and vertical velocity
     Kv = zeros(Float64, size(grid.physical))
     Kvspectral = zeros(Float64, size(grid.spectral))
     w = zeros(Float64, size(grid.physical[:,4,1]))
-    
+
     S = sqrt.((uz .* uz) .+ (vz .* vz))
 
     # Surface drag
     r1 = 1
-    r2 = grid.params.rDim
+    r2 = grid.params.iDim
     Kv[r1:r2,1,1] = Cd .* U10 .* u10
     Kv[r1:r2,2,1] = Cd .* U10 .* v10
-    
+
     # Go through each vertical level
-    for z = 2:grid.params.zDim
+    for z = 2:grid.params.kDim
         # Calculate Kv
         l = 1.0 / ((1.0 / (0.4 * gridpoints[z])) + (1.0 / 80.0))
-        r1 = ((z-1)*grid.params.rDim)+1
-        r2 = z*grid.params.rDim
+        r1 = ((z-1)*grid.params.iDim)+1
+        r2 = z*grid.params.iDim
         Kv[r1:r2,1,1] = (l * l) .* S[r1:r2] .* uz[r1:r2]
         Kv[r1:r2,2,1] = (l * l) .* S[r1:r2] .* vz[r1:r2]
     end
@@ -295,9 +295,7 @@ function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend
 
     # Integrate divergence to get W
     # Use h since it doesn't have any boundary conditions in the vertical
-    h_col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["h"]])
-    col = Chebyshev1D(h_col.params,h_col.mishPoints,h_col.gammaBC,
-        h_col.fftPlan,h_col.filter,h_col.uMish,h_col.b,h_col.a,h_col.ax)
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["h"]])
     col.uMish .= @. -((ub / r) + ubr)
     CBtransform!(col)
     CAtransform!(col)
@@ -451,7 +449,7 @@ function RLZ_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, 
 
     # Integrate divergence to get W
     # Use vg since it doesn't have any boundary conditions in the vertical
-    col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["vg"]])
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["vg"]])
     #col = Chebyshev1D(h_col.params,h_col.mishPoints,h_col.gammaBC,
     #    h_col.fftPlan,h_col.filter,h_col.uMish,h_col.b,h_col.a,h_col.ax)
     col.uMish .= @. -((ub / r) + ubr + (vbl / r))
