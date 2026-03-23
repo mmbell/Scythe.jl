@@ -279,10 +279,10 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
         wait(save_at(send_index, :mtile, :(createModelTile(patch,tile,model,$(sendMap)))))
     end
 
-    # Delete the patch and tile_params from the workers since the relevant info is already in the modelTile
+    # Delete tile_params from workers since the relevant info is already in the modelTile
+    # Keep patch on all workers — it is needed by the 3-arg splineTransform!
     # Don't delete from the first worker in case they are also the master
     map(wait, [remove_from(w, :tile_params) for w in workerids[2:length(workerids)]])
-    map(wait, [remove_from(w, :patch) for w in workerids[2:length(workerids)]])
 
     println("Ready for time integration!")
     flush(stdout)
@@ -337,7 +337,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     for w in workerids
         save_at(w, :sharedSpectral, sharedSpectral)
     end
-    map(wait, [get_from(w, :(splineTransform!(sharedSpectral, mtile.tile))) for w in workerids])
+    map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
 
     # Output initial time
     patch.spectral .= sharedSpectral
@@ -392,7 +392,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         accumulate_at_map!(sharedSpectral, haloReceiveMap, haloReceiveBuffer)
 
         # Reset the shared spectral patch to the tiles
-        map(wait, [get_from(w, :(splineTransform!(sharedSpectral, mtile.tile))) for w in workerids])
+        map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
 
         # Output if on specified time interval
         if mod(t,output_int) == 0
