@@ -17,8 +17,8 @@ using LinearAlgebra
     gp = GridParameters(
         geometry = "R",
         num_cells = 100,
-        xmin = -50.0,
-        xmax = 50.0,
+        iMin = -50.0,
+        iMax = 50.0,
         BCL = bc_dict,
         BCR = bc_dict,
         vars = Dict("u" => 1),

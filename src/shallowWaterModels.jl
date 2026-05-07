@@ -585,7 +585,7 @@ function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64,
     vbzz = view(grid.physical,colstart:colend,5,7)
 
     # Helper arrays to reduce memory allocations
-    zDim = mtile.model.grid_params.zDim
+    zDim = mtile.model.grid_params.kDim
     ADV = similar(r)
     COR = similar(r)
     PGF = similar(r)

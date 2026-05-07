@@ -277,7 +277,7 @@ function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend
     vbzz = view(grid.physical,colstart:colend,5,5)
 
     # Helper arrays to reduce memory allocations
-    zDim = mtile.model.grid_params.zDim
+    zDim = mtile.model.grid_params.kDim
     ADV = similar(r)
     COR = similar(r)
     PGF = similar(r)
@@ -431,7 +431,7 @@ function RLZ_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, 
     vbzz = view(grid.physical,colstart:colend,3,7)
 
     # Helper arrays to reduce memory allocations
-    zDim = mtile.model.grid_params.zDim
+    zDim = mtile.model.grid_params.kDim
     ADV = similar(r)
     COR = similar(r)
     PGF = similar(r)

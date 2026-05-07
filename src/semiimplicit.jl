@@ -77,7 +77,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Set up the reference file
     ref_state = empty_reference_state()
     if !isempty(model.ref_state_file)
-        z_values = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
+        z_values = tilepoints[1:model.grid_params.kDim,ndims(tilepoints)]
         ref_column = deepcopy(tile.kbasis.data[1])
 
         if (model.options[:exact_reference_state])
@@ -464,7 +464,7 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
     else
         # RZ or RLZ grid: use the vertical dimension to stride columns
         gp = mtile.model.grid_params
-        vdim = gp isa GridParameters ? gp.zDim : gp.kDim
+        vdim = gp.kDim
         colstart = (c-1) * vdim + 1
         colend = colstart + vdim - 1
     end
@@ -556,8 +556,8 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     w_nstar_z = ts_term .* Ixtransform(w_col)
 
     # Set up the matrix problem
-    nz = mtile.model.grid_params.zDim
-    nbasis = mtile.model.grid_params.b_zDim
+    nz = mtile.model.grid_params.kDim
+    nbasis = mtile.model.grid_params.b_kDim
     g = xi_nstar .- w_nstar_z
     g = [0.0 ; 0.0; g[2:nz-1]]
 
@@ -638,7 +638,7 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     w_nstar_z = ts_term .* Ixtransform(w_col)
 
     # Set up the matrix problem
-    nz = mtile.model.grid_params.zDim
+    nz = mtile.model.grid_params.kDim
     g = xi_nstar .- w_nstar_z
     g = [0.0 ; 0.0; g[2:nz-1]]
 
@@ -722,7 +722,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     xi_nstar_z = ts_term .* Pxi_bar .* Ixtransform(xi_col)
 
     # Set up the matrix problem
-    nz = mtile.model.grid_params.zDim
+    nz = mtile.model.grid_params.kDim
     g = xi_nstar_z .- w_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
 
@@ -801,7 +801,7 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     xi_nstar_z = ts_term .* Pxi_bar .* Ixtransform(xi_col)
 
     # Set up the matrix problem
-    nz = mtile.model.grid_params.zDim
+    nz = mtile.model.grid_params.kDim
     g = xi_nstar_z .- w_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
 
@@ -911,7 +911,7 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
     mu_sat_dot_nm1 .= mu_sat_dot_n
 
     # Set up the matrix problem
-    nz = mtile.model.grid_params.zDim
+    nz = mtile.model.grid_params.kDim
     col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["s"]])
 
     # Solve for the coefficients
@@ -1103,7 +1103,7 @@ function calc_Helmholtz_semiimplicit_matrix_xi(grid::AbstractGrid, model::ModelP
         bc_bottom::BoundaryConditions=NeumannBC(), bc_top::BoundaryConditions=NeumannBC())
 
     # Build basis matrices via the abstract operator_matrix interface
-    nz = model.grid_params.zDim
+    nz = model.grid_params.kDim
     M0 = operator_matrix(grid, :k, 0)
     M1 = operator_matrix(grid, :k, 1)
     M2 = operator_matrix(grid, :k, 2)
@@ -1132,7 +1132,7 @@ function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelPara
         bc_bottom::BoundaryConditions=DirichletBC(), bc_top::BoundaryConditions=DirichletBC())
 
     # Build basis matrices via the abstract operator_matrix interface
-    nz = model.grid_params.zDim
+    nz = model.grid_params.kDim
     M0 = operator_matrix(grid, :k, 0)
     M1 = operator_matrix(grid, :k, 1)
     M2 = operator_matrix(grid, :k, 2)
@@ -1160,7 +1160,7 @@ function calc_Helmholtz_diffusion_matrix(grid::AbstractGrid, model::ModelParamet
         bc_bottom::BoundaryConditions=NeumannBC(), bc_top::BoundaryConditions=NeumannBC())
 
     # Build basis matrices via the abstract operator_matrix interface
-    nz = model.grid_params.zDim
+    nz = model.grid_params.kDim
     M0 = operator_matrix(grid, :k, 0)
     M1 = operator_matrix(grid, :k, 1)
     M2 = operator_matrix(grid, :k, 2)

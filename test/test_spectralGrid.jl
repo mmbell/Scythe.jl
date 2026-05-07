@@ -9,9 +9,9 @@ using Springsteel
     # ──────────────────────────────────────────────
     @testset "Default GridParameters" begin
         gp = GridParameters()
-        @test gp.geometry == "R"
-        @test gp.xmin == 0.0
-        @test gp.xmax == 0.0
+        @test gp.geometry == "1D"
+        @test gp.iMin == 0.0
+        @test gp.iMax == 0.0
     end
 
     # ──────────────────────────────────────────────
@@ -19,16 +19,16 @@ using Springsteel
     # ──────────────────────────────────────────────
     @testset "Derived fields" begin
         gp = GridParameters(num_cells=4)
-        # rDim = num_cells * CubicBSpline.mubar
-        @test gp.rDim == 4 * Springsteel.CubicBSpline.mubar
-        # b_rDim = num_cells + 3
-        @test gp.b_rDim == 4 + 3
-        # spectralIndexR = spectralIndexL + b_rDim - 1
-        @test gp.spectralIndexR == gp.spectralIndexL + gp.b_rDim - 1
-        # patchOffsetL = (spectralIndexL - 1) * 3
-        @test gp.patchOffsetL == (gp.spectralIndexL - 1) * 3
-        # patchOffsetR = patchOffsetL + rDim
-        @test gp.patchOffsetR == gp.patchOffsetL + gp.rDim
+        # iDim = num_cells * mubar
+        @test gp.iDim == 4 * gp.mubar
+        # b_iDim = num_cells + 3
+        @test gp.b_iDim == 4 + 3
+        # spectralIndexR = spectralIndexL + b_iDim - 1
+        @test gp.spectralIndexR == gp.spectralIndexL + gp.b_iDim - 1
+        # patchOffsetL = (spectralIndexL - 1) * mubar
+        @test gp.patchOffsetL == (gp.spectralIndexL - 1) * gp.mubar
+        # patchOffsetR = patchOffsetL + iDim
+        @test gp.patchOffsetR == gp.patchOffsetL + gp.iDim
     end
 
     # ──────────────────────────────────────────────
@@ -39,8 +39,8 @@ using Springsteel
         gp = GridParameters(
             geometry = "R",
             num_cells = 4,
-            xmin = 0.0,
-            xmax = 100.0,
+            iMin = 0.0,
+            iMax = 100.0,
             BCL = bc_dict,
             BCR = bc_dict,
             vars = Dict("u" => 1),
@@ -75,16 +75,16 @@ using Springsteel
     end
 
     # ──────────────────────────────────────────────
-    # 7. b_zDim computed correctly when zDim > 0
+    # 7. b_kDim computed correctly when kDim > 0
     # ──────────────────────────────────────────────
-    @testset "b_zDim with positive zDim" begin
-        gp = GridParameters(zDim = 30)
+    @testset "b_kDim with positive kDim" begin
+        gp = GridParameters(kDim = 30)
         expected = min(30, floor(((2 * 30) - 1) / 3) + 1)
-        @test gp.b_zDim == Int64(expected)
+        @test gp.b_kDim == Int64(expected)
 
-        gp2 = GridParameters(zDim = 10)
+        gp2 = GridParameters(kDim = 10)
         expected2 = min(10, floor(((2 * 10) - 1) / 3) + 1)
-        @test gp2.b_zDim == Int64(expected2)
+        @test gp2.b_kDim == Int64(expected2)
     end
 
     # ──────────────────────────────────────────────

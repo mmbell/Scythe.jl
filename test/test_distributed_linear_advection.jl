@@ -28,8 +28,8 @@ include("distributed_test_helpers.jl")
             gp = GridParameters(
                 geometry = "R",
                 num_cells = num_cells,
-                xmin = -50.0,
-                xmax = 50.0,
+                iMin = -50.0,
+                iMax = 50.0,
                 BCL = bc_dict,
                 BCR = bc_dict,
                 vars = Dict("u" => 1),
