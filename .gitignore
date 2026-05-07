@@ -1,0 +1,18 @@
+Manifest.toml
+
+# macOS
+.DS_Store
+
+# Editor / Jupyter
+.ipynb_checkpoints/
+
+# Backup files
+*.bk
+*.bak
+
+# Run logs
+*.log
+
+# Default Scythe output
+physical_out_*.csv
+spectral_out_*.csv
