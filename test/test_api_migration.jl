@@ -10,7 +10,7 @@ using SharedArrays
     # 1. GridParameters backward compatibility
     # ──────────────────────────────────────────────
     @testset "GridParameters backward compat" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 10,
@@ -35,8 +35,8 @@ using SharedArrays
             num_cells = 10,
             iMin = -50.0,
             iMax = 50.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1),
         )
         grid = createGrid(sgp)
@@ -49,7 +49,7 @@ using SharedArrays
     # 3. Grid field access — ibasis.data for R grid
     # ──────────────────────────────────────────────
     @testset "Grid field access — R grid ibasis" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 10,
@@ -69,8 +69,8 @@ using SharedArrays
     # 3b. Grid field access — kbasis.data for RZ grid
     # ──────────────────────────────────────────────
     @testset "Grid field access — RZ grid kbasis" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
-        bc_z = Dict("u" => Springsteel.Chebyshev.R0)
+        bc_dict = Dict("u" => NaturalBC())
+        bc_z = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "RZ",
             num_cells = 4,
@@ -95,7 +95,7 @@ using SharedArrays
     # 4. calcTileSizes returns Vector{SpringsteelGrid}
     # ──────────────────────────────────────────────
     @testset "calcTileSizes returns Vector" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 10,
@@ -121,7 +121,7 @@ using SharedArrays
     # 5. calcPatchMap returns SparseMatrixCSC
     # ──────────────────────────────────────────────
     @testset "calcPatchMap returns SparseMatrixCSC" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 10,
@@ -141,7 +141,7 @@ using SharedArrays
     # 6. calcHaloMap returns SparseMatrixCSC
     # ──────────────────────────────────────────────
     @testset "calcHaloMap returns SparseMatrixCSC" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 10,
@@ -161,7 +161,7 @@ using SharedArrays
     # 7. Transform 2-arg signatures
     # ──────────────────────────────────────────────
     @testset "splineTransform! 2-arg signature" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 10,
@@ -188,7 +188,7 @@ using SharedArrays
     # 8. ModelTile construction with new field types
     # ──────────────────────────────────────────────
     @testset "ModelTile construction" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 10,
@@ -228,8 +228,8 @@ using SharedArrays
             num_cells = 12,
             iMin = 0.0,
             iMax = 120.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1),
         )
         patch = createGrid(gp)
@@ -265,8 +265,8 @@ using SharedArrays
             num_cells = 12,
             iMin = 0.0,
             iMax = 120.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1, "v" => 2),
         )
         patch = createGrid(sgp)
@@ -306,8 +306,8 @@ using SharedArrays
             num_cells = 12,
             iMin = 0.0,
             iMax = 120.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1),
         )
         patch = createGrid(sgp)
@@ -341,8 +341,8 @@ using SharedArrays
             num_cells = 12,
             iMin = 0.0,
             iMax = 120.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1),
         )
         patch = createGrid(sgp)
@@ -378,8 +378,8 @@ using SharedArrays
             num_cells = 12,
             iMin = 0.0,
             iMax = 120.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1),
         )
         patch = createGrid(sgp)
@@ -417,8 +417,8 @@ using SharedArrays
             num_cells = 12,
             iMin = 0.0,
             iMax = 120.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1),
         )
         model = ModelParameters(
@@ -458,8 +458,8 @@ using SharedArrays
             iMin = 0.0,
             iMax = 120.0,
             max_wavenumber = Dict("default" => 8),
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1, "v" => 2),
         )
         patch = createGrid(sgp)
@@ -487,8 +487,8 @@ using SharedArrays
             num_cells = 12,
             iMin = 0.0,
             iMax = 120.0,
-            BCL = Dict("default" => Springsteel.CubicBSpline.R0),
-            BCR = Dict("default" => Springsteel.CubicBSpline.R0),
+            BCL = Dict("default" => NaturalBC()),
+            BCR = Dict("default" => NaturalBC()),
             vars = Dict("u" => 1),
         )
         patch = createGrid(gp)

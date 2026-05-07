@@ -35,7 +35,7 @@ using Springsteel
     # 3. createGrid with "R" geometry
     # ──────────────────────────────────────────────
     @testset "createGrid R geometry" begin
-        bc_dict = Dict("u" => Springsteel.CubicBSpline.R0)
+        bc_dict = Dict("u" => NaturalBC())
         gp = GridParameters(
             geometry = "R",
             num_cells = 4,

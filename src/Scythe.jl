@@ -4,6 +4,10 @@ module Scythe
 # Infrastructure for model grid representation
 using Springsteel
 
+# Re-export Springsteel's basis-agnostic BoundaryConditions type system
+export BoundaryConditions, NaturalBC, DirichletBC, NeumannBC, SecondDerivativeBC
+export RobinBC, PeriodicBC, CauchyBC, ExponentialBC, SymmetricBC, AntisymmetricBC
+
 """
     ModelParameters
 

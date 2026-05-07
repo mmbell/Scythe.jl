@@ -1059,57 +1059,114 @@ function checkCFL(grid)
 end
 
 """
-    calc_Helmholtz_semiimplicit_matrix_xi(grid, model, Pxi_bar, ts_term)
+    _helmholtz_bc_row(bc, M0, M1, M2, row_idx)
+
+Select the appropriate operator matrix row for a boundary condition in the Helmholtz solver.
+Returns the raw row vector from the operator matrix corresponding to the BC type;
+the caller is responsible for applying any physics-specific coefficients.
+
+Dispatches on `BoundaryConditions` fields: Dirichlet → M0, Neumann → M1, SecondDeriv → M2.
+"""
+function _helmholtz_bc_row(bc::BoundaryConditions, M0, M1, M2, row_idx)
+    if is_periodic(bc)
+        error("PeriodicBC not supported in Helmholtz solver")
+    elseif bc.robin !== nothing
+        error("RobinBC not yet supported in Helmholtz solver")
+    elseif is_inhomogeneous(bc)
+        error("Inhomogeneous BCs not yet supported in Helmholtz solver")
+    elseif bc.u !== nothing       # Dirichlet
+        return M0[row_idx, :]
+    elseif bc.du !== nothing      # Neumann
+        return M1[row_idx, :]
+    elseif bc.d2u !== nothing     # Second derivative
+        return M2[row_idx, :]
+    else                          # Natural (R0)
+        return M0[row_idx, :]
+    end
+end
+
+"""
+    calc_Helmholtz_semiimplicit_matrix_xi(grid, model, Pxi_bar, ts_term; bc_bottom, bc_top)
 
 Build and factorize the spectral-collocation Helmholtz matrix for the xi-form
-semi-implicit solve, with derivative (Neumann) boundary conditions at top and bottom.
+semi-implicit solve. Boundary condition type is configurable via keyword arguments.
+
+# Arguments
+- `grid::AbstractGrid`: the tile grid providing basis objects for `operator_matrix`.
+- `model::ModelParameters`: model configuration providing grid parameters.
+- `Pxi_bar::Float64`: domain-mean speed of sound squared.
+- `ts_term::Float64`: time-stepping coefficient.
+- `bc_bottom::BoundaryConditions`: bottom boundary condition (default: `NeumannBC()`).
+- `bc_top::BoundaryConditions`: top boundary condition (default: `NeumannBC()`).
 """
-function calc_Helmholtz_semiimplicit_matrix_xi(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
+function calc_Helmholtz_semiimplicit_matrix_xi(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64;
+        bc_bottom::BoundaryConditions=NeumannBC(), bc_top::BoundaryConditions=NeumannBC())
 
     # Build basis matrices via the abstract operator_matrix interface
     nz = model.grid_params.zDim
     M0 = operator_matrix(grid, :k, 0)
     M1 = operator_matrix(grid, :k, 1)
-    h = (-ts_term .* ts_term .* Pxi_bar) .* operator_matrix(grid, :k, 2) .+ M0
-    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* M1[1, :]
-    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* M1[nz, :]
+    M2 = operator_matrix(grid, :k, 2)
+    h = (-ts_term .* ts_term .* Pxi_bar) .* M2 .+ M0
+    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
+    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     return factorize(h_a)
 end
 
 """
-    calc_Helmholtz_semiimplicit_matrix(grid, model, Pxi_bar, ts_term)
+    calc_Helmholtz_semiimplicit_matrix(grid, model, Pxi_bar, ts_term; bc_bottom, bc_top)
 
 Build and factorize the spectral-collocation Helmholtz matrix for the w-form
-semi-implicit solve, with Dirichlet boundary conditions at top and bottom.
-"""
-function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
+semi-implicit solve. Boundary condition type is configurable via keyword arguments.
 
-    # Build basis matrices via the abstract operator_matrix interface
-    nz = model.grid_params.zDim
-    M0 = operator_matrix(grid, :k, 0)
-    h = (ts_term .* ts_term .* Pxi_bar) .* operator_matrix(grid, :k, 2) .- M0
-    bc1 = M0[1, :]
-    bc2 = M0[nz, :]
-    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
-    return factorize(h_a)
-end
-
+# Arguments
+- `grid::AbstractGrid`: the tile grid providing basis objects for `operator_matrix`.
+- `model::ModelParameters`: model configuration providing grid parameters.
+- `Pxi_bar::Float64`: domain-mean speed of sound squared.
+- `ts_term::Float64`: time-stepping coefficient.
+- `bc_bottom::BoundaryConditions`: bottom boundary condition (default: `DirichletBC()`).
+- `bc_top::BoundaryConditions`: top boundary condition (default: `DirichletBC()`).
 """
-    calc_Helmholtz_diffusion_matrix(grid, model, ts_term)
-
-Build and factorize the spectral-collocation Helmholtz matrix for implicit vertical
-diffusion, with Neumann (zero-flux) boundary conditions at top and bottom.
-"""
-function calc_Helmholtz_diffusion_matrix(grid::AbstractGrid, model::ModelParameters, ts_term::Float64)
+function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64;
+        bc_bottom::BoundaryConditions=DirichletBC(), bc_top::BoundaryConditions=DirichletBC())
 
     # Build basis matrices via the abstract operator_matrix interface
     nz = model.grid_params.zDim
     M0 = operator_matrix(grid, :k, 0)
     M1 = operator_matrix(grid, :k, 1)
-    h = M0 .- (ts_term .* operator_matrix(grid, :k, 2))
-    bc1 = M1[1, :]
-    bc2 = M1[nz, :]
+    M2 = operator_matrix(grid, :k, 2)
+    h = (ts_term .* ts_term .* Pxi_bar) .* M2 .- M0
+    bc1 = _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
+    bc2 = _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
+    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
+    return factorize(h_a)
+end
+
+"""
+    calc_Helmholtz_diffusion_matrix(grid, model, ts_term; bc_bottom, bc_top)
+
+Build and factorize the spectral-collocation Helmholtz matrix for implicit vertical
+diffusion. Boundary condition type is configurable via keyword arguments.
+
+# Arguments
+- `grid::AbstractGrid`: the tile grid providing basis objects for `operator_matrix`.
+- `model::ModelParameters`: model configuration providing grid parameters.
+- `ts_term::Float64`: time-stepping coefficient.
+- `bc_bottom::BoundaryConditions`: bottom boundary condition (default: `NeumannBC()`).
+- `bc_top::BoundaryConditions`: top boundary condition (default: `NeumannBC()`).
+"""
+function calc_Helmholtz_diffusion_matrix(grid::AbstractGrid, model::ModelParameters, ts_term::Float64;
+        bc_bottom::BoundaryConditions=NeumannBC(), bc_top::BoundaryConditions=NeumannBC())
+
+    # Build basis matrices via the abstract operator_matrix interface
+    nz = model.grid_params.zDim
+    M0 = operator_matrix(grid, :k, 0)
+    M1 = operator_matrix(grid, :k, 1)
+    M2 = operator_matrix(grid, :k, 2)
+    h = M0 .- (ts_term .* M2)
+    bc1 = _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
+    bc2 = _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     return factorize(h_a)
 end
