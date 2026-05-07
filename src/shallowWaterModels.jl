@@ -605,9 +605,9 @@ function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64,
     # Use h since it doesn't have any boundary conditions in the vertical
     col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["h"]])
     col.uMish .= @. -((ub / r) + ubr + (vbl / r))
-    CBtransform!(col)
-    CAtransform!(col)
-    wb .= CIInttransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    wb .= IInttransform(col)
     expdot[colstart:colend,6] .= 0.0
 
     # h tendency
@@ -658,9 +658,9 @@ function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64,
     end
     col.uMish[1] = Cd * U10 * u10 #UDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
 
     expdot[colstart:colend,4] .= @. ADV + PGF + COR + VDIFF + HDIFF
 
@@ -680,9 +680,9 @@ function Oneway_ShallowWater_HeightResolvedBL(mtile::ModelTile, colstart::Int64,
     # Drag only applies at z = 0
     col.uMish[1] = Cd * U10 * v10 #VDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
     
     expdot[colstart:colend,5] .= @. ADV + PGF + COR + VDIFF + HDIFF
 

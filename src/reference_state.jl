@@ -39,23 +39,23 @@ function empty_reference_state()
 end
 
 """
-    calculate_reference_state(model::ModelParameters, z::Array{Float64}, max_wavenumber::Int64=-1)
+    calculate_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
 Calculate a hydrostatic reference state from a sounding file specified in `model.ref_state_file`.
 
-The sounding file is interpolated to model levels, then re-integrated using Chebyshev spectral
+The sounding file is interpolated to model levels, then re-integrated using spectral
 methods to obtain a hydrostatically balanced base state. Iteratively adjusts density and
 temperature to refine the balance.
 
 # Arguments
 - `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
 - `z::Array{Float64}`: vertical coordinate array of model levels [m].
-- `max_wavenumber::Int64`: maximum Chebyshev wavenumber for spectral integration; uses `model.grid_params.b_zDim` if not specified (default: `-1`).
+- `column`: a 1D spectral basis object (e.g., `Chebyshev1D` or `Spline1D`) used for spectral integration and differentiation.
 
 # Returns
 - `ReferenceState`: the computed hydrostatic reference state with entropy, log density, transformed moisture, saturation ratio profiles and their vertical derivatives.
 """
-function calculate_reference_state(model::ModelParameters, z::Array{Float64}, max_wavenumber::Int64 =-1)
+function calculate_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
     # Open the file with sounding information
     ref = open(model.ref_state_file,"r")
@@ -125,46 +125,31 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
         end
     end
 
-    # Re-integrate with Chebyshev column to get hydrostatic balance
-    # If max_wavenumber is specified then use that, otherwise use the model configuration
-    if (max_wavenumber > 0)
-        b_zDim = max_wavenumber
-    else
-        b_zDim = model.grid_params.b_zDim
-    end
-    cp = ChebyshevParameters(
-        zmin = model.grid_params.zmin,
-        zmax = model.grid_params.zmax,
-        zDim = model.grid_params.zDim,
-        bDim = b_zDim,
-        BCB = Chebyshev.R0,
-        BCT = Chebyshev.R0)
-    column = Chebyshev1D(cp)
+    # Re-integrate with spectral column to get hydrostatic balance
+    nz = length(z)
 
-    # Fit the interpolated dtheta/dz to a Chebyshev column and integrate it
+    # Fit the interpolated dtheta/dz to the column and integrate it
     column.uMish[:] .= theta[:]
-    CBtransform!(column)
-    CAtransform!(column)
-    theta_new = zeros(Float64, cp.zDim)
-    #theta_new .= CItransform!(column)
-    theta_new .= CIInttransform(column, theta_in[1])
+    Btransform!(column)
+    Atransform!(column)
+    theta_new = zeros(Float64, nz)
+    theta_new .= IInttransform(column, theta_in[1])
 
     # Fit the water vapor
     q_v = q_v .* 1.0e-3
-    #mu = mu_transform.(q_v)
     column.uMish[:] .= q_v[:]
-    CBtransform!(column)
-    CAtransform!(column)
-    q_v_new = zeros(Float64, cp.zDim)
-    q_v_new .= CIInttransform(column, q_v_in[1]*1.0e-3)
+    Btransform!(column)
+    Atransform!(column)
+    q_v_new = zeros(Float64, nz)
+    q_v_new .= IInttransform(column, q_v_in[1]*1.0e-3)
 
-    mu_new = zeros(Float64, cp.zDim)
+    mu_new = zeros(Float64, nz)
     column.uMish[:] = mu_transform.(q_v_new)
-    CBtransform!(column)
-    CAtransform!(column)
-    mu_new .= CItransform!(column)
-    mu_new_z = CIxtransform(column)
-    mu_new_zz = CIxxtransform(column)
+    Btransform!(column)
+    Atransform!(column)
+    mu_new .= Itransform!(column)
+    mu_new_z = Ixtransform(column)
+    mu_new_zz = Ixxtransform(column)
     q_v_new = inv_mu_transform.(mu_new)
     q_v_new_z = mu_new_z ./ dmudq.(mu_new, q_v_new)
 
@@ -172,30 +157,30 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     theta_rho = @. theta_new * (1.0 + (q_v_new / Eps)) / (1.0 + q_v_new)
     dexnerdz = -gravity ./ (Cpd .* theta_rho)
     column.uMish[:] .= dexnerdz
-    CBtransform!(column)
-    CAtransform!(column)
+    Btransform!(column)
+    Atransform!(column)
     sfc_exner = (sfc_pressure/1000.0)^(Rd/Cpd)
-    exner = CIInttransform(column, sfc_exner)
+    exner = IInttransform(column, sfc_exner)
     p_new = @. (exner^(Cpd/Rd))*1000.0
     rho_t_new = @. ((p_new * 100.0/(Rd * theta_rho))*(1000.0/p_new)^(Rd/Cpd))
     rho_d_new = rho_t_new./(1.0 .+ q_v_new)
     xi_new = log_dry_density.(rho_d_new)
     sfc_xi = xi_new[1]
     column.uMish[:] .= xi_new
-    CBtransform!(column)
-    CAtransform!(column)
-    xi_new_z = CIxtransform(column)
-    xi_new_zz = CIxxtransform(column)
+    Btransform!(column)
+    Atransform!(column)
+    xi_new_z = Ixtransform(column)
+    xi_new_zz = Ixxtransform(column)
 
     # Calculate the moist entropy
     Tk_new = @. (p_new - vapor_pressure(p_new, q_v_new))*100.0/(rho_d_new * Rd)
     s_new = entropy.(Tk_new, rho_d_new, q_v_new)
     column.uMish[:] .= s_new
-    CBtransform!(column)
-    CAtransform!(column)
-    s_new .= CItransform!(column)
-    s_new_z = CIxtransform(column)
-    s_new_zz = CIxxtransform(column)
+    Btransform!(column)
+    Atransform!(column)
+    s_new .= Itransform!(column)
+    s_new_z = Ixtransform(column)
+    s_new_zz = Ixxtransform(column)
     Tk_new = temperature.(s_new, rho_d_new, q_v_new)
 
     # Adjust density and temperature to refine hydrostatic balance
@@ -206,10 +191,10 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     
         xi_new_z = ((-gravity .* rho_t_new) .- (Ps .* s_new_z) .- (Pqv .* q_v_new_z)) ./ Pxi
         column.uMish[:] .= xi_new_z[:]
-        CBtransform!(column)
-        CAtransform!(column)
-        xi_new = CIInttransform(column, sfc_xi)
-        xi_new_zz = CIxtransform(column)
+        Btransform!(column)
+        Atransform!(column)
+        xi_new = IInttransform(column, sfc_xi)
+        xi_new_zz = Ixtransform(column)
         rho_d_new = dry_density.(xi_new)
         rho_t_new = rho_d_new .* (1.0 .+ q_v_new)
         Tk_new = temperature.(s_new, rho_d_new, q_v_new)
@@ -241,11 +226,11 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
     q_bar = [x[1] for x in thermo]
     q_sat = q_sat_liquid.(T_bar, p_bar)
     column.uMish[:] .= mu_transform.(q_bar ./ q_sat)
-    CBtransform!(column)
-    CAtransform!(column)
-    sat_ratio = CItransform!(column)
-    sat_ratio_z = CIxtransform(column)
-    sat_ratio_zz = CIxxtransform(column)
+    Btransform!(column)
+    Atransform!(column)
+    sat_ratio = Itransform!(column)
+    sat_ratio_z = Ixtransform(column)
+    sat_ratio_zz = Ixxtransform(column)
 
     satbar[:,1] .= sat_ratio
     satbar[:,2] .= sat_ratio_z
@@ -259,21 +244,22 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, ma
 end
 
 """
-    interpolate_reference_file(model::ModelParameters, z::Array{Float64})
+    interpolate_reference_file(model::ModelParameters, z::Array{Float64}, column)
 
 Interpolate a sounding file to model levels and compute a reference state using simple
-hydrostatic integration (without Chebyshev spectral re-integration of the raw profiles).
+hydrostatic integration (without spectral re-integration of the raw profiles).
 
 Vertical derivatives are computed afterwards via [`transform_reference_state!`](@ref).
 
 # Arguments
 - `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
 - `z::Array{Float64}`: vertical coordinate array of model levels [m].
+- `column`: a 1D spectral basis object (e.g., `Chebyshev1D` or `Spline1D`) for computing vertical derivatives.
 
 # Returns
 - `ReferenceState`: the interpolated reference state with entropy, log density, transformed moisture, and saturation ratio profiles.
 """
-function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
+function interpolate_reference_file(model::ModelParameters, z::Array{Float64}, column)
 
     # Open the file with sounding information
     ref = open(model.ref_state_file,"r")
@@ -352,19 +338,11 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
         dlnpdz = -gravity * rho_t[i] / (p[i] * 100.0)
     end
 
-    # Re-integrate with Chebyshev column to adjust T
-    #cp = ChebyshevParameters(
-    #    zmin = model.grid_params.zmin,
-    #    zmax = model.grid_params.zmax,
-    #    zDim = model.grid_params.zDim,
-    #    bDim = model.grid_params.b_zDim,
-    #    BCB = Chebyshev.R0,
-    #    BCT = Chebyshev.R0)
-    #column = Chebyshev1D(cp)
+    # Re-integrate with spectral column to adjust T (disabled)
     #column.uMish[:] .= -gravity .* rho_t[:]
-    #CBtransform!(column)
-    #CAtransform!(column)
-    #p_new = CIInttransform(column, sfc_pressure * 100.0) ./ 100.0
+    #Btransform!(column)
+    #Atransform!(column)
+    #p_new = IInttransform(column, sfc_pressure * 100.0) ./ 100.0
     #Tk = theta ./ (p_0 ./ p_new).^(Rd./Cpd)
     #e = vapor_pressure.(p_new,q_v)
     #rho_d = 100.0 .* (p_new .- e) ./ (Tk .* Rd)
@@ -379,9 +357,9 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
     mubar[:,1] = mu_transform.(q_v)
 
     # Calculate the derivatives
-    transform_reference_state!(model, sbar)
-    transform_reference_state!(model, xibar)
-    transform_reference_state!(model, mubar)
+    transform_reference_state!(column, sbar)
+    transform_reference_state!(column, xibar)
+    transform_reference_state!(column, mubar)
 
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
@@ -395,44 +373,34 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64})
 end
 
 """
-    transform_reference_state!(model::ModelParameters, ref::Array{Float64})
+    transform_reference_state!(column, ref::Array{Float64})
 
-Compute vertical derivatives of a reference state variable in-place using Chebyshev spectral transforms.
+Compute vertical derivatives of a reference state variable in-place using spectral transforms.
 
-Fits the values in `ref[:, 1]` to a Chebyshev polynomial basis, then overwrites
+Fits the values in `ref[:, 1]` to the spectral basis, then overwrites
 `ref[:, 1]` with the filtered values, `ref[:, 2]` with the first vertical derivative,
 and `ref[:, 3]` with the second vertical derivative.
 
 # Arguments
-- `model::ModelParameters`: model configuration providing grid parameters for the Chebyshev column.
+- `column`: a 1D spectral basis object (e.g., `Chebyshev1D` or `Spline1D`) for vertical transforms.
 - `ref::Array{Float64}`: array of size `(nlevels, 3)` where column 1 holds the variable values; columns 2 and 3 are overwritten with derivatives.
 
 # Returns
 - `ref::Array{Float64}`: the modified array (also mutated in-place).
 """
-function transform_reference_state!(model::ModelParameters, ref::Array{Float64})
+function transform_reference_state!(column, ref::Array{Float64})
 
-    # Calculate vertical derivatives without BCs
-    cp = ChebyshevParameters(
-        zmin = model.grid_params.zmin,
-        zmax = model.grid_params.zmax,
-        zDim = model.grid_params.zDim,
-        bDim = model.grid_params.b_zDim,
-        BCB = Chebyshev.R0,
-        BCT = Chebyshev.R0)
-    column = Chebyshev1D(cp)
-    
     column.uMish[:] .= ref[:,1]
-    CBtransform!(column)
-    CAtransform!(column)
-    ref[:,1] .= CItransform!(column)
-    ref[:,2] .= CIxtransform(column)
-    ref[:,3] .= CIxxtransform(column)
+    Btransform!(column)
+    Atransform!(column)
+    ref[:,1] .= Itransform!(column)
+    ref[:,2] .= Ixtransform(column)
+    ref[:,3] .= Ixxtransform(column)
     return ref
 end
 
 """
-    exact_reference_state(model::ModelParameters, z::Array{Float64})
+    exact_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
 Read a pre-computed reference state from a file that has already been adjusted to
 hydrostatic balance. Useful for highly idealized simulations and benchmarking.
@@ -443,6 +411,7 @@ and transformed moisture. Vertical derivatives are computed via [`transform_refe
 # Arguments
 - `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
 - `z::Array{Float64}`: vertical coordinate array of model levels [m].
+- `column`: a 1D spectral basis object (e.g., `Chebyshev1D` or `Spline1D`) for computing vertical derivatives.
 
 # Returns
 - `ReferenceState`: the reference state read from file with computed vertical derivatives.
@@ -450,7 +419,7 @@ and transformed moisture. Vertical derivatives are computed via [`transform_refe
 # Throws
 - `DomainError` if a model level does not match the corresponding level in the file.
 """
-function exact_reference_state(model::ModelParameters, z::Array{Float64})
+function exact_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
     # Read a reference state file that has already been adjusted to hydrostatic balance
     # This function is useful for highly idealized simulations and benchmarking
@@ -475,9 +444,9 @@ function exact_reference_state(model::ModelParameters, z::Array{Float64})
     end
 
     # Calculate the derivatives
-    transform_reference_state!(model, sbar)
-    transform_reference_state!(model, xibar)
-    transform_reference_state!(model, mubar)
+    transform_reference_state!(column, sbar)
+    transform_reference_state!(column, xibar)
+    transform_reference_state!(column, mubar)
 
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])

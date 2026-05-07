@@ -198,10 +198,10 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Calculate the flux divergence of the falling precipitation
     col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]]) 
     col.uMish .= Vt
-    CBtransform!(col)
-    CAtransform!(col)
-    Vt .= CItransform!(col)
-    dVtdz = CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    Vt .= Itransform!(col)
+    dVtdz = Ixtransform(col)
     Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
 
     # Calculate the vertical diffusivity
@@ -214,9 +214,9 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     # Calculate vapor mixing first since it is needed for entropy and saturation ratio
     col.uMish .= rho_d .* Kv .* (mu_z .+ mubar_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col) ./ rho_d
     q_flux = VDIFF ./ mu_v_factor
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
@@ -230,9 +230,9 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     # Entropy mixing
     col.uMish .= rho_d .* Kv .* (s_z .+ sbar_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
     FORCING .= @. s_cond + s_div + s_v_mix
@@ -246,9 +246,9 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     impdot[colstart:colend,2] .= @. -w_z
 
     col.uMish .= rho_d .* Kv .* u_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * u_x) + (-w * u_z) #UADV
     @turbo FORCING .= @. -dpdx / rho_t #UPGF
@@ -263,9 +263,9 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
     col.uMish .= rho_d .* Kv .* mu_c_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_c_x) + (-w * mu_c_z) #Q_C ADV
     FORCING .= @. (q_cond -q_auto -q_coll) * mu_c_factor
@@ -274,9 +274,9 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo impdot[colstart:colend,6] .= @. Kv_mudiff * mu_c_zz
 
     col.uMish .= rho_d .* Kv .* mu_r_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_r_x) + (-w * mu_r_z) #Q_R ADV
     FORCING .= @. (q_auto +q_coll -q_evap -Vt_flux) * mu_r_factor
@@ -285,9 +285,9 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo impdot[colstart:colend,7] .= @. Kv_mudiff * mu_r_zz
 
     col.uMish .= rho_d .* Kv .* (mu_sat_z + satbar_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     # Saturation forcing
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
@@ -535,10 +535,10 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Calculate the flux divergence of the falling precipitation
     col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]]) 
     col.uMish .= Vt
-    CBtransform!(col)
-    CAtransform!(col)
-    Vt .= CItransform!(col)
-    dVtdz = CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    Vt .= Itransform!(col)
+    dVtdz = Ixtransform(col)
     Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
 
     # Calculate the vertical diffusivity
@@ -571,9 +571,9 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     q10 = q_v[z_ref_level]
     col.uMish .= rho_d .* Kv .* (mu_v_z .+ mubar_z)
     col.uMish[1] = rho_d[1] * Ck * U10 * (q_sfc - q10) * mu_v_factor[z_ref_level] # Q FLUX
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
     q_flux = VDIFF ./ mu_v_factor
 
     @turbo ADV .= @. (-u * mu_v_r) + (-w * (mu_v_z + mubar_z)) #MUADV
@@ -589,9 +589,9 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     s10 = s[z_ref_level]
     col.uMish .= rho_d .* Kv .* (s_z .+ sbar_z)
     col.uMish[1] = rho_d[1] * Ck * U10 * (s_sfc - s10) # S FLUX
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * s_r) + (-w * (s_z + sbar_z)) #SADV
     FORCING .= @. s_cond + s_div + s_v_mix
@@ -606,9 +606,9 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     col.uMish .= rho_d .* Kv .* u_z
     col.uMish[1] = rho_d[1] * Cd * U10 * u10 #UDRAG
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * u_r) + (-w * u_z) #UADV
     @turbo FORCING .= @. -dpdr / rho_t #UPGF
@@ -619,9 +619,9 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     col.uMish .= rho_d .* Kv .* v_z
     col.uMish[1] = rho_d[1] * Cd * U10 * v10 #VDRAG
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
 
     @turbo ADV .= @. (-u * v_r) + (-w * v_z) #VBADV
     @turbo FORCING .= 0.0 #VBPGF # There is no L pressure gradient in an axisymmetric storm
@@ -637,9 +637,9 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     impdot[colstart:colend,6] .= @. -(Pxi_bar * xi_z)
 
     col.uMish .= rho_d .* Kv .* mu_c_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_c_r) + (-w * mu_c_z) #Q_C ADV
     FORCING .= @. (q_cond -q_auto -q_coll) * mu_c_factor
@@ -648,9 +648,9 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo impdot[colstart:colend,7] .= @. Kv_mudiff * mu_c_zz
 
     col.uMish .= rho_d .* Kv .* mu_r_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_r_r) + (-w * mu_r_z) #Q_R ADV
     FORCING .= @. (q_auto +q_coll -q_evap -Vt_flux) * mu_r_factor
@@ -663,9 +663,9 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + q_flux + ((q_evap - q_cond) * (1.0 + Q_s)))/q_sat
 
     col.uMish .= rho_d .* Kv .* (mu_sat_z + satbar_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_sat_r) + (-w * (mu_sat_z + satbar_z)) #QSS ADV
     FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
@@ -876,9 +876,9 @@ function primitive_equation_cylindrical(mtile::ModelTile, colstart::Int64, colen
     end
     col.uMish[1] = Cd * U10 * u10 #UDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
     
     @turbo expdot[colstart:colend,4] .= @. ADV + PGF + KDIFF + VDIFF + COR
 
@@ -893,9 +893,9 @@ function primitive_equation_cylindrical(mtile::ModelTile, colstart::Int64, colen
     # Drag only applies at z = 0
     col.uMish[1] = Cd * U10 * v10 #VDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
     
     @turbo expdot[colstart:colend,5] .= @. ADV + PGF + KDIFF + COR
 

@@ -868,11 +868,11 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]])
     col.uMish .= Vt
     #col.uMish .= q_r .* rho_d .* Vt
-    CBtransform!(col)
-    CAtransform!(col)
-    Vt .= CItransform!(col)
-    dVtdz = CIxtransform(col) #./ rho_d
-    #Vt_flux = CIxtransform(col) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    Vt .= Itransform!(col)
+    dVtdz = Ixtransform(col) #./ rho_d
+    #Vt_flux = Ixtransform(col) ./ rho_d
     Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
     #Vt_flux = precipitation_flux.(q_r, rho_d, Tk, q_r_z, xi_z)
 
@@ -892,9 +892,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     #col = deepcopy(mtile.tile.columns[mtile.model.grid_params.vars["mu_r"]])
     col.uMish .= rho_d .* Kv .* s_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
     FORCING .= @. s_cond + s_div 
@@ -909,9 +909,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Differentiate Kv * du/dz
     col.uMish .= rho_d .* Kv .* (mu_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_x) + (-w * (mu_z + mubar_z)) #MUADV
     FORCING .= @. (q_evap - q_cond) * mu_factor
@@ -921,9 +921,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Differentiate u turbulent flux
     col.uMish .= rho_d .* Kv .* u_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * u_x) + (-w * u_z) #UADV
     @turbo FORCING .= @. -dpdx / rho_t  #UPGF
@@ -933,9 +933,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Differentiate w turbulent flux
     col.uMish .= rho_d .* Kv .* w_z
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
     @turbo FORCING .= @.  ((-gravity * rho_p) - dpdz) / rho_t
@@ -945,9 +945,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Differentiate Kv * du/dz
     col.uMish .= rho_d .* Kv .* (mu_c_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_c_x) + (-w * (mu_c_z + mubar_z)) #Q_C ADV
     FORCING .= @. (q_cond -q_auto -q_coll) * mu_c_factor # Condensation forcing
@@ -971,9 +971,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Differentiate Kv * du/dz
     col.uMish .= rho_d .* Kv .* (mu_r_z)
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= (CIxtransform(col)) ./ rho_d
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * mu_r_x) + (-w * (mu_r_z + mubar_z)) #Q_R ADV
     FORCING .= @. (q_auto +q_coll -q_evap -Vt_flux) * mu_r_factor # Precipitation forcing
@@ -983,9 +983,9 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
 
     # Differentiate Kv * du/dz
     #col.uMish .= rho_d .* Kv .* (sat_ratio_z)
-    #CBtransform!(col)
-    #CAtransform!(col)
-    #VDIFF .= (CIxtransform(col)) ./ rho_d
+    #Btransform!(col)
+    #Atransform!(col)
+    #VDIFF .= (Ixtransform(col)) ./ rho_d
 
     @turbo ADV .= @. (-u * sat_ratio_x) + (-w * sat_ratio_z) #QSS ADV
     FORCING .= @. sat_forcing #* mu_sat_factor

@@ -297,9 +297,9 @@ function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend
     # Use h since it doesn't have any boundary conditions in the vertical
     col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["h"]])
     col.uMish .= @. -((ub / r) + ubr)
-    CBtransform!(col)
-    CAtransform!(col)
-    wb .= CIInttransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    wb .= IInttransform(col)
     expdot[colstart:colend,6] .= 0.0 # TB: wb tendency = 0 because wb is diagnostic
 
     # h tendency
@@ -342,9 +342,9 @@ function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend
     end
     col.uMish[1] = Cd * U10 * u10 #UDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
 
     expdot[colstart:colend,4] .= @. ADV + PGF + COR + VDIFF + HDIFF
 
@@ -367,9 +367,9 @@ function Kepert2017_HeightResolvedTCBL(mtile::ModelTile, colstart::Int64, colend
     # Drag only applies at z = 0
     col.uMish[1] = Cd * U10 * v10 #VDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
     
     expdot[colstart:colend,5] .= @. ADV + PGF + COR + VDIFF + HDIFF
 
@@ -453,9 +453,9 @@ function RLZ_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, 
     #col = Chebyshev1D(h_col.params,h_col.mishPoints,h_col.gammaBC,
     #    h_col.fftPlan,h_col.filter,h_col.uMish,h_col.b,h_col.a,h_col.ax)
     col.uMish .= @. -((ub / r) + ubr + (vbl / r))
-    CBtransform!(col)
-    CAtransform!(col)
-    wb .= CIInttransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    wb .= IInttransform(col)
     expdot[colstart:colend,4] .= 0.0
 
     # vg tendency
@@ -497,9 +497,9 @@ function RLZ_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, 
     end
     col.uMish[1] = Cd * U10 * u10 #UDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
 
     expdot[colstart:colend,2] .= @. ADV + PGF + COR + VDIFF + HDIFF
 
@@ -519,9 +519,9 @@ function RLZ_HeightResolvedBL(mtile::ModelTile, colstart::Int64, colend::Int64, 
     # Drag only applies at z = 0
     col.uMish[1] = Cd * U10 * v10 #VDRAG
 
-    CBtransform!(col)
-    CAtransform!(col)
-    VDIFF .= CIxtransform(col)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
 
     expdot[colstart:colend,3] .= @. ADV + PGF + COR + VDIFF + HDIFF
 

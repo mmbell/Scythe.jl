@@ -78,11 +78,12 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     ref_state = empty_reference_state()
     if !isempty(model.ref_state_file)
         z_values = tilepoints[1:model.grid_params.zDim,ndims(tilepoints)]
+        ref_column = deepcopy(tile.kbasis.data[1])
 
         if (model.options[:exact_reference_state])
-            ref_state = exact_reference_state(model, z_values)
+            ref_state = exact_reference_state(model, z_values, ref_column)
         else
-            ref_state = calculate_reference_state(model, z_values, model.grid_params.zDim)
+            ref_state = calculate_reference_state(model, z_values, ref_column)
         end
     end
 
@@ -101,8 +102,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     h_matrix = factorize([1 2; 2 1])
     diffusion_matrix = factorize([1 2; 2 1])
     if model.options[:semiimplicit]
-        diffusion_matrix = calc_Helmholtz_diffusion_matrix(model, 1.25 * model.ts * model.physical_params[:Kvdiff] )
-        h_matrix = calc_Helmholtz_semiimplicit_matrix(model, ref_state.Pxi_bar, 1.25 * model.ts)
+        diffusion_matrix = calc_Helmholtz_diffusion_matrix(tile, model, 1.25 * model.ts * model.physical_params[:Kvdiff] )
+        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, ref_state.Pxi_bar, 1.25 * model.ts)
     end
 
     mtile = ModelTile(
@@ -549,10 +550,10 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     # Take the vertical derivative of w_nstar and multiply by ts term
     w_col = mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]]
     w_col.uMish .= w_nstar
-    CBtransform!(w_col)
-    CAtransform!(w_col)
-    w_nstar = CItransform!(w_col)
-    w_nstar_z = ts_term .* CIxtransform(w_col)
+    Btransform!(w_col)
+    Atransform!(w_col)
+    w_nstar = Itransform!(w_col)
+    w_nstar_z = ts_term .* Ixtransform(w_col)
 
     # Set up the matrix problem
     nz = mtile.model.grid_params.zDim
@@ -561,14 +562,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     g = [0.0 ; 0.0; g[2:nz-1]]
 
     # Calculate the Helmholtz matrix
-    dct = Chebyshev.dct_matrix(nz)
-    column_length = mtile.model.grid_params.zmax - mtile.model.grid_params.zmin
-    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
-    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
-    h = (-ts_term .* ts_term .* Pxi_bar) .* dct2 .+ dct
-    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[1,:]
-    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[nz,:]
-    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
+    h_a = calc_Helmholtz_semiimplicit_matrix_xi(mtile.tile, mtile.model, Pxi_bar, ts_term)
 
     # Solve for the coefficients
     xi_a = h_a \ g
@@ -576,16 +570,16 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     # Set xi_n+1
     xi_col = mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]]
     xi_col.a .= xi_a
-    view(mtile.var_np1,colstart:colend,xi_index) .= CItransform!(xi_col)
+    view(mtile.var_np1,colstart:colend,xi_index) .= Itransform!(xi_col)
 
     # Set w_n+1
-    view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
+    view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* Ixtransform(xi_col))
 end
 
 """
     semiimplicit_adjustment_xi(mtile, colstart, colend, t)
 
-Semi-implicit adjustment that solves a Chebyshev-collocation Helmholtz problem for xi,
+Semi-implicit adjustment that solves a spectral-collocation Helmholtz problem for xi,
 using AB3 explicit extrapolation and AI2* implicit treatment of acoustic modes.
 """
 function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
@@ -638,10 +632,10 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     # Take the vertical derivative of w_nstar and multiply by ts term
     w_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
     w_col.uMish .= w_nstar
-    CBtransform!(w_col)
-    CAtransform!(w_col)
-    w_nstar = CItransform!(w_col)
-    w_nstar_z = ts_term .* CIxtransform(w_col)
+    Btransform!(w_col)
+    Atransform!(w_col)
+    w_nstar = Itransform!(w_col)
+    w_nstar_z = ts_term .* Ixtransform(w_col)
 
     # Set up the matrix problem
     nz = mtile.model.grid_params.zDim
@@ -652,7 +646,7 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
-        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.model, Pxi_bar, ts_term)
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
         xi_col.a .= h_a \ g
     else
         # Use the pre-calculated one
@@ -660,16 +654,16 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     end
 
     # Set xi_n+1
-    view(mtile.var_np1,colstart:colend,xi_index) .= CItransform!(xi_col)
+    view(mtile.var_np1,colstart:colend,xi_index) .= Itransform!(xi_col)
 
     # Set w_n+1
-    view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* CIxtransform(xi_col))
+    view(mtile.var_np1,colstart:colend,w_index) .= w_nstar .- (ts_term .* Pxi_bar .* Ixtransform(xi_col))
 end
 
 """
     semiimplicit_adjustment(mtile, colstart, colend, t)
 
-Semi-implicit adjustment that solves a Chebyshev-collocation Helmholtz problem for w,
+Semi-implicit adjustment that solves a spectral-collocation Helmholtz problem for w,
 using AB3 explicit extrapolation and AI2* implicit treatment of acoustic modes.
 """
 function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
@@ -722,10 +716,10 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     # Take the vertical derivative of xi_nstar and multiply by ts term
     xi_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]])
     xi_col.uMish .= xi_nstar
-    CBtransform!(xi_col)
-    CAtransform!(xi_col)
-    xi_nstar = CItransform!(xi_col)
-    xi_nstar_z = ts_term .* Pxi_bar .* CIxtransform(xi_col)
+    Btransform!(xi_col)
+    Atransform!(xi_col)
+    xi_nstar = Itransform!(xi_col)
+    xi_nstar_z = ts_term .* Pxi_bar .* Ixtransform(xi_col)
 
     # Set up the matrix problem
     nz = mtile.model.grid_params.zDim
@@ -736,7 +730,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
-        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.model, Pxi_bar, ts_term)
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
         w_col.a .= h_a \ g
     else
         # Use the pre-calculated one
@@ -744,10 +738,10 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     end
 
     # Set w_n+1
-    view(mtile.var_np1,colstart:colend,w_index) .= CItransform!(w_col)
+    view(mtile.var_np1,colstart:colend,w_index) .= Itransform!(w_col)
 
     # Set xi_n+1
-    view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* CIxtransform(w_col))
+    view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* Ixtransform(w_col))
 end
 
 """
@@ -801,10 +795,10 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Take the vertical derivative of xi_nstar and multiply by ts term
     xi_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]])
     xi_col.uMish .= xi_nstar
-    CBtransform!(xi_col)
-    CAtransform!(xi_col)
-    xi_nstar = CItransform!(xi_col)
-    xi_nstar_z = ts_term .* Pxi_bar .* CIxtransform(xi_col)
+    Btransform!(xi_col)
+    Atransform!(xi_col)
+    xi_nstar = Itransform!(xi_col)
+    xi_nstar_z = ts_term .* Pxi_bar .* Ixtransform(xi_col)
 
     # Set up the matrix problem
     nz = mtile.model.grid_params.zDim
@@ -815,7 +809,7 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
-        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.model, Pxi_bar, ts_term)
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
         w_col.a .= h_a \ g
     else
         # Use the pre-calculated one
@@ -823,10 +817,10 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     end
 
     # Set w_n+1
-    view(mtile.var_np1,colstart:colend,w_index) .= CItransform!(w_col)
+    view(mtile.var_np1,colstart:colend,w_index) .= Itransform!(w_col)
 
     # Set xi_n+1
-    view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* CIxtransform(w_col))
+    view(mtile.var_np1,colstart:colend,xi_index) .= xi_nstar .- (ts_term .* Ixtransform(w_col))
 end
 
 """
@@ -924,38 +918,38 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
     h_a = mtile.diffusion_matrix
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
-        h_a = calc_Helmholtz_diffusion_matrix(mtile.model, ts_term)
+        h_a = calc_Helmholtz_diffusion_matrix(mtile.tile, mtile.model, ts_term)
     end
 
     # Set s_n+1
     g = s_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
     col.a .= h_a \ g
-    view(mtile.var_np1,colstart:colend,s_index) .= CItransform!(col)
+    view(mtile.var_np1,colstart:colend,s_index) .= Itransform!(col)
 
     # Set mu_n+1
     g = mu_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
     col.a .= h_a \ g
-    view(mtile.var_np1,colstart:colend,mu_index) .= CItransform!(col)
+    view(mtile.var_np1,colstart:colend,mu_index) .= Itransform!(col)
 
     # Set mu_c_n+1
     g = mu_c_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
     col.a .= h_a \ g
-    view(mtile.var_np1,colstart:colend,mu_c_index) .= CItransform!(col)
+    view(mtile.var_np1,colstart:colend,mu_c_index) .= Itransform!(col)
 
     # Set mu_r_n+1
     g = mu_r_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
     col.a .= h_a \ g
-    view(mtile.var_np1,colstart:colend,mu_r_index) .= CItransform!(col)
+    view(mtile.var_np1,colstart:colend,mu_r_index) .= Itransform!(col)
 
     # Set mu_sat_n+1
     g = mu_sat_nstar
     g = [0.0 ; 0.0; g[2:nz-1]]
     col.a .= h_a \ g
-    view(mtile.var_np1,colstart:colend,mu_sat_index) .= CItransform!(col)
+    view(mtile.var_np1,colstart:colend,mu_sat_index) .= Itransform!(col)
 
 end
 
@@ -1065,64 +1059,57 @@ function checkCFL(grid)
 end
 
 """
-    calc_Helmholtz_semiimplicit_matrix_xi(model, Pxi_bar, ts_term)
+    calc_Helmholtz_semiimplicit_matrix_xi(grid, model, Pxi_bar, ts_term)
 
-Build and factorize the Chebyshev-collocation Helmholtz matrix for the xi-form
-semi-implicit solve, with derivative boundary conditions at top and bottom.
+Build and factorize the spectral-collocation Helmholtz matrix for the xi-form
+semi-implicit solve, with derivative (Neumann) boundary conditions at top and bottom.
 """
-function calc_Helmholtz_semiimplicit_matrix_xi(model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
+function calc_Helmholtz_semiimplicit_matrix_xi(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
 
-    # Calculate the Helmholtz matrix
+    # Build basis matrices via the abstract operator_matrix interface
     nz = model.grid_params.zDim
-    dct = Chebyshev.dct_matrix(nz)
-    column_length = model.grid_params.zmax - model.grid_params.zmin
-    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
-    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
-    h = (-ts_term .* ts_term .* Pxi_bar) .* dct2 .+ dct
-    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[1,:]
-    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* dct1[nz,:]
+    M0 = operator_matrix(grid, :k, 0)
+    M1 = operator_matrix(grid, :k, 1)
+    h = (-ts_term .* ts_term .* Pxi_bar) .* operator_matrix(grid, :k, 2) .+ M0
+    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* M1[1, :]
+    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* M1[nz, :]
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     return factorize(h_a)
 end
 
 """
-    calc_Helmholtz_semiimplicit_matrix(model, Pxi_bar, ts_term)
+    calc_Helmholtz_semiimplicit_matrix(grid, model, Pxi_bar, ts_term)
 
-Build and factorize the Chebyshev-collocation Helmholtz matrix for the w-form
+Build and factorize the spectral-collocation Helmholtz matrix for the w-form
 semi-implicit solve, with Dirichlet boundary conditions at top and bottom.
 """
-function calc_Helmholtz_semiimplicit_matrix(model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
+function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64)
 
-    # Calculate the Helmholtz matrix
+    # Build basis matrices via the abstract operator_matrix interface
     nz = model.grid_params.zDim
-    dct = Chebyshev.dct_matrix(nz)
-    column_length = model.grid_params.zmax - model.grid_params.zmin
-    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
-    #dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
-    h = (ts_term .* ts_term .* Pxi_bar) .* dct2 .- dct
-    bc1 = dct[1,:]
-    bc2 = dct[nz,:]
+    M0 = operator_matrix(grid, :k, 0)
+    h = (ts_term .* ts_term .* Pxi_bar) .* operator_matrix(grid, :k, 2) .- M0
+    bc1 = M0[1, :]
+    bc2 = M0[nz, :]
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     return factorize(h_a)
 end
 
 """
-    calc_Helmholtz_diffusion_matrix(model, ts_term)
+    calc_Helmholtz_diffusion_matrix(grid, model, ts_term)
 
-Build and factorize the Chebyshev-collocation Helmholtz matrix for implicit vertical
+Build and factorize the spectral-collocation Helmholtz matrix for implicit vertical
 diffusion, with Neumann (zero-flux) boundary conditions at top and bottom.
 """
-function calc_Helmholtz_diffusion_matrix(model::ModelParameters, ts_term::Float64)
+function calc_Helmholtz_diffusion_matrix(grid::AbstractGrid, model::ModelParameters, ts_term::Float64)
 
-    # Calculate the Helmholtz matrix
+    # Build basis matrices via the abstract operator_matrix interface
     nz = model.grid_params.zDim
-    dct = Chebyshev.dct_matrix(nz)
-    column_length = model.grid_params.zmax - model.grid_params.zmin
-    dct2 = Chebyshev.dct_2nd_derivative(nz, column_length)
-    dct1 = Chebyshev.dct_1st_derivative(nz, column_length)
-    h = dct .- (ts_term .* dct2)
-    bc1 = dct1[1,:]
-    bc2 = dct1[nz,:]
+    M0 = operator_matrix(grid, :k, 0)
+    M1 = operator_matrix(grid, :k, 1)
+    h = M0 .- (ts_term .* operator_matrix(grid, :k, 2))
+    bc1 = M1[1, :]
+    bc2 = M1[nz, :]
     h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
     return factorize(h_a)
 end
