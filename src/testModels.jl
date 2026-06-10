@@ -243,12 +243,15 @@ end
 """
     BF02_test(mtile, colstart, colend, t)
 
-Bryan & Fritsch (2002) moist benchmark test in XZ with condensation and cloud water.
-Deprecated: may produce incorrect results.
+Bryan & Fritsch (2002) moist benchmark test with condensation and cloud water.
+Carries liquid water in `mu_l` and an advected supersaturation mixing ratio in
+`qss` (7 variables: s, xi, mu, u, w, mu_l, qss). Uses the qss-relaxation
+condensation scheme ([`q_condensation_relaxation`](@ref),
+[`condensation_adjustment_qss`](@ref)) restored from the formulation that
+passed the moist benchmark (commit a4bf2a0), ported to the linear `mu_transform`
+moisture convention. Validated by `benchmarks/bf02_moist.jl`.
 """
 function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
-
-    @warn "BF02_test is deprecated and may produce incorrect results" maxlog=1
 
     grid = mtile.tile
     gridpoints = mtile.tilepoints
@@ -320,9 +323,8 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     mubar_z = refstate.mubar[:,2]
     mubar_zz = refstate.mubar[:,3]
 
-    mu_lbar = refstate.mu_lbar[:,1]
-    mu_lbar_z = refstate.mu_lbar[:,2]
-    mu_lbar_zz = refstate.mu_lbar[:,3]
+    # The reference liquid water profile is zero, so mu_l is the full
+    # liquid water variable
 
     # Fundamental thermodynamic quantities derived from model variables
     mu_total = mu .+ mubar
@@ -331,13 +333,13 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     rho_d = [x[2] for x in thermo]  # Dry air density
     Tk = [x[3] for x in thermo]     # Temperature in K
     p = [x[4] for x in thermo]      # Total air pressure
-    q_l = ahyp.(mu_l .+ mu_lbar)               # Liquid mixing ratio
+    q_l = inv_mu_transform.(mu_l)              # Liquid mixing ratio
     rho_t = rho_d .* (1.0 .+ q_v .+ q_l)   # Total air density
-    qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
+    qvp = q_v .- inv_mu_transform.(mubar)       # Perturbation mixing ratio
     mu_factor = dmudq.(mu_total, q_v)
     qvp_x = mu_x ./ mu_factor # Perturbation vapor gradient in x
     qvp_z = mu_z ./ mu_factor # Perturbation vapor gradient in z
-    rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
+    rhobar = dry_density.(xibar) .* (1.0 .+ inv_mu_transform.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
@@ -359,8 +361,8 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     # Condensation rate
     N_c = 500.0
     r_c = 10.0
-    q_cond = q_condensation.(qss, Tk, p, q_v, q_l, N_c, r_c)
-    s_cond = s_condensation.(q_cond, Tk, rho_d, q_v, q_l, p)
+    q_cond = q_condensation_relaxation.(qss, Tk, p, q_v, q_l, N_c, r_c)
+    s_cond = s_condensation_relaxation.(q_cond, Tk, rho_d, q_v, q_l, p)
     Q_s = Q_s_factor.(Tk, p, q_v, q_l)
     invtau = invtau_condensation.(Tk, p, N_c, r_c)
     qss_cond = @. dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity))) - qss * invtau
@@ -392,7 +394,7 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
     impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
 
-    @turbo ADV .= @. (-u * mu_l_x) + (-w * (mu_l_z + mu_lbar_z)) #Q_L ADV
+    @turbo ADV .= @. (-u * mu_l_x) + (-w * mu_l_z) #Q_L ADV
     FORCING .= @. q_cond * dmudq.(mu_l, q_l)
     @turbo KDIFF .= @. K * (mu_l_xx + mu_l_zz)
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
@@ -411,7 +413,7 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     end
 
     # Adjust the condensation rate from the advected supersaturation
-    condensation_adjustment(mtile, colstart, colend, t)
+    condensation_adjustment_qss(mtile, colstart, colend, t)
 
     # Increment the explicit timestep terms with other forcings
     #explicit_increment(mtile, colstart, colend, t)

@@ -160,6 +160,40 @@ function q_condensation_qss(qss, Tk, p, rho_d, q_v, q_c, q_r, N_c)
 end
 
 """
+    q_condensation_relaxation(qss, Tk, p, q_v, q_l, N_c, r_c)
+
+Compute the condensation or evaporation rate from an advected supersaturation
+mixing ratio using a fixed-droplet-property relaxation timescale. This is the
+scheme used by the restored `BF02_test` equation set and matches the formulation
+that passed the Bryan & Fritsch (2002) moist benchmark (commit a4bf2a0).
+
+# Arguments
+- `qss`: Supersaturation mixing ratio (q_v - q_sat) [kg/kg]
+- `Tk`: Temperature [K]
+- `p`: Pressure [hPa]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_l`: Liquid water mixing ratio [kg/kg]
+- `N_c`: Cloud droplet number concentration [#/cm³]
+- `r_c`: Cloud droplet radius [microns]
+
+# Returns
+- `q_cond`: Condensation rate scaled by the inverse condensation timescale [kg/kg/s]
+
+# References
+- Ooyama (2001); Bryan & Fritsch (2002)
+"""
+function q_condensation_relaxation(qss, Tk, p, q_v, q_l, N_c, r_c)
+
+    Q_s = Q_s_factor(Tk, p, q_v, q_l)
+    q_cond = qss/(1.0 + Q_s)
+    # Adjust to ensure no negative water
+    q_cond = min(q_v, q_cond)
+    q_cond = max(-q_l, q_cond)
+    invtau = invtau_condensation(Tk, p, N_c, r_c)
+    return q_cond*invtau
+end
+
+"""
     q_condensation(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
 
 Compute the condensation or evaporation rate for cloud droplets using explicit
@@ -325,6 +359,39 @@ function s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
         RH = 1.0e-6
     end
     ds = (q_cond - q_evap) * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*(log(RH)+1.0)) )
+    return ds
+end
+
+"""
+    s_condensation_relaxation(q_cond, Tk, rho_d, q_v, q_l, p)
+
+Compute the entropy source/sink due to condensation for the restored `BF02_test`
+qss-relaxation scheme. Matches the formulation that passed the Bryan & Fritsch
+(2002) moist benchmark (commit a4bf2a0); differs from [`s_condensation`](@ref)
+by the absence of the `+Rv` vapor entropy term added later for the primitive
+equation set.
+
+# Arguments
+- `q_cond`: Condensation rate (positive for condensation) [kg/kg/s]
+- `Tk`: Temperature [K]
+- `rho_d`: Dry air density [kg/m³]
+- `q_v`: Water vapor mixing ratio [kg/kg]
+- `q_l`: Total liquid water mixing ratio [kg/kg]
+- `p`: Pressure [hPa]
+
+# Returns
+- `ds`: Entropy tendency due to condensation [J/(kg·K·s)]
+"""
+function s_condensation_relaxation(q_cond, Tk, rho_d, q_v, q_l, p)
+
+    if q_cond == 0.0
+        # Avoid 0 * log(0) = NaN when there is no vapor and no condensation
+        return 0.0
+    end
+    Cm = (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
+    e = vapor_pressure(p, q_v)
+    sat_e = sat_pressure_liquid_buck(Tk, p)
+    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(e/sat_e)) )
     return ds
 end
 
@@ -602,6 +669,74 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
 
     # Incorrect implicit method
     #dq = @. tau_r * ( ((2.0 * Q_s - 1.0) * q_v) - (0.75 * Q_s * qv_n) + q_sat + qss) / (1.0 + (1.25 * Q_s * tau_r))
+
+end
+
+"""
+    condensation_adjustment_qss(mtile, colstart, colend, t)
+
+Perform a saturation adjustment for the restored `BF02_test` equation set, which
+carries liquid water in `mu_l` and an advected supersaturation mixing ratio in
+`qss`. Updates entropy (`s`), water vapor (`mu`), and liquid water (`mu_l`) in
+place using an explicit Euler increment with a relaxation factor of 0.25.
+
+Restored from the formulation that passed the Bryan & Fritsch (2002) moist
+benchmark (commit a4bf2a0), with two deliberate changes: the reference liquid
+water profile (`mu_lbar`) is zero since `ReferenceState` no longer carries it,
+and the condensation limiters are applied elementwise (the original applied
+`min`/`max` to whole arrays, which compares lexicographically and was a no-op
+in practice).
+
+# Arguments
+- `mtile::ModelTile`: Model tile containing prognostic and reference state variables
+- `colstart::Int64`: Starting index of the column range to adjust
+- `colend::Int64`: Ending index of the column range to adjust
+- `t::Int64`: Current time step index
+"""
+function condensation_adjustment_qss(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # Calculate the condensation rate from the advected variables
+    s_index = mtile.model.grid_params.vars["s"]
+    s = view(mtile.var_np1,colstart:colend,s_index)
+
+    # Xi is not modified
+    xi_index = mtile.model.grid_params.vars["xi"]
+    xi = view(mtile.var_np1,colstart:colend,xi_index)
+
+    mu_index = mtile.model.grid_params.vars["mu"]
+    mu = view(mtile.var_np1,colstart:colend,mu_index)
+
+    mu_l_index = mtile.model.grid_params.vars["mu_l"]
+    mu_l = view(mtile.var_np1,colstart:colend,mu_l_index)
+
+    qss_index = mtile.model.grid_params.vars["qss"]
+    qss = view(mtile.var_np1,colstart:colend,qss_index)
+
+    # Get total state from the reference profile. The reference liquid water
+    # is zero, so mu_l is the full liquid water variable.
+    s_total = s .+ mtile.ref_state.sbar[:,1]
+    xi_total = xi .+ mtile.ref_state.xibar[:,1]
+    mu_total = mu .+ mtile.ref_state.mubar[:,1]
+
+    thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
+    q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
+    rho_d = [x[2] for x in thermo]  # Dry air density
+    Tk = [x[3] for x in thermo]     # Temperature in K
+    p = [x[4] for x in thermo]      # Total air pressure
+    q_l = inv_mu_transform.(mu_l)   # Liquid mixing ratio
+    q_sat = q_sat_liquid.(Tk, p)
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+
+    # Do the increment using explicit Euler integration
+    tau_r = 0.25
+    q_cond = (q_v .- q_sat .- qss) ./ (1.0 .+ Q_s)
+    # Restrict condensation to available vapor and evaporation to available liquid
+    q_cond = min.(q_v, q_cond)
+    q_cond = max.(-q_l, q_cond)
+
+    mu .= @. mu - tau_r * dmudq(mu_total, q_v) * q_cond
+    mu_l .= @. mu_l + tau_r * dmudq(mu_l, q_l) * q_cond
+    s .= @. s + tau_r * s_condensation_relaxation(q_cond, Tk, rho_d, q_v, q_l, p)
 
 end
 

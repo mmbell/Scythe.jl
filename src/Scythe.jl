@@ -14,7 +14,7 @@ export RobinBC, PeriodicBC, CauchyBC, ExponentialBC, SymmetricBC, AntisymmetricB
 Main configuration struct for Scythe model runs. Uses `Base.@kwdef` for keyword construction.
 
 # Fields
-- `ts::Float64`: simulation start time [s] (default: `0.0`)
+- `ts::Float64`: model timestep [s] (default: `0.0`)
 - `integration_time::Float64`: total integration duration [s] (default: `1.0`)
 - `output_interval::Float64`: time between output writes [s] (default: `1.0`)
 - `equation_set`: name of the equation set to solve (default: `"LinearAdvection1D"`)
