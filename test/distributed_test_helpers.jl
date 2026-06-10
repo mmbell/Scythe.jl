@@ -5,6 +5,24 @@
 # workers or RemoteChannels, enabling deterministic single-process testing.
 
 """
+    advance_tile_columns(mtile, t)
+
+Advance every column of a tile, mirroring the dispatch in `advanceTimestep`:
+RZ/RLZ grids advance per vertical column, R/RL grids advance all points as a
+single column (`c = -1`).
+"""
+function advance_tile_columns(mtile, t)
+    nc = Springsteel.num_columns(mtile.tile)
+    if nc > 0
+        for c in 1:nc
+            Scythe.advance_column(mtile, c, t)
+        end
+    else
+        Scythe.advance_column(mtile, -1, t)
+    end
+end
+
+"""
     run_distributed_simulation(model, initial_spectral, num_workers, num_ts)
 
 Simulate the distributed model_loop workflow in a single process using
@@ -57,12 +75,8 @@ function run_distributed_simulation(model, initial_spectral::AbstractArray,
         end
 
         # Phase 2: Advance all tiles (compute tendencies and step forward)
-        # Note: For R and RL grids, num_columns returns 0 or 1 but there is no
-        # vertical column decomposition, so we always use c=-1 to process all
-        # points as a single column. Column decomposition (c>0) is only valid
-        # for RZ/RLZ grids with a nonzero vertical dimension.
         for mtile in mtiles
-            Scythe.advance_column(mtile, -1, t)
+            advance_tile_columns(mtile, t)
             Scythe.calcTendency(mtile)
         end
 
@@ -112,7 +126,7 @@ function run_single_process_simulation(model, initial_spectral::AbstractArray, n
     mtile = createModelTile(patch, patch, model, haloReceiveMap)
 
     for t in 1:num_ts
-        Scythe.advance_column(mtile, -1, t)
+        advance_tile_columns(mtile, t)
         Scythe.calcTendency(mtile)
         gridTransform!(mtile.tile)
     end

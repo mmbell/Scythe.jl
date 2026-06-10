@@ -11,5 +11,6 @@ using Scythe
     include("test_generic_transforms.jl")
     include("test_linear_advection_integration.jl")
     include("test_distributed_linear_advection.jl")
+    include("test_distributed_rz.jl")
     include("test_oneway_sw_slab.jl")
 end

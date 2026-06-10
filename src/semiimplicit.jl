@@ -187,6 +187,29 @@ function extract_halo_values(tile::AbstractGrid)
     end
 end
 
+"""
+    extract_halo_values(tile::RZ_Grid)
+
+RZ grids store `b_kDim` consecutive spline blocks (one per Chebyshev mode), so
+the 3-row right halo is extracted from the end of each block. Ordering matches
+the column-major sparse indices of the RZ `calcHaloMap`.
+"""
+function extract_halo_values(tile::RZ_Grid)
+    b_iDim = tile.params.b_iDim
+    b_kDim = tile.params.b_kDim
+    nvars = size(tile.spectral, 2)
+    result = zeros(Float64, 3 * nvars * b_kDim)
+    pos = 1
+    for v in 1:nvars
+        for z in 1:b_kDim
+            te = z * b_iDim   # last row of block z
+            result[pos:pos+2] .= tile.spectral[te-2:te, v]
+            pos += 3
+        end
+    end
+    return result
+end
+
 """Accumulate (add) spectral values at sparse map locations in a patch-sized array."""
 function accumulate_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
     idx = sparse_indices(map)
@@ -224,6 +247,26 @@ function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Abstr
             tp1 = p * b_iDim_tile + 1
             sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
         end
+    end
+end
+
+"""
+    write_tile_to_shared!(sharedSpectral, tile::RZ_Grid, b_iDim_patch)
+
+RZ grids store `b_kDim` consecutive spline blocks (one per Chebyshev mode);
+copy the inner rows of every block to its patch position.
+"""
+function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::RZ_Grid,
+                                b_iDim_patch::Int64)
+    siL = tile.params.spectralIndexL
+    b_iDim_tile = tile.params.b_iDim
+    b_kDim = tile.params.b_kDim
+    inner_rows = b_iDim_tile - 4  # inner region excludes 3-row halo
+
+    for z in 1:b_kDim
+        pp1 = (z - 1) * b_iDim_patch + siL
+        tp1 = (z - 1) * b_iDim_tile + 1
+        sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
     end
 end
 
