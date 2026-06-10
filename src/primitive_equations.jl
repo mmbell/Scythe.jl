@@ -465,7 +465,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     # Entropy divergence forcing
     Cm = @. (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
-    s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
+    s_div = @. Cm * (Rd + q_v * Rv) * (u_r + w_z)
 
     # Condensation rate
     sat_ratio = inv_mu_transform.(mu_sat .+ satbar) # Saturation ratio
