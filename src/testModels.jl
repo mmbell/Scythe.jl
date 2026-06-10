@@ -193,7 +193,7 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     #qvp = q_v .- ahyp.(mubar)       # Perturbation mixing ratio
     qvp_x = mu_x ./ dmudq.(mu .+ mubar, q_v) # Perturbation vapor gradient in x
     qvp_z = mu_z ./ dmudq.(mu .+ mubar, q_v) # Perturbation vapor gradient in z
-    rhobar = dry_density.(xibar) .* (1.0 .+ ahyp.(mubar)) # Ref. air density
+    rhobar = dry_density.(xibar) .* (1.0 .+ inv_mu_transform.(mubar)) # Ref. air density
     rho_p = rho_t .- rhobar         # Perturbation air density
     
     # Get the mean speed of sound squared from the reference state
