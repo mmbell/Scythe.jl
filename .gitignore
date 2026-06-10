@@ -13,6 +13,14 @@ Manifest.toml
 # Run logs
 *.log
 
-# Default Scythe output
+# Default Scythe output (old and current naming)
 physical_out_*.csv
 spectral_out_*.csv
+*_physical.csv
+*_spectral.csv
+*_gridded.csv
+!benchmarks/reference_data/**
+
+# Benchmark run artifacts (committed reference data lives in benchmarks/reference_data)
+benchmarks/output/
+benchmarks/results/
