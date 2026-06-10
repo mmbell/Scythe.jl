@@ -78,7 +78,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     ref_state = empty_reference_state()
     if !isempty(model.ref_state_file)
         z_values = tilepoints[1:model.grid_params.kDim,ndims(tilepoints)]
-        ref_column = deepcopy(tile.kbasis.data[1])
+        ref_column = reference_column(tile, model.grid_params)
 
         if (model.options[:exact_reference_state])
             ref_state = exact_reference_state(model, z_values, ref_column)

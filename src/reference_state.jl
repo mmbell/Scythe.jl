@@ -39,6 +39,36 @@ function empty_reference_state()
 end
 
 """
+    reference_column(grid, grid_params)
+
+Build a vertical basis column with natural (R0) boundary conditions for
+reference state derivative calculations. Reference profiles can have nonzero
+gradients at the domain boundaries, so the model variables' boundary
+conditions must not be imposed on them (this matches the pre-migration
+behavior, which always differentiated reference profiles on an R0 column).
+Falls back to a copy of the first variable's column for vertical bases other
+than Chebyshev.
+"""
+function reference_column(grid::AbstractGrid, grid_params)
+    return natural_column(grid.kbasis.data[1], grid_params)
+end
+
+function natural_column(column::Chebyshev1D, grid_params)
+    cp = ChebyshevParameters(
+        zmin = grid_params.kMin,
+        zmax = grid_params.kMax,
+        zDim = grid_params.kDim,
+        bDim = grid_params.b_kDim,
+        BCB = Chebyshev.R0,
+        BCT = Chebyshev.R0)
+    return Chebyshev1D(cp)
+end
+
+function natural_column(column, grid_params)
+    return deepcopy(column)
+end
+
+"""
     calculate_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
 Calculate a hydrostatic reference state from a sounding file specified in `model.ref_state_file`.

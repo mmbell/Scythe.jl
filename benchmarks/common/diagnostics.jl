@@ -18,7 +18,7 @@ function rebuild_reference(model)
     gridpoints = Scythe.getGridpoints(patch)
     kDim = model.grid_params.kDim
     z = gridpoints[1:kDim, 2]
-    column = deepcopy(patch.kbasis.data[1])
+    column = Scythe.reference_column(patch, model.grid_params)
     if model.options[:exact_reference_state]
         ref = Scythe.exact_reference_state(model, z, column)
     else
@@ -52,10 +52,8 @@ function theta_perturbation(df::DataFrame, ref, kDim::Int)
     sbar = repeat(ref.sbar[:, 1], ncols)
     xibar = repeat(ref.xibar[:, 1], ncols)
     mubar = repeat(ref.mubar[:, 1], ncols)
-    q_v = Scythe.inv_mu_transform.(df.mu .+ mubar)
-    q_bar = Scythe.inv_mu_transform.(mubar)
-    theta = Scythe.potential_temperature.(df.s .+ sbar, df.xi .+ xibar, q_v)
-    theta0 = Scythe.potential_temperature.(sbar, xibar, q_bar)
+    theta = Scythe.potential_temperature.(df.s .+ sbar, df.xi .+ xibar, df.mu .+ mubar)
+    theta0 = Scythe.potential_temperature.(sbar, xibar, mubar)
     theta_p = reshape(theta .- theta0, kDim, ncols)
     return theta_p, ncols
 end

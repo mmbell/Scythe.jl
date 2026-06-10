@@ -94,7 +94,7 @@ function straka_init!(model)
     gridpoints = Scythe.getGridpoints(patch)
     kDim = model.grid_params.kDim
     z = gridpoints[1:kDim, 2]
-    column = deepcopy(patch.kbasis.data[1])
+    column = Scythe.reference_column(patch, model.grid_params)
     ref = Scythe.calculate_reference_state(model, z, column)
 
     patch.physical .= 0.0
