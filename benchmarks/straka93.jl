@@ -86,19 +86,9 @@ end
 
 # ── Initial conditions ─────────────────────────────────────────────────────
 
-"""Write a dry constant-theta sounding covering the model domain."""
-function write_dry_sounding(path; sfc_p_hPa=1000.0, theta=300.0, zmax=8000.0, dz=500.0)
-    open(path, "w") do f
-        println(f, "$(sfc_p_hPa)\t$(theta)\t0.0")
-        for z in dz:dz:zmax
-            println(f, "$(z)\t$(theta)\t0.0")
-        end
-    end
-end
-
 """Generate the reference sounding and cold bubble initial conditions."""
 function straka_init!(model)
-    write_dry_sounding(model.ref_state_file)
+    Scythe.write_dry_sounding(model.ref_state_file; theta=300.0, zmax=8000.0)
 
     patch = createGrid(model.grid_params)
     gridpoints = Scythe.getGridpoints(patch)
@@ -107,40 +97,10 @@ function straka_init!(model)
     column = deepcopy(patch.kbasis.data[1])
     ref = Scythe.calculate_reference_state(model, z, column)
 
-    thermo = Scythe.thermodynamic_tuple.(ref.sbar[:, 1], ref.xibar[:, 1], ref.mubar[:, 1])
-    q_bar = [x[1] for x in thermo]
-    T_bar = [x[3] for x in thermo]
-    p_bar = [x[4] for x in thermo]
-
-    # Cold bubble: dT = -15 K * (cos(pi L) + 1)/2 inside the unit ellipse,
-    # applied isobarically (rho recomputed from perturbed T at unchanged p)
-    xc, xr = 0.0, 4000.0
-    zc, zr = 3000.0, 2000.0
-    i = 1
-    for _ in 1:Scythe.num_columns(patch)
-        for k in 1:kDim
-            x = gridpoints[i, 1]
-            zz = gridpoints[i, 2]
-            L = sqrt(((x - xc) / xr)^2 + ((zz - zc) / zr)^2)
-            dT = L <= 1.0 ? -15.0 * (cos(pi * L) + 1.0) / 2.0 : 0.0
-            new_T = T_bar[k] + dT
-            new_rho_d = p_bar[k] * 100.0 / (Scythe.Rd * new_T)
-            patch.physical[i, 1, 1] = Scythe.entropy(new_T, new_rho_d, q_bar[k]) - ref.sbar[k, 1]
-            patch.physical[i, 2, 1] = Scythe.log_dry_density(new_rho_d) - ref.xibar[k, 1]
-            i += 1
-        end
-    end
-
-    ics = DataFrame(
-        r = gridpoints[:, 1],
-        z = gridpoints[:, 2],
-        s = patch.physical[:, 1, 1],
-        xi = patch.physical[:, 2, 1],
-        mu = patch.physical[:, 3, 1],
-        u = patch.physical[:, 4, 1],
-        w = patch.physical[:, 5, 1],
-    )
-    CSV.write(model.initial_conditions, ics)
+    patch.physical .= 0.0
+    Scythe.temperature_bubble!(patch, gridpoints, ref;
+                               xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0)
+    Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
 end
 
 # ── Diagnostics ────────────────────────────────────────────────────────────
