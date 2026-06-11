@@ -111,7 +111,7 @@ function straka_diagnostics(model)
     theta_p, ncols = theta_perturbation(df, ref, kDim)
     r = reshape(df.r, kDim, ncols)[1, :]
     front = front_location(r, theta_p[1, :]; threshold=-1.0)
-    return Dict(
+    diags = Dict(
         "min_theta_p" => minimum(theta_p),
         "max_theta_p" => maximum(theta_p),
         "max_u" => maximum(df.u),
@@ -120,6 +120,28 @@ function straka_diagnostics(model)
         "min_w" => minimum(df.w),
         "front_location" => front,
     )
+    return merge(diags, conservation_drift(model, ref))
+end
+
+# ── Figures ────────────────────────────────────────────────────────────────
+
+plotter = nothing
+if opts.plot
+    include(joinpath(@__DIR__, "common", "plots.jl"))
+    plotter = function (model)
+        df = read_final_output(model)
+        ref, _, kDim = rebuild_reference(model)
+        theta_p, ncols = theta_perturbation(df, ref, kDim)
+        x = reshape(df.r, kDim, ncols)[1, :]
+        z = reshape(df.z, kDim, ncols)[:, 1]
+        w = reshape(df.w, kDim, ncols)
+        save_benchmark_figure(
+            joinpath(model.output_dir, "straka93_$(opts.mode)_$(opts.stage)_final.png"),
+            x, z,
+            [(theta_p, "θ′ (K)", -15.5:1.0:-0.5),
+             (w, "w (m/s)", -16.0:2.0:14.0)];
+            title = "Straka93 density current, t = $(model.integration_time) s")
+    end
 end
 
 # ── Run ────────────────────────────────────────────────────────────────────
@@ -129,5 +151,6 @@ passed = run_benchmark("straka93", opts;
                        model = model,
                        init! = straka_init!,
                        diagnostics = straka_diagnostics,
-                       varnames = STRAKA_VARS)
+                       varnames = STRAKA_VARS,
+                       plotter = plotter)
 exit(passed ? 0 : 1)

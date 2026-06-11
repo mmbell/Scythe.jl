@@ -59,6 +59,91 @@ function theta_perturbation(df::DataFrame, ref, kDim::Int)
 end
 
 """
+    domain_integral(field, model) -> Float64
+
+Spectrally integrate a `(kDim, ncols)` field over the 2-D domain: Chebyshev
+integral in z for each column, then a cubic B-spline integral across columns
+with the antiderivative evaluated at the domain edge.
+"""
+function domain_integral(field::AbstractMatrix, model)
+    gp = model.grid_params
+    cp = ChebyshevParameters(zmin = gp.kMin, zmax = gp.kMax,
+                             zDim = gp.kDim, bDim = gp.b_kDim,
+                             BCB = Chebyshev.R0, BCT = Chebyshev.R0)
+    col = Chebyshev1D(cp)
+    ncols = size(field, 2)
+    colints = zeros(ncols)
+    for c in 1:ncols
+        col.uMish .= field[:, c]
+        Btransform!(col)
+        Atransform!(col)
+        colints[c] = IInttransform(col, 0.0)[end]
+    end
+    sp = SplineParameters(xmin = gp.iMin, xmax = gp.iMax, num_cells = gp.num_cells,
+                          BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
+    spline = Spline1D(sp)
+    CubicBSpline.SIIntcoefficients!(spline, colints)
+    out = zeros(1)
+    CubicBSpline.SItransform(spline.params, spline.a, [gp.iMax], out, 0)
+    return out[1]
+end
+
+"""
+    conservation_drift(model, ref; liquid_var=nothing) -> Dict
+
+Percent drift of the domain-integrated total mass, total energy, and total
+entropy between the initial and final output times (cf. Bryan & Fritsch 2002,
+eqs. 28-29, who report ~1e-4 % drift for their benchmark).
+
+The prognostic entropy is dry air + vapor only, so condensation acts as a
+source/sink on it; the total entropy integrated here adds the condensate
+entropy `q_l*Cl*log(T/T_0)` and should be conserved even in the moist case.
+Set `liquid_var` to the liquid water variable name (e.g. `"mu_l"`) for moist
+runs; `nothing` treats the run as dry.
+"""
+function conservation_drift(model, ref; liquid_var=nothing)
+    kDim = model.grid_params.kDim
+
+    function integrals(tag)
+        df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
+        ncols = div(nrow(df), kDim)
+        sbar = repeat(ref.sbar[:, 1], ncols)
+        xibar = repeat(ref.xibar[:, 1], ncols)
+        mubar = repeat(ref.mubar[:, 1], ncols)
+        s = df.s .+ sbar
+        xi = df.xi .+ xibar
+        mu = df.mu .+ mubar
+        thermo = Scythe.thermodynamic_tuple.(s, xi, mu)
+        q_v = [x[1] for x in thermo]
+        rho_d = [x[2] for x in thermo]
+        Tk = [x[3] for x in thermo]
+        q_l = liquid_var === nothing ? zero(q_v) :
+              Scythe.inv_mu_transform.(df[!, liquid_var])
+        q_t = q_v .+ q_l
+        ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
+
+        mass = rho_d .* (1.0 .+ q_t)
+        energy = rho_d .* ((Scythe.Cvd .* Tk) .+ (q_v .* Scythe.Cvv .* Tk) .+
+                           (q_l .* Scythe.Cl .* Tk) .- (Scythe.L_v.(Tk) .* q_l) .+
+                           ((1.0 .+ q_t) .* ke) .+
+                           ((1.0 .+ q_t) .* Scythe.gravity .* df.z))
+        total_entropy = rho_d .* (s .+ (q_l .* Scythe.Cl .* log.(Tk ./ Scythe.T_0)))
+
+        return (mass = domain_integral(reshape(mass, kDim, ncols), model),
+                energy = domain_integral(reshape(energy, kDim, ncols), model),
+                entropy = domain_integral(reshape(total_entropy, kDim, ncols), model))
+    end
+
+    init = integrals("0.0")
+    final = integrals(string(round(model.integration_time; digits=2)))
+    return Dict(
+        "mass_drift_pct" => 100.0 * (final.mass - init.mass) / abs(init.mass),
+        "energy_drift_pct" => 100.0 * (final.energy - init.energy) / abs(init.energy),
+        "entropy_drift_pct" => 100.0 * (final.entropy - init.entropy) / abs(init.entropy),
+    )
+end
+
+"""
     front_location(r, row; threshold=-1.0)
 
 Locate a density current front: the largest radius where `row` crosses

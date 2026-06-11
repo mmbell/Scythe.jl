@@ -109,7 +109,7 @@ function bf02_dry_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
     theta_p, _ = theta_perturbation(df, ref, kDim)
-    return Dict(
+    diags = Dict(
         "max_theta_p" => maximum(theta_p),
         "min_theta_p" => minimum(theta_p),
         "max_w" => maximum(df.w),
@@ -117,6 +117,28 @@ function bf02_dry_diagnostics(model)
         "max_u" => maximum(df.u),
         "min_u" => minimum(df.u),
     )
+    return merge(diags, conservation_drift(model, ref))
+end
+
+# ── Figures ────────────────────────────────────────────────────────────────
+
+plotter = nothing
+if opts.plot
+    include(joinpath(@__DIR__, "common", "plots.jl"))
+    plotter = function (model)
+        df = read_final_output(model)
+        ref, _, kDim = rebuild_reference(model)
+        theta_p, ncols = theta_perturbation(df, ref, kDim)
+        x = reshape(df.r, kDim, ncols)[1, :]
+        z = reshape(df.z, kDim, ncols)[:, 1]
+        w = reshape(df.w, kDim, ncols)
+        save_benchmark_figure(
+            joinpath(model.output_dir, "bf02_dry_$(opts.mode)_$(opts.stage)_final.png"),
+            x, z,
+            [(theta_p, "θ′ (K)", -0.2:0.2:2.2),
+             (w, "w (m/s)", -10.0:2.0:16.0)];
+            title = "BF02 dry thermal, t = $(model.integration_time) s")
+    end
 end
 
 # ── Run ────────────────────────────────────────────────────────────────────
@@ -126,5 +148,6 @@ passed = run_benchmark("bf02_dry", opts;
                        model = model,
                        init! = bf02_dry_init!,
                        diagnostics = bf02_dry_diagnostics,
-                       varnames = BF02_DRY_VARS)
+                       varnames = BF02_DRY_VARS,
+                       plotter = plotter)
 exit(passed ? 0 : 1)

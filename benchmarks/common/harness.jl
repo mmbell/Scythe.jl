@@ -24,6 +24,7 @@ struct BenchmarkOptions
     stage::Symbol       # :legacy | :pe
     workers::Int
     update_reference::Bool
+    plot::Bool
 end
 
 struct Target
@@ -38,13 +39,14 @@ end
 
 Parse benchmark command line arguments:
 --mode quick|full (default quick), --stage legacy|pe (default legacy),
---workers N (default 2), --update-reference.
+--workers N (default 2), --update-reference, --plot.
 """
 function parse_benchmark_args(args::Vector{String})
     mode = :quick
     stage = :legacy
     nworkers = 2
     update_reference = false
+    plot = false
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -56,9 +58,11 @@ function parse_benchmark_args(args::Vector{String})
             nworkers = parse(Int, args[i+1]); i += 2
         elseif arg == "--update-reference"
             update_reference = true; i += 1
+        elseif arg == "--plot"
+            plot = true; i += 1
         elseif arg in ("--help", "-h")
             println("Usage: julia --project=. benchmarks/<case>.jl " *
-                    "[--mode quick|full] [--stage legacy|pe] [--workers N] [--update-reference]")
+                    "[--mode quick|full] [--stage legacy|pe] [--workers N] [--update-reference] [--plot]")
             exit(0)
         else
             error("Unknown argument: $arg")
@@ -67,7 +71,7 @@ function parse_benchmark_args(args::Vector{String})
     mode in (:quick, :full) || error("--mode must be quick or full")
     stage in (:legacy, :pe) || error("--stage must be legacy or pe")
     nworkers >= 1 || error("--workers must be >= 1")
-    return BenchmarkOptions(mode, stage, nworkers, update_reference)
+    return BenchmarkOptions(mode, stage, nworkers, update_reference, plot)
 end
 
 """Output directory for a benchmark variant (created if missing)."""
@@ -231,7 +235,7 @@ committed reference exists) is within tolerance.
 """
 function run_benchmark(name::String, opts::BenchmarkOptions;
                        model, init!::Function, diagnostics::Function,
-                       varnames::Vector{String})
+                       varnames::Vector{String}, plotter=nothing)
 
     println("═"^70)
     println("Benchmark: $name  mode=$(opts.mode)  stage=$(opts.stage)  " *
@@ -251,6 +255,11 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
 
     println("Computing diagnostics...")
     diags = diagnostics(model)
+
+    if plotter !== nothing
+        println("Generating figures...")
+        plotter(model)
+    end
 
     targets = load_targets(name, opts)
     target_pass = check_targets(diags, targets)

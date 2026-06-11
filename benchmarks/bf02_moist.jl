@@ -1,0 +1,215 @@
+#!/usr/bin/env julia
+# Bryan & Fritsch (2002) moist warm bubble benchmark.
+#
+# A buoyancy perturbation identical to the dry case rises through a saturated,
+# exactly neutrally stable atmosphere (uniform reversible theta_e = 320 K,
+# constant total water r_t = 0.020) with reversible phase changes and no
+# precipitation. Verified against the theta_e' and w extrema printed in
+# Fig. 3 of the paper.
+#
+# Note on physics: this configuration uses the BF02_test equation set with a
+# prognostic supersaturation variable (qss) rather than the paper's strict
+# instantaneous saturation adjustment. Allowing supersaturation production/
+# consumption softens the latent heat release slightly, so the w and theta_e'
+# extrema are expected to sit a little below the published values. The total
+# entropy (prognostic dry+vapor entropy plus condensate entropy) should still
+# be conserved; see the conservation diagnostics.
+#
+#   julia --project=. benchmarks/bf02_moist.jl --mode quick --stage legacy
+#
+# Modes: quick (200 m cells) | full (100 m cells, paper-grade)
+# Stages: legacy (BF02_test) | pe (primitive_equation_XZ)
+#
+# Reference: Bryan & Fritsch (2002), Mon. Wea. Rev. 130, 2917-2928.
+# reference/bryan_fritsch_mwr2002.pdf
+
+using Distributed
+
+include(joinpath(@__DIR__, "common", "harness.jl"))
+opts = parse_benchmark_args(ARGS)
+
+addprocs(opts.workers, exeflags="--threads=auto")
+@everywhere using Springsteel
+@everywhere using Scythe
+
+include(joinpath(@__DIR__, "common", "diagnostics.jl"))
+
+# ── Configuration ──────────────────────────────────────────────────────────
+
+const BF02_MOIST_VARS = ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
+const Q_T = 0.02
+const THETA_E = 320.0
+
+function bf02_moist_model(opts::BenchmarkOptions)
+    if opts.mode == :full
+        num_cells = 200         # 100 m cells
+        kDim = 100
+        ts = 0.1
+        output_interval = 100.0
+    else
+        num_cells = 100         # 200 m cells
+        kDim = 50
+        # The condensation relaxation timescale does not coarsen with the
+        # grid, so quick mode keeps the full-mode timestep
+        ts = 0.1
+        output_interval = 250.0
+    end
+
+    if opts.stage == :legacy
+        equation_set = "BF02_test"
+        physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
+    else
+        error("--stage pe for bf02_moist is not wired up yet (Stage 2 of the benchmark plan)")
+    end
+
+    output_dir = benchmark_output_dir("bf02_moist", opts)
+    scalar_bc = Dict(v => NeumannBC() for v in BF02_MOIST_VARS)
+    wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+
+    grid_params = GridParameters(
+        geometry = "RZ",   # Cartesian x-z in Springsteel
+        iMin = 0.0,
+        iMax = 20.0e3,
+        num_cells = num_cells,
+        kMin = 0.0,
+        kMax = 10.0e3,
+        kDim = kDim,
+        BCL = wall_bc,
+        BCR = wall_bc,
+        BCB = wall_bc,
+        BCT = wall_bc,
+        vars = Dict(v => i for (i, v) in enumerate(BF02_MOIST_VARS)),
+    )
+
+    return ModelParameters(
+        ts = ts,
+        integration_time = 1000.0,
+        output_interval = output_interval,
+        equation_set = equation_set,
+        initial_conditions = joinpath(output_dir, "bf02_moist_ics.csv"),
+        output_dir = output_dir,
+        ref_state_file = joinpath(output_dir, "bf02_moist_exact.ref"),
+        grid_params = grid_params,
+        physical_params = physical_params,
+        # The converged saturated base state is written as an exact reference
+        # at the model levels, so the model integrates pure perturbations
+        options = Dict(:semiimplicit => true, :exact_reference_state => true),
+    )
+end
+
+# ── Initial conditions ─────────────────────────────────────────────────────
+
+"""
+Construct the saturated neutrally stable base state, write it as the model's
+exact reference, and add the moist buoyancy bubble.
+"""
+function bf02_moist_init!(model)
+    patch = createGrid(model.grid_params)
+    gridpoints = Scythe.getGridpoints(patch)
+    kDim = model.grid_params.kDim
+    z = gridpoints[1:kDim, 2]
+    column = Scythe.reference_column(patch, model.grid_params)
+
+    # First-guess sounding -> hydrostatic reference -> spectral refinement
+    sounding = joinpath(model.output_dir, "first_guess_sounding.ref")
+    Scythe.write_moist_neutral_sounding(sounding; q_t=Q_T, theta_e=THETA_E,
+                                        sfc_p_hPa=1000.0, zmax=12000.0)
+    guess_model = ModelParameters(
+        ts = model.ts, equation_set = model.equation_set,
+        ref_state_file = sounding, grid_params = model.grid_params,
+        physical_params = model.physical_params,
+    )
+    ref_guess = Scythe.calculate_reference_state(guess_model, z, column)
+    base = Scythe.saturated_hydrostatic_profile(z, column, ref_guess;
+                                                q_t=Q_T, theta_e=THETA_E,
+                                                sfc_p_hPa=1000.0)
+    println("Base state: max|q_v - q_sat| = ",
+            maximum(abs.(base.q_v .- Scythe.q_sat_liquid.(base.Tk, base.p))),
+            ", max hydrostatic residual = ", maximum(abs.(base.residual)), " m/s²")
+
+    # The model integrates perturbations from the converged base state
+    Scythe.write_exact_ref(model.ref_state_file, z, base.s, base.xi, base.mu)
+    ref = Scythe.exact_reference_state(model, z, column)
+
+    patch.physical .= 0.0
+    Scythe.moist_buoyancy_bubble!(patch, gridpoints, base, ref;
+                                  q_t=Q_T, xc=10000.0, xr=2000.0,
+                                  zc=2000.0, zr=2000.0, amp=2.0/300.0,
+                                  liquid_var="mu_l")
+    Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
+
+    # Save the base profile for diagnostics (theta_e perturbation baseline)
+    CSV.write(joinpath(model.output_dir, "base_profile.csv"),
+              DataFrame(z = z, s = base.s, xi = base.xi, mu = base.mu,
+                        mu_l = base.mu_l, theta_e = base.theta_e))
+end
+
+# ── Diagnostics ────────────────────────────────────────────────────────────
+
+"""Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
+function moist_fields(df, ref, kDim, base)
+    ncols = div(nrow(df), kDim)
+    sbar = repeat(ref.sbar[:, 1], ncols)
+    xibar = repeat(ref.xibar[:, 1], ncols)
+    mubar = repeat(ref.mubar[:, 1], ncols)
+    s = df.s .+ sbar
+    xi = df.xi .+ xibar
+    mu = df.mu .+ mubar
+    theta_e = Scythe.reversible_theta_e.(s, xi, mu, df.mu_l)
+    theta_e_p = reshape(theta_e .- repeat(base.theta_e, ncols), kDim, ncols)
+    thermo = Scythe.thermodynamic_tuple.(s, xi, mu)
+    q_v = [x[1] for x in thermo]
+    Tk = [x[3] for x in thermo]
+    p = [x[4] for x in thermo]
+    supersat = reshape(q_v .- Scythe.q_sat_liquid.(Tk, p), kDim, ncols)
+    return theta_e_p, supersat, ncols
+end
+
+function bf02_moist_diagnostics(model)
+    df = read_final_output(model)
+    ref, _, kDim = rebuild_reference(model)
+    base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
+    theta_e_p, supersat, _ = moist_fields(df, ref, kDim, base)
+    diags = Dict(
+        "max_theta_e_p" => maximum(theta_e_p),
+        "min_theta_e_p" => minimum(theta_e_p),
+        "max_w" => maximum(df.w),
+        "min_w" => minimum(df.w),
+        "max_supersat" => maximum(supersat),
+        "min_supersat" => minimum(supersat),
+    )
+    return merge(diags, conservation_drift(model, ref; liquid_var="mu_l"))
+end
+
+# ── Figures ────────────────────────────────────────────────────────────────
+
+plotter = nothing
+if opts.plot
+    include(joinpath(@__DIR__, "common", "plots.jl"))
+    plotter = function (model)
+        df = read_final_output(model)
+        ref, _, kDim = rebuild_reference(model)
+        base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
+        theta_e_p, _, ncols = moist_fields(df, ref, kDim, base)
+        x = reshape(df.r, kDim, ncols)[1, :]
+        z = reshape(df.z, kDim, ncols)[:, 1]
+        w = reshape(df.w, kDim, ncols)
+        save_benchmark_figure(
+            joinpath(model.output_dir, "bf02_moist_$(opts.mode)_$(opts.stage)_final.png"),
+            x, z,
+            [(theta_e_p, "θ_e′ (K)", -0.5:0.5:4.5),
+             (w, "w (m/s)", -10.0:2.0:16.0)];
+            title = "BF02 moist thermal, t = $(model.integration_time) s")
+    end
+end
+
+# ── Run ────────────────────────────────────────────────────────────────────
+
+model = bf02_moist_model(opts)
+passed = run_benchmark("bf02_moist", opts;
+                       model = model,
+                       init! = bf02_moist_init!,
+                       diagnostics = bf02_moist_diagnostics,
+                       varnames = BF02_MOIST_VARS,
+                       plotter = plotter)
+exit(passed ? 0 : 1)
