@@ -36,7 +36,11 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-const BF02_MOIST_VARS = ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
+const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+bf02_moist_vars(stage) = stage == :legacy ?
+    ["s", "xi", "mu", "u", "w", "mu_l", "qss"] : PE_VARS
+# Liquid water variable(s) per stage (PE splits liquid into cloud and rain)
+liquid_vars(stage) = stage == :legacy ? ["mu_l"] : ["mu_c", "mu_r"]
 const Q_T = 0.02
 const THETA_E = 320.0
 
@@ -55,15 +59,24 @@ function bf02_moist_model(opts::BenchmarkOptions)
         output_interval = 250.0
     end
 
+    vars = bf02_moist_vars(opts.stage)
     if opts.stage == :legacy
         equation_set = "BF02_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
+        options = Dict(:semiimplicit => true, :exact_reference_state => true)
     else
-        error("--stage pe for bf02_moist is not wired up yet (Stage 2 of the benchmark plan)")
+        equation_set = "primitive_equation_XZ"
+        physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
+                               :alpha => 0.0, :z_damp => 20.0e3)
+        # Reversible benchmark: no precipitation fallout (BF02 spec). The
+        # saturated base state carries cloud water everywhere, so
+        # autoconversion would otherwise generate rain domain-wide.
+        options = Dict(:semiimplicit => true, :exact_reference_state => true,
+                       :precipitation => false, :vertical_mixing => false)
     end
 
     output_dir = benchmark_output_dir("bf02_moist", opts)
-    scalar_bc = Dict(v => NeumannBC() for v in BF02_MOIST_VARS)
+    scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
 
     grid_params = GridParameters(
@@ -78,7 +91,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
         BCR = wall_bc,
         BCB = wall_bc,
         BCT = wall_bc,
-        vars = Dict(v => i for (i, v) in enumerate(BF02_MOIST_VARS)),
+        vars = Dict(v => i for (i, v) in enumerate(vars)),
     )
 
     return ModelParameters(
@@ -93,7 +106,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
         physical_params = physical_params,
         # The converged saturated base state is written as an exact reference
         # at the model levels, so the model integrates pure perturbations
-        options = Dict(:semiimplicit => true, :exact_reference_state => true),
+        options = options,
     )
 end
 
@@ -132,10 +145,33 @@ function bf02_moist_init!(model)
     ref = Scythe.exact_reference_state(model, z, column)
 
     patch.physical .= 0.0
+    bubble_liquid = opts.stage == :legacy ? "mu_l" : "mu_c"
     Scythe.moist_buoyancy_bubble!(patch, gridpoints, base, ref;
                                   q_t=Q_T, xc=10000.0, xr=2000.0,
                                   zc=2000.0, zr=2000.0, amp=2.0/300.0,
-                                  liquid_var="mu_l")
+                                  liquid_var=bubble_liquid)
+
+    if opts.stage == :pe
+        # The PE set advects a transformed saturation ratio with satbar = 0
+        # for exact reference states: initialize it from the actual state
+        # (the base is saturated, so the ratio is 1 everywhere up to the
+        # construction tolerance)
+        vars = model.grid_params.vars
+        sat_i = vars["mu_sat"]
+        kDim_l = model.grid_params.kDim
+        i = 1
+        for _ in 1:Scythe.num_columns(patch)
+            for k in 1:kDim_l
+                s_tot = patch.physical[i, vars["s"], 1] + ref.sbar[k, 1]
+                xi_tot = patch.physical[i, vars["xi"], 1] + ref.xibar[k, 1]
+                mu_tot = patch.physical[i, vars["mu"], 1] + ref.mubar[k, 1]
+                q_v, _, Tk, p = Scythe.thermodynamic_tuple(s_tot, xi_tot, mu_tot)
+                patch.physical[i, sat_i, 1] =
+                    Scythe.mu_transform(q_v / Scythe.q_sat_liquid(Tk, p))
+                i += 1
+            end
+        end
+    end
     Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
 
     # Save the base profile for diagnostics (theta_e perturbation baseline)
@@ -147,7 +183,7 @@ end
 # ── Diagnostics ────────────────────────────────────────────────────────────
 
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
-function moist_fields(df, ref, kDim, base)
+function moist_fields(df, ref, kDim, base, stage)
     ncols = div(nrow(df), kDim)
     sbar = repeat(ref.sbar[:, 1], ncols)
     xibar = repeat(ref.xibar[:, 1], ncols)
@@ -155,7 +191,13 @@ function moist_fields(df, ref, kDim, base)
     s = df.s .+ sbar
     xi = df.xi .+ xibar
     mu = df.mu .+ mubar
-    theta_e = Scythe.reversible_theta_e.(s, xi, mu, df.mu_l)
+    # Total transformed liquid: the linear mu transform makes the sum of
+    # transformed cloud and rain equal the transform of their sum
+    mu_liq = zero(mu)
+    for lv in liquid_vars(stage)
+        mu_liq = mu_liq .+ df[!, lv]
+    end
+    theta_e = Scythe.reversible_theta_e.(s, xi, mu, mu_liq)
     theta_e_p = reshape(theta_e .- repeat(base.theta_e, ncols), kDim, ncols)
     thermo = Scythe.thermodynamic_tuple.(s, xi, mu)
     q_v = [x[1] for x in thermo]
@@ -169,7 +211,7 @@ function bf02_moist_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
     base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
-    theta_e_p, supersat, _ = moist_fields(df, ref, kDim, base)
+    theta_e_p, supersat, _ = moist_fields(df, ref, kDim, base, opts.stage)
     diags = Dict(
         "max_theta_e_p" => maximum(theta_e_p),
         "min_theta_e_p" => minimum(theta_e_p),
@@ -178,7 +220,7 @@ function bf02_moist_diagnostics(model)
         "max_supersat" => maximum(supersat),
         "min_supersat" => minimum(supersat),
     )
-    return merge(diags, conservation_drift(model, ref; liquid_var="mu_l"))
+    return merge(diags, conservation_drift(model, ref; liquid_vars=liquid_vars(opts.stage)))
 end
 
 # ── Figures ────────────────────────────────────────────────────────────────
@@ -190,7 +232,7 @@ if opts.plot
         df = read_final_output(model)
         ref, _, kDim = rebuild_reference(model)
         base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
-        theta_e_p, _, ncols = moist_fields(df, ref, kDim, base)
+        theta_e_p, _, ncols = moist_fields(df, ref, kDim, base, opts.stage)
         x = reshape(df.r, kDim, ncols)[1, :]
         z = reshape(df.z, kDim, ncols)[:, 1]
         w = reshape(df.w, kDim, ncols)
@@ -210,6 +252,6 @@ passed = run_benchmark("bf02_moist", opts;
                        model = model,
                        init! = bf02_moist_init!,
                        diagnostics = bf02_moist_diagnostics,
-                       varnames = BF02_MOIST_VARS,
+                       varnames = bf02_moist_vars(opts.stage),
                        plotter = plotter)
 exit(passed ? 0 : 1)

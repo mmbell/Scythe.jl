@@ -67,6 +67,28 @@ variable) catches "the code changed the answer".
   reference solution; the ~10–17% updraft-maximum deficit is an open question
   for the Stage 2 equation-set comparison. Conservation in the dry case is at
   the paper's own level (mass 3.5e-6 %, energy 2.0e-4 %, entropy 1.5e-4 %).
+
+### Stage 2 (primitive_equation_XZ) findings (2026-06, quick resolution)
+
+- The PE set runs all three benchmarks in **reduced form**: the benchmark
+  configs set `options[:precipitation] = false` (BF02 spec: no fallout; the
+  saturated base state would otherwise autoconvert to rain domain-wide) and
+  `options[:vertical_mixing] = false` (no turbulence in the benchmark specs;
+  the Louis shear mixing is also explicitly unstable where arch shear meets
+  the ~10 m Chebyshev spacing at the lid).
+- **Dry equivalence**: with the reduced form the PE solution matches
+  `Euler_test` to rel-L2 ~1e-5 across all fields — the comprehensive set
+  collapses to the dry Euler equations
+  (`julia benchmarks/compare_stages.jl bf02_dry quick`).
+- **Moist**: the PE's explicit droplet-growth condensation recovers the
+  paper's updraft (max w 15.0 vs 15.7 at 200 m) where the legacy qss
+  relaxation softened it to 10.5. θ_e′ extrema overshoot more (5.9 vs 4.1)
+  with the stronger arch — the Chebyshev overshoot question (see
+  FUTURE_WORK.md).
+- **Straka PE** passes the same targets as legacy with a sharper front
+  (max u 42 vs legacy 37 at 100 m), but with notably larger conservation
+  drifts (mass 0.11 %, total entropy −0.89 % vs legacy's ~1e-4 %) traced to
+  the implicit `Kvdiff` vertical diffusion path — under investigation.
 - Conservation diagnostics (informational): total mass, BF02 eq.-29 total
   energy, and total entropy including the condensate term
   `q_l·Cl·ln(T/T₀)` are spectrally integrated over the domain; percent drift

@@ -27,7 +27,8 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-const BF02_DRY_VARS = ["s", "xi", "mu", "u", "w"]
+const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+bf02_dry_vars(stage) = stage == :legacy ? ["s", "xi", "mu", "u", "w"] : PE_VARS
 
 function bf02_dry_model(opts::BenchmarkOptions)
     if opts.mode == :full
@@ -42,17 +43,28 @@ function bf02_dry_model(opts::BenchmarkOptions)
         output_interval = 500.0
     end
 
+    vars = bf02_dry_vars(opts.stage)
     if opts.stage == :legacy
         # The dry case carries no liquid water, so the 5-variable Euler_test
         # set is physically identical to the historical 6-variable BF02 run
         equation_set = "Euler_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
     else
-        error("--stage pe for bf02_dry is not wired up yet (Stage 2 of the benchmark plan)")
+        # No physical or computational diffusion, matching the paper; the
+        # Rayleigh damping is disabled with alpha = 0
+        equation_set = "primitive_equation_XZ"
+        physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
+                               :alpha => 0.0, :z_damp => 20.0e3)
+    end
+    options = Dict(:semiimplicit => true, :exact_reference_state => false)
+    if opts.stage == :pe
+        # Benchmark specification has no turbulence or precipitation
+        options[:precipitation] = false
+        options[:vertical_mixing] = false
     end
 
     output_dir = benchmark_output_dir("bf02_dry", opts)
-    scalar_bc = Dict(v => NeumannBC() for v in BF02_DRY_VARS)
+    scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
 
     grid_params = GridParameters(
@@ -67,7 +79,7 @@ function bf02_dry_model(opts::BenchmarkOptions)
         BCR = wall_bc,
         BCB = wall_bc,
         BCT = wall_bc,
-        vars = Dict(v => i for (i, v) in enumerate(BF02_DRY_VARS)),
+        vars = Dict(v => i for (i, v) in enumerate(vars)),
     )
 
     return ModelParameters(
@@ -80,7 +92,7 @@ function bf02_dry_model(opts::BenchmarkOptions)
         ref_state_file = joinpath(output_dir, "bf02_dry.ref"),
         grid_params = grid_params,
         physical_params = physical_params,
-        options = Dict(:semiimplicit => true, :exact_reference_state => false),
+        options = options,
     )
 end
 
@@ -148,6 +160,6 @@ passed = run_benchmark("bf02_dry", opts;
                        model = model,
                        init! = bf02_dry_init!,
                        diagnostics = bf02_dry_diagnostics,
-                       varnames = BF02_DRY_VARS,
+                       varnames = bf02_dry_vars(opts.stage),
                        plotter = plotter)
 exit(passed ? 0 : 1)

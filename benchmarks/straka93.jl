@@ -28,7 +28,8 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-const STRAKA_VARS = ["s", "xi", "mu", "u", "w"]
+const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+straka_vars(stage) = stage == :legacy ? ["s", "xi", "mu", "u", "w"] : PE_VARS
 
 function straka_model(opts::BenchmarkOptions)
     if opts.mode == :full
@@ -43,15 +44,28 @@ function straka_model(opts::BenchmarkOptions)
         output_interval = 300.0
     end
 
+    vars = straka_vars(opts.stage)
     if opts.stage == :legacy
         equation_set = "Euler_test"
         physical_params = Dict(:K => 75.0, :Kvdiff => 0.0)
     else
-        error("--stage pe for straka93 is not wired up yet (Stage 2 of the benchmark plan)")
+        # The PE set has explicit horizontal diffusion and implicit vertical
+        # diffusion: Khdiff = Kvdiff = 75 approximates the legacy uniform
+        # Laplacian K = 75 of the paper specification
+        equation_set = "primitive_equation_XZ"
+        physical_params = Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
+                               :alpha => 0.0, :z_damp => 12.8e3)
+    end
+    options = Dict(:semiimplicit => true, :exact_reference_state => false)
+    if opts.stage == :pe
+        # The paper prescribes uniform K = 75 only (carried by Khdiff/Kvdiff);
+        # no precipitation or shear-based turbulence
+        options[:precipitation] = false
+        options[:vertical_mixing] = false
     end
 
     output_dir = benchmark_output_dir("straka93", opts)
-    scalar_bc = Dict(v => NeumannBC() for v in STRAKA_VARS)
+    scalar_bc = Dict(v => NeumannBC() for v in vars)
     bc_side = merge(scalar_bc, Dict("u" => DirichletBC()))   # no-normal-flow walls
     bc_topbot = merge(scalar_bc, Dict("w" => DirichletBC()))
 
@@ -67,7 +81,7 @@ function straka_model(opts::BenchmarkOptions)
         BCR = bc_side,
         BCB = bc_topbot,
         BCT = bc_topbot,
-        vars = Dict(v => i for (i, v) in enumerate(STRAKA_VARS)),
+        vars = Dict(v => i for (i, v) in enumerate(vars)),
     )
 
     return ModelParameters(
@@ -80,7 +94,7 @@ function straka_model(opts::BenchmarkOptions)
         ref_state_file = joinpath(output_dir, "straka93.ref"),
         grid_params = grid_params,
         physical_params = physical_params,
-        options = Dict(:semiimplicit => true, :exact_reference_state => false),
+        options = options,
     )
 end
 
@@ -151,6 +165,6 @@ passed = run_benchmark("straka93", opts;
                        model = model,
                        init! = straka_init!,
                        diagnostics = straka_diagnostics,
-                       varnames = STRAKA_VARS,
+                       varnames = straka_vars(opts.stage),
                        plotter = plotter)
 exit(passed ? 0 : 1)

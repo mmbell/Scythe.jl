@@ -98,10 +98,12 @@ eqs. 28-29, who report ~1e-4 % drift for their benchmark).
 The prognostic entropy is dry air + vapor only, so condensation acts as a
 source/sink on it; the total entropy integrated here adds the condensate
 entropy `q_l*Cl*log(T/T_0)` and should be conserved even in the moist case.
-Set `liquid_var` to the liquid water variable name (e.g. `"mu_l"`) for moist
-runs; `nothing` treats the run as dry.
+Set `liquid_vars` to the liquid water variable names (e.g. `["mu_l"]` for the
+legacy BF02 set or `["mu_c", "mu_r"]` for the primitive equations); an empty
+list treats the run as dry. The linear mu transform makes the sum of
+transformed variables equal the transform of the summed mixing ratios.
 """
-function conservation_drift(model, ref; liquid_var=nothing)
+function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
     kDim = model.grid_params.kDim
 
     function integrals(tag)
@@ -117,8 +119,10 @@ function conservation_drift(model, ref; liquid_var=nothing)
         q_v = [x[1] for x in thermo]
         rho_d = [x[2] for x in thermo]
         Tk = [x[3] for x in thermo]
-        q_l = liquid_var === nothing ? zero(q_v) :
-              Scythe.inv_mu_transform.(df[!, liquid_var])
+        q_l = zero(q_v)
+        for lv in liquid_vars
+            q_l = q_l .+ Scythe.inv_mu_transform.(df[!, lv])
+        end
         q_t = q_v .+ q_l
         ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
 

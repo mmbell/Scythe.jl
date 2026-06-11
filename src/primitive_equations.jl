@@ -21,6 +21,17 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     alpha = model.physical_params[:alpha]
     z_damp = model.physical_params[:z_damp]
 
+    # Reduced form for reversible benchmarks (e.g. Bryan & Fritsch 2002,
+    # where precipitation fallout is not allowed): disable autoconversion,
+    # collection, sedimentation, and rain evaporation
+    precipitation = get(model.options, :precipitation, true)
+
+    # Louis shear-based vertical mixing. Disable for benchmark cases whose
+    # specification has no turbulence; the explicit mixing is also unstable
+    # where strong shear meets the fine Chebyshev spacing at the boundaries
+    # (Kv ~ lv^2 |du/dz| can exceed the explicit diffusion limit there)
+    vertical_mixing = get(model.options, :vertical_mixing, true)
+
     # Gridpoints
     x = view(gridpoints,colstart:colend,1)
     z = view(gridpoints,colstart:colend,2)
@@ -154,7 +165,8 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     
     # Rain evaporation rate
     mean_r = 250.0 # Mean radius of rain drops in microns
-    q_evap = q_evaporation.(sat_ratio, Tk, p, rho_d, q_v, q_r, mean_r)
+    q_evap = precipitation ? q_evaporation.(sat_ratio, Tk, p, rho_d, q_v, q_r, mean_r) :
+                             zero(q_v)
     for i in 1:length(q_evap)
         if isnan(q_evap[i]) || abs(q_evap[i]) > 1.0
             println("q_evap is NaN at index $i")
@@ -186,23 +198,29 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Rayleigh damping
     rayleigh_coeff = Rayleigh_damping.(alpha, z, z_damp, z[end])
 
-    # Autoconversion rate
-    q_auto = autoconversion.(q_c, rho_d) 
+    if precipitation
+        # Autoconversion rate
+        q_auto = autoconversion.(q_c, rho_d)
 
-    # Collection rate
-    q_coll = collection.(q_c, q_r, rho_d, Tk) 
+        # Collection rate
+        q_coll = collection.(q_c, q_r, rho_d, Tk)
 
-    # Sedimentation rate
-    Vt = sedimentation.(q_r, rho_d, Tk)
+        # Sedimentation rate
+        Vt = sedimentation.(q_r, rho_d, Tk)
 
-    # Calculate the flux divergence of the falling precipitation
-    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]]) 
-    col.uMish .= Vt
-    Btransform!(col)
-    Atransform!(col)
-    Vt .= Itransform!(col)
-    dVtdz = Ixtransform(col)
-    Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
+        # Calculate the flux divergence of the falling precipitation
+        col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu_r"]])
+        col.uMish .= Vt
+        Btransform!(col)
+        Atransform!(col)
+        Vt .= Itransform!(col)
+        dVtdz = Ixtransform(col)
+        Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
+    else
+        q_auto = zero(q_v)
+        q_coll = zero(q_v)
+        Vt_flux = zero(q_v)
+    end
 
     # Calculate the vertical diffusivity
     col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["mu"]])
@@ -210,7 +228,7 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Vertical mixing length based on Louis parameterization
     Sv = sqrt.(u_z.^2)
     lv = 1.0 ./ ((1.0 ./ (0.4 .* z)) .+ (1.0 ./ 80.0))
-    Kv = (lv.^2) .* Sv
+    Kv = vertical_mixing ? (lv.^2) .* Sv : zero(Sv)
 
     # Calculate vapor mixing first since it is needed for entropy and saturation ratio
     col.uMish .= rho_d .* Kv .* (mu_z .+ mubar_z)
