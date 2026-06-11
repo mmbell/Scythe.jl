@@ -81,9 +81,55 @@ function benchmark_output_dir(name::String, opts::BenchmarkOptions)
     return dir * "/"   # integrate_model concatenates paths with *
 end
 
-"""Committed regression reference CSV path for a benchmark variant."""
+"""
+Committed regression reference path for a benchmark variant. Quick mode
+references store the full final-time fields (small grids); full mode stores
+the final scalar diagnostics (full fields are tens of MB).
+"""
 function reference_csv_path(name::String, opts::BenchmarkOptions)
+    if opts.mode == :full
+        return joinpath(REFERENCE_DATA_DIR, name, "full_$(opts.stage)_diagnostics.csv")
+    end
     return joinpath(REFERENCE_DATA_DIR, name, "$(opts.mode)_$(opts.stage)_final.csv")
+end
+
+"""Write a full-mode regression reference: target diagnostics as name,value rows."""
+function write_diagnostics_reference(path::String, diags::Dict{String,Float64},
+                                     targets::Vector{Target})
+    names = sort([t.name for t in targets])
+    mkpath(dirname(path))
+    open(path, "w") do f
+        println(f, "diagnostic,value")
+        for n in names
+            println(f, "$(n),$(diags[n])")
+        end
+    end
+    return path
+end
+
+"""
+Compare target diagnostics against a committed full-mode reference. Only the
+published-target diagnostics are compared (conservation drifts are
+machine-precision residuals whose relative run-to-run change is meaningless).
+"""
+function compare_diagnostics_reference(path::String, diags::Dict{String,Float64};
+                                       rtol=1.0e-6)
+    ref = CSV.read(path, DataFrame)
+    stats = Dict{String,Tuple{Float64,Float64}}()
+    pass = true
+    for row in eachrow(ref)
+        name = row.diagnostic
+        if haskey(diags, name)
+            diff = abs(diags[name] - row.value)
+            rel = diff / max(abs(row.value), eps())
+            stats[name] = (rel, diff)
+            pass &= rel <= rtol
+        else
+            stats[name] = (Inf, Inf)
+            pass = false
+        end
+    end
+    return pass, stats
 end
 
 """
@@ -273,15 +319,28 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
     regression_ok = nothing
     regression_stats = Dict{String,Tuple{Float64,Float64}}()
     if opts.update_reference
-        write_reference(output_csv, ref_csv, varnames)
+        if opts.mode == :full
+            write_diagnostics_reference(ref_csv, diags, targets)
+        else
+            write_reference(output_csv, ref_csv, varnames)
+        end
         println("\nUpdated regression reference: $ref_csv")
     elseif isfile(ref_csv)
-        regression_ok, regression_stats = compare_reference(output_csv, ref_csv, varnames)
-        println("\nRegression vs committed reference ($(basename(ref_csv))):")
-        for var in varnames
-            rel_l2, max_abs = regression_stats[var]
-            @printf("  %-8s rel_L2 = %.3e  max_abs = %.3e  %s\n",
-                    var, rel_l2, max_abs, rel_l2 <= 1.0e-6 ? "PASS" : "FAIL")
+        if opts.mode == :full
+            regression_ok, regression_stats = compare_diagnostics_reference(ref_csv, diags)
+            println("\nRegression vs committed diagnostics ($(basename(ref_csv))):")
+            for (name, (rel, diff)) in sort(collect(regression_stats), by = first)
+                @printf("  %-16s rel = %.3e  abs = %.3e  %s\n",
+                        name, rel, diff, rel <= 1.0e-6 ? "PASS" : "FAIL")
+            end
+        else
+            regression_ok, regression_stats = compare_reference(output_csv, ref_csv, varnames)
+            println("\nRegression vs committed reference ($(basename(ref_csv))):")
+            for var in varnames
+                rel_l2, max_abs = regression_stats[var]
+                @printf("  %-8s rel_L2 = %.3e  max_abs = %.3e  %s\n",
+                        var, rel_l2, max_abs, rel_l2 <= 1.0e-6 ? "PASS" : "FAIL")
+            end
         end
     else
         println("\nNo committed reference at $ref_csv")

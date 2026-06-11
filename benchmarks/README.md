@@ -50,6 +50,23 @@ variable) catches "the code changed the answer".
   which lowers the w extrema relative to Fig. 3 while avoiding the stiffness
   of strict adjustment. The structure comparison (`--plot`: rotors, arch,
   thermal top near 8 km) is the primary check.
+- **Spectral vs finite-difference amplitudes**: with K=0 the spectral method
+  retains dispersive ripples (±0.1–0.4 K in θ′/θ_e′) that the papers'
+  odd-order FD advection schemes implicitly diffuse, so the BF02 cases
+  over/undershoot the strict Fig. 1/3 extrema. Full-resolution legacy results
+  (2026-06, baseline in `reference_data/*/full_legacy_diagnostics.csv`):
+
+  | Diagnostic | bf02_dry (paper) | bf02_moist (paper) |
+  |------------|------------------|--------------------|
+  | max θ′ / θ_e′ | 2.26 (2.07) | 5.57 (4.10) |
+  | min θ′ / θ_e′ | −0.39 (−0.14) | −0.95 (−0.31) |
+  | max w | 13.0 (14.5) | 13.0 (15.7) |
+  | min w | −8.50 (−8.58) ✓ | −12.1 (−9.93) |
+
+  Structure (rotors, arch, thermal top ≈ 8 km) matches the unapproximated
+  reference solution; the ~10–17% updraft-maximum deficit is an open question
+  for the Stage 2 equation-set comparison. Conservation in the dry case is at
+  the paper's own level (mass 3.5e-6 %, energy 2.0e-4 %, entropy 1.5e-4 %).
 - Conservation diagnostics (informational): total mass, BF02 eq.-29 total
   energy, and total entropy including the condensate term
   `q_l·Cl·ln(T/T₀)` are spectrally integrated over the domain; percent drift
