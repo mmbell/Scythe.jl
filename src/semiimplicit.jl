@@ -97,12 +97,20 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
     splineBuffer = allocateSplineBuffer(tile)
 
-    # Pre-calculate the Helmholtz matrices for semi-implicit adjustment
-    # Declare a basic factorization for the structure if semiimplicit integration is not used
+    # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
+    # structural placeholder where a real one is not needed.
     h_matrix = factorize([1 2; 2 1])
     diffusion_matrix = factorize([1 2; 2 1])
+    # The implicit vertical diffusion solve (diffusion_timestep) runs on every
+    # step independently of the acoustic solver, so build its matrix whenever the
+    # model carries a vertical diffusivity — NOT only when semi-implicit is on.
+    # (Gating it on :semiimplicit left a 2×2 dummy in fully-explicit runs, which
+    # diffusion_timestep then tried to apply to a kDim-length column.)
+    if haskey(model.physical_params, :Kvdiff)
+        diffusion_matrix = calc_Helmholtz_diffusion_matrix(tile, model, 1.25 * model.ts * model.physical_params[:Kvdiff])
+    end
+    # The semi-implicit acoustic adjustment matrix is only used when enabled.
     if model.options[:semiimplicit]
-        diffusion_matrix = calc_Helmholtz_diffusion_matrix(tile, model, 1.25 * model.ts * model.physical_params[:Kvdiff] )
         h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, ref_state.Pxi_bar, 1.25 * model.ts)
     end
 
