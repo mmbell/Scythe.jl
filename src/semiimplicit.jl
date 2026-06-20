@@ -419,7 +419,21 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
     output_int = round(Int,model.output_interval / model.ts)
+    # CFL/Courant diagnostic cadence — independent of output; defaults to the
+    # output cadence so it is free (reuses the output-step gridTransform!).
+    cfl_int = max(1, round(Int, get(model.options, :cfl_interval, model.output_interval) / model.ts))
     println("Integrating $(model.ts) sec increments for $(num_ts) timesteps")
+
+    # Precompute grid spacing and mean sound speed for the Courant diagnostic.
+    # Only meaningful for the convective (vertical-velocity) models; gracefully
+    # disabled for e.g. 1-D advection, which has no "w". Pxi_bar (domain-mean
+    # speed of sound squared) is constant, so fetch it once from a worker.
+    cfl_diag_on = haskey(model.grid_params.vars, "w")
+    dz_min = dx_min = c_bar = 0.0
+    if cfl_diag_on
+        dz_min, dx_min = grid_spacing_minima(patch, model)
+        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(mtile.ref_state.Pxi_bar))))
+    end
 
     # Loop through the timesteps
     for t = 1:num_ts
@@ -441,12 +455,33 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         # Reset the shared spectral patch to the tiles
         map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
 
-        # Output if on specified time interval
-        if mod(t,output_int) == 0
+        # Cheap master-side blow-up trap, every step and independent of the output
+        # cadence: a non-finite physical field implies non-finite spectral
+        # coefficients here, so this catches an instability without any extra
+        # gridTransform! (defense in depth behind the per-worker checkCFL).
+        if any(!isfinite, sharedSpectral)
+            error("Non-finite spectral coefficient at t=$(round(t*model.ts; digits=3)) s ! CFL condition likely violated")
+        end
+
+        # Materialize the physical field once if either the diagnostic or the
+        # output cadence fires this step (they coincide by default, costing a
+        # single gridTransform!).
+        is_cfl_step = cfl_diag_on && mod(t, cfl_int) == 0
+        is_output_step = mod(t, output_int) == 0
+        if is_cfl_step || is_output_step
             patch.spectral .= sharedSpectral
             gridTransform!(patch)
+        end
+
+        # CFL/Courant diagnostic on its own cadence (defaults to the output cadence)
+        if is_cfl_step
+            cfl_diagnostics(patch, model, t, dz_min, dx_min, c_bar)
+        end
+
+        # Output if on specified time interval
+        if is_output_step
             @async write_output(patch, model, (t*model.ts))
-            checkCFL(patch)
+            checkCFL(patch; t=t, ts=model.ts, where="output")
         end
 
         # Done with this timestep
@@ -466,6 +501,12 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
 
     # Transform to local physical tile
     tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
+
+    # Trap a numerical blow-up early: scan the freshly transformed physical state
+    # for non-finite values *before* feeding it into the NaN-blind spline solve in
+    # advance_column. This runs single-threaded (before the @threads loop) so it is
+    # thread-safe, and halts the run cleanly instead of segfaulting in the solver.
+    checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
 
     # Advance each column
     if num_columns(mtile.tile) > 0
@@ -1055,25 +1096,81 @@ function calcTendency(mtile::ModelTile)
 end
 
 """
-    checkCFL(grid)
+    grid_spacing_minima(patch, model) -> (dz_min, dx_min)
 
-Check all physical variables for NaN values, which indicate a likely CFL violation.
-Throws an error if any NaN is found.
+Smallest grid spacing along the vertical (`dz_min`) and horizontal (`dx_min`)
+directions, from the patch gridpoints. Used to form Courant numbers. `dx_min`
+is `Inf` for a single-column grid. Works for both RZ (Chebyshev, boundary-
+clustered) and RiRk (B-spline, near-uniform) vertical bases since it measures
+the actual point spacing.
 """
-function checkCFL(grid)
+function grid_spacing_minima(patch, model)
+    gp = getGridpoints(patch)
+    kDim = model.grid_params.kDim
+    npts = size(gp, 1)
+    z = gp[1:kDim, 2]                       # one column's vertical levels
+    dz_min = minimum(diff(sort(z)))
+    x = gp[1:kDim:npts, 1]                  # one point per horizontal column
+    dx_min = length(x) > 1 ? minimum(diff(sort(x))) : Inf
+    return dz_min, dx_min
+end
+
+"""
+    cfl_diagnostics(patch, model, t, dz_min, dx_min, c_bar)
+
+Print CFL/Courant diagnostics for the current physical state: peak vertical and
+horizontal velocity, the acoustic Courant number (`c_bar * dt / dz_min`, with
+`c_bar = sqrt(Pxi_bar)` the mean sound speed) and the advective Courant numbers
+(`max|w|*dt/dz_min`, `max|u|*dt/dx_min`). Cheap reductions over the already-
+materialized physical field; no transform of its own.
+"""
+function cfl_diagnostics(patch, model, t::Int64, dz_min::Float64, dx_min::Float64, c_bar::Float64)
+    vars = model.grid_params.vars
+    ts = model.ts
+    w = view(patch.physical, :, vars["w"], 1)
+    maxw = maximum(abs, w)
+    line = "  CFL diag t=$(round(t*ts; digits=2)) s: max|w|=$(round(maxw; digits=3)) m/s" *
+           ", acoustic Co=$(round(c_bar * ts / dz_min; digits=3))" *
+           ", w Co=$(round(maxw * ts / dz_min; digits=3))"
+    if haskey(vars, "u") && isfinite(dx_min)
+        u = view(patch.physical, :, vars["u"], 1)
+        maxu = maximum(abs, u)
+        line *= ", max|u|=$(round(maxu; digits=3)) m/s, u Co=$(round(maxu * ts / dx_min; digits=3))"
+    end
+    println(line)
+    return nothing
+end
+
+"""
+    checkCFL(grid; t=0, ts=0.0, where="")
+
+Scan every physical-space variable for non-finite values (`NaN` **or** `Inf`),
+which indicate a likely CFL violation / numerical blow-up, and `error` on the
+first one found. `Inf` typically appears one step before `NaN` in a blow-up, so
+`!isfinite` traps the instability earlier than an `isnan`-only check.
+
+Optional `t`/`ts` add the model time `t*ts` to the message, and `where` labels
+the call site (e.g. `"worker tile"`). This is called as a cheap per-step trap on
+each worker tile (see [`advanceTimestep`](@ref)) so a blow-up halts cleanly
+*before* it reaches the NaN-blind spline solve, rather than segfaulting.
+"""
+function checkCFL(grid; t::Int64=0, ts::Float64=0.0, where::String="")
 
     # Check to see if CFL condition may have been violated
     for var in keys(grid.params.vars)
         v = grid.params.vars[var]
-        testvar = grid.physical[:,v,1]
+        testvar = view(grid.physical, :, v, 1)
         for i in eachindex(testvar)
-            if (isnan(testvar[i]))
-                error("NaN found in variable $var at index$(i) ! CFL condition likely violated")
+            if !isfinite(testvar[i])
+                loc = isempty(where) ? "" : " [$where]"
+                tstr = ts > 0.0 ? " at t=$(round(t*ts; digits=3)) s" : ""
+                error("Non-finite value ($(testvar[i])) in variable $var at index $i$loc$tstr ! CFL condition likely violated")
             end
             # Can do more extensive checks here to see if collapse is impending
             #TBD
         end
     end
+    return nothing
 end
 
 """

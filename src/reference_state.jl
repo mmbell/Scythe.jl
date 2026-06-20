@@ -85,6 +85,58 @@ function natural_column(column, grid_params)
 end
 
 """
+    warn_timestep_stability(grid_params, ts; c_nominal=340.0, target_courant=0.5)
+
+Advisory startup check that the timestep is consistent with the vertical
+resolution, aimed at catching the common mistake of raising `kDim` without
+lowering `ts`. Builds a lightweight 1-D B-spline column from `grid_params` to get
+the true minimum mish-point spacing `dz_min`, estimates the acoustic Courant
+number `c_nominal * ts / dz_min`, and emits an `@warn` (never aborts) if it
+exceeds `target_courant`. Returns the estimated Courant number, or `nothing`
+when skipped.
+
+**RiRk only.** The check is restricted to the cubic B-spline (`"RiRk"`) vertical
+geometry, whose mish points are near-uniform so a single `dz_min`-based Courant
+number is meaningful. It is a deliberate no-op for the Chebyshev (`"RZ"`)
+geometry: boundary clustering makes `dz_min` tiny, so stable RZ runs routinely
+sit at an acoustic Courant of several (the semi-implicit scheme treats vertical
+acoustics implicitly), and a nominal-sound-speed threshold would fire on every
+run.
+
+The default `target_courant=0.5` is a conservative *empirical* tripwire, not a
+derived stability bound: the BF02 RiRk case is stable near Co≈0.25 (kDim=100) but
+blew up near Co≈0.75 (kDim=300). The true RiRk semi-implicit margin is still
+under investigation, so treat this as advisory.
+"""
+function warn_timestep_stability(grid_params, ts::Float64;
+                                 c_nominal::Float64=340.0, target_courant::Float64=0.5)
+    grid_params.geometry == "RiRk" || return nothing
+    z = try
+        sp = SplineParameters(
+            xmin = grid_params.kMin, xmax = grid_params.kMax,
+            num_cells = grid_params.kDim ÷ grid_params.mubar,
+            mubar = grid_params.mubar, quadrature = grid_params.quadrature,
+            BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
+        Spline1D(sp).mishPoints
+    catch
+        return nothing       # best-effort: never let a startup check break a run
+    end
+
+    dz_min = minimum(diff(sort(z)))
+    courant = c_nominal * ts / dz_min
+    if courant > target_courant
+        suggested = target_courant * dz_min / c_nominal
+        @warn "Timestep may be too large for the RiRk vertical resolution " *
+              "(kDim=$(grid_params.kDim)): estimated acoustic Courant " *
+              "≈ $(round(courant; digits=2)) [c≈$(round(c_nominal)) m/s, " *
+              "dz_min=$(round(dz_min; digits=2)) m, ts=$(ts) s] exceeds target " *
+              "$(target_courant). Consider ts ≲ $(round(suggested; digits=4)) s. " *
+              "(Advisory empirical heuristic — the semi-implicit solver treats vertical acoustics implicitly.)"
+    end
+    return courant
+end
+
+"""
     calculate_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
 Calculate a hydrostatic reference state from a sounding file specified in `model.ref_state_file`.
