@@ -59,33 +59,48 @@ function theta_perturbation(df::DataFrame, ref, kDim::Int)
 end
 
 """
+    gauss_cell_weights(npts, ncells, length, mubar, quadrature) -> Vector
+
+Physical Gauss-quadrature weights for a field sampled on `npts = ncells*mubar`
+mish points (cell-by-cell Gauss nodes) spanning `length`. The dot product of
+these weights with the mish values is the exact integral of the cubic-spline
+representation — the same quadrature the model's Galerkin solver uses.
+"""
+function gauss_cell_weights(npts::Int, ncells::Int, length::Float64,
+                            mubar::Int, quadrature::Symbol)
+    @assert npts == ncells * mubar "mish count $npts ≠ ncells*mubar $(ncells*mubar)"
+    DX = length / ncells
+    _, qw = CubicBSpline._quadrature_rule(mubar, quadrature)
+    return repeat(qw .* DX, outer = ncells)              # length npts
+end
+
+"""
     domain_integral(field, model) -> Float64
 
 Integrate a `(kDim, ncols)` field over the 2-D domain: a vertical integral in z
-for each column, then a cubic B-spline integral across columns.
+for each column, then a horizontal integral across columns.
 
-For the RiRk (cubic B-spline) vertical basis the column integral uses the
-**Gauss quadrature weights on the mish points** — the same quadrature the model's
-Galerkin acoustic solver uses, and exact for the model's spline representation.
-The earlier approach (refit the physical data to a non-interpolating spline,
-`b_kDim = num_cells+3 < kDim` coefficients, and integrate the antiderivative)
-introduced a shape-dependent ~0.5% quadrature error that oscillated with the
-field and masqueraded as a mass/energy conservation drift; the Gauss-weight
-integral reduces it by ~30×. The RZ (Chebyshev) vertical integral is spectrally
-exact and unchanged.
+The mish points are Gauss quadrature nodes in **both** directions, so the
+integral uses the **Gauss-weight quadrature on those nodes** directly — exact for
+the model's spline representation and consistent with its Galerkin solver.
+Refitting the data to a non-interpolating spline (`b_kDim = num_cells+3 < kDim/
+ncols` coefficients) and integrating its antiderivative, as before, introduced a
+shape-dependent ~0.5% error that oscillated with the field and masqueraded as a
+mass/energy conservation drift; the Gauss-weight integral removes it (apparent
+RiRk drift ~30× smaller). The RZ (Chebyshev) vertical integral is spectrally
+exact and unchanged; both grids share the spline horizontal direction, so the
+horizontal Gauss-weight integral tightens RZ as well.
 """
 function domain_integral(field::AbstractMatrix, model)
     gp = model.grid_params
     spline_vertical = String(gp.geometry) == "RiRk"
     ncols = size(field, 2)
     colints = zeros(ncols)
-    out = zeros(1)
+
+    # Vertical integral per column
     if spline_vertical
-        # Gauss-weight quadrature on the mish points (cell-by-cell Gauss nodes).
-        ncv = gp.kDim ÷ gp.mubar
-        DXv = (gp.kMax - gp.kMin) / ncv
-        _, qw = CubicBSpline._quadrature_rule(gp.mubar, gp.quadrature)
-        Wv = repeat(qw .* DXv, outer = ncv)              # length kDim
+        Wv = gauss_cell_weights(gp.kDim, gp.kDim ÷ gp.mubar, gp.kMax - gp.kMin,
+                                gp.mubar, gp.quadrature)
         for c in 1:ncols
             colints[c] = sum(Wv .* @view(field[:, c]))
         end
@@ -101,12 +116,12 @@ function domain_integral(field::AbstractMatrix, model)
             colints[c] = IInttransform(zcol, 0.0)[end]
         end
     end
-    sp = SplineParameters(xmin = gp.iMin, xmax = gp.iMax, num_cells = gp.num_cells,
-                          BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
-    spline = Spline1D(sp)
-    CubicBSpline.SIIntcoefficients!(spline, colints)
-    CubicBSpline.SItransform(spline.params, spline.a, [gp.iMax], out, 0)
-    return out[1]
+
+    # Horizontal integral across columns (spline-i for both RZ and RiRk): Gauss
+    # weights on the i mish points (mubar_i inferred from the output column count).
+    Wh = gauss_cell_weights(ncols, gp.num_cells, gp.iMax - gp.iMin,
+                            ncols ÷ gp.num_cells, gp.quadrature)
+    return sum(Wh .* colints)
 end
 
 """
