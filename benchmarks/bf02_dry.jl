@@ -63,12 +63,15 @@ function bf02_dry_model(opts::BenchmarkOptions)
         options[:vertical_mixing] = false
     end
 
+    kDim = vertical_kdim(kDim, opts)
+    ts = vertical_ts(ts, opts)
+
     output_dir = benchmark_output_dir("bf02_dry", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
 
     grid_params = GridParameters(
-        geometry = "RZ",   # Cartesian x-z in Springsteel
+        geometry = benchmark_geometry(opts),   # RZ (Chebyshev) or RiRk (B-spline) vertical
         iMin = 0.0,
         iMax = 20.0e3,
         num_cells = num_cells,

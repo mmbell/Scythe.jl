@@ -61,29 +61,46 @@ end
 """
     domain_integral(field, model) -> Float64
 
-Spectrally integrate a `(kDim, ncols)` field over the 2-D domain: Chebyshev
-integral in z for each column, then a cubic B-spline integral across columns
-with the antiderivative evaluated at the domain edge.
+Spectrally integrate a `(kDim, ncols)` field over the 2-D domain: a vertical
+integral in z for each column (Chebyshev for the RZ grid, cubic B-spline for the
+RiRk grid — matching the model's vertical basis), then a cubic B-spline integral
+across columns with the antiderivative evaluated at the domain edge.
 """
 function domain_integral(field::AbstractMatrix, model)
     gp = model.grid_params
-    cp = ChebyshevParameters(zmin = gp.kMin, zmax = gp.kMax,
-                             zDim = gp.kDim, bDim = gp.b_kDim,
-                             BCB = Chebyshev.R0, BCT = Chebyshev.R0)
-    col = Chebyshev1D(cp)
+    spline_vertical = String(gp.geometry) == "RiRk"
+    if spline_vertical
+        zcol = Spline1D(SplineParameters(
+            xmin = gp.kMin, xmax = gp.kMax,
+            num_cells = gp.kDim ÷ gp.mubar, mubar = gp.mubar,
+            quadrature = gp.quadrature,
+            BCL = CubicBSpline.R0, BCR = CubicBSpline.R0))
+    else
+        zcol = Chebyshev1D(ChebyshevParameters(
+            zmin = gp.kMin, zmax = gp.kMax,
+            zDim = gp.kDim, bDim = gp.b_kDim,
+            BCB = Chebyshev.R0, BCT = Chebyshev.R0))
+    end
     ncols = size(field, 2)
     colints = zeros(ncols)
+    out = zeros(1)
     for c in 1:ncols
-        col.uMish .= field[:, c]
-        Btransform!(col)
-        Atransform!(col)
-        colints[c] = IInttransform(col, 0.0)[end]
+        if spline_vertical
+            # Definite integral 0→kMax: spline antiderivative evaluated at the top.
+            CubicBSpline.SIIntcoefficients!(zcol, field[:, c])
+            CubicBSpline.SItransform(zcol.params, zcol.a, [gp.kMax], out, 0)
+            colints[c] = out[1]
+        else
+            zcol.uMish .= field[:, c]
+            Btransform!(zcol)
+            Atransform!(zcol)
+            colints[c] = IInttransform(zcol, 0.0)[end]
+        end
     end
     sp = SplineParameters(xmin = gp.iMin, xmax = gp.iMax, num_cells = gp.num_cells,
                           BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
     spline = Spline1D(sp)
     CubicBSpline.SIIntcoefficients!(spline, colints)
-    out = zeros(1)
     CubicBSpline.SItransform(spline.params, spline.a, [gp.iMax], out, 0)
     return out[1]
 end

@@ -349,6 +349,32 @@ function saturated_hydrostatic_profile(z::Vector{Float64}, column, ref::Referenc
 end
 
 """
+    interpolate_base_state(base, src_column::Chebyshev1D, z_target) -> NamedTuple
+
+Spectrally interpolate every field of a base-state NamedTuple (from
+[`saturated_hydrostatic_profile`](@ref)) off the source Chebyshev column's levels
+onto `z_target`. The saturated-neutral base-state iteration converges on a
+Chebyshev column but not on a low-DOF cubic B-spline column (the iteration is not
+a true root finder and the saturation vapor pressure aloft is hypersensitive), so
+the moist RiRk case builds the base state on Chebyshev and transfers it to the
+spline model levels with this near-analytic spectral interpolation. The
+interpolated profile is a stable initial condition; it is not re-balanced on the
+target grid (a small hydrostatic residual from interpolation is acceptable for a
+perturbation run).
+"""
+function interpolate_base_state(base::NamedTuple, src_column::Chebyshev1D,
+                                z_target::Vector{Float64})
+    Cmat = Chebyshev.CItransform_matrix(src_column, z_target, 0)
+    interp = function (vals)
+        src_column.uMish[:] .= vals
+        Btransform!(src_column)
+        Atransform!(src_column)
+        return Cmat * src_column.a
+    end
+    return NamedTuple{keys(base)}(map(interp, values(base)))
+end
+
+"""
     write_exact_ref(path, z, s, xi, mu)
 
 Write an exact reference state file (`z s xi mu` per line) in the format read

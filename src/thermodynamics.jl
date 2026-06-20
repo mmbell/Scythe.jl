@@ -45,6 +45,28 @@ const T_0 = 273.16
 const p_0 = 1000.0
 const q0 = 1.0e-5
 
+# Water-vapor (mu) prognostic-variable transform mode. `:linear` uses mu = q*1e5
+# (the default, exactly matching the existing RZ/Chebyshev results); `:hyperbolic`
+# uses the biased hyperbolic transform of Ooyama (2002) (mu = bhyp(q),
+# q = ahyp(mu) ≥ 0), which keeps water vapor non-negative under overshoot. Set
+# per run via `set_mu_transform!`; on distributed runs it must be set on every
+# worker (e.g. `@everywhere Scythe.set_mu_transform!(:hyperbolic)`).
+const _MU_HYPERBOLIC = Ref(false)
+
+"""
+    set_mu_transform!(mode::Symbol) -> Symbol
+
+Select the water-vapor `mu` transform: `:linear` (mu = q*1e5, default) or
+`:hyperbolic` (Ooyama 2002 biased hyperbolic, non-negative q_v). Affects
+[`mu_transform`](@ref), [`inv_mu_transform`](@ref) and [`dmudq`](@ref).
+"""
+function set_mu_transform!(mode::Symbol)
+    mode in (:linear, :hyperbolic) ||
+        throw(ArgumentError("mu transform mode must be :linear or :hyperbolic, got :$mode"))
+    _MU_HYPERBOLIC[] = (mode === :hyperbolic)
+    return mode
+end
+
 """
     sat_pressure_liquid(Tk)
 
@@ -620,18 +642,10 @@ julia> Scythe.inv_mu_transform(1000.0)
 """
 function inv_mu_transform(mu::Float64)
 
-    if (mu < 0.0)
-        return 0.0
-    else
-        q = mu * 1.0e-5
-        return q
+    if _MU_HYPERBOLIC[]
+        return ahyp(mu)   # Ooyama (2002) biased hyperbolic; q_v ≥ 0
     end
-    #return ahyp(mu)
-
-    #return sqrt(mu*mu + q0*q0) + mu
-    
-    # new
-    #return q0 * exp(mu)
+    return mu < 0.0 ? 0.0 : mu * 1.0e-5
 end
 
 """
@@ -656,21 +670,7 @@ julia> Scythe.mu_transform(0.01)
 """
 function mu_transform(q::Float64)
 
-    return q*1.0e5
-    #return bhyp(q)
-
-
-    #if (abs(q) < eps())
-    #    return -5.0e-8
-    #else
-    #    return 0.5 * (q - (q0*q0/q) )
-    #end
-
-    #new
-    #if (abs(q) < eps())
-    #    q = eps()
-    #end
-    #return log(q/q0)
+    return _MU_HYPERBOLIC[] ? bhyp(q) : q * 1.0e5
 end
 
 """
@@ -688,20 +688,7 @@ i.e. `dmu/dq_v`. Currently returns the constant `10⁵` (linear scaling).
 """
 function dmudq(mu::Float64, q_v::Float64)
 
-    return 1.0e5
-    #return ((q_v + q0) - mu)/(q_v + q0) #bhyp
-
-    # hyp 
-    #if (abs(q_v) < eps())
-    #    return 0.5
-    #else
-    #    return (q_v - mu)/q_v
-    #end
-
-    #if (abs(q_v) < eps())
-    #    q_v = eps()
-    #end
-    #return 1.0 / q_v
+    return _MU_HYPERBOLIC[] ? ((q_v + q0) - mu) / (q_v + q0) : 1.0e5
 end
 
 """

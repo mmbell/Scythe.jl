@@ -64,6 +64,22 @@ function natural_column(column::Chebyshev1D, grid_params)
     return Chebyshev1D(cp)
 end
 
+function natural_column(column::Spline1D, grid_params)
+    # Cubic B-spline column with natural (R0) boundary conditions, matching the
+    # model's vertical spline resolution and quadrature so the mish points align.
+    # Reference profiles can have nonzero boundary gradients, so the model
+    # variables' wall BCs must not be imposed on them.
+    sp = SplineParameters(
+        xmin = grid_params.kMin,
+        xmax = grid_params.kMax,
+        num_cells = grid_params.kDim ÷ grid_params.mubar,
+        mubar = grid_params.mubar,
+        quadrature = grid_params.quadrature,
+        BCL = CubicBSpline.R0,
+        BCR = CubicBSpline.R0)
+    return Spline1D(sp)
+end
+
 function natural_column(column, grid_params)
     return deepcopy(column)
 end

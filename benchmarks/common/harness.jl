@@ -22,6 +22,7 @@ include(joinpath(REFERENCE_DATA_DIR, "expected_values.jl"))
 struct BenchmarkOptions
     mode::Symbol        # :quick | :full
     stage::Symbol       # :legacy | :pe
+    grid::Symbol        # :rz (Chebyshev vertical) | :rirk (B-spline vertical)
     workers::Int
     update_reference::Bool
     plot::Bool
@@ -39,11 +40,12 @@ end
 
 Parse benchmark command line arguments:
 --mode quick|full (default quick), --stage legacy|pe (default legacy),
---workers N (default 2), --update-reference, --plot.
+--grid rz|rirk (default rz), --workers N (default 2), --update-reference, --plot.
 """
 function parse_benchmark_args(args::Vector{String})
     mode = :quick
     stage = :legacy
+    grid = :rz
     nworkers = 2
     update_reference = false
     plot = false
@@ -54,6 +56,8 @@ function parse_benchmark_args(args::Vector{String})
             mode = Symbol(args[i+1]); i += 2
         elseif arg == "--stage"
             stage = Symbol(args[i+1]); i += 2
+        elseif arg == "--grid"
+            grid = Symbol(args[i+1]); i += 2
         elseif arg == "--workers"
             nworkers = parse(Int, args[i+1]); i += 2
         elseif arg == "--update-reference"
@@ -62,7 +66,8 @@ function parse_benchmark_args(args::Vector{String})
             plot = true; i += 1
         elseif arg in ("--help", "-h")
             println("Usage: julia --project=. benchmarks/<case>.jl " *
-                    "[--mode quick|full] [--stage legacy|pe] [--workers N] [--update-reference] [--plot]")
+                    "[--mode quick|full] [--stage legacy|pe] [--grid rz|rirk] " *
+                    "[--workers N] [--update-reference] [--plot]")
             exit(0)
         else
             error("Unknown argument: $arg")
@@ -70,13 +75,46 @@ function parse_benchmark_args(args::Vector{String})
     end
     mode in (:quick, :full) || error("--mode must be quick or full")
     stage in (:legacy, :pe) || error("--stage must be legacy or pe")
+    grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
-    return BenchmarkOptions(mode, stage, nworkers, update_reference, plot)
+    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot)
 end
+
+"""Geometry string for the configured vertical basis (RZ Chebyshev vs RiRk B-spline)."""
+benchmark_geometry(opts::BenchmarkOptions) = opts.grid == :rirk ? "RiRk" : "RZ"
+
+"""
+    vertical_ts(ts, opts; factor=0.5) -> Float64
+
+Timestep for the configured grid. The cubic B-spline (RiRk) acoustic solve has a
+tighter stability limit than the Chebyshev pseudospectral solve at the same
+horizontal resolution (the implicit vertical solve lives in the b_kDim spline
+coefficient space rather than being collocated point-for-point), so RiRk runs at
+a reduced timestep. The physical times — and hence output and diagnostics — are
+unchanged; only the step count grows.
+"""
+vertical_ts(ts::Float64, opts::BenchmarkOptions; factor::Float64=0.5) =
+    opts.grid == :rirk ? ts * factor : ts
+
+"""
+    vertical_kdim(kDim, opts; mubar=3) -> Int
+
+Vertical point count for the configured grid. The Chebyshev (RZ) grid accepts any
+`kDim`; the cubic B-spline (RiRk) grid requires `kDim` to be a multiple of `mubar`
+(`kDim = num_cells * mubar`), so snap to the nearest valid count for RiRk.
+"""
+function vertical_kdim(kDim::Int, opts::BenchmarkOptions; mubar::Int=3)
+    opts.grid == :rirk || return kDim
+    return max(mubar, round(Int, kDim / mubar) * mubar)
+end
+
+"""Path suffix distinguishing non-default grids (empty for the default RZ grid)."""
+grid_suffix(opts::BenchmarkOptions) = opts.grid == :rz ? "" : "_$(opts.grid)"
 
 """Output directory for a benchmark variant (created if missing)."""
 function benchmark_output_dir(name::String, opts::BenchmarkOptions)
-    dir = joinpath(BENCHMARKS_DIR, "output", "$(name)_$(opts.mode)_$(opts.stage)")
+    dir = joinpath(BENCHMARKS_DIR, "output",
+                   "$(name)_$(opts.mode)_$(opts.stage)$(grid_suffix(opts))")
     mkpath(dir)
     return dir * "/"   # integrate_model concatenates paths with *
 end
@@ -88,9 +126,11 @@ the final scalar diagnostics (full fields are tens of MB).
 """
 function reference_csv_path(name::String, opts::BenchmarkOptions)
     if opts.mode == :full
-        return joinpath(REFERENCE_DATA_DIR, name, "full_$(opts.stage)_diagnostics.csv")
+        return joinpath(REFERENCE_DATA_DIR, name,
+                        "full_$(opts.stage)$(grid_suffix(opts))_diagnostics.csv")
     end
-    return joinpath(REFERENCE_DATA_DIR, name, "$(opts.mode)_$(opts.stage)_final.csv")
+    return joinpath(REFERENCE_DATA_DIR, name,
+                    "$(opts.mode)_$(opts.stage)$(grid_suffix(opts))_final.csv")
 end
 
 """Write a full-mode regression reference: target diagnostics as name,value rows."""
@@ -284,7 +324,7 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
                        varnames::Vector{String}, plotter=nothing)
 
     println("═"^70)
-    println("Benchmark: $name  mode=$(opts.mode)  stage=$(opts.stage)  " *
+    println("Benchmark: $name  mode=$(opts.mode)  stage=$(opts.stage)  grid=$(opts.grid)  " *
             "equation_set=$(model.equation_set)")
     nsteps = round(Int, model.integration_time / model.ts)
     println("Grid: num_cells=$(model.grid_params.num_cells) kDim=$(model.grid_params.kDim)  " *
@@ -357,6 +397,7 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
         "case" => name,
         "mode" => opts.mode,
         "stage" => opts.stage,
+        "grid" => opts.grid,
         "equation_set" => model.equation_set,
         "scythe_sha" => scythe_sha,
         "scythe_dirty" => scythe_dirty,

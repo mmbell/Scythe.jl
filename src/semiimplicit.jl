@@ -188,13 +188,15 @@ function extract_halo_values(tile::AbstractGrid)
 end
 
 """
-    extract_halo_values(tile::RZ_Grid)
+    extract_halo_values(tile::Union{RZ_Grid, RiRk_Grid})
 
-RZ grids store `b_kDim` consecutive spline blocks (one per Chebyshev mode), so
-the 3-row right halo is extracted from the end of each block. Ordering matches
-the column-major sparse indices of the RZ `calcHaloMap`.
+RZ and RiRk grids store `b_kDim` consecutive spline blocks (one per vertical
+mode — Chebyshev for RZ, B-spline for RiRk), so the 3-row right halo is
+extracted from the end of each block. Ordering matches the column-major sparse
+indices of the `calcHaloMap`. The spectral layout is identical for both, so the
+same extraction applies.
 """
-function extract_halo_values(tile::RZ_Grid)
+function extract_halo_values(tile::Union{RZ_Grid, RiRk_Grid})
     b_iDim = tile.params.b_iDim
     b_kDim = tile.params.b_kDim
     nvars = size(tile.spectral, 2)
@@ -251,12 +253,13 @@ function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Abstr
 end
 
 """
-    write_tile_to_shared!(sharedSpectral, tile::RZ_Grid, b_iDim_patch)
+    write_tile_to_shared!(sharedSpectral, tile::Union{RZ_Grid, RiRk_Grid}, b_iDim_patch)
 
-RZ grids store `b_kDim` consecutive spline blocks (one per Chebyshev mode);
-copy the inner rows of every block to its patch position.
+RZ and RiRk grids store `b_kDim` consecutive spline blocks (one per vertical
+mode); copy the inner rows of every block to its patch position. The spectral
+layout is identical for both.
 """
-function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::RZ_Grid,
+function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union{RZ_Grid, RiRk_Grid},
                                 b_iDim_patch::Int64)
     siL = tile.params.spectralIndexL
     b_iDim_tile = tile.params.b_iDim
@@ -598,21 +601,12 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     w_nstar = Itransform!(w_col)
     w_nstar_z = ts_term .* Ixtransform(w_col)
 
-    # Set up the matrix problem
-    nz = mtile.model.grid_params.kDim
-    nbasis = mtile.model.grid_params.b_kDim
-    g = xi_nstar .- w_nstar_z
-    g = [0.0 ; 0.0; g[2:nz-1]]
-
     # Calculate the Helmholtz matrix
     h_a = calc_Helmholtz_semiimplicit_matrix_xi(mtile.tile, mtile.model, Pxi_bar, ts_term)
 
-    # Solve for the coefficients
-    xi_a = h_a \ g
-
-    # Set xi_n+1
+    # Solve for the xi coefficients (RHS = xi_nstar - w_nstar_z; homogeneous BCs)
     xi_col = mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]]
-    xi_col.a .= xi_a
+    _vertical_solve!(xi_col, h_a, xi_nstar .- w_nstar_z, mtile.tile)
     view(mtile.var_np1,colstart:colend,xi_index) .= Itransform!(xi_col)
 
     # Set w_n+1
@@ -680,20 +674,17 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     w_nstar = Itransform!(w_col)
     w_nstar_z = ts_term .* Ixtransform(w_col)
 
-    # Set up the matrix problem
-    nz = mtile.model.grid_params.kDim
-    g = xi_nstar .- w_nstar_z
-    g = [0.0 ; 0.0; g[2:nz-1]]
-
+    # Set up the matrix problem (RHS = xi_nstar - w_nstar_z; homogeneous BCs)
+    rhs = xi_nstar .- w_nstar_z
     xi_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]])
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        xi_col.a .= h_a \ g
+        _vertical_solve!(xi_col, h_a, rhs, mtile.tile)
     else
         # Use the pre-calculated one
-        xi_col.a .= mtile.h_matrix \ g
+        _vertical_solve!(xi_col, mtile.h_matrix, rhs, mtile.tile)
     end
 
     # Set xi_n+1
@@ -764,20 +755,17 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     xi_nstar = Itransform!(xi_col)
     xi_nstar_z = ts_term .* Pxi_bar .* Ixtransform(xi_col)
 
-    # Set up the matrix problem
-    nz = mtile.model.grid_params.kDim
-    g = xi_nstar_z .- w_nstar
-    g = [0.0 ; 0.0; g[2:nz-1]]
-
+    # Set up the matrix problem (RHS = xi_nstar_z - w_nstar; homogeneous BCs)
+    rhs = xi_nstar_z .- w_nstar
     w_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        w_col.a .= h_a \ g
+        _vertical_solve!(w_col, h_a, rhs, mtile.tile)
     else
         # Use the pre-calculated one
-        w_col.a .= mtile.h_matrix \ g
+        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile.tile)
     end
 
     # Set w_n+1
@@ -843,20 +831,17 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     xi_nstar = Itransform!(xi_col)
     xi_nstar_z = ts_term .* Pxi_bar .* Ixtransform(xi_col)
 
-    # Set up the matrix problem
-    nz = mtile.model.grid_params.kDim
-    g = xi_nstar_z .- w_nstar
-    g = [0.0 ; 0.0; g[2:nz-1]]
-
+    # Set up the matrix problem (RHS = xi_nstar_z - w_nstar; homogeneous BCs)
+    rhs = xi_nstar_z .- w_nstar
     w_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
     # Solve for the coefficients
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        w_col.a .= h_a \ g
+        _vertical_solve!(w_col, h_a, rhs, mtile.tile)
     else
         # Use the pre-calculated one
-        w_col.a .= mtile.h_matrix \ g
+        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile.tile)
     end
 
     # Set w_n+1
@@ -964,34 +949,24 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
         h_a = calc_Helmholtz_diffusion_matrix(mtile.tile, mtile.model, ts_term)
     end
 
-    # Set s_n+1
-    g = s_nstar
-    g = [0.0 ; 0.0; g[2:nz-1]]
-    col.a .= h_a \ g
+    # Set s_n+1 (homogeneous BCs)
+    _vertical_solve!(col, h_a, s_nstar, mtile.tile)
     view(mtile.var_np1,colstart:colend,s_index) .= Itransform!(col)
 
     # Set mu_n+1
-    g = mu_nstar
-    g = [0.0 ; 0.0; g[2:nz-1]]
-    col.a .= h_a \ g
+    _vertical_solve!(col, h_a, mu_nstar, mtile.tile)
     view(mtile.var_np1,colstart:colend,mu_index) .= Itransform!(col)
 
     # Set mu_c_n+1
-    g = mu_c_nstar
-    g = [0.0 ; 0.0; g[2:nz-1]]
-    col.a .= h_a \ g
+    _vertical_solve!(col, h_a, mu_c_nstar, mtile.tile)
     view(mtile.var_np1,colstart:colend,mu_c_index) .= Itransform!(col)
 
     # Set mu_r_n+1
-    g = mu_r_nstar
-    g = [0.0 ; 0.0; g[2:nz-1]]
-    col.a .= h_a \ g
+    _vertical_solve!(col, h_a, mu_r_nstar, mtile.tile)
     view(mtile.var_np1,colstart:colend,mu_r_index) .= Itransform!(col)
 
     # Set mu_sat_n+1
-    g = mu_sat_nstar
-    g = [0.0 ; 0.0; g[2:nz-1]]
-    col.a .= h_a \ g
+    _vertical_solve!(col, h_a, mu_sat_nstar, mtile.tile)
     view(mtile.var_np1,colstart:colend,mu_sat_index) .= Itransform!(col)
 
 end
@@ -1128,6 +1103,126 @@ function _helmholtz_bc_row(bc::BoundaryConditions, M0, M1, M2, row_idx)
     end
 end
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Cubic B-spline vertical (RiRk): Galerkin Helmholtz support
+#
+# The Chebyshev acoustic solver is a square pseudospectral collocation: the DCT
+# has #points == #coefficients == kDim, so operator_matrix(:k,·) is kDim×kDim and
+# `h \ g` is a square solve. A cubic B-spline instead has b_kDim = num_cells + 3
+# coefficients but kDim = num_cells·mubar mish points, so operator_matrix(:k,·) is
+# the rectangular (kDim × b_kDim) evaluation matrix and `h \ g` degenerates to an
+# ill-posed least-squares solve.
+#
+# We restore a square system with a Galerkin (finite-element) discretisation on
+# the spline basis. The weak form of (α ∂_zz + β) is  -α ∫ψ'φ' + β ∫ψφ, integrated
+# with the spline's own Gauss quadrature (weights W at the mish points). Writing
+# M0, M1 for the basis and first-derivative matrices at the mish points, the
+# operator is  A = -α M1ᵀW M1 + β M0ᵀW M0  (symmetric, b_kDim×b_kDim) and the load
+# vector is  b = M0ᵀW g_mish. Crucially A is built from the *same* mish operators
+# the explicit tendencies use, so the implicit and explicit acoustic operators are
+# consistent — a requirement of the AI2* split that a node-collocation operator
+# (built at different points, and non-symmetric) violates, producing a slow
+# acoustic instability. Neumann conditions are natural; Dirichlet conditions
+# replace the first/last rows with the boundary-value constraint. Full derivation:
+# reference/rirk_vertical_solver.tex.
+# ─────────────────────────────────────────────────────────────────────────────
+
+const _RIRK_SOLVE_CACHE = Dict{UInt, NamedTuple}()
+const _RIRK_SOLVE_LOCK = ReentrantLock()
+# Per-factorization Dirichlet flags (bottom, top), so the load vector can zero the
+# matching boundary rows. Keyed by objectid of the factorization object.
+const _RIRK_DIRICHLET = Dict{UInt, Tuple{Bool, Bool}}()
+
+_is_dirichlet(bc::BoundaryConditions) = bc.u !== nothing
+
+"""
+Per-column cached Galerkin data: the mish basis matrix `M0` and first-derivative
+matrix `M1` (both `kDim × b_kDim`), the diagonal physical Gauss-quadrature weights
+`W` (length `kDim`), and the boundary-value rows `Nb` (`2 × b_kDim`, evaluated at
+`z_b` and `z_t`) used to impose Dirichlet conditions. `M0`/`M1` are exactly the
+operators the explicit gridTransform tendencies use, ensuring consistency.
+"""
+function _rirk_solve_data(kcol::CubicBSpline.Spline1D)
+    lock(_RIRK_SOLVE_LOCK) do
+        get!(_RIRK_SOLVE_CACHE, objectid(kcol)) do
+            sp = kcol.params
+            M0 = CubicBSpline.SItransform_matrix(kcol, kcol.mishPoints, 0)
+            M1 = CubicBSpline.SItransform_matrix(kcol, kcol.mishPoints, 1)
+            _, qw = CubicBSpline._quadrature_rule(sp.mubar, sp.quadrature)
+            W  = repeat(qw .* sp.DX, outer = sp.num_cells)   # physical weights, length kDim
+            Nb = CubicBSpline.SItransform_matrix(kcol, [sp.xmin, sp.xmax], 0)
+            (M0 = M0, M1 = M1, W = W, Nb = Nb)
+        end
+    end
+end
+
+# Galerkin assembly of (α ∂_zz + β) on the spline basis; see the block comment.
+function _assemble_spline_matrix(d, α::Float64, β::Float64,
+        bc_bottom::BoundaryConditions, bc_top::BoundaryConditions)
+    Mass  = d.M0' * (d.W .* d.M0)
+    Stiff = d.M1' * (d.W .* d.M1)
+    A = (-α) .* Stiff .+ β .* Mass
+    db = _is_dirichlet(bc_bottom); dt = _is_dirichlet(bc_top)
+    if db; A[1,   :] .= d.Nb[1, :]; end
+    if dt; A[end, :] .= d.Nb[2, :]; end
+    F = factorize(A)
+    lock(_RIRK_SOLVE_LOCK) do
+        _RIRK_DIRICHLET[objectid(F)] = (db, dt)
+    end
+    return F
+end
+
+"""
+    _assemble_vertical_matrix(grid, model, α, β, bc_scale, bc_bottom, bc_top)
+
+Assemble and factorize the vertical operator `α ∂_zz + β` for the semi-implicit
+solves. For a Chebyshev k-basis this is the square `kDim × kDim` pseudospectral
+collocation (`α M2 + β M0`, interior rows `2:nz-1`, BC rows scaled by `bc_scale`);
+for a cubic B-spline k-basis it is the symmetric `b_kDim × b_kDim` Galerkin form.
+"""
+function _assemble_vertical_matrix(grid::AbstractGrid, model::ModelParameters,
+        α::Float64, β::Float64, bc_scale::Float64,
+        bc_bottom::BoundaryConditions, bc_top::BoundaryConditions)
+    kcol = grid.kbasis.data[1]
+    if kcol isa CubicBSpline.Spline1D
+        return _assemble_spline_matrix(_rirk_solve_data(kcol), α, β, bc_bottom, bc_top)
+    else
+        nz = model.grid_params.kDim
+        M0 = operator_matrix(grid, :k, 0)
+        M1 = operator_matrix(grid, :k, 1)
+        M2 = operator_matrix(grid, :k, 2)
+        h = α .* M2 .+ β .* M0
+        bc1 = bc_scale .* _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
+        bc2 = bc_scale .* _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
+        return factorize([bc1[:]'; bc2[:]'; h[2:nz-1, :]])
+    end
+end
+
+"""
+    _vertical_solve!(col, h_a, rhs_mish, grid)
+
+Solve the factorized vertical system `h_a` for the spectral coefficients `col.a`,
+given the right-hand side `rhs_mish` sampled at the `kDim` physical mish points
+(boundary rows are homogeneous). For a Chebyshev k-basis the interior mish values
+are used directly; for a cubic B-spline k-basis the Galerkin load vector
+`M0ᵀW rhs_mish` is formed and the Dirichlet boundary rows (if any) are zeroed.
+"""
+function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, grid::AbstractGrid)
+    kcol = grid.kbasis.data[1]
+    if kcol isa CubicBSpline.Spline1D
+        d = _rirk_solve_data(kcol)
+        b = d.M0' * (d.W .* rhs_mish)
+        db, dt = get(_RIRK_DIRICHLET, objectid(h_a), (false, false))
+        if db; b[1]   = 0.0; end
+        if dt; b[end] = 0.0; end
+        col.a .= h_a \ b
+    else
+        nz = length(rhs_mish)
+        col.a .= h_a \ vcat(0.0, 0.0, rhs_mish[2:nz-1])
+    end
+    return col
+end
+
 """
     calc_Helmholtz_semiimplicit_matrix_xi(grid, model, Pxi_bar, ts_term; bc_bottom, bc_top)
 
@@ -1145,16 +1240,8 @@ semi-implicit solve. Boundary condition type is configurable via keyword argumen
 function calc_Helmholtz_semiimplicit_matrix_xi(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64;
         bc_bottom::BoundaryConditions=NeumannBC(), bc_top::BoundaryConditions=NeumannBC())
 
-    # Build basis matrices via the abstract operator_matrix interface
-    nz = model.grid_params.kDim
-    M0 = operator_matrix(grid, :k, 0)
-    M1 = operator_matrix(grid, :k, 1)
-    M2 = operator_matrix(grid, :k, 2)
-    h = (-ts_term .* ts_term .* Pxi_bar) .* M2 .+ M0
-    bc1 = (-ts_term .* ts_term .* Pxi_bar) .* _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
-    bc2 = (-ts_term .* ts_term .* Pxi_bar) .* _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
-    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
-    return factorize(h_a)
+    c = -ts_term * ts_term * Pxi_bar
+    return _assemble_vertical_matrix(grid, model, c, 1.0, c, bc_bottom, bc_top)
 end
 
 """
@@ -1174,16 +1261,8 @@ semi-implicit solve. Boundary condition type is configurable via keyword argumen
 function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelParameters, Pxi_bar::Float64, ts_term::Float64;
         bc_bottom::BoundaryConditions=DirichletBC(), bc_top::BoundaryConditions=DirichletBC())
 
-    # Build basis matrices via the abstract operator_matrix interface
-    nz = model.grid_params.kDim
-    M0 = operator_matrix(grid, :k, 0)
-    M1 = operator_matrix(grid, :k, 1)
-    M2 = operator_matrix(grid, :k, 2)
-    h = (ts_term .* ts_term .* Pxi_bar) .* M2 .- M0
-    bc1 = _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
-    bc2 = _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
-    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
-    return factorize(h_a)
+    c = ts_term * ts_term * Pxi_bar
+    return _assemble_vertical_matrix(grid, model, c, -1.0, 1.0, bc_bottom, bc_top)
 end
 
 """
@@ -1202,14 +1281,5 @@ diffusion. Boundary condition type is configurable via keyword arguments.
 function calc_Helmholtz_diffusion_matrix(grid::AbstractGrid, model::ModelParameters, ts_term::Float64;
         bc_bottom::BoundaryConditions=NeumannBC(), bc_top::BoundaryConditions=NeumannBC())
 
-    # Build basis matrices via the abstract operator_matrix interface
-    nz = model.grid_params.kDim
-    M0 = operator_matrix(grid, :k, 0)
-    M1 = operator_matrix(grid, :k, 1)
-    M2 = operator_matrix(grid, :k, 2)
-    h = M0 .- (ts_term .* M2)
-    bc1 = _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
-    bc2 = _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
-    h_a = [bc1[:]'; bc2[:]'; h[2:nz-1,:]]
-    return factorize(h_a)
+    return _assemble_vertical_matrix(grid, model, -ts_term, 1.0, 1.0, bc_bottom, bc_top)
 end

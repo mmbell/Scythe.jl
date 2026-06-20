@@ -75,12 +75,15 @@ function bf02_moist_model(opts::BenchmarkOptions)
                        :precipitation => false, :vertical_mixing => false)
     end
 
+    kDim = vertical_kdim(kDim, opts)
+    ts = vertical_ts(ts, opts)
+
     output_dir = benchmark_output_dir("bf02_moist", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
 
     grid_params = GridParameters(
-        geometry = "RZ",   # Cartesian x-z in Springsteel
+        geometry = benchmark_geometry(opts),   # RZ (Chebyshev) or RiRk (B-spline) vertical
         iMin = 0.0,
         iMax = 20.0e3,
         num_cells = num_cells,
@@ -132,10 +135,30 @@ function bf02_moist_init!(model)
         ref_state_file = sounding, grid_params = model.grid_params,
         physical_params = model.physical_params,
     )
-    ref_guess = Scythe.calculate_reference_state(guess_model, z, column)
-    base = Scythe.saturated_hydrostatic_profile(z, column, ref_guess;
-                                                q_t=Q_T, theta_e=THETA_E,
-                                                sfc_p_hPa=1000.0)
+    if column isa Spline1D
+        # The saturated-neutral base-state iteration converges on a Chebyshev
+        # column but not on the low-DOF cubic B-spline column, so build it on a
+        # Chebyshev column (at the resolution the RZ moist case uses, where it is
+        # known to converge) and spectrally interpolate the converged profiles
+        # onto the spline model levels for a stable initial condition.
+        kDim_cheb = opts.mode == :full ? 100 : 50
+        b_cheb = min(kDim_cheb, Int(floor((2 * kDim_cheb - 1) / 3)) + 1)
+        cheb = Chebyshev1D(ChebyshevParameters(
+            zmin = model.grid_params.kMin, zmax = model.grid_params.kMax,
+            zDim = kDim_cheb, bDim = b_cheb,
+            BCB = Chebyshev.R0, BCT = Chebyshev.R0))
+        z_cheb = cheb.mishPoints
+        ref_guess = Scythe.calculate_reference_state(guess_model, z_cheb, cheb)
+        base_cheb = Scythe.saturated_hydrostatic_profile(z_cheb, cheb, ref_guess;
+                                                         q_t=Q_T, theta_e=THETA_E,
+                                                         sfc_p_hPa=1000.0)
+        base = Scythe.interpolate_base_state(base_cheb, cheb, z)
+    else
+        ref_guess = Scythe.calculate_reference_state(guess_model, z, column)
+        base = Scythe.saturated_hydrostatic_profile(z, column, ref_guess;
+                                                    q_t=Q_T, theta_e=THETA_E,
+                                                    sfc_p_hPa=1000.0)
+    end
     println("Base state: max|q_v - q_sat| = ",
             maximum(abs.(base.q_v .- Scythe.q_sat_liquid.(base.Tk, base.p))),
             ", max hydrostatic residual = ", maximum(abs.(base.residual)), " m/s²")
