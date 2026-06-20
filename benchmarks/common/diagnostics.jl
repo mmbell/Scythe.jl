@@ -61,36 +61,40 @@ end
 """
     domain_integral(field, model) -> Float64
 
-Spectrally integrate a `(kDim, ncols)` field over the 2-D domain: a vertical
-integral in z for each column (Chebyshev for the RZ grid, cubic B-spline for the
-RiRk grid — matching the model's vertical basis), then a cubic B-spline integral
-across columns with the antiderivative evaluated at the domain edge.
+Integrate a `(kDim, ncols)` field over the 2-D domain: a vertical integral in z
+for each column, then a cubic B-spline integral across columns.
+
+For the RiRk (cubic B-spline) vertical basis the column integral uses the
+**Gauss quadrature weights on the mish points** — the same quadrature the model's
+Galerkin acoustic solver uses, and exact for the model's spline representation.
+The earlier approach (refit the physical data to a non-interpolating spline,
+`b_kDim = num_cells+3 < kDim` coefficients, and integrate the antiderivative)
+introduced a shape-dependent ~0.5% quadrature error that oscillated with the
+field and masqueraded as a mass/energy conservation drift; the Gauss-weight
+integral reduces it by ~30×. The RZ (Chebyshev) vertical integral is spectrally
+exact and unchanged.
 """
 function domain_integral(field::AbstractMatrix, model)
     gp = model.grid_params
     spline_vertical = String(gp.geometry) == "RiRk"
+    ncols = size(field, 2)
+    colints = zeros(ncols)
+    out = zeros(1)
     if spline_vertical
-        zcol = Spline1D(SplineParameters(
-            xmin = gp.kMin, xmax = gp.kMax,
-            num_cells = gp.kDim ÷ gp.mubar, mubar = gp.mubar,
-            quadrature = gp.quadrature,
-            BCL = CubicBSpline.R0, BCR = CubicBSpline.R0))
+        # Gauss-weight quadrature on the mish points (cell-by-cell Gauss nodes).
+        ncv = gp.kDim ÷ gp.mubar
+        DXv = (gp.kMax - gp.kMin) / ncv
+        _, qw = CubicBSpline._quadrature_rule(gp.mubar, gp.quadrature)
+        Wv = repeat(qw .* DXv, outer = ncv)              # length kDim
+        for c in 1:ncols
+            colints[c] = sum(Wv .* @view(field[:, c]))
+        end
     else
         zcol = Chebyshev1D(ChebyshevParameters(
             zmin = gp.kMin, zmax = gp.kMax,
             zDim = gp.kDim, bDim = gp.b_kDim,
             BCB = Chebyshev.R0, BCT = Chebyshev.R0))
-    end
-    ncols = size(field, 2)
-    colints = zeros(ncols)
-    out = zeros(1)
-    for c in 1:ncols
-        if spline_vertical
-            # Definite integral 0→kMax: spline antiderivative evaluated at the top.
-            CubicBSpline.SIIntcoefficients!(zcol, field[:, c])
-            CubicBSpline.SItransform(zcol.params, zcol.a, [gp.kMax], out, 0)
-            colints[c] = out[1]
-        else
+        for c in 1:ncols
             zcol.uMish .= field[:, c]
             Btransform!(zcol)
             Atransform!(zcol)

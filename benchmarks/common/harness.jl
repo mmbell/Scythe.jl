@@ -313,6 +313,33 @@ function report_table(name::String, opts::BenchmarkOptions, diags::Dict{String,F
 end
 
 """
+    write_diagnostics_csv(path, diags, targets, target_pass)
+
+Write every computed diagnostic (targets with their target/atol/pass/source,
+then informational ones) to a CSV, mirroring [`report_table`](@ref). Written on
+every run — independent of `--update-reference` — so min/max w and the other
+metrics can be assessed after the fact.
+"""
+function write_diagnostics_csv(path::String, diags::Dict{String,Float64},
+                               targets::Vector{Target}, target_pass::Dict{String,Bool})
+    target_names = Set(t.name for t in targets)
+    open(path, "w") do f
+        println(f, "diagnostic,value,target,atol,pass,source")
+        for t in targets
+            value = get(diags, t.name, NaN)
+            pass = target_pass[t.name] ? "PASS" : "FAIL"
+            println(f, "$(t.name),$(value),$(t.value),$(t.atol),$(pass),\"$(t.source)\"")
+        end
+        for key in sort(collect(keys(diags)))
+            if !(key in target_names)
+                println(f, "$(key),$(diags[key]),,,,informational")
+            end
+        end
+    end
+    return path
+end
+
+"""
     run_benchmark(name, opts; model, init!, diagnostics, varnames) -> Bool
 
 Run a benchmark end-to-end: initialize, integrate, verify, report, record.
@@ -350,6 +377,9 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
     targets = load_targets(name, opts)
     target_pass = check_targets(diags, targets)
     report_table(name, opts, diags, targets, target_pass)
+    diag_csv = write_diagnostics_csv(joinpath(model.output_dir, "diagnostics.csv"),
+                                     diags, targets, target_pass)
+    println("\nSaved diagnostics: $diag_csv")
     targets_ok = all(values(target_pass))
 
     # Regression comparison against committed reference output
