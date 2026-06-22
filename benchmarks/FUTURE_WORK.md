@@ -20,19 +20,51 @@ style of the CM1 gravity current test
   Chebyshev vertical grid forces a very small timestep at high kDim, so a
   single "full" run is less informative than the convergence curve.
 
-## Vertical basis experiments (Chebyshev vs cubic B-spline)
+## Vertical basis experiments (Chebyshev vs cubic B-spline) — DONE
 
 The theta'/theta_e' ripple in the BF02 benchmarks is spectral overshoot
-associated with the Chebyshev vertical basis. Options to test now that the
-benchmarks are reproducible:
+associated with the Chebyshev vertical basis.
 
-- Switch the vertical basis to cubic B-splines (RR-style grid) which has the
-  built-in smoothing filter; rerun bf02_dry/bf02_moist/straka93 and compare
-  ripple amplitude, extrema, conservation, and the allowable timestep (the
-  spline grid relaxes the near-boundary clustering that limits dt on the
-  Chebyshev grid).
-- Alternatively: stronger spectral filtering on the Chebyshev basis, or small
-  explicit diffusion, as cheaper mitigations.
+- [x] Switch the vertical basis to cubic B-splines and rerun
+  bf02_dry/bf02_moist/straka93. Implemented as the new `RiRk` Springsteel
+  geometry (spline-i × spline-k, vertical kept in the k-slot) with a `--grid
+  rz|rirk` benchmark option. All three benchmarks run; moist RiRk passes all
+  targets. The B-spline smoothing removes the Chebyshev Gibbs ripple, but at
+  matched *point count* the spline has far fewer vertical DOF (`nc+3` vs the
+  Chebyshev mode count), so the sharp extrema (theta' peak, density-current
+  front) are damped rather than just de-rippled — a resolution effect, see the
+  kDim item below. Two reformulations were needed and are documented in
+  `reference/rirk_vertical_solver.tex`:
+  - The semi-implicit vertical acoustic solve: Chebyshev's square pseudospectral
+    collocation does not transfer (`b_kDim != kDim`); replaced with a symmetric
+    Galerkin assembly consistent with the explicit mish-point tendencies.
+  - The saturated moist base state: its iteration converges on Chebyshev but not
+    on the low-DOF spline (it assumes the first guess is close rather than doing
+    true root finding, and the saturation vapor pressure aloft is hypersensitive);
+    worked around by constructing it on a Chebyshev column and spectrally
+    interpolating to the spline levels (`interpolate_base_state`).
+- Observed: RiRk runs at ~half the Chebyshev timestep (tighter acoustic
+  stability of the coefficient-space implicit solve), the opposite of the
+  near-boundary-clustering expectation — worth understanding.
+- [ ] Alternative cheaper mitigations on the Chebyshev basis (stronger spectral
+  filtering, small explicit diffusion) — still untried.
+
+## RiRk follow-ups
+
+- [ ] **Refactor the saturated base-state iteration into a proper root finder.**
+  `saturated_hydrostatic_profile` currently assumes the first guess is close
+  enough and is not a Newton/root-finding scheme, which is why it converges for
+  Chebyshev but diverges on the B-spline. A well-posed root-finding formulation
+  should converge directly on any vertical basis and remove the need for the
+  Chebyshev-construct-then-interpolate workaround.
+- [ ] **Determine the RiRk vertical resolution (kDim) for dry/straka.** At the
+  current matched-point-count `kDim`, the spline under-resolves the sharp
+  extrema. Pick a `kDim` (more DOF) that brings dry theta' and the Straka front
+  close to the published values, and weigh it against the runtime cost
+  (`vertical_kdim` snaps kDim to a multiple of `mubar`).
+- [ ] **Commit RiRk regression references** (via `--update-reference`) once the
+  resolution above is settled, to lock in the dry/straka/moist RiRk behavior as
+  a guard alongside the RZ references.
 
 ## Open questions from the Stage 1 baselines
 
