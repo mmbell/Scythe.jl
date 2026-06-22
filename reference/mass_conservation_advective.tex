@@ -1,0 +1,186 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb}
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{hyperref}
+
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\vv}{\mathbf{v}}
+\newcommand{\rd}{\rho_d}
+\newcommand{\xhat}{\hat{\xi}}
+
+\title{Where the dry--air mass drift in the moist BF02 benchmark comes from}
+\author{Scythe diagnostic note}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The moist Bryan--Fritsch (2002) benchmark loses dry--air mass at
+$\sim 3\times10^{-3}\,\%$ over $200$\,s, three orders of magnitude more than the
+dry case at identical resolution. This note shows, with an offline diagnostic
+that uses the model's own spectral operators, that the leak is \emph{not} the
+advective form of the continuity equation (its discrete tendency conserves mass
+to $\sim10^{-9}\,\%$), but the \textbf{$l_q$ third--derivative smoothing penalty}
+in the cubic B--spline least--squares fit, applied to the \emph{nonlinear}
+log--density $\xi=\ln(\rd/\rho_0)$ on every timestep. The bare $b_{kDim}<kDim$
+projection (with $\mathrm{mubar}=3$ Gauss nodes per cell) is integral--preserving;
+it is the smoothing of a nonlinear variable that breaks conservation. Two
+independent in--loop tests confirm this: setting $l_q=0$ cuts the loss $120\times$,
+and projecting the \emph{linear} density $\rd$ (flux form) conserves mass to
+machine precision \emph{with or without} $l_q$. The unbalanced base--state cloud
+loading is the trigger only because it drives the circulation that injects the
+sub--grid $\xi$ structure the smoothing then removes.
+\end{abstract}
+
+\section{Setup}
+
+The dry--air continuity equation is integrated in advective (non--conservative)
+form for the log--density perturbation $\xi'=\xi-\xhat$,
+\begin{equation}
+  \frac{\partial \xi'}{\partial t}
+   = -\vv\cdot\nabla\xi' \;-\; w\,\frac{\partial\xhat}{\partial z}
+     \;-\; \nabla\cdot\vv ,
+  \qquad \rd=\rho_0\,e^{\xi}, \quad \xi=\xi'+\xhat .
+  \label{eq:cont}
+\end{equation}
+Total dry mass is the Gauss--weight quadrature of $\rd$ over the mish points,
+$M=\sum_i W_i\,\rd{}_{,i}$, which is the exact integral of the model's cubic
+representation. The diagnostic reproduces the benchmark's reported drift
+exactly, so $M$ and its drift are correct.
+
+\section{The advective discretization is not the leak}
+
+Continuously, \eqref{eq:cont} is identical to the flux form
+$\partial_t\rd=-\nabla\cdot(\rd\vv)$, so $\dd M/\dd t=-\oint\rd\,\vv\cdot\mathbf n=0$
+at rigid walls. Discretely one finds, writing $D$ for the spline derivative,
+\begin{equation}
+  \frac{\dd M}{\dd t}
+   = \sum_i W_i\,\rd{}_{,i}\Big(\tfrac{\dd\xi}{\dd t}\Big)_i
+   = \underbrace{-\sum_i W_i\big[\nabla\!\cdot(\rd\vv)\big]_i}_{\text{flux form}\;\approx\;0}
+     \;+\; \underbrace{\sum_i W_i\,\vv_i\cdot\mathbf E_i}_{\langle\vv,\mathbf E\rangle},
+  \qquad
+  \mathbf E = D(e^{\xi})-e^{\xi}\,D(\xi).
+  \label{eq:defect}
+\end{equation}
+$\mathbf E$ is the discrete chain--rule defect (zero in the continuum, nonzero
+because $e^{\xi}$ is not in the spline space). \emph{This was the original
+hypothesis, and it is wrong.} Evaluated from the saved fields with the model's
+operators:
+\begin{center}
+\begin{tabular}{lrr}
+\hline
+quantity & moist & dry \\
+\hline
+$\int \dd M/\dd t\big|_{\text{advective RHS}}$ & $5.8\times10^{-10}\,\%$ & $2.2\times10^{-7}\,\%$ \\
+$\int \dd M/\dd t\big|_{\text{flux form}}$      & $6.8\times10^{-17}\,\%$ & $6.1\times10^{-18}\,\%$ \\
+\textbf{observed drift}                          & $-3.0\times10^{-3}\,\%$ & $-4.3\times10^{-6}\,\%$ \\
+\hline
+\end{tabular}
+\end{center}
+The advective RHS conserves mass to $\sim10^{-9}\,\%$ at every output time:
+$\langle\vv,\mathbf E\rangle$ is negligible. The mass change therefore enters
+through something that modifies $\xi$ \emph{outside} its prognostic equation.
+
+\section{The leak is the $l_q$ smoothing of the nonlinear $\xi$}
+
+The only other operation that touches $\xi$ is the transform. With $kDim=99$
+collocation points and $b_{kDim}=66$ cubic B--spline coefficients
+($\mathrm{mubar}=3$ Gauss nodes per cell), \verb|spectralTransform!| applies, on
+every step, a regularized least--squares fit $P_{l_q}$ that minimizes
+\begin{equation}
+  \big\|\,f-\text{data}\,\big\|^2_{W} \;+\; l_q \int \big(f'''\big)^2 ,
+  \label{eq:lq}
+\end{equation}
+where $W$ are the Gauss weights and the second term (the Springsteel $Q$--matrix,
+$l_q=2$ by default) suppresses high--wavenumber overshoot for stability. The model
+then re--evaluates the field from this fit each step
+($\xi^n\to P_{l_q}\xi^{\star}$).
+
+\paragraph{The bare projection conserves; the smoothing of a nonlinear variable
+does not.} With $l_q=0$, \eqref{eq:lq} is the plain Gauss--weighted Galerkin
+projection, which preserves the integral of the projected field (constants lie in
+the spline span, and the $\mathrm{mubar}=3$ nodes integrate cubics exactly). So
+$b_{kDim}<kDim$ alone is \emph{not} the problem. The trouble is that the model
+projects the \emph{nonlinear} $\xi=\ln(\rd/\rho_0)$ \emph{with} $l_q>0$. The
+smoothing lowers the variance of $\xi$ while approximately preserving $\int\xi$;
+because $e^{(\cdot)}$ is convex, Jensen's inequality gives
+\begin{equation}
+  \int \rho_0\,e^{\,P_{l_q}\xi} \;<\; \int \rho_0\,e^{\xi},
+  \label{eq:jensen}
+\end{equation}
+a \emph{systematic} (always--negative) loss of $\int\rd$. Projecting the
+\emph{linear} density $\rd$ instead has no such convexity bias: $P_{l_q}$
+preserves $\int\rd$ directly.
+
+\paragraph{Direct confirmation.} Iterating the actual update with the velocity
+frozen at $t=200$\,s --- so the conservative transport is held fixed and only the
+fit acts --- isolates the projection. Two knobs (project $\xi$ vs.\ $\rd$; $l_q=2$
+vs.\ $0$) give:
+\begin{center}
+\begin{tabular}{llrr}
+\hline
+variable projected & filter & loss rate [kg/s] & fraction of observed \\
+\hline
+$\xi$ (log--density)   & $l_q=2.0$ & $-21.8$            & $0.99$ \\
+$\xi$ (log--density)   & $l_q=0.0$ & $-1.8\times10^{-1}$ & $0.008$ \\
+$\rd$ (linear / flux)  & $l_q=2.0$ & $\phantom{-}4\times10^{-7}$ & $\approx 0$ \\
+$\rd$ (linear / flux)  & $l_q=0.0$ & $\phantom{-}3\times10^{-7}$ & $\approx 0$ \\
+\hline
+\end{tabular}
+\end{center}
+The $\xi$/$l_q{=}2$ loop reproduces $99\,\%$ of the observed model rate
+($-22.1$\,kg/s). Turning the smoothing off ($l_q=0$) cuts the loss $120\times$.
+Projecting the linear density conserves to $\sim10^{-15}$ regardless of $l_q$.
+For contrast, the dry run's frozen loop loses $\sim10^{-2}$\,kg/s,
+$\sim2000\times$ less, because its smooth $\xi'$ carries almost no high--wavenumber
+content for the penalty to act on. A single offline application of $P_{l_q}$ to one
+instantaneous tendency captures only $\sim7\,\%$ of the drift: the loss is a
+\emph{steady--state} balance in which the RHS continually regenerates
+high--wavenumber $\xi$ structure and the smoothing continually removes it.
+
+\section{Why the moist run, and the link to the reference imbalance}
+
+The high--wavenumber $\xi$ content that the penalty acts on is generated mainly by
+$-w\,\partial\xhat/\partial z$ in \eqref{eq:cont}: vertical motion sliding $\xi$
+along the steep background density gradient $\partial\xhat/\partial z$ (the
+largest gradient in the problem). The rate of structure generation --- and hence
+the smoothing loss --- therefore scales with the velocity field. In the dry case
+the flow is a weak, transient, closed overturning and $\xi'$ stays smooth. In the
+moist case the unbalanced base--state cloud loading (the reference density
+$\bar\rho$ omits the condensate weight that $\rho_t$ carries via $\mu_c$) drives a
+strong, persistent, nearly domain--wide circulation; that flow continually
+injects high--wavenumber structure into $\xi$, which the $l_q$ term then damps via
+\eqref{eq:jensen} every step. The Chebyshev (Z--grid) variant, which has no such
+spline smoothing, drifts only $\sim10^{-4}\,\%$, corroborating a basis$+$filter
+cause.
+
+This reconciles the two layers: the reference imbalance does not lose mass by
+itself --- it sets up the velocity, and the velocity feeds the smoothing loss. A
+balanced initial state (condensate weight included in $\bar\rho$) removes the
+circulation and so removes the loss, which is why it passes the benchmark; but it
+is a trigger fix, not a cure for the underlying behaviour.
+
+\section{Implications}
+
+\begin{itemize}
+\item The non--conservation is the $l_q$ third--derivative smoothing acting on the
+\emph{nonlinear} log--density $\xi$ (Jensen bias, \eqref{eq:jensen}), not the
+advective form of continuity, not $b_{kDim}<kDim$ by itself, and not a
+boundary--flux error.
+\item \textbf{Structural cure:} carry/project the \emph{linear} density $\rd$
+(flux form). The smoothing then preserves $\int\rd$ directly --- confirmed to
+$\sim10^{-15}$ \emph{with} $l_q=2$ --- so stability and conservation coexist.
+\item Setting $l_q=0$ removes $\sim99\,\%$ of the loss but invites the spectral
+overshoot the penalty exists to suppress, so it is not a usable fix on its own.
+\item For idealized balanced benchmarks, removing the spurious circulation (e.g.
+including the base condensate loading in $\bar\rho$) suppresses the trigger and
+recovers near machine--precision conservation.
+\end{itemize}
+
+The offline diagnostic that produced every number here is
+\verb|benchmarks/mass_error_diagnostic.jl| (\verb|moist|/\verb|dry|); it changes
+no model code and uses the model's own spectral operators.
+
+\end{document}

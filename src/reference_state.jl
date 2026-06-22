@@ -11,6 +11,7 @@ and their first and second derivatives.
 # Fields
 - `sbar::Array{Float64}`: moist entropy profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative [J/(kg K)]
 - `xibar::Array{Float64}`: log dry air density profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative [log(kg/m^3)]
+- `rhobar::Array{Float64}`: dry air density profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative [kg/m^3]. Derived from `xibar` for the linear-`rho_d` equation set; the spectral derivatives are computed on the model basis (not via the chain rule) so they are consistent with the prognostic field's auto-derivatives.
 - `mubar::Array{Float64}`: transformed water vapor mixing ratio profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative
 - `satbar::Array{Float64}`: transformed saturation ratio profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative
 - `Pxi_bar::Float64`: domain-mean speed of sound squared [m^2/s^2]
@@ -18,9 +19,26 @@ and their first and second derivatives.
 struct ReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
+    rhobar::Array{Float64}
     mubar::Array{Float64}
     satbar::Array{Float64}
     Pxi_bar::Float64
+end
+
+"""
+    rhobar_from_xibar(xibar, column) -> Array{Float64}
+
+Build the dry-air density reference profile `rhobar` (value + first/second vertical
+derivative, shape `(nlevels, 3)`) from the log-density reference `xibar` by applying
+`dry_density` and then computing the derivatives spectrally on `column` (via
+[`transform_reference_state!`](@ref)). Used by the linear-`rho_d` equation set so the
+reference density and its gradients are consistent with the model basis.
+"""
+function rhobar_from_xibar(xibar::Array{Float64}, column)
+    rhobar = zeros(Float64, size(xibar, 1), 3)
+    rhobar[:, 1] .= dry_density.(xibar[:, 1])
+    transform_reference_state!(column, rhobar)
+    return rhobar
 end
 
 """
@@ -35,7 +53,7 @@ Useful as a placeholder when a reference state is not needed (e.g., for simple t
 """
 function empty_reference_state()
 
-    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
+    ReferenceState(Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), Array{Float64}(undef), 0.0)
 end
 
 """
@@ -337,7 +355,8 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, co
     # Get the mean speed of sound squared
     Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
     Pxi_bar = mean(Pxi ./ (rho_d_new .* (1.0 .+ q_v_new)))
-    ref_state = ReferenceState(sbar, xibar, mubar, satbar, Pxi_bar)
+    rhobar = rhobar_from_xibar(xibar, column)
+    ref_state = ReferenceState(sbar, xibar, rhobar, mubar, satbar, Pxi_bar)
     return ref_state
 end
 
@@ -466,7 +485,8 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64}, c
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
     satbar = zeros(Float64,length(z),3)
-    ref_state = ReferenceState(sbar, xibar, mubar, satbar, Pxi_bar)
+    rhobar = rhobar_from_xibar(xibar, column)
+    ref_state = ReferenceState(sbar, xibar, rhobar, mubar, satbar, Pxi_bar)
     return ref_state
 end
 
@@ -553,6 +573,7 @@ function exact_reference_state(model::ModelParameters, z::Array{Float64}, column
     Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
 
     satbar = zeros(Float64,length(z),3)
-    ref_state = ReferenceState(sbar, xibar, mubar, satbar, Pxi_bar)
+    rhobar = rhobar_from_xibar(xibar, column)
+    ref_state = ReferenceState(sbar, xibar, rhobar, mubar, satbar, Pxi_bar)
     return ref_state
 end

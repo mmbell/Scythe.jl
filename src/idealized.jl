@@ -409,9 +409,11 @@ water is zero. All other variables are left untouched.
 function moist_buoyancy_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                                 base, ref::ReferenceState; q_t=0.02,
                                 xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0,
-                                amp=2.0/300.0, liquid_var="mu_l")
+                                amp=2.0/300.0, liquid_var="mu_l", control::Symbol=:xi)
     vars = patch.params.vars
-    s_i = vars["s"]; xi_i = vars["xi"]; mu_i = vars["mu"]
+    s_i = vars["s"]; mu_i = vars["mu"]
+    # Density control variable: log-density "xi" (default) or linear "rho_d"
+    dens_i = control === :rhod ? vars["rho_d"] : vars["xi"]
     ql_i = vars[liquid_var]
     kDim = patch.params.kDim
     i = 1
@@ -424,6 +426,7 @@ function moist_buoyancy_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64}
 
             new_s = base.s[k]
             new_xi = base.xi[k]
+            new_rho_d = base.rho_d[k]
             new_mu = base.mu[k]
             new_mu_l = base.mu_l[k]
             if b_incr > 0.0
@@ -449,7 +452,8 @@ function moist_buoyancy_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64}
             end
 
             patch.physical[i, s_i, 1] = new_s - ref.sbar[k, 1]
-            patch.physical[i, xi_i, 1] = new_xi - ref.xibar[k, 1]
+            patch.physical[i, dens_i, 1] = control === :rhod ?
+                (new_rho_d - ref.rhobar[k, 1]) : (new_xi - ref.xibar[k, 1])
             patch.physical[i, mu_i, 1] = new_mu - ref.mubar[k, 1]
             patch.physical[i, ql_i, 1] = new_mu_l
             i += 1

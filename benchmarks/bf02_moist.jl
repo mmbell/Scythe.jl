@@ -37,8 +37,13 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 # ── Configuration ──────────────────────────────────────────────────────────
 
 const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
-bf02_moist_vars(stage) = stage == :legacy ?
-    ["s", "xi", "mu", "u", "w", "mu_l", "qss"] : PE_VARS
+# Linear dry-air-density variant: slot 2 is "rho_d" (rho_d') instead of "xi"
+const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+function bf02_moist_vars(stage)
+    stage == :legacy && return ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
+    stage == :perhod && return PE_VARS_RHOD
+    return PE_VARS
+end
 # Liquid water variable(s) per stage (PE splits liquid into cloud and rain)
 liquid_vars(stage) = stage == :legacy ? ["mu_l"] : ["mu_c", "mu_r"]
 const Q_T = 0.02
@@ -48,7 +53,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
     if opts.mode == :full
         num_cells = 200         # 100 m cells
         kDim = 100
-        ts = 0.1
+        ts = 0.05
         output_interval = 100.0
     else
         num_cells = 100         # 200 m cells
@@ -64,6 +69,15 @@ function bf02_moist_model(opts::BenchmarkOptions)
         equation_set = "BF02_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
         options = Dict(:semiimplicit => true, :exact_reference_state => true)
+    elseif opts.stage == :perhod
+        # Linear dry-air-density prognostic variant (mass-conserving continuity).
+        # Semi-implicit acoustics are not yet validated for this set (Phase 2), so
+        # run fully explicit.
+        equation_set = "primitive_equation_XZ_rhod"
+        physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
+                               :alpha => 0.0, :z_damp => 20.0e3)
+        options = Dict(:semiimplicit => false, :exact_reference_state => true,
+                       :precipitation => false, :vertical_mixing => false)
     else
         equation_set = "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
@@ -99,7 +113,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
 
     return ModelParameters(
         ts = ts,
-        integration_time = 1000.0,
+        integration_time = 200.0,
         output_interval = output_interval,
         equation_set = equation_set,
         initial_conditions = joinpath(output_dir, "bf02_moist_ics.csv"),
@@ -171,10 +185,11 @@ function bf02_moist_init!(model)
     bubble_liquid = opts.stage == :legacy ? "mu_l" : "mu_c"
     Scythe.moist_buoyancy_bubble!(patch, gridpoints, base, ref;
                                   q_t=Q_T, xc=10000.0, xr=2000.0,
-                                  zc=2000.0, zr=2000.0, amp=2.0/300.0,
-                                  liquid_var=bubble_liquid)
+                                  zc=2000.0, zr=2000.0, amp = 0.0, #amp=2.0/300.0,
+                                  liquid_var=bubble_liquid,
+                                  control = (opts.stage == :perhod ? :rhod : :xi))
 
-    if opts.stage == :pe
+    if opts.stage in (:pe, :perhod)
         # The PE set advects a transformed saturation ratio with satbar = 0
         # for exact reference states: initialize it from the actual state
         # (the base is saturated, so the ratio is 1 everywhere up to the
@@ -182,13 +197,20 @@ function bf02_moist_init!(model)
         vars = model.grid_params.vars
         sat_i = vars["mu_sat"]
         kDim_l = model.grid_params.kDim
+        rhod_stage = opts.stage == :perhod
+        dens_i = rhod_stage ? vars["rho_d"] : vars["xi"]
         i = 1
         for _ in 1:Scythe.num_columns(patch)
             for k in 1:kDim_l
                 s_tot = patch.physical[i, vars["s"], 1] + ref.sbar[k, 1]
-                xi_tot = patch.physical[i, vars["xi"], 1] + ref.xibar[k, 1]
                 mu_tot = patch.physical[i, vars["mu"], 1] + ref.mubar[k, 1]
-                q_v, _, Tk, p = Scythe.thermodynamic_tuple(s_tot, xi_tot, mu_tot)
+                if rhod_stage
+                    rho_d_tot = patch.physical[i, dens_i, 1] + ref.rhobar[k, 1]
+                    q_v, _, Tk, p = Scythe.thermodynamic_tuple_rhod(s_tot, rho_d_tot, mu_tot)
+                else
+                    xi_tot = patch.physical[i, dens_i, 1] + ref.xibar[k, 1]
+                    q_v, _, Tk, p = Scythe.thermodynamic_tuple(s_tot, xi_tot, mu_tot)
+                end
                 patch.physical[i, sat_i, 1] =
                     Scythe.mu_transform(q_v / Scythe.q_sat_liquid(Tk, p))
                 i += 1
@@ -205,15 +227,39 @@ end
 
 # ── Diagnostics ────────────────────────────────────────────────────────────
 
+# theta_e' contour (K) defining the rising thermal's cap, used for the bubble-top
+# height diagnostic. BF02 Fig. 3a's thermal reaches ~8.2 km; adjust this contour
+# to match the published definition if the reported height looks off.
+const THETA_E_BUBBLE_THRESHOLD = 0.5
+
+"""
+Maximum altitude (m) at which the theta_e' perturbation exceeds
+`threshold` — i.e. how high the rising thermal cap has reached.
+`theta_e_p` is `(kDim, ncols)` and `z` is the per-level height vector.
+"""
+function theta_e_bubble_height(theta_e_p, z; threshold=THETA_E_BUBBLE_THRESHOLD)
+    h = 0.0
+    for k in 1:size(theta_e_p, 1)
+        if any(>(threshold), view(theta_e_p, k, :))
+            h = max(h, z[k])
+        end
+    end
+    return h
+end
+
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
 function moist_fields(df, ref, kDim, base, stage)
     ncols = div(nrow(df), kDim)
     sbar = repeat(ref.sbar[:, 1], ncols)
-    xibar = repeat(ref.xibar[:, 1], ncols)
     mubar = repeat(ref.mubar[:, 1], ncols)
     s = df.s .+ sbar
-    xi = df.xi .+ xibar
     mu = df.mu .+ mubar
+    # Recover log-density xi from whichever control variable the run stored
+    if "rho_d" in names(df)
+        xi = Scythe.log_dry_density.(df.rho_d .+ repeat(ref.rhobar[:, 1], ncols))
+    else
+        xi = df.xi .+ repeat(ref.xibar[:, 1], ncols)
+    end
     # Total transformed liquid: the linear mu transform makes the sum of
     # transformed cloud and rain equal the transform of their sum
     mu_liq = zero(mu)
@@ -234,7 +280,8 @@ function bf02_moist_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
     base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
-    theta_e_p, supersat, _ = moist_fields(df, ref, kDim, base, opts.stage)
+    theta_e_p, supersat, ncols = moist_fields(df, ref, kDim, base, opts.stage)
+    z = reshape(df.z, kDim, ncols)[:, 1]
     diags = Dict(
         "max_theta_e_p" => maximum(theta_e_p),
         "min_theta_e_p" => minimum(theta_e_p),
@@ -242,6 +289,7 @@ function bf02_moist_diagnostics(model)
         "min_w" => minimum(df.w),
         "max_supersat" => maximum(supersat),
         "min_supersat" => minimum(supersat),
+        "theta_e_bubble_top_km" => theta_e_bubble_height(theta_e_p, z) / 1000.0,
     )
     return merge(diags, conservation_drift(model, ref; liquid_vars=liquid_vars(opts.stage)))
 end

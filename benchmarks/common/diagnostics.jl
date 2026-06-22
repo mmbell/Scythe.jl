@@ -146,14 +146,18 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
         df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
         ncols = div(nrow(df), kDim)
         sbar = repeat(ref.sbar[:, 1], ncols)
-        xibar = repeat(ref.xibar[:, 1], ncols)
         mubar = repeat(ref.mubar[:, 1], ncols)
         s = df.s .+ sbar
-        xi = df.xi .+ xibar
         mu = df.mu .+ mubar
-        thermo = Scythe.thermodynamic_tuple.(s, xi, mu)
+        # Recover total dry density from whichever control variable the run stored:
+        # the linear "rho_d" (rho_d') or the log-density "xi".
+        if "rho_d" in names(df)
+            rho_d = df.rho_d .+ repeat(ref.rhobar[:, 1], ncols)
+        else
+            rho_d = Scythe.dry_density.(df.xi .+ repeat(ref.xibar[:, 1], ncols))
+        end
+        thermo = Scythe.thermodynamic_tuple_rhod.(s, rho_d, mu)
         q_v = [x[1] for x in thermo]
-        rho_d = [x[2] for x in thermo]
         Tk = [x[3] for x in thermo]
         q_l = zero(q_v)
         for lv in liquid_vars
@@ -161,7 +165,8 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
         end
         q_t = q_v .+ q_l
         ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
-
+        dry_mass = rho_d
+        water_mass = rho_d .* q_t
         mass = rho_d .* (1.0 .+ q_t)
         energy = rho_d .* ((Scythe.Cvd .* Tk) .+ (q_v .* Scythe.Cvv .* Tk) .+
                            (q_l .* Scythe.Cl .* Tk) .- (Scythe.L_v.(Tk) .* q_l) .+
@@ -169,18 +174,28 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
                            ((1.0 .+ q_t) .* Scythe.gravity .* df.z))
         total_entropy = rho_d .* (s .+ (q_l .* Scythe.Cl .* log.(Tk ./ Scythe.T_0)))
 
-        return (mass = domain_integral(reshape(mass, kDim, ncols), model),
+        return (dry_mass = domain_integral(reshape(dry_mass, kDim, ncols), model),
+                water_mass = domain_integral(reshape(water_mass, kDim, ncols), model),
+                mass = domain_integral(reshape(mass, kDim, ncols), model),
                 energy = domain_integral(reshape(energy, kDim, ncols), model),
                 entropy = domain_integral(reshape(total_entropy, kDim, ncols), model))
     end
 
     init = integrals("0.0")
     final = integrals(string(round(model.integration_time; digits=2)))
-    return Dict(
+    pct_change = Dict(
+        "dry_mass_drift_pct" => 100.0 * (final.dry_mass - init.dry_mass) / abs(init.dry_mass),
         "mass_drift_pct" => 100.0 * (final.mass - init.mass) / abs(init.mass),
         "energy_drift_pct" => 100.0 * (final.energy - init.energy) / abs(init.energy),
         "entropy_drift_pct" => 100.0 * (final.entropy - init.entropy) / abs(init.entropy),
     )
+    # Check if any water mass exists before dividing by zero
+    if abs(init.water_mass) > 0.0
+        pct_change["water_mass_drift_pct"] = 100.0 * (final.water_mass - init.water_mass) / abs(init.water_mass)
+    else
+        pct_change["water_mass_drift_pct"] = 0.0
+    end
+    return pct_change
 end
 
 """

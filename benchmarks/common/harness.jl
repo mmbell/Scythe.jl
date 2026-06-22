@@ -74,7 +74,7 @@ function parse_benchmark_args(args::Vector{String})
         end
     end
     mode in (:quick, :full) || error("--mode must be quick or full")
-    stage in (:legacy, :pe) || error("--stage must be legacy or pe")
+    stage in (:legacy, :pe, :perhod) || error("--stage must be legacy, pe, or perhod")
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
     return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot)
@@ -180,7 +180,7 @@ equation stage use the wider quick tolerances.
 """
 function load_targets(name::String, opts::BenchmarkOptions)
     haskey(BENCHMARK_EXPECTED, name) || error("No expected values defined for $name")
-    use_quick_tol = opts.mode == :quick || opts.stage == :pe
+    use_quick_tol = opts.mode == :quick || opts.stage in (:pe, :perhod)
     targets = Target[]
     for (diag, (value, atol_full, atol_quick, source)) in BENCHMARK_EXPECTED[name]
         atol = use_quick_tol ? atol_quick : atol_full

@@ -852,6 +852,28 @@ function thermodynamic_tuple(s::Float64, xi::Float64, mu::Float64)
 end
 
 """
+    thermodynamic_tuple_rhod(s, rho_d, mu)
+
+Like [`thermodynamic_tuple`](@ref) but for the linear-`rho_d` equation set: takes the
+dry-air density `rho_d` directly instead of the log-density `xi`, skipping the
+`dry_density` conversion. Returns `(q_v, rho_d, Tk, p)`.
+
+# Arguments
+- `s::Float64`: specific moist entropy [J/(kg·K)]
+- `rho_d::Float64`: dry air density [kg/m³]
+- `mu::Float64`: scaled mixing ratio variable [dimensionless]
+"""
+function thermodynamic_tuple_rhod(s::Float64, rho_d::Float64, mu::Float64)
+
+    q_v = inv_mu_transform(mu)
+    Tk = temperature(s, rho_d, q_v)
+    pd = 0.01 * Rd * Tk * rho_d
+    e = 0.01 * Rv * Tk * rho_d * q_v
+    p = pd + e
+    return (q_v, rho_d, Tk, p)
+end
+
+"""
     potential_temperature(s, xi, mu)
 
 Compute the dry potential temperature from the prognostic variables
