@@ -53,7 +53,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
     if opts.mode == :full
         num_cells = 200         # 100 m cells
         kDim = 100
-        ts = 0.05
+        ts = 0.1
         output_interval = 100.0
     else
         num_cells = 100         # 200 m cells
@@ -70,13 +70,13 @@ function bf02_moist_model(opts::BenchmarkOptions)
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
         options = Dict(:semiimplicit => true, :exact_reference_state => true)
     elseif opts.stage == :perhod
-        # Linear dry-air-density prognostic variant (mass-conserving continuity).
-        # Semi-implicit acoustics are not yet validated for this set (Phase 2), so
-        # run fully explicit.
+        # Linear dry-air-density prognostic variant (mass-conserving continuity)
+        # with semi-implicit acoustics on the mass flux phi = rhobar_d * w
+        # (Phase 2; see reference/Semiimplicit_linear_rhod.tex).
         equation_set = "primitive_equation_XZ_rhod"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
-        options = Dict(:semiimplicit => false, :exact_reference_state => true,
+        options = Dict(:semiimplicit => true, :exact_reference_state => true,
                        :precipitation => false, :vertical_mixing => false)
     else
         equation_set = "primitive_equation_XZ"
@@ -113,7 +113,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
 
     return ModelParameters(
         ts = ts,
-        integration_time = 200.0,
+        integration_time = 1000.0,
         output_interval = output_interval,
         equation_set = equation_set,
         initial_conditions = joinpath(output_dir, "bf02_moist_ics.csv"),
@@ -185,7 +185,7 @@ function bf02_moist_init!(model)
     bubble_liquid = opts.stage == :legacy ? "mu_l" : "mu_c"
     Scythe.moist_buoyancy_bubble!(patch, gridpoints, base, ref;
                                   q_t=Q_T, xc=10000.0, xr=2000.0,
-                                  zc=2000.0, zr=2000.0, amp = 0.0, #amp=2.0/300.0,
+                                  zc=2000.0, zr=2000.0, amp=2.0/300.0,
                                   liquid_var=bubble_liquid,
                                   control = (opts.stage == :perhod ? :rhod : :xi))
 
