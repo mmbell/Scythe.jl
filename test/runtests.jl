@@ -14,5 +14,6 @@ using Scythe
     include("test_distributed_linear_advection.jl")
     include("test_distributed_rz.jl")
     include("test_oneway_sw_slab.jl")
+    include("test_pv_mixing_floor.jl")
     include("test_benchmark_smoke.jl")
 end
