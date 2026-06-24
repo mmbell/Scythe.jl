@@ -28,7 +28,13 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 # ── Configuration ──────────────────────────────────────────────────────────
 
 const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
-bf02_dry_vars(stage) = stage == :legacy ? ["s", "xi", "mu", "u", "w"] : PE_VARS
+# Linear dry-air-density variant: slot 2 is "rho_d" (rho_d') instead of "xi"
+const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+function bf02_dry_vars(stage)
+    stage == :legacy && return ["s", "xi", "mu", "u", "w"]
+    stage == STAGE_PE_RHOD && return PE_VARS_RHOD
+    return PE_VARS
+end
 
 function bf02_dry_model(opts::BenchmarkOptions)
     if opts.mode == :full
@@ -52,12 +58,13 @@ function bf02_dry_model(opts::BenchmarkOptions)
     else
         # No physical or computational diffusion, matching the paper; the
         # Rayleigh damping is disabled with alpha = 0
-        equation_set = "primitive_equation_XZ"
+        equation_set = opts.stage == STAGE_PE_RHOD ? "primitive_equation_XZ_rhod" :
+                                                     "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
     end
     options = Dict(:semiimplicit => true, :exact_reference_state => false)
-    if opts.stage == :pe
+    if opts.stage in (:pe, STAGE_PE_RHOD)
         # Benchmark specification has no turbulence or precipitation
         options[:precipitation] = false
         options[:vertical_mixing] = false
@@ -114,7 +121,8 @@ function bf02_dry_init!(model)
 
     patch.physical .= 0.0
     Scythe.theta_bubble!(patch, gridpoints, ref;
-                         xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0)
+                         xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0,
+                         control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
     Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
 end
 
