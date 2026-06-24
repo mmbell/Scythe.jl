@@ -52,7 +52,11 @@ function theta_perturbation(df::DataFrame, ref, kDim::Int)
     sbar = repeat(ref.sbar[:, 1], ncols)
     xibar = repeat(ref.xibar[:, 1], ncols)
     mubar = repeat(ref.mubar[:, 1], ncols)
-    theta = Scythe.potential_temperature.(df.s .+ sbar, df.xi .+ xibar, df.mu .+ mubar)
+    # The PE rho_d stage carries linear rho_d'; reconstruct xi = ln(rho_d/rho_0)
+    xi = "rho_d" in names(df) ?
+        Scythe.log_dry_density.(df.rho_d .+ repeat(ref.rhobar[:, 1], ncols)) :
+        df.xi .+ xibar
+    theta = Scythe.potential_temperature.(df.s .+ sbar, xi, df.mu .+ mubar)
     theta0 = Scythe.potential_temperature.(sbar, xibar, mubar)
     theta_p = reshape(theta .- theta0, kDim, ncols)
     return theta_p, ncols

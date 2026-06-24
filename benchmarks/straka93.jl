@@ -29,7 +29,13 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 # ── Configuration ──────────────────────────────────────────────────────────
 
 const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
-straka_vars(stage) = stage == :legacy ? ["s", "xi", "mu", "u", "w"] : PE_VARS
+# Linear dry-air-density variant: slot 2 is "rho_d" (rho_d') instead of "xi"
+const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+function straka_vars(stage)
+    stage == :legacy && return ["s", "xi", "mu", "u", "w"]
+    stage == STAGE_PE_RHOD && return PE_VARS_RHOD
+    return PE_VARS
+end
 
 function straka_model(opts::BenchmarkOptions)
     if opts.mode == :full
@@ -52,12 +58,16 @@ function straka_model(opts::BenchmarkOptions)
         # The PE set has explicit horizontal diffusion and implicit vertical
         # diffusion: Khdiff = Kvdiff = 75 approximates the legacy uniform
         # Laplacian K = 75 of the paper specification
-        equation_set = "primitive_equation_XZ"
+        equation_set = opts.stage == STAGE_PE_RHOD ? "primitive_equation_XZ_rhod" :
+                                                     "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
                                :alpha => 0.0, :z_damp => 12.8e3)
     end
-    options = Dict(:semiimplicit => true, :exact_reference_state => false)
-    if opts.stage == :pe
+    # Semi-implicit acoustics are validated for the linear rho_d set (Phase 2),
+    # so enable them there; the xi stages stay explicit for this dry benchmark.
+    options = Dict(:semiimplicit => opts.stage == STAGE_PE_RHOD,
+                   :exact_reference_state => false)
+    if opts.stage in (:pe, STAGE_PE_RHOD)
         # The paper prescribes uniform K = 75 only (carried by Khdiff/Kvdiff);
         # no precipitation or shear-based turbulence
         options[:precipitation] = false
@@ -116,7 +126,8 @@ function straka_init!(model)
 
     patch.physical .= 0.0
     Scythe.temperature_bubble!(patch, gridpoints, ref;
-                               xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0)
+                               xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0,
+                               control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
     Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
 end
 

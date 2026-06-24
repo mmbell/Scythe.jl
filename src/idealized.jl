@@ -52,9 +52,11 @@ Straka et al. (1993) cold bubble for `dT_max = -15`.
 """
 function temperature_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                              ref::ReferenceState;
-                             xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0)
+                             xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0,
+                             control::Symbol=:xi)
     prof = reference_profiles(ref)
     kDim = patch.params.kDim
+    # Density control variable: log-density "xi" (default) or linear "rho_d" (slot 2)
     i = 1
     for _ in 1:num_columns(patch)
         for k in 1:kDim
@@ -65,7 +67,8 @@ function temperature_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             new_T = prof.Tk[k] + dT
             new_rho_d = prof.p[k] * 100.0 / (Rd * new_T)
             patch.physical[i, 1, 1] = entropy(new_T, new_rho_d, prof.q_v[k]) - ref.sbar[k, 1]
-            patch.physical[i, 2, 1] = log_dry_density(new_rho_d) - ref.xibar[k, 1]
+            patch.physical[i, 2, 1] = control === :rhod ?
+                (new_rho_d - ref.rhobar[k, 1]) : (log_dry_density(new_rho_d) - ref.xibar[k, 1])
             i += 1
         end
     end
