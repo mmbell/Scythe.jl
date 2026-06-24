@@ -260,6 +260,9 @@ computed from the full cylindrical strain rate tensor.
 # Required physical parameters
 - `:Ls_free`: Smagorinsky length scale for the free-atmosphere (SW) layer (m).
 - `:Ls_bl`: Smagorinsky length scale for the boundary layer (m).
+- `:K_min_free`: lower bound on the free-atmosphere diffusivity ``K`` (m²/s); set `0`
+  to make the free atmosphere inviscid where the strain-dependent `K` is small.
+- `:K_min_bl`: lower bound on the boundary-layer diffusivity ``K`` (m²/s).
 - `:g`, `:Cd`, `:Hfree`, `:Hb`, `:f`, `:S1`: same as `Twoway_ShallowWater_Slab`.
 """
 function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
@@ -274,6 +277,8 @@ function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::I
     g = model.physical_params[:g]
     Ls_free = model.physical_params[:Ls_free]
     Ls_bl = model.physical_params[:Ls_bl]
+    K_min_free = model.physical_params[:K_min_free]
+    K_min_bl = model.physical_params[:K_min_bl]
     Cd = model.physical_params[:Cd]
     Hfree = model.physical_params[:Hfree]
     Hb = model.physical_params[:Hb]
@@ -329,14 +334,14 @@ function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::I
     @turbo S_rr .= ugr
     @turbo S_ll .= @. (vgl / r) + (ug / r)
     @turbo S_rl .= @. 0.5 * ((ugl / r) + vgr - (vg / r))
-    K_free = @. max(Ls_free * Ls_free * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), 1000.0)
+    K_free = @. max(Ls_free * Ls_free * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), K_min_free)
 
     # Compute Smagorinsky diffusion coefficient for the boundary layer
     # Full cylindrical strain rate tensor using (ub, vb)
     @turbo S_rr .= ubr
     @turbo S_ll .= @. (vbl / r) + (ub / r)
     @turbo S_rl .= @. 0.5 * ((ubl / r) + vbr - (vb / r))
-    K_bl = @. max(Ls_bl * Ls_bl * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), 1000.0)
+    K_bl = @. max(Ls_bl * Ls_bl * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), K_min_bl)
 
     # Parameterized surface wind speed
     sfc_factor = 0.78
