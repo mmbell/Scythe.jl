@@ -21,12 +21,17 @@ include(joinpath(REFERENCE_DATA_DIR, "expected_values.jl"))
 
 struct BenchmarkOptions
     mode::Symbol        # :quick | :full
-    stage::Symbol       # :legacy | :pe
+    stage::Symbol       # :legacy | :pe | Symbol("pe-rho_d")
     grid::Symbol        # :rz (Chebyshev vertical) | :rirk (B-spline vertical)
     workers::Int
     update_reference::Bool
     plot::Bool
 end
+
+# Primitive-equation stage carrying the linear dry-air density rho_d' (slot 2)
+# in place of the log-density xi. Spelled with a hyphen for external clarity;
+# the hyphen precludes a `:pe-rho_d` symbol literal, so reference this constant.
+const STAGE_PE_RHOD = Symbol("pe-rho_d")
 
 struct Target
     name::String
@@ -39,7 +44,7 @@ end
     parse_benchmark_args(args) -> BenchmarkOptions
 
 Parse benchmark command line arguments:
---mode quick|full (default quick), --stage legacy|pe (default legacy),
+--mode quick|full (default quick), --stage legacy|pe|pe-rho_d (default legacy),
 --grid rz|rirk (default rz), --workers N (default 2), --update-reference, --plot.
 """
 function parse_benchmark_args(args::Vector{String})
@@ -66,7 +71,7 @@ function parse_benchmark_args(args::Vector{String})
             plot = true; i += 1
         elseif arg in ("--help", "-h")
             println("Usage: julia --project=. benchmarks/<case>.jl " *
-                    "[--mode quick|full] [--stage legacy|pe] [--grid rz|rirk] " *
+                    "[--mode quick|full] [--stage legacy|pe|pe-rho_d] [--grid rz|rirk] " *
                     "[--workers N] [--update-reference] [--plot]")
             exit(0)
         else
@@ -74,7 +79,7 @@ function parse_benchmark_args(args::Vector{String})
         end
     end
     mode in (:quick, :full) || error("--mode must be quick or full")
-    stage in (:legacy, :pe, :perhod) || error("--stage must be legacy, pe, or perhod")
+    stage in (:legacy, :pe, STAGE_PE_RHOD) || error("--stage must be legacy, pe, or pe-rho_d")
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
     return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot)
@@ -180,7 +185,7 @@ equation stage use the wider quick tolerances.
 """
 function load_targets(name::String, opts::BenchmarkOptions)
     haskey(BENCHMARK_EXPECTED, name) || error("No expected values defined for $name")
-    use_quick_tol = opts.mode == :quick || opts.stage in (:pe, :perhod)
+    use_quick_tol = opts.mode == :quick || opts.stage in (:pe, STAGE_PE_RHOD)
     targets = Target[]
     for (diag, (value, atol_full, atol_quick, source)) in BENCHMARK_EXPECTED[name]
         atol = use_quick_tol ? atol_quick : atol_full

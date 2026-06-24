@@ -41,7 +41,7 @@ const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 function bf02_moist_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
-    stage == :perhod && return PE_VARS_RHOD
+    stage == STAGE_PE_RHOD && return PE_VARS_RHOD
     return PE_VARS
 end
 # Liquid water variable(s) per stage (PE splits liquid into cloud and rain)
@@ -69,7 +69,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
         equation_set = "BF02_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
         options = Dict(:semiimplicit => true, :exact_reference_state => true)
-    elseif opts.stage == :perhod
+    elseif opts.stage == STAGE_PE_RHOD
         # Linear dry-air-density prognostic variant (mass-conserving continuity)
         # with semi-implicit acoustics on the mass flux phi = rhobar_d * w
         # (Phase 2; see reference/Semiimplicit_linear_rhod.tex).
@@ -187,9 +187,9 @@ function bf02_moist_init!(model)
                                   q_t=Q_T, xc=10000.0, xr=2000.0,
                                   zc=2000.0, zr=2000.0, amp=2.0/300.0,
                                   liquid_var=bubble_liquid,
-                                  control = (opts.stage == :perhod ? :rhod : :xi))
+                                  control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
 
-    if opts.stage in (:pe, :perhod)
+    if opts.stage in (:pe, STAGE_PE_RHOD)
         # The PE set advects a transformed saturation ratio with satbar = 0
         # for exact reference states: initialize it from the actual state
         # (the base is saturated, so the ratio is 1 everywhere up to the
@@ -197,7 +197,7 @@ function bf02_moist_init!(model)
         vars = model.grid_params.vars
         sat_i = vars["mu_sat"]
         kDim_l = model.grid_params.kDim
-        rhod_stage = opts.stage == :perhod
+        rhod_stage = opts.stage == STAGE_PE_RHOD
         dens_i = rhod_stage ? vars["rho_d"] : vars["xi"]
         i = 1
         for _ in 1:Scythe.num_columns(patch)
