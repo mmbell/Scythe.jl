@@ -26,6 +26,7 @@ struct BenchmarkOptions
     workers::Int
     update_reference::Bool
     plot::Bool
+    ts_factor::Float64  # RiRk timestep scale (--ts-factor, default 1.0)
 end
 
 # Primitive-equation stage carrying the linear dry-air density rho_d' (slot 2)
@@ -45,7 +46,8 @@ end
 
 Parse benchmark command line arguments:
 --mode quick|full (default quick), --stage legacy|pe|pe-rho_d (default legacy),
---grid rz|rirk (default rz), --workers N (default 2), --update-reference, --plot.
+--grid rz|rirk (default rz), --workers N (default 2), --ts-factor F (RiRk timestep
+scale, default 1.0), --update-reference, --plot.
 """
 function parse_benchmark_args(args::Vector{String})
     mode = :quick
@@ -54,6 +56,7 @@ function parse_benchmark_args(args::Vector{String})
     nworkers = 2
     update_reference = false
     plot = false
+    ts_factor = 1.0
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -65,6 +68,8 @@ function parse_benchmark_args(args::Vector{String})
             grid = Symbol(args[i+1]); i += 2
         elseif arg == "--workers"
             nworkers = parse(Int, args[i+1]); i += 2
+        elseif arg == "--ts-factor"
+            ts_factor = parse(Float64, args[i+1]); i += 2
         elseif arg == "--update-reference"
             update_reference = true; i += 1
         elseif arg == "--plot"
@@ -72,7 +77,7 @@ function parse_benchmark_args(args::Vector{String})
         elseif arg in ("--help", "-h")
             println("Usage: julia --project=. benchmarks/<case>.jl " *
                     "[--mode quick|full] [--stage legacy|pe|pe-rho_d] [--grid rz|rirk] " *
-                    "[--workers N] [--update-reference] [--plot]")
+                    "[--workers N] [--ts-factor F] [--update-reference] [--plot]")
             exit(0)
         else
             error("Unknown argument: $arg")
@@ -82,24 +87,27 @@ function parse_benchmark_args(args::Vector{String})
     stage in (:legacy, :pe, STAGE_PE_RHOD) || error("--stage must be legacy, pe, or pe-rho_d")
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
-    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot)
+    ts_factor > 0.0 || error("--ts-factor must be > 0")
+    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot, ts_factor)
 end
 
 """Geometry string for the configured vertical basis (RZ Chebyshev vs RiRk B-spline)."""
 benchmark_geometry(opts::BenchmarkOptions) = opts.grid == :rirk ? "RiRk" : "RZ"
 
 """
-    vertical_ts(ts, opts; factor=0.5) -> Float64
+    vertical_ts(ts, opts) -> Float64
 
-Timestep for the configured grid. The cubic B-spline (RiRk) acoustic solve has a
-tighter stability limit than the Chebyshev pseudospectral solve at the same
-horizontal resolution (the implicit vertical solve lives in the b_kDim spline
-coefficient space rather than being collocated point-for-point), so RiRk runs at
-a reduced timestep. The physical times — and hence output and diagnostics — are
-unchanged; only the step count grows.
+Timestep for the configured grid. On the cubic B-spline (RiRk) grid the base
+timestep is scaled by `opts.ts_factor` (the `--ts-factor` flag, default 1.0); the
+Chebyshev (RZ) grid is unaffected. RiRk historically used 0.5 because its explicit
+acoustic solve has a tighter stability limit than the Chebyshev pseudospectral
+solve, but the semi-implicit solver treats vertical acoustics implicitly, so the
+reduction is now opt-in via the flag (e.g. `--ts-factor 0.5` for explicit runs).
+The physical times — and hence output and diagnostics — are unchanged; only the
+step count changes.
 """
-vertical_ts(ts::Float64, opts::BenchmarkOptions; factor::Float64=0.5) =
-    opts.grid == :rirk ? ts * factor : ts
+vertical_ts(ts::Float64, opts::BenchmarkOptions) =
+    opts.grid == :rirk ? ts * opts.ts_factor : ts
 
 """
     vertical_kdim(kDim, opts; mubar=3) -> Int
