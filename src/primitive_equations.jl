@@ -570,12 +570,16 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
 
     # Dry-air mass continuity in advective (product-rule) form:
     # ∂rho_d/∂t = -v·∇rho_d - rho_d ∇·v  (= -∇·(rho_d v)).
-    # NOTE: impdot below retains the xi-form acoustic linearization; semi-implicit
-    # is not yet validated for this set (run with :semiimplicit => false).
     @turbo ADV .= @. (-u * rho_dp_x) + (-w * (rho_dp_z + rho_dbar_z)) #RHO_D ADV
     @turbo FORCING .= @. -rho_d * (u_x + w_z)
     @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
-    impdot[colstart:colend,2] .= @. -w_z
+    # Implicit acoustic continuity: flux form -∂_z(ρ̂_d w), a single spline derivative
+    # of the dry-air mass flux, consistent with the φ = ρ̂_d w semi-implicit solve.
+    flux_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
+    flux_col.uMish .= rho_dbar .* w
+    Btransform!(flux_col)
+    Atransform!(flux_col)
+    impdot[colstart:colend,2] .= .-Ixtransform(flux_col)
 
     col.uMish .= rho_d .* Kv .* u_z
     Btransform!(col)
@@ -592,7 +596,8 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
     @turbo FORCING .= @.  ((-gravity * rho_p) - dpdz) / rho_t
     @turbo KDIFF .= @. Khdiff * w_xx
     @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
-    impdot[colstart:colend,5] .= @. -(Pxi_bar * xi_z)
+    # Implicit acoustic w-momentum: -c̄_ρ ∂_z ρ_d' with c̄_ρ = Pxi_bar/ρ̂_d
+    impdot[colstart:colend,5] .= @. -(Pxi_bar / rho_dbar) * rho_dp_z
 
     col.uMish .= rho_d .* Kv .* mu_c_z
     Btransform!(col)
@@ -634,9 +639,9 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
 
-    # Solve for semi-implicit n+1 terms (not validated for rho_d; keep disabled)
+    # Solve for semi-implicit n+1 terms (linear rho_d mass-flux acoustic adjustment)
     if mtile.model.options[:semiimplicit]
-        semiimplicit_adjustment(mtile, colstart, colend, t)
+        semiimplicit_adjustment_rhod(mtile, colstart, colend, t)
     end
 
     # Adjust the condensation rate from the advected supersaturation (rho_d form)

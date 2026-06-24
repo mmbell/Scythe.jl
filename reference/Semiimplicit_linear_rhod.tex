@@ -1,0 +1,223 @@
+\documentclass[11pt, oneside]{article}   	% use "amsart" instead of "article" for AMSLaTeX format
+\usepackage{geometry}                		% See geometry.pdf to learn the layout options. There are lots.
+\geometry{letterpaper}                   		% ... or a4paper or a5paper or ...
+%\geometry{landscape}                		% Activate for rotated page geometry
+%\usepackage[parfill]{parskip}    		% Activate to begin paragraphs with an empty line rather than an indent
+\usepackage{graphicx}				% Use pdf, png, jpg, or eps§ with pdflatex; use eps in DVI mode
+									% TeX will automatically convert eps --> pdf in pdflatex
+\usepackage{amssymb}
+\usepackage{amsmath}
+%SetFonts
+
+%SetFonts
+
+
+\title{Semi-implicit acoustics for the linear dry-air density}
+\author{Michael M. Bell}
+%\date{}							% Activate to display a given date or no date
+
+\begin{document}
+\maketitle
+
+\section{Motivation}
+
+The semi-implicit formulation (companion note) treats the vertically propagating
+acoustic modes implicitly so that the model timestep is governed by advection rather
+than the speed of sound. In its original form the implicit acoustic operator is
+constant-coefficient \emph{because} the dry-air continuity equation is carried for the
+log-density $\xi = \ln(\rho_d/\rho_0)$: its linearized continuity is simply
+$\partial \xi'/\partial t = -\partial w/\partial z$, with no density weighting.
+
+Carrying the log-density, however, breaks discrete conservation of dry-air mass: the
+per-step cubic B-spline smoothing penalty acts on the \emph{nonlinear} $\xi$ and,
+through Jensen's inequality, systematically lowers $\int \rho_d$ (see the companion
+diagnostic note). The cure is to carry the \emph{linear} dry-air density $\rho_d$
+directly, so that the smoothing preserves $\int \rho_d$ exactly. Doing so makes the
+linearized continuity carry the reference density $\hat{\rho}_d(z)$, and the acoustic
+operator appears to become variable-coefficient. This note shows that, under the
+mass-flux change of variable $\varphi \equiv \hat{\rho}_d\, w$, the operator reduces to
+the \emph{same} constant-coefficient Helmholtz problem already solved for the $\xi$
+form, so no new variable-coefficient solver is required.
+
+\section{Governing equations and reference state}
+
+We use the notation of the Scythe documentation. The dry-air continuity equation in
+conservative flux form, and the vertical momentum equation with the Ooyama (1990)
+pressure-gradient decomposition, are
+
+\begin{align}
+\frac{\partial \rho_d}{\partial t} &= -\nabla \cdot \left( \rho_d \mathbf{v} \right) , \\
+\frac{\partial w}{\partial t} &= -\mathbf{v}\cdot\nabla w
+   - \frac{1}{\rho}\frac{\partial p}{\partial z} - g\frac{\rho'}{\rho} + \dot{F}_w ,
+\end{align}
+
+where the vertical pressure gradient is
+
+\begin{equation}
+\frac{\partial p}{\partial z} = P_s \frac{\partial s}{\partial z}
+   + \rho_d P_{\rho_d}\frac{\partial \xi}{\partial z}
+   + \frac{dq_v}{d\mu}P_{q_v}\frac{\partial \mu}{\partial z} ,
+\qquad
+P_{\rho_d} = \frac{\partial p}{\partial \rho_d}\bigg\vert_{s,q_v} .
+\end{equation}
+
+We define a hydrostatic reference state, denoted by the hat operator, and solve for
+perturbations to it:
+
+\begin{equation}
+\frac{d\hat{p}}{dz} = -\hat{\rho}\,g , \qquad
+\hat{\xi} = \ln(\hat{\rho}_d/\rho_0) , \qquad
+\rho_d' = \rho_d - \hat{\rho}_d , \qquad
+\xi' = \ln(\rho_d/\hat{\rho}_d) \approx \frac{\rho_d'}{\hat{\rho}_d} .
+\end{equation}
+
+The last relation is the linearization of $\xi'$ used throughout the acoustic
+treatment.
+
+\section{The linearized acoustic subsystem}
+
+Splitting each tendency into an explicit part $[\,\cdot\,]^{ex}$ and the linear
+acoustic part that propagates sound vertically, the dry-acoustic pair couples
+$\rho_d'$ and $w$:
+
+\begin{align}
+\frac{\partial \rho_d'}{\partial t} &= \left[\frac{\partial \rho_d'}{\partial t}\right]^{ex}
+   - \frac{\partial}{\partial z}\left(\hat{\rho}_d\, w\right) , \label{eq:cont} \\
+\frac{\partial w}{\partial t} &= \left[\frac{\partial w}{\partial t}\right]^{ex}
+   - \bar{c}_\rho\,\frac{\partial \rho_d'}{\partial z} , \label{eq:wmom}
+\end{align}
+
+where the reference acoustic coefficient is
+
+\begin{equation}
+\bar{c}_\rho \equiv \frac{\bar{P}_\xi}{\hat{\rho}_d} , \qquad
+\bar{P}_\xi \equiv \left\langle \frac{\rho_d P_{\rho_d}}{\rho} \right\rangle .
+\label{eq:cbar}
+\end{equation}
+
+Here $\bar{P}_\xi$ is the domain-mean sound speed squared --- the single scalar the
+code stores as \texttt{Pxi\_bar}, namely $\langle P_\xi / \rho \rangle$ with
+$P_\xi = \rho_d P_{\rho_d}$. It is the \emph{same} reference constant used by the $\xi$
+form; the $\rho_d$ form differs only in carrying $\hat{\rho}_d(z)$ explicitly in both
+\eqref{eq:cont} and \eqref{eq:wmom}.
+
+\paragraph{Reduction to the $\xi$ form.} With $\xi' \approx \rho_d'/\hat{\rho}_d$, the
+momentum source in \eqref{eq:wmom} is
+\begin{equation}
+-\bar{c}_\rho\,\frac{\partial \rho_d'}{\partial z}
+   = -\frac{\bar{P}_\xi}{\hat{\rho}_d}\frac{\partial \rho_d'}{\partial z}
+   = -\bar{P}_\xi\,\frac{\partial \xi'}{\partial z} ,
+\end{equation}
+which is exactly the $\xi$-form implicit term $-\bar{P}_\xi\,\partial \xi'/\partial z$.
+Likewise $-\partial_z(\hat{\rho}_d w)/\hat{\rho}_d \approx -\partial_z w$ when
+$\hat{\rho}_d$ is slowly varying. A constant $\hat{\rho}_d$ recovers the $\xi$ form
+identically.
+
+\section{Time discretization}
+
+We use the same splitting as the existing solver: a third-order Adams--Bashforth (AB3)
+extrapolation of the explicit parts and the AI2$^\ast$ weighting
+$\left(\tfrac{5}{4}, -1, \tfrac{3}{4}\right)$ of the implicit acoustic terms, with
+$\Delta\tau$ the implicit time-stepping coefficient ($\Delta\tau = \tfrac{5}{4}\Delta t$
+after the startup steps). Let $\rho_d'^{\,*}$ and $w^{*}$ denote the explicitly
+advanced predictors, formed by adding the AB3 explicit increment, removing the
+AB-extrapolated estimate of the implicit terms, and adding their implicit weight.
+Equations \eqref{eq:cont}--\eqref{eq:wmom} then give the coupled implicit update
+
+\begin{align}
+w^{n+1} &= w^{*} - \Delta\tau\,\bar{c}_\rho\,\frac{\partial \rho_d'^{\,n+1}}{\partial z} ,
+   \label{eq:wupd} \\
+\rho_d'^{\,n+1} &= \rho_d'^{\,*}
+   - \Delta\tau\,\frac{\partial}{\partial z}\left(\hat{\rho}_d\, w^{n+1}\right) .
+   \label{eq:cupd}
+\end{align}
+
+\section{The mass-flux reduction}
+
+Introduce the vertical \textbf{mass flux} $\varphi \equiv \hat{\rho}_d\, w$. Multiplying
+\eqref{eq:wupd} by $\hat{\rho}_d$ and substituting \eqref{eq:cupd},
+
+\begin{equation}
+\varphi^{n+1} = \hat{\rho}_d\, w^{*}
+   - \Delta\tau\,\hat{\rho}_d\,\bar{c}_\rho\,\frac{\partial}{\partial z}
+     \left[ \rho_d'^{\,*} - \Delta\tau\,\frac{\partial \varphi^{n+1}}{\partial z} \right] .
+\end{equation}
+
+The decisive simplification is that the product
+$\hat{\rho}_d\,\bar{c}_\rho = \hat{\rho}_d\,(\bar{P}_\xi/\hat{\rho}_d) = \bar{P}_\xi$
+is \emph{constant}. The variable reference density cancels, leaving a
+constant-coefficient modified-Helmholtz problem for the mass flux:
+
+\begin{equation}
+\boxed{\;
+\varphi^{n+1} - \Delta\tau^2\,\bar{P}_\xi\,\frac{\partial^2 \varphi^{n+1}}{\partial z^2}
+   = \hat{\rho}_d\, w^{*} - \Delta\tau\,\bar{P}_\xi\,\frac{\partial \rho_d'^{\,*}}{\partial z} \; }
+\label{eq:helmholtz}
+\end{equation}
+
+The operator $\left(1 - \Delta\tau^2\,\bar{P}_\xi\,\partial_{zz}\right)$ is
+\emph{identical} to the operator of the existing $w$-form solve
+(\texttt{calc\_Helmholtz\_semiimplicit\_matrix}), which assembles
+$c\,\partial_{zz} - 1$ with $c = \Delta\tau^2 \bar{P}_\xi$ and homogeneous Dirichlet
+boundary rows. The boundary conditions are unchanged: a rigid lid and floor impose
+$w = 0$, hence $\varphi = \hat{\rho}_d\, w = 0$, the same homogeneous Dirichlet
+conditions. The already-factorized matrix is therefore reused without modification, on
+either the Chebyshev (RZ) or cubic B-spline (RiRk) vertical basis.
+
+\paragraph{Recovery.} Having solved \eqref{eq:helmholtz} for $\varphi^{n+1}$, the
+physical fields are recovered by
+
+\begin{align}
+w^{n+1} &= \frac{\varphi^{n+1}}{\hat{\rho}_d} , \label{eq:wrec} \\
+\rho_d'^{\,n+1} &= \rho_d'^{\,*} - \Delta\tau\,\frac{\partial \varphi^{n+1}}{\partial z} .
+   \label{eq:crec}
+\end{align}
+
+\paragraph{Mass conservation.} Equation \eqref{eq:crec} updates the density through the
+flux divergence $\partial_z(\hat{\rho}_d w)$. Its vertical integral is a boundary flux,
+\begin{equation}
+\frac{d}{dt}\int_{z_b}^{z_t}\!\rho_d'\,dz
+   = -\int_{z_b}^{z_t}\!\frac{\partial}{\partial z}\!\left(\hat{\rho}_d\, w\right)dz
+   = -\left[\hat{\rho}_d\, w\right]_{z_b}^{z_t} = 0
+\end{equation}
+at rigid walls, so the implicit acoustic step conserves $\int \rho_d'$ to machine
+precision. The mass-conservation property established in the explicit linear-$\rho_d$
+prototype thus carries over to the semi-implicit step.
+
+\section{Operator consistency}
+
+The AI2$^\ast$ split requires the implicit operator and the explicit acoustic
+tendencies to apply the \emph{same} discrete derivative. Accordingly, the explicit
+implicit-candidate tendencies are written in the flux form using a single spline
+derivative of the mass flux, matching the recovery \eqref{eq:wrec}--\eqref{eq:crec}:
+
+\begin{align}
+\left[\frac{\partial \rho_d'}{\partial t}\right]^{\mathrm{imp}}
+   &= -\frac{\partial}{\partial z}\left(\hat{\rho}_d\, w\right) , \\
+\left[\frac{\partial w}{\partial t}\right]^{\mathrm{imp}}
+   &= -\bar{c}_\rho\,\frac{\partial \rho_d'}{\partial z}
+    = -\frac{\bar{P}_\xi}{\hat{\rho}_d}\,\frac{\partial \rho_d'}{\partial z} .
+\end{align}
+
+The continuity term must be evaluated as a single derivative of the product
+$\hat{\rho}_d\, w$, \emph{not} as the product-rule expansion
+$\hat{\rho}_d\,\partial_z w + w\,\partial_z\hat{\rho}_d$; the two differ in the discrete
+spline operators, and only the single-derivative (flux) form is consistent with the
+implicit solve \eqref{eq:helmholtz}--\eqref{eq:crec}. Using the product rule would
+desynchronize the explicit and implicit acoustic operators and reintroduce a small mass
+drift.
+
+\section{Summary}
+
+Carrying the linear dry-air density $\rho_d$ in place of $\xi$ restores discrete mass
+conservation, and the resulting variable-coefficient acoustic operator collapses, under
+the mass-flux variable $\varphi = \hat{\rho}_d w$, to the constant-coefficient Helmholtz
+problem \eqref{eq:helmholtz} already solved for the $\xi$ form. The implementation reuses
+the existing factorized matrix and adds only a new adjustment routine that (i) forms the
+right-hand side of \eqref{eq:helmholtz} from the predictors $\rho_d'^{\,*}$ and
+$\hat{\rho}_d w^{*}$, (ii) solves for $\varphi^{n+1}$, and (iii) recovers
+$w^{n+1}$ and $\rho_d'^{\,n+1}$ by \eqref{eq:wrec}--\eqref{eq:crec}. Constant
+$\hat{\rho}_d$ reduces the scheme exactly to the $\xi$-form solver, which provides a
+machine-precision regression test.
+
+\end{document}

@@ -825,6 +825,92 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
 end
 
 """
+    semiimplicit_adjustment_rhod(mtile, colstart, colend, t)
+
+Semi-implicit acoustic adjustment for the linear dry-air density set. Solves the
+constant-coefficient Helmholtz problem for the vertical mass flux `φ = ρ̂_d w`, which
+reuses the xi-form w-solve matrix because `ρ̂_d c̄_ρ = Pxi_bar` is constant, then
+recovers `w = φ/ρ̂_d` and `ρ_d' = ρ_d'* - Δτ ∂_z φ` (flux form, conserves `∫ρ_d'`).
+See `reference/Semiimplicit_linear_rhod.tex`.
+"""
+function semiimplicit_adjustment_rhod(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    w_index = mtile.model.grid_params.vars["w"]
+    rhod_index = mtile.model.grid_params.vars["rho_d"]
+    ts = mtile.model.ts
+
+    # rho_d' predictor and its implicit continuity tendency -∂_z(ρ̂_d w)
+    rho_dp_nstar = mtile.var_np1[colstart:colend,rhod_index]
+    cdot_n = view(mtile.impdot_n,colstart:colend,rhod_index)
+    cdot_nm1 = view(mtile.impdot_nm1,colstart:colend,rhod_index)
+    cdot_nm2 = view(mtile.impdot_nm2,colstart:colend,rhod_index)
+
+    # w predictor and its implicit momentum tendency -c̄_ρ ∂_z ρ_d'
+    w_nstar = mtile.var_np1[colstart:colend,w_index]
+    wdot_n = view(mtile.impdot_n,colstart:colend,w_index)
+    wdot_nm1 = view(mtile.impdot_nm1,colstart:colend,w_index)
+    wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
+
+    # Mean speed of sound squared and the dry-air reference density ρ̂_d
+    Pxi_bar = mtile.ref_state.Pxi_bar
+    rho_dbar = mtile.ref_state.rhobar[:,1]
+
+    # Subtract the explicit terms and add the implicit terms (AI2*)
+    ts_term = 0.0
+    if (t == 1)
+        # Use trapezoidal method (AM2) for first step
+        ts_term = 0.5 * ts
+        w_nstar .= @. w_nstar - (ts * wdot_n) + (ts * 0.5 * wdot_n)
+        rho_dp_nstar .= @. rho_dp_nstar - (ts * cdot_n) + (ts * 0.5 * cdot_n)
+    elseif (t == 2)
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts
+        w_nstar .= @. w_nstar - (0.5 * ts) * ((3.0 * wdot_n) - wdot_nm1) - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+        rho_dp_nstar .= @. rho_dp_nstar - (0.5 * ts) * ((3.0 * cdot_n) - cdot_nm1) - (ts * cdot_n) + (ts * 0.75 * cdot_nm1)
+    else
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts
+        w_nstar .= @. w_nstar - ((ts / 12.0) * ((23.0 * wdot_n) - (16.0 * wdot_nm1) + (5.0 * wdot_nm2))) - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+        rho_dp_nstar .= @. rho_dp_nstar - ((ts / 12.0) * ((23.0 * cdot_n) - (16.0 * cdot_nm1) + (5.0 * cdot_nm2))) - (ts * cdot_n) + (ts * 0.75 * cdot_nm1)
+    end
+
+    # Set the n-1 and n-2 terms
+    wdot_nm2 .= wdot_nm1
+    wdot_nm1 .= wdot_n
+
+    cdot_nm2 .= cdot_nm1
+    cdot_nm1 .= cdot_n
+
+    # Take the vertical derivative of the rho_d' predictor and scale by ts_term * Pxi_bar
+    rho_dp_col = deepcopy(mtile.tile.kbasis.data[rhod_index])
+    rho_dp_col.uMish .= rho_dp_nstar
+    Btransform!(rho_dp_col)
+    Atransform!(rho_dp_col)
+    rho_dp_nstar = Itransform!(rho_dp_col)
+    rho_dp_nstar_z = ts_term .* Pxi_bar .* Ixtransform(rho_dp_col)
+
+    # Mass-flux Helmholtz RHS (φ = ρ̂_d w): rhs = Δτ Pxi_bar ∂_z ρ_d'* - ρ̂_d w*.
+    # The operator (I - Δτ² Pxi_bar ∂_zz) is the same w-form matrix, so reuse h_matrix.
+    rhs = rho_dp_nstar_z .- (rho_dbar .* w_nstar)
+    phi_col = deepcopy(mtile.tile.kbasis.data[w_index])
+    # Solve for the coefficients
+    if t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
+        _vertical_solve!(phi_col, h_a, rhs, mtile.tile)
+    else
+        # Use the pre-calculated one
+        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile.tile)
+    end
+
+    # Recover w_n+1 = φ_n+1 / ρ̂_d
+    view(mtile.var_np1,colstart:colend,w_index) .= Itransform!(phi_col) ./ rho_dbar
+
+    # Recover rho_d'_n+1 = rho_d'* - Δτ ∂_z φ_n+1 (flux form ⇒ conserves ∫ρ_d')
+    view(mtile.var_np1,colstart:colend,rhod_index) .= rho_dp_nstar .- (ts_term .* Ixtransform(phi_col))
+end
+
+"""
     semiimplicit_timestep(mtile, colstart, colend, t)
 
 Combined explicit-implicit split timestep for acoustic modes. Applies AI2*-AB3
