@@ -82,8 +82,17 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
 
         if (model.options[:exact_reference_state])
             ref_state = exact_reference_state(model, z_values, ref_column)
-        else
+        elseif get(model.options, :legacy_reference_builder, false)
+            # Transition fallback: the original Scythe xi-space sounding builder, for
+            # A/B comparison against the shared physical-density builder.
             ref_state = calculate_reference_state(model, z_values, ref_column)
+        else
+            # Build the shared physical-density reference state (Springsteel) and view
+            # it back as a legacy ReferenceState so the xi/mu equation sets are
+            # unchanged. Equivalent to the old builder to round-off (linear mu).
+            phys = Springsteel.calculate_reference_state(model.ref_state_file, z_values,
+                ref_column; moisture=true)
+            ref_state = legacy_reference_view(phys, ref_column)
         end
     end
 

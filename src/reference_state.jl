@@ -53,6 +53,51 @@ ref_sat(rs::ReferenceState) = rs.satbar
 sound_speed_sq(rs::ReferenceState) = rs.Pxi_bar
 
 """
+    legacy_reference_view(rs::AbstractReferenceState, column) -> ReferenceState
+
+Materialize a legacy `ReferenceState` (transformed `xi`/`mu` profiles) from a physical
+Springsteel reference state, so the existing `xi`/`mu` equation sets consume the new
+physical-density reference without change. Derived profiles are
+`xibar = log_dry_density(rho_dbar)`, `mubar = mu_transform(rho_vbar/rho_dbar)`, and
+`satbar = mu_transform(saturation ratio)`, with spectral derivatives recomputed on
+`column`. `rhobar` is the physical dry-air density profile carried through directly.
+"""
+function legacy_reference_view(rs::AbstractReferenceState, column)
+    sbar = copy(Springsteel.ref_entropy(rs))
+    rhobar = copy(Springsteel.ref_rho_d(rs))
+    n = size(rhobar, 1)
+    rho_d = rhobar[:, 1]
+
+    xibar = zeros(Float64, n, 3)
+    xibar[:, 1] .= log_dry_density.(rho_d)
+    transform_reference_state!(column, xibar)
+
+    rv = Springsteel.ref_rho_v(rs)
+    q_v = rv === 0.0 ? zeros(Float64, n) : rv[:, 1] ./ rho_d
+    mubar = zeros(Float64, n, 3)
+    mubar[:, 1] .= mu_transform.(q_v)
+    transform_reference_state!(column, mubar)
+
+    # satbar = mu_transform(saturation ratio). The physical satbar profile is already
+    # spectrally smoothed with derivatives; in linear mode mu_transform is a constant
+    # scaling that commutes with smoothing, so scale the profile directly rather than
+    # re-smoothing (which would double-filter and perturb the derivatives). Fall back to
+    # transform-then-smooth for the nonlinear hyperbolic transform.
+    satbar = zeros(Float64, n, 3)
+    sat = Springsteel.ref_sat(rs)
+    if sat !== 0.0
+        if _MU_HYPERBOLIC[]
+            satbar[:, 1] .= mu_transform.(sat[:, 1])
+            transform_reference_state!(column, satbar)
+        else
+            satbar .= mu_transform.(sat)
+        end
+    end
+
+    return ReferenceState(sbar, xibar, rhobar, mubar, satbar, Springsteel.sound_speed_sq(rs))
+end
+
+"""
     rhobar_from_xibar(xibar, column) -> Array{Float64}
 
 Build the dry-air density reference profile `rhobar` (value + first/second vertical
