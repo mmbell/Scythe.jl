@@ -653,6 +653,360 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
 end
 
 """
+    primitive_equation_XZ_rhod_pd(mtile, colstart, colend, t)
+
+Partial-density moisture variant of [`primitive_equation_XZ_rhod`](@ref). The prognostic
+moisture variables are the *partial densities* `rho_v = rho_d·q_v` (slot 3),
+`rho_c = rho_d·q_c` (slot 6) and `rho_r = rho_d·q_r` (slot 7), carried as perturbations
+from the reference partial densities. Because the partial densities are extensive (linear
+in mass), the per-step cubic-spline `l_q` smoothing preserves each `∫rho_x`, so the
+physical water mass `∫(rho_v+rho_c+rho_r)` is conserved (the mixing-ratio `mu` set only
+conserved `∫mu`, not `∫rho_d q`). See `reference/phase3_moisture_partial_density.md`.
+
+The moisture continuity equations are the advective (product-rule) form, mirroring the
+`rho_d` continuity: `∂rho_x/∂t = -v·∇rho_x - rho_x ∇·v + rho_d·(sources)`. The
+condensation source `rho_d·(q_evap - q_cond)` is exactly equal and opposite between vapor
+and cloud, so it cancels in the water-mass sum.
+
+This set consumes a *physical* reference state directly (`MoistReferenceState` or
+`CondensateReferenceState`): `ref_rho_v`/`ref_rho_c` supply the vapor/condensate partial
+densities, and `rhobar = rho_dbar + rho_vbar + rho_cbar` is condensate-inclusive so a
+saturated cloudy base (Bryan & Fritsch 2002) is truly neutrally buoyant. The transformed
+saturation ratio `mu_sat` (slot 8) is retained as in the `rho_d` set; the reference's raw
+`satbar` is rescaled into the transformed convention (linear-mu assumption).
+
+NOTE: semi-implicit acoustics reuse `semiimplicit_adjustment_rhod` (operates on `rho_d`
+and `w`, unchanged by the moisture representation).
+"""
+function primitive_equation_XZ_rhod_pd(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    impdot = mtile.impdot_n
+    model = mtile.model
+    refstate = mtile.ref_state
+
+    # Physical parameters
+    Khdiff = model.physical_params[:Khdiff]
+    Kvdiff = model.physical_params[:Kvdiff]
+    Kv_mudiff = model.physical_params[:Kv_mudiff]
+    alpha = model.physical_params[:alpha]
+    z_damp = model.physical_params[:z_damp]
+
+    precipitation = get(model.options, :precipitation, true)
+    vertical_mixing = get(model.options, :vertical_mixing, true)
+
+    # Gridpoints
+    x = view(gridpoints,colstart:colend,1)
+    z = view(gridpoints,colstart:colend,2)
+
+    # Variables
+    s = view(grid.physical,colstart:colend,1,1)
+    s_x = view(grid.physical,colstart:colend,1,2)
+    s_xx = view(grid.physical,colstart:colend,1,3)
+    s_z = view(grid.physical,colstart:colend,1,4)
+    s_zz = view(grid.physical,colstart:colend,1,5)
+
+    # Slot 2 is the dry-air density perturbation rho_d'
+    rho_dp = view(grid.physical,colstart:colend,2,1)
+    rho_dp_x = view(grid.physical,colstart:colend,2,2)
+    rho_dp_xx = view(grid.physical,colstart:colend,2,3)
+    rho_dp_z = view(grid.physical,colstart:colend,2,4)
+    rho_dp_zz = view(grid.physical,colstart:colend,2,5)
+
+    # Slot 3 is the vapor partial-density perturbation rho_v'
+    rho_vp = view(grid.physical,colstart:colend,3,1)
+    rho_vp_x = view(grid.physical,colstart:colend,3,2)
+    rho_vp_xx = view(grid.physical,colstart:colend,3,3)
+    rho_vp_z = view(grid.physical,colstart:colend,3,4)
+    rho_vp_zz = view(grid.physical,colstart:colend,3,5)
+
+    u = view(grid.physical,colstart:colend,4,1)
+    u_x = view(grid.physical,colstart:colend,4,2)
+    u_xx = view(grid.physical,colstart:colend,4,3)
+    u_z = view(grid.physical,colstart:colend,4,4)
+    u_zz = view(grid.physical,colstart:colend,4,5)
+
+    w = view(grid.physical,colstart:colend,5,1)
+    w_x = view(grid.physical,colstart:colend,5,2)
+    w_xx = view(grid.physical,colstart:colend,5,3)
+    w_z = view(grid.physical,colstart:colend,5,4)
+    w_zz = view(grid.physical,colstart:colend,5,5)
+
+    # Slot 6 is the cloud partial-density perturbation rho_c'
+    rho_cp = view(grid.physical,colstart:colend,6,1)
+    rho_cp_x = view(grid.physical,colstart:colend,6,2)
+    rho_cp_xx = view(grid.physical,colstart:colend,6,3)
+    rho_cp_z = view(grid.physical,colstart:colend,6,4)
+    rho_cp_zz = view(grid.physical,colstart:colend,6,5)
+
+    # Slot 7 is the rain partial density rho_r (reference rho_rbar = 0)
+    rho_rp = view(grid.physical,colstart:colend,7,1)
+    rho_rp_x = view(grid.physical,colstart:colend,7,2)
+    rho_rp_xx = view(grid.physical,colstart:colend,7,3)
+    rho_rp_z = view(grid.physical,colstart:colend,7,4)
+    rho_rp_zz = view(grid.physical,colstart:colend,7,5)
+
+    mu_sat = view(grid.physical,colstart:colend,8,1)
+    mu_sat_x = view(grid.physical,colstart:colend,8,2)
+    mu_sat_xx = view(grid.physical,colstart:colend,8,3)
+    mu_sat_z = view(grid.physical,colstart:colend,8,4)
+    mu_sat_zz = view(grid.physical,colstart:colend,8,5)
+
+    # Get reference state (physical partial densities)
+    sbar = ref_entropy(refstate)[:,1]
+    sbar_z = ref_entropy(refstate)[:,2]
+    sbar_zz = ref_entropy(refstate)[:,3]
+
+    rho_dbar = ref_rho_d(refstate)[:,1]
+    rho_dbar_z = ref_rho_d(refstate)[:,2]
+
+    # Vapor partial-density reference (value + first vertical derivative). Guard the
+    # dry-reference convention where ref_rho_v is the scalar 0.0.
+    rvbar = ref_rho_v(refstate)
+    rho_vbar = rvbar === 0.0 ? zero(sbar) : rvbar[:,1]
+    rho_vbar_z = rvbar === 0.0 ? zero(sbar) : rvbar[:,2]
+
+    # Condensate partial-density reference (scalar 0.0 for MoistReferenceState ⇒ a
+    # cloudless base; a CondensateReferenceState carries a nonzero cloudy base profile).
+    rcbar = ref_rho_c(refstate)
+    rho_cbar = rcbar === 0.0 ? zero(sbar) : rcbar[:,1]
+    rho_cbar_z = rcbar === 0.0 ? zero(sbar) : rcbar[:,2]
+
+    # Saturation-ratio reference, rescaled from raw to the transformed (mu) convention
+    # (linear-mu assumption; mu_transform is a constant scaling that commutes with the
+    # spectral smoothing, so it applies to the value and derivative columns alike).
+    satraw = ref_sat(refstate)
+    satbar = satraw === 0.0 ? zero(sbar) : mu_transform.(satraw[:,1])
+    satbar_z = satraw === 0.0 ? zero(sbar) : mu_transform.(satraw[:,2])
+
+    # Total fields (perturbation + reference)
+    rho_d = rho_dp .+ rho_dbar       # Total dry air density
+    rho_v = rho_vp .+ rho_vbar       # Total vapor partial density
+    rho_c = rho_cp .+ rho_cbar       # Total cloud partial density
+    rho_r = rho_rp                   # Total rain partial density (rho_rbar = 0)
+
+    # Fundamental thermodynamic quantities
+    thermo = thermodynamic_tuple_pd.(s .+ sbar, rho_d, rho_v)
+    q_v = [x[1] for x in thermo]    # Water vapor mixing ratio
+    Tk = [x[3] for x in thermo]     # Temperature in K
+    p = [x[4] for x in thermo]      # Total air pressure
+    q_c = rho_c ./ rho_d            # Cloud water mixing ratio
+    q_r = rho_r ./ rho_d            # Rain water mixing ratio
+    q_l = q_c .+ q_r                # Liquid mixing ratio
+    q_t = q_v .+ q_l                # Total water mixing ratio
+    rho_t = rho_d .+ rho_v .+ rho_c .+ rho_r   # Total air density
+
+    # Total vertical gradients of the partial densities (perturbation + reference)
+    rho_d_z = rho_dp_z .+ rho_dbar_z
+    rho_v_z = rho_vp_z .+ rho_vbar_z
+    rho_c_z = rho_cp_z .+ rho_cbar_z
+
+    # Perturbation log-density gradients reconstructed from the linear rho_d', so the
+    # existing xi-based pressure_gradient is reused unchanged (xibar has no x-dependence;
+    # xi' = ln(rho_d/rho_dbar) ⇒ xi'_z = rho_d_z/rho_d - rho_dbar_z/rho_dbar).
+    xi_x = rho_dp_x ./ rho_d
+    xi_z = (rho_d_z ./ rho_d) .- (rho_dbar_z ./ rho_dbar)
+
+    # Perturbation vapor-mixing-ratio gradients from the partial densities via the
+    # quotient rule q_v = rho_v/rho_d, minus the reference contribution (the base is
+    # x-uniform so q_vbar_x = 0).
+    q_vbar = rho_vbar ./ rho_dbar
+    qvp_x = (rho_vp_x .- (q_v .* rho_dp_x)) ./ rho_d
+    qvp_z = ((rho_v_z .- (q_v .* rho_d_z)) ./ rho_d) .-
+            ((rho_vbar_z .- (q_vbar .* rho_dbar_z)) ./ rho_dbar)
+
+    # Reference total (condensate-inclusive) air density and the perturbation
+    rhobar = rho_dbar .+ rho_vbar .+ rho_cbar
+    rho_p = rho_t .- rhobar
+
+    # Get the mean speed of sound squared from the reference state
+    Pxi_bar = sound_speed_sq(refstate)
+
+    # Pressure gradients (perturbation form, reusing the xi-based chain rule)
+    dpdx = pressure_gradient.(Tk, rho_d, q_v, s_x, xi_x, qvp_x)
+    dpdz = pressure_gradient.(Tk, rho_d, q_v, s_z, xi_z, qvp_z)
+
+    # Placeholders for intermediate calculations
+    ADV = similar(s)
+    FORCING = similar(s)
+    KDIFF = similar(s)
+    VDIFF = similar(s)
+
+    # Entropy divergence forcing
+    Cm = @. (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
+    s_div = @. Cm * (Rd + q_v * Rv) * (u_x + w_z)
+
+    # Condensation rate
+    sat_ratio = inv_mu_transform.(mu_sat .+ satbar) # Saturation ratio
+    q_sat = q_sat_liquid.(Tk, p)
+    max_N_c = 100.0
+
+    # Condensation and nucleation
+    q_cond = q_condensation.(sat_ratio, Tk, p, rho_d, q_v, q_c, max_N_c)
+    for i in 1:length(q_cond)
+        if isnan(q_cond[i])
+            error("q_cond is NaN at index $i, time $(t)!")
+        end
+    end
+
+    # Rain evaporation rate
+    mean_r = 250.0 # Mean radius of rain drops in microns
+    q_evap = precipitation ? q_evaporation.(sat_ratio, Tk, p, rho_d, q_v, q_r, mean_r) :
+                             zero(q_v)
+
+    # Entropy change due to condensation and evaporation
+    s_cond = s_condensation.(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
+
+    # Rayleigh damping
+    rayleigh_coeff = Rayleigh_damping.(alpha, z, z_damp, z[end])
+
+    if precipitation
+        q_auto = autoconversion.(q_c, rho_d)
+        q_coll = collection.(q_c, q_r, rho_d, Tk)
+        Vt = sedimentation.(q_r, rho_d, Tk)
+        # Rain mixing-ratio vertical gradient from the partial densities
+        q_r_z = (rho_rp_z .- (q_r .* rho_d_z)) ./ rho_d
+        col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["rho_r"]])
+        col.uMish .= Vt
+        Btransform!(col)
+        Atransform!(col)
+        Vt .= Itransform!(col)
+        dVtdz = Ixtransform(col)
+        Vt_flux = (q_r_z .* Vt) .+ (q_r .* dVtdz) .+ (q_r .* Vt .* xi_z) # Precipitation flux divergence
+    else
+        q_auto = zero(q_v)
+        q_coll = zero(q_v)
+        Vt_flux = zero(q_v)
+    end
+
+    # Calculate the vertical diffusivity
+    col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["rho_v"]])
+
+    # Vertical mixing length based on Louis parameterization
+    Sv = sqrt.(u_z.^2)
+    lv = 1.0 ./ ((1.0 ./ (0.4 .* z)) .+ (1.0 ./ 80.0))
+    Kv = vertical_mixing ? (lv.^2) .* Sv : zero(Sv)
+
+    # Subgrid vapor flux: tendency on the *extensive* rho_v is the flux divergence
+    # ∂z(rho_d Kv ∂q_v/∂z); the equivalent intensive rate q_flux = (1/rho_d)∂z(...) is
+    # reused by the entropy and saturation forcings.
+    qv_z_total = (rho_v_z .- (q_v .* rho_d_z)) ./ rho_d   # ∂q_v/∂z (total)
+    col.uMish .= rho_d .* Kv .* qv_z_total
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
+    q_flux = VDIFF ./ rho_d
+
+    @turbo ADV .= @. (-u * rho_vp_x) + (-w * rho_v_z) #RHO_V ADV
+    @turbo FORCING .= @. (-rho_v * (u_x + w_z)) + (rho_d * (q_evap - q_cond))
+    @turbo KDIFF .= @. Khdiff * rho_vp_xx
+    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,3] .= @. Kvdiff * rho_vp_zz
+
+    # Apply the subgrid vapor flux to the entropy
+    s_v_mix = s_vapor_mixing.(q_flux, Tk, rho_d, q_v)
+
+    # Entropy mixing
+    col.uMish .= rho_d .* Kv .* (s_z .+ sbar_z)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
+
+    @turbo ADV .= @. (-u * s_x) + (-w * (s_z + sbar_z)) #SADV
+    FORCING .= @. s_cond + s_div + s_v_mix
+    @turbo KDIFF .= @. Khdiff * s_xx
+    @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,1] .= @. Kvdiff * s_zz
+
+    # Dry-air mass continuity in advective (product-rule) form
+    @turbo ADV .= @. (-u * rho_dp_x) + (-w * rho_d_z) #RHO_D ADV
+    @turbo FORCING .= @. -rho_d * (u_x + w_z)
+    @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
+    # Implicit acoustic continuity: flux form -∂_z(ρ̂_d w)
+    flux_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
+    flux_col.uMish .= rho_dbar .* w
+    Btransform!(flux_col)
+    Atransform!(flux_col)
+    impdot[colstart:colend,2] .= .-Ixtransform(flux_col)
+
+    col.uMish .= rho_d .* Kv .* u_z
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
+
+    @turbo ADV .= @. (-u * u_x) + (-w * u_z) #UADV
+    @turbo FORCING .= @. -dpdx / rho_t #UPGF
+    @turbo KDIFF .= @. Khdiff * u_xx
+    @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,4] .= @. Kvdiff * u_zz
+
+    @turbo ADV .= @. (-u * w_x) + (-w * w_z) #WADV
+    @turbo FORCING .= @.  ((-gravity * rho_p) - dpdz) / rho_t
+    @turbo KDIFF .= @. Khdiff * w_xx
+    @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
+    # Implicit acoustic w-momentum: -c̄_ρ ∂_z ρ_d' with c̄_ρ = Pxi_bar/ρ̂_d
+    impdot[colstart:colend,5] .= @. -(Pxi_bar / rho_dbar) * rho_dp_z
+
+    # Cloud partial-density continuity (product-rule form) + microphysics source
+    qc_z_total = (rho_c_z .- (q_c .* rho_d_z)) ./ rho_d
+    col.uMish .= rho_d .* Kv .* qc_z_total
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
+
+    @turbo ADV .= @. (-u * rho_cp_x) + (-w * rho_c_z) #RHO_C ADV
+    @turbo FORCING .= @. (-rho_c * (u_x + w_z)) + (rho_d * (q_cond - q_auto - q_coll))
+    @turbo KDIFF .= @. Khdiff * rho_cp_xx
+    @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,6] .= @. Kv_mudiff * rho_cp_zz
+
+    # Rain partial-density continuity (product-rule form) + microphysics source
+    qr_z_total = (rho_rp_z .- (q_r .* rho_d_z)) ./ rho_d
+    col.uMish .= rho_d .* Kv .* qr_z_total
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= Ixtransform(col)
+
+    @turbo ADV .= @. (-u * rho_rp_x) + (-w * rho_rp_z) #RHO_R ADV
+    @turbo FORCING .= @. (-rho_r * (u_x + w_z)) + (rho_d * (q_auto + q_coll - q_evap - Vt_flux))
+    @turbo KDIFF .= @. Khdiff * rho_rp_xx
+    @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,7] .= @. Kv_mudiff * rho_rp_zz
+
+    col.uMish .= rho_d .* Kv .* (mu_sat_z + satbar_z)
+    Btransform!(col)
+    Atransform!(col)
+    VDIFF .= (Ixtransform(col)) ./ rho_d
+
+    # Saturation forcing
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+    sat_forcing = @. (sat_ratio*(dqsdp(Tk, p, rho_d, q_v, q_l)*((u * dpdx) + (w * (dpdz - rhobar*gravity)))) + q_flux + ((q_evap - q_cond) * (1.0 + Q_s)))/q_sat
+
+    @turbo ADV .= @. (-u * mu_sat_x) + (-w * (mu_sat_z + satbar_z)) #QSS ADV
+    FORCING .= @. sat_forcing * dmudq.(mu_sat, sat_ratio)
+    @turbo KDIFF .= @. Khdiff * mu_sat_xx
+    @turbo expdot[colstart:colend,8] .= @. ADV + FORCING + KDIFF + VDIFF
+    @turbo impdot[colstart:colend,8] .= @. Kv_mudiff * mu_sat_zz
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
+    # Solve for semi-implicit n+1 terms (linear rho_d mass-flux acoustic adjustment)
+    if mtile.model.options[:semiimplicit]
+        semiimplicit_adjustment_rhod(mtile, colstart, colend, t)
+    end
+
+    # Adjust the condensation rate from the advected supersaturation (partial-density form)
+    condensation_adjustment_pd(mtile, colstart, colend, t)
+
+    # Use implicit timestep for diffusion
+    diffusion_timestep_pd(mtile, colstart, colend, t)
+
+end
+
+"""
     primitive_equation_RZ(mtile, colstart, colend, t)
 
 Primitive equations in axisymmetric r-z cylindrical coordinates with full microphysics,

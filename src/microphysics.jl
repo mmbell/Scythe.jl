@@ -984,6 +984,92 @@ function condensation_adjustment_new_rhod(mtile::ModelTile, colstart::Int64, col
 end
 
 """
+    condensation_adjustment_pd(mtile, colstart, colend, t)
+
+Partial-density variant of [`condensation_adjustment_new_rhod`](@ref) for the
+`primitive_equation_XZ_rhod_pd` set. Reads the vapor and cloud *partial densities*
+(`rho_v`, `rho_c`) and the dry-air density (`rho_d`), reconstructs the thermodynamic
+state via [`thermodynamic_tuple_pd`](@ref) (`q_v = rho_v/rho_d`), and moves condensed
+mass between vapor and cloud as `Δrho_v = -Δrho_c = -τ_r·rho_d·q_cond`. Because the
+update is in partial densities, the cloud+vapor water mass `rho_v + rho_c` is conserved
+exactly. The advected saturation ratio is recovered from the physical reference's raw
+`satbar` rescaled into the transformed (`mu`) convention (linear-mu assumption, matching
+the rest of the partial-density set). Densities themselves are not modified — only
+`rho_v`, `rho_c`, and `s`.
+"""
+function condensation_adjustment_pd(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    s_index = mtile.model.grid_params.vars["s"]
+    s = view(mtile.var_np1,colstart:colend,s_index)
+
+    # Density (rho_d') is not modified
+    rho_d_index = mtile.model.grid_params.vars["rho_d"]
+    rho_dp = view(mtile.var_np1,colstart:colend,rho_d_index)
+
+    rho_v_index = mtile.model.grid_params.vars["rho_v"]
+    rho_v = view(mtile.var_np1,colstart:colend,rho_v_index)
+
+    rho_c_index = mtile.model.grid_params.vars["rho_c"]
+    rho_c = view(mtile.var_np1,colstart:colend,rho_c_index)
+
+    rho_r_index = mtile.model.grid_params.vars["rho_r"]
+    rho_r = view(mtile.var_np1,colstart:colend,rho_r_index)
+
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
+
+    # Reference state (physical partial densities). Condensate may be absent
+    # (MoistReferenceState ⇒ ref_rho_c is the scalar 0.0), so guard the accessor.
+    refstate = mtile.ref_state
+    rho_dbar = ref_rho_d(refstate)[:,1]
+    rho_vbar = ref_rho_v(refstate)[:,1]
+    rcbar = ref_rho_c(refstate)
+    rho_cbar = rcbar === 0.0 ? zero(rho_dbar) : rcbar[:,1]
+    satbar = mu_transform.(ref_sat(refstate)[:,1])   # raw → transformed (linear mu)
+
+    s_total = s .+ ref_entropy(refstate)[:,1]
+    rho_d = rho_dp .+ rho_dbar
+    rho_v_total = rho_v .+ rho_vbar
+    rho_c_total = rho_c .+ rho_cbar
+
+    thermo = thermodynamic_tuple_pd.(s_total, rho_d, rho_v_total)
+    q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
+    Tk = [x[3] for x in thermo]     # Temperature in K
+    p = [x[4] for x in thermo]      # Total air pressure
+    q_c = rho_c_total ./ rho_d      # Cloud water mixing ratio
+    q_r = rho_r ./ rho_d            # Rain water mixing ratio
+    q_l = q_c .+ q_r                # Liquid mixing ratio
+    q_sat = q_sat_liquid.(Tk, p)
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+
+    sat_ratio = inv_mu_transform.(mu_sat .+ satbar)
+    qss = (q_sat .* sat_ratio) .- q_sat
+
+    # Do the increment using explicit Euler integration
+    tau_r = 0.25
+    q_cond = (q_v .- q_sat .- qss) ./ (1.0 .+ Q_s)
+    for i in 1:length(q_cond)
+        if qss[i] < 0.0
+            if q_cond[i] > 0.0
+                q_cond[i] = 0.0
+            else
+                q_cond[i] = max(-q_c[i], q_cond[i])
+            end
+        else
+            q_cond[i] = min(q_v[i], q_cond[i])
+        end
+    end
+
+    # Move condensed mass between vapor and cloud partial densities (Δrho_v = -Δrho_c),
+    # conserving rho_v + rho_c exactly.
+    dmass = @. tau_r * rho_d * q_cond
+    rho_v .= rho_v .- dmass
+    rho_c .= rho_c .+ dmass
+    s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
+
+end
+
+"""
     autoconversion(q_c, rho_d)
 
 Compute the autoconversion rate of cloud water to rain water. Cloud water exceeding

@@ -80,19 +80,28 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         z_values = tilepoints[1:model.grid_params.kDim,ndims(tilepoints)]
         ref_column = reference_column(tile, model.grid_params)
 
+        # The partial-density equation sets (primitive_equation_*_pd) read the physical
+        # vapor/condensate partial-density profiles (ref_rho_v / ref_rho_c) directly, so
+        # they keep the Springsteel physical reference state rather than the legacy
+        # xi/mu derived view used by the older equation sets.
+        physical_ref = endswith(model.equation_set, "_pd")
+
         if (model.options[:exact_reference_state])
-            ref_state = exact_reference_state(model, z_values, ref_column)
+            ref_state = physical_ref ?
+                Springsteel.exact_reference_state(model.ref_state_file, z_values, ref_column) :
+                exact_reference_state(model, z_values, ref_column)
         elseif get(model.options, :legacy_reference_builder, false)
             # Transition fallback: the original Scythe xi-space sounding builder, for
             # A/B comparison against the shared physical-density builder.
             ref_state = calculate_reference_state(model, z_values, ref_column)
         else
-            # Build the shared physical-density reference state (Springsteel) and view
-            # it back as a legacy ReferenceState so the xi/mu equation sets are
-            # unchanged. Equivalent to the old builder to round-off (linear mu).
+            # Build the shared physical-density reference state (Springsteel). The
+            # partial-density sets consume it directly; the legacy xi/mu sets view it
+            # back as a legacy ReferenceState (equivalent to the old builder to
+            # round-off in linear mu) so their bodies are unchanged.
             phys = Springsteel.calculate_reference_state(model.ref_state_file, z_values,
                 ref_column; moisture=true)
-            ref_state = legacy_reference_view(phys, ref_column)
+            ref_state = physical_ref ? phys : legacy_reference_view(phys, ref_column)
         end
     end
 
@@ -1108,6 +1117,115 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
     # Set mu_r_n+1
     _vertical_solve!(col, h_a, mu_r_nstar, mtile.tile)
     view(mtile.var_np1,colstart:colend,mu_r_index) .= Itransform!(col)
+
+    # Set mu_sat_n+1
+    _vertical_solve!(col, h_a, mu_sat_nstar, mtile.tile)
+    view(mtile.var_np1,colstart:colend,mu_sat_index) .= Itransform!(col)
+
+end
+
+"""
+    diffusion_timestep_pd(mtile, colstart, colend, t)
+
+Partial-density variant of [`diffusion_timestep`](@ref) for the
+`primitive_equation_XZ_rhod_pd` set: the diffused thermodynamic/moisture variables are
+`s`, the moisture partial densities `rho_v`, `rho_c`, `rho_r`, and the transformed
+saturation ratio `mu_sat` (replacing `mu`, `mu_c`, `mu_r`). Identical AI2* implicit
+vertical-diffusion solve; only the prognostic slot names differ.
+"""
+function diffusion_timestep_pd(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    s_index = mtile.model.grid_params.vars["s"]
+    rho_v_index = mtile.model.grid_params.vars["rho_v"]
+    rho_c_index = mtile.model.grid_params.vars["rho_c"]
+    rho_r_index = mtile.model.grid_params.vars["rho_r"]
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+
+    ts = mtile.model.ts
+
+    # Predictor states and their stored implicit (vertical-diffusion) tendencies
+    s_nstar = mtile.var_np1[colstart:colend,s_index]
+    sdot_n = view(mtile.impdot_n,colstart:colend,s_index)
+    sdot_nm1 = view(mtile.impdot_nm1,colstart:colend,s_index)
+    sdot_nm2 = view(mtile.impdot_nm2,colstart:colend,s_index)
+
+    rho_v_nstar = mtile.var_np1[colstart:colend,rho_v_index]
+    rho_vdot_n = view(mtile.impdot_n,colstart:colend,rho_v_index)
+    rho_vdot_nm1 = view(mtile.impdot_nm1,colstart:colend,rho_v_index)
+    rho_vdot_nm2 = view(mtile.impdot_nm2,colstart:colend,rho_v_index)
+
+    rho_c_nstar = mtile.var_np1[colstart:colend,rho_c_index]
+    rho_cdot_n = view(mtile.impdot_n,colstart:colend,rho_c_index)
+    rho_cdot_nm1 = view(mtile.impdot_nm1,colstart:colend,rho_c_index)
+    rho_cdot_nm2 = view(mtile.impdot_nm2,colstart:colend,rho_c_index)
+
+    rho_r_nstar = mtile.var_np1[colstart:colend,rho_r_index]
+    rho_rdot_n = view(mtile.impdot_n,colstart:colend,rho_r_index)
+    rho_rdot_nm1 = view(mtile.impdot_nm1,colstart:colend,rho_r_index)
+    rho_rdot_nm2 = view(mtile.impdot_nm2,colstart:colend,rho_r_index)
+
+    mu_sat_nstar = mtile.var_np1[colstart:colend,mu_sat_index]
+    mu_sat_dot_n = view(mtile.impdot_n,colstart:colend,mu_sat_index)
+    mu_sat_dot_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
+    mu_sat_dot_nm2 = view(mtile.impdot_nm2,colstart:colend,mu_sat_index)
+
+    # Add the implicit terms
+    ts_term = 0.0
+    if (t == 1)
+        # Use trapezoidal method (AM2) for first step
+        ts_term = 0.5 * ts * mtile.model.physical_params[:Kvdiff]
+        s_nstar .= @. s_nstar + (ts * 0.5 * sdot_n)
+        rho_v_nstar .= @. rho_v_nstar + (ts * 0.5 * rho_vdot_n)
+        rho_c_nstar .= @. rho_c_nstar + (ts * 0.5 * rho_cdot_n)
+        rho_r_nstar .= @. rho_r_nstar + (ts * 0.5 * rho_rdot_n)
+        mu_sat_nstar .= @. mu_sat_nstar + (ts * 0.5 * mu_sat_dot_n)
+    else
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts * mtile.model.physical_params[:Kvdiff]
+        s_nstar .= @. s_nstar - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
+        rho_v_nstar .= @. rho_v_nstar - (ts * rho_vdot_n) + (ts * 0.75 * rho_vdot_nm1)
+        rho_c_nstar .= @. rho_c_nstar - (ts * rho_cdot_n) + (ts * 0.75 * rho_cdot_nm1)
+        rho_r_nstar .= @. rho_r_nstar - (ts * rho_rdot_n) + (ts * 0.75 * rho_rdot_nm1)
+        mu_sat_nstar .= @. mu_sat_nstar - (ts * mu_sat_dot_n) + (ts * 0.75 * mu_sat_dot_nm1)
+    end
+
+    # Set the n-1 and n-2 terms
+    sdot_nm2 .= sdot_nm1
+    sdot_nm1 .= sdot_n
+    rho_vdot_nm2 .= rho_vdot_nm1
+    rho_vdot_nm1 .= rho_vdot_n
+    rho_cdot_nm2 .= rho_cdot_nm1
+    rho_cdot_nm1 .= rho_cdot_n
+    rho_rdot_nm2 .= rho_rdot_nm1
+    rho_rdot_nm1 .= rho_rdot_n
+    mu_sat_dot_nm2 .= mu_sat_dot_nm1
+    mu_sat_dot_nm1 .= mu_sat_dot_n
+
+    # Set up the matrix problem
+    col = deepcopy(mtile.tile.kbasis.data[s_index])
+
+    # Solve for the coefficients
+    h_a = mtile.diffusion_matrix
+    if t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_diffusion_matrix(mtile.tile, mtile.model, ts_term)
+    end
+
+    # Set s_n+1 (homogeneous BCs)
+    _vertical_solve!(col, h_a, s_nstar, mtile.tile)
+    view(mtile.var_np1,colstart:colend,s_index) .= Itransform!(col)
+
+    # Set rho_v_n+1
+    _vertical_solve!(col, h_a, rho_v_nstar, mtile.tile)
+    view(mtile.var_np1,colstart:colend,rho_v_index) .= Itransform!(col)
+
+    # Set rho_c_n+1
+    _vertical_solve!(col, h_a, rho_c_nstar, mtile.tile)
+    view(mtile.var_np1,colstart:colend,rho_c_index) .= Itransform!(col)
+
+    # Set rho_r_n+1
+    _vertical_solve!(col, h_a, rho_r_nstar, mtile.tile)
+    view(mtile.var_np1,colstart:colend,rho_r_index) .= Itransform!(col)
 
     # Set mu_sat_n+1
     _vertical_solve!(col, h_a, mu_sat_nstar, mtile.tile)
