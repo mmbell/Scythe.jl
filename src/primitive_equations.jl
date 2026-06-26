@@ -86,21 +86,21 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     mu_sat_zz = view(grid.physical,colstart:colend,8,5)
 
     # Get reference state
-    sbar = refstate.sbar[:,1]
-    sbar_z = refstate.sbar[:,2]
-    sbar_zz = refstate.sbar[:,3]
+    sbar = ref_entropy(refstate)[:,1]
+    sbar_z = ref_entropy(refstate)[:,2]
+    sbar_zz = ref_entropy(refstate)[:,3]
 
-    xibar = refstate.xibar[:,1]
-    xibar_z = refstate.xibar[:,2]
-    xibar_zz = refstate.xibar[:,3]
+    xibar = ref_xi(refstate)[:,1]
+    xibar_z = ref_xi(refstate)[:,2]
+    xibar_zz = ref_xi(refstate)[:,3]
 
-    mubar = refstate.mubar[:,1]
-    mubar_z = refstate.mubar[:,2]
-    mubar_zz = refstate.mubar[:,3]
+    mubar = ref_mu(refstate)[:,1]
+    mubar_z = ref_mu(refstate)[:,2]
+    mubar_zz = ref_mu(refstate)[:,3]
 
-    satbar = refstate.satbar[:,1]
-    satbar_z = refstate.satbar[:,2]
-    satbar_zz = refstate.satbar[:,3]
+    satbar = ref_sat(refstate)[:,1]
+    satbar_z = ref_sat(refstate)[:,2]
+    satbar_zz = ref_sat(refstate)[:,3]
 
     # Fundamental thermodynamic quantities derived from model variables
     mu_total = mu .+ mubar
@@ -125,7 +125,7 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Pressure gradients
     dpdx = pressure_gradient.(Tk, rho_d, q_v, s_x, xi_x, qvp_x)
@@ -429,21 +429,21 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
     mu_sat_zz = view(grid.physical,colstart:colend,8,5)
 
     # Get reference state
-    sbar = refstate.sbar[:,1]
-    sbar_z = refstate.sbar[:,2]
-    sbar_zz = refstate.sbar[:,3]
+    sbar = ref_entropy(refstate)[:,1]
+    sbar_z = ref_entropy(refstate)[:,2]
+    sbar_zz = ref_entropy(refstate)[:,3]
 
     # Dry-air density reference (value + first vertical derivative)
-    rho_dbar = refstate.rhobar[:,1]
-    rho_dbar_z = refstate.rhobar[:,2]
+    rho_dbar = ref_rho_d(refstate)[:,1]
+    rho_dbar_z = ref_rho_d(refstate)[:,2]
 
-    mubar = refstate.mubar[:,1]
-    mubar_z = refstate.mubar[:,2]
-    mubar_zz = refstate.mubar[:,3]
+    mubar = ref_mu(refstate)[:,1]
+    mubar_z = ref_mu(refstate)[:,2]
+    mubar_zz = ref_mu(refstate)[:,3]
 
-    satbar = refstate.satbar[:,1]
-    satbar_z = refstate.satbar[:,2]
-    satbar_zz = refstate.satbar[:,3]
+    satbar = ref_sat(refstate)[:,1]
+    satbar_z = ref_sat(refstate)[:,2]
+    satbar_zz = ref_sat(refstate)[:,3]
 
     # Fundamental thermodynamic quantities derived from model variables
     mu_total = mu .+ mubar
@@ -474,7 +474,7 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Pressure gradients (perturbation form, reusing the xi-based chain rule)
     dpdx = pressure_gradient.(Tk, rho_d, q_v, s_x, xi_x, qvp_x)
@@ -740,21 +740,21 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     mu_sat_zz = view(grid.physical,colstart:colend,9,5)
 
     # Get reference state
-    sbar = refstate.sbar[:,1]
-    sbar_z = refstate.sbar[:,2]
-    sbar_zz = refstate.sbar[:,3]
+    sbar = ref_entropy(refstate)[:,1]
+    sbar_z = ref_entropy(refstate)[:,2]
+    sbar_zz = ref_entropy(refstate)[:,3]
 
-    xibar = refstate.xibar[:,1]
-    xibar_z = refstate.xibar[:,2]
-    xibar_zz = refstate.xibar[:,3]
+    xibar = ref_xi(refstate)[:,1]
+    xibar_z = ref_xi(refstate)[:,2]
+    xibar_zz = ref_xi(refstate)[:,3]
 
-    mubar = refstate.mubar[:,1]
-    mubar_z = refstate.mubar[:,2]
-    mubar_zz = refstate.mubar[:,3]
+    mubar = ref_mu(refstate)[:,1]
+    mubar_z = ref_mu(refstate)[:,2]
+    mubar_zz = ref_mu(refstate)[:,3]
 
-    satbar = refstate.satbar[:,1]
-    satbar_z = refstate.satbar[:,2]
-    satbar_zz = refstate.satbar[:,3]
+    satbar = ref_sat(refstate)[:,1]
+    satbar_z = ref_sat(refstate)[:,2]
+    satbar_zz = ref_sat(refstate)[:,3]
 
     # Fundamental thermodynamic quantities derived from model variables
     mu_v_total = mu_v .+ mubar
@@ -779,7 +779,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Pressure gradients
     dpdr = pressure_gradient.(Tk, rho_d, q_v, s_r, xi_r, qvp_r)
@@ -1126,17 +1126,17 @@ function primitive_equation_cylindrical(mtile::ModelTile, colstart::Int64, colen
     mu_p_zz = view(grid.physical,colstart:colend,8,7)
 
     # Get reference state
-    sbar = refstate.sbar[:,1]
-    sbar_z = refstate.sbar[:,2]
-    sbar_zz = refstate.sbar[:,3]
+    sbar = ref_entropy(refstate)[:,1]
+    sbar_z = ref_entropy(refstate)[:,2]
+    sbar_zz = ref_entropy(refstate)[:,3]
 
-    xibar = refstate.xibar[:,1]
-    xibar_z = refstate.xibar[:,2]
-    xibar_zz = refstate.xibar[:,3]
+    xibar = ref_xi(refstate)[:,1]
+    xibar_z = ref_xi(refstate)[:,2]
+    xibar_zz = ref_xi(refstate)[:,3]
 
-    mubar = refstate.mubar[:,1]
-    mubar_z = refstate.mubar[:,2]
-    mubar_zz = refstate.mubar[:,3]
+    mubar = ref_mu(refstate)[:,1]
+    mubar_z = ref_mu(refstate)[:,2]
+    mubar_zz = ref_mu(refstate)[:,3]
 
     # Fundamental thermodynamic quantities derived from model variables
     thermo = thermodynamic_tuple.(s .+ sbar, xi .+ xibar, mu .+ mubar)
@@ -1155,7 +1155,7 @@ function primitive_equation_cylindrical(mtile::ModelTile, colstart::Int64, colen
     rho_p = rho_t .- rhobar         # Perturbation air density
 
     # Get the mean speed of sound squared from the reference state
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Placeholders for intermediate calculations
     ADV = similar(s)

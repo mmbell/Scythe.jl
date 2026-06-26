@@ -25,6 +25,33 @@ struct ReferenceState
     Pxi_bar::Float64
 end
 
+# ── Reference-state accessor interface ─────────────────────────────────────────
+# Equation sets and microphysics read reference profiles through these accessors
+# rather than reaching into struct fields directly. This decouples the call sites
+# from the concrete layout so the struct can later be replaced by a physical-density
+# reference type (carried in Springsteel) without touching every consumer.
+#
+# Each profile accessor returns the `(nlevels, 3)` array (value, 1st, 2nd vertical
+# derivative); `sound_speed_sq` returns the scalar domain-mean speed of sound squared.
+
+"""Moist entropy reference profile `(nlevels, 3)` [J/(kg K)]."""
+ref_entropy(rs::ReferenceState) = rs.sbar
+
+"""Log dry-air density reference profile `(nlevels, 3)`."""
+ref_xi(rs::ReferenceState) = rs.xibar
+
+"""Dry-air density reference profile `(nlevels, 3)` [kg/m^3]."""
+ref_rho_d(rs::ReferenceState) = rs.rhobar
+
+"""Transformed water-vapor mixing ratio reference profile `(nlevels, 3)`."""
+ref_mu(rs::ReferenceState) = rs.mubar
+
+"""Transformed saturation-ratio reference profile `(nlevels, 3)`."""
+ref_sat(rs::ReferenceState) = rs.satbar
+
+"""Domain-mean speed of sound squared [m^2/s^2]."""
+sound_speed_sq(rs::ReferenceState) = rs.Pxi_bar
+
 """
     rhobar_from_xibar(xibar, column) -> Array{Float64}
 

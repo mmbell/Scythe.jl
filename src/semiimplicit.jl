@@ -111,7 +111,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     end
     # The semi-implicit acoustic adjustment matrix is only used when enabled.
     if model.options[:semiimplicit]
-        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, ref_state.Pxi_bar, 1.25 * model.ts)
+        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
     end
 
     mtile = ModelTile(
@@ -440,7 +440,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
     dz_min = dx_min = c_bar = 0.0
     if cfl_diag_on
         dz_min, dx_min = grid_spacing_minima(patch, model)
-        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(mtile.ref_state.Pxi_bar))))
+        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(sound_speed_sq(mtile.ref_state)))))
     end
 
     # Loop through the timesteps
@@ -619,7 +619,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared from the reference state
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Add the implicit terms
     ts_term = 0.0
@@ -687,7 +687,7 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Subtract the explicit terms and add the implicit terms
     ts_term = 0.0
@@ -768,7 +768,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Subtract the explicit terms and add the implicit terms
     ts_term = 0.0
@@ -852,8 +852,8 @@ function semiimplicit_adjustment_rhod(mtile::ModelTile, colstart::Int64, colend:
     wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Mean speed of sound squared and the dry-air reference density ρ̂_d
-    Pxi_bar = mtile.ref_state.Pxi_bar
-    rho_dbar = mtile.ref_state.rhobar[:,1]
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
+    rho_dbar = ref_rho_d(mtile.ref_state)[:,1]
 
     # Subtract the explicit terms and add the implicit terms (AI2*)
     ts_term = 0.0
@@ -935,7 +935,7 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Subtract the explicit terms and add the implicit terms
     ts_term = 0.0

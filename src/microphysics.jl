@@ -610,11 +610,11 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     #sat_ratio = max.(sat_ratio, 1.0e-6)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mubar = mtile.ref_state.mubar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mubar = ref_mu(mtile.ref_state)[:,1]
     mu_total = mu .+ mubar
-    satbar = mtile.ref_state.satbar[:,1]
+    satbar = ref_sat(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -661,10 +661,10 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
     # Adjust the condensate and precipitation mixing ratios
-    #mu_c_adjust = mu_transform.(q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
+    #mu_c_adjust = mu_transform.(q_c .+ q_v) .- ref_mu(mtile.ref_state)[:,1]
     #mu_c .= @. mu_c + tau_r * (mu_c_adjust - mu_c)
 
-    #mu_r_adjust = mu_transform.(q_r .+ q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
+    #mu_r_adjust = mu_transform.(q_r .+ q_c .+ q_v) .- ref_mu(mtile.ref_state)[:,1]
     #mu_r .= @. mu_r + tau_r * (mu_r_adjust - mu_r)
 
     # Incorrect implicit method
@@ -714,9 +714,9 @@ function condensation_adjustment_qss(mtile::ModelTile, colstart::Int64, colend::
 
     # Get total state from the reference profile. The reference liquid water
     # is zero, so mu_l is the full liquid water variable.
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -786,9 +786,9 @@ function condensation_adjustment_BF02(mtile::ModelTile, colstart::Int64, colend:
     qss_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -866,10 +866,10 @@ function condensation_adjustment_new(mtile::ModelTile, colstart::Int64, colend::
     mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
-    satbar = mtile.ref_state.satbar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
+    satbar = ref_sat(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -944,10 +944,10 @@ function condensation_adjustment_new_rhod(mtile::ModelTile, colstart::Int64, col
     mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    rho_d = rho_dp .+ mtile.ref_state.rhobar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
-    satbar = mtile.ref_state.satbar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    rho_d = rho_dp .+ ref_rho_d(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
+    satbar = ref_sat(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple_rhod.(s_total, rho_d, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -1267,7 +1267,7 @@ function rain_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::In
     mu_r_index = mtile.model.grid_params.vars["mu_r"]
     mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
 
-    mubar = mtile.ref_state.mubar[1,1]
+    mubar = ref_mu(mtile.ref_state)[1,1]
     q_c_total = inv_mu_transform(mu_c[1] + mubar) # Cloud mixing ratio
     q_r_total = inv_mu_transform(mu_r[1] + mubar) # Rain mixing ratio
     q_r = q_r_total - q_c_total # Precipitation mixing ratio

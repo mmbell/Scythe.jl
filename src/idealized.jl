@@ -31,12 +31,12 @@ Return a NamedTuple of physical profiles `(q_v, rho_d, Tk, p, theta)` derived
 from a reference state, for use in initial condition construction.
 """
 function reference_profiles(ref::ReferenceState)
-    thermo = thermodynamic_tuple.(ref.sbar[:, 1], ref.xibar[:, 1], ref.mubar[:, 1])
+    thermo = thermodynamic_tuple.(ref_entropy(ref)[:, 1], ref_xi(ref)[:, 1], ref_mu(ref)[:, 1])
     q_v = [x[1] for x in thermo]
     rho_d = [x[2] for x in thermo]
     Tk = [x[3] for x in thermo]
     p = [x[4] for x in thermo]
-    theta = potential_temperature.(ref.sbar[:, 1], ref.xibar[:, 1], ref.mubar[:, 1])
+    theta = potential_temperature.(ref_entropy(ref)[:, 1], ref_xi(ref)[:, 1], ref_mu(ref)[:, 1])
     return (; q_v, rho_d, Tk, p, theta)
 end
 
@@ -66,9 +66,9 @@ function temperature_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             dT = L <= 1.0 ? dT_max * (cos(pi * L) + 1.0) / 2.0 : 0.0
             new_T = prof.Tk[k] + dT
             new_rho_d = prof.p[k] * 100.0 / (Rd * new_T)
-            patch.physical[i, 1, 1] = entropy(new_T, new_rho_d, prof.q_v[k]) - ref.sbar[k, 1]
+            patch.physical[i, 1, 1] = entropy(new_T, new_rho_d, prof.q_v[k]) - ref_entropy(ref)[k, 1]
             patch.physical[i, 2, 1] = control === :rhod ?
-                (new_rho_d - ref.rhobar[k, 1]) : (log_dry_density(new_rho_d) - ref.xibar[k, 1])
+                (new_rho_d - ref_rho_d(ref)[k, 1]) : (log_dry_density(new_rho_d) - ref_xi(ref)[k, 1])
             i += 1
         end
     end
@@ -102,9 +102,9 @@ function theta_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             theta = prof.theta[k] + dtheta
             Tk = theta / (p_0 / prof.p[k])^(Rd / Cpd)
             rho_d = prof.p[k] * 100.0 / (Rd * Tk)
-            patch.physical[i, 1, 1] = entropy(Tk, rho_d, prof.q_v[k]) - ref.sbar[k, 1]
+            patch.physical[i, 1, 1] = entropy(Tk, rho_d, prof.q_v[k]) - ref_entropy(ref)[k, 1]
             patch.physical[i, 2, 1] = control === :rhod ?
-                (rho_d - ref.rhobar[k, 1]) : (log_dry_density(rho_d) - ref.xibar[k, 1])
+                (rho_d - ref_rho_d(ref)[k, 1]) : (log_dry_density(rho_d) - ref_xi(ref)[k, 1])
             i += 1
         end
     end
@@ -247,7 +247,7 @@ function saturated_hydrostatic_profile(z::Vector{Float64}, column, ref::Referenc
                                        n_outer=5, n_inner=10)
     sfc = saturated_surface_state(; q_t, theta_e, sfc_p_hPa)
     s_rev_const = sfc.s_rev
-    sfc_xiprime = sfc.xi - ref.xibar[1, 1]
+    sfc_xiprime = sfc.xi - ref_xi(ref)[1, 1]
 
     nz = length(z)
     prof = reference_profiles(ref)
@@ -304,14 +304,14 @@ function saturated_hydrostatic_profile(z::Vector{Float64}, column, ref::Referenc
 
             mu = mu_transform.(q_v)
             mu_l = mu_transform.(q_l)
-            column.uMish[:] .= mu .- ref.mubar[:, 1]
+            column.uMish[:] .= mu .- ref_mu(ref)[:, 1]
             Btransform!(column)
             Atransform!(column)
             mu_z = Ixtransform(column)
             qvp_z = mu_z ./ dmudq.(mu, q_v)
 
             s = s_rev_const .- (q_l .* Cl .* log.(Tk ./ T_0))
-            column.uMish[:] .= s .- ref.sbar[:, 1]
+            column.uMish[:] .= s .- ref_entropy(ref)[:, 1]
             Btransform!(column)
             Atransform!(column)
             s_z = Ixtransform(column)
@@ -321,7 +321,7 @@ function saturated_hydrostatic_profile(z::Vector{Float64}, column, ref::Referenc
             Btransform!(column)
             Atransform!(column)
             xi_prime = IInttransform(column, sfc_xiprime)
-            xi = xi_prime .+ ref.xibar[:, 1]
+            xi = xi_prime .+ ref_xi(ref)[:, 1]
             rho_d = dry_density.(xi)
             rho_t = rho_d .* (1.0 .+ q_t)
             rho_p = rho_t .- rho_bar
@@ -457,10 +457,10 @@ function moist_buoyancy_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64}
                 new_mu_l = mu_transform(new_q_l)
             end
 
-            patch.physical[i, s_i, 1] = new_s - ref.sbar[k, 1]
+            patch.physical[i, s_i, 1] = new_s - ref_entropy(ref)[k, 1]
             patch.physical[i, dens_i, 1] = control === :rhod ?
-                (new_rho_d - ref.rhobar[k, 1]) : (new_xi - ref.xibar[k, 1])
-            patch.physical[i, mu_i, 1] = new_mu - ref.mubar[k, 1]
+                (new_rho_d - ref_rho_d(ref)[k, 1]) : (new_xi - ref_xi(ref)[k, 1])
+            patch.physical[i, mu_i, 1] = new_mu - ref_mu(ref)[k, 1]
             patch.physical[i, ql_i, 1] = new_mu_l
             i += 1
         end
