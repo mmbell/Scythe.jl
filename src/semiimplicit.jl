@@ -458,7 +458,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
     dz_min = dx_min = c_bar = 0.0
     if cfl_diag_on
         dz_min, dx_min = grid_spacing_minima(patch, model)
-        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(sound_speed_sq(mtile.ref_state)))))
+        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(Scythe.sound_speed_sq(mtile.ref_state)))))
     end
 
     # Loop through the timesteps

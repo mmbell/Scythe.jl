@@ -19,7 +19,10 @@ function rebuild_reference(model)
     kDim = model.grid_params.kDim
     z = gridpoints[1:kDim, 2]
     column = Scythe.reference_column(patch, model.grid_params)
-    if model.options[:exact_reference_state]
+    if endswith(model.equation_set, "_pd")
+        # Partial-density stage: physical condensate-bearing reference
+        ref = Springsteel.exact_reference_state(model.ref_state_file, z, column)
+    elseif model.options[:exact_reference_state]
         ref = Scythe.exact_reference_state(model, z, column)
     else
         ref = Scythe.calculate_reference_state(model, z, column)
@@ -146,9 +149,45 @@ transformed variables equal the transform of the summed mixing ratios.
 function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
     kDim = model.grid_params.kDim
 
+    # Partial-density runs store moisture as the densities rho_v/rho_c/rho_r and use
+    # a physical (CondensateReferenceState) reference accessed through the generic
+    # Springsteel accessors rather than the legacy sbar/mubar/rhobar fields.
+    pd = endswith(model.equation_set, "_pd")
+
     function integrals(tag)
         df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
         ncols = div(nrow(df), kDim)
+
+        if pd
+            s = df.s .+ repeat(Springsteel.ref_entropy(ref)[:, 1], ncols)
+            rho_d = df.rho_d .+ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)
+            rho_v = df.rho_v .+ repeat(Springsteel.ref_rho_v(ref)[:, 1], ncols)
+            rcbar = Springsteel.ref_rho_c(ref)
+            rho_cbar = rcbar === 0.0 ? zeros(kDim) : rcbar[:, 1]
+            rho_c = df.rho_c .+ repeat(rho_cbar, ncols)
+            rho_r = df.rho_r                         # rho_rbar = 0
+            q_v = rho_v ./ rho_d
+            q_l = (rho_c .+ rho_r) ./ rho_d
+            Tk = Scythe.temperature.(s, rho_d, q_v)
+            q_t = q_v .+ q_l
+            ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
+            # Water mass is the integral of the partial densities directly — the
+            # quantity the pd formulation conserves exactly under spline smoothing.
+            water_mass = rho_v .+ rho_c .+ rho_r
+            dry_mass = rho_d
+            mass = rho_d .+ water_mass
+            energy = rho_d .* ((Scythe.Cvd .* Tk) .+ (q_v .* Scythe.Cvv .* Tk) .+
+                               (q_l .* Scythe.Cl .* Tk) .- (Scythe.L_v.(Tk) .* q_l) .+
+                               ((1.0 .+ q_t) .* ke) .+
+                               ((1.0 .+ q_t) .* Scythe.gravity .* df.z))
+            total_entropy = rho_d .* (s .+ (q_l .* Scythe.Cl .* log.(Tk ./ Scythe.T_0)))
+            return (dry_mass = domain_integral(reshape(dry_mass, kDim, ncols), model),
+                    water_mass = domain_integral(reshape(water_mass, kDim, ncols), model),
+                    mass = domain_integral(reshape(mass, kDim, ncols), model),
+                    energy = domain_integral(reshape(energy, kDim, ncols), model),
+                    entropy = domain_integral(reshape(total_entropy, kDim, ncols), model))
+        end
+
         sbar = repeat(ref.sbar[:, 1], ncols)
         mubar = repeat(ref.mubar[:, 1], ncols)
         s = df.s .+ sbar

@@ -398,6 +398,28 @@ function write_exact_ref(path::String, z::Vector{Float64}, s::Vector{Float64},
 end
 
 """
+    write_exact_ref_pd(path, z, s, rho_d, rho_v, rho_c)
+
+Write a physical-density exact reference state file (`z s rho_d rho_v rho_c` per line)
+in the format read by `Springsteel.exact_reference_state`, which returns a
+`CondensateReferenceState`. The partial densities carry the condensate in the base so a
+saturated cloudy profile (Bryan & Fritsch 2002) is neutrally buoyant. `z` values are
+written with `string()` so they match the model gridpoints exactly when generated
+in-process. Used by the partial-density (`*_pd`) equation sets in place of the
+transformed `z s xi mu` format of [`write_exact_ref`](@ref).
+"""
+function write_exact_ref_pd(path::String, z::Vector{Float64}, s::Vector{Float64},
+                            rho_d::Vector{Float64}, rho_v::Vector{Float64},
+                            rho_c::Vector{Float64})
+    open(path, "w") do f
+        for i in 1:length(z)
+            println(f, "$(z[i]) $(s[i]) $(rho_d[i]) $(rho_v[i]) $(rho_c[i])")
+        end
+    end
+    return path
+end
+
+"""
     moist_buoyancy_bubble!(patch, gridpoints, base, ref; q_t=0.02,
                            xc, xr, zc, zr, amp=2.0/300.0, liquid_var="mu_l")
 
@@ -462,6 +484,76 @@ function moist_buoyancy_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64}
                 (new_rho_d - ref_rho_d(ref)[k, 1]) : (new_xi - ref_xi(ref)[k, 1])
             patch.physical[i, mu_i, 1] = new_mu - ref_mu(ref)[k, 1]
             patch.physical[i, ql_i, 1] = new_mu_l
+            i += 1
+        end
+    end
+    return patch
+end
+
+"""
+    moist_buoyancy_bubble_pd!(patch, gridpoints, base, ref; q_t=0.02,
+                              xc, xr, zc, zr, amp=2.0/300.0)
+
+Partial-density variant of [`moist_buoyancy_bubble!`](@ref) for the
+`primitive_equation_XZ_rhod_pd` set. Identical Bryan & Fritsch (2002) warm-bubble
+construction, but writes the moisture state as *partial densities*: the perturbations
+`s'`, `rho_d'`, `rho_v' = rho_d·q_v - ref_rho_v`, and `rho_c = rho_d·q_l - ref_rho_c`
+(all liquid is cloud, so `rho_r = 0`). `ref` is the physical reference state
+(`CondensateReferenceState` for the saturated cloudy base), whose `ref_rho_c` carries the
+base cloud so the perturbation is (near) zero outside the bubble. Outside the bubble the
+perturbations are at the spectral-smoothing level (raw base minus the smoothed reference),
+matching the transformed-variable bubble.
+"""
+function moist_buoyancy_bubble_pd!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                   base, ref::Springsteel.AbstractReferenceState; q_t=0.02,
+                                   xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0,
+                                   amp=2.0/300.0)
+    vars = patch.params.vars
+    s_i = vars["s"]; rho_d_i = vars["rho_d"]; rho_v_i = vars["rho_v"]
+    rho_c_i = vars["rho_c"]; rho_r_i = vars["rho_r"]
+    kDim = patch.params.kDim
+
+    rho_vbar = ref_rho_v(ref)
+    rcbar = ref_rho_c(ref)
+    rho_cbar = rcbar === 0.0 ? zeros(Float64, kDim) : rcbar[:, 1]
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            b_incr = L <= 1.0 ? amp * (cos(pi * L / 2.0))^2 : 0.0
+
+            new_s = base.s[k]
+            new_rho_d = base.rho_d[k]
+            new_q_v = base.q_v[k]
+            new_q_l = base.q_l[k]
+            if b_incr > 0.0
+                p = base.p[k]
+                new_theta = base.theta_rho[k] * (1.0 + b_incr) * (1.0 + q_t) /
+                            (1.0 + (base.q_v[k] / Eps))
+                new_T = new_theta / (p_0 / p)^(Rd / Cpd)
+                new_q_v = q_sat_liquid(new_T, p)
+                new_q_l = q_t - new_q_v
+                new_T_rho = new_T * (1.0 + new_q_v / Eps) / (1.0 + q_t)
+                new_rho_t = (p * 100.0) / (new_T_rho * Rd)
+                new_rho_d = new_rho_t / (1.0 + q_t)
+                new_xi = log_dry_density(new_rho_d)
+                new_mu = mu_transform(new_q_v)
+                new_mu_l = mu_transform(new_q_l)
+                new_s = entropy(new_T, new_rho_d, new_q_v)
+                dq, _ = saturation_adjustment(new_s, new_xi, new_mu, new_mu_l, eps())
+                new_s += s_condensation_relaxation(-dq, new_T, new_rho_d, new_q_v, new_q_l, p)
+                new_q_v += dq
+                new_q_l = q_t - new_q_v
+            end
+
+            patch.physical[i, s_i, 1] = new_s - ref_entropy(ref)[k, 1]
+            patch.physical[i, rho_d_i, 1] = new_rho_d - ref_rho_d(ref)[k, 1]
+            patch.physical[i, rho_v_i, 1] = (new_rho_d * new_q_v) - rho_vbar[k, 1]
+            patch.physical[i, rho_c_i, 1] = (new_rho_d * new_q_l) - rho_cbar[k]
+            patch.physical[i, rho_r_i, 1] = 0.0
             i += 1
         end
     end

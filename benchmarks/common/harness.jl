@@ -34,6 +34,11 @@ end
 # the hyphen precludes a `:pe-rho_d` symbol literal, so reference this constant.
 const STAGE_PE_RHOD = Symbol("pe-rho_d")
 
+# Partial-density moisture stage: as STAGE_PE_RHOD but the moisture variables are the
+# partial densities rho_v/rho_c/rho_r (conserving the physical water mass under spline
+# smoothing). Uses a condensate-bearing physical reference state.
+const STAGE_PE_RHOD_PD = Symbol("pe-rho_d-pd")
+
 struct Target
     name::String
     value::Float64
@@ -84,7 +89,8 @@ function parse_benchmark_args(args::Vector{String})
         end
     end
     mode in (:quick, :full) || error("--mode must be quick or full")
-    stage in (:legacy, :pe, STAGE_PE_RHOD) || error("--stage must be legacy, pe, or pe-rho_d")
+    stage in (:legacy, :pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD) ||
+        error("--stage must be legacy, pe, pe-rho_d, or pe-rho_d-pd")
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
     ts_factor > 0.0 || error("--ts-factor must be > 0")
@@ -193,7 +199,7 @@ equation stage use the wider quick tolerances.
 """
 function load_targets(name::String, opts::BenchmarkOptions)
     haskey(BENCHMARK_EXPECTED, name) || error("No expected values defined for $name")
-    use_quick_tol = opts.mode == :quick || opts.stage in (:pe, STAGE_PE_RHOD)
+    use_quick_tol = opts.mode == :quick || opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD)
     targets = Target[]
     for (diag, (value, atol_full, atol_quick, source)) in BENCHMARK_EXPECTED[name]
         atol = use_quick_tol ? atol_quick : atol_full
