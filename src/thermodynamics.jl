@@ -214,6 +214,23 @@ function thermodynamic_tuple_rhod(s::Float64, rho_d::Float64, mu::Float64)
 end
 
 """
+    thermodynamic_tuple_pd(s, rho_d, rho_v)
+
+Like [`thermodynamic_tuple_rhod`](@ref) but for the partial-density moisture equation set:
+takes the vapor partial density `rho_v = rho_d*q_v` directly instead of the transformed
+`mu`. Recovers `q_v = rho_v/rho_d`. Returns `(q_v, rho_d, Tk, p)`.
+"""
+function thermodynamic_tuple_pd(s::Float64, rho_d::Float64, rho_v::Float64)
+
+    q_v = rho_v / rho_d
+    Tk = temperature(s, rho_d, q_v)
+    pd = 0.01 * Rd * Tk * rho_d
+    e = 0.01 * Rv * Tk * rho_d * q_v
+    p = pd + e
+    return (q_v, rho_d, Tk, p)
+end
+
+"""
     potential_temperature(s, xi, mu)
 
 Dry potential temperature [K] from the prognostic variables (`s`, `xi`, `mu`). Thin
