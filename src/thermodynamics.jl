@@ -12,7 +12,7 @@ using Springsteel.Thermodynamics: Rd, Rv, Eps, Cvd, Cvv, Cpd, Cpv, Cl, Ci, gravi
     sat_pressure_liquid, sat_pressure_ice, sat_pressure_liquid_buck,
     sat_pressure_liquid_buck_dT, sat_pressure_ice_buck, q_sat_liquid, q_sat_ice,
     L_v, dewpoint, entropy, vapor_entropy, temperature, pressure, vapor_pressure,
-    mixing_ratio, dry_density, log_dry_density, P_s
+    mixing_ratio, dry_density, log_dry_density, P_s, P_xi, P_qv
 
 # `potential_temperature`, `reversible_theta_e`, `theta_rho` are NOT imported: Scythe
 # keeps transformed-variable (`s`, `xi`, `mu`) adapters of the same name below that
@@ -140,17 +140,6 @@ function dmudq(mu::Float64, q_v::Float64)
 end
 
 """
-    P_xi(Tk, rho_d, q_v)
-
-Partial derivative of pressure with respect to the log-density variable `xi`,
-`∂p/∂ξ`, at constant entropy and mixing ratio [hPa].
-"""
-function P_xi(Tk::Float64, rho_d::Float64, q_v::Float64)
-
-    return (Rd + (q_v * rho_d * Rv)) * ((rho_d * Tk) + P_s(Tk, rho_d, q_v))
-end
-
-"""
     P_xi_from_s(s, xi, mu)
 
 Compute `∂p/∂ξ` directly from the prognostic variables (`s`, `xi`, `mu`) by first
@@ -160,24 +149,6 @@ function P_xi_from_s(s::Float64, xi::Float64, mu::Float64)
 
     q_v, rho_d, Tk, p = thermodynamic_tuple(s, xi, mu)
     return P_xi(Tk, rho_d, q_v)
-end
-
-"""
-    P_qv(Tk, rho_d, q_v)
-
-Partial derivative of pressure with respect to water vapor mixing ratio, `∂p/∂q_v`,
-at constant entropy and dry-air density. Zero when `q_v` is zero.
-"""
-function P_qv(Tk::Float64, rho_d::Float64, q_v::Float64)
-
-    if (q_v != 0.0)
-        rho_v = q_v * rho_d
-        qfactor = Rv * (1 + log(rho_v/rho_v0)) - (Cvv * log(Tk/T_0)) - L_v(T_0)/T_0
-        qfactor *= P_s(Tk, rho_d, q_v)
-        return (rho_d * Rv * Tk) + qfactor
-    else
-        return 0.0
-    end
 end
 
 """
