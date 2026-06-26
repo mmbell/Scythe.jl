@@ -61,7 +61,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
     if opts.mode == :full
         num_cells = 200         # 100 m cells
         kDim = 300
-        ts = 0.03
+        ts = 0.1/3.0
         output_interval = 100.0
     else
         num_cells = 100         # 200 m cells
@@ -212,10 +212,13 @@ function bf02_moist_init!(model)
     end
 
     if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD)
-        # The PE set advects a transformed saturation ratio with satbar = 0
-        # for exact reference states: initialize it from the actual state
-        # (the base is saturated, so the ratio is 1 everywhere up to the
-        # construction tolerance)
+        # The PE sets advect a transformed saturation ratio as a PERTURBATION about
+        # the reference: the equation set reconstructs sat_ratio = inv_mu_transform(
+        # mu_sat + satbar). For the legacy/rho_d exact reference satbar = 0, so the
+        # perturbation is the full ratio. The pd condensate reference instead carries a
+        # nonzero satbar (≈1, the base q_v/q_sat), so the full ratio must NOT be stored
+        # raw here — subtract the reference satbar, or it is double-counted (sat_ratio
+        # would start at ≈2 domain-wide and drive spurious condensation/heating).
         vars = model.grid_params.vars
         sat_i = vars["mu_sat"]
         kDim_l = model.grid_params.kDim
@@ -237,8 +240,11 @@ function bf02_moist_init!(model)
                     xi_tot = patch.physical[i, vars["xi"], 1] + ref.xibar[k, 1]
                     q_v, _, Tk, p = Scythe.thermodynamic_tuple(s_tot, xi_tot, mu_tot)
                 end
-                patch.physical[i, sat_i, 1] =
-                    Scythe.mu_transform(q_v / Scythe.q_sat_liquid(Tk, p))
+                sat_full = Scythe.mu_transform(q_v / Scythe.q_sat_liquid(Tk, p))
+                # Reference satbar (transformed): zero for the legacy exact reference,
+                # nonzero (≈ the base saturation ratio) for the pd condensate reference.
+                sat_ref = pd_stage ? Scythe.mu_transform(Springsteel.ref_sat(ref)[k, 1]) : 0.0
+                patch.physical[i, sat_i, 1] = sat_full - sat_ref
                 i += 1
             end
         end

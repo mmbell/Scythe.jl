@@ -247,6 +247,38 @@ using LinearAlgebra
         end
     end
 
+    @testset "saturation IC convention (no double-count)" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_pd_condensate_mtile(tmpdir)
+            rs = mtile.ref_state
+            n = model.grid_params.kDim
+
+            # The pd equation set reconstructs sat_ratio = inv_mu_transform(mu_sat + satbar)
+            # with satbar = mu_transform(ref_sat) (raw → transformed). The benchmark IC must
+            # therefore store mu_sat as a PERTURBATION about the reference saturation; storing
+            # the full ratio double-counts the reference (sat_ratio ≈ 2 on a saturated base),
+            # which drove spurious condensation/heating. This mirrors bf02_moist_init!.
+            satbar_eqset = Scythe.mu_transform.(Springsteel.ref_sat(rs)[:, 1])
+            sat_full = similar(satbar_eqset)
+            for k in 1:n
+                qv, _, Tk, p = Scythe.thermodynamic_tuple_pd(
+                    Springsteel.ref_entropy(rs)[k, 1],
+                    Springsteel.ref_rho_d(rs)[k, 1],
+                    Springsteel.ref_rho_v(rs)[k, 1])
+                sat_full[k] = Scythe.mu_transform(qv / Scythe.q_sat_liquid(Tk, p))
+            end
+
+            # Correct (perturbation) init → the equation set sees sat_ratio ≈ 1
+            mu_sat_pert = sat_full .- satbar_eqset
+            sat_ratio = Scythe.inv_mu_transform.(mu_sat_pert .+ satbar_eqset)
+            @test all(abs.(sat_ratio .- 1.0) .< 1.0e-6)
+
+            # Buggy (full-ratio) init would double-count → sat_ratio ≈ 2
+            sat_ratio_buggy = Scythe.inv_mu_transform.(sat_full .+ satbar_eqset)
+            @test all(sat_ratio_buggy .> 1.9)
+        end
+    end
+
     @testset "saturated cloudy base is neutrally buoyant" begin
         mktempdir() do tmpdir
             mtile, patch, model, col = make_pd_condensate_mtile(tmpdir)
