@@ -21,7 +21,7 @@ export initialize_model, run_model, finalize_model
 Fundamental computational unit holding model state, tendencies, reference state,
 and spectral transform infrastructure for a single tile in the domain decomposition.
 """
-struct ModelTile
+struct ModelTile{R<:AbstractReferenceState}
     model::ModelParameters
     tile::AbstractGrid
     var_np1::Array{Float64}
@@ -34,7 +34,7 @@ struct ModelTile
     impdot_nm1::Array{Float64}
     impdot_nm2::Array{Float64}
     tilepoints::Array{Float64}
-    ref_state::ReferenceState
+    ref_state::R
     patchMap::SparseMatrixCSC{Float64, Int64}
     haloSendMap::SparseMatrixCSC{Float64, Int64}
     haloReceiveMap::SparseMatrixCSC{Float64, Int64}

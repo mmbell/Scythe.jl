@@ -16,7 +16,7 @@ and their first and second derivatives.
 - `satbar::Array{Float64}`: transformed saturation ratio profile, size `(nlevels, 3)` with columns for value, first derivative, and second derivative
 - `Pxi_bar::Float64`: domain-mean speed of sound squared [m^2/s^2]
 """
-struct ReferenceState
+struct ReferenceState <: AbstractReferenceState
     sbar::Array{Float64}
     xibar::Array{Float64}
     rhobar::Array{Float64}
@@ -27,12 +27,12 @@ end
 
 # ── Reference-state accessor interface ─────────────────────────────────────────
 # Equation sets and microphysics read reference profiles through these accessors
-# rather than reaching into struct fields directly. This decouples the call sites
-# from the concrete layout so the struct can later be replaced by a physical-density
-# reference type (carried in Springsteel) without touching every consumer.
-#
-# Each profile accessor returns the `(nlevels, 3)` array (value, 1st, 2nd vertical
-# derivative); `sound_speed_sq` returns the scalar domain-mean speed of sound squared.
+# rather than reaching into struct fields directly. The accessor generics are shared
+# with Springsteel (which defines them for the physical-density AbstractReferenceState
+# subtypes); here we extend them for the legacy transformed-variable ReferenceState so
+# both reference representations dispatch through one interface. `ref_xi`/`ref_mu` are
+# Scythe-only (transformed-variable) accessors.
+import Springsteel: ref_entropy, ref_rho_d, ref_rho_v, ref_rho_c, ref_sat, sound_speed_sq
 
 """Moist entropy reference profile `(nlevels, 3)` [J/(kg K)]."""
 ref_entropy(rs::ReferenceState) = rs.sbar
@@ -42,6 +42,12 @@ ref_xi(rs::ReferenceState) = rs.xibar
 
 """Dry-air density reference profile `(nlevels, 3)` [kg/m^3]."""
 ref_rho_d(rs::ReferenceState) = rs.rhobar
+
+"""Vapor partial-density reference profile derived from the transformed mubar."""
+ref_rho_v(rs::ReferenceState) = rs.rhobar .* inv_mu_transform.(rs.mubar)
+
+"""Legacy reference carries no separate condensate profile."""
+ref_rho_c(rs::ReferenceState) = 0.0
 
 """Transformed water-vapor mixing ratio reference profile `(nlevels, 3)`."""
 ref_mu(rs::ReferenceState) = rs.mubar
