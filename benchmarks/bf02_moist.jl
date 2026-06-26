@@ -60,8 +60,8 @@ const THETA_E = 320.0
 function bf02_moist_model(opts::BenchmarkOptions)
     if opts.mode == :full
         num_cells = 200         # 100 m cells
-        kDim = 100
-        ts = 0.1
+        kDim = 300
+        ts = 0.03
         output_interval = 100.0
     else
         num_cells = 100         # 200 m cells
