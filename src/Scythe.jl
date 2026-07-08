@@ -50,6 +50,7 @@ include("tcblModels.jl")
 include("primitive_equations.jl")
 include("io.jl")
 include("microphysics.jl")
+include("moist_compressible.jl")
 include("idealized.jl")
 
 # Export the primary driver function and the ModelParameters
