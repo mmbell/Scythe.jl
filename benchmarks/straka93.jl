@@ -39,8 +39,8 @@ end
 
 function straka_model(opts::BenchmarkOptions)
     if opts.mode == :full
-        num_cells = 1024        # 25 m cells
-        kDim = 256
+        num_cells = 256        # 25 m cells
+        kDim = 300
         ts = 0.015625
         output_interval = 100.0
     else

@@ -41,17 +41,20 @@ const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 # Partial-density variant: moisture carried as partial densities rho_v/rho_c/rho_r
 const PE_VARS_PD = ["s", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
+# Entropy-density variant: slot 1 carries sigma = rho_d*s instead of s
+const PE_VARS_SIGMA = ["sigma", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
 function bf02_moist_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
+    stage == STAGE_PE_SIGMA && return PE_VARS_SIGMA
     stage == STAGE_PE_RHOD_PD && return PE_VARS_PD
     stage == STAGE_PE_RHOD && return PE_VARS_RHOD
     return PE_VARS
 end
 # Liquid water variable(s) per stage (PE splits liquid into cloud and rain; the
-# partial-density stage carries them as densities rho_c/rho_r)
+# partial-density and entropy-density stages carry them as densities rho_c/rho_r)
 function liquid_vars(stage)
     stage == :legacy && return ["mu_l"]
-    stage == STAGE_PE_RHOD_PD && return ["rho_c", "rho_r"]
+    stage in (STAGE_PE_RHOD_PD, STAGE_PE_SIGMA) && return ["rho_c", "rho_r"]
     return ["mu_c", "mu_r"]
 end
 const Q_T = 0.02
@@ -59,13 +62,13 @@ const THETA_E = 320.0
 
 function bf02_moist_model(opts::BenchmarkOptions)
     if opts.mode == :full
-        num_cells = 200         # 100 m cells
-        kDim = 300
-        ts = 0.1/3.0
+        num_cells = 100         # 100 m cells
+        kDim = 150
+        ts = 0.1/2.0
         output_interval = 100.0
     else
-        num_cells = 100         # 200 m cells
-        kDim = 50
+        num_cells = 50         # 200 m cells
+        kDim = 75
         # The condensation relaxation timescale does not coarsen with the
         # grid, so quick mode keeps the full-mode timestep
         ts = 0.1
@@ -77,14 +80,16 @@ function bf02_moist_model(opts::BenchmarkOptions)
         equation_set = "BF02_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
         options = Dict(:semiimplicit => true, :exact_reference_state => true)
-    elseif opts.stage in (STAGE_PE_RHOD, STAGE_PE_RHOD_PD)
+    elseif opts.stage in (STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
         # Linear dry-air-density prognostic variant (mass-conserving continuity)
         # with semi-implicit acoustics on the mass flux phi = rhobar_d * w
         # (Phase 2; see reference/Semiimplicit_linear_rhod.tex). The pd stage
         # additionally carries the moisture as partial densities (Phase 3) on a
-        # condensate-bearing physical reference state.
-        equation_set = opts.stage == STAGE_PE_RHOD_PD ?
-            "primitive_equation_XZ_rhod_pd" : "primitive_equation_XZ_rhod"
+        # condensate-bearing physical reference state; the moist-compressible stage
+        # (Stage 2) further carries the entropy density sigma = rho_d*s in slot 1.
+        equation_set = opts.stage == STAGE_PE_SIGMA ? "primitive_equation_XZ_sigma" :
+            opts.stage == STAGE_PE_RHOD_PD ? "primitive_equation_XZ_rhod_pd" :
+            "primitive_equation_XZ_rhod"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
         options = Dict(:semiimplicit => true, :exact_reference_state => true,
@@ -192,11 +197,15 @@ function bf02_moist_init!(model)
     # partial-density stage uses a physical (condensate-bearing) reference written
     # as `z s rho_d rho_v rho_c`; the other stages use the transformed `z s xi mu`.
     pd_stage = opts.stage == STAGE_PE_RHOD_PD
+    sigma_stage = opts.stage == STAGE_PE_SIGMA
+    physical_stage = pd_stage || sigma_stage   # condensate-bearing physical reference
     patch.physical .= 0.0
-    if pd_stage
+    if physical_stage
         Scythe.write_exact_ref_pd(model.ref_state_file, z, base.s, base.rho_d,
                                   base.rho_d .* base.q_v, base.rho_d .* base.q_l)
         ref = Springsteel.exact_reference_state(model.ref_state_file, z, column)
+        # moist_buoyancy_bubble_pd! writes slot 1 as s' (pd) or sigma'=rho_d*s-sigmabar
+        # (PE_SIGMA), detected from the grid's variable names.
         Scythe.moist_buoyancy_bubble_pd!(patch, gridpoints, base, ref;
                                          q_t=Q_T, xc=10000.0, xr=2000.0,
                                          zc=2000.0, zr=2000.0, amp=2.0/300.0)
@@ -211,7 +220,7 @@ function bf02_moist_init!(model)
                                       control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
     end
 
-    if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD)
+    if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
         # The PE sets advect a transformed saturation ratio as a PERTURBATION about
         # the reference: the equation set reconstructs sat_ratio = inv_mu_transform(
         # mu_sat + satbar). For the legacy/rho_d exact reference satbar = 0, so the
@@ -226,16 +235,22 @@ function bf02_moist_init!(model)
         i = 1
         for _ in 1:Scythe.num_columns(patch)
             for k in 1:kDim_l
-                s_tot = patch.physical[i, vars["s"], 1] + Springsteel.ref_entropy(ref)[k, 1]
-                if pd_stage
+                if physical_stage
                     rho_d_tot = patch.physical[i, vars["rho_d"], 1] + Springsteel.ref_rho_d(ref)[k, 1]
                     rho_v_tot = patch.physical[i, vars["rho_v"], 1] + Springsteel.ref_rho_v(ref)[k, 1]
+                    # Recover specific entropy: from sigma'=rho_d*s-sigmabar, or directly from s'.
+                    s_tot = sigma_stage ?
+                        (patch.physical[i, vars["sigma"], 1] +
+                         Springsteel.ref_rho_d(ref)[k, 1] * Springsteel.ref_entropy(ref)[k, 1]) / rho_d_tot :
+                        patch.physical[i, vars["s"], 1] + Springsteel.ref_entropy(ref)[k, 1]
                     q_v, _, Tk, p = Scythe.thermodynamic_tuple_pd(s_tot, rho_d_tot, rho_v_tot)
                 elseif rhod_stage
+                    s_tot = patch.physical[i, vars["s"], 1] + Springsteel.ref_entropy(ref)[k, 1]
                     mu_tot = patch.physical[i, vars["mu"], 1] + ref.mubar[k, 1]
                     rho_d_tot = patch.physical[i, vars["rho_d"], 1] + ref.rhobar[k, 1]
                     q_v, _, Tk, p = Scythe.thermodynamic_tuple_rhod(s_tot, rho_d_tot, mu_tot)
                 else
+                    s_tot = patch.physical[i, vars["s"], 1] + Springsteel.ref_entropy(ref)[k, 1]
                     mu_tot = patch.physical[i, vars["mu"], 1] + ref.mubar[k, 1]
                     xi_tot = patch.physical[i, vars["xi"], 1] + ref.xibar[k, 1]
                     q_v, _, Tk, p = Scythe.thermodynamic_tuple(s_tot, xi_tot, mu_tot)
@@ -243,7 +258,7 @@ function bf02_moist_init!(model)
                 sat_full = Scythe.mu_transform(q_v / Scythe.q_sat_liquid(Tk, p))
                 # Reference satbar (transformed): zero for the legacy exact reference,
                 # nonzero (≈ the base saturation ratio) for the pd condensate reference.
-                sat_ref = pd_stage ? Scythe.mu_transform(Springsteel.ref_sat(ref)[k, 1]) : 0.0
+                sat_ref = physical_stage ? Scythe.mu_transform(Springsteel.ref_sat(ref)[k, 1]) : 0.0
                 patch.physical[i, sat_i, 1] = sat_full - sat_ref
                 i += 1
             end
@@ -282,12 +297,17 @@ end
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
 function moist_fields(df, ref, kDim, base, stage)
     ncols = div(nrow(df), kDim)
-    if stage == STAGE_PE_RHOD_PD
-        # Partial-density stage: reconstruct xi/mu/mu_liq from the partial densities
-        # and a physical (CondensateReferenceState) reference, then reuse the
+    if stage in (STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
+        # Partial-density / entropy-density stage: reconstruct xi/mu/mu_liq from the partial
+        # densities and a physical (CondensateReferenceState) reference, then reuse the
         # transformed-variable theta_e / saturation diagnostics.
-        s = df.s .+ repeat(Springsteel.ref_entropy(ref)[:, 1], ncols)
         rho_d = df.rho_d .+ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)
+        if "sigma" in names(df)
+            sigmabar = Springsteel.ref_rho_d(ref)[:, 1] .* Springsteel.ref_entropy(ref)[:, 1]
+            s = (df.sigma .+ repeat(sigmabar, ncols)) ./ rho_d
+        else
+            s = df.s .+ repeat(Springsteel.ref_entropy(ref)[:, 1], ncols)
+        end
         rho_v = df.rho_v .+ repeat(Springsteel.ref_rho_v(ref)[:, 1], ncols)
         rcbar = Springsteel.ref_rho_c(ref)
         rho_cbar = rcbar === 0.0 ? zeros(kDim) : rcbar[:, 1]

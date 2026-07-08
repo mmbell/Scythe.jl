@@ -32,7 +32,7 @@ end
 # subtypes); here we extend them for the legacy transformed-variable ReferenceState so
 # both reference representations dispatch through one interface. `ref_xi`/`ref_mu` are
 # Scythe-only (transformed-variable) accessors.
-import Springsteel: ref_entropy, ref_rho_d, ref_rho_v, ref_rho_c, ref_sat, sound_speed_sq
+import Springsteel: ref_entropy, ref_sigma, ref_rho_d, ref_rho_v, ref_rho_c, ref_sat, sound_speed_sq
 
 """Moist entropy reference profile `(nlevels, 3)` [J/(kg K)]."""
 ref_entropy(rs::ReferenceState) = rs.sbar
@@ -253,12 +253,12 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, co
 
     # Open the file with sounding information
     ref = open(model.ref_state_file,"r")
-    
+
     # Allocate some empty arrays
     alt = Vector{Float64}(undef,0)
     theta_in = Vector{Float64}(undef,0)
     q_v_in = Vector{Float64}(undef,0)
-    
+
     # Read the file
     surface = readline(ref)
     sfc_pressure = parse(Float64,split(surface)[1])
@@ -382,7 +382,7 @@ function calculate_reference_state(model::ModelParameters, z::Array{Float64}, co
         Ps = P_s.(Tk_new, rho_d_new, q_v_new)
         Pxi = P_xi.(Tk_new, rho_d_new, q_v_new)
         Pqv = P_qv.(Tk_new, rho_d_new, q_v_new)
-    
+
         xi_new_z = ((-gravity .* rho_t_new) .- (Ps .* s_new_z) .- (Pqv .* q_v_new_z)) ./ Pxi
         column.uMish[:] .= xi_new_z[:]
         Btransform!(column)
@@ -458,12 +458,12 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64}, c
 
     # Open the file with sounding information
     ref = open(model.ref_state_file,"r")
-    
+
     # Allocate some empty arrays
     alt = Vector{Float64}(undef,0)
     theta_in = Vector{Float64}(undef,0)
     q_v_in = Vector{Float64}(undef,0)
-    
+
     # Read the file
     surface = readline(ref)
     sfc_pressure = parse(Float64,split(surface)[1])
@@ -542,7 +542,7 @@ function interpolate_reference_file(model::ModelParameters, z::Array{Float64}, c
     #e = vapor_pressure.(p_new,q_v)
     #rho_d = 100.0 .* (p_new .- e) ./ (Tk .* Rd)
     #rho_t = rho_d .* (1.0 .+ q_v)
-    
+
     sbar = zeros(Float64,length(z),3)
     xibar = zeros(Float64,length(z),3)
     mubar = zeros(Float64,length(z),3)
@@ -594,6 +594,17 @@ function transform_reference_state!(column, ref::Array{Float64})
     ref[:,3] .= Ixxtransform(column)
     return ref
 end
+
+"""
+    uses_physical_reference(equation_set) -> Bool
+
+True for equation sets that consume the *physical* (partial-density, condensate-bearing)
+Springsteel reference state directly — `ref_rho_v`/`ref_rho_c` profiles rather than the legacy
+xi/mu derived view. These are the partial-density `_pd` sets and the `_sigma`
+family (which carries the entropy density σ=ρ_d·s on the same physical reference).
+"""
+uses_physical_reference(equation_set::AbstractString) =
+    endswith(equation_set, "_pd") || endswith(equation_set, "_sigma")
 
 """
     exact_reference_state(model::ModelParameters, z::Array{Float64}, column)

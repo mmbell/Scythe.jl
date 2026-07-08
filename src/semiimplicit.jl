@@ -84,7 +84,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         # vapor/condensate partial-density profiles (ref_rho_v / ref_rho_c) directly, so
         # they keep the Springsteel physical reference state rather than the legacy
         # xi/mu derived view used by the older equation sets.
-        physical_ref = endswith(model.equation_set, "_pd")
+        physical_ref = uses_physical_reference(model.equation_set)
 
         if (model.options[:exact_reference_state])
             ref_state = physical_ref ?
@@ -1135,7 +1135,11 @@ vertical-diffusion solve; only the prognostic slot names differ.
 """
 function diffusion_timestep_pd(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
-    s_index = mtile.model.grid_params.vars["s"]
+    # Slot 1 is the entropy variable: intensive "s" (rhod_pd set) or the entropy density
+    # "sigma" (primitive_equation_XZ_sigma set). The vertical-diffusion solve is identical for
+    # either, so resolve whichever name this model carries.
+    vars = mtile.model.grid_params.vars
+    s_index = haskey(vars, "sigma") ? vars["sigma"] : vars["s"]
     rho_v_index = mtile.model.grid_params.vars["rho_v"]
     rho_c_index = mtile.model.grid_params.vars["rho_c"]
     rho_r_index = mtile.model.grid_params.vars["rho_r"]

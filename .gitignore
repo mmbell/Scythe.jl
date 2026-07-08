@@ -24,3 +24,5 @@ spectral_out_*.csv
 # Benchmark run artifacts (committed reference data lives in benchmarks/reference_data)
 benchmarks/output/
 benchmarks/results/
+
+reference/

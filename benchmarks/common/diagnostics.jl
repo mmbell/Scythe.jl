@@ -7,6 +7,16 @@
 using CSV
 using DataFrames
 
+# Internal-energy latent reference constant (Bryan & Fritsch 2002). The total-energy budget
+# of this compressible EOS uses each species' own sensible heat (Cvd/Cvv/Cl) plus a CONSTANT
+# latent offset on the vapor density: the temperature dependence of L_v(T) is carried by the
+# Cvv vs Cl heat-capacity difference, so the conserved internal energy is
+#   ρ_d·Cvd·T + ρ_v·Cvv·T + ρ_c·Cl·T + ρ_v·L_const ,   L_const = L_v0 − (Cpv − Cl)·T_0 .
+# Using the enthalpy form −L_v(T)·q_l instead double-counts that dependence and drifts
+# spuriously (positive, condensation-driven) as condensate forms — see the single-column
+# closure test in test/test_partial_density.jl.
+const L_const = Scythe.L_v0 - (Scythe.Cpv - Scythe.Cl) * Scythe.T_0
+
 """
     rebuild_reference(model) -> (ref, z, kDim)
 
@@ -19,8 +29,8 @@ function rebuild_reference(model)
     kDim = model.grid_params.kDim
     z = gridpoints[1:kDim, 2]
     column = Scythe.reference_column(patch, model.grid_params)
-    if endswith(model.equation_set, "_pd")
-        # Partial-density stage: physical condensate-bearing reference
+    if Scythe.uses_physical_reference(model.equation_set)
+        # Partial-density / entropy-density stage: physical condensate-bearing reference
         ref = Springsteel.exact_reference_state(model.ref_state_file, z, column)
     elseif model.options[:exact_reference_state]
         ref = Scythe.exact_reference_state(model, z, column)
@@ -52,6 +62,29 @@ output ordering.
 function theta_perturbation(df::DataFrame, ref, kDim::Int)
     npts = nrow(df)
     ncols = div(npts, kDim)
+
+    # Physical-density sets (pd / moist_compressible) store rho_v and use a Springsteel
+    # reference; reconstruct θ = T·(p_0/p)^(Rd/Cpd) from the densities and (s or σ).
+    if "rho_v" in names(df)
+        rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
+        rho_d = df.rho_d .+ repeat(rho_dbar, ncols)
+        if "sigma" in names(df)
+            sigmabar = rho_dbar .* Springsteel.ref_entropy(ref)[:, 1]
+            s = (df.sigma .+ repeat(sigmabar, ncols)) ./ rho_d
+        else
+            s = df.s .+ repeat(Springsteel.ref_entropy(ref)[:, 1], ncols)
+        end
+        rvbar = Springsteel.ref_rho_v(ref)
+        rho_vbar = rvbar === 0.0 ? zeros(kDim) : rvbar[:, 1]
+        q_v = (df.rho_v .+ repeat(rho_vbar, ncols)) ./ rho_d
+        θ(s_, rd_, qv_) = Scythe.temperature(s_, rd_, qv_) *
+            (Scythe.p_0 / Scythe.pressure(s_, rd_, qv_))^(Scythe.Rd / Scythe.Cpd)
+        theta = θ.(s, rho_d, q_v)
+        theta0 = θ.(repeat(Springsteel.ref_entropy(ref)[:, 1], ncols),
+                    repeat(rho_dbar, ncols), repeat(rho_vbar ./ rho_dbar, ncols))
+        return reshape(theta .- theta0, kDim, ncols), ncols
+    end
+
     sbar = repeat(ref.sbar[:, 1], ncols)
     xibar = repeat(ref.xibar[:, 1], ncols)
     mubar = repeat(ref.mubar[:, 1], ncols)
@@ -151,16 +184,24 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
 
     # Partial-density runs store moisture as the densities rho_v/rho_c/rho_r and use
     # a physical (CondensateReferenceState) reference accessed through the generic
-    # Springsteel accessors rather than the legacy sbar/mubar/rhobar fields.
-    pd = endswith(model.equation_set, "_pd")
+    # Springsteel accessors rather than the legacy sbar/mubar/rhobar fields. The
+    # moist_compressible (entropy-density) set additionally stores slot 1 as sigma = rho_d*s.
+    pd = Scythe.uses_physical_reference(model.equation_set)
 
     function integrals(tag)
         df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
         ncols = div(nrow(df), kDim)
 
         if pd
-            s = df.s .+ repeat(Springsteel.ref_entropy(ref)[:, 1], ncols)
             rho_d = df.rho_d .+ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)
+            # Recover specific entropy s: directly (s set) or from the entropy density
+            # sigma = rho_d*s carried by the moist_compressible set (s = (sigma'+sigmabar)/rho_d).
+            if "sigma" in names(df)
+                sigmabar = Springsteel.ref_rho_d(ref)[:, 1] .* Springsteel.ref_entropy(ref)[:, 1]
+                s = (df.sigma .+ repeat(sigmabar, ncols)) ./ rho_d
+            else
+                s = df.s .+ repeat(Springsteel.ref_entropy(ref)[:, 1], ncols)
+            end
             rho_v = df.rho_v .+ repeat(Springsteel.ref_rho_v(ref)[:, 1], ncols)
             rcbar = Springsteel.ref_rho_c(ref)
             rho_cbar = rcbar === 0.0 ? zeros(kDim) : rcbar[:, 1]
@@ -177,7 +218,7 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
             dry_mass = rho_d
             mass = rho_d .+ water_mass
             energy = rho_d .* ((Scythe.Cvd .* Tk) .+ (q_v .* Scythe.Cvv .* Tk) .+
-                               (q_l .* Scythe.Cl .* Tk) .- (Scythe.L_v.(Tk) .* q_l) .+
+                               (q_l .* Scythe.Cl .* Tk) .+ (q_v .* L_const) .+
                                ((1.0 .+ q_t) .* ke) .+
                                ((1.0 .+ q_t) .* Scythe.gravity .* df.z))
             total_entropy = rho_d .* (s .+ (q_l .* Scythe.Cl .* log.(Tk ./ Scythe.T_0)))

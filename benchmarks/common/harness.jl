@@ -39,6 +39,11 @@ const STAGE_PE_RHOD = Symbol("pe-rho_d")
 # smoothing). Uses a condensate-bearing physical reference state.
 const STAGE_PE_RHOD_PD = Symbol("pe-rho_d-pd")
 
+# Entropy-density stage (Stage 2): as STAGE_PE_RHOD_PD but slot 1 carries the extensive
+# entropy density sigma = rho_d*s instead of the intensive specific entropy s, so the spline
+# smoothing conserves the entropy-density integral ∫sigma (equation set PE_SIGMA_XZ).
+const STAGE_PE_SIGMA = Symbol("pe-sigma")
+
 struct Target
     name::String
     value::Float64
@@ -89,8 +94,8 @@ function parse_benchmark_args(args::Vector{String})
         end
     end
     mode in (:quick, :full) || error("--mode must be quick or full")
-    stage in (:legacy, :pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD) ||
-        error("--stage must be legacy, pe, pe-rho_d, or pe-rho_d-pd")
+    stage in (:legacy, :pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA) ||
+        error("--stage must be legacy, pe, pe-rho_d, pe-rho_d-pd, or pe-sigma")
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
     ts_factor > 0.0 || error("--ts-factor must be > 0")

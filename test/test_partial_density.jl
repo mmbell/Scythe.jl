@@ -279,6 +279,92 @@ using LinearAlgebra
         end
     end
 
+    # ──────────────────────────────────────────────
+    # Energy-closure: condensation conserves internal energy (Stage 1 arbiter)
+    # ──────────────────────────────────────────────
+    #
+    # condensation_adjustment_pd is a purely LOCAL (per-level) map: at fixed rho_d it
+    # moves mass rho_v -> rho_c and updates s, with T recovered from the EOS. A closed
+    # reversible phase change conserves the parcel internal energy (latent -> sensible,
+    # no external heat, no p·dα_d work since rho_d is fixed). The thermodynamically clean
+    # internal-energy density of this EOS is each species' sensible heat plus a CONSTANT
+    # latent offset on vapor (Bryan & Fritsch 2002, eq. 3; the constant absorbs the
+    # temperature dependence of L_v via the Cvv/Cl sensible terms):
+    #
+    #   E = rho_d·Cvd·T + rho_v·Cvv·T + (rho_c+rho_r)·Cl·T + rho_v·L_const ,
+    #   L_const = L_v0 − (Cpv − Cl)·T_0
+    #
+    # This is the invariant the energy diagnostic (benchmarks/common/diagnostics.jl) must
+    # compute — NOT the enthalpy form `− L_v(T)·q_l`, which double-counts the temperature
+    # dependence and drifts spuriously as condensate forms. The saturation adjustment is a
+    # first-order explicit step (q_s linearized, pre-step thermo, tau_r relaxation), so its
+    # energy non-closure is O(δ) in the condensed amount δ and vanishes for the small
+    # per-step supersaturation of a real run; the test uses a realistic small δ.
+    @testset "condensation conserves internal energy" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_pd_condensate_mtile(tmpdir)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            rho_d_i = vars["rho_d"]; rho_v_i = vars["rho_v"]
+            rho_c_i = vars["rho_c"]; rho_r_i = vars["rho_r"]
+            s_i = vars["s"]; mu_sat_i = vars["mu_sat"]
+
+            rs = mtile.ref_state
+            rho_dbar = Springsteel.ref_rho_d(rs)[:, 1]
+            rho_vbar = Springsteel.ref_rho_v(rs)[:, 1]
+            rho_cbar = Springsteel.ref_rho_c(rs)[:, 1]
+            sbar = Springsteel.ref_entropy(rs)[:, 1]
+            satbar_t = Scythe.mu_transform.(Springsteel.ref_sat(rs)[:, 1])
+
+            L_const = Scythe.L_v0 - (Scythe.Cpv - Scythe.Cl) * Scythe.T_0
+
+            # Form-A internal energy density per level from the var_np1 perturbations.
+            function internal_energy(v)
+                E = zeros(kDim)
+                for k in 1:kDim
+                    rho_d = v[k, rho_d_i] + rho_dbar[k]
+                    rho_v = v[k, rho_v_i] + rho_vbar[k]
+                    rho_c = v[k, rho_c_i] + rho_cbar[k]
+                    rho_r = v[k, rho_r_i]
+                    s = v[k, s_i] + sbar[k]
+                    q_v = rho_v / rho_d
+                    Tk = Scythe.temperature(s, rho_d, q_v)
+                    E[k] = rho_d * Scythe.Cvd * Tk + rho_v * Scythe.Cvv * Tk +
+                           (rho_c + rho_r) * Scythe.Cl * Tk + rho_v * L_const
+                end
+                return E
+            end
+
+            water(v) = v[1:kDim, rho_v_i] .+ rho_vbar .+
+                       v[1:kDim, rho_c_i] .+ rho_cbar .+ v[1:kDim, rho_r_i]
+
+            # Supersaturate the lower half of the (saturated cloudy) base column by a small,
+            # realistic amount so the explicit-step O(δ) error is negligible.
+            pert = 1:div(kDim, 2)
+            dq = 5.0e-5
+            mtile.var_np1 .= 0.0
+            mtile.var_np1[pert, rho_v_i] .= rho_dbar[pert] .* dq
+            mtile.var_np1[pert, mu_sat_i] .= Scythe.mu_transform(1.0) .- satbar_t[pert]
+
+            E_before = internal_energy(mtile.var_np1)
+            water_before = water(mtile.var_np1)
+
+            Scythe.condensation_adjustment_pd(mtile, 1, kDim, 1)
+
+            E_after = internal_energy(mtile.var_np1)
+            water_after = water(mtile.var_np1)
+
+            # Condensation actually occurred where supersaturated
+            @test all(mtile.var_np1[pert, rho_c_i] .> 0.0)
+
+            # Water mass conserved exactly; internal energy conserved (Form-A) to the
+            # explicit-step floor — orders of magnitude below the spurious drift the
+            # enthalpy diagnostic produced.
+            @test maximum(abs.(water_after .- water_before)) < 1.0e-12
+            @test maximum(abs.(E_after .- E_before) ./ abs.(E_before)) < 1.0e-6
+        end
+    end
+
     @testset "saturated cloudy base is neutrally buoyant" begin
         mktempdir() do tmpdir
             mtile, patch, model, col = make_pd_condensate_mtile(tmpdir)

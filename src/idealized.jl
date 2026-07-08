@@ -112,6 +112,54 @@ function theta_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64},
 end
 
 """
+    theta_bubble_pd!(patch, gridpoints, ref; xc, xr, zc, zr, dtheta_max)
+
+Dry warm-bubble initial condition for the physical-density equation sets
+(`primitive_equation_XZ_rhod_pd`, `primitive_equation_XZ_sigma`) on a `Springsteel` reference state.
+The constant-pressure θ perturbation mirrors [`theta_bubble!`](@ref) but writes the
+physical-density slots: slot 1 is the intensive entropy `s'` (pd) or the entropy density
+`σ' = ρ_d·s − σ̂` (when a `"sigma"` slot is present), slot 2 is `ρ_d'`, and the moisture slots
+(`rho_v`, `rho_c`, `rho_r`) are zero (a dry run of the moist set, `q_v = 0`).
+"""
+function theta_bubble_pd!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                          ref::Springsteel.AbstractReferenceState;
+                          xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0)
+    vars = patch.params.vars
+    sigma_mode = haskey(vars, "sigma")
+    s1_i = sigma_mode ? vars["sigma"] : vars["s"]
+    rho_d_i = vars["rho_d"]; rho_v_i = vars["rho_v"]
+    rho_c_i = vars["rho_c"]; rho_r_i = vars["rho_r"]
+    kDim = patch.params.kDim
+    sbar = ref_entropy(ref); rho_dbar = ref_rho_d(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            dtheta = L <= 1.0 ? dtheta_max * (cos(pi * L / 2.0))^2 : 0.0
+            s_ref = sbar[k, 1]; rho_dref = rho_dbar[k, 1]
+            T_ref = temperature(s_ref, rho_dref, 0.0)
+            p_ref = pressure(s_ref, rho_dref, 0.0)          # hPa
+            exner = (p_0 / p_ref)^(Rd / Cpd)
+            theta = (T_ref * exner) + dtheta
+            Tk = theta / exner
+            rho_d = p_ref * 100.0 / (Rd * Tk)               # constant-pressure perturbation
+            s = entropy(Tk, rho_d, 0.0)
+            patch.physical[i, s1_i, 1] = sigma_mode ? (rho_d * s) - (rho_dref * s_ref) :
+                                                      s - s_ref
+            patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
+            patch.physical[i, rho_v_i, 1] = 0.0
+            patch.physical[i, rho_c_i, 1] = 0.0
+            patch.physical[i, rho_r_i, 1] = 0.0
+            i += 1
+        end
+    end
+    return patch
+end
+
+"""
     saturated_surface_state(; q_t=0.02, theta_e=320.0, sfc_p_hPa=1000.0, T_guess=290.0, tol=1.0e-10)
 
 Find the saturated surface state at pressure `sfc_p_hPa` with constant total
@@ -509,9 +557,14 @@ function moist_buoyancy_bubble_pd!(patch::AbstractGrid, gridpoints::Matrix{Float
                                    xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0,
                                    amp=2.0/300.0)
     vars = patch.params.vars
-    s_i = vars["s"]; rho_d_i = vars["rho_d"]; rho_v_i = vars["rho_v"]
+    rho_d_i = vars["rho_d"]; rho_v_i = vars["rho_v"]
     rho_c_i = vars["rho_c"]; rho_r_i = vars["rho_r"]
     kDim = patch.params.kDim
+
+    # Slot 1 is either the intensive entropy s' (rhod_pd set) or the entropy density
+    # sigma' = rho_d*s - sigmabar (moist_compressible set). Detect which this grid carries.
+    sigma_mode = haskey(vars, "sigma")
+    s1_i = sigma_mode ? vars["sigma"] : vars["s"]
 
     rho_vbar = ref_rho_v(ref)
     rcbar = ref_rho_c(ref)
@@ -549,7 +602,9 @@ function moist_buoyancy_bubble_pd!(patch::AbstractGrid, gridpoints::Matrix{Float
                 new_q_l = q_t - new_q_v
             end
 
-            patch.physical[i, s_i, 1] = new_s - ref_entropy(ref)[k, 1]
+            patch.physical[i, s1_i, 1] = sigma_mode ?
+                (new_rho_d * new_s) - (ref_rho_d(ref)[k, 1] * ref_entropy(ref)[k, 1]) :
+                new_s - ref_entropy(ref)[k, 1]
             patch.physical[i, rho_d_i, 1] = new_rho_d - ref_rho_d(ref)[k, 1]
             patch.physical[i, rho_v_i, 1] = (new_rho_d * new_q_v) - rho_vbar[k, 1]
             patch.physical[i, rho_c_i, 1] = (new_rho_d * new_q_l) - rho_cbar[k]

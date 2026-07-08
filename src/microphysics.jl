@@ -326,7 +326,7 @@ function s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
     if RH <= 0.0
         RH = 1.0e-6
     end
-    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*(log(RH)) ))
+    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) )#+ (Rv*(log(RH)) ))
     return ds
 end
 
@@ -358,7 +358,7 @@ function s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
     if RH <= 0.0
         RH = 1.0e-6
     end
-    ds = (q_cond - q_evap) * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*(log(RH))) )
+    ds = (q_cond - q_evap) * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) )# + (Rv*(log(RH))) )
     return ds
 end
 
@@ -391,7 +391,7 @@ function s_condensation_relaxation(q_cond, Tk, rho_d, q_v, q_l, p)
     Cm = (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
     e = vapor_pressure(p, q_v)
     sat_e = sat_pressure_liquid_buck(Tk, p)
-    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(e/sat_e)) )
+    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) )# + (Rv*log(e/sat_e)) )
     return ds
 end
 
@@ -1066,6 +1066,88 @@ function condensation_adjustment_pd(mtile::ModelTile, colstart::Int64, colend::I
     rho_v .= rho_v .- dmass
     rho_c .= rho_c .+ dmass
     s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
+
+end
+
+"""
+    condensation_adjustment_sigma(mtile, colstart, colend, t)
+
+Entropy-density (`σ = ρ_d·s`) variant of [`condensation_adjustment_pd`](@ref) for the
+[`primitive_equation_XZ_sigma`](@ref) set. Identical saturation-adjustment logic, but slot 1 holds
+`σ'` (variable `"sigma"`): the specific entropy is recovered as `s = (σ' + σ̂)/ρ_d` with
+`σ̂ = ρ̂_d·ŝ`, and the entropy source acts on the density, `σ' += τ_r·ρ_d·s_condensation(...)`.
+The vapor/cloud partial-density moves are unchanged (so `ρ_v + ρ_c` is conserved exactly).
+"""
+function condensation_adjustment_sigma(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    sigma_index = mtile.model.grid_params.vars["sigma"]
+    sigmap = view(mtile.var_np1,colstart:colend,sigma_index)
+
+    # Density (rho_d') is not modified
+    rho_d_index = mtile.model.grid_params.vars["rho_d"]
+    rho_dp = view(mtile.var_np1,colstart:colend,rho_d_index)
+
+    rho_v_index = mtile.model.grid_params.vars["rho_v"]
+    rho_v = view(mtile.var_np1,colstart:colend,rho_v_index)
+
+    rho_c_index = mtile.model.grid_params.vars["rho_c"]
+    rho_c = view(mtile.var_np1,colstart:colend,rho_c_index)
+
+    rho_r_index = mtile.model.grid_params.vars["rho_r"]
+    rho_r = view(mtile.var_np1,colstart:colend,rho_r_index)
+
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
+
+    refstate = mtile.ref_state
+    rho_dbar = ref_rho_d(refstate)[:,1]
+    rho_vbar = ref_rho_v(refstate)[:,1]
+    rcbar = ref_rho_c(refstate)
+    rho_cbar = rcbar === 0.0 ? zero(rho_dbar) : rcbar[:,1]
+    sbar = ref_entropy(refstate)[:,1]
+    satbar = mu_transform.(ref_sat(refstate)[:,1])   # raw → transformed (linear mu)
+
+    rho_d = rho_dp .+ rho_dbar
+    rho_v_total = rho_v .+ rho_vbar
+    rho_c_total = rho_c .+ rho_cbar
+    sigmabar = rho_dbar .* sbar
+    s_total = (sigmap .+ sigmabar) ./ rho_d          # specific entropy s = σ/ρ_d
+
+    thermo = thermodynamic_tuple_pd.(s_total, rho_d, rho_v_total)
+    q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
+    Tk = [x[3] for x in thermo]     # Temperature in K
+    p = [x[4] for x in thermo]      # Total air pressure
+    q_c = rho_c_total ./ rho_d      # Cloud water mixing ratio
+    q_r = rho_r ./ rho_d            # Rain water mixing ratio
+    q_l = q_c .+ q_r                # Liquid mixing ratio
+    q_sat = q_sat_liquid.(Tk, p)
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+
+    sat_ratio = inv_mu_transform.(mu_sat .+ satbar)
+    qss = (q_sat .* sat_ratio) .- q_sat
+
+    # Do the increment using explicit Euler integration
+    tau_r = 0.25
+    q_cond = (q_v .- q_sat .- qss) ./ (1.0 .+ Q_s)
+    for i in 1:length(q_cond)
+        if qss[i] < 0.0
+            if q_cond[i] > 0.0
+                q_cond[i] = 0.0
+            else
+                q_cond[i] = max(-q_c[i], q_cond[i])
+            end
+        else
+            q_cond[i] = min(q_v[i], q_cond[i])
+        end
+    end
+
+    # Move condensed mass between vapor and cloud partial densities (Δrho_v = -Δrho_c),
+    # conserving rho_v + rho_c exactly.
+    dmass = @. tau_r * rho_d * q_cond
+    rho_v .= rho_v .- dmass
+    rho_c .= rho_c .+ dmass
+    # Entropy source acts on the density: σ' += τ_r·ρ_d·s_condensation.
+    sigmap .= @. sigmap + tau_r * rho_d * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
 end
 
