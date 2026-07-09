@@ -138,19 +138,16 @@ function bf02_dry_init!(model)
     patch.physical .= 0.0
 
     if Scythe.uses_pressure_reference(model.equation_set)
-        # Total-energy set: build the balanced dry profile with the legacy builder, then
-        # write it as an exact pressure-based reference (p from the EOS of the converged
-        # s/rho_d so the t=0 temperature retrieval is exact; rho_v = rho_c = 0) and seed
-        # the dry total-energy bubble.
-        sounding = joinpath(model.output_dir, "dry_sounding.ref")
-        Scythe.write_dry_sounding(sounding; theta=300.0, zmax=12000.0)
-        guess = ModelParameters(ts = model.ts, equation_set = model.equation_set,
-                                ref_state_file = sounding, grid_params = model.grid_params,
-                                physical_params = model.physical_params)
-        legacy_ref = Scythe.calculate_reference_state(guess, z, column)
-        s_prof = Scythe.ref_entropy(legacy_ref)[:, 1]
-        rho_d_prof = Scythe.ref_rho_d(legacy_ref)[:, 1]
-        p_prof = 100.0 .* Scythe.pressure.(s_prof, rho_d_prof, 0.0)
+        # Total-energy set: the dry neutral base is the analytic constant-theta Exner
+        # profile, so write it exactly (hydrostatic dp/dz = -rho*g to machine precision
+        # analytically; rho_v = rho_c = 0) rather than via the legacy sounding builder,
+        # whose hydrostatic iteration does not converge on the low-DOF B-spline (RiRk)
+        # column (it lands on the correct adiabat displaced in pressure).
+        theta0 = 300.0
+        exner = @. 1.0 - (Scythe.gravity * z) / (Scythe.Cpd * theta0)
+        T_prof = theta0 .* exner
+        p_prof = @. 100000.0 * exner^(Scythe.Cpd / Scythe.Rd)   # 1000 hPa surface, Pa
+        rho_d_prof = p_prof ./ (Scythe.Rd .* T_prof)
         zeros_prof = zeros(Float64, kDim)
         Scythe.write_exact_ref_mc(model.ref_state_file, z, p_prof, rho_d_prof,
                                   zeros_prof, zeros_prof)
