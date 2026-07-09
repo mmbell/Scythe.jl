@@ -167,3 +167,507 @@ function qss_condensation_rate(Q_ss, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=1
     Qdot = min(Qdot, max(Q_ss + rho_vs, 0.0) / ts)
     return Qdot
 end
+
+import Springsteel: ref_pressure, ref_rho_t, ref_total_energy, ref_qss
+
+# Canonical slot order for the total-energy set (u=4, w=5 in the shared-machinery
+# positions used by the other XZ sets).
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+
+# ── Equation set ───────────────────────────────────────────────────────────────
+
+"""
+    moist_compressible_XZ(mtile, colstart, colend, t)
+
+Total-energy moist compressible equation set on an XZ slice. Prognostic slots
+(perturbations vs the `PressureReferenceState` except u, w, rho_r):
+p' [Pa], rho_d', rho_t', u, w, E_t' [J/m^3], Q_ss' [kg/m^3], rho_r.
+
+Each step the temperature is retrieved from `retrieve_temperature`, the water
+partition follows diagnostically (rho_v = Q_ss + rho_vs, rho_c residual), and the
+condensation rate is the limited supersaturation relaxation. The energy equation
+carries no condensation source (exact first law); the pressure equation's
+condensation coefficient is (L_v - R_v*C_pt*T/R_m). See
+reference/Scythe_moist_compressible.tex.
+"""
+function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    impdot = mtile.impdot_n
+    model = mtile.model
+    refstate = mtile.ref_state
+
+    # Physical parameters
+    Khdiff = model.physical_params[:Khdiff]
+    Kvdiff = model.physical_params[:Kvdiff]
+    Kv_mudiff = model.physical_params[:Kv_mudiff]
+
+    # Gridpoints
+    x = view(gridpoints,colstart:colend,1)
+    z = view(gridpoints,colstart:colend,2)
+
+    # Slot 1 is the pressure perturbation p' [Pa]
+    pp = view(grid.physical,colstart:colend,1,1)
+    pp_x = view(grid.physical,colstart:colend,1,2)
+    pp_xx = view(grid.physical,colstart:colend,1,3)
+    pp_z = view(grid.physical,colstart:colend,1,4)
+    pp_zz = view(grid.physical,colstart:colend,1,5)
+
+    # Slot 2 is the dry-air density perturbation rho_d'
+    rho_dp = view(grid.physical,colstart:colend,2,1)
+    rho_dp_x = view(grid.physical,colstart:colend,2,2)
+    rho_dp_xx = view(grid.physical,colstart:colend,2,3)
+    rho_dp_z = view(grid.physical,colstart:colend,2,4)
+    rho_dp_zz = view(grid.physical,colstart:colend,2,5)
+
+    # Slot 3 is the total density perturbation rho_t'
+    rho_tp = view(grid.physical,colstart:colend,3,1)
+    rho_tp_x = view(grid.physical,colstart:colend,3,2)
+    rho_tp_xx = view(grid.physical,colstart:colend,3,3)
+    rho_tp_z = view(grid.physical,colstart:colend,3,4)
+    rho_tp_zz = view(grid.physical,colstart:colend,3,5)
+
+    u = view(grid.physical,colstart:colend,4,1)
+    u_x = view(grid.physical,colstart:colend,4,2)
+    u_xx = view(grid.physical,colstart:colend,4,3)
+    u_z = view(grid.physical,colstart:colend,4,4)
+    u_zz = view(grid.physical,colstart:colend,4,5)
+
+    w = view(grid.physical,colstart:colend,5,1)
+    w_x = view(grid.physical,colstart:colend,5,2)
+    w_xx = view(grid.physical,colstart:colend,5,3)
+    w_z = view(grid.physical,colstart:colend,5,4)
+    w_zz = view(grid.physical,colstart:colend,5,5)
+
+    # Slot 6 is the total energy density perturbation E_t'
+    E_tp = view(grid.physical,colstart:colend,6,1)
+    E_tp_x = view(grid.physical,colstart:colend,6,2)
+    E_tp_xx = view(grid.physical,colstart:colend,6,3)
+    E_tp_z = view(grid.physical,colstart:colend,6,4)
+    E_tp_zz = view(grid.physical,colstart:colend,6,5)
+
+    # Slot 7 is the supersaturation density perturbation Q_ss'
+    Q_ssp = view(grid.physical,colstart:colend,7,1)
+    Q_ssp_x = view(grid.physical,colstart:colend,7,2)
+    Q_ssp_xx = view(grid.physical,colstart:colend,7,3)
+    Q_ssp_z = view(grid.physical,colstart:colend,7,4)
+    Q_ssp_zz = view(grid.physical,colstart:colend,7,5)
+
+    # Slot 8 is the rain partial density rho_r (reference rho_rbar = 0)
+    rho_rp = view(grid.physical,colstart:colend,8,1)
+    rho_rp_x = view(grid.physical,colstart:colend,8,2)
+    rho_rp_xx = view(grid.physical,colstart:colend,8,3)
+    rho_rp_z = view(grid.physical,colstart:colend,8,4)
+    rho_rp_zz = view(grid.physical,colstart:colend,8,5)
+
+    # Reference state (pressure-based)
+    pbar = ref_pressure(refstate)[:,1]
+    pbar_z = ref_pressure(refstate)[:,2]
+    rho_dbar = ref_rho_d(refstate)[:,1]
+    rho_dbar_z = ref_rho_d(refstate)[:,2]
+    rho_tbar = ref_rho_t(refstate)[:,1]
+    rho_tbar_z = ref_rho_t(refstate)[:,2]
+    E_tbar = ref_total_energy(refstate)[:,1]
+    E_tbar_z = ref_total_energy(refstate)[:,2]
+    Q_ssbar = ref_qss(refstate)[:,1]
+    Q_ssbar_z = ref_qss(refstate)[:,2]
+    Tbar = refstate.Tbar[:,1]
+    Pxi_bar = sound_speed_sq(refstate)
+
+    # Total fields (perturbation + reference)
+    p = pp .+ pbar
+    rho_d = rho_dp .+ rho_dbar
+    rho_t = rho_tp .+ rho_tbar
+    E_t = E_tp .+ E_tbar
+    Q_ss = Q_ssp .+ Q_ssbar
+    rho_r = rho_rp
+
+    # Total vertical gradients (perturbation + reference)
+    p_z = pp_z .+ pbar_z
+    rho_d_z = rho_dp_z .+ rho_dbar_z
+    rho_t_z = rho_tp_z .+ rho_tbar_z
+    E_t_z = E_tp_z .+ E_tbar_z
+    Q_ss_z = Q_ssp_z .+ Q_ssbar_z
+
+    # Diagnostic thermodynamic state: T from the total-energy retrieval, then the
+    # water partition follows from the prognostic supersaturation.
+    ke = @. 0.5 * ((u * u) + (w * w))
+    geo = @. ke + (gravity * z)
+    M = @. p + E_t - (rho_t * geo)
+    Tk = retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, Tbar)
+    p_hPa = p ./ 100.0
+    rho_vs = rho_v_sat.(Tk, p_hPa)
+    rho_v = Q_ss .+ rho_vs
+    rho_c = rho_t .- rho_d .- rho_v .- rho_r
+    q_v = rho_v ./ rho_d
+    q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
+    C_vt = @. Cvd + (q_v * Cvv) + (q_l * Cl)
+    R_m = @. Rd + (q_v * Rv)
+    C_pt = C_vt .+ R_m
+    gamma_m = C_pt ./ C_vt
+    Lv = L_v.(Tk)
+
+    # Condensation: limited supersaturation relaxation with the energy-consistent
+    # psychrometric factor. rho_v and rho_c are diagnostic, so no separate
+    # condensation-adjustment step is needed after the timestep.
+    Q_s = Q_s_energy.(Tk, p, rho_d, q_v, q_l)
+    Qdot = qss_condensation_rate.(Q_ss, rho_c, rho_d, Tk, p_hPa, Q_s, model.ts)
+    for i in 1:length(Qdot)
+        if isnan(Qdot[i])
+            error("Qdot is NaN at index $i, time $(t)!")
+        end
+    end
+
+    div = u_x .+ w_z
+
+    # Placeholders for intermediate calculations
+    ADV = similar(Tk)
+    FORCING = similar(Tk)
+    KDIFF = similar(Tk)
+
+    # Pressure (slot 1): -v·∇p - γp∇·v + (R_m/C_vt)(L_v - R_v C_pt T/R_m) Q̇_cond
+    @turbo ADV .= @. (-u * pp_x) + (-w * p_z)
+    FORCING .= @. (-gamma_m * p * div) + ((R_m / C_vt) * (Lv - (Rv * C_pt * Tk / R_m)) * Qdot)
+    @turbo KDIFF .= @. Khdiff * pp_xx
+    @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF
+
+    # Implicit acoustic tendencies from the vertical mass flux φ = ρ̄_t w:
+    # impdot[p] = -Pxi_bar ∂z(ρ̄_t w), impdot[rho_t] = -∂z(ρ̄_t w).
+    flux_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
+    flux_col.uMish .= rho_tbar .* w
+    Btransform!(flux_col)
+    Atransform!(flux_col)
+    phi_z = Ixtransform(flux_col)
+    impdot[colstart:colend,1] .= .-(Pxi_bar .* phi_z)
+    impdot[colstart:colend,3] .= .-phi_z
+
+    # Dry-air mass continuity (slot 2, advective product-rule form)
+    @turbo ADV .= @. (-u * rho_dp_x) + (-w * rho_d_z)
+    @turbo FORCING .= @. -rho_d * div
+    @turbo KDIFF .= @. Khdiff * rho_dp_xx
+    @turbo expdot[colstart:colend,2] .= @. ADV + FORCING + KDIFF
+    # Implicit acoustic continuity: flux form -∂z(ρ̄_d w)
+    flux_col.uMish .= rho_dbar .* w
+    Btransform!(flux_col)
+    Atransform!(flux_col)
+    impdot[colstart:colend,2] .= .-Ixtransform(flux_col)
+
+    # Total mass continuity (slot 3; sources zero without flux/sedimentation)
+    @turbo ADV .= @. (-u * rho_tp_x) + (-w * rho_t_z)
+    @turbo FORCING .= @. -rho_t * div
+    @turbo KDIFF .= @. Khdiff * rho_tp_xx
+    @turbo expdot[colstart:colend,3] .= @. ADV + FORCING + KDIFF
+
+    # u momentum (slot 4): PGF directly from the prognostic pressure
+    @turbo ADV .= @. (-u * u_x) + (-w * u_z)
+    @turbo FORCING .= @. -pp_x / rho_t
+    @turbo KDIFF .= @. Khdiff * u_xx
+    @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF
+    @turbo impdot[colstart:colend,4] .= @. Kvdiff * u_zz
+
+    # w momentum (slot 5): perturbation PGF + total-density buoyancy loading
+    @turbo ADV .= @. (-u * w_x) + (-w * w_z)
+    @turbo FORCING .= @. ((-gravity * rho_tp) - pp_z) / rho_t
+    @turbo KDIFF .= @. Khdiff * w_xx
+    @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
+    # Implicit acoustic w-momentum: -(1/ρ̄_t) ∂z p'
+    impdot[colstart:colend,5] .= @. -pp_z / rho_tbar
+
+    # Total energy (slot 6): -v·∇E_t - E_t∇·v - ∇·(pv); no condensation source
+    # (exact first law: phase change is not an energy source). pbar has no
+    # x-dependence so u*p_x = u*pp_x.
+    @turbo ADV .= @. (-u * E_tp_x) + (-w * E_t_z)
+    @turbo FORCING .= @. (-(E_t + p) * div) - (u * pp_x) - (w * p_z)
+    @turbo KDIFF .= @. Khdiff * E_tp_xx
+    @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
+    # Implicit acoustic energy flux: -∂z((Ē_t + p̄) w)
+    flux_col.uMish .= (E_tbar .+ pbar) .* w
+    Btransform!(flux_col)
+    Atransform!(flux_col)
+    impdot[colstart:colend,6] .= .-Ixtransform(flux_col)
+
+    # Supersaturation density (slot 7): the saturation chain-rule terms use the
+    # non-condensation T and p tendencies; the condensation contribution is
+    # -Q̇_cond(1+Q_s) (= -Q_ss/τ when the rate is unlimited).
+    dT_nc = @. -(p * div) / (rho_d * C_vt)
+    dp_nc = @. -gamma_m * p * div
+    drvs_dT = drho_vsat_dT.(Tk, p_hPa)
+    drvs_dp = drho_vsat_dp.(Tk, p_hPa)
+    SATF = @. (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
+    @turbo ADV .= @. (-u * Q_ssp_x) + (-w * Q_ss_z)
+    FORCING .= @. (-Q_ss * div) + SATF - (Qdot * (1.0 + Q_s))
+    @turbo KDIFF .= @. Khdiff * Q_ssp_xx
+    @turbo expdot[colstart:colend,7] .= @. ADV + FORCING + KDIFF
+    @turbo impdot[colstart:colend,7] .= @. Kv_mudiff * Q_ssp_zz
+
+    # Rain partial density (slot 8; microphysics sources deferred)
+    @turbo ADV .= @. (-u * rho_rp_x) + (-w * rho_rp_z)
+    @turbo FORCING .= @. -rho_r * div
+    @turbo KDIFF .= @. Khdiff * rho_rp_xx
+    @turbo expdot[colstart:colend,8] .= @. ADV + FORCING + KDIFF
+    @turbo impdot[colstart:colend,8] .= @. Kv_mudiff * rho_rp_zz
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+
+    # Solve for semi-implicit n+1 terms ((p', ρ̄_t w) acoustic adjustment)
+    if mtile.model.options[:semiimplicit]
+        semiimplicit_adjustment_p(mtile, colstart, colend, t)
+    end
+
+end
+
+# ── Semi-implicit adjustment ───────────────────────────────────────────────────
+
+"""
+    semiimplicit_adjustment_p(mtile, colstart, colend, t)
+
+Semi-implicit acoustic adjustment for the total-energy set. Solves the
+constant-coefficient Helmholtz problem for the vertical mass flux `φ = ρ̄_t w` from
+the implicit pair `∂φ/∂t = -∂z p'`, `∂p'/∂t = -Pxi_bar ∂z φ` (the same operator as
+the rho_d form, so `mtile.h_matrix` is reused), then recovers `w = φ/ρ̄_t` and
+`p' = p'* - Δτ Pxi_bar ∂z φ`. The density and energy slots are slaved to the flux
+in flux form: `rho_t' -= Δτ ∂z φ` (conserves `∫rho_t'`), `rho_d' -= Δτ ∂z(ρ̄_d/ρ̄_t φ)`,
+`E_t' -= Δτ ∂z((Ē_t+p̄)/ρ̄_t φ)`.
+"""
+function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    vars = mtile.model.grid_params.vars
+    p_index = vars["p"]
+    rhod_index = vars["rho_d"]
+    rhot_index = vars["rho_t"]
+    w_index = vars["w"]
+    et_index = vars["E_t"]
+    ts = mtile.model.ts
+
+    # Predictors (copies) and implicit tendency histories (views)
+    p_nstar = mtile.var_np1[colstart:colend,p_index]
+    w_nstar = mtile.var_np1[colstart:colend,w_index]
+    rhod_nstar = mtile.var_np1[colstart:colend,rhod_index]
+    rhot_nstar = mtile.var_np1[colstart:colend,rhot_index]
+    et_nstar = mtile.var_np1[colstart:colend,et_index]
+
+    # Reference profiles and mean sound speed squared
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
+    rho_dbar = ref_rho_d(mtile.ref_state)[:,1]
+    rho_tbar = ref_rho_t(mtile.ref_state)[:,1]
+    E_tbar = ref_total_energy(mtile.ref_state)[:,1]
+    pbar = ref_pressure(mtile.ref_state)[:,1]
+
+    # Subtract the AB3 explicit treatment of the implicit tendency and add the
+    # off-centered AI2* terms (AM2 trapezoidal on the first step), then shift the
+    # tendency history. Applied identically to each participating slot.
+    ts_term = (t == 1) ? 0.5 * ts : 1.25 * ts
+    for index in (p_index, w_index, rhod_index, rhot_index, et_index)
+        nstar = index == p_index ? p_nstar :
+                index == w_index ? w_nstar :
+                index == rhod_index ? rhod_nstar :
+                index == rhot_index ? rhot_nstar : et_nstar
+        dot_n = view(mtile.impdot_n,colstart:colend,index)
+        dot_nm1 = view(mtile.impdot_nm1,colstart:colend,index)
+        dot_nm2 = view(mtile.impdot_nm2,colstart:colend,index)
+        if (t == 1)
+            nstar .= @. nstar - (ts * dot_n) + (ts * 0.5 * dot_n)
+        elseif (t == 2)
+            nstar .= @. nstar - (0.5 * ts) * ((3.0 * dot_n) - dot_nm1) - (ts * dot_n) + (ts * 0.75 * dot_nm1)
+        else
+            nstar .= @. nstar - ((ts / 12.0) * ((23.0 * dot_n) - (16.0 * dot_nm1) + (5.0 * dot_nm2))) - (ts * dot_n) + (ts * 0.75 * dot_nm1)
+        end
+        dot_nm2 .= dot_nm1
+        dot_nm1 .= dot_n
+    end
+
+    # Take the vertical derivative of the p' predictor (coefficient 1: the pair is
+    # ∂φ/∂t = -∂z p'; Pxi_bar enters in the p' update instead)
+    p_col = deepcopy(mtile.tile.kbasis.data[p_index])
+    p_col.uMish .= p_nstar
+    Btransform!(p_col)
+    Atransform!(p_col)
+    p_nstar = Itransform!(p_col)
+    p_nstar_z = ts_term .* Ixtransform(p_col)
+
+    # Mass-flux Helmholtz RHS (φ = ρ̄_t w): rhs = Δτ ∂z p'* - ρ̄_t w*.
+    # Elimination gives (I - Δτ² Pxi_bar ∂zz) φ, the same operator as the rho_d
+    # form, so h_matrix is reused.
+    rhs = p_nstar_z .- (rho_tbar .* w_nstar)
+    phi_col = deepcopy(mtile.tile.kbasis.data[w_index])
+    if t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
+        _vertical_solve!(phi_col, h_a, rhs, mtile.tile)
+    else
+        # Use the pre-calculated one
+        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile.tile)
+    end
+
+    phi = Itransform!(phi_col)
+    phi_z = Ixtransform(phi_col)
+
+    # Recover w_n+1 = φ_n+1 / ρ̄_t
+    view(mtile.var_np1,colstart:colend,w_index) .= phi ./ rho_tbar
+
+    # Recover p'_n+1 = p'* - Δτ Pxi_bar ∂z φ_n+1
+    view(mtile.var_np1,colstart:colend,p_index) .= p_nstar .- (ts_term .* Pxi_bar .* phi_z)
+
+    # Slaved flux-form updates: rho_t' directly from ∂z φ (conserves ∫rho_t'), and
+    # rho_d'/E_t' from smooth coefficient profiles times φ.
+    view(mtile.var_np1,colstart:colend,rhot_index) .= rhot_nstar .- (ts_term .* phi_z)
+
+    flux_col = deepcopy(mtile.tile.kbasis.data[w_index])
+    flux_col.uMish .= (rho_dbar ./ rho_tbar) .* phi
+    Btransform!(flux_col)
+    Atransform!(flux_col)
+    view(mtile.var_np1,colstart:colend,rhod_index) .= rhod_nstar .- (ts_term .* Ixtransform(flux_col))
+
+    flux_col.uMish .= ((E_tbar .+ pbar) ./ rho_tbar) .* phi
+    Btransform!(flux_col)
+    Atransform!(flux_col)
+    view(mtile.var_np1,colstart:colend,et_index) .= et_nstar .- (ts_term .* Ixtransform(flux_col))
+end
+
+# ── Initial conditions and reference writer ────────────────────────────────────
+
+"""
+    write_exact_ref_mc(path, z, p_Pa, rho_d, rho_v, rho_c)
+
+Write a pressure-based exact reference state file (`z p rho_d rho_v rho_c` per line,
+p in Pa) in the format read by `Springsteel.exact_pressure_reference_state`. `z`
+values are written with `string()` so they match the model gridpoints exactly when
+generated in-process.
+"""
+function write_exact_ref_mc(path::String, z::Vector{Float64}, p_Pa::Vector{Float64},
+                            rho_d::Vector{Float64}, rho_v::Vector{Float64},
+                            rho_c::Vector{Float64})
+    open(path, "w") do f
+        for i in 1:length(z)
+            println(f, "$(z[i]) $(p_Pa[i]) $(rho_d[i]) $(rho_v[i]) $(rho_c[i])")
+        end
+    end
+    return path
+end
+
+"""
+    theta_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dtheta_max)
+
+Dry warm-bubble initial condition for the total-energy set on a
+`PressureReferenceState`. The constant-pressure θ perturbation mirrors
+[`theta_bubble_pd!`](@ref) but writes the moist_compressible slots: p' = 0 (constant
+pressure), rho_d' = rho_t', E_t' from the BF02 internal energy at rest, and Q_ss'
+tracking -ρ_v*(T, p̄) in the dry air.
+"""
+function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                          ref::Springsteel.PressureReferenceState;
+                          xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0)
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
+    et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            dtheta = L <= 1.0 ? dtheta_max * (cos(pi * L / 2.0))^2 : 0.0
+            p_ref = pbar[k, 1]                              # Pa
+            rho_dref = rho_dbar[k, 1]
+            T_ref = p_ref / (Rd * rho_dref)                 # dry EOS
+            exner = (p_0 * 100.0 / p_ref)^(Rd / Cpd)
+            theta = (T_ref * exner) + dtheta
+            Tk = theta / exner
+            rho_d = p_ref / (Rd * Tk)                       # constant-pressure perturbation
+            E_t = (rho_d * internal_energy_bf02(Tk, 0.0, 0.0)) + (rho_d * gravity * z)
+            Q_ss = -rho_v_sat(Tk, p_ref / 100.0)
+            patch.physical[i, p_i, 1] = 0.0
+            patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
+            patch.physical[i, rho_t_i, 1] = rho_d - rho_tbar[k, 1]
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = 0.0
+            i += 1
+        end
+    end
+    return patch
+end
+
+"""
+    moist_buoyancy_bubble_mc!(patch, gridpoints, base, ref; q_t=0.02,
+                              xc, xr, zc, zr, amp=2.0/300.0)
+
+Total-energy variant of [`moist_buoyancy_bubble_pd!`](@ref): the identical Bryan &
+Fritsch (2002) warm-bubble construction (θ_ρ inflation at constant pressure, reset to
+exact saturation, re-converged with `saturation_adjustment`), written to the
+moist_compressible slots. The final pressure comes from the EOS of the converged
+(s, ρ_d, q_v) state so the initial temperature retrieval is exact; E_t and Q_ss are
+computed pointwise from (T, p, ρ_d, ρ_v, ρ_c) before subtracting the reference.
+"""
+function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                   base, ref::Springsteel.PressureReferenceState; q_t=0.02,
+                                   xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0,
+                                   amp=2.0/300.0)
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
+    et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            b_incr = L <= 1.0 ? amp * (cos(pi * L / 2.0))^2 : 0.0
+
+            new_s = base.s[k]
+            new_rho_d = base.rho_d[k]
+            new_q_v = base.q_v[k]
+            new_q_l = base.q_l[k]
+            if b_incr > 0.0
+                p = base.p[k]
+                new_theta = base.theta_rho[k] * (1.0 + b_incr) * (1.0 + q_t) /
+                            (1.0 + (base.q_v[k] / Eps))
+                new_T = new_theta / (p_0 / p)^(Rd / Cpd)
+                new_q_v = q_sat_liquid(new_T, p)
+                new_q_l = q_t - new_q_v
+                new_T_rho = new_T * (1.0 + new_q_v / Eps) / (1.0 + q_t)
+                new_rho_t = (p * 100.0) / (new_T_rho * Rd)
+                new_rho_d = new_rho_t / (1.0 + q_t)
+                new_xi = log_dry_density(new_rho_d)
+                new_mu = mu_transform(new_q_v)
+                new_mu_l = mu_transform(new_q_l)
+                new_s = entropy(new_T, new_rho_d, new_q_v)
+                dq, _ = saturation_adjustment(new_s, new_xi, new_mu, new_mu_l, eps())
+                new_s += s_condensation_relaxation(-dq, new_T, new_rho_d, new_q_v, new_q_l, p)
+                new_q_v += dq
+                new_q_l = q_t - new_q_v
+            end
+
+            # Final consistent state: T from the entropy, p from the EOS, so that the
+            # total-energy temperature retrieval reproduces T exactly at t = 0.
+            Tk = temperature(new_s, new_rho_d, new_q_v)
+            p_Pa = 100.0 * pressure(new_s, new_rho_d, new_q_v)
+            rho_v = new_rho_d * new_q_v
+            rho_c = new_rho_d * new_q_l
+            rho_t = new_rho_d + rho_v + rho_c
+            E_t = (new_rho_d * internal_energy_bf02(Tk, new_q_v, new_q_l)) +
+                  (rho_t * gravity * z)
+            Q_ss = rho_v - rho_v_sat(Tk, p_Pa / 100.0)
+
+            patch.physical[i, p_i, 1] = p_Pa - pbar[k, 1]
+            patch.physical[i, rho_d_i, 1] = new_rho_d - rho_dbar[k, 1]
+            patch.physical[i, rho_t_i, 1] = rho_t - rho_tbar[k, 1]
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = 0.0
+            i += 1
+        end
+    end
+    return patch
+end

@@ -136,4 +136,208 @@ using Springsteel
         @test Scythe.qss_condensation_rate(1.0e-5 * rho_vs, 0.0, rho_d, Tk, p_hPa,
                                            Q_s, ts) == 0.0
     end
+
+    # ──────────────────────────────────────────────
+    # 5. Integration: equation set on a ModelTile
+    # ──────────────────────────────────────────────
+
+    using SparseArrays
+
+    """Saturated cloudy column exactly on the Q_ss = 0 manifold (density form)."""
+    function saturated_cloudy_column_mc(z; q_l=1.0e-3)
+        n = length(z)
+        Tk = @. 290.0 - 0.005 * z
+        p_Pa = @. 90000.0 * exp(-z / 8000.0)
+        rho_v = rho_v_sat.(Tk, p_Pa ./ 100.0)
+        rho_d = (p_Pa .- (Rv .* Tk .* rho_v)) ./ (Rd .* Tk)
+        rho_c = q_l .* rho_d
+        return (; z, Tk, p_Pa, rho_d, rho_v, rho_c)
+    end
+
+    function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=false, ts=0.1)
+        varlist = Scythe.MC_VARS
+        vars = Dict(v => i for (i, v) in enumerate(varlist))
+        scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+        wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+        gp = GridParameters(
+            geometry = "RZ", num_cells = num_cells,
+            iMin = 0.0, iMax = 2000.0, kMin = 0.0, kMax = 2000.0, kDim = kDim,
+            BCL = wall_bc, BCR = wall_bc, BCB = wall_bc, BCT = wall_bc, vars = vars,
+        )
+        patch = createGrid(gp)
+        gridpoints = Scythe.getGridpoints(patch)
+        z = gridpoints[1:kDim, 2]
+        col = saturated_cloudy_column_mc(z)
+        ref_file = joinpath(tmpdir, "mc_pressure.ref")
+        Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+        model = ModelParameters(
+            ts = ts, integration_time = 1.0, output_interval = 1.0,
+            equation_set = "moist_compressible_XZ",
+            ref_state_file = ref_file, grid_params = gp,
+            physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
+                                   :alpha => 0.0, :z_damp => 20.0e3),
+            options = Dict(:semiimplicit => semiimplicit, :exact_reference_state => true,
+                           :precipitation => false, :vertical_mixing => false),
+        )
+        patch.physical .= 0.0
+        spectralTransform!(patch)
+        gridTransform!(patch)
+        haloReceiveMap = sparse(Int64[], Int64[], Float64[],
+                                size(patch.spectral, 1), size(patch.spectral, 2))
+        mtile = createModelTile(patch, patch, model, haloReceiveMap)
+        return mtile, patch, model, col
+    end
+
+    @testset "reference routing" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            rs = mtile.ref_state
+            @test rs isa Springsteel.PressureReferenceState
+            @test 250.0 < sqrt(Springsteel.sound_speed_sq(rs)) < 400.0
+            # Saturated base: Q_ssbar = 0 identically before smoothing
+            @test maximum(abs.(Springsteel.ref_qss(rs)[:, 1])) < 1e-10
+        end
+    end
+
+    @testset "resting cloudy base preserved" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            kDim = model.grid_params.kDim
+            ncols = div(size(patch.physical, 1), kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+            # Per-slot tendency tolerances scaled to the slot magnitudes
+            # (p ~ 1e5 Pa, E_t ~ 2e8 J/m^3, densities ~ 1)
+            scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0)
+            for v in 1:8
+                @test maximum(abs.(mtile.expdot_n[:, v])) / scales[v] < 1.0e-9
+                @test maximum(abs.(mtile.var_np1[:, v])) / scales[v] < 1.0e-9
+            end
+            @test all(isfinite.(mtile.var_np1))
+        end
+    end
+
+    @testset "condensation closure at rest" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            qss_i = vars["Q_ss"]
+
+            # Supersaturate the lower half of every column by a small, realistic amount
+            rho_dbar = Springsteel.ref_rho_d(mtile.ref_state)[:, 1]
+            dq = 5.0e-5
+            npts = size(patch.physical, 1)
+            for i in 1:npts
+                k = mod1(i, kDim)
+                if k <= div(kDim, 2)
+                    patch.physical[i, qss_i, 1] = rho_dbar[k] * dq
+                end
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+
+            ncols = div(npts, kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+
+            perturbed = [i for i in 1:npts if mod1(i, kDim) <= div(kDim, 2)]
+            # Exact first law: no condensation source in E_t or rho_t at rest
+            @test maximum(abs.(mtile.expdot_n[:, vars["E_t"]])) == 0.0
+            @test maximum(abs.(mtile.expdot_n[:, vars["rho_t"]])) == 0.0
+            @test maximum(abs.(mtile.expdot_n[:, vars["rho_d"]])) == 0.0
+            # Latent heating raises pressure; supersaturation relaxes
+            @test all(mtile.expdot_n[perturbed, vars["p"]] .> 0.0)
+            @test all(mtile.expdot_n[perturbed, qss_i] .< 0.0)
+            @test all(isfinite.(mtile.var_np1))
+        end
+    end
+
+    @testset "post-step retrieval physical" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            # Small warm perturbation via E_t' in the lower half
+            E_tbar = Springsteel.ref_total_energy(mtile.ref_state)[:, 1]
+            npts = size(patch.physical, 1)
+            for i in 1:npts
+                k = mod1(i, kDim)
+                if k <= div(kDim, 2)
+                    patch.physical[i, vars["E_t"], 1] = 1.0e-4 * E_tbar[k]
+                end
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            ncols = div(npts, kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+            # Re-retrieve T from the advanced state
+            rs = mtile.ref_state
+            pbar = Springsteel.ref_pressure(rs)[:, 1]
+            rho_dbar = Springsteel.ref_rho_d(rs)[:, 1]
+            rho_tbar = Springsteel.ref_rho_t(rs)[:, 1]
+            Q_ssbar = Springsteel.ref_qss(rs)[:, 1]
+            Tbar = Springsteel.reference_temperature(rs)
+            z = Scythe.getGridpoints(patch)[1:kDim, 2]
+            for i in 1:npts
+                k = mod1(i, kDim)
+                v = mtile.var_np1
+                p = v[i, vars["p"]] + pbar[k]
+                rho_d = v[i, vars["rho_d"]] + rho_dbar[k]
+                rho_t = v[i, vars["rho_t"]] + rho_tbar[k]
+                E_t = v[i, vars["E_t"]] + E_tbar[k]
+                Q_ss = v[i, vars["Q_ss"]] + Q_ssbar[k]
+                ke = 0.5 * (v[i, vars["u"]]^2 + v[i, vars["w"]]^2)
+                M = p + E_t - rho_t * (ke + Scythe.gravity * z[k])
+                Tk = Scythe.retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k])
+                @test isfinite(Tk) && 200.0 < Tk < 320.0
+            end
+        end
+    end
+
+    @testset "semi-implicit acoustic stability" begin
+        mktempdir() do tmpdir
+            # ts = 0.1 s is ~7x the explicit VERTICAL acoustic limit for the
+            # boundary-clustered Chebyshev levels (kDim=32: dz_min ~ 5 m, c ~ 340 m/s
+            # => ~0.015 s; the fully explicit scheme NaNs by step ~19 at this ts) while
+            # staying below the HORIZONTAL limit (dx ~ 80 m), since the semi-implicit
+            # adjustment is vertical-only.
+            mtile, patch, model, col = make_mc_mtile(tmpdir; semiimplicit=true,
+                                                     ts=0.1, kDim=32)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            p_i = vars["p"]; rhot_i = vars["rho_t"]
+            npts = size(patch.physical, 1)
+            gridpoints = Scythe.getGridpoints(patch)
+
+            # Small pressure pulse in the domain center
+            for i in 1:npts
+                x = gridpoints[i, 1]; z = gridpoints[i, 2]
+                L = sqrt(((x - 1000.0) / 500.0)^2 + ((z - 1000.0) / 500.0)^2)
+                patch.physical[i, p_i, 1] = L <= 1.0 ? 10.0 * (cos(pi * L / 2.0))^2 : 0.0
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+
+            p0_max = maximum(abs.(patch.physical[:, p_i, 1]))
+            ncols = div(npts, kDim)
+            for t in 1:200
+                for c in 1:ncols
+                    Scythe.advance_column(mtile, c, t)
+                end
+                Scythe.calcTendency(mtile)
+                gridTransform!(patch)
+            end
+            @test all(isfinite.(patch.physical[:, :, 1]))
+            # Acoustic energy must not grow: the dispersing pulse DECAYS below its
+            # initial amplitude after 200 vertically-stiff steps
+            @test maximum(abs.(patch.physical[:, p_i, 1])) < p0_max
+            @test maximum(abs.(patch.physical[:, vars["w"], 1])) < 1.0
+        end
+    end
 end

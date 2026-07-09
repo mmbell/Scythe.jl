@@ -607,6 +607,15 @@ uses_physical_reference(equation_set::AbstractString) =
     endswith(equation_set, "_pd") || endswith(equation_set, "_sigma")
 
 """
+    uses_pressure_reference(equation_set) -> Bool
+
+True for equation sets that consume the pressure-based `PressureReferenceState`
+(prognostic p / E_t / Q_ss), i.e. the `moist_compressible` family.
+"""
+uses_pressure_reference(equation_set::AbstractString) =
+    startswith(equation_set, "moist_compressible")
+
+"""
     exact_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
 Read a pre-computed reference state from a file that has already been adjusted to

@@ -86,7 +86,13 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         # xi/mu derived view used by the older equation sets.
         physical_ref = uses_physical_reference(model.equation_set)
 
-        if (model.options[:exact_reference_state])
+        if uses_pressure_reference(model.equation_set)
+            # The total-energy set (moist_compressible) consumes the pressure-based
+            # reference (p, partial densities, E_t, Q_ss) directly.
+            ref_state = model.options[:exact_reference_state] ?
+                Springsteel.exact_pressure_reference_state(model.ref_state_file, z_values, ref_column) :
+                Springsteel.calculate_pressure_reference_state(model.ref_state_file, z_values, ref_column)
+        elseif (model.options[:exact_reference_state])
             ref_state = physical_ref ?
                 Springsteel.exact_reference_state(model.ref_state_file, z_values, ref_column) :
                 exact_reference_state(model, z_values, ref_column)
