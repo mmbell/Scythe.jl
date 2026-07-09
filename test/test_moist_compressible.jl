@@ -114,26 +114,30 @@ using Springsteel
         Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_vs / rho_d, 1.0e-3)
 
         # Subsaturated, cloud-free: no droplets to evaporate -> zero
-        @test Scythe.qss_condensation_rate(-0.5 * rho_vs, 0.0, rho_d, Tk, p_hPa,
-                                           Q_s, ts) == 0.0
+        @test Scythe.qss_condensation_rate(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, rho_d, Tk,
+                                           p_hPa, Q_s, ts) == 0.0
         # Strongly subsaturated with a little cloud: evaporation clamped by rho_c/ts
         rho_c = 1.0e-6 * rho_d
-        rate = Scythe.qss_condensation_rate(-0.5 * rho_vs, rho_c, rho_d, Tk, p_hPa,
-                                            Q_s, ts)
+        rate = Scythe.qss_condensation_rate(-0.5 * rho_vs, 0.5 * rho_vs, rho_c, rho_d, Tk,
+                                            p_hPa, Q_s, ts)
         @test rate ≈ -rho_c / ts
         # Mildly subsaturated with plenty of cloud: physical evaporation, not clamped
         rho_c = 2.0e-3 * rho_d
-        rate = Scythe.qss_condensation_rate(-1.0e-4 * rho_vs, rho_c, rho_d, Tk, p_hPa,
-                                            Q_s, ts)
+        rate = Scythe.qss_condensation_rate(-1.0e-4 * rho_vs, (1.0 - 1.0e-4) * rho_vs, rho_c,
+                                            rho_d, Tk, p_hPa, Q_s, ts)
         @test -rho_c / ts < rate < 0.0
         # Supersaturated with cloud: condensation
-        @test Scythe.qss_condensation_rate(1.0e-3 * rho_vs, rho_c, rho_d, Tk, p_hPa,
-                                           Q_s, ts) > 0.0
+        @test Scythe.qss_condensation_rate(1.0e-3 * rho_vs, (1.0 + 1.0e-3) * rho_vs, rho_c,
+                                           rho_d, Tk, p_hPa, Q_s, ts) > 0.0
         # Supersaturated, cloud-free: Twomey nucleation kicks in
-        @test Scythe.qss_condensation_rate(1.0e-3 * rho_vs, 0.0, rho_d, Tk, p_hPa,
-                                           Q_s, ts) > 0.0
+        @test Scythe.qss_condensation_rate(1.0e-3 * rho_vs, (1.0 + 1.0e-3) * rho_vs, 0.0,
+                                           rho_d, Tk, p_hPa, Q_s, ts) > 0.0
         # Nearly saturated, cloud-free (below nucleation threshold): zero
-        @test Scythe.qss_condensation_rate(1.0e-5 * rho_vs, 0.0, rho_d, Tk, p_hPa,
+        @test Scythe.qss_condensation_rate(1.0e-5 * rho_vs, (1.0 + 1.0e-5) * rho_vs, 0.0,
+                                           rho_d, Tk, p_hPa, Q_s, ts) == 0.0
+        # Dry air with spurious positive Q_ss drift (no actual vapor): the clamped
+        # rho_v = 0 kills phantom condensation entirely
+        @test Scythe.qss_condensation_rate(0.5 * rho_vs, 0.0, 0.0, rho_d, Tk, p_hPa,
                                            Q_s, ts) == 0.0
     end
 

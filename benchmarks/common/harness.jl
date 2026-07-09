@@ -44,6 +44,11 @@ const STAGE_PE_RHOD_PD = Symbol("pe-rho_d-pd")
 # smoothing conserves the entropy-density integral ∫sigma (equation set PE_SIGMA_XZ).
 const STAGE_PE_SIGMA = Symbol("pe-sigma")
 
+# Total-energy stage: prognostic p / rho_d / rho_t / E_t / Q_ss on a pressure-based
+# reference (equation set moist_compressible_XZ). All conserved quantities are extensive
+# flux-form prognostics; T is diagnosed and the vapor/cloud partition follows from Q_ss.
+const STAGE_MC = Symbol("mc")
+
 struct Target
     name::String
     value::Float64
@@ -94,8 +99,8 @@ function parse_benchmark_args(args::Vector{String})
         end
     end
     mode in (:quick, :full) || error("--mode must be quick or full")
-    stage in (:legacy, :pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA) ||
-        error("--stage must be legacy, pe, pe-rho_d, pe-rho_d-pd, or pe-sigma")
+    stage in (:legacy, :pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA, STAGE_MC) ||
+        error("--stage must be legacy, pe, pe-rho_d, pe-rho_d-pd, pe-sigma, or mc")
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
     ts_factor > 0.0 || error("--ts-factor must be > 0")
@@ -204,7 +209,8 @@ equation stage use the wider quick tolerances.
 """
 function load_targets(name::String, opts::BenchmarkOptions)
     haskey(BENCHMARK_EXPECTED, name) || error("No expected values defined for $name")
-    use_quick_tol = opts.mode == :quick || opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD)
+    use_quick_tol = opts.mode == :quick ||
+                    opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_MC)
     targets = Target[]
     for (diag, (value, atol_full, atol_quick, source)) in BENCHMARK_EXPECTED[name]
         atol = use_quick_tol ? atol_quick : atol_full

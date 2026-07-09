@@ -391,7 +391,13 @@ function s_condensation_relaxation(q_cond, Tk, rho_d, q_v, q_l, p)
     Cm = (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
     e = vapor_pressure(p, q_v)
     sat_e = sat_pressure_liquid_buck(Tk, p)
-    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) )# + (Rv*log(e/sat_e)) )
+    # The Rv*log(e/sat_e) = R_v*ln(H) term is the irreversible entropy PRODUCTION of
+    # phase change away from saturation (T ds_irr = -R_v T ln(H) dq_v >= 0) and belongs
+    # in the entropy source: total entropy is NOT conserved under finite-supersaturation
+    # condensation, while total energy is (see reference/Scythe_moist_compressible.tex,
+    # entropy budget). It was removed during the sigma-set experiments, which changed
+    # the moist base-state/bubble construction and weakened the BF02 thermal.
+    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(e/sat_e)) )
     return ds
 end
 

@@ -10,7 +10,7 @@
 #
 # Modes: quick (200 m cells) | full (100 m cells, paper-grade)
 # Stages: legacy (Euler_test) | pe (primitive_equation_XZ) | pe-rho_d | pe-rho_d-pd |
-#         moist-compressible (the physical-density sets run dry here, q_v = 0)
+#         pe-sigma | mc (total-energy set; the physical-density sets run dry here, q_v = 0)
 #
 # Reference: Bryan & Fritsch (2002), Mon. Wea. Rev. 130, 2917-2928.
 # reference/bryan_fritsch_mwr2002.pdf
@@ -35,8 +35,11 @@ const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 # intensive entropy "s" (pd) or the entropy density "sigma" (moist-compressible).
 const PE_VARS_PD = ["s", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
 const PE_VARS_SIGMA = ["sigma", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
+# Total-energy variant (runs dry here: rho_t = rho_d, Q_ss tracks -rho_v_sat)
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
 function bf02_dry_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w"]
+    stage == STAGE_MC && return MC_VARS
     stage == STAGE_PE_SIGMA && return PE_VARS_SIGMA
     stage == STAGE_PE_RHOD_PD && return PE_VARS_PD
     stage == STAGE_PE_RHOD && return PE_VARS_RHOD
@@ -68,7 +71,8 @@ function bf02_dry_model(opts::BenchmarkOptions)
     else
         # No physical or computational diffusion, matching the paper; the
         # Rayleigh damping is disabled with alpha = 0
-        equation_set = opts.stage == STAGE_PE_SIGMA ? "primitive_equation_XZ_sigma" :
+        equation_set = opts.stage == STAGE_MC ? "moist_compressible_XZ" :
+            opts.stage == STAGE_PE_SIGMA ? "primitive_equation_XZ_sigma" :
             opts.stage == STAGE_PE_RHOD_PD ? "primitive_equation_XZ_rhod_pd" :
             opts.stage == STAGE_PE_RHOD ? "primitive_equation_XZ_rhod" :
             "primitive_equation_XZ"
@@ -76,9 +80,11 @@ function bf02_dry_model(opts::BenchmarkOptions)
                                :alpha => 0.0, :z_damp => 20.0e3)
     end
     # The physical-density sets read a physical (Springsteel) reference written as an exact
-    # dry profile (rho_v = rho_c = 0); the legacy/pe/pe-rho_d sets build the xi/mu reference.
-    options = Dict(:semiimplicit => true, :exact_reference_state => physical_stage)
-    if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
+    # dry profile (rho_v = rho_c = 0), and the total-energy set a pressure-based one;
+    # the legacy/pe/pe-rho_d sets build the xi/mu reference.
+    exact_ref = physical_stage || opts.stage == STAGE_MC
+    options = Dict(:semiimplicit => true, :exact_reference_state => exact_ref)
+    if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA, STAGE_MC)
         # Benchmark specification has no turbulence or precipitation
         options[:precipitation] = false
         options[:vertical_mixing] = false
@@ -131,7 +137,27 @@ function bf02_dry_init!(model)
     column = Scythe.reference_column(patch, model.grid_params)
     patch.physical .= 0.0
 
-    if Scythe.uses_physical_reference(model.equation_set)
+    if Scythe.uses_pressure_reference(model.equation_set)
+        # Total-energy set: build the balanced dry profile with the legacy builder, then
+        # write it as an exact pressure-based reference (p from the EOS of the converged
+        # s/rho_d so the t=0 temperature retrieval is exact; rho_v = rho_c = 0) and seed
+        # the dry total-energy bubble.
+        sounding = joinpath(model.output_dir, "dry_sounding.ref")
+        Scythe.write_dry_sounding(sounding; theta=300.0, zmax=12000.0)
+        guess = ModelParameters(ts = model.ts, equation_set = model.equation_set,
+                                ref_state_file = sounding, grid_params = model.grid_params,
+                                physical_params = model.physical_params)
+        legacy_ref = Scythe.calculate_reference_state(guess, z, column)
+        s_prof = Scythe.ref_entropy(legacy_ref)[:, 1]
+        rho_d_prof = Scythe.ref_rho_d(legacy_ref)[:, 1]
+        p_prof = 100.0 .* Scythe.pressure.(s_prof, rho_d_prof, 0.0)
+        zeros_prof = zeros(Float64, kDim)
+        Scythe.write_exact_ref_mc(model.ref_state_file, z, p_prof, rho_d_prof,
+                                  zeros_prof, zeros_prof)
+        ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column)
+        Scythe.theta_bubble_mc!(patch, gridpoints, ref;
+                                xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0)
+    elseif Scythe.uses_physical_reference(model.equation_set)
         # Physical-density sets need a physical (Springsteel) reference. Build the balanced
         # dry profile with the legacy builder, then write it as an exact physical reference
         # with zero moisture (rho_v = rho_c = 0) and seed the dry physical-density bubble.

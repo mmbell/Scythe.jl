@@ -95,10 +95,12 @@ using LinearAlgebra
         Tk = 290.0; p = 900.0; rho_d = 1.05; q_v = 0.012; q_l = 1.0e-4
         q_cond = 1.0e-7
         Cm = (q_l * Scythe.Cl) / (Scythe.Cvd + (q_v * Scythe.Cvv) + (q_l * Scythe.Cl))
-        # The Rv*log(e/sat_e) (R_v ln H) term was removed from the formula in the
-        # sigma-era revision; the expected value matches the code as benchmarked.
+        e = Scythe.vapor_pressure(p, q_v)
+        sat_e = Scythe.sat_pressure_liquid_buck(Tk, p)
+        # Includes the R_v*ln(H) entropy-production term (irreversible phase change).
         expected = q_cond * (((-Scythe.L_v(Tk) * Cm) / Tk) -
-                             (Scythe.Cl * log(Tk / Scythe.T_0)))
+                             (Scythe.Cl * log(Tk / Scythe.T_0)) +
+                             (Scythe.Rv * log(e / sat_e)))
         @test Scythe.s_condensation_relaxation(q_cond, Tk, rho_d, q_v, q_l, p) ≈ expected
 
         # Zero condensation produces zero entropy change

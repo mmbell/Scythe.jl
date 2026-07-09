@@ -29,7 +29,10 @@ function rebuild_reference(model)
     kDim = model.grid_params.kDim
     z = gridpoints[1:kDim, 2]
     column = Scythe.reference_column(patch, model.grid_params)
-    if Scythe.uses_physical_reference(model.equation_set)
+    if Scythe.uses_pressure_reference(model.equation_set)
+        # Total-energy stage: pressure-based reference (p, densities, E_t, Q_ss)
+        ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column)
+    elseif Scythe.uses_physical_reference(model.equation_set)
         # Partial-density / entropy-density stage: physical condensate-bearing reference
         ref = Springsteel.exact_reference_state(model.ref_state_file, z, column)
     elseif model.options[:exact_reference_state]
@@ -52,6 +55,36 @@ function read_final_output(model)
 end
 
 """
+    mc_state(df, ref, kDim, ncols)
+
+Reconstruct the diagnostic thermodynamic state of the total-energy set
+(moist_compressible) from a perturbation output DataFrame: temperature from the
+Newton retrieval, then the diagnostic water partition. Returns
+`(Tk, p, rho_d, rho_v, rho_c, rho_t)` as flat vectors (z fastest), with p in Pa.
+"""
+function mc_state(df, ref, kDim, ncols)
+    pbar = Springsteel.ref_pressure(ref)[:, 1]
+    rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
+    rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
+    E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
+    Q_ssbar = Springsteel.ref_qss(ref)[:, 1]
+    Tbar = Springsteel.reference_temperature(ref)
+    p = df.p .+ repeat(pbar, ncols)
+    rho_d = df.rho_d .+ repeat(rho_dbar, ncols)
+    rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
+    E_t = df.E_t .+ repeat(E_tbar, ncols)
+    Q_ss = df.Q_ss .+ repeat(Q_ssbar, ncols)
+    ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
+    M = p .+ E_t .- (rho_t .* (ke .+ Scythe.gravity .* df.z))
+    Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, repeat(Tbar, ncols))
+    # Clamped partition, matching the equation set
+    rho_v = clamp.(Q_ss .+ Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0),
+                   0.0, max.(rho_t .- rho_d, 0.0))
+    rho_c = rho_t .- rho_d .- rho_v .- df.rho_r
+    return Tk, p, rho_d, rho_v, rho_c, rho_t
+end
+
+"""
     theta_perturbation(df, ref, kDim)
 
 Compute the potential temperature perturbation field from output entropy and
@@ -63,7 +96,18 @@ function theta_perturbation(df::DataFrame, ref, kDim::Int)
     npts = nrow(df)
     ncols = div(npts, kDim)
 
-    # Physical-density sets (pd / moist_compressible) store rho_v and use a Springsteel
+    # Total-energy set (moist_compressible): retrieve T from the prognostic
+    # (p, E_t, Q_ss, densities), then θ = T·(p_0/p)^(Rd/Cpd) directly.
+    if "E_t" in names(df)
+        Tk, p, _, _, _, _ = mc_state(df, ref, kDim, ncols)
+        theta = Tk .* ((Scythe.p_0 .* 100.0) ./ p) .^ (Scythe.Rd / Scythe.Cpd)
+        Tbar = Springsteel.reference_temperature(ref)
+        pbar = Springsteel.ref_pressure(ref)[:, 1]
+        theta0 = Tbar .* ((Scythe.p_0 .* 100.0) ./ pbar) .^ (Scythe.Rd / Scythe.Cpd)
+        return reshape(theta .- repeat(theta0, ncols), kDim, ncols), ncols
+    end
+
+    # Physical-density sets (pd / sigma) store rho_v and use a Springsteel
     # reference; reconstruct θ = T·(p_0/p)^(Rd/Cpd) from the densities and (s or σ).
     if "rho_v" in names(df)
         rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
@@ -185,12 +229,37 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
     # Partial-density runs store moisture as the densities rho_v/rho_c/rho_r and use
     # a physical (CondensateReferenceState) reference accessed through the generic
     # Springsteel accessors rather than the legacy sbar/mubar/rhobar fields. The
-    # moist_compressible (entropy-density) set additionally stores slot 1 as sigma = rho_d*s.
+    # sigma (entropy-density) set additionally stores slot 1 as sigma = rho_d*s.
     pd = Scythe.uses_physical_reference(model.equation_set)
+    # The total-energy set (moist_compressible) integrates its extensive prognostics
+    # directly: mass from rho_d/rho_t and energy from E_t itself, which IS the
+    # corrected total-energy diagnostic E_t = ρ_d e_i + ρ_t(ke + gz) of
+    # reference/Scythe_moist_compressible.tex.
+    mc = Scythe.uses_pressure_reference(model.equation_set)
 
     function integrals(tag)
         df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
         ncols = div(nrow(df), kDim)
+
+        if mc
+            Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+            E_t = df.E_t .+ repeat(Springsteel.ref_total_energy(ref)[:, 1], ncols)
+            # Clamp for the entropy diagnostic: in dry air the diagnostic
+            # rho_v = Q_ss + rho_vs sits at 0 ± roundoff, and entropy() takes log(q_v).
+            q_v = max.(rho_v, 0.0) ./ rho_d
+            q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
+            water_mass = rho_t .- rho_d
+            # Total entropy (informational; NOT conserved under finite-τ condensation —
+            # the second-law production ∫ρ_d R_v ln(H) q̇_cond ≥ 0 makes it rise while
+            # E_t stays flat; see the entropy budget subsection of the TeX).
+            s = Scythe.entropy.(Tk, rho_d, q_v)
+            total_entropy = rho_d .* (s .+ (q_l .* Scythe.Cl .* log.(Tk ./ Scythe.T_0)))
+            return (dry_mass = domain_integral(reshape(rho_d, kDim, ncols), model),
+                    water_mass = domain_integral(reshape(water_mass, kDim, ncols), model),
+                    mass = domain_integral(reshape(rho_t, kDim, ncols), model),
+                    energy = domain_integral(reshape(E_t, kDim, ncols), model),
+                    entropy = domain_integral(reshape(total_entropy, kDim, ncols), model))
+        end
 
         if pd
             rho_d = df.rho_d .+ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)
@@ -279,7 +348,39 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
     else
         pct_change["water_mass_drift_pct"] = 0.0
     end
+    if mc
+        pct_change["entropy_prod_rate"] = mc_entropy_production(model, ref)
+    end
     return pct_change
+end
+
+"""
+    mc_entropy_production(model, ref) -> Float64
+
+Second-law diagnostic for the total-energy set: the domain-integrated
+instantaneous entropy production rate ∫ρ_d R_v ln(H) q̇_cond dV [J/(K s)] at the
+final output time. Positive-definite for irreversible phase change (supersaturated
+condensation or subsaturated evaporation); zero for a saturation-adjustment
+scheme. The domain total entropy should rise at roughly this rate while the total
+energy stays constant.
+"""
+function mc_entropy_production(model, ref)
+    kDim = model.grid_params.kDim
+    tag = string(round(model.integration_time; digits=2))
+    df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
+    ncols = div(nrow(df), kDim)
+    Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+    rho_vs = Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0)
+    q_v = rho_v ./ rho_d
+    q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
+    Q_ssbar = Springsteel.ref_qss(ref)[:, 1]
+    Q_ss = df.Q_ss .+ repeat(Q_ssbar, ncols)
+    H = max.(rho_v, 1.0e-12) ./ rho_vs
+    Q_s = Scythe.Q_s_energy.(Tk, p, rho_d, q_v, q_l)
+    Qdot = Scythe.qss_condensation_rate.(Q_ss, rho_v, max.(rho_c, 0.0), rho_d,
+                                         Tk, p ./ 100.0, Q_s, model.ts)
+    sprod = Scythe.Rv .* log.(H) .* Qdot
+    return domain_integral(reshape(sprod, kDim, ncols), model)
 end
 
 """

@@ -74,13 +74,20 @@ function retrieve_temperature(M, rho_d, rho_t, Q_ss, p_Pa, T_guess;
 
     p_hPa = p_Pa / 100.0
     Cfactor = (rho_d * Cpd) + ((rho_t - rho_d) * Cpv)
+    rho_w = max(rho_t - rho_d, 0.0)                      # total water density
     Tk = T_guess
     for _ in 1:maxiter
         rho_vs = rho_v_sat(Tk, p_hPa)
-        wfactor = Q_ss + rho_d + rho_vs - rho_t          # = rho_v - rho_l (diagnostic)
+        # Clamped diagnostic partition: vapor cannot be negative or exceed the total
+        # water. Conservation lives in (rho_d, rho_t, E_t); the partition is pure
+        # bookkeeping, and the clamp makes the retrieval immune to Q_ss tracking
+        # drift where rho_vs → 0 (e.g. dry air, where wfactor = 0 exactly).
+        rho_v = clamp(Q_ss + rho_vs, 0.0, rho_w)
+        wfactor = rho_v - rho_w                          # = -rho_l (liquid incl. rain)
         F = (Cfactor * Tk) + (wfactor * L_v(Tk)) - M
-        Fprime = Cfactor + (L_v(Tk) * drho_vsat_dT(Tk, p_hPa)) +
-                 (wfactor * (Cpv - Cl))
+        dvdT = (0.0 < Q_ss + rho_vs) && (Q_ss + rho_vs < rho_w) ?
+               drho_vsat_dT(Tk, p_hPa) : 0.0
+        Fprime = Cfactor + (L_v(Tk) * dvdT) + (wfactor * (Cpv - Cl))
         dT = -F / Fprime
         Tk = clamp(Tk + dT, 150.0, 350.0)
         if abs(dT) < tol
@@ -115,7 +122,7 @@ function Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l)
 end
 
 """
-    qss_condensation_rate(Q_ss, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
+    qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
 
 Cloud condensation/evaporation rate [kg/m³/s] from the prognostic supersaturation
 density, with the droplet-growth timescale of [`q_condensation`](@ref) (Twomey-type
@@ -123,11 +130,13 @@ nucleation, minimum droplet radius) and the energy-consistent psychrometric fact
 
     Q̇_cond = Q_ss (1/τ) / (1 + Q_s)
 
-Evaporation is limited by the available cloud water (`≥ −max(rho_c,0)/ts`) so the
-diagnostic ρ_c cannot be driven negative; condensation is limited by the available
-vapor. Subsaturated cloud-free air returns zero (no droplets, 1/τ = 0).
+`rho_v` is the CLAMPED diagnostic vapor density. Evaporation is limited by the
+available cloud water (`≥ −max(rho_c,0)/ts`) so the diagnostic ρ_c cannot be driven
+negative; condensation is limited by the available vapor (`≤ rho_v/ts`), which kills
+phantom condensation in dry air where Q_ss tracking drift can otherwise indicate
+spurious supersaturation. Subsaturated cloud-free air returns zero.
 """
-function qss_condensation_rate(Q_ss, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
+function qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
 
     rho_vs = rho_v_sat(Tk, p_hPa)
     S = Q_ss / rho_vs                    # supersaturation (ratio - 1)
@@ -164,7 +173,7 @@ function qss_condensation_rate(Q_ss, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=1
 
     # No negative water: evaporation limited by cloud, condensation by vapor
     Qdot = max(Qdot, -max(rho_c, 0.0) / ts)
-    Qdot = min(Qdot, max(Q_ss + rho_vs, 0.0) / ts)
+    Qdot = min(Qdot, max(rho_v, 0.0) / ts)
     return Qdot
 end
 
@@ -299,7 +308,9 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Tk = retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, Tbar)
     p_hPa = p ./ 100.0
     rho_vs = rho_v_sat.(Tk, p_hPa)
-    rho_v = Q_ss .+ rho_vs
+    # Clamped diagnostic partition (see retrieve_temperature): vapor within
+    # [0, total water], cloud the residual
+    rho_v = clamp.(Q_ss .+ rho_vs, 0.0, max.(rho_t .- rho_d, 0.0))
     rho_c = rho_t .- rho_d .- rho_v .- rho_r
     q_v = rho_v ./ rho_d
     q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
@@ -313,7 +324,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # psychrometric factor. rho_v and rho_c are diagnostic, so no separate
     # condensation-adjustment step is needed after the timestep.
     Q_s = Q_s_energy.(Tk, p, rho_d, q_v, q_l)
-    Qdot = qss_condensation_rate.(Q_ss, rho_c, rho_d, Tk, p_hPa, Q_s, model.ts)
+    Qdot = qss_condensation_rate.(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, model.ts)
     for i in 1:length(Qdot)
         if isnan(Qdot[i])
             error("Qdot is NaN at index $i, time $(t)!")
@@ -333,26 +344,20 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo KDIFF .= @. Khdiff * pp_xx
     @turbo expdot[colstart:colend,1] .= @. ADV + FORCING + KDIFF
 
-    # Implicit acoustic tendencies from the vertical mass flux φ = ρ̄_t w:
-    # impdot[p] = -Pxi_bar ∂z(ρ̄_t w), impdot[rho_t] = -∂z(ρ̄_t w).
-    flux_col = deepcopy(mtile.tile.kbasis.data[mtile.model.grid_params.vars["w"]])
-    flux_col.uMish .= rho_tbar .* w
-    Btransform!(flux_col)
-    Atransform!(flux_col)
-    phi_z = Ixtransform(flux_col)
-    impdot[colstart:colend,1] .= .-(Pxi_bar .* phi_z)
-    impdot[colstart:colend,3] .= .-phi_z
+    # Implicit acoustic tendencies from the vertical mass flux φ = ρ̄_t w, in
+    # pointwise product-rule form ∂z(c w) = c w_z + c_z w (no column refits: the
+    # refit reapplies the spectral filter, which makes the rho_d and rho_t paths
+    # inconsistent and lets the two densities drift apart in dry air).
+    impdot[colstart:colend,1] .= @. -Pxi_bar * ((rho_tbar * w_z) + (rho_tbar_z * w))
+    impdot[colstart:colend,3] .= @. -((rho_tbar * w_z) + (rho_tbar_z * w))
 
     # Dry-air mass continuity (slot 2, advective product-rule form)
     @turbo ADV .= @. (-u * rho_dp_x) + (-w * rho_d_z)
     @turbo FORCING .= @. -rho_d * div
     @turbo KDIFF .= @. Khdiff * rho_dp_xx
     @turbo expdot[colstart:colend,2] .= @. ADV + FORCING + KDIFF
-    # Implicit acoustic continuity: flux form -∂z(ρ̄_d w)
-    flux_col.uMish .= rho_dbar .* w
-    Btransform!(flux_col)
-    Atransform!(flux_col)
-    impdot[colstart:colend,2] .= .-Ixtransform(flux_col)
+    # Implicit acoustic continuity: -∂z(ρ̄_d w), product-rule form
+    impdot[colstart:colend,2] .= @. -((rho_dbar * w_z) + (rho_dbar_z * w))
 
     # Total mass continuity (slot 3; sources zero without flux/sedimentation)
     @turbo ADV .= @. (-u * rho_tp_x) + (-w * rho_t_z)
@@ -382,11 +387,8 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo FORCING .= @. (-(E_t + p) * div) - (u * pp_x) - (w * p_z)
     @turbo KDIFF .= @. Khdiff * E_tp_xx
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + KDIFF
-    # Implicit acoustic energy flux: -∂z((Ē_t + p̄) w)
-    flux_col.uMish .= (E_tbar .+ pbar) .* w
-    Btransform!(flux_col)
-    Atransform!(flux_col)
-    impdot[colstart:colend,6] .= .-Ixtransform(flux_col)
+    # Implicit acoustic energy flux: -∂z((Ē_t + p̄) w), product-rule form
+    impdot[colstart:colend,6] .= @. -(((E_tbar + pbar) * w_z) + ((E_tbar_z + pbar_z) * w))
 
     # Supersaturation density (slot 7): the saturation chain-rule terms use the
     # non-condensation T and p tendencies; the condensation contribution is
@@ -452,9 +454,13 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # Reference profiles and mean sound speed squared
     Pxi_bar = sound_speed_sq(mtile.ref_state)
     rho_dbar = ref_rho_d(mtile.ref_state)[:,1]
+    rho_dbar_z = ref_rho_d(mtile.ref_state)[:,2]
     rho_tbar = ref_rho_t(mtile.ref_state)[:,1]
+    rho_tbar_z = ref_rho_t(mtile.ref_state)[:,2]
     E_tbar = ref_total_energy(mtile.ref_state)[:,1]
+    E_tbar_z = ref_total_energy(mtile.ref_state)[:,2]
     pbar = ref_pressure(mtile.ref_state)[:,1]
+    pbar_z = ref_pressure(mtile.ref_state)[:,2]
 
     # Subtract the AB3 explicit treatment of the implicit tendency and add the
     # off-centered AI2* terms (AM2 trapezoidal on the first step), then shift the
@@ -511,20 +517,23 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # Recover p'_n+1 = p'* - Δτ Pxi_bar ∂z φ_n+1
     view(mtile.var_np1,colstart:colend,p_index) .= p_nstar .- (ts_term .* Pxi_bar .* phi_z)
 
-    # Slaved flux-form updates: rho_t' directly from ∂z φ (conserves ∫rho_t'), and
-    # rho_d'/E_t' from smooth coefficient profiles times φ.
+    # Slaved flux-form updates ∂z(c φ) = c φ_z + c_z φ, pointwise from the solve's
+    # φ and φ_z (no column refits — a refit reapplies the spectral filter and makes
+    # the paths inconsistent). rho_t' has c = 1 exactly (conserves ∫rho_t'); with a
+    # dry reference the rho_d' update is then IDENTICAL to rho_t''s, so the two
+    # densities cannot drift apart.
     view(mtile.var_np1,colstart:colend,rhot_index) .= rhot_nstar .- (ts_term .* phi_z)
 
-    flux_col = deepcopy(mtile.tile.kbasis.data[w_index])
-    flux_col.uMish .= (rho_dbar ./ rho_tbar) .* phi
-    Btransform!(flux_col)
-    Atransform!(flux_col)
-    view(mtile.var_np1,colstart:colend,rhod_index) .= rhod_nstar .- (ts_term .* Ixtransform(flux_col))
+    c_d = rho_dbar ./ rho_tbar
+    c_d_z = ((rho_dbar_z .* rho_tbar) .- (rho_dbar .* rho_tbar_z)) ./ (rho_tbar .^ 2)
+    view(mtile.var_np1,colstart:colend,rhod_index) .=
+        rhod_nstar .- (ts_term .* ((c_d .* phi_z) .+ (c_d_z .* phi)))
 
-    flux_col.uMish .= ((E_tbar .+ pbar) ./ rho_tbar) .* phi
-    Btransform!(flux_col)
-    Atransform!(flux_col)
-    view(mtile.var_np1,colstart:colend,et_index) .= et_nstar .- (ts_term .* Ixtransform(flux_col))
+    c_e = (E_tbar .+ pbar) ./ rho_tbar
+    c_e_z = (((E_tbar_z .+ pbar_z) .* rho_tbar) .-
+             ((E_tbar .+ pbar) .* rho_tbar_z)) ./ (rho_tbar .^ 2)
+    view(mtile.var_np1,colstart:colend,et_index) .=
+        et_nstar .- (ts_term .* ((c_e .* phi_z) .+ (c_e_z .* phi)))
 end
 
 # ── Initial conditions and reference writer ────────────────────────────────────

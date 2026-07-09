@@ -43,17 +43,22 @@ const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 const PE_VARS_PD = ["s", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
 # Entropy-density variant: slot 1 carries sigma = rho_d*s instead of s
 const PE_VARS_SIGMA = ["sigma", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
+# Total-energy variant: prognostic p/rho_d/rho_t/E_t/Q_ss; rho_v and rho_c are diagnostic
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
 function bf02_moist_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
+    stage == STAGE_MC && return MC_VARS
     stage == STAGE_PE_SIGMA && return PE_VARS_SIGMA
     stage == STAGE_PE_RHOD_PD && return PE_VARS_PD
     stage == STAGE_PE_RHOD && return PE_VARS_RHOD
     return PE_VARS
 end
 # Liquid water variable(s) per stage (PE splits liquid into cloud and rain; the
-# partial-density and entropy-density stages carry them as densities rho_c/rho_r)
+# partial-density and entropy-density stages carry them as densities rho_c/rho_r;
+# the total-energy stage diagnoses liquid from Q_ss so no output column applies)
 function liquid_vars(stage)
     stage == :legacy && return ["mu_l"]
+    stage == STAGE_MC && return String[]
     stage in (STAGE_PE_RHOD_PD, STAGE_PE_SIGMA) && return ["rho_c", "rho_r"]
     return ["mu_c", "mu_r"]
 end
@@ -80,14 +85,16 @@ function bf02_moist_model(opts::BenchmarkOptions)
         equation_set = "BF02_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
         options = Dict(:semiimplicit => true, :exact_reference_state => true)
-    elseif opts.stage in (STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
+    elseif opts.stage in (STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA, STAGE_MC)
         # Linear dry-air-density prognostic variant (mass-conserving continuity)
         # with semi-implicit acoustics on the mass flux phi = rhobar_d * w
         # (Phase 2; see reference/Semiimplicit_linear_rhod.tex). The pd stage
         # additionally carries the moisture as partial densities (Phase 3) on a
-        # condensate-bearing physical reference state; the moist-compressible stage
-        # (Stage 2) further carries the entropy density sigma = rho_d*s in slot 1.
-        equation_set = opts.stage == STAGE_PE_SIGMA ? "primitive_equation_XZ_sigma" :
+        # condensate-bearing physical reference state; the sigma stage carries the
+        # entropy density sigma = rho_d*s in slot 1; the mc stage is the total-energy
+        # set (prognostic p/E_t/Q_ss, (p,w) semi-implicit acoustics).
+        equation_set = opts.stage == STAGE_MC ? "moist_compressible_XZ" :
+            opts.stage == STAGE_PE_SIGMA ? "primitive_equation_XZ_sigma" :
             opts.stage == STAGE_PE_RHOD_PD ? "primitive_equation_XZ_rhod_pd" :
             "primitive_equation_XZ_rhod"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
@@ -200,7 +207,18 @@ function bf02_moist_init!(model)
     sigma_stage = opts.stage == STAGE_PE_SIGMA
     physical_stage = pd_stage || sigma_stage   # condensate-bearing physical reference
     patch.physical .= 0.0
-    if physical_stage
+    if opts.stage == STAGE_MC
+        # Total-energy stage: pressure-based reference. The reference pressure comes
+        # from the EOS of the converged (s, rho_d, q_v) base so the temperature is
+        # EOS-exact and the saturated base sits exactly on the Q_ss = 0 manifold.
+        p_Pa = 100.0 .* Scythe.pressure.(base.s, base.rho_d, base.q_v)
+        Scythe.write_exact_ref_mc(model.ref_state_file, z, p_Pa, base.rho_d,
+                                  base.rho_d .* base.q_v, base.rho_d .* base.q_l)
+        ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column)
+        Scythe.moist_buoyancy_bubble_mc!(patch, gridpoints, base, ref;
+                                         q_t=Q_T, xc=10000.0, xr=2000.0,
+                                         zc=2000.0, zr=2000.0, amp=2.0/300.0)
+    elseif physical_stage
         Scythe.write_exact_ref_pd(model.ref_state_file, z, base.s, base.rho_d,
                                   base.rho_d .* base.q_v, base.rho_d .* base.q_l)
         ref = Springsteel.exact_reference_state(model.ref_state_file, z, column)
@@ -297,6 +315,21 @@ end
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
 function moist_fields(df, ref, kDim, base, stage)
     ncols = div(nrow(df), kDim)
+    if stage == STAGE_MC
+        # Total-energy stage: retrieve (T, p) and the diagnostic water partition from
+        # the prognostics, then reuse the transformed-variable theta_e diagnostic.
+        Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+        q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
+        q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
+        s = Scythe.entropy.(Tk, rho_d, q_v)
+        xi = Scythe.log_dry_density.(rho_d)
+        mu = Scythe.mu_transform.(q_v)
+        mu_liq = Scythe.mu_transform.(q_l)
+        theta_e = Scythe.reversible_theta_e.(s, xi, mu, mu_liq)
+        theta_e_p = reshape(theta_e .- repeat(base.theta_e, ncols), kDim, ncols)
+        supersat = reshape(q_v .- Scythe.q_sat_liquid.(Tk, p ./ 100.0), kDim, ncols)
+        return theta_e_p, supersat, ncols
+    end
     if stage in (STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
         # Partial-density / entropy-density stage: reconstruct xi/mu/mu_liq from the partial
         # densities and a physical (CondensateReferenceState) reference, then reuse the
