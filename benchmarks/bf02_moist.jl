@@ -67,9 +67,9 @@ const THETA_E = 320.0
 
 function bf02_moist_model(opts::BenchmarkOptions)
     if opts.mode == :full
-        num_cells = 100         # 100 m cells
-        kDim = 150
-        ts = 0.1/2.0
+        num_cells = 200         # 100 m cells
+        kDim = 300
+        ts = 0.025#0.1/3.0
         output_interval = 100.0
     else
         num_cells = 50         # 200 m cells
@@ -98,6 +98,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
             opts.stage == STAGE_PE_RHOD_PD ? "primitive_equation_XZ_rhod_pd" :
             "primitive_equation_XZ_rhod"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
+                               :Prandtl => 1.0, :tau_qss => 10.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
         options = Dict(:semiimplicit => true, :exact_reference_state => true,
                        :precipitation => false, :vertical_mixing => false)

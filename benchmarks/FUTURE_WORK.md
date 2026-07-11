@@ -97,3 +97,25 @@ associated with the Chebyshev vertical basis.
 - theta_e' Gibbs overshoot at the arch grows with updraft strength (5.9 K at
   200 m in the PE moist run vs 4.1 published). Ties into the
   Chebyshev-vs-spline vertical basis experiment above.
+
+## Dead implicit vertical momentum diffusion in the pe/pd/sigma sets
+
+`impdot[u] = Kvdiff * u_zz` is written by `primitive_equation_XZ`
+(src/primitive_equations.jl:275), `_rhod` (:593), `_rhod_pd` (:943) and
+`_sigma` (:1306), but `diffusion_timestep` (src/semiimplicit.jl:1019) and
+`diffusion_timestep_pd` (:1142) only solve the `s`/`sigma` and moisture slots,
+and `explicit_timestep` (:1252) reads only `expdot`. The write is therefore
+dropped: those sets apply HORIZONTAL momentum diffusion only, and `w` never had
+vertical diffusion at all (its `impdot` slot is the acoustic PGF).
+
+straka93 `--stage pe` and `--stage pe-rho_d` have been passing their targets in
+that state. `moist_compressible_XZ` was fixed (it now carries its own
+`diffdot_n`/`diffdot_nm1` channel and `diffusion_timestep_mc`, which diffuses
+u, w and theta_d'); the older sets were left bit-for-bit alone so no baseline
+moved.
+
+Fixing them means adding `u` and `w` to the `diffusion_timestep*` variable lists
+— `w` needs the `diffdot` channel, since `impdot[w]` is the acoustic tendency —
+and will change straka93 `pe` / `pe-rho_d` results plus anything in
+`tcblModels` that has tuned around the current behavior. Re-seed those
+baselines deliberately when it is done.

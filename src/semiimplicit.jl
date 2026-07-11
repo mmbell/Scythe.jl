@@ -43,6 +43,18 @@ struct ModelTile{R<:AbstractReferenceState}
     patch_b_iDim::Int64
     h_matrix::Factorization
     diffusion_matrix::Factorization
+    # Implicit vertical-diffusion tendency history, separate from `impdot_*`. The
+    # acoustic solvers own the `impdot` slots of every variable they touch (p, rho_d,
+    # rho_t, w, E_t), so a set that wants implicit vertical diffusion on w — or on a
+    # DIAGNOSED scalar such as the moist_compressible potential temperature — has no
+    # free `impdot` column to store its AI2* history in. `diffdot_*` is that channel.
+    # Only `moist_compressible_XZ` uses it; the older sets still stage their (currently
+    # unconsumed) vertical diffusion in `impdot`.
+    diffdot_n::Array{Float64}
+    diffdot_nm1::Array{Float64}
+    # Per-boundary-condition vertical-diffusion factorizations for the total-energy set:
+    # :neumann_m (u), :dirichlet_m (w), :neumann_h (theta_d'). Empty for other sets.
+    mc_diffusion_matrices::Dict{Symbol,Factorization}
 end
 
 """
@@ -70,6 +82,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     impdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    diffdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    diffdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
 
     # Get the local gridpoints
     tilepoints = getGridpoints(tile)
@@ -138,6 +152,32 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
     end
 
+    # The total-energy set diffuses momentum (u, w) and the diagnosed moist entropy s_t
+    # (heat, Kvdiff/Prandtl). Each needs its own factorization: the boundary conditions
+    # differ (straka93 free-slip u, bf02 no-slip; w a rigid lid; scalars Neumann), and the
+    # heat diffusivity is Kvdiff/Prandtl. s_t rides on the Neumann E_t column. Both the
+    # AI2* coefficient (t >= 2) and the first-step AM2 coefficient are cached, so
+    # `diffusion_timestep_mc` never factorizes per column.
+    # Water-species diffusion (a Kvdiff/Schmidt Neumann matrix on rho_t) is DEFERRED to
+    # the rainfall session — see reference/moist_compressible_diffusion_handoff.md.
+    # Built only for Kvdiff > 0: at K = 0 a vertical solve is not the identity (it refits
+    # the column and reapplies the spectral filter), so the routine returns before it.
+    mc_diffusion_matrices = Dict{Symbol,Factorization}()
+    if uses_pressure_reference(model.equation_set) &&
+            get(model.physical_params, :Kvdiff, 0.0) > 0.0
+        Kv = model.physical_params[:Kvdiff]
+        Pr = get(model.physical_params, :Prandtl, 1.0)
+        bcb = model.grid_params.BCB
+        bct = model.grid_params.BCT
+        for (key, var, K) in ((:u, "u", Kv), (:w, "w", Kv), (:heat, "E_t", Kv / Pr))
+            for (suffix, coeff) in ((key, 1.25 * model.ts * K),
+                                    (Symbol(key, :_first), 0.5 * model.ts * K))
+                mc_diffusion_matrices[suffix] = calc_Helmholtz_diffusion_matrix(tile, model, coeff;
+                    bc_bottom = bcb[var], bc_top = bct[var])
+            end
+        end
+    end
+
     mtile = ModelTile(
         model,
         tile,
@@ -159,7 +199,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         splineBuffer,
         patch.params.b_iDim,
         h_matrix,
-        diffusion_matrix)
+        diffusion_matrix,
+        diffdot_n,
+        diffdot_nm1,
+        mc_diffusion_matrices)
     return mtile
 end
 

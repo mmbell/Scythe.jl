@@ -158,27 +158,44 @@ using Springsteel
         return (; z, Tk, p_Pa, rho_d, rho_v, rho_c)
     end
 
-    function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=false, ts=0.1)
+    """Dry, neutrally stable (theta = 300 K) analytic adiabat -- the Straka/BF02 base."""
+    function dry_adiabatic_column_mc(z; theta0=300.0)
+        n = length(z)
+        exner = @. 1.0 - (Scythe.gravity * z) / (Cpd * theta0)
+        Tk = theta0 .* exner
+        p_Pa = @. 100000.0 * exner^(Cpd / Rd)
+        rho_d = p_Pa ./ (Rd .* Tk)
+        return (; z, Tk, p_Pa, rho_d, rho_v = zeros(n), rho_c = zeros(n))
+    end
+
+    function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=false, ts=0.1,
+                           dry=false, Khdiff=0.0, Kvdiff=0.0, Prandtl=1.0, tau_qss=10.0,
+                           u_side_bc=DirichletBC())
         varlist = Scythe.MC_VARS
         vars = Dict(v => i for (i, v) in enumerate(varlist))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
         wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+        # A z-only u profile is only representable when the side walls let u be nonzero;
+        # with a Dirichlet u the spline fit forces u -> 0 at x = 0, L and u_x (hence the
+        # divergence) swamps any diffusive tendency.
+        side_bc = merge(scalar_bc, Dict("u" => u_side_bc, "w" => DirichletBC()))
         gp = GridParameters(
             geometry = "RZ", num_cells = num_cells,
             iMin = 0.0, iMax = 2000.0, kMin = 0.0, kMax = 2000.0, kDim = kDim,
-            BCL = wall_bc, BCR = wall_bc, BCB = wall_bc, BCT = wall_bc, vars = vars,
+            BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc, vars = vars,
         )
         patch = createGrid(gp)
         gridpoints = Scythe.getGridpoints(patch)
         z = gridpoints[1:kDim, 2]
-        col = saturated_cloudy_column_mc(z)
+        col = dry ? dry_adiabatic_column_mc(z) : saturated_cloudy_column_mc(z)
         ref_file = joinpath(tmpdir, "mc_pressure.ref")
         Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
         model = ModelParameters(
             ts = ts, integration_time = 1.0, output_interval = 1.0,
             equation_set = "moist_compressible_XZ",
             ref_state_file = ref_file, grid_params = gp,
-            physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
+            physical_params = Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff, :Kv_mudiff => 0.0,
+                                   :Prandtl => Prandtl, :tau_qss => tau_qss,
                                    :alpha => 0.0, :z_damp => 20.0e3),
             options = Dict(:semiimplicit => semiimplicit, :exact_reference_state => true,
                            :precipitation => false, :vertical_mixing => false),
@@ -190,6 +207,20 @@ using Springsteel
                                 size(patch.spectral, 1), size(patch.spectral, 2))
         mtile = createModelTile(patch, patch, model, haloReceiveMap)
         return mtile, patch, model, col
+    end
+
+    """Advance every column of `mtile` for `nsteps` steps, refreshing the transforms."""
+    function step_mc!(mtile, patch, model, nsteps)
+        kDim = model.grid_params.kDim
+        ncols = div(size(patch.physical, 1), kDim)
+        for t in 1:nsteps
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, t)
+            end
+            Scythe.calcTendency(mtile)
+            gridTransform!(patch)
+        end
+        return patch
     end
 
     @testset "reference routing" begin
@@ -342,6 +373,246 @@ using Springsteel
             # initial amplitude after 200 vertically-stiff steps
             @test maximum(abs.(patch.physical[:, p_i, 1])) < p0_max
             @test maximum(abs.(patch.physical[:, vars["w"], 1])) < 1.0
+        end
+    end
+
+    # ──────────────────────────────────────────────
+    # 6. Diffusion: theta_d, heating consistency, dissipation
+    # ──────────────────────────────────────────────
+
+    @testset "dry_potential_temperature" begin
+        # Dry air: exactly Straka's theta = T (p_0/p)^kappa
+        for (Tk, p_Pa) in ((300.0, 100000.0), (280.0, 85000.0), (250.0, 50000.0))
+            rho_d = p_Pa / (Rd * Tk)
+            theta = Tk * ((100.0 * Scythe.p_0) / p_Pa)^(Rd / Cpd)
+            @test Scythe.dry_potential_temperature(p_Pa, rho_d) ≈ theta rtol=1e-14
+        end
+        # Moist air: (R_m/R_d) T (p_0/p)^kappa
+        Tk, p_Pa, q_v = 295.0, 95000.0, 0.015
+        R_m = Rd + (q_v * Rv)
+        rho_d = p_Pa / (R_m * Tk)
+        expected = (R_m / Rd) * Tk * ((100.0 * Scythe.p_0) / p_Pa)^(Rd / Cpd)
+        @test Scythe.dry_potential_temperature(p_Pa, rho_d) ≈ expected rtol=1e-14
+
+        # The mc heating coefficient rho_d*C_vt*(Cpd/Cvd)*(T/theta_d) reduces to the
+        # classical rho*C_p*pi in dry air, so Q_therm = rho*Cp*pi*K*Lap(theta) exactly.
+        Tk, p_Pa = 290.0, 90000.0
+        rho_d = p_Pa / (Rd * Tk)
+        theta_d = Scythe.dry_potential_temperature(p_Pa, rho_d)
+        exner = (p_Pa / (100.0 * Scythe.p_0))^(Rd / Cpd)
+        @test rho_d * Cvd * (Cpd / Cvd) * (Tk / theta_d) ≈ rho_d * Cpd * exner rtol=1e-12
+    end
+
+    @testset "qss admissible bounds and relaxation" begin
+        Tk, p_hPa = 290.0, 900.0
+        rho_vs = rho_v_sat(Tk, p_hPa)
+        rho_d = 1.1
+        tau = 10.0
+
+        # Dry air: rho_t == rho_d, so the interval collapses to the point -rho_vs
+        lo, hi = Scythe.qss_admissible_bounds(rho_d, rho_d, 0.0, rho_vs)
+        @test lo == -rho_vs && hi == -rho_vs
+        # ... and the relaxation drives Q_ss there from either side, at rate 1/tau
+        @test Scythe.qss_relaxation(0.0, rho_d, rho_d, 0.0, rho_vs, tau) ≈ -rho_vs / tau
+        @test Scythe.qss_relaxation(-2rho_vs, rho_d, rho_d, 0.0, rho_vs, tau) ≈ rho_vs / tau
+
+        # Cloudy air: Q_ss strictly interior => exactly zero, no nudge at all
+        rho_t = rho_d + rho_vs + 1.0e-3          # 1 g/m^3 of cloud
+        @test Scythe.qss_relaxation(0.0, rho_d, rho_t, 0.0, rho_vs, tau) == 0.0
+        @test Scythe.qss_relaxation(1.0e-4, rho_d, rho_t, 0.0, rho_vs, tau) == 0.0
+
+        # Supersaturated cloud-free air sits exactly at the ceiling Q_hi > 0: the
+        # relaxation is zero there, so nucleation is not suppressed.
+        rho_w = 1.05 * rho_vs
+        rho_t = rho_d + rho_w
+        _, Q_hi = Scythe.qss_admissible_bounds(rho_d, rho_t, 0.0, rho_vs)
+        @test Q_hi > 0.0
+        @test Scythe.qss_relaxation(Q_hi, rho_d, rho_t, 0.0, rho_vs, tau) == 0.0
+        Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_w / rho_d, 0.0)
+        @test Scythe.qss_condensation_rate(Q_hi, rho_w, 0.0, rho_d, Tk, p_hPa, Q_s, 0.1) > 0.0
+        # Drift above the ceiling is pulled back
+        @test Scythe.qss_relaxation(Q_hi + 0.02, rho_d, rho_t, 0.0, rho_vs, tau) ≈ -0.02 / tau
+
+        # Rain is liquid: the ceiling excludes it
+        rho_r = 5.0e-4
+        rho_t = rho_d + rho_vs + rho_r
+        _, Q_hi_rain = Scythe.qss_admissible_bounds(rho_d, rho_t, rho_r, rho_vs)
+        @test Q_hi_rain ≈ 0.0 atol=1e-15
+    end
+
+    @testset "retrieval clamp keeps rho_c nonnegative with rain" begin
+        # Total water is all rain: vapor must clamp to zero, not to rho_w, or the
+        # residual cloud rho_c = rho_t - rho_d - rho_v - rho_r goes negative.
+        Tk, p_Pa = 290.0, 90000.0
+        rho_d = p_Pa / (Rd * Tk)
+        rho_r = 1.0e-3
+        rho_t = rho_d + rho_r
+        rho_vs = rho_v_sat(Tk, p_Pa / 100.0)
+        Q_ss = -rho_vs                                   # rho_v = 0
+        M = (rho_d * Cpd * Tk) + (-rho_r * Scythe.L_v(Tk))
+        T_ret = Scythe.retrieve_temperature(M + p_Pa - p_Pa, rho_d, rho_t, Q_ss, p_Pa,
+                                            Tk, rho_r)
+        rho_v = clamp(Q_ss + rho_v_sat(T_ret, p_Pa / 100.0), 0.0,
+                      max(rho_t - rho_d - rho_r, 0.0))
+        @test rho_v ≈ 0.0 atol=1e-14
+        @test rho_t - rho_d - rho_v - rho_r >= -1e-14    # rho_c >= 0
+    end
+
+    @testset "resting dry base is untouched by diffusion" begin
+        # s_d' = 0 identically on the reference (s_d = C_vd ln p - C_pd ln rho_d is an
+        # explicit function of p, rho_d, so at rest it equals s_dbar bit-for-bit), so every
+        # diffusive tendency must vanish. A K = 75 run has to be BIT-IDENTICAL to a K = 0
+        # run at rest: this catches a bad s_dbar subtraction that would cook the base.
+        mktempdir() do tmpdir
+            m0, p0, mod0, _ = make_mc_mtile(tmpdir; dry=true, Kvdiff=0.0, Khdiff=0.0)
+            step_mc!(m0, p0, mod0, 3)
+        end
+        mktempdir() do tmpdir
+            mK, pK, modK, _ = make_mc_mtile(tmpdir; dry=true, Kvdiff=75.0, Khdiff=75.0)
+            step_mc!(mK, pK, modK, 3)
+            # Nothing was seeded, so the base must stay exactly at zero perturbation
+            @test maximum(abs.(pK.physical[:, 4, 1])) == 0.0   # u
+            @test maximum(abs.(pK.physical[:, 5, 1])) == 0.0   # w
+            @test maximum(abs.(pK.physical[:, 1, 1])) == 0.0   # p'
+            @test maximum(abs.(pK.physical[:, 6, 1])) == 0.0   # E_t'
+            @test all(isfinite.(pK.physical[:, :, 1]))
+        end
+    end
+
+    @testset "diffusive heating sources p and E_t consistently" begin
+        # In dry air the retrieval Jacobian is F_T = rho_d*C_pt, so a heating Qdot that
+        # sources dE_t = Qdot and dp = (R_m/C_vt)*Qdot yields dT = dp/(rho_d*R_m) exactly.
+        # Diffing a Kvdiff = 75 step against a Kvdiff = 0 step isolates the split from
+        # the O(ts^2) truncation error of the rest of the scheme. Khdiff = 0 so the two
+        # runs share an identical expdot.
+        mktempdir() do tmpdir
+            args = (; dry=true, Khdiff=0.0, kDim=16, num_cells=8)
+            m0, patch0, mod0, _ = make_mc_mtile(tmpdir; args..., Kvdiff=0.0)
+            gp0 = Scythe.getGridpoints(patch0)
+            ref0 = m0.ref_state
+            Scythe.theta_bubble_mc!(patch0, gp0, ref0;
+                                    xc=1000.0, xr=400.0, zc=1000.0, zr=400.0, dtheta_max=2.0)
+            spectralTransform!(patch0); gridTransform!(patch0)
+            ncols = div(size(patch0.physical, 1), mod0.grid_params.kDim)
+            for c in 1:ncols; Scythe.advance_column(m0, c, 1); end
+
+            mK, patchK, modK, _ = make_mc_mtile(tmpdir; args..., Kvdiff=75.0)
+            gpK = Scythe.getGridpoints(patchK)
+            Scythe.theta_bubble_mc!(patchK, gpK, mK.ref_state;
+                                    xc=1000.0, xr=400.0, zc=1000.0, zr=400.0, dtheta_max=2.0)
+            spectralTransform!(patchK); gridTransform!(patchK)
+            for c in 1:ncols; Scythe.advance_column(mK, c, 1); end
+
+            kDim = mod0.grid_params.kDim
+            pbar = Springsteel.ref_pressure(ref0)[:, 1]
+            rho_dbar = Springsteel.ref_rho_d(ref0)[:, 1]
+            rho_tbar = Springsteel.ref_rho_t(ref0)[:, 1]
+            E_tbar = Springsteel.ref_total_energy(ref0)[:, 1]
+            Q_ssbar = Springsteel.ref_qss(ref0)[:, 1]
+            Tbar = Springsteel.reference_temperature(ref0)
+            zs = gp0[:, 2]
+
+            function retrieved(mt, i, k)
+                p = mt.var_np1[i, 1] + pbar[k]
+                rho_d = mt.var_np1[i, 2] + rho_dbar[k]
+                rho_t = mt.var_np1[i, 3] + rho_tbar[k]
+                E_t = mt.var_np1[i, 6] + E_tbar[k]
+                Q_ss = mt.var_np1[i, 7] + Q_ssbar[k]
+                ke = 0.5 * (mt.var_np1[i, 4]^2 + mt.var_np1[i, 5]^2)
+                M = p + E_t - rho_t * (ke + Scythe.gravity * zs[i])
+                return Scythe.retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k],
+                                                   mt.var_np1[i, 8]), p, rho_d
+            end
+
+            dp_max = 0.0
+            worst = 0.0
+            for i in 1:size(patch0.physical, 1)
+                k = mod1(i, kDim)
+                T0, p0v, rho_d0 = retrieved(m0, i, k)
+                TK, pKv, rho_dK = retrieved(mK, i, k)
+                dp = pKv - p0v
+                dp_max = max(dp_max, abs(dp))
+                # Dry air: R_m = Rd, and rho_d is untouched by the diffusion split
+                @test rho_dK ≈ rho_d0 rtol=1e-14
+                dT_expected = dp / (rho_dK * Rd)
+                worst = max(worst, abs((TK - T0) - dT_expected))
+            end
+            # The diffusion split actually did something...
+            @test dp_max > 1.0e-6
+            # ...and the retrieved temperature increment matches the EOS-slaved pressure
+            # increment to machine precision. Sourcing p or E_t alone breaks this.
+            @test worst < 1.0e-9
+        end
+    end
+
+    @testset "momentum diffusion is a resolved-KE sink" begin
+        # Eddy friction removes resolved KE to the subgrid (the future TKE shear
+        # production), so E_t follows the KE DOWN and the internal energy is HELD: T and p
+        # are unchanged (no dissipative heating — the review fix). The E_t decrease equals
+        # the resolved KE removed, dE_t = rho_t*dke.
+        mktempdir() do tmpdir
+            mtile, patch, model, _ = make_mc_mtile(tmpdir; dry=true, Khdiff=0.0,
+                                                   Kvdiff=75.0, kDim=16,
+                                                   u_side_bc=NeumannBC())
+            kDim = model.grid_params.kDim
+            gridpoints = Scythe.getGridpoints(patch)
+            # u = U0 sin(pi z/H): vanishes at the no-slip lids, u_zz != 0 in the interior,
+            # and is x-independent so the divergence (hence every other tendency) is zero.
+            for i in 1:size(patch.physical, 1)
+                patch.physical[i, 4, 1] = 10.0 * sin(pi * gridpoints[i, 2] / 2000.0)
+            end
+            spectralTransform!(patch); gridTransform!(patch)
+
+            E_t_before = copy(patch.physical[:, 6, 1])
+            p_before = copy(patch.physical[:, 1, 1])
+            u_before = copy(patch.physical[:, 4, 1])
+            ncols = div(size(patch.physical, 1), kDim)
+            for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+
+            @test all(isfinite.(mtile.var_np1))
+            dke = 0.5 .* (mtile.var_np1[:, 4] .^ 2 .+ mtile.var_np1[:, 5] .^ 2 .-
+                          u_before .^ 2)
+            # Net kinetic energy falls
+            @test sum(dke) < 0.0
+
+            rho_tbar = Springsteel.ref_rho_t(mtile.ref_state)[:, 1]
+            sheared = findall(x -> x < -1.0e-9, dke)
+            @test !isempty(sheared)
+            for i in sheared
+                k = mod1(i, kDim)
+                # E_t follows the KE down (the sink), and p is untouched (internal energy
+                # held — no frictional heating).
+                @test (mtile.var_np1[i, 6] - E_t_before[i]) ≈ rho_tbar[k] * dke[i] rtol=1e-6
+                @test mtile.var_np1[i, 1] ≈ p_before[i] atol=1e-9
+            end
+        end
+    end
+
+    @testset "Q_ss relaxation is thermodynamically inert in dry air" begin
+        # rho_w = 0 => rho_v == 0 regardless of Q_ss, so the relaxation cannot move T, p,
+        # E_t or the densities. It must, however, pull the drifting Q_ss back to -rho_vs.
+        mktempdir() do tmpdir
+            function run_dry(qss_offset)
+                mtile, patch, model, _ = make_mc_mtile(tmpdir; dry=true, tau_qss=10.0)
+                gridpoints = Scythe.getGridpoints(patch)
+                Scythe.theta_bubble_mc!(patch, gridpoints, mtile.ref_state;
+                                        xc=1000.0, xr=400.0, zc=1000.0, zr=400.0,
+                                        dtheta_max=2.0)
+                patch.physical[:, 7, 1] .+= qss_offset
+                spectralTransform!(patch); gridTransform!(patch)
+                step_mc!(mtile, patch, model, 5)
+                return copy(patch.physical[:, :, 1])
+            end
+            base = run_dry(0.0)
+            drifted = run_dry(0.02)
+
+            # Every slot except Q_ss is bit-identical
+            for v in (1, 2, 3, 4, 5, 6, 8)
+                @test base[:, v] == drifted[:, v]
+            end
+            # ... and the drift decays toward the base at the relaxation rate
+            @test maximum(abs.(drifted[:, 7] .- base[:, 7])) < 0.02
+            @test maximum(abs.(drifted[:, 7] .- base[:, 7])) > 0.0
         end
     end
 end

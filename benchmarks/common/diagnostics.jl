@@ -76,10 +76,10 @@ function mc_state(df, ref, kDim, ncols)
     Q_ss = df.Q_ss .+ repeat(Q_ssbar, ncols)
     ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
     M = p .+ E_t .- (rho_t .* (ke .+ Scythe.gravity .* df.z))
-    Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, repeat(Tbar, ncols))
-    # Clamped partition, matching the equation set
+    Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, repeat(Tbar, ncols), df.rho_r)
+    # Clamped partition, matching the equation set: vapor within [0, total water - rain]
     rho_v = clamp.(Q_ss .+ Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0),
-                   0.0, max.(rho_t .- rho_d, 0.0))
+                   0.0, max.(rho_t .- rho_d .- df.rho_r, 0.0))
     rho_c = rho_t .- rho_d .- rho_v .- df.rho_r
     return Tk, p, rho_d, rho_v, rho_c, rho_t
 end

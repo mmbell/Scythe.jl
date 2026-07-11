@@ -10,7 +10,8 @@
 #   julia --project=. benchmarks/straka93.jl --mode quick --stage legacy
 #
 # Modes: quick (100 m cells, regression-sized) | full (25 m cells, paper-grade)
-# Stages: legacy (Euler_test) | pe (primitive_equation_XZ)
+# Stages: legacy (Euler_test) | pe (primitive_equation_XZ) | pe-rho_d | mc
+#         (moist_compressible_XZ, the total-energy set)
 #
 # Reference: Straka, Wilhelmson, Wicker, Anderson, Droegemeier (1993),
 # Int. J. Numer. Methods Fluids 17, 1-22. reference/Straka.pdf
@@ -31,16 +32,20 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 # Linear dry-air-density variant: slot 2 is "rho_d" (rho_d') instead of "xi"
 const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+# Total-energy (moist_compressible) set
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
 function straka_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w"]
     stage == STAGE_PE_RHOD && return PE_VARS_RHOD
+    stage == STAGE_MC && return MC_VARS
     return PE_VARS
 end
 
 function straka_model(opts::BenchmarkOptions)
     if opts.mode == :full
-        num_cells = 256        # 25 m cells
-        kDim = 300
+        num_cells = 512        # 25 m cells
+        num_cells_k = 128
+        kDim = num_cells_k * 3
         ts = 0.015625
         output_interval = 100.0
     else
@@ -54,6 +59,18 @@ function straka_model(opts::BenchmarkOptions)
     if opts.stage == :legacy
         equation_set = "Euler_test"
         physical_params = Dict(:K => 75.0, :Kvdiff => 0.0)
+    elseif opts.stage == STAGE_MC
+        # The total-energy set diffuses u, w and the dry entropy s_d (no mass diffusion, as
+        # in the paper). Prandtl = 1 gives the paper's single K on momentum and entropy.
+        # Momentum diffusion is a resolved-KE sink to the subgrid (not dissipative heating,
+        # matching Straka): E_t follows the KE down and T is held. The thermal (entropy)
+        # diffusion is a genuine O(K) energy source, since rho*T*Lap(s) is not a flux
+        # divergence. Both are expected; full conservation returns with a prognostic-TKE
+        # closure. See reference/moist_compressible_diffusion_plan.md.
+        equation_set = "moist_compressible_XZ"
+        physical_params = Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
+                               :Prandtl => 1.0, :tau_qss => 10.0,
+                               :alpha => 0.0, :z_damp => 12.8e3)
     else
         # The PE set has explicit horizontal diffusion and implicit vertical
         # diffusion: Khdiff = Kvdiff = 75 approximates the legacy uniform
@@ -63,11 +80,12 @@ function straka_model(opts::BenchmarkOptions)
         physical_params = Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
                                :alpha => 0.0, :z_damp => 12.8e3)
     end
-    # Semi-implicit acoustics are validated for the linear rho_d set (Phase 2),
-    # so enable them there; the xi stages stay explicit for this dry benchmark.
-    options = Dict(:semiimplicit => opts.stage == STAGE_PE_RHOD,
-                   :exact_reference_state => false)
-    if opts.stage in (:pe, STAGE_PE_RHOD)
+    # Semi-implicit acoustics are validated for the linear rho_d set (Phase 2) and the
+    # total-energy set, so enable them there; the xi stages stay explicit for this dry
+    # benchmark. The mc set consumes an exact pressure-based reference state.
+    options = Dict(:semiimplicit => opts.stage in (STAGE_PE_RHOD, STAGE_MC),
+                   :exact_reference_state => opts.stage == STAGE_MC)
+    if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_MC)
         # The paper prescribes uniform K = 75 only (carried by Khdiff/Kvdiff);
         # no precipitation or shear-based turbulence
         options[:precipitation] = false
@@ -115,19 +133,36 @@ end
 
 """Generate the reference sounding and cold bubble initial conditions."""
 function straka_init!(model)
-    Scythe.write_dry_sounding(model.ref_state_file; theta=300.0, zmax=8000.0)
-
     patch = createGrid(model.grid_params)
     gridpoints = Scythe.getGridpoints(patch)
     kDim = model.grid_params.kDim
     z = gridpoints[1:kDim, 2]
     column = Scythe.reference_column(patch, model.grid_params)
-    ref = Scythe.calculate_reference_state(model, z, column)
-
     patch.physical .= 0.0
-    Scythe.temperature_bubble!(patch, gridpoints, ref;
-                               xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0,
-                               control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
+
+    if Scythe.uses_pressure_reference(model.equation_set)
+        # Straka's base state IS a constant-theta = 300 K dry adiabat, so it is the same
+        # analytic Exner profile bf02_dry uses for the total-energy set -- written exactly
+        # rather than via the legacy hydrostatic iteration, which does not converge on the
+        # low-DOF B-spline (RiRk) column.
+        theta0 = 300.0
+        exner = @. 1.0 - (Scythe.gravity * z) / (Scythe.Cpd * theta0)
+        T_prof = theta0 .* exner
+        p_prof = @. 100000.0 * exner^(Scythe.Cpd / Scythe.Rd)   # 1000 hPa surface, Pa
+        rho_d_prof = p_prof ./ (Scythe.Rd .* T_prof)
+        zeros_prof = zeros(Float64, kDim)
+        Scythe.write_exact_ref_mc(model.ref_state_file, z, p_prof, rho_d_prof,
+                                  zeros_prof, zeros_prof)
+        ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column)
+        Scythe.temperature_bubble_mc!(patch, gridpoints, ref;
+                                      xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0)
+    else
+        Scythe.write_dry_sounding(model.ref_state_file; theta=300.0, zmax=8000.0)
+        ref = Scythe.calculate_reference_state(model, z, column)
+        Scythe.temperature_bubble!(patch, gridpoints, ref;
+                                   xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0,
+                                   control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
+    end
     Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
 end
 
