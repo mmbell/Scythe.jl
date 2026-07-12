@@ -101,22 +101,6 @@ function retrieve_temperature(M, rho_d, rho_t, Q_ss, p_Pa, T_guess, rho_r=0.0;
 end
 
 """
-    dry_potential_temperature(p_Pa, rho_d)
-
-The potential temperature θ_d ≡ (p_0^κ / R_d) p^(1−κ) / ρ_d, κ = R_d/C_pd, built purely
-from the prognostic pressure and dry-air density so no diagnosed field needs a spectral
-transform. In dry air this is exactly Straka's θ = T (p_0/p)^κ; in moist air it evaluates
-to (R_m/R_d) T (p_0/p)^κ, a dry-density-referenced virtual potential temperature. This is
-the quantity the mc set diffuses; see the diffusion section of
-reference/Scythe_moist_compressible.tex for the moist caveat.
-"""
-function dry_potential_temperature(p_Pa, rho_d)
-
-    kappa = Rd / Cpd
-    return ((100.0 * p_0)^kappa) * (p_Pa^(1.0 - kappa)) / (Rd * rho_d)
-end
-
-"""
     qss_admissible_bounds(rho_d, rho_t, rho_r, rho_vs)
 
 Lower and upper bounds on the prognostic supersaturation density Q_ss = ρ_v − ρ_vs(T,p),

@@ -66,14 +66,19 @@ const Q_T = 0.02
 const THETA_E = 320.0
 
 function bf02_moist_model(opts::BenchmarkOptions)
+    # The B-spline (RiRk) vertical is sized by cell count, the Chebyshev (RZ) vertical by kDim
+    # (see `vertical_size` in common/harness.jl). Here they coincide -- 100 cells == kDim 300 and
+    # 25 cells == kDim 75 -- so both geometries keep exactly the grid they had before.
     if opts.mode == :full
-        num_cells = 200         # 100 m cells
-        kDim = 300
+        num_cells_i = 200       # 100 m cells
+        num_cells_k = 100       # RiRk: 100 m cells
+        kDim = 300              # RZ: Chebyshev points
         ts = 0.025#0.1/3.0
         output_interval = 100.0
     else
-        num_cells = 50         # 200 m cells
-        kDim = 75
+        num_cells_i = 50        # 400 m cells
+        num_cells_k = 25        # RiRk: 400 m cells
+        kDim = 75               # RZ: Chebyshev points
         # The condensation relaxation timescale does not coarsen with the
         # grid, so quick mode keeps the full-mode timestep
         ts = 0.1
@@ -113,21 +118,20 @@ function bf02_moist_model(opts::BenchmarkOptions)
                        :precipitation => false, :vertical_mixing => false)
     end
 
-    kDim = vertical_kdim(kDim, opts)
     ts = vertical_ts(ts, opts)
 
     output_dir = benchmark_output_dir("bf02_moist", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
 
-    grid_params = GridParameters(
+    grid_params = GridParameters(;
         geometry = benchmark_geometry(opts),   # RZ (Chebyshev) or RiRk (B-spline) vertical
         iMin = 0.0,
         iMax = 20.0e3,
-        num_cells = num_cells,
+        num_cells_i = num_cells_i,
         kMin = 0.0,
         kMax = 10.0e3,
-        kDim = kDim,
+        vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
         BCL = wall_bc,
         BCR = wall_bc,
         BCB = wall_bc,

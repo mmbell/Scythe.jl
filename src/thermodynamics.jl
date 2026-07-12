@@ -245,6 +245,20 @@ function potential_temperature(s::Float64, xi::Float64, mu::Float64)
 end
 
 """
+    potential_temperature(p_Pa, rho_d)
+
+Dry potential temperature [K] from pressure [Pa] and dry-air density, delegating to
+`Springsteel.Thermodynamics.potential_temperature`. This is the form the total-energy
+(`moist_compressible`) set uses: it is built purely from the prognostic pressure and dry-air
+density, so no diagnosed field needs a spectral transform. In dry air it is exactly Straka's
+θ = T (p_0/p)^κ; in moist air it is (R_m/R_d) T (p_0/p)^κ, a dry-density-referenced virtual
+potential temperature. This is the quantity the mc set diffuses; see the diffusion section of
+reference/Scythe_moist_compressible.tex for the moist caveat.
+"""
+potential_temperature(p_Pa::Float64, rho_d::Float64) =
+    Springsteel.Thermodynamics.potential_temperature(p_Pa, rho_d)
+
+"""
     reversible_theta_e(s, xi, mu, mu_l=0.0)
 
 Reversible equivalent potential temperature [K] from the prognostic variables. Thin

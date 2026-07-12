@@ -380,25 +380,25 @@ using Springsteel
     # 6. Diffusion: theta_d, heating consistency, dissipation
     # ──────────────────────────────────────────────
 
-    @testset "dry_potential_temperature" begin
+    @testset "potential_temperature(p_Pa, rho_d)" begin
         # Dry air: exactly Straka's theta = T (p_0/p)^kappa
         for (Tk, p_Pa) in ((300.0, 100000.0), (280.0, 85000.0), (250.0, 50000.0))
             rho_d = p_Pa / (Rd * Tk)
             theta = Tk * ((100.0 * Scythe.p_0) / p_Pa)^(Rd / Cpd)
-            @test Scythe.dry_potential_temperature(p_Pa, rho_d) ≈ theta rtol=1e-14
+            @test Scythe.potential_temperature(p_Pa, rho_d) ≈ theta rtol=1e-14
         end
         # Moist air: (R_m/R_d) T (p_0/p)^kappa
         Tk, p_Pa, q_v = 295.0, 95000.0, 0.015
         R_m = Rd + (q_v * Rv)
         rho_d = p_Pa / (R_m * Tk)
         expected = (R_m / Rd) * Tk * ((100.0 * Scythe.p_0) / p_Pa)^(Rd / Cpd)
-        @test Scythe.dry_potential_temperature(p_Pa, rho_d) ≈ expected rtol=1e-14
+        @test Scythe.potential_temperature(p_Pa, rho_d) ≈ expected rtol=1e-14
 
         # The mc heating coefficient rho_d*C_vt*(Cpd/Cvd)*(T/theta_d) reduces to the
         # classical rho*C_p*pi in dry air, so Q_therm = rho*Cp*pi*K*Lap(theta) exactly.
         Tk, p_Pa = 290.0, 90000.0
         rho_d = p_Pa / (Rd * Tk)
-        theta_d = Scythe.dry_potential_temperature(p_Pa, rho_d)
+        theta_d = Scythe.potential_temperature(p_Pa, rho_d)
         exner = (p_Pa / (100.0 * Scythe.p_0))^(Rd / Cpd)
         @test rho_d * Cvd * (Cpd / Cvd) * (Tk / theta_d) ≈ rho_d * Cpd * exner rtol=1e-12
     end

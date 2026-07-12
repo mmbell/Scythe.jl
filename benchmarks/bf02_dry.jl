@@ -8,7 +8,7 @@
 #
 #   julia --project=. benchmarks/bf02_dry.jl --mode quick --stage legacy
 #
-# Modes: quick (200 m cells) | full (100 m cells, paper-grade)
+# Modes: quick (400 m cells) | full (100 m cells, paper-grade)
 # Stages: legacy (Euler_test) | pe (primitive_equation_XZ) | pe-rho_d | pe-rho_d-pd |
 #         pe-sigma | mc (total-energy set; the physical-density sets run dry here, q_v = 0)
 #
@@ -47,14 +47,19 @@ function bf02_dry_vars(stage)
 end
 
 function bf02_dry_model(opts::BenchmarkOptions)
+    # The B-spline (RiRk) vertical is sized by cell count, the Chebyshev (RZ) vertical by kDim
+    # (see `vertical_size` in common/harness.jl). Here they coincide -- 100 cells == kDim 300 and
+    # 25 cells == kDim 75 -- so both geometries keep exactly the grid they had before.
     if opts.mode == :full
-        num_cells = 200         # 100 m cells
-        kDim = 300
+        num_cells_i = 200       # 100 m cells
+        num_cells_k = 100       # RiRk: 100 m cells
+        kDim = 300              # RZ: Chebyshev points
         ts = 0.025 #0.1/2.0
         output_interval = 100.0
     else
-        num_cells = 50         # 200 m cells
-        kDim = 75
+        num_cells_i = 50        # 400 m cells
+        num_cells_k = 25        # RiRk: 400 m cells
+        kDim = 75               # RZ: Chebyshev points
         ts = 0.1
         output_interval = 500.0
     end
@@ -91,21 +96,20 @@ function bf02_dry_model(opts::BenchmarkOptions)
         options[:vertical_mixing] = false
     end
 
-    kDim = vertical_kdim(kDim, opts)
     ts = vertical_ts(ts, opts)
 
     output_dir = benchmark_output_dir("bf02_dry", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
 
-    grid_params = GridParameters(
+    grid_params = GridParameters(;
         geometry = benchmark_geometry(opts),   # RZ (Chebyshev) or RiRk (B-spline) vertical
         iMin = 0.0,
         iMax = 20.0e3,
-        num_cells = num_cells,
+        num_cells_i = num_cells_i,
         kMin = 0.0,
         kMax = 10.0e3,
-        kDim = kDim,
+        vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
         BCL = wall_bc,
         BCR = wall_bc,
         BCB = wall_bc,

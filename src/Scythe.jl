@@ -21,9 +21,16 @@ Main configuration struct for Scythe model runs. Uses `Base.@kwdef` for keyword 
 - `initial_conditions`: path to the initial conditions file (default: `"ic.csv"`)
 - `output_dir`: path to the output directory (default: `"./output/"`)
 - `ref_state_file`: path to the reference state sounding file (default: `""`)
-- `grid_params::GridParameters`: Springsteel grid configuration (required, no default)
+- `grid_params::SpringsteelGridParameters`: Springsteel grid configuration (required, no default)
 - `physical_params::Dict`: dictionary of physical parameters for the equation set (default: empty `Dict`)
 - `options::Dict`: dictionary of solver options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`)
+
+`grid_params` is passed through Springsteel's `compute_derived_params` on construction, so a
+cubic B-spline axis may be sized by *either* its cell count (`num_cells_i`/`num_cells_k`, the
+canonical form) or its gridpoint count (`iDim`/`kDim`), and both fields are populated and
+mutually consistent afterwards. Without this, supplying only `num_cells_k` would leave
+`grid_params.kDim == 0` for every consumer that reads it (the grid factory resolves the counts
+onto the grid it returns, not onto the caller's parameter struct).
 """
 Base.@kwdef struct ModelParameters
     ts::Float64 = 0.0
@@ -33,11 +40,19 @@ Base.@kwdef struct ModelParameters
     initial_conditions = "ic.csv"
     output_dir = "./output/"
     ref_state_file = ""
-    grid_params::Union{GridParameters, SpringsteelGridParameters}
+    grid_params::SpringsteelGridParameters
     physical_params::Dict = Dict()
     options::Dict = Dict(
         :semiimplicit => false,
         :exact_reference_state => false)
+
+    function ModelParameters(ts, integration_time, output_interval, equation_set,
+                             initial_conditions, output_dir, ref_state_file,
+                             grid_params, physical_params, options)
+        new(ts, integration_time, output_interval, equation_set, initial_conditions,
+            output_dir, ref_state_file, compute_derived_params(grid_params),
+            physical_params, options)
+    end
 end
 
 # Files for model integration

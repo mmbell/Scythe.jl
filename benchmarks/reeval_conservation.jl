@@ -26,12 +26,15 @@ end
 liquid_vars(stage) = stage == :legacy ? ["mu_l"] :
                      stage == STAGE_PE_RHOD_PD ? ["rho_c", "rho_r"] : ["mu_c", "mu_r"]
 
-# Model builder copied verbatim from bf02_moist.jl::bf02_moist_model
+# Model builder mirroring bf02_moist.jl::bf02_moist_model — it must rebuild the *same* grid as
+# the run whose output is being re-evaluated. The quick-mode counts here had drifted from
+# bf02_moist (num_cells 100/kDim 50 vs 50/75), so the reconstructed grid did not actually match
+# the run; they are realigned here alongside the move to cell counts.
 function bf02_moist_model(opts::BenchmarkOptions)
     if opts.mode == :full
-        num_cells = 200; kDim = 300; ts = 0.1/3.0; output_interval = 100.0
+        num_cells_i = 200; num_cells_k = 100; kDim = 300; ts = 0.1/3.0; output_interval = 100.0
     else
-        num_cells = 100; kDim = 50; ts = 0.1; output_interval = 250.0
+        num_cells_i = 50;  num_cells_k = 25;  kDim = 75; ts = 0.1; output_interval = 250.0
     end
     vars = bf02_moist_vars(opts.stage)
     if opts.stage in (STAGE_PE_RHOD, STAGE_PE_RHOD_PD)
@@ -44,15 +47,14 @@ function bf02_moist_model(opts::BenchmarkOptions)
     else
         error("This re-eval helper is for the pe-rho_d / pe-rho_d-pd stages.")
     end
-    kDim = vertical_kdim(kDim, opts)
     ts = vertical_ts(ts, opts)
     output_dir = benchmark_output_dir("bf02_moist", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
-    grid_params = GridParameters(
+    grid_params = GridParameters(;
         geometry = benchmark_geometry(opts),
-        iMin = 0.0, iMax = 20.0e3, num_cells = num_cells,
-        kMin = 0.0, kMax = 10.0e3, kDim = kDim,
+        iMin = 0.0, iMax = 20.0e3, num_cells_i = num_cells_i,
+        kMin = 0.0, kMax = 10.0e3, vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
         BCL = wall_bc, BCR = wall_bc, BCB = wall_bc, BCT = wall_bc,
         vars = Dict(v => i for (i, v) in enumerate(vars)),
     )

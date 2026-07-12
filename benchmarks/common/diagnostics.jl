@@ -183,7 +183,7 @@ function domain_integral(field::AbstractMatrix, model)
 
     # Vertical integral per column
     if spline_vertical
-        Wv = gauss_cell_weights(gp.kDim, gp.kDim ÷ gp.mubar, gp.kMax - gp.kMin,
+        Wv = gauss_cell_weights(gp.kDim, gp.num_cells_k, gp.kMax - gp.kMin,
                                 gp.mubar, gp.quadrature)
         for c in 1:ncols
             colints[c] = sum(Wv .* @view(field[:, c]))

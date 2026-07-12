@@ -1,6 +1,5 @@
 # Reference state functions
 using Statistics
-using LsqFit
 
 """
     ReferenceState
@@ -33,6 +32,14 @@ end
 # both reference representations dispatch through one interface. `ref_xi`/`ref_mu` are
 # Scythe-only (transformed-variable) accessors.
 import Springsteel: ref_entropy, ref_sigma, ref_rho_d, ref_rho_v, ref_rho_c, ref_sat, sound_speed_sq
+
+# The vertical reference column and the spectral derivative fill are Springsteel's, not
+# Scythe's. Importing (rather than redefining) them is what keeps the two packages from
+# drifting: Springsteel exports only the reference-state *types*, so a same-named definition
+# here would silently become a separate generic function with no ambiguity error — which is
+# exactly how Scythe's copy came to size a spline column as `kDim ÷ mubar` while Springsteel's
+# had moved to the canonical `num_cells_k`.
+import Springsteel: reference_column, natural_column, transform_reference_state!
 
 """Moist entropy reference profile `(nlevels, 3)` [J/(kg K)]."""
 ref_entropy(rs::ReferenceState) = rs.sbar
@@ -135,52 +142,6 @@ function empty_reference_state()
 end
 
 """
-    reference_column(grid, grid_params)
-
-Build a vertical basis column with natural (R0) boundary conditions for
-reference state derivative calculations. Reference profiles can have nonzero
-gradients at the domain boundaries, so the model variables' boundary
-conditions must not be imposed on them (this matches the pre-migration
-behavior, which always differentiated reference profiles on an R0 column).
-Falls back to a copy of the first variable's column for vertical bases other
-than Chebyshev.
-"""
-function reference_column(grid::AbstractGrid, grid_params)
-    return natural_column(grid.kbasis.data[1], grid_params)
-end
-
-function natural_column(column::Chebyshev1D, grid_params)
-    cp = ChebyshevParameters(
-        zmin = grid_params.kMin,
-        zmax = grid_params.kMax,
-        zDim = grid_params.kDim,
-        bDim = grid_params.b_kDim,
-        BCB = Chebyshev.R0,
-        BCT = Chebyshev.R0)
-    return Chebyshev1D(cp)
-end
-
-function natural_column(column::Spline1D, grid_params)
-    # Cubic B-spline column with natural (R0) boundary conditions, matching the
-    # model's vertical spline resolution and quadrature so the mish points align.
-    # Reference profiles can have nonzero boundary gradients, so the model
-    # variables' wall BCs must not be imposed on them.
-    sp = SplineParameters(
-        xmin = grid_params.kMin,
-        xmax = grid_params.kMax,
-        num_cells = grid_params.kDim ÷ grid_params.mubar,
-        mubar = grid_params.mubar,
-        quadrature = grid_params.quadrature,
-        BCL = CubicBSpline.R0,
-        BCR = CubicBSpline.R0)
-    return Spline1D(sp)
-end
-
-function natural_column(column, grid_params)
-    return deepcopy(column)
-end
-
-"""
     warn_timestep_stability(grid_params, ts; c_nominal=340.0, target_courant=0.5)
 
 Advisory startup check that the timestep is consistent with the vertical
@@ -207,10 +168,15 @@ under investigation, so treat this as advisory.
 function warn_timestep_stability(grid_params, ts::Float64;
                                  c_nominal::Float64=340.0, target_courant::Float64=0.5)
     grid_params.geometry == "RiRk" || return nothing
+    # `num_cells_k` is the canonical cell count for the spline vertical, resolved by
+    # `compute_derived_params` when `ModelParameters` is built (so it is populated whether the
+    # caller supplied cells or gridpoints). This is a lightweight mish-spacing probe, not a
+    # reference column, so it builds SplineParameters directly rather than via `natural_column`
+    # (which dispatches on an existing column instance we do not have here).
     z = try
         sp = SplineParameters(
             xmin = grid_params.kMin, xmax = grid_params.kMax,
-            num_cells = grid_params.kDim ÷ grid_params.mubar,
+            num_cells = grid_params.num_cells_k,
             mubar = grid_params.mubar, quadrature = grid_params.quadrature,
             BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
         Spline1D(sp).mishPoints
@@ -235,365 +201,23 @@ end
 """
     calculate_reference_state(model::ModelParameters, z::Array{Float64}, column)
 
-Calculate a hydrostatic reference state from a sounding file specified in `model.ref_state_file`.
+Hydrostatic reference state from the sounding file named in `model.ref_state_file`, as a
+legacy transformed-variable [`ReferenceState`](@ref).
 
-The sounding file is interpolated to model levels, then re-integrated using spectral
-methods to obtain a hydrostatically balanced base state. Iteratively adjusts density and
-temperature to refine the balance.
+Thin adapter over `Springsteel.calculate_reference_state` (the shared physical-density
+builder: sounding interpolation, spectral re-integration to hydrostatic balance, Newton
+refinement), viewed back into `xi`/`mu` control variables via [`legacy_reference_view`](@ref).
+The numerics live in Springsteel so there is exactly one hydrostatic builder; Scythe only
+supplies the `ModelParameters` -> file-path adaptation and the transformed view.
 
-# Arguments
-- `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
-- `z::Array{Float64}`: vertical coordinate array of model levels [m].
-- `column`: a 1D spectral basis object (e.g., `Chebyshev1D` or `Spline1D`) used for spectral integration and differentiation.
-
-# Returns
-- `ReferenceState`: the computed hydrostatic reference state with entropy, log density, transformed moisture, saturation ratio profiles and their vertical derivatives.
+This is the same path `initialize_model` takes at run time, so a benchmark that builds its
+initial condition against this reference is now consistent with the reference the solver
+itself uses.
 """
-function calculate_reference_state(model::ModelParameters, z::Array{Float64}, column)
-
-    # Open the file with sounding information
-    ref = open(model.ref_state_file,"r")
-
-    # Allocate some empty arrays
-    alt = Vector{Float64}(undef,0)
-    theta_in = Vector{Float64}(undef,0)
-    q_v_in = Vector{Float64}(undef,0)
-
-    # Read the file
-    surface = readline(ref)
-    sfc_pressure = parse(Float64,split(surface)[1])
-    pushfirst!(alt, 0.0)
-    pushfirst!(theta_in, parse(Float64,split(surface)[2]))
-    pushfirst!(q_v_in, parse(Float64,split(surface)[3]))
-    while(true)
-        level = readline(ref)
-        if isempty(level)
-            break
-        end
-        push!(alt, parse(Float64,split(level)[1]))
-        push!(theta_in, parse(Float64,split(level)[2]))
-        push!(q_v_in, parse(Float64,split(level)[3]))
-    end
-
-    # Calculate the vertical derivative
-    qvdz = zeros(Float64,length(alt))
-    thetadz = zeros(Float64,length(alt))
-    qvdz[1] = (q_v_in[2] - q_v_in[1]) / alt[2]
-    thetadz[1] = (theta_in[2] - theta_in[1]) / alt[2]
-    for i = 2:(length(alt)-1)
-        qvdz[i] = (q_v_in[i+1] - q_v_in[i-1]) / (alt[i+1] - alt[i-1])
-        thetadz[i] = (theta_in[i+1] - theta_in[i-1]) / (alt[i+1] - alt[i-1])
-    end
-    qvdz[end] = (q_v_in[end] - q_v_in[end-1]) / (alt[end] - alt[end-1])
-    thetadz[end] = (theta_in[end] - theta_in[end-1]) / (alt[end] - alt[end-1])
-
-    # Convert q_v_in to log form
-    #q_v_in = mu_transform.(q_v_in * 1.0e-3)  # Convert to kg/kg
-
-    # Interpolate to model levels
-    theta = zeros(Float64,length(z))
-    q_v = zeros(Float64,length(z))
-
-    # Assumes first level in both cases is the surface
-    theta[1] = thetadz[1]
-    q_v[1] = qvdz[1]
-
-    for i = 2:length(z)
-        found = false
-        for j = 2:length(alt)
-            if (alt[j-1] < z[i]) && (alt[j] > z[i])
-                # Found the interpolating levels
-                theta[i] = thetadz[j-1] + (z[i] - alt[j-1]) * (thetadz[j] - thetadz[j-1])/(alt[j] - alt[j-1])
-                q_v[i] = qvdz[j-1] + (z[i] - alt[j-1]) * (qvdz[j] - qvdz[j-1])/(alt[j] - alt[j-1])
-                found = true
-            elseif alt[j] == z[i]
-                # Model level and reference level are the same
-                theta[i] = thetadz[j]
-                q_v[i] = qvdz[j]
-                found = true
-            end
-        end
-        if !found
-            # Can't find the level
-            throw(DomainError(i, "Can't find an interpolating level for reference state"))
-        end
-    end
-
-    # Re-integrate with spectral column to get hydrostatic balance
-    nz = length(z)
-
-    # Fit the interpolated dtheta/dz to the column and integrate it
-    column.uMish[:] .= theta[:]
-    Btransform!(column)
-    Atransform!(column)
-    theta_new = zeros(Float64, nz)
-    theta_new .= IInttransform(column, theta_in[1])
-
-    # Fit the water vapor
-    q_v = q_v .* 1.0e-3
-    column.uMish[:] .= q_v[:]
-    Btransform!(column)
-    Atransform!(column)
-    q_v_new = zeros(Float64, nz)
-    q_v_new .= IInttransform(column, q_v_in[1]*1.0e-3)
-
-    mu_new = zeros(Float64, nz)
-    column.uMish[:] = mu_transform.(q_v_new)
-    Btransform!(column)
-    Atransform!(column)
-    mu_new .= Itransform!(column)
-    mu_new_z = Ixtransform(column)
-    mu_new_zz = Ixxtransform(column)
-    q_v_new = inv_mu_transform.(mu_new)
-    q_v_new_z = mu_new_z ./ dmudq.(mu_new, q_v_new)
-
-    # Combine theta and q_v to get hydrostatic pressure and density
-    theta_rho = @. theta_new * (1.0 + (q_v_new / Eps)) / (1.0 + q_v_new)
-    dexnerdz = -gravity ./ (Cpd .* theta_rho)
-    column.uMish[:] .= dexnerdz
-    Btransform!(column)
-    Atransform!(column)
-    sfc_exner = (sfc_pressure/1000.0)^(Rd/Cpd)
-    exner = IInttransform(column, sfc_exner)
-    p_new = @. (exner^(Cpd/Rd))*1000.0
-    rho_t_new = @. ((p_new * 100.0/(Rd * theta_rho))*(1000.0/p_new)^(Rd/Cpd))
-    rho_d_new = rho_t_new./(1.0 .+ q_v_new)
-    xi_new = log_dry_density.(rho_d_new)
-    sfc_xi = xi_new[1]
-    column.uMish[:] .= xi_new
-    Btransform!(column)
-    Atransform!(column)
-    xi_new_z = Ixtransform(column)
-    xi_new_zz = Ixxtransform(column)
-
-    # Calculate the moist entropy
-    Tk_new = @. (p_new - vapor_pressure(p_new, q_v_new))*100.0/(rho_d_new * Rd)
-    s_new = entropy.(Tk_new, rho_d_new, q_v_new)
-    column.uMish[:] .= s_new
-    Btransform!(column)
-    Atransform!(column)
-    s_new .= Itransform!(column)
-    s_new_z = Ixtransform(column)
-    s_new_zz = Ixxtransform(column)
-    Tk_new = temperature.(s_new, rho_d_new, q_v_new)
-
-    # Adjust density and temperature to refine hydrostatic balance
-    for n in 1:10
-        Ps = P_s.(Tk_new, rho_d_new, q_v_new)
-        Pxi = P_xi.(Tk_new, rho_d_new, q_v_new)
-        Pqv = P_qv.(Tk_new, rho_d_new, q_v_new)
-
-        xi_new_z = ((-gravity .* rho_t_new) .- (Ps .* s_new_z) .- (Pqv .* q_v_new_z)) ./ Pxi
-        column.uMish[:] .= xi_new_z[:]
-        Btransform!(column)
-        Atransform!(column)
-        xi_new = IInttransform(column, sfc_xi)
-        xi_new_zz = Ixtransform(column)
-        rho_d_new = dry_density.(xi_new)
-        rho_t_new = rho_d_new .* (1.0 .+ q_v_new)
-        Tk_new = temperature.(s_new, rho_d_new, q_v_new)
-        #res = -Scythe.pressure_gradient.(Tk_new, rho_d_new, q_v_new, s_new_z, xi_new_z, q_v_new_z) .+ (-Scythe.gravity .* rho_t_new)
-        #println("$(Tk_new[1]), $(s_new[1]), $(res[1]) : $(Tk_new[50]), $(s_new[50]), $(res[50])")
-    end
-
-    sbar = zeros(Float64,length(z),3)
-    xibar = zeros(Float64,length(z),3)
-    mubar = zeros(Float64,length(z),3)
-    satbar = zeros(Float64,length(z),3)
-
-    sbar[:,1] .= s_new
-    sbar[:,2] .= s_new_z
-    sbar[:,3] .= s_new_zz
-
-    xibar[:,1] .= xi_new
-    xibar[:,2] .= xi_new_z
-    xibar[:,3] .= xi_new_zz
-
-    mubar[:,1] .= mu_new
-    mubar[:,2] .= mu_new_z
-    mubar[:,3] .= mu_new_zz
-
-    # Calculate the saturation ratio
-    thermo = thermodynamic_tuple.(sbar[:,1], xibar[:,1], mubar[:,1])
-    T_bar = [x[3] for x in thermo]     # Temperature in K
-    p_bar = [x[4] for x in thermo]      # Total air pressure
-    q_bar = [x[1] for x in thermo]
-    q_sat = q_sat_liquid.(T_bar, p_bar)
-    column.uMish[:] .= mu_transform.(q_bar ./ q_sat)
-    Btransform!(column)
-    Atransform!(column)
-    sat_ratio = Itransform!(column)
-    sat_ratio_z = Ixtransform(column)
-    sat_ratio_zz = Ixxtransform(column)
-
-    satbar[:,1] .= sat_ratio
-    satbar[:,2] .= sat_ratio_z
-    satbar[:,3] .= sat_ratio_zz
-
-    # Get the mean speed of sound squared
-    Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
-    Pxi_bar = mean(Pxi ./ (rho_d_new .* (1.0 .+ q_v_new)))
-    rhobar = rhobar_from_xibar(xibar, column)
-    ref_state = ReferenceState(sbar, xibar, rhobar, mubar, satbar, Pxi_bar)
-    return ref_state
-end
-
-"""
-    interpolate_reference_file(model::ModelParameters, z::Array{Float64}, column)
-
-Interpolate a sounding file to model levels and compute a reference state using simple
-hydrostatic integration (without spectral re-integration of the raw profiles).
-
-Vertical derivatives are computed afterwards via [`transform_reference_state!`](@ref).
-
-# Arguments
-- `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.
-- `z::Array{Float64}`: vertical coordinate array of model levels [m].
-- `column`: a 1D spectral basis object (e.g., `Chebyshev1D` or `Spline1D`) for computing vertical derivatives.
-
-# Returns
-- `ReferenceState`: the interpolated reference state with entropy, log density, transformed moisture, and saturation ratio profiles.
-"""
-function interpolate_reference_file(model::ModelParameters, z::Array{Float64}, column)
-
-    # Open the file with sounding information
-    ref = open(model.ref_state_file,"r")
-
-    # Allocate some empty arrays
-    alt = Vector{Float64}(undef,0)
-    theta_in = Vector{Float64}(undef,0)
-    q_v_in = Vector{Float64}(undef,0)
-
-    # Read the file
-    surface = readline(ref)
-    sfc_pressure = parse(Float64,split(surface)[1])
-    pushfirst!(alt, 0.0)
-    pushfirst!(theta_in, parse(Float64,split(surface)[2]))
-    pushfirst!(q_v_in, parse(Float64,split(surface)[3]))
-    while(true)
-        level = readline(ref)
-        if isempty(level)
-            break
-        end
-        push!(alt, parse(Float64,split(level)[1]))
-        push!(theta_in, parse(Float64,split(level)[2]))
-        push!(q_v_in, parse(Float64,split(level)[3]))
-    end
-
-    # Interpolate to model levels
-    theta = zeros(Float64,length(z))
-    q_v = zeros(Float64,length(z))
-
-    # Assumes first level in both cases is the surface
-    theta[1] = theta_in[1]
-    q_v[1] = q_v_in[1]
-
-    for i = 2:length(z)
-        found = false
-        for j = 2:length(alt)
-            if (alt[j-1] < z[i]) && (alt[j] > z[i])
-                # Found the interpolating levels
-                theta[i] = theta_in[j-1] + (z[i] - alt[j-1]) * (theta_in[j] - theta_in[j-1])/(alt[j] - alt[j-1])
-                q_v[i] = q_v_in[j-1] + (z[i] - alt[j-1]) * (q_v_in[j] - q_v_in[j-1])/(alt[j] - alt[j-1])
-                found = true
-            elseif alt[j] == z[i]
-                # Model level and reference level are the same
-                theta[i] = theta_in[j]
-                q_v[i] = q_v_in[j]
-                found = true
-            end
-        end
-        if !found
-            # Can't find the level
-            throw(DomainError(i, "Can't find an interpolating level for reference state"))
-        end
-    end
-
-    # Convert to needed variables and do a hydrostatic integration
-    q_v = q_v .* 1.0e-3
-    nlevels = length(z)
-    Tk = zeros(Float64,nlevels)
-    p = zeros(Float64,nlevels)
-    rho_d = zeros(Float64,nlevels)
-    rho_t = zeros(Float64,nlevels)
-
-    p[1] = sfc_pressure
-    e = vapor_pressure(p[1],q_v[1])
-    Tk[1] = theta[1]/(p_0/p[1])^(Rd/Cpd)
-    rho_d[1] = 100.0 * (p[1] - e) / (Tk[1] * Rd)
-    rho_t[1] = rho_d[1] * (1.0 + q_v[1])
-    dlnpdz = -gravity * rho_t[1] / (p[1] * 100.0)
-    for i = 2:nlevels
-        lnp = log(p[i-1]) + (dlnpdz * (z[i] - z[i-1]))
-        p[i] = exp(lnp)
-        Tk[i] = theta[i]/(p_0/p[i])^(Rd/Cpd)
-        e = vapor_pressure(p[i],q_v[i])
-        rho_d[i] = 100.0 * (p[i] - e)/ (Tk[i] * Rd)
-        rho_t[i] = rho_d[i] * (1.0 + q_v[i])
-        dlnpdz = -gravity * rho_t[i] / (p[i] * 100.0)
-    end
-
-    # Re-integrate with spectral column to adjust T (disabled)
-    #column.uMish[:] .= -gravity .* rho_t[:]
-    #Btransform!(column)
-    #Atransform!(column)
-    #p_new = IInttransform(column, sfc_pressure * 100.0) ./ 100.0
-    #Tk = theta ./ (p_0 ./ p_new).^(Rd./Cpd)
-    #e = vapor_pressure.(p_new,q_v)
-    #rho_d = 100.0 .* (p_new .- e) ./ (Tk .* Rd)
-    #rho_t = rho_d .* (1.0 .+ q_v)
-
-    sbar = zeros(Float64,length(z),3)
-    xibar = zeros(Float64,length(z),3)
-    mubar = zeros(Float64,length(z),3)
-
-    sbar[:,1] = entropy.(Tk, rho_d, q_v)
-    xibar[:,1] = log_dry_density.(rho_d)
-    mubar[:,1] = mu_transform.(q_v)
-
-    # Calculate the derivatives
-    transform_reference_state!(column, sbar)
-    transform_reference_state!(column, xibar)
-    transform_reference_state!(column, mubar)
-
-    # Get the mean speed of sound squared
-    Pxi =  P_xi_from_s.(sbar[:,1], xibar[:,1], mubar[:,1])
-    rho_bar = dry_density.(xibar[:,1])
-    q_bar = inv_mu_transform.(mubar[:,1])
-    Pxi_bar = mean(Pxi ./ (rho_bar .* (1.0 .+ q_bar)))
-
-    satbar = zeros(Float64,length(z),3)
-    rhobar = rhobar_from_xibar(xibar, column)
-    ref_state = ReferenceState(sbar, xibar, rhobar, mubar, satbar, Pxi_bar)
-    return ref_state
-end
-
-"""
-    transform_reference_state!(column, ref::Array{Float64})
-
-Compute vertical derivatives of a reference state variable in-place using spectral transforms.
-
-Fits the values in `ref[:, 1]` to the spectral basis, then overwrites
-`ref[:, 1]` with the filtered values, `ref[:, 2]` with the first vertical derivative,
-and `ref[:, 3]` with the second vertical derivative.
-
-# Arguments
-- `column`: a 1D spectral basis object (e.g., `Chebyshev1D` or `Spline1D`) for vertical transforms.
-- `ref::Array{Float64}`: array of size `(nlevels, 3)` where column 1 holds the variable values; columns 2 and 3 are overwritten with derivatives.
-
-# Returns
-- `ref::Array{Float64}`: the modified array (also mutated in-place).
-"""
-function transform_reference_state!(column, ref::Array{Float64})
-
-    column.uMish[:] .= ref[:,1]
-    Btransform!(column)
-    Atransform!(column)
-    ref[:,1] .= Itransform!(column)
-    ref[:,2] .= Ixtransform(column)
-    ref[:,3] .= Ixxtransform(column)
-    return ref
-end
+calculate_reference_state(model::ModelParameters, z::Array{Float64}, column) =
+    legacy_reference_view(
+        Springsteel.calculate_reference_state(model.ref_state_file, z, column; moisture=true),
+        column)
 
 """
     uses_physical_reference(equation_set) -> Bool
@@ -623,6 +247,24 @@ hydrostatic balance. Useful for highly idealized simulations and benchmarking.
 
 The file must contain one line per model level with columns: altitude, entropy, log density,
 and transformed moisture. Vertical derivatives are computed via [`transform_reference_state!`](@ref).
+
+!!! note "Deliberately not delegated to Springsteel"
+    Unlike [`calculate_reference_state`](@ref), this is *not* a thin adapter over
+    `Springsteel.exact_reference_state`, and the difference is load-bearing rather than
+    cosmetic. Two things differ:
+
+    1. **File schema.** This reads the transformed `z s xi mu` written by
+       [`write_exact_ref`](@ref); Springsteel reads the physical `z s rho_d rho_v rho_c`
+       written by [`write_exact_ref_pd`](@ref).
+    2. **`satbar` convention.** This returns `satbar = 0`, so the `mu_sat` prognostic carries
+       the *full* saturation ratio. Springsteel's builder returns a nonzero `satbar` (≈1, the
+       base `q_v/q_sat`), against which `mu_sat` is a *perturbation*.
+
+    The legacy/`pe`/`pe-rho_d` stages of `bf02_moist` depend on convention (2): switching them
+    to the Springsteel builder without also re-splitting `mu_sat` would double-count the
+    saturation ratio (it would start at ≈2 domain-wide and drive spurious condensation). Doing
+    that re-split changes the advected field and hence those benchmarks' results, so it is
+    tracked as follow-up work rather than folded into the reference-state deduplication.
 
 # Arguments
 - `model::ModelParameters`: model configuration containing the reference state file path and grid parameters.

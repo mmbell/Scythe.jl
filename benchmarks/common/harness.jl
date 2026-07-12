@@ -126,16 +126,46 @@ vertical_ts(ts::Float64, opts::BenchmarkOptions) =
     opts.grid == :rirk ? ts * opts.ts_factor : ts
 
 """
-    vertical_kdim(kDim, opts; mubar=3) -> Int
+    vertical_size(opts; num_cells_k, kDim) -> NamedTuple
 
-Vertical point count for the configured grid. The Chebyshev (RZ) grid accepts any
-`kDim`; the cubic B-spline (RiRk) grid requires `kDim` to be a multiple of `mubar`
-(`kDim = num_cells * mubar`), so snap to the nearest valid count for RiRk.
+Vertical sizing keywords for the configured geometry, to be splatted into
+`GridParameters(...)`. The two vertical bases are sized by *different*, independent numbers:
+
+- **RiRk** (cubic B-spline vertical) is sized by its **cell count** `num_cells_k`. That is the
+  formal definition of a spline axis (`kDim = num_cells_k * mubar`, `b_kDim = num_cells_k + 3`),
+  and it is what lets the vertical cell width be matched to the horizontal one.
+- **RZ** (Chebyshev vertical) is sized by its **gridpoint count** `kDim`. A Chebyshev axis has
+  no cells: Springsteel leaves `num_cells_k = 0` for it, so passing a cell count to an RZ grid
+  is silently ignored and yields a zero-height column.
+
+The two are deliberately *not* tied together (e.g. `kDim = num_cells_k * mubar`), for two
+reasons. First, `mubar` is a B-spline parameter; there is no reason a Chebyshev axis should
+carry 3x the spline cell count. Second, and decisively, Chebyshev points cluster at the walls,
+so `dz_min` shrinks roughly as `1/kDim^2` (measured over 6.4 km: `kDim` 32/48/64/96 gives
+`dz_min` 16.4/7.2/4.0/1.8 m). The *explicit* acoustic CFL therefore tightens quadratically, and
+straka's `legacy`/`pe` stages integrate explicitly on RZ: sizing them to `3 * num_cells_k = 96`
+instead of 64 shrinks `dz_min` by 2.3x and they go non-finite at t = 0.688 s. Sizing the two
+bases independently keeps the spline vertical physically correct without destabilising the
+Chebyshev one — raising RZ `kDim` requires cutting `ts` to match.
+
+This replaces the old `vertical_kdim`, whose only job was to snap a gridpoint count to a
+multiple of `mubar`; sizing the spline axis by cells makes that rounding unnecessary (and the
+rounding was what left the RiRk vertical 3x coarser in cells than the horizontal).
+
+Splat it into the *keyword* section of the call — note the leading `;`, without which Julia
+splats the NamedTuple positionally and the constructor fails:
+
+```julia
+grid_params = GridParameters(;
+    geometry = benchmark_geometry(opts),
+    iMin = 0.0, iMax = 25.6e3, num_cells_i = num_cells_i,
+    kMin = 0.0, kMax = 6.4e3,
+    vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
+    ...)
+```
 """
-function vertical_kdim(kDim::Int, opts::BenchmarkOptions; mubar::Int=3)
-    opts.grid == :rirk || return kDim
-    return max(mubar, round(Int, kDim / mubar) * mubar)
-end
+vertical_size(opts::BenchmarkOptions; num_cells_k::Int, kDim::Int) =
+    opts.grid == :rirk ? (; num_cells_k = num_cells_k) : (; kDim = kDim)
 
 """Path suffix distinguishing non-default grids (empty for the default RZ grid)."""
 grid_suffix(opts::BenchmarkOptions) = opts.grid == :rz ? "" : "_$(opts.grid)"

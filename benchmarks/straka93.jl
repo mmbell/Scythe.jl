@@ -9,7 +9,7 @@
 #
 #   julia --project=. benchmarks/straka93.jl --mode quick --stage legacy
 #
-# Modes: quick (100 m cells, regression-sized) | full (25 m cells, paper-grade)
+# Modes: quick (200 m cells, regression-sized) | full (50 m cells, paper-grade)
 # Stages: legacy (Euler_test) | pe (primitive_equation_XZ) | pe-rho_d | mc
 #         (moist_compressible_XZ, the total-energy set)
 #
@@ -42,15 +42,25 @@ function straka_vars(stage)
 end
 
 function straka_model(opts::BenchmarkOptions)
+    # Horizontal and the B-spline (RiRk) vertical are sized by cell count, at a 1:1 aspect ratio
+    # (DX_i == DX_k) over the 25.6 x 6.4 km domain: 512x128 -> 50 m cells, 128x32 -> 200 m cells.
+    #
+    # The Chebyshev (RZ) vertical is sized independently by `kDim`, and is NOT tied to
+    # num_cells_k: its points cluster at the walls, so dz_min shrinks roughly as 1/kDim^2 and
+    # the explicit acoustic CFL tightens quadratically. The legacy and pe stages integrate
+    # explicitly on RZ, and sizing them to 3*num_cells_k = 96 rather than 64 makes them go
+    # non-finite at t = 0.688 s. Raising RZ kDim means cutting ts to match. See `vertical_size`
+    # in common/harness.jl.
     if opts.mode == :full
-        num_cells = 512        # 25 m cells
-        num_cells_k = 128
-        kDim = num_cells_k * 3
+        num_cells_i = 512       # 50 m cells
+        num_cells_k = 128       # RiRk: 50 m cells
+        kDim = 384              # RZ: Chebyshev points (full runs the semi-implicit mc stage)
         ts = 0.015625
         output_interval = 100.0
     else
-        num_cells = 256         # 100 m cells
-        kDim = 64
+        num_cells_i = 128       # 200 m cells
+        num_cells_k = 32        # RiRk: 200 m cells
+        kDim = 64               # RZ: Chebyshev points; ts = 0.0625 is stable for explicit stages
         ts = 0.0625
         output_interval = 300.0
     end
@@ -92,7 +102,6 @@ function straka_model(opts::BenchmarkOptions)
         options[:vertical_mixing] = false
     end
 
-    kDim = vertical_kdim(kDim, opts)
     ts = vertical_ts(ts, opts)
 
     output_dir = benchmark_output_dir("straka93", opts)
@@ -100,14 +109,14 @@ function straka_model(opts::BenchmarkOptions)
     bc_side = merge(scalar_bc, Dict("u" => DirichletBC()))   # no-normal-flow walls
     bc_topbot = merge(scalar_bc, Dict("w" => DirichletBC()))
 
-    grid_params = GridParameters(
+    grid_params = GridParameters(;
         geometry = benchmark_geometry(opts),   # RZ (Chebyshev) or RiRk (B-spline) vertical
         iMin = 0.0,
         iMax = 25.6e3,
-        num_cells = num_cells,
+        num_cells_i = num_cells_i,
         kMin = 0.0,
         kMax = 6.4e3,
-        kDim = kDim,
+        vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
         BCL = bc_side,
         BCR = bc_side,
         BCB = bc_topbot,
