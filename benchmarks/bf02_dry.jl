@@ -20,7 +20,7 @@ using Distributed
 include(joinpath(@__DIR__, "common", "harness.jl"))
 opts = parse_benchmark_args(ARGS)
 
-addprocs(opts.workers, exeflags="--threads=auto")
+add_benchmark_workers(opts)
 @everywhere using Springsteel
 @everywhere using Scythe
 

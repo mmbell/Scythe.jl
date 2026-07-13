@@ -111,6 +111,25 @@ end
 benchmark_geometry(opts::BenchmarkOptions) = opts.grid == :rirk ? "RiRk" : "RZ"
 
 """
+    add_benchmark_workers(opts)
+
+Add the worker processes, dividing the machine's threads *among* them rather than giving
+each one the whole box.
+
+`--threads=auto` hands every worker `Sys.CPU_THREADS` threads, so the default 2 workers on a
+12-core machine spawn 24 compute threads for 12 cores. They then all allocate into a shared
+GC from inside the `Threads.@threads` column loop, which shows up as heavy GC time and
+millions of lock conflicts — and is a suspected contributor to the intermittent worker death
+in long moist_compressible runs.
+"""
+function add_benchmark_workers(opts::BenchmarkOptions)
+    nthreads = max(1, Sys.CPU_THREADS ÷ opts.workers)
+    println("Adding $(opts.workers) worker(s) with $(nthreads) thread(s) each " *
+            "($(Sys.CPU_THREADS) CPU threads available)")
+    return addprocs(opts.workers, exeflags = "--threads=$(nthreads)")
+end
+
+"""
     vertical_ts(ts, opts) -> Float64
 
 Timestep for the configured grid. On the cubic B-spline (RiRk) grid the base
