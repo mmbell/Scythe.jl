@@ -1,6 +1,103 @@
 # Scythe allocation / type-stability refactor — plan
 
-**Status:** not started. Written 2026-07-12, immediately after commit `aedce4d`.
+> **UPDATE 2026-07-12 — Phase 1 is IMPLEMENTED. Read §0 first: it corrects four claims in
+> this document that measurement disproved, and it records that Phase 1 did NOT stop the
+> crash.**
+
+---
+
+## 0. What Phase 1 actually did (measured, post-implementation)
+
+Phase 1 is done and is a strict improvement — but **the central prediction in §2e below was
+wrong, and the crash survives.** Phase 2 is therefore *required*, not optional.
+
+### 0a. Results
+
+`ModelTile` and `ModelParameters` are now fully concrete (every field passes
+`isconcretetype`). Output is **bit-identical** — the 8 `bf02_dry quick/mc` output CSVs diff
+byte-for-byte clean against a pre-change run. Test suite: **4374 passing, 0 failures** (4328
+baseline + 46 new in `test/test_allocations.jl`).
+
+| straka93 quick/mc/rirk | before | after Phase 1 |
+|---|---|---|
+| allocations | 4.73 G | **1.94 G** (2.4×) |
+| allocated | 836.6 GiB | 680.9 GiB |
+| wall clock | 484.5 s | 484.0 s (**unchanged**) |
+| GC time | 14.2 % | 20.2 % |
+| lock conflicts | 1.51 M | 1.74 M |
+
+| bf02_dry quick/mc/rz | before | after Phase 1 |
+|---|---|---|
+| allocations | 991.2 M | **359.2 M** (2.8×) |
+| wall clock | 269.8 s | **175.8 s** (1.53×) |
+
+Per-column call (`moist_compressible_XZ`, RiRk): **1447 → 619 allocations**, 128,336 → 76,768 B.
+
+### 0b. **The crash is NOT fixed**
+
+`straka93 --mode quick --stage mc --grid rirk` still dies intermittently: **1 of 3 post-change
+runs segfaulted at t = 793.6 s of 900 s** (worker 3, signal 11), the same late-run intermittent
+signature as the original signal-4 death at t = 862.5 s. Phase 1 alone is not enough.
+
+(The change did not *cause* it: output is bit-identical, the suite is green, and every column of
+every timestep runs the same code — a type-induced miscompile would fail on step 1, not after
+12,700 successful steps.)
+
+### 0c. Four claims in this document that measurement disproved
+
+1. **§2e's "~170× reduction" premise is wrong.** It assumed the allocations were *boxed
+   scalars* that concrete typing would collapse into one array per broadcast. They are not.
+   They are **genuine array temporaries**, and concrete typing does not remove them. The real
+   reduction is **2.4×**, not 170×.
+
+2. **§4 Phase 2's priority order is backwards.** It calls the loop-invariant reference-column
+   copies the "highest payoff, lowest risk" item. An allocation profile
+   (`Profile.Allocs`, sample_rate=1.0) says otherwise — the ref-column `[:,1]` copies are ~2
+   allocations each, while **the four `deepcopy(kbasis.data[...])` sites cost 93 allocations
+   *each*** and are **60 % of everything left**:
+
+   | site | allocs / column call |
+   |---|---|
+   | `moist_compressible.jl:527` `deepcopy` (moist_compressible_XZ) | 93 |
+   | `moist_compressible.jl:645` `deepcopy` (semiimplicit_adjustment_p) | 93 |
+   | `moist_compressible.jl:656` `deepcopy` (semiimplicit_adjustment_p) | 93 |
+   | `moist_compressible.jl:790` `deepcopy` (diffusion_timestep_mc) | 93 |
+   | `_vertical_solve!` internals (`semiimplicit.jl:1598,1602`) | 40 |
+   | `SItransform` (`CubicBSpline.jl:1541`) | 6 |
+   | each `ref_*(refstate)[:,N]` copy | 2 |
+   | **total** | **619** |
+
+   **Phase 2 must start with the `deepcopy` sites (item 3), not the ref columns (item 1).**
+
+3. **§4's `tilepoints::Matrix{Float64}` would break every 1-D grid.** `getGridpoints` returns a
+   bare `Vector` for `_1DCartesianGrid` / `_1DCartesianZ` / `_1DCartesianL` (it hands back
+   `ibasis.data[1,1].mishPoints`), which is exactly why `createModelTile` reads
+   `tilepoints[:, ndims(tilepoints)]`. It needs a **rank type parameter**.
+
+4. **§4's `h_matrix::LU{Float64,Matrix{Float64},Vector{Int64}}` would break every explicit
+   run.** The §7c table only sampled semi-implicit-*on* configs. The dummy placeholder
+   `factorize([1 2; 2 1])` is detected as **tridiagonal**, giving
+   `LU{Float64,Tridiagonal{...},Vector{Int64}}` — and that is what lands in `h_matrix` whenever
+   `:semiimplicit` is false. Likewise `mc_diffusion_matrices` **cannot** be a
+   `Dict{Symbol,F}`: its six entries are *not* one type (differing BCs flip `factorize`'s
+   symmetry detection, so on RiRk `u` is a `BunchKaufman` while `w` is an `LU`). It is now a
+   **`NamedTuple`** — concrete *and* heterogeneous, which a `Dict` cannot be.
+
+### 0d. Where to go next
+
+- **Phase 2, `deepcopy` first** (~60 % of remaining allocations). The code already documents
+  that one scratch column can serve multiple solves (`moist_compressible.jl:788-790`), because
+  the BCs live in the factorization, not the column.
+- **Phase 4 (thread oversubscription) is now clearly implicated**, not merely "aggravating":
+  **1.74 M lock conflicts** and GC time *rising* to 20 % on a run whose allocation count fell
+  2.4×. `--threads=auto` gives 12 threads/worker × 2 workers on a 12-core box = 24 threads
+  contending for one GC.
+- Phase 3 (static dispatch) remains low priority.
+
+---
+
+**Status:** ~~not started~~ **Phase 1 implemented 2026-07-12 (see §0).** Written 2026-07-12,
+immediately after commit `aedce4d`.
 **Prerequisite (recommended, not required):** the Springsteel `vars::Dict{String,Int64}` typing —
 see `Springsteel.jl/agent_files/plan_gridparams_dict_typing.md`. Doing that first avoids adding
 ~8 `::Int64` type assertions per equation set across 26 equation sets, all of which would then be

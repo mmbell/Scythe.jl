@@ -17,13 +17,13 @@ Main configuration struct for Scythe model runs. Uses `Base.@kwdef` for keyword 
 - `ts::Float64`: model timestep [s] (default: `0.0`)
 - `integration_time::Float64`: total integration duration [s] (default: `1.0`)
 - `output_interval::Float64`: time between output writes [s] (default: `1.0`)
-- `equation_set`: name of the equation set to solve (default: `"LinearAdvection1D"`)
-- `initial_conditions`: path to the initial conditions file (default: `"ic.csv"`)
-- `output_dir`: path to the output directory (default: `"./output/"`)
-- `ref_state_file`: path to the reference state sounding file (default: `""`)
+- `equation_set::String`: name of the equation set to solve (default: `"LinearAdvection1D"`)
+- `initial_conditions::String`: path to the initial conditions file (default: `"ic.csv"`)
+- `output_dir::String`: path to the output directory (default: `"./output/"`)
+- `ref_state_file::String`: path to the reference state sounding file (default: `""`)
 - `grid_params::SpringsteelGridParameters`: Springsteel grid configuration (required, no default)
-- `physical_params::Dict`: dictionary of physical parameters for the equation set (default: empty `Dict`)
-- `options::Dict`: dictionary of solver options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`)
+- `physical_params::Dict{Symbol,Float64}`: physical parameters for the equation set (default: empty)
+- `options::Dict{Symbol,Any}`: solver options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`)
 
 `grid_params` is passed through Springsteel's `compute_derived_params` on construction, so a
 cubic B-spline axis may be sized by *either* its cell count (`num_cells_i`/`num_cells_k`, the
@@ -36,13 +36,19 @@ Base.@kwdef struct ModelParameters
     ts::Float64 = 0.0
     integration_time::Float64 = 1.0
     output_interval::Float64 = 1.0
-    equation_set = "LinearAdvection1D"
-    initial_conditions = "ic.csv"
-    output_dir = "./output/"
-    ref_state_file = ""
+    equation_set::String = "LinearAdvection1D"
+    initial_conditions::String = "ic.csv"
+    output_dir::String = "./output/"
+    ref_state_file::String = ""
     grid_params::SpringsteelGridParameters
-    physical_params::Dict = Dict()
-    options::Dict = Dict(
+    # Concretely typed so that `model.physical_params[:Khdiff]` inside a per-column function
+    # returns a `Float64` instead of boxing an `Any`. The inner constructor's `new` converts,
+    # so a caller passing an integer value (`:K => 75`) still works.
+    physical_params::Dict{Symbol,Float64} = Dict{Symbol,Float64}()
+    # Deliberately left with an `Any` value type: options are not all Bool (e.g. a numeric
+    # :cfl_interval). The handful of option reads that sit inside per-column functions carry
+    # a `::Bool` assertion at the read site instead, which is what type-stability needs.
+    options::Dict{Symbol,Any} = Dict{Symbol,Any}(
         :semiimplicit => false,
         :exact_reference_state => false)
 

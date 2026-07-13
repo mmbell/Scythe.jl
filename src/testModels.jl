@@ -234,7 +234,7 @@ function Euler_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
 
@@ -408,7 +408,7 @@ function BF02_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
 
@@ -640,7 +640,7 @@ function BF02_test_alt(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
 
@@ -999,7 +999,7 @@ function rainfall_test(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
 

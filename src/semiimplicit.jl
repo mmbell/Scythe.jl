@@ -21,28 +21,40 @@ export initialize_model, run_model, finalize_model
 Fundamental computational unit holding model state, tendencies, reference state,
 and spectral transform infrastructure for a single tile in the domain decomposition.
 """
-struct ModelTile{R<:AbstractReferenceState}
+struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
+                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N}
     model::ModelParameters
-    tile::AbstractGrid
-    var_np1::Array{Float64}
-    expdot_incr::Array{Float64}
-    expdot_n::Array{Float64}
-    expdot_nm1::Array{Float64}
-    expdot_nm2::Array{Float64}
-    impdot_np1::Array{Float64}
-    impdot_n::Array{Float64}
-    impdot_nm1::Array{Float64}
-    impdot_nm2::Array{Float64}
-    tilepoints::Array{Float64}
+    # Concretely typed, so `mtile.tile.physical` and `mtile.tile.kbasis` infer. Declaring
+    # this `AbstractGrid` made every view and broadcast in the per-column equation-set
+    # bodies fall back to `Any` and box, which is what drove the GC over (12.6e9 pool
+    # allocations in a 900 s straka93 run). Springsteel's grids are already concrete.
+    tile::G
+    var_np1::Matrix{Float64}
+    expdot_incr::Matrix{Float64}
+    expdot_n::Matrix{Float64}
+    expdot_nm1::Matrix{Float64}
+    expdot_nm2::Matrix{Float64}
+    impdot_np1::Matrix{Float64}
+    impdot_n::Matrix{Float64}
+    impdot_nm1::Matrix{Float64}
+    impdot_nm2::Matrix{Float64}
+    # Rank-parameterized, NOT `Matrix`: `getGridpoints` returns a bare `Vector` for the 1-D
+    # geometries (it hands back `ibasis.data[1,1].mishPoints` directly) and a matrix for
+    # everything else — which is why the reference-state setup below reads
+    # `tilepoints[:, ndims(tilepoints)]`.
+    tilepoints::Array{Float64, N}
     ref_state::R
     patchMap::SparseMatrixCSC{Float64, Int64}
     haloSendMap::SparseMatrixCSC{Float64, Int64}
     haloReceiveMap::SparseMatrixCSC{Float64, Int64}
-    haloReceiveBuffer::Array{Float64}
-    splineBuffer::Array{Float64}
+    haloReceiveBuffer::Vector{Float64}
     patch_b_iDim::Int64
-    h_matrix::Factorization
-    diffusion_matrix::Factorization
+    # Parameterized rather than pinned to a single factorization type: the concrete type
+    # varies with both the grid and the run configuration. `h_matrix` is an `LU` over a
+    # `Matrix` when semi-implicit is on but an `LU` over a `Tridiagonal` (the 2x2 dummy)
+    # when it is off; `diffusion_matrix` is a `BunchKaufman` on RiRk and an `LU` on RZ.
+    h_matrix::H
+    diffusion_matrix::D
     # Implicit vertical-diffusion tendency history, separate from `impdot_*`. The
     # acoustic solvers own the `impdot` slots of every variable they touch (p, rho_d,
     # rho_t, w, E_t), so a set that wants implicit vertical diffusion on w — or on a
@@ -50,11 +62,17 @@ struct ModelTile{R<:AbstractReferenceState}
     # free `impdot` column to store its AI2* history in. `diffdot_*` is that channel.
     # Only `moist_compressible_XZ` uses it; the older sets still stage their (currently
     # unconsumed) vertical diffusion in `impdot`.
-    diffdot_n::Array{Float64}
-    diffdot_nm1::Array{Float64}
-    # Per-boundary-condition vertical-diffusion factorizations for the total-energy set:
-    # :neumann_m (u), :dirichlet_m (w), :neumann_h (theta_d'). Empty for other sets.
-    mc_diffusion_matrices::Dict{Symbol,Factorization}
+    diffdot_n::Matrix{Float64}
+    diffdot_nm1::Matrix{Float64}
+    # Per-variable vertical-diffusion factorizations for the total-energy set, keyed
+    # :u/:w/:heat and :u_first/:w_first/:heat_first. Empty NamedTuple for other sets.
+    #
+    # A NamedTuple rather than a Dict because these six are NOT all the same concrete type:
+    # the boundary conditions differ per variable, which flips `factorize`'s symmetry
+    # detection, so on RiRk `u` comes back an `LU` while `w` comes back a `BunchKaufman`.
+    # A Dict would have to widen its value type to the abstract `Factorization` join and
+    # box on every lookup, in the hot path. A NamedTuple is concrete AND heterogeneous.
+    mc_diffusion_matrices::MC
 end
 
 """
@@ -128,7 +146,6 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
 
     # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
-    splineBuffer = allocateSplineBuffer(tile)
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
     # structural placeholder where a real one is not needed.
@@ -157,20 +174,22 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # the rainfall session — see reference/moist_compressible_diffusion_handoff.md.
     # Built only for Kvdiff > 0: at K = 0 a vertical solve is not the identity (it refits
     # the column and reapplies the spectral filter), so the routine returns before it.
-    mc_diffusion_matrices = Dict{Symbol,Factorization}()
+    mc_diffusion_matrices = NamedTuple()
     if uses_pressure_reference(model.equation_set) &&
             get(model.physical_params, :Kvdiff, 0.0) > 0.0
         Kv = model.physical_params[:Kvdiff]
         Pr = get(model.physical_params, :Prandtl, 1.0)
         bcb = model.grid_params.BCB
         bct = model.grid_params.BCT
-        for (key, var, K) in ((:u, "u", Kv), (:w, "w", Kv), (:heat, "E_t", Kv / Pr))
-            for (suffix, coeff) in ((key, 1.25 * model.ts * K),
-                                    (Symbol(key, :_first), 0.5 * model.ts * K))
-                mc_diffusion_matrices[suffix] = calc_Helmholtz_diffusion_matrix(tile, model, coeff;
-                    bc_bottom = bcb[var], bc_top = bct[var])
-            end
-        end
+        mc_matrix(var, K, coeff) = calc_Helmholtz_diffusion_matrix(tile, model,
+            coeff * model.ts * K; bc_bottom = bcb[var], bc_top = bct[var])
+        mc_diffusion_matrices = (
+            u          = mc_matrix("u",   Kv,      1.25),
+            u_first    = mc_matrix("u",   Kv,      0.5),
+            w          = mc_matrix("w",   Kv,      1.25),
+            w_first    = mc_matrix("w",   Kv,      0.5),
+            heat       = mc_matrix("E_t", Kv / Pr, 1.25),
+            heat_first = mc_matrix("E_t", Kv / Pr, 0.5))
     end
 
     mtile = ModelTile(
@@ -191,7 +210,6 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         haloSendMap,
         haloReceiveMap,
         haloReceiveBuffer,
-        splineBuffer,
         patch.params.b_iDim,
         h_matrix,
         diffusion_matrix,

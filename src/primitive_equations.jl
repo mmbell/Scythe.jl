@@ -24,13 +24,13 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Reduced form for reversible benchmarks (e.g. Bryan & Fritsch 2002,
     # where precipitation fallout is not allowed): disable autoconversion,
     # collection, sedimentation, and rain evaporation
-    precipitation = get(model.options, :precipitation, true)
+    precipitation = get(model.options, :precipitation, true)::Bool
 
     # Louis shear-based vertical mixing. Disable for benchmark cases whose
     # specification has no turbulence; the explicit mixing is also unstable
     # where strong shear meets the fine Chebyshev spacing at the boundaries
     # (Kv ~ lv^2 |du/dz| can exceed the explicit diffusion limit there)
-    vertical_mixing = get(model.options, :vertical_mixing, true)
+    vertical_mixing = get(model.options, :vertical_mixing, true)::Bool
 
     # Gridpoints
     x = view(gridpoints,colstart:colend,1)
@@ -321,7 +321,7 @@ function primitive_equation_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
 
@@ -371,8 +371,8 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
     alpha = model.physical_params[:alpha]
     z_damp = model.physical_params[:z_damp]
 
-    precipitation = get(model.options, :precipitation, true)
-    vertical_mixing = get(model.options, :vertical_mixing, true)
+    precipitation = get(model.options, :precipitation, true)::Bool
+    vertical_mixing = get(model.options, :vertical_mixing, true)::Bool
 
     # Gridpoints
     x = view(gridpoints,colstart:colend,1)
@@ -640,7 +640,7 @@ function primitive_equation_XZ_rhod(mtile::ModelTile, colstart::Int64, colend::I
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms (linear rho_d mass-flux acoustic adjustment)
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment_rhod(mtile, colstart, colend, t)
     end
 
@@ -694,8 +694,8 @@ function primitive_equation_XZ_rhod_pd(mtile::ModelTile, colstart::Int64, colend
     alpha = model.physical_params[:alpha]
     z_damp = model.physical_params[:z_damp]
 
-    precipitation = get(model.options, :precipitation, true)
-    vertical_mixing = get(model.options, :vertical_mixing, true)
+    precipitation = get(model.options, :precipitation, true)::Bool
+    vertical_mixing = get(model.options, :vertical_mixing, true)::Bool
 
     # Gridpoints
     x = view(gridpoints,colstart:colend,1)
@@ -994,7 +994,7 @@ function primitive_equation_XZ_rhod_pd(mtile::ModelTile, colstart::Int64, colend
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms (linear rho_d mass-flux acoustic adjustment)
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment_rhod(mtile, colstart, colend, t)
     end
 
@@ -1042,8 +1042,8 @@ function primitive_equation_XZ_sigma(mtile::ModelTile, colstart::Int64, colend::
     alpha = model.physical_params[:alpha]
     z_damp = model.physical_params[:z_damp]
 
-    precipitation = get(model.options, :precipitation, true)
-    vertical_mixing = get(model.options, :vertical_mixing, true)
+    precipitation = get(model.options, :precipitation, true)::Bool
+    vertical_mixing = get(model.options, :vertical_mixing, true)::Bool
 
     # Gridpoints
     x = view(gridpoints,colstart:colend,1)
@@ -1357,7 +1357,7 @@ function primitive_equation_XZ_sigma(mtile::ModelTile, colstart::Int64, colend::
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms (linear rho_d mass-flux acoustic adjustment)
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment_rhod(mtile, colstart, colend, t)
     end
 
@@ -1728,7 +1728,7 @@ function primitive_equation_RZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment(mtile, colstart, colend, t)
     end
 

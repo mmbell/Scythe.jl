@@ -535,7 +535,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     explicit_timestep(mtile, colstart, colend, t)
 
     # Solve for semi-implicit n+1 terms ((p', ρ̄_t w) acoustic adjustment)
-    if mtile.model.options[:semiimplicit]
+    if mtile.model.options[:semiimplicit]::Bool
         semiimplicit_adjustment_p(mtile, colstart, colend, t)
     end
 
