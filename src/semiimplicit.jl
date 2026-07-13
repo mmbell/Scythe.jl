@@ -22,7 +22,7 @@ Fundamental computational unit holding model state, tendencies, reference state,
 and spectral transform infrastructure for a single tile in the domain decomposition.
 """
 struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
-                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N}
+                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N, KC}
     model::ModelParameters
     # Concretely typed, so `mtile.tile.physical` and `mtile.tile.kbasis` infer. Declaring
     # this `AbstractGrid` made every view and broadcast in the per-column equation-set
@@ -73,6 +73,44 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # A Dict would have to widen its value type to the abstract `Factorization` join and
     # box on every lookup, in the hot path. A NamedTuple is concrete AND heterogeneous.
     mc_diffusion_matrices::MC
+    # Reusable vertical work columns, indexed [thread, variable]. The equation sets used to
+    # `deepcopy(tile.kbasis.data[v])` a fresh column per variable, PER COLUMN, PER TIMESTEP —
+    # 93 allocations a pop, and 60% of all remaining per-column allocations. The copy only
+    # exists to get private `uMish`/`b`/`a` work vectors; it also clones the (read-only) basis
+    # matrices and factorizations, which is the expensive part.
+    #
+    # Indexed by thread, not by column: per-column scratch would need 2.9 GB on a full-mode RZ
+    # run (1536 columns x 1.9 MiB), whereas per-thread needs ~90 MiB. Safe because the column
+    # loop in `advanceTimestep` is `@threads :static`, which pins each iteration to a fixed
+    # thread, so `threadid()` is a stable owner tag. Per-VARIABLE as well as per-thread because
+    # callers hold two columns live at once (`semiimplicit_adjustment_p` reads `p_nstar`, which
+    # aliases the p-column's `uMish`, after transforming the w-column) and because
+    # `Btransform!`/`Atransform!` consult the column's own boundary conditions.
+    #
+    # Empty (`Matrix{Nothing}`) for grids with no vertical basis — `NoBasisArray` has no `data`.
+    scratch_columns::Matrix{KC}
+end
+
+"""
+    scratch_column(mtile, var_index)
+
+The calling thread's reusable vertical work column for variable slot `var_index`.
+Replaces `deepcopy(mtile.tile.kbasis.data[var_index])` in the per-column hot path.
+
+The contents carry no meaning between uses: every caller either overwrites `uMish` before
+transforming, or has `_vertical_solve!` set `a` outright.
+"""
+@inline function scratch_column(mtile::ModelTile, var_index::Int64)
+    return @inbounds mtile.scratch_columns[Threads.threadid(), var_index]
+end
+
+"""Reusable per-thread vertical work columns, or an empty matrix if the grid has no k-basis."""
+_allocate_scratch_columns(::NoBasisArray, tile::AbstractGrid) = Matrix{Nothing}(undef, 0, 0)
+
+function _allocate_scratch_columns(kbasis, tile::AbstractGrid)
+    nthreads = Threads.maxthreadid()
+    nvars = size(tile.physical, 2)
+    return [deepcopy(kbasis.data[v]) for _ in 1:nthreads, v in 1:nvars]
 end
 
 """
@@ -146,6 +184,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
 
     # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
+    scratch_columns = _allocate_scratch_columns(tile.kbasis, tile)
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
     # structural placeholder where a real one is not needed.
@@ -215,7 +254,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         diffusion_matrix,
         diffdot_n,
         diffdot_nm1,
-        mc_diffusion_matrices)
+        mc_diffusion_matrices,
+        scratch_columns)
     return mtile
 end
 
@@ -596,9 +636,15 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # thread-safe, and halts the run cleanly instead of segfaulting in the solver.
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
 
-    # Advance each column
+    # Advance each column.
+    #
+    # `:static` (not the default `:dynamic`) because the equation sets take their vertical work
+    # column from `mtile.scratch_columns[threadid(), var]`. Under dynamic scheduling a task may
+    # resume on a different thread, so `threadid()` is not a stable owner tag and two columns
+    # could end up sharing one work column. `:static` pins each iteration to a fixed thread.
+    # The columns are equal-cost, so there is nothing for dynamic scheduling to balance anyway.
     if num_columns(mtile.tile) > 0
-        Threads.@threads for c in 1:num_columns(mtile.tile)
+        Threads.@threads :static for c in 1:num_columns(mtile.tile)
             advance_column(mtile, c, t)
         end
     else

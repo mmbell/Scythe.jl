@@ -338,18 +338,19 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     rho_rp_z = view(grid.physical,colstart:colend,8,4)
     rho_rp_zz = view(grid.physical,colstart:colend,8,5)
 
-    # Reference state (pressure-based)
-    pbar = ref_pressure(refstate)[:,1]
-    pbar_z = ref_pressure(refstate)[:,2]
-    rho_dbar = ref_rho_d(refstate)[:,1]
-    rho_dbar_z = ref_rho_d(refstate)[:,2]
-    rho_tbar = ref_rho_t(refstate)[:,1]
-    rho_tbar_z = ref_rho_t(refstate)[:,2]
-    E_tbar = ref_total_energy(refstate)[:,1]
-    E_tbar_z = ref_total_energy(refstate)[:,2]
-    Q_ssbar = ref_qss(refstate)[:,1]
-    Q_ssbar_z = ref_qss(refstate)[:,2]
-    Tbar = refstate.Tbar[:,1]
+    # Reference state (pressure-based). Views, not `[:,1]` copies: these are read-only and
+    # loop-invariant, so copying them allocated a fresh kDim vector per column per timestep.
+    pbar = view(ref_pressure(refstate),:,1)
+    pbar_z = view(ref_pressure(refstate),:,2)
+    rho_dbar = view(ref_rho_d(refstate),:,1)
+    rho_dbar_z = view(ref_rho_d(refstate),:,2)
+    rho_tbar = view(ref_rho_t(refstate),:,1)
+    rho_tbar_z = view(ref_rho_t(refstate),:,2)
+    E_tbar = view(ref_total_energy(refstate),:,1)
+    E_tbar_z = view(ref_total_energy(refstate),:,2)
+    Q_ssbar = view(ref_qss(refstate),:,1)
+    Q_ssbar_z = view(ref_qss(refstate),:,2)
+    Tbar = view(refstate.Tbar,:,1)
     Pxi_bar = sound_speed_sq(refstate)
 
     # Total fields (perturbation + reference)
@@ -524,7 +525,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
         @turbo diffdot[colstart:colend,5] .= @. Kvdiff * w_zz
         # ∂zz(s_d') from the column basis, so the explicit AI2* tendency and the implicit
         # Helmholtz operator use the same discrete ∂zz.
-        s_col = deepcopy(mtile.tile.kbasis.data[6])
+        s_col = scratch_column(mtile, 6)
         s_col.uMish .= s_d .- s_dbar
         Btransform!(s_col)
         Atransform!(s_col)
@@ -606,16 +607,16 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     rhot_nstar = mtile.var_np1[colstart:colend,rhot_index]
     et_nstar = mtile.var_np1[colstart:colend,et_index]
 
-    # Reference profiles and mean sound speed squared
+    # Reference profiles and mean sound speed squared (views — read-only, loop-invariant)
     Pxi_bar = sound_speed_sq(mtile.ref_state)
-    rho_dbar = ref_rho_d(mtile.ref_state)[:,1]
-    rho_dbar_z = ref_rho_d(mtile.ref_state)[:,2]
-    rho_tbar = ref_rho_t(mtile.ref_state)[:,1]
-    rho_tbar_z = ref_rho_t(mtile.ref_state)[:,2]
-    E_tbar = ref_total_energy(mtile.ref_state)[:,1]
-    E_tbar_z = ref_total_energy(mtile.ref_state)[:,2]
-    pbar = ref_pressure(mtile.ref_state)[:,1]
-    pbar_z = ref_pressure(mtile.ref_state)[:,2]
+    rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
+    rho_dbar_z = view(ref_rho_d(mtile.ref_state),:,2)
+    rho_tbar = view(ref_rho_t(mtile.ref_state),:,1)
+    rho_tbar_z = view(ref_rho_t(mtile.ref_state),:,2)
+    E_tbar = view(ref_total_energy(mtile.ref_state),:,1)
+    E_tbar_z = view(ref_total_energy(mtile.ref_state),:,2)
+    pbar = view(ref_pressure(mtile.ref_state),:,1)
+    pbar_z = view(ref_pressure(mtile.ref_state),:,2)
 
     # Subtract the AB3 explicit treatment of the implicit tendency and add the
     # off-centered AI2* terms (AM2 trapezoidal on the first step), then shift the
@@ -642,7 +643,10 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
 
     # Take the vertical derivative of the p' predictor (coefficient 1: the pair is
     # ∂φ/∂t = -∂z p'; Pxi_bar enters in the p' update instead)
-    p_col = deepcopy(mtile.tile.kbasis.data[p_index])
+    # Distinct scratch columns per variable: `p_nstar` below aliases `p_col.uMish`, and is
+    # still read after `phi_col` has been transformed — so these two must not be the same
+    # object. Keyed on p_index vs w_index, they are not.
+    p_col = scratch_column(mtile, p_index)
     p_col.uMish .= p_nstar
     Btransform!(p_col)
     Atransform!(p_col)
@@ -653,7 +657,7 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # Elimination gives (I - Δτ² Pxi_bar ∂zz) φ, the same operator as the rho_d
     # form, so h_matrix is reused.
     rhs = p_nstar_z .- (rho_tbar .* w_nstar)
-    phi_col = deepcopy(mtile.tile.kbasis.data[w_index])
+    phi_col = scratch_column(mtile, w_index)
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
@@ -734,9 +738,9 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     ts = mtile.model.ts
 
-    pbar = ref_pressure(mtile.ref_state)[:,1]
-    rho_dbar = ref_rho_d(mtile.ref_state)[:,1]
-    rho_tbar = ref_rho_t(mtile.ref_state)[:,1]
+    pbar = view(ref_pressure(mtile.ref_state),:,1)
+    rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
+    rho_tbar = view(ref_rho_t(mtile.ref_state),:,1)
 
     # Post-acoustic totals; dry EOS temperature (no retrieval — s_d is dry-exact)
     u_star = mtile.var_np1[colstart:colend,u_index]
@@ -787,7 +791,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     # factorization, and neither `_vertical_solve!` nor `Itransform!` consults the
     # column's own BCs (only Btransform!/Atransform! do). Same reuse as
     # `diffusion_timestep_pd`, which shares one column across five variables.
-    col = deepcopy(mtile.tile.kbasis.data[u_index])
+    col = scratch_column(mtile, u_index)
     _vertical_solve!(col, h_u, u_nstar, mtile.tile)
     u_np1 = copy(Itransform!(col))
 

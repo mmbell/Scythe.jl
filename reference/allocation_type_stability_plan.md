@@ -1,17 +1,50 @@
 # Scythe allocation / type-stability refactor — plan
 
-> **UPDATE 2026-07-12 — Phase 1 is IMPLEMENTED. Read §0 first: it corrects four claims in
-> this document that measurement disproved, and it records that Phase 1 did NOT stop the
-> crash.**
+> **UPDATE 2026-07-12 — Phases 1, 2 and 4 are IMPLEMENTED. Read §0 first: it corrects four
+> claims in this document that measurement disproved. Phase 1 alone did NOT stop the crash;
+> Phases 1+2+4 together appear to.**
 
 ---
 
-## 0. What Phase 1 actually did (measured, post-implementation)
+## 0. What was actually implemented (measured)
 
-Phase 1 is done and is a strict improvement — but **the central prediction in §2e below was
-wrong, and the crash survives.** Phase 2 is therefore *required*, not optional.
+### 0z. Final state — Phases 1 + 2 + 4
 
-### 0a. Results
+| straka93 quick/mc/rirk | before | Phase 1 | **+ Phase 2+4** |
+|---|---|---|---|
+| allocations | 4.73 G | 1.94 G | **757 M** (6.2×) |
+| allocated | 836.6 GiB | 680.9 GiB | **224.9 GiB** |
+| wall clock | 484.5 s | 484.0 s | **392 s** (1.24×) |
+| GC time | 14.2 % | 20.2 % | **~6 %** |
+| crash | ~1 in 3 runs | 1 in 3 runs | **0 in 8 runs** |
+
+| bf02_dry quick/mc/rz | before | **+ Phase 2+4** |
+|---|---|---|
+| allocations | 991.2 M | **248.8 M** (4.0×) |
+| allocated | 213.2 GiB | **42.3 GiB** (5.0×) |
+| wall clock | 269.8 s | **103.3 s** (2.6×) |
+| GC time | 12.0 % | **3.96 %** |
+
+Per-column call (`moist_compressible_XZ`, RiRk): **1447 → 203 allocations** (7.1×).
+Output is **bit-identical** throughout (all 8 bf02_dry CSVs diff byte-for-byte clean against a
+pre-refactor run). Tests: **4379 passing, 0 failures.**
+
+**What Phase 2 changed.** The four `deepcopy(tile.kbasis.data[v])` sites in
+`moist_compressible.jl` now borrow a persistent **per-thread** work column from
+`mtile.scratch_columns[threadid(), var]`, and the loop-invariant `ref_*(refstate)[:,N]` copies
+became views. Per-thread, *not* per-column: per-column scratch would need **2.9 GB** on a
+full-mode RZ run (1536 columns × 1.9 MiB/column), versus ~90 MiB per-thread. That makes
+`threadid()` an ownership tag, which is only sound under **`Threads.@threads :static`** — the
+column loop in `advanceTimestep` was switched accordingly (the columns are equal-cost, so
+there is nothing for dynamic scheduling to balance).
+
+The scratch columns are keyed per **variable** as well as per thread, for two reasons:
+`Btransform!`/`Atransform!` consult the column's own BCs, and `semiimplicit_adjustment_p` holds
+the p- and w-columns live simultaneously (`p_nstar` aliases the p-column's `uMish` and is read
+*after* the w-column is transformed) — handing it one object twice would corrupt the pressure
+update silently.
+
+### 0a. Phase 1 results (for the record)
 
 `ModelTile` and `ModelParameters` are now fully concrete (every field passes
 `isconcretetype`). Output is **bit-identical** — the 8 `bf02_dry quick/mc` output CSVs diff
@@ -33,15 +66,19 @@ baseline + 46 new in `test/test_allocations.jl`).
 
 Per-column call (`moist_compressible_XZ`, RiRk): **1447 → 619 allocations**, 128,336 → 76,768 B.
 
-### 0b. **The crash is NOT fixed**
+### 0b. Phase 1 alone did NOT fix the crash
 
-`straka93 --mode quick --stage mc --grid rirk` still dies intermittently: **1 of 3 post-change
+`straka93 --mode quick --stage mc --grid rirk` still died intermittently after Phase 1: **1 of 3
 runs segfaulted at t = 793.6 s of 900 s** (worker 3, signal 11), the same late-run intermittent
-signature as the original signal-4 death at t = 862.5 s. Phase 1 alone is not enough.
+signature as the original signal-4 death at t = 862.5 s. That is what motivated Phase 2.
 
-(The change did not *cause* it: output is bit-identical, the suite is green, and every column of
+(Phase 1 did not *cause* it: output was bit-identical, the suite was green, and every column of
 every timestep runs the same code — a type-induced miscompile would fail on step 1, not after
 12,700 successful steps.)
+
+**After Phases 2+4: 8 consecutive clean runs to t = 900.** Not a proof of absence — but against a
+~1-in-3 baseline crash rate, 8 clean runs is a ~4 % chance of luck, and the mechanism moved in
+the right direction (6.2× fewer allocations, GC time 14 % → 6 %).
 
 ### 0c. Four claims in this document that measurement disproved
 
@@ -83,16 +120,25 @@ every timestep runs the same code — a type-induced miscompile would fail on st
    symmetry detection, so on RiRk `u` is a `BunchKaufman` while `w` is an `LU`). It is now a
    **`NamedTuple`** — concrete *and* heterogeneous, which a `Dict` cannot be.
 
-### 0d. Where to go next
+### 0d. What is left (not done)
 
-- **Phase 2, `deepcopy` first** (~60 % of remaining allocations). The code already documents
-  that one scratch column can serve multiple solves (`moist_compressible.jl:788-790`), because
-  the BCs live in the factorization, not the column.
-- **Phase 4 (thread oversubscription) is now clearly implicated**, not merely "aggravating":
-  **1.74 M lock conflicts** and GC time *rising* to 20 % on a run whose allocation count fell
-  2.4×. `--threads=auto` gives 12 threads/worker × 2 workers on a 12-core box = 24 threads
-  contending for one GC.
-- Phase 3 (static dispatch) remains low priority.
+Ranked by measured cost, on the remaining 203 allocations per column call:
+
+1. **`_vertical_solve!` (`semiimplicit.jl:1644,1648`) — ~40 allocs/call, now the single biggest
+   item.** `b = d.M0' * (d.W .* rhs_mish)` and `col.a .= h_a \ b` each allocate. Fixable with
+   `mul!`/`ldiv!` into per-thread scratch vectors (same ownership trick as the scratch columns).
+2. **Broadcast temporaries** (~150/call) — the `p = pp .+ pbar` family. This is §4 Phase 2 item 2
+   (a preallocated full-tile `scratch` matrix). Invasive, and the *only* item here that risks
+   changing results, so it needs the bit-identity check.
+3. `SItransform` (`Springsteel/CubicBSpline.jl:1541`) — ~6/call, inside Springsteel.
+4. **The same Phase 2 treatment for `primitive_equations.jl`**, which still has 13 per-column
+   `deepcopy` sites. Only `moist_compressible.jl` was converted (it is the crashing set). PE is
+   untouched and still pays the 93-allocations-per-deepcopy cost.
+5. Phase 3 (static equation-set dispatch) remains low priority (~736 B/column).
+
+Springsteel also exports `mul!`-based out-arg variants of `Ixtransform`/`Ixxtransform`
+(`Chebyshev.jl:683-687`) that Scythe never calls; every hot-path call site uses the allocating
+1-arg form.
 
 ---
 

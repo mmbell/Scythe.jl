@@ -117,16 +117,33 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
         @test fieldtype(ModelParameters, :physical_params) === Dict{Symbol,Float64}
     end
 
+    @testset "scratch columns replace the per-column deepcopy" begin
+        # The equation sets used to deepcopy a fresh vertical column out of the basis for
+        # every variable, every column, every timestep — 93 allocations each, and 60% of all
+        # per-column allocations. They now borrow a persistent per-thread column.
+        @test isconcretetype(fieldtype(MT, :scratch_columns))
+        @test size(mtile.scratch_columns) == (Threads.maxthreadid(), 8)
+
+        # Distinct object per (thread, variable): `semiimplicit_adjustment_p` holds the p- and
+        # w-columns live simultaneously (p_nstar aliases the p-column's uMish), so handing it
+        # the same object twice would silently corrupt the pressure update.
+        @test mtile.scratch_columns[1, 1] !== mtile.scratch_columns[1, 5]
+
+        # No equation set may reintroduce the per-column deepcopy.
+        @test !occursin("deepcopy(mtile.tile.kbasis",
+            read(joinpath(@__DIR__, "..", "src", "moist_compressible.jl"), String))
+    end
+
     @testset "per-column allocation ceilings" begin
-        # Regression tripwire, not a target. Measured after the concrete-typing refactor:
-        # moist_compressible_XZ 619 allocs, diffusion_timestep_mc 179 allocs per column
-        # call (down from 1447 / 249). The ceilings sit ~40% above those so that normal
-        # churn does not trip them, but a reintroduced abstract field — which roughly
-        # doubles the count — does.
+        # Regression tripwire, not a target. Measured after the refactor: moist_compressible_XZ
+        # 203 allocs, diffusion_timestep_mc 80 allocs per column call (down from 1447 / 249).
+        # The ceilings sit ~50% above those so normal churn does not trip them, but a
+        # reintroduced abstract field or a per-column deepcopy — each of which multiplies the
+        # count several-fold — does.
         moist_compressible_XZ(mtile, 1, kDim, 2)      # compile
         diffusion_timestep_mc(mtile, 1, kDim, 2)
 
-        @test (@allocations moist_compressible_XZ(mtile, 1, kDim, 2)) < 900
-        @test (@allocations diffusion_timestep_mc(mtile, 1, kDim, 2)) < 260
+        @test (@allocations moist_compressible_XZ(mtile, 1, kDim, 2)) < 300
+        @test (@allocations diffusion_timestep_mc(mtile, 1, kDim, 2)) < 120
     end
 end
