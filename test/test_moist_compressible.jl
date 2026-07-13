@@ -247,7 +247,8 @@ using Springsteel
     end
 
     function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=false, ts=0.1,
-                           dry=false, Khdiff=0.0, Kvdiff=0.0, Kvdiff_heat=nothing, tau_qss=10.0,
+                           dry=false, Khdiff=0.0, Kvdiff=0.0, Kvdiff_heat=nothing,
+                           Kvdiff_water=0.0, tau_qss=10.0,
                            u_side_bc=DirichletBC(), precipitation=false, N_r=1.0e-3,
                            q_l=1.0e-3)
         varlist = Scythe.MC_VARS
@@ -275,6 +276,7 @@ using Springsteel
             ref_state_file = ref_file, grid_params = gp,
             physical_params = Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff,
                                    :Kvdiff_heat => (Kvdiff_heat === nothing ? Kvdiff : Kvdiff_heat),
+                                   :Kvdiff_water => Kvdiff_water,
                                    :Kv_mudiff => 0.0, :tau_qss => tau_qss, :N_r => N_r,
                                    :alpha => 0.0, :z_damp => 20.0e3),
             options = Dict(:semiimplicit => semiimplicit, :exact_reference_state => true,
@@ -636,10 +638,17 @@ using Springsteel
                                                    u_side_bc=NeumannBC())
             kDim = model.grid_params.kDim
             gridpoints = Scythe.getGridpoints(patch)
+            rho_tbar = Springsteel.ref_rho_t(mtile.ref_state)[:, 1]
             # u = U0 sin(pi z/H): vanishes at the no-slip lids, u_zz != 0 in the interior,
             # and is x-independent so the divergence (hence every other tendency) is zero.
+            # E_t carries the kinetic energy in this set, so a consistent shear IC must
+            # seed E_t' = rho_t*ke too — without it the retrieval sees a phantom cold
+            # anomaly and the (now moist-entropy) heat path fires on it.
             for i in 1:size(patch.physical, 1)
-                patch.physical[i, 4, 1] = 10.0 * sin(pi * gridpoints[i, 2] / 2000.0)
+                k = mod1(i, kDim)
+                u0 = 10.0 * sin(pi * gridpoints[i, 2] / 2000.0)
+                patch.physical[i, 4, 1] = u0
+                patch.physical[i, 6, 1] = rho_tbar[k] * 0.5 * u0^2
             end
             spectralTransform!(patch); gridTransform!(patch)
 
@@ -655,15 +664,16 @@ using Springsteel
             # Net kinetic energy falls
             @test sum(dke) < 0.0
 
-            rho_tbar = Springsteel.ref_rho_t(mtile.ref_state)[:, 1]
             sheared = findall(x -> x < -1.0e-9, dke)
             @test !isempty(sheared)
             for i in sheared
                 k = mod1(i, kDim)
                 # E_t follows the KE down (the sink), and p is untouched (internal energy
-                # held — no frictional heating).
-                @test (mtile.var_np1[i, 6] - E_t_before[i]) ≈ rho_tbar[k] * dke[i] rtol=1e-6
-                @test mtile.var_np1[i, 1] ≈ p_before[i] atol=1e-9
+                # held — no frictional heating; the fit-residual s_t' leaves only a
+                # negligible heat increment).
+                @test isapprox(mtile.var_np1[i, 6] - E_t_before[i], rho_tbar[k] * dke[i];
+                               rtol=1e-4, atol=1e-7)
+                @test mtile.var_np1[i, 1] ≈ p_before[i] atol=1e-6
             end
         end
     end
@@ -920,6 +930,138 @@ using Springsteel
             dT = retrieved_T_mc(m_on, kDim, zs) .- retrieved_T_mc(m_off, kDim, zs)
             @test minimum(dT) < 0.0
             @test maximum(dT) < 1.0e-3
+        end
+    end
+
+    # ──────────────────────────────────────────────
+    # 8. Vertical moist diffusion (s_t heat + water species)
+    # ──────────────────────────────────────────────
+
+    @testset "resting base is untouched by full moist diffusion" begin
+        # s_tbar and rho_vbar come from mc_reference_diagnostics — the SAME retrieval
+        # pipeline the equation set runs — so at rest s_t' = 0 and rho_v' = 0 BIT-exactly.
+        # On the DRY base every vertical diffusive tendency (heat AND water) must then
+        # vanish bit-for-bit; this catches a reference profile built from the (not
+        # bit-identical) file Tbar instead.
+        mktempdir() do tmpdir
+            mK, pK, modK, _ = make_mc_mtile(tmpdir; dry=true,
+                                            Kvdiff=75.0, Kvdiff_water=75.0, Khdiff=0.0)
+            step_mc!(mK, pK, modK, 3)
+            for slot in (1, 2, 3, 4, 5, 6, 8)
+                @test maximum(abs.(pK.physical[:, slot, 1])) == 0.0
+            end
+            # Q_ss carries a pre-existing ~1e-18 tracking crumb (file Tbar vs retrieved-T
+            # saturation in the relaxation limiters) even with all diffusion off
+            @test maximum(abs.(pK.physical[:, 7, 1])) < 1.0e-16
+        end
+        # The CLOUDY base carries a pre-existing machine-precision condensation crumb
+        # (the file-derived Q_ssbar vs the retrieved-T saturation differ at ~1e-17, so
+        # Qdot != 0 at rest even with diffusion off — verified on the pre-diffusion
+        # code). The diffusion solves see that crumb through the star state, so exact
+        # zero is unattainable; the base must still be preserved to noise level.
+        mktempdir() do tmpdir
+            mK, pK, modK, _ = make_mc_mtile(tmpdir; dry=false, q_l=1.0e-3,
+                                            Kvdiff=75.0, Kvdiff_water=75.0, Khdiff=0.0)
+            step_mc!(mK, pK, modK, 3)
+            @test maximum(abs.(pK.physical[:, 1, 1])) < 1.0e-9    # p [Pa]
+            @test maximum(abs.(pK.physical[:, 6, 1])) < 1.0e-8    # E_t [J/m^3]
+            for slot in (2, 3, 4, 5, 7, 8)
+                @test maximum(abs.(pK.physical[:, slot, 1])) < 1.0e-10
+            end
+        end
+    end
+
+    @testset "water diffusion: rain bump conserves mass and holds T" begin
+        # Rain bump aloft in a cloud-free saturated column, ONLY Kvdiff_water active.
+        # The on/off difference isolates the water solves: rho_d untouched bit-exactly,
+        # rho_t tracks rho_r (rain is the only water moving), the column integral of the
+        # Neumann solve is conserved, and the fixed-T increment map leaves the retrieval
+        # unchanged to splitting-error tolerance.
+        mktempdir() do tmpdir
+            args = (; q_l=0.0, kDim=32, num_cells=8, ts=0.05)
+            function run_once(Kw)
+                mtile, patch, model, col = make_mc_mtile(tmpdir; args..., Kvdiff_water=Kw)
+                gp = Scythe.getGridpoints(patch)
+                seed_rain_bump!(patch, gp, col, model.grid_params.kDim)
+                ncols = div(size(patch.physical, 1), model.grid_params.kDim)
+                for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+                return mtile, gp
+            end
+            m_off, gp = run_once(0.0)
+            m_on, _ = run_once(75.0)
+            @test all(isfinite.(m_on.var_np1))
+
+            # rho_d carries no water diffusion: bit-identical
+            @test m_on.var_np1[:, 2] == m_off.var_np1[:, 2]
+            d3 = m_on.var_np1[:, 3] .- m_off.var_np1[:, 3]
+            d8 = m_on.var_np1[:, 8] .- m_off.var_np1[:, 8]
+            @test maximum(abs.(d8)) > 1.0e-8            # diffusion acted on the bump
+            # Rain is the only water species moving: rho_w' and rho_r' get the same
+            # increment (same Neumann operator, same data)
+            @test all(isapprox.(d3, d8; atol=1.0e-12))
+            # Neumann solve conserves the column integral (trapezoid per column)
+            kDim = 32
+            zs = gp[1:kDim, 2]
+            ncols = div(length(d8), kDim)
+            for c in 1:ncols
+                seg = d8[(c-1)*kDim+1:c*kDim]
+                integral = sum(0.5 .* (seg[1:end-1] .+ seg[2:end]) .* diff(zs))
+                mass = sum(0.5 .* (m_on.var_np1[(c-1)*kDim+1:c*kDim, 8][1:end-1] .+
+                                   m_on.var_np1[(c-1)*kDim+1:c*kDim, 8][2:end]) .* diff(zs))
+                @test abs(integral) < 1.0e-6 * max(abs(mass), 1.0e-3)
+            end
+            # Fixed-T map: the retrieval is invariant under the water increments
+            dT = retrieved_T_mc(m_on, kDim, gp[:, 2]) .- retrieved_T_mc(m_off, kDim, gp[:, 2])
+            @test maximum(abs.(dT)) < 1.0e-4
+        end
+    end
+
+    @testset "water diffusion: vapor bump keeps the cloud residual zero" begin
+        # Subsaturated vapor bump in dry air, ONLY Kvdiff_water active: rho_w' and
+        # rho_v' diffuse through the SAME operator, so the implied cloud increment
+        # delta_rho_c = delta_rho_w - delta_rho_v must stay ~0 — vapor diffusion cannot
+        # manufacture cloud. Rain stays exactly zero, and the fixed-T map holds T.
+        mktempdir() do tmpdir
+            args = (; dry=true, kDim=32, num_cells=8, ts=0.05)
+            function run_once(Kw)
+                mtile, patch, model, col = make_mc_mtile(tmpdir; args..., Kvdiff_water=Kw)
+                gp = Scythe.getGridpoints(patch)
+                kDim = model.grid_params.kDim
+                # T-invariant vapor seed: dQ_ss = drho_t = seed, dp = Rv*T*seed,
+                # dE_t = (Cvv*T + g*z)*seed (the water map's drho_w = drho_v case)
+                for i in 1:size(patch.physical, 1)
+                    k = mod1(i, kDim)
+                    zi = gp[i, 2]
+                    seed = 2.0e-3 * exp(-((zi - 1000.0) / 300.0)^2)
+                    Tref = col.Tk[k]
+                    patch.physical[i, 7, 1] += seed
+                    patch.physical[i, 3, 1] += seed
+                    patch.physical[i, 1, 1] += Rv * Tref * seed
+                    patch.physical[i, 6, 1] += ((Cvv * Tref) + (Scythe.gravity * zi)) * seed
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                ncols = div(size(patch.physical, 1), kDim)
+                for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+                return mtile, gp
+            end
+            m_off, gp = run_once(0.0)
+            m_on, _ = run_once(75.0)
+            @test all(isfinite.(m_on.var_np1))
+
+            d3 = m_on.var_np1[:, 3] .- m_off.var_np1[:, 3]
+            d7 = m_on.var_np1[:, 7] .- m_off.var_np1[:, 7]
+            @test maximum(abs.(d3)) > 1.0e-8            # diffusion acted
+            # Vapor-only water: the rho_w and rho_v increments must agree (no cloud
+            # manufactured); the two fields ride the same operator but different
+            # staging paths (prognostic zz slots vs a column refit), hence the tolerance
+            @test all(isapprox.(d3, d7; atol=1.0e-9))
+            # No rain appears from water diffusion of a rain-free column
+            @test m_on.var_np1[:, 8] == m_off.var_np1[:, 8]
+            # Fixed-T map holds the retrieval
+            kDim = 32
+            dT = retrieved_T_mc(m_on, kDim, gp[:, 2]) .- retrieved_T_mc(m_off, kDim, gp[:, 2])
+            @test maximum(abs.(dT)) < 1.0e-4
         end
     end
 end

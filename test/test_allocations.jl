@@ -98,7 +98,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
     end
 
     @testset "mc_diffusion_matrices stays concrete despite mixed factorization types" begin
-        # The six entries are NOT all the same concrete type — differing BCs flip
+        # The ten entries are NOT all the same concrete type — differing BCs flip
         # `factorize`'s symmetry detection, so `u` is a BunchKaufman while `w` is an LU on
         # RiRk. A Dict would have to widen to the abstract `Factorization` join; a
         # NamedTuple is concrete AND heterogeneous.
@@ -106,7 +106,10 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
         @test MC <: NamedTuple
         @test isconcretetype(MC)
         @test Set(fieldnames(MC)) ==
-            Set((:u, :u_first, :w, :w_first, :heat, :heat_first))
+            Set((:u, :u_first, :w, :w_first, :heat, :heat_first,
+                 :water, :water_first, :water_r, :water_r_first))
+        # The retrieved reference diagnostics for the moist diffusion are concrete too
+        @test isconcretetype(fieldtype(MT, :mc_ref_diag))
     end
 
     @testset "ModelParameters is concretely typed" begin

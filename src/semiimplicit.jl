@@ -102,6 +102,13 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # broadcast temporaries (`p = pp .+ pbar` and friends). Empty for every other set.
     # See `_allocate_mc_scratch` for why these are keyed by NAME rather than by index.
     mc_scratch::MSC
+    # Consistently-retrieved diagnostics of the RESTING reference for the total-energy
+    # set's vertical moist diffusion: s_tbar and rho_vbar computed through the SAME
+    # retrieval pipeline the equation set runs each step, so at rest the diffused
+    # perturbations s_t' and rho_v' are zero BIT-FOR-BIT and diffusion cannot cook the
+    # base (the reference's own Tbar is not bit-identical to the retrieved T). Empty
+    # vectors for every other equation set.
+    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar), Tuple{Vector{Float64}, Vector{Float64}}}
 end
 
 """
@@ -226,6 +233,13 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Defined in moist_compressible.jl, which is included after this file — resolved at call
     # time, so the forward reference is fine.
     mc_scratch = _allocate_mc_scratch(tile, model)
+    mc_ref_diag = if uses_pressure_reference(model.equation_set) &&
+                     !isempty(model.ref_state_file)
+        mc_reference_diagnostics(ref_state,
+                                 tilepoints[1:model.grid_params.kDim, ndims(tilepoints)])
+    else
+        (s_tbar = Float64[], rho_vbar = Float64[])
+    end
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
     # structural placeholder where a real one is not needed.
@@ -244,32 +258,40 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
     end
 
-    # The total-energy set diffuses momentum (u, w; Kvdiff) and the diagnosed moist entropy
-    # s_t (heat; Kvdiff_heat, defaulting to Kvdiff). Each needs its own factorization: the
-    # boundary conditions differ (straka93 free-slip u, bf02 no-slip; w a rigid lid; scalars
-    # Neumann), and the coefficients are independent. s_t rides on the Neumann E_t column.
-    # Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are cached, so
-    # `diffusion_timestep_mc` never factorizes per column.
-    # Water-species diffusion (a Kvdiff_water Neumann matrix on rho_t) is DEFERRED to
-    # the rainfall session — see reference/moist_compressible_diffusion_handoff.md.
+    # The total-energy set diffuses momentum (u, w; Kvdiff), the diagnosed moist entropy
+    # s_t (heat; Kvdiff_heat, defaulting to Kvdiff), and the water species (Kvdiff_water:
+    # total water and vapor on the rho_t operator, rain on its own). Each needs its own
+    # factorization: the boundary conditions differ (straka93 free-slip u, bf02 no-slip;
+    # w a rigid lid; scalars Neumann, rho_r possibly Natural at the surface for rain
+    # outflow), and the coefficients are independent. s_t rides on the Neumann E_t
+    # column; rho_w' and rho_v' SHARE the rho_t operator so the implied cloud increment
+    # delta_rho_c = delta_rho_w - delta_rho_v - delta_rho_r is exactly the diffusion of
+    # rho_c. Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are
+    # cached, so `diffusion_timestep_mc` never factorizes per column.
     # Built only when a coefficient is positive: at K = 0 a vertical solve is not the
     # identity (it refits the column and reapplies the spectral filter), so the routine
     # skips that solve; its matrices are built anyway (cheap) to keep the NamedTuple shape.
     mc_diffusion_matrices = NamedTuple()
     Kv_mc = get(model.physical_params, :Kvdiff, 0.0)
     Kv_heat_mc = get(model.physical_params, :Kvdiff_heat, Kv_mc)
-    if uses_pressure_reference(model.equation_set) && (Kv_mc > 0.0 || Kv_heat_mc > 0.0)
+    Kv_water_mc = get(model.physical_params, :Kvdiff_water, 0.0)
+    if uses_pressure_reference(model.equation_set) &&
+            (Kv_mc > 0.0 || Kv_heat_mc > 0.0 || Kv_water_mc > 0.0)
         bcb = model.grid_params.BCB
         bct = model.grid_params.BCT
         mc_matrix(var, K, coeff) = calc_Helmholtz_diffusion_matrix(tile, model,
             coeff * model.ts * K; bc_bottom = bcb[var], bc_top = bct[var])
         mc_diffusion_matrices = (
-            u          = mc_matrix("u",   Kv_mc,      1.25),
-            u_first    = mc_matrix("u",   Kv_mc,      0.5),
-            w          = mc_matrix("w",   Kv_mc,      1.25),
-            w_first    = mc_matrix("w",   Kv_mc,      0.5),
-            heat       = mc_matrix("E_t", Kv_heat_mc, 1.25),
-            heat_first = mc_matrix("E_t", Kv_heat_mc, 0.5))
+            u             = mc_matrix("u",     Kv_mc,       1.25),
+            u_first       = mc_matrix("u",     Kv_mc,       0.5),
+            w             = mc_matrix("w",     Kv_mc,       1.25),
+            w_first       = mc_matrix("w",     Kv_mc,       0.5),
+            heat          = mc_matrix("E_t",   Kv_heat_mc,  1.25),
+            heat_first    = mc_matrix("E_t",   Kv_heat_mc,  0.5),
+            water         = mc_matrix("rho_t", Kv_water_mc, 1.25),
+            water_first   = mc_matrix("rho_t", Kv_water_mc, 0.5),
+            water_r       = mc_matrix("rho_r", Kv_water_mc, 1.25),
+            water_r_first = mc_matrix("rho_r", Kv_water_mc, 0.5))
     end
 
     mtile = ModelTile(
@@ -300,7 +322,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         solve_data,
         solve_rhs,
         solve_load,
-        mc_scratch)
+        mc_scratch,
+        mc_ref_diag)
     return mtile
 end
 

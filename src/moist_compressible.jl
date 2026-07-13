@@ -44,7 +44,7 @@ const MC_SCRATCH_SLOTS = (
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
-    :s_dbar, :s_d,                                                    # dry entropy
+    :s_t,                                                             # moist entropy (vertical heat)
     # ── semiimplicit_adjustment_p (si_ prefix) ──
     # Deliberately NOT sharing the names above. The two functions' temporaries are not live at
     # the same time today, so sharing would work — but it would be an invisible coupling, and
@@ -54,9 +54,14 @@ const MC_SCRATCH_SLOTS = (
     :si_p_nstar_z, :si_rhs, :si_c_d, :si_c_d_z, :si_c_e, :si_c_e_z,
     # ── diffusion_timestep_mc (df_ prefix) ──
     :df_u_star, :df_w_star, :df_p_star, :df_rho_d_star, :df_rho_t_star,
-    :df_T_star, :df_p_hPa_star, :df_drvs_dT, :df_drvs_dp, :df_s_dp_star,
+    :df_E_t_star, :df_Q_ss_star, :df_ke_star, :df_M_star,
+    :df_T_star, :df_p_hPa_star, :df_drvs_dT, :df_drvs_dp,
+    :df_rho_vs_star, :df_rho_v_star, :df_q_v_star, :df_q_l_star,
+    :df_C_vt_star, :df_R_m_star, :df_Lv_star, :df_stp_star,
     :df_u_nstar, :df_w_nstar, :df_s_nstar, :df_u_np1, :df_w_np1,
-    :df_dke, :df_dE_visc, :df_ds_d, :df_dT_h, :df_dE_h, :df_dp_h, :df_dQ_h)
+    :df_dke, :df_dE_visc, :df_ds_t, :df_dT_h, :df_dE_h, :df_dp_h, :df_dQ_h,
+    :df_rw_star, :df_rv_star, :df_rw_nstar, :df_rv_nstar, :df_rr_nstar,
+    :df_rw_np1, :df_rv_np1, :df_drw, :df_drv, :df_drr, :df_dE_w)
 
 """
     _allocate_mc_scratch(tile, model)
@@ -190,6 +195,50 @@ increment δs_t maps to a heating ρ_d·T·δs_t (= ρ_d C_vt δT). In dry air i
 function moist_entropy_total(Tk, rho_d, q_v, q_l)
 
     return entropy(Tk, rho_d, q_v) + (q_l * Cl * log(Tk / T_0))
+end
+
+"""
+    mc_reference_diagnostics(ref_state, z) -> (s_tbar, rho_vbar)
+
+Consistently-RETRIEVED diagnostics of the resting reference for the vertical moist
+diffusion: the moist entropy `s_tbar` and clamped vapor density `rho_vbar`, computed
+through the exact pipeline `moist_compressible_XZ` runs each step (retrieval at rest,
+clamped partition, `moist_entropy_total`). The reference's own `Tbar` is NOT
+bit-identical to the retrieved temperature, so subtracting profiles built from it
+would leave a spurious O(retrieval tolerance) perturbation that diffusion then acts
+on; with these, a resting base has `s_t' ≡ 0` and `rho_v' ≡ 0` bit-for-bit and every
+moist diffusive tendency vanishes exactly.
+"""
+function mc_reference_diagnostics(ref_state, z)
+
+    pbar = ref_pressure(ref_state)
+    rho_dbar = ref_rho_d(ref_state)
+    rho_tbar = ref_rho_t(ref_state)
+    E_tbar = ref_total_energy(ref_state)
+    Q_ssbar = ref_qss(ref_state)
+    Tbar = ref_state.Tbar
+    n = length(z)
+    s_tbar = zeros(Float64, n)
+    rho_vbar = zeros(Float64, n)
+    for k in 1:n
+        p = pbar[k, 1]
+        rho_d = rho_dbar[k, 1]
+        rho_t = rho_tbar[k, 1]
+        Q_ss = Q_ssbar[k, 1]
+        # Mirror the equation set's per-point pipeline at rest (ke = 0, rho_r = 0);
+        # every expression must match moist_compressible_XZ bit-for-bit.
+        geo = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0)) + (gravity * z[k])
+        M = p + (E_tbar[k, 1]) - (rho_t * geo)
+        Tk = retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k, 1], 0.0)
+        rho_vs = rho_v_sat(Tk, p / 100.0)
+        rho_v = clamp(Q_ss + rho_vs, 0.0, max(rho_t - rho_d - 0.0, 0.0))
+        rho_c = rho_t - rho_d - rho_v - 0.0
+        q_v = rho_v / rho_d
+        q_l = (max(rho_c, 0.0) + 0.0) / rho_d
+        s_tbar[k] = moist_entropy_total(Tk, rho_d, q_v, q_l)
+        rho_vbar[k] = rho_v
+    end
+    return (s_tbar = s_tbar, rho_vbar = rho_vbar)
 end
 
 """
@@ -383,6 +432,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Kvdiff = model.physical_params[:Kvdiff]
     Khdiff_heat = get(model.physical_params, :Khdiff_heat, Khdiff)
     Kvdiff_heat = get(model.physical_params, :Kvdiff_heat, Kvdiff)
+    Kvdiff_water = get(model.physical_params, :Kvdiff_water, 0.0)
     tau_qss = get(model.physical_params, :tau_qss, 10.0)
 
     # Warm-rain microphysics (autoconversion, collection, sedimentation, and the rain
@@ -686,32 +736,44 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # second-derivative eigenvalues scale as N^4. The acoustic solver owns impdot[w],
     # impdot[p] and impdot[E_t], so these live in diffdot instead. Slot 6 (E_t) carries the
     # HEAT tendency in entropy space (not an energy tendency): diffusion_timestep_mc solves
-    # for s_d' and maps the increment onto (p, E_t, Q_ss).
+    # for s_t' and maps the increment onto (p, E_t, Q_ss). Slots 3/7/8 carry the water
+    # tendencies (total water rho_w' = rho_t' - rho_d', vapor rho_v', rain rho_r).
     #
-    # The heat variable is the DRY-exact entropy s_d = C_vd ln p - C_pd ln rho_d, an explicit
-    # function of the prognostic p, rho_d — so at rest s_d = s_dbar EXACTLY (no retrieval
-    # dependence), the base is bit-preserved, and it matches Straka's dry-entropy diffusion.
-    # The full moist entropy s_t (with the vapor/liquid contribution) is DEFERRED to the
-    # rainfall session together with the water-species mixing and the moist horizontal terms
-    # (see reference/moist_compressible_diffusion_handoff.md).
-    if Kvdiff > 0.0 || Kvdiff_heat > 0.0
+    # The heat variable is the full moist entropy s_t (vapor + liquid contribution), a
+    # retrieval-dependent diagnostic; the resting base is still bit-preserved because
+    # s_tbar comes from mc_reference_diagnostics — the SAME retrieval pipeline — so at
+    # rest s_t' == 0 exactly. (The horizontal heat diffusion keeps the dry-exact s_d
+    # chain rule: transforming a diagnosed field horizontally needs halo machinery the
+    # column decomposition doesn't have; see the handoff doc.)
+    if Kvdiff > 0.0 || Kvdiff_heat > 0.0 || Kvdiff_water > 0.0
         diffdot = mtile.diffdot_n
         if Kvdiff > 0.0
             @turbo diffdot[colstart:colend,4] .= @. Kvdiff * u_zz
             @turbo diffdot[colstart:colend,5] .= @. Kvdiff * w_zz
         end
         if Kvdiff_heat > 0.0
-            s_dbar = S.s_dbar
-            @. s_dbar = dry_entropy_pd(pbar, rho_dbar)
-            s_d = S.s_d
-            @. s_d = dry_entropy_pd(p, rho_d)
-            # ∂zz(s_d') from the column basis, so the explicit AI2* tendency and the implicit
+            s_t = S.s_t
+            @. s_t = moist_entropy_total(Tk, rho_d, q_v, q_l)
+            # ∂zz(s_t') from the column basis, so the explicit AI2* tendency and the implicit
             # Helmholtz operator use the same discrete ∂zz.
             s_col = scratch_column(mtile, 6)
-            s_col.uMish .= s_d .- s_dbar
+            s_col.uMish .= s_t .- mtile.mc_ref_diag.s_tbar
             Btransform!(s_col)
             Atransform!(s_col)
             diffdot[colstart:colend,6] .= Kvdiff_heat .* Ixxtransform(s_col)
+        end
+        if Kvdiff_water > 0.0
+            # Total water and rain are combinations of prognostic slots, so their ∂zz
+            # comes straight from the grid's derivative slots; vapor is diagnosed, so it
+            # takes the column transform like s_t. rho_v' rides on rho_t's operator
+            # (scratch column 3) to match the implicit `water` matrix.
+            @turbo diffdot[colstart:colend,3] .= @. Kvdiff_water * (rho_tp_zz - rho_dp_zz)
+            @turbo diffdot[colstart:colend,8] .= @. Kvdiff_water * rho_rp_zz
+            v_col = scratch_column(mtile, 3)
+            v_col.uMish .= rho_v .- mtile.mc_ref_diag.rho_vbar
+            Btransform!(v_col)
+            Atransform!(v_col)
+            diffdot[colstart:colend,7] .= Kvdiff_water .* Ixxtransform(v_col)
         end
     end
 
@@ -723,10 +785,11 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
         semiimplicit_adjustment_p(mtile, colstart, colend, t)
     end
 
-    # Implicit vertical diffusion of u, w (friction sink) and the dry entropy s_d' (heat,
-    # slaved onto p, E_t, Q_ss). Skipped when both coefficients are zero: a vertical solve
-    # is not the identity there — it refits the column and reapplies the spectral filter.
-    if Kvdiff > 0.0 || Kvdiff_heat > 0.0
+    # Implicit vertical diffusion of u, w (friction sink), the moist entropy s_t' (heat,
+    # slaved onto p, E_t, Q_ss) and the water species (rho_w', rho_v', rho_r). Skipped
+    # when every coefficient is zero: a vertical solve is not the identity there — it
+    # refits the column and reapplies the spectral filter.
+    if Kvdiff > 0.0 || Kvdiff_heat > 0.0 || Kvdiff_water > 0.0
         diffusion_timestep_mc(mtile, colstart, colend, t)
     end
 
@@ -890,23 +953,23 @@ end
 """
     diffusion_timestep_mc(mtile, colstart, colend, t)
 
-Implicit vertical diffusion of `u` and `w` (momentum, `Kvdiff`) and the dry entropy `s_d'`
-(heat, `Kvdiff_heat`) for the total-energy set, using the AI2* off-centered weights
+Implicit vertical diffusion of `u` and `w` (momentum, `Kvdiff`), the moist entropy `s_t'`
+(heat, `Kvdiff_heat`) and the water species (`Kvdiff_water`: total water `rho_w'`, vapor
+`rho_v'`, rain `rho_r`) for the total-energy set, using the AI2* off-centered weights
 (`+1.25 N^{n+1} - 1.0 N^n + 0.75 N^{n-1}`) with the tendency history in `mtile.diffdot_*`.
 It needs its own tendency channel because the acoustic solve owns `impdot[w/p/E_t]`.
-The momentum and heat solves are gated independently on their coefficients: a K = 0 solve
-is not the identity (it refits the column and reapplies the spectral filter), so a zero
-coefficient must skip its solve entirely, leaving the post-acoustic state untouched.
+The momentum, heat and water solves are gated independently on their coefficients: a K = 0
+solve is not the identity (it refits the column and reapplies the spectral filter), so a
+zero coefficient must skip its solve entirely, leaving the post-acoustic state untouched.
 
 Runs AFTER [`semiimplicit_adjustment_p`](@ref). The density fields are NOT re-slaved to the
 post-diffusion `w` — momentum diffusion is a force, not a mass flux, and they were already
 advanced with the acoustic flux divergence (which conserves `∫rho_t'`). The residual is the
 usual O(ts·Kv) splitting error.
 
-The heat variable is the dry-exact entropy `s_d = C_vd ln p - C_pd ln rho_d`, so the whole
-routine is retrieval-free: `T = p/(R_d rho_d)` from the dry EOS, and at rest `s_d = s_dbar`
-exactly (bit-preserved base). The moist entropy `s_t` (and its retrieval) is deferred; see
-reference/moist_compressible_diffusion_handoff.md.
+The heat and water paths retrieve the post-acoustic temperature (the star state) with the
+full Newton retrieval; the resting base stays bit-preserved because the reference profiles
+`s_tbar`/`rho_vbar` come from the same pipeline (`mc_reference_diagnostics`).
 
 Energy routing:
 
@@ -914,9 +977,18 @@ Energy routing:
   momentum solve removes goes to the subgrid cascade (the future TKE shear production), and
   the molecular heating is negligible. So `E_t += rho_t δke` (E_t follows the KE down),
   holding internal energy — `T` and `p` are unchanged by friction.
-- **Heat.** The `s_d` increment maps at fixed `rho_d` via `∂s_d/∂T = C_vd/T`:
-  `δT = (T/C_vd) δs_d`, `δE_t = rho_d T δs_d`, `δp = rho_d R_d δT`, and
+- **Heat.** The `s_t` increment maps at fixed `rho_d` and composition via `∂s_t/∂T = C_vt/T`:
+  `δT = (T/C_vt) δs_t`, `δE_t = rho_d T δs_t`, `δp = rho_d R_m δT`, and
   `δQ_ss = -(∂ρ_vs/∂T δT + ∂ρ_vs/∂p δp)` (so `Q_ss = ρ_v - ρ_vs` tracks the diabatic heating).
+- **Water.** The species increments map at FIXED temperature (verified against the
+  retrieval: `δF(T) ≡ 0` under this map), moving the partial pressure and the internal +
+  potential energy the water carries:
+  `δp = R_v T δρ_v`, `δE_t = (C_pv T − L_v + ke + gz) δρ_w + (L_v − R_v T) δρ_v`,
+  `δQ_ss = δρ_v − ∂ρ_vs/∂p · δp`, with `δρ_c = δρ_w − δρ_v − δρ_r` implicit in the
+  residual. Each species' Neumann solve conserves its own `∫ρ`; `∫E_t` is conserved only
+  approximately (the exact multicomponent enthalpy flux needs a flux form the per-column
+  architecture excludes — see the handoff doc; the residual is O(K_water × vertical
+  variation of e_l + gz) and shows up in the energy-drift diagnostic).
 """
 function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
@@ -928,21 +1000,28 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     w_index = vars["w"]
     et_index = vars["E_t"]
     qss_index = vars["Q_ss"]
+    rhor_index = vars["rho_r"]
 
     ts = mtile.model.ts
 
     Kvdiff = mtile.model.physical_params[:Kvdiff]
     Kvdiff_heat = get(mtile.model.physical_params, :Kvdiff_heat, Kvdiff)
+    Kvdiff_water = get(mtile.model.physical_params, :Kvdiff_water, 0.0)
     do_momentum = Kvdiff > 0.0
     do_heat = Kvdiff_heat > 0.0
+    do_water = Kvdiff_water > 0.0
 
     pbar = view(ref_pressure(mtile.ref_state),:,1)
     rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
     rho_tbar = view(ref_rho_t(mtile.ref_state),:,1)
+    E_tbar = view(ref_total_energy(mtile.ref_state),:,1)
+    Q_ssbar = view(ref_qss(mtile.ref_state),:,1)
+    Tbar = view(mtile.ref_state.Tbar,:,1)
+    z = view(mtile.tilepoints,colstart:colend,2)
 
     S = @inbounds mtile.mc_scratch[Threads.threadid()]
 
-    # Post-acoustic totals; dry EOS temperature (no retrieval — s_d is dry-exact)
+    # Post-acoustic totals (the star state)
     vnp1 = mtile.var_np1
     # Bind the views OUTSIDE the `@.` blocks below — `@.` dots every call in the expression,
     # `view` included, which broadcasts the view itself instead of its contents.
@@ -951,20 +1030,57 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     p_v = view(vnp1,colstart:colend,p_index)
     rhod_v = view(vnp1,colstart:colend,rhod_index)
     rhot_v = view(vnp1,colstart:colend,rhot_index)
+    et_v = view(vnp1,colstart:colend,et_index)
+    qss_v = view(vnp1,colstart:colend,qss_index)
+    rhor_v = view(vnp1,colstart:colend,rhor_index)
 
     u_star = S.df_u_star; copyto!(u_star, u_v)
     w_star = S.df_w_star; copyto!(w_star, w_v)
     p_star = S.df_p_star;         @. p_star = p_v + pbar
     rho_d_star = S.df_rho_d_star; @. rho_d_star = rhod_v + rho_dbar
     rho_t_star = S.df_rho_t_star; @. rho_t_star = rhot_v + rho_tbar
-    T_star = S.df_T_star;         @. T_star = p_star / (Rd * rho_d_star)
-    p_hPa_star = S.df_p_hPa_star; @. p_hPa_star = p_star / 100.0
-    drvs_dT = S.df_drvs_dT;       @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
-    drvs_dp = S.df_drvs_dp;       @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
-    s_dp_star = S.df_s_dp_star
-    @. s_dp_star = dry_entropy_pd(p_star, rho_d_star) - dry_entropy_pd(pbar, rho_dbar)
 
-    # Implicit tendency histories (slot 6 carries the s_d ENTROPY tendency, not an E_t one)
+    # The heat and water maps need the retrieved star-state thermodynamics; the
+    # momentum-only path skips the retrieval entirely.
+    T_star = S.df_T_star
+    p_hPa_star = S.df_p_hPa_star
+    drvs_dT = S.df_drvs_dT
+    drvs_dp = S.df_drvs_dp
+    rho_v_star = S.df_rho_v_star
+    C_vt_star = S.df_C_vt_star
+    R_m_star = S.df_R_m_star
+    Lv_star = S.df_Lv_star
+    ke_star = S.df_ke_star
+    stp_star = S.df_stp_star
+    if do_heat || do_water
+        E_t_star = S.df_E_t_star;   @. E_t_star = et_v + E_tbar
+        Q_ss_star = S.df_Q_ss_star; @. Q_ss_star = qss_v + Q_ssbar
+        @. ke_star = 0.5 * ((u_star * u_star) + (w_star * w_star))
+        M_star = S.df_M_star
+        @. M_star = p_star + E_t_star - (rho_t_star * (ke_star + (gravity * z)))
+        @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, Q_ss_star,
+                                         p_star, Tbar, rhor_v)
+        @. p_hPa_star = p_star / 100.0
+        @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
+        @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
+        rho_vs_star = S.df_rho_vs_star
+        @. rho_vs_star = rho_v_sat(T_star, p_hPa_star)
+        @. rho_v_star = clamp(Q_ss_star + rho_vs_star, 0.0,
+                              max(rho_t_star - rho_d_star - rhor_v, 0.0))
+        q_v_star = S.df_q_v_star
+        q_l_star = S.df_q_l_star
+        @. q_v_star = rho_v_star / rho_d_star
+        @. q_l_star = (max(rho_t_star - rho_d_star - rho_v_star - rhor_v, 0.0) + rhor_v) /
+                      rho_d_star
+        @. C_vt_star = Cvd + (q_v_star * Cvv) + (q_l_star * Cl)
+        @. R_m_star = Rd + (q_v_star * Rv)
+        @. Lv_star = L_v(T_star)
+        @. stp_star = moist_entropy_total(T_star, rho_d_star, q_v_star, q_l_star)
+        stp_star .-= mtile.mc_ref_diag.s_tbar
+    end
+
+    # Implicit tendency histories (slot 6 carries the s_t ENTROPY tendency, not an E_t
+    # one; slots 3/7/8 carry the water tendencies)
     udot_n = view(mtile.diffdot_n,colstart:colend,u_index)
     udot_nm1 = view(mtile.diffdot_nm1,colstart:colend,u_index)
     wdot_n = view(mtile.diffdot_n,colstart:colend,w_index)
@@ -1021,41 +1137,99 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         view(mtile.var_np1,colstart:colend,w_index) .= w_np1
     end
 
-    # ── Heat (Kvdiff_heat): entropy increment -> (T, p, E_t, Q_ss) at fixed rho_d
-    #    (dry: C_vt=C_vd, R_m=R_d). ──
+    # ── Heat (Kvdiff_heat): moist entropy increment -> (T, p, E_t, Q_ss) at fixed
+    #    rho_d and composition via ∂s_t/∂T = C_vt/T (dry limit: C_vt=C_vd, R_m=R_d). ──
     dE_h = S.df_dE_h
     if do_heat
         s_nstar = S.df_s_nstar
         if (t == 1)
-            @. s_nstar = s_dp_star + (ts * 0.5 * sdot_n)
+            @. s_nstar = stp_star + (ts * 0.5 * sdot_n)
         else
-            @. s_nstar = s_dp_star - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
+            @. s_nstar = stp_star - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
         end
         sdot_nm1 .= sdot_n
 
         h_h = (t == 1) ? mats[:heat_first] : mats[:heat]
-        # s_dp_np1 is the last use of `col`, so it can stay an alias.
         _vertical_solve!(col, h_h, s_nstar, mtile)
-        s_dp_np1 = Itransform!(col)
+        stp_np1 = Itransform!(col)
 
-        ds_d = S.df_ds_d; @. ds_d = s_dp_np1 - s_dp_star
-        dT_h = S.df_dT_h; @. dT_h = (T_star / Cvd) * ds_d
-        @. dE_h = rho_d_star * T_star * ds_d
-        dp_h = S.df_dp_h; @. dp_h = rho_d_star * Rd * dT_h
+        ds_t = S.df_ds_t; @. ds_t = stp_np1 - stp_star
+        dT_h = S.df_dT_h; @. dT_h = (T_star / C_vt_star) * ds_t
+        @. dE_h = rho_d_star * T_star * ds_t
+        dp_h = S.df_dp_h; @. dp_h = rho_d_star * R_m_star * dT_h
         dQ_h = S.df_dQ_h; @. dQ_h = -((drvs_dT * dT_h) + (drvs_dp * dp_h))
 
         view(mtile.var_np1,colstart:colend,p_index) .+= dp_h
         view(mtile.var_np1,colstart:colend,qss_index) .+= dQ_h
     end
 
-    # E_t update: keep the single fused add when both paths ran (bit-identical to the
-    # historical combined update), and touch E_t only with the terms that were computed.
+    # ── Water (Kvdiff_water): rho_w' and rho_v' on the rho_t operator, rho_r on its
+    #    own; increments map at FIXED temperature (the retrieval is invariant under
+    #    them), moving the vapor partial pressure and the water's internal + potential
+    #    energy. delta_rho_c = delta_rho_w - delta_rho_v - delta_rho_r is implicit. ──
+    dE_w = S.df_dE_w
+    if do_water
+        rw_star = S.df_rw_star; @. rw_star = rhot_v - rhod_v
+        rv_star = S.df_rv_star; @. rv_star = rho_v_star - mtile.mc_ref_diag.rho_vbar
+
+        rwdot_n = view(mtile.diffdot_n,colstart:colend,rhot_index)
+        rwdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhot_index)
+        rvdot_n = view(mtile.diffdot_n,colstart:colend,qss_index)
+        rvdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,qss_index)
+        rrdot_n = view(mtile.diffdot_n,colstart:colend,rhor_index)
+        rrdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhor_index)
+
+        rw_nstar = S.df_rw_nstar
+        rv_nstar = S.df_rv_nstar
+        rr_nstar = S.df_rr_nstar
+        if (t == 1)
+            @. rw_nstar = rw_star + (ts * 0.5 * rwdot_n)
+            @. rv_nstar = rv_star + (ts * 0.5 * rvdot_n)
+            @. rr_nstar = rhor_v + (ts * 0.5 * rrdot_n)
+        else
+            @. rw_nstar = rw_star - (ts * rwdot_n) + (ts * 0.75 * rwdot_nm1)
+            @. rv_nstar = rv_star - (ts * rvdot_n) + (ts * 0.75 * rvdot_nm1)
+            @. rr_nstar = rhor_v - (ts * rrdot_n) + (ts * 0.75 * rrdot_nm1)
+        end
+        rwdot_nm1 .= rwdot_n
+        rvdot_nm1 .= rvdot_n
+        rrdot_nm1 .= rrdot_n
+
+        h_rw = (t == 1) ? mats[:water_first] : mats[:water]
+        h_rr = (t == 1) ? mats[:water_r_first] : mats[:water_r]
+        rw_np1 = S.df_rw_np1
+        rv_np1 = S.df_rv_np1
+        _vertical_solve!(col, h_rw, rw_nstar, mtile)
+        copyto!(rw_np1, Itransform!(col))
+        _vertical_solve!(col, h_rw, rv_nstar, mtile)
+        copyto!(rv_np1, Itransform!(col))
+        _vertical_solve!(col, h_rr, rr_nstar, mtile)
+        rr_np1 = Itransform!(col)
+
+        drw = S.df_drw; @. drw = rw_np1 - rw_star
+        drv = S.df_drv; @. drv = rv_np1 - rv_star
+        drr = S.df_drr; @. drr = rr_np1 - rhor_v
+        @. dE_w = (((Cpv * T_star) - Lv_star + ke_star + (gravity * z)) * drw) +
+                  ((Lv_star - (Rv * T_star)) * drv)
+
+        view(mtile.var_np1,colstart:colend,rhot_index) .+= drw
+        view(mtile.var_np1,colstart:colend,rhor_index) .+= drr
+        view(mtile.var_np1,colstart:colend,p_index) .+= Rv .* T_star .* drv
+        view(mtile.var_np1,colstart:colend,qss_index) .+=
+            drv .- (drvs_dp .* (Rv .* T_star .* drv))
+    end
+
+    # E_t update: keep the single fused add when the historical pair ran (bit-identical
+    # to the pre-water combined update), and touch E_t only with computed terms.
     if do_momentum && do_heat
         view(mtile.var_np1,colstart:colend,et_index) .+= dE_visc .+ dE_h
     elseif do_momentum
         view(mtile.var_np1,colstart:colend,et_index) .+= dE_visc
     elseif do_heat
         view(mtile.var_np1,colstart:colend,et_index) .+= dE_h
+    end
+    if do_water
+        view(mtile.var_np1,colstart:colend,et_index) .+= dE_w
     end
 end
 
@@ -1163,6 +1337,64 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
             patch.physical[i, p_i, 1] = 0.0
             patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
             patch.physical[i, rho_t_i, 1] = rho_d - rho_tbar[k, 1]
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = 0.0
+            i += 1
+        end
+    end
+    return patch
+end
+
+"""
+    moist_temperature_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dT_max)
+
+Ooyama (2001)-style warm-rain trigger for the total-energy set on a moist (vapor-bearing)
+`PressureReferenceState`: a constant-pressure temperature perturbation
+`ΔT = dT_max cos²(πL/2)` for `L ≤ 1` with the vapor adjusted to PRESERVE the local
+relative humidity at the perturbed temperature (`ρ_v = H·ρ_v*(T)` with
+`H = ρ̄_v/ρ_v*(T̄)`), so the bubble carries extra moisture rather than drying out as it
+warms. The dry density follows from the moist EOS at constant pressure; E_t and Q_ss
+are computed pointwise before subtracting the reference; rho_r = 0.
+"""
+function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                      ref::Springsteel.PressureReferenceState;
+                                      xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
+                                      dT_max=3.0)
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
+    et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_vbar = Springsteel.ref_rho_v(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            dT = L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+            p_ref = pbar[k, 1]                              # Pa
+            rho_dref = rho_dbar[k, 1]
+            rho_vref = rho_vbar[k, 1]
+            # Moist EOS reference temperature (matches the reference's own Tbar)
+            T_ref = p_ref / ((rho_dref * Rd) + (rho_vref * Rv))
+            Tk = T_ref + dT
+            rho_v = rho_vref
+            if dT > 0.0
+                H = rho_vref / rho_v_sat(T_ref, p_ref / 100.0)
+                rho_v = H * rho_v_sat(Tk, p_ref / 100.0)
+            end
+            rho_d = (p_ref - (rho_v * Rv * Tk)) / (Rd * Tk) # constant-pressure moist EOS
+            rho_t = rho_d + rho_v
+            q_v = rho_v / rho_d
+            E_t = (rho_d * internal_energy_bf02(Tk, q_v, 0.0)) + (rho_t * gravity * z)
+            Q_ss = rho_v - rho_v_sat(Tk, p_ref / 100.0)
+            patch.physical[i, p_i, 1] = 0.0
+            patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
+            patch.physical[i, rho_t_i, 1] = rho_t - rho_tbar[k, 1]
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
