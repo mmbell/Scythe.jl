@@ -2,8 +2,9 @@
 # Ooyama (2001)-style warm-rain benchmark for the total-energy set.
 #
 # A 3 K RH-preserving warm bubble (cos² profile, 16 km x 3 km radii, centered
-# at 500 m over the domain midpoint) rises through the Dunion moist-tropical
-# sounding, condenses, converts cloud to rain (autoconversion + collection),
+# at 500 m over the domain midpoint) rises through a humidified Dunion
+# moist-tropical sounding (see DUNION_SOUNDING below for why the humidification
+# is required), condenses, converts cloud to rain (autoconversion + collection),
 # and rains out through the surface: the rho_r bottom boundary is a free
 # (Natural) fit so the sedimentation flux removes water and its energy through
 # z = 0. Rain condensation/evaporation runs through the tau_r channel of the
@@ -40,20 +41,32 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 
 const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
 
-# Dunion moist-tropical sounding (WRF input_sounding format), committed beside the
-# reference data so the benchmark is self-contained.
-const DUNION_SOUNDING = joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "dunion_MT.ref")
+# HUMIDIFIED Dunion moist-tropical sounding (WRF input_sounding format): RH floors
+# of 0.90 (z <= 1.6 km) / 0.88 (<= 3.2 km) / 0.85 (<= 4.5 km) applied to the
+# original dunion_MT.ref (committed alongside), mirroring Ooyama's own "slightly
+# humidified" Jordan sounding. The UNmodified Dunion profile (low-level RH ~83%,
+# falling to 56% at 4.4 km) does NOT convect from this trigger within the hour at
+# ANY resolution: the wide slab's linear ascent (~w < 1 m/s) saturates a thin core
+# at ~14 min but dry entrainment and CIN kill it — the archived RZ notebook run
+# with the same bubble only erupted at t ~ 2.7 h, and only with Kv_mudiff = 100
+# background moistening. The RH floors give O01-comparable onset (~24 min) and
+# ground rain rates (quick ~28, full ~78 g m^-2 s^-1 vs O01's 75-125).
+const DUNION_SOUNDING = joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "dunion_MT_hum90.ref")
 
 # Rain-drop number concentration [#/cm^3] for the monodisperse tau_r closure
 # (~1000 drops per m^3; the small number keeps the bulk of condensation on cloud).
 const N_R = 1.0e-3
 
-# Vertical eddy coefficients [m^2/s]. Kept small and equal across momentum, heat
-# and water — the goal is the near-inviscid solution; these are the minimum found
-# stable, revisit downward before re-seeding references.
-const KV_MOM = 25.0
-const KV_HEAT = 25.0
-const KV_WATER = 25.0
+# Vertical eddy coefficients [m^2/s]. ZERO: the run is stable fully inviscid on
+# the RiRk grid at both resolutions — the cubic B-spline Galerkin filter is the
+# only dissipation, which is the near-inviscid goal. (Kv = 5 and 25 were tested
+# and change the solution by < 1%; raise these if a future configuration needs
+# damping, they feed the momentum/heat/water solves independently.) The rain
+# shafts do ring: min(rho_r) undershoots reach ~ -1.8 g/m^3 at 500 m resolution
+# (all rate functions are negative-safe; reported as min_rho_r_gm3).
+const KV_MOM = 0.0
+const KV_HEAT = 0.0
+const KV_WATER = 0.0
 
 function o01_model(opts::BenchmarkOptions)
     if opts.mode == :full
@@ -127,6 +140,13 @@ run's exact pressure-based reference (one file for init, integration and
 diagnostics), and add the RH-preserving 3 K warm bubble.
 """
 function o01_init!(model)
+    # The output directory is shared across runs of this variant and the rain
+    # diagnostics sweep EVERY snapshot in it — stale files from a previous (e.g.
+    # longer) run would silently contaminate the onset/accumulation numbers.
+    for f in readdir(model.output_dir)
+        endswith(f, "_physical.csv") && rm(joinpath(model.output_dir, f))
+    end
+
     patch = createGrid(model.grid_params)
     gridpoints = Scythe.getGridpoints(patch)
     kDim = model.grid_params.kDim
@@ -157,11 +177,13 @@ end
 
 # ── Diagnostics ─────────────────────────────────────────────────────────────
 
-"""Sorted (time, path) pairs for every physical output snapshot of the run."""
+"""Sorted (time, path) pairs for every physical output snapshot of THIS run
+(bounded by the integration time as a second guard against stale files)."""
 function output_snapshots(model)
     files = filter(f -> endswith(f, "_physical.csv"), readdir(model.output_dir))
     pairs = [(parse(Float64, replace(f, "_physical.csv" => "")),
               joinpath(model.output_dir, f)) for f in files]
+    filter!(p -> p[1] <= model.integration_time + 1.0e-6, pairs)
     return sort(pairs, by = first)
 end
 

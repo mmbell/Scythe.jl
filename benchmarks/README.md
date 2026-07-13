@@ -34,7 +34,7 @@ timing, worker/thread counts, and all diagnostics.
 | `straka93` | `Euler_test` | 25.6 × 6.4 km, K=75 m²/s | 25 m / 100 m | Straka et al. (1993), `reference/Straka.pdf` |
 | `bf02_dry` | `Euler_test` | 20 × 10 km, K=0 | 100 m / 200 m | Bryan & Fritsch (2002) Fig. 1, `reference/bryan_fritsch_mwr2002.pdf` |
 | `bf02_moist` | `BF02_test` | 20 × 10 km, K=0, θ_e=320 K, r_t=0.020 | 100 m / 200 m | Bryan & Fritsch (2002) Fig. 3 |
-| `o01_rainfall` | `moist_compressible_XZ` (mc only) | 150 × 20 km, warm rain, Kv=25 m²/s | 500 m / 2 km (Δz 500 m both) | Ooyama (2001) Fig. 6 magnitudes, `reference/ooyama_jas2001.pdf` |
+| `o01_rainfall` | `moist_compressible_XZ` (mc only) | 150 × 20 km, warm rain, inviscid (spline filter only), humidified Dunion sounding | 500 m / 2 km (Δz 500 m both) | Ooyama (2001) Fig. 6 magnitudes, `reference/ooyama_jas2001.pdf` |
 
 Published target values and tolerances live in
 `reference_data/expected_values.jl` with their sources. Full-mode tolerances

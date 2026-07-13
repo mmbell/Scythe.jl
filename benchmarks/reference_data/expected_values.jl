@@ -46,16 +46,21 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
         "max_w"         => (15.713,    1.0, 5.5, "BF02 Fig. 3b"),
         "min_w"         => (-9.92698,  1.0, 3.0, "BF02 Fig. 3b"),
     ),
-    # O01 warm rain: sanity WINDOWS, not published values — the equation set,
-    # microphysics closure (tau_r channel instead of Qevap), sounding, and single
-    # non-nested grid all differ from Ooyama (2001), so only comparable magnitude
-    # and timing are enforced. O01 Fig. 6 (p. 2087): peak ground precipitation
-    # ~75-125 g m^-2 s^-1 at ~35-40 min; Figs. 4-6, 11: rho_r up to ~4 g/m^3.
-    # Tighten these from the accepted seeded run.
+    # O01 warm rain: sanity WINDOWS seeded from the accepted 2026-07-13 runs (full
+    # 500 m: peak rate 78.5 g m^-2 s^-1, onset 24 min, max w 8.1, max rho_r 11.2,
+    # accum 0.72 mm; quick 2 km: 28.0 / 24 min / 10.0 / 5.9 / 1.40 mm). The mc
+    # stage always takes the quick tolerance, so each window must span BOTH
+    # resolutions — resolution halves the peak rate exactly as in O01's own
+    # Dx = 1 vs 2 km comparison (Fig. 6: ~125 vs ~75 g m^-2 s^-1). The equation
+    # set, tau_r microphysics closure (no separate Qevap), humidified-Dunion
+    # sounding and single non-nested grid all differ from Ooyama (2001), so only
+    # comparable magnitude and timing are enforced here; tight version-to-version
+    # regression comes from the committed reference CSVs.
     "o01_rainfall" => Dict(
-        "peak_rain_rate_gm2s" => (75.0, 70.0, 70.0, "O01 Fig. 6 sanity window"),
-        "max_rho_r_gm3"       => (3.0,  2.9,  2.9,  "O01 Figs. 4-6, 11 sanity window"),
-        "max_w"               => (25.0, 20.0, 20.0, "O01 updraft sanity window"),
-        "rain_onset_min"      => (30.0, 20.0, 20.0, "O01 Fig. 6 timing sanity window"),
+        "peak_rain_rate_gm2s" => (55.0, 35.0, 35.0, "seeded 2026-07-13; O01 Fig. 6 range 75-125"),
+        "max_rho_r_gm3"       => (8.5,  4.0,  4.0,  "seeded 2026-07-13; O01 Figs. 4-6, 11 show ~4"),
+        "max_w"               => (9.0,  4.0,  4.0,  "seeded 2026-07-13"),
+        "rain_onset_min"      => (24.0, 6.0,  8.0,  "seeded 2026-07-13; O01 Fig. 6 ~25-40 min"),
+        "accum_rainfall_mm"   => (1.05, 0.5,  0.6,  "seeded 2026-07-13 (domain-mean rain-out)"),
     ),
 )
