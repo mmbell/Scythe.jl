@@ -134,6 +134,47 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
             read(joinpath(@__DIR__, "..", "src", "moist_compressible.jl"), String))
     end
 
+    @testset "threaded column loop matches serial (scratch columns are not shared)" begin
+        # The scratch columns are owned per-thread and handed out by threadid(), which is only
+        # a valid owner tag because the column loop is `@threads :static`. If that assumption
+        # ever breaks — or if a scratch column gets shared across columns — two columns would
+        # scribble on one work buffer and the result would diverge from serial, and would vary
+        # run to run.
+        #
+        # Needs a multithreaded Julia to mean anything: run the suite with `julia --threads=8`.
+        if Threads.nthreads() < 2
+            @info "Skipping threaded scratch-column race check (Threads.nthreads() == 1); " *
+                  "run the suite with --threads=8 to exercise it"
+        else
+            seed = zeros(size(mtile.tile.physical))
+            for i in axes(seed,1), v in axes(seed,2), d in axes(seed,3)
+                seed[i,v,d] = 1.0e-3 * sin(0.7i + 1.3v + 2.1d)
+            end
+
+            function advance_all(threaded::Bool)
+                mt = build_mc_tile()[1]
+                mt.tile.physical .= seed
+                ncols = Springsteel.num_columns(mt.tile)
+                for t in 1:3
+                    if threaded
+                        Threads.@threads :static for c in 1:ncols
+                            Scythe.advance_column(mt, c, t)
+                        end
+                    else
+                        for c in 1:ncols
+                            Scythe.advance_column(mt, c, t)
+                        end
+                    end
+                end
+                return copy(mt.var_np1)
+            end
+
+            serial = advance_all(false)
+            @test advance_all(true) == serial      # bit-identical, not just close
+            @test advance_all(true) == serial      # and deterministic across runs
+        end
+    end
+
     @testset "per-column allocation ceilings" begin
         # Regression tripwire, not a target. Measured after the refactor: moist_compressible_XZ
         # 203 allocs, diffusion_timestep_mc 80 allocs per column call (down from 1447 / 249).
