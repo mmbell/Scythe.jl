@@ -169,7 +169,7 @@ using Springsteel
     end
 
     function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=false, ts=0.1,
-                           dry=false, Khdiff=0.0, Kvdiff=0.0, Prandtl=1.0, tau_qss=10.0,
+                           dry=false, Khdiff=0.0, Kvdiff=0.0, Kvdiff_heat=nothing, tau_qss=10.0,
                            u_side_bc=DirichletBC())
         varlist = Scythe.MC_VARS
         vars = Dict(v => i for (i, v) in enumerate(varlist))
@@ -194,8 +194,9 @@ using Springsteel
             ts = ts, integration_time = 1.0, output_interval = 1.0,
             equation_set = "moist_compressible_XZ",
             ref_state_file = ref_file, grid_params = gp,
-            physical_params = Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff, :Kv_mudiff => 0.0,
-                                   :Prandtl => Prandtl, :tau_qss => tau_qss,
+            physical_params = Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff,
+                                   :Kvdiff_heat => (Kvdiff_heat === nothing ? Kvdiff : Kvdiff_heat),
+                                   :Kv_mudiff => 0.0, :tau_qss => tau_qss,
                                    :alpha => 0.0, :z_damp => 20.0e3),
             options = Dict(:semiimplicit => semiimplicit, :exact_reference_state => true,
                            :precipitation => false, :vertical_mixing => false),
@@ -584,6 +585,85 @@ using Springsteel
                 # held — no frictional heating).
                 @test (mtile.var_np1[i, 6] - E_t_before[i]) ≈ rho_tbar[k] * dke[i] rtol=1e-6
                 @test mtile.var_np1[i, 1] ≈ p_before[i] atol=1e-9
+            end
+        end
+    end
+
+    @testset "Prandtl/Schmidt parameters are rejected" begin
+        # Eddy mixing coefficients are not molecular ratios: heat and water diffusivities
+        # are specified directly (:Khdiff_heat/:Kvdiff_heat, :Khdiff_water/:Kvdiff_water).
+        vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+        scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+        gp = GridParameters(
+            geometry = "RZ", num_cells = 4,
+            iMin = 0.0, iMax = 1000.0, kMin = 0.0, kMax = 1000.0, kDim = 8,
+            BCL = scalar_bc, BCR = scalar_bc, BCB = scalar_bc, BCT = scalar_bc, vars = vars,
+        )
+        for bad in (:Prandtl, :Schmidt)
+            @test_throws ErrorException ModelParameters(
+                ts = 0.1, equation_set = "moist_compressible_XZ", grid_params = gp,
+                physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, bad => 1.0))
+        end
+    end
+
+    @testset "heat-only vertical diffusion leaves momentum untouched" begin
+        # Kvdiff = 0, Kvdiff_heat > 0: the momentum solve must be skipped entirely (a K = 0
+        # solve is not the identity — it refits and refilters the column), so u and w must
+        # be BIT-identical to a no-diffusion run, while the heat path sources p/E_t/Q_ss.
+        mktempdir() do tmpdir
+            args = (; dry=true, Khdiff=0.0, kDim=16, num_cells=8)
+            function run_bubble(; kwargs...)
+                mtile, patch, model, _ = make_mc_mtile(tmpdir; args..., kwargs...)
+                gp = Scythe.getGridpoints(patch)
+                Scythe.theta_bubble_mc!(patch, gp, mtile.ref_state;
+                                        xc=1000.0, xr=400.0, zc=1000.0, zr=400.0,
+                                        dtheta_max=2.0)
+                spectralTransform!(patch); gridTransform!(patch)
+                ncols = div(size(patch.physical, 1), model.grid_params.kDim)
+                for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+                return mtile
+            end
+            m0 = run_bubble(; Kvdiff=0.0)
+            mH = run_bubble(; Kvdiff=0.0, Kvdiff_heat=75.0)
+            @test mH.var_np1[:, 4] == m0.var_np1[:, 4]   # u bit-identical
+            @test mH.var_np1[:, 5] == m0.var_np1[:, 5]   # w bit-identical
+            # ...but the heat path actually did something to p, E_t and Q_ss
+            @test maximum(abs.(mH.var_np1[:, 1] .- m0.var_np1[:, 1])) > 1.0e-6
+            @test maximum(abs.(mH.var_np1[:, 6] .- m0.var_np1[:, 6])) > 1.0e-6
+        end
+    end
+
+    @testset "momentum-only vertical diffusion leaves thermodynamics untouched" begin
+        # Kvdiff > 0, Kvdiff_heat = 0: the heat solve must be skipped, so p and Q_ss are
+        # BIT-identical to a no-diffusion run and E_t changes only by the resolved-KE sink
+        # dE_visc = rho_t*dke. The x-independent shear IC keeps the divergence (and hence
+        # every explicit tendency) identical between the runs.
+        mktempdir() do tmpdir
+            args = (; dry=true, Khdiff=0.0, kDim=16, num_cells=8, u_side_bc=NeumannBC())
+            function run_shear(; kwargs...)
+                mtile, patch, model, _ = make_mc_mtile(tmpdir; args..., kwargs...)
+                gridpoints = Scythe.getGridpoints(patch)
+                for i in 1:size(patch.physical, 1)
+                    patch.physical[i, 4, 1] = 10.0 * sin(pi * gridpoints[i, 2] / 2000.0)
+                end
+                spectralTransform!(patch); gridTransform!(patch)
+                ncols = div(size(patch.physical, 1), model.grid_params.kDim)
+                for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+                return mtile
+            end
+            m0 = run_shear(; Kvdiff=0.0)
+            mM = run_shear(; Kvdiff=75.0, Kvdiff_heat=0.0)
+            @test mM.var_np1[:, 1] == m0.var_np1[:, 1]   # p bit-identical
+            @test mM.var_np1[:, 7] == m0.var_np1[:, 7]   # Q_ss bit-identical
+            # Momentum diffusion acted, and E_t moved by exactly the resolved-KE sink
+            @test maximum(abs.(mM.var_np1[:, 4] .- m0.var_np1[:, 4])) > 1.0e-6
+            kDim = 16
+            rho_tbar = Springsteel.ref_rho_t(mM.ref_state)[:, 1]
+            dke = 0.5 .* (mM.var_np1[:, 4] .^ 2 .+ mM.var_np1[:, 5] .^ 2 .-
+                          m0.var_np1[:, 4] .^ 2 .- m0.var_np1[:, 5] .^ 2)
+            for i in findall(x -> abs(x) > 1.0e-9, dke)
+                k = mod1(i, kDim)
+                @test (mM.var_np1[i, 6] - m0.var_np1[i, 6]) ≈ rho_tbar[k] * dke[i] rtol=1e-6
             end
         end
     end

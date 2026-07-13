@@ -82,7 +82,7 @@ function bf02_dry_model(opts::BenchmarkOptions)
             opts.stage == STAGE_PE_RHOD ? "primitive_equation_XZ_rhod" :
             "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
-                               :Prandtl => 1.0, :tau_qss => 10.0,
+                               :tau_qss => 10.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
     end
     # The physical-density sets read a physical (Springsteel) reference written as an exact

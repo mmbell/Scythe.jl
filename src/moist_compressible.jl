@@ -325,11 +325,14 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     # Physical parameters. Momentum and the moist entropy s_t (heat) are the diffused
     # quantities: the masses, pressure, total energy and Q_ss carry no diffusive tendency
-    # of their own (the heat/friction increments are slaved onto them). Heat diffusivity is
-    # Kvdiff/Prandtl. Water-species mixing is deferred (see the handoff doc).
+    # of their own (the heat/friction increments are slaved onto them). Momentum and heat
+    # eddy coefficients are specified independently (eddy mixing is not a molecular-ratio
+    # process); the heat coefficients default to the momentum values. Water-species mixing
+    # is deferred (see the handoff doc).
     Khdiff = model.physical_params[:Khdiff]
     Kvdiff = model.physical_params[:Kvdiff]
-    Prandtl = get(model.physical_params, :Prandtl, 1.0)
+    Khdiff_heat = get(model.physical_params, :Khdiff_heat, Khdiff)
+    Kvdiff_heat = get(model.physical_params, :Kvdiff_heat, Kvdiff)
     tau_qss = get(model.physical_params, :tau_qss, 10.0)
 
     # Gridpoints
@@ -474,10 +477,10 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
                (Cpd * ((rho_dp_xx / rho_d) - (rho_dp_x * rho_dp_x / (rho_d * rho_d))))
 
     # Horizontal diabatic heating [W/m^3] from the entropy diffusion: the source to internal
-    # energy is rho_d*T*(ds_t/dt)_diff = rho_d*T*(Khdiff/Prandtl)*d2(s_t)/dx2. This is the
+    # energy is rho_d*T*(ds_t/dt)_diff = rho_d*T*Khdiff_heat*d2(s_t)/dx2. This is the
     # moist analogue of Straka's rho*T*ds_d source.
     QDOT_TH = S.QDOT_TH
-    @. QDOT_TH = rho_d * Tk * (Khdiff / Prandtl) * sd_xx
+    @. QDOT_TH = rho_d * Tk * Khdiff_heat * sd_xx
 
     # Horizontal frictional KE change [W/m^3]. Momentum diffusion is a resolved-KE SINK to
     # the subgrid (the future TKE shear production), NOT dissipative heating: with an eddy K
@@ -578,21 +581,25 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # The full moist entropy s_t (with the vapor/liquid contribution) is DEFERRED to the
     # rainfall session together with the water-species mixing and the moist horizontal terms
     # (see reference/moist_compressible_diffusion_handoff.md).
-    s_dbar = S.s_dbar
-    @. s_dbar = dry_entropy_pd(pbar, rho_dbar)
-    if Kvdiff > 0.0
-        s_d = S.s_d
-        @. s_d = dry_entropy_pd(p, rho_d)
+    if Kvdiff > 0.0 || Kvdiff_heat > 0.0
         diffdot = mtile.diffdot_n
-        @turbo diffdot[colstart:colend,4] .= @. Kvdiff * u_zz
-        @turbo diffdot[colstart:colend,5] .= @. Kvdiff * w_zz
-        # ∂zz(s_d') from the column basis, so the explicit AI2* tendency and the implicit
-        # Helmholtz operator use the same discrete ∂zz.
-        s_col = scratch_column(mtile, 6)
-        s_col.uMish .= s_d .- s_dbar
-        Btransform!(s_col)
-        Atransform!(s_col)
-        diffdot[colstart:colend,6] .= (Kvdiff / Prandtl) .* Ixxtransform(s_col)
+        if Kvdiff > 0.0
+            @turbo diffdot[colstart:colend,4] .= @. Kvdiff * u_zz
+            @turbo diffdot[colstart:colend,5] .= @. Kvdiff * w_zz
+        end
+        if Kvdiff_heat > 0.0
+            s_dbar = S.s_dbar
+            @. s_dbar = dry_entropy_pd(pbar, rho_dbar)
+            s_d = S.s_d
+            @. s_d = dry_entropy_pd(p, rho_d)
+            # ∂zz(s_d') from the column basis, so the explicit AI2* tendency and the implicit
+            # Helmholtz operator use the same discrete ∂zz.
+            s_col = scratch_column(mtile, 6)
+            s_col.uMish .= s_d .- s_dbar
+            Btransform!(s_col)
+            Atransform!(s_col)
+            diffdot[colstart:colend,6] .= Kvdiff_heat .* Ixxtransform(s_col)
+        end
     end
 
     # Advance the explicit terms
@@ -604,9 +611,9 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     end
 
     # Implicit vertical diffusion of u, w (friction sink) and the dry entropy s_d' (heat,
-    # slaved onto p, E_t, Q_ss). Skipped at Kvdiff = 0: a vertical solve is not the identity
-    # there — it refits the column and reapplies the spectral filter.
-    if Kvdiff > 0.0
+    # slaved onto p, E_t, Q_ss). Skipped when both coefficients are zero: a vertical solve
+    # is not the identity there — it refits the column and reapplies the spectral filter.
+    if Kvdiff > 0.0 || Kvdiff_heat > 0.0
         diffusion_timestep_mc(mtile, colstart, colend, t)
     end
 
@@ -770,10 +777,13 @@ end
 """
     diffusion_timestep_mc(mtile, colstart, colend, t)
 
-Implicit vertical diffusion of `u` and `w` (momentum) and the dry entropy `s_d'` (heat) for
-the total-energy set, using the AI2* off-centered weights
+Implicit vertical diffusion of `u` and `w` (momentum, `Kvdiff`) and the dry entropy `s_d'`
+(heat, `Kvdiff_heat`) for the total-energy set, using the AI2* off-centered weights
 (`+1.25 N^{n+1} - 1.0 N^n + 0.75 N^{n-1}`) with the tendency history in `mtile.diffdot_*`.
 It needs its own tendency channel because the acoustic solve owns `impdot[w/p/E_t]`.
+The momentum and heat solves are gated independently on their coefficients: a K = 0 solve
+is not the identity (it refits the column and reapplies the spectral filter), so a zero
+coefficient must skip its solve entirely, leaving the post-acoustic state untouched.
 
 Runs AFTER [`semiimplicit_adjustment_p`](@ref). The density fields are NOT re-slaved to the
 post-diffusion `w` — momentum diffusion is a force, not a mass flux, and they were already
@@ -807,6 +817,11 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     qss_index = vars["Q_ss"]
 
     ts = mtile.model.ts
+
+    Kvdiff = mtile.model.physical_params[:Kvdiff]
+    Kvdiff_heat = get(mtile.model.physical_params, :Kvdiff_heat, Kvdiff)
+    do_momentum = Kvdiff > 0.0
+    do_heat = Kvdiff_heat > 0.0
 
     pbar = view(ref_pressure(mtile.ref_state),:,1)
     rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
@@ -844,69 +859,91 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     sdot_n = view(mtile.diffdot_n,colstart:colend,et_index)
     sdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,et_index)
 
-    u_nstar = S.df_u_nstar
-    w_nstar = S.df_w_nstar
-    s_nstar = S.df_s_nstar
-    if (t == 1)
-        # Use trapezoidal method (AM2) for first step
-        @. u_nstar = u_star + (ts * 0.5 * udot_n)
-        @. w_nstar = w_star + (ts * 0.5 * wdot_n)
-        @. s_nstar = s_dp_star + (ts * 0.5 * sdot_n)
-    else
-        # Use AI2* for second step and beyond
-        @. u_nstar = u_star - (ts * udot_n) + (ts * 0.75 * udot_nm1)
-        @. w_nstar = w_star - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
-        @. s_nstar = s_dp_star - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
-    end
-
-    # Set the n-1 terms
-    udot_nm1 .= udot_n
-    wdot_nm1 .= wdot_n
-    sdot_nm1 .= sdot_n
-
     # Pre-factorized in createModelTile, per variable and per timestep coefficient (the
     # first step uses the AM2 coefficient), so nothing is factorized per column here.
     mats = mtile.mc_diffusion_matrices
-    h_u = (t == 1) ? mats[:u_first] : mats[:u]
-    h_w = (t == 1) ? mats[:w_first] : mats[:w]
-    h_h = (t == 1) ? mats[:heat_first] : mats[:heat]
 
     # One scratch column serves all three solves: the boundary conditions live in the
     # factorization, and neither `_vertical_solve!` nor `Itransform!` consults the
     # column's own BCs (only Btransform!/Atransform! do). Same reuse as
     # `diffusion_timestep_pd`, which shares one column across five variables.
     col = scratch_column(mtile, u_index)
-    # u_np1 and w_np1 must be copied out: `col` is reused by the next solve, and Itransform!
-    # returns the column's own buffer. s_dp_np1 is the last use, so it can stay an alias.
-    u_np1 = S.df_u_np1
-    w_np1 = S.df_w_np1
-    _vertical_solve!(col, h_u, u_nstar, mtile)
-    copyto!(u_np1, Itransform!(col))
 
-    _vertical_solve!(col, h_w, w_nstar, mtile)
-    copyto!(w_np1, Itransform!(col))
+    # ── Momentum (Kvdiff): friction is a resolved-KE sink, E_t follows the KE down;
+    #    T, p, Q_ss held. ──
+    dE_visc = S.df_dE_visc
+    if do_momentum
+        u_nstar = S.df_u_nstar
+        w_nstar = S.df_w_nstar
+        if (t == 1)
+            # Use trapezoidal method (AM2) for first step
+            @. u_nstar = u_star + (ts * 0.5 * udot_n)
+            @. w_nstar = w_star + (ts * 0.5 * wdot_n)
+        else
+            # Use AI2* for second step and beyond
+            @. u_nstar = u_star - (ts * udot_n) + (ts * 0.75 * udot_nm1)
+            @. w_nstar = w_star - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+        end
+        udot_nm1 .= udot_n
+        wdot_nm1 .= wdot_n
 
-    _vertical_solve!(col, h_h, s_nstar, mtile)
-    s_dp_np1 = Itransform!(col)
+        h_u = (t == 1) ? mats[:u_first] : mats[:u]
+        h_w = (t == 1) ? mats[:w_first] : mats[:w]
+        # u_np1 and w_np1 must be copied out: `col` is reused by the next solve, and
+        # Itransform! returns the column's own buffer.
+        u_np1 = S.df_u_np1
+        w_np1 = S.df_w_np1
+        _vertical_solve!(col, h_u, u_nstar, mtile)
+        copyto!(u_np1, Itransform!(col))
 
-    # Friction: resolved-KE sink, E_t follows the KE down; T, p, Q_ss held.
-    dke = S.df_dke
-    @. dke = 0.5 * (((u_np1 * u_np1) + (w_np1 * w_np1)) -
-                    ((u_star * u_star) + (w_star * w_star)))
-    dE_visc = S.df_dE_visc; @. dE_visc = rho_t_star * dke
+        _vertical_solve!(col, h_w, w_nstar, mtile)
+        copyto!(w_np1, Itransform!(col))
 
-    # Heat: entropy increment -> (T, p, E_t, Q_ss) at fixed rho_d (dry: C_vt=C_vd, R_m=R_d).
-    ds_d = S.df_ds_d; @. ds_d = s_dp_np1 - s_dp_star
-    dT_h = S.df_dT_h; @. dT_h = (T_star / Cvd) * ds_d
-    dE_h = S.df_dE_h; @. dE_h = rho_d_star * T_star * ds_d
-    dp_h = S.df_dp_h; @. dp_h = rho_d_star * Rd * dT_h
-    dQ_h = S.df_dQ_h; @. dQ_h = -((drvs_dT * dT_h) + (drvs_dp * dp_h))
+        dke = S.df_dke
+        @. dke = 0.5 * (((u_np1 * u_np1) + (w_np1 * w_np1)) -
+                        ((u_star * u_star) + (w_star * w_star)))
+        @. dE_visc = rho_t_star * dke
 
-    view(mtile.var_np1,colstart:colend,u_index) .= u_np1
-    view(mtile.var_np1,colstart:colend,w_index) .= w_np1
-    view(mtile.var_np1,colstart:colend,p_index) .+= dp_h
-    view(mtile.var_np1,colstart:colend,et_index) .+= dE_visc .+ dE_h
-    view(mtile.var_np1,colstart:colend,qss_index) .+= dQ_h
+        view(mtile.var_np1,colstart:colend,u_index) .= u_np1
+        view(mtile.var_np1,colstart:colend,w_index) .= w_np1
+    end
+
+    # ── Heat (Kvdiff_heat): entropy increment -> (T, p, E_t, Q_ss) at fixed rho_d
+    #    (dry: C_vt=C_vd, R_m=R_d). ──
+    dE_h = S.df_dE_h
+    if do_heat
+        s_nstar = S.df_s_nstar
+        if (t == 1)
+            @. s_nstar = s_dp_star + (ts * 0.5 * sdot_n)
+        else
+            @. s_nstar = s_dp_star - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
+        end
+        sdot_nm1 .= sdot_n
+
+        h_h = (t == 1) ? mats[:heat_first] : mats[:heat]
+        # s_dp_np1 is the last use of `col`, so it can stay an alias.
+        _vertical_solve!(col, h_h, s_nstar, mtile)
+        s_dp_np1 = Itransform!(col)
+
+        ds_d = S.df_ds_d; @. ds_d = s_dp_np1 - s_dp_star
+        dT_h = S.df_dT_h; @. dT_h = (T_star / Cvd) * ds_d
+        @. dE_h = rho_d_star * T_star * ds_d
+        dp_h = S.df_dp_h; @. dp_h = rho_d_star * Rd * dT_h
+        dQ_h = S.df_dQ_h; @. dQ_h = -((drvs_dT * dT_h) + (drvs_dp * dp_h))
+
+        view(mtile.var_np1,colstart:colend,p_index) .+= dp_h
+        view(mtile.var_np1,colstart:colend,qss_index) .+= dQ_h
+    end
+
+    # E_t update: keep the single fused add when both paths ran (bit-identical to the
+    # historical combined update), and touch E_t only with the terms that were computed.
+    if do_momentum && do_heat
+        view(mtile.var_np1,colstart:colend,et_index) .+= dE_visc .+ dE_h
+    elseif do_momentum
+        view(mtile.var_np1,colstart:colend,et_index) .+= dE_visc
+    elseif do_heat
+        view(mtile.var_np1,colstart:colend,et_index) .+= dE_h
+    end
 end
 
 # ── Initial conditions and reference writer ────────────────────────────────────

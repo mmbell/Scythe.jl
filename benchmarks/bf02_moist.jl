@@ -103,7 +103,7 @@ function bf02_moist_model(opts::BenchmarkOptions)
             opts.stage == STAGE_PE_RHOD_PD ? "primitive_equation_XZ_rhod_pd" :
             "primitive_equation_XZ_rhod"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
-                               :Prandtl => 1.0, :tau_qss => 10.0,
+                               :tau_qss => 10.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
         options = Dict(:semiimplicit => true, :exact_reference_state => true,
                        :precipitation => false, :vertical_mixing => false)

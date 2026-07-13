@@ -244,32 +244,32 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
     end
 
-    # The total-energy set diffuses momentum (u, w) and the diagnosed moist entropy s_t
-    # (heat, Kvdiff/Prandtl). Each needs its own factorization: the boundary conditions
-    # differ (straka93 free-slip u, bf02 no-slip; w a rigid lid; scalars Neumann), and the
-    # heat diffusivity is Kvdiff/Prandtl. s_t rides on the Neumann E_t column. Both the
-    # AI2* coefficient (t >= 2) and the first-step AM2 coefficient are cached, so
+    # The total-energy set diffuses momentum (u, w; Kvdiff) and the diagnosed moist entropy
+    # s_t (heat; Kvdiff_heat, defaulting to Kvdiff). Each needs its own factorization: the
+    # boundary conditions differ (straka93 free-slip u, bf02 no-slip; w a rigid lid; scalars
+    # Neumann), and the coefficients are independent. s_t rides on the Neumann E_t column.
+    # Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are cached, so
     # `diffusion_timestep_mc` never factorizes per column.
-    # Water-species diffusion (a Kvdiff/Schmidt Neumann matrix on rho_t) is DEFERRED to
+    # Water-species diffusion (a Kvdiff_water Neumann matrix on rho_t) is DEFERRED to
     # the rainfall session — see reference/moist_compressible_diffusion_handoff.md.
-    # Built only for Kvdiff > 0: at K = 0 a vertical solve is not the identity (it refits
-    # the column and reapplies the spectral filter), so the routine returns before it.
+    # Built only when a coefficient is positive: at K = 0 a vertical solve is not the
+    # identity (it refits the column and reapplies the spectral filter), so the routine
+    # skips that solve; its matrices are built anyway (cheap) to keep the NamedTuple shape.
     mc_diffusion_matrices = NamedTuple()
-    if uses_pressure_reference(model.equation_set) &&
-            get(model.physical_params, :Kvdiff, 0.0) > 0.0
-        Kv = model.physical_params[:Kvdiff]
-        Pr = get(model.physical_params, :Prandtl, 1.0)
+    Kv_mc = get(model.physical_params, :Kvdiff, 0.0)
+    Kv_heat_mc = get(model.physical_params, :Kvdiff_heat, Kv_mc)
+    if uses_pressure_reference(model.equation_set) && (Kv_mc > 0.0 || Kv_heat_mc > 0.0)
         bcb = model.grid_params.BCB
         bct = model.grid_params.BCT
         mc_matrix(var, K, coeff) = calc_Helmholtz_diffusion_matrix(tile, model,
             coeff * model.ts * K; bc_bottom = bcb[var], bc_top = bct[var])
         mc_diffusion_matrices = (
-            u          = mc_matrix("u",   Kv,      1.25),
-            u_first    = mc_matrix("u",   Kv,      0.5),
-            w          = mc_matrix("w",   Kv,      1.25),
-            w_first    = mc_matrix("w",   Kv,      0.5),
-            heat       = mc_matrix("E_t", Kv / Pr, 1.25),
-            heat_first = mc_matrix("E_t", Kv / Pr, 0.5))
+            u          = mc_matrix("u",   Kv_mc,      1.25),
+            u_first    = mc_matrix("u",   Kv_mc,      0.5),
+            w          = mc_matrix("w",   Kv_mc,      1.25),
+            w_first    = mc_matrix("w",   Kv_mc,      0.5),
+            heat       = mc_matrix("E_t", Kv_heat_mc, 1.25),
+            heat_first = mc_matrix("E_t", Kv_heat_mc, 0.5))
     end
 
     mtile = ModelTile(

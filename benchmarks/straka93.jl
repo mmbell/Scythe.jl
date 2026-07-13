@@ -71,7 +71,8 @@ function straka_model(opts::BenchmarkOptions)
         physical_params = Dict(:K => 75.0, :Kvdiff => 0.0)
     elseif opts.stage == STAGE_MC
         # The total-energy set diffuses u, w and the dry entropy s_d (no mass diffusion, as
-        # in the paper). Prandtl = 1 gives the paper's single K on momentum and entropy.
+        # in the paper). Kvdiff_heat defaults to Kvdiff, giving the paper's single K on
+        # momentum and entropy.
         # Momentum diffusion is a resolved-KE sink to the subgrid (not dissipative heating,
         # matching Straka): E_t follows the KE down and T is held. The thermal (entropy)
         # diffusion is a genuine O(K) energy source, since rho*T*Lap(s) is not a flux
@@ -79,7 +80,7 @@ function straka_model(opts::BenchmarkOptions)
         # closure. See reference/moist_compressible_diffusion_plan.md.
         equation_set = "moist_compressible_XZ"
         physical_params = Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
-                               :Prandtl => 1.0, :tau_qss => 10.0,
+                               :tau_qss => 10.0,
                                :alpha => 0.0, :z_damp => 12.8e3)
     else
         # The PE set has explicit horizontal diffusion and implicit vertical

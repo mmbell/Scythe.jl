@@ -39,7 +39,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
             ref_state_file = joinpath(outdir, "ref.csv"),
             grid_params = gp,
             physical_params = Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
-                                   :Prandtl => 1.0, :tau_qss => 10.0, :alpha => 0.0,
+                                   :tau_qss => 10.0, :alpha => 0.0,
                                    :z_damp => 12.8e3),
             options = Dict(:semiimplicit => true, :exact_reference_state => true,
                            :precipitation => false, :vertical_mixing => false))

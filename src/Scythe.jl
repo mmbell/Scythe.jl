@@ -55,6 +55,16 @@ Base.@kwdef struct ModelParameters
     function ModelParameters(ts, integration_time, output_interval, equation_set,
                              initial_conditions, output_dir, ref_state_file,
                              grid_params, physical_params, options)
+        # Eddy diffusivities are specified directly per quantity, not as molecular-style
+        # ratios of the momentum coefficient: :Khdiff/:Kvdiff (momentum),
+        # :Khdiff_heat/:Kvdiff_heat (heat, default = momentum values), and
+        # :Khdiff_water/:Kvdiff_water (water species, default 0).
+        for bad in (:Prandtl, :Schmidt)
+            haskey(physical_params, bad) && error(
+                "physical_params[:$bad] was removed: eddy mixing coefficients are not " *
+                "molecular ratios. Set :Khdiff_heat/:Kvdiff_heat (heat) and " *
+                ":Khdiff_water/:Kvdiff_water (water species) directly.")
+        end
         new(ts, integration_time, output_interval, equation_set, initial_conditions,
             output_dir, ref_state_file, compute_derived_params(grid_params),
             physical_params, options)
