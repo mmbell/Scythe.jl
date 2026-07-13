@@ -14,10 +14,14 @@
 |---|---|---|---|---|
 | allocations | 4.73 G | 1.94 G | 757 M | **215 M** (22×) |
 | allocated | 836.6 GiB | 680.9 GiB | 224.9 GiB | **38.3 GiB** (22×) |
-| wall clock | 484.5 s | 484.0 s | 392 s | **379 s** (1.28×) |
+| wall clock | 484.5 s | 484.0 s | 392 s | **368 s** (1.32×) |
 | GC time | 14.2 % | 20.2 % | ~6 % | **1.0 %** |
 | lock conflicts | 1 506 732 | — | 1 535 657 | **840** (1794×) |
 | crash | ~1 in 3 runs | 1 in 3 runs | 0 in 8 runs | **0 in 5 runs** |
+
+(Wall clock on an otherwise-idle machine: 370.1 / 367.6 / 368.6 s across three runs. Do not
+time a benchmark while the test suite is running — a contended run came out at 474 s with an
+*identical* allocation count, which is how you tell contention from a real regression.)
 
 | bf02_dry quick/mc/rz | before | **final** |
 |---|---|---|
