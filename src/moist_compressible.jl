@@ -39,7 +39,8 @@ const MC_SCRATCH_SLOTS = (
     :p_z, :rho_d_z, :rho_t_z, :E_t_z, :Q_ss_z,                        # total vertical gradients
     :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :rho_c, :q_v, :q_l,  # diagnostic state
     :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
-    :Q_s, :Qdot, :div,                                                # condensation, divergence
+    :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
+    :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
@@ -251,13 +252,40 @@ negative; condensation is limited by the available vapor (`≤ rho_v/ts`), which
 phantom condensation in dry air where Q_ss tracking drift can otherwise indicate
 spurious supersaturation. Subsaturated cloud-free air returns zero.
 """
-function qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
+qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0) =
+    qss_condensation_rates(Q_ss, rho_v, rho_c, 0.0, rho_d, Tk, p_hPa, Q_s, ts, 0.0,
+                           max_N_c)[1]
+
+"""
+    qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts, N_r,
+                           max_N_c=100.0) -> (Qdot_c, Qdot_r)
+
+Two-category condensation/evaporation rates [kg/m³/s] from the generalized
+supersaturation relaxation `1/τ = 1/τ_c + 1/τ_r` (see
+reference/Scythe_moist_compressible.tex): the total rate `Q_ss (1/τ)/(1+Q_s)` splits
+between the cloud and rain channels in proportion to their inverse timescales, in BOTH
+directions — rain gains a (small, `N_r`-controlled) share of supersaturated
+condensation and evaporates in subsaturated air, so no separate rain-evaporation
+parameterization (O01's `Q_evap`) is needed. The ventilation enhancement lives inside
+[`invtau_rain`](@ref).
+
+Limiters: cloud evaporation is bounded by the available cloud (`≥ −max(rho_c,0)/ts`),
+rain evaporation by the available rain (`≥ −max(rho_r,0)/ts`), and if the combined
+condensation would exceed the available vapor both channels are rescaled
+proportionally so `Qdot_c + Qdot_r ≤ max(rho_v,0)/ts`. With the rain channel inactive
+(`Qdot_r == 0`) the vapor cap reduces to the historical `min(Qdot, rho_v/ts)`, keeping
+the single-category [`qss_condensation_rate`](@ref) delegate bit-identical to its
+pre-rain behavior.
+"""
+function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts,
+                                N_r, max_N_c=100.0)
 
     rho_vs = rho_v_sat(Tk, p_hPa)
     S = Q_ss / rho_vs                    # supersaturation (ratio - 1)
     q_c = max(rho_c, 0.0) / rho_d
 
-    # Droplet number and radius logic mirrors q_condensation
+    # Cloud channel: droplet number and radius logic mirrors q_condensation
+    invtau_c = 0.0
     N_c = max_N_c
     r_c = cloud_droplet_radius(N_c, q_c, rho_d)
     if q_c > 1.0e-8
@@ -269,27 +297,49 @@ function qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, ma
                 N_c = 0.0
             end
         end
+        if N_c > 0.0 && r_c > 0.0
+            invtau_c = invtau_condensation(Tk, p_hPa, N_c, r_c)
+        end
     elseif S > 1.0e-4
         # Nucleation: linear interpolation of the Twomey relationship
         if r_c < 1.0
             r_c = 1.0
             N_c = min(1.0e4 * N_c * S, max_N_c)
         end
-    else
-        # No cloud and not supersaturated: nothing to condense or evaporate
-        return 0.0
+        if N_c > 0.0 && r_c > 0.0
+            invtau_c = invtau_condensation(Tk, p_hPa, N_c, r_c)
+        end
     end
-    if N_c <= 0.0 || r_c <= 0.0
-        return 0.0
+    # (no cloud and not supersaturated: invtau_c stays 0 — rain may still exchange)
+
+    invtau_r = invtau_rain(Tk, p_hPa, N_r, rho_r)
+    invtau = invtau_c + invtau_r
+    if invtau == 0.0
+        return (0.0, 0.0)
     end
 
-    invtau = invtau_condensation(Tk, p_hPa, N_c, r_c)
     Qdot = Q_ss * invtau / (1.0 + Q_s)
+    # An inactive channel gets an exact 0.0 (Qdot * 0.0 would be -0.0 for evaporation);
+    # a lone active channel gets Qdot exactly (invtau/invtau == 1.0), which keeps the
+    # single-category delegate bit-identical.
+    Qdot_c = invtau_c == 0.0 ? 0.0 : Qdot * (invtau_c / invtau)
+    Qdot_r = invtau_r == 0.0 ? 0.0 : Qdot * (invtau_r / invtau)
 
-    # No negative water: evaporation limited by cloud, condensation by vapor
-    Qdot = max(Qdot, -max(rho_c, 0.0) / ts)
-    Qdot = min(Qdot, max(rho_v, 0.0) / ts)
-    return Qdot
+    # No negative water: each condensate's evaporation limited by its own mass
+    Qdot_c = max(Qdot_c, -max(rho_c, 0.0) / ts)
+    Qdot_r = max(Qdot_r, -max(rho_r, 0.0) / ts)
+
+    # Condensation limited by the available vapor. With the rain channel inactive this
+    # is the historical min(); with both active the channels rescale proportionally.
+    cap = max(rho_v, 0.0) / ts
+    if Qdot_r == 0.0
+        Qdot_c = min(Qdot_c, cap)
+    elseif Qdot_c + Qdot_r > cap
+        scale = cap / (Qdot_c + Qdot_r)
+        Qdot_c *= scale
+        Qdot_r *= scale
+    end
+    return (Qdot_c, Qdot_r)
 end
 
 import Springsteel: ref_pressure, ref_rho_t, ref_total_energy, ref_qss
@@ -334,6 +384,13 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Khdiff_heat = get(model.physical_params, :Khdiff_heat, Khdiff)
     Kvdiff_heat = get(model.physical_params, :Kvdiff_heat, Kvdiff)
     tau_qss = get(model.physical_params, :tau_qss, 10.0)
+
+    # Warm-rain microphysics (autoconversion, collection, sedimentation, and the rain
+    # channel of the supersaturation relaxation). N_r [#/cm^3] is the fixed rain-drop
+    # number of the monodisperse tau_r closure; zeroing it (or the switch) makes the
+    # rain channel inert and slot 8 advection-only.
+    precipitation = get(model.options, :precipitation, false)::Bool
+    N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
 
     # Gridpoints
     x = view(gridpoints,colstart:colend,1)
@@ -450,15 +507,65 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     drvs_dp = S.drvs_dp; @. drvs_dp = drho_vsat_dp(Tk, p_hPa)
 
     # Condensation: limited supersaturation relaxation with the energy-consistent
-    # psychrometric factor. rho_v and rho_c are diagnostic, so no separate
-    # condensation-adjustment step is needed after the timestep.
+    # psychrometric factor, split between the cloud and rain channels in proportion to
+    # their inverse timescales (1/tau = 1/tau_c + 1/tau_r). rho_v and rho_c are
+    # diagnostic, so no separate condensation-adjustment step is needed after the
+    # timestep. With the rain channel inert (N_r = 0), Qdot is bit-identical to the
+    # single-category closure and Qdot_r is exactly zero.
     Q_s = S.Q_s;   @. Q_s = Q_s_energy(Tk, p, rho_d, q_v, q_l)
-    Qdot = S.Qdot; @. Qdot = qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s,
-                                                   model.ts)
+    Qdot = S.Qdot          # cloud channel
+    Qdot_r = S.Qdot_r      # rain channel
     for i in 1:length(Qdot)
-        if isnan(Qdot[i])
+        Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
+                                                    rho_d[i], Tk[i], p_hPa[i], Q_s[i],
+                                                    model.ts, N_r)
+        if isnan(Qdot[i]) || isnan(Qdot_r[i])
             error("Qdot is NaN at index $i, time $(t)!")
         end
+    end
+
+    # Warm-rain conversion and sedimentation. Autoconversion + collection move cloud to
+    # rain — a liquid-to-liquid exchange, thermodynamically inert (T, p, E_t, Q_ss all
+    # unmoved; cloud is the diagnostic residual, so only slot 8 carries a source). The
+    # sedimentation flux F_r = rho_r*Vt (Vt <= 0) moves rain mass AND the energy it
+    # carries: e_l(T) + ke + gz per kg of liquid, with e_l = C_pv*T - L_v(T) in the
+    # BF02 internal-energy convention. Its divergence sources rho_r, rho_t and E_t with
+    # the SAME fitted -dF/dz, so the two densities cannot drift apart, and the column
+    # integral telescopes to the boundary fluxes — with a free (Natural) bottom BC on
+    # rho_r the surface flux removes rain from the domain. T is invariant under the
+    # local exchange (delta_E_t = (e_l+ke+gz)*delta_rho at delta_rho_r = delta_rho_t);
+    # the residual flux terms are the physical energy transport by falling rain. No p
+    # or Q_ss source: rain exerts no partial pressure, and the (small) sedimentation
+    # dT/dt is omitted from the saturation chain rule below (absorbed by the
+    # condensation relaxation).
+    AUTO_COLL = S.AUTO_COLL
+    Fr_z = S.Fr_z
+    E_sed_z = S.E_sed_z
+    if precipitation
+        for i in 1:length(AUTO_COLL)
+            auto = autoconversion_density(max(rho_c[i], 0.0), rho_d[i])
+            coll = collection_density(max(rho_c[i], 0.0), rho_r[i], rho_d[i], Tk[i])
+            # Shared depletion cap: never convert more cloud than exists this step
+            AUTO_COLL[i] = min(auto + coll, max(rho_c[i], 0.0) / model.ts)
+        end
+        Vt = S.Vt;       @. Vt = rain_terminal_velocity(rho_r, rho_d, Tk)
+        Fr = S.Fr;       @. Fr = max(rho_r, 0.0) * Vt
+        E_sed = S.E_sed; @. E_sed = Fr * ((Cpv * Tk) - Lv + ke + (gravity * z))
+        # Fitted flux divergences on rho_r's column basis (its BCs decide whether the
+        # surface flux is free to be nonzero), same discrete d/dz as the advection.
+        r_col = scratch_column(mtile, 8)
+        r_col.uMish .= Fr
+        Btransform!(r_col)
+        Atransform!(r_col)
+        Fr_z .= Ixtransform(r_col)
+        r_col.uMish .= E_sed
+        Btransform!(r_col)
+        Atransform!(r_col)
+        E_sed_z .= Ixtransform(r_col)
+    else
+        fill!(AUTO_COLL, 0.0)
+        fill!(Fr_z, 0.0)
+        fill!(E_sed_z, 0.0)
     end
 
     div = S.div; @. div = u_x + w_z
@@ -497,10 +604,12 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     KDIFF = S.KDIFF
 
     # Pressure (slot 1): -v·∇p - γp∇·v + (R_m/C_vt)[(L_v - R_v C_pt T/R_m) Q̇_cond + Q̇_therm].
-    # Only the THERMAL diffusion sources pressure (friction holds T, hence p).
+    # Q̇_cond is the TOTAL phase-change rate (cloud + rain channels); only the THERMAL
+    # diffusion sources pressure (friction holds T, hence p; sedimentation moves no
+    # partial pressure).
     @turbo ADV .= @. (-u * pp_x) + (-w * p_z)
     FORCING .= @. (-gamma_m * p * div) +
-                  ((R_m / C_vt) * (((Lv - (Rv * C_pt * Tk / R_m)) * Qdot) + QDOT_TH))
+                  ((R_m / C_vt) * (((Lv - (Rv * C_pt * Tk / R_m)) * (Qdot + Qdot_r)) + QDOT_TH))
     @turbo expdot[colstart:colend,1] .= @. ADV + FORCING
 
     # Implicit acoustic tendencies from the vertical mass flux φ = ρ̄_t w, in
@@ -517,9 +626,10 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Implicit acoustic continuity: -∂z(ρ̄_d w), product-rule form
     impdot[colstart:colend,2] .= @. -((rho_dbar * w_z) + (rho_dbar_z * w))
 
-    # Total mass continuity (slot 3; sources zero without flux/sedimentation)
+    # Total mass continuity (slot 3): the only source is the sedimentation flux
+    # divergence, identical to slot 8's so rain and total water cannot drift apart.
     @turbo ADV .= @. (-u * rho_tp_x) + (-w * rho_t_z)
-    @turbo FORCING .= @. -rho_t * div
+    @turbo FORCING .= @. (-rho_t * div) - Fr_z
     @turbo expdot[colstart:colend,3] .= @. ADV + FORCING
 
     # u momentum (slot 4): PGF directly from the prognostic pressure
@@ -536,13 +646,14 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Implicit acoustic w-momentum: -(1/ρ̄_t) ∂z p'
     impdot[colstart:colend,5] .= @. -pp_z / rho_tbar
 
-    # Total energy (slot 6): -v·∇E_t - E_t∇·v - ∇·(pv) + Q̇_therm + friction sink. No
-    # condensation source (exact first law: phase change is not an energy source). The
+    # Total energy (slot 6): -v·∇E_t - E_t∇·v - ∇·(pv) - ∇·(E_sed) + Q̇_therm + friction
+    # sink. No condensation source (exact first law: phase change is not an energy source).
+    # E_sed is the energy carried by falling rain (see the microphysics block above). The
     # THERMAL diffusion heats (Q̇_therm); the momentum diffusion adds FRIC_KE = d(rho_t*ke)/dt
     # so E_t follows the resolved KE down to the subgrid (internal energy held). pbar has no
     # x-dependence so u*p_x = u*pp_x.
     @turbo ADV .= @. (-u * E_tp_x) + (-w * E_t_z)
-    @turbo FORCING .= @. (-(E_t + p) * div) - (u * pp_x) - (w * p_z)
+    @turbo FORCING .= @. (-(E_t + p) * div) - (u * pp_x) - (w * p_z) - E_sed_z
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE
     # Implicit acoustic energy flux: -∂z((Ē_t + p̄) w), product-rule form
     impdot[colstart:colend,6] .= @. -(((E_tbar + pbar) * w_z) + ((E_tbar_z + pbar_z) * w))
@@ -560,12 +671,14 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     QSSREL = S.QSSREL
     @. QSSREL = qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau_qss)
     @turbo ADV .= @. (-u * Q_ssp_x) + (-w * Q_ss_z)
-    FORCING .= @. (-Q_ss * div) + SATF - (Qdot * (1.0 + Q_s)) + QSSREL
+    FORCING .= @. (-Q_ss * div) + SATF - ((Qdot + Qdot_r) * (1.0 + Q_s)) + QSSREL
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
 
-    # Rain partial density (slot 8; microphysics sources deferred, no diffusion)
+    # Rain partial density (slot 8): rain-channel condensation/evaporation,
+    # autoconversion + collection from cloud, and the sedimentation flux divergence
+    # (no diffusion yet — water-species mixing arrives with the moist diffusion).
     @turbo ADV .= @. (-u * rho_rp_x) + (-w * rho_rp_z)
-    @turbo FORCING .= @. -rho_r * div
+    @turbo FORCING .= @. (-rho_r * div) + Qdot_r + AUTO_COLL - Fr_z
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──

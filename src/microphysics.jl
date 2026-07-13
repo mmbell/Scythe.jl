@@ -1390,6 +1390,85 @@ function precipitation_flux(q_r, rho_d, Tk, q_r_z, xi_z)
     return Vt_flux
 end
 
+# ── Density-form warm-rain rates (total-energy set) ────────────────────────────
+#
+# The moist_compressible prognostics are partial densities, so the Ooyama (2001)
+# Appendix A rates are used in their native density form [kg m^-3 s^-1] instead of
+# the mixing-ratio wrappers above (which divide by rho_d for the transformed sets).
+# Every rate guards rho_r with max(rho_r, 0): a spline undershoot raised to a
+# fractional power is NaN, and the guards make negative excursions inert instead.
+
+"Minimum rain density [kg/m³] below which the rain relaxation channel is inactive."
+const RHO_R_MIN = 1.0e-8
+
+"""
+    autoconversion_density(rho_c, rho_d)
+
+Autoconversion of cloud to rain [kg m⁻³ s⁻¹], Ooyama (2001) eq. A.3:
+`Q_auto = 0.001 (ρ_c − 0.001 ρ_d)`, clamped ≥ 0 (threshold 1 g/kg of cloud).
+"""
+autoconversion_density(rho_c, rho_d) = max(0.001 * (rho_c - (0.001 * rho_d)), 0.0)
+
+"""
+    collection_density(rho_c, rho_r, rho_d, Tk)
+
+Collection (accretion) of cloud by rain [kg m⁻³ s⁻¹], Ooyama (2001) eq. A.4:
+`Q_coll = 2.20 ρ_c (ρ_r/ρ_d)^0.875 f_ice`, clamped ≥ 0.
+"""
+collection_density(rho_c, rho_r, rho_d, Tk) =
+    max(2.20 * rho_c * (max(rho_r, 0.0) / rho_d)^0.875 * f_ice(Tk), 0.0)
+
+"""
+    rain_terminal_velocity(rho_r, rho_d, Tk)
+
+Mass-weighted terminal fall speed of rain [m/s, ≤ 0], Ooyama (2001) eq. A.1:
+`W = −14.164 ρ_r^0.1364 (ρ_d0/ρ_d)^0.5 f_ice`. Zero at (or below) ρ_r = 0.
+"""
+rain_terminal_velocity(rho_r, rho_d, Tk) =
+    -14.164 * max(rho_r, 0.0)^0.1364 * sqrt(rho_d0 / rho_d) * f_ice(Tk)
+
+"""
+    f_ventilation_density(rho_r, Tk)
+
+Bulk ventilation factor for falling rain [dimensionless], Ooyama (2001) eq. A.6:
+`f_vent = 1.6 + 30.39 ρ_r^0.2046 f_ice^1.5`.
+"""
+f_ventilation_density(rho_r, Tk) =
+    1.6 + (30.39 * max(rho_r, 0.0)^0.2046 * f_ice(Tk)^1.5)
+
+"""
+    rain_drop_radius(N_r, rho_r)
+
+Mean rain drop radius [μm] for a monodisperse population of `N_r` [#/cm³] spherical
+drops holding `rho_r` [kg/m³] of liquid: `ρ_r = N_r·10⁶ · (4/3)π ρ_l (r·10⁻⁶)³`.
+The same closure as [`cloud_droplet_radius`](@ref), taken directly in density form.
+Returns 0 for `N_r ≤ 0`.
+"""
+function rain_drop_radius(N_r, rho_r)
+
+    N_r <= 0.0 && return 0.0
+    kg_drop = max(rho_r, 0.0) / (N_r * 1.0e6)
+    return 1.0e6 * (kg_drop * 3.0 / (4.0 * pi * rho_l))^(1.0 / 3.0)
+end
+
+"""
+    invtau_rain(Tk, p_hPa, N_r, rho_r)
+
+Inverse rain relaxation timescale `1/τ_r = 4π D_v N_r ⟨r_r f(r)⟩` [1/s] with the
+monodisperse [`rain_drop_radius`](@ref) and the bulk ventilation factor
+[`f_ventilation_density`](@ref) — the rain channel of the generalized supersaturation
+relaxation `1/τ = 1/τ_c + 1/τ_r` (see reference/Scythe_moist_compressible.tex). The
+units convention matches [`invtau_condensation`](@ref): `N_r` in #/cm³, radius in μm,
+`D_v` in cm²/s. Returns 0 when `rho_r < RHO_R_MIN` or `N_r ≤ 0`, so rain-free air
+never exchanges through this channel.
+"""
+function invtau_rain(Tk, p_hPa, N_r, rho_r)
+
+    (rho_r < RHO_R_MIN || N_r <= 0.0) && return 0.0
+    r_r = rain_drop_radius(N_r, rho_r)
+    return invtau_condensation(Tk, p_hPa, N_r, r_r) * f_ventilation_density(rho_r, Tk)
+end
+
 """
     droplet_growth_rate(Tk, p)
 

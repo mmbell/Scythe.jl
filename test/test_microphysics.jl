@@ -188,6 +188,69 @@ using Scythe
     end
 
     # ──────────────────────────────────────────────
+    # 5.5 Density-form warm-rain rates for the total-energy set
+    # ──────────────────────────────────────────────
+    @testset "Density-form warm-rain rates (Ooyama 2001 App. A)" begin
+        Tk = 290.0
+        p_hPa = 950.0
+        rho_d = 1.1
+
+        # Autoconversion: Q_auto = 0.001*(rho_c - 0.001*rho_d), clamped >= 0.
+        # Consistent with the mixing-ratio form: rho_d * autoconversion(q_c) at q_c = rho_c/rho_d.
+        @test Scythe.autoconversion_density(2.0e-3, 1.0) ≈ 1.0e-6
+        @test Scythe.autoconversion_density(0.5e-3, 1.0) == 0.0
+        @test Scythe.autoconversion_density(3.0e-3, rho_d) ≈
+              rho_d * Scythe.autoconversion(3.0e-3 / rho_d, rho_d)
+
+        # Collection: Q_coll = 2.20*rho_c*(rho_r/rho_d)^0.875*f_ice = rho_d * q-form
+        @test Scythe.collection_density(1.0e-3, 1.0e-3, rho_d, Tk) ≈
+              rho_d * Scythe.collection(1.0e-3 / rho_d, 1.0e-3 / rho_d, rho_d, Tk)
+        @test Scythe.collection_density(0.0, 1.0e-3, rho_d, Tk) == 0.0
+
+        # Terminal velocity: same fall speed as the mixing-ratio form, <= 0
+        @test Scythe.rain_terminal_velocity(1.0e-3, rho_d, Tk) ≈
+              Scythe.sedimentation(1.0e-3 / rho_d, rho_d, Tk)
+        @test Scythe.rain_terminal_velocity(1.0e-3, rho_d, Tk) < 0.0
+        @test Scythe.rain_terminal_velocity(0.0, rho_d, Tk) == 0.0
+
+        # Ventilation factor: same as the q-form at rho_r = q_r*rho_d
+        @test Scythe.f_ventilation_density(1.0e-3, Tk) ≈
+              Scythe.f_ventilation(1.0e-3 / rho_d, rho_d, Tk)
+        @test Scythe.f_ventilation_density(0.0, Tk) ≈ 1.6
+
+        # Monodisperse rain drop radius [microns]: rho_r = N_r*1e6*(4/3)*pi*rho_l*(r*1e-6)^3.
+        # Round trip through the cloud geometry helper (same monodisperse assumption).
+        N_r = 1.0e-3   # #/cm^3 (~1000 per m^3)
+        r_r = Scythe.rain_drop_radius(N_r, 1.0e-3)
+        @test r_r ≈ Scythe.cloud_droplet_radius(N_r, 1.0e-3 / rho_d, rho_d)
+        @test 500.0 < r_r < 800.0            # ~620 microns at 1 g/m^3, N_r = 1e-3/cm^3
+        @test Scythe.rain_drop_radius(0.0, 1.0e-3) == 0.0
+
+        # Rain relaxation timescale: tau_r = (4*pi*Dv*N_r*<r_r*f(r)>)^-1, with the bulk
+        # ventilation factor. Same units convention as invtau_condensation.
+        invtau_r = Scythe.invtau_rain(Tk, p_hPa, N_r, 1.0e-3)
+        @test invtau_r ≈ Scythe.invtau_condensation(Tk, p_hPa, N_r, r_r) *
+                         Scythe.f_ventilation_density(1.0e-3, Tk)
+        @test 5.0e-4 < invtau_r < 5.0e-3     # ~1.7e-3 1/s at 1 g/m^3
+        # No rain (or no drops): no relaxation through the rain channel
+        @test Scythe.invtau_rain(Tk, p_hPa, N_r, 0.0) == 0.0
+        @test Scythe.invtau_rain(Tk, p_hPa, N_r, 0.5e-8) == 0.0   # below RHO_R_MIN
+        @test Scythe.invtau_rain(Tk, p_hPa, 0.0, 1.0e-3) == 0.0
+
+        # Spline undershoots: negative rho_r to a fractional power is NaN unless guarded.
+        for f in (rho_r -> Scythe.autoconversion_density(rho_r, rho_d),
+                  rho_r -> Scythe.collection_density(1.0e-3, rho_r, rho_d, Tk),
+                  rho_r -> Scythe.rain_terminal_velocity(rho_r, rho_d, Tk),
+                  rho_r -> Scythe.f_ventilation_density(rho_r, Tk),
+                  rho_r -> Scythe.rain_drop_radius(N_r, rho_r),
+                  rho_r -> Scythe.invtau_rain(Tk, p_hPa, N_r, rho_r))
+            @test isfinite(f(-1.0e-12))
+        end
+        @test Scythe.rain_terminal_velocity(-1.0e-12, rho_d, Tk) == 0.0
+        @test Scythe.invtau_rain(Tk, p_hPa, N_r, -1.0e-12) == 0.0
+    end
+
+    # ──────────────────────────────────────────────
     # 6. s_condensation (entropy source from condensation)
     # ──────────────────────────────────────────────
     @testset "s_condensation" begin

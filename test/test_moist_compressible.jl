@@ -141,6 +141,84 @@ using Springsteel
                                            Q_s, ts) == 0.0
     end
 
+    @testset "qss_condensation_rates cloud/rain split" begin
+        Tk = 285.0; p_hPa = 900.0; ts = 0.1
+        N_r = 1.0e-3   # #/cm^3
+        rho_vs = rho_v_sat(Tk, p_hPa)
+        rho_d = (100.0 * p_hPa - Rv * Tk * rho_vs) / (Rd * Tk)
+        Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_vs / rho_d, 1.0e-3)
+
+        # With no rain (or no rain channel), the cloud rate is BIT-identical to the
+        # single-category closure across the branch space.
+        for (Q_ss, rho_v, rho_c) in (
+                (-0.5 * rho_vs, 0.5 * rho_vs, 0.0),
+                (-0.5 * rho_vs, 0.5 * rho_vs, 1.0e-6 * rho_d),
+                (-1.0e-4 * rho_vs, (1.0 - 1.0e-4) * rho_vs, 2.0e-3 * rho_d),
+                (1.0e-3 * rho_vs, (1.0 + 1.0e-3) * rho_vs, 2.0e-3 * rho_d),
+                (1.0e-3 * rho_vs, (1.0 + 1.0e-3) * rho_vs, 0.0),
+                (1.0e-5 * rho_vs, (1.0 + 1.0e-5) * rho_vs, 0.0),
+                (0.5 * rho_vs, 0.0, 0.0))
+            old = Scythe.qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts)
+            c0, r0 = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, 0.0, rho_d, Tk,
+                                                   p_hPa, Q_s, ts, N_r)
+            @test c0 === old
+            @test r0 === 0.0
+            cN, rN = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, 1.0e-3, rho_d, Tk,
+                                                   p_hPa, Q_s, ts, 0.0)
+            @test cN === old
+            @test rN === 0.0
+        end
+
+        # Seamless split: with cloud AND rain, the unlimited rates divide in proportion
+        # to the channel timescales, both directions.
+        rho_c = 2.0e-3 * rho_d
+        rho_r = 1.0e-3
+        q_c = rho_c / rho_d
+        invtau_c = Scythe.invtau_condensation(Tk, p_hPa, 100.0,
+                                              Scythe.cloud_droplet_radius(100.0, q_c, rho_d))
+        invtau_r = Scythe.invtau_rain(Tk, p_hPa, N_r, rho_r)
+        for Q_ss in (1.0e-3 * rho_vs, -1.0e-4 * rho_vs)
+            rho_v = rho_vs + Q_ss
+            Qc, Qr = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk,
+                                                   p_hPa, Q_s, ts, N_r)
+            @test sign(Qc) == sign(Q_ss)
+            @test sign(Qr) == sign(Q_ss)
+            @test Qc / Qr ≈ invtau_c / invtau_r
+            @test Qc + Qr ≈ Q_ss * (invtau_c + invtau_r) / (1.0 + Q_s)
+        end
+
+        # Rain evaporates in subsaturated cloud-free air (the O01 Qevap analogue). The
+        # relaxation timescale is ~10 min, so a model step never clamps; the physical
+        # rate is negative and bounded by the available rain.
+        Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, 1.0e-3,
+                                               rho_d, Tk, p_hPa, Q_s, ts, N_r)
+        @test Qc == 0.0
+        @test -1.0e-3 / ts < Qr < 0.0
+        @test Qr ≈ -0.5 * rho_vs * Scythe.invtau_rain(Tk, p_hPa, N_r, 1.0e-3) / (1.0 + Q_s)
+        # With a long enough step the rho_r/ts clamp engages: no negative rain
+        ts_long = 1.0e6
+        Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, 1.0e-3,
+                                               rho_d, Tk, p_hPa, Q_s, ts_long, N_r)
+        @test Qc == 0.0
+        @test Qr ≈ -1.0e-3 / ts_long
+
+        # No negative rain: evaporation never exceeds the available rho_r even when
+        # cloud has more to give.
+        Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, rho_c, 1.0e-9,
+                                               rho_d, Tk, p_hPa, Q_s, ts, N_r)
+        @test Qr == 0.0                # below RHO_R_MIN: channel inactive
+        Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, rho_c, 2.0e-8,
+                                               rho_d, Tk, p_hPa, Q_s, ts, N_r)
+        @test Qr >= -2.0e-8 / ts
+
+        # Vapor cap rescales both channels proportionally: tiny vapor, strong drive
+        rho_v_tiny = 1.0e-9
+        Qc, Qr = Scythe.qss_condensation_rates(0.5 * rho_vs, rho_v_tiny, rho_c, rho_r,
+                                               rho_d, Tk, p_hPa, Q_s, ts, N_r)
+        @test Qc + Qr ≈ rho_v_tiny / ts
+        @test Qc / Qr ≈ invtau_c / invtau_r
+    end
+
     # ──────────────────────────────────────────────
     # 5. Integration: equation set on a ModelTile
     # ──────────────────────────────────────────────
@@ -170,7 +248,8 @@ using Springsteel
 
     function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=false, ts=0.1,
                            dry=false, Khdiff=0.0, Kvdiff=0.0, Kvdiff_heat=nothing, tau_qss=10.0,
-                           u_side_bc=DirichletBC())
+                           u_side_bc=DirichletBC(), precipitation=false, N_r=1.0e-3,
+                           q_l=1.0e-3)
         varlist = Scythe.MC_VARS
         vars = Dict(v => i for (i, v) in enumerate(varlist))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
@@ -187,7 +266,7 @@ using Springsteel
         patch = createGrid(gp)
         gridpoints = Scythe.getGridpoints(patch)
         z = gridpoints[1:kDim, 2]
-        col = dry ? dry_adiabatic_column_mc(z) : saturated_cloudy_column_mc(z)
+        col = dry ? dry_adiabatic_column_mc(z) : saturated_cloudy_column_mc(z; q_l)
         ref_file = joinpath(tmpdir, "mc_pressure.ref")
         Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
         model = ModelParameters(
@@ -196,10 +275,10 @@ using Springsteel
             ref_state_file = ref_file, grid_params = gp,
             physical_params = Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff,
                                    :Kvdiff_heat => (Kvdiff_heat === nothing ? Kvdiff : Kvdiff_heat),
-                                   :Kv_mudiff => 0.0, :tau_qss => tau_qss,
+                                   :Kv_mudiff => 0.0, :tau_qss => tau_qss, :N_r => N_r,
                                    :alpha => 0.0, :z_damp => 20.0e3),
             options = Dict(:semiimplicit => semiimplicit, :exact_reference_state => true,
-                           :precipitation => false, :vertical_mixing => false),
+                           :precipitation => precipitation, :vertical_mixing => false),
         )
         patch.physical .= 0.0
         spectralTransform!(patch)
@@ -693,6 +772,154 @@ using Springsteel
             # ... and the drift decays toward the base at the relaxation rate
             @test maximum(abs.(drifted[:, 7] .- base[:, 7])) < 0.02
             @test maximum(abs.(drifted[:, 7] .- base[:, 7])) > 0.0
+        end
+    end
+
+    # ──────────────────────────────────────────────
+    # 7. Warm-rain microphysics (density form)
+    # ──────────────────────────────────────────────
+
+    """Retrieved temperature at every point of a stepped mtile (var_np1 + reference)."""
+    function retrieved_T_mc(mtile, kDim, zs)
+        ref = mtile.ref_state
+        pbar = Springsteel.ref_pressure(ref)[:, 1]
+        rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
+        rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
+        E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
+        Q_ssbar = Springsteel.ref_qss(ref)[:, 1]
+        Tbar = Springsteel.reference_temperature(ref)
+        n = size(mtile.var_np1, 1)
+        T = zeros(n)
+        for i in 1:n
+            k = mod1(i, kDim)
+            p = mtile.var_np1[i, 1] + pbar[k]
+            rho_d = mtile.var_np1[i, 2] + rho_dbar[k]
+            rho_t = mtile.var_np1[i, 3] + rho_tbar[k]
+            E_t = mtile.var_np1[i, 6] + E_tbar[k]
+            Q_ss = mtile.var_np1[i, 7] + Q_ssbar[k]
+            ke = 0.5 * (mtile.var_np1[i, 4]^2 + mtile.var_np1[i, 5]^2)
+            M = p + E_t - rho_t * (ke + Scythe.gravity * zs[i])
+            T[i] = Scythe.retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k],
+                                               mtile.var_np1[i, 8])
+        end
+        return T
+    end
+
+    """Seed a T-invariant rain bump: rho_r, rho_t and E_t move together so the
+    retrieval is unchanged (delta_E_t = (C_pv*T - L_v + g*z)*delta_rho at fixed p, Q_ss)."""
+    function seed_rain_bump!(patch, gridpoints, col, kDim; rho_r0=1.0e-3, zc=1200.0, zr=300.0)
+        for i in 1:size(patch.physical, 1)
+            k = mod1(i, kDim)
+            z = gridpoints[i, 2]
+            seed = rho_r0 * exp(-((z - zc) / zr)^2)
+            Tref = col.Tk[k]
+            patch.physical[i, 8, 1] += seed
+            patch.physical[i, 3, 1] += seed
+            patch.physical[i, 6, 1] += seed * ((Cpv * Tref) - L_v(Tref) +
+                                               (Scythe.gravity * z))
+        end
+        spectralTransform!(patch)
+        gridTransform!(patch)
+    end
+
+    @testset "autoconversion is thermodynamically inert" begin
+        # Cloud above the 1 g/kg threshold, no rain yet: autoconversion is the only
+        # active process (collection needs rain, sedimentation and the rain relaxation
+        # channel need rho_r >= RHO_R_MIN). Liquid -> liquid conversion must leave every
+        # thermodynamic slot BIT-identical to a precipitation-off run; only rho_r grows
+        # (cloud is the diagnostic residual, so it shrinks automatically).
+        mktempdir() do tmpdir
+            args = (; q_l=3.0e-3, kDim=16, num_cells=8)
+            function run_once(precip)
+                mtile, patch, model, _ = make_mc_mtile(tmpdir; args..., precipitation=precip)
+                ncols = div(size(patch.physical, 1), model.grid_params.kDim)
+                for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+                return mtile
+            end
+            m_off = run_once(false)
+            m_on = run_once(true)
+            for slot in (1, 2, 3, 4, 5, 6, 7)
+                @test m_on.var_np1[:, slot] == m_off.var_np1[:, slot]
+            end
+            @test all(m_on.var_np1[:, 8] .> 0.0)
+            @test maximum(m_on.var_np1[:, 8]) < 3.0e-3   # bounded by the available cloud
+            @test all(m_off.var_np1[:, 8] .== 0.0)
+        end
+    end
+
+    @testset "sedimentation moves rain and total mass together" begin
+        # Cloud-free saturated column with a T-invariant rain bump aloft: the rain
+        # channel is quiet (Q_ss = 0) and there is no cloud to convert, so the on/off
+        # difference isolates the sedimentation flux. rho_r and rho_t must receive the
+        # SAME fitted divergence, the bump must fall, and the energy coupling must keep
+        # the retrieved temperature unchanged to leading order.
+        mktempdir() do tmpdir
+            args = (; q_l=0.0, kDim=32, num_cells=8, ts=0.05)
+            function run_once(precip)
+                mtile, patch, model, col = make_mc_mtile(tmpdir; args..., precipitation=precip)
+                gp = Scythe.getGridpoints(patch)
+                seed_rain_bump!(patch, gp, col, model.grid_params.kDim)
+                rho_r0 = copy(patch.physical[:, 8, 1])
+                ncols = div(size(patch.physical, 1), model.grid_params.kDim)
+                for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+                return mtile, gp, rho_r0
+            end
+            m_off, gp, rho_r0 = run_once(false)
+            m_on, _, _ = run_once(true)
+            @test all(isfinite.(m_on.var_np1))
+
+            d3 = m_on.var_np1[:, 3] .- m_off.var_np1[:, 3]
+            d8 = m_on.var_np1[:, 8] .- m_off.var_np1[:, 8]
+            # Sedimentation actually moved mass...
+            @test maximum(abs.(d8)) > 1.0e-8
+            # ...and rho_t tracks rho_r exactly (identical -dF/dz in both slots)
+            @test all(isapprox.(d3, d8; atol=1.0e-14))
+            # The bump falls: rain-weighted mean height decreases
+            kDim = 32
+            zs = gp[:, 2]
+            com(r) = sum(max.(r, 0.0) .* zs) / sum(max.(r, 0.0))
+            @test com(m_on.var_np1[:, 8]) < com(rho_r0)
+            # Full energy coupling: the local exchange leaves the retrieval unchanged;
+            # only the genuine transport term (~1e-5 K per step) remains. A missing or
+            # wrong e_l/gz coupling shows up at the 0.1 K level.
+            dT = retrieved_T_mc(m_on, kDim, zs) .- retrieved_T_mc(m_off, kDim, zs)
+            @test maximum(abs.(dT)) < 1.0e-3
+        end
+    end
+
+    @testset "rain evaporation in subsaturated air" begin
+        # Rain falling through dry air: the rain channel of the supersaturation
+        # relaxation evaporates it (no separate Qevap parameterization). Vapor is
+        # added (Q_ss rises toward saturation), rain is lost from rho_r but NOT from
+        # rho_t (the vapor stays in the column), and the retrieval cools.
+        mktempdir() do tmpdir
+            args = (; dry=true, kDim=32, num_cells=8, ts=0.05)
+            function run_once(precip)
+                mtile, patch, model, col = make_mc_mtile(tmpdir; args..., precipitation=precip)
+                gp = Scythe.getGridpoints(patch)
+                seed_rain_bump!(patch, gp, col, model.grid_params.kDim)
+                ncols = div(size(patch.physical, 1), model.grid_params.kDim)
+                for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
+                return mtile, gp
+            end
+            m_off, gp = run_once(false)
+            m_on, _ = run_once(true)
+            @test all(isfinite.(m_on.var_np1))
+
+            d3 = m_on.var_np1[:, 3] .- m_off.var_np1[:, 3]
+            d7 = m_on.var_np1[:, 7] .- m_off.var_np1[:, 7]
+            d8 = m_on.var_np1[:, 8] .- m_off.var_np1[:, 8]
+            # Evaporation added vapor somewhere in the rain shaft
+            @test maximum(d7) > 0.0
+            # Rain lost beyond what sedimentation moved: d8 - d3 = ts * Qdot_r < 0
+            @test minimum(d8 .- d3) < 0.0
+            @test all(d8 .- d3 .<= 1.0e-14)
+            # Evaporative cooling with E_t held: the retrieval must cool, never warm
+            kDim = 32
+            zs = gp[:, 2]
+            dT = retrieved_T_mc(m_on, kDim, zs) .- retrieved_T_mc(m_off, kDim, zs)
+            @test minimum(dT) < 0.0
+            @test maximum(dT) < 1.0e-3
         end
     end
 end
