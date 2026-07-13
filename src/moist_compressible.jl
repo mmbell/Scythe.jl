@@ -21,6 +21,58 @@
 
 using Springsteel.Thermodynamics: rho_v_sat, internal_energy_bf02
 
+# ── Per-thread scratch for the equation-set RHS ────────────────────────────────
+
+"""
+The live broadcast temporaries of [`moist_compressible_XZ`](@ref). Each is a `kDim` column,
+recomputed every column of every timestep — as fresh allocations they were ~150 of the
+function's 163 per-call allocations.
+
+Keyed by NAME, not by index. An index-numbered scratch pool (`view(pool, :, 7, tid)`) makes it
+easy to hand the same buffer to two temporaries that are live at once, and the resulting
+corruption is silent and hard to see. A `NamedTuple` cannot hold a duplicate field, so that
+class of bug cannot be written here at all.
+"""
+const MC_SCRATCH_SLOTS = (
+    # ── moist_compressible_XZ ──
+    :p, :rho_d, :rho_t, :E_t, :Q_ss,                                  # totals
+    :p_z, :rho_d_z, :rho_t_z, :E_t_z, :Q_ss_z,                        # total vertical gradients
+    :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :rho_c, :q_v, :q_l,  # diagnostic state
+    :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
+    :Q_s, :Qdot, :div,                                                # condensation, divergence
+    :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
+    :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
+    :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
+    :s_dbar, :s_d,                                                    # dry entropy
+    # ── semiimplicit_adjustment_p (si_ prefix) ──
+    # Deliberately NOT sharing the names above. The two functions' temporaries are not live at
+    # the same time today, so sharing would work — but it would be an invisible coupling, and
+    # the first person to read an mc_XZ value after the adjustment call would get silent
+    # corruption. Distinct names cost ~200 KB and make that unwriteable.
+    :si_p_nstar, :si_w_nstar, :si_rhod_nstar, :si_rhot_nstar, :si_et_nstar,
+    :si_p_nstar_z, :si_rhs, :si_c_d, :si_c_d_z, :si_c_e, :si_c_e_z,
+    # ── diffusion_timestep_mc (df_ prefix) ──
+    :df_u_star, :df_w_star, :df_p_star, :df_rho_d_star, :df_rho_t_star,
+    :df_T_star, :df_p_hPa_star, :df_drvs_dT, :df_drvs_dp, :df_s_dp_star,
+    :df_u_nstar, :df_w_nstar, :df_s_nstar, :df_u_np1, :df_w_np1,
+    :df_dke, :df_dE_visc, :df_ds_d, :df_dT_h, :df_dE_h, :df_dp_h, :df_dQ_h)
+
+"""
+    _allocate_mc_scratch(tile, model)
+
+One `NamedTuple` of `kDim` work vectors per thread for the total-energy set; an empty vector
+for every other equation set. Indexed by `threadid()`, which is a valid owner tag because the
+column loop is `Threads.@threads :static` (same rule as `scratch_columns`).
+"""
+function _allocate_mc_scratch(tile::AbstractGrid, model::ModelParameters)
+
+    uses_pressure_reference(model.equation_set) || return Vector{Nothing}(undef, 0)
+    kDim = model.grid_params.kDim
+    return [NamedTuple{MC_SCRATCH_SLOTS}(
+                ntuple(_ -> zeros(Float64, kDim), length(MC_SCRATCH_SLOTS)))
+            for _ in 1:Threads.maxthreadid()]
+end
+
 # ── Thermodynamic helpers ──────────────────────────────────────────────────────
 
 """
@@ -353,55 +405,60 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Tbar = view(refstate.Tbar,:,1)
     Pxi_bar = sound_speed_sq(refstate)
 
+    # Per-thread work vectors for every temporary below (see `MC_SCRATCH_SLOTS`). Each `@.`
+    # writes into a preallocated column instead of allocating a fresh one per column per step.
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+
     # Total fields (perturbation + reference)
-    p = pp .+ pbar
-    rho_d = rho_dp .+ rho_dbar
-    rho_t = rho_tp .+ rho_tbar
-    E_t = E_tp .+ E_tbar
-    Q_ss = Q_ssp .+ Q_ssbar
+    p = S.p;         @. p = pp + pbar
+    rho_d = S.rho_d; @. rho_d = rho_dp + rho_dbar
+    rho_t = S.rho_t; @. rho_t = rho_tp + rho_tbar
+    E_t = S.E_t;     @. E_t = E_tp + E_tbar
+    Q_ss = S.Q_ss;   @. Q_ss = Q_ssp + Q_ssbar
     rho_r = rho_rp
 
     # Total vertical gradients (perturbation + reference)
-    p_z = pp_z .+ pbar_z
-    rho_d_z = rho_dp_z .+ rho_dbar_z
-    rho_t_z = rho_tp_z .+ rho_tbar_z
-    E_t_z = E_tp_z .+ E_tbar_z
-    Q_ss_z = Q_ssp_z .+ Q_ssbar_z
+    p_z = S.p_z;         @. p_z = pp_z + pbar_z
+    rho_d_z = S.rho_d_z; @. rho_d_z = rho_dp_z + rho_dbar_z
+    rho_t_z = S.rho_t_z; @. rho_t_z = rho_tp_z + rho_tbar_z
+    E_t_z = S.E_t_z;     @. E_t_z = E_tp_z + E_tbar_z
+    Q_ss_z = S.Q_ss_z;   @. Q_ss_z = Q_ssp_z + Q_ssbar_z
 
     # Diagnostic thermodynamic state: T from the total-energy retrieval, then the
     # water partition follows from the prognostic supersaturation.
-    ke = @. 0.5 * ((u * u) + (w * w))
-    geo = @. ke + (gravity * z)
-    M = @. p + E_t - (rho_t * geo)
-    Tk = retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, Tbar, rho_r)
-    p_hPa = p ./ 100.0
-    rho_vs = rho_v_sat.(Tk, p_hPa)
+    ke = S.ke;   @. ke = 0.5 * ((u * u) + (w * w))
+    geo = S.geo; @. geo = ke + (gravity * z)
+    M = S.M;     @. M = p + E_t - (rho_t * geo)
+    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar, rho_r)
+    p_hPa = S.p_hPa;   @. p_hPa = p / 100.0
+    rho_vs = S.rho_vs; @. rho_vs = rho_v_sat(Tk, p_hPa)
     # Clamped diagnostic partition (see retrieve_temperature): vapor within
     # [0, total water - rain], cloud the residual
-    rho_v = clamp.(Q_ss .+ rho_vs, 0.0, max.(rho_t .- rho_d .- rho_r, 0.0))
-    rho_c = rho_t .- rho_d .- rho_v .- rho_r
-    q_v = rho_v ./ rho_d
-    q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
-    C_vt = @. Cvd + (q_v * Cvv) + (q_l * Cl)
-    R_m = @. Rd + (q_v * Rv)
-    C_pt = C_vt .+ R_m
-    gamma_m = C_pt ./ C_vt
-    Lv = L_v.(Tk)
-    drvs_dT = drho_vsat_dT.(Tk, p_hPa)
-    drvs_dp = drho_vsat_dp.(Tk, p_hPa)
+    rho_v = S.rho_v; @. rho_v = clamp(Q_ss + rho_vs, 0.0, max(rho_t - rho_d - rho_r, 0.0))
+    rho_c = S.rho_c; @. rho_c = rho_t - rho_d - rho_v - rho_r
+    q_v = S.q_v;     @. q_v = rho_v / rho_d
+    q_l = S.q_l;     @. q_l = (max(rho_c, 0.0) + rho_r) / rho_d
+    C_vt = S.C_vt;   @. C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
+    R_m = S.R_m;     @. R_m = Rd + (q_v * Rv)
+    C_pt = S.C_pt;   @. C_pt = C_vt + R_m
+    gamma_m = S.gamma_m; @. gamma_m = C_pt / C_vt
+    Lv = S.Lv;           @. Lv = L_v(Tk)
+    drvs_dT = S.drvs_dT; @. drvs_dT = drho_vsat_dT(Tk, p_hPa)
+    drvs_dp = S.drvs_dp; @. drvs_dp = drho_vsat_dp(Tk, p_hPa)
 
     # Condensation: limited supersaturation relaxation with the energy-consistent
     # psychrometric factor. rho_v and rho_c are diagnostic, so no separate
     # condensation-adjustment step is needed after the timestep.
-    Q_s = Q_s_energy.(Tk, p, rho_d, q_v, q_l)
-    Qdot = qss_condensation_rate.(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, model.ts)
+    Q_s = S.Q_s;   @. Q_s = Q_s_energy(Tk, p, rho_d, q_v, q_l)
+    Qdot = S.Qdot; @. Qdot = qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s,
+                                                   model.ts)
     for i in 1:length(Qdot)
         if isnan(Qdot[i])
             error("Qdot is NaN at index $i, time $(t)!")
         end
     end
 
-    div = u_x .+ w_z
+    div = S.div; @. div = u_x + w_z
 
     # ── Horizontal diffusion ───────────────────────────────────────────────────
     # Turbulence diffuses momentum (u, w) and the moist entropy s_t (heat). Horizontally,
@@ -412,13 +469,15 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # correction (through the retrieval's T sensitivities) is deferred to the rainfall
     # session (reference/moist_compressible_diffusion_handoff.md). pbar/rho_dbar have no
     # x-dependence, so the total x-derivatives are the perturbation slots.
-    sd_xx = @. (Cvd * ((pp_xx / p) - (pp_x * pp_x / (p * p)))) -
+    sd_xx = S.sd_xx
+    @. sd_xx = (Cvd * ((pp_xx / p) - (pp_x * pp_x / (p * p)))) -
                (Cpd * ((rho_dp_xx / rho_d) - (rho_dp_x * rho_dp_x / (rho_d * rho_d))))
 
     # Horizontal diabatic heating [W/m^3] from the entropy diffusion: the source to internal
     # energy is rho_d*T*(ds_t/dt)_diff = rho_d*T*(Khdiff/Prandtl)*d2(s_t)/dx2. This is the
     # moist analogue of Straka's rho*T*ds_d source.
-    QDOT_TH = @. rho_d * Tk * (Khdiff / Prandtl) * sd_xx
+    QDOT_TH = S.QDOT_TH
+    @. QDOT_TH = rho_d * Tk * (Khdiff / Prandtl) * sd_xx
 
     # Horizontal frictional KE change [W/m^3]. Momentum diffusion is a resolved-KE SINK to
     # the subgrid (the future TKE shear production), NOT dissipative heating: with an eddy K
@@ -426,12 +485,13 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # to the far-smaller kinematic viscosity) is negligible. So E_t follows the KE down and
     # internal energy (T, p) is held. FRIC_KE is d(rho_t*ke)/dt from horizontal momentum
     # diffusion, added to E_t; p and Q_ss get NO friction term.
-    FRIC_KE = @. rho_t * Khdiff * ((u * u_xx) + (w * w_xx))
+    FRIC_KE = S.FRIC_KE
+    @. FRIC_KE = rho_t * Khdiff * ((u * u_xx) + (w * w_xx))
 
     # Placeholders for intermediate calculations
-    ADV = similar(Tk)
-    FORCING = similar(Tk)
-    KDIFF = similar(Tk)
+    ADV = S.ADV
+    FORCING = S.FORCING
+    KDIFF = S.KDIFF
 
     # Pressure (slot 1): -v·∇p - γp∇·v + (R_m/C_vt)[(L_v - R_v C_pt T/R_m) Q̇_cond + Q̇_therm].
     # Only the THERMAL diffusion sources pressure (friction holds T, hence p).
@@ -491,10 +551,11 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # The condensation contribution is -Q̇_cond(1+Q_s) (= -Q_ss/τ when the rate is unlimited).
     # QSSREL relaxes Q_ss onto the water-mass-admissible interval; it is exactly zero
     # wherever cloud exists.
-    dT_nc = @. ((-p * div) + QDOT_TH) / (rho_d * C_vt)
-    dp_nc = @. (-gamma_m * p * div) + ((R_m / C_vt) * QDOT_TH)
-    SATF = @. (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
-    QSSREL = qss_relaxation.(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau_qss)
+    dT_nc = S.dT_nc; @. dT_nc = ((-p * div) + QDOT_TH) / (rho_d * C_vt)
+    dp_nc = S.dp_nc; @. dp_nc = (-gamma_m * p * div) + ((R_m / C_vt) * QDOT_TH)
+    SATF = S.SATF;   @. SATF = (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
+    QSSREL = S.QSSREL
+    @. QSSREL = qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau_qss)
     @turbo ADV .= @. (-u * Q_ssp_x) + (-w * Q_ss_z)
     FORCING .= @. (-Q_ss * div) + SATF - (Qdot * (1.0 + Q_s)) + QSSREL
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
@@ -517,9 +578,11 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # The full moist entropy s_t (with the vapor/liquid contribution) is DEFERRED to the
     # rainfall session together with the water-species mixing and the moist horizontal terms
     # (see reference/moist_compressible_diffusion_handoff.md).
-    s_dbar = dry_entropy_pd.(pbar, rho_dbar)
+    s_dbar = S.s_dbar
+    @. s_dbar = dry_entropy_pd(pbar, rho_dbar)
     if Kvdiff > 0.0
-        s_d = dry_entropy_pd.(p, rho_d)
+        s_d = S.s_d
+        @. s_d = dry_entropy_pd(p, rho_d)
         diffdot = mtile.diffdot_n
         @turbo diffdot[colstart:colend,4] .= @. Kvdiff * u_zz
         @turbo diffdot[colstart:colend,5] .= @. Kvdiff * w_zz
@@ -600,12 +663,15 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     et_index = vars["E_t"]
     ts = mtile.model.ts
 
-    # Predictors (copies) and implicit tendency histories (views)
-    p_nstar = mtile.var_np1[colstart:colend,p_index]
-    w_nstar = mtile.var_np1[colstart:colend,w_index]
-    rhod_nstar = mtile.var_np1[colstart:colend,rhod_index]
-    rhot_nstar = mtile.var_np1[colstart:colend,rhot_index]
-    et_nstar = mtile.var_np1[colstart:colend,et_index]
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+
+    # Predictors (copies — they are mutated below, so these must NOT be views onto var_np1)
+    # and implicit tendency histories (views).
+    p_nstar = S.si_p_nstar;       copyto!(p_nstar, view(mtile.var_np1,colstart:colend,p_index))
+    w_nstar = S.si_w_nstar;       copyto!(w_nstar, view(mtile.var_np1,colstart:colend,w_index))
+    rhod_nstar = S.si_rhod_nstar; copyto!(rhod_nstar, view(mtile.var_np1,colstart:colend,rhod_index))
+    rhot_nstar = S.si_rhot_nstar; copyto!(rhot_nstar, view(mtile.var_np1,colstart:colend,rhot_index))
+    et_nstar = S.si_et_nstar;     copyto!(et_nstar, view(mtile.var_np1,colstart:colend,et_index))
 
     # Reference profiles and mean sound speed squared (views — read-only, loop-invariant)
     Pxi_bar = sound_speed_sq(mtile.ref_state)
@@ -651,20 +717,22 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     Btransform!(p_col)
     Atransform!(p_col)
     p_nstar = Itransform!(p_col)
-    p_nstar_z = ts_term .* Ixtransform(p_col)
+    p_nstar_z = S.si_p_nstar_z
+    p_nstar_z .= ts_term .* Ixtransform(p_col)
 
     # Mass-flux Helmholtz RHS (φ = ρ̄_t w): rhs = Δτ ∂z p'* - ρ̄_t w*.
     # Elimination gives (I - Δτ² Pxi_bar ∂zz) φ, the same operator as the rho_d
     # form, so h_matrix is reused.
-    rhs = p_nstar_z .- (rho_tbar .* w_nstar)
+    rhs = S.si_rhs
+    @. rhs = p_nstar_z - (rho_tbar * w_nstar)
     phi_col = scratch_column(mtile, w_index)
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(phi_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(phi_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile)
     end
 
     phi = Itransform!(phi_col)
@@ -683,14 +751,16 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # densities cannot drift apart.
     view(mtile.var_np1,colstart:colend,rhot_index) .= rhot_nstar .- (ts_term .* phi_z)
 
-    c_d = rho_dbar ./ rho_tbar
-    c_d_z = ((rho_dbar_z .* rho_tbar) .- (rho_dbar .* rho_tbar_z)) ./ (rho_tbar .^ 2)
+    c_d = S.si_c_d;     @. c_d = rho_dbar / rho_tbar
+    c_d_z = S.si_c_d_z
+    @. c_d_z = ((rho_dbar_z * rho_tbar) - (rho_dbar * rho_tbar_z)) / (rho_tbar^2)
     view(mtile.var_np1,colstart:colend,rhod_index) .=
         rhod_nstar .- (ts_term .* ((c_d .* phi_z) .+ (c_d_z .* phi)))
 
-    c_e = (E_tbar .+ pbar) ./ rho_tbar
-    c_e_z = (((E_tbar_z .+ pbar_z) .* rho_tbar) .-
-             ((E_tbar .+ pbar) .* rho_tbar_z)) ./ (rho_tbar .^ 2)
+    c_e = S.si_c_e;     @. c_e = (E_tbar + pbar) / rho_tbar
+    c_e_z = S.si_c_e_z
+    @. c_e_z = (((E_tbar_z + pbar_z) * rho_tbar) -
+                ((E_tbar + pbar) * rho_tbar_z)) / (rho_tbar^2)
     view(mtile.var_np1,colstart:colend,et_index) .=
         et_nstar .- (ts_term .* ((c_e .* phi_z) .+ (c_e_z .* phi)))
 end
@@ -742,17 +812,29 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
     rho_tbar = view(ref_rho_t(mtile.ref_state),:,1)
 
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+
     # Post-acoustic totals; dry EOS temperature (no retrieval — s_d is dry-exact)
-    u_star = mtile.var_np1[colstart:colend,u_index]
-    w_star = mtile.var_np1[colstart:colend,w_index]
-    p_star = mtile.var_np1[colstart:colend,p_index] .+ pbar
-    rho_d_star = mtile.var_np1[colstart:colend,rhod_index] .+ rho_dbar
-    rho_t_star = mtile.var_np1[colstart:colend,rhot_index] .+ rho_tbar
-    T_star = @. p_star / (Rd * rho_d_star)
-    p_hPa_star = p_star ./ 100.0
-    drvs_dT = drho_vsat_dT.(T_star, p_hPa_star)
-    drvs_dp = drho_vsat_dp.(T_star, p_hPa_star)
-    s_dp_star = dry_entropy_pd.(p_star, rho_d_star) .- dry_entropy_pd.(pbar, rho_dbar)
+    vnp1 = mtile.var_np1
+    # Bind the views OUTSIDE the `@.` blocks below — `@.` dots every call in the expression,
+    # `view` included, which broadcasts the view itself instead of its contents.
+    u_v = view(vnp1,colstart:colend,u_index)
+    w_v = view(vnp1,colstart:colend,w_index)
+    p_v = view(vnp1,colstart:colend,p_index)
+    rhod_v = view(vnp1,colstart:colend,rhod_index)
+    rhot_v = view(vnp1,colstart:colend,rhot_index)
+
+    u_star = S.df_u_star; copyto!(u_star, u_v)
+    w_star = S.df_w_star; copyto!(w_star, w_v)
+    p_star = S.df_p_star;         @. p_star = p_v + pbar
+    rho_d_star = S.df_rho_d_star; @. rho_d_star = rhod_v + rho_dbar
+    rho_t_star = S.df_rho_t_star; @. rho_t_star = rhot_v + rho_tbar
+    T_star = S.df_T_star;         @. T_star = p_star / (Rd * rho_d_star)
+    p_hPa_star = S.df_p_hPa_star; @. p_hPa_star = p_star / 100.0
+    drvs_dT = S.df_drvs_dT;       @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
+    drvs_dp = S.df_drvs_dp;       @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
+    s_dp_star = S.df_s_dp_star
+    @. s_dp_star = dry_entropy_pd(p_star, rho_d_star) - dry_entropy_pd(pbar, rho_dbar)
 
     # Implicit tendency histories (slot 6 carries the s_d ENTROPY tendency, not an E_t one)
     udot_n = view(mtile.diffdot_n,colstart:colend,u_index)
@@ -762,17 +844,19 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     sdot_n = view(mtile.diffdot_n,colstart:colend,et_index)
     sdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,et_index)
 
-    local u_nstar, w_nstar, s_nstar
+    u_nstar = S.df_u_nstar
+    w_nstar = S.df_w_nstar
+    s_nstar = S.df_s_nstar
     if (t == 1)
         # Use trapezoidal method (AM2) for first step
-        u_nstar = @. u_star + (ts * 0.5 * udot_n)
-        w_nstar = @. w_star + (ts * 0.5 * wdot_n)
-        s_nstar = @. s_dp_star + (ts * 0.5 * sdot_n)
+        @. u_nstar = u_star + (ts * 0.5 * udot_n)
+        @. w_nstar = w_star + (ts * 0.5 * wdot_n)
+        @. s_nstar = s_dp_star + (ts * 0.5 * sdot_n)
     else
         # Use AI2* for second step and beyond
-        u_nstar = @. u_star - (ts * udot_n) + (ts * 0.75 * udot_nm1)
-        w_nstar = @. w_star - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
-        s_nstar = @. s_dp_star - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
+        @. u_nstar = u_star - (ts * udot_n) + (ts * 0.75 * udot_nm1)
+        @. w_nstar = w_star - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+        @. s_nstar = s_dp_star - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
     end
 
     # Set the n-1 terms
@@ -792,26 +876,31 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     # column's own BCs (only Btransform!/Atransform! do). Same reuse as
     # `diffusion_timestep_pd`, which shares one column across five variables.
     col = scratch_column(mtile, u_index)
-    _vertical_solve!(col, h_u, u_nstar, mtile.tile)
-    u_np1 = copy(Itransform!(col))
+    # u_np1 and w_np1 must be copied out: `col` is reused by the next solve, and Itransform!
+    # returns the column's own buffer. s_dp_np1 is the last use, so it can stay an alias.
+    u_np1 = S.df_u_np1
+    w_np1 = S.df_w_np1
+    _vertical_solve!(col, h_u, u_nstar, mtile)
+    copyto!(u_np1, Itransform!(col))
 
-    _vertical_solve!(col, h_w, w_nstar, mtile.tile)
-    w_np1 = copy(Itransform!(col))
+    _vertical_solve!(col, h_w, w_nstar, mtile)
+    copyto!(w_np1, Itransform!(col))
 
-    _vertical_solve!(col, h_h, s_nstar, mtile.tile)
+    _vertical_solve!(col, h_h, s_nstar, mtile)
     s_dp_np1 = Itransform!(col)
 
     # Friction: resolved-KE sink, E_t follows the KE down; T, p, Q_ss held.
-    dke = @. 0.5 * (((u_np1 * u_np1) + (w_np1 * w_np1)) -
+    dke = S.df_dke
+    @. dke = 0.5 * (((u_np1 * u_np1) + (w_np1 * w_np1)) -
                     ((u_star * u_star) + (w_star * w_star)))
-    dE_visc = @. rho_t_star * dke
+    dE_visc = S.df_dE_visc; @. dE_visc = rho_t_star * dke
 
     # Heat: entropy increment -> (T, p, E_t, Q_ss) at fixed rho_d (dry: C_vt=C_vd, R_m=R_d).
-    ds_d = s_dp_np1 .- s_dp_star
-    dT_h = @. (T_star / Cvd) * ds_d
-    dE_h = @. rho_d_star * T_star * ds_d
-    dp_h = @. rho_d_star * Rd * dT_h
-    dQ_h = @. -((drvs_dT * dT_h) + (drvs_dp * dp_h))
+    ds_d = S.df_ds_d; @. ds_d = s_dp_np1 - s_dp_star
+    dT_h = S.df_dT_h; @. dT_h = (T_star / Cvd) * ds_d
+    dE_h = S.df_dE_h; @. dE_h = rho_d_star * T_star * ds_d
+    dp_h = S.df_dp_h; @. dp_h = rho_d_star * Rd * dT_h
+    dQ_h = S.df_dQ_h; @. dQ_h = -((drvs_dT * dT_h) + (drvs_dp * dp_h))
 
     view(mtile.var_np1,colstart:colend,u_index) .= u_np1
     view(mtile.var_np1,colstart:colend,w_index) .= w_np1

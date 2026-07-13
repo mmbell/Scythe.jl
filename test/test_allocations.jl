@@ -177,14 +177,28 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
 
     @testset "per-column allocation ceilings" begin
         # Regression tripwire, not a target. Measured after the refactor: moist_compressible_XZ
-        # 203 allocs, diffusion_timestep_mc 80 allocs per column call (down from 1447 / 249).
-        # The ceilings sit ~50% above those so normal churn does not trip them, but a
-        # reintroduced abstract field or a per-column deepcopy — each of which multiplies the
-        # count several-fold — does.
+        # 7 allocations per column call (down from 1447) and diffusion_timestep_mc exactly 0
+        # (down from 249). The 7 that remain are the allocating 1-arg Ixtransform/Ixxtransform
+        # in Springsteel plus the dynamic equation-set dispatch.
+        #
+        # The ceilings leave headroom for churn but trip immediately on the mistakes that
+        # actually happened here: an abstract ModelTile field, a per-column deepcopy, a
+        # loop-invariant ref_*(...)[:,N] copy, or a broadcast that allocates a fresh column
+        # instead of writing into mc_scratch. Each of those costs tens to hundreds of allocs.
         moist_compressible_XZ(mtile, 1, kDim, 2)      # compile
         diffusion_timestep_mc(mtile, 1, kDim, 2)
 
-        @test (@allocations moist_compressible_XZ(mtile, 1, kDim, 2)) < 300
-        @test (@allocations diffusion_timestep_mc(mtile, 1, kDim, 2)) < 120
+        @test (@allocations moist_compressible_XZ(mtile, 1, kDim, 2)) < 25
+        @test (@allocations diffusion_timestep_mc(mtile, 1, kDim, 2)) < 10
+    end
+
+    @testset "mc scratch slots are unique and cover every temporary" begin
+        # A NamedTuple cannot hold duplicate names, so construction itself is the guard against
+        # two live temporaries silently sharing one buffer. Assert the shape anyway, and that
+        # the three functions' slots stay namespaced apart.
+        @test length(unique(Scythe.MC_SCRATCH_SLOTS)) == length(Scythe.MC_SCRATCH_SLOTS)
+        @test isconcretetype(eltype(mtile.mc_scratch))
+        @test length(mtile.mc_scratch) == Threads.maxthreadid()
+        @test all(length(v) == kDim for v in mtile.mc_scratch[1])
     end
 end

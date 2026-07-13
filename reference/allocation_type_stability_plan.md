@@ -10,24 +10,26 @@
 
 ### 0z. Final state — Phases 1 + 2 + 4
 
-| straka93 quick/mc/rirk | before | Phase 1 | **+ Phase 2+4** |
-|---|---|---|---|
-| allocations | 4.73 G | 1.94 G | **757 M** (6.2×) |
-| allocated | 836.6 GiB | 680.9 GiB | **224.9 GiB** |
-| wall clock | 484.5 s | 484.0 s | **392 s** (1.24×) |
-| GC time | 14.2 % | 20.2 % | **~6 %** |
-| crash | ~1 in 3 runs | 1 in 3 runs | **0 in 8 runs** |
+| straka93 quick/mc/rirk | before | Phase 1 | Phase 2+4 | **final** |
+|---|---|---|---|---|
+| allocations | 4.73 G | 1.94 G | 757 M | **215 M** (22×) |
+| allocated | 836.6 GiB | 680.9 GiB | 224.9 GiB | **38.3 GiB** (22×) |
+| wall clock | 484.5 s | 484.0 s | 392 s | **379 s** (1.28×) |
+| GC time | 14.2 % | 20.2 % | ~6 % | **1.0 %** |
+| lock conflicts | 1 506 732 | — | 1 535 657 | **840** (1794×) |
+| crash | ~1 in 3 runs | 1 in 3 runs | 0 in 8 runs | **0 in 5 runs** |
 
-| bf02_dry quick/mc/rz | before | **+ Phase 2+4** |
+| bf02_dry quick/mc/rz | before | **final** |
 |---|---|---|
-| allocations | 991.2 M | **248.8 M** (4.0×) |
-| allocated | 213.2 GiB | **42.3 GiB** (5.0×) |
-| wall clock | 269.8 s | **103.3 s** (2.6×) |
-| GC time | 12.0 % | **3.96 %** |
+| allocations | 991.2 M | **161.2 M** (6.1×) |
+| allocated | 213.2 GiB | **16.6 GiB** (12.8×) |
+| wall clock | 269.8 s | **99.8 s** (2.7×) |
+| GC time | 12.0 % | **1.5 %** |
 
-Per-column call (`moist_compressible_XZ`, RiRk): **1447 → 203 allocations** (7.1×).
+Per-column call (`moist_compressible_XZ`, RiRk): **1447 → 7 allocations** (206×);
+`diffusion_timestep_mc` **249 → 0**.
 Output is **bit-identical** throughout (all 8 bf02_dry CSVs diff byte-for-byte clean against a
-pre-refactor run). Tests: **4379 passing, 0 failures.**
+pre-refactor run, at every stage). Tests: **4389 passing, 0 failures.**
 
 **What Phase 2 changed.** The four `deepcopy(tile.kbasis.data[v])` sites in
 `moist_compressible.jl` now borrow a persistent **per-thread** work column from
@@ -120,25 +122,51 @@ the right direction (6.2× fewer allocations, GC time 14 % → 6 %).
    symmetry detection, so on RiRk `u` is a `BunchKaufman` while `w` is an `LU`). It is now a
    **`NamedTuple`** — concrete *and* heterogeneous, which a `Dict` cannot be.
 
-### 0d. What is left (not done)
+### 0d. The rest of Phase 2 (done) — `_vertical_solve!` and the temporaries
 
-Ranked by measured cost, on the remaining 203 allocations per column call:
+Both are now done, for the mc set only.
 
-1. **`_vertical_solve!` (`semiimplicit.jl:1644,1648`) — ~40 allocs/call, now the single biggest
-   item.** `b = d.M0' * (d.W .* rhs_mish)` and `col.a .= h_a \ b` each allocate. Fixable with
-   `mul!`/`ldiv!` into per-thread scratch vectors (same ownership trick as the scratch columns).
-2. **Broadcast temporaries** (~150/call) — the `p = pp .+ pbar` family. This is §4 Phase 2 item 2
-   (a preallocated full-tile `scratch` matrix). Invasive, and the *only* item here that risks
-   changing results, so it needs the bit-identity check.
-3. `SItransform` (`Springsteel/CubicBSpline.jl:1541`) — ~6/call, inside Springsteel.
-4. **The same Phase 2 treatment for `primitive_equations.jl`**, which still has 13 per-column
-   `deepcopy` sites. Only `moist_compressible.jl` was converted (it is the crashing set). PE is
-   untouched and still pays the 93-allocations-per-deepcopy cost.
-5. Phase 3 (static equation-set dispatch) remains low priority (~736 B/column).
+**`_vertical_solve!`** was the biggest single item after the deepcopy fix (~40 allocs/call). It
+allocated three temporaries per call (`d.W .* rhs_mish`, the `M0'*` product, `h_a \ b`) — and,
+worse, reached `_rirk_solve_data`, which **took a global lock and hit a `Dict` on every call**.
+That is ~22 M lock acquisitions across a straka93 run, from every thread at once. The solve
+data is per-grid and invariant, so it now lives on the tile (`mtile.solve_data`), the work
+vectors are per-thread, and the solve is `mul!`/`ldiv!` into them. Zero allocations.
 
-Springsteel also exports `mul!`-based out-arg variants of `Ixtransform`/`Ixxtransform`
-(`Chebyshev.jl:683-687`) that Scythe never calls; every hot-path call site uses the allocating
-1-arg form.
+**The broadcast temporaries** (the `p = pp .+ pbar` family) now write into `mtile.mc_scratch` —
+one `NamedTuple` of `kDim` work vectors per thread, covering all 76 live temporaries across
+`moist_compressible_XZ`, `semiimplicit_adjustment_p` and `diffusion_timestep_mc`. Keyed by NAME,
+not index: a `NamedTuple` cannot hold a duplicate field, so two live temporaries sharing one
+buffer — a silent, hard-to-see corruption — is not writeable. The three functions' slots are
+namespaced (`si_`, `df_`) so they cannot collide either.
+
+Watch out for one trap: **`@.` dots every call in the expression, `view` included.** Writing
+`@. p_star = view(vnp1, r, i) + pbar` broadcasts the *view constructor* and throws a
+`DimensionMismatch`. Bind views outside the `@.` block.
+
+**Final per-column call (RiRk, mc):**
+
+| | before | after |
+|---|---|---|
+| `moist_compressible_XZ` | 1447 allocs | **7** (206×) |
+| `diffusion_timestep_mc` | 249 allocs | **0** |
+
+### 0e. What is left (not done)
+
+1. **`primitive_equations.jl` is untouched** and still has **13 per-column `deepcopy` sites**,
+   plus the same ref-column copies and broadcast temporaries. Only `moist_compressible.jl` was
+   converted (it is the crashing set). The same treatment applies, and the machinery
+   (`scratch_column`, `_vertical_solve!`'s workspace) is already there — PE only needs its own
+   scratch slots.
+2. **The 7 remaining mc allocations** are Springsteel's allocating 1-arg
+   `Ixtransform`/`Ixxtransform` (called 3× per column) plus the dynamic dispatch. Springsteel has
+   a `mul!`-based out-arg variant for Chebyshev (`Chebyshev.jl:683-687`) but not, as far as I can
+   see, for the B-spline basis, and neither is reachable through the top-level generic
+   (`Springsteel.jl:228-232`) — so this needs a Springsteel change, not a Scythe one.
+3. **Phase 3 (static equation-set dispatch) is not worth doing** — measured. The dynamic
+   `getfield(Scythe, Symbol(equation_set))` costs exactly **1 allocation** (`physical_model` 8 vs
+   `moist_compressible_XZ` 7) and one dynamic call per column per timestep, ≈0.5 s out of 392 s.
+   It would have to cover 25 equation-set entry points to save that. **Skip it.**
 
 ---
 

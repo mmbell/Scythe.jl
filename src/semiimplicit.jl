@@ -22,7 +22,7 @@ Fundamental computational unit holding model state, tendencies, reference state,
 and spectral transform infrastructure for a single tile in the domain decomposition.
 """
 struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
-                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N, KC}
+                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N, KC, SD, MSC}
     model::ModelParameters
     # Concretely typed, so `mtile.tile.physical` and `mtile.tile.kbasis` infer. Declaring
     # this `AbstractGrid` made every view and broadcast in the per-column equation-set
@@ -89,6 +89,19 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     #
     # Empty (`Matrix{Nothing}`) for grids with no vertical basis — `NoBasisArray` has no `data`.
     scratch_columns::Matrix{KC}
+    # Galerkin solve data (M0, M1, W, Nb) for a cubic B-spline k-basis; `nothing` otherwise.
+    # `_vertical_solve!` used to fetch this from a global Dict behind a global lock on EVERY
+    # call — 4 solves x every column x every timestep, from every thread. It is per-grid and
+    # invariant, so it is hoisted here.
+    solve_data::SD
+    # Per-thread work vectors for `_vertical_solve!`, columns indexed by threadid() (same
+    # `@threads :static` ownership rule as `scratch_columns`).
+    solve_rhs::Matrix{Float64}    # (nmish, nthreads) — W .* rhs_mish, B-spline path only
+    solve_load::Matrix{Float64}   # (nload, nthreads) — the Helmholtz load vector / RHS
+    # One NamedTuple of kDim work vectors per thread, for `moist_compressible_XZ`'s 42 live
+    # broadcast temporaries (`p = pp .+ pbar` and friends). Empty for every other set.
+    # See `_allocate_mc_scratch` for why these are keyed by NAME rather than by index.
+    mc_scratch::MSC
 end
 
 """
@@ -111,6 +124,30 @@ function _allocate_scratch_columns(kbasis, tile::AbstractGrid)
     nthreads = Threads.maxthreadid()
     nvars = size(tile.physical, 2)
     return [deepcopy(kbasis.data[v]) for _ in 1:nthreads, v in 1:nvars]
+end
+
+"""
+    _allocate_solve_workspace(kbasis, tile) -> (solve_data, solve_rhs, solve_load)
+
+Hoist `_vertical_solve!`'s per-call work out of the hot path: the B-spline Galerkin solve data
+(fetched behind a global lock on every call before this) and the per-thread work vectors.
+"""
+_allocate_solve_workspace(::NoBasisArray, tile::AbstractGrid) =
+    (nothing, zeros(Float64, 0, 0), zeros(Float64, 0, 0))
+
+function _allocate_solve_workspace(kbasis, tile::AbstractGrid)
+    nthreads = Threads.maxthreadid()
+    kcol = kbasis.data[1]
+    if kcol isa CubicBSpline.Spline1D
+        d = _rirk_solve_data(kcol)
+        # W is sampled at the kDim mish points; the Galerkin load vector lives in spline space.
+        return (d, zeros(Float64, length(d.W), nthreads),
+                   zeros(Float64, size(d.M0, 2), nthreads))
+    else
+        # Chebyshev: the load vector IS the mish-point RHS with homogeneous boundary rows.
+        nz = length(kcol.mishPoints)
+        return (nothing, zeros(Float64, 0, nthreads), zeros(Float64, nz, nthreads))
+    end
 end
 
 """
@@ -185,6 +222,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
     scratch_columns = _allocate_scratch_columns(tile.kbasis, tile)
+    solve_data, solve_rhs, solve_load = _allocate_solve_workspace(tile.kbasis, tile)
+    # Defined in moist_compressible.jl, which is included after this file — resolved at call
+    # time, so the forward reference is fine.
+    mc_scratch = _allocate_mc_scratch(tile, model)
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
     # structural placeholder where a real one is not needed.
@@ -255,7 +296,11 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         diffdot_n,
         diffdot_nm1,
         mc_diffusion_matrices,
-        scratch_columns)
+        scratch_columns,
+        solve_data,
+        solve_rhs,
+        solve_load,
+        mc_scratch)
     return mtile
 end
 
@@ -781,7 +826,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
 
     # Solve for the xi coefficients (RHS = xi_nstar - w_nstar_z; homogeneous BCs)
     xi_col = mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]]
-    _vertical_solve!(xi_col, h_a, xi_nstar .- w_nstar_z, mtile.tile)
+    _vertical_solve!(xi_col, h_a, xi_nstar .- w_nstar_z, mtile)
     view(mtile.var_np1,colstart:colend,xi_index) .= Itransform!(xi_col)
 
     # Set w_n+1
@@ -856,10 +901,10 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(xi_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(xi_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(xi_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(xi_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Set xi_n+1
@@ -937,10 +982,10 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(w_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(w_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Set w_n+1
@@ -1023,10 +1068,10 @@ function semiimplicit_adjustment_rhod(mtile::ModelTile, colstart::Int64, colend:
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(phi_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(phi_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Recover w_n+1 = φ_n+1 / ρ̂_d
@@ -1099,10 +1144,10 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(w_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(w_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Set w_n+1
@@ -1211,23 +1256,23 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
     end
 
     # Set s_n+1 (homogeneous BCs)
-    _vertical_solve!(col, h_a, s_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, s_nstar, mtile)
     view(mtile.var_np1,colstart:colend,s_index) .= Itransform!(col)
 
     # Set mu_n+1
-    _vertical_solve!(col, h_a, mu_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_index) .= Itransform!(col)
 
     # Set mu_c_n+1
-    _vertical_solve!(col, h_a, mu_c_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_c_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_c_index) .= Itransform!(col)
 
     # Set mu_r_n+1
-    _vertical_solve!(col, h_a, mu_r_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_r_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_r_index) .= Itransform!(col)
 
     # Set mu_sat_n+1
-    _vertical_solve!(col, h_a, mu_sat_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_sat_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_sat_index) .= Itransform!(col)
 
 end
@@ -1324,23 +1369,23 @@ function diffusion_timestep_pd(mtile::ModelTile, colstart::Int64, colend::Int64,
     end
 
     # Set s_n+1 (homogeneous BCs)
-    _vertical_solve!(col, h_a, s_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, s_nstar, mtile)
     view(mtile.var_np1,colstart:colend,s_index) .= Itransform!(col)
 
     # Set rho_v_n+1
-    _vertical_solve!(col, h_a, rho_v_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, rho_v_nstar, mtile)
     view(mtile.var_np1,colstart:colend,rho_v_index) .= Itransform!(col)
 
     # Set rho_c_n+1
-    _vertical_solve!(col, h_a, rho_c_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, rho_c_nstar, mtile)
     view(mtile.var_np1,colstart:colend,rho_c_index) .= Itransform!(col)
 
     # Set rho_r_n+1
-    _vertical_solve!(col, h_a, rho_r_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, rho_r_nstar, mtile)
     view(mtile.var_np1,colstart:colend,rho_r_index) .= Itransform!(col)
 
     # Set mu_sat_n+1
-    _vertical_solve!(col, h_a, mu_sat_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_sat_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_sat_index) .= Itransform!(col)
 
 end
@@ -1629,7 +1674,7 @@ function _assemble_vertical_matrix(grid::AbstractGrid, model::ModelParameters,
 end
 
 """
-    _vertical_solve!(col, h_a, rhs_mish, grid)
+    _vertical_solve!(col, h_a, rhs_mish, mtile)
 
 Solve the factorized vertical system `h_a` for the spectral coefficients `col.a`,
 given the right-hand side `rhs_mish` sampled at the `kDim` physical mish points
@@ -1637,19 +1682,34 @@ given the right-hand side `rhs_mish` sampled at the `kDim` physical mish points
 are used directly; for a cubic B-spline k-basis the Galerkin load vector
 `M0ᵀW rhs_mish` is formed and the Dirichlet boundary rows (if any) are zeroed.
 """
-function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, grid::AbstractGrid)
-    kcol = grid.kbasis.data[1]
-    if kcol isa CubicBSpline.Spline1D
-        d = _rirk_solve_data(kcol)
-        b = d.M0' * (d.W .* rhs_mish)
+function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, mtile::ModelTile)
+    # Everything here is preallocated per-thread. This runs 4x per column per timestep, so the
+    # old version's cost was structural, not incidental: it allocated three temporaries
+    # (`d.W .* rhs_mish`, the `M0'*` product, and `h_a \ b`) and — worse — reached
+    # `_rirk_solve_data`, which took a GLOBAL LOCK and hit a Dict on every call. That is ~22 M
+    # lock acquisitions across a straka93 run, from every thread at once. The solve data is
+    # per-grid and invariant, so it now lives on the tile.
+    tid = Threads.threadid()
+    d = mtile.solve_data
+    b = @inbounds view(mtile.solve_load, :, tid)
+
+    if d !== nothing
+        # Cubic B-spline (RiRk) k-basis: Galerkin load vector M0ᵀ W rhs_mish.
+        w = @inbounds view(mtile.solve_rhs, :, tid)
+        w .= d.W .* rhs_mish
+        mul!(b, d.M0', w)
         db, dt = get(_RIRK_DIRICHLET, objectid(h_a), (false, false))
         if db; b[1]   = 0.0; end
         if dt; b[end] = 0.0; end
-        col.a .= h_a \ b
     else
+        # Chebyshev k-basis: interior mish values directly, homogeneous boundary rows.
         nz = length(rhs_mish)
-        col.a .= h_a \ vcat(0.0, 0.0, rhs_mish[2:nz-1])
+        b[1] = 0.0
+        b[2] = 0.0
+        @inbounds @views b[3:nz] .= rhs_mish[2:nz-1]
     end
+
+    ldiv!(col.a, h_a, b)
     return col
 end
 
