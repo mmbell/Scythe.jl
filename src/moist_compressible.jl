@@ -44,14 +44,14 @@ const MC_SCRATCH_SLOTS = (
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
-    :s_t,                                                             # moist entropy (vertical heat)
+    :s_t, :stage_zz,                                                             # moist entropy (vertical heat)
     # ── semiimplicit_adjustment_p (si_ prefix) ──
     # Deliberately NOT sharing the names above. The two functions' temporaries are not live at
     # the same time today, so sharing would work — but it would be an invisible coupling, and
     # the first person to read an mc_XZ value after the adjustment call would get silent
     # corruption. Distinct names cost ~200 KB and make that unwriteable.
     :si_p_nstar, :si_w_nstar, :si_rhod_nstar, :si_rhot_nstar, :si_et_nstar,
-    :si_p_nstar_z, :si_rhs, :si_c_d, :si_c_d_z, :si_c_e, :si_c_e_z,
+    :si_p_nstar_z, :si_phi_z, :si_rhs, :si_c_d, :si_c_d_z, :si_c_e, :si_c_e_z,
     # ── diffusion_timestep_mc (df_ prefix) ──
     :df_u_star, :df_w_star, :df_p_star, :df_rho_d_star, :df_rho_t_star,
     :df_E_t_star, :df_Q_ss_star, :df_ke_star, :df_M_star,
@@ -607,11 +607,11 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
         r_col.uMish .= Fr
         Btransform!(r_col)
         Atransform!(r_col)
-        Fr_z .= Ixtransform(r_col)
+        Ixtransform(r_col, Fr_z)
         r_col.uMish .= E_sed
         Btransform!(r_col)
         Atransform!(r_col)
-        E_sed_z .= Ixtransform(r_col)
+        Ixtransform(r_col, E_sed_z)
     else
         fill!(AUTO_COLL, 0.0)
         fill!(Fr_z, 0.0)
@@ -760,7 +760,9 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
             s_col.uMish .= s_t .- mtile.mc_ref_diag.s_tbar
             Btransform!(s_col)
             Atransform!(s_col)
-            diffdot[colstart:colend,6] .= Kvdiff_heat .* Ixxtransform(s_col)
+            stage_zz = S.stage_zz
+            Ixxtransform(s_col, stage_zz)
+            @turbo diffdot[colstart:colend,6] .= Kvdiff_heat .* stage_zz
         end
         if Kvdiff_water > 0.0
             # Total water and rain are combinations of prognostic slots, so their ∂zz
@@ -773,7 +775,9 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
             v_col.uMish .= rho_v .- mtile.mc_ref_diag.rho_vbar
             Btransform!(v_col)
             Atransform!(v_col)
-            diffdot[colstart:colend,7] .= Kvdiff_water .* Ixxtransform(v_col)
+            stage_zz = S.stage_zz
+            Ixxtransform(v_col, stage_zz)
+            @turbo diffdot[colstart:colend,7] .= Kvdiff_water .* stage_zz
         end
     end
 
@@ -901,7 +905,8 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     Atransform!(p_col)
     p_nstar = Itransform!(p_col)
     p_nstar_z = S.si_p_nstar_z
-    p_nstar_z .= ts_term .* Ixtransform(p_col)
+    Ixtransform(p_col, p_nstar_z)
+    p_nstar_z .*= ts_term
 
     # Mass-flux Helmholtz RHS (φ = ρ̄_t w): rhs = Δτ ∂z p'* - ρ̄_t w*.
     # Elimination gives (I - Δτ² Pxi_bar ∂zz) φ, the same operator as the rho_d
@@ -919,7 +924,8 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     end
 
     phi = Itransform!(phi_col)
-    phi_z = Ixtransform(phi_col)
+    phi_z = S.si_phi_z
+    Ixtransform(phi_col, phi_z)
 
     # Recover w_n+1 = φ_n+1 / ρ̄_t
     view(mtile.var_np1,colstart:colend,w_index) .= phi ./ rho_tbar
@@ -1116,8 +1122,8 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         udot_nm1 .= udot_n
         wdot_nm1 .= wdot_n
 
-        h_u = (t == 1) ? mats[:u_first] : mats[:u]
-        h_w = (t == 1) ? mats[:w_first] : mats[:w]
+        h_u = (t == 1) ? mats.u_first : mats.u
+        h_w = (t == 1) ? mats.w_first : mats.w
         # u_np1 and w_np1 must be copied out: `col` is reused by the next solve, and
         # Itransform! returns the column's own buffer.
         u_np1 = S.df_u_np1
@@ -1133,8 +1139,8 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
                         ((u_star * u_star) + (w_star * w_star)))
         @. dE_visc = rho_t_star * dke
 
-        view(mtile.var_np1,colstart:colend,u_index) .= u_np1
-        view(mtile.var_np1,colstart:colend,w_index) .= w_np1
+        u_v .= u_np1
+        w_v .= w_np1
     end
 
     # ── Heat (Kvdiff_heat): moist entropy increment -> (T, p, E_t, Q_ss) at fixed
@@ -1149,7 +1155,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         end
         sdot_nm1 .= sdot_n
 
-        h_h = (t == 1) ? mats[:heat_first] : mats[:heat]
+        h_h = (t == 1) ? mats.heat_first : mats.heat
         _vertical_solve!(col, h_h, s_nstar, mtile)
         stp_np1 = Itransform!(col)
 
@@ -1159,78 +1165,121 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         dp_h = S.df_dp_h; @. dp_h = rho_d_star * R_m_star * dT_h
         dQ_h = S.df_dQ_h; @. dQ_h = -((drvs_dT * dT_h) + (drvs_dp * dp_h))
 
-        view(mtile.var_np1,colstart:colend,p_index) .+= dp_h
-        view(mtile.var_np1,colstart:colend,qss_index) .+= dQ_h
+        p_v .+= dp_h
+        qss_v .+= dQ_h
     end
 
     # ── Water (Kvdiff_water): rho_w' and rho_v' on the rho_t operator, rho_r on its
     #    own; increments map at FIXED temperature (the retrieval is invariant under
     #    them), moving the vapor partial pressure and the water's internal + potential
-    #    energy. delta_rho_c = delta_rho_w - delta_rho_v - delta_rho_r is implicit. ──
+    #    energy. delta_rho_c = delta_rho_w - delta_rho_v - delta_rho_r is implicit.
+    #    Lives in its own function: inlined here it pushed diffusion_timestep_mc past
+    #    the optimizer's budget and one broadcast-into-view stopped eliding its
+    #    SubArray (one 64-byte allocation per column per step). ──
     dE_w = S.df_dE_w
     if do_water
-        rw_star = S.df_rw_star; @. rw_star = rhot_v - rhod_v
-        rv_star = S.df_rv_star; @. rv_star = rho_v_star - mtile.mc_ref_diag.rho_vbar
-
-        rwdot_n = view(mtile.diffdot_n,colstart:colend,rhot_index)
-        rwdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhot_index)
-        rvdot_n = view(mtile.diffdot_n,colstart:colend,qss_index)
-        rvdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,qss_index)
-        rrdot_n = view(mtile.diffdot_n,colstart:colend,rhor_index)
-        rrdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhor_index)
-
-        rw_nstar = S.df_rw_nstar
-        rv_nstar = S.df_rv_nstar
-        rr_nstar = S.df_rr_nstar
-        if (t == 1)
-            @. rw_nstar = rw_star + (ts * 0.5 * rwdot_n)
-            @. rv_nstar = rv_star + (ts * 0.5 * rvdot_n)
-            @. rr_nstar = rhor_v + (ts * 0.5 * rrdot_n)
-        else
-            @. rw_nstar = rw_star - (ts * rwdot_n) + (ts * 0.75 * rwdot_nm1)
-            @. rv_nstar = rv_star - (ts * rvdot_n) + (ts * 0.75 * rvdot_nm1)
-            @. rr_nstar = rhor_v - (ts * rrdot_n) + (ts * 0.75 * rrdot_nm1)
-        end
-        rwdot_nm1 .= rwdot_n
-        rvdot_nm1 .= rvdot_n
-        rrdot_nm1 .= rrdot_n
-
-        h_rw = (t == 1) ? mats[:water_first] : mats[:water]
-        h_rr = (t == 1) ? mats[:water_r_first] : mats[:water_r]
-        rw_np1 = S.df_rw_np1
-        rv_np1 = S.df_rv_np1
-        _vertical_solve!(col, h_rw, rw_nstar, mtile)
-        copyto!(rw_np1, Itransform!(col))
-        _vertical_solve!(col, h_rw, rv_nstar, mtile)
-        copyto!(rv_np1, Itransform!(col))
-        _vertical_solve!(col, h_rr, rr_nstar, mtile)
-        rr_np1 = Itransform!(col)
-
-        drw = S.df_drw; @. drw = rw_np1 - rw_star
-        drv = S.df_drv; @. drv = rv_np1 - rv_star
-        drr = S.df_drr; @. drr = rr_np1 - rhor_v
-        @. dE_w = (((Cpv * T_star) - Lv_star + ke_star + (gravity * z)) * drw) +
-                  ((Lv_star - (Rv * T_star)) * drv)
-
-        view(mtile.var_np1,colstart:colend,rhot_index) .+= drw
-        view(mtile.var_np1,colstart:colend,rhor_index) .+= drr
-        view(mtile.var_np1,colstart:colend,p_index) .+= Rv .* T_star .* drv
-        view(mtile.var_np1,colstart:colend,qss_index) .+=
-            drv .- (drvs_dp .* (Rv .* T_star .* drv))
+        _diffusion_water_step!(mtile, S, col, mats, ts, t, colstart, colend, z,
+                               rhod_v, rhot_v, rhor_v, p_v, qss_v)
     end
 
     # E_t update: keep the single fused add when the historical pair ran (bit-identical
     # to the pre-water combined update), and touch E_t only with computed terms.
     if do_momentum && do_heat
-        view(mtile.var_np1,colstart:colend,et_index) .+= dE_visc .+ dE_h
+        et_v .+= dE_visc .+ dE_h
     elseif do_momentum
-        view(mtile.var_np1,colstart:colend,et_index) .+= dE_visc
+        et_v .+= dE_visc
     elseif do_heat
-        view(mtile.var_np1,colstart:colend,et_index) .+= dE_h
+        et_v .+= dE_h
     end
     if do_water
-        view(mtile.var_np1,colstart:colend,et_index) .+= dE_w
+        # Explicit loop, not broadcast: as the last branch of this large function
+        # both the broadcast and @turbo forms stopped eliding the destination
+        # SubArray wrapper (one 64-byte heap allocation per column per step)
+        @inbounds for i in eachindex(dE_w)
+            et_v[i] += dE_w[i]
+        end
     end
+end
+
+"""
+    _diffusion_water_step!(mtile, S, col, mats, ts, t, colstart, colend, z,
+                           rhod_v, rhot_v, rhor_v, p_v, qss_v)
+
+The water-species half of [`diffusion_timestep_mc`](@ref): AM2/AI2* staging and
+implicit solves for rho_w' and rho_v' (both on the rho_t operator) and rho_r (its
+own), then the fixed-temperature increment maps onto rho_t, rho_r, p and Q_ss.
+The energy increment lands in `S.df_dE_w`; the CALLER adds it to E_t so the
+historical dE_visc + dE_h fusion stays bit-identical. Star-state fields
+(`df_T_star` etc.) are read from the scratch where the caller computed them.
+
+`@noinline` in its own function on purpose: inlined into diffusion_timestep_mc this
+block pushed the function past the optimizer's budget and one broadcast-into-view
+stopped eliding its SubArray — one 64-byte heap allocation per column per step.
+"""
+@noinline function _diffusion_water_step!(mtile::ModelTile, S, col, mats,
+                                          ts::Float64, t::Int64,
+                                          colstart::Int64, colend::Int64, z,
+                                          rhod_v, rhot_v, rhor_v, p_v, qss_v)
+    vars = mtile.model.grid_params.vars
+    rhot_index = vars["rho_t"]
+    qss_index = vars["Q_ss"]
+    rhor_index = vars["rho_r"]
+
+    T_star = S.df_T_star
+    Lv_star = S.df_Lv_star
+    ke_star = S.df_ke_star
+    drvs_dp = S.df_drvs_dp
+    rho_v_star = S.df_rho_v_star
+    dE_w = S.df_dE_w
+
+    rw_star = S.df_rw_star; @. rw_star = rhot_v - rhod_v
+    rv_star = S.df_rv_star; @. rv_star = rho_v_star - mtile.mc_ref_diag.rho_vbar
+
+    rwdot_n = view(mtile.diffdot_n,colstart:colend,rhot_index)
+    rwdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhot_index)
+    rvdot_n = view(mtile.diffdot_n,colstart:colend,qss_index)
+    rvdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,qss_index)
+    rrdot_n = view(mtile.diffdot_n,colstart:colend,rhor_index)
+    rrdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhor_index)
+
+    rw_nstar = S.df_rw_nstar
+    rv_nstar = S.df_rv_nstar
+    rr_nstar = S.df_rr_nstar
+    if (t == 1)
+        @. rw_nstar = rw_star + (ts * 0.5 * rwdot_n)
+        @. rv_nstar = rv_star + (ts * 0.5 * rvdot_n)
+        @. rr_nstar = rhor_v + (ts * 0.5 * rrdot_n)
+    else
+        @. rw_nstar = rw_star - (ts * rwdot_n) + (ts * 0.75 * rwdot_nm1)
+        @. rv_nstar = rv_star - (ts * rvdot_n) + (ts * 0.75 * rvdot_nm1)
+        @. rr_nstar = rhor_v - (ts * rrdot_n) + (ts * 0.75 * rrdot_nm1)
+    end
+    rwdot_nm1 .= rwdot_n
+    rvdot_nm1 .= rvdot_n
+    rrdot_nm1 .= rrdot_n
+
+    h_rw = (t == 1) ? mats.water_first : mats.water
+    h_rr = (t == 1) ? mats.water_r_first : mats.water_r
+    rw_np1 = S.df_rw_np1
+    rv_np1 = S.df_rv_np1
+    _vertical_solve!(col, h_rw, rw_nstar, mtile)
+    copyto!(rw_np1, Itransform!(col))
+    _vertical_solve!(col, h_rw, rv_nstar, mtile)
+    copyto!(rv_np1, Itransform!(col))
+    _vertical_solve!(col, h_rr, rr_nstar, mtile)
+    rr_np1 = Itransform!(col)
+
+    drw = S.df_drw; @. drw = rw_np1 - rw_star
+    drv = S.df_drv; @. drv = rv_np1 - rv_star
+    drr = S.df_drr; @. drr = rr_np1 - rhor_v
+    @. dE_w = (((Cpv * T_star) - Lv_star + ke_star + (gravity * z)) * drw) +
+              ((Lv_star - (Rv * T_star)) * drv)
+
+    rhot_v .+= drw
+    rhor_v .+= drr
+    p_v .+= Rv .* T_star .* drv
+    qss_v .+= drv .- (drvs_dp .* (Rv .* T_star .* drv))
+    return nothing
 end
 
 # ── Initial conditions and reference writer ────────────────────────────────────

@@ -19,7 +19,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
 
     # Build a small moist_compressible tile on the RiRk (B-spline vertical) grid — the
     # configuration that was crashing.
-    function build_mc_tile()
+    function build_mc_tile(; extra_params = Dict{Symbol,Float64}(), precipitation = false)
         vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
         scalar_bc = Dict(v => NeumannBC() for v in vars)
         bc_side = merge(scalar_bc, Dict("u" => DirichletBC()))
@@ -38,11 +38,11 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
             output_dir = outdir * "/",
             ref_state_file = joinpath(outdir, "ref.csv"),
             grid_params = gp,
-            physical_params = Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
-                                   :tau_qss => 10.0, :alpha => 0.0,
-                                   :z_damp => 12.8e3),
+            physical_params = merge(Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
+                                         :tau_qss => 10.0, :alpha => 0.0,
+                                         :z_damp => 12.8e3), extra_params),
             options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                           :precipitation => false, :vertical_mixing => false))
+                           :precipitation => precipitation, :vertical_mixing => false))
 
         patch = createGrid(model.grid_params)
         gridpoints = Scythe.getGridpoints(patch)
@@ -179,20 +179,34 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
     end
 
     @testset "per-column allocation ceilings" begin
-        # Regression tripwire, not a target. Measured after the refactor: moist_compressible_XZ
-        # 7 allocations per column call (down from 1447) and diffusion_timestep_mc exactly 0
-        # (down from 249). The 7 that remain are the allocating 1-arg Ixtransform/Ixxtransform
-        # in Springsteel plus the dynamic equation-set dispatch.
-        #
-        # The ceilings leave headroom for churn but trip immediately on the mistakes that
-        # actually happened here: an abstract ModelTile field, a per-column deepcopy, a
-        # loop-invariant ref_*(...)[:,N] copy, or a broadcast that allocates a fresh column
-        # instead of writing into mc_scratch. Each of those costs tens to hundreds of allocs.
+        # The per-column hot path is ALLOCATION-FREE: moist_compressible_XZ and
+        # diffusion_timestep_mc both make exactly 0 allocations per call (down from
+        # 1447/249 pre-refactor; the last 7 were Springsteel's allocating 1-arg
+        # Ixtransform/Ixxtransform, now called through the in-place forms with
+        # per-thread scratch). Any nonzero count is a real hot-path allocation —
+        # historically an abstract ModelTile field, a per-column deepcopy, a
+        # loop-invariant ref_*(...)[:,N] copy, a broadcast into a fresh column
+        # instead of mc_scratch, or a broadcast-into-view whose SubArray stops
+        # eliding once the function grows (the dE_w add needed an explicit loop).
         moist_compressible_XZ(mtile, 1, kDim, 2)      # compile
         diffusion_timestep_mc(mtile, 1, kDim, 2)
 
-        @test (@allocations moist_compressible_XZ(mtile, 1, kDim, 2)) < 25
-        @test (@allocations diffusion_timestep_mc(mtile, 1, kDim, 2)) < 10
+        @test (@allocations moist_compressible_XZ(mtile, 1, kDim, 2)) == 0
+        @test (@allocations diffusion_timestep_mc(mtile, 1, kDim, 2)) == 0
+    end
+
+    @testset "per-column allocations stay zero with rain and water diffusion" begin
+        # The warm-rain microphysics (sedimentation column transforms) and the
+        # water-species diffusion (three extra vertical solves + fixed-T maps) are
+        # branches the base configuration never runs; guard them separately.
+        mtile_w, kDim_w = build_mc_tile(extra_params = Dict(:Kvdiff_water => 25.0,
+                                                            :N_r => 1.0e-3),
+                                        precipitation = true)
+        moist_compressible_XZ(mtile_w, 1, kDim_w, 2)  # compile
+        diffusion_timestep_mc(mtile_w, 1, kDim_w, 2)
+
+        @test (@allocations moist_compressible_XZ(mtile_w, 1, kDim_w, 2)) == 0
+        @test (@allocations diffusion_timestep_mc(mtile_w, 1, kDim_w, 2)) == 0
     end
 
     @testset "mc scratch slots are unique and cover every temporary" begin
