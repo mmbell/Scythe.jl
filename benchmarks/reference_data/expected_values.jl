@@ -46,4 +46,16 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
         "max_w"         => (15.713,    1.0, 5.5, "BF02 Fig. 3b"),
         "min_w"         => (-9.92698,  1.0, 3.0, "BF02 Fig. 3b"),
     ),
+    # O01 warm rain: sanity WINDOWS, not published values — the equation set,
+    # microphysics closure (tau_r channel instead of Qevap), sounding, and single
+    # non-nested grid all differ from Ooyama (2001), so only comparable magnitude
+    # and timing are enforced. O01 Fig. 6 (p. 2087): peak ground precipitation
+    # ~75-125 g m^-2 s^-1 at ~35-40 min; Figs. 4-6, 11: rho_r up to ~4 g/m^3.
+    # Tighten these from the accepted seeded run.
+    "o01_rainfall" => Dict(
+        "peak_rain_rate_gm2s" => (75.0, 70.0, 70.0, "O01 Fig. 6 sanity window"),
+        "max_rho_r_gm3"       => (3.0,  2.9,  2.9,  "O01 Figs. 4-6, 11 sanity window"),
+        "max_w"               => (25.0, 20.0, 20.0, "O01 updraft sanity window"),
+        "rain_onset_min"      => (30.0, 20.0, 20.0, "O01 Fig. 6 timing sanity window"),
+    ),
 )
