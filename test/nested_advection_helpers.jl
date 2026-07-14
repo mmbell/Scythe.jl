@@ -113,6 +113,61 @@ end
 gaussian_pulse(x0, sigma) = x -> exp(-(x - x0)^2 / (2 * sigma^2))
 
 """
+Advance a coarseL | fine | coarseR two-way nest for `n_coarse_steps` parent
+steps with `n_sub` fine substeps per parent step (DeMaria et al. 1992 steps
+1–11). The fine patch's ts must equal the coarse ts / n_sub. Interface trio
+payloads are linearly interpolated in time across each parent step;
+fine→coarse feedback is collar injection using the fine state at the start
+of each parent step. `n_sub = 1` reduces exactly to the same-Δt schedule.
+"""
+function run_twoway_subcycled!(coarseL::AdvectionNestPatch,
+                               fine::AdvectionNestPatch,
+                               coarseR::AdvectionNestPatch,
+                               ifaceL, ifaceR,
+                               collarL_idx, collarL_x, collarR_idx, collarR_x,
+                               n_coarse_steps::Int, n_sub::Int)
+    metaL, metaR = ifaceL.metadata, ifaceR.metadata
+    # Bracketing payloads (parent step endpoints) + interpolation buffer
+    p0L = compute_interface_payload(metaL, coarseL.patch)
+    p0R = compute_interface_payload(metaR, coarseR.patch)
+    p1L = compute_interface_payload(metaL, coarseL.patch)
+    p1R = compute_interface_payload(metaR, coarseR.patch)
+    pjL = compute_interface_payload(metaL, coarseL.patch)
+    pjR = compute_interface_payload(metaR, coarseR.patch)
+
+    tf = 0
+    for n in 1:n_coarse_steps
+        # Fine→coarse: collar injection from the fine state at T_n
+        inject_collar!(coarseL, fine, collarL_idx, collarL_x)
+        inject_collar!(coarseR, fine, collarR_idx, collarR_x)
+
+        # Parents advance T_n → T_{n+1}
+        step_patch!(coarseL, n)
+        step_patch!(coarseR, n)
+        gridTransform!(coarseL.patch)
+        gridTransform!(coarseR.patch)
+        compute_interface_payload!(p1L, metaL, coarseL.patch)
+        compute_interface_payload!(p1R, metaR, coarseR.patch)
+
+        # Child subcycles with time-interpolated boundary payloads
+        for j in 1:n_sub
+            tf += 1
+            step_patch!(fine, tf)
+            θ = j / n_sub
+            lerp_payload!(pjL, p0L, p1L, θ)
+            lerp_payload!(pjR, p0R, p1R, θ)
+            apply_interface_payload!(metaL, fine.patch, pjL)
+            apply_interface_payload!(metaR, fine.patch, pjR)
+            gridTransform!(fine.patch)
+        end
+
+        copyto!(p0L.border, p1L.border)
+        copyto!(p0R.border, p1R.border)
+    end
+    return nothing
+end
+
+"""
 Gauss-quadrature integral of u over the patch, optionally restricted to
 `[xmin, xmax]` (bounds must coincide with cell edges — used to exclude collar
 cells so overlapping strips are counted once across a nest).
