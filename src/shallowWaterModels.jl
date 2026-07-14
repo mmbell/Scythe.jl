@@ -1,4 +1,44 @@
 """
+    SW_SCRATCH_SLOTS
+
+Names of the reusable work vectors `Twoway_PV_mixing` needs, one full-tile-length
+`Vector{Float64}` each. The set used to allocate all of these on every call — 13 heap arrays per
+timestep, ~19 MB at `num_cells = 100`, ~230 GB of churn over a 10-hour run.
+
+Keyed by NAME, not by index, for the same reason as [`MC_SCRATCH_SLOTS`](@ref): an index-numbered
+pool makes it easy to hand one buffer to two temporaries that are live at once, and the resulting
+corruption is silent. A `NamedTuple` cannot hold a duplicate field, so that bug cannot be written.
+
+Note `:W_` and `:w_up` are DIFFERENT arrays and both are live at the same time: `:W_` is the
+BL/free-layer momentum exchange term, `:w_up` is the upward-mass-flux limiter `0.5|w| - w`. The
+source spells them `W_` and `w_`, which differ by one character — hence the distinct slot names.
+"""
+const SW_SCRATCH_SLOTS = (:ADV, :DRAG, :COR, :PGF, :W_, :KDIFF,
+                          :S_rr, :S_ll, :S_rl, :K_free, :K_bl, :U, :w_up)
+
+"""
+    _allocate_sw_scratch(tile, model)
+
+Work vectors for `Twoway_PV_mixing`; an empty `NamedTuple` for every other equation set.
+
+ONE workspace per tile, not one per thread (unlike `mc_scratch`). `advanceTimestep` only reaches
+its `Threads.@threads :static` column loop when `num_columns(tile) > 0`; on an RL grid that is 0,
+so it takes the `else` branch and calls the equation set exactly once per timestep, serially, over
+the whole tile. There is no concurrency to guard against, and per-thread copies would cost
+`maxthreadid()` × 19 MB for nothing. `test/test_allocations.jl` asserts `num_columns == 0` for this
+grid so the invariant this relies on cannot silently lapse.
+
+Length is the tile's GRIDPOINT count, not `kDim`: the shallow-water sets have no vertical basis and
+treat the entire tile as a single column.
+"""
+function _allocate_sw_scratch(tile::AbstractGrid, model::ModelParameters)
+    model.equation_set == "Twoway_PV_mixing" || return NamedTuple()
+    n = size(tile.physical, 1)
+    return NamedTuple{SW_SCRATCH_SLOTS}(
+        ntuple(_ -> zeros(Float64, n), length(SW_SCRATCH_SLOTS)))
+end
+
+"""
     Oneway_ShallowWater_Slab(mtile, colstart, colend, t)
 
 One-way coupled shallow water model with a slab boundary layer in r-lambda coordinates.
@@ -318,40 +358,48 @@ function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::I
     vbl = view(grid.physical,:,5,4)
     vbll = view(grid.physical,:,5,5)
 
-    # Helper arrays to reduce memory allocations
-    ADV = similar(r)
-    DRAG = similar(r)
-    COR = similar(r)
-    PGF = similar(r)
-    W_ = similar(r)
-    KDIFF = similar(r)
-    S_rr = similar(r)
-    S_ll = similar(r)
-    S_rl = similar(r)
+    # Reusable work vectors, allocated once per tile (see `_allocate_sw_scratch`). These used to be
+    # `similar(r)` — a fresh heap array per call, per timestep, the whole tile long.
+    #
+    # Every slot below is the destination of a whole-array `.=` before it is ever read, so the stale
+    # contents left by the previous timestep are unobservable.
+    sw = mtile.sw_scratch
+    ADV = sw.ADV
+    DRAG = sw.DRAG
+    COR = sw.COR
+    PGF = sw.PGF
+    W_ = sw.W_
+    KDIFF = sw.KDIFF
+    S_rr = sw.S_rr
+    S_ll = sw.S_ll
+    S_rl = sw.S_rl
 
     # Compute Smagorinsky diffusion coefficient for the free-atmosphere layer
     # Full cylindrical strain rate tensor using (ug, vg)
     @turbo S_rr .= ugr
     @turbo S_ll .= @. (vgl / r) + (ug / r)
     @turbo S_rl .= @. 0.5 * ((ugl / r) + vgr - (vg / r))
-    K_free = @. max(Ls_free * Ls_free * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), K_min_free)
+    K_free = sw.K_free
+    @. K_free = max(Ls_free * Ls_free * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), K_min_free)
 
     # Compute Smagorinsky diffusion coefficient for the boundary layer
     # Full cylindrical strain rate tensor using (ub, vb)
     @turbo S_rr .= ubr
     @turbo S_ll .= @. (vbl / r) + (ub / r)
     @turbo S_rl .= @. 0.5 * ((ubl / r) + vbr - (vb / r))
-    K_bl = @. max(Ls_bl * Ls_bl * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), K_min_bl)
+    K_bl = sw.K_bl
+    @. K_bl = max(Ls_bl * Ls_bl * sqrt(2.0 * (S_rr * S_rr + S_ll * S_ll + 2.0 * S_rl * S_rl)), K_min_bl)
 
     # Parameterized surface wind speed
     sfc_factor = 0.78
-    U = similar(ub)
+    U = sw.U
     @turbo U .= @. sfc_factor * sqrt((ub * ub) + (vb * vb))
 
     # W is diagnostic and is needed first for other calculations
     w = view(grid.physical,:,6,1)
     @turbo w .= @. -Hb * ((ub / r) + ubr + (vbl / r))
-    w_ = @. 0.5 * abs(w) - w
+    w_ = sw.w_up
+    @. w_ = 0.5 * abs(w) - w
     @turbo expdot[:,6] .= 0.0
 
     # h tendency (no diffusion on height field)

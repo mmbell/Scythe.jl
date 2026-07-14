@@ -22,7 +22,8 @@ Fundamental computational unit holding model state, tendencies, reference state,
 and spectral transform infrastructure for a single tile in the domain decomposition.
 """
 struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
-                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N, KC, SD, MSC}
+                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N, KC, SD, MSC,
+                 SWS<:NamedTuple}
     model::ModelParameters
     # Concretely typed, so `mtile.tile.physical` and `mtile.tile.kbasis` infer. Declaring
     # this `AbstractGrid` made every view and broadcast in the per-column equation-set
@@ -109,6 +110,10 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # base (the reference's own Tbar is not bit-identical to the retrieved T). Empty
     # vectors for every other equation set.
     mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar), Tuple{Vector{Float64}, Vector{Float64}}}
+    # One NamedTuple of full-tile-length work vectors for `Twoway_PV_mixing`'s 13 broadcast
+    # temporaries. Empty for every other set. See `_allocate_sw_scratch` for why there is one
+    # workspace per TILE here rather than one per thread as `mc_scratch` has.
+    sw_scratch::SWS
 end
 
 """
@@ -323,7 +328,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         solve_rhs,
         solve_load,
         mc_scratch,
-        mc_ref_diag)
+        mc_ref_diag,
+        _allocate_sw_scratch(tile, model))
     return mtile
 end
 

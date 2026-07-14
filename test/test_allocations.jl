@@ -3,7 +3,7 @@ using Scythe
 using Springsteel
 using SparseArrays
 
-using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
+using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Twoway_PV_mixing
 
 # Guards for the allocation / type-stability refactor.
 #
@@ -217,5 +217,90 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc
         @test isconcretetype(eltype(mtile.mc_scratch))
         @test length(mtile.mc_scratch) == Threads.maxthreadid()
         @test all(length(v) == kDim for v in mtile.mc_scratch[1])
+    end
+
+    # ------------------------------------------------------------------------------------------
+    # Twoway_PV_mixing (RL shallow water). Same disease as the mc set, different geometry: this one
+    # used to heap-allocate 13 FULL-TILE-LENGTH Vector{Float64} per call (9 `similar(r)`, `U`, and
+    # the materializing `K_free`/`K_bl`/`w_` broadcasts). On an RL grid the whole tile is ONE
+    # column, so that is ~19 MB of garbage per timestep at num_cells=100 — ~230 GB over a 10-hour
+    # run, which is the memory build-up this refactor exists to kill.
+    # ------------------------------------------------------------------------------------------
+
+    """Small RL Twoway_PV_mixing tile with a nonzero max_wavenumber, so the azimuthal (_l, _ll)
+    derivative slots the equation set reads are actually populated."""
+    function build_pv_mixing_tile(; extra_params = Dict{Symbol,Float64}(),
+                                    options = Dict{Symbol,Any}())
+        vars = ["h", "u", "v", "ub", "vb", "wb"]
+        gp = GridParameters(
+            geometry = "RL",
+            iMin = 0.0, iMax = 3.0e5, num_cells = 20,
+            max_wavenumber = Dict(v => 8 for v in vars),
+            BCL = Dict("h"  => Springsteel.CubicBSpline.R1T1,
+                       "u"  => Springsteel.CubicBSpline.R1T0,
+                       "v"  => Springsteel.CubicBSpline.R1T0,
+                       "ub" => Springsteel.CubicBSpline.R1T0,
+                       "vb" => Springsteel.CubicBSpline.R1T0,
+                       "wb" => Springsteel.CubicBSpline.R1T1),
+            BCR = Dict("h"  => Springsteel.CubicBSpline.R0,
+                       "u"  => Springsteel.CubicBSpline.R1T1,
+                       "v"  => Springsteel.CubicBSpline.R0,
+                       "ub" => Springsteel.CubicBSpline.R1T1,
+                       "vb" => Springsteel.CubicBSpline.R0,
+                       "wb" => Springsteel.CubicBSpline.R0),
+            vars = Dict(v => i for (i, v) in enumerate(vars)))
+
+        model = ModelParameters(
+            ts = 3.0,
+            equation_set = "Twoway_PV_mixing",
+            output_dir = mktempdir() * "/",
+            grid_params = gp,
+            physical_params = merge(Dict(:g => 9.81, :Ls_free => 500.0, :Ls_bl => 2000.0,
+                                         :K_min_free => 0.0, :K_min_bl => 1000.0,
+                                         :Cd => 2.4e-3, :Hfree => 2000.0, :Hb => 1000.0,
+                                         :f => 5.0e-5, :S1 => 1.0e-5), extra_params),
+            options = merge(Dict{Symbol,Any}(:semiimplicit => false,
+                                             :exact_reference_state => false), options))
+
+        patch = createGrid(model.grid_params)
+        # A broad axisymmetric vortex, so the strain rates (and hence the Smagorinsky K) are
+        # nonzero and every branch of the tendency does real work.
+        gridpoints = Scythe.getGridpoints(patch)
+        for i in 1:size(patch.physical, 1)
+            r_m = gridpoints[i, 1]
+            vmax = 30.0 * (r_m / 50.0e3) * exp(1.0 - (r_m / 50.0e3))
+            patch.physical[i, 1, 1] = 100.0 * exp(-(r_m / 100.0e3)^2)   # h
+            patch.physical[i, 3, 1] = vmax                               # v  (free atmosphere)
+            patch.physical[i, 5, 1] = 0.8 * vmax                         # vb (boundary layer)
+            patch.physical[i, 4, 1] = -0.1 * vmax                        # ub (inflow)
+        end
+        spectralTransform!(patch)
+        gridTransform!(patch)
+
+        return createModelTile(patch, patch, model, spzeros(1, 1)), size(patch.physical, 1)
+    end
+
+    pv_mtile, pv_N = build_pv_mixing_tile()
+
+    @testset "RL tile is a single serial column" begin
+        # This is the invariant that lets Twoway_PV_mixing share ONE scratch workspace per tile
+        # rather than one per thread: `advanceTimestep` only reaches the `@threads :static` column
+        # loop when num_columns > 0. For RL it is 0, so the `else` branch runs the equation set
+        # exactly once per timestep, serially, over the whole tile. If this ever becomes nonzero,
+        # the shared buffers become a data race and must go per-thread (as mc_scratch is).
+        @test Springsteel.num_columns(pv_mtile.tile) == 0
+    end
+
+    @testset "Twoway_PV_mixing tendency is allocation-free" begin
+        Twoway_PV_mixing(pv_mtile, 1, pv_N, 2)        # compile
+        @test (@allocations Twoway_PV_mixing(pv_mtile, 1, pv_N, 2)) == 0
+    end
+
+    @testset "sw scratch slots are unique and correctly sized" begin
+        @test length(unique(Scythe.SW_SCRATCH_SLOTS)) == length(Scythe.SW_SCRATCH_SLOTS)
+        @test isconcretetype(typeof(pv_mtile.sw_scratch))
+        # Full tile length, NOT kDim: this set has no vertical basis and treats the tile as one column.
+        @test all(length(getfield(pv_mtile.sw_scratch, s)) == pv_N
+                  for s in Scythe.SW_SCRATCH_SLOTS)
     end
 end
