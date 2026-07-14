@@ -70,6 +70,11 @@ struct NestInterface
     collar_rows::Vector{Int}     # parent `physical` rows inside the collar
     collar_x::Vector{Float64}    # unique i-coordinates of the collar columns
     nslices::Int                 # derivative slices carried by `physical`
+    # RL (ragged-ring) collars: explicit (r, λ) evaluation points, one per
+    # collar physical row, plus the target ring's supported max wavenumber
+    # (empty for tensor-product geometries, which use collar_x).
+    collar_pts::Matrix{Float64}
+    collar_kmax::Vector{Int}
 end
 
 """
@@ -96,9 +101,11 @@ function _physical_nslices(geometry::String)
         return 3                       # value, ∂i, ∂²i
     elseif geometry == "RiRk"
         return 5                       # value, ∂i, ∂²i, ∂k, ∂²k
+    elseif geometry == "RL"
+        return 5                       # value, ∂r, ∂²r, ∂λ, ∂²λ
     else
         throw(ArgumentError(
-            "Nesting currently supports geometries \"R\" and \"RiRk\", got \"$geometry\""))
+            "Nesting currently supports geometries \"R\", \"RiRk\", and \"RL\", got \"$geometry\""))
     end
 end
 
@@ -128,18 +135,21 @@ function build_nest(nest::NestedModelParameters)
 
     dx = [_nest_dx(nest, i) for i in 1:n]
 
-    # ── Junction parent/child determination (exact 2:1) ─────────────────────
+    # ── Junction parent/child determination (exact 2:1 or 1:1) ──────────────
+    # 1:1 junctions (same-resolution domain decomposition through the nesting
+    # machinery, identity coupling matrix) take the LEFT patch as parent by
+    # convention — either choice is valid.
     junction_parent = zeros(Int, n - 1)   # patch index of the parent at junction j
     for j in 1:(n - 1)
         ratio = dx[j] / dx[j + 1]
-        if isapprox(ratio, 2.0; rtol=1e-10)
-            junction_parent[j] = j            # left patch is coarser
+        if isapprox(ratio, 2.0; rtol=1e-10) || isapprox(ratio, 1.0; rtol=1e-10)
+            junction_parent[j] = j            # left patch coarser (or equal)
         elseif isapprox(ratio, 0.5; rtol=1e-10)
             junction_parent[j] = j + 1        # right patch is coarser
         else
             throw(ArgumentError(
                 "Junction $j at x=$(nest.boundaries[j + 1]): cell-width ratio " *
-                "$(ratio):1 — nesting requires exactly 2:1 (parent the coarser side)"))
+                "$(ratio):1 — nesting requires exactly 2:1 or 1:1 (parent the coarser side)"))
         end
     end
 
@@ -237,6 +247,22 @@ function build_nest(nest::NestedModelParameters)
         end
 
         bgp = base.grid_params
+        # RL annulus patches carry the GLOBAL ring numbering through an
+        # explicit patchOffsetL (ring point counts and wavenumber support are
+        # tied to the global ring index), while spectralIndexL stays 1 — the
+        # patch is its own spectral frame. The (collar-extended) inner edge
+        # must sit on a whole number of this patch's own cells from the global
+        # origin for the offset to be well-defined.
+        ring_offset = 0
+        if geometry == "RL"
+            dxi = (iMax - iMin) / cells
+            cells_inside = (iMin - nest.boundaries[1]) / dxi
+            isapprox(cells_inside, round(cells_inside); atol=1e-8) || throw(ArgumentError(
+                "Patch $i: inner edge $(iMin) is not a whole number of its own " *
+                "cells ($(dxi)) from the origin $(nest.boundaries[1]) — required " *
+                "for the RL global ring numbering"))
+            ring_offset = round(Int, cells_inside) * bgp.mubar
+        end
         gps[i] = SpringsteelGridParameters(
             geometry = geometry,
             iMin = iMin, iMax = iMax,
@@ -244,6 +270,8 @@ function build_nest(nest::NestedModelParameters)
             mubar = bgp.mubar, quadrature = bgp.quadrature,
             l_q = bgp.l_q,
             BCL = bcl, BCR = bcr,
+            jMin = bgp.jMin, jMax = bgp.jMax,
+            max_wavenumber = bgp.max_wavenumber,
             kMin = bgp.kMin, kMax = bgp.kMax,
             num_cells_k = bgp.num_cells_k, kDim = bgp.kDim, b_kDim = bgp.b_kDim,
             BCB = bgp.BCB, BCT = bgp.BCT,
@@ -251,6 +279,7 @@ function build_nest(nest::NestedModelParameters)
             fourier_filter = bgp.fourier_filter,
             chebyshev_filter = bgp.chebyshev_filter,
             spline_filter = bgp.spline_filter,
+            patchOffsetL = ring_offset,
         )
 
         ics = isempty(base.initial_conditions) ? "" :
@@ -283,28 +312,55 @@ function build_nest(nest::NestedModelParameters)
         iface = PatchInterface(grids[p], grids[c], parent_side, child_side, :i;
                                is_stacked=true)
 
-        # Parent collar mish columns (past the nominal junction, toward child)
+        # Parent collar description (mish points past the nominal junction,
+        # toward the child)
         ppts = getGridpoints(grids[p])
-        xcol = geometry == "R" ? vec(ppts) : ppts[1:models[p].grid_params.kDim:end, 1]
-        if parent_side == :right
-            cols = findall(x -> x > x_int + 1e-9, xcol)
+        collar_x = Float64[]
+        collar_rows = Int[]
+        collar_pts = zeros(Float64, 0, 2)
+        collar_kmax = Int[]
+        if geometry == "RL"
+            # Ragged rings: the collar is one parent cell = mubar rings. Rows
+            # follow the cumulative ring point counts; each point carries its
+            # target ring's supported max wavenumber for the evaluation.
+            pgp = models[p].grid_params
+            row = 0
+            pt_rows = Int[]
+            for r in 1:pgp.iDim
+                ri = r + pgp.patchOffsetL
+                lpoints = 4 + 4 * ri
+                rrad = ppts[row + 1, 1]
+                in_collar = parent_side == :right ? (rrad > x_int + 1e-9) :
+                                                    (rrad < x_int - 1e-9)
+                if in_collar
+                    append!(collar_rows, (row + 1):(row + lpoints))
+                    append!(pt_rows, (row + 1):(row + lpoints))
+                    append!(collar_kmax, fill(ri, lpoints))
+                end
+                row += lpoints
+            end
+            collar_pts = ppts[pt_rows, :]
         else
-            cols = findall(x -> x < x_int - 1e-9, xcol)
-        end
-        collar_x = xcol[cols]
-        if geometry == "R"
-            collar_rows = cols
-        else
-            kDim = models[p].grid_params.kDim
-            collar_rows = Int[]
-            for q in cols
-                append!(collar_rows, ((q - 1) * kDim + 1):(q * kDim))
+            xcol = geometry == "R" ? vec(ppts) : ppts[1:models[p].grid_params.kDim:end, 1]
+            if parent_side == :right
+                cols = findall(x -> x > x_int + 1e-9, xcol)
+            else
+                cols = findall(x -> x < x_int - 1e-9, xcol)
+            end
+            collar_x = xcol[cols]
+            if geometry == "R"
+                collar_rows = cols
+            else
+                kDim = models[p].grid_params.kDim
+                for q in cols
+                    append!(collar_rows, ((q - 1) * kDim + 1):(q * kDim))
+                end
             end
         end
 
         push!(interfaces, NestInterface(p, c, parent_side, child_side, x_int,
                                         iface.metadata, collar_rows, collar_x,
-                                        nslices))
+                                        nslices, collar_pts, collar_kmax))
     end
 
     parent_ifaces = [Int[] for _ in 1:n]
@@ -328,7 +384,9 @@ state is current for the time level and before its tendency computation.
 """
 function inject_collar!(parent_physical::AbstractArray{Float64,3},
                         child_grid, ni::NestInterface)
-    vals = evaluate_grid_ipoints(child_grid, ni.collar_x)
+    vals = isempty(ni.collar_pts) ?
+           evaluate_grid_ipoints(child_grid, ni.collar_x) :
+           evaluate_grid_points(child_grid, ni.collar_pts; kmax = ni.collar_kmax)
     nvars = size(parent_physical, 2)
     @inbounds for s in 1:ni.nslices, v in 1:nvars
         for (r, row) in enumerate(ni.collar_rows)
@@ -368,6 +426,19 @@ struct NestParentLink
     down::RemoteChannel                  # take parent trio payloads
     up::RemoteChannel                    # send my collar evaluation
     parent_collar_x::Vector{Float64}     # where the parent needs my values
+    # RL: explicit (r, λ) points + per-point wavenumber truncation (empty for
+    # tensor-product geometries, which use parent_collar_x)
+    parent_collar_pts::Matrix{Float64}
+    parent_collar_kmax::Vector{Int}
+end
+
+"""Evaluate this patch's representation at the parent's collar points."""
+function _collar_evaluation(patch, pl::NestParentLink)
+    if isempty(pl.parent_collar_pts)
+        return evaluate_grid_ipoints(patch, pl.parent_collar_x)
+    end
+    return evaluate_grid_points(patch, pl.parent_collar_pts;
+                                kmax = pl.parent_collar_kmax)
 end
 
 """Per-interface link data for a patch acting as the PARENT."""
@@ -461,18 +532,31 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
     # ── Per-worker collar injection maps ─────────────────────────────────────
     # A collar row (patch-global) belongs to the worker whose tile covers its
     # mish column; precompute (worker → selection into collar values, tile-local rows).
-    kDim_eff = model.grid_params.geometry == "R" ? 1 : model.grid_params.kDim
     inj_maps = Vector{Vector{Tuple{Int, Vector{Int}, Vector{Int}}}}(undef, length(child_links))
-    for (li, cl) in enumerate(child_links)
-        inj_maps[li] = Tuple{Int, Vector{Int}, Vector{Int}}[]
-        for w in workerids
-            offL, iDim = get_val_from(w, :((mtile.tile.params.patchOffsetL, mtile.tile.params.iDim)))
-            lo = offL * kDim_eff
-            hi = (offL + iDim) * kDim_eff
-            sel = findall(r -> lo < r <= hi, cl.collar_rows)
-            isempty(sel) && continue
-            local_rows = [cl.collar_rows[s] - lo for s in sel]
-            push!(inj_maps[li], (w, sel, local_rows))
+    if model.grid_params.geometry == "RL"
+        # Ragged rings: the tensor-product row arithmetic below does not apply.
+        # v1 restricts RL nest patches to a single worker whose tile spans the
+        # whole patch, so the tile-local rows ARE the patch rows.
+        num_workers == 1 || throw(ErrorException(
+            "RL nest patches currently support exactly 1 worker per patch " *
+            "(ragged ring layout), got $(num_workers)"))
+        for (li, cl) in enumerate(child_links)
+            inj_maps[li] = [(workerids[1], collect(1:length(cl.collar_rows)),
+                             copy(cl.collar_rows))]
+        end
+    else
+        kDim_eff = model.grid_params.geometry == "R" ? 1 : model.grid_params.kDim
+        for (li, cl) in enumerate(child_links)
+            inj_maps[li] = Tuple{Int, Vector{Int}, Vector{Int}}[]
+            for w in workerids
+                offL, iDim = get_val_from(w, :((mtile.tile.params.patchOffsetL, mtile.tile.params.iDim)))
+                lo = offL * kDim_eff
+                hi = (offL + iDim) * kDim_eff
+                sel = findall(r -> lo < r <= hi, cl.collar_rows)
+                isempty(sel) && continue
+                local_rows = [cl.collar_rows[s] - lo for s in sel]
+                push!(inj_maps[li], (w, sel, local_rows))
+            end
         end
     end
 
@@ -491,13 +575,16 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         gridTransform!(patch)
     end
     for (li, pl) in enumerate(parent_links)
-        pj[li] = compute_interface_payload(pl.meta, patch)   # shape-matched buffer
+        # Interpolation buffer sized from the metadata — NOT computed from this
+        # (child) grid: the parent-side metadata's spectral block sizes belong
+        # to the parent's grid and generally differ from the child's.
+        pj[li] = Springsteel._allocate_payload(pl.meta)
     end
     for cl in child_links
         put!(cl.down, compute_interface_payload(cl.meta, patch))
     end
     for pl in parent_links
-        put!(pl.up, evaluate_grid_ipoints(patch, pl.parent_collar_x))
+        put!(pl.up, _collar_evaluation(patch, pl))
     end
 
     # ── Shared spectral seed + t = 0 output (as in run_model) ───────────────
@@ -593,7 +680,7 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         # Cycle end: send my collar evaluation upstream, roll the brackets
         if cycle_end
             for pl in parent_links
-                put!(pl.up, evaluate_grid_ipoints(patch, pl.parent_collar_x))
+                put!(pl.up, _collar_evaluation(patch, pl))
             end
             for li in eachindex(parent_links)
                 p0[li] = p1[li]
@@ -680,15 +767,11 @@ function integrate_nested_model(nest::NestedModelParameters)
         plinks = NestParentLink[]
         for k in topo.parent_ifaces[i]
             ni = topo.interfaces[k]
-            # The parent's collar x-points, computed from the parent's grid
-            parent_gp = models[ni.parent].grid_params
-            pgrid = createGrid(parent_gp)
-            ppts = getGridpoints(pgrid)
-            xcol = parent_gp.geometry == "R" ? vec(ppts) : ppts[1:parent_gp.kDim:end, 1]
-            cx = ni.parent_side == :right ?
-                 xcol[findall(x -> x > ni.interface_x + 1e-9, xcol)] :
-                 xcol[findall(x -> x < ni.interface_x - 1e-9, xcol)]
-            push!(plinks, NestParentLink(ni.meta, down[k], up[k], cx))
+            # The parent's collar coordinates are carried on the interface
+            # (collar_x for tensor-product geometries, (r, λ) points + per-ring
+            # wavenumber truncation for RL).
+            push!(plinks, NestParentLink(ni.meta, down[k], up[k], ni.collar_x,
+                                         ni.collar_pts, ni.collar_kmax))
         end
         clinks = NestChildLink[]
         for k in topo.child_ifaces[i]
@@ -699,7 +782,20 @@ function integrate_nested_model(nest::NestedModelParameters)
             :(Scythe.run_nested_patch(patch, model, $(groups[i]), $(topo.n_sub[i]),
                                       $(plinks), $(clinks))))
     end
-    map(wait, futures)
+    # Poll every patch future so an exception on ANY group master surfaces
+    # promptly. A plain in-order wait blocks on patch 1 while a failed
+    # neighbor's exception sits unobserved — the neighbors then deadlock on
+    # the dead patch's channels and the failure looks like a silent hang.
+    done = falses(n)
+    while !all(done)
+        for i in 1:n
+            if !done[i] && isready(futures[i])
+                fetch(futures[i])       # rethrows the group's exception
+                done[i] = true
+            end
+        end
+        all(done) || sleep(0.25)
+    end
 
     # Finalize each patch and close the log files
     for i in 1:n

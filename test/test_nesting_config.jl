@@ -147,6 +147,73 @@ using Springsteel
         @test all(x -> 63.0e3 < x < 64.0e3, i23.collar_x)
     end
 
+    @testset "RL radial nest (Twoway_PV_mixing layout)" begin
+        pv_vars = Dict("h" => 1, "u" => 2, "v" => 3, "ub" => 4, "vb" => 5, "wb" => 6)
+        base_rl = ModelParameters(
+            ts = 3.0,
+            integration_time = 1800.0,
+            output_interval = 1800.0,
+            equation_set = "Twoway_PV_mixing",
+            initial_conditions = "",
+            output_dir = "./output_nesttest_rl/",
+            grid_params = GridParameters(
+                geometry = "RL",
+                num_cells = 100, iMin = 0.0, iMax = 3.0e5,   # placeholder
+                BCL = Dict(v => (v in ("h", "wb") ? NeumannBC() : DirichletBC()) for v in keys(pv_vars)),
+                BCR = Dict(v => NaturalBC() for v in keys(pv_vars)),
+                vars = pv_vars),
+            physical_params = Dict(:g => 9.81),
+        )
+
+        # 1:1 split (same resolution both sides; left patch is parent)
+        nest11 = NestedModelParameters(
+            boundaries = [0.0, 1.5e5, 3.0e5],
+            num_cells = [50, 50],
+            ts = [3.0, 3.0],
+            workers_per_patch = [1, 1],
+            base = base_rl)
+        models, topo = build_nest(nest11)
+        @test topo.n_sub == [1, 1]
+        @test models[1].grid_params.iMax == 1.53e5          # +1 own cell collar
+        @test models[1].grid_params.num_cells == 51
+        @test models[1].grid_params.patchOffsetL == 0
+        @test models[2].grid_params.iMin == 1.5e5
+        @test models[2].grid_params.patchOffsetL == 50 * models[2].grid_params.mubar
+        @test models[2].grid_params.BCL["h"] == FixedBC()
+        @test models[2].grid_params.BCR["h"] == NaturalBC()  # outer from base
+        ni = topo.interfaces[1]
+        @test (ni.parent, ni.child) == (1, 2)
+        @test ni.meta.coupling_matrix == Springsteel.COUPLING_MATRIX_1X
+        @test ni.nslices == 5
+        # Collar = mubar rings past 150 km; ragged rows with per-ring kmax
+        mubar = models[1].grid_params.mubar
+        gp1 = models[1].grid_params
+        expected_rows = sum(4 + 4 * ri for ri in (gp1.iDim - mubar + 1):gp1.iDim)
+        @test length(ni.collar_rows) == expected_rows
+        @test size(ni.collar_pts, 1) == expected_rows
+        @test length(ni.collar_kmax) == expected_rows
+        @test all(ni.collar_pts[:, 1] .> 1.5e5)
+        @test minimum(ni.collar_kmax) == gp1.iDim - mubar + 1
+
+        # 2:1: fine inner disc, coarse outer annulus (parent on the right)
+        nest21 = NestedModelParameters(
+            boundaries = [0.0, 1.5e5, 3.0e5],
+            num_cells = [50, 25],
+            ts = [3.0, 6.0],
+            workers_per_patch = [1, 1],
+            base = base_rl)
+        models2, topo2 = build_nest(nest21)
+        ni2 = topo2.interfaces[1]
+        @test (ni2.parent, ni2.child) == (2, 1)
+        @test topo2.n_sub == [2, 1]
+        @test topo2.ts_actual == [3.0, 6.0]
+        @test models2[2].grid_params.iMin == 1.44e5          # −1 own (6 km) cell collar
+        @test models2[2].grid_params.num_cells == 26
+        @test models2[2].grid_params.patchOffsetL == 24 * models2[2].grid_params.mubar
+        @test models2[1].grid_params.BCR["h"] == FixedBC()
+        @test all(ni2.collar_pts[:, 1] .< 1.5e5)
+    end
+
     @testset "validation errors" begin
         # 4:1 junction ratio
         nest_bad = NestedModelParameters(
