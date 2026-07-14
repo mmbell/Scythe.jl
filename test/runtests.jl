@@ -19,6 +19,7 @@ using Scythe
     include("test_nested_advection_oneway.jl")
     include("test_nested_advection_twoway.jl")
     include("test_nested_advection_subcycle.jl")
+    include("test_distributed_nesting.jl")
     include("test_distributed_linear_advection.jl")
     include("test_distributed_rz.jl")
     include("test_oneway_sw_slab.jl")

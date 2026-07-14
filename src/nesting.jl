@@ -18,6 +18,7 @@
 using SparseArrays
 
 export NestedModelParameters, build_nest, NestTopology, NestInterface
+export integrate_nested_model
 
 """
     NestedModelParameters
@@ -335,4 +336,378 @@ function inject_collar!(parent_physical::AbstractArray{Float64,3},
         end
     end
     return parent_physical
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# Distributed nested integration
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Each nest patch owns a disjoint worker group running the existing tile
+# machinery (initialize_model / advanceTimestep / splineTransform!), driven by
+# run_nested_patch on the group's master worker. Groups exchange over
+# RemoteChannels:
+#   down (parent master → child master): the parent's R3X trio payload, one
+#       per parent step; the child brackets consecutive payloads and applies
+#       lerp_payload!-interpolated trios at each of its substeps.
+#   up (child master → parent master): the child's collar evaluation
+#       (evaluate_grid_ipoints at the parent's collar mish points), one per
+#       parent step; the parent injects it into its border tiles' physical
+#       arrays before each tendency step.
+#
+# Schedule per parent step t (sequential-consistent, DeMaria et al. 1992):
+#   parent: take collar(t-1) → advance → send payload(t) →
+#   child:  subcycles n_sub steps with lerp(payload(t-1), payload(t)) →
+#           sends collar(t) → parent step t+1 takes it.
+# The initial exchange (state at t=0) primes both channel directions so the
+# blocking takes are uniform; the chain order (roots send first) makes it
+# deadlock-free.
+
+"""Per-interface link data for a patch acting as the CHILD."""
+struct NestParentLink
+    meta::PatchInterfaceMetadata
+    down::RemoteChannel                  # take parent trio payloads
+    up::RemoteChannel                    # send my collar evaluation
+    parent_collar_x::Vector{Float64}     # where the parent needs my values
+end
+
+"""Per-interface link data for a patch acting as the PARENT."""
+struct NestChildLink
+    meta::PatchInterfaceMetadata
+    down::RemoteChannel                  # send my trio payload
+    up::RemoteChannel                    # take child collar values
+    collar_rows::Vector{Int}             # my patch-global physical rows
+    nslices::Int
+end
+
+"""
+    advance_nested_timestep(mtile, sharedSpectral, haloSend, haloReceive, t, injections)
+
+`advanceTimestep` with fine→coarse collar injection: after the tile transform
+and before the tendency computation, overwrite the tile's physical rows given
+by each `(tile_local_rows, values)` pair with the child-grid evaluation, so
+the Galerkin loads near the interface integrate child data.
+"""
+function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
+        haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64,
+        injections::Vector{Tuple{Vector{Int}, Array{Float64,3}}})
+
+    # Transform to local physical tile
+    tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
+
+    # Fine→coarse feedback: inject child values (all vars, all derivative
+    # slices) at the collar mish points owned by this tile
+    for (rows, vals) in injections
+        nsl = size(vals, 3)
+        nv = size(vals, 2)
+        @inbounds for s in 1:nsl, v in 1:nv
+            for (r, row) in enumerate(rows)
+                mtile.tile.physical[row, v, s] = vals[r, v, s]
+            end
+        end
+    end
+
+    checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
+
+    if num_columns(mtile.tile) > 0
+        Threads.@threads :static for c in 1:num_columns(mtile.tile)
+            advance_column(mtile, c, t)
+        end
+    else
+        advance_column(mtile, -1, t)
+    end
+
+    calcTendency(mtile)
+    put!(haloSend, extract_halo_values(mtile.tile))
+    write_tile_to_shared!(sharedSpectral, mtile.tile, mtile.patch_b_iDim)
+    mtile.haloReceiveBuffer .= take!(haloReceive)
+    accumulate_at_map!(sharedSpectral, mtile.haloReceiveMap, mtile.haloReceiveBuffer)
+
+    return nothing
+end
+
+"""
+    run_nested_patch(patch, model, workerids, n_sub, parent_links, child_links)
+
+Time-integrate one nest patch on its worker group (runs on the group master).
+Mirrors `run_model`/`model_loop` — group halo ring, shared spectral array,
+per-step tile advance — plus the nest coupling: parent-payload application at
+every substep (time-interpolated), child-payload emission and child-collar
+injection at every own step, and collar evaluation upstream at every cycle
+end.
+"""
+function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
+                          workerids::Vector{Int64}, n_sub::Int,
+                          parent_links::Vector{NestParentLink},
+                          child_links::Vector{NestChildLink})
+
+    num_workers = length(workerids)
+    println("Nest patch starting up with $(num_workers) workers...")
+
+    # ── Group halo ring (as in run_model, but robust to non-contiguous ids) ─
+    haloInit = RemoteChannel(()->Channel{Array{Float64}}(1), workerids[1])
+    wait(save_at(workerids[1], :haloReceive, :($(haloInit))))
+    for (a, b) in zip(workerids[1:end-1], workerids[2:end])
+        wait(save_at(a, :haloSend, :(RemoteChannel(()->Channel{Array{Float64}}(1), $(b)))))
+        receiver = get_val_from(a, :haloSend)
+        wait(save_at(b, :haloReceive, :($(receiver))))
+    end
+    wait(save_at(last(workerids), :haloSend,
+            :(RemoteChannel(()->Channel{Array{Float64}}(1), $(workerids[1])))))
+    haloReceive = get_val_from(last(workerids), :haloSend)
+    haloInitBuffer = zeros(Float64, 1)
+    haloReceiveMap = get_val_from(last(workerids), :(mtile.haloSendMap))
+    haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
+
+    # ── Per-worker collar injection maps ─────────────────────────────────────
+    # A collar row (patch-global) belongs to the worker whose tile covers its
+    # mish column; precompute (worker → selection into collar values, tile-local rows).
+    kDim_eff = model.grid_params.geometry == "R" ? 1 : model.grid_params.kDim
+    inj_maps = Vector{Vector{Tuple{Int, Vector{Int}, Vector{Int}}}}(undef, length(child_links))
+    for (li, cl) in enumerate(child_links)
+        inj_maps[li] = Tuple{Int, Vector{Int}, Vector{Int}}[]
+        for w in workerids
+            offL, iDim = get_val_from(w, :((mtile.tile.params.patchOffsetL, mtile.tile.params.iDim)))
+            lo = offL * kDim_eff
+            hi = (offL + iDim) * kDim_eff
+            sel = findall(r -> lo < r <= hi, cl.collar_rows)
+            isempty(sel) && continue
+            local_rows = [cl.collar_rows[s] - lo for s in sel]
+            push!(inj_maps[li], (w, sel, local_rows))
+        end
+    end
+
+    # ── Initial exchange (state at t = 0) ────────────────────────────────────
+    # Take parent payloads first (roots have none, so the chain resolves
+    # outermost-in); refresh the local fit with the correct ahat before
+    # donating to children — the ICs' spectral b is unchanged by ahat.
+    p0 = Vector{InterfacePayload}(undef, length(parent_links))
+    p1 = Vector{InterfacePayload}(undef, length(parent_links))
+    pj = Vector{InterfacePayload}(undef, length(parent_links))
+    for (li, pl) in enumerate(parent_links)
+        p0[li] = take!(pl.down)
+        map(wait, [get_from(w, :(Springsteel.apply_interface_payload!($(pl.meta), patch, $(p0[li])))) for w in workerids])
+    end
+    if !isempty(parent_links)
+        gridTransform!(patch)
+    end
+    for (li, pl) in enumerate(parent_links)
+        pj[li] = compute_interface_payload(pl.meta, patch)   # shape-matched buffer
+    end
+    for cl in child_links
+        put!(cl.down, compute_interface_payload(cl.meta, patch))
+    end
+    for pl in parent_links
+        put!(pl.up, evaluate_grid_ipoints(patch, pl.parent_collar_x))
+    end
+
+    # ── Shared spectral seed + t = 0 output (as in run_model) ───────────────
+    sharedSpectral = SharedArray{Float64,2}((size(patch.spectral, 1), size(patch.spectral, 2)))
+    sharedSpectral[:] .= patch.spectral[:]
+    for w in workerids
+        save_at(w, :sharedSpectral, sharedSpectral)
+    end
+    map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
+    patch.spectral .= sharedSpectral
+    gridTransform!(patch)
+    write_output(patch, model, 0.0)
+    flush(stdout)
+    checkCFL(patch)
+
+    # ── Main loop ────────────────────────────────────────────────────────────
+    num_ts = round(Int, model.integration_time / model.ts)
+    output_int = round(Int, model.output_interval / model.ts)
+    cfl_int = max(1, round(Int, get(model.options, :cfl_interval, model.output_interval) / model.ts))
+    println("Integrating $(model.ts) sec increments for $(num_ts) timesteps ($(n_sub) per parent step)")
+    cfl_diag_on = haskey(model.grid_params.vars, "w")
+    dz_min = dx_min = c_bar = 0.0
+    if cfl_diag_on
+        dz_min, dx_min = grid_spacing_minima(patch, model)
+        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(Scythe.sound_speed_sq(mtile.ref_state)))))
+    end
+
+    for t = 1:num_ts
+        j = isempty(parent_links) ? 1 : mod1(t, n_sub)
+
+        # New bracketing payload from each parent at cycle start
+        if !isempty(parent_links) && j == 1
+            for (li, pl) in enumerate(parent_links)
+                p1[li] = take!(pl.down)
+            end
+        end
+
+        # Child collar values for this step (child state at my time t-1)
+        inj_vals = [take!(cl.up) for cl in child_links]
+
+        # Advance all tiles (with collar injection on the owning workers)
+        @turbo sharedSpectral .= 0.0
+        put!(haloInit, haloInitBuffer)
+        futures = Future[]
+        for w in workerids
+            w_inj = Tuple{Vector{Int}, Array{Float64,3}}[]
+            for (li, _) in enumerate(child_links)
+                for (mw, sel, local_rows) in inj_maps[li]
+                    mw == w || continue
+                    push!(w_inj, (local_rows, inj_vals[li][sel, :, :]))
+                end
+            end
+            push!(futures, get_from(w, :(Scythe.advance_nested_timestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), $(w_inj)))))
+        end
+        map(wait, futures)
+        haloReceiveBuffer .= take!(haloReceive)
+        accumulate_at_map!(sharedSpectral, haloReceiveMap, haloReceiveBuffer)
+
+        # Apply the time-interpolated parent trio for this substep on every
+        # group worker (the b→a solve honoring ahat runs per worker in the
+        # 3-arg splineTransform!)
+        if !isempty(parent_links)
+            θ = j / n_sub
+            for (li, pl) in enumerate(parent_links)
+                lerp_payload!(pj[li], p0[li], p1[li], θ)
+                map(wait, [get_from(w, :(Springsteel.apply_interface_payload!($(pl.meta), patch, $(pj[li])))) for w in workerids])
+            end
+        end
+
+        # Reset tiles from the merged spectral state
+        map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
+
+        if any(!isfinite, sharedSpectral)
+            error("Non-finite spectral coefficient at t=$(round(t*model.ts; digits=3)) s ! CFL condition likely violated")
+        end
+
+        # Materialize the master patch when anything downstream needs it
+        is_cfl_step = cfl_diag_on && mod(t, cfl_int) == 0
+        is_output_step = mod(t, output_int) == 0
+        cycle_end = !isempty(parent_links) && j == n_sub
+        if !isempty(child_links) || cycle_end || is_cfl_step || is_output_step
+            patch.spectral .= sharedSpectral
+        end
+        if !isempty(child_links) || is_cfl_step || is_output_step
+            gridTransform!(patch)
+        end
+
+        # Donate my trio payload to each child (they subcycle against it)
+        for cl in child_links
+            put!(cl.down, compute_interface_payload(cl.meta, patch))
+        end
+
+        # Cycle end: send my collar evaluation upstream, roll the brackets
+        if cycle_end
+            for pl in parent_links
+                put!(pl.up, evaluate_grid_ipoints(patch, pl.parent_collar_x))
+            end
+            for li in eachindex(parent_links)
+                p0[li] = p1[li]
+            end
+        end
+
+        if is_cfl_step
+            cfl_diagnostics(patch, model, t, dz_min, dx_min, c_bar)
+        end
+        if is_output_step
+            write_output(patch, model, t * model.ts)
+            checkCFL(patch; t=t, ts=model.ts, where="output")
+        end
+        flush(stdout)
+    end
+
+    patch.spectral .= sharedSpectral
+    gridTransform!(patch)
+    println("Nest patch done with time integration")
+    return true
+end
+
+"""
+    integrate_nested_model(nest::NestedModelParameters)
+
+Main entry point for a nested run. Builds the per-patch models and topology,
+partitions the available workers into per-patch groups, initializes each
+group with the existing `initialize_model`, wires the inter-group payload
+channels, and runs all patches concurrently via `run_nested_patch`.
+
+Per-patch output (including logs) goes to `base.output_dir/nest\$i/`.
+Requires `sum(workers_per_patch)` worker processes.
+"""
+function integrate_nested_model(nest::NestedModelParameters)
+
+    models, topo = build_nest(nest)
+    n = length(models)
+
+    ws = workers()
+    needed = sum(nest.workers_per_patch)
+    (ws[1] != 1 && length(ws) >= needed) || throw(ErrorException(
+        "Need at least $needed worker processes for this nest, have $(ws[1] == 1 ? 0 : length(ws))"))
+
+    groups = Vector{Vector{Int64}}(undef, n)
+    off = 0
+    for i in 1:n
+        groups[i] = ws[(off + 1):(off + nest.workers_per_patch[i])]
+        off += nest.workers_per_patch[i]
+    end
+
+    println("Starting nested model: $n patches on worker groups $(groups)...")
+    for i in 1:n
+        warn_timestep_stability(models[i].grid_params, models[i].ts)
+        mkpath(models[i].output_dir)
+    end
+
+    # Redirect each group master's output to its nest's log files
+    for i in 1:n
+        gm = groups[i][1]
+        outfile = joinpath(models[i].output_dir, "scythe_out.log")
+        errfile = joinpath(models[i].output_dir, "scythe_err.log")
+        wait(save_at(gm, :out, :(open($(outfile), "w"))))
+        wait(save_at(gm, :err, :(open($(errfile), "w"))))
+        wait(get_from(gm, :(redirect_stdout(out))))
+        wait(get_from(gm, :(redirect_stderr(err))))
+    end
+
+    # Initialize every group's patch (concurrently; each group master builds
+    # its grid, reads its ICs, and constructs the group's ModelTiles)
+    map(wait, [save_at(groups[i][1], :patch,
+                       :(initialize_model($(models[i]), $(groups[i])))) for i in 1:n])
+
+    # Inter-group channels: down hosted on the child's master, up on the parent's
+    down = Vector{RemoteChannel}(undef, length(topo.interfaces))
+    up = Vector{RemoteChannel}(undef, length(topo.interfaces))
+    for (k, ni) in enumerate(topo.interfaces)
+        down[k] = RemoteChannel(() -> Channel{InterfacePayload}(2), groups[ni.child][1])
+        up[k] = RemoteChannel(() -> Channel{Array{Float64,3}}(2), groups[ni.parent][1])
+    end
+
+    # Per-patch link bundles
+    futures = Vector{Future}(undef, n)
+    for i in 1:n
+        plinks = NestParentLink[]
+        for k in topo.parent_ifaces[i]
+            ni = topo.interfaces[k]
+            # The parent's collar x-points, computed from the parent's grid
+            parent_gp = models[ni.parent].grid_params
+            pgrid = createGrid(parent_gp)
+            ppts = getGridpoints(pgrid)
+            xcol = parent_gp.geometry == "R" ? vec(ppts) : ppts[1:parent_gp.kDim:end, 1]
+            cx = ni.parent_side == :right ?
+                 xcol[findall(x -> x > ni.interface_x + 1e-9, xcol)] :
+                 xcol[findall(x -> x < ni.interface_x - 1e-9, xcol)]
+            push!(plinks, NestParentLink(ni.meta, down[k], up[k], cx))
+        end
+        clinks = NestChildLink[]
+        for k in topo.child_ifaces[i]
+            ni = topo.interfaces[k]
+            push!(clinks, NestChildLink(ni.meta, down[k], up[k], ni.collar_rows, ni.nslices))
+        end
+        futures[i] = get_from(groups[i][1],
+            :(Scythe.run_nested_patch(patch, model, $(groups[i]), $(topo.n_sub[i]),
+                                      $(plinks), $(clinks))))
+    end
+    map(wait, futures)
+
+    # Finalize each patch and close the log files
+    for i in 1:n
+        gm = groups[i][1]
+        wait(get_from(gm, :(finalize_model(patch, model))))
+        wait(get_from(gm, :(close(out))))
+        wait(get_from(gm, :(close(err))))
+    end
+    println("Nested integration complete!")
+    return models, topo, groups
 end

@@ -497,9 +497,11 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     # Transfer the model and patch/tile info to each worker
     println("Initializing workers")
     # Print the tile information — calcTileSizes now returns Vector{SpringsteelGrid}
+    # Tiles are assigned positionally along workerids (NOT by worker pid: nested
+    # runs pass worker groups whose pids don't start at 2).
     tiles = calcTileSizes(patch, num_workers)
-    for w in workerids
-        t = tiles[w-1]
+    for (n, w) in enumerate(workerids)
+        t = tiles[n]
         println("Worker $w: $(t.params.iDim) gridpoints in $(t.params.num_cells) cells from $(t.params.iMin) to $(t.params.iMax) starting at index $(t.params.spectralIndexL)")
     end
 
@@ -511,7 +513,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     # Send tile parameters and create grids on workers to avoid serializing CHOLMOD factors
     println("Initializing tiles on workers")
-    map(wait, [save_at(w, :tile_params, tiles[w-1].params) for w in workerids])
+    map(wait, [save_at(w, :tile_params, tiles[n].params) for (n, w) in enumerate(workerids)])
     map(wait, [save_at(w, :tile, :(createGrid(tile_params))) for w in workerids])
 
     # Create the model tiles
@@ -522,8 +524,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     # Precalculate indices and allocate buffers for shared and border transfers
     wait(save_at(workerids[1], :mtile, :(createModelTile(patch,tile,model,$(firstMap)))))
-    for w in workerids[1:length(workerids)-1]
-        send_index = w + 1
+    for (w, send_index) in zip(workerids[1:end-1], workerids[2:end])
         sendMap = get_val_from(w, :(mtile.haloSendMap))
         wait(save_at(send_index, :mtile, :(createModelTile(patch,tile,model,$(sendMap)))))
     end
