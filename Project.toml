@@ -1,7 +1,7 @@
 name = "Scythe"
 uuid = "d55642f6-1d05-468f-911d-cecaa5a3b3bf"
-authors = ["Michael Bell <mmbell@colostate.edu> and contributors"]
 version = "1.0.1"
+authors = ["Michael Bell <mmbell@colostate.edu> and contributors"]
 
 [deps]
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
@@ -16,6 +16,7 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
 LsqFit = "2fda8390-95c7-5789-9bda-21331edee243"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SharedArrays = "1a1011a3-84de-559e-8e89-a11a2f7dc383"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 Springsteel = "66b52f22-0fad-4358-9559-2105d4560aaf"
@@ -24,6 +25,7 @@ SuiteSparse = "4607b0f0-06f3-5cda-b6b1-a6196a1729e9"
 
 [compat]
 LsqFit = "0.15.1"
+Random = "1.11.0"
 julia = "1.7"
 
 [extras]

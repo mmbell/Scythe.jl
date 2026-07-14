@@ -1,3 +1,5 @@
+using Random: Xoshiro, randn!
+
 """
     SW_SCRATCH_SLOTS
 
@@ -14,7 +16,7 @@ BL/free-layer momentum exchange term, `:w_up` is the upward-mass-flux limiter `0
 source spells them `W_` and `w_`, which differ by one character — hence the distinct slot names.
 """
 const SW_SCRATCH_SLOTS = (:ADV, :DRAG, :COR, :PGF, :W_, :KDIFF,
-                          :S_rr, :S_ll, :S_rl, :K_free, :K_bl, :U, :w_up)
+                          :S_rr, :S_ll, :S_rl, :K_free, :K_bl, :U, :w_up, :eps)
 
 """
     _allocate_sw_scratch(tile, model)
@@ -30,12 +32,22 @@ grid so the invariant this relies on cannot silently lapse.
 
 Length is the tile's GRIDPOINT count, not `kDim`: the shallow-water sets have no vertical basis and
 treat the entire tile as a single column.
+
+The workspace also carries the tile's stochastic-forcing RNG (see `:S1_sigma` in
+[`Twoway_PV_mixing`](@ref)). It is seeded ONCE, here, from `(options[:noise_seed], tile_num)`: per
+tile so that each tile of a distributed run draws an independent stream rather than replaying the
+same numbers at different radii, and from an explicit seed so a run is exactly reproducible. Note
+that reproducibility therefore holds for a fixed (seed, worker count) pair — the tile decomposition
+is what decides which stream covers which radii.
 """
 function _allocate_sw_scratch(tile::AbstractGrid, model::ModelParameters)
     model.equation_set == "Twoway_PV_mixing" || return NamedTuple()
     n = size(tile.physical, 1)
-    return NamedTuple{SW_SCRATCH_SLOTS}(
+    vectors = NamedTuple{SW_SCRATCH_SLOTS}(
         ntuple(_ -> zeros(Float64, n), length(SW_SCRATCH_SLOTS)))
+    seed = get(model.options, :noise_seed, 0)
+    rng = Xoshiro(hash((seed, tile.params.tile_num)))
+    return merge(vectors, (rng = rng,))
 end
 
 """
@@ -304,6 +316,32 @@ computed from the full cylindrical strain rate tensor.
   to make the free atmosphere inviscid where the strain-dependent `K` is small.
 - `:K_min_bl`: lower bound on the boundary-layer diffusivity ``K`` (m²/s).
 - `:g`, `:Cd`, `:Hfree`, `:Hb`, `:f`, `:S1`: same as `Twoway_ShallowWater_Slab`.
+
+# Optional: stochastic forcing of the mass sink
+`:S1` is the diabatic mass-sink coefficient: the `h` tendency carries ``-(H_{free} + h)\\, w_b\\, S_1``,
+which removes mass where air leaves the boundary layer and so acts as a material source of potential
+vorticity. Held constant, every bit of the forcing's variability comes from ``w_b``.
+
+- `:S1_sigma`: standard deviation of a zero-mean Gaussian perturbation to `S1`, in the same
+  (absolute) units as `S1`. Defaults to `0.0`, which takes the deterministic branch and is
+  bit-for-bit identical to having no stochastic code at all. With `:S1_sigma > 0`, an independent
+  ``\\varepsilon \\sim N(0, \\sigma)`` is drawn at every gridpoint on every timestep and the sink
+  becomes ``-(H_{free} + h)\\, w_b\\, (S_1 + \\varepsilon)`` — mimicking variable buoyancy in the
+  rising motion.
+- `:noise_seed` (in `options`, not `physical_params`): integer seed. Same seed and worker count
+  reproduce a run exactly; a new seed is a new ensemble member. Defaults to `0`.
+
+Because the perturbation MULTIPLIES ``w_b``, which is itself low-azimuthal-wavenumber, the forcing is
+confined to convergent boundary-layer regions and is reddened by that coupling, even though
+``\\varepsilon`` is white. Two consequences worth knowing:
+
+- The noise is white in TIME, so the realized forcing amplitude depends on the timestep (AB3
+  integration of white noise gives variance ``\\propto \\Delta t``). ``\\sigma`` is a knob tuned at a
+  fixed `ts`, not a timestep-invariant physical constant.
+- Nothing clips ``S_1 + \\varepsilon`` at zero. At ``\\sigma = 0.5\\times10^{-5}`` with
+  ``S_1 = 10^{-5}`` the sum is negative about 2.3% of the time, locally flipping the sink to a
+  source. That is the honest consequence of a zero-mean Gaussian at 50% relative amplitude; clipping
+  it would put a positive bias in the mean.
 """
 function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
@@ -324,6 +362,8 @@ function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::I
     Hb = model.physical_params[:Hb]
     f = model.physical_params[:f]
     S1 = model.physical_params[:S1]
+    # Zero (the default) selects the deterministic branch of the mass sink below.
+    S1_sigma = get(model.physical_params, :S1_sigma, 0.0)
 
     # Assign local variables with views
     r = view(gridpoints,:,1)
@@ -405,7 +445,17 @@ function Twoway_PV_mixing(mtile::ModelTile, colstart::Int64, colend::Int64, t::I
     # h tendency (no diffusion on height field)
     @turbo ADV .= @. (-vg * hl / r) + (-ug * hr) #HADV
     @turbo PGF .= @. (-(Hfree + h) * ((ug / r) + ugr + (vgl / r))) # Divergence but use PGF array
-    @turbo COR .= @. -(Hfree + h) * w * S1
+    # Mass sink S = w * S1, a material source of PV. With :S1_sigma > 0, S1 is perturbed by a
+    # zero-mean Gaussian drawn fresh at every gridpoint every timestep — stochastic physics standing
+    # in for variable buoyancy in the rising motion. The sigma == 0 branch is the original
+    # expression untouched, so the deterministic path stays bit-for-bit what it always was.
+    if S1_sigma > 0.0
+        eps = sw.eps
+        randn!(sw.rng, eps)                       # in place: no allocation
+        @turbo COR .= @. -(Hfree + h) * w * (S1 + (S1_sigma * eps))
+    else
+        @turbo COR .= @. -(Hfree + h) * w * S1
+    end
     @turbo expdot[:,1] .= @. ADV + PGF + COR
 
     # ug tendency (with Smagorinsky diffusion)
