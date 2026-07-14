@@ -408,6 +408,15 @@ function o01_nested_diagnostics(models, topo)
     onset = NaN
     max_rr = 0.0
     min_rr = 0.0
+    # w extrema over the WHOLE run (user decision 2026-07-14): the nested max_w
+    # is defined as the run maximum, not the final-time value the single-grid
+    # diagnostic reports. By the end of the hour the secondary cells have
+    # propagated into the coarser outer nests where their intensity is
+    # resolution-limited, so a final-time sample measures the outer-nest
+    # resolution rather than the convection the benchmark targets; the run
+    # maximum (reached in the fine nest) is the comparable quantity.
+    max_w = -Inf
+    min_w = Inf
     rate_int = zeros(ntimes)
     eflux_int = zeros(ntimes)
     Whs = [Float64[] for _ in 1:n]            # masked weights, filled lazily
@@ -424,6 +433,8 @@ function o01_nested_diagnostics(models, topo)
             colmask = repeat(mask, inner = kDim)
             max_rr = max(max_rr, maximum(df.rho_r[colmask]))
             min_rr = min(min_rr, minimum(df.rho_r[colmask]))
+            max_w = max(max_w, maximum(df.w[colmask]))
+            min_w = min(min_w, minimum(df.w[colmask]))
             rr_s = max.(df.rho_r[surf], 0.0) .* mask
             Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
             R = -rr_s .* Vt
@@ -481,15 +492,6 @@ function o01_nested_diagnostics(models, topo)
     predicted_gain_pct = 100.0 * diags["precip_energy_gain_Jm2"] * total_width / E0
     diags["energy_residual_pct"] = diags["energy_drift_pct"] - predicted_gain_pct
 
-    # Vertical velocity extremes over nominal regions (final snapshots)
-    max_w = -Inf
-    min_w = Inf
-    for i in 1:n
-        df = CSV.read(snaps[i][ntimes][2], DataFrame)
-        colmask = repeat(masks[i], inner = kDim)
-        max_w = max(max_w, maximum(df.w[colmask]))
-        min_w = min(min_w, minimum(df.w[colmask]))
-    end
     diags["max_w"] = max_w
     diags["min_w"] = min_w
 
