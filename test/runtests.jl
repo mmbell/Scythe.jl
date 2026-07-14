@@ -15,6 +15,7 @@ using Scythe
     include("test_api_migration.jl")
     include("test_generic_transforms.jl")
     include("test_linear_advection_integration.jl")
+    include("test_nesting_config.jl")
     include("test_nested_advection_oneway.jl")
     include("test_nested_advection_twoway.jl")
     include("test_nested_advection_subcycle.jl")

@@ -83,6 +83,7 @@ include("io.jl")
 include("microphysics.jl")
 include("moist_compressible.jl")
 include("idealized.jl")
+include("nesting.jl")
 
 # Export the primary driver function and the ModelParameters
 export integrate_model
