@@ -209,6 +209,38 @@ function domain_integral(field::AbstractMatrix, model)
 end
 
 """
+    domain_integral(field, model, col_mask) -> Float64
+
+Column-masked variant for nested runs: only columns with `col_mask[c] == true`
+contribute to the horizontal integral. Used to restrict a nest patch to its
+NOMINAL region (its collar cells duplicate the child's territory and must be
+excluded so abutting patches partition the domain exactly; collars occupy
+whole cells, so a column mask loses no accuracy).
+"""
+function domain_integral(field::AbstractMatrix, model, col_mask::AbstractVector{Bool})
+    gp = model.grid_params
+    ncols = size(field, 2)
+    length(col_mask) == ncols || error("col_mask length $(length(col_mask)) ≠ ncols $ncols")
+    masked = field .* reshape(Float64.(col_mask), 1, ncols)
+    return domain_integral(masked, model)
+end
+
+"""
+    nominal_col_mask(model, xlo, xhi) -> Vector{Bool}
+
+Column mask selecting the mish columns of `model`'s grid whose x lies in the
+nominal region `[xlo, xhi]` (excluding this patch's collar cells).
+"""
+function nominal_col_mask(model, xlo::Float64, xhi::Float64)
+    patch = createGrid(model.grid_params)
+    pts = Scythe.getGridpoints(patch)
+    kDim = model.grid_params.kDim
+    x = kDim > 0 && String(model.grid_params.geometry) != "R" ?
+        pts[1:kDim:end, 1] : vec(pts)
+    return [xlo - 1e-9 <= xi <= xhi + 1e-9 for xi in x]
+end
+
+"""
     conservation_drift(model, ref; liquid_var=nothing) -> Dict
 
 Percent drift of the domain-integrated total mass, total energy, and total

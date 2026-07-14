@@ -27,6 +27,7 @@ struct BenchmarkOptions
     update_reference::Bool
     plot::Bool
     ts_factor::Float64  # RiRk timestep scale (--ts-factor, default 1.0)
+    nests::Int          # --nests N: grid-nesting levels (1 = single grid, default)
 end
 
 # Primitive-equation stage carrying the linear dry-air density rho_d' (slot 2)
@@ -72,6 +73,7 @@ function parse_benchmark_args(args::Vector{String})
     update_reference = false
     plot = false
     ts_factor = 1.0
+    nests = 1
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -85,6 +87,8 @@ function parse_benchmark_args(args::Vector{String})
             nworkers = parse(Int, args[i+1]); i += 2
         elseif arg == "--ts-factor"
             ts_factor = parse(Float64, args[i+1]); i += 2
+        elseif arg == "--nests"
+            nests = parse(Int, args[i+1]); i += 2
         elseif arg == "--update-reference"
             update_reference = true; i += 1
         elseif arg == "--plot"
@@ -92,7 +96,7 @@ function parse_benchmark_args(args::Vector{String})
         elseif arg in ("--help", "-h")
             println("Usage: julia --project=. benchmarks/<case>.jl " *
                     "[--mode quick|full] [--stage legacy|pe|pe-rho_d] [--grid rz|rirk] " *
-                    "[--workers N] [--ts-factor F] [--update-reference] [--plot]")
+                    "[--workers N] [--ts-factor F] [--nests N] [--update-reference] [--plot]")
             exit(0)
         else
             error("Unknown argument: $arg")
@@ -104,7 +108,8 @@ function parse_benchmark_args(args::Vector{String})
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
     ts_factor > 0.0 || error("--ts-factor must be > 0")
-    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot, ts_factor)
+    nests >= 1 || error("--nests must be >= 1")
+    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot, ts_factor, nests)
 end
 
 """Geometry string for the configured vertical basis (RZ Chebyshev vs RiRk B-spline)."""
@@ -122,11 +127,11 @@ GC from inside the `Threads.@threads` column loop, which shows up as heavy GC ti
 millions of lock conflicts — and is a suspected contributor to the intermittent worker death
 in long moist_compressible runs.
 """
-function add_benchmark_workers(opts::BenchmarkOptions)
-    nthreads = max(1, Sys.CPU_THREADS ÷ opts.workers)
-    println("Adding $(opts.workers) worker(s) with $(nthreads) thread(s) each " *
+function add_benchmark_workers(opts::BenchmarkOptions; count::Int = opts.workers)
+    nthreads = max(1, Sys.CPU_THREADS ÷ count)
+    println("Adding $(count) worker(s) with $(nthreads) thread(s) each " *
             "($(Sys.CPU_THREADS) CPU threads available)")
-    return addprocs(opts.workers, exeflags = "--threads=$(nthreads)")
+    return addprocs(count, exeflags = "--threads=$(nthreads)")
 end
 
 """
@@ -189,10 +194,13 @@ vertical_size(opts::BenchmarkOptions; num_cells_k::Int, kDim::Int) =
 """Path suffix distinguishing non-default grids (empty for the default RZ grid)."""
 grid_suffix(opts::BenchmarkOptions) = opts.grid == :rz ? "" : "_$(opts.grid)"
 
+"""Suffix distinguishing nested-run artifacts (`_n3`); empty for single-grid runs."""
+nest_suffix(opts::BenchmarkOptions) = opts.nests > 1 ? "_n$(opts.nests)" : ""
+
 """Output directory for a benchmark variant (created if missing)."""
 function benchmark_output_dir(name::String, opts::BenchmarkOptions)
     dir = joinpath(BENCHMARKS_DIR, "output",
-                   "$(name)_$(opts.mode)_$(opts.stage)$(grid_suffix(opts))")
+                   "$(name)_$(opts.mode)_$(opts.stage)$(grid_suffix(opts))$(nest_suffix(opts))")
     mkpath(dir)
     return dir * "/"   # integrate_model concatenates paths with *
 end
@@ -531,5 +539,103 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
     println()
     println(passed ? "✓ $name [$(opts.mode)/$(opts.stage)] PASSED" :
                      "✗ $name [$(opts.mode)/$(opts.stage)] FAILED")
+    return passed
+end
+
+"""
+    run_nested_benchmark(name, opts; nest, init!, diagnostics) -> Bool
+
+Nested-grid counterpart of [`run_benchmark`](@ref): builds the nest, runs
+`init!(models, topo)`, integrates via `integrate_nested_model`, and checks
+`diagnostics(models, topo)` against the same published target windows.
+Regression uses the scalar-diagnostics reference (per-nest field CSVs are not
+committed); the reference file carries the `_n<nests>` suffix so single-grid
+references are untouched.
+"""
+function run_nested_benchmark(name::String, opts::BenchmarkOptions;
+                              nest, init!::Function, diagnostics::Function)
+
+    models, topo = build_nest(nest)
+    n = length(models)
+
+    println("═"^70)
+    println("Benchmark: $name  mode=$(opts.mode)  stage=$(opts.stage)  grid=$(opts.grid)  " *
+            "nests=$(opts.nests) ($(n) patches)  equation_set=$(nest.base.equation_set)")
+    for (i, m) in enumerate(models)
+        nsteps = round(Int, m.integration_time / m.ts)
+        println("  nest$i: [$(m.grid_params.iMin/1000), $(m.grid_params.iMax/1000)] km  " *
+                "num_cells=$(m.grid_params.num_cells)  ts=$(m.ts) s (n_sub=$(topo.n_sub[i]))  steps=$nsteps")
+    end
+    println("═"^70)
+
+    println("Generating reference state and initial conditions...")
+    init!(models, topo)
+
+    println("Integrating...")
+    wallclock = @elapsed integrate_nested_model(nest)
+    @printf("Wall clock: %.1f s\n", wallclock)
+
+    println("Computing diagnostics...")
+    diags = diagnostics(models, topo)
+
+    targets = load_targets(name, opts)
+    target_pass = check_targets(diags, targets)
+    report_table(name, opts, diags, targets, target_pass)
+    diag_csv = write_diagnostics_csv(joinpath(nest.base.output_dir, "diagnostics.csv"),
+                                     diags, targets, target_pass)
+    println("\nSaved diagnostics: $diag_csv")
+    targets_ok = all(values(target_pass))
+
+    ref_csv = joinpath(REFERENCE_DATA_DIR, name,
+                       "$(opts.mode)_$(opts.stage)$(grid_suffix(opts))$(nest_suffix(opts))_diagnostics.csv")
+    regression_ok = nothing
+    if opts.update_reference
+        write_diagnostics_reference(ref_csv, diags, targets)
+        println("\nUpdated regression reference: $ref_csv")
+    elseif isfile(ref_csv)
+        regression_ok, regression_stats = compare_diagnostics_reference(ref_csv, diags)
+        println("\nRegression vs committed diagnostics ($(basename(ref_csv))):")
+        for (dname, (rel, diff)) in sort(collect(regression_stats), by = first)
+            @printf("  %-16s rel = %.3e  abs = %.3e  %s\n",
+                    dname, rel, diff, rel <= 1.0e-6 ? "PASS" : "FAIL")
+        end
+    else
+        println("\nNo committed reference at $ref_csv")
+        println("(re-run with --update-reference after accepting this result)")
+    end
+
+    scythe_sha, scythe_dirty = git_info(normpath(joinpath(@__DIR__, "..", "..")))
+    springsteel_sha, _ = git_info(pkgdir(Springsteel))
+
+    passed = targets_ok && (isnothing(regression_ok) || regression_ok)
+    record = Dict(
+        "timestamp" => string(now()),
+        "case" => name,
+        "mode" => opts.mode,
+        "stage" => opts.stage,
+        "grid" => opts.grid,
+        "nests" => opts.nests,
+        "equation_set" => nest.base.equation_set,
+        "scythe_sha" => scythe_sha,
+        "scythe_dirty" => scythe_dirty,
+        "springsteel_sha" => springsteel_sha,
+        "julia_version" => string(VERSION),
+        "hostname" => gethostname(),
+        "nworkers" => nworkers(),
+        "ts" => join(topo.ts_actual, "|"),
+        "num_cells" => join([m.grid_params.num_cells for m in models], "|"),
+        "kDim" => nest.base.grid_params.kDim,
+        "integration_time" => nest.base.integration_time,
+        "wallclock_s" => round(wallclock, digits=2),
+        "diagnostics" => Dict(k => v for (k, v) in diags),
+        "target_pass" => target_pass,
+        "regression_pass" => regression_ok,
+        "passed" => passed,
+    )
+    record_result(name, record)
+
+    println()
+    println(passed ? "✓ $name [$(opts.mode)/$(opts.stage)/n$(opts.nests)] PASSED" :
+                     "✗ $name [$(opts.mode)/$(opts.stage)/n$(opts.nests)] FAILED")
     return passed
 end

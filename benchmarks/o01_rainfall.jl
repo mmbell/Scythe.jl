@@ -30,8 +30,17 @@ include(joinpath(@__DIR__, "common", "harness.jl"))
 opts = parse_benchmark_args(ARGS)
 opts.stage == STAGE_MC ||
     error("o01_rainfall supports only --stage mc (the total-energy set carries rho_r)")
+opts.nests in (1, 3) ||
+    error("o01_rainfall supports --nests 1 (single grid) or 3 (5-patch two-way nest)")
+opts.nests == 1 || opts.grid == :rirk ||
+    error("--nests 3 requires --grid rirk (spline interface coupling)")
 
-add_benchmark_workers(opts)
+# 3-level nest = 5 abutting patches; the fine center patch gets the extra workers
+# in full mode (it dominates the column-step cost).
+nested_workers(opts) = opts.mode == :full ? [1, 1, 4, 1, 1] : [1, 1, 1, 1, 1]
+
+add_benchmark_workers(opts;
+                      count = opts.nests > 1 ? sum(nested_workers(opts)) : opts.workers)
 @everywhere using Springsteel
 @everywhere using Scythe
 
@@ -290,6 +299,203 @@ function o01_diagnostics(model)
     return merge(diags, drift)
 end
 
+# ── Nested (3-level, 5-patch) configuration ─────────────────────────────────
+#
+# Grid nesting per DeMaria et al. (1992)/Ooyama (2001): fine center patch over
+# the bubble, 2x-coarser abutting patches outward, two-way coupling (R3X trio
+# down, collar tendency injection up), per-patch timesteps. The vertical grid
+# is identical everywhere. Coarse-patch timesteps are capped at 0.6 s: the
+# moist scheme's stability ceiling is set by the vertical acoustic Courant
+# (c*ts/dz_min ≈ 1.8 at 0.6 s; a single-grid isolation run at ts = 1.2
+# reproduced the blow-up with no nesting involved), so the outermost patches
+# gain less than the full 2x-per-level — the nested speedup comes mostly from
+# the column-count reduction.
+
+"""Nest layout for the configured mode, wrapping the single-grid model as base."""
+function o01_nest(opts::BenchmarkOptions)
+    base = o01_model(opts)
+    if opts.mode == :full
+        boundaries = [0.0, 50.0e3, 63.0e3, 87.0e3, 100.0e3, 150.0e3]
+        num_cells = [25, 13, 48, 13, 25]           # 2 | 1 | 0.5 | 1 | 2 km cells
+        ts = [0.6, 0.3, 0.15, 0.3, 0.6]
+    else
+        boundaries = [0.0, 48.0e3, 64.0e3, 86.0e3, 102.0e3, 150.0e3]
+        num_cells = [6, 4, 11, 4, 6]               # 8 | 4 | 2 | 4 | 8 km cells
+        ts = [0.6, 0.6, 0.3, 0.6, 0.6]
+    end
+    ts = [vertical_ts(t, opts) for t in ts]
+    return NestedModelParameters(
+        boundaries = boundaries,
+        num_cells = num_cells,
+        ts = ts,
+        workers_per_patch = nested_workers(opts),
+        base = base)
+end
+
+"""Nominal (collar-excluded) x-bounds of nest patch `i`."""
+function o01_nominal_bounds(models, topo, i)
+    xlo = models[i].grid_params.iMin
+    xhi = models[i].grid_params.iMax
+    for k in topo.child_ifaces[i]
+        ni = topo.interfaces[k]
+        if ni.parent_side == :right
+            xhi = ni.interface_x
+        else
+            xlo = ni.interface_x
+        end
+    end
+    return xlo, xhi
+end
+
+"""Shared reference + per-patch RH-preserving bubble ICs (nested o01_init!)."""
+function o01_init_nested!(models, topo)
+    for m in models
+        mkpath(m.output_dir)
+        for f in readdir(m.output_dir)
+            endswith(f, "_physical.csv") && rm(joinpath(m.output_dir, f))
+        end
+    end
+
+    # The reference depends on z only; build it once and share the file.
+    m1 = models[1]
+    patch = createGrid(m1.grid_params)
+    gridpoints = Scythe.getGridpoints(patch)
+    kDim = m1.grid_params.kDim
+    z = gridpoints[1:kDim, 2]
+    column = Scythe.reference_column(patch, m1.grid_params)
+    ref_phys = Springsteel.calculate_pressure_reference_state(DUNION_SOUNDING, z, column)
+    Scythe.write_exact_ref_mc(m1.ref_state_file, z,
+                              Springsteel.ref_pressure(ref_phys)[:, 1],
+                              Springsteel.ref_rho_d(ref_phys)[:, 1],
+                              Springsteel.ref_rho_v(ref_phys)[:, 1],
+                              zeros(kDim))
+    ref = Springsteel.exact_pressure_reference_state(m1.ref_state_file, z, column)
+    rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
+    pbar_z = Springsteel.ref_pressure(ref)[:, 2]
+    residual = pbar_z .+ (Scythe.gravity .* rho_tbar)
+    println("Reference: sfc p = $(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits=2)) hPa, ",
+            "max hydrostatic residual = $(maximum(abs.(residual))) Pa/m")
+
+    for m in models
+        p = createGrid(m.grid_params)
+        gpts = Scythe.getGridpoints(p)
+        p.physical .= 0.0
+        Scythe.moist_temperature_bubble_mc!(p, gpts, ref;
+                                            xc = 75.0e3, xr = 16.0e3,
+                                            zc = 500.0, zr = 3000.0, dT_max = 3.0)
+        Scythe.write_ics_csv(m.initial_conditions, p, gpts)
+    end
+end
+
+"""
+Nested rain + budget diagnostics: per-patch surface-rain series restricted to
+each patch's nominal region (collar cells excluded so abutting patches
+partition the domain exactly), summed/maxed across patches; masked domain
+integrals for the water and energy budgets.
+"""
+function o01_nested_diagnostics(models, topo)
+    ref, _, kDim = rebuild_reference(models[1])
+    n = length(models)
+    masks = [nominal_col_mask(models[i], o01_nominal_bounds(models, topo, i)...)
+             for i in 1:n]
+    total_width = models[n].grid_params.iMax - models[1].grid_params.iMin
+
+    snaps = [output_snapshots(m) for m in models]
+    ntimes = minimum(length.(snaps))
+    times = [snaps[1][j][1] for j in 1:ntimes]
+
+    peak_rate = 0.0
+    onset = NaN
+    max_rr = 0.0
+    min_rr = 0.0
+    rate_int = zeros(ntimes)
+    eflux_int = zeros(ntimes)
+    Whs = [Float64[] for _ in 1:n]            # masked weights, filled lazily
+    for j in 1:ntimes
+        pk_t = 0.0
+        for i in 1:n
+            t, path = snaps[i][j]
+            df = CSV.read(path, DataFrame)
+            gp = models[i].grid_params
+            ncols = div(nrow(df), kDim)
+            surf = 1:kDim:nrow(df)
+            Tk, _, rho_d, _, _, _ = mc_state(df, ref, kDim, ncols)
+            mask = masks[i]
+            colmask = repeat(mask, inner = kDim)
+            max_rr = max(max_rr, maximum(df.rho_r[colmask]))
+            min_rr = min(min_rr, minimum(df.rho_r[colmask]))
+            rr_s = max.(df.rho_r[surf], 0.0) .* mask
+            Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
+            R = -rr_s .* Vt
+            pk_t = max(pk_t, maximum(R))
+            if isempty(Whs[i])
+                Whs[i] = gauss_cell_weights(ncols, gp.num_cells, gp.iMax - gp.iMin,
+                                            ncols ÷ gp.num_cells, gp.quadrature) .* mask
+            end
+            e_l = (Scythe.Cpv .* Tk[surf]) .- Scythe.L_v.(Tk[surf])
+            rate_int[j] += sum(Whs[i] .* R)
+            eflux_int[j] += sum(Whs[i] .* (rr_s .* Vt .* e_l))    # F_E(z≈0), > 0 for e_l < 0
+        end
+        peak_rate = max(peak_rate, pk_t)
+        if isnan(onset) && pk_t > 1.0e-3
+            onset = times[j]
+        end
+    end
+    accum_flux = 0.0
+    accum_E = 0.0
+    for j in 1:(ntimes - 1)
+        dt = times[j+1] - times[j]
+        accum_flux += 0.5 * (rate_int[j] + rate_int[j+1]) * dt
+        accum_E += 0.5 * (eflux_int[j] + eflux_int[j+1]) * dt
+    end
+
+    diags = Dict(
+        "peak_rain_rate_gm2s" => 1000.0 * peak_rate,
+        "rain_onset_min" => onset / 60.0,
+        "max_rho_r_gm3" => 1000.0 * max_rr,
+        "min_rho_r_gm3" => 1000.0 * min_rr,
+        "accum_rainfall_flux_mm" => accum_flux / total_width,
+        "precip_energy_gain_Jm2" => accum_E / total_width,
+    )
+
+    # Masked water/energy budgets across the nest
+    rho_wbar = Springsteel.ref_rho_t(ref)[:, 1] .- Springsteel.ref_rho_d(ref)[:, 1]
+    E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
+    function nest_budget(j)
+        W = 0.0
+        E = 0.0
+        for i in 1:n
+            df = CSV.read(snaps[i][j][2], DataFrame)
+            ncols = div(nrow(df), kDim)
+            rho_w = (df.rho_t .- df.rho_d) .+ repeat(rho_wbar, ncols)
+            E_t = df.E_t .+ repeat(E_tbar, ncols)
+            W += domain_integral(reshape(rho_w, kDim, ncols), models[i], masks[i])
+            E += domain_integral(reshape(E_t, kDim, ncols), models[i], masks[i])
+        end
+        return W, E
+    end
+    W0, E0 = nest_budget(1)
+    WN, EN = nest_budget(ntimes)
+    diags["accum_rainfall_mm"] = (W0 - WN) / total_width
+    diags["energy_drift_pct"] = 100.0 * (EN - E0) / E0
+    predicted_gain_pct = 100.0 * diags["precip_energy_gain_Jm2"] * total_width / E0
+    diags["energy_residual_pct"] = diags["energy_drift_pct"] - predicted_gain_pct
+
+    # Vertical velocity extremes over nominal regions (final snapshots)
+    max_w = -Inf
+    min_w = Inf
+    for i in 1:n
+        df = CSV.read(snaps[i][ntimes][2], DataFrame)
+        colmask = repeat(masks[i], inner = kDim)
+        max_w = max(max_w, maximum(df.w[colmask]))
+        min_w = min(min_w, minimum(df.w[colmask]))
+    end
+    diags["max_w"] = max_w
+    diags["min_w"] = min_w
+
+    return diags
+end
+
 # ── Figures ────────────────────────────────────────────────────────────────
 
 plotter = nothing
@@ -314,11 +520,19 @@ end
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
-model = o01_model(opts)
-passed = run_benchmark("o01_rainfall", opts;
-                       model = model,
-                       init! = o01_init!,
-                       diagnostics = o01_diagnostics,
-                       varnames = MC_VARS,
-                       plotter = plotter)
+if opts.nests == 1
+    model = o01_model(opts)
+    passed = run_benchmark("o01_rainfall", opts;
+                           model = model,
+                           init! = o01_init!,
+                           diagnostics = o01_diagnostics,
+                           varnames = MC_VARS,
+                           plotter = plotter)
+else
+    nest = o01_nest(opts)
+    passed = run_nested_benchmark("o01_rainfall", opts;
+                                  nest = nest,
+                                  init! = o01_init_nested!,
+                                  diagnostics = o01_nested_diagnostics)
+end
 exit(passed ? 0 : 1)
