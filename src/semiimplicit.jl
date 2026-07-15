@@ -519,10 +519,11 @@ end
 
 3D cylindrical layout: `b_kDim` vertical-mode blocks of `1 + 2*kDim` radial
 sub-blocks (k = 0 spline, then real/imag per azimuthal wavenumber); copy the
-inner rows of every sub-block to its patch position. The wavenumber count is
-taken from the tile, which is exact for the single-tile (tile = patch) case the
-cylindrical mc runs currently use; radial multi-tile decomposition of 3D
-cylindrical grids would need the patch's own wavenumber stride here.
+inner rows of every sub-block to its patch position. Sub-blocks are aligned by
+wavenumber, but an inner tile carries FEWER wavenumbers than the patch (its
+`kDim` follows its outermost ring), so the patch's z-level stride is taken from
+the shared array itself (`rows = wn_stride_patch * b_kDim`; the vertical is
+never decomposed).
 """
 function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union{RLZ_Grid, RLR_Grid},
                                 b_iDim_patch::Int64)
@@ -531,11 +532,12 @@ function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union
     b_kDim = tile.params.b_kDim
     kDim = tile.params.iDim + tile.params.patchOffsetL
     nblocks = 1 + 2 * kDim
+    wn_stride_p = size(sharedSpectral, 1) ÷ b_kDim   # patch z-level stride
     inner_rows = b_iDim_tile - 4  # inner region excludes 3-row halo
 
     for z_b in 1:b_kDim
         for j in 0:nblocks-1
-            pp1 = ((z_b - 1) * nblocks + j) * b_iDim_patch + siL
+            pp1 = (z_b - 1) * wn_stride_p + j * b_iDim_patch + siL
             tp1 = ((z_b - 1) * nblocks + j) * b_iDim_tile + 1
             sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
         end
