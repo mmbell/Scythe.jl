@@ -61,7 +61,9 @@ const MC_SCRATCH_SLOTS = (
     :df_u_nstar, :df_w_nstar, :df_s_nstar, :df_u_np1, :df_w_np1,
     :df_dke, :df_dE_visc, :df_ds_t, :df_dT_h, :df_dE_h, :df_dp_h, :df_dQ_h,
     :df_rw_star, :df_rv_star, :df_rw_nstar, :df_rv_nstar, :df_rr_nstar,
-    :df_rw_np1, :df_rv_np1, :df_drw, :df_drv, :df_drr, :df_dE_w)
+    :df_rw_np1, :df_rv_np1, :df_drw, :df_drv, :df_drr, :df_dE_w,
+    # ── tangential wind v (cylindrical geometries; inert columns on the XZ slice) ──
+    :df_v_star, :df_v_nstar, :df_v_np1)
 
 """
     _allocate_mc_scratch(tile, model)
@@ -410,11 +412,12 @@ const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
 # ── Equation set ───────────────────────────────────────────────────────────────
 
 """
-    moist_compressible_XZ(mtile, colstart, colend, t)
+    mc_driver!(mtile, colstart, colend, t, geom)
 
-Total-energy moist compressible equation set on an XZ slice. Prognostic slots
-(perturbations vs the `PressureReferenceState` except u, w, rho_r):
-p' [Pa], rho_d', rho_t', u, w, E_t' [J/m^3], Q_ss' [kg/m^3], rho_r.
+Total-energy moist compressible equation set — the geometry-generic master driver.
+Prognostic slots (perturbations vs the `PressureReferenceState` except u, w, rho_r,
+and v on the cylindrical geometries): p' [Pa], rho_d', rho_t', u, w, E_t' [J/m^3],
+Q_ss' [kg/m^3], rho_r (+ tangential v, slot 9, on the cylinders).
 
 Each step the temperature is retrieved from `retrieve_temperature`, the water
 partition follows diagnostically (rho_v = Q_ss + rho_vs, rho_c residual), and the
@@ -422,8 +425,15 @@ condensation rate is the limited supersaturation relaxation. The energy equation
 carries no condensation source (exact first law); the pressure equation's
 condensation coefficient is (L_v - R_v*C_pt*T/R_m). See
 reference/Scythe_moist_compressible.tex.
+
+Everything geometry-specific — the derivative-slot mapping, metric and curvature
+terms, and the tangential-wind machinery — is dispatched on the singleton `geom`
+trait (see mc_geometry.jl), so the Cartesian path compiles to exactly the
+historical `moist_compressible_XZ` code. The name-dispatched equation sets are
+thin wrappers below.
 """
-function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
+                    geom::MCGeometry)
 
     grid = mtile.tile
     gridpoints = mtile.tilepoints
@@ -445,6 +455,10 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Kvdiff_water = get(model.physical_params, :Kvdiff_water, 0.0)
     tau_qss = get(model.physical_params, :tau_qss, 10.0)
 
+    # Coriolis parameter (constant f-plane) for the cylindrical geometries; the
+    # Cartesian slice carries no rotation and its methods never read it.
+    fcor = get(model.physical_params, :f, 0.0)
+
     # Rayleigh sponge (Durran-Klemp 1983 eq. 29 profile above z_damp): momentum-only,
     # damping u and w toward the resting base state. alpha = 0 (or absent keys)
     # disables it and skips the block entirely, keeping alpha = 0 configs bit-identical.
@@ -458,63 +472,32 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     precipitation = get(model.options, :precipitation, false)::Bool
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
 
-    # Gridpoints
-    x = view(gridpoints,colstart:colend,1)
-    z = view(gridpoints,colstart:colend,2)
+    # Gridpoints: z from the geometry's vertical column; r is gridpoint column 1
+    # on the cylinders (`nothing` on the Cartesian slice, where no method reads it)
+    z = view(gridpoints,colstart:colend,zcoord(geom))
+    r = mc_radius(geom, gridpoints, colstart, colend)
 
-    # Slot 1 is the pressure perturbation p' [Pa]
-    pp = view(grid.physical,colstart:colend,1,1)
-    pp_x = view(grid.physical,colstart:colend,1,2)
-    pp_xx = view(grid.physical,colstart:colend,1,3)
-    pp_z = view(grid.physical,colstart:colend,1,4)
-    pp_zz = view(grid.physical,colstart:colend,1,5)
+    # Prognostic slot views, geometry-mapped (see mc_slot_views): `_x` is ∂x on the
+    # slice and ∂r on the cylinders, `_z`/`_zz` sit at zslot(geom), and the raw
+    # azimuthal `f_l`/`f_ll` pair exists only on the 3D grid (`nothing` on 2D).
+    pv  = mc_slot_views(grid, colstart, colend, 1, geom)   # p' [Pa]
+    rdv = mc_slot_views(grid, colstart, colend, 2, geom)   # rho_d'
+    rtv = mc_slot_views(grid, colstart, colend, 3, geom)   # rho_t'
+    uv  = mc_slot_views(grid, colstart, colend, 4, geom)   # u
+    wv  = mc_slot_views(grid, colstart, colend, 5, geom)   # w
+    etv = mc_slot_views(grid, colstart, colend, 6, geom)   # E_t'
+    qsv = mc_slot_views(grid, colstart, colend, 7, geom)   # Q_ss'
+    rrv = mc_slot_views(grid, colstart, colend, 8, geom)   # rho_r (rho_rbar = 0)
+    vv  = mc_v_views(geom, grid, colstart, colend)         # tangential v (cylinders)
 
-    # Slot 2 is the dry-air density perturbation rho_d'
-    rho_dp = view(grid.physical,colstart:colend,2,1)
-    rho_dp_x = view(grid.physical,colstart:colend,2,2)
-    rho_dp_xx = view(grid.physical,colstart:colend,2,3)
-    rho_dp_z = view(grid.physical,colstart:colend,2,4)
-    rho_dp_zz = view(grid.physical,colstart:colend,2,5)
-
-    # Slot 3 is the total density perturbation rho_t'
-    rho_tp = view(grid.physical,colstart:colend,3,1)
-    rho_tp_x = view(grid.physical,colstart:colend,3,2)
-    rho_tp_xx = view(grid.physical,colstart:colend,3,3)
-    rho_tp_z = view(grid.physical,colstart:colend,3,4)
-    rho_tp_zz = view(grid.physical,colstart:colend,3,5)
-
-    u = view(grid.physical,colstart:colend,4,1)
-    u_x = view(grid.physical,colstart:colend,4,2)
-    u_xx = view(grid.physical,colstart:colend,4,3)
-    u_z = view(grid.physical,colstart:colend,4,4)
-    u_zz = view(grid.physical,colstart:colend,4,5)
-
-    w = view(grid.physical,colstart:colend,5,1)
-    w_x = view(grid.physical,colstart:colend,5,2)
-    w_xx = view(grid.physical,colstart:colend,5,3)
-    w_z = view(grid.physical,colstart:colend,5,4)
-    w_zz = view(grid.physical,colstart:colend,5,5)
-
-    # Slot 6 is the total energy density perturbation E_t'
-    E_tp = view(grid.physical,colstart:colend,6,1)
-    E_tp_x = view(grid.physical,colstart:colend,6,2)
-    E_tp_xx = view(grid.physical,colstart:colend,6,3)
-    E_tp_z = view(grid.physical,colstart:colend,6,4)
-    E_tp_zz = view(grid.physical,colstart:colend,6,5)
-
-    # Slot 7 is the supersaturation density perturbation Q_ss'
-    Q_ssp = view(grid.physical,colstart:colend,7,1)
-    Q_ssp_x = view(grid.physical,colstart:colend,7,2)
-    Q_ssp_xx = view(grid.physical,colstart:colend,7,3)
-    Q_ssp_z = view(grid.physical,colstart:colend,7,4)
-    Q_ssp_zz = view(grid.physical,colstart:colend,7,5)
-
-    # Slot 8 is the rain partial density rho_r (reference rho_rbar = 0)
-    rho_rp = view(grid.physical,colstart:colend,8,1)
-    rho_rp_x = view(grid.physical,colstart:colend,8,2)
-    rho_rp_xx = view(grid.physical,colstart:colend,8,3)
-    rho_rp_z = view(grid.physical,colstart:colend,8,4)
-    rho_rp_zz = view(grid.physical,colstart:colend,8,5)
+    pp = pv.f;      pp_x = pv.f_x;         pp_z = pv.f_z
+    rho_dp = rdv.f; rho_dp_x = rdv.f_x;    rho_dp_z = rdv.f_z; rho_dp_zz = rdv.f_zz
+    rho_tp = rtv.f; rho_tp_x = rtv.f_x;    rho_tp_z = rtv.f_z; rho_tp_zz = rtv.f_zz
+    u = uv.f;       u_x = uv.f_x;          u_z = uv.f_z;       u_zz = uv.f_zz
+    w = wv.f;       w_x = wv.f_x;          w_z = wv.f_z;       w_zz = wv.f_zz
+    E_tp = etv.f;   E_tp_x = etv.f_x;      E_tp_z = etv.f_z
+    Q_ssp = qsv.f;  Q_ssp_x = qsv.f_x;     Q_ssp_z = qsv.f_z
+    rho_rp = rrv.f; rho_rp_x = rrv.f_x;    rho_rp_z = rrv.f_z; rho_rp_zz = rrv.f_zz
 
     # Reference state (pressure-based). Views, not `[:,1]` copies: these are read-only and
     # loop-invariant, so copying them allocated a fresh kDim vector per column per timestep.
@@ -552,7 +535,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     # Diagnostic thermodynamic state: T from the total-energy retrieval, then the
     # water partition follows from the prognostic supersaturation.
-    ke = S.ke;   @. ke = 0.5 * ((u * u) + (w * w))
+    ke = S.ke;   mc_ke!(ke, geom, u, w, vv)
     geo = S.geo; @. geo = ke + (gravity * z)
     M = S.M;     @. M = p + E_t - (rho_t * geo)
     Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar, rho_r)
@@ -634,7 +617,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
         fill!(E_sed_z, 0.0)
     end
 
-    div = S.div; @. div = u_x + w_z
+    div = S.div; mc_divergence!(div, geom, u, u_x, w_z, vv, r)
 
     # ── Horizontal diffusion ───────────────────────────────────────────────────
     # Turbulence diffuses momentum (u, w) and the moist entropy s_t (heat). Horizontally,
@@ -646,8 +629,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # session (reference/moist_compressible_diffusion_handoff.md). pbar/rho_dbar have no
     # x-dependence, so the total x-derivatives are the perturbation slots.
     sd_xx = S.sd_xx
-    @. sd_xx = (Cvd * ((pp_xx / p) - (pp_x * pp_x / (p * p)))) -
-               (Cpd * ((rho_dp_xx / rho_d) - (rho_dp_x * rho_dp_x / (rho_d * rho_d))))
+    mc_sd_lap!(sd_xx, geom, p, rho_d, pv, rdv, r)
 
     # Horizontal diabatic heating [W/m^3] from the entropy diffusion: the source to internal
     # energy is rho_d*T*(ds_t/dt)_diff = rho_d*T*Khdiff_heat*d2(s_t)/dx2. This is the
@@ -662,7 +644,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # internal energy (T, p) is held. FRIC_KE is d(rho_t*ke)/dt from horizontal momentum
     # diffusion, added to E_t; p and Q_ss get NO friction term.
     FRIC_KE = S.FRIC_KE
-    @. FRIC_KE = rho_t * Khdiff * ((u * u_xx) + (w * w_xx))
+    mc_fric_ke!(FRIC_KE, geom, rho_t, Khdiff, uv, wv, vv, r)
 
     # Placeholders for intermediate calculations
     ADV = S.ADV
@@ -673,7 +655,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # Q̇_cond is the TOTAL phase-change rate (cloud + rain channels); only the THERMAL
     # diffusion sources pressure (friction holds T, hence p; sedimentation moves no
     # partial pressure).
-    @turbo ADV .= @. (-u * pp_x) + (-w * p_z)
+    mc_advect!(ADV, geom, u, w, vv, r, pp_x, p_z, pv.f_l)
     FORCING .= @. (-gamma_m * p * div) +
                   ((R_m / C_vt) * (((Lv - (Rv * C_pt * Tk / R_m)) * (Qdot + Qdot_r)) + QDOT_TH))
     @turbo expdot[colstart:colend,1] .= @. ADV + FORCING
@@ -686,7 +668,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     impdot[colstart:colend,3] .= @. -((rho_tbar * w_z) + (rho_tbar_z * w))
 
     # Dry-air mass continuity (slot 2, advective product-rule form; no mass diffusion)
-    @turbo ADV .= @. (-u * rho_dp_x) + (-w * rho_d_z)
+    mc_advect!(ADV, geom, u, w, vv, r, rho_dp_x, rho_d_z, rdv.f_l)
     @turbo FORCING .= @. -rho_d * div
     @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
     # Implicit acoustic continuity: -∂z(ρ̄_d w), product-rule form
@@ -694,20 +676,20 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     # Total mass continuity (slot 3): the only source is the sedimentation flux
     # divergence, identical to slot 8's so rain and total water cannot drift apart.
-    @turbo ADV .= @. (-u * rho_tp_x) + (-w * rho_t_z)
+    mc_advect!(ADV, geom, u, w, vv, r, rho_tp_x, rho_t_z, rtv.f_l)
     @turbo FORCING .= @. (-rho_t * div) - Fr_z
     @turbo expdot[colstart:colend,3] .= @. ADV + FORCING
 
     # u momentum (slot 4): PGF directly from the prognostic pressure
-    @turbo ADV .= @. (-u * u_x) + (-w * u_z)
-    @turbo FORCING .= @. -pp_x / rho_t
-    @turbo KDIFF .= @. Khdiff * u_xx
+    mc_advect!(ADV, geom, u, w, vv, r, u_x, u_z, uv.f_l)
+    mc_u_forcing!(FORCING, geom, pp_x, rho_t, vv, r, fcor)
+    mc_u_kdiff!(KDIFF, geom, Khdiff, uv, vv, r)
     @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF
 
     # w momentum (slot 5): perturbation PGF + total-density buoyancy loading
-    @turbo ADV .= @. (-u * w_x) + (-w * w_z)
+    mc_advect!(ADV, geom, u, w, vv, r, w_x, w_z, wv.f_l)
     @turbo FORCING .= @. ((-gravity * rho_tp) - pp_z) / rho_t
-    @turbo KDIFF .= @. Khdiff * w_xx
+    mc_w_kdiff!(KDIFF, geom, Khdiff, wv, r)
     @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
     # Implicit acoustic w-momentum: -(1/ρ̄_t) ∂z p'
     impdot[colstart:colend,5] .= @. -pp_z / rho_tbar
@@ -718,8 +700,8 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # THERMAL diffusion heats (Q̇_therm); the momentum diffusion adds FRIC_KE = d(rho_t*ke)/dt
     # so E_t follows the resolved KE down to the subgrid (internal energy held). pbar has no
     # x-dependence so u*p_x = u*pp_x.
-    @turbo ADV .= @. (-u * E_tp_x) + (-w * E_t_z)
-    @turbo FORCING .= @. (-(E_t + p) * div) - (u * pp_x) - (w * p_z) - E_sed_z
+    mc_advect!(ADV, geom, u, w, vv, r, E_tp_x, E_t_z, etv.f_l)
+    mc_et_work!(FORCING, geom, E_t, p, div, u, pp_x, w, p_z, E_sed_z, pv, vv, r)
     @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE
     # Implicit acoustic energy flux: -∂z((Ē_t + p̄) w), product-rule form
     impdot[colstart:colend,6] .= @. -(((E_tbar + pbar) * w_z) + ((E_tbar_z + pbar_z) * w))
@@ -736,36 +718,34 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     SATF = S.SATF;   @. SATF = (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
     QSSREL = S.QSSREL
     @. QSSREL = qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau_qss)
-    @turbo ADV .= @. (-u * Q_ssp_x) + (-w * Q_ss_z)
+    mc_advect!(ADV, geom, u, w, vv, r, Q_ssp_x, Q_ss_z, qsv.f_l)
     FORCING .= @. (-Q_ss * div) + SATF - ((Qdot + Qdot_r) * (1.0 + Q_s)) + QSSREL
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
 
     # Rain partial density (slot 8): rain-channel condensation/evaporation,
     # autoconversion + collection from cloud, and the sedimentation flux divergence
     # (no diffusion yet — water-species mixing arrives with the moist diffusion).
-    @turbo ADV .= @. (-u * rho_rp_x) + (-w * rho_rp_z)
+    mc_advect!(ADV, geom, u, w, vv, r, rho_rp_x, rho_rp_z, rrv.f_l)
     @turbo FORCING .= @. (-rho_r * div) + Qdot_r + AUTO_COLL - Fr_z
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
 
+    # Tangential momentum (slot 9, cylindrical geometries only — no method body
+    # executes on the Cartesian slice): advection, azimuthal PGF (3D), Coriolis +
+    # curvature -u(f + v/r), and the λ-component of the cylindrical vector Laplacian.
+    mc_v_tendency!(expdot, geom, colstart, colend, S, u, w, uv, vv, pv, rho_t, r,
+                   fcor, Khdiff)
+
     # ── Rayleigh sponge (momentum-only) ──
     # Klemp-Durran absorbing layer against gravity-wave reflection off the rigid lid:
-    # u and w relax toward the resting base state with the (negative) coefficient
-    # ray(z), and E_t follows the resolved KE down exactly as for friction (the
-    # FRIC_KE invariant: dE = rho_t*(u*ray*u + w*ray*w) = 2*rho_t*ray*ke). T, p and
+    # u and w (and v on the cylinders) relax toward the resting base state with the
+    # (negative) coefficient ray(z), and E_t follows the resolved KE down exactly as
+    # for friction (the FRIC_KE invariant: dE = rho_t*(u*ray*u + w*ray*w) =
+    # 2*rho_t*ray*ke, with ke already carrying v on the cylinders). T, p and
     # Q_ss are held — a KE sink to the sponge, not diabatic heating. Explicit loop,
     # not `.+=` view broadcasts: the SubArray stops eliding at this function size
     # (the dE_w lesson). Behind `alpha > 0` so disabled configs are bit-identical
     # (an unconditional `+ 0.0` term could flip -0.0 tendencies).
-    if alpha > 0.0
-        z_top = z[end]
-        @inbounds for i in eachindex(z)
-            ray = Rayleigh_damping(alpha, z[i], z_damp, z_top)
-            j = colstart + i - 1
-            expdot[j,4] += ray * u[i]
-            expdot[j,5] += ray * w[i]
-            expdot[j,6] += 2.0 * rho_t[i] * ray * ke[i]
-        end
-    end
+    mc_sponge!(expdot, geom, colstart, alpha, z_damp, z, u, w, vv, rho_t, ke)
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──
     # Vertical diffusion must be implicit on a Chebyshev column, where the spectral
@@ -786,6 +766,7 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
         if Kvdiff > 0.0
             @turbo diffdot[colstart:colend,4] .= @. Kvdiff * u_zz
             @turbo diffdot[colstart:colend,5] .= @. Kvdiff * w_zz
+            mc_v_diffdot!(diffdot, geom, colstart, colend, Kvdiff, vv)
         end
         if Kvdiff_heat > 0.0
             s_t = S.s_t
@@ -830,10 +811,30 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     # when every coefficient is zero: a vertical solve is not the identity there — it
     # refits the column and reapplies the spectral filter.
     if Kvdiff > 0.0 || Kvdiff_heat > 0.0 || Kvdiff_water > 0.0
-        diffusion_timestep_mc(mtile, colstart, colend, t)
+        diffusion_timestep_mc(mtile, colstart, colend, t, geom)
     end
 
 end
+
+# ── Name-dispatched equation-set wrappers (physical_model resolves the config's
+#    equation_set string to one of these by name; all keep the moist_compressible
+#    prefix so uses_pressure_reference gates their scratch/reference plumbing) ──
+
+"Total-energy moist compressible set on a Cartesian XZ slice (RiRk/RZ grid), 8 vars."
+moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCCartesianXZ())
+
+"""
+Axisymmetric r–z cylinder on the RiRk/RZ grid (gridpoint column 1 reinterpreted as
+radius, so the domain must sit at r > 0), with prognostic tangential wind v
+(`MC_VARS_CYL`, 9 vars) and optional f-plane rotation (`physical_params[:f]`).
+"""
+moist_compressible_axisym(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCAxisymRZ())
+
+"3D r–λ–z cylinder on the RLR grid (`MC_VARS_CYL`, 9 vars, f-plane rotation optional)."
+moist_compressible_RLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCCylindricalRLR())
 
 """
     qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau)
@@ -1032,7 +1033,11 @@ Energy routing:
   architecture excludes — see the handoff doc; the residual is O(K_water × vertical
   variation of e_l + gz) and shows up in the energy-drift diagnostic).
 """
-function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    diffusion_timestep_mc(mtile, colstart, colend, t, MCCartesianXZ())
+
+function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
+                               geom::MCGeometry)
 
     vars = mtile.model.grid_params.vars
     p_index = vars["p"]
@@ -1059,7 +1064,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     E_tbar = view(ref_total_energy(mtile.ref_state),:,1)
     Q_ssbar = view(ref_qss(mtile.ref_state),:,1)
     Tbar = view(mtile.ref_state.Tbar,:,1)
-    z = view(mtile.tilepoints,colstart:colend,2)
+    z = view(mtile.tilepoints,colstart:colend,zcoord(geom))
 
     S = @inbounds mtile.mc_scratch[Threads.threadid()]
 
@@ -1078,6 +1083,8 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
 
     u_star = S.df_u_star; copyto!(u_star, u_v)
     w_star = S.df_w_star; copyto!(w_star, w_v)
+    v_v = mc_v_np1_view(geom, vnp1, colstart, colend, vars)
+    v_star = mc_v_star!(geom, S, v_v)
     p_star = S.df_p_star;         @. p_star = p_v + pbar
     rho_d_star = S.df_rho_d_star; @. rho_d_star = rhod_v + rho_dbar
     rho_t_star = S.df_rho_t_star; @. rho_t_star = rhot_v + rho_tbar
@@ -1097,7 +1104,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     if do_heat || do_water
         E_t_star = S.df_E_t_star;   @. E_t_star = et_v + E_tbar
         Q_ss_star = S.df_Q_ss_star; @. Q_ss_star = qss_v + Q_ssbar
-        @. ke_star = 0.5 * ((u_star * u_star) + (w_star * w_star))
+        mc_ke_star!(ke_star, geom, u_star, w_star, v_star)
         M_star = S.df_M_star
         @. M_star = p_star + E_t_star - (rho_t_star * (ke_star + (gravity * z)))
         @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, Q_ss_star,
@@ -1170,13 +1177,16 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         _vertical_solve!(col, h_w, w_nstar, mtile)
         copyto!(w_np1, Itransform!(col))
 
+        v_np1 = mc_v_diffusion_solve!(geom, S, mtile, col, mats, ts, t,
+                                      colstart, colend, v_star)
+
         dke = S.df_dke
-        @. dke = 0.5 * (((u_np1 * u_np1) + (w_np1 * w_np1)) -
-                        ((u_star * u_star) + (w_star * w_star)))
+        mc_dke!(dke, geom, u_np1, w_np1, u_star, w_star, v_np1, v_star)
         @. dE_visc = rho_t_star * dke
 
         u_v .= u_np1
         w_v .= w_np1
+        mc_assign_v!(geom, v_v, v_np1)
     end
 
     # ── Heat (Kvdiff_heat): moist entropy increment -> (T, p, E_t, Q_ss) at fixed
@@ -1445,7 +1455,7 @@ are computed pointwise before subtracting the reference; rho_r = 0.
 function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                                       ref::Springsteel.PressureReferenceState;
                                       xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
-                                      dT_max=3.0)
+                                      dT_max=3.0, zcol=2)
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
@@ -1457,8 +1467,10 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
     i = 1
     for _ in 1:num_columns(patch)
         for k in 1:kDim
+            # On a 3D cylindrical grid (zcol = 3) this is a WN0 torus bubble:
+            # column 1 is the radius and λ (column 2) does not enter.
             x = gridpoints[i, 1]
-            z = gridpoints[i, 2]
+            z = gridpoints[i, zcol]
             L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
             dT = L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
             p_ref = pbar[k, 1]                              # Pa

@@ -196,7 +196,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Set up the reference file
     ref_state = empty_reference_state()
     if !isempty(model.ref_state_file)
-        z_values = tilepoints[1:model.grid_params.kDim,ndims(tilepoints)]
+        # z is the LAST gridpoint column (x/r on 2D grids have 2 columns, r/λ/z 3D
+        # grids have 3 — `ndims` was wrong there, it is always 2 for a Matrix)
+        z_values = tilepoints[1:model.grid_params.kDim,end]
         ref_column = reference_column(tile, model.grid_params)
 
         # The partial-density equation sets (primitive_equation_*_pd) read the physical
@@ -241,7 +243,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     mc_ref_diag = if uses_pressure_reference(model.equation_set) &&
                      !isempty(model.ref_state_file)
         mc_reference_diagnostics(ref_state,
-                                 tilepoints[1:model.grid_params.kDim, ndims(tilepoints)])
+                                 tilepoints[1:model.grid_params.kDim, end])
     else
         (s_tbar = Float64[], rho_vbar = Float64[])
     end
@@ -297,6 +299,13 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
             water_first   = mc_matrix("rho_t", Kv_water_mc, 0.5),
             water_r       = mc_matrix("rho_r", Kv_water_mc, 1.25),
             water_r_first = mc_matrix("rho_r", Kv_water_mc, 0.5))
+        # The cylindrical variants carry the tangential wind v (its own BCs) through
+        # the same momentum solve as u/w.
+        if haskey(model.grid_params.vars, "v")
+            mc_diffusion_matrices = merge(mc_diffusion_matrices, (
+                v       = mc_matrix("v", Kv_mc, 1.25),
+                v_first = mc_matrix("v", Kv_mc, 0.5)))
+        end
     end
 
     mtile = ModelTile(
@@ -414,6 +423,36 @@ function extract_halo_values(tile::Union{RZ_Grid, RiRk_Grid})
     return result
 end
 
+"""
+    extract_halo_values(tile::Union{RLZ_Grid, RLR_Grid})
+
+3D cylindrical grids store `b_kDim` vertical-mode blocks, each holding a k = 0
+radial-spline sub-block plus real/imag sub-blocks per azimuthal wavenumber
+(`1 + 2*kDim` sub-blocks of `b_iDim` rows). The 3-row right halo comes from the
+end of every sub-block, in the same ascending row order as the cylindrical
+`calcHaloMap`, so the result maps one-to-one onto its sparse indices.
+"""
+function extract_halo_values(tile::Union{RLZ_Grid, RLR_Grid})
+    b_iDim = tile.params.b_iDim
+    b_kDim = tile.params.b_kDim
+    kDim = tile.params.iDim + tile.params.patchOffsetL
+    nblocks = 1 + 2 * kDim
+    nvars = size(tile.spectral, 2)
+    result = zeros(Float64, 3 * nvars * nblocks * b_kDim)
+    pos = 1
+    for v in 1:nvars
+        for z_b in 1:b_kDim
+            base = (z_b - 1) * b_iDim * nblocks
+            for j in 1:nblocks
+                te = base + j * b_iDim   # last row of sub-block j
+                result[pos:pos+2] .= tile.spectral[te-2:te, v]
+                pos += 3
+            end
+        end
+    end
+    return result
+end
+
 """Accumulate (add) spectral values at sparse map locations in a patch-sized array."""
 function accumulate_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
     idx = sparse_indices(map)
@@ -472,6 +511,34 @@ function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union
         pp1 = (z - 1) * b_iDim_patch + siL
         tp1 = (z - 1) * b_iDim_tile + 1
         sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
+    end
+end
+
+"""
+    write_tile_to_shared!(sharedSpectral, tile::Union{RLZ_Grid, RLR_Grid}, b_iDim_patch)
+
+3D cylindrical layout: `b_kDim` vertical-mode blocks of `1 + 2*kDim` radial
+sub-blocks (k = 0 spline, then real/imag per azimuthal wavenumber); copy the
+inner rows of every sub-block to its patch position. The wavenumber count is
+taken from the tile, which is exact for the single-tile (tile = patch) case the
+cylindrical mc runs currently use; radial multi-tile decomposition of 3D
+cylindrical grids would need the patch's own wavenumber stride here.
+"""
+function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union{RLZ_Grid, RLR_Grid},
+                                b_iDim_patch::Int64)
+    siL = tile.params.spectralIndexL
+    b_iDim_tile = tile.params.b_iDim
+    b_kDim = tile.params.b_kDim
+    kDim = tile.params.iDim + tile.params.patchOffsetL
+    nblocks = 1 + 2 * kDim
+    inner_rows = b_iDim_tile - 4  # inner region excludes 3-row halo
+
+    for z_b in 1:b_kDim
+        for j in 0:nblocks-1
+            pp1 = ((z_b - 1) * nblocks + j) * b_iDim_patch + siL
+            tp1 = ((z_b - 1) * nblocks + j) * b_iDim_tile + 1
+            sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
+        end
     end
 end
 
@@ -1569,9 +1636,14 @@ function grid_spacing_minima(patch, model)
     gp = getGridpoints(patch)
     kDim = model.grid_params.kDim
     npts = size(gp, 1)
-    z = gp[1:kDim, 2]                       # one column's vertical levels
+    z = gp[1:kDim, end]                     # one column's vertical levels (z is the
+                                            # LAST gridpoint column on 2D and 3D grids)
     dz_min = minimum(diff(sort(z)))
-    x = gp[1:kDim:npts, 1]                  # one point per horizontal column
+    # First horizontal coordinate (x, or r on the cylinders). On 3D ring grids many
+    # columns share one radius, so measure the unique values; note the tightest
+    # horizontal spacing there is really the outer-ring arc length, not dr — this
+    # is a run-once advisory diagnostic, not a stability guard.
+    x = unique(gp[1:kDim:npts, 1])
     dx_min = length(x) > 1 ? minimum(diff(sort(x))) : Inf
     return dz_min, dx_min
 end

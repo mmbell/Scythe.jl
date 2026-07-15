@@ -304,8 +304,11 @@ using Springsteel
                            dry=false, Khdiff=0.0, Kvdiff=0.0, Kvdiff_heat=nothing,
                            Kvdiff_water=0.0, tau_qss=10.0,
                            u_side_bc=DirichletBC(), precipitation=false, N_r=1.0e-3,
-                           q_l=1.0e-3, alpha=0.0, z_damp=20.0e3)
-        varlist = Scythe.MC_VARS
+                           q_l=1.0e-3, alpha=0.0, z_damp=20.0e3,
+                           equation_set="moist_compressible_XZ",
+                           iMin=0.0, iMax=2000.0, f=0.0)
+        varlist = equation_set == "moist_compressible_XZ" ? Scythe.MC_VARS :
+                                                            Scythe.MC_VARS_CYL
         vars = Dict(v => i for (i, v) in enumerate(varlist))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
         wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
@@ -315,7 +318,7 @@ using Springsteel
         side_bc = merge(scalar_bc, Dict("u" => u_side_bc, "w" => DirichletBC()))
         gp = GridParameters(
             geometry = "RZ", num_cells = num_cells,
-            iMin = 0.0, iMax = 2000.0, kMin = 0.0, kMax = 2000.0, kDim = kDim,
+            iMin = iMin, iMax = iMax, kMin = 0.0, kMax = 2000.0, kDim = kDim,
             BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc, vars = vars,
         )
         patch = createGrid(gp)
@@ -326,13 +329,13 @@ using Springsteel
         Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
         model = ModelParameters(
             ts = ts, integration_time = 1.0, output_interval = 1.0,
-            equation_set = "moist_compressible_XZ",
+            equation_set = equation_set,
             ref_state_file = ref_file, grid_params = gp,
             physical_params = Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff,
                                    :Kvdiff_heat => (Kvdiff_heat === nothing ? Kvdiff : Kvdiff_heat),
                                    :Kvdiff_water => Kvdiff_water,
                                    :Kv_mudiff => 0.0, :tau_qss => tau_qss, :N_r => N_r,
-                                   :alpha => alpha, :z_damp => z_damp),
+                                   :alpha => alpha, :z_damp => z_damp, :f => f),
             options = Dict(:semiimplicit => semiimplicit, :exact_reference_state => true,
                            :precipitation => precipitation, :vertical_mixing => false),
         )
@@ -1238,6 +1241,246 @@ using Springsteel
             kDim = 32
             dT = retrieved_T_mc(m_on, kDim, gp[:, 2]) .- retrieved_T_mc(m_off, kDim, gp[:, 2])
             @test maximum(abs.(dT)) < 1.0e-4
+        end
+    end
+
+    # ── Axisymmetric cylinder (moist_compressible_axisym): the same kernel on the
+    #    same 2D grid with x reinterpreted as radius, metric/curvature terms, and
+    #    the prognostic tangential wind v (slot 9) ──
+    @testset "axisym: resting cloudy base preserved" begin
+        mktempdir() do tmpdir
+            # Small radius on purpose: the metric terms are O(1/r), so this exercises
+            # them as strongly as the domain allows; at rest they must all vanish.
+            mtile, patch, model, col = make_mc_mtile(tmpdir;
+                equation_set = "moist_compressible_axisym",
+                iMin = 10.0e3, iMax = 12.0e3, f = 5.0e-5)
+            kDim = model.grid_params.kDim
+            ncols = div(size(patch.physical, 1), kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+            scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0)
+            for v in 1:9
+                @test maximum(abs.(mtile.expdot_n[:, v])) / scales[v] < 1.0e-9
+                @test maximum(abs.(mtile.var_np1[:, v])) / scales[v] < 1.0e-9
+            end
+            @test all(isfinite.(mtile.var_np1))
+        end
+    end
+
+    @testset "axisym: v stays exactly zero without rotation" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir;
+                equation_set = "moist_compressible_axisym",
+                iMin = 10.0e3, iMax = 12.0e3, Khdiff = 25.0, Kvdiff = 25.0, f = 0.0)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            # A column-varying pressure anomaly drives u through the PGF from step 1
+            p_i = vars["p"]
+            for i in 1:npts
+                c = div(i - 1, kDim)
+                patch.physical[i, p_i, 1] = 10.0 * sinpi((c + 0.5) / ncols)
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            step_mc!(mtile, patch, model, 5)
+            # The flow spins up ...
+            @test maximum(abs.(patch.physical[:, vars["u"], 1])) > 0.0
+            # ... but with f = 0 and v0 = 0 the tangential wind has no source at all
+            @test maximum(abs.(patch.physical[:, vars["v"], 1])) == 0.0
+            @test maximum(abs.(mtile.expdot_n[:, vars["v"]])) == 0.0
+            @test all(isfinite.(patch.physical))
+        end
+    end
+
+    @testset "axisym: large-radius tendencies match the Cartesian slice" begin
+        mktempdir() do tmpdir
+            # At r ~ 1e9 m the metric terms are O(dx/r) ~ 1e-6 relative: the axisym
+            # tendencies of the shared 8 slots must converge to XZ's on identical fields.
+            R0 = 1.0e9
+            mt_xz, p_xz, model_xz, _ = make_mc_mtile(tmpdir; Khdiff = 25.0)
+            mt_ax, p_ax, model_ax, _ = make_mc_mtile(tmpdir;
+                equation_set = "moist_compressible_axisym",
+                iMin = R0, iMax = R0 + 2000.0, Khdiff = 25.0, f = 0.0)
+            kDim = model_xz.grid_params.kDim
+            vars = model_xz.grid_params.vars
+            npts = size(p_xz.physical, 1)
+            for (patch, nv) in ((p_xz, 8), (p_ax, 9))
+                for i in 1:npts, v in 1:8    # identical fields on the shared slots; v = 0
+                    k = mod1(i, kDim)
+                    c = div(i - 1, kDim)
+                    amp = v in (4, 5) ? 0.5 : (v == 1 ? 10.0 : (v == 6 ? 100.0 : 1.0e-4))
+                    patch.physical[i, v, 1] = amp * sinpi(0.25 * k / kDim) *
+                                              sinpi(0.5 * (c + 1) / 9.0)
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+            end
+            ncols = div(npts, kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mt_xz, c, 1)
+                Scythe.advance_column(mt_ax, c, 1)
+            end
+            for v in 1:8
+                exz = mt_xz.expdot_n[:, v]
+                eax = mt_ax.expdot_n[:, v]
+                scale = max(maximum(abs.(exz)), 1.0e-12)
+                @test maximum(abs.(eax .- exz)) / scale < 1.0e-5
+            end
+            # v is untouched by the passive dynamics
+            @test maximum(abs.(mt_ax.expdot_n[:, 9])) == 0.0
+        end
+    end
+
+    @testset "axisym: Coriolis and curvature couple u and v" begin
+        f = 5.0e-5
+        run_once(vseed) = mktempdir() do dir
+            mtile, patch, model, _ = make_mc_mtile(dir;
+                equation_set = "moist_compressible_axisym",
+                iMin = 100.0e3, iMax = 102.0e3, u_side_bc = NeumannBC(), f = f)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            patch.physical[:, vars["u"], 1] .= 2.0
+            patch.physical[:, vars["v"], 1] .= vseed
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            for c in 1:div(size(patch.physical, 1), kDim)
+                Scythe.advance_column(mtile, c, 1)
+            end
+            return (expdot = copy(mtile.expdot_n),
+                    u = copy(patch.physical[:, vars["u"], 1]),
+                    v = copy(patch.physical[:, vars["v"], 1]),
+                    r = Scythe.getGridpoints(patch)[:, 1],
+                    vars = vars)
+        end
+
+        # v = 0: the v equation reduces to dv/dt = -u(f + 0/r) = -f u exactly
+        # (advection and curvature of a zero field vanish, no diffusion), pointwise
+        # in the spline-fit u.
+        r0 = run_once(0.0)
+        @test all(isapprox.(r0.expdot[:, r0.vars["v"]], -f .* r0.u; atol = 1.0e-12))
+
+        # v = 1: dv/dt = -u(f + v/r) (a constant v is fit exactly by the Neumann
+        # spline, so its derivatives vanish), and relative to the v = 0 run the
+        # u tendency gains exactly the absolute-rotation force +(f + v/r)v — the
+        # thermodynamic and advective terms are v-independent and cancel in the
+        # difference.
+        r1 = run_once(1.0)
+        @test all(isapprox.(r1.expdot[:, r1.vars["v"]],
+                            -(f .+ r1.v ./ r1.r) .* r1.u; rtol = 1.0e-6, atol = 1.0e-10))
+        du = r1.expdot[:, r1.vars["u"]] .- r0.expdot[:, r0.vars["u"]]
+        @test all(isapprox.(du, (f .+ r1.v ./ r1.r) .* r1.v;
+                            rtol = 1.0e-6, atol = 1.0e-10))
+        @test all(isfinite.(r1.expdot))
+    end
+
+    # ── 3D cylinder (moist_compressible_RLR): the same kernel on the RLR grid
+    #    (spline-r, Fourier-λ, spline-z). The radial and vertical mish nodes of an
+    #    RLR grid are bitwise identical to the matched RiRk grid's, so a WN0
+    #    (axisymmetric) state can be compared POINTWISE against the axisym set. ──
+    @testset "RLR: WN0 tendencies match the axisymmetric set" begin
+        mktempdir() do tmpdir
+            R = 24.0e3
+            H = 2000.0
+            f = 5.0e-5
+
+            varlist = Scythe.MC_VARS_CYL
+            vars = Dict(v => i for (i, v) in enumerate(varlist))
+            scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+            axis_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "v" => DirichletBC()))
+            wall_bc = merge(scalar_bc, Dict("u" => DirichletBC()))
+            topbot_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+
+            gp_rlr = GridParameters(
+                geometry = "RLR", iMin = 0.0, iMax = R, num_cells_i = 6,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                max_wavenumber = Dict(v => 2 for v in keys(vars)),
+                BCL = axis_bc, BCR = wall_bc, BCB = topbot_bc, BCT = topbot_bc,
+                vars = vars)
+            gp_ax = GridParameters(
+                geometry = "RiRk", iMin = 0.0, iMax = R, num_cells_i = 6,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                BCL = axis_bc, BCR = wall_bc, BCB = topbot_bc, BCT = topbot_bc,
+                vars = vars)
+
+            function build(gp, eqset, zc)
+                ref_file = joinpath(tmpdir, "rlr_$(eqset).ref")
+                model = ModelParameters(
+                    ts = 0.1, integration_time = 1.0, output_interval = 1.0,
+                    equation_set = eqset, ref_state_file = ref_file, grid_params = gp,
+                    physical_params = Dict(:Khdiff => 25.0, :Kvdiff => 0.0,
+                                           :Kvdiff_water => 0.0, :Kv_mudiff => 0.0,
+                                           :tau_qss => 10.0, :N_r => 1.0e-3,
+                                           :alpha => 0.0, :z_damp => H, :f => f),
+                    options = Dict(:semiimplicit => false,
+                                   :exact_reference_state => true,
+                                   :precipitation => true,
+                                   :vertical_mixing => false))
+                # kDim is DERIVED for spline-vertical grids — read it off the model's
+                # recomputed grid_params, not the input gp
+                kD = model.grid_params.kDim
+                patch = createGrid(model.grid_params)
+                gpts = Scythe.getGridpoints(patch)
+                z = gpts[1:kD, zc]
+                col = saturated_cloudy_column_mc(z; q_l = 1.0e-3)
+                Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d,
+                                          col.rho_v, col.rho_c)
+                patch.physical .= 0.0
+                # Smooth axisymmetric seeds on every prognostic slot (functions of
+                # r and z only, so the RLR state is exactly WN0)
+                npts = size(patch.physical, 1)
+                amps = Dict(1 => 10.0, 2 => 1.0e-4, 3 => 1.0e-4, 4 => 0.5,
+                            5 => 0.25, 6 => 100.0, 7 => 1.0e-5, 8 => 1.0e-5,
+                            9 => 0.5)
+                for i in 1:npts
+                    r = gpts[i, 1]
+                    z_i = gpts[i, zc]
+                    bump = exp(-((r - 12.0e3) / 6.0e3)^2 - ((z_i - 1000.0) / 500.0)^2)
+                    for (v, amp) in amps
+                        patch.physical[i, v, 1] = amp * bump
+                    end
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                mtile = createModelTile(patch, patch, model,
+                                        sparse(Int64[], Int64[], Float64[],
+                                               size(patch.spectral, 1),
+                                               size(patch.spectral, 2)))
+                for c in 1:div(npts, kD)
+                    Scythe.advance_column(mtile, c, 1)
+                end
+                return mtile, gpts, kD
+            end
+
+            mt_rlr, gp1, kDim = build(gp_rlr, "moist_compressible_RLR", 3)
+            mt_ax, gp2, kD_ax = build(gp_ax, "moist_compressible_axisym", 2)
+            @test kDim == kD_ax
+
+            # Map each RLR column to the axisym column at the same radius
+            r_ax = gp2[1:kDim:end, 1]
+            ncols_rlr = div(size(gp1, 1), kDim)
+            worst = 0.0
+            scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
+                          5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6,
+                          9 => 1.0e-2)
+            for c in 1:ncols_rlr
+                i0 = (c - 1) * kDim
+                r_c = gp1[i0 + 1, 1]
+                a = findfirst(x -> x == r_c, r_ax)
+                @test a !== nothing
+                j0 = (a - 1) * kDim
+                for v in 1:9
+                    d = maximum(abs.(mt_rlr.expdot_n[i0+1:i0+kDim, v] .-
+                                     mt_ax.expdot_n[j0+1:j0+kDim, v])) / scales[v]
+                    worst = max(worst, d)
+                end
+            end
+            @info "RLR WN0 vs axisym: worst scaled tendency mismatch = $worst"
+            @test worst < 1.0e-6
+            @test all(isfinite.(mt_rlr.expdot_n))
         end
     end
 end

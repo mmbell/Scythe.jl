@@ -19,22 +19,32 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
 
     # Build a small moist_compressible tile on the RiRk (B-spline vertical) grid — the
     # configuration that was crashing.
-    function build_mc_tile(; extra_params = Dict{Symbol,Float64}(), precipitation = false)
-        vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+    function build_mc_tile(; extra_params = Dict{Symbol,Float64}(), precipitation = false,
+                             geometry = "RiRk",
+                             equation_set = "moist_compressible_XZ")
+        cyl = equation_set != "moist_compressible_XZ"
+        vars = cyl ? Scythe.MC_VARS_CYL :
+                     ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
         scalar_bc = Dict(v => NeumannBC() for v in vars)
         bc_side = merge(scalar_bc, Dict("u" => DirichletBC()))
         bc_topbot = merge(scalar_bc, Dict("w" => DirichletBC()))
+        # The axisym set reinterprets x as radius, so keep the domain off the axis;
+        # the RLR grid runs from the axis out (its mish points exclude r = 0).
+        iMin = equation_set == "moist_compressible_axisym" ? 100.0e3 : 0.0
+        wavenumbers = geometry == "RLR" ? Dict(v => 2 for v in vars) :
+                                          Dict{String,Int64}()
         gp = GridParameters(
-            geometry = "RiRk",
-            iMin = 0.0, iMax = 25.6e3, num_cells_i = 16,
+            geometry = geometry,
+            iMin = iMin, iMax = iMin + 25.6e3, num_cells_i = 16,
             kMin = 0.0, kMax = 6.4e3, num_cells_k = 8,
+            max_wavenumber = wavenumbers,
             BCL = bc_side, BCR = bc_side, BCB = bc_topbot, BCT = bc_topbot,
             vars = Dict(v => i for (i, v) in enumerate(vars)))
 
         outdir = mktempdir()
         model = ModelParameters(
             ts = 0.0625,
-            equation_set = "moist_compressible_XZ",
+            equation_set = equation_set,
             output_dir = outdir * "/",
             ref_state_file = joinpath(outdir, "ref.csv"),
             grid_params = gp,
@@ -47,7 +57,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         patch = createGrid(model.grid_params)
         gridpoints = Scythe.getGridpoints(patch)
         kDim = model.grid_params.kDim
-        z = gridpoints[1:kDim, 2]
+        z = gridpoints[1:kDim, end]     # z is the LAST gridpoint column (2D and 3D)
 
         # Dry adiabat, matching the analytic base used by the mc benchmarks.
         exner = @. 1.0 - (Scythe.gravity * z) / (Scythe.Cpd * 300.0)
@@ -207,6 +217,39 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
 
         @test (@allocations moist_compressible_XZ(mtile_w, 1, kDim_w, 2)) == 0
         @test (@allocations diffusion_timestep_mc(mtile_w, 1, kDim_w, 2)) == 0
+    end
+
+    @testset "per-column allocations stay zero on the axisymmetric cylinder" begin
+        # The cylindrical trait path binds the extra v views and metric terms; the
+        # trait dispatch must stay compile-time (no boxing) and the v machinery in
+        # the RHS, sponge and diffusion solves must reuse mc_scratch like u/w.
+        mtile_a, kDim_a = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                        extra_params = Dict(:f => 5.0e-5,
+                                                            :alpha => 0.05,
+                                                            :z_damp => 3.2e3))
+        Scythe.moist_compressible_axisym(mtile_a, 1, kDim_a, 2)  # compile
+        Scythe.diffusion_timestep_mc(mtile_a, 1, kDim_a, 2, Scythe.MCAxisymRZ())
+
+        @test (@allocations Scythe.moist_compressible_axisym(mtile_a, 1, kDim_a, 2)) == 0
+        @test (@allocations Scythe.diffusion_timestep_mc(mtile_a, 1, kDim_a, 2,
+                                                         Scythe.MCAxisymRZ())) == 0
+    end
+
+    @testset "per-column allocations stay zero on the 3D RLR cylinder" begin
+        # The 7-slot layout (z at slots 6/7, raw λ at 4/5) and the azimuthal metric
+        # terms; the column loop and vertical solves are identical to RiRk.
+        mtile_r, kDim_r = build_mc_tile(geometry = "RLR",
+                                        equation_set = "moist_compressible_RLR",
+                                        extra_params = Dict(:f => 5.0e-5,
+                                                            :alpha => 0.05,
+                                                            :z_damp => 3.2e3),
+                                        precipitation = true)
+        Scythe.moist_compressible_RLR(mtile_r, 1, kDim_r, 2)  # compile
+        Scythe.diffusion_timestep_mc(mtile_r, 1, kDim_r, 2, Scythe.MCCylindricalRLR())
+
+        @test (@allocations Scythe.moist_compressible_RLR(mtile_r, 1, kDim_r, 2)) == 0
+        @test (@allocations Scythe.diffusion_timestep_mc(mtile_r, 1, kDim_r, 2,
+                                                         Scythe.MCCylindricalRLR())) == 0
     end
 
     @testset "per-column allocations stay zero with the Rayleigh sponge active" begin
