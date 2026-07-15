@@ -66,4 +66,16 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
         "rain_onset_min"      => (24.0, 6.0,  8.0,  "seeded 2026-07-13; O01 Fig. 6 ~25-40 min"),
         "accum_rainfall_mm"   => (1.05, 0.5,  0.6,  "seeded 2026-07-13 (domain-mean rain-out)"),
     ),
+    # Axisymmetric-cylinder O01 at large mean radius (r in [1000, 1150] km, f = 0):
+    # the metric terms are O(dx/r) ~ 0.2%, so the rain windows are the o01_rainfall
+    # quick values; the tangential wind must stay identically zero (no source with
+    # f = 0 and v0 = 0), which validates the 9-var cylindrical machinery.
+    "o01_axisym" => Dict(
+        "peak_rain_rate_gm2s" => (55.0, 35.0, 35.0, "o01_rainfall window (metric terms ~0.2%)"),
+        "max_rho_r_gm3"       => (8.5,  4.0,  4.0,  "o01_rainfall window"),
+        "max_w"               => (9.0,  4.0,  4.0,  "o01_rainfall window"),
+        "rain_onset_min"      => (24.0, 6.0,  8.0,  "o01_rainfall window"),
+        "accum_rainfall_mm"   => (1.05, 0.5,  0.6,  "o01_rainfall window"),
+        "max_abs_v"           => (0.0,  1.0e-12, 1.0e-12, "v has no source at f = 0, v0 = 0"),
+    ),
 )
