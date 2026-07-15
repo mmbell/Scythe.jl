@@ -12,13 +12,19 @@
 # monodisperse N_r closure — no separate Qevap parameterization (this differs
 # from Ooyama 2001, as do the equation set and the single non-nested grid with
 # the bubble at the domain center, so the targets are comparable-magnitude
-# sanity windows, not a reproduction of his figures).
+# sanity windows, not a reproduction of his figures). Rain CONDENSATION is
+# gated on cloud presence (see qss_condensation_rates): without the gate,
+# spectral-ringing rain seeds grow in the wave-driven supersaturation at the
+# lid and sediment back down as a spurious upper-tropospheric rain blob.
 #
 #   julia --project=. benchmarks/o01_rainfall.jl --mode quick --stage mc --grid rirk
 #
 # Modes: quick (2 km cells) | full (500 m cells). Both use 500 m vertical
-# nodal spacing to the 20 km rigid lid (no sponge; late-hour reflections are
-# accepted — see the plan in the repo docs). Only --stage mc is supported.
+# nodal spacing to the 25 km rigid lid, with a Durran-Klemp Rayleigh sponge
+# (momentum-only, KE routed to E_t) over the top 8 km — confined to the
+# stratosphere (the sounding tropopause knot is at 16.59 km) so deep
+# convective flow is never damped, only the radiated gravity waves.
+# Only --stage mc is supported.
 #
 # Reference: Ooyama (2001), J. Atmos. Sci. 58, 2073-2102 (Fig. 6: peak ground
 # precipitation ~75-125 g m^-2 s^-1 at ~35-40 min for a similar bubble).
@@ -85,19 +91,29 @@ function o01_model(opts::BenchmarkOptions)
         num_cells_i = 75        # 2 km cells
         ts = 0.3
     end
-    # Vertical: 500 m nodal spacing to 20 km in BOTH modes (the rain physics and
-    # the sedimentation flux do not coarsen with the horizontal grid).
-    num_cells_k = 40            # RiRk: 500 m cells
-    kDim = 120                  # RZ: Chebyshev points (untargeted fallback)
+    # Vertical: 500 m nodal spacing to 25 km in BOTH modes (the rain physics and
+    # the sedimentation flux do not coarsen with the horizontal grid). The top
+    # 8 km (17-25 km) is the Rayleigh sponge; the 25 km lid (vs the historical
+    # 20 km) buys a stratosphere-confined absorber above the 16.59 km tropopause.
+    num_cells_k = 50            # RiRk: 500 m cells
+    kDim = 150                  # RZ: Chebyshev points (untargeted fallback)
     output_interval = 60.0
 
     ts = vertical_ts(ts, opts)
 
     vars = MC_VARS
+    # Rayleigh sponge (Durran-Klemp 1983 eq. 29 profile, momentum-only in mc):
+    # onset at 17 km (just above the sounding's 16.59 km tropopause knot, so the
+    # damping lives entirely in the high-static-stability stratosphere), 8 km =
+    # 16 cells deep. alpha = 0.02 1/s puts the lid e-folding at ~39 s (the DK
+    # profile peaks at 1.285*alpha) against stratospheric wave intrinsic
+    # frequencies ~0.005-0.015 1/s — inside the Klemp-Lilly 2 <= alpha/omega <= 5
+    # optimum for the dominant modes.
     physical_params = Dict(:Khdiff => 0.0, :Kvdiff => KV_MOM,
                            :Khdiff_heat => 0.0, :Kvdiff_heat => KV_HEAT,
                            :Kvdiff_water => KV_WATER,
-                           :tau_qss => 10.0, :N_r => N_R)
+                           :tau_qss => 10.0, :N_r => N_R,
+                           :alpha => 0.02, :z_damp => 17.0e3)
     options = Dict(:semiimplicit => true, :exact_reference_state => true,
                    :precipitation => true, :vertical_mixing => false)
 
@@ -118,7 +134,7 @@ function o01_model(opts::BenchmarkOptions)
         iMax = 150.0e3,
         num_cells_i = num_cells_i,
         kMin = 0.0,
-        kMax = 20.0e3,
+        kMax = 25.0e3,
         vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
         BCL = side_bc,
         BCR = side_bc,

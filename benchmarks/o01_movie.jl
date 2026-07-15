@@ -58,7 +58,9 @@ scalar_bc = Dict(v => NeumannBC() for v in vars)
 gp = Scythe.compute_derived_params(GridParameters(;
     geometry = grid == "rz" ? "RZ" : "RiRk",
     iMin = 0.0, iMax = 150.0e3, num_cells_i = div(ncols, 3),
-    kMin = 0.0, kMax = 20.0e3,
+    # The mish is symmetric about the domain midpoint, so the top and bottom
+    # gridpoint heights sum to the domain height (works for 20 or 25 km tops).
+    kMin = 0.0, kMax = z[1] + z[end],
     (grid == "rz" ? (; kDim = kDim) : (; num_cells_k = div(kDim, 3)))...,
     BCL = scalar_bc, BCR = scalar_bc, BCB = scalar_bc, BCT = scalar_bc,
     vars = Dict(v => i for (i, v) in enumerate(vars))))

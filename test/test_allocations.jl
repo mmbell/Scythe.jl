@@ -209,6 +209,17 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations diffusion_timestep_mc(mtile_w, 1, kDim_w, 2)) == 0
     end
 
+    @testset "per-column allocations stay zero with the Rayleigh sponge active" begin
+        # The sponge block only runs for alpha > 0 (the base configuration never
+        # enters it) and must not allocate: `.+=` view broadcasts stopped eliding
+        # at this function size (the dE_w lesson), so it is an explicit loop.
+        mtile_s, kDim_s = build_mc_tile(extra_params = Dict(:alpha => 0.05,
+                                                            :z_damp => 3.2e3))
+        moist_compressible_XZ(mtile_s, 1, kDim_s, 2)  # compile
+
+        @test (@allocations moist_compressible_XZ(mtile_s, 1, kDim_s, 2)) == 0
+    end
+
     @testset "mc scratch slots are unique and cover every temporary" begin
         # A NamedTuple cannot hold duplicate names, so construction itself is the guard against
         # two live temporaries silently sharing one buffer. Assert the shape anyway, and that

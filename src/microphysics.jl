@@ -1460,7 +1460,9 @@ monodisperse [`rain_drop_radius`](@ref) and the bulk ventilation factor
 relaxation `1/τ = 1/τ_c + 1/τ_r` (see reference/Scythe_moist_compressible.tex). The
 units convention matches [`invtau_condensation`](@ref): `N_r` in #/cm³, radius in μm,
 `D_v` in cm²/s. Returns 0 when `rho_r < RHO_R_MIN` or `N_r ≤ 0`, so rain-free air
-never exchanges through this channel.
+never exchanges through this channel. The cloud-presence gate on the CONDENSATION
+side of this channel lives in the caller (`qss_condensation_rates`), which zeroes
+`1/τ_r` in cloud-free supersaturated air.
 """
 function invtau_rain(Tk, p_hPa, N_r, rho_r)
 

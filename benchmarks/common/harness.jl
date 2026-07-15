@@ -493,10 +493,14 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
         else
             regression_ok, regression_stats = compare_reference(output_csv, ref_csv, varnames)
             println("\nRegression vs committed reference ($(basename(ref_csv))):")
-            for var in varnames
-                rel_l2, max_abs = regression_stats[var]
-                @printf("  %-8s rel_L2 = %.3e  max_abs = %.3e  %s\n",
-                        var, rel_l2, max_abs, rel_l2 <= 1.0e-6 ? "PASS" : "FAIL")
+            if isempty(regression_stats)
+                println("  FAIL (incomparable grids — no per-variable stats)")
+            else
+                for var in varnames
+                    rel_l2, max_abs = regression_stats[var]
+                    @printf("  %-8s rel_L2 = %.3e  max_abs = %.3e  %s\n",
+                            var, rel_l2, max_abs, rel_l2 <= 1.0e-6 ? "PASS" : "FAIL")
+                end
             end
         end
     else

@@ -289,12 +289,22 @@ end
 """
     Rayleigh_damping(alpha, z, z_d, z_t)
 
-Rayleigh damping coefficient for an upper-boundary sponge layer. Zero below the
-damping onset height `z_d`; a half-cosine profile increasing to `alpha/2` at the
-model top `z_t`.
+Rayleigh damping coefficient τ(z) [1/s, ≤ 0] for an upper-boundary sponge layer,
+the full piecewise profile of Durran & Klemp (1983) eq. 29 (originally Klemp &
+Lilly 1978). With `norm_z = (z − z_d)/(z_t − z_d)`:
+
+- `0` for `z ≤ z_d`
+- `−(α/2)(1 − cos(norm_z·π))` for `0 ≤ norm_z ≤ 1/2` (half-cosine ramp)
+- `−(α/2)[1 + (norm_z − 1/2)π]` for `1/2 ≤ norm_z ≤ 1` (linear continuation,
+  C¹-continuous at the junction), reaching `−(α/2)(1 + π/2) ≈ −1.285α` at `z_t`.
+
+Callers add `τ(z)·field` to the tendency directly (the damping sign is built in).
+Klemp & Lilly (1978) found the layer most effective for `2 ≤ α/ω ≤ 5`, with `ω`
+the intrinsic frequency of the dominant waves entering the layer.
 
 # References
-- Durran, D. R. and J. B. Klemp (1983). *Mon. Wea. Rev.*, 111, 2341–2361.
+- Durran, D. R. and J. B. Klemp (1983). *Mon. Wea. Rev.*, 111, 2341–2361, eq. 29.
+- Klemp, J. B. and D. K. Lilly (1978). *J. Atmos. Sci.*, 35, 78–107.
 """
 function Rayleigh_damping(alpha::Float64, z::Float64, z_d::Float64, z_t::Float64)
 
@@ -303,8 +313,10 @@ function Rayleigh_damping(alpha::Float64, z::Float64, z_d::Float64, z_t::Float64
     end
 
     norm_z = (z - z_d)/(z_t - z_d)
-    tau = -0.5 * alpha * (1.0 - cos(norm_z * pi))
-    return tau
+    if norm_z <= 0.5
+        return -0.5 * alpha * (1.0 - cos(norm_z * pi))
+    end
+    return -0.5 * alpha * (1.0 + ((norm_z - 0.5) * pi))
 end
 
 """

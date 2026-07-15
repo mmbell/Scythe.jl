@@ -312,11 +312,15 @@ qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100
 Two-category condensation/evaporation rates [kg/m³/s] from the generalized
 supersaturation relaxation `1/τ = 1/τ_c + 1/τ_r` (see
 reference/Scythe_moist_compressible.tex): the total rate `Q_ss (1/τ)/(1+Q_s)` splits
-between the cloud and rain channels in proportion to their inverse timescales, in BOTH
-directions — rain gains a (small, `N_r`-controlled) share of supersaturated
-condensation and evaporates in subsaturated air, so no separate rain-evaporation
-parameterization (O01's `Q_evap`) is needed. The ventilation enhancement lives inside
-[`invtau_rain`](@ref).
+between the cloud and rain channels in proportion to their inverse timescales. Rain
+gains a (small, `N_r`-controlled) share of supersaturated condensation ONLY where
+cloud coexists (`q_c > 1e-8`, the cloud channel's own existence threshold): the
+physical pathway to rain is condensation → cloud → autoconversion, and an ungated
+rain channel grows rain from arbitrarily small seeds in cloud-free supersaturated
+air (rate ∝ `rho_r^{1/3}` under the monodisperse fixed-`N_r` closure, non-Lipschitz
+at zero). Rain evaporation in subsaturated air is unconditional, so no separate
+rain-evaporation parameterization (O01's `Q_evap`) is needed. The ventilation
+enhancement lives inside [`invtau_rain`](@ref).
 
 Limiters: cloud evaporation is bounded by the available cloud (`≥ −max(rho_c,0)/ts`),
 rain evaporation by the available rain (`≥ −max(rho_r,0)/ts`), and if the combined
@@ -359,9 +363,15 @@ function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s
             invtau_c = invtau_condensation(Tk, p_hPa, N_c, r_c)
         end
     end
-    # (no cloud and not supersaturated: invtau_c stays 0 — rain may still exchange)
+    # (no cloud and not supersaturated: invtau_c stays 0 — rain may still evaporate)
 
-    invtau_r = invtau_rain(Tk, p_hPa, N_r, rho_r)
+    # Rain CONDENSATION is gated on cloud presence (same q_c > 1e-8 existence
+    # threshold as the cloud channel): the physical pathway to rain is condensation
+    # -> cloud -> autoconversion, and in cloud-free supersaturated air the ungated
+    # channel grows rain from arbitrarily small seeds in finite time (the rate is
+    # ∝ rho_r^{1/3} under the fixed-N_r monodisperse closure, non-Lipschitz at zero
+    # — the O01 spurious-blob pathway). Evaporation (Q_ss <= 0) is unconditional.
+    invtau_r = (Q_ss > 0.0 && q_c <= 1.0e-8) ? 0.0 : invtau_rain(Tk, p_hPa, N_r, rho_r)
     invtau = invtau_c + invtau_r
     if invtau == 0.0
         return (0.0, 0.0)
@@ -434,6 +444,12 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     Kvdiff_heat = get(model.physical_params, :Kvdiff_heat, Kvdiff)
     Kvdiff_water = get(model.physical_params, :Kvdiff_water, 0.0)
     tau_qss = get(model.physical_params, :tau_qss, 10.0)
+
+    # Rayleigh sponge (Durran-Klemp 1983 eq. 29 profile above z_damp): momentum-only,
+    # damping u and w toward the resting base state. alpha = 0 (or absent keys)
+    # disables it and skips the block entirely, keeping alpha = 0 configs bit-identical.
+    alpha = get(model.physical_params, :alpha, 0.0)
+    z_damp = get(model.physical_params, :z_damp, 0.0)
 
     # Warm-rain microphysics (autoconversion, collection, sedimentation, and the rain
     # channel of the supersaturation relaxation). N_r [#/cm^3] is the fixed rain-drop
@@ -730,6 +746,26 @@ function moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64,
     @turbo ADV .= @. (-u * rho_rp_x) + (-w * rho_rp_z)
     @turbo FORCING .= @. (-rho_r * div) + Qdot_r + AUTO_COLL - Fr_z
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
+
+    # ── Rayleigh sponge (momentum-only) ──
+    # Klemp-Durran absorbing layer against gravity-wave reflection off the rigid lid:
+    # u and w relax toward the resting base state with the (negative) coefficient
+    # ray(z), and E_t follows the resolved KE down exactly as for friction (the
+    # FRIC_KE invariant: dE = rho_t*(u*ray*u + w*ray*w) = 2*rho_t*ray*ke). T, p and
+    # Q_ss are held — a KE sink to the sponge, not diabatic heating. Explicit loop,
+    # not `.+=` view broadcasts: the SubArray stops eliding at this function size
+    # (the dE_w lesson). Behind `alpha > 0` so disabled configs are bit-identical
+    # (an unconditional `+ 0.0` term could flip -0.0 tendencies).
+    if alpha > 0.0
+        z_top = z[end]
+        @inbounds for i in eachindex(z)
+            ray = Rayleigh_damping(alpha, z[i], z_damp, z_top)
+            j = colstart + i - 1
+            expdot[j,4] += ray * u[i]
+            expdot[j,5] += ray * w[i]
+            expdot[j,6] += 2.0 * rho_t[i] * ray * ke[i]
+        end
+    end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──
     # Vertical diffusion must be implicit on a Chebyshev column, where the spectral
