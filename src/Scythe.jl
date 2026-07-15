@@ -16,14 +16,17 @@ Main configuration struct for Scythe model runs. Uses `Base.@kwdef` for keyword 
 # Fields
 - `ts::Float64`: model timestep [s] (default: `0.0`)
 - `integration_time::Float64`: total integration duration [s] (default: `1.0`)
-- `output_interval::Float64`: time between output writes [s] (default: `1.0`)
+- `output_interval::Float64`: time between analysis output writes [s] (default: `1.0`)
+- `restart_interval::Float64`: time between JLD2 restart-checkpoint writes [s] (default: `0.0` = no checkpoints). Written by [`write_restart`](@ref); independent of `output_interval` so checkpoints can be less frequent than analysis output. A resulting `<t>.jld2` can be used as `initial_conditions` to restart. The restart is WARM, not bit-identical: the checkpoint stores the grid state exactly but not the AB3 integrator's tendency history (see [`write_restart`](@ref)).
 - `equation_set::String`: name of the equation set to solve (default: `"LinearAdvection1D"`)
 - `initial_conditions::String`: path to the initial conditions file (default: `"ic.csv"`)
 - `output_dir::String`: path to the output directory (default: `"./output/"`)
 - `ref_state_file::String`: path to the reference state sounding file (default: `""`)
 - `grid_params::SpringsteelGridParameters`: Springsteel grid configuration (required, no default)
 - `physical_params::Dict{Symbol,Float64}`: physical parameters for the equation set (default: empty)
-- `options::Dict{Symbol,Any}`: solver options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`)
+- `options::Dict{Symbol,Any}`: solver and output options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`). Output-format keys read by [`write_output`](@ref):
+    - `:output_formats::Vector{Symbol}` (default `[:csv]`) — which ANALYSIS formats to write each `output_interval`. `:csv` writes the `<t>_spectral.csv`/`<t>_physical.csv`/`<t>_gridded.csv` trio (Springsteel `write_grid`); `:netcdf` writes the gridded representation to `<t>.nc` (`write_netcdf`). List several to write several, e.g. `[:csv, :netcdf]`. JLD2 is not listed here — it is the restart format, written at `restart_interval` (see `write_restart`). NOTE: the ICs reader, regression references, and benchmark harnesses parse the CSVs, so drop `:csv` only for runs that don't feed them.
+    - `:netcdf_derivatives::Bool` (default `false`) — when `:netcdf` is selected, whether to write derivative slots alongside field values.
 
 `grid_params` is passed through Springsteel's `compute_derived_params` on construction, so a
 cubic B-spline axis may be sized by *either* its cell count (`num_cells_i`/`num_cells_k`, the
@@ -36,6 +39,10 @@ Base.@kwdef struct ModelParameters
     ts::Float64 = 0.0
     integration_time::Float64 = 1.0
     output_interval::Float64 = 1.0
+    # JLD2 restart-checkpoint cadence [s]. 0.0 = no checkpoints. Independent of
+    # output_interval so checkpoints (for restart) can be less frequent
+    # than analysis output (CSV/NetCDF); see write_restart.
+    restart_interval::Float64 = 0.0
     equation_set::String = "LinearAdvection1D"
     initial_conditions::String = "ic.csv"
     output_dir::String = "./output/"
@@ -52,8 +59,8 @@ Base.@kwdef struct ModelParameters
         :semiimplicit => false,
         :exact_reference_state => false)
 
-    function ModelParameters(ts, integration_time, output_interval, equation_set,
-                             initial_conditions, output_dir, ref_state_file,
+    function ModelParameters(ts, integration_time, output_interval, restart_interval,
+                             equation_set, initial_conditions, output_dir, ref_state_file,
                              grid_params, physical_params, options)
         # Eddy diffusivities are specified directly per quantity, not as molecular-style
         # ratios of the momentum coefficient: :Khdiff/:Kvdiff (momentum),
@@ -65,9 +72,9 @@ Base.@kwdef struct ModelParameters
                 "molecular ratios. Set :Khdiff_heat/:Kvdiff_heat (heat) and " *
                 ":Khdiff_water/:Kvdiff_water (water species) directly.")
         end
-        new(ts, integration_time, output_interval, equation_set, initial_conditions,
-            output_dir, ref_state_file, compute_derived_params(grid_params),
-            physical_params, options)
+        new(ts, integration_time, output_interval, restart_interval, equation_set,
+            initial_conditions, output_dir, ref_state_file,
+            compute_derived_params(grid_params), physical_params, options)
     end
 end
 

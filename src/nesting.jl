@@ -289,6 +289,7 @@ function build_nest(nest::NestedModelParameters)
             ts = ts_actual[i],
             integration_time = base.integration_time,
             output_interval = base.output_interval,
+            restart_interval = base.restart_interval,
             equation_set = base.equation_set,
             initial_conditions = ics,
             output_dir = joinpath(base.output_dir, "nest$i"),
@@ -603,6 +604,7 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
     # ── Main loop ────────────────────────────────────────────────────────────
     num_ts = round(Int, model.integration_time / model.ts)
     output_int = round(Int, model.output_interval / model.ts)
+    restart_int = model.restart_interval > 0 ? round(Int, model.restart_interval / model.ts) : 0
     cfl_int = max(1, round(Int, get(model.options, :cfl_interval, model.output_interval) / model.ts))
     println("Integrating $(model.ts) sec increments for $(num_ts) timesteps ($(n_sub) per parent step)")
     cfl_diag_on = haskey(model.grid_params.vars, "w")
@@ -664,11 +666,12 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         # Materialize the master patch when anything downstream needs it
         is_cfl_step = cfl_diag_on && mod(t, cfl_int) == 0
         is_output_step = mod(t, output_int) == 0
+        is_restart_step = restart_int > 0 && mod(t, restart_int) == 0
         cycle_end = !isempty(parent_links) && j == n_sub
-        if !isempty(child_links) || cycle_end || is_cfl_step || is_output_step
+        if !isempty(child_links) || cycle_end || is_cfl_step || is_output_step || is_restart_step
             patch.spectral .= sharedSpectral
         end
-        if !isempty(child_links) || is_cfl_step || is_output_step
+        if !isempty(child_links) || is_cfl_step || is_output_step || is_restart_step
             gridTransform!(patch)
         end
 
@@ -693,6 +696,9 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         if is_output_step
             write_output(patch, model, t * model.ts)
             checkCFL(patch; t=t, ts=model.ts, where="output")
+        end
+        if is_restart_step
+            write_restart(patch, model, t * model.ts)   # each patch → nest$i/<t>.jld2
         end
         flush(stdout)
     end

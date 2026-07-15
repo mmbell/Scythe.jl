@@ -476,6 +476,46 @@ function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union
 end
 
 """
+    load_initial_conditions!(patch, model)
+
+Populate `patch` from `model.initial_conditions`, dispatching on the file
+extension:
+
+- `*.jld2` — a restart from a checkpoint. `load_grid` reconstructs the archived
+  grid; its spectral coefficients (the prognostic state) are copied verbatim and
+  physical space is regenerated with `gridTransform!`, so the loaded grid state
+  matches the checkpoint exactly. The archive must be grid-compatible with
+  `model.grid_params` (same geometry, spectral/physical sizes, and variable map)
+  or an error is raised. Note this is a WARM restart, not a bit-identical
+  continuation: the AB3 integrator's tendency history is not part of the grid and
+  is not restored (see [`write_restart`](@ref)).
+- anything else (CSV) — the physical field is read with `read_physical_grid` and
+  `spectralTransform!` fits the spectral coefficients from it.
+
+Runs on the master process before tiling; mutates and returns `patch`.
+"""
+function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
+    if endswith(model.initial_conditions, ".jld2")
+        loaded = load_grid(model.initial_conditions)
+        (typeof(loaded) == typeof(patch) &&
+         size(loaded.spectral) == size(patch.spectral) &&
+         size(loaded.physical) == size(patch.physical) &&
+         loaded.params.vars == patch.params.vars) || error(
+            "restart archive $(model.initial_conditions) is not compatible with the " *
+            "configured grid_params (geometry/size/vars mismatch): archive is " *
+            "$(typeof(loaded)) spectral $(size(loaded.spectral)), grid is " *
+            "$(typeof(patch)) spectral $(size(patch.spectral))")
+        patch.spectral .= loaded.spectral
+        gridTransform!(patch)
+    else
+        read_physical_grid(model.initial_conditions, patch)
+        spectralTransform!(patch)
+        gridTransform!(patch)
+    end
+    return patch
+end
+
+"""
     initialize_model(model, workerids)
 
 Set up the distributed model infrastructure by creating the grid patch, distributing
@@ -489,10 +529,8 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     patch = createGrid(model.grid_params)
     println("$model")
 
-    # Initialize the patch locally on master process
-    read_physical_grid(model.initial_conditions, patch)
-    spectralTransform!(patch)
-    gridTransform!(patch)
+    # Initialize the patch locally on master process (CSV read or JLD2 restart)
+    load_initial_conditions!(patch, model)
 
     # Transfer the model and patch/tile info to each worker
     println("Initializing workers")
@@ -622,6 +660,8 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
     output_int = round(Int,model.output_interval / model.ts)
+    # JLD2 restart-checkpoint cadence (0 = disabled). Independent of output_int.
+    restart_int = model.restart_interval > 0 ? round(Int, model.restart_interval / model.ts) : 0
     # CFL/Courant diagnostic cadence — independent of output; defaults to the
     # output cadence so it is free (reuses the output-step gridTransform!).
     cfl_int = max(1, round(Int, get(model.options, :cfl_interval, model.output_interval) / model.ts))
@@ -671,7 +711,8 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         # single gridTransform!).
         is_cfl_step = cfl_diag_on && mod(t, cfl_int) == 0
         is_output_step = mod(t, output_int) == 0
-        if is_cfl_step || is_output_step
+        is_restart_step = restart_int > 0 && mod(t, restart_int) == 0
+        if is_cfl_step || is_output_step || is_restart_step
             patch.spectral .= sharedSpectral
             gridTransform!(patch)
         end
@@ -685,6 +726,13 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         if is_output_step
             @async write_output(patch, model, (t*model.ts))
             checkCFL(patch; t=t, ts=model.ts, where="output")
+        end
+
+        # Restart checkpoint on its own (typically coarser) cadence. Synchronous,
+        # unlike the analysis output: a checkpoint half-written by an @async task
+        # racing process exit is useless for restart.
+        if is_restart_step
+            write_restart(patch, model, (t*model.ts))
         end
 
         # Done with this timestep
@@ -778,6 +826,11 @@ Write final model output at the end of the integration period.
 function finalize_model(grid::AbstractGrid, model::ModelParameters)
 
     write_output(grid, model, model.integration_time)
+    # Guaranteed final restart checkpoint (covers both single-grid and nested,
+    # which route their finalize through here). Skipped when checkpoints are off.
+    if model.restart_interval > 0
+        write_restart(grid, model, model.integration_time)
+    end
     println("Model complete!")
 end
 

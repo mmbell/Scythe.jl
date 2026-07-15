@@ -10,6 +10,7 @@ using Scythe
     include("test_moist_compressible.jl")
     include("test_idealized_init.jl")
     include("test_spectralGrid.jl")
+    include("test_output_formats.jl")
     include("test_reference_state.jl")
     include("test_reference_migration.jl")
     include("test_api_migration.jl")
