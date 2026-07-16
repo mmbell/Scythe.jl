@@ -248,6 +248,24 @@ using Scythe
         end
         @test Scythe.rain_terminal_velocity(-1.0e-12, rho_d, Tk) == 0.0
         @test Scythe.invtau_rain(Tk, p_hPa, N_r, -1.0e-12) == 0.0
+
+        # rho_d undershoots: vigorous convection can momentarily drive the dry
+        # density negative at cloud edges (this killed the first 6-h TC run at
+        # rain onset: (rho_d0/rho_d)^0.25 with rho_d = -0.08). Every rate that
+        # divides by rho_d or raises a rho_d ratio to a fractional power must
+        # stay finite there too.
+        for f in (rd -> Scythe.rain_terminal_velocity(1.0e-3, rd, Tk),
+                  rd -> Scythe.collection_density(1.0e-3, 1.0e-3, rd, Tk),
+                  rd -> Scythe.f_ventilation_mp(2000.0, rd, Tk),
+                  rd -> Scythe.invtau_rain_mp(Tk, p_hPa, 8.0e6, 1.0e-3, rd),
+                  rd -> Scythe.autoconversion_density(1.0e-3, rd))
+            @test isfinite(f(-0.08))
+            @test isfinite(f(0.0))
+            @test isfinite(f(1.0e-6))
+        end
+        # and the guarded factors stay bounded (no blowup from a tiny floor)
+        @test abs(Scythe.rain_terminal_velocity(1.0e-3, -0.08, Tk)) < 100.0
+        @test Scythe.f_ventilation_mp(2000.0, -0.08, Tk) < 100.0
     end
 
     # ──────────────────────────────────────────────

@@ -1402,6 +1402,17 @@ end
 const RHO_R_MIN = 1.0e-8
 
 """
+Dry-density floor [kg/m³] for the rate factors that divide by ρ_d or raise a
+ρ_d ratio to a fractional power. Vigorous convection can momentarily undershoot
+ρ_d at cloud edges (the first 6-h TC run died at rain onset from
+`(ρ_d0/ρ_d)^{1/4}` with ρ_d = −0.08); like the `max(rho_r, 0)` guards, the
+floor makes the excursion inert instead of a DomainError. 1e-2 kg/m³ is far
+below any physical tropospheric value, so the floor only ever engages on
+undershoots.
+"""
+const RHO_D_MIN = 1.0e-2
+
+"""
     autoconversion_density(rho_c, rho_d)
 
 Autoconversion of cloud to rain [kg m⁻³ s⁻¹], Ooyama (2001) eq. A.3:
@@ -1416,7 +1427,7 @@ Collection (accretion) of cloud by rain [kg m⁻³ s⁻¹], Ooyama (2001) eq. A.
 `Q_coll = 2.20 ρ_c (ρ_r/ρ_d)^0.875 f_ice`, clamped ≥ 0.
 """
 collection_density(rho_c, rho_r, rho_d, Tk) =
-    max(2.20 * rho_c * (max(rho_r, 0.0) / rho_d)^0.875 * f_ice(Tk), 0.0)
+    max(2.20 * rho_c * (max(rho_r, 0.0) / max(rho_d, RHO_D_MIN))^0.875 * f_ice(Tk), 0.0)
 
 """
     rain_terminal_velocity(rho_r, rho_d, Tk)
@@ -1425,7 +1436,7 @@ Mass-weighted terminal fall speed of rain [m/s, ≤ 0], Ooyama (2001) eq. A.1:
 `W = −14.164 ρ_r^0.1364 (ρ_d0/ρ_d)^0.5 f_ice`. Zero at (or below) ρ_r = 0.
 """
 rain_terminal_velocity(rho_r, rho_d, Tk) =
-    -14.164 * max(rho_r, 0.0)^0.1364 * sqrt(rho_d0 / rho_d) * f_ice(Tk)
+    -14.164 * max(rho_r, 0.0)^0.1364 * sqrt(rho_d0 / max(rho_d, RHO_D_MIN)) * f_ice(Tk)
 
 """
     f_ventilation_density(rho_r, Tk)
@@ -1516,7 +1527,8 @@ Since `λ ∝ ρ_r^{-1/4}`, the enhancement grows as `ρ_r^{3/16}` — the DSD-e
 analogue of the bulk exponent 0.2046 in [`f_ventilation_density`](@ref).
 """
 f_ventilation_mp(lambda, rho_d, Tk) =
-    0.78 + (0.308 * MP_SC13 * sqrt(MP_AV / MP_NU) * (rho_d0 / rho_d)^0.25 *
+    0.78 + (0.308 * MP_SC13 * sqrt(MP_AV / MP_NU) *
+            (rho_d0 / max(rho_d, RHO_D_MIN))^0.25 *
             MP_GAMMA_11_4 * lambda^-0.75 * sqrt(f_ice(Tk)))
 
 """
