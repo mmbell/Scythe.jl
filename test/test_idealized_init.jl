@@ -296,4 +296,66 @@ using Springsteel
             end
         end
     end
+
+    @testset "balanced modified-Rankine vortex" begin
+        import Springsteel.Thermodynamics: Rd, Rv, gravity
+
+        # ── v profile ──
+        Vmax = 15.0; RMW = 50.0e3; alpha = 0.3; v_top = 15.0e3
+        vfun(r, z) = Scythe.modified_rankine_v(r, z; Vmax, RMW, alpha, v_top)
+        @test vfun(0.0, 0.0) == 0.0
+        @test vfun(RMW, 0.0) == Vmax
+        @test vfun(25.0e3, 0.0) == 0.5 * Vmax                 # linear inside
+        @test vfun(2.0 * RMW, 0.0) ≈ Vmax * 0.5^alpha          # decay outside
+        @test vfun(RMW, 7.5e3) ≈ 0.5 * Vmax                    # linear in height
+        @test vfun(RMW, v_top) == 0.0
+        @test vfun(RMW, 20.0e3) == 0.0                         # clamped above
+
+        # ── thermal wind: no vortex leaves the background exactly ──
+        z = collect(0.0:125.0:25.0e3)
+        r_axis = collect(0.0:500.0:300.0e3)
+        nz = length(z); nr = length(r_axis)
+        # Analytic isothermal moist hydrostatic background (T0 = 300 keeps
+        # q = 10 g/kg comfortably subsaturated at the surface)
+        T0 = 300.0; q = 0.01; p0 = 1.0e5
+        Reff = Rd + q * Rv
+        pbar = @. p0 * exp(-(1.0 + q) * gravity * z / (Reff * T0))
+        rho_dbar = pbar ./ (Reff * T0)
+        rho_vbar = q .* rho_dbar
+        rho_tbar = rho_dbar .+ rho_vbar
+        lnrho = Scythe.thermal_wind_lnrho(r_axis, z, zeros(nz, nr), log.(rho_tbar))
+        @test lnrho ≈ repeat(log.(rho_tbar), 1, nr) atol = 0.0  # exact
+
+        flds0 = Scythe.balanced_vortex_fields(r_axis, z, pbar, rho_dbar, rho_vbar;
+                                              Vmax = 0.0, fcor = 3.775e-5)
+        @test flds0.rho_t ≈ repeat(rho_tbar, 1, nr)            # exactly background
+        @test flds0.n_supersat == 0
+
+        # ── balanced vortex: residual, warm core, low center ──
+        flds = Scythe.balanced_vortex_fields(r_axis, z, pbar, rho_dbar, rho_vbar;
+                                             Vmax, RMW, alpha, v_top, fcor = 3.775e-5)
+        # The max residual lives exactly at the RMW, where the modified-Rankine
+        # kink makes the centered-difference metric first-order (0.006 at
+        # dr = 500 m, halving with dr); away from the kink the balance is tight.
+        @test flds.residual < 1.0e-2
+        offkink = 0.0
+        dpdrmax = 1.0e-300
+        for j in 2:nr-1, k in 1:nz
+            abs(r_axis[j] - RMW) > 3.0e3 || continue
+            dpdr = (flds.p[k, j+1] - flds.p[k, j-1]) / (r_axis[j+1] - r_axis[j-1])
+            r = r_axis[j]
+            C = r > 0.0 ? (flds.v[k, j]^2 / r) + (3.775e-5 * flds.v[k, j]) : 0.0
+            offkink = max(offkink, abs(dpdr - (flds.rho_t[k, j] * C)))
+            dpdrmax = max(dpdrmax, abs(dpdr))
+        end
+        @test offkink / dpdrmax < 1.0e-3
+        @test flds.n_supersat == 0
+        @test flds.p[1, 1] < flds.p[1, nr]                     # central pressure deficit
+        @test flds.Tk[10, 1] > flds.Tk[10, nr]                 # warm core aloft
+        @test all(isfinite, flds.rho_t) && all(flds.rho_t .> 0.0)
+        # v = 0 above v_top: density relaxes to the background there
+        k_top = findfirst(>=(16.0e3), z)
+        @test maximum(abs.(flds.rho_t[k_top:end, :] .- rho_tbar[k_top:end])) /
+              maximum(rho_tbar) < 1.0e-6
+    end
 end

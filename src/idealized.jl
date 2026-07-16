@@ -636,3 +636,210 @@ function write_ics_csv(path::String, patch::AbstractGrid, gridpoints::Matrix{Flo
     end
     return path
 end
+
+# ── Balanced vortex initialization (tropical cyclone spin-up) ───────────────────
+
+"""
+    modified_rankine_v(r, z; Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3)
+
+Modified Rankine vortex tangential wind [m/s]: linear inside the radius of
+maximum wind, `Vmax (RMW/r)^alpha` outside, decaying linearly with height to
+zero at `v_top` (`v *= max(0, (v_top - z)/v_top)`).
+"""
+function modified_rankine_v(r, z; Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3)
+
+    vr = r <= RMW ? Vmax * (r / RMW) : Vmax * (RMW / r)^alpha
+    return vr * max(0.0, (v_top - z) / v_top)
+end
+
+"Centered first derivative on a (possibly nonuniform) axis; one-sided at the ends."
+function _ddz_nonuniform!(out::AbstractVector, f::AbstractVector, z::AbstractVector)
+
+    n = length(z)
+    out[1] = (f[2] - f[1]) / (z[2] - z[1])
+    out[n] = (f[n] - f[n-1]) / (z[n] - z[n-1])
+    @inbounds for k in 2:n-1
+        h1 = z[k] - z[k-1]
+        h2 = z[k+1] - z[k]
+        out[k] = ((f[k+1] * h1 * h1) - (f[k-1] * h2 * h2) +
+                  (f[k] * ((h2 * h2) - (h1 * h1)))) / (h1 * h2 * (h1 + h2))
+    end
+    return out
+end
+
+"""
+    thermal_wind_lnrho(r_axis, z, C, lnrho_bar) -> Matrix (length(z) × length(r_axis))
+
+Solve the thermal-wind equation for the log total density,
+
+    ∂_r ln ρ + (C/g) ∂_z ln ρ = -(1/g) ∂_z C,      C = v²/r + f v,
+
+marching INWARD from the outer edge (`ln ρ = ln ρ̄(z)` at `r_axis[end]`) with a
+trapezoidal predictor–corrector in r and centered ∂_z on the (possibly
+nonuniform) `z` axis. With `C = 0` (no vortex) the result is `ln ρ̄` exactly.
+`C` is a `(length(z), length(r_axis))` matrix.
+"""
+function thermal_wind_lnrho(r_axis::AbstractVector, z::AbstractVector,
+                            C::AbstractMatrix, lnrho_bar::AbstractVector)
+
+    nz = length(z)
+    nr = length(r_axis)
+    lnrho = zeros(nz, nr)
+    dCdz = zeros(nz, nr)
+    for j in 1:nr
+        _ddz_nonuniform!(view(dCdz, :, j), view(C, :, j), z)
+    end
+    dlnrho_dz = zeros(nz)
+    rhs = zeros(nz)
+    pred = zeros(nz)
+    rhs_p = zeros(nz)
+
+    lnrho[:, nr] .= lnrho_bar
+    for j in (nr-1):-1:1
+        dr = r_axis[j+1] - r_axis[j]
+        # RHS at the outer column (known)
+        _ddz_nonuniform!(dlnrho_dz, view(lnrho, :, j+1), z)
+        @. rhs = (-dCdz[:, j+1] / gravity) - ((C[:, j+1] / gravity) * dlnrho_dz)
+        @. pred = lnrho[:, j+1] - (dr * rhs)
+        # Corrector at the inner column with the predicted profile
+        _ddz_nonuniform!(dlnrho_dz, pred, z)
+        @. rhs_p = (-dCdz[:, j] / gravity) - ((C[:, j] / gravity) * dlnrho_dz)
+        @. lnrho[:, j] = lnrho[:, j+1] - (dr * 0.5 * (rhs + rhs_p))
+    end
+    return lnrho
+end
+
+"""
+    balanced_vortex_fields(r_axis, z, pbar, rho_dbar, rho_vbar;
+                           Vmax, RMW, alpha, v_top, fcor)
+        -> (; v, rho_t, p, rho_d, rho_v, Tk, residual, n_supersat)
+
+Gradient-wind and hydrostatically balanced modified-Rankine vortex on the
+`(z, r_axis)` work grid, anchored on the reference profiles at the domain top
+and outer edge:
+
+1. `v(r,z)` from [`modified_rankine_v`](@ref), `C = v²/r + f v`.
+2. `ρ_t` from the thermal-wind march [`thermal_wind_lnrho`](@ref).
+3. `p` by downward hydrostatic integration from `p(r, z_top) = p̄(z_top)`
+   (the vortex vanishes above `v_top`, so `ρ = ρ̄` there and the anchor is
+   consistent).
+4. Moisture: the mixing ratio holds its ambient profile, `q_v(r,z) = q̄_v(z)`,
+   so `ρ_d = ρ_t/(1 + q̄_v)`, `ρ_v = ρ_t − ρ_d`, and `T` from the moist EOS.
+
+`residual` is the max relative gradient-wind imbalance `|∂_r p − ρ_t C|` over
+the interior (scaled by the max `|∂_r p|`); `n_supersat` counts grid points
+pushed past saturation (should be 0 for a warm-core vortex on a subsaturated
+sounding).
+"""
+function balanced_vortex_fields(r_axis::AbstractVector, z::AbstractVector,
+                                pbar::AbstractVector, rho_dbar::AbstractVector,
+                                rho_vbar::AbstractVector;
+                                Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3,
+                                fcor=3.775e-5)
+
+    nz = length(z)
+    nr = length(r_axis)
+    q_vbar = rho_vbar ./ rho_dbar
+    rho_tbar = rho_dbar .+ rho_vbar
+
+    v = zeros(nz, nr)
+    C = zeros(nz, nr)
+    for j in 1:nr, k in 1:nz
+        r = r_axis[j]
+        vv = modified_rankine_v(r, z[k]; Vmax, RMW, alpha, v_top)
+        v[k, j] = vv
+        C[k, j] = r > 0.0 ? ((vv * vv) / r) + (fcor * vv) : 0.0
+    end
+
+    lnrho = thermal_wind_lnrho(r_axis, z, C, log.(rho_tbar))
+    rho_t = exp.(lnrho)
+
+    # Hydrostatic pressure, downward from the reference top
+    p = zeros(nz, nr)
+    for j in 1:nr
+        p[nz, j] = pbar[nz]
+        for k in (nz-1):-1:1
+            p[k, j] = p[k+1, j] + (0.5 * (rho_t[k, j] + rho_t[k+1, j]) *
+                                   gravity * (z[k+1] - z[k]))
+        end
+    end
+
+    rho_d = rho_t ./ (1.0 .+ q_vbar)     # broadcast q̄_v(z) down the columns
+    rho_v = rho_t .- rho_d
+    Tk = p ./ ((rho_d .* Rd) .+ (rho_v .* Rv))
+
+    n_supersat = count(rho_v .> rho_v_sat.(Tk, p ./ 100.0))
+    n_supersat == 0 ||
+        @warn "balanced_vortex_fields: $(n_supersat) points pushed past saturation"
+
+    # Gradient-wind imbalance diagnostic (interior columns)
+    residual = 0.0
+    dpdr_max = 1.0e-300
+    for j in 2:nr-1, k in 1:nz
+        dpdr = (p[k, j+1] - p[k, j-1]) / (r_axis[j+1] - r_axis[j-1])
+        res = abs(dpdr - (rho_t[k, j] * C[k, j]))
+        residual = max(residual, res)
+        dpdr_max = max(dpdr_max, abs(dpdr))
+    end
+    residual /= dpdr_max
+
+    return (; v, rho_t, p, rho_d, rho_v, Tk, residual, n_supersat)
+end
+
+"""
+    balanced_vortex_mc!(patch, gridpoints, ref, flds, r_axis; zcol=2)
+
+Write the [`balanced_vortex_fields`](@ref) result to the 9-variable
+moist_compressible slots of `patch` as perturbations from the
+`PressureReferenceState ref`: p′, ρ_d′, ρ_t′, v (prognostic, v̄ ≡ 0), Q_ss′,
+and E_t′ from the exact retrieval identity
+`E_t = ρ_d e_int(T, q_v) + ρ_t (gz + v²/2)`; u = w = ρ_r = 0. The work grid's
+`z` axis must be the patch's own vertical mish (no vertical interpolation);
+fields are linearly interpolated in radius from `r_axis`.
+"""
+function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                             ref::Springsteel.PressureReferenceState,
+                             flds, r_axis::AbstractVector; zcol=2)
+
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
+    u_i = vars["u"]; w_i = vars["w"]; et_i = vars["E_t"]
+    qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]; v_i = vars["v"]
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    nr = length(r_axis)
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            r = gridpoints[i, 1]
+            z = gridpoints[i, zcol]
+            # Linear interpolation in radius (clamped to the work-grid extent)
+            j = clamp(searchsortedlast(r_axis, r), 1, nr - 1)
+            wgt = clamp((r - r_axis[j]) / (r_axis[j+1] - r_axis[j]), 0.0, 1.0)
+            interp(F) = ((1.0 - wgt) * F[k, j]) + (wgt * F[k, j+1])
+            v = interp(flds.v)
+            p = interp(flds.p)
+            rho_d = interp(flds.rho_d)
+            rho_v = interp(flds.rho_v)
+            rho_t = rho_d + rho_v
+            Tk = p / ((rho_d * Rd) + (rho_v * Rv))
+            q_v = rho_v / rho_d
+            E_t = (rho_d * internal_energy_bf02(Tk, q_v, 0.0)) +
+                  (rho_t * ((gravity * z) + (0.5 * v * v)))
+            Q_ss = rho_v - rho_v_sat(Tk, p / 100.0)
+            patch.physical[i, p_i, 1] = p - pbar[k, 1]
+            patch.physical[i, rho_d_i, 1] = rho_d - rho_dbar[k, 1]
+            patch.physical[i, rho_t_i, 1] = rho_t - rho_tbar[k, 1]
+            patch.physical[i, u_i, 1] = 0.0
+            patch.physical[i, w_i, 1] = 0.0
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = 0.0
+            patch.physical[i, v_i, 1] = v
+            i += 1
+        end
+    end
+    return patch
+end
