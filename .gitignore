@@ -25,4 +25,12 @@ spectral_out_*.csv
 benchmarks/output/
 benchmarks/results/
 
+# TC and model_tests run output (NetCDF, JLD2 restarts, ICs, ref states):
+# model output never goes in the repo — validation references, when accepted,
+# are committed as small JSON like the benchmarks
+tc/output/
+model_tests/output/
+*.nc
+*.jld2
+
 reference/
