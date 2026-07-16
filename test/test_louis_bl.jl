@@ -169,8 +169,20 @@ using SparseArrays
         return D, patch_on, gp_on, z_on, mtile_on
     end
 
-    "Trapezoid column integral of y(z) on the mish points."
-    trapz(z, y) = sum(0.5 * (y[i] + y[i+1]) * (z[i+1] - z[i]) for i in 1:length(z)-1)
+    """Exact column integral on the RiRk mish: the points are 3-node
+    Gauss-Legendre per 250-m cell (kMax = 2000), so the GL weights integrate
+    the fitted profiles properly (trapezoid underestimates surface-localized
+    divergences by ~11%)."""
+    function trapz(z, y)
+        kDim = length(y)
+        dz = 2000.0 / (kDim / 3)
+        w = (dz / 2.0) .* (5.0 / 9.0, 8.0 / 9.0, 5.0 / 9.0)
+        s = 0.0
+        for c in 0:div(kDim, 3)-1, j in 1:3
+            s += w[j] * y[3c + j]
+        end
+        return s
+    end
 
     # ──────────────────────────────────────────────
     # 4. Resting state: the BL adds exactly nothing
@@ -244,13 +256,14 @@ using SparseArrays
             @test maximum(abs.(D5)) < 1.0e-10
 
             # Column-integrated v momentum loss = the surface stress
-            # rho_t(1) Cd U1 v1, with U1 = v1 = the FITTED surface swirl
+            # rho_t(1) Cd U1 v1, with U1 = v1 = the FITTED surface swirl. The
+            # analytic g(z) delivery makes this exact up to the quadrature.
             v1 = v_fit[1]
             Cd = Scythe.komori_cd(abs(v1))
             got = trapz(z, rho_t .* D9)
             want = -rho_t[1] * Cd * v1 * v1
             @test got < 0.0
-            @test isapprox(got, want; rtol=0.2)
+            @test isapprox(got, want; rtol=0.02)
 
             # E_t follows the resolved KE down pointwise: dE = rho_t * v * dv/dt
             # (thermo channels are inert with the KE-compensated E_t)

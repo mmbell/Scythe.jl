@@ -499,6 +499,22 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     K_min = get(model.physical_params, :K_min, 0.0)
     use_smag = Ls > 0.0
 
+    # Bulk surface enthalpy/moisture fluxes over a fixed-SST ocean: the flux
+    # values are the bottom nodes of the Louis heat/water flux columns, so the
+    # switch requires louis_bl. SST is in KELVIN (Float64 params carry no units;
+    # the guard catches the Celsius footgun).
+    surface_fluxes = get(model.options, :surface_fluxes, false)::Bool
+    if surface_fluxes && !louis_bl
+        error("options[:surface_fluxes] requires options[:louis_bl] — the fluxes " *
+              "enter as the bottom nodes of the Louis boundary-layer flux columns")
+    end
+    Ck = get(model.physical_params, :Ck, 1.0e-3)
+    SST = get(model.physical_params, :SST, 301.15)
+    if surface_fluxes && SST <= 200.0
+        error("physical_params[:SST] must be in Kelvin (got $SST — 28 C is 301.15)")
+    end
+    U_min = get(model.physical_params, :U_min, 0.0)
+
     # Gridpoints: z from the geometry's vertical column; r is the geometry metric
     # handle (radius view on the cylinders, colatitude/a/Omega on the sphere,
     # `nothing` on the Cartesian geometries — see mc_metric)
@@ -806,7 +822,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # louis_bl = false is bit-identical. See mc_boundary_layer.jl.
     if louis_bl
         mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv,
-                     expdot, l_inf, Cd_param, sfc_wind_factor)
+                     expdot, l_inf, Cd_param, sfc_wind_factor,
+                     surface_fluxes, Ck, SST, U_min)
     end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──

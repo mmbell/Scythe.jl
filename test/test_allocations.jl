@@ -268,8 +268,10 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         mtile_bl, kDim_bl = build_mc_tile(equation_set = "moist_compressible_axisym",
                                           extra_params = Dict(:f => 5.0e-5, :Cd => -1.0,
                                                               :Ls => 200.0, :K_min => 5.0,
-                                                              :l_inf => 80.0),
-                                          extra_options = Dict{Symbol,Any}(:louis_bl => true))
+                                                              :l_inf => 80.0, :Ck => 1.0e-3,
+                                                              :SST => 301.15, :U_min => 1.0),
+                                          extra_options = Dict{Symbol,Any}(:louis_bl => true,
+                                                                           :surface_fluxes => true))
         Scythe.moist_compressible_axisym(mtile_bl, 1, kDim_bl, 2)  # compile
         @test (@allocations Scythe.moist_compressible_axisym(mtile_bl, 1, kDim_bl, 2)) == 0
 
@@ -278,8 +280,10 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                             equation_set = "moist_compressible_RLR",
                                             extra_params = Dict(:f => 5.0e-5, :Cd => -1.0,
                                                                 :Ls => 200.0, :K_min => 5.0,
-                                                                :l_inf => 80.0),
-                                            extra_options = Dict{Symbol,Any}(:louis_bl => true))
+                                                                :l_inf => 80.0, :Ck => 1.0e-3,
+                                                                :SST => 301.15, :U_min => 1.0),
+                                            extra_options = Dict{Symbol,Any}(:louis_bl => true,
+                                                                             :surface_fluxes => true))
         Scythe.moist_compressible_RLR(mtile_blr, 1, kDim_blr, 2)  # compile
         @test (@allocations Scythe.moist_compressible_RLR(mtile_blr, 1, kDim_blr, 2)) == 0
     end

@@ -8,15 +8,18 @@
 # chain rule is linear in the non-condensation T/p tendencies), so the frozen
 # driver lines are untouched and louis_bl = false is bit-identical.
 #
-# Discretization: every vertical flux divergence is fitted on the rho_r column
-# basis (scratch_column(mtile, 8)) exactly like the sedimentation flux — that
-# basis' bottom BC decides whether the surface node is free to carry a flux, so
-# boundary-layer configurations give rho_r a NaturalBC bottom (as the O01
-# rainfall benchmark already does). Sign convention: the fitted column holds
-# +K ∂z(field) (minus the diffusive flux), the tendency is its ∂z, and the
-# column integral of the tendency telescopes to col(top) − col(bottom). Hence
-# the momentum drag enters as a POSITIVE bottom node +ρ_t Cd |U| u (a momentum
-# sink) and a scalar surface GAIN enters as a negative bottom node −F_sfc.
+# Discretization: the INTERIOR vertical flux divergences are fitted on the
+# rho_r column basis (scratch_column(mtile, 8)) exactly like the sedimentation
+# flux — the fitted column holds +K ∂z(field) (minus the diffusive flux) and
+# the tendency is its ∂z. The SURFACE exchange (drag, enthalpy and moisture
+# fluxes) is NOT delivered through a fitted bottom node: the spline fit of a
+# single-node spike is basis-dependent (its extrapolated boundary value
+# overshoots the node by ~13% on the RiRk basis, so the column would gain
+# 1.13 F). Instead each surface flux F enters as the ANALYTIC divergence
+# F·g(z) with g(z) = (2/δ)(1 − z/δ)₊ and ∫g dz = 1, distributed over the
+# lowest grid cell (δ = twice the first-cell Gauss midpoint) — the column
+# gains exactly F on any basis, and the Gauss quadrature integrates the
+# linear profile exactly.
 #
 # Explicit, not implicit: Kv(z,t) is state-dependent and the implicit Helmholtz
 # matrices are factorized once with constant K (createModelTile); the explicit
@@ -63,15 +66,12 @@ end
 @inline _louis_v1(::MCCartesianXZ, vv) = 0.0
 @inline _louis_v1(::MCWithV, vv) = vv.f[1]
 
-@inline function _louis_v_flux!(VD_v, col, ::MCCartesianXZ, rho_t, Kv, vv,
-                                drag_coeff, v1)
+@inline function _louis_v_flux!(VD_v, col, ::MCCartesianXZ, rho_t, Kv, vv)
     return nothing
 end
-@inline function _louis_v_flux!(VD_v, col, ::MCWithV, rho_t, Kv, vv,
-                                drag_coeff, v1)
+@inline function _louis_v_flux!(VD_v, col, ::MCWithV, rho_t, Kv, vv)
     v_z = vv.f_z
     col.uMish .= rho_t .* Kv .* v_z
-    col.uMish[1] = rho_t[1] * drag_coeff * v1
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VD_v)
@@ -82,8 +82,9 @@ end
 # from ever touching the `nothing` views)
 @inline _louis_v(::MCCartesianXZ, vv, i) = 0.0
 @inline _louis_v(::MCWithV, vv, i) = @inbounds vv.f[i]
-@inline _louis_dv(::MCCartesianXZ, VD_v, rho_t, i) = 0.0
-@inline _louis_dv(::MCWithV, VD_v, rho_t, i) = @inbounds VD_v[i] / rho_t[i]
+@inline _louis_dv(::MCCartesianXZ, VD_v, rho_t, tau_v, gz, i) = 0.0
+@inline _louis_dv(::MCWithV, VD_v, rho_t, tau_v, gz, i) =
+    @inbounds (VD_v[i] - (tau_v * gz)) / rho_t[i]
 @inline _louis_add_v!(::MCCartesianXZ, expdot, j, dv) = nothing
 @inline function _louis_add_v!(::MCWithV, expdot, j, dv)
     @inbounds expdot[j, 9] += dv
@@ -92,7 +93,7 @@ end
 
 """
     mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv,
-                 expdot, l_inf, Cd_param, sfc_fac)
+                 expdot, l_inf, Cd_param, sfc_fac, surface_fluxes, Ck, SST, U_min)
 
 Louis boundary layer for one column of the total-energy set: eddy diffusivity
 `Kv = l(z)² |∂V/∂z|` with the Blackadar-blended length `l = 1/(1/(κz) + 1/l∞)`,
@@ -100,8 +101,11 @@ applied to momentum (u, w, v), heat (the moist entropy s_t', in energy-flux form
 `F_h = ρ_d T Kv ∂z s_t'` so the column energy books telescope exactly) and water
 (total water ρ_w' and diagnostic vapor ρ_v'; rain is left to sedimentation).
 Surface momentum drag `τ = ρ_t Cd |U₁| u₁` on the lowest mish-level wind
-([`komori_cd`](@ref) when `Cd_param < 0`); the scalar surface nodes are zero here
-and are filled by the surface-flux stage (options[:surface_fluxes]).
+([`komori_cd`](@ref) when `Cd_param < 0`). With `surface_fluxes` on, the scalar
+surface nodes carry the bulk enthalpy/moisture fluxes over a fixed-`SST` sea:
+`F_sh = ρ_d1 C_pd Ck U₁ (SST − T₁)` into the heat column and
+`F_q = Ck U₁ (ρ_vs(SST, p₁) − ρ_v1)` into BOTH water columns (the surface source
+adds vapor), with the exchange wind floored by the gustiness minimum `U_min`.
 
 The increments are mapped onto the prognostic slots with the model's canonical
 consistent mappings: momentum/E_t via the FRIC_KE invariant (E_t follows the
@@ -115,7 +119,8 @@ slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
                                 colstart::Int64, colend::Int64, z,
                                 uv, wv, vv, rtv, rdv, expdot,
                                 l_inf::Float64, Cd_param::Float64,
-                                sfc_fac::Float64)
+                                sfc_fac::Float64, surface_fluxes::Bool,
+                                Ck::Float64, SST::Float64, U_min::Float64)
     u = uv.f; u_z = uv.f_z
     w = wv.f; w_z = wv.f_z
     rho_t = S.rho_t
@@ -130,32 +135,56 @@ slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
         Kv[i] = l * l * Kv[i]
     end
 
-    # Surface drag: bulk stress on the lowest mish-level wind
+    # Surface exchange wind: the lowest mish-level speed, floored by the
+    # optional gustiness minimum U_min (applies to drag AND the fluxes; with a
+    # calm surface wind the stress is still zero since tau ∝ U1*u1)
     u1 = u[1] * sfc_fac
     v1 = _louis_v1(geom, vv) * sfc_fac
-    U1 = sqrt((u1 * u1) + (v1 * v1))
+    U1 = max(sqrt((u1 * u1) + (v1 * v1)), U_min)
     Cd = Cd_param < 0.0 ? komori_cd(U1) : Cd_param
     drag_coeff = Cd * U1
 
-    # Momentum flux divergences on the rho_r column basis: fit ρ_t Kv ∂z(u) with
-    # the surface stress as the bottom node; ∂z of the fit is ρ_t du/dt.
+    # Bulk surface enthalpy/moisture fluxes over the fixed-SST sea surface:
+    # sensible F_sh = rho_d1 Cpd Ck U1 (SST - T1) [W/m²] and moisture
+    # F_q = Ck U1 (rho_vs(SST, p1) - rho_v1) [kg/m²/s]. Latent heat is NOT a
+    # separate term — it enters through the fixed-T energy bookkeeping of the
+    # vapor mass source below (the (CpvT-Lv)+(Lv-RvT) = CvvT identity).
+    F_sh = 0.0
+    F_q = 0.0
+    if surface_fluxes
+        Tk1 = Tk[1]
+        rho_v1 = S.rho_v[1]
+        p1_hPa = S.p_hPa[1]
+        F_sh = rho_d[1] * Cpd * Ck * U1 * (SST - Tk1)
+        F_q = Ck * U1 * (rho_v_sat(SST, p1_hPa) - rho_v1)
+    end
+
+    # Surface-layer delivery profile g(z) = (2/δ)(1 − z/δ)₊, ∫g = 1, over the
+    # lowest cell (the first-cell Gauss midpoint z[2] sits at δ/2 exactly for
+    # odd-order Gauss quadrature). The bulk surface stresses/fluxes enter the
+    # tendencies as F·g(z) — see the header comment for why not a fitted node.
+    delta = 2.0 * z[2]
+    inv_delta = 1.0 / delta
+    tau_u = rho_t[1] * drag_coeff * u1
+    tau_v = rho_t[1] * drag_coeff * v1
+
+    # Interior momentum flux divergences on the rho_r column basis: fit
+    # ρ_t Kv ∂z(u); ∂z of the fit is ρ_t du/dt.
     col = scratch_column(mtile, 8)
     VD_u = S.VD_u
     col.uMish .= rho_t .* Kv .* u_z
-    col.uMish[1] = rho_t[1] * drag_coeff * u1
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VD_u)
 
     VD_w = S.VD_w
     col.uMish .= rho_t .* Kv .* w_z
-    col.uMish[1] = 0.0
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VD_w)
 
     VD_v = S.VD_v
-    _louis_v_flux!(VD_v, col, geom, rho_t, Kv, vv, drag_coeff, v1)
+    _louis_v_flux!(VD_v, col, geom, rho_t, Kv, vv)
 
     # Heat: s_t' gradient from its own column basis (slot 6, the Kvdiff_heat
     # staging pattern), then the energy-flux column ρ_d T Kv ∂z(s_t') whose ∂z is
@@ -171,7 +200,6 @@ slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
     Ixtransform(s_col, s_z)
     QDOT_V = S.QDOT_V
     col.uMish .= rho_d .* Tk .* Kv .* s_z
-    col.uMish[1] = 0.0                       # surface enthalpy flux stage fills this
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, QDOT_V)
@@ -187,7 +215,6 @@ slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
     Ixtransform(v_col, rv_z)
     VDOT_v = S.VDOT_v
     col.uMish .= Kv .* rv_z
-    col.uMish[1] = 0.0                       # surface moisture flux stage fills this
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_v)
@@ -195,37 +222,42 @@ slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
     VDOT_w = S.VDOT_w
     rho_tp_z = rtv.f_z; rho_dp_z = rdv.f_z
     col.uMish .= Kv .* (rho_tp_z .- rho_dp_z)
-    col.uMish[1] = 0.0
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_w)
 
     # Apply to the prognostic slots (all additive; explicit loop, not view
-    # broadcasts — the SubArray elision lesson at this function size)
+    # broadcasts — the SubArray elision lesson at this function size). The
+    # surface terms ride in on the analytic delivery profile g(z): drag −τ·g
+    # into the momentum, F_sh·g into the heating, F_q·g into both water rates.
     R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv
     drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp
     ke = S.ke
     @inbounds for i in eachindex(Kv)
         j = colstart + i - 1
-        du = VD_u[i] / rho_t[i]
+        gz = z[i] < delta ? 2.0 * inv_delta * (1.0 - (z[i] * inv_delta)) : 0.0
+        du = (VD_u[i] - (tau_u * gz)) / rho_t[i]
         dw = VD_w[i] / rho_t[i]
-        dv = _louis_dv(geom, VD_v, rho_t, i)
+        dv = _louis_dv(geom, VD_v, rho_t, tau_v, gz, i)
         expdot[j, 4] += du
         expdot[j, 5] += dw
         _louis_add_v!(geom, expdot, j, dv)
 
         # Heat (QDOT_TH pattern) and the fixed-T vapor pressure source
-        dT_v = QDOT_V[i] / (rho_d[i] * C_vt[i])
-        dp_v = (R_m[i] / C_vt[i]) * QDOT_V[i]
-        dp_q = Rv * Tk[i] * VDOT_v[i]
+        qdot = QDOT_V[i] + (F_sh * gz)
+        vdot_v = VDOT_v[i] + (F_q * gz)
+        vdot_w = VDOT_w[i] + (F_q * gz)
+        dT_v = qdot / (rho_d[i] * C_vt[i])
+        dp_v = (R_m[i] / C_vt[i]) * qdot
+        dp_q = Rv * Tk[i] * vdot_v
         expdot[j, 1] += dp_v + dp_q
-        expdot[j, 3] += VDOT_w[i]
-        expdot[j, 6] += QDOT_V[i] +
-                        (((Cpv * Tk[i]) - Lv[i] + ke[i] + (gravity * z[i])) * VDOT_w[i]) +
-                        ((Lv[i] - (Rv * Tk[i])) * VDOT_v[i]) +
+        expdot[j, 3] += vdot_w
+        expdot[j, 6] += qdot +
+                        (((Cpv * Tk[i]) - Lv[i] + ke[i] + (gravity * z[i])) * vdot_w) +
+                        ((Lv[i] - (Rv * Tk[i])) * vdot_v) +
                         (rho_t[i] * (((u[i] * du) + (w[i] * dw)) +
                                      (_louis_v(geom, vv, i) * dv)))
-        expdot[j, 7] += VDOT_v[i] - (drvs_dT[i] * dT_v) -
+        expdot[j, 7] += vdot_v - (drvs_dT[i] * dT_v) -
                         (drvs_dp[i] * (dp_v + dp_q))
     end
     return nothing
