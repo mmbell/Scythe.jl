@@ -70,11 +70,15 @@ struct NestInterface
     collar_rows::Vector{Int}     # parent `physical` rows inside the collar
     collar_x::Vector{Float64}    # unique i-coordinates of the collar columns
     nslices::Int                 # derivative slices carried by `physical`
-    # RL (ragged-ring) collars: explicit (r, λ) evaluation points, one per
-    # collar physical row, plus the target ring's supported max wavenumber
-    # (empty for tensor-product geometries, which use collar_x).
+    # RL/RLR (ragged-ring) collars: explicit (r, λ) evaluation points — one per
+    # collar physical row on RL, one per collar COLUMN on RLR — plus the target
+    # ring's supported max wavenumber (empty for tensor-product geometries,
+    # which use collar_x).
     collar_pts::Matrix{Float64}
     collar_kmax::Vector{Int}
+    # RLR only: the shared vertical mish, cached so the per-step injection
+    # does not rebuild the child's gridpoints (empty for 2D geometries).
+    collar_z::Vector{Float64}
 end
 
 """
@@ -103,9 +107,12 @@ function _physical_nslices(geometry::String)
         return 5                       # value, ∂i, ∂²i, ∂k, ∂²k
     elseif geometry == "RL"
         return 5                       # value, ∂r, ∂²r, ∂λ, ∂²λ
+    elseif geometry == "RLR"
+        return 7                       # value, ∂r, ∂²r, ∂λ, ∂²λ, ∂z, ∂²z
     else
         throw(ArgumentError(
-            "Nesting currently supports geometries \"R\", \"RiRk\", and \"RL\", got \"$geometry\""))
+            "Nesting currently supports geometries \"R\", \"RiRk\", \"RL\", and " *
+            "\"RLR\", got \"$geometry\""))
     end
 end
 
@@ -254,7 +261,7 @@ function build_nest(nest::NestedModelParameters)
         # must sit on a whole number of this patch's own cells from the global
         # origin for the offset to be well-defined.
         ring_offset = 0
-        if geometry == "RL"
+        if geometry in ("RL", "RLR")
             dxi = (iMax - iMin) / cells
             cells_inside = (iMin - nest.boundaries[1]) / dxi
             isapprox(cells_inside, round(cells_inside); atol=1e-8) || throw(ArgumentError(
@@ -320,12 +327,16 @@ function build_nest(nest::NestedModelParameters)
         collar_rows = Int[]
         collar_pts = zeros(Float64, 0, 2)
         collar_kmax = Int[]
-        if geometry == "RL"
+        collar_z = Float64[]
+        if geometry in ("RL", "RLR")
             # Ragged rings: the collar is one parent cell = mubar rings. Rows
-            # follow the cumulative ring point counts; each point carries its
-            # target ring's supported max wavenumber for the evaluation.
+            # follow the cumulative ring point counts (× kDim z-fastest columns
+            # on RLR); each ring point carries its target ring's supported max
+            # wavenumber for the evaluation.
             pgp = models[p].grid_params
+            kz = geometry == "RLR" ? pgp.kDim : 1
             row = 0
+            col = 0
             pt_rows = Int[]
             for r in 1:pgp.iDim
                 ri = r + pgp.patchOffsetL
@@ -334,13 +345,17 @@ function build_nest(nest::NestedModelParameters)
                 in_collar = parent_side == :right ? (rrad > x_int + 1e-9) :
                                                     (rrad < x_int - 1e-9)
                 if in_collar
-                    append!(collar_rows, (row + 1):(row + lpoints))
-                    append!(pt_rows, (row + 1):(row + lpoints))
+                    append!(collar_rows, (row + 1):(row + (lpoints * kz)))
+                    append!(pt_rows, ((col + l - 1) * kz + 1 for l in 1:lpoints))
                     append!(collar_kmax, fill(ri, lpoints))
                 end
-                row += lpoints
+                row += lpoints * kz
+                col += lpoints
             end
-            collar_pts = ppts[pt_rows, :]
+            collar_pts = ppts[pt_rows, 1:2]
+            if geometry == "RLR"
+                collar_z = ppts[1:pgp.kDim, 3]     # shared vertical mish
+            end
         else
             xcol = geometry == "R" ? vec(ppts) : ppts[1:models[p].grid_params.kDim:end, 1]
             if parent_side == :right
@@ -361,7 +376,8 @@ function build_nest(nest::NestedModelParameters)
 
         push!(interfaces, NestInterface(p, c, parent_side, child_side, x_int,
                                         iface.metadata, collar_rows, collar_x,
-                                        nslices, collar_pts, collar_kmax))
+                                        nslices, collar_pts, collar_kmax,
+                                        collar_z))
     end
 
     parent_ifaces = [Int[] for _ in 1:n]
@@ -385,9 +401,16 @@ state is current for the time level and before its tendency computation.
 """
 function inject_collar!(parent_physical::AbstractArray{Float64,3},
                         child_grid, ni::NestInterface)
-    vals = isempty(ni.collar_pts) ?
-           evaluate_grid_ipoints(child_grid, ni.collar_x) :
-           evaluate_grid_points(child_grid, ni.collar_pts; kmax = ni.collar_kmax)
+    vals = if isempty(ni.collar_pts)
+        evaluate_grid_ipoints(child_grid, ni.collar_x)
+    elseif !isempty(ni.collar_z)
+        # RLR: column evaluation on the shared vertical mish (z-fastest rows,
+        # matching the collar_rows layout)
+        evaluate_grid_points(child_grid, ni.collar_pts, ni.collar_z;
+                             kmax = ni.collar_kmax)
+    else
+        evaluate_grid_points(child_grid, ni.collar_pts; kmax = ni.collar_kmax)
+    end
     nvars = size(parent_physical, 2)
     @inbounds for s in 1:ni.nslices, v in 1:nvars
         for (r, row) in enumerate(ni.collar_rows)
@@ -427,16 +450,22 @@ struct NestParentLink
     down::RemoteChannel                  # take parent trio payloads
     up::RemoteChannel                    # send my collar evaluation
     parent_collar_x::Vector{Float64}     # where the parent needs my values
-    # RL: explicit (r, λ) points + per-point wavenumber truncation (empty for
-    # tensor-product geometries, which use parent_collar_x)
+    # RL/RLR: explicit (r, λ) points + per-ring wavenumber truncation (empty
+    # for tensor-product geometries, which use parent_collar_x)
     parent_collar_pts::Matrix{Float64}
     parent_collar_kmax::Vector{Int}
+    # RLR: the shared vertical mish for the column evaluation (empty on 2D)
+    parent_collar_z::Vector{Float64}
 end
 
 """Evaluate this patch's representation at the parent's collar points."""
 function _collar_evaluation(patch, pl::NestParentLink)
     if isempty(pl.parent_collar_pts)
         return evaluate_grid_ipoints(patch, pl.parent_collar_x)
+    elseif !isempty(pl.parent_collar_z)
+        return evaluate_grid_points(patch, pl.parent_collar_pts,
+                                    pl.parent_collar_z;
+                                    kmax = pl.parent_collar_kmax)
     end
     return evaluate_grid_points(patch, pl.parent_collar_pts;
                                 kmax = pl.parent_collar_kmax)
@@ -534,12 +563,12 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
     # A collar row (patch-global) belongs to the worker whose tile covers its
     # mish column; precompute (worker → selection into collar values, tile-local rows).
     inj_maps = Vector{Vector{Tuple{Int, Vector{Int}, Vector{Int}}}}(undef, length(child_links))
-    if model.grid_params.geometry == "RL"
+    if model.grid_params.geometry in ("RL", "RLR")
         # Ragged rings: the tensor-product row arithmetic below does not apply.
-        # v1 restricts RL nest patches to a single worker whose tile spans the
-        # whole patch, so the tile-local rows ARE the patch rows.
+        # v1 restricts RL/RLR nest patches to a single worker whose tile spans
+        # the whole patch, so the tile-local rows ARE the patch rows.
         num_workers == 1 || throw(ErrorException(
-            "RL nest patches currently support exactly 1 worker per patch " *
+            "RL/RLR nest patches currently support exactly 1 worker per patch " *
             "(ragged ring layout), got $(num_workers)"))
         for (li, cl) in enumerate(child_links)
             inj_maps[li] = [(workerids[1], collect(1:length(cl.collar_rows)),
@@ -777,7 +806,8 @@ function integrate_nested_model(nest::NestedModelParameters)
             # (collar_x for tensor-product geometries, (r, λ) points + per-ring
             # wavenumber truncation for RL).
             push!(plinks, NestParentLink(ni.meta, down[k], up[k], ni.collar_x,
-                                         ni.collar_pts, ni.collar_kmax))
+                                         ni.collar_pts, ni.collar_kmax,
+                                         ni.collar_z))
         end
         clinks = NestChildLink[]
         for k in topo.child_ifaces[i]

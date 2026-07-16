@@ -214,6 +214,60 @@ using Springsteel
         @test all(ni2.collar_pts[:, 1] .< 1.5e5)
     end
 
+    @testset "RLR radial nest (3D cylindrical TC layout)" begin
+        mc_vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS_CYL))
+        scalar_bc = Dict(v => NeumannBC() for v in keys(mc_vars))
+        base_rlr = ModelParameters(
+            ts = 0.3,
+            integration_time = 1800.0,
+            output_interval = 900.0,
+            equation_set = "moist_compressible_RLR",
+            initial_conditions = "",
+            output_dir = "./output_nesttest_rlr/",
+            grid_params = GridParameters(
+                geometry = "RLR",
+                num_cells = 30, iMin = 0.0, iMax = 1.8e5,     # placeholder
+                kMin = 0.0, kMax = 20.0e3, num_cells_k = 20,
+                BCL = merge(scalar_bc, Dict("u" => DirichletBC(), "v" => DirichletBC())),
+                BCR = merge(scalar_bc, Dict("u" => DirichletBC())),
+                BCB = merge(scalar_bc, Dict("w" => DirichletBC(), "rho_r" => NaturalBC())),
+                BCT = merge(scalar_bc, Dict("w" => DirichletBC())),
+                vars = mc_vars),
+            physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0),
+        )
+
+        # 2:1: fine inner disc (4 km), coarse outer annulus (8 km); the
+        # junction must be a whole number of PARENT cells from the origin so
+        # the collar-extended inner edge keeps the global ring numbering
+        nest = NestedModelParameters(
+            boundaries = [0.0, 6.4e4, 1.92e5],
+            num_cells = [16, 16],
+            ts = [0.3, 0.3],
+            workers_per_patch = [1, 1],
+            base = base_rlr)
+        models, topo = build_nest(nest)
+        ni = topo.interfaces[1]
+        @test (ni.parent, ni.child) == (2, 1)
+        @test ni.nslices == 7
+        gp2 = models[2].grid_params
+        kDim = gp2.kDim
+        @test kDim == models[1].grid_params.kDim              # shared vertical
+        @test gp2.iMin == 5.6e4                               # −1 own (8 km) cell collar
+        @test gp2.patchOffsetL == round(Int, 5.6e4 / 8.0e3) * gp2.mubar
+        # Collar: mubar parent rings inside 60 km; one (r, λ) point per COLUMN,
+        # kDim z-fastest physical rows per column, and the cached vertical mish
+        mubar = gp2.mubar
+        collar_cols = sum(4 + 4 * (r + gp2.patchOffsetL) for r in 1:mubar)
+        @test length(ni.collar_kmax) == collar_cols
+        @test size(ni.collar_pts) == (collar_cols, 2)
+        @test length(ni.collar_rows) == collar_cols * kDim
+        @test length(ni.collar_z) == kDim
+        @test issorted(ni.collar_z)
+        @test all(ni.collar_pts[:, 1] .< 6.4e4)
+        # Rows really are the collar columns' z-fastest runs
+        @test ni.collar_rows[1:kDim] == collect(1:kDim)
+    end
+
     @testset "validation errors" begin
         # 4:1 junction ratio
         nest_bad = NestedModelParameters(
