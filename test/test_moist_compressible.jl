@@ -343,7 +343,7 @@ using Springsteel
         return (; z, Tk, p_Pa, rho_d, rho_v = zeros(n), rho_c = zeros(n))
     end
 
-    function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=false, ts=0.1,
+    function make_mc_mtile(tmpdir; num_cells=8, kDim=16, semiimplicit=true, ts=0.1,
                            dry=false, Khdiff=0.0, Kvdiff=0.0, Kvdiff_heat=nothing,
                            Kvdiff_water=0.0, tau_qss=10.0,
                            u_side_bc=DirichletBC(), precipitation=false, N_r=1.0e-3,
@@ -555,6 +555,92 @@ using Springsteel
             # initial amplitude after 200 vertically-stiff steps
             @test maximum(abs.(patch.physical[:, p_i, 1])) < p0_max
             @test maximum(abs.(patch.physical[:, vars["w"], 1])) < 1.0
+        end
+    end
+
+    @testset "SI vertical-acoustic ceiling removed (dry isothermal, RiRk)" begin
+        # Regression gate for the operator-consistent AI2* staging: the old
+        # subtract-AB3 scheme mixed the pointwise product-rule acoustic operator
+        # (history levels) with the fitted Galerkin operator (implicit level), leaving
+        # a grid-scale residual under explicit weights that blew up above a VERTICAL
+        # acoustic Courant of ~2.1-2.4 on the RiRk spline vertical (grid-scale,
+        # top-boundary-localized mode; tc/SI_VERTICAL_CEILING.md). With the
+        # spline-consistent history staging (single fitted-φ chain for the slaved
+        # legs, stored applied increment for the w leg) the measured ceiling moves to
+        # Co_z ≈ 9-18, past the explicit HORIZONTAL acoustic limit of any realistic
+        # grid aspect ratio: a broadband w seed on a resting, statically stable,
+        # bone-dry isothermal base must DECAY at the previously-fatal Co_z ≈ 4.5 and
+        # 9.0 (the old scheme e-folded in ~65 s at Co_z 2.4 and NaN'd within ~50 s at
+        # Co_z 4.5). Horizontal cells widen with ts so the explicit horizontal
+        # acoustic Courant stays <= 0.35 and cannot bind.
+        function isothermal_column_mc(z; T0=250.0, p0=101325.0)
+            n = length(z)
+            p_Pa = @. p0 * exp(-gravity * z / (Rd * T0))
+            return (; z, Tk = fill(T0, n), p_Pa, rho_d = p_Pa ./ (Rd * T0),
+                    rho_v = zeros(n), rho_c = zeros(n))
+        end
+        for ts in (0.75, 1.5)   # Co_z ≈ 4.5, 9.0 on dz_min = 0.2254 * 250 m, c ≈ 340 m/s
+            mktempdir() do tmpdir
+                dx_cell = max(3200.0, 340.0 * ts / (0.35 * 0.2254))
+                vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+                scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+                side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+                wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+                gp = GridParameters(geometry = "RiRk",
+                    iMin = 0.0, iMax = 4.0 * dx_cell, num_cells_i = 4,
+                    kMin = 0.0, kMax = 10.0e3, num_cells_k = 40,   # dz_cell = 250 m
+                    BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
+                    vars = vars)
+                ref_file = joinpath(tmpdir, "ceiling_pressure.ref")
+                model = ModelParameters(
+                    ts = ts, integration_time = 600.0, output_interval = 600.0,
+                    equation_set = "moist_compressible_XZ",
+                    ref_state_file = ref_file, grid_params = gp,
+                    physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                           :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                           :tau_qss => 10.0, :alpha => 0.0,
+                                           :z_damp => 20.0e3, :f => 0.0),
+                    options = Dict(:semiimplicit => true,
+                                   :exact_reference_state => true,
+                                   :precipitation => false))
+                gp = model.grid_params
+                patch = createGrid(gp)
+                gridpoints = Scythe.getGridpoints(patch)
+                kDim = gp.kDim
+                z = gridpoints[1:kDim, end]
+                col = isothermal_column_mc(z)
+                Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d,
+                                          col.rho_v, col.rho_c)
+                patch.physical .= 0.0
+                # Deterministic broadband w seed (irrational chirp sweeps every
+                # vertical wavenumber, grid scale included)
+                w_i = gp.vars["w"]
+                npts = size(patch.physical, 1)
+                for i in 1:npts
+                    patch.physical[i, w_i, 1] = 1.0e-4 * sin(0.5 * sqrt(2.0) * i^2)
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                haloReceiveMap = sparse(Int64[], Int64[], Float64[],
+                                        size(patch.spectral, 1),
+                                        size(patch.spectral, 2))
+                mtile = createModelTile(patch, patch, model, haloReceiveMap)
+
+                w0_max = maximum(abs.(patch.physical[:, w_i, 1]))
+                ncols = div(npts, kDim)
+                nsteps = round(Int, 600.0 / ts)
+                for t in 1:nsteps
+                    for c in 1:ncols
+                        Scythe.advance_column(mtile, c, t)
+                    end
+                    Scythe.calcTendency(mtile)
+                    gridTransform!(patch)
+                end
+                @test all(isfinite.(patch.physical[:, :, 1]))
+                # The seed must decay, not grow (the old scheme grew 1e-4 -> ~1 m/s
+                # here); the stable reference behavior is a x40-50 decay over 600 s.
+                @test maximum(abs.(patch.physical[:, w_i, 1])) < w0_max
+            end
         end
     end
 
@@ -1021,9 +1107,13 @@ using Springsteel
             d8 = m_on.var_np1[:, 8] .- m_off.var_np1[:, 8]
             # Evaporation added vapor somewhere in the rain shaft
             @test maximum(d7) > 0.0
-            # Rain lost beyond what sedimentation moved: d8 - d3 = ts * Qdot_r < 0
+            # Rain lost beyond what sedimentation moved: d8 - d3 = ts * Qdot_r < 0.
+            # The upper bound is acoustic cross-talk, not evaporation: the (always-on)
+            # SI solve slaves rho_t' to the mass flux but not rho_r, and the precip
+            # switch perturbs the solve, so the difference is no longer exactly
+            # ts * Qdot_r (measured ~1e-9 vs the >1e-6 evaporation signal).
             @test minimum(d8 .- d3) < 0.0
-            @test all(d8 .- d3 .<= 1.0e-14)
+            @test maximum(d8 .- d3) <= 1.0e-8
             # Evaporative cooling with E_t held: the retrieval must cool, never warm
             kDim = 32
             zs = gp[:, 2]
@@ -1071,7 +1161,7 @@ using Springsteel
             # Sedimentation is active (the rain actually moves)...
             @test maximum(abs.(d8)) > 1.0e-8
             # ...but no rain is created by condensation anywhere in the column
-            @test all(d8 .- d3 .<= 1.0e-14)
+            @test maximum(d8 .- d3) <= 1.0e-14
         end
     end
 
@@ -1140,8 +1230,11 @@ using Springsteel
             end
             # After the step the retrieved temperature is unchanged to O(ts^2): a
             # missing E_t coupling shows up at the ~1e-2 K level with this seed.
+            # (3e-3: the always-on SI solve routes the sponge's w difference through
+            # the acoustic E_t slaving, adding ~1.4e-3 K on top of the old bound —
+            # still 3x below the missing-coupling discriminant.)
             dT = retrieved_T_mc(m_on, kDim, zs) .- retrieved_T_mc(m_off, kDim, zs)
-            @test maximum(abs.(dT)) < 1.0e-3
+            @test maximum(abs.(dT)) < 3.0e-3
         end
 
         # Configs without :alpha/:z_damp keys must run (the sponge defaults to off)
@@ -1219,8 +1312,11 @@ using Springsteel
             d8 = m_on.var_np1[:, 8] .- m_off.var_np1[:, 8]
             @test maximum(abs.(d8)) > 1.0e-8            # diffusion acted on the bump
             # Rain is the only water species moving: rho_w' and rho_r' get the same
-            # increment (same Neumann operator, same data)
-            @test all(isapprox.(d3, d8; atol=1.0e-12))
+            # increment (same Neumann operator, same data). Tolerance: the always-on
+            # SI solve slaves an acoustic increment onto rho_t' (moist base: c_d < 1)
+            # but not rho_r, so the two solves' inputs differ at the ~1e-12 level
+            # (signal > 1e-8).
+            @test maximum(abs.(d3 .- d8)) < 1.0e-10
             # Neumann solve conserves the column integral (trapezoid per column)
             kDim = 32
             zs = gp[1:kDim, 2]
@@ -1276,8 +1372,9 @@ using Springsteel
             @test maximum(abs.(d3)) > 1.0e-8            # diffusion acted
             # Vapor-only water: the rho_w and rho_v increments must agree (no cloud
             # manufactured); the two fields ride the same operator but different
-            # staging paths (prognostic zz slots vs a column refit), hence the tolerance
-            @test all(isapprox.(d3, d7; atol=1.0e-9))
+            # staging paths (prognostic zz slots vs a column refit), plus the acoustic
+            # slaving on rho_t' from the always-on SI solve, hence the tolerance
+            @test maximum(abs.(d3 .- d7)) < 5.0e-9
             # No rain appears from water diffusion of a rain-free column
             @test m_on.var_np1[:, 8] == m_off.var_np1[:, 8]
             # Fixed-T map holds the retrieval
@@ -1458,7 +1555,7 @@ using Springsteel
                                            :Kvdiff_water => 0.0, :Kv_mudiff => 0.0,
                                            :tau_qss => 10.0, :N_r => 1.0e-3,
                                            :alpha => 0.0, :z_damp => H, :f => f),
-                    options = Dict(:semiimplicit => false,
+                    options = Dict(:semiimplicit => true,
                                    :exact_reference_state => true,
                                    :precipitation => true,
                                    :vertical_mixing => false))
@@ -1571,7 +1668,7 @@ using Springsteel
                                            :Kvdiff_water => 0.0, :Kv_mudiff => 0.0,
                                            :tau_qss => 10.0, :N_r => 1.0e-3,
                                            :alpha => 0.0, :z_damp => H, :f => f),
-                    options = Dict(:semiimplicit => false,
+                    options = Dict(:semiimplicit => true,
                                    :exact_reference_state => true,
                                    :precipitation => true,
                                    :vertical_mixing => false))
@@ -1686,7 +1783,7 @@ using Springsteel
                                            :alpha => 0.0, :z_damp => H,
                                            :Omega => 0.0,
                                            :sphere_radius => a_sphere),
-                    options = Dict(:semiimplicit => false,
+                    options = Dict(:semiimplicit => true,
                                    :exact_reference_state => true,
                                    :precipitation => true,
                                    :vertical_mixing => false))

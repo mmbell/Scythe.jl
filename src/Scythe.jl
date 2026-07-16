@@ -24,7 +24,7 @@ Main configuration struct for Scythe model runs. Uses `Base.@kwdef` for keyword 
 - `ref_state_file::String`: path to the reference state sounding file (default: `""`)
 - `grid_params::SpringsteelGridParameters`: Springsteel grid configuration (required, no default)
 - `physical_params::Dict{Symbol,Float64}`: physical parameters for the equation set (default: empty)
-- `options::Dict{Symbol,Any}`: solver and output options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`). Output-format keys read by [`write_output`](@ref):
+- `options::Dict{Symbol,Any}`: solver and output options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`). `:semiimplicit` is an opt-in for the LEGACY equation sets only; the moist_compressible (pressure-reference) sets are ALWAYS semi-implicit — the key may be omitted or `true`, and an explicit `false` is an error (the explicit acoustic mode was removed). Output-format keys read by [`write_output`](@ref):
     - `:output_formats::Vector{Symbol}` (default `[:csv]`) — which ANALYSIS formats to write each `output_interval`. `:csv` writes the `<t>_spectral.csv`/`<t>_physical.csv`/`<t>_gridded.csv` trio (Springsteel `write_grid`); `:netcdf` writes the gridded representation to `<t>.nc` (`write_netcdf`). List several to write several, e.g. `[:csv, :netcdf]`. JLD2 is not listed here — it is the restart format, written at `restart_interval` (see `write_restart`). NOTE: the ICs reader, regression references, and benchmark harnesses parse the CSVs, so drop `:csv` only for runs that don't feed them.
     - `:netcdf_derivatives::Bool` (default `false`) — when `:netcdf` is selected, whether to write derivative slots alongside field values.
 
@@ -124,7 +124,7 @@ function integrate_model(model::ModelParameters)
     # Advisory startup check (master console, before the worker stdout redirect):
     # catch a timestep that is too large for the vertical resolution (e.g. raising
     # kDim without lowering ts). Warn-only; never aborts.
-    warn_timestep_stability(model.grid_params, model.ts)
+    warn_timestep_stability(model.grid_params, model.ts; equation_set=model.equation_set)
 
     if !isdir(model.output_dir)
         mkdir(model.output_dir)

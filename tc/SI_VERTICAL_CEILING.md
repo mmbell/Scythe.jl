@@ -1,9 +1,54 @@
 # The vertical-acoustic timestep ceiling of the mc semi-implicit solver
 
-Handoff note, 2026-07-16. Status: **diagnosed and measured, mitigated by
-timestep choice (ts = 0.3 s at 250-m cells), not yet fixed.** This documents
-why the semi-implicit solver is *not* unconditionally stable for vertical
-acoustics, the experimental evidence, and the candidate fixes.
+Handoff note, 2026-07-16. Status: **FIXED (same day)** — the explicit acoustic
+mode was removed and the AI2* staging made operator-consistent, moving the
+measured ceiling from Co_z ≈ 2.1–2.4 to ≈ 9–18. See "The fix" at the end; the
+diagnosis and measurement history below is kept for the record (its
+"candidate fixes" section is superseded).
+
+## The fix (2026-07-16)
+
+The subtract-AB3/add-implicit structure was removed entirely (`:semiimplicit
+=> false` is now an error for the mc sets):
+
+- `expdot` stages the acoustic REMAINDER (full tendency minus the pointwise
+  reference-linear term, cancelling analytically at grid scale), so AB3 never
+  integrates any part of the linear vertical acoustic operator.
+- The AI2* histories for p/ρ_d/ρ_t/E_t are staged in `mc_driver!` from ONE
+  fit of φⁿ = ρ̄_t wⁿ in w's column basis — the same discrete chain the
+  Helmholtz solve and the slaved recoveries apply — freshly evaluated each
+  step (robust to diffusion/collar/refit between steps). A dry reference
+  gives bitwise-identical ρ_d/ρ_t histories (c_d = 1, c_d,z = 0 exactly), so
+  the historical drift objection to fitted staging is void.
+- The w-leg history is the increment the Helmholtz elimination ACTUALLY
+  applied, stored by the adjustment ((w^{n+1} − w*)/Δτ): the weak-Galerkin
+  elimination is not expressible as a pointwise chain, and staging −∂z p′/ρ̄_t
+  instead leaves its residual under explicit weights (ceiling stays ≈ 2–3;
+  measured). Recovering w from a refit ∂z p′^{n+1} (moving the residual to the
+  p leg) is WORSE (NaN at Co_z 4.5 in ~20 s; measured).
+- Corrections to this note's original framing, found during the fix: the
+  spline filter `_filter_mish!` runs inside `spectralTransform!` (every step,
+  not on the output cadence), and it was configured OFF in these runs anyway —
+  the "filter" that matters is the Ooyama `l_q` regularization inside EVERY
+  `SAtransform!` fit. It is load-bearing: with `l_q = 0` every variant blows
+  up (the scheme's damping composition relies on it), and histories must be
+  evaluated on the post-refit state (all-stored histories go unstable at
+  Co_z 9 where fresh staging survives).
+
+Measured after the fix (`model_tests/si_ceiling_sweep.jl`, same dry isothermal
+base, horizontal Courant held ≤ 0.35): Co_z 3.0/4.5/9.05 decay (×100–300 over
+600 s); Co_z 18 grows slowly (e-fold ≈ 62 s); Co_z 36 NaNs. The vertical
+ceiling (≈ 9 with solid margin) now sits ABOVE the explicit horizontal
+acoustic limit (AB3, ω·Δt ≈ 0.72) for every realistic grid aspect ratio, so
+the horizontal Courant is the binding constraint — per-nest timestep scaling
+with DX is meaningful again (`tc/tc_params.jl` NEST_TS = [0.75, 1.5, 1.5]).
+The regression gate lives in test/test_moist_compressible.jl ("SI
+vertical-acoustic ceiling removed"), asserting decay at Co_z 4.5 and 9.
+`warn_timestep_stability` now checks the horizontal Courant for mc runs.
+
+---
+
+Original note (2026-07-16, pre-fix) follows.
 
 ## Session-close state of the TC effort (2026-07-16)
 

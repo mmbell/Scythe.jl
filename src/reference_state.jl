@@ -142,31 +142,64 @@ function empty_reference_state()
 end
 
 """
-    warn_timestep_stability(grid_params, ts; c_nominal=340.0, target_courant=0.5)
+    warn_timestep_stability(grid_params, ts; c_nominal=340.0, target_courant=0.5,
+                            equation_set="")
 
-Advisory startup check that the timestep is consistent with the vertical
-resolution, aimed at catching the common mistake of raising `kDim` without
-lowering `ts`. Builds a lightweight 1-D B-spline column from `grid_params` to get
-the true minimum mish-point spacing `dz_min`, estimates the acoustic Courant
-number `c_nominal * ts / dz_min`, and emits an `@warn` (never aborts) if it
-exceeds `target_courant`. Returns the estimated Courant number, or `nothing`
-when skipped.
+Advisory startup check that the timestep is consistent with the resolution's
+explicit acoustic limit. Builds a lightweight 1-D B-spline axis from `grid_params`
+to get the true minimum mish-point spacing, estimates the acoustic Courant number
+`c_nominal * ts / d_min`, and emits an `@warn` (never aborts) if it exceeds
+`target_courant`. Returns the estimated Courant number, or `nothing` when skipped.
 
-**RiRk only.** The check is restricted to the cubic B-spline (`"RiRk"`) vertical
-geometry, whose mish points are near-uniform so a single `dz_min`-based Courant
-number is meaningful. It is a deliberate no-op for the Chebyshev (`"RZ"`)
-geometry: boundary clustering makes `dz_min` tiny, so stable RZ runs routinely
-sit at an acoustic Courant of several (the semi-implicit scheme treats vertical
-acoustics implicitly), and a nominal-sound-speed threshold would fire on every
-run.
+**Which axis depends on the equation set.** For the pressure-reference
+(`moist_compressible`) sets the vertical acoustics are integrated semi-implicitly
+with no Courant limit (operator-consistent AI2*; see
+[`semiimplicit_adjustment_p`](@ref)), so the binding explicit limit is the
+HORIZONTAL acoustic Courant on the i axis — checked whenever the i axis is a cubic
+B-spline (geometry `"R..."`), with `target_courant=0.5` advisory against the AB3
+imaginary-axis stability limit of ω·Δt ≈ 0.72. (The azimuthal spacing of the 3D
+cylinder at its inner radius is not probed — configure it comparably.)
 
-The default `target_courant=0.5` is a conservative *empirical* tripwire, not a
-derived stability bound: the BF02 RiRk case is stable near Co≈0.25 (kDim=100) but
-blew up near Co≈0.75 (kDim=300). The true RiRk semi-implicit margin is still
-under investigation, so treat this as advisory.
+For the legacy sets the historical VERTICAL check runs, restricted to the cubic
+B-spline (`"RiRk"`) vertical whose mish points are near-uniform; it is a
+deliberate no-op for the Chebyshev (`"RZ"`) vertical, where boundary clustering
+makes `dz_min` tiny and a nominal-sound-speed threshold would fire on every run.
+Its `target_courant=0.5` is a conservative *empirical* tripwire for the legacy
+subtract-AB3 semi-implicit form, not a derived bound.
 """
 function warn_timestep_stability(grid_params, ts::Float64;
-                                 c_nominal::Float64=340.0, target_courant::Float64=0.5)
+                                 c_nominal::Float64=340.0, target_courant::Float64=0.5,
+                                 equation_set::String="")
+
+    if uses_pressure_reference(equation_set)
+        # SI-only mc: vertical acoustics have no Courant limit; probe the i axis.
+        startswith(grid_params.geometry, "R") || return nothing
+        x = try
+            sp = SplineParameters(
+                xmin = grid_params.iMin, xmax = grid_params.iMax,
+                num_cells = grid_params.num_cells_i,
+                mubar = grid_params.mubar, quadrature = grid_params.quadrature,
+                BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
+            Spline1D(sp).mishPoints
+        catch
+            return nothing       # best-effort: never let a startup check break a run
+        end
+
+        dx_min = minimum(diff(sort(x)))
+        courant = c_nominal * ts / dx_min
+        if courant > target_courant
+            suggested = target_courant * dx_min / c_nominal
+            @warn "Timestep may be too large for the horizontal resolution " *
+                  "(iDim=$(grid_params.iDim)): estimated HORIZONTAL acoustic Courant " *
+                  "≈ $(round(courant; digits=2)) [c≈$(round(c_nominal)) m/s, " *
+                  "dx_min=$(round(dx_min; digits=2)) m, ts=$(ts) s] exceeds target " *
+                  "$(target_courant). Consider ts ≲ $(round(suggested; digits=4)) s. " *
+                  "(Advisory: vertical acoustics are semi-implicit with no Courant limit; " *
+                  "the horizontal acoustics are explicit AB3.)"
+        end
+        return courant
+    end
+
     grid_params.geometry == "RiRk" || return nothing
     # `num_cells_k` is the canonical cell count for the spline vertical, resolved by
     # `compute_derived_params` when `ModelParameters` is built (so it is populated whether the

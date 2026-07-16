@@ -121,7 +121,7 @@ using SparseArrays
                                    :f => 0.0, :Cd => Cd, :Ls => Ls, :K_min => K_min,
                                    :l_inf => l_inf,
                                    :sfc_wind_factor => sfc_wind_factor),
-            options = Dict(:semiimplicit => false, :exact_reference_state => true,
+            options = Dict(:semiimplicit => true, :exact_reference_state => true,
                            :precipitation => false, :louis_bl => louis_bl))
         # gp.kDim is derived inside ModelParameters (compute_derived_params) — the
         # grid must come from model.grid_params, not the raw gp.

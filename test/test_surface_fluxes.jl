@@ -52,7 +52,7 @@ using SparseArrays
             equation_set = "moist_compressible_axisym",
             ref_state_file = ref_file, grid_params = gp,
             physical_params = pp,
-            options = Dict(:semiimplicit => false, :exact_reference_state => true,
+            options = Dict(:semiimplicit => true, :exact_reference_state => true,
                            :precipitation => false, :louis_bl => true,
                            :surface_fluxes => surface_fluxes))
         gp = model.grid_params

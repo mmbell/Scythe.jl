@@ -35,7 +35,6 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     expdot_n::Matrix{Float64}
     expdot_nm1::Matrix{Float64}
     expdot_nm2::Matrix{Float64}
-    impdot_np1::Matrix{Float64}
     impdot_n::Matrix{Float64}
     impdot_nm1::Matrix{Float64}
     impdot_nm2::Matrix{Float64}
@@ -183,7 +182,6 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     expdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
-    impdot_np1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
@@ -260,8 +258,21 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     if haskey(model.physical_params, :Kvdiff)
         diffusion_matrix = calc_Helmholtz_diffusion_matrix(tile, model, 1.25 * model.ts * model.physical_params[:Kvdiff])
     end
-    # The semi-implicit acoustic adjustment matrix is only used when enabled.
-    if model.options[:semiimplicit]
+    # The semi-implicit acoustic solve is UNCONDITIONAL for the pressure-reference
+    # (moist_compressible) sets: the explicit acoustic mode was removed when the AI2*
+    # staging was made operator-consistent (see semiimplicit_adjustment_p). A config
+    # that explicitly asks for the removed mode fails loudly rather than silently
+    # producing different numbers; an absent :semiimplicit key simply runs SI.
+    # The legacy sets keep the opt-in flag.
+    if uses_pressure_reference(model.equation_set)
+        if get(model.options, :semiimplicit, true) != true
+            error("options[:semiimplicit] => false is not supported for the " *
+                  "moist_compressible equation sets: the explicit acoustic mode was " *
+                  "removed (the vertical acoustics are always integrated semi-implicitly). " *
+                  "Remove the option or set it to true.")
+        end
+        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
+    elseif get(model.options, :semiimplicit, false)
         h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
     end
 
@@ -316,7 +327,6 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         expdot_n,
         expdot_nm1,
         expdot_nm2,
-        impdot_np1,
         impdot_n,
         impdot_nm1,
         impdot_nm2,
