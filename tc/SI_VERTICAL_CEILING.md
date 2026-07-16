@@ -5,6 +5,37 @@ timestep choice (ts = 0.3 s at 250-m cells), not yet fixed.** This documents
 why the semi-implicit solver is *not* unconditionally stable for vertical
 acoustics, the experimental evidence, and the candidate fixes.
 
+## Session-close state of the TC effort (2026-07-16)
+
+All seven stages of the TC plan are CODE-COMPLETE and committed on
+`development` (MP rain DSD `aaeb981`; Louis BL + Smagorinsky `f013c3e`;
+surface fluxes `cfc1a09`; balanced vortex init + tc/ `352120e`; ts fix +
+sbatch `dcf1247`; RLR nesting `9e144bf`, `8455660`; rho_d rate guards
+`23cf85b`; this doc `e824642`). Springsteel `feature/rlr-tiling` carries
+`5f02f11` (RLR collar evaluator, unstructured-eval sine-sign fix,
+coupled-border cache) and `f988eff` (tiled RLR splineTransform! R3X ahat
+reload — required by Scythe's RLR nesting). Suites at close: Scythe
+7637/7637, Springsteel 41220/41220. The nested-RLR vs nested-axisym
+equivalence gate (`model_tests/nested_rlr_equivalence.jl`) passes at ~1e-10
+pointwise.
+
+**Deliberately deferred, in order:**
+
+1. **Fix this SI ceiling** (below) so the TC runs at a larger timestep before
+   burning wall clock on long integrations.
+2. **Rerun the 6-h laptop validation** (`julia --project tc/tc_run_axisym.jl
+   21600 --csv`). The first attempt at ts = 0.3 reached t ≈ 5 h and showed a
+   healthy quiet spin-up (BL inflow to −1.3 m/s, v 15 → 12 m/s under drag)
+   followed by a vigorous but resolved first CAPE release (updraft annulus at
+   r ≈ 10 km, axis downdraft −28 m/s, smooth in r and z — NOT an axis
+   instability) — it died at rain onset from an unguarded ρ_d undershoot in
+   the rain rates, now fixed (`23cf85b`, RHO_D_MIN floors). A rerun with the
+   guards was killed by choice to fix the SI first; expect the eruption
+   near t ≈ 4.5–5 h.
+3. **Server production**: 5-day axisym via `tc/scythe_tc.sbatch` (single
+   20-core node) or `tc/scythe_tc_multinode.sbatch` (node per patch —
+   run a 1-h test job first); then the 3D run via `--rlr`.
+
 ## Symptom
 
 With `options[:semiimplicit] => true`, mc runs blow up above a **vertical**
