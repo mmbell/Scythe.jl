@@ -19,7 +19,8 @@ end
 
 function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                    output_dir=OUTPUT_DIR,
-                   initial_conditions=joinpath(output_dir, "tc_ics.csv"))
+                   initial_conditions=joinpath(output_dir, "tc_ics.csv"),
+                   geometry="RiRk")
     axis_bc, wall_bc, bot_bc, top_bc = tc_boundary_conditions()
     mkpath(output_dir)
     return ModelParameters(
@@ -27,15 +28,20 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         integration_time = integration_time,
         output_interval = OUTPUT_INTERVAL,
         restart_interval = RESTART_INTERVAL,
-        equation_set = "moist_compressible_axisym",
+        equation_set = geometry == "RLR" ? "moist_compressible_RLR" :
+                                           "moist_compressible_axisym",
         initial_conditions = initial_conditions,
         output_dir = output_dir,
         ref_state_file = joinpath(output_dir, "tc_exact.ref"),
         grid_params = GridParameters(;
-            geometry = "RiRk",
+            geometry = geometry,
             iMin = 0.0, iMax = NEST_BOUNDARIES[end],   # placeholders (per-patch
             num_cells_i = sum(NEST_CELLS),             # grids come from the nest)
             kMin = 0.0, kMax = Z_TOP, num_cells_k = NUM_CELLS_K,
+            # RLR: ring-native ragged azimuthal truncation (the production
+            # choice; max_wavenumber -1 = per-ring support)
+            max_wavenumber = geometry == "RLR" ?
+                Dict(v => -1 for v in TC_VARS) : Dict{String,Int64}(),
             BCL = axis_bc, BCR = wall_bc, BCB = bot_bc, BCT = top_bc,
             vars = Dict(v => i for (i, v) in enumerate(TC_VARS))),
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
@@ -56,12 +62,15 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                    :output_formats => output_formats))
 end
 
-make_nest(base) = NestedModelParameters(
-    boundaries = NEST_BOUNDARIES,
-    num_cells = NEST_CELLS,
-    ts = NEST_TS,
-    workers_per_patch = NEST_WORKERS,
-    base = base)
+function make_nest(base)
+    rlr = base.grid_params.geometry == "RLR"
+    return NestedModelParameters(
+        boundaries = rlr ? NEST_BOUNDARIES_RLR : NEST_BOUNDARIES,
+        num_cells = rlr ? NEST_CELLS_RLR : NEST_CELLS,
+        ts = NEST_TS,
+        workers_per_patch = NEST_WORKERS,
+        base = base)
+end
 
 """
     init_tc!(nest) -> (models, topo)
@@ -83,7 +92,8 @@ function init_tc!(nest)
     patch1 = createGrid(models[1].grid_params)
     gp1 = models[1].grid_params
     kDim = gp1.kDim
-    z = Scythe.getGridpoints(patch1)[1:kDim, 2]
+    zcol = gp1.geometry == "RLR" ? 3 : 2       # z gridpoint column
+    z = Scythe.getGridpoints(patch1)[1:kDim, zcol]
     column = Scythe.reference_column(patch1, gp1)
     ref_phys = Springsteel.calculate_pressure_reference_state(SOUNDING, z, column)
     Scythe.write_exact_ref_mc(nest.base.ref_state_file, z,
@@ -96,7 +106,8 @@ function init_tc!(nest)
             "$(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits=2)) hPa")
 
     # Balanced vortex on the radial work grid x model mish vertical axis
-    r_axis = collect(0.0:DR_WORK:NEST_BOUNDARIES[end])
+    r_outer = gp1.geometry == "RLR" ? NEST_BOUNDARIES_RLR[end] : NEST_BOUNDARIES[end]
+    r_axis = collect(0.0:DR_WORK:r_outer)
     flds = Scythe.balanced_vortex_fields(r_axis, z,
                                          Springsteel.ref_pressure(ref)[:, 1],
                                          Springsteel.ref_rho_d(ref)[:, 1],
@@ -115,7 +126,7 @@ function init_tc!(nest)
         p = createGrid(m.grid_params)
         gpts = Scythe.getGridpoints(p)
         p.physical .= 0.0
-        Scythe.balanced_vortex_mc!(p, gpts, ref, flds, r_axis)
+        Scythe.balanced_vortex_mc!(p, gpts, ref, flds, r_axis; zcol = zcol)
         Scythe.write_ics_csv(m.initial_conditions, p, gpts)
     end
     return models, topo

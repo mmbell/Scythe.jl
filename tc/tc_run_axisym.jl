@@ -9,6 +9,8 @@
 #
 #   integration_time_s  default 1800 (laptop smoke); production 432000 (5 days)
 #   --csv               add CSV output alongside NetCDF (short runs/diagnostics)
+#   --rlr               run the 3D cylindrical (RLR) nest instead of axisym:
+#                       ring-native azimuthal truncation, output in tc_rlr/
 #   --restart T         continue from the T-second JLD2 restarts in each nest's
 #                       output dir (warm restart: the AB3 history is rebuilt)
 
@@ -16,12 +18,15 @@ using Distributed
 
 integration_time = 1800.0
 csv = false
+rlr = false
 restart_t = nothing
 let args = copy(ARGS)
     i = 1
     while i <= length(args)
         if args[i] == "--csv"
             global csv = true
+        elseif args[i] == "--rlr"
+            global rlr = true
         elseif args[i] == "--restart"
             global restart_t = args[i+1]
             i += 1
@@ -49,8 +54,11 @@ using CSV, DataFrames
 
 include(joinpath(@__DIR__, "tc_init.jl"))
 
+geometry = rlr ? "RLR" : "RiRk"
+run_outdir = rlr ? replace(OUTPUT_DIR, "tc_axisym" => "tc_rlr") : OUTPUT_DIR
 base = make_base(integration_time;
-                 output_formats = csv ? [:csv, :netcdf] : OUTPUT_FORMATS)
+                 output_formats = csv ? [:csv, :netcdf] : OUTPUT_FORMATS,
+                 output_dir = run_outdir, geometry = geometry)
 nest = make_nest(base)
 
 if restart_t === nothing
@@ -68,6 +76,7 @@ else
     end
     base = make_base(integration_time;
                      output_formats = csv ? [:csv, :netcdf] : OUTPUT_FORMATS,
+                     output_dir = run_outdir, geometry = geometry,
                      initial_conditions = joinpath(ics_dir, "tc_restart.jld2"))
     nest = make_nest(base)
 end

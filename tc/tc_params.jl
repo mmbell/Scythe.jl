@@ -41,6 +41,11 @@ const NEST_CELLS = [50, 50, 50]
 # count. 0.3 s = Courant 1.8 at dz_min = 56.35 m.
 const NEST_TS = [0.3, 0.3, 0.3]           # [s]; outer patch is the root
 const NEST_WORKERS = [1, 1, 1]
+# RLR requires each junction to sit a whole number of PARENT cells from the
+# origin (global ring numbering): 450 km is not a multiple of 12 km, so the
+# outer junctions shift by 6 km (physically negligible).
+const NEST_BOUNDARIES_RLR = [0.0, 150.0e3, 456.0e3, 1056.0e3]
+const NEST_CELLS_RLR = [50, 51, 50]
 const Z_TOP = 25.0e3
 const NUM_CELLS_K = 100
 
