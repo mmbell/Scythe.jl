@@ -34,7 +34,12 @@ const Z_DAMP = 17.0e3        # [m] sponge onset (tropopause knot at 16.59 km)
 # Grid: 3 nests, 2:1 refinement chain (3 | 6 | 12 km), 250 m vertical to 25 km
 const NEST_BOUNDARIES = [0.0, 150.0e3, 450.0e3, 1050.0e3]
 const NEST_CELLS = [50, 50, 50]
-const NEST_TS = [0.75, 1.5, 3.0]          # [s]; outer patch is the root
+# The mc timestep ceiling is VERTICAL even with semi-implicit on (empirical
+# acoustic Courant ≈ 1.8 on the min Gauss spacing; ts = 0.75 at 250-m cells
+# blows up within minutes). All patches share the vertical grid, so per-nest
+# ts scaling with DX buys nothing here — the nesting speedup is the column
+# count. 0.3 s = Courant 1.8 at dz_min = 56.35 m.
+const NEST_TS = [0.3, 0.3, 0.3]           # [s]; outer patch is the root
 const NEST_WORKERS = [1, 1, 1]
 const Z_TOP = 25.0e3
 const NUM_CELLS_K = 100

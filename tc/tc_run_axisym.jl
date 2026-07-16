@@ -33,7 +33,16 @@ let args = copy(ARGS)
 end
 
 include(joinpath(@__DIR__, "tc_params.jl"))
-addprocs(sum(NEST_WORKERS))
+if haskey(ENV, "SCYTHE_SLURM_WORKERS")
+    # Node-per-patch shape (scythe_tc_multinode.sbatch): workers land on the
+    # allocated nodes via srun; integrate_nested_model partitions workers() in
+    # order, so with 1 worker per patch the node<->patch mapping is automatic.
+    using ClusterManagers
+    addprocs_slurm(parse(Int, ENV["SCYTHE_SLURM_WORKERS"]);
+                   exeflags = "--project=$(Base.active_project())")
+else
+    addprocs(sum(NEST_WORKERS))
+end
 @everywhere using Springsteel
 @everywhere using Scythe
 using CSV, DataFrames
