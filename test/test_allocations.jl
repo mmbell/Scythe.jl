@@ -228,6 +228,20 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations diffusion_timestep_mc(mtile_w, 1, kDim_w, 2)) == 0
     end
 
+    @testset "per-column allocations stay zero with the Marshall-Palmer DSD" begin
+        # N_0 > 0 routes the rain channel through invtau_rain_mp (mp_slope +
+        # f_ventilation_mp); the keyword call and the MP branch must not box.
+        mtile_mp, kDim_mp = build_mc_tile(extra_params = Dict(:Kvdiff_water => 25.0,
+                                                              :N_r => 1.0e-3,
+                                                              :N_0 => 8.0e6),
+                                          precipitation = true)
+        moist_compressible_XZ(mtile_mp, 1, kDim_mp, 2)  # compile
+        diffusion_timestep_mc(mtile_mp, 1, kDim_mp, 2)
+
+        @test (@allocations moist_compressible_XZ(mtile_mp, 1, kDim_mp, 2)) == 0
+        @test (@allocations diffusion_timestep_mc(mtile_mp, 1, kDim_mp, 2)) == 0
+    end
+
     @testset "per-column allocations stay zero on the axisymmetric cylinder" begin
         # The cylindrical trait path binds the extra v views and metric terms; the
         # trait dispatch must stay compile-time (no boxing) and the v machinery in

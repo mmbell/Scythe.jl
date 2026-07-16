@@ -251,6 +251,67 @@ using Scythe
     end
 
     # ──────────────────────────────────────────────
+    # 5b. Exponential (Marshall-Palmer) rain DSD: tau-only closure
+    # ──────────────────────────────────────────────
+    @testset "Marshall-Palmer rain DSD (tau-only)" begin
+        Tk = 293.15
+        p_hPa = 1013.25
+        rho_d = 1.1
+        N_0 = 8.0e6            # MP intercept [m^-4]
+        rho_r = 1.0e-3         # 1 g/m^3
+
+        # Slope roundtrip: rho_r = pi rho_l N_0 / lambda^4
+        lam = Scythe.mp_slope(rho_r, N_0)
+        @test lam ≈ (pi * Scythe.rho_l * N_0 / rho_r)^0.25
+        @test pi * Scythe.rho_l * N_0 / lam^4 ≈ rho_r
+        @test 2000.0 < lam < 2500.0          # ~2239 m^-1 at 1 g/m^3
+
+        # The DSD-integrated diffusional moment 2*pi*Dv*N_0/lambda^2 equals the
+        # monodisperse formula 4*pi*Dv*N_T*r evaluated at the DSD total number
+        # N_T = N_0/lambda and mean radius r = 1/(2*lambda), so invtau_rain_mp is
+        # exactly the composition of the existing plumbing with the DSD-mean
+        # ventilation factor (units convention: #/cm^3 and microns).
+        N_eff_cm3 = 1.0e-6 * N_0 / lam
+        r_eff_um = 1.0e6 / (2.0 * lam)
+        @test (N_eff_cm3 * 1.0e6) * (r_eff_um * 1.0e-6) ≈ N_0 / (2.0 * lam^2)
+        invtau_mp = Scythe.invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d)
+        @test invtau_mp ≈ Scythe.invtau_condensation(Tk, p_hPa, N_eff_cm3, r_eff_um) *
+                          Scythe.f_ventilation_mp(lam, rho_d, Tk)
+
+        # DSD-mean ventilation: quiescent limit 0.78, enhancement ∝ lambda^{-3/4}
+        # (~4.6 at 1 g/m^3, about half of Ooyama's bulk 9.0 — the intended slowdown);
+        # thinner air ventilates more (faster fall speed).
+        fbar = Scythe.f_ventilation_mp(lam, rho_d, Tk)
+        @test 4.0 < fbar < 5.5
+        @test Scythe.f_ventilation_mp(Inf, rho_d, Tk) ≈ 0.78
+        @test Scythe.f_ventilation_mp(lam, 0.7, Tk) > fbar
+
+        # Guards match the monodisperse channel: inert below RHO_R_MIN, for N_0 <= 0,
+        # and for spline undershoots (fractional powers of negative rho_r).
+        @test Scythe.invtau_rain_mp(Tk, p_hPa, N_0, 0.0, rho_d) == 0.0
+        @test Scythe.invtau_rain_mp(Tk, p_hPa, N_0, 0.5e-8, rho_d) == 0.0   # < RHO_R_MIN
+        @test Scythe.invtau_rain_mp(Tk, p_hPa, 0.0, rho_r, rho_d) == 0.0
+        @test Scythe.invtau_rain_mp(Tk, p_hPa, N_0, -1.0e-12, rho_d) == 0.0
+
+        # Monotone increasing in rho_r: more rain, faster relaxation
+        for rr in (1.0e-6, 1.0e-4, 1.0e-3, 5.0e-3)
+            @test Scythe.invtau_rain_mp(Tk, p_hPa, N_0, 1.01 * rr, rho_d) >
+                  Scythe.invtau_rain_mp(Tk, p_hPa, N_0, rr, rho_d)
+        end
+
+        # Consistency of the retained Ooyama bulk sedimentation with the MP DSD: the
+        # MP mass-weighted fall speed a_v*(Γ(4.5)/Γ(4))/sqrt(lambda) matches the bulk
+        # terminal velocity within 10% at moderate rain content (Γ(4.5)/Γ(4) = 1.938622).
+        Vmp = Scythe.MP_AV * 1.938622 / sqrt(lam)
+        @test isapprox(Vmp, -Scythe.rain_terminal_velocity(rho_r, Scythe.rho_d0, Tk),
+                       rtol=0.1)
+
+        # Slower phase change than the monodisperse closure at the model defaults —
+        # fewer large drops means less integrated surface area x ventilation.
+        @test invtau_mp < Scythe.invtau_rain(Tk, p_hPa, 1.0e-3, rho_r)
+    end
+
+    # ──────────────────────────────────────────────
     # 6. s_condensation (entropy source from condensation)
     # ──────────────────────────────────────────────
     @testset "s_condensation" begin

@@ -219,6 +219,49 @@ using Springsteel
         @test Qc / Qr ≈ invtau_c / invtau_r
     end
 
+    @testset "Marshall-Palmer keyword selects the rain-channel closure" begin
+        Tk = 285.0; p_hPa = 900.0; ts = 0.1
+        N_r = 1.0e-3   # #/cm^3 (monodisperse)
+        N_0 = 8.0e6    # m^-4 (MP intercept)
+        rho_vs = rho_v_sat(Tk, p_hPa)
+        rho_d = (100.0 * p_hPa - Rv * Tk * rho_vs) / (Rd * Tk)
+        Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_vs / rho_d, 1.0e-3)
+        rho_c = 2.0e-3 * rho_d
+        rho_r = 1.0e-3
+        invtau_c = Scythe.invtau_condensation(Tk, p_hPa, 100.0,
+                                              Scythe.cloud_droplet_radius(100.0, rho_c / rho_d, rho_d))
+        invtau_mp = Scythe.invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d)
+
+        for Q_ss in (1.0e-3 * rho_vs, -1.0e-4 * rho_vs)
+            rho_v = rho_vs + Q_ss
+            # Default keyword (N_0 = 0) is BIT-identical to the monodisperse call
+            base = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk,
+                                                 p_hPa, Q_s, ts, N_r)
+            kw = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk,
+                                               p_hPa, Q_s, ts, N_r; N_0=0.0)
+            @test kw[1] === base[1]
+            @test kw[2] === base[2]
+
+            # N_0 > 0 swaps ONLY the rain-channel timescale to MP; the cloud channel
+            # and the proportional split arithmetic are untouched.
+            Qc, Qr = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk,
+                                                   p_hPa, Q_s, ts, N_r; N_0=N_0)
+            @test Qc / Qr ≈ invtau_c / invtau_mp
+            @test Qc + Qr ≈ Q_ss * (invtau_c + invtau_mp) / (1.0 + Q_s)
+        end
+
+        # The cloud gate applies identically to the MP channel: no deposition on rain
+        # in supersaturated cloud-free air; evaporation stays unconditional.
+        Q_ss = 1.0e-3 * rho_vs
+        Qc, Qr = Scythe.qss_condensation_rates(Q_ss, rho_vs + Q_ss, 0.0, rho_r,
+                                               rho_d, Tk, p_hPa, Q_s, ts, N_r; N_0=N_0)
+        @test Qr === 0.0
+        Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, rho_r,
+                                               rho_d, Tk, p_hPa, Q_s, ts, N_r; N_0=N_0)
+        @test Qc == 0.0
+        @test Qr ≈ -0.5 * rho_vs * invtau_mp / (1.0 + Q_s)
+    end
+
     @testset "rain condensation is gated on cloud presence" begin
         # The physical pathway to rain is condensation -> cloud -> autoconversion:
         # direct vapor deposition onto rain in CLOUD-FREE air is unphysically fast

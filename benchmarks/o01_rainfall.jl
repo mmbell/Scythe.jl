@@ -72,6 +72,11 @@ const DUNION_SOUNDING = joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "dunion_MT_
 # (~1000 drops per m^3; the small number keeps the bulk of condensation on cloud).
 const N_R = 1.0e-3
 
+# Marshall-Palmer intercept [m^-4] for the exponential-DSD tau_r closure, for
+# sensitivity runs only (SCYTHE_O01_N0=8.0e6 selects MP; the default 0.0 keeps
+# the monodisperse closure the references were seeded with, bit-identical).
+const N_0_MP = parse(Float64, get(ENV, "SCYTHE_O01_N0", "0.0"))
+
 # Vertical eddy coefficients [m^2/s]. ZERO: the run is stable fully inviscid on
 # the RiRk grid at both resolutions — the cubic B-spline Galerkin filter is the
 # only dissipation, which is the near-inviscid goal. (Kv = 5 and 25 were tested
@@ -112,7 +117,7 @@ function o01_model(opts::BenchmarkOptions)
     physical_params = Dict(:Khdiff => 0.0, :Kvdiff => KV_MOM,
                            :Khdiff_heat => 0.0, :Kvdiff_heat => KV_HEAT,
                            :Kvdiff_water => KV_WATER,
-                           :tau_qss => 10.0, :N_r => N_R,
+                           :tau_qss => 10.0, :N_r => N_R, :N_0 => N_0_MP,
                            :alpha => 0.02, :z_damp => 17.0e3)
     options = Dict(:semiimplicit => true, :exact_reference_state => true,
                    :precipitation => true, :vertical_mixing => false)

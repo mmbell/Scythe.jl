@@ -1471,6 +1471,77 @@ function invtau_rain(Tk, p_hPa, N_r, rho_r)
     return invtau_condensation(Tk, p_hPa, N_r, r_r) * f_ventilation_density(rho_r, Tk)
 end
 
+# ── Exponential (Marshall-Palmer) rain DSD: tau-only closure ────────────────────
+#
+# n(D) = N_0 exp(-lambda D) with a fixed intercept N_0 [m^-4] (Marshall & Palmer
+# 1948; the classic value is 8e6). Only the phase-change timescale changes: the
+# DSD-integrated diffusional moment and ventilation replace the monodisperse
+# fixed-N_r closure, while Ooyama's bulk terminal velocity and collection — which
+# were themselves fit for this DSD at N_0 = 8e6 — are retained. Selected by
+# physical_params[:N_0] > 0 (see `qss_condensation_rates`).
+
+"Per-drop fall-speed coefficient a_v [m^0.5/s] in V(D) = a_v sqrt(D) sqrt(rho_d0/rho_d)."
+const MP_AV = 130.0
+"Kinematic viscosity of air [m^2/s] in the ventilation Reynolds number."
+const MP_NU = 1.46e-5
+"Schmidt number to the one-third power in the ventilation factor."
+const MP_SC13 = 0.84
+"Gamma(11/4): the exponential-DSD moment of D^{7/4} in the ventilation integral."
+const MP_GAMMA_11_4 = 1.6083594219855456
+
+"""
+    mp_slope(rho_r, N_0)
+
+Slope `λ` [1/m] of the exponential rain DSD `n(D) = N_0 exp(-λD)` holding `rho_r`
+[kg/m³] of liquid: `ρ_r = ∫ (π/6) ρ_l D³ n dD = π ρ_l N_0 / λ⁴`, so
+`λ = (π ρ_l N_0 / ρ_r)^{1/4}`. Non-positive `rho_r` is an empty DSD (`λ = Inf`),
+which keeps fractional powers of spline undershoots finite.
+"""
+function mp_slope(rho_r, N_0)
+
+    rho_r <= 0.0 && return Inf
+    return (pi * rho_l * N_0 / rho_r)^0.25
+end
+
+"""
+    f_ventilation_mp(lambda, rho_d, Tk)
+
+DSD-mean ventilation factor `⟨D f_v⟩/⟨D⟩` [dimensionless] for the exponential rain
+DSD, with the per-drop `f_v(D) = 0.78 + 0.308 Sc^{1/3} Re^{1/2}`,
+`Re = V(D) D / ν`, and `V(D) = a_v √D √(ρ_d0/ρ_d) f_ice`:
+
+    f̄ = 0.78 + 0.308 Sc^{1/3} (a_v/ν)^{1/2} (ρ_d0/ρ_d)^{1/4} Γ(11/4) λ^{-3/4} f_ice^{1/2}
+
+Since `λ ∝ ρ_r^{-1/4}`, the enhancement grows as `ρ_r^{3/16}` — the DSD-exact
+analogue of the bulk exponent 0.2046 in [`f_ventilation_density`](@ref).
+"""
+f_ventilation_mp(lambda, rho_d, Tk) =
+    0.78 + (0.308 * MP_SC13 * sqrt(MP_AV / MP_NU) * (rho_d0 / rho_d)^0.25 *
+            MP_GAMMA_11_4 * lambda^-0.75 * sqrt(f_ice(Tk)))
+
+"""
+    invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d)
+
+Inverse rain relaxation timescale [1/s] for the exponential (Marshall-Palmer) DSD:
+`∫ 2π D_v D n(D) f_v(D) dD = (2π D_v N_0/λ²) f̄`. The diffusional moment is exactly
+the monodisperse [`invtau_condensation`](@ref) evaluated at the DSD total number
+`N_T = N_0/λ` and mean radius `r̄ = 1/(2λ)` (`N_T r̄ = N_0/2λ²`), so the same
+plumbing — including its #/cm³ and micron units convention — is reused, times the
+DSD-mean ventilation [`f_ventilation_mp`](@ref). Guards match [`invtau_rain`](@ref):
+inert below `RHO_R_MIN` or for `N_0 ≤ 0`; the condensation-side cloud gate lives in
+the caller (`qss_condensation_rates`), unchanged — the MP rate `∝ ρ_r^{1/2} f̄` is
+still non-Lipschitz at zero rain.
+"""
+function invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d)
+
+    (rho_r < RHO_R_MIN || N_0 <= 0.0) && return 0.0
+    lambda = mp_slope(rho_r, N_0)
+    N_eff = 1.0e-6 * N_0 / lambda        # DSD total number [#/cm^3]
+    r_eff = 1.0e6 / (2.0 * lambda)       # DSD mean radius [microns]
+    return invtau_condensation(Tk, p_hPa, N_eff, r_eff) *
+           f_ventilation_mp(lambda, rho_d, Tk)
+end
+
 """
     droplet_growth_rate(Tk, p)
 

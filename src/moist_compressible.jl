@@ -309,7 +309,7 @@ qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100
 
 """
     qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts, N_r,
-                           max_N_c=100.0) -> (Qdot_c, Qdot_r)
+                           max_N_c=100.0; N_0=0.0) -> (Qdot_c, Qdot_r)
 
 Two-category condensation/evaporation rates [kg/m³/s] from the generalized
 supersaturation relaxation `1/τ = 1/τ_c + 1/τ_r` (see
@@ -320,7 +320,11 @@ cloud coexists (`q_c > 1e-8`, the cloud channel's own existence threshold): the
 physical pathway to rain is condensation → cloud → autoconversion, and an ungated
 rain channel grows rain from arbitrarily small seeds in cloud-free supersaturated
 air (rate ∝ `rho_r^{1/3}` under the monodisperse fixed-`N_r` closure, non-Lipschitz
-at zero). Rain evaporation in subsaturated air is unconditional, so no separate
+at zero). The rain-channel timescale is [`invtau_rain`](@ref) by default; the
+keyword `N_0 > 0` [m⁻⁴] selects the exponential Marshall-Palmer closure
+[`invtau_rain_mp`](@ref) instead (`N_r` is then unused), leaving the split
+arithmetic, gate and limiters untouched. Rain evaporation in subsaturated air is
+unconditional, so no separate
 rain-evaporation parameterization (O01's `Q_evap`) is needed. The ventilation
 enhancement lives inside [`invtau_rain`](@ref).
 
@@ -333,7 +337,7 @@ the single-category [`qss_condensation_rate`](@ref) delegate bit-identical to it
 pre-rain behavior.
 """
 function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts,
-                                N_r, max_N_c=100.0)
+                                N_r, max_N_c=100.0; N_0=0.0)
 
     rho_vs = rho_v_sat(Tk, p_hPa)
     S = Q_ss / rho_vs                    # supersaturation (ratio - 1)
@@ -373,7 +377,12 @@ function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s
     # channel grows rain from arbitrarily small seeds in finite time (the rate is
     # ∝ rho_r^{1/3} under the fixed-N_r monodisperse closure, non-Lipschitz at zero
     # — the O01 spurious-blob pathway). Evaporation (Q_ss <= 0) is unconditional.
-    invtau_r = (Q_ss > 0.0 && q_c <= 1.0e-8) ? 0.0 : invtau_rain(Tk, p_hPa, N_r, rho_r)
+    # The channel timescale is monodisperse fixed-N_r by default; N_0 > 0 selects the
+    # exponential (Marshall-Palmer) DSD closure. Both are non-Lipschitz at zero rain
+    # (rho_r^{1/3} and rho_r^{1/2} respectively), so the gate applies to either.
+    invtau_r = (Q_ss > 0.0 && q_c <= 1.0e-8) ? 0.0 :
+               (N_0 > 0.0 ? invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d) :
+                            invtau_rain(Tk, p_hPa, N_r, rho_r))
     invtau = invtau_c + invtau_r
     if invtau == 0.0
         return (0.0, 0.0)
@@ -468,9 +477,12 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Warm-rain microphysics (autoconversion, collection, sedimentation, and the rain
     # channel of the supersaturation relaxation). N_r [#/cm^3] is the fixed rain-drop
     # number of the monodisperse tau_r closure; zeroing it (or the switch) makes the
-    # rain channel inert and slot 8 advection-only.
+    # rain channel inert and slot 8 advection-only. N_0 [m^-4] > 0 switches the
+    # channel's timescale to the exponential (Marshall-Palmer) DSD closure (classic
+    # value 8.0e6); absent, the monodisperse closure is bit-identical to before.
     precipitation = get(model.options, :precipitation, false)::Bool
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
+    N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
 
     # Gridpoints: z from the geometry's vertical column; r is the geometry metric
     # handle (radius view on the cylinders, colatitude/a/Omega on the sphere,
@@ -568,7 +580,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     for i in 1:length(Qdot)
         Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
                                                     rho_d[i], Tk[i], p_hPa[i], Q_s[i],
-                                                    model.ts, N_r)
+                                                    model.ts, N_r; N_0=N_0)
         if isnan(Qdot[i]) || isnan(Qdot_r[i])
             error("Qdot is NaN at index $i, time $(t)!")
         end
