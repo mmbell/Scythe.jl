@@ -45,6 +45,9 @@ const MC_SCRATCH_SLOTS = (
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
     :s_t, :stage_zz,                                                             # moist entropy (vertical heat)
+    # ── Louis boundary layer + Smagorinsky closure (mc_boundary_layer.jl) ──
+    :Kv, :K_smag, :VD_u, :VD_v, :VD_w, :QDOT_V, :VDOT_w, :VDOT_v,
+    :bl_s_z, :bl_rv_z,
     # ── semiimplicit_adjustment_p (si_ prefix) ──
     # Deliberately NOT sharing the names above. The two functions' temporaries are not live at
     # the same time today, so sharing would work — but it would be an invisible coupling, and
@@ -484,6 +487,18 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
     N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
 
+    # Louis boundary layer (vertical mixing + surface drag; mc_boundary_layer.jl)
+    # and Smagorinsky horizontal closure (Ls > 0 replaces the constant Khdiff in
+    # the momentum diffusion). Both default OFF so existing configurations are
+    # bit-identical.
+    louis_bl = get(model.options, :louis_bl, false)::Bool
+    l_inf = get(model.physical_params, :l_inf, 80.0)
+    Cd_param = get(model.physical_params, :Cd, -1.0)
+    sfc_wind_factor = get(model.physical_params, :sfc_wind_factor, 1.0)
+    Ls = get(model.physical_params, :Ls, 0.0)
+    K_min = get(model.physical_params, :K_min, 0.0)
+    use_smag = Ls > 0.0
+
     # Gridpoints: z from the geometry's vertical column; r is the geometry metric
     # handle (radius view on the cylinders, colatitude/a/Omega on the sphere,
     # `nothing` on the Cartesian geometries — see mc_metric)
@@ -656,8 +671,20 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # to the far-smaller kinematic viscosity) is negligible. So E_t follows the KE down and
     # internal energy (T, p) is held. FRIC_KE is d(rho_t*ke)/dt from horizontal momentum
     # diffusion, added to E_t; p and Q_ss get NO friction term.
+    # Smagorinsky horizontal eddy viscosity (Ls > 0): flow-dependent K(strain)
+    # replaces the constant Khdiff in the momentum diffusion and its FRIC_KE
+    # energy sink below (heat keeps the constant Khdiff_heat).
+    K_smag = S.K_smag
+    if use_smag
+        mc_smag_k!(K_smag, geom, uv, vv, r, Ls, K_min)
+    end
+
     FRIC_KE = S.FRIC_KE
-    mc_fric_ke!(FRIC_KE, geom, rho_t, Khdiff, uv, wv, vv, r)
+    if use_smag
+        mc_fric_ke!(FRIC_KE, geom, rho_t, K_smag, uv, wv, vv, r)
+    else
+        mc_fric_ke!(FRIC_KE, geom, rho_t, Khdiff, uv, wv, vv, r)
+    end
 
     # Placeholders for intermediate calculations
     ADV = S.ADV
@@ -696,13 +723,21 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # u momentum (slot 4): PGF directly from the prognostic pressure
     mc_advect!(ADV, geom, u, w, vv, r, u_x, u_z, uv.f_l)
     mc_u_forcing!(FORCING, geom, pp_x, rho_t, vv, r, fcor)
-    mc_u_kdiff!(KDIFF, geom, Khdiff, uv, vv, r)
+    if use_smag
+        mc_u_kdiff!(KDIFF, geom, K_smag, uv, vv, r)
+    else
+        mc_u_kdiff!(KDIFF, geom, Khdiff, uv, vv, r)
+    end
     @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF
 
     # w momentum (slot 5): perturbation PGF + total-density buoyancy loading
     mc_advect!(ADV, geom, u, w, vv, r, w_x, w_z, wv.f_l)
     @turbo FORCING .= @. ((-gravity * rho_tp) - pp_z) / rho_t
-    mc_w_kdiff!(KDIFF, geom, Khdiff, wv, r)
+    if use_smag
+        mc_w_kdiff!(KDIFF, geom, K_smag, wv, r)
+    else
+        mc_w_kdiff!(KDIFF, geom, Khdiff, wv, r)
+    end
     @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
     # Implicit acoustic w-momentum: -(1/ρ̄_t) ∂z p'
     impdot[colstart:colend,5] .= @. -pp_z / rho_tbar
@@ -745,8 +780,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Tangential momentum (slot 9, cylindrical geometries only — no method body
     # executes on the Cartesian slice): advection, azimuthal PGF (3D), Coriolis +
     # curvature -u(f + v/r), and the λ-component of the cylindrical vector Laplacian.
-    mc_v_tendency!(expdot, geom, colstart, colend, S, u, w, uv, vv, pv, rho_t, r,
-                   fcor, Khdiff)
+    if use_smag
+        mc_v_tendency!(expdot, geom, colstart, colend, S, u, w, uv, vv, pv, rho_t, r,
+                       fcor, K_smag)
+    else
+        mc_v_tendency!(expdot, geom, colstart, colend, S, u, w, uv, vv, pv, rho_t, r,
+                       fcor, Khdiff)
+    end
 
     # ── Rayleigh sponge (momentum-only) ──
     # Klemp-Durran absorbing layer against gravity-wave reflection off the rigid lid:
@@ -759,6 +799,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # (the dE_w lesson). Behind `alpha > 0` so disabled configs are bit-identical
     # (an unconditional `+ 0.0` term could flip -0.0 tendencies).
     mc_sponge!(expdot, geom, colstart, alpha, z_damp, z, u, w, vv, rho_t, ke)
+
+    # ── Louis boundary layer (explicit vertical mixing + surface drag) ──
+    # Added AFTER every slot is written: all contributions are additive (the Q_ss
+    # saturation chain rule is linear), so the lines above stay frozen and
+    # louis_bl = false is bit-identical. See mc_boundary_layer.jl.
+    if louis_bl
+        mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv,
+                     expdot, l_inf, Cd_param, sfc_wind_factor)
+    end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──
     # Vertical diffusion must be implicit on a Chebyshev column, where the spectral

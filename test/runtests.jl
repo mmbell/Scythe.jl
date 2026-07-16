@@ -8,6 +8,7 @@ using Scythe
     include("test_partial_density.jl")
     include("test_sigma_entropy.jl")
     include("test_moist_compressible.jl")
+    include("test_louis_bl.jl")
     include("test_idealized_init.jl")
     include("test_spectralGrid.jl")
     include("test_output_formats.jl")

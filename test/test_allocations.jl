@@ -20,7 +20,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
     # Build a small moist_compressible tile on the RiRk (B-spline vertical) grid — the
     # configuration that was crashing.
     function build_mc_tile(; extra_params = Dict{Symbol,Float64}(), precipitation = false,
-                             geometry = "RiRk",
+                             geometry = "RiRk", extra_options = Dict{Symbol,Any}(),
                              equation_set = "moist_compressible_XZ")
         cyl = equation_set != "moist_compressible_XZ"
         vars = cyl ? Scythe.MC_VARS_CYL :
@@ -60,8 +60,11 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
             physical_params = merge(Dict(:Khdiff => 75.0, :Kvdiff => 75.0, :Kv_mudiff => 0.0,
                                          :tau_qss => 10.0, :alpha => 0.0,
                                          :z_damp => 12.8e3), extra_params),
-            options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                           :precipitation => precipitation, :vertical_mixing => false))
+            options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                             :exact_reference_state => true,
+                                             :precipitation => precipitation,
+                                             :vertical_mixing => false),
+                            extra_options))
 
         patch = createGrid(model.grid_params)
         gridpoints = Scythe.getGridpoints(patch)
@@ -256,6 +259,29 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations Scythe.moist_compressible_axisym(mtile_a, 1, kDim_a, 2)) == 0
         @test (@allocations Scythe.diffusion_timestep_mc(mtile_a, 1, kDim_a, 2,
                                                          Scythe.MCAxisymRZ())) == 0
+    end
+
+    @testset "per-column allocations stay zero with the Louis BL + Smagorinsky" begin
+        # The Louis boundary layer (flux-column transforms, Komori drag, the slot
+        # apply loop) and the vector-K Smagorinsky call sites must not box or
+        # allocate; guard the axisym trait path where the TC runs live.
+        mtile_bl, kDim_bl = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                          extra_params = Dict(:f => 5.0e-5, :Cd => -1.0,
+                                                              :Ls => 200.0, :K_min => 5.0,
+                                                              :l_inf => 80.0),
+                                          extra_options = Dict{Symbol,Any}(:louis_bl => true))
+        Scythe.moist_compressible_axisym(mtile_bl, 1, kDim_bl, 2)  # compile
+        @test (@allocations Scythe.moist_compressible_axisym(mtile_bl, 1, kDim_bl, 2)) == 0
+
+        # And the RLR trait path (the production 3D geometry)
+        mtile_blr, kDim_blr = build_mc_tile(geometry = "RLR",
+                                            equation_set = "moist_compressible_RLR",
+                                            extra_params = Dict(:f => 5.0e-5, :Cd => -1.0,
+                                                                :Ls => 200.0, :K_min => 5.0,
+                                                                :l_inf => 80.0),
+                                            extra_options = Dict{Symbol,Any}(:louis_bl => true))
+        Scythe.moist_compressible_RLR(mtile_blr, 1, kDim_blr, 2)  # compile
+        @test (@allocations Scythe.moist_compressible_RLR(mtile_blr, 1, kDim_blr, 2)) == 0
     end
 
     @testset "per-column allocations stay zero on the 3D RLR cylinder" begin

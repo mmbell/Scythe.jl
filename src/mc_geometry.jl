@@ -306,6 +306,35 @@ end
 end
 
 """
+Smagorinsky-type horizontal eddy viscosity from the horizontal strain tensor,
+`K = max(Ls² √(2 S_ij S_ij), K_min)` — the same closure as Twoway_PV_mixing
+(shallowWaterModels.jl), with the cylindrical strain components
+`S_rr = ∂u/∂r`, `S_λλ = (1/r)∂v/∂λ + u/r`, `S_rλ = ½((1/r)∂u/∂λ + ∂v/∂r − v/r)`.
+Vertical shear is deliberately excluded: the Louis scheme owns vertical mixing on
+the anisotropic grid. Methods exist only for the cylindrical geometries; a config
+with `Ls > 0` on any other trait errors at the first step.
+"""
+@inline function mc_smag_k!(K, ::MCAxisymRZ, uv, vv, r, Ls, K_min)
+    u = uv.f; u_x = uv.f_x
+    v = vv.f; v_x = vv.f_x
+    @. K = max(Ls * Ls * sqrt(2.0 * ((u_x * u_x) + ((u / r) * (u / r)) +
+                                     (2.0 * (0.5 * (v_x - (v / r)))^2))), K_min)
+    return nothing
+end
+@inline function mc_smag_k!(K, ::MCCylindricalRLR, uv, vv, r, Ls, K_min)
+    u = uv.f; u_x = uv.f_x; u_l = uv.f_l
+    v = vv.f; v_x = vv.f_x; v_l = vv.f_l
+    @. K = max(Ls * Ls * sqrt(2.0 * ((u_x * u_x) +
+                                     (((v_l / r) + (u / r))^2) +
+                                     (2.0 * (0.5 * (((u_l / r) + v_x) - (v / r)))^2))),
+               K_min)
+    return nothing
+end
+mc_smag_k!(K, geom::MCGeometry, uv, vv, r, Ls, K_min) =
+    error("Smagorinsky horizontal diffusion (Ls > 0) is implemented only for the " *
+          "cylindrical geometries (axisym, RLR); got $(typeof(geom))")
+
+"""
 Tangential (v) momentum tendency, slot 9 — explicit-only (no impdot; vertical
 diffusion is handled by diffusion_timestep_mc like u/w). Advection, azimuthal PGF
 (3D only; pbar has no λ-dependence), Coriolis + curvature -u(f + v/r), and the
