@@ -30,16 +30,25 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         bc_topbot = merge(scalar_bc, Dict("w" => DirichletBC()))
         # The axisym set reinterprets x as radius, so keep the domain off the axis;
         # the RLR grid runs from the axis out (its mish points exclude r = 0).
-        iMin = equation_set == "moist_compressible_axisym" ? 100.0e3 : 0.0
-        wavenumbers = geometry == "RLR" ? Dict(v => 2 for v in vars) :
-                                          Dict{String,Int64}()
-        gp = GridParameters(
+        # The spherical shell's i-coordinate is the colatitude [rad]
+        iMin = equation_set == "moist_compressible_axisym" ? 100.0e3 :
+               geometry == "SLR" ? pi/4 - 0.035 : 0.0
+        iSpan = geometry == "SLR" ? 0.07 : 25.6e3
+        wavenumbers = geometry in ("RLR", "SLR") ? Dict(v => 2 for v in vars) :
+                                                   Dict{String,Int64}()
+        # The 3D Cartesian box needs the y direction: v (the y-wind) is the
+        # normal component at the y walls
+        bc_y = merge(scalar_bc, Dict("v" => DirichletBC()))
+        ykw = geometry == "RRR" ?
+              (jMin = 0.0, jMax = 25.6e3, BCU = bc_y, BCD = bc_y) : (;)
+        gp = GridParameters(;
             geometry = geometry,
-            iMin = iMin, iMax = iMin + 25.6e3, num_cells_i = 16,
+            iMin = iMin, iMax = iMin + iSpan, num_cells_i = 16,
             kMin = 0.0, kMax = 6.4e3, num_cells_k = 8,
             max_wavenumber = wavenumbers,
             BCL = bc_side, BCR = bc_side, BCB = bc_topbot, BCT = bc_topbot,
-            vars = Dict(v => i for (i, v) in enumerate(vars)))
+            vars = Dict(v => i for (i, v) in enumerate(vars)),
+            ykw...)
 
         outdir = mktempdir()
         model = ModelParameters(
@@ -250,6 +259,40 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations Scythe.moist_compressible_RLR(mtile_r, 1, kDim_r, 2)) == 0
         @test (@allocations Scythe.diffusion_timestep_mc(mtile_r, 1, kDim_r, 2,
                                                          Scythe.MCCylindricalRLR())) == 0
+    end
+
+    @testset "per-column allocations stay zero on the 3D Cartesian box" begin
+        # RRR: 7-slot layout with the full ∂y/∂yy at 4/5 and no metric terms.
+        mtile_b, kDim_b = build_mc_tile(geometry = "RRR",
+                                        equation_set = "moist_compressible_RRR",
+                                        extra_params = Dict(:f => 5.0e-5,
+                                                            :alpha => 0.05,
+                                                            :z_damp => 3.2e3),
+                                        precipitation = true)
+        Scythe.moist_compressible_RRR(mtile_b, 1, kDim_b, 2)  # compile
+        Scythe.diffusion_timestep_mc(mtile_b, 1, kDim_b, 2, Scythe.MCCartesianRRR())
+
+        @test (@allocations Scythe.moist_compressible_RRR(mtile_b, 1, kDim_b, 2)) == 0
+        @test (@allocations Scythe.diffusion_timestep_mc(mtile_b, 1, kDim_b, 2,
+                                                         Scythe.MCCartesianRRR())) == 0
+    end
+
+    @testset "per-column allocations stay zero on the 3D spherical shell" begin
+        # SLR: the metric handle is a (theta, a, Omega) NamedTuple and the
+        # broadcasts carry sin/cos of the colatitude view — none of it may box.
+        mtile_s, kDim_s = build_mc_tile(geometry = "SLR",
+                                        equation_set = "moist_compressible_SLR",
+                                        extra_params = Dict(:Omega => 7.292e-5,
+                                                            :sphere_radius => 6.371e6,
+                                                            :alpha => 0.05,
+                                                            :z_damp => 3.2e3),
+                                        precipitation = true)
+        Scythe.moist_compressible_SLR(mtile_s, 1, kDim_s, 2)  # compile
+        Scythe.diffusion_timestep_mc(mtile_s, 1, kDim_s, 2, Scythe.MCSphericalSLR())
+
+        @test (@allocations Scythe.moist_compressible_SLR(mtile_s, 1, kDim_s, 2)) == 0
+        @test (@allocations Scythe.diffusion_timestep_mc(mtile_s, 1, kDim_s, 2,
+                                                         Scythe.MCSphericalSLR())) == 0
     end
 
     @testset "per-column allocations stay zero with the Rayleigh sponge active" begin

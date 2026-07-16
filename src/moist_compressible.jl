@@ -472,10 +472,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     precipitation = get(model.options, :precipitation, false)::Bool
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
 
-    # Gridpoints: z from the geometry's vertical column; r is gridpoint column 1
-    # on the cylinders (`nothing` on the Cartesian slice, where no method reads it)
+    # Gridpoints: z from the geometry's vertical column; r is the geometry metric
+    # handle (radius view on the cylinders, colatitude/a/Omega on the sphere,
+    # `nothing` on the Cartesian geometries — see mc_metric)
     z = view(gridpoints,colstart:colend,zcoord(geom))
-    r = mc_radius(geom, gridpoints, colstart, colend)
+    r = mc_metric(geom, model, gridpoints, colstart, colend)
 
     # Prognostic slot views, geometry-mapped (see mc_slot_views): `_x` is ∂x on the
     # slice and ∂r on the cylinders, `_z`/`_zz` sit at zslot(geom), and the raw
@@ -835,6 +836,23 @@ moist_compressible_axisym(mtile::ModelTile, colstart::Int64, colend::Int64, t::I
 "3D r–λ–z cylinder on the RLR grid (`MC_VARS_CYL`, 9 vars, f-plane rotation optional)."
 moist_compressible_RLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCCylindricalRLR())
+
+"""
+3D Cartesian x–y–z box on the RRR grid (`MC_VARS_CYL`, 9 vars: v is the y-wind,
+f-plane rotation optional — +f v / −f u with no curvature terms).
+"""
+moist_compressible_RRR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCCartesianRRR())
+
+"""
+3D spherical θ–λ–z shell on the SLR grid (`MC_VARS_CYL`, 9 vars: u is the
+θ-ward wind, v the zonal wind). Shallow atmosphere with metric radius
+`physical_params[:sphere_radius]` (default Earth) and full latitude-dependent
+Coriolis f = 2Ω cosθ from `physical_params[:Omega]` (NOT the cylinders' f-plane
+`:f`). See `MCSphericalSLR`.
+"""
+moist_compressible_SLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCSphericalSLR())
 
 """
     qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau)

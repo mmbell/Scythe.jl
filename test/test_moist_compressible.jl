@@ -1483,4 +1483,228 @@ using Springsteel
             @test all(isfinite.(mt_rlr.expdot_n))
         end
     end
+
+    # ── 3D Cartesian box (moist_compressible_RRR): slots 4/5 are the full ∂y/∂yy,
+    #    v is the y-wind, rotation is a plain f-plane. A y-invariant state on RRR
+    #    lives on the same x/z mish nodes as the matched RiRk slice, so the shared
+    #    8 slots must match the XZ set pointwise; v feels only -f u. ──
+    @testset "RRR: y-invariant tendencies match the XZ slice" begin
+        mktempdir() do tmpdir
+            L = 24.0e3
+            H = 2000.0
+            f = 5.0e-5
+
+            varlist9 = Scythe.MC_VARS_CYL
+            vars9 = Dict(v => i for (i, v) in enumerate(varlist9))
+            vars8 = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+            mkbc(vars) = Dict(v => NeumannBC() for v in keys(vars))
+
+            gp_rrr = GridParameters(
+                geometry = "RRR", iMin = 0.0, iMax = L, num_cells_i = 6,
+                jMin = 0.0, jMax = L,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                BCL = merge(mkbc(vars9), Dict("u" => DirichletBC())),
+                BCR = merge(mkbc(vars9), Dict("u" => DirichletBC())),
+                BCU = merge(mkbc(vars9), Dict("v" => DirichletBC())),
+                BCD = merge(mkbc(vars9), Dict("v" => DirichletBC())),
+                BCB = merge(mkbc(vars9), Dict("w" => DirichletBC())),
+                BCT = merge(mkbc(vars9), Dict("w" => DirichletBC())),
+                vars = vars9)
+            gp_xz = GridParameters(
+                geometry = "RiRk", iMin = 0.0, iMax = L, num_cells_i = 6,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                BCL = merge(mkbc(vars8), Dict("u" => DirichletBC())),
+                BCR = merge(mkbc(vars8), Dict("u" => DirichletBC())),
+                BCB = merge(mkbc(vars8), Dict("w" => DirichletBC())),
+                BCT = merge(mkbc(vars8), Dict("w" => DirichletBC())),
+                vars = vars8)
+
+            function build(gp, eqset, zc)
+                ref_file = joinpath(tmpdir, "rrr_$(eqset).ref")
+                model = ModelParameters(
+                    ts = 0.1, integration_time = 1.0, output_interval = 1.0,
+                    equation_set = eqset, ref_state_file = ref_file, grid_params = gp,
+                    physical_params = Dict(:Khdiff => 25.0, :Kvdiff => 0.0,
+                                           :Kvdiff_water => 0.0, :Kv_mudiff => 0.0,
+                                           :tau_qss => 10.0, :N_r => 1.0e-3,
+                                           :alpha => 0.0, :z_damp => H, :f => f),
+                    options = Dict(:semiimplicit => false,
+                                   :exact_reference_state => true,
+                                   :precipitation => true,
+                                   :vertical_mixing => false))
+                kD = model.grid_params.kDim
+                patch = createGrid(model.grid_params)
+                gpts = Scythe.getGridpoints(patch)
+                z = gpts[1:kD, zc]
+                col = saturated_cloudy_column_mc(z; q_l = 1.0e-3)
+                Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d,
+                                          col.rho_v, col.rho_c)
+                patch.physical .= 0.0
+                # Smooth y-invariant seeds on the shared 8 slots (v stays 0)
+                npts = size(patch.physical, 1)
+                amps = Dict(1 => 10.0, 2 => 1.0e-4, 3 => 1.0e-4, 4 => 0.5,
+                            5 => 0.25, 6 => 100.0, 7 => 1.0e-5, 8 => 1.0e-5)
+                for i in 1:npts
+                    x = gpts[i, 1]
+                    z_i = gpts[i, zc]
+                    bump = exp(-((x - 12.0e3) / 6.0e3)^2 - ((z_i - 1000.0) / 500.0)^2)
+                    for (v, amp) in amps
+                        patch.physical[i, v, 1] = amp * bump
+                    end
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                mtile = createModelTile(patch, patch, model,
+                                        sparse(Int64[], Int64[], Float64[],
+                                               size(patch.spectral, 1),
+                                               size(patch.spectral, 2)))
+                for c in 1:div(npts, kD)
+                    Scythe.advance_column(mtile, c, 1)
+                end
+                return mtile, gpts, kD
+            end
+
+            mt_rrr, gp3, kDim = build(gp_rrr, "moist_compressible_RRR", 3)
+            mt_xz, gp2, kD_xz = build(gp_xz, "moist_compressible_XZ", 2)
+            @test kDim == kD_xz
+
+            # Map each RRR column to the XZ column at the same x
+            x_xz = gp2[1:kDim:end, 1]
+            ncols_rrr = div(size(gp3, 1), kDim)
+            worst = 0.0
+            scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
+                          5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6)
+            worst_v = 0.0
+            for c in 1:ncols_rrr
+                i0 = (c - 1) * kDim
+                x_c = gp3[i0 + 1, 1]
+                a = findfirst(==(x_c), x_xz)
+                @test a !== nothing
+                j0 = (a - 1) * kDim
+                for v in 1:8
+                    d = maximum(abs.(mt_rrr.expdot_n[i0+1:i0+kDim, v] .-
+                                     mt_xz.expdot_n[j0+1:j0+kDim, v])) / scales[v]
+                    worst = max(worst, d)
+                end
+                # v feels exactly -f u (advection/PGF/diffusion of a zero field
+                # vanish; pp_y of a y-invariant field is spline roundoff)
+                worst_v = max(worst_v,
+                    maximum(abs.(mt_rrr.expdot_n[i0+1:i0+kDim, 9] .+
+                                 f .* mt_rrr.tile.physical[i0+1:i0+kDim, 4, 1])))
+            end
+            @info "RRR y-invariant vs XZ: worst scaled mismatch = $worst; " *
+                  "max |dv/dt + f u| = $worst_v"
+            @test worst < 1.0e-6
+            @test worst_v < 1.0e-10
+            @test all(isfinite.(mt_rrr.expdot_n))
+        end
+    end
+
+    # ── 3D spherical shell (moist_compressible_SLR): a zonally-symmetric (WN0)
+    #    state on a narrow equatorial band converges to the Cartesian XZ slice
+    #    with x = a·(θ − θ₀): at θ ≈ π/2 the metric terms (cotθ, 1 − sinθ) are
+    #    O(half-width/a) ≈ 2e-6 relative, and the θ-mish maps affinely onto the
+    #    x-mish so columns correspond one-to-one. ──
+    @testset "SLR: equatorial WN0 tendencies converge to the XZ slice" begin
+        mktempdir() do tmpdir
+            a_sphere = 6.371e6
+            L = 24.0e3
+            H = 2000.0
+            th0 = pi / 2 - (L / (2.0 * a_sphere))
+
+            varlist9 = Scythe.MC_VARS_CYL
+            vars9 = Dict(v => i for (i, v) in enumerate(varlist9))
+            vars8 = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+            mkbc(vars) = Dict(v => NeumannBC() for v in keys(vars))
+            side9 = merge(mkbc(vars9), Dict("u" => DirichletBC()))
+            side8 = merge(mkbc(vars8), Dict("u" => DirichletBC()))
+            tb9 = merge(mkbc(vars9), Dict("w" => DirichletBC()))
+            tb8 = merge(mkbc(vars8), Dict("w" => DirichletBC()))
+
+            gp_slr = GridParameters(
+                geometry = "SLR", iMin = th0, iMax = th0 + L / a_sphere,
+                num_cells_i = 6,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                max_wavenumber = Dict(v => 2 for v in keys(vars9)),
+                BCL = side9, BCR = side9, BCB = tb9, BCT = tb9, vars = vars9)
+            gp_xz = GridParameters(
+                geometry = "RiRk", iMin = 0.0, iMax = L, num_cells_i = 6,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                BCL = side8, BCR = side8, BCB = tb8, BCT = tb8, vars = vars8)
+
+            function build(gp, eqset, zc, xmap)
+                ref_file = joinpath(tmpdir, "slr_$(eqset).ref")
+                model = ModelParameters(
+                    ts = 0.1, integration_time = 1.0, output_interval = 1.0,
+                    equation_set = eqset, ref_state_file = ref_file, grid_params = gp,
+                    physical_params = Dict(:Khdiff => 25.0, :Kvdiff => 0.0,
+                                           :Kvdiff_water => 0.0, :Kv_mudiff => 0.0,
+                                           :tau_qss => 10.0, :N_r => 1.0e-3,
+                                           :alpha => 0.0, :z_damp => H,
+                                           :Omega => 0.0,
+                                           :sphere_radius => a_sphere),
+                    options = Dict(:semiimplicit => false,
+                                   :exact_reference_state => true,
+                                   :precipitation => true,
+                                   :vertical_mixing => false))
+                kD = model.grid_params.kDim
+                patch = createGrid(model.grid_params)
+                gpts = Scythe.getGridpoints(patch)
+                z = gpts[1:kD, zc]
+                col = saturated_cloudy_column_mc(z; q_l = 1.0e-3)
+                Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d,
+                                          col.rho_v, col.rho_c)
+                patch.physical .= 0.0
+                npts = size(patch.physical, 1)
+                amps = Dict(1 => 10.0, 2 => 1.0e-4, 3 => 1.0e-4, 4 => 0.5,
+                            5 => 0.25, 6 => 100.0, 7 => 1.0e-5, 8 => 1.0e-5)
+                for i in 1:npts
+                    x = xmap(gpts[i, 1])           # arc length from the band edge
+                    z_i = gpts[i, zc]
+                    bump = exp(-((x - 12.0e3) / 6.0e3)^2 - ((z_i - 1000.0) / 500.0)^2)
+                    for (v, amp) in amps
+                        patch.physical[i, v, 1] = amp * bump
+                    end
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                mtile = createModelTile(patch, patch, model,
+                                        sparse(Int64[], Int64[], Float64[],
+                                               size(patch.spectral, 1),
+                                               size(patch.spectral, 2)))
+                for c in 1:div(npts, kD)
+                    Scythe.advance_column(mtile, c, 1)
+                end
+                return mtile, gpts, kD
+            end
+
+            mt_slr, gp1, kDim = build(gp_slr, "moist_compressible_SLR", 3,
+                                      th -> a_sphere * (th - th0))
+            mt_xz, gp2, kD_xz = build(gp_xz, "moist_compressible_XZ", 2, identity)
+            @test kDim == kD_xz
+
+            # Map each SLR column to the XZ column at the corresponding arc length
+            x_xz = gp2[1:kDim:end, 1]
+            ncols_slr = div(size(gp1, 1), kDim)
+            worst = 0.0
+            scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
+                          5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6)
+            for c in 1:ncols_slr
+                i0 = (c - 1) * kDim
+                x_c = a_sphere * (gp1[i0 + 1, 1] - th0)
+                d, a_idx = findmin(abs.(x_xz .- x_c))
+                @test d < 1.0e-3            # affine mish correspondence (roundoff)
+                j0 = (a_idx - 1) * kDim
+                for v in 1:8
+                    dd = maximum(abs.(mt_slr.expdot_n[i0+1:i0+kDim, v] .-
+                                      mt_xz.expdot_n[j0+1:j0+kDim, v])) / scales[v]
+                    worst = max(worst, dd)
+                end
+            end
+            @info "SLR equatorial WN0 vs XZ: worst scaled mismatch = $worst " *
+                  "(metric terms are O(L/2a) ≈ 2e-6)"
+            @test worst < 1.0e-4
+            @test all(isfinite.(mt_slr.expdot_n))
+        end
+    end
 end
