@@ -108,7 +108,8 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # perturbations s_t' and rho_v' are zero BIT-FOR-BIT and diffusion cannot cook the
     # base (the reference's own Tbar is not bit-identical to the retrieved T). Empty
     # vectors for every other equation set.
-    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar), Tuple{Vector{Float64}, Vector{Float64}}}
+    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar, :Pxi_prof),
+                            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}}}
     # One NamedTuple of full-tile-length work vectors for `Twoway_PV_mixing`'s 13 broadcast
     # temporaries. Empty for every other set. See `_allocate_sw_scratch` for why there is one
     # workspace per TILE here rather than one per thread as `mc_scratch` has.
@@ -243,7 +244,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_reference_diagnostics(ref_state,
                                  tilepoints[1:model.grid_params.kDim, end])
     else
-        (s_tbar = Float64[], rho_vbar = Float64[])
+        (s_tbar = Float64[], rho_vbar = Float64[], Pxi_prof = Float64[])
     end
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
@@ -271,7 +272,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
                   "removed (the vertical acoustics are always integrated semi-implicitly). " *
                   "Remove the option or set it to true.")
         end
-        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
+        # The LOCAL reference sound-speed profile, not the domain mean: a mean-c̄²
+        # linearization is unstable above Co_z ≈ 4.5 on a stratified sounding
+        # (see calc_Helmholtz_semiimplicit_matrix's profile method).
+        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, mc_ref_diag.Pxi_prof, 1.25 * model.ts)
     elseif get(model.options, :semiimplicit, false)
         h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
     end
@@ -1814,6 +1818,26 @@ function _assemble_spline_matrix(d, α::Float64, β::Float64,
     return F
 end
 
+# Profile-coefficient variant, ∂_z(α(z) ∂_z ·) + β with α given at the mish points
+# (the mc pressure-reference local sound speed Δτ²·Pξ̄(z)): the weak form weights
+# the stiffness quadrature, ∫ψ'αφ' = M1ᵀ(W·α)M1, keeping A symmetric. A separate
+# method (not a Union) so the scalar path stays bitwise-identical for the legacy
+# sets and the diffusion matrices.
+function _assemble_spline_matrix(d, α::AbstractVector{Float64}, β::Float64,
+        bc_bottom::BoundaryConditions, bc_top::BoundaryConditions)
+    Mass  = d.M0' * (d.W .* d.M0)
+    Stiff = d.M1' * ((d.W .* α) .* d.M1)
+    A = (-1.0) .* Stiff .+ β .* Mass
+    db = _is_dirichlet(bc_bottom); dt = _is_dirichlet(bc_top)
+    if db; A[1,   :] .= d.Nb[1, :]; end
+    if dt; A[end, :] .= d.Nb[2, :]; end
+    F = factorize(A)
+    lock(_RIRK_SOLVE_LOCK) do
+        _RIRK_DIRICHLET[objectid(F)] = (db, dt)
+    end
+    return F
+end
+
 """
     _assemble_vertical_matrix(grid, model, α, β, bc_scale, bc_bottom, bc_top)
 
@@ -1834,6 +1858,29 @@ function _assemble_vertical_matrix(grid::AbstractGrid, model::ModelParameters,
         M1 = operator_matrix(grid, :k, 1)
         M2 = operator_matrix(grid, :k, 2)
         h = α .* M2 .+ β .* M0
+        bc1 = bc_scale .* _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
+        bc2 = bc_scale .* _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
+        return factorize([bc1[:]'; bc2[:]'; h[2:nz-1, :]])
+    end
+end
+
+# Profile-coefficient variant, ∂_z(α(z) ∂_z ·) + β with α at the mish points. The
+# spline path is the symmetric weighted-stiffness Galerkin form; the Chebyshev
+# path is the exact collocation of the product, M1·(M0 \ (α .* M1)) — the nodal
+# derivative of the fitted pointwise product α·∂_z(·), mirroring the pointwise
+# recovery/staging chain, with no need for ∂_z α.
+function _assemble_vertical_matrix(grid::AbstractGrid, model::ModelParameters,
+        α::AbstractVector{Float64}, β::Float64, bc_scale::Float64,
+        bc_bottom::BoundaryConditions, bc_top::BoundaryConditions)
+    kcol = grid.kbasis.data[1]
+    if kcol isa CubicBSpline.Spline1D
+        return _assemble_spline_matrix(_rirk_solve_data(kcol), α, β, bc_bottom, bc_top)
+    else
+        nz = model.grid_params.kDim
+        M0 = operator_matrix(grid, :k, 0)
+        M1 = operator_matrix(grid, :k, 1)
+        M2 = operator_matrix(grid, :k, 2)
+        h = (M1 * (M0 \ (α .* M1))) .+ β .* M0
         bc1 = bc_scale .* _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
         bc2 = bc_scale .* _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
         return factorize([bc1[:]'; bc2[:]'; h[2:nz-1, :]])
@@ -1919,6 +1966,22 @@ function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelPara
         bc_bottom::BoundaryConditions=DirichletBC(), bc_top::BoundaryConditions=DirichletBC())
 
     c = ts_term * ts_term * Pxi_bar
+    return _assemble_vertical_matrix(grid, model, c, -1.0, 1.0, bc_bottom, bc_top)
+end
+
+"""
+Profile variant of [`calc_Helmholtz_semiimplicit_matrix`](@ref): `Pxi_prof` is the
+LOCAL reference sound speed squared γ̄_m(z)·p̄(z)/ρ̄_t(z) at the mish points (the mc
+pressure-reference sets; see `mc_reference_diagnostics`). The operator becomes
+`∂_z(Δτ²·Pξ̄(z)·∂_z) - 1`, so the acoustic remainder left to AB3 is O(perturbation)
+at every level — a domain-mean c̄² leaves the local deviation explicit, which is
+the classic reference-state SI instability (Simmons, Hoskins & Burridge 1978) and
+blows up above Co_z ≈ 4.5 on a realistically stratified sounding.
+"""
+function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelParameters, Pxi_prof::AbstractVector{Float64}, ts_term::Float64;
+        bc_bottom::BoundaryConditions=DirichletBC(), bc_top::BoundaryConditions=DirichletBC())
+
+    c = (ts_term * ts_term) .* Pxi_prof
     return _assemble_vertical_matrix(grid, model, c, -1.0, 1.0, bc_bottom, bc_top)
 end
 

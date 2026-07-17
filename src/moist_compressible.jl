@@ -226,6 +226,7 @@ function mc_reference_diagnostics(ref_state, z)
     n = length(z)
     s_tbar = zeros(Float64, n)
     rho_vbar = zeros(Float64, n)
+    Pxi_prof = zeros(Float64, n)
     for k in 1:n
         p = pbar[k, 1]
         rho_d = rho_dbar[k, 1]
@@ -243,8 +244,19 @@ function mc_reference_diagnostics(ref_state, z)
         q_l = (max(rho_c, 0.0) + 0.0) / rho_d
         s_tbar[k] = moist_entropy_total(Tk, rho_d, q_v, q_l)
         rho_vbar[k] = rho_v
+        # Local reference sound speed squared γ_m(z)·p̄(z)/ρ̄_t(z) for the acoustic
+        # linearization. A DOMAIN-MEAN c̄² (Springsteel's sound_speed_sq) leaves the
+        # local deviation of the vertical acoustic operator EXPLICIT under AB3 —
+        # the classic reference-state SI instability (Simmons, Hoskins & Burridge
+        # 1978): on the Dunion sounding the ±20-25% c² deviations blow up above
+        # Co_z ≈ 4.5 even though the operator-consistent scheme is stable to
+        # Co_z ≈ 9-18 on a uniform-c base. The PROFILE makes the explicit acoustic
+        # remainder O(perturbation) at every level.
+        C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
+        R_m = Rd + (q_v * Rv)
+        Pxi_prof[k] = ((C_vt + R_m) / C_vt) * p / rho_t
     end
-    return (s_tbar = s_tbar, rho_vbar = rho_vbar)
+    return (s_tbar = s_tbar, rho_vbar = rho_vbar, Pxi_prof = Pxi_prof)
 end
 
 """
@@ -557,7 +569,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     Q_ssbar = view(ref_qss(refstate),:,1)
     Q_ssbar_z = view(ref_qss(refstate),:,2)
     Tbar = view(refstate.Tbar,:,1)
-    Pxi_bar = sound_speed_sq(refstate)
+    # LOCAL reference sound-speed-squared profile γ̄_m(z)·p̄/ρ̄_t (see
+    # mc_reference_diagnostics) — the acoustic linearization must use the local
+    # value so the explicit remainder is O(perturbation) at every level; the
+    # domain-mean sound_speed_sq is unstable above Co_z ≈ 4.5 on a stratified base.
+    Pxi_bar = mtile.mc_ref_diag.Pxi_prof
 
     # Per-thread work vectors for every temporary below (see `MC_SCRATCH_SLOTS`). Each `@.`
     # writes into a preallocated column instead of allocating a fresh one per column per step.
@@ -1006,10 +1022,11 @@ Semi-implicit acoustic solve for the total-energy set — the ONLY integrator of
 reference-linear vertical acoustic terms (the explicit acoustic mode was removed; the
 AB3 predictor advances the acoustic remainder). Applies the AI2* explicit history
 weights (`-1.0 Lⁿ + 0.75 Lⁿ⁻¹`, staged spline-consistently in `mc_driver!`), then
-solves the constant-coefficient Helmholtz problem for the vertical mass flux
-`φ = ρ̄_t w` from the implicit pair `∂φ/∂t = -∂z p'`, `∂p'/∂t = -Pxi_bar ∂z φ`
-(the same operator as the rho_d form, so `mtile.h_matrix` is reused), and recovers
-`w = φ/ρ̄_t` and `p' = p'* - Δτ Pxi_bar ∂z φ`. The density and energy slots are
+solves the Helmholtz problem `∂z(Δτ² Pξ̄(z) ∂z φ) - φ` for the vertical mass flux
+`φ = ρ̄_t w` from the implicit pair `∂φ/∂t = -∂z p'`, `∂p'/∂t = -Pξ̄(z) ∂z φ`, with
+`Pξ̄(z)` the LOCAL reference sound speed squared (`mc_ref_diag.Pxi_prof` — a
+domain-mean c̄² is the classic SHB78 reference-state instability above Co_z ≈ 4.5
+on a stratified base), and recovers `w = φ/ρ̄_t` and `p' = p'* - Δτ Pξ̄(z) ∂z φ`. The density and energy slots are
 slaved to the flux in flux form: `rho_t' -= Δτ ∂z φ` (conserves `∫rho_t'`),
 `rho_d' -= Δτ ∂z(ρ̄_d/ρ̄_t φ)`, `E_t' -= Δτ ∂z((Ē_t+p̄)/ρ̄_t φ)`. Because the history
 staging mirrors this operator chain exactly, no part of the linear acoustic operator
@@ -1035,8 +1052,9 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     rhot_nstar = S.si_rhot_nstar; copyto!(rhot_nstar, view(mtile.var_np1,colstart:colend,rhot_index))
     et_nstar = S.si_et_nstar;     copyto!(et_nstar, view(mtile.var_np1,colstart:colend,et_index))
 
-    # Reference profiles and mean sound speed squared (views — read-only, loop-invariant)
-    Pxi_bar = sound_speed_sq(mtile.ref_state)
+    # Reference profiles and the LOCAL sound-speed-squared profile (views/vectors —
+    # read-only, loop-invariant; see the staging comment in mc_driver!)
+    Pxi_bar = mtile.mc_ref_diag.Pxi_prof
     rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
     rho_dbar_z = view(ref_rho_d(mtile.ref_state),:,2)
     rho_tbar = view(ref_rho_t(mtile.ref_state),:,1)
@@ -1086,8 +1104,8 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     p_nstar_z .*= ts_term
 
     # Mass-flux Helmholtz RHS (φ = ρ̄_t w): rhs = Δτ ∂z p'* - ρ̄_t w*.
-    # Elimination gives (I - Δτ² Pxi_bar ∂zz) φ, the same operator as the rho_d
-    # form, so h_matrix is reused.
+    # Elimination gives (∂z(Δτ² Pξ̄(z) ∂z ·) - I) φ (profile coefficient — the
+    # weighted-stiffness Galerkin form on RiRk).
     rhs = S.si_rhs
     @. rhs = p_nstar_z - (rho_tbar * w_nstar)
     phi_col = scratch_column(mtile, w_index)

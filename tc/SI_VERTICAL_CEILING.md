@@ -46,6 +46,36 @@ The regression gate lives in test/test_moist_compressible.jl ("SI
 vertical-acoustic ceiling removed"), asserting decay at Co_z 4.5 and 9.
 `warn_timestep_stability` now checks the horizontal Courant for mc runs.
 
+## Second mechanism, found immediately after (2026-07-16, same day): the
+## reference-state (SHB78) instability of the mean-c² linearization
+
+The first TC run at NEST_TS [0.75, 1.5, 1.5] died within ~1 min (ρ_d → −0.9 on
+nest2, surfacing as a `log` DomainError in the Louis-BL entropy staging). The
+operator-consistent scheme above was validated on an ISOTHERMAL base — uniform
+c — which is structurally blind to a second explicit residual: `Pxi_bar` was
+Springsteel's DOMAIN-MEAN `mean(γp̄/ρ̄_t)`, so wherever the local reference c²
+deviates from that mean (±20–25% on the Dunion sounding between the 300-K
+surface and the 195-K tropopause) that fraction of the grid-scale vertical
+acoustic operator stays EXPLICIT under AB3. This is the classic
+reference-state semi-implicit instability (Simmons, Hoskins & Burridge 1978).
+It never bit before because ε·Co_z ≈ 0.25·1.8 < 0.72 at ts = 0.3; at ts = 1.5
+(Co_z 9) it is ≈ 2, fatal in tens of steps. Minimal reproduction: the sweep's
+`:stratified` base (Dunion-like lapse) NaN'd at Co_z 9 in 232 s while the
+isothermal base decayed — no physics, no nesting, single patch.
+
+Fix (same day): the acoustic linearization uses the LOCAL profile
+`Pξ̄(z) = γ̄_m(z)·p̄(z)/ρ̄_t(z)`, computed in `mc_reference_diagnostics` through
+the model's own retrieval pipeline and used everywhere the scalar was: the
+expdot remainder, the impdot staging, the p′ recovery, and the Helmholtz
+operator — which becomes `∂z(Δτ²Pξ̄(z)∂z·) − I`, assembled on RiRk as the
+symmetric weighted-stiffness Galerkin form `M1ᵀ(W·Pξ̄)M1` (a new
+profile-coefficient method; the scalar path is untouched so the legacy sets
+stay bitwise) and on RZ as the exact collocation product `M1·(M0\(Pξ̄·M1))`.
+After the fix the stratified base decays at Co_z 9 exactly like the isothermal
+one; the regression testset gained the stratified case. Lesson recorded: any
+future SI stability claim must be tested on a STRATIFIED base — an isothermal
+base cannot see reference-state errors in the linearization coefficients.
+
 ---
 
 Original note (2026-07-16, pre-fix) follows.

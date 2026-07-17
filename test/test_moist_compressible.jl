@@ -573,22 +573,42 @@ using Springsteel
         # 9.0 (the old scheme e-folded in ~65 s at Co_z 2.4 and NaN'd within ~50 s at
         # Co_z 4.5). Horizontal cells widen with ts so the explicit horizontal
         # acoustic Courant stays <= 0.35 and cannot bind.
-        function isothermal_column_mc(z; T0=250.0, p0=101325.0)
+        # The stratified case guards the reference-state (SHB78) instability on top
+        # of the operator-consistency one: with a Dunion-like lapse to a 195-K
+        # tropopause, a DOMAIN-MEAN Pxi in the acoustic linearization left the
+        # local c² deviation explicit and NaN'd at Co_z 9 within 240 s — the local
+        # Pxi_prof profile must keep it decaying.
+        function ceiling_column_mc(z; kind, p0=101325.0)
             n = length(z)
-            p_Pa = @. p0 * exp(-gravity * z / (Rd * T0))
-            return (; z, Tk = fill(T0, n), p_Pa, rho_d = p_Pa ./ (Rd * T0),
+            if kind == :isothermal
+                T0 = 250.0
+                Tk = fill(T0, n)
+                p_Pa = @. p0 * exp(-gravity * z / (Rd * T0))
+            else
+                gam = (300.0 - 195.0) / 17000.0
+                Tk = [zz <= 17000.0 ? 300.0 - gam * zz :
+                      195.0 + 2.0e-3 * (zz - 17000.0) for zz in z]
+                p_trop = p0 * (195.0 / 300.0)^(gravity / (Rd * gam))
+                p_Pa = [zz <= 17000.0 ?
+                        p0 * ((300.0 - gam * zz) / 300.0)^(gravity / (Rd * gam)) :
+                        p_trop * ((195.0 + 2.0e-3 * (zz - 17000.0)) / 195.0)^(-gravity / (Rd * 2.0e-3))
+                        for zz in z]
+            end
+            return (; z, Tk, p_Pa, rho_d = p_Pa ./ (Rd .* Tk),
                     rho_v = zeros(n), rho_c = zeros(n))
         end
-        for ts in (0.75, 1.5)   # Co_z ≈ 4.5, 9.0 on dz_min = 0.2254 * 250 m, c ≈ 340 m/s
+        for (kind, ts) in ((:isothermal, 0.75), (:isothermal, 1.5), (:stratified, 1.5))
+            # Co_z ≈ 4.5, 9.0 on dz_min = 0.2254 * 250 m, c ≈ 340 m/s
             mktempdir() do tmpdir
                 dx_cell = max(3200.0, 340.0 * ts / (0.35 * 0.2254))
                 vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
                 scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
                 side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
                 wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+                kMax = kind == :isothermal ? 10.0e3 : 25.0e3       # dz_cell = 250 m
                 gp = GridParameters(geometry = "RiRk",
                     iMin = 0.0, iMax = 4.0 * dx_cell, num_cells_i = 4,
-                    kMin = 0.0, kMax = 10.0e3, num_cells_k = 40,   # dz_cell = 250 m
+                    kMin = 0.0, kMax = kMax, num_cells_k = round(Int, kMax / 250.0),
                     BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
                     vars = vars)
                 ref_file = joinpath(tmpdir, "ceiling_pressure.ref")
@@ -608,7 +628,7 @@ using Springsteel
                 gridpoints = Scythe.getGridpoints(patch)
                 kDim = gp.kDim
                 z = gridpoints[1:kDim, end]
-                col = isothermal_column_mc(z)
+                col = ceiling_column_mc(z; kind)
                 Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d,
                                           col.rho_v, col.rho_c)
                 patch.physical .= 0.0
