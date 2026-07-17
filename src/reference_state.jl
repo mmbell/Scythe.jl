@@ -200,7 +200,10 @@ function warn_timestep_stability(grid_params, ts::Float64;
         u_max = get(options, :u_max, 90.0)
         w_max = get(options, :w_max, 25.0)
         state_deviation = get(options, :state_deviation, 0.25)
-        hsi = get(options, :horizontal_semiimplicit, false) === true
+        # The exact (unsplit) 2-D solve shares the horizontal-SI advisory
+        # envelope (its measured envelope is set by Stage 2's sweeps).
+        hsi = get(options, :horizontal_semiimplicit, false) === true ||
+              get(options, :exact_si, false) === true
         mish = axis -> try
             sp = axis == :i ?
                 SplineParameters(xmin = grid_params.iMin, xmax = grid_params.iMax,

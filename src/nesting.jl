@@ -184,6 +184,9 @@ function build_nest(nest::NestedModelParameters)
     get(nest.base.options, :horizontal_semiimplicit, false) === true && throw(ArgumentError(
         "options[:horizontal_semiimplicit] is not supported in nested runs yet " *
         "(single-patch only; nesting is a later phase of the horizontal SI plan)"))
+    get(nest.base.options, :exact_si, false) === true && throw(ArgumentError(
+        "options[:exact_si] is not supported in nested runs yet " *
+        "(single-patch only; nesting is Stage 3 of the exact-SI plan)"))
 
     base = nest.base
     geometry = base.grid_params.geometry

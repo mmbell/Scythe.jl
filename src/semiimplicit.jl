@@ -12,7 +12,7 @@ using SparseArrays
 using SuiteSparse
 
 # Need to export these for distributed operations in Main namespace
-export createModelTile, advanceTimestep
+export createModelTile, advanceTimestep, advanceTimestepA, advanceTimestepB
 export initialize_model, run_model, finalize_model
 
 """
@@ -196,9 +196,17 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     diffdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     diffdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
-    # Horizontal-acoustic history channel, allocated only when the option is on
-    # (zero-size otherwise so the memory cost is nil for every other run).
-    hacdot_dim = get(model.options, :horizontal_semiimplicit, false) === true ?
+    # Setup-time validation of the exact (unsplit) 2-D semi-implicit option:
+    # incompatible flags and unsupported geometries error loudly here, before
+    # any allocation (defined in exact_si.jl; a no-op when the option is off).
+    validate_exact_si_options(model)
+
+    # Horizontal-acoustic history channel, allocated when either the ADI sweep
+    # or the exact 2-D solve is on (exact_si shares the hacdot staging and the
+    # horizontal_si_history! application; zero-size otherwise so the memory
+    # cost is nil for every other run).
+    hacdot_dim = (get(model.options, :horizontal_semiimplicit, false) === true ||
+                  get(model.options, :exact_si, false) === true) ?
                  (size(tile.physical,1), size(tile.physical,2)) : (0, 0)
     hacdot_n = zeros(Float64, hacdot_dim...)
     hacdot_nm1 = zeros(Float64, hacdot_dim...)
@@ -758,6 +766,37 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
         end
     end
 
+    # Exact (unsplit) 2-D semi-implicit setup (options[:exact_si], exact_si.jl):
+    # the patch-level solve data, the shared predictor-publication array
+    # (u*, w*, p′* at the patch physical points) and the shared solve feed
+    # (δu, ∂x u^{n+1}, δu/Δτ), plus each tile's patch row window.
+    xsi = get(model.options, :exact_si, false) === true
+    esd = nothing
+    xsi_xstar = nothing
+    xsi_h = nothing
+    if xsi
+        w1 = workerids[1]
+        Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
+        rho_t2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_t(mtile.ref_state), :, 1:2))))
+        rho_d2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1:2))))
+        etp2 = get_val_from(w1, :(collect(
+            view(Scythe.ref_total_energy(mtile.ref_state), :, 1:2) .+
+            view(Scythe.ref_pressure(mtile.ref_state), :, 1:2))))
+        esd = create_exact_si_data(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+        npts = patch.params.iDim * patch.params.kDim
+        xsi_xstar = SharedArray{Float64,2}((npts, 3))
+        xsi_h = SharedArray{Float64,2}((npts, XSI_NPLANES))
+        xpatch = patch.ibasis.data[1, 1].mishPoints
+        kDim = model.grid_params.kDim
+        for w in workerids
+            x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
+            i1 = argmin(abs.(xpatch .- x1))
+            save_at(w, :xsi_rowstart, (i1 - 1) * kDim + 1)
+            save_at(w, :xsi_xstar, xsi_xstar)
+            save_at(w, :xsi_h, xsi_h)
+        end
+    end
+
     # Output initial time
     patch.spectral .= sharedSpectral
     gridTransform!(patch)
@@ -768,7 +807,8 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
-        haloInitBuffer, haloReceiveBuffer, haloReceiveMap; hsd, hsi_u_incr)
+        haloInitBuffer, haloReceiveBuffer, haloReceiveMap; hsd, hsi_u_incr,
+        esd, xsi_xstar, xsi_h)
 
     # Integration complete! Finalize the patch
     patch.spectral .= sharedSpectral
@@ -787,7 +827,7 @@ via `RemoteChannel`s, accumulates spectral contributions, and writes periodic ou
 function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
         sharedSpectral::SharedArray{Float64}, haloInit::RemoteChannel, haloReceive::RemoteChannel,
         haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveMap::SparseMatrixCSC{Float64, Int64};
-        hsd=nothing, hsi_u_incr=nothing)
+        hsd=nothing, hsi_u_incr=nothing, esd=nothing, xsi_xstar=nothing, xsi_h=nothing)
 
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
@@ -820,10 +860,21 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
 
         # Advance each tile (the horizontal-SI variant also hands each worker the
         # shared applied-u-increment array and its tile's patch row window, loaded
-        # into hacdot_n at the top of the step as the u-leg AI2* history)
-        adv = hsd === nothing ?
-            [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids] :
-            [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), hsi_u_incr, hsi_rowstart))) for w in workerids]
+        # into hacdot_n at the top of the step as the u-leg AI2* history).
+        # The exact-SI variant is two-phase: phase A publishes the (u, w, p′)
+        # predictors, the master runs the unsplit patch solve, phase B completes
+        # the columns and the end-of-step communication.
+        if esd !== nothing
+            map(wait, [get_from(w, :(advanceTimestepA(mtile, sharedSpectral, $(t),
+                xsi_xstar, xsi_h, xsi_rowstart))) for w in workerids])
+            exact_si_solve!(xsi_h, esd, patch, model, t, xsi_xstar)
+            adv = [get_from(w, :(advanceTimestepB(mtile, sharedSpectral, haloSend,
+                haloReceive, $(t), xsi_h, xsi_rowstart))) for w in workerids]
+        else
+            adv = hsd === nothing ?
+                [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids] :
+                [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), hsi_u_incr, hsi_rowstart))) for w in workerids]
+        end
         map(wait, adv)
 
         # Get halo from previous tile

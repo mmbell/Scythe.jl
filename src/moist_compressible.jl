@@ -509,6 +509,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Horizontal acoustic semi-implicit (the patch-level ADI sweep in
     # horizontal_si.jl). Default OFF so existing configurations are bit-identical.
     hsi = get(model.options, :horizontal_semiimplicit, false)::Bool
+    # Exact (unsplit) 2-D acoustic semi-implicit (exact_si.jl). Shares the
+    # horizontal remainder/staging blocks with hsi below; the driver exits at
+    # the end of phase A (before the per-column implicit solve — the solve
+    # happens at the patch level, then exact_si_apply_column! completes the
+    # column). :exact_si_zero_x is the A≡0 TEST lever: it zeroes the whole
+    # horizontal coupling so the path must be bitwise the vertical-only path.
+    xsi = get(model.options, :exact_si, false)::Bool
+    xsi_zero = xsi && (get(model.options, :exact_si_zero_x, false)::Bool)
+    hsi_like = hsi || (xsi && !xsi_zero)
     # State-dependent vertical acoustic linearization: the implicit pair's
     # coefficients (Pξ, ρ̂_t and the slaved-leg chains) come from the CURRENT
     # column state each step instead of the resting reference, and the
@@ -897,7 +906,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # fit and no product-rule chain is needed). u's history is NOT staged here —
     # it is the stored applied increment of the patch-level sweep
     # (horizontal_si_load_increment!, the w-leg discipline).
-    if hsi
+    if hsi_like
         LDIV = S.ADV                     # free between slot 6 and slot 7
         mc_linear_div!(LDIV, geom, uv, vv, r)
         @turbo expdot[colstart:colend,1] .+= @. Pxi_bar * rho_tbar * LDIV
@@ -1032,9 +1041,19 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Explicit AI2* history levels of the HORIZONTAL acoustic legs: both
     # dimensions' history levels belong to the star state before either implicit
     # solve (the ADI factorization applies the vertical solve below first, then
-    # the horizontal patch-level sweep after the spectral merge).
-    if hsi
+    # the horizontal patch-level sweep after the spectral merge; the exact_si
+    # unsplit solve wants ALL explicit levels inside X* before it runs).
+    if hsi_like
         horizontal_si_history!(mtile, colstart, colend, t)
+    end
+
+    # Exact (unsplit) 2-D semi-implicit: phase A ends here. The vertical AI2*
+    # explicit history levels are applied now (the patch-level solve must see
+    # the complete X*); the implicit solve and everything after it happen in
+    # exact_si_apply_column! (phase B) once the patch solve has run.
+    if xsi
+        apply_acoustic_histories!(mtile, colstart, colend, t)
+        return
     end
 
     # Semi-implicit (p', ρ̄_t w) acoustic solve — unconditional: the explicit acoustic
@@ -1136,7 +1155,13 @@ slaved to the flux in flux form: `rho_t' -= Δτ ∂z φ` (conserves `∫rho_t'`
 staging mirrors this operator chain exactly, no part of the linear acoustic operator
 is left under explicit weights — the scheme has no vertical-acoustic Courant limit.
 """
-function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64;
+        apply_histories::Bool=true)
+    # apply_histories = false: the exact_si path applies the AI2* explicit
+    # history levels in phase A (apply_acoustic_histories!, so the patch-level
+    # solve sees the complete X*); the predictors arriving here already carry
+    # them and the history roll has been done. The default (true) is the
+    # production vertical-only path, bitwise unchanged.
 
     vars = mtile.model.grid_params.vars
     p_index = vars["p"]
@@ -1199,19 +1224,21 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # of tc/SI_VERTICAL_CEILING.md). The first step is AM2 trapezoidal (+0.5 Lⁿ with the
     # ts_term = 0.5·ts solve); its history seed gives t == 2 the full AI2* weights.
     ts_term = (t == 1) ? 0.5 * ts : 1.25 * ts
-    for index in (p_index, w_index, rhod_index, rhot_index, et_index)
-        nstar = index == p_index ? p_nstar :
-                index == w_index ? w_nstar :
-                index == rhod_index ? rhod_nstar :
-                index == rhot_index ? rhot_nstar : et_nstar
-        dot_n = view(mtile.impdot_n,colstart:colend,index)
-        dot_nm1 = view(mtile.impdot_nm1,colstart:colend,index)
-        if (t == 1)
-            nstar .= @. nstar + (ts * 0.5 * dot_n)
-        else
-            nstar .= @. nstar + (ts * ((0.75 * dot_nm1) - dot_n))
+    if apply_histories
+        for index in (p_index, w_index, rhod_index, rhot_index, et_index)
+            nstar = index == p_index ? p_nstar :
+                    index == w_index ? w_nstar :
+                    index == rhod_index ? rhod_nstar :
+                    index == rhot_index ? rhot_nstar : et_nstar
+            dot_n = view(mtile.impdot_n,colstart:colend,index)
+            dot_nm1 = view(mtile.impdot_nm1,colstart:colend,index)
+            if (t == 1)
+                nstar .= @. nstar + (ts * 0.5 * dot_n)
+            else
+                nstar .= @. nstar + (ts * ((0.75 * dot_nm1) - dot_n))
+            end
+            dot_nm1 .= dot_n
         end
-        dot_nm1 .= dot_n
     end
 
     # Take the vertical derivative of the p' predictor (coefficient 1: the pair is

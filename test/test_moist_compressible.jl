@@ -767,6 +767,161 @@ using Springsteel
         end
     end
 
+    @testset "exact SI (unsplit 2-D solve, RiRk XZ)" begin
+        # Stage-2 gates for options[:exact_si] (src/exact_si.jl): the unsplit
+        # p′-form weighted-mass 2-D Helmholtz replacing the per-column vertical
+        # solve, every fast leg recovered from the one solved coefficient set
+        # (reference/exact_si_derivation.md; von Neumann part 3(a) — the
+        # ε-insensitive consistent-weak composition).
+        function xsi_build(tmpdir; opts_extra=Dict{Symbol,Any}(), dx_cell=503.0,
+                           dz_cells=50, ts=1.0, kind=:isothermal, seed_u=true)
+            vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+            scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+            side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+            wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+            gp = GridParameters(geometry = "RiRk",
+                iMin = 0.0, iMax = 50.0 * dx_cell, num_cells_i = 50,
+                kMin = 0.0, kMax = 25.0e3, num_cells_k = dz_cells,
+                BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
+                vars = vars)
+            ref_file = joinpath(tmpdir, "xsi_$(kind)_$(dz_cells)_$(round(dx_cell)).ref")
+            model = ModelParameters(
+                ts = ts, integration_time = 600.0, output_interval = 600.0,
+                equation_set = "moist_compressible_XZ",
+                ref_state_file = ref_file, grid_params = gp,
+                physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                       :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                       :tau_qss => 10.0, :alpha => 0.0,
+                                       :z_damp => 30.0e3, :f => 0.0),
+                options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                :exact_reference_state => true,
+                                :precipitation => false), opts_extra))
+            gp = model.grid_params
+            patch = createGrid(gp)
+            z = Scythe.getGridpoints(patch)[1:gp.kDim, end]
+            if kind == :isothermal
+                T0 = 250.0
+                p_Pa = @. 101325.0 * exp(-gravity * z / (Rd * T0))
+                rho_prof = p_Pa ./ (Rd * T0)
+            else
+                gam = (300.0 - 195.0) / 17000.0
+                p_trop = 101325.0 * (195.0 / 300.0)^(gravity / (Rd * gam))
+                Tk = [zz <= 17000.0 ? 300.0 - gam * zz :
+                      195.0 + 2.0e-3 * (zz - 17000.0) for zz in z]
+                p_Pa = [zz <= 17000.0 ?
+                        101325.0 * ((300.0 - gam * zz) / 300.0)^(gravity / (Rd * gam)) :
+                        p_trop * ((195.0 + 2.0e-3 * (zz - 17000.0)) / 195.0)^(-gravity / (Rd * 2.0e-3))
+                        for zz in z]
+                rho_prof = p_Pa ./ (Rd .* Tk)
+            end
+            Scythe.write_exact_ref_mc(ref_file, z, p_Pa, rho_prof,
+                                      zeros(gp.kDim), zeros(gp.kDim))
+            patch.physical .= 0.0
+            u_i = gp.vars["u"]; w_i = gp.vars["w"]
+            for i in 1:size(patch.physical, 1)
+                seed_u && (patch.physical[i, u_i, 1] = 1.0e-4 * sin(0.5 * sqrt(2.0) * i^2))
+                patch.physical[i, w_i, 1] = 1.0e-4 * sin(0.4 * sqrt(3.0) * i^2 + 1.0)
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            haloReceiveMap = sparse(Int64[], Int64[], Float64[],
+                                    size(patch.spectral, 1), size(patch.spectral, 2))
+            mtile = Scythe.createModelTile(patch, patch, model, haloReceiveMap)
+            esd = nothing
+            if get(model.options, :exact_si, false) === true
+                esd = Scythe.create_exact_si_data(patch, model,
+                    mtile.mc_ref_diag.Pxi_prof,
+                    collect(view(Springsteel.ref_rho_t(mtile.ref_state), :, 1:2)),
+                    collect(view(Springsteel.ref_rho_d(mtile.ref_state), :, 1:2)),
+                    collect(view(Springsteel.ref_total_energy(mtile.ref_state), :, 1:2) .+
+                            view(Springsteel.ref_pressure(mtile.ref_state), :, 1:2)))
+            end
+            return mtile, patch, model, gp, esd
+        end
+        function xsi_run!(mtile, patch, model, gp, esd; nsteps)
+            kDim = gp.kDim
+            u_i = gp.vars["u"]; w_i = gp.vars["w"]; p_i = gp.vars["p"]
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            xsi = get(model.options, :exact_si, false) === true
+            xstar = zeros(npts, 3)
+            hfields = zeros(npts, Scythe.XSI_NPLANES)
+            for t in 1:nsteps
+                xsi && t > 1 && Scythe.exact_si_load_history!(mtile, hfields, t, 1)
+                for c in 1:ncols
+                    Scythe.advance_column(mtile, c, t)
+                end
+                if xsi
+                    xstar[:, 1] .= view(mtile.var_np1, :, u_i)
+                    xstar[:, 2] .= view(mtile.var_np1, :, w_i)
+                    xstar[:, 3] .= view(mtile.var_np1, :, p_i)
+                    Scythe.exact_si_solve!(hfields, esd, patch, model, t, xstar)
+                    for c in 1:ncols
+                        cs = (c - 1) * kDim + 1
+                        Scythe.exact_si_apply_column!(mtile, cs, cs + kDim - 1, t,
+                                                      hfields, 1)
+                    end
+                end
+                Scythe.calcTendency(mtile)
+                gridTransform!(patch)
+            end
+        end
+
+        mktempdir() do tmpdir
+            # 1. Flag validation: the structurally incompatible combinations
+            # error at createModelTile time.
+            for bad in (Dict{Symbol,Any}(:exact_si => true, :state_dependent_si => true),
+                        Dict{Symbol,Any}(:exact_si => true, :horizontal_semiimplicit => true))
+                @test_throws ErrorException xsi_build(tmpdir; opts_extra=bad)
+            end
+
+            # 2. A≡0 bypass equivalence: with the horizontal coupling zeroed
+            # (options[:exact_si_zero_x]) the two-phase exact-SI path must
+            # reproduce the production vertical-only path to ≤ 1e-10 (measured
+            # bitwise 0.0) — the per-column vertical solve runs on identical
+            # data with identical operations, only split across the phases.
+            mref, pref, modref, gpref, _ = xsi_build(tmpdir)
+            xsi_run!(mref, pref, modref, gpref, nothing; nsteps=20)
+            mzx, pzx, modzx, gpzx, ezx = xsi_build(tmpdir;
+                opts_extra=Dict{Symbol,Any}(:exact_si => true, :exact_si_zero_x => true))
+            xsi_run!(mzx, pzx, modzx, gpzx, ezx; nsteps=20)
+            @test maximum(abs.(pref.physical[:, :, 1] .- pzx.physical[:, :, 1])) <= 1.0e-10
+
+            # 3. Ceiling gate: broadband u+w seed on the resting base must
+            # DECAY over 300 s at Co_h 3.0 (4x past the explicit AB3 limit),
+            # both bases (the SHB78 lesson), with Co_z ≈ 3 simultaneously
+            # (dz 500-m cells) — the combined-Courant case. The measured
+            # envelope (model_tests/hsi_ceiling_sweep.jl --exact-si) is clean
+            # decay through Co_h 18 on both bases.
+            for kind in (:isothermal, :stratified)
+                m3, p3, mod3, gp3, e3 = xsi_build(tmpdir; kind,
+                    opts_extra=Dict{Symbol,Any}(:exact_si => true))
+                u_i = gp3.vars["u"]; w_i = gp3.vars["w"]
+                seed = max(maximum(abs.(p3.physical[:, u_i, 1])),
+                           maximum(abs.(p3.physical[:, w_i, 1])))
+                xsi_run!(m3, p3, mod3, gp3, e3; nsteps=300)
+                @test all(isfinite.(p3.physical[:, :, 1]))
+                amp = max(maximum(abs.(p3.physical[:, u_i, 1])),
+                          maximum(abs.(p3.physical[:, w_i, 1])))
+                @test amp < seed
+            end
+
+            # 4. The p′-primary VERTICAL ceiling must not regress: Co_z ≈ 9 on
+            # the stratified base (the SHB78 case) with the 2-D solve active
+            # must decay — 250-m cells, ts 1.5, wide horizontal cells so Co_h
+            # never binds (measured: decay ×226 over 600 s, matching the
+            # φ-solve; this is a NEW measured quantity, not inherited).
+            mv, pv, modv, gpv, ev = xsi_build(tmpdir; kind=:stratified,
+                dx_cell=6800.0, dz_cells=100, ts=1.5,
+                opts_extra=Dict{Symbol,Any}(:exact_si => true), seed_u=false)
+            w_i = gpv.vars["w"]
+            w0 = maximum(abs.(pv.physical[:, w_i, 1]))
+            xsi_run!(mv, pv, modv, gpv, ev; nsteps=round(Int, 600.0 / 1.5))
+            @test all(isfinite.(pv.physical[:, :, 1]))
+            @test maximum(abs.(pv.physical[:, w_i, 1])) < w0
+        end
+    end
+
     # ──────────────────────────────────────────────
     # 6. Diffusion: theta_d, heating consistency, dissipation
     # ──────────────────────────────────────────────
