@@ -151,14 +151,18 @@ to get the true minimum mish-point spacing, estimates the acoustic Courant numbe
 `c_nominal * ts / d_min`, and emits an `@warn` (never aborts) if it exceeds
 `target_courant`. Returns the estimated Courant number, or `nothing` when skipped.
 
-**Which axis depends on the equation set.** For the pressure-reference
-(`moist_compressible`) sets the vertical acoustics are integrated semi-implicitly
-with no Courant limit (operator-consistent AI2*; see
-[`semiimplicit_adjustment_p`](@ref)), so the binding explicit limit is the
-HORIZONTAL acoustic Courant on the i axis — checked whenever the i axis is a cubic
-B-spline (geometry `"R..."`), with `target_courant=0.5` advisory against the AB3
-imaginary-axis stability limit of ω·Δt ≈ 0.72. (The azimuthal spacing of the 3D
-cylinder at its inner radius is not probed — configure it comparably.)
+**For the pressure-reference (`moist_compressible`) sets this is a generic
+multi-limit advisor**: it computes every known limit for the actual
+configuration — the horizontal acoustic Courant (explicit AB3, or the measured
+semi-implicit envelope when `options[:horizontal_semiimplicit]` is on), the
+CONVECTIVE vertical SI ceiling `Co_z ≤ 0.72/δ` (state-dependent linearization
+residual, tc/SI_CONVECTIVE_CEILING.md; δ from `options[:state_deviation]`,
+default 0.25), and the u/w advective Courants for the expected peak winds
+(`options[:u_max]`/`options[:w_max]`, defaults 90/25 m/s) — prints all margins,
+names the binding one, and warns only if it is exceeded. Resolution-agnostic by
+design: no assumption about which limit binds. Returns the limits NamedTuple.
+(The azimuthal spacing of the 3D cylinder at its inner radius is not probed —
+configure it comparably.)
 
 For the legacy sets the historical VERTICAL check runs, restricted to the cubic
 B-spline (`"RiRk"`) vertical whose mish points are near-uniform; it is a
@@ -169,35 +173,81 @@ subtract-AB3 semi-implicit form, not a derived bound.
 """
 function warn_timestep_stability(grid_params, ts::Float64;
                                  c_nominal::Float64=340.0, target_courant::Float64=0.5,
-                                 equation_set::String="")
+                                 equation_set::String="",
+                                 options::AbstractDict=Dict{Symbol,Any}())
 
     if uses_pressure_reference(equation_set)
-        # SI-only mc: vertical acoustics have no Courant limit; probe the i axis.
+        # Generic multi-limit advisor for the mc sets: compute EVERY known limit
+        # for the actual configuration — resolution-agnostic, no assumption about
+        # which one binds — report the margins, and name the binding constraint.
+        #
+        #   h_acoustic  explicit horizontal acoustic Co_h = c·ts/dx_min against
+        #               the AB3 limit (advisory 0.5, hard ≈ 0.72). With
+        #               options[:horizontal_semiimplicit] the limit moves to the
+        #               measured envelope of the Phase-1 ADI sweep (clean decay
+        #               through Co_h 3; model_tests/hsi_ceiling_sweep.jl).
+        #   v_acoustic  the CONVECTIVE (state-dependent) vertical SI ceiling:
+        #               the linearization is about the resting reference, so a
+        #               local state deviation δ leaves δ·Co_z of the grid-scale
+        #               operator explicit (tc/SI_CONVECTIVE_CEILING.md). The
+        #               advisory target is 0.72/δ with δ = `state_deviation`
+        #               (default 0.25, TC deep convection; quiescent runs can
+        #               pass a smaller δ).
+        #   u_advective / w_advective  explicit AB3 advection on the minimum
+        #               spacings for the caller's expected peak winds
+        #               (`u_max`/`w_max`), advisory Courant 0.5.
         startswith(grid_params.geometry, "R") || return nothing
-        x = try
-            sp = SplineParameters(
-                xmin = grid_params.iMin, xmax = grid_params.iMax,
-                num_cells = grid_params.num_cells_i,
-                mubar = grid_params.mubar, quadrature = grid_params.quadrature,
-                BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
+        u_max = get(options, :u_max, 90.0)
+        w_max = get(options, :w_max, 25.0)
+        state_deviation = get(options, :state_deviation, 0.25)
+        hsi = get(options, :horizontal_semiimplicit, false) === true
+        mish = axis -> try
+            sp = axis == :i ?
+                SplineParameters(xmin = grid_params.iMin, xmax = grid_params.iMax,
+                                 num_cells = grid_params.num_cells_i,
+                                 mubar = grid_params.mubar, quadrature = grid_params.quadrature,
+                                 BCL = CubicBSpline.R0, BCR = CubicBSpline.R0) :
+                SplineParameters(xmin = grid_params.kMin, xmax = grid_params.kMax,
+                                 num_cells = grid_params.num_cells_k,
+                                 mubar = grid_params.mubar, quadrature = grid_params.quadrature,
+                                 BCL = CubicBSpline.R0, BCR = CubicBSpline.R0)
             Spline1D(sp).mishPoints
         catch
-            return nothing       # best-effort: never let a startup check break a run
+            nothing              # best-effort: never let a startup check break a run
         end
-
+        x = mish(:i); z = mish(:k)
+        (x === nothing || z === nothing) && return nothing
         dx_min = minimum(diff(sort(x)))
-        courant = c_nominal * ts / dx_min
-        if courant > target_courant
-            suggested = target_courant * dx_min / c_nominal
-            @warn "Timestep may be too large for the horizontal resolution " *
-                  "(iDim=$(grid_params.iDim)): estimated HORIZONTAL acoustic Courant " *
-                  "≈ $(round(courant; digits=2)) [c≈$(round(c_nominal)) m/s, " *
-                  "dx_min=$(round(dx_min; digits=2)) m, ts=$(ts) s] exceeds target " *
-                  "$(target_courant). Consider ts ≲ $(round(suggested; digits=4)) s. " *
-                  "(Advisory: vertical acoustics are semi-implicit with no Courant limit; " *
-                  "the horizontal acoustics are explicit AB3.)"
+        dz_min = minimum(diff(sort(z)))
+
+        limits = [
+            (name = "horizontal acoustic" * (hsi ? " (semi-implicit)" : " (explicit AB3)"),
+             courant = c_nominal * ts / dx_min,
+             target = hsi ? 3.0 : target_courant),
+            (name = "vertical acoustic (convective SI ceiling, δ=$(state_deviation))",
+             courant = c_nominal * ts / dz_min,
+             target = 0.72 / state_deviation),
+            (name = "u advection (u_max=$(u_max) m/s)",
+             courant = u_max * ts / dx_min, target = 0.5),
+            (name = "w advection (w_max=$(w_max) m/s)",
+             courant = w_max * ts / dz_min, target = 0.5),
+        ]
+        margins = [l.target / l.courant for l in limits]
+        binding = argmin(margins)
+        println("Timestep limits at ts=$(ts) s (dx_min=$(round(dx_min; digits=1)) m, " *
+                "dz_min=$(round(dz_min; digits=1)) m): " *
+                join(["$(l.name): Co=$(round(l.courant; digits=2))/$(round(l.target; digits=2))"
+                      for l in limits], "; ") *
+                " — binding: $(limits[binding].name) " *
+                "(margin $(round(margins[binding]; digits=2))×)")
+        if margins[binding] < 1.0
+            suggested = ts * margins[binding]
+            @warn "Timestep exceeds the $(limits[binding].name) limit: " *
+                  "Co ≈ $(round(limits[binding].courant; digits=2)) vs target " *
+                  "$(round(limits[binding].target; digits=2)). Consider " *
+                  "ts ≲ $(round(suggested; digits=4)) s."
         end
-        return courant
+        return (; limits, binding, dx_min, dz_min)
     end
 
     grid_params.geometry == "RiRk" || return nothing

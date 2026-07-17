@@ -819,7 +819,8 @@ function integrate_nested_model(nest::NestedModelParameters)
     println("Starting nested model: $n patches on worker groups $(groups)...")
     for i in 1:n
         warn_timestep_stability(models[i].grid_params, models[i].ts;
-                                equation_set=models[i].equation_set)
+                                equation_set=models[i].equation_set,
+                                options=models[i].options)
         mkpath(models[i].output_dir)
     end
 

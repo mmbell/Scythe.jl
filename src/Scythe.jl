@@ -125,7 +125,8 @@ function integrate_model(model::ModelParameters)
     # Advisory startup check (master console, before the worker stdout redirect):
     # catch a timestep that is too large for the vertical resolution (e.g. raising
     # kDim without lowering ts). Warn-only; never aborts.
-    warn_timestep_stability(model.grid_params, model.ts; equation_set=model.equation_set)
+    warn_timestep_stability(model.grid_params, model.ts; equation_set=model.equation_set,
+                            options=model.options)
 
     if !isdir(model.output_dir)
         mkdir(model.output_dir)

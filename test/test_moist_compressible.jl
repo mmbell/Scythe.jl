@@ -664,6 +664,109 @@ using Springsteel
         end
     end
 
+    @testset "SI horizontal-acoustic ceiling removed (resting XZ, RiRk)" begin
+        # Regression gate for the Phase-1 horizontal semi-implicit
+        # (options[:horizontal_semiimplicit], src/horizontal_si.jl): a broadband
+        # u+w seed on a resting base must DECAY over 300 s at a horizontal
+        # acoustic Courant of 3.0 on dx_min — 4x past the explicit AB3 limit
+        # (flag-off control blows up above Co_h ≈ 0.7; the measured flag-on
+        # envelope with the default hsi_u_history = "none" is clean decay
+        # through Co_h 3, marginal at 4.5 on the stratified base, unstable at
+        # 9 — model_tests/hsi_ceiling_sweep.jl). The vertical is 500-m cells so
+        # this is simultaneously a combined-Courant case (Co_z ≈ 3.0 x
+        # Co_h 3.0). Stratified case included per the SHB78 lesson: an
+        # isothermal base cannot see reference-state errors in the
+        # linearization coefficients.
+        for kind in (:isothermal, :stratified)
+            mktempdir() do tmpdir
+                ts = 1.0
+                co_h = 3.0
+                dx_cell = 340.0 * ts / (co_h * 0.2254)
+                vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+                scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+                side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+                wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+                gp = GridParameters(geometry = "RiRk",
+                    iMin = 0.0, iMax = 50.0 * dx_cell, num_cells_i = 50,
+                    kMin = 0.0, kMax = 25.0e3, num_cells_k = 50,
+                    BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
+                    vars = vars)
+                ref_file = joinpath(tmpdir, "hsi_ceiling.ref")
+                model = ModelParameters(
+                    ts = ts, integration_time = 300.0, output_interval = 300.0,
+                    equation_set = "moist_compressible_XZ",
+                    ref_state_file = ref_file, grid_params = gp,
+                    physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                           :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                           :tau_qss => 10.0, :alpha => 0.0,
+                                           :z_damp => 30.0e3, :f => 0.0),
+                    options = Dict(:semiimplicit => true,
+                                   :exact_reference_state => true,
+                                   :precipitation => false,
+                                   :horizontal_semiimplicit => true))
+                gp = model.grid_params
+                patch = createGrid(gp)
+                kDim = gp.kDim
+                z = Scythe.getGridpoints(patch)[1:kDim, end]
+                if kind == :isothermal
+                    T0 = 250.0
+                    p_Pa = @. 101325.0 * exp(-gravity * z / (Rd * T0))
+                else
+                    gam = (300.0 - 195.0) / 17000.0
+                    p_trop = 101325.0 * (195.0 / 300.0)^(gravity / (Rd * gam))
+                    p_Pa = [zz <= 17000.0 ?
+                            101325.0 * ((300.0 - gam * zz) / 300.0)^(gravity / (Rd * gam)) :
+                            p_trop * ((195.0 + 2.0e-3 * (zz - 17000.0)) / 195.0)^(-gravity / (Rd * 2.0e-3))
+                            for zz in z]
+                end
+                Tk = kind == :isothermal ? fill(250.0, kDim) :
+                     [zz <= 17000.0 ? 300.0 - (300.0 - 195.0) / 17000.0 * zz :
+                      195.0 + 2.0e-3 * (zz - 17000.0) for zz in z]
+                Scythe.write_exact_ref_mc(ref_file, z, p_Pa, p_Pa ./ (Rd .* Tk),
+                                          zeros(kDim), zeros(kDim))
+                patch.physical .= 0.0
+                u_i = gp.vars["u"]; w_i = gp.vars["w"]
+                npts = size(patch.physical, 1)
+                for i in 1:npts
+                    patch.physical[i, u_i, 1] = 1.0e-4 * sin(0.5 * sqrt(2.0) * i^2)
+                    patch.physical[i, w_i, 1] = 1.0e-4 * sin(0.4 * sqrt(3.0) * i^2 + 1.0)
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                haloReceiveMap = sparse(Int64[], Int64[], Float64[],
+                                        size(patch.spectral, 1),
+                                        size(patch.spectral, 2))
+                mtile = createModelTile(patch, patch, model, haloReceiveMap)
+                hsd = Scythe.create_horizontal_solve_data(patch, model,
+                    mtile.mc_ref_diag.Pxi_prof,
+                    collect(view(Springsteel.ref_rho_t(mtile.ref_state), :, 1)),
+                    collect(view(Springsteel.ref_rho_d(mtile.ref_state), :, 1)),
+                    collect(view(Springsteel.ref_total_energy(mtile.ref_state), :, 1) .+
+                            view(Springsteel.ref_pressure(mtile.ref_state), :, 1)))
+                seed = max(maximum(abs.(patch.physical[:, u_i, 1])),
+                           maximum(abs.(patch.physical[:, w_i, 1])))
+                ncols = div(npts, kDim)
+                u_incr = zeros(npts, 2)
+                for t in 1:round(Int, 300.0 / ts)
+                    if t > 1
+                        Scythe.horizontal_si_load_increment!(mtile, u_incr, t, 1)
+                    end
+                    for c in 1:ncols
+                        Scythe.advance_column(mtile, c, t)
+                    end
+                    Scythe.calcTendency(mtile)
+                    u_incr .= Scythe.horizontal_si_correct!(patch.spectral, patch,
+                                                            model, hsd, t)
+                    gridTransform!(patch)
+                end
+                @test all(isfinite.(patch.physical[:, :, 1]))
+                amp = max(maximum(abs.(patch.physical[:, u_i, 1])),
+                          maximum(abs.(patch.physical[:, w_i, 1])))
+                @test amp < seed
+            end
+        end
+    end
+
     # ──────────────────────────────────────────────
     # 6. Diffusion: theta_d, heating consistency, dissipation
     # ──────────────────────────────────────────────
