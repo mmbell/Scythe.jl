@@ -693,8 +693,14 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(Scythe.sound_speed_sq(mtile.ref_state)))))
     end
 
+    nest_label = basename(model.output_dir)
     for t = 1:num_ts
         j = isempty(parent_links) ? 1 : mod1(t, n_sub)
+
+        # Per-step progress so each nest's log tracks where it is (and where a
+        # crash occurred), mirroring the non-nested model_loop print. Each nest's
+        # stdout is redirected to its own scythe_out.log, so prefix with the label.
+        println("$(nest_label) ts $(t)/$(num_ts): $(round(t * model.ts; digits=3)) s")
 
         # New bracketing payload from each parent at cycle start
         if !isempty(parent_links) && j == 1
