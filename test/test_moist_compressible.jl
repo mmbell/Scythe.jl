@@ -746,7 +746,7 @@ using Springsteel
                 seed = max(maximum(abs.(patch.physical[:, u_i, 1])),
                            maximum(abs.(patch.physical[:, w_i, 1])))
                 ncols = div(npts, kDim)
-                u_incr = zeros(npts, 5)
+                u_incr = zeros(npts, 6)
                 for t in 1:round(Int, 300.0 / ts)
                     if t > 1
                         Scythe.horizontal_si_load_increment!(mtile, u_incr, t, 1)

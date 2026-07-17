@@ -747,7 +747,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
             view(Scythe.ref_pressure(mtile.ref_state), :, 1))))
         hsd = create_horizontal_solve_data(patch, model, Pxi_prof,
                                            rho_tprof, rho_dprof, etp_prof)
-        hsi_u_incr = SharedArray{Float64,2}((patch.params.iDim * patch.params.kDim, 5))
+        hsi_u_incr = SharedArray{Float64,2}((patch.params.iDim * patch.params.kDim, 6))
         xpatch = patch.ibasis.data[1, 1].mishPoints
         kDim = model.grid_params.kDim
         for w in workerids

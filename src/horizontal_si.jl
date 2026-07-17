@@ -278,14 +278,33 @@ function horizontal_si_correct!(spectral::AbstractMatrix{Float64}, patch::Abstra
     _hsi_add_increment!(spectral, hsd, patch, hsd.rhot_index, view(dlev, :, :, 4))
     _hsi_add_increment!(spectral, hsd, patch, hsd.et_index,   view(dlev, :, :, 5))
 
-    # The applied increments (X^{n+1} − X*)/Δτ of all five legs at the patch
-    # physical points, (i−1)·kDim + k row order, plane order (u, p, ρ_d, ρ_t,
-    # E_t) — the exact operator the sweep applied, available as the next
+    # Per-point feeds for the workers, (i−1)·kDim + k row order. Planes 1–5:
+    # the applied increments (X^{n+1} − X*)/Δτ of the (u, p, ρ_d, ρ_t, E_t)
+    # legs — the exact operator the sweep applied, available as the next
     # step's AI2* histories (see horizontal_si_load_increment! for which
-    # channels consume them under which options).
-    incr = zeros(iDim * kDim, 5)
+    # channels consume them under which options). Plane 6: the factorization
+    # cross-term field G = (1/ρ̄_t)∂z(Pξ̄ρ̄_t ∂x u^{n+1}) = −∂z(δp)/(ρ̄_t Δτ),
+    # the ONLY nonzero row of BA·X for this acoustic pair; the next step adds
+    # +ν²·G to the w predictor before the vertical solve, converting the
+    # factored composition's defect from O(ν²·X) per step to O(ν³) — the
+    # Douglas–Gunn-style consistency repair (derivation in
+    # reference/horizontal_si_phase2_findings.md, addendum). ∂z is taken
+    # through p's own column basis, the chain that produces the p_z slot.
+    incr = zeros(iDim * kDim, 6)
     @inbounds for n in 1:5, i in 1:iDim, k in 1:kDim
         incr[(i - 1) * kDim + k, n] = dlev[i, k, n] / ts_term
+    end
+    kcol = patch.kbasis.data[hsd.p_index]
+    for i in 1:iDim
+        @inbounds for k in 1:kDim
+            kcol.uMish[k] = dlev[i, k, 2]
+        end
+        SBtransform!(kcol)
+        SAtransform!(kcol)
+        SIxtransform(kcol, hsd.zwork)
+        @inbounds for k in 1:kDim
+            incr[(i - 1) * kDim + k, 6] = -hsd.zwork[k] / (hsd.rho_tbar[k] * ts_term)
+        end
     end
     return incr
 end
@@ -317,6 +336,16 @@ function horizontal_si_history!(mtile::ModelTile, colstart::Int64, colend::Int64
             nstar .+= ts .* ((0.75 .* dot_nm1) .- dot_n)
         end
         dot_nm1 .= dot_n
+    end
+    # Factorization cross-term compensation: +ν²·G on the w predictor before
+    # the vertical solve (G lagged one step through the increment feed; zero
+    # at t == 1). See horizontal_si_correct!'s plane-6 comment and the
+    # findings-note addendum for the derivation and the sign cross-check.
+    if get(mtile.model.options, :hsi_cross_comp, false) === true
+        ts_term = (t == 1) ? 0.5 * ts : 1.25 * ts
+        w_index = vars["w"]
+        view(mtile.var_np1, colstart:colend, w_index) .+=
+            (ts_term^2) .* view(mtile.hacdot_n, colstart:colend, w_index)
     end
     return nothing
 end
@@ -374,6 +403,18 @@ function horizontal_si_load_increment!(mtile::ModelTile, incr::AbstractMatrix{Fl
             copyto!(dst, view(incr, rows, plane))
             t == 2 && copyto!(view(mtile.hacdot_nm1, :, vars[var]), dst)
         end
+    end
+    # Cross-term compensation field G (plane 6), parked in hacdot_n's otherwise
+    # unused w column (the horizontal legs never touch w); consumed by
+    # horizontal_si_history! as +ν²·G on the w predictor. DEFAULT OFF: as a
+    # LAGGED EXPLICIT source the compensation is itself unstable wherever
+    # ν²|BA| ≳ 1 (grid-scale oblique modes at Co_x·Co_z ≳ 1 — NaN within
+    # 200 s on the Co_h 3 probe). The consistent repair must be the true
+    # delta-form Douglas–Gunn split, with the correction inside both implicit
+    # factors — which restructures the vertical solve (see the findings-note
+    # addendum). Lever kept for low-Courant experiments only.
+    if get(opts, :hsi_cross_comp, false) === true
+        copyto!(view(mtile.hacdot_n, :, vars["w"]), view(incr, rows, 6))
     end
     return nothing
 end

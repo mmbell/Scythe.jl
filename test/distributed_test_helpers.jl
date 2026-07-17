@@ -129,7 +129,7 @@ function run_single_process_simulation(model, initial_spectral::AbstractArray, n
     # calcTendency and the inverse transform, mirroring model_loop.
     hsi = get(model.options, :horizontal_semiimplicit, false) === true
     hsd = nothing
-    u_incr = zeros(size(patch.physical, 1), 5)
+    u_incr = zeros(size(patch.physical, 1), 6)
     if hsi
         hsd = Scythe.create_horizontal_solve_data(patch, model,
             mtile.mc_ref_diag.Pxi_prof,
