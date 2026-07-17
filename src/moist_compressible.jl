@@ -838,16 +838,23 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     if hsi
         LDIV = S.ADV                     # free between slot 6 and slot 7
         mc_linear_div!(LDIV, geom, uv, vv, r)
-        hacdot = mtile.hacdot_n
         @turbo expdot[colstart:colend,1] .+= @. Pxi_bar * rho_tbar * LDIV
         @turbo expdot[colstart:colend,2] .+= @. rho_dbar * LDIV
         @turbo expdot[colstart:colend,3] .+= @. rho_tbar * LDIV
         @turbo expdot[colstart:colend,4] .+= @. pp_x / rho_tbar
         @turbo expdot[colstart:colend,6] .+= @. (E_tbar + pbar) * LDIV
-        hacdot[colstart:colend,1] .= @. -Pxi_bar * rho_tbar * LDIV
-        hacdot[colstart:colend,2] .= @. -rho_dbar * LDIV
-        hacdot[colstart:colend,3] .= @. -rho_tbar * LDIV
-        hacdot[colstart:colend,6] .= @. -(E_tbar + pbar) * LDIV
+        # Fresh history staging only under options[:hsi_x_history] = "fresh"
+        # (the A/B alternative): the default "stored" histories are the
+        # sweep's applied increments, loaded into hacdot_n at the top of the
+        # step (horizontal_si_load_increment!) — writing here would clobber
+        # them. See the load function for the measured trade-offs.
+        if get(model.options, :hsi_x_history, "fresh") == "fresh"
+            hacdot = mtile.hacdot_n
+            hacdot[colstart:colend,1] .= @. -Pxi_bar * rho_tbar * LDIV
+            hacdot[colstart:colend,2] .= @. -rho_dbar * LDIV
+            hacdot[colstart:colend,3] .= @. -rho_tbar * LDIV
+            hacdot[colstart:colend,6] .= @. -(E_tbar + pbar) * LDIV
+        end
     end
 
     # Supersaturation density (slot 7): the saturation chain-rule terms use the

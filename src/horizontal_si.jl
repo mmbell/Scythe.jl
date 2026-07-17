@@ -278,16 +278,14 @@ function horizontal_si_correct!(spectral::AbstractMatrix{Float64}, patch::Abstra
     _hsi_add_increment!(spectral, hsd, patch, hsd.rhot_index, view(dlev, :, :, 4))
     _hsi_add_increment!(spectral, hsd, patch, hsd.et_index,   view(dlev, :, :, 5))
 
-    # The applied u increment (u^{n+1} − u*)/Δτ at the patch physical points,
-    # (i−1)·kDim + k row order — consumed as the u-leg AI2* history only under
-    # options[:hsi_u_history] = "stored" (see the A/B note in
-    # horizontal_si_load_increment!). Kept a (npts × 2) matrix; column 2 is a
-    # reserved experiment channel (a "correct the vertical w history to the
-    # final-state tendency" variant was measured WORSE than leaving the stored
-    # w history alone — e-fold 50 s vs 110 s — and removed).
-    incr = zeros(iDim * kDim, 2)
-    @inbounds for i in 1:iDim, k in 1:kDim
-        incr[(i - 1) * kDim + k, 1] = dlev[i, k, 1] / ts_term
+    # The applied increments (X^{n+1} − X*)/Δτ of all five legs at the patch
+    # physical points, (i−1)·kDim + k row order, plane order (u, p, ρ_d, ρ_t,
+    # E_t) — the exact operator the sweep applied, available as the next
+    # step's AI2* histories (see horizontal_si_load_increment! for which
+    # channels consume them under which options).
+    incr = zeros(iDim * kDim, 5)
+    @inbounds for n in 1:5, i in 1:iDim, k in 1:kDim
+        incr[(i - 1) * kDim + k, n] = dlev[i, k, n] / ts_term
     end
     return incr
 end
@@ -347,17 +345,35 @@ row in patch numbering.
 """
 function horizontal_si_load_increment!(mtile::ModelTile, incr::AbstractMatrix{Float64},
         t::Int64, rowstart::Int64)
-    # The stored u increment is consumed under "stored" (AI2* weights) and
-    # always under the AM2 scheme (whose single history level is the stored
-    # increment); "none" leaves the u leg implicit-only.
-    (get(mtile.model.options, :hsi_u_history, "none") == "stored" ||
-     get(mtile.model.options, :hsi_scheme, "ai2s") == "am2") || return nothing
-    u_index = mtile.model.grid_params.vars["u"]
+    opts = mtile.model.options
+    u_hist = get(opts, :hsi_u_history, "none")
+    x_hist = get(opts, :hsi_x_history, "fresh")
+    am2 = get(opts, :hsi_scheme, "ai2s") == "am2"
+    vars = mtile.model.grid_params.vars
     n = size(mtile.hacdot_n, 1)
-    dst = view(mtile.hacdot_n, :, u_index)
-    copyto!(dst, view(incr, rowstart:rowstart + n - 1, 1))
-    if t == 2
-        copyto!(view(mtile.hacdot_nm1, :, u_index), dst)
+    rows = rowstart:rowstart + n - 1
+    # u channel: stored applied increment under "stored" (default)/AM2; "none"
+    # leaves the u leg implicit-only (θ = 1 — measured to over-damp resolved
+    # circulations by tens of percent at Co_h 0.6 on bf02, so pair it only
+    # with configurations that tolerate the damping).
+    if u_hist == "stored" || am2
+        dst = view(mtile.hacdot_n, :, vars["u"])
+        copyto!(dst, view(incr, rows, 1))
+        t == 2 && copyto!(view(mtile.hacdot_nm1, :, vars["u"]), dst)
+    end
+    # p/ρ_d/ρ_t/E_t channels: under :hsi_x_history = "stored" (default) the
+    # histories are the sweep's APPLIED increments — the same self-consistency
+    # the vertical w leg relies on. The "fresh" alternative (staged in
+    # mc_driver! from the u_x grid slot) re-evaluates the leg through the
+    # refit chain, whose l_q-filtered difference from the applied operator is
+    # a grid-scale residual under the explicit AI2* weights (the slow
+    # oblique-mode leak measured in model_tests/hsi_growth_probe.jl).
+    if x_hist == "stored"
+        for (plane, var) in ((2, "p"), (3, "rho_d"), (4, "rho_t"), (5, "E_t"))
+            dst = view(mtile.hacdot_n, :, vars[var])
+            copyto!(dst, view(incr, rows, plane))
+            t == 2 && copyto!(view(mtile.hacdot_nm1, :, vars[var]), dst)
+        end
     end
     return nothing
 end

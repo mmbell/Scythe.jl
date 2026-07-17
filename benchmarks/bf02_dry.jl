@@ -94,6 +94,7 @@ function bf02_dry_model(opts::BenchmarkOptions)
         # Benchmark specification has no turbulence or precipitation
         options[:precipitation] = false
         options[:vertical_mixing] = false
+        options[:horizontal_semiimplicit] = opts.hsi
     end
 
     ts = vertical_ts(ts, opts)

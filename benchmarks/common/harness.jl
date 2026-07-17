@@ -28,6 +28,7 @@ struct BenchmarkOptions
     plot::Bool
     ts_factor::Float64  # RiRk timestep scale (--ts-factor, default 1.0)
     nests::Int          # --nests N: grid-nesting levels (1 = single grid, default)
+    hsi::Bool           # --hsi: horizontal semi-implicit (mc stage, RiRk grid only)
 end
 
 # Primitive-equation stage carrying the linear dry-air density rho_d' (slot 2)
@@ -74,6 +75,7 @@ function parse_benchmark_args(args::Vector{String})
     plot = false
     ts_factor = 1.0
     nests = 1
+    hsi = false
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -89,6 +91,8 @@ function parse_benchmark_args(args::Vector{String})
             ts_factor = parse(Float64, args[i+1]); i += 2
         elseif arg == "--nests"
             nests = parse(Int, args[i+1]); i += 2
+        elseif arg == "--hsi"
+            hsi = true; i += 1
         elseif arg == "--update-reference"
             update_reference = true; i += 1
         elseif arg == "--plot"
@@ -96,7 +100,7 @@ function parse_benchmark_args(args::Vector{String})
         elseif arg in ("--help", "-h")
             println("Usage: julia --project=. benchmarks/<case>.jl " *
                     "[--mode quick|full] [--stage legacy|pe|pe-rho_d] [--grid rz|rirk] " *
-                    "[--workers N] [--ts-factor F] [--nests N] [--update-reference] [--plot]")
+                    "[--workers N] [--ts-factor F] [--nests N] [--hsi] [--update-reference] [--plot]")
             exit(0)
         else
             error("Unknown argument: $arg")
@@ -109,7 +113,9 @@ function parse_benchmark_args(args::Vector{String})
     nworkers >= 1 || error("--workers must be >= 1")
     ts_factor > 0.0 || error("--ts-factor must be > 0")
     nests >= 1 || error("--nests must be >= 1")
-    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot, ts_factor, nests)
+    hsi && (stage == STAGE_MC && grid == :rirk ||
+        error("--hsi requires --stage mc --grid rirk"))
+    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot, ts_factor, nests, hsi)
 end
 
 """Geometry string for the configured vertical basis (RZ Chebyshev vs RiRk B-spline)."""
