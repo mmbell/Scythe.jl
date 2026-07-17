@@ -1,5 +1,14 @@
 # Horizontal SI, Phases 2–5: self-contained plan (delta-form Douglas–Gunn first)
 
+> **OUTCOME (2026-07-17, DG session): Phase 2-DG was executed and G1 FAILED —
+> structurally, mechanism identified and quantified (ε-chain explicit residual;
+> both factor orderings blocked). Per the stopping rule below, the next step is
+> variant 1, with two design decisions flagged for user review first. See
+> `reference/horizontal_si_phase2_findings.md` ("The Phase-2-DG round"),
+> commits da86266 (DG, preserved) and f4a6fd5 (revert to Phase 1). NOTE the
+> item-1 correction: Ikawa (1988) contains NO ADI-split SI — its E-HI-VI is a
+> full 2-D implicit solve, i.e. variant-1 precedent.**
+
 Plan handoff, 2026-07-17, for a FRESH session. Approved direction (user, 2026-07-17):
 attempt the **delta-form Douglas–Gunn (DG) split**; if it fails the measured gates,
 **scrap the ADI composition and implement variant 1** (the vertical-normal-mode exact
