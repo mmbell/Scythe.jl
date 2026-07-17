@@ -256,8 +256,15 @@ staging them strong against the weak Helmholtz reintroduces ε-growth (max|G| 1.
 at ε 0.2 — part 3(a-cautionary)). The normal-mode form 1a is rejected: the in-mode
 SHB78 residual is a benign rank-1 perturbation, but inter-mode coupling of δc²∂zz
 + the slaved legs give the measured r·Co_z ≲ 0.72, and a warm-reference constant
-Pξ̄* fails Co_z 9 by ~4.5× on the Dunion sounding — the local-profile weighted
-stiffness stays load-bearing. Proceeding to Stage 1 (opt-in `:exact_si`).
+Pξ̄* fails Co_z 9 by ~4.5× on the Dunion sounding — the local-profile operator
+stays load-bearing. Review correction (same day): the derivation's first-draft
+vertical block (the φ-solve's DPD weighted stiffness applied to p′) solved
+NEITHER elimination — off by the commutator [D,P]D ≈ (∂zPξ̄)∂z (script part 3(c):
+misses by the full commutator scale while the exact p′-elimination and the
+corrected P⁻¹-scaled weighted-MASS form `M0ᵀ(W/Pξ̄)M0 + Δτ²·plain stiffness`
+match the φ-solve to ~1e-16). The A≡0 roundoff unit test is therefore
+ISOTHERMAL-base; the p′-primary stratified vertical ceiling is a new measured
+quantity for Stage 1's sweeps. Proceeding to Stage 1 (opt-in `:exact_si`).
 
 ### Tree state after this round
 

@@ -99,9 +99,17 @@ in-mode SHB78 residual is benign rank-1, but inter-mode coupling + slaved legs
 give the measured r·Co_z ≲ 0.72; warm-reference max_z Pξ̄* fails Co_z 9 by ~4.5×).
 Sizing: b_iDim 53 × b_kDim 87, N 4611, i-fast half-bandwidth 162, LU 2.4e8 flop
 once / 4.5e6 flop-per-step / 18 MB; RLR ≤ 2.5 GB all-n per node — feasible, no 1a
-fallback. Key deviation from the handoff sketch: assemble the vertical block as
-the SELF-ADJOINT weighted stiffness ∂z(Δτ²Pξ̄∂z·) (not literal Pξ̄∂zz) so ∂xx→0
-reproduces the validated vertical solve. Six Stage-0 items below all addressed.
+fallback. Operator form (REVISED in Stage-0 review — the first draft's
+"φ-solve weighted stiffness on p′" solved neither elimination, off by the
+commutator [D,P]D ≈ (∂zPξ̄)∂z; script part 3(c) verifies): the recommendation is
+the P⁻¹-scaled weighted-MASS form `M0ᵀ(W/Pξ̄)M0 + Δτ²·plain stiffness` — the
+EXACT p′ elimination AND self-adjoint (SPD; all BCs natural, Pξ̄-free loads
++Δτ·φ* lid / +Δτ·ρ̄_t u* wall). Consequence for the Stage-1 first unit test:
+the A≡0 ≤1e-10 equivalence with the vertical solve holds on the ISOTHERMAL base
+(proportional operators + resolvent identity); on the stratified base agreement
+is truncation-level only, and the p′-primary stratified vertical ceiling is a
+NEW measured quantity (G1's Co_z 9 stratified sweep establishes it). Six
+Stage-0 items below all addressed.
 
 1. Derive the p′-form elimination for the XZ reference-linearized acoustic pair
    (u, w/φ, p′ with local Pξ̄(z), ρ̄_t(z)) into a single weak-Galerkin 2-D
@@ -150,8 +158,12 @@ reproduces the validated vertical solve. Six Stage-0 items below all addressed.
   `:exact_si` + `:horizontal_semiimplicit` ⇒ error. Flag-off must be bitwise
   (suite green unchanged) — keep every change behind the option.
 - First unit test: A≡0 recoverability — `:exact_si` with the ∂xx block disabled
-  matches the vertical-only path to ≤1e-10 on one step of the resting stratified
-  base.
+  matches the vertical-only path to ≤1e-10 on one step of the resting
+  ISOTHERMAL base. (Stage-0 review correction: on a stratified base the p′- and
+  φ-primary discretizations are different exact eliminations — agreement is
+  truncation-level, NOT roundoff; the stratified vertical check is the Co_z 9
+  sweep in G1, and the p′-primary stratified ceiling is a new measured
+  quantity. See exact_si_derivation.md §3.)
 - History A/B: start with the discipline that mirrors the vertical (stored w-leg,
   fresh others); one A/B round on the sweep if the default disappoints.
 
