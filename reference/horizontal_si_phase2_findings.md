@@ -1,7 +1,11 @@
 # Horizontal SI Phase 2 findings — the ADI cross term is not benign (decision point)
 
-Working note, 2026-07-17. Status: **Phase-1 prototype works and is committed (opt-in);
-Phase-2 measurements trip the plan's ADI-rejection metric 2 — escalation decision needed.**
+Working note, 2026-07-17. Status: **Phase-2-DG round complete (same day, second
+session): the delta-form Douglas–Gunn split was implemented, measured, and
+REJECTED — G1 fails structurally, mechanism identified and quantified (see "The
+Phase-2-DG round" at the end). The plan's stopping rule applies: proceed to
+variant 1. The tree reverts the sweep to the Phase-1 composition (opt-in,
+rejected-for-production) pending that decision.**
 Companion to the approved plan and `reference/horizontal_acoustic_si_handoff.md`.
 
 ## What was measured
@@ -127,3 +131,124 @@ worker-invariance smoke (9e-12), `--hsi` benchmark flag, A/B levers
 (`hsi_u_history="stored"`, `hsi_x_history="stored"`, `hsi_scheme="am2"`), 5-plane
 increment feed (all applied increments available to any history scheme — DG will
 want them too).
+
+## The Phase-2-DG round (2026-07-17, second session): delta form implemented, measured, rejected
+
+### Derivation-pass corrections to the plan
+
+- **Ikawa (1988, JMSJ) contains NO ADI-split semi-implicit scheme** — the plan's
+  citation was a false lead (text hits are e.g. "r**adi**ation"). Its schemes are
+  AE, E-HI-VI (a FULL 2-D implicit elliptic solve, iterated direct method — the
+  class of variant 1), and E-HE-VI (split-explicit). Useful content: the
+  Kurihara (1965)/SHB78 partially-implicit instability discussion, consistent
+  with the state-dependence lessons. The two-factor delta form stands on
+  Douglas & Gunn (1964) / Beam & Warming (1978). Caution recorded: the
+  THREE-factor delta form is known unstable for pure wave systems — future 3-D
+  compositions must stay at two factors.
+- AI2* weights verified against Durran & Blossey (2012) eq. (30): P₃ = I −
+  (5/4)LΔt etc. expand to exactly the implemented +1.25 L^{n+1} − 1.0 Lⁿ +
+  0.75 L^{n−1}.
+- Von Neumann analysis (`model_tests/hsi_dg_von_neumann.jl`, part 1), exact
+  arithmetic, AI2* weights, 2-D acoustic pair, Co ∈ [0,30]²: unsplit 1.0;
+  naive sequential 1.019 at oblique Co ≈ 0.5 (the measured leak) with 0.85
+  over-damping at Co 2 (the measured accuracy deficit); **delta-form DG 1.0 to
+  1e-8 for both u-history variants** — the premise of the round was sound.
+- Key algebraic identities found during design: (i) with Y ≡ Xⁿ + δ¹ the DG
+  z factor is the EXISTING vertical state solve applied to X* + ν·A(Xⁿ) — no
+  restructure of `semiimplicit_adjustment_p`, both vertical coefficient paths
+  covered, B-only case exact; (ii) the whole DG scheme is algebraically the
+  naive composition plus the single source +ν²(BA·Xⁿ)_w — i.e. the shelved
+  `hsi_cross_comp` lever evaluated at the CURRENT state was already the DG
+  scheme in disguise.
+
+### What was implemented and measured (all on the 120-s resting sweeps, both bases)
+
+The delta sweep (coefficient-difference δ¹ against a snapshot baseline,
+per-level Helmholtz on δ_u, write-back δ − δ¹, 5-plane operator feed) plus the
+per-column predictor addition ν·A(Xⁿ), in successive variants as instability
+drivers were identified:
+
+1. **Predictor staged through the grid-slot chain** (A_grid): growth e-fold
+   ≈ 20 s at Co_h 3, all history variants (stored/stored, stored/fresh,
+   none/fresh — history-independent).
+2. **Predictor through the sweep-chain feed** (A_sweep evaluated from the final
+   coefficients): statistically identical growth — chain-of-staging was not the
+   dominant driver.
+3. **u-row via an accumulated applied-increment recursion** (au ← au + A_u(δ)):
+   much worse (growth at Co_h 1.5). A stored-increment field used as a
+   PREDICTOR is a free integrator coupled to the state — secular growth. The
+   vertical w-leg stored increment works only because it is a HISTORY
+   (net −0.25 weight), refreshed each step from a state-form solve.
+4. **Round-tripped baseline fix** (the real first-order bug): δ¹ = Y − Xⁿ_raw
+   leaks (P − I)Xⁿ — the l_q refit residual of the CARRIED STATE, grid-scale
+   and state-amplitude — into the sweep, which the acoustic coupling re-injects
+   across variables every step. Fix: snapshot the baseline through the same
+   eval + fit round trip the state undergoes (P = fit∘eval), so
+   δ¹ = fit(step increment) exactly. This removed the violent low-Co growth
+   (Co 1.5 clean; Co 3 growth slowed to e-fold ≈ 25–40 s) — but growth at
+   Co 3–4.5 persists in every history variant.
+5. **Isolation control** (predictor additions disabled): worse (NaN at Co 3 in
+   ~90 s) — the DG structure is net stabilizing; the residual growth is the
+   imperfect recombination.
+
+### The mechanism, quantified (the structural verdict)
+
+`model_tests/hsi_dg_von_neumann.jl` part 2 adds a chain-imperfection knob: the
+sweep's weak Helmholtz symbol differs from the strong read chain by a factor
+(1 − ε) on k². Results:
+
+- **phase-1 state-form: ε-INSENSITIVE** (max|G| = 1.063 from the cross term at
+  every ε) — state-form solves absorb chain mismatch as a consistent shift of
+  the implicit operator.
+- **DG delta form: ε-fragile** — the split requires ν·A(Xⁿ) (staged outside
+  the weak solve) to recombine with the weak-solve increment term exactly; the
+  mismatch leaves ε·ν·A of the STATE-amplitude fast operator explicit.
+  Growth onset: Co ≈ 3 at ε = 0.1, Co ≈ 4.5 at ε = 0.05, Co 9 unstable even at
+  ε = 0.02. Measured onset (Co 1.5–3) ⇒ effective ε ≈ 0.1–0.2 at grid scale —
+  the expected weak-Galerkin vs strong-chain + l_q-fit symbol difference for
+  the cubic-spline basis.
+- **naive + ν²BA(Xⁿ) source** (the DG-equivalent arrangement): the source is
+  O(Co²·X) at grid scale, so its ε-fraction is explicit at ε·Co² ⇒ ceiling
+  Co ≈ √(0.7/ε) ≈ 2 — this retroactively explains why the `hsi_cross_comp`
+  lever NaN'd at Co 3 despite being (at the correct time level) algebraically
+  the DG scheme.
+- The z-factor-last ordering moves the same intrinsic split to the w row,
+  whose pointwise-staged ceiling is the MEASURED vertical Co_z ≈ 2–3 of
+  2026-07-16 — both orderings are blocked by the same wall.
+
+**Conclusion: every two-factor composition of this pair requires staging one
+weak-solve leg's linear operator at state amplitude outside its own solve, and
+the ε ≈ 0.1–0.2 chain mismatch of this discretization converts that into a
+hard Courant ceiling ≈ 0.7/(1.25ε) ≈ 3–6. G1 (stable 4.5 both bases, report
+9) needs ε ≲ 0.02–0.05: not achievable. The delta-form DG split is REJECTED —
+not by tuning, but structurally.** Per the plan's stopping rule the next step
+is variant 1 (the vertical-normal-mode exact 3-D solve) — an UNSPLIT
+state-form solve, i.e. exactly the ε-tolerant class (Ikawa's E-HI-VI is the
+literature precedent).
+
+### Variant-1 design tensions to resolve BEFORE implementing (user decisions)
+
+1. **`:state_dependent_si` is structurally incompatible with a precomputed
+   vertical-normal-mode decomposition** (state-dependent operator ⇒
+   state-dependent eigenmodes). Freezing modes at the reference reintroduces
+   the convective ceiling (tc/SI_CONVECTIVE_CEILING.md); re-eigen-solving per
+   column per step erases the cost advantage. Realistically variant 1 forces
+   the two-path structure the user was already weighing: keep the current
+   per-column vertical-only SI (with sd_si) as one path, add the full 3-D
+   normal-mode solve (reference-linearized) as the other. The maintenance
+   concern is real but the split is intrinsic, not optional.
+2. The p′-form boundary rows (inhomogeneous Neumann ∂z p′ = φ*/Δτ at the lid,
+   and the u-Dirichlet side walls) remain the budgeted "session-eating detail".
+3. The ε-analysis methodology (part 2 of the script) should be reused to check
+   variant 1's staging choices before implementation: any leg staged outside
+   the 3-D solve must be a history (small net weight), never a predictor-level
+   term.
+
+### Tree state after this round
+
+The DG implementation is preserved in the commit history (one commit, gates
+marked skipped) and then REVERTED to the Phase-1 composition (opt-in, its own
+documented limits), so the live `options[:horizontal_semiimplicit]` behavior is
+unchanged from the 2026-07-17 morning state. Kept: this note,
+`model_tests/hsi_dg_von_neumann.jl`, and the harness `--no-dg-pred` lever
+documentation in the history.

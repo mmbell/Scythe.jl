@@ -68,10 +68,18 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # (mc sets only; zero-size otherwise). Separate from `impdot_*` for the same
     # reason `diffdot_*` is: the vertical acoustic solve owns the impdot slots of
     # p/rho_d/rho_t/E_t, and the horizontal legs need their own history levels.
-    # The u column is the stored applied increment of the patch-level sweep
-    # (`horizontal_si_load_increment!`); the rest are staged fresh in `mc_driver!`.
+    # The stored-history channels are loaded from the sweep's operator feed
+    # (`horizontal_si_load_increment!`); fresh channels are staged in `mc_driver!`.
     hacdot_n::Matrix{Float64}
     hacdot_nm1::Matrix{Float64}
+    # The sweep-chain horizontal linear operator A(Xⁿ) at this tile's points
+    # (plane order u, p, ρ_d, ρ_t, E_t), loaded from the sweep's feed at the top
+    # of each step: the delta-form Douglas–Gunn predictor addition ν·A(Xⁿ) that
+    # `horizontal_si_history!` applies before the vertical solve. It MUST be the
+    # sweep's own discrete chain — a pointwise grid-slot evaluation leaves the
+    # chain difference as a once-per-step O(ν·X) forcing at grid scale (measured
+    # unstable, e-fold ~20 s at Co_h 3). Zero-size when the option is off.
+    hsi_a_n::Matrix{Float64}
     # Per-variable vertical-diffusion factorizations for the total-energy set, keyed
     # :u/:w/:heat and :u_first/:w_first/:heat_first. Empty NamedTuple for other sets.
     #
@@ -202,6 +210,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
                  (size(tile.physical,1), size(tile.physical,2)) : (0, 0)
     hacdot_n = zeros(Float64, hacdot_dim...)
     hacdot_nm1 = zeros(Float64, hacdot_dim...)
+    hsi_a_n = zeros(Float64, hacdot_dim == (0, 0) ? (0, 0) :
+                            (size(tile.physical,1), 5))
 
     # Get the local gridpoints
     tilepoints = getGridpoints(tile)
@@ -361,6 +371,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         diffdot_nm1,
         hacdot_n,
         hacdot_nm1,
+        hsi_a_n,
         mc_diffusion_matrices,
         scratch_columns,
         solve_data,
@@ -746,8 +757,9 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
             view(Scythe.ref_total_energy(mtile.ref_state), :, 1) .+
             view(Scythe.ref_pressure(mtile.ref_state), :, 1))))
         hsd = create_horizontal_solve_data(patch, model, Pxi_prof,
-                                           rho_tprof, rho_dprof, etp_prof)
-        hsi_u_incr = SharedArray{Float64,2}((patch.params.iDim * patch.params.kDim, 6))
+                                           rho_tprof, rho_dprof, etp_prof,
+                                           sharedSpectral)
+        hsi_u_incr = SharedArray{Float64,2}((patch.params.iDim * patch.params.kDim, 5))
         xpatch = patch.ibasis.data[1, 1].mishPoints
         kDim = model.grid_params.kDim
         for w in workerids
@@ -819,8 +831,8 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         put!(haloInit, haloInitBuffer)
 
         # Advance each tile (the horizontal-SI variant also hands each worker the
-        # shared applied-u-increment array and its tile's patch row window, loaded
-        # into hacdot_n at the top of the step as the u-leg AI2* history)
+        # shared applied-delta-operator array and its tile's patch row window,
+        # added to the stored-history hacdot_n channels at the top of the step)
         adv = hsd === nothing ?
             [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids] :
             [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), hsi_u_incr, hsi_rowstart))) for w in workerids]
@@ -937,9 +949,9 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     return nothing
 end
 
-# Horizontal-SI variant: load this tile's window of the previous step's applied
-# u increment (published by the patch-level sweep in `model_loop`) into the
-# hacdot_n u column before the columns advance — the u-leg AI2* history.
+# Horizontal-SI variant: add this tile's window of the previous step's applied
+# delta operator (published by the patch-level sweep in `model_loop`) to the
+# stored-history hacdot_n channels before the columns advance.
 function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64,
         hsi_u_incr::AbstractMatrix{Float64}, hsi_rowstart::Int64)
