@@ -46,6 +46,7 @@ const MC_SCRATCH_SLOTS = (
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
     :s_t, :stage_zz,                                                             # moist entropy (vertical heat)
     :imp_phi_z, :imp_c_d, :imp_c_d_z, :imp_c_e, :imp_c_e_z,           # acoustic AI2* history staging
+    :sd_pxi, :sd_alpha,                    # state-dependent acoustic linearization
     # ── Louis boundary layer + Smagorinsky closure (mc_boundary_layer.jl) ──
     :Kv, :K_smag, :VD_u, :VD_v, :VD_w, :QDOT_V, :VDOT_w, :VDOT_v,
     :bl_s_z, :bl_rv_z,
@@ -508,6 +509,16 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Horizontal acoustic semi-implicit (the patch-level ADI sweep in
     # horizontal_si.jl). Default OFF so existing configurations are bit-identical.
     hsi = get(model.options, :horizontal_semiimplicit, false)::Bool
+    # State-dependent vertical acoustic linearization: the implicit pair's
+    # coefficients (Pξ, ρ̂_t and the slaved-leg chains) come from the CURRENT
+    # column state each step instead of the resting reference, and the
+    # Helmholtz matrix is refactorized per column per step. Removes the
+    # convective (finite-amplitude) SI ceiling — the resting-reference form
+    # leaves δ·Co_z of the grid-scale acoustic operator explicit in a core
+    # whose state deviates by δ, fatal in TC deep convection at Co_z ≳ 4
+    # (tc/SI_CONVECTIVE_CEILING.md). Default OFF so existing configurations
+    # are bit-identical; the TC configs enable it. Spline (RiRk) vertical only.
+    sd_si = get(model.options, :state_dependent_si, false)::Bool
     l_inf = get(model.physical_params, :l_inf, 80.0)
     Cd_param = get(model.physical_params, :Cd, -1.0)
     sfc_wind_factor = get(model.physical_params, :sfc_wind_factor, 1.0)
@@ -615,6 +626,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     R_m = S.R_m;     @. R_m = Rd + (q_v * Rv)
     C_pt = S.C_pt;   @. C_pt = C_vt + R_m
     gamma_m = S.gamma_m; @. gamma_m = C_pt / C_vt
+    # State-dependent acoustic coefficient Pξⁿ(z) = γ_m·p/ρ_t of the CURRENT
+    # column state — used by the remainder/history staging below and by
+    # semiimplicit_adjustment_p (same thread, same column, so the scratch
+    # column persists into the adjustment call).
+    if sd_si
+        @. S.sd_pxi = gamma_m * p / rho_t
+    end
     Lv = S.Lv;           @. Lv = L_v(Tk)
     drvs_dT = S.drvs_dT; @. drvs_dT = drho_vsat_dT(Tk, p_hPa)
     drvs_dp = S.drvs_dp; @. drvs_dp = drho_vsat_dp(Tk, p_hPa)
@@ -738,19 +756,36 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # is O(perturbation). The linear part is integrated by the AI2* acoustic solve alone
     # (see semiimplicit_adjustment_p and the impdot staging block below).
     mc_advect!(ADV, geom, u, w, vv, r, pp_x, p_z, pv.f_l)
-    FORCING .= @. (-gamma_m * p * div) + (Pxi_bar * ((rho_tbar * w_z) + (rho_tbar_z * w))) +
-                  ((R_m / C_vt) * (((Lv - (Rv * C_pt * Tk / R_m)) * (Qdot + Qdot_r)) + QDOT_TH))
+    # sd_si: the added-back linear term uses the same frozen-at-n state
+    # coefficients the implicit solve applies (Pξⁿ, ρ_tⁿ and its FULL vertical
+    # gradient), so the grid-scale acoustic cancellation holds at any
+    # perturbation amplitude — the point of the state-dependent linearization.
+    if sd_si
+        FORCING .= @. (-gamma_m * p * div) + (S.sd_pxi * ((rho_t * w_z) + (rho_t_z * w))) +
+                      ((R_m / C_vt) * (((Lv - (Rv * C_pt * Tk / R_m)) * (Qdot + Qdot_r)) + QDOT_TH))
+    else
+        FORCING .= @. (-gamma_m * p * div) + (Pxi_bar * ((rho_tbar * w_z) + (rho_tbar_z * w))) +
+                      ((R_m / C_vt) * (((Lv - (Rv * C_pt * Tk / R_m)) * (Qdot + Qdot_r)) + QDOT_TH))
+    end
     @turbo expdot[colstart:colend,1] .= @. ADV + FORCING
 
     # Dry-air mass continuity (slot 2, advective product-rule form; no mass diffusion)
     mc_advect!(ADV, geom, u, w, vv, r, rho_dp_x, rho_d_z, rdv.f_l)
-    @turbo FORCING .= @. (-rho_d * div) + ((rho_dbar * w_z) + (rho_dbar_z * w))
+    if sd_si
+        @turbo FORCING .= @. (-rho_d * div) + ((rho_d * w_z) + (rho_d_z * w))
+    else
+        @turbo FORCING .= @. (-rho_d * div) + ((rho_dbar * w_z) + (rho_dbar_z * w))
+    end
     @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
 
     # Total mass continuity (slot 3): the only source is the sedimentation flux
     # divergence, identical to slot 8's so rain and total water cannot drift apart.
     mc_advect!(ADV, geom, u, w, vv, r, rho_tp_x, rho_t_z, rtv.f_l)
-    @turbo FORCING .= @. (-rho_t * div) + ((rho_tbar * w_z) + (rho_tbar_z * w)) - Fr_z
+    if sd_si
+        @turbo FORCING .= @. (-rho_t * div) + ((rho_t * w_z) + (rho_t_z * w)) - Fr_z
+    else
+        @turbo FORCING .= @. (-rho_t * div) + ((rho_tbar * w_z) + (rho_tbar_z * w)) - Fr_z
+    end
     @turbo expdot[colstart:colend,3] .= @. ADV + FORCING
 
     # u momentum (slot 4): PGF directly from the prognostic pressure
@@ -766,7 +801,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # w momentum (slot 5): perturbation PGF + total-density buoyancy loading, minus the
     # reference-linear PGF -pp_z/ρ̄_t (the acoustic remainder; see the slot-1 comment)
     mc_advect!(ADV, geom, u, w, vv, r, w_x, w_z, wv.f_l)
-    @turbo FORCING .= @. (((-gravity * rho_tp) - pp_z) / rho_t) + (pp_z / rho_tbar)
+    if sd_si
+        # With ρ̂_t = ρ_tⁿ the linear PGF −pp_z/ρ̂_t cancels the full
+        # perturbation PGF exactly: the explicit w remainder is pure buoyancy.
+        @turbo FORCING .= @. (-gravity * rho_tp) / rho_t
+    else
+        @turbo FORCING .= @. (((-gravity * rho_tp) - pp_z) / rho_t) + (pp_z / rho_tbar)
+    end
     if use_smag
         mc_w_kdiff!(KDIFF, geom, K_smag, wv, r)
     else
@@ -782,8 +823,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # x-dependence so u*p_x = u*pp_x.
     mc_advect!(ADV, geom, u, w, vv, r, E_tp_x, E_t_z, etv.f_l)
     mc_et_work!(FORCING, geom, E_t, p, div, u, pp_x, w, p_z, E_sed_z, pv, vv, r)
-    @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE +
-                                           (((E_tbar + pbar) * w_z) + ((E_tbar_z + pbar_z) * w))
+    if sd_si
+        @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE +
+                                               (((E_t + p) * w_z) + ((E_t_z + p_z) * w))
+    else
+        @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE +
+                                               (((E_tbar + pbar) * w_z) + ((E_tbar_z + pbar_z) * w))
+    end
 
     # ── AI2* acoustic history staging ──
     # The linear vertical acoustic operator, evaluated on the CURRENT state with the same
@@ -800,22 +846,38 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # to whatever touches the state between steps (implicit diffusion, nesting collar
     # injection, the spectral refit).
     w_col = scratch_column(mtile, 5)
-    w_col.uMish .= rho_tbar .* w
+    # sd_si: φⁿ = ρ_tⁿ·w and every coefficient chain from the CURRENT column
+    # state (frozen at n), matching the operator the adjustment's per-column
+    # state-dependent solve applies; else the resting-reference profiles.
+    if sd_si
+        w_col.uMish .= rho_t .* w
+    else
+        w_col.uMish .= rho_tbar .* w
+    end
     Btransform!(w_col)
     Atransform!(w_col)
     phi_n = Itransform!(w_col)
     imp_phi_z = S.imp_phi_z
     Ixtransform(w_col, imp_phi_z)
 
-    imp_c_d = S.imp_c_d;     @. imp_c_d = rho_dbar / rho_tbar
+    imp_c_d = S.imp_c_d
     imp_c_d_z = S.imp_c_d_z
-    @. imp_c_d_z = ((rho_dbar_z * rho_tbar) - (rho_dbar * rho_tbar_z)) / (rho_tbar^2)
-    imp_c_e = S.imp_c_e;     @. imp_c_e = (E_tbar + pbar) / rho_tbar
+    imp_c_e = S.imp_c_e
     imp_c_e_z = S.imp_c_e_z
-    @. imp_c_e_z = (((E_tbar_z + pbar_z) * rho_tbar) -
-                    ((E_tbar + pbar) * rho_tbar_z)) / (rho_tbar^2)
-
-    impdot[colstart:colend,1] .= @. -Pxi_bar * imp_phi_z
+    if sd_si
+        @. imp_c_d = rho_d / rho_t
+        @. imp_c_d_z = ((rho_d_z * rho_t) - (rho_d * rho_t_z)) / (rho_t^2)
+        @. imp_c_e = (E_t + p) / rho_t
+        @. imp_c_e_z = (((E_t_z + p_z) * rho_t) - ((E_t + p) * rho_t_z)) / (rho_t^2)
+        impdot[colstart:colend,1] .= @. -S.sd_pxi * imp_phi_z
+    else
+        @. imp_c_d = rho_dbar / rho_tbar
+        @. imp_c_d_z = ((rho_dbar_z * rho_tbar) - (rho_dbar * rho_tbar_z)) / (rho_tbar^2)
+        @. imp_c_e = (E_tbar + pbar) / rho_tbar
+        @. imp_c_e_z = (((E_tbar_z + pbar_z) * rho_tbar) -
+                        ((E_tbar + pbar) * rho_tbar_z)) / (rho_tbar^2)
+        impdot[colstart:colend,1] .= @. -Pxi_bar * imp_phi_z
+    end
     impdot[colstart:colend,2] .= @. -((imp_c_d * imp_phi_z) + (imp_c_d_z * phi_n))
     impdot[colstart:colend,3] .= @. -imp_phi_z
     impdot[colstart:colend,6] .= @. -((imp_c_e * imp_phi_z) + (imp_c_e_z * phi_n))
@@ -1106,6 +1168,27 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     pbar = view(ref_pressure(mtile.ref_state),:,1)
     pbar_z = view(ref_pressure(mtile.ref_state),:,2)
 
+    # State-dependent linearization (options[:state_dependent_si]): every
+    # coefficient of the implicit pair — Pξ, the mass-flux density ρ̂_t, and
+    # the slaved-leg chains — comes from the CURRENT column state (the driver's
+    # scratch, filled this column on this thread, frozen at time n), and the
+    # Helmholtz matrix is refactorized per column with that Pξ profile. The
+    # remainder/history staging in mc_driver! uses the SAME coefficients, so
+    # the operator-consistency cancellation holds at finite amplitude — the
+    # resting-reference form leaves δ·Co_z of the grid-scale operator explicit
+    # in a convective core with state deviation δ (tc/SI_CONVECTIVE_CEILING.md).
+    sd_si = get(mtile.model.options, :state_dependent_si, false)::Bool
+    if sd_si && mtile.solve_data === nothing
+        error("options[:state_dependent_si] requires the cubic B-spline (RiRk) " *
+              "vertical — the per-column profile Helmholtz is not implemented " *
+              "for the Chebyshev vertical")
+    end
+    # (Pxi_bar and S.sd_pxi are both Vector{Float64}, so this binding is
+    # type-stable; ρ̂ is branched at each use site instead — a `? S.rho_t :
+    # rho_tbar` union of Vector and SubArray boxes every broadcast it touches,
+    # which showed up as per-column allocations in the flag-OFF path.)
+    Pxi_vec = sd_si ? S.sd_pxi : Pxi_bar
+
     # Off-centered AI2* history terms (Durran & Blossey 2012). The AB3 predictor carries
     # only the acoustic REMAINDER, so the linear terms enter purely here: the explicit
     # history levels -1.0 Lⁿ + 0.75 Lⁿ⁻¹ now, the implicit +1.25 L̃ⁿ⁺¹ through the
@@ -1149,9 +1232,19 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # Elimination gives (∂z(Δτ² Pξ̄(z) ∂z ·) - I) φ (profile coefficient — the
     # weighted-stiffness Galerkin form on RiRk).
     rhs = S.si_rhs
-    @. rhs = p_nstar_z - (rho_tbar * w_nstar)
+    if sd_si
+        @. rhs = p_nstar_z - (S.rho_t * w_nstar)
+    else
+        @. rhs = p_nstar_z - (rho_tbar * w_nstar)
+    end
     phi_col = scratch_column(mtile, w_index)
-    if t == 1
+    if sd_si
+        # Per-column, per-step factorization with the state's Pξⁿ profile
+        # (w-Dirichlet rows, flags passed explicitly — no registry traffic).
+        @. S.sd_alpha = (ts_term * ts_term) * Pxi_vec
+        h_sd = _assemble_sd_helmholtz(mtile.solve_data, S.sd_alpha, true, true)
+        _vertical_solve!(phi_col, h_sd, rhs, mtile; dirichlet=(true, true))
+    elseif t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
         _vertical_solve!(phi_col, h_a, rhs, mtile)
@@ -1164,11 +1257,15 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     phi_z = S.si_phi_z
     Ixtransform(phi_col, phi_z)
 
-    # Recover w_n+1 = φ_n+1 / ρ̄_t
-    view(mtile.var_np1,colstart:colend,w_index) .= phi ./ rho_tbar
+    # Recover w_n+1 = φ_n+1 / ρ̂_t
+    if sd_si
+        view(mtile.var_np1,colstart:colend,w_index) .= phi ./ S.rho_t
+    else
+        view(mtile.var_np1,colstart:colend,w_index) .= phi ./ rho_tbar
+    end
 
-    # Recover p'_n+1 = p'* - Δτ Pxi_bar ∂z φ_n+1
-    view(mtile.var_np1,colstart:colend,p_index) .= p_nstar .- (ts_term .* Pxi_bar .* phi_z)
+    # Recover p'_n+1 = p'* - Δτ Pξ ∂z φ_n+1
+    view(mtile.var_np1,colstart:colend,p_index) .= p_nstar .- (ts_term .* Pxi_vec .* phi_z)
 
     # Slaved flux-form updates ∂z(c φ) = c φ_z + c_z φ, pointwise from the solve's
     # φ and φ_z — the exact form the AI2* history staging in mc_driver! mirrors, so
@@ -1177,16 +1274,29 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # then IDENTICAL to rho_t''s, so the two densities cannot drift apart.
     view(mtile.var_np1,colstart:colend,rhot_index) .= rhot_nstar .- (ts_term .* phi_z)
 
-    c_d = S.si_c_d;     @. c_d = rho_dbar / rho_tbar
+    c_d = S.si_c_d
     c_d_z = S.si_c_d_z
-    @. c_d_z = ((rho_dbar_z * rho_tbar) - (rho_dbar * rho_tbar_z)) / (rho_tbar^2)
+    if sd_si
+        @. c_d = S.rho_d / S.rho_t
+        @. c_d_z = ((S.rho_d_z * S.rho_t) - (S.rho_d * S.rho_t_z)) / (S.rho_t^2)
+    else
+        @. c_d = rho_dbar / rho_tbar
+        @. c_d_z = ((rho_dbar_z * rho_tbar) - (rho_dbar * rho_tbar_z)) / (rho_tbar^2)
+    end
     view(mtile.var_np1,colstart:colend,rhod_index) .=
         rhod_nstar .- (ts_term .* ((c_d .* phi_z) .+ (c_d_z .* phi)))
 
-    c_e = S.si_c_e;     @. c_e = (E_tbar + pbar) / rho_tbar
+    c_e = S.si_c_e
     c_e_z = S.si_c_e_z
-    @. c_e_z = (((E_tbar_z + pbar_z) * rho_tbar) -
-                ((E_tbar + pbar) * rho_tbar_z)) / (rho_tbar^2)
+    if sd_si
+        @. c_e = (S.E_t + S.p) / S.rho_t
+        @. c_e_z = (((S.E_t_z + S.p_z) * S.rho_t) -
+                    ((S.E_t + S.p) * S.rho_t_z)) / (S.rho_t^2)
+    else
+        @. c_e = (E_tbar + pbar) / rho_tbar
+        @. c_e_z = (((E_tbar_z + pbar_z) * rho_tbar) -
+                    ((E_tbar + pbar) * rho_tbar_z)) / (rho_tbar^2)
+    end
     view(mtile.var_np1,colstart:colend,et_index) .=
         et_nstar .- (ts_term .* ((c_e .* phi_z) .+ (c_e_z .* phi)))
 

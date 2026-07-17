@@ -21,11 +21,14 @@ using Distributed
 integration_time = isempty(ARGS) ? 3600.0 : parse(Float64, ARGS[1])
 run_tag = length(ARGS) >= 2 ? ARGS[2] : ""
 opt_overrides = Dict{Symbol,Any}()
+phys_overrides = Dict{Symbol,Float64}()
 ts_scale = 1.0
 for a in ARGS[3:end]
     k, v = split(a, "=")
     if k == "ts_scale"
         global ts_scale = parse(Float64, v)
+    elseif startswith(k, "phys.")
+        phys_overrides[Symbol(k[6:end])] = parse(Float64, v)
     else
         opt_overrides[Symbol(k)] = v == "true" ? true : v == "false" ? false :
                                    something(tryparse(Int, v), tryparse(Float64, v))
@@ -71,6 +74,9 @@ base = make_base(integration_time;
 if ts_scale != 1.0
     base = ModelParameters(; (f => f == :ts ? base.ts * ts_scale : getfield(base, f)
                               for f in fieldnames(ModelParameters))...)
+end
+if !isempty(phys_overrides)
+    merge!(base.physical_params, phys_overrides)
 end
 nest = make_nest(base)
 if ts_scale != 1.0

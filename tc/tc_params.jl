@@ -39,11 +39,15 @@ const NEST_CELLS = [50, 50, 50]
 # at [0.75, 1.5, 1.5] died in the CAPE release: the SI linearizes about the
 # RESTING reference, and in violent convective cores the state deviation δ
 # leaves δ·Co_z of the grid-scale acoustic operator effectively explicit
-# (AB3 limit 0.72) — the state-dependent/convective ceiling, diagnosed and
-# measured in tc/SI_CONVECTIVE_CEILING.md. Co_z 4.1 tolerates only δ ≈ 0.18,
-# which TC deep convection exceeds. STOPGAP until the durable fix (candidate:
-# state-dependent linearization): half the previous values — validated by the
-# full-physics restart completing the crash hour cleanly (E3 in the doc).
+# (AB3 limit 0.72) — diagnosed in tc/SI_CONVECTIVE_CEILING.md. The
+# state-dependent linearization (options[:state_dependent_si], on in
+# tc_init.jl) makes the acoustic coefficients local to the current state —
+# a correctness improvement — but did NOT rescue the [0.75, 1.5, 1.5] crash
+# (the amplifier is Courant-dependent but not the coefficient locality; see
+# the doc's experiment table — the leading remaining suspect is the
+# grid-scale fit-chain residual growing with local state sharpness, favored
+# at the axis column). Production stays at the VALIDATED half timesteps
+# (the full-physics restart completed the crash hour cleanly at these).
 const NEST_TS = [0.375, 0.75, 0.75]       # [s]; outer patch is the root
 const NEST_WORKERS = [1, 1, 1]
 # RLR requires each junction to sit a whole number of PARENT cells from the

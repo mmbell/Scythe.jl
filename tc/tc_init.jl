@@ -56,6 +56,10 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                :Ls => LS_SMAG, :K_min => K_MIN,
                                :Ck => CK, :SST => SST_K, :U_min => U_MIN),
         options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                         # State-dependent acoustic linearization: removes the
+                                         # convective SI ceiling that killed the first 6-h run
+                                         # at Co_z 4.1 (tc/SI_CONVECTIVE_CEILING.md)
+                                         :state_dependent_si => true,
                                          :exact_reference_state => true,
                                          :precipitation => true,
                                          :vertical_mixing => false,

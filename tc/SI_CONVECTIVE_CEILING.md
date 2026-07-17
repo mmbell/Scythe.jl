@@ -1,6 +1,10 @@
 # The state-dependent (convective) ceiling of the mc semi-implicit — TC crash diagnosis
 
-Working note, 2026-07-16/17. Status: **DIAGNOSED, fix decision pending user review.**
+Working note, 2026-07-16/17. Status: **MECHANISM PARTIALLY REVISED after the
+state-dependent-linearization test (see "Second round" below) — the amplifier is
+Courant-dependent but NOT the linearization-coefficient locality. Production runs
+at the validated half timesteps; the focused follow-up is an axis-column
+instability investigation.**
 Companion to `tc/SI_VERTICAL_CEILING.md` (the resting-base operator-consistency
 ceiling, FIXED) — this note documents the *next* ceiling out, found by the first
 6-h nested TC run at NEST_TS [0.75, 1.5, 1.5].
@@ -124,6 +128,55 @@ A separate, smaller item regardless of the above: **ρ_r positivity
 restoration** (a `qss_relaxation`-style term or floor-with-bookkeeping), since
 fitted-flux overshoot + AB3 can and does produce persistent negative rain at
 gust fronts even in healthy runs.
+
+## Second round (2026-07-17): the state-dependent linearization does NOT fix it
+
+Per the user's decision, `options[:state_dependent_si]` was implemented (opt-in;
+mc_driver!/semiimplicit_adjustment_p): every coefficient of the vertical implicit
+pair — Pξⁿ(z) = γ_m·p/ρ_t, ρ̂ = ρ_tⁿ, and the slaved-leg chains — comes from the
+CURRENT column state each step, with a per-column Helmholtz refactorization
+(`_assemble_sd_helmholtz`, registry-free Dirichlet flags, precomputed Mass).
+Correctness controls pass: at rest and at 1 m/s seeds the sd and reference paths
+are indistinguishable and decay at Co_z 9 on the stratified base; flag-off is
+bitwise (suite + the per-column allocation gates — note a Vector/SubArray union
+in the first version boxed the flag-off path and tripped 10 allocation ceilings;
+fixed by branching at the use sites).
+
+**Experiment table (all restarts from the same 18000-s state, "fatal" =
+NEST_TS [0.75, 1.5, 1.5]):**
+
+| run | physics | ts | sd_si | died at | where |
+|-----|---------|----|----|---------|-------|
+| ref | full    | fatal | off | +1580 s | surface dome r 9–24 km |
+| E1  | no rain | fatal | off | +511 s  | axis column z 9–10 km |
+| E2  | no rain | half  | off | +868 s  | axis column |
+| E3  | full    | half  | off | **completed 3600 s** | — |
+| sd  | full    | fatal | on  | +616 s  | axis column z 9–10 km |
+| E4  | no rain, condensation inert (τ_qss 10⁹) | fatal | off | +567 s | axis column z 9–10 km |
+
+Conclusions: the amplifier is Courant-dependent (E1 vs E2, E3), but it is NOT
+rain (E1), NOT condensation heating (E4 — effectively dry dynamics still die),
+NOT the linearization-coefficient locality (sd run), and NOT advective CFL onset
+(max|w| = 5.6 m/s, Co_w 0.075 at t = 300 in E4, 267 s before death — the state
+is quiet when growth begins). Every reduced-physics death sits on the AXIS
+column (r = 338 m, the innermost mish point) at z ≈ 9–10 km, ending in
+grid-scale-in-z flickering.
+
+**Leading remaining hypothesis:** the residual grid-scale mismatch between the
+pointwise remainder/history staging and the l_q-filtered weak Galerkin solve —
+the ~4–8% fraction that sets the resting-base ceiling at Co_z 9–18 — is not a
+constant: it grows with the local sharpness of the state (the l_q fit removes
+more where the fields are grid-scale), so a developing sharp feature lowers its
+own local ceiling until δ_fit·Co_z crosses the AB3 limit. Coefficient locality
+cannot help (the mismatch is between discrete chains, not coefficients), and the
+axis column — where axisymmetric convergence focuses the sharpest structures —
+is the natural first victim. NOTE the user's standing contingency for near-axis
+trouble (plain u,v at r → 0 vs ru,rv prognostics) may be relevant if the axis
+metric terms are implicated. Candidate probes for the follow-up session: (i) an
+axis-focused reduced test (the 18000-s axis columns transplanted to a small
+axisym domain); (ii) staging the impdot chain THROUGH the refit (candidate fix
+2 of SI_VERTICAL_CEILING.md — the delicate one it deferred); (iii) targeted
+divergence damping; (iv) the ru/rv axis contingency.
 
 ## Verification assets
 

@@ -1915,7 +1915,11 @@ function _rirk_solve_data(kcol::CubicBSpline.Spline1D)
             _, qw = CubicBSpline._quadrature_rule(sp.mubar, sp.quadrature)
             W  = repeat(qw .* sp.DX, outer = sp.num_cells)   # physical weights, length kDim
             Nb = CubicBSpline.SItransform_matrix(kcol, [sp.xmin, sp.xmax], 0)
-            (M0 = M0, M1 = M1, W = W, Nb = Nb)
+            # α-independent Galerkin mass matrix, precomputed so per-step
+            # profile-coefficient assemblies (the state-dependent semi-implicit)
+            # only rebuild the weighted stiffness.
+            Mass = M0' * (W .* M0)
+            (M0 = M0, M1 = M1, W = W, Nb = Nb, Mass = Mass)
         end
     end
 end
@@ -1934,6 +1938,24 @@ function _assemble_spline_matrix(d, α::Float64, β::Float64,
         _RIRK_DIRICHLET[objectid(F)] = (db, dt)
     end
     return F
+end
+
+"""
+    _assemble_sd_helmholtz(d, α, db, dt)
+
+Per-column, per-step Helmholtz assembly for the STATE-DEPENDENT semi-implicit:
+the operator `∂z(α(z)∂z·) − 1` in the weak Galerkin form `−M1ᵀ(W·α)M1 − Mass`
+with `α = Δτ²·Pξⁿ(z)` evaluated from the CURRENT column state, Dirichlet rows
+per `db`/`dt`. Unlike `_assemble_spline_matrix` this reuses the precomputed
+`d.Mass` and does NOT register in the `_RIRK_DIRICHLET` dict (which would take
+a global lock and grow by one entry per column per step) — callers pass the
+Dirichlet flags to `_vertical_solve!` explicitly.
+"""
+function _assemble_sd_helmholtz(d, α::AbstractVector{Float64}, db::Bool, dt::Bool)
+    A = -(d.M1' * ((d.W .* α) .* d.M1)) .- d.Mass
+    if db; A[1,   :] .= d.Nb[1, :]; end
+    if dt; A[end, :] .= d.Nb[2, :]; end
+    return factorize(A)
 end
 
 # Profile-coefficient variant, ∂_z(α(z) ∂_z ·) + β with α given at the mish points
@@ -2014,7 +2036,8 @@ given the right-hand side `rhs_mish` sampled at the `kDim` physical mish points
 are used directly; for a cubic B-spline k-basis the Galerkin load vector
 `M0ᵀW rhs_mish` is formed and the Dirichlet boundary rows (if any) are zeroed.
 """
-function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, mtile::ModelTile)
+function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, mtile::ModelTile;
+        dirichlet::Union{Nothing, NTuple{2, Bool}}=nothing)
     # Everything here is preallocated per-thread. This runs 4x per column per timestep, so the
     # old version's cost was structural, not incidental: it allocated three temporaries
     # (`d.W .* rhs_mish`, the `M0'*` product, and `h_a \ b`) and — worse — reached
@@ -2030,7 +2053,11 @@ function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, mtile::ModelTile)
         w = @inbounds view(mtile.solve_rhs, :, tid)
         w .= d.W .* rhs_mish
         mul!(b, d.M0', w)
-        db, dt = get(_RIRK_DIRICHLET, objectid(h_a), (false, false))
+        # Dirichlet flags: explicit from the caller (per-step factorizations,
+        # `_assemble_sd_helmholtz`) or from the registry keyed by the
+        # precomputed factorization object.
+        db, dt = dirichlet === nothing ?
+            get(_RIRK_DIRICHLET, objectid(h_a), (false, false)) : dirichlet
         if db; b[1]   = 0.0; end
         if dt; b[end] = 0.0; end
     else
