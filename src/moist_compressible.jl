@@ -505,6 +505,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # the momentum diffusion). Both default OFF so existing configurations are
     # bit-identical.
     louis_bl = get(model.options, :louis_bl, false)::Bool
+    # Horizontal acoustic semi-implicit (the patch-level ADI sweep in
+    # horizontal_si.jl). Default OFF so existing configurations are bit-identical.
+    hsi = get(model.options, :horizontal_semiimplicit, false)::Bool
     l_inf = get(model.physical_params, :l_inf, 80.0)
     Cd_param = get(model.physical_params, :Cd, -1.0)
     sfc_wind_factor = get(model.physical_params, :sfc_wind_factor, 1.0)
@@ -823,6 +826,30 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # weak-Galerkin elimination residual under the explicit AI2* weights (vertical
     # Courant ceiling at Co_z ≈ 2-3, measured).
 
+    # ── Horizontal acoustic remainder + AI2* history staging (horizontal SI) ──
+    # The horizontal analogue of the vertical staging above (see horizontal_si.jl):
+    # the remainder additions cancel the reference-linear horizontal legs out of
+    # the AB3 predictor, and the fresh histories are the same legs evaluated on
+    # the carried state through the grid slots (u_x IS the spline-chain derivative
+    # of the post-refit state, and the reference coefficients are z-only, so no
+    # fit and no product-rule chain is needed). u's history is NOT staged here —
+    # it is the stored applied increment of the patch-level sweep
+    # (horizontal_si_load_increment!, the w-leg discipline).
+    if hsi
+        LDIV = S.ADV                     # free between slot 6 and slot 7
+        mc_linear_div!(LDIV, geom, uv, vv, r)
+        hacdot = mtile.hacdot_n
+        @turbo expdot[colstart:colend,1] .+= @. Pxi_bar * rho_tbar * LDIV
+        @turbo expdot[colstart:colend,2] .+= @. rho_dbar * LDIV
+        @turbo expdot[colstart:colend,3] .+= @. rho_tbar * LDIV
+        @turbo expdot[colstart:colend,4] .+= @. pp_x / rho_tbar
+        @turbo expdot[colstart:colend,6] .+= @. (E_tbar + pbar) * LDIV
+        hacdot[colstart:colend,1] .= @. -Pxi_bar * rho_tbar * LDIV
+        hacdot[colstart:colend,2] .= @. -rho_dbar * LDIV
+        hacdot[colstart:colend,3] .= @. -rho_tbar * LDIV
+        hacdot[colstart:colend,6] .= @. -(E_tbar + pbar) * LDIV
+    end
+
     # Supersaturation density (slot 7): the saturation chain-rule terms use the
     # non-condensation T and p tendencies, which carry the horizontal THERMAL diffusive
     # heating as well as the divergence work (friction holds T, so it does not enter; the
@@ -932,6 +959,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
+
+    # Explicit AI2* history levels of the HORIZONTAL acoustic legs: both
+    # dimensions' history levels belong to the star state before either implicit
+    # solve (the ADI factorization applies the vertical solve below first, then
+    # the horizontal patch-level sweep after the spectral merge).
+    if hsi
+        horizontal_si_history!(mtile, colstart, colend, t)
+    end
 
     # Semi-implicit (p', ρ̄_t w) acoustic solve — unconditional: the explicit acoustic
     # mode was removed (expdot carries only the remainder; the linear vertical acoustic

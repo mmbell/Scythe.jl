@@ -125,9 +125,29 @@ function run_single_process_simulation(model, initial_spectral::AbstractArray, n
                             size(patch.spectral, 1), size(patch.spectral, 2))
     mtile = createModelTile(patch, patch, model, haloReceiveMap)
 
+    # Horizontal semi-implicit (mc sets): the patch-level sweep between
+    # calcTendency and the inverse transform, mirroring model_loop.
+    hsi = get(model.options, :horizontal_semiimplicit, false) === true
+    hsd = nothing
+    u_incr = zeros(size(patch.physical, 1), 2)
+    if hsi
+        hsd = Scythe.create_horizontal_solve_data(patch, model,
+            mtile.mc_ref_diag.Pxi_prof,
+            collect(view(Springsteel.ref_rho_t(mtile.ref_state), :, 1)),
+            collect(view(Springsteel.ref_rho_d(mtile.ref_state), :, 1)),
+            collect(view(Springsteel.ref_total_energy(mtile.ref_state), :, 1) .+
+                    view(Springsteel.ref_pressure(mtile.ref_state), :, 1)))
+    end
+
     for t in 1:num_ts
+        if hsi && t > 1
+            Scythe.horizontal_si_load_increment!(mtile, u_incr, t, 1)
+        end
         advance_tile_columns(mtile, t)
         Scythe.calcTendency(mtile)
+        if hsi
+            u_incr .= Scythe.horizontal_si_correct!(patch.spectral, patch, model, hsd, t)
+        end
         gridTransform!(mtile.tile)
     end
 
