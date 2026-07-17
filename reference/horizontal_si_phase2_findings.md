@@ -244,6 +244,21 @@ literature precedent).
    the 3-D solve must be a history (small net weight), never a predictor-level
    term.
 
+### Stage-0 follow-up (2026-07-17): variant 1 derivation done, GO
+
+`reference/exact_si_derivation.md` + `model_tests/hsi_dg_von_neumann.jl` part 3.
+The ε-analysis methodology of part 2 (tension #3 above) was reused on the unsplit
+2-D solve: it is **ε-INSENSITIVE** (flat max|G| ≤ 1.003 at every ε ∈ [0,0.2],
+Co ≤ 30²) — exactly the ε-tolerant state-form class this note predicted, and the
+opposite of the DG split (max|G| 1.10–1.54, ceiling Co 3–6). Requirement surfaced
+by the derivation: the leg recoveries must reuse the stiffness's M1 (weak/weak);
+staging them strong against the weak Helmholtz reintroduces ε-growth (max|G| 1.10
+at ε 0.2 — part 3(a-cautionary)). The normal-mode form 1a is rejected: the in-mode
+SHB78 residual is a benign rank-1 perturbation, but inter-mode coupling of δc²∂zz
++ the slaved legs give the measured r·Co_z ≲ 0.72, and a warm-reference constant
+Pξ̄* fails Co_z 9 by ~4.5× on the Dunion sounding — the local-profile weighted
+stiffness stays load-bearing. Proceeding to Stage 1 (opt-in `:exact_si`).
+
 ### Tree state after this round
 
 The DG implementation is preserved in the commit history (one commit, gates
