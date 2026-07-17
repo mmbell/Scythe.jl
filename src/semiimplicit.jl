@@ -64,6 +64,14 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # unconsumed) vertical diffusion in `impdot`.
     diffdot_n::Matrix{Float64}
     diffdot_nm1::Matrix{Float64}
+    # Horizontal-acoustic AI2* history channel for options[:horizontal_semiimplicit]
+    # (mc sets only; zero-size otherwise). Separate from `impdot_*` for the same
+    # reason `diffdot_*` is: the vertical acoustic solve owns the impdot slots of
+    # p/rho_d/rho_t/E_t, and the horizontal legs need their own history levels.
+    # The u column is the stored applied increment of the patch-level sweep
+    # (`horizontal_si_load_increment!`); the rest are staged fresh in `mc_driver!`.
+    hacdot_n::Matrix{Float64}
+    hacdot_nm1::Matrix{Float64}
     # Per-variable vertical-diffusion factorizations for the total-energy set, keyed
     # :u/:w/:heat and :u_first/:w_first/:heat_first. Empty NamedTuple for other sets.
     #
@@ -188,6 +196,12 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     diffdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     diffdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    # Horizontal-acoustic history channel, allocated only when the option is on
+    # (zero-size otherwise so the memory cost is nil for every other run).
+    hacdot_dim = get(model.options, :horizontal_semiimplicit, false) === true ?
+                 (size(tile.physical,1), size(tile.physical,2)) : (0, 0)
+    hacdot_n = zeros(Float64, hacdot_dim...)
+    hacdot_nm1 = zeros(Float64, hacdot_dim...)
 
     # Get the local gridpoints
     tilepoints = getGridpoints(tile)
@@ -345,6 +359,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         diffusion_matrix,
         diffdot_n,
         diffdot_nm1,
+        hacdot_n,
+        hacdot_nm1,
         mc_diffusion_matrices,
         scratch_columns,
         solve_data,
@@ -710,6 +726,38 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     end
     map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
 
+    # Horizontal semi-implicit sweep setup (mc sets, XZ Phase 1): build the
+    # patch-level solve data from a worker's reference profiles, the shared
+    # applied-u-increment array, and each tile's patch row window for the
+    # increment load (tile mish points are a contiguous subsequence of the
+    # patch mish points, so the window is (first_i − 1)·kDim + 1 onward).
+    hsi = get(model.options, :horizontal_semiimplicit, false) === true
+    hsd = nothing
+    hsi_u_incr = nothing
+    if hsi
+        uses_pressure_reference(model.equation_set) || error(
+            "options[:horizontal_semiimplicit] requires a moist_compressible " *
+            "(pressure-reference) equation set")
+        w1 = workerids[1]
+        Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
+        rho_tprof = get_val_from(w1, :(collect(view(Scythe.ref_rho_t(mtile.ref_state), :, 1))))
+        rho_dprof = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1))))
+        etp_prof = get_val_from(w1, :(collect(
+            view(Scythe.ref_total_energy(mtile.ref_state), :, 1) .+
+            view(Scythe.ref_pressure(mtile.ref_state), :, 1))))
+        hsd = create_horizontal_solve_data(patch, model, Pxi_prof,
+                                           rho_tprof, rho_dprof, etp_prof)
+        hsi_u_incr = SharedArray{Float64,2}((patch.params.iDim * patch.params.kDim, 2))
+        xpatch = patch.ibasis.data[1, 1].mishPoints
+        kDim = model.grid_params.kDim
+        for w in workerids
+            x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
+            i1 = argmin(abs.(xpatch .- x1))
+            save_at(w, :hsi_rowstart, (i1 - 1) * kDim + 1)
+            save_at(w, :hsi_u_incr, hsi_u_incr)
+        end
+    end
+
     # Output initial time
     patch.spectral .= sharedSpectral
     gridTransform!(patch)
@@ -720,7 +768,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
 
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
-        haloInitBuffer, haloReceiveBuffer, haloReceiveMap)
+        haloInitBuffer, haloReceiveBuffer, haloReceiveMap; hsd, hsi_u_incr)
 
     # Integration complete! Finalize the patch
     patch.spectral .= sharedSpectral
@@ -738,7 +786,8 @@ via `RemoteChannel`s, accumulates spectral contributions, and writes periodic ou
 """
 function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
         sharedSpectral::SharedArray{Float64}, haloInit::RemoteChannel, haloReceive::RemoteChannel,
-        haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveMap::SparseMatrixCSC{Float64, Int64})
+        haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveMap::SparseMatrixCSC{Float64, Int64};
+        hsd=nothing, hsi_u_incr=nothing)
 
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
@@ -769,14 +818,26 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         @turbo sharedSpectral .= 0.0
         put!(haloInit, haloInitBuffer)
 
-        # Advance each tile
-        map(wait, [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids])
+        # Advance each tile (the horizontal-SI variant also hands each worker the
+        # shared applied-u-increment array and its tile's patch row window, loaded
+        # into hacdot_n at the top of the step as the u-leg AI2* history)
+        adv = hsd === nothing ?
+            [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids] :
+            [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), hsi_u_incr, hsi_rowstart))) for w in workerids]
+        map(wait, adv)
 
         # Get halo from previous tile
         haloReceiveBuffer .= take!(haloReceive)
 
         # Add it to the sharedArray
         accumulate_at_map!(sharedSpectral, haloReceiveMap, haloReceiveBuffer)
+
+        # Horizontal semi-implicit sweep on the merged patch B coefficients —
+        # the communication is already paid; the sweep's applied u increment is
+        # published for the workers' next-step history load.
+        if hsd !== nothing
+            hsi_u_incr .= horizontal_si_correct!(sharedSpectral, patch, model, hsd, t)
+        end
 
         # Reset the shared spectral patch to the tiles
         map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
@@ -841,6 +902,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # advance_column. This runs single-threaded (before the @threads loop) so it is
     # thread-safe, and halts the run cleanly instead of segfaulting in the solver.
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
+    state_minima_trace(mtile, t)
 
     # Advance each column.
     #
@@ -873,6 +935,18 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     accumulate_at_map!(sharedSpectral, mtile.haloReceiveMap, mtile.haloReceiveBuffer)
 
     return nothing
+end
+
+# Horizontal-SI variant: load this tile's window of the previous step's applied
+# u increment (published by the patch-level sweep in `model_loop`) into the
+# hacdot_n u column before the columns advance — the u-leg AI2* history.
+function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
+        haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64,
+        hsi_u_incr::AbstractMatrix{Float64}, hsi_rowstart::Int64)
+    if t > 1
+        horizontal_si_load_increment!(mtile, hsi_u_incr, t, hsi_rowstart)
+    end
+    return advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, t)
 end
 
 """
@@ -1687,6 +1761,50 @@ function cfl_diagnostics(patch, model, t::Int64, dz_min::Float64, dx_min::Float6
         line *= ", max|u|=$(round(maxu; digits=3)) m/s, u Co=$(round(maxu * ts / dx_min; digits=3))"
     end
     println(line)
+    return nothing
+end
+
+"""
+    state_minima_trace(mtile, t)
+
+Optional per-step blow-up-precursor diagnostic for the pressure-reference (mc)
+sets, gated on `options[:state_minima_trace] = interval::Int` (0/absent = off).
+Every `interval` steps — and on ANY step where the tile minimum of the full dry
+density `ρ_d = ρ_d' + ρ̄_d(z)` drops below half its reference — print that
+minimum with its location. One cheap pass over two variables; runs
+single-threaded before the column loop, so printing is race-free. Intended for
+short diagnostic reruns chasing positive-definiteness undershoots (the
+`log`-DomainError blow-up class); leave off in production.
+"""
+function state_minima_trace(mtile::ModelTile, t::Int64)
+    interval = Int(get(mtile.model.options, :state_minima_trace, 0))
+    interval > 0 || return nothing
+    uses_pressure_reference(mtile.model.equation_set) || return nothing
+    vars = mtile.model.grid_params.vars
+    kDim = mtile.model.grid_params.kDim
+    rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
+    rd = view(mtile.tile.physical, :, vars["rho_d"], 1)
+    min_frac = Inf
+    min_i = 1
+    @inbounds for i in eachindex(rd)
+        frac = rd[i] / rho_dbar[mod1(i, kDim)] + 1.0
+        if frac < min_frac
+            min_frac = frac
+            min_i = i
+        end
+    end
+    low = min_frac < 0.5
+    if low || t % interval == 0
+        k = mod1(min_i, kDim)
+        r = mtile.tilepoints[min_i, 1]
+        z = mtile.tilepoints[min_i, end]
+        println("  rho_d trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min rho_d/ref=$(round(min_frac; digits=4)) " *
+                "(rho_d=$(round(rd[min_i] + rho_dbar[k]; sigdigits=4)), " *
+                "ref=$(round(rho_dbar[k]; sigdigits=4))) " *
+                "at r=$(round(r; digits=1)) z=$(round(z; digits=1))" *
+                (low ? "  << LOW" : ""))
+    end
     return nothing
 end
 

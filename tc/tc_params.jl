@@ -34,17 +34,17 @@ const Z_DAMP = 17.0e3        # [m] sponge onset (tropopause knot at 16.59 km)
 # Grid: 3 nests, 2:1 refinement chain (3 | 6 | 12 km), 250 m vertical to 25 km
 const NEST_BOUNDARIES = [0.0, 150.0e3, 450.0e3, 1050.0e3]
 const NEST_CELLS = [50, 50, 50]
-# Timesteps: the explicit acoustic mode was removed and the AI2* staging made
-# operator-consistent (2026-07-16, see tc/SI_VERTICAL_CEILING.md), which moved
-# the VERTICAL acoustic ceiling from Co_z ≈ 2.1-2.4 to ≈ 9-18 on the resting
-# dry stable base (Co_z 9.05 = ts 1.5 decays x200 over 600 s; ts 3.0 grows
-# slowly; dz_min = 56.35 m). The binding limits are now the explicit
-# HORIZONTAL acoustic Courant per nest (dx_min = 0.2254·DX: 676/1352/2705 m →
-# ts ≲ 1.0/2.0/4.0 s at Co_h 0.5 against the AB3 limit 0.72) and the vertical
-# ceiling for the outermost nest — so per-nest ts scaling with DX is
-# meaningful again. Chosen values keep Co_h ≤ 0.38 everywhere and cap the
-# shared vertical at the demonstrated-stable Co_z 9.
-const NEST_TS = [0.75, 1.5, 1.5]          # [s]; outer patch is the root
+# Timesteps: the resting-base vertical ceiling is Co_z ≈ 9-18 after the
+# operator-consistency fix (tc/SI_VERTICAL_CEILING.md), BUT the first 6-h run
+# at [0.75, 1.5, 1.5] died in the CAPE release: the SI linearizes about the
+# RESTING reference, and in violent convective cores the state deviation δ
+# leaves δ·Co_z of the grid-scale acoustic operator effectively explicit
+# (AB3 limit 0.72) — the state-dependent/convective ceiling, diagnosed and
+# measured in tc/SI_CONVECTIVE_CEILING.md. Co_z 4.1 tolerates only δ ≈ 0.18,
+# which TC deep convection exceeds. STOPGAP until the durable fix (candidate:
+# state-dependent linearization): half the previous values — validated by the
+# full-physics restart completing the crash hour cleanly (E3 in the doc).
+const NEST_TS = [0.375, 0.75, 0.75]       # [s]; outer patch is the root
 const NEST_WORKERS = [1, 1, 1]
 # RLR requires each junction to sit a whole number of PARENT cells from the
 # origin (global ring numbering): 450 km is not a multiple of 12 km, so the

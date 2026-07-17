@@ -18,7 +18,7 @@
 using SparseArrays
 
 export NestedModelParameters, build_nest, NestTopology, NestInterface
-export integrate_nested_model
+export integrate_nested_model, collar_cadence_check
 
 """
     NestedModelParameters
@@ -51,6 +51,49 @@ Base.@kwdef struct NestedModelParameters
     ts::Vector{Float64}
     workers_per_patch::Vector{Int}
     base::ModelParameters
+end
+
+"""
+    collar_cadence_check(nest; c_sound=340.0, u_max=90.0, verbose=true)
+
+Per-junction check that the two-way collar is wide enough for the exchange
+cadence. Fresh parent boundary data reaches a child once per PARENT step
+(the parent-payload trio is time-interpolated between parent steps), so any
+signal must not cross the collar — one parent cell per junction, the
+`build_nest` rule — within `ts_parent` or the interface itself becomes the
+stability/accuracy limit regardless of how each patch integrates its interior.
+
+Returns a `Vector` of per-junction NamedTuples with the collar width, the
+acoustic (`c_sound·ts_parent`) and advective (`u_max·ts_parent`) crossing
+distances, and their margins `collar/(distance)` (comfortable ≳ 2; < 1 means
+the signal outruns the exchange). Works for any nest configuration; `c_sound`
+and `u_max` should reflect the application (e.g. peak in-storm wind for TC).
+"""
+function collar_cadence_check(nest::NestedModelParameters;
+                              c_sound::Float64=340.0, u_max::Float64=90.0,
+                              verbose::Bool=true)
+    b, n, ts = nest.boundaries, nest.num_cells, nest.ts
+    rows = NamedTuple[]
+    for i in 1:length(n)-1                       # junction between patch i and parent i+1
+        dx_parent = (b[i+2] - b[i+1]) / n[i+1]
+        collar = dx_parent                       # one parent cell past the junction
+        dt_ex = ts[i+1]                          # exchange refresh = parent step
+        acoustic = c_sound * dt_ex
+        advective = u_max * dt_ex
+        row = (junction_km = b[i+1] / 1000.0, collar_m = collar,
+               ts_parent = dt_ex, c_dt_m = acoustic, u_dt_m = advective,
+               acoustic_margin = collar / acoustic,
+               advective_margin = collar / advective)
+        push!(rows, row)
+        if verbose
+            println("junction $(row.junction_km) km: collar $(round(collar)) m, " *
+                    "exchange every $(dt_ex) s → c·Δt $(round(acoustic)) m " *
+                    "(margin $(round(row.acoustic_margin; digits=1))×), " *
+                    "u·Δt $(round(advective)) m " *
+                    "(margin $(round(row.advective_margin; digits=1))×)")
+        end
+    end
+    return rows
 end
 
 """
@@ -135,6 +178,12 @@ function build_nest(nest::NestedModelParameters)
         "boundaries must be strictly increasing"))
     all(nest.num_cells .> 0) || throw(ArgumentError("num_cells must be positive"))
     all(nest.ts .> 0) || throw(ArgumentError("ts must be positive"))
+    # The nested loop (`run_nested_patch`) does not run the horizontal-SI patch
+    # sweep yet; letting the flag through would stage the acoustic remainder in
+    # mc_driver! with nothing integrating the linear horizontal terms.
+    get(nest.base.options, :horizontal_semiimplicit, false) === true && throw(ArgumentError(
+        "options[:horizontal_semiimplicit] is not supported in nested runs yet " *
+        "(single-patch only; nesting is a later phase of the horizontal SI plan)"))
 
     base = nest.base
     geometry = base.grid_params.geometry
@@ -508,6 +557,7 @@ function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{F
     end
 
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
+    state_minima_trace(mtile, t)
 
     if num_columns(mtile.tile) > 0
         Threads.@threads :static for c in 1:num_columns(mtile.tile)

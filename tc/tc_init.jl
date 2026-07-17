@@ -20,13 +20,15 @@ end
 function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                    output_dir=OUTPUT_DIR,
                    initial_conditions=joinpath(output_dir, "tc_ics.csv"),
-                   geometry="RiRk")
+                   geometry="RiRk",
+                   output_interval=OUTPUT_INTERVAL,
+                   extra_options=Dict{Symbol,Any}())
     axis_bc, wall_bc, bot_bc, top_bc = tc_boundary_conditions()
     mkpath(output_dir)
     return ModelParameters(
         ts = NEST_TS[end],                     # root (outer patch) timestep
         integration_time = integration_time,
-        output_interval = OUTPUT_INTERVAL,
+        output_interval = output_interval,
         restart_interval = RESTART_INTERVAL,
         equation_set = geometry == "RLR" ? "moist_compressible_RLR" :
                                            "moist_compressible_axisym",
@@ -53,13 +55,14 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                :Cd => CD, :l_inf => L_INF,
                                :Ls => LS_SMAG, :K_min => K_MIN,
                                :Ck => CK, :SST => SST_K, :U_min => U_MIN),
-        options = Dict{Symbol,Any}(:semiimplicit => true,
-                                   :exact_reference_state => true,
-                                   :precipitation => true,
-                                   :vertical_mixing => false,
-                                   :louis_bl => true,
-                                   :surface_fluxes => true,
-                                   :output_formats => output_formats))
+        options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                         :exact_reference_state => true,
+                                         :precipitation => true,
+                                         :vertical_mixing => false,
+                                         :louis_bl => true,
+                                         :surface_fluxes => true,
+                                         :output_formats => output_formats),
+                        extra_options))
 end
 
 function make_nest(base)
