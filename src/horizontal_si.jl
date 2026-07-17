@@ -1,85 +1,45 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Horizontal acoustic semi-implicit sweep for the mc (pressure-reference) sets:
-# the delta-form Douglas–Gunn (approximate-factorization) companion to the
-# per-column vertical solve in `semiimplicit_adjustment_p`.
+# Horizontal acoustic semi-implicit sweep for the mc (pressure-reference) sets.
 #
-# The reference-linear HORIZONTAL acoustic pair
+# ADI companion to the per-column vertical solve in `semiimplicit_adjustment_p`:
+# the reference-linear HORIZONTAL acoustic pair
 #
 #     ∂u/∂t  = −(1/ρ̄_t) ∂x p′,      ∂p′/∂t = −Pξ̄(z) ρ̄_t ∂x u
 #     slaved: ∂ρ_t′/∂t = −ρ̄_t ∂x u,  ∂ρ_d′/∂t = −ρ̄_d ∂x u,
 #             ∂E_t′/∂t = −(Ē_t+p̄) ∂x u
 #
-# is integrated with the same AI2* off-centering as the vertical legs
-# (ν = 1.25·ts; 0.5·ts on the AM2 first step). Writing the combined implicit
-# system for the STEP INCREMENT δ = X^{n+1} − Xⁿ,
+# is integrated with the same AI2* off-centering as the vertical legs. The
+# explicit history levels are applied per column in `mc_driver!`
+# (`horizontal_si_history!`, histories in the tile's `hacdot_*` channel — the
+# `impdot` slots are owned by the vertical solve); the implicit level is this
+# patch-level sweep, which runs on the merged patch B coefficients between
+# `accumulate_at_map!` and `splineTransform!` in `model_loop`. Eliminating
+# p′^{n+1} gives one scalar Helmholtz **in u** per physical vertical level z_k
+# (the reference coefficients are z-only, so they are constants along the solve
+# direction — the u-form mirrors the vertical φ = ρ̄_t w solve: a weak Galerkin
+# solve in u's Dirichlet side-wall basis, everything else recovered by strong
+# derivatives of the solved coefficients):
 #
-#     (I − νL) δ = R,    R = [AB3 remainder] + [AI2* explicit histories] + ν·L(Xⁿ),
+#     (I − Δτ² Pξ̄(z_k) ∂xx) u^{n+1} = u* − (Δτ/ρ̄_t(z_k)) ∂x p′*
 #
-# the two-factor delta-form split (Douglas & Gunn 1964; Beam & Warming 1978)
+#     p′^{n+1}  = p′*  − Δτ Pξ̄ ρ̄_t ∂x u^{n+1}
+#     ρ_t′^{n+1} = ρ_t′* − Δτ ρ̄_t ∂x u^{n+1}      (+ the ρ_d′/E_t′ analogues)
 #
-#     (I − νB) δ¹ = R          (z factor)
-#     (I − νA) δ  = δ¹         (x factor)
+# Operator consistency across the AI2* time levels (THE stability requirement —
+# see tc/SI_VERTICAL_CEILING.md) is by construction:
+#   • the solve reads u*, ∂x p′* through EXACTLY the model's read chain
+#     (per-z_b-block i-direction SA fit → evaluate, then per-i-point vertical
+#     SA fit → evaluate — the `gridTransform` chain), the same chain that
+#     produces the `u_x`/`pp_x` grid slots the fresh `hacdot` staging uses;
+#   • the corrections are written back as B-coefficient INCREMENTS through the
+#     model's forward chain (per-i-point vertical SB, then per-z_b-block
+#     i-direction SB — the `spectralTransform` chain), so the correction gets
+#     the same fit treatment `calcTendency` gives the state;
+#   • the u leg is recovered through the weak Galerkin solve, so its history is
+#     the STORED APPLIED INCREMENT ((u^{n+1} − u*)/Δτ, the 2026-07-16 w-leg
+#     lesson), carried back to the tiles through the `hsi_u_incr` shared array.
 #
-# has splitting defect ν²BA·δ = O(ts³) per step — 2nd-order cumulative, with the
-# correction regularized by both implicit factors. The Phase-1 SEQUENTIAL
-# composition (each factor solving for the full state) instead left the defect
-# ν²BA·X = O(ts²)/step ⇒ O(ts) cumulative on all pressure-coupled modes:
-# measured as 8–20% resolved-flow damping on the BF02 bubble plus a slow
-# non-normal leak, and confirmed by von Neumann analysis (max|G| = 1.019 at
-# oblique Co ≈ 0.5, over-damping 0.85 at Co 2). The delta form is neutrally
-# stable (max|G| = 1.0 to 1e-8) over Co_x × Co_z ∈ [0, 30]² for both u-history
-# variants — indistinguishable from the unsplit AI2* solve
-# (reference/horizontal_si_phase2_findings.md; the von Neumann script is
-# reproduced in the phase-2 commit message). NOTE: Ikawa (1988, JMSJ) was
-# checked per the house rule and contains NO ADI-split SI (its E-HI-VI is a
-# full 2-D implicit elliptic solve — the spirit of the variant-1 fallback);
-# the two-factor delta form stands on Douglas–Gunn/Beam–Warming plus the
-# direct analysis above. (Caution recorded: the THREE-factor delta form is
-# known unstable for pure wave systems — keep future 3-D compositions at two
-# factors, e.g. the per-wavenumber (r, λ) solve of the RLR phase.)
-#
-# Implementation shape (the algebra that keeps the vertical solve untouched):
-# with Y ≡ Xⁿ + δ¹, the z factor is identical to
-#
-#     (I − νB) Y = X* + ν·A(Xⁿ),
-#
-# i.e. the EXISTING vertical state solve applied to a predictor augmented by
-# the pointwise horizontal linear term — `semiimplicit_adjustment_p` is not
-# restructured at all (ν·B(Xⁿ) cancels analytically), so the B-only special
-# case recovers the vertical-only scheme exactly and BOTH vertical coefficient
-# paths (reference-profile and `:state_dependent_si`) are handled by
-# construction. The predictor addition is applied per column in
-# `horizontal_si_history!` (from the `u_x`/`pp_x`-slot staging in `mc_driver!`);
-# the x factor is this patch-level sweep, which solves for the increment: the
-# per-physical-level u-form Helmholtz
-#
-#     (I − Δτ² Pξ̄(z_k) ∂xx) δ_u = δ¹_u − (Δτ/ρ̄_t(z_k)) ∂x δ¹_p
-#
-# with δ¹ read as the COEFFICIENT DIFFERENCE between the merged post-column
-# patch state Y and the previous step's end-of-step coefficients Xⁿ (snapshot
-# kept in this struct), and the recoveries
-#
-#     δ_p  = δ¹_p  − Δτ Pξ̄ ρ̄_t ∂x δ_u      (+ the ρ_d′/ρ_t′/E_t′ analogues),
-#
-# written back as B-coefficient increments δ − δ¹ through the model's forward
-# chain. Operator consistency across the AI2* time levels (THE stability
-# requirement — see tc/SI_VERTICAL_CEILING.md) is by construction:
-#   • the sweep reads δ¹ through EXACTLY the model's read chain (per-z_b-block
-#     i-direction SA fit → evaluate, then per-i-point vertical SA fit →
-#     evaluate — the `gridTransform` chain), the same chain that produces the
-#     `u_x`/`pp_x` grid slots the pointwise staging uses;
-#   • the boundary rows are homogeneous on the increment (uⁿ and u^{n+1} both
-#     satisfy the u side-wall BCs), so the Dirichlet row treatment of the
-#     Phase-1 solve carries over unchanged;
-#   • the predictor addition AND the stored histories use the operator feed —
-#     A(X^{n+1}) evaluated by the sweep from the final coefficients through
-#     its own chain, which by linearity equals the operator the step applied
-#     (`horizontal_si_load_increment!`). One discrete chain for every
-#     appearance of A: staging the predictor addition pointwise instead
-#     leaves (A_grid − A_sweep)(Xⁿ) as a once-per-step O(ν·X) grid-scale
-#     forcing — measured unstable, e-fold ≈ 20 s at Co_h 3.
-#
-# Phase 2 scope: Cartesian XZ (`RiRk`) single patch, Dirichlet or Neumann u
+# Phase 1 scope: Cartesian XZ (`RiRk`) single patch, Dirichlet or Neumann u
 # side walls. The cylindrical geometries take the p′-form per-(level,
 # wavenumber) solves in later phases.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,9 +49,8 @@ Precomputed patch-level data for the horizontal semi-implicit sweep: i-direction
 Galerkin solve data for u's and p's side-wall bases, the per-physical-level
 Helmholtz factorizations (production `Δτ = 1.25·ts` set and the first-step
 `0.5·ts` AM2 set), the z-only reference coefficient profiles at the kDim mish
-levels, the previous step's end-of-step u/p patch B coefficients (the delta-form
-baseline Xⁿ), and preallocated level/transform work arrays. Built once by
-[`create_horizontal_solve_data`](@ref), which also takes the initial snapshot.
+levels, and preallocated level/transform work arrays. Built once by
+[`create_horizontal_solve_data`](@ref).
 """
 # Parametric so the per-level solve loop infers: `du`/`dp` are the Galerkin
 # NamedTuples, `fact*` the per-level factorization vectors — abstractly typed
@@ -107,32 +66,21 @@ struct HorizontalSolveData{DU, DP, FA, FB}
     dp::DP                  # (M0, M1, W, Nb) on p's i-basis
     dirichlet::Tuple{Bool, Bool}
     fact::FA                # per-level factorizations, Δτ = 1.25·ts
-    fact_first::FB          # per-level factorizations, Δτ = 0.5·ts (t == 1 / AM2)
+    fact_first::FB          # per-level factorizations, Δτ = 0.5·ts (t == 1)
     Pxi::Vector{Float64}    # Pξ̄(z_k), local reference sound speed squared
     rho_tbar::Vector{Float64}
     rho_dbar::Vector{Float64}
     etp_bar::Vector{Float64}    # Ē_t + p̄
-    # Delta-form baseline: previous end-of-step patch B coefficients of u and p
-    prev_u::Vector{Float64}     # (b_iDim·b_kDim)
-    prev_p::Vector{Float64}     # (b_iDim·b_kDim)
-    # u-row predictor field A_u(Xⁿ) = −(1/ρ̄_t)∂x p′ⁿ at the physical points,
-    # re-evaluated at the END of each sweep from the final p coefficients
-    # (state-anchored; an accumulated stored-increment recursion here is a free
-    # integrator coupled to the state — measured secular growth at every Co_h).
-    # Applied master-side as +ν·au in the sweep rhs (B has no u row, so the
-    # u-leg's Douglas–Gunn predictor term need not ride the tile predictors).
-    au::Matrix{Float64}         # (iDim, kDim)
-    initialized::Base.RefValue{Bool}
     # Work arrays (single-threaded master-side sweep)
-    dcoef::Vector{Float64}  # (b_iDim·b_kDim) coefficient-difference staging
-    ulev::Matrix{Float64}   # (iDim, kDim) δ¹_u at physical points
-    pxlev::Matrix{Float64}  # (iDim, kDim) ∂x δ¹_p at physical points
-    dlev::Array{Float64,3}  # (iDim, kDim, 5) write-back δ−δ¹: u, p, ρ_d, ρ_t, E_t
+    ulev::Matrix{Float64}   # (iDim, kDim) u* at physical points
+    pxlev::Matrix{Float64}  # (iDim, kDim) ∂x p′* at physical points
+    dlev::Array{Float64,3}  # (iDim, kDim, 5) corrections δu, δp, δρ_d, δρ_t, δE_t
     zbuf::Matrix{Float64}   # (iDim, b_kDim) i-evaluated vertical B coefficients
     rhs::Vector{Float64}    # (iDim)
     load::Vector{Float64}   # (b_iDim)
     acoef::Vector{Float64}  # (b_iDim)
     tempcb::Matrix{Float64} # (b_kDim, iDim) forward-transform staging
+    zwork::Vector{Float64}  # (kDim) ∂z work column for the w-history correction
 end
 
 # Correction plane order in `dlev` (and the write-back loop): the var each
@@ -140,21 +88,16 @@ end
 const _HSI_PLANES = (:u_index, :p_index, :rhod_index, :rhot_index, :et_index)
 
 """
-    create_horizontal_solve_data(patch, model, Pxi_prof, rho_tbar, rho_dbar,
-                                 etp_bar, init_spectral)
+    create_horizontal_solve_data(patch, model, Pxi_prof, rho_tbar, rho_dbar, etp_bar)
 
 Build the [`HorizontalSolveData`](@ref) for `patch`. The reference profiles are
 passed in (kDim vectors at the physical mish levels) so the caller can source
-them from a worker's `ModelTile` (`model_loop`) or a local one (tests);
-`init_spectral` is the patch B-coefficient state at t = 0 (`sharedSpectral` in
-`integrate_model`, `patch.spectral` in tests), snapshotted as the delta-form
-baseline for the first sweep. XZ (`RiRk`) only in Phase 2; the option is
-rejected for other geometries.
+them from a worker's `ModelTile` (`model_loop`) or a local one (tests). XZ
+(`RiRk`) only in Phase 1; the option is rejected for other geometries.
 """
 function create_horizontal_solve_data(patch::AbstractGrid, model::ModelParameters,
         Pxi_prof::AbstractVector{Float64}, rho_tbar::AbstractVector{Float64},
-        rho_dbar::AbstractVector{Float64}, etp_bar::AbstractVector{Float64},
-        init_spectral::AbstractMatrix{Float64})
+        rho_dbar::AbstractVector{Float64}, etp_bar::AbstractVector{Float64})
 
     model.grid_params.geometry == "RiRk" || error(
         "options[:horizontal_semiimplicit] is only implemented for the XZ RiRk " *
@@ -188,60 +131,19 @@ function create_horizontal_solve_data(patch::AbstractGrid, model::ModelParameter
     fact = build_set(1.25 * model.ts)
     fact_first = build_set(0.5 * model.ts)
 
-    hsd = HorizontalSolveData(u_index, p_index, rhod_index, rhot_index, et_index,
+    return HorizontalSolveData(u_index, p_index, rhod_index, rhot_index, et_index,
         du, dp, (_is_dirichlet(bcl), _is_dirichlet(bcr)), fact, fact_first,
         collect(Pxi_prof), collect(rho_tbar), collect(rho_dbar), collect(etp_bar),
-        zeros(b_iDim * b_kDim), zeros(b_iDim * b_kDim), zeros(iDim, kDim),
-        Ref(false), zeros(b_iDim * b_kDim),
         zeros(iDim, kDim), zeros(iDim, kDim), zeros(iDim, kDim, 5),
         zeros(iDim, b_kDim), zeros(iDim), zeros(b_iDim), zeros(b_iDim),
-        zeros(b_kDim, iDim))
-    horizontal_si_snapshot!(hsd, init_spectral, patch)
-    # Seed the u-row predictor field: A_u(X⁰) = −(1/ρ̄_t)∂x p′⁰ (identically
-    # zero at a resting start).
-    _hsi_to_levels!(hsd.pxlev, hsd, view(init_spectral, :, p_index), patch, p_index, 1)
-    for k in 1:kDim
-        @inbounds for i in 1:iDim
-            hsd.au[i, k] = -hsd.pxlev[i, k] / hsd.rho_tbar[k]
-        end
-    end
-    return hsd
+        zeros(b_kDim, iDim), zeros(kDim))
 end
 
-"""
-    horizontal_si_snapshot!(hsd, spectral, patch)
-
-Record the delta-form baseline for the next sweep: `spectral`'s u and p patch
-B-coefficient columns ROUND-TRIPPED through the model's eval + fit chain
-(`P = fit ∘ eval`, the read chain of `_hsi_to_levels!` followed by the forward
-chain of `_hsi_fit!`). The baseline must be the state AS THE NEXT STEP CARRIES
-IT — the next merged state is `Y = P(Xⁿ) + fit(increments)`, so differencing
-against the raw coefficients would leak `(P − I)Xⁿ`, the l_q refit residual of
-the carried state (grid-scale, STATE-amplitude), into the sweep, where the
-acoustic coupling re-injects it across variables every step (measured: growth
-at Co_h 1.5–3 in every history/predictor variant, 2026-07-17). With the
-round-tripped baseline, `δ¹ = Y − P(Xⁿ) = fit(increments)` exactly, and the
-refit damping of the carried state stays out of the solve — identical to its
-flag-off role. Called by [`create_horizontal_solve_data`](@ref) at t = 0 and by
-[`horizontal_si_correct!`](@ref) after each write-back.
-"""
-function horizontal_si_snapshot!(hsd::HorizontalSolveData, spectral::AbstractMatrix{Float64},
-        patch::AbstractGrid)
-    _hsi_to_levels!(hsd.ulev, hsd, view(spectral, :, hsd.u_index), patch, hsd.u_index, 0)
-    _hsi_fit!(hsd.prev_u, hsd, patch, hsd.u_index, hsd.ulev)
-    _hsi_to_levels!(hsd.ulev, hsd, view(spectral, :, hsd.p_index), patch, hsd.p_index, 0)
-    _hsi_fit!(hsd.prev_p, hsd, patch, hsd.p_index, hsd.ulev)
-    hsd.initialized[] = true
-    return nothing
-end
-
-# Read chain: a patch B-coefficient column → values (or ∂x, via `deriv`) at the
-# physical mish points, exactly mirroring `gridTransform`'s per-variable path so
-# the sweep sees the same discrete state the grid slots see. `v` selects the
-# variable's bases; `coeffs` is the (b_iDim·b_kDim) coefficient vector — the
-# merged state or the delta-form coefficient difference.
+# Read chain: patch B coefficients → values (or ∂x, via `deriv`) at the physical
+# mish points, exactly mirroring `gridTransform`'s per-variable path so the sweep
+# sees the same discrete state the grid slots see.
 function _hsi_to_levels!(out::Matrix{Float64}, hsd::HorizontalSolveData,
-        coeffs::AbstractVector{Float64}, patch::AbstractGrid, v::Int, deriv::Int)
+        spectral::AbstractMatrix{Float64}, patch::AbstractGrid, v::Int, deriv::Int)
     iDim = patch.params.iDim; kDim = patch.params.kDim
     b_iDim = patch.params.b_iDim; b_kDim = patch.params.b_kDim
     zbuf = hsd.zbuf
@@ -249,7 +151,7 @@ function _hsi_to_levels!(out::Matrix{Float64}, hsd::HorizontalSolveData,
         isp = patch.ibasis.data[z, v]
         r1 = (z - 1) * b_iDim
         @inbounds for i in 1:b_iDim
-            isp.b[i] = coeffs[r1 + i]
+            isp.b[i] = spectral[r1 + i, v]
         end
         SAtransform!(isp)
         if deriv == 0
@@ -273,40 +175,6 @@ function _hsi_to_levels!(out::Matrix{Float64}, hsd::HorizontalSolveData,
         end
     end
     return out
-end
-
-# Forward chain: a field at the physical mish points → its B-coefficient fit,
-# mirroring `spectralTransform`'s per-variable path (per-i vertical SB, then
-# per-z_b i-direction SB) — the same discrete fit `calcTendency` applies to the
-# advanced state. Writes the coefficient vector; used for the round-tripped
-# delta-form baseline (see horizontal_si_snapshot!).
-function _hsi_fit!(coeffs::AbstractVector{Float64}, hsd::HorizontalSolveData,
-        patch::AbstractGrid, v::Int, field::AbstractMatrix{Float64})
-    iDim = patch.params.iDim; kDim = patch.params.kDim
-    b_iDim = patch.params.b_iDim; b_kDim = patch.params.b_kDim
-    tempcb = hsd.tempcb
-    kcol = patch.kbasis.data[v]
-    for i in 1:iDim
-        @inbounds for z in 1:kDim
-            kcol.uMish[z] = field[i, z]
-        end
-        SBtransform!(kcol)
-        @inbounds for z in 1:b_kDim
-            tempcb[z, i] = kcol.b[z]
-        end
-    end
-    for z in 1:b_kDim
-        isp = patch.ibasis.data[z, v]
-        @inbounds for i in 1:iDim
-            isp.uMish[i] = tempcb[z, i]
-        end
-        SBtransform!(isp)
-        r1 = (z - 1) * b_iDim
-        @inbounds for i in 1:b_iDim
-            coeffs[r1 + i] = isp.b[i]
-        end
-    end
-    return coeffs
 end
 
 # Write-back chain: a correction field at the physical mish points → B-coefficient
@@ -345,77 +213,58 @@ end
 """
     horizontal_si_correct!(spectral, patch, model, hsd, t) -> incr
 
-Apply the delta-form implicit horizontal acoustic correction to the merged patch
+Apply the implicit horizontal acoustic correction to the merged patch
 B coefficients `spectral` (the `sharedSpectral` array in `model_loop`, or
-`patch.spectral` in single-process tests). Reads the z-implicit step increment
-δ¹ as the coefficient difference between `spectral` and the previous end-of-step
-snapshot, solves the per-level u-form Helmholtz for the final increment δ_u,
-updates u/p′/ρ_d′/ρ_t′/E_t′ with the B-coefficient increments δ − δ¹, and
-re-snapshots. Returns an `(npts × 5)` matrix at the patch physical points (row
-order `(i−1)·kDim + k`): the operator feed `A(X^{n+1})` per leg
-(u, p, ρ_d, ρ_t, E_t), evaluated through the sweep's own chain — distributed
-to the tiles by [`horizontal_si_load_increment!`](@ref) at the top of the next
-step as the delta-form predictor-addition field and the stored-history values.
+`patch.spectral` in single-process tests). Solves the per-level u-form
+Helmholtz and updates u/p′/ρ_d′/ρ_t′/E_t′ as B-coefficient increments. Returns
+an `(npts × 2)` matrix at the patch physical points (row order
+`(i−1)·kDim + k`): column 1 the applied u increment `(u^{n+1} − u*)/Δτ` (the
+u-leg AI2* history) and column 2 the staleness correction `−∂z δp/ρ̄_t` to the
+vertical solve's stored w-leg history — both distributed to the tiles by
+[`horizontal_si_load_increment!`](@ref) at the top of the next step.
 """
 function horizontal_si_correct!(spectral::AbstractMatrix{Float64}, patch::AbstractGrid,
         model::ModelParameters, hsd::HorizontalSolveData, t::Int64)
 
-    hsd.initialized[] || error(
-        "horizontal_si_correct! called before the delta-form baseline snapshot; " *
-        "create_horizontal_solve_data takes the initial spectral state")
     iDim = patch.params.iDim; kDim = patch.params.kDim
     # options[:hsi_scheme]: "ai2s" (default) = the off-centered AI2* weights of
     # the vertical solve; "am2" = trapezoidal (the t == 1 branch every step) on
     # the horizontal channel only — 2nd-order, single history level, neutrally
-    # stable for pure-horizontal modes (an A/B lever; the vertical channel
-    # keeps AI2* regardless).
+    # stable for pure-horizontal modes (an A/B lever for the factorization-
+    # interaction experiments; the vertical channel keeps AI2* regardless).
     am2 = get(model.options, :hsi_scheme, "ai2s") == "am2"
     ts_term = (t == 1 || am2) ? 0.5 * model.ts : 1.25 * model.ts
     facts = (t == 1 || am2) ? hsd.fact_first : hsd.fact
-    # Debug lever (see horizontal_si_history!): drop the u-row predictor term.
-    au_w = get(model.options, :hsi_dg_predictor, true) === false ? 0.0 : ts_term
 
-    # δ¹ from the coefficient differences against the previous end-of-step
-    # snapshot: the full pre-sweep step increment (explicit remainder, both
-    # dimensions' histories, the ν·A(Xⁿ) predictor addition, the vertical
-    # solve, and the refit of the carried state — everything the step did).
-    hsd.dcoef .= view(spectral, :, hsd.u_index) .- hsd.prev_u
-    _hsi_to_levels!(hsd.ulev, hsd, hsd.dcoef, patch, hsd.u_index, 0)
-    hsd.dcoef .= view(spectral, :, hsd.p_index) .- hsd.prev_p
-    _hsi_to_levels!(hsd.pxlev, hsd, hsd.dcoef, patch, hsd.p_index, 1)
+    _hsi_to_levels!(hsd.ulev, hsd, spectral, patch, hsd.u_index, 0)
+    _hsi_to_levels!(hsd.pxlev, hsd, spectral, patch, hsd.p_index, 1)
 
     du = hsd.du
     dlev = hsd.dlev
     for k in 1:kDim
-        # rhs = δ¹_u + Δτ·A_u(Xⁿ) − (Δτ/ρ̄_t) ∂x δ¹_p, Galerkin load M0ᵀW·rhs;
-        # Dirichlet rows zeroed — homogeneous on the increment (both time levels
-        # satisfy the BC). The ν·A_u(Xⁿ) predictor addition of the u row lives
-        # HERE (master-side, the state-anchored `au` field re-evaluated each
-        # sweep) — B has no u row, so it need not ride the tile predictors.
+        # rhs = u* − (Δτ/ρ̄_t) ∂x p′*, Galerkin load M0ᵀW·rhs, Dirichlet rows zeroed
         @inbounds for i in 1:iDim
-            hsd.rhs[i] = du.W[i] * (hsd.ulev[i, k] + au_w * hsd.au[i, k] -
-                                    (ts_term / hsd.rho_tbar[k]) * hsd.pxlev[i, k])
+            hsd.rhs[i] = du.W[i] * (hsd.ulev[i, k] - (ts_term / hsd.rho_tbar[k]) * hsd.pxlev[i, k])
         end
         mul!(hsd.load, du.M0', hsd.rhs)
         if hsd.dirichlet[1]; hsd.load[1] = 0.0; end
         if hsd.dirichlet[2]; hsd.load[end] = 0.0; end
         ldiv!(hsd.acoef, facts[k], hsd.load)
 
-        # Recoveries: δ_u from the solved coefficients; the p/ρ_d/ρ_t/E_t legs
-        # from the strong derivative ∂x δ_u with the z-only reference
-        # coefficients. The write-back fields are δ − δ¹ per leg.
+        # Recoveries: δu from the solved coefficients; the p/ρ_d/ρ_t/E_t legs from
+        # the strong derivative ∂x u^{n+1} with the z-only reference coefficients.
         cp = ts_term * hsd.Pxi[k] * hsd.rho_tbar[k]
         ct = ts_term * hsd.rho_tbar[k]
         cd = ts_term * hsd.rho_dbar[k]
         ce = ts_term * hsd.etp_bar[k]
         @inbounds for i in 1:iDim
-            dunew = 0.0
+            unew = 0.0
             dxu = 0.0
             for j in 1:size(du.M0, 2)
-                dunew += du.M0[i, j] * hsd.acoef[j]
+                unew += du.M0[i, j] * hsd.acoef[j]
                 dxu += du.M1[i, j] * hsd.acoef[j]
             end
-            dlev[i, k, 1] = dunew - hsd.ulev[i, k]
+            dlev[i, k, 1] = unew - hsd.ulev[i, k]
             dlev[i, k, 2] = -cp * dxu
             dlev[i, k, 3] = -cd * dxu
             dlev[i, k, 4] = -ct * dxu
@@ -429,28 +278,33 @@ function horizontal_si_correct!(spectral::AbstractMatrix{Float64}, patch::Abstra
     _hsi_add_increment!(spectral, hsd, patch, hsd.rhot_index, view(dlev, :, :, 4))
     _hsi_add_increment!(spectral, hsd, patch, hsd.et_index,   view(dlev, :, :, 5))
 
-    # New delta-form baseline: the ROUND-TRIPPED post-correction coefficients
-    # (see horizontal_si_snapshot! — the state as the next step carries it).
-    horizontal_si_snapshot!(hsd, spectral, patch)
-
-    # Operator feed for the workers, (i−1)·kDim + k row order: A(X^{n+1})
-    # evaluated through the sweep's own chain from the final coefficients —
-    # next step's predictor-addition field ν·A(Xⁿ) (planes 2–5 tile-side;
-    # plane 1's role is played by `au` master-side) and the stored-history
-    # values (all planes). The u-row field `au` is re-evaluated here from the
-    # final p coefficients (state-anchored).
-    _hsi_to_levels!(hsd.ulev, hsd, view(spectral, :, hsd.u_index), patch, hsd.u_index, 1)
-    _hsi_to_levels!(hsd.pxlev, hsd, view(spectral, :, hsd.p_index), patch, hsd.p_index, 1)
-    incr = zeros(iDim * kDim, 5)
-    @inbounds for i in 1:iDim, k in 1:kDim
-        row = (i - 1) * kDim + k
-        dxu = hsd.ulev[i, k]
-        hsd.au[i, k] = -hsd.pxlev[i, k] / hsd.rho_tbar[k]
-        incr[row, 1] = hsd.au[i, k]
-        incr[row, 2] = -hsd.Pxi[k] * hsd.rho_tbar[k] * dxu
-        incr[row, 3] = -hsd.rho_dbar[k] * dxu
-        incr[row, 4] = -hsd.rho_tbar[k] * dxu
-        incr[row, 5] = -hsd.etp_bar[k] * dxu
+    # Per-point feeds for the workers, (i−1)·kDim + k row order. Planes 1–5:
+    # the applied increments (X^{n+1} − X*)/Δτ of the (u, p, ρ_d, ρ_t, E_t)
+    # legs — the exact operator the sweep applied, available as the next
+    # step's AI2* histories (see horizontal_si_load_increment! for which
+    # channels consume them under which options). Plane 6: the factorization
+    # cross-term field G = (1/ρ̄_t)∂z(Pξ̄ρ̄_t ∂x u^{n+1}) = −∂z(δp)/(ρ̄_t Δτ),
+    # the ONLY nonzero row of BA·X for this acoustic pair; the next step adds
+    # +ν²·G to the w predictor before the vertical solve, converting the
+    # factored composition's defect from O(ν²·X) per step to O(ν³) — the
+    # Douglas–Gunn-style consistency repair (derivation in
+    # reference/horizontal_si_phase2_findings.md, addendum). ∂z is taken
+    # through p's own column basis, the chain that produces the p_z slot.
+    incr = zeros(iDim * kDim, 6)
+    @inbounds for n in 1:5, i in 1:iDim, k in 1:kDim
+        incr[(i - 1) * kDim + k, n] = dlev[i, k, n] / ts_term
+    end
+    kcol = patch.kbasis.data[hsd.p_index]
+    for i in 1:iDim
+        @inbounds for k in 1:kDim
+            kcol.uMish[k] = dlev[i, k, 2]
+        end
+        SBtransform!(kcol)
+        SAtransform!(kcol)
+        SIxtransform(kcol, hsd.zwork)
+        @inbounds for k in 1:kDim
+            incr[(i - 1) * kDim + k, 6] = -hsd.zwork[k] / (hsd.rho_tbar[k] * ts_term)
+        end
     end
     return incr
 end
@@ -458,42 +312,19 @@ end
 """
     horizontal_si_history!(mtile, colstart, colend, t)
 
-Per-column horizontal-SI star-state work between `explicit_timestep` and the
-vertical solve: apply the explicit AI2* history levels of the horizontal
-acoustic legs (`ts·(0.75·hacdot_{n−1} − hacdot_n)`; `+0.5·ts·hacdot_n` on the
-AM2 first step) and roll the history, then apply the delta-form Douglas–Gunn
-predictor addition `+ν·A(Xⁿ)` to all five legs — the term that puts the
-cross-dimension correction INSIDE the z-implicit factor, converting the
-factorization defect from O(ts²) to O(ts³) per step. The A(Xⁿ) field is the
-sweep-chain operator feed loaded into `hsi_a_n` at the top of the step; the
-pointwise grid-slot staging from `mc_driver!` is only the t == 1 fallback.
+Apply the explicit AI2* history levels of the horizontal acoustic legs to the
+predictor state (`ts·(0.75·hacdot_{n−1} − hacdot_n)`; `+0.5·ts·hacdot_n` on the
+AM2 first step) and roll the history. Called per column in `mc_driver!` after
+`explicit_timestep` and before `semiimplicit_adjustment_p`: both dimensions'
+explicit history levels belong to the star state before either implicit solve
+(the ADI factorization applies the z solve first, then the x sweep at the patch
+layer). p/ρ_d/ρ_t/E_t histories are staged fresh in `mc_driver!`; the u history
+is the stored applied increment loaded by [`horizontal_si_load_increment!`](@ref).
 """
 function horizontal_si_history!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
     vars = mtile.model.grid_params.vars
     ts = mtile.model.ts
-    opts = mtile.model.options
-    am2 = get(opts, :hsi_scheme, "ai2s") == "am2"
-    u_hist = get(opts, :hsi_u_history, "none")
-    x_hist = get(opts, :hsi_x_history, "fresh")
-    S = @inbounds mtile.mc_scratch[Threads.threadid()]
-    ts_term = (t == 1 || am2) ? 0.5 * ts : 1.25 * ts
-
-    # First-step stored-mode seeding: no sweep has run yet, so the applied
-    # operator IS the pointwise staging — write it before the application so
-    # the AM2 first step carries its explicit Lⁿ half (fresh mode staged
-    # hacdot_n in mc_driver! already).
-    if t == 1
-        if u_hist == "stored" || am2
-            view(mtile.hacdot_n, colstart:colend, vars["u"]) .= S.hsi_au
-        end
-        if x_hist == "stored"
-            view(mtile.hacdot_n, colstart:colend, vars["p"]) .= S.hsi_ap
-            view(mtile.hacdot_n, colstart:colend, vars["rho_d"]) .= S.hsi_ad
-            view(mtile.hacdot_n, colstart:colend, vars["rho_t"]) .= S.hsi_at
-            view(mtile.hacdot_n, colstart:colend, vars["E_t"]) .= S.hsi_ae
-        end
-    end
-
+    am2 = get(mtile.model.options, :hsi_scheme, "ai2s") == "am2"
     for var in ("p", "rho_d", "rho_t", "u", "E_t")
         index = vars[var]
         nstar = view(mtile.var_np1, colstart:colend, index)
@@ -506,64 +337,40 @@ function horizontal_si_history!(mtile::ModelTile, colstart::Int64, colend::Int64
         end
         dot_nm1 .= dot_n
     end
-
-    # Delta-form predictor addition ν·A(Xⁿ): the star state handed to the
-    # vertical solve becomes X* + ν·A(Xⁿ), making that solve the exact z factor
-    # (I − νB)(Xⁿ + δ¹) = X* + ν·A(Xⁿ) of the Douglas–Gunn split — no change
-    # inside semiimplicit_adjustment_p itself (ν·B(Xⁿ) cancels analytically).
-    # The A(Xⁿ) field is the SWEEP-CHAIN evaluation from the previous step's
-    # feed (hsi_a_n, loaded by horizontal_si_load_increment!) — the pointwise
-    # grid-slot staging is only the t == 1 fallback (no sweep has run yet;
-    # one AM2 half-step of chain inconsistency, transient by construction).
-    # The u row is NOT touched here: its addition is applied master-side in
-    # the sweep rhs through the stored-applied-increment field `au` (the u leg
-    # is the weak-solve leg — see the hsd.au field note).
-    # Debug lever :hsi_dg_predictor => false disables the additions to isolate
-    # the delta-sweep machinery from the predictor-addition chain.
-    get(opts, :hsi_dg_predictor, true) === false && return nothing
-    if t == 1
-        view(mtile.var_np1, colstart:colend, vars["p"]) .+= ts_term .* S.hsi_ap
-        view(mtile.var_np1, colstart:colend, vars["rho_d"]) .+= ts_term .* S.hsi_ad
-        view(mtile.var_np1, colstart:colend, vars["rho_t"]) .+= ts_term .* S.hsi_at
-        view(mtile.var_np1, colstart:colend, vars["E_t"]) .+= ts_term .* S.hsi_ae
-    else
-        view(mtile.var_np1, colstart:colend, vars["p"]) .+=
-            ts_term .* view(mtile.hsi_a_n, colstart:colend, 2)
-        view(mtile.var_np1, colstart:colend, vars["rho_d"]) .+=
-            ts_term .* view(mtile.hsi_a_n, colstart:colend, 3)
-        view(mtile.var_np1, colstart:colend, vars["rho_t"]) .+=
-            ts_term .* view(mtile.hsi_a_n, colstart:colend, 4)
-        view(mtile.var_np1, colstart:colend, vars["E_t"]) .+=
-            ts_term .* view(mtile.hsi_a_n, colstart:colend, 5)
+    # Factorization cross-term compensation: +ν²·G on the w predictor before
+    # the vertical solve (G lagged one step through the increment feed; zero
+    # at t == 1). See horizontal_si_correct!'s plane-6 comment and the
+    # findings-note addendum for the derivation and the sign cross-check.
+    if get(mtile.model.options, :hsi_cross_comp, false) === true
+        ts_term = (t == 1) ? 0.5 * ts : 1.25 * ts
+        w_index = vars["w"]
+        view(mtile.var_np1, colstart:colend, w_index) .+=
+            (ts_term^2) .* view(mtile.hacdot_n, colstart:colend, w_index)
     end
     return nothing
 end
 
 """
-    horizontal_si_load_increment!(mtile, incr, t, rowstart)
+    horizontal_si_load_increment!(mtile, u_incr, t)
 
-Load this tile's window of the sweep's operator feed `A(Xⁿ)` (from
-[`horizontal_si_correct!`](@ref) at the end of step `t−1`, row order
-`(i−1)·kDim + k`, plane order u/p/ρ_d/ρ_t/E_t):
+Distribute this tile's window of the sweep's applied u increment (from
+[`horizontal_si_correct!`](@ref), row order `(i−1)·kDim + k`, column 1) into
+the tile's `hacdot_n` u column as the u-leg AI2* history — ONLY under
+`options[:hsi_u_history] = "stored"`. The default (`"none"`) leaves the u
+history zero, integrating the u acoustic leg with its implicit level alone
+(θ = 1): parameter-free, and it damps only the horizontal acoustic modes the
+SI exists to suppress. Measured on the resting-base sweep (2026-07-17):
+"none" is neutrally stable through Co_h 9; "stored" — the exact mirror of the
+vertical w-leg discipline — carries a slow Courant-independent leak (e-fold
+≈ 90–110 s, a smooth oblique mode) from the AI2* explicit levels interacting
+with the non-commuting z/x factorization; pointwise-fresh staging blows up in
+minutes (the w-leg lesson, reconfirmed). Revisit in the Phase-2 A/B round
+(all-stored-x-channel variant) before the default is finalized.
 
-  - into `hsi_a_n` — the delta-form predictor-addition field ν·A(Xⁿ) that
-    [`horizontal_si_history!`](@ref) applies before the vertical solve, in
-    EVERY history mode;
-  - into the `hacdot_n` AI2* history channels under the stored options, where
-    it is the horizontal implicit operator the previous step actually applied
-    (the sweep-chain evaluation at the carried state — exact by linearity):
-      · `options[:hsi_u_history] = "stored"` (or the AM2 scheme): the u leg.
-        The default `"none"` leaves the u history zero — the u leg is then
-        integrated with its implicit levels alone (θ = 1 at ν):
-        parameter-free, damping only the horizontal acoustic modes the SI
-        exists to suppress.
-      · `options[:hsi_x_history] = "stored"`: the p/ρ_d/ρ_t/E_t legs. The
-        `"fresh"` default re-evaluates them each step from the `u_x` grid
-        slot in `mc_driver!`, whose chain difference from the applied
-        operator sits only under the net explicit AI2* weights (the A/B
-        lever of the Phase-2 measurement round).
-
-`rowstart` is the tile's first physical row in patch numbering.
+Called at the top of step `t` with the feed from step `t−1`; at `t == 2` (the
+first load after the AM2 start) the n−1 level is seeded too, mirroring the
+vertical w-leg's first-step seeding. `rowstart` is the tile's first physical
+row in patch numbering.
 """
 function horizontal_si_load_increment!(mtile::ModelTile, incr::AbstractMatrix{Float64},
         t::Int64, rowstart::Int64)
@@ -574,15 +381,40 @@ function horizontal_si_load_increment!(mtile::ModelTile, incr::AbstractMatrix{Fl
     vars = mtile.model.grid_params.vars
     n = size(mtile.hacdot_n, 1)
     rows = rowstart:rowstart + n - 1
-    mtile.hsi_a_n .= view(incr, rows, :)
+    # u channel: stored applied increment under "stored" (default)/AM2; "none"
+    # leaves the u leg implicit-only (θ = 1 — measured to over-damp resolved
+    # circulations by tens of percent at Co_h 0.6 on bf02, so pair it only
+    # with configurations that tolerate the damping).
     if u_hist == "stored" || am2
-        copyto!(view(mtile.hacdot_n, :, vars["u"]), view(incr, rows, 1))
+        dst = view(mtile.hacdot_n, :, vars["u"])
+        copyto!(dst, view(incr, rows, 1))
+        t == 2 && copyto!(view(mtile.hacdot_nm1, :, vars["u"]), dst)
     end
+    # p/ρ_d/ρ_t/E_t channels: under :hsi_x_history = "stored" (default) the
+    # histories are the sweep's APPLIED increments — the same self-consistency
+    # the vertical w leg relies on. The "fresh" alternative (staged in
+    # mc_driver! from the u_x grid slot) re-evaluates the leg through the
+    # refit chain, whose l_q-filtered difference from the applied operator is
+    # a grid-scale residual under the explicit AI2* weights (the slow
+    # oblique-mode leak measured in model_tests/hsi_growth_probe.jl).
     if x_hist == "stored"
-        copyto!(view(mtile.hacdot_n, :, vars["p"]), view(incr, rows, 2))
-        copyto!(view(mtile.hacdot_n, :, vars["rho_d"]), view(incr, rows, 3))
-        copyto!(view(mtile.hacdot_n, :, vars["rho_t"]), view(incr, rows, 4))
-        copyto!(view(mtile.hacdot_n, :, vars["E_t"]), view(incr, rows, 5))
+        for (plane, var) in ((2, "p"), (3, "rho_d"), (4, "rho_t"), (5, "E_t"))
+            dst = view(mtile.hacdot_n, :, vars[var])
+            copyto!(dst, view(incr, rows, plane))
+            t == 2 && copyto!(view(mtile.hacdot_nm1, :, vars[var]), dst)
+        end
+    end
+    # Cross-term compensation field G (plane 6), parked in hacdot_n's otherwise
+    # unused w column (the horizontal legs never touch w); consumed by
+    # horizontal_si_history! as +ν²·G on the w predictor. DEFAULT OFF: as a
+    # LAGGED EXPLICIT source the compensation is itself unstable wherever
+    # ν²|BA| ≳ 1 (grid-scale oblique modes at Co_x·Co_z ≳ 1 — NaN within
+    # 200 s on the Co_h 3 probe). The consistent repair must be the true
+    # delta-form Douglas–Gunn split, with the correction inside both implicit
+    # factors — which restructures the vertical solve (see the findings-note
+    # addendum). Lever kept for low-Courant experiments only.
+    if get(opts, :hsi_cross_comp, false) === true
+        copyto!(view(mtile.hacdot_n, :, vars["w"]), view(incr, rows, 6))
     end
     return nothing
 end

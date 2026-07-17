@@ -47,10 +47,6 @@ const MC_SCRATCH_SLOTS = (
     :s_t, :stage_zz,                                                             # moist entropy (vertical heat)
     :imp_phi_z, :imp_c_d, :imp_c_d_z, :imp_c_e, :imp_c_e_z,           # acoustic AI2* history staging
     :sd_pxi, :sd_alpha,                    # state-dependent acoustic linearization
-    # Horizontal SI: pointwise reference-linear operator A(Xⁿ) rows (u, p, ρ_d,
-    # ρ_t, E_t), staged in the hsi block and consumed after explicit_timestep by
-    # horizontal_si_history! (delta-form predictor addition + history baselines)
-    :hsi_au, :hsi_ap, :hsi_ad, :hsi_at, :hsi_ae,
     # ── Louis boundary layer + Smagorinsky closure (mc_boundary_layer.jl) ──
     :Kv, :K_smag, :VD_u, :VD_v, :VD_w, :QDOT_V, :VDOT_w, :VDOT_v,
     :bl_s_z, :bl_rv_z,
@@ -892,44 +888,34 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # weak-Galerkin elimination residual under the explicit AI2* weights (vertical
     # Courant ceiling at Co_z ≈ 2-3, measured).
 
-    # ── Horizontal acoustic remainder + pointwise-operator staging (horizontal SI) ──
+    # ── Horizontal acoustic remainder + AI2* history staging (horizontal SI) ──
     # The horizontal analogue of the vertical staging above (see horizontal_si.jl):
-    # the pointwise reference-linear operator A(Xⁿ) is evaluated once into the
-    # hsi_a* scratch rows from the grid slots (u_x IS the spline-chain derivative
+    # the remainder additions cancel the reference-linear horizontal legs out of
+    # the AB3 predictor, and the fresh histories are the same legs evaluated on
+    # the carried state through the grid slots (u_x IS the spline-chain derivative
     # of the post-refit state, and the reference coefficients are z-only, so no
-    # fit and no product-rule chain is needed) and consumed three ways:
-    #   • the remainder additions below (−A rows) cancel the reference-linear
-    #     horizontal legs out of the AB3 predictor;
-    #   • horizontal_si_history! applies the delta-form Douglas–Gunn predictor
-    #     addition +ν·A(Xⁿ) to the star state after explicit_timestep — the
-    #     term that makes the vertical solve the exact z factor of the split;
-    #   • the AI2* histories: fresh x-channels copy the rows here; the stored
-    #     channels get the same rows as post-roll baselines in
-    #     horizontal_si_history!, completed by the sweep's delta feed at the
-    #     top of the next step (horizontal_si_load_increment!).
+    # fit and no product-rule chain is needed). u's history is NOT staged here —
+    # it is the stored applied increment of the patch-level sweep
+    # (horizontal_si_load_increment!, the w-leg discipline).
     if hsi
         LDIV = S.ADV                     # free between slot 6 and slot 7
         mc_linear_div!(LDIV, geom, uv, vv, r)
-        @. S.hsi_au = -pp_x / rho_tbar
-        @. S.hsi_ap = -Pxi_bar * rho_tbar * LDIV
-        @. S.hsi_ad = -rho_dbar * LDIV
-        @. S.hsi_at = -rho_tbar * LDIV
-        @. S.hsi_ae = -(E_tbar + pbar) * LDIV
-        @turbo expdot[colstart:colend,1] .-= S.hsi_ap
-        @turbo expdot[colstart:colend,2] .-= S.hsi_ad
-        @turbo expdot[colstart:colend,3] .-= S.hsi_at
-        @turbo expdot[colstart:colend,4] .-= S.hsi_au
-        @turbo expdot[colstart:colend,6] .-= S.hsi_ae
+        @turbo expdot[colstart:colend,1] .+= @. Pxi_bar * rho_tbar * LDIV
+        @turbo expdot[colstart:colend,2] .+= @. rho_dbar * LDIV
+        @turbo expdot[colstart:colend,3] .+= @. rho_tbar * LDIV
+        @turbo expdot[colstart:colend,4] .+= @. pp_x / rho_tbar
+        @turbo expdot[colstart:colend,6] .+= @. (E_tbar + pbar) * LDIV
         # Fresh history staging only under options[:hsi_x_history] = "fresh"
-        # (the default): under "stored" the hacdot_n channels hold the applied
-        # operator (baseline + sweep feed) loaded at the top of the step —
-        # writing here would clobber them.
+        # (the A/B alternative): the default "stored" histories are the
+        # sweep's applied increments, loaded into hacdot_n at the top of the
+        # step (horizontal_si_load_increment!) — writing here would clobber
+        # them. See the load function for the measured trade-offs.
         if get(model.options, :hsi_x_history, "fresh") == "fresh"
             hacdot = mtile.hacdot_n
-            hacdot[colstart:colend,1] .= S.hsi_ap
-            hacdot[colstart:colend,2] .= S.hsi_ad
-            hacdot[colstart:colend,3] .= S.hsi_at
-            hacdot[colstart:colend,6] .= S.hsi_ae
+            hacdot[colstart:colend,1] .= @. -Pxi_bar * rho_tbar * LDIV
+            hacdot[colstart:colend,2] .= @. -rho_dbar * LDIV
+            hacdot[colstart:colend,3] .= @. -rho_tbar * LDIV
+            hacdot[colstart:colend,6] .= @. -(E_tbar + pbar) * LDIV
         end
     end
 
