@@ -107,7 +107,8 @@ function bf02_moist_model(opts::BenchmarkOptions)
                                :alpha => 0.0, :z_damp => 20.0e3)
         options = Dict(:semiimplicit => true, :exact_reference_state => true,
                        :precipitation => false, :vertical_mixing => false,
-                       :horizontal_semiimplicit => opts.hsi)
+                       :horizontal_semiimplicit => opts.hsi,
+                       :exact_si => opts.xsi)
     else
         equation_set = "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,

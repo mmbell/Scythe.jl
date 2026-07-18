@@ -45,8 +45,11 @@
 #
 # Options:
 #   :exact_si          — master switch (opt-in; RiRk XZ only in Stage 1)
-#   :xsi_u_history     — "none" (default; the u leg is implicit-only, θ = 1)
-#                        or "stored" (the applied increment δu/Δτ — A/B lever)
+#   :xsi_u_history     — "stored" (default; the u-leg AI2* history is the
+#                        applied increment δu/Δτ — full 2nd-order, the
+#                        ε-insensitive fresh-history composition of VN 3(a)) or
+#                        "none" (implicit-only, θ = 1: stable but leaves an ~11%
+#                        max|u| bias on the BF02 bubble — the rejected A/B arm)
 #   :xsi_lid_rows      — "strong" (default): the first/last vertical
 #                        coefficient planes carry the ∂z-value rows
 #                        ∂z p̂ = φ*(bnd)/Δτ; "natural": weak by-parts flux loads
@@ -184,9 +187,18 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
     kcol_p0 = patch.kbasis.data[p_index]
     dz = _rirk_solve_data(kcol_p0)
 
-    Sx = dx.M1' * (dx.W .* dx.M1)
-    Sz = dz.M1' * (dz.W .* dz.M1)
-    Mzw = dz.M0' * ((dz.W ./ Pxi_prof) .* dz.M0)   # the 1/Pξ̄-weighted mass
+    # Sparse (banded) 1-D blocks: the cubic-spline Gram/stiffness matrices have
+    # coefficient half-bandwidth 3, so the tensor operator is banded (half-band
+    # 3·b_iDim in the i-fast layout, derivation §6). A sparse LU makes the
+    # per-step back-substitution O(band·N) ≈ 1e6 flop instead of the dense
+    # O(N²) — the cost gate. (droptol clears the ~1e-16 fill from the outer
+    # products so the sparsity is the true band.)
+    Sx = sparse(dx.M1' * (dx.W .* dx.M1));  droptol!(Sx, 1e-13 * maximum(abs, Sx))
+    Sz = sparse(dz.M1' * (dz.W .* dz.M1));  droptol!(Sz, 1e-13 * maximum(abs, Sz))
+    Mzw = sparse(dz.M0' * ((dz.W ./ Pxi_prof) .* dz.M0))
+    droptol!(Mzw, 1e-13 * maximum(abs, Mzw))
+    Mx = sparse(dx.Mass);  droptol!(Mx, 1e-13 * maximum(abs, Mx))
+    Mz = sparse(dz.Mass);  droptol!(Mz, 1e-13 * maximum(abs, Mz))
 
     ax0 = get(model.options, :exact_si_ax0, false) === true
     lid_rows = get(model.options, :xsi_lid_rows, "strong")
@@ -195,14 +207,15 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
 
     # i-fast layout: coefficient (k_b−1)·b_iDim + i_b ⇒ A = kron(Z-block, X-block)
     function build(ts_term)
-        A = kron(Mzw, dx.Mass) .+ (ts_term^2) .* kron(Sz, dx.Mass)
+        A = kron(Mzw, Mx) .+ (ts_term^2) .* kron(Sz, Mx)
         if !ax0
-            A .+= (ts_term^2) .* kron(dz.Mass, Sx)
+            A = A .+ (ts_term^2) .* kron(Mz, Sx)
         end
         if lid_rows == "strong"
             # Replace the first/last vertical coefficient planes with the
             # ∂z-value rows Σ_kb ∂zψ_kb(z_bnd)·p̂[ib,kb] = φ*(bnd)/Δτ — pinning
             # the lid Neumann data the recovery enforces (w^{n+1} = 0).
+            A = Matrix{Float64}(A)   # temporary dense for the row surgery
             for ib in 1:b_iDim
                 r_bot = ib
                 r_top = (b_kDim - 1) * b_iDim + ib
@@ -213,9 +226,9 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
                     A[r_top, (kb - 1) * b_iDim + ib] = Nb1z[2, kb]
                 end
             end
-            return factorize(A)
+            return lu(sparse(A))
         end
-        return factorize(Symmetric(A))
+        return lu(sparse(A))
     end
     fact = build(1.25 * model.ts)
     fact_first = build(0.5 * model.ts)
@@ -510,14 +523,17 @@ end
     exact_si_load_history!(mtile, hfields, t, rowstart)
 
 Load the previous step's applied u increment (plane 7 of the solve feed) into
-the tile's `hacdot_n` u column as the u-leg AI2* history — ONLY under
-`options[:xsi_u_history] = "stored"`. The default `"none"` integrates the u leg
-with its implicit level alone (θ = 1). Mirrors
-[`horizontal_si_load_increment!`](@ref)'s t == 2 seeding.
+the tile's `hacdot_n` u column as the u-leg AI2* history — under the default
+`options[:xsi_u_history] = "stored"`. `"none"` integrates the u leg with its
+implicit level alone (θ = 1): stable, but the θ = 1 first-order component
+leaves an ~11% max|u| bias on the BF02 dry bubble (G2 A/B, 2026-07-17), so it
+is not the default. Mirrors [`horizontal_si_load_increment!`](@ref)'s t == 2
+seeding. Unlike the rejected ADI sweep, the stored u history in the UNSPLIT
+solve carries no leak (VN 3(a): the fresh strong u-history is ε-insensitive).
 """
 function exact_si_load_history!(mtile::ModelTile, hfields::AbstractMatrix{Float64},
         t::Int64, rowstart::Int64)
-    get(mtile.model.options, :xsi_u_history, "none") == "stored" || return nothing
+    get(mtile.model.options, :xsi_u_history, "stored") == "stored" || return nothing
     u_index = mtile.model.grid_params.vars["u"]
     n = size(mtile.hacdot_n, 1)
     rows = rowstart:(rowstart + n - 1)

@@ -95,6 +95,7 @@ function bf02_dry_model(opts::BenchmarkOptions)
         options[:precipitation] = false
         options[:vertical_mixing] = false
         options[:horizontal_semiimplicit] = opts.hsi
+        options[:exact_si] = opts.xsi
     end
 
     ts = vertical_ts(ts, opts)

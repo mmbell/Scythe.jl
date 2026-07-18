@@ -500,3 +500,84 @@ fail for 1a, so 1b stands unconditionally for the production grid.
 7. **Axisym metric** — this note is XZ (RiRk). The axisym radial metric (the TC
    actually needs it) and the RLR per-n solves are Stage 3; the boundary-row
    structure (§3-BC) already anticipates the axis-regularity rows.
+
+---
+
+## 8. Stage 1–2 implementation outcomes (2026-07-17; code wins, documented)
+
+`src/exact_si.jl` implements the above behind `options[:exact_si]`. All Stage-2
+gates pass. Five places where the CODE corrected or refined this note:
+
+1. **Every fast leg must be recovered from the ONE 2-D solve** (not a hybrid).
+   §5's audit envisioned the vertical legs completing through the existing
+   per-column φ-solve with the horizontal absorbed into its predictors. Measured:
+   every composite that routed some legs through a SEPARATE solve (the φ-solve,
+   or u through its own per-level Helmholtz threaded via the z-solve, or u from a
+   strong ∂x of the merged p) left an O(state) fraction of the fast operator
+   staged outside a solve and grew at e-fold 12–40 s for Co_h ≥ 3 × Co_z ≈ 2 —
+   the ε-chain mechanism of the DG round in a new guise, invisible to the
+   symbol-level VN because it lives in the fit-chain/boundary mismatch. The
+   fix — u, w, p, and the slaved ρ_d/ρ_t/E_t ALL recovered from the single
+   solved p̂ (u,w by M1x/M1z; the slaved legs by the pointwise divergence
+   identity `div^{n+1} = −δp/(Δτ Pξ̄)` plus the fitted φ^{n+1}) — is the
+   consistent-weak composition VN 3(a) proved ε-insensitive, and decays cleanly
+   to Co_h 18 on both bases.
+2. **The u-leg history default is `"stored"`, not `"none"`** (§5/§7 item resolved
+   by the G2 A/B round). θ=1 ("none") is stable but its first-order component
+   leaves an **~11% max|u| bias** on the BF02 dry bubble at BOTH ts-factors
+   (constant in ts ⇒ not truncation). The stored applied-increment history (full
+   2nd-order AI2*) brings every extremum to ≤ 1.1%/0.6% of the explicit
+   reference. Unlike the rejected ADI sweep, the stored u-history in the UNSPLIT
+   solve carries no leak (VN 3(a): the fresh strong u-history is ε-insensitive).
+3. **Round-trip the u*/p′* predictors through their own vertical fit chains
+   before the solve** (P = eval∘fit). The raw AB3 predictors carry z-grid-scale
+   content the model's read chains never see; feeding it to the solve leaks the
+   (I−P) l_q-refit residual into the implicit operator at state amplitude — the
+   DG round's "round-tripped baseline" lesson, and it recurs here (top-localized
+   growth, e-fold ≈ 30 s) until the predictors are round-tripped.
+4. **Lid rows: strong ∂z-value rows + Neumann-basis lid data** (§3-BC refined).
+   The natural (load-only) lid of §3-BC left the p̂ lid weakly controlled and fed
+   a slow surface/lid u–p̂ inconsistency. Adopted: replace the first/last vertical
+   coefficient planes with strong rows `Σ ∂zψ_kb(z_bnd) p̂ = φ*(bnd)/Δτ`
+   (`options[:xsi_lid_rows] = "strong"`, default), and evaluate the lid φ* VALUES
+   through p's NEUMANN column basis (w's Dirichlet basis forces them to zero,
+   losing the inhomogeneous-Neumann data). Both cut the surface growth.
+5. **A≡0 is a plumbing bypass, not operator equivalence; §3(i) roundoff-on-
+   isothermal was optimistic.** The implemented A≡0 test (`options[:exact_si_zero_x]`)
+   bypasses the 2-D solve to the per-column φ-solve and is **bitwise 0.0** — it
+   validates the two-phase orchestration and flag-off, and IS the ≤1e-10 gate.
+   But the OPERATOR-level check (`options[:exact_si_ax0]`: the 2-D operator with
+   ∂xx disabled vs the φ-solve) is **0.012 on isothermal**, surface-localized
+   (k=1–4: 0.025→0.014, decaying to 0.007 mid-domain) — NOT roundoff. Cause: the
+   p′-primary form carries inhomogeneous-Neumann lid/surface rows while the
+   φ-solve carries Dirichlet-φ rows, so §3(i)'s "same discrete D + BCs ⇒
+   roundoff" premise does not hold (the BCs differ by construction). The p′-primary
+   vertical scheme is therefore validated NOT by equivalence but by its OWN
+   measured ceiling (below) — the "new measured quantity" §3 flagged. This is a
+   genuine deviation from the Stage-0 §3(i) prediction; §3(i) should be read as
+   "roundoff-equal ONLY if the boundary rows are also identical", which they are
+   not for the p′-form.
+
+### Measured gate numbers (600-s sweeps unless noted; RiRk XZ)
+
+- **A≡0 plumbing** (isothermal, ∂xx bypassed vs vertical-only, 20 steps):
+  **0.0** (bitwise). Flag-off bitwise vs 2ca710c: **0.0**.
+- **G1 stability** (`hsi_ceiling_sweep.jl --exact-si`, both bases): decay at every
+  Co_h ∈ {1.5, 3, 4.5, 9, 18} — e.g. stratified Co_h 4.5 → 1.5e-5, Co_h 9 →
+  1.7e-5 from seed 6.5e-5. Growth probe (Co_h 3, 600 s): flat, t20 3.8e-5 → t600
+  1.3e-5 (no leak). **PASS.**
+- **p′-primary vertical ceiling (NEW measured quantity)** (`si_ceiling_sweep.jl
+  --exact-si`, stratified): Co_z 9.05 → max|w| 3.2e-7 from seed 7.3e-5 (decay
+  ×226), matching the φ-solve's Co_z 9–18. **The p′-primary form inherits the
+  vertical ceiling** — measured, not assumed.
+- **G2 accuracy** (BF02 dry, exact-si stored vs off): ts-factor 0.5 →
+  max_w +1.1%, min_w −0.35%, max|u| +0.44%; ts-factor 1.5 → +1.8% / +0.36% /
+  +0.58%. All within 2%. **PASS** (the ADI measured 8–20% / 20–55%).
+- **G4 combined** (Co_z 9 × Co_h 4.5, stratified): decay ×5.2. **PASS.**
+- **Cost** (`step_cost_profile.jl`): the solve is 8.6 ms (TC-nest1 50×100) /
+  11.6 ms (o01 128×50) per step ≈ **11% of a step** — comparable to and net
+  cheaper than the phase-1 ADI sweep (12–21% here). Uses a **sparse (banded) LU**
+  (the plan's banded form, brought forward from Stage 3 to meet the gate; the
+  dense factorization was 40–60% of a step).
+- **G3 regression**: full suite **7655/7655**; 2-worker invariance 2.1e-12
+  (≤ 1e-10); the two flag-error tests pass.
