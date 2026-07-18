@@ -181,6 +181,10 @@ end
     @. ldiv = uv.f_x + (uv.f / r)
     return nothing
 end
+@inline function mc_linear_div!(ldiv, ::MCCylindricalRLR, uv, vv, r)
+    @. ldiv = uv.f_x + (uv.f / r) + (vv.f_l / r)
+    return nothing
+end
 @inline mc_linear_div!(ldiv, geom::MCGeometry, uv, vv, r) =
     error("mc_linear_div! (reference-linear horizontal divergence) is not " *
           "implemented for $(typeof(geom))")
