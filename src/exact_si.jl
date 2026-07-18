@@ -95,6 +95,10 @@ struct ExactSIData{FA, FB, SU, SW, SP, KP, KU}
     dirichlet_u::Tuple{Bool, Bool}
     strong_lid::Bool
     ax0::Bool              # ∂xx block and all x-terms disabled (test lever)
+    axisym::Bool           # axisymmetric radial metric (r-weighted blocks/load)
+    rmet::Vector{Float64}  # radial coordinate at the iDim mish points (axisym)
+    r_wall_l::Float64      # radial weight of the left (r=iMin/axis) wall load
+    r_wall_r::Float64      # radial weight of the right (r=iMax) wall load
     # Reference profiles at the kDim mish levels
     Pxi::Vector{Float64}
     rho_tbar::Vector{Float64}
@@ -130,20 +134,38 @@ struct ExactSIData{FA, FB, SU, SW, SP, KP, KU}
 end
 
 """
+    exact_si_is_axisym(model) -> Bool
+
+Whether `options[:exact_si]` runs the axisymmetric radial-metric path (the
+`moist_compressible_axisym` set on the RiRk grid, Stage 3) rather than the XZ
+Cartesian path. The two share the RiRk grid and differ only by the radial
+`r`-weight on the Galerkin blocks and load — the sole geometry switch the
+solve needs. RLR (`moist_compressible_RLR`, `"RLR"` geometry) is Stage 4 and is
+rejected upstream by [`validate_exact_si_options`](@ref).
+"""
+@inline exact_si_is_axisym(model::ModelParameters) =
+    model.equation_set == "moist_compressible_axisym"
+
+"""
     validate_exact_si_options(model)
 
 Setup-time validation of `options[:exact_si]` (called from `createModelTile`):
-pressure-reference set on the RiRk XZ geometry only, and the structurally
-incompatible flags error loudly.
+pressure-reference set on the RiRk grid — XZ Cartesian or axisymmetric r–z
+(Stage 3) — and the structurally incompatible flags error loudly. The RLR
+cylindrical set is Stage 4 and still errors here.
 """
 function validate_exact_si_options(model::ModelParameters)
     get(model.options, :exact_si, false) === true || return nothing
     uses_pressure_reference(model.equation_set) || error(
         "options[:exact_si] requires a moist_compressible (pressure-reference) " *
         "equation set")
+    (model.equation_set == "moist_compressible_RLR" ||
+     model.grid_params.geometry == "RLR") && error(
+        "options[:exact_si] on the RLR cylindrical set is Stage 4 (per-wavenumber " *
+        "solves); not yet implemented")
     model.grid_params.geometry == "RiRk" || error(
-        "options[:exact_si] is only implemented for the XZ RiRk geometry " *
-        "(got $(model.grid_params.geometry)); the cylindrical solves are Stage 3")
+        "options[:exact_si] is only implemented for the RiRk grid (XZ or " *
+        "axisymmetric r–z); got geometry $(model.grid_params.geometry)")
     get(model.options, :state_dependent_si, false) === true && error(
         "options[:exact_si] and options[:state_dependent_si] are structurally " *
         "incompatible: the 2-D solve is reference-linearized with a precomputed " *
@@ -187,17 +209,33 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
     kcol_p0 = patch.kbasis.data[p_index]
     dz = _rirk_solve_data(kcol_p0)
 
+    # Axisymmetric radial metric (Stage 3): the horizontal Laplacian becomes the
+    # cylindrical (1/r)∂r(r∂r·) and the weak Galerkin integral carries the
+    # cylindrical volume element r dr dz. Net effect: re-weight ONLY the radial
+    # (i) Galerkin blocks by r (the radial coordinate at the i-mish points);
+    # every vertical block is unchanged. `rmet` is the i-mish radius vector, or
+    # `ones` on the XZ Cartesian path (never used there).
+    axisym = exact_si_is_axisym(model)
+    rmet = axisym ? collect(isp_p0.mishPoints) : ones(iDim)
+
     # Sparse (banded) 1-D blocks: the cubic-spline Gram/stiffness matrices have
     # coefficient half-bandwidth 3, so the tensor operator is banded (half-band
     # 3·b_iDim in the i-fast layout, derivation §6). A sparse LU makes the
     # per-step back-substitution O(band·N) ≈ 1e6 flop instead of the dense
     # O(N²) — the cost gate. (droptol clears the ~1e-16 fill from the outer
     # products so the sparsity is the true band.)
-    Sx = sparse(dx.M1' * (dx.W .* dx.M1));  droptol!(Sx, 1e-13 * maximum(abs, Sx))
+    if axisym
+        Sx = sparse(dx.M1' * ((dx.W .* rmet) .* dx.M1))  # Sᵣ = M1ᵣᵀ(W·r)M1ᵣ
+        Mx = sparse(dx.M0' * ((dx.W .* rmet) .* dx.M0))  # Mᵣ = M0ᵣᵀ(W·r)M0ᵣ
+    else
+        Sx = sparse(dx.M1' * (dx.W .* dx.M1))
+        Mx = sparse(dx.Mass)
+    end
+    droptol!(Sx, 1e-13 * maximum(abs, Sx))
+    droptol!(Mx, 1e-13 * maximum(abs, Mx))
     Sz = sparse(dz.M1' * (dz.W .* dz.M1));  droptol!(Sz, 1e-13 * maximum(abs, Sz))
     Mzw = sparse(dz.M0' * ((dz.W ./ Pxi_prof) .* dz.M0))
     droptol!(Mzw, 1e-13 * maximum(abs, Mzw))
-    Mx = sparse(dx.Mass);  droptol!(Mx, 1e-13 * maximum(abs, Mx))
     Mz = sparse(dz.Mass);  droptol!(Mz, 1e-13 * maximum(abs, Mz))
 
     ax0 = get(model.options, :exact_si_ax0, false) === true
@@ -248,11 +286,20 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
     c_e = etp ./ rho_tb
     c_e_z = ((etp_z .* rho_tb) .- (etp .* rho_tb_z)) ./ (rho_tb .^ 2)
 
+    # Wall radii for the boundary loads: the radial Laplacian by-parts flux
+    # [ψ·Δτ²·r·∂r p′] is r-weighted (derivation §3-BC/§9). The outer wall carries
+    # r = iMax; the inner (r=iMin) carries r = iMin, which is 0 on the axis and
+    # kills the axis load automatically (cylindrical regularity — no explicit
+    # axis row). On the Cartesian path the flux has no r-factor, so both are 1.0.
+    r_wall_l = axisym ? Float64(model.grid_params.iMin) : 1.0
+    r_wall_r = axisym ? Float64(model.grid_params.iMax) : 1.0
+
     return ExactSIData(u_index, w_index, p_index, rhod_index, rhot_index, et_index,
         fact, fact_first,
         Matrix(dx.M0), Matrix(dx.M1), collect(dx.W), Matrix(dx.Nb),
         Matrix(dz.M0), Matrix(dz.M1), collect(dz.W), Matrix(dz.Nb),
         (_is_dirichlet(bcl), _is_dirichlet(bcr)), lid_rows == "strong", ax0,
+        axisym, rmet, r_wall_l, r_wall_r,
         collect(Pxi_prof), collect(rho_tb), c_d, c_d_z, c_e, c_e_z,
         deepcopy(patch.ibasis.data[1, u_index]), deepcopy(patch.ibasis.data[1, p_index]),
         deepcopy(patch.kbasis.data[w_index]), deepcopy(patch.kbasis.data[p_index]),
@@ -372,12 +419,24 @@ function exact_si_solve!(hfields::AbstractMatrix{Float64}, esd::ExactSIData,
 
     # Galerkin load: the p′* term through the 1/Pξ̄-weighted quadrature, the
     # divergence term unweighted (derivation §3), both with the 2-D Gauss
-    # weights Wx·Wz; then the boundary terms (§3-BC).
+    # weights Wx·Wz; then the boundary terms (§3-BC). On the axisym path the
+    # radial quadrature carries the cylindrical volume weight r (Wx → Wx·r) and
+    # the divergence gains the radial metric term u*/r (the strong linear radial
+    # divergence ∂r u* + u*/r; §9), both disabled under ax0.
     G = esd.G
-    @inbounds for i in 1:iDim, k in 1:kDim
-        G[i, k] = esd.Wx[i] * esd.Wz[k] *
-                  ((PR[i, k] / esd.Pxi[k]) -
-                   ts_term * ((esd.rho_tbar[k] * esd.ux[i, k]) + esd.phiz[i, k]))
+    if esd.axisym
+        @inbounds for i in 1:iDim, k in 1:kDim
+            ldiv = esd.ux[i, k] + (esd.ax0 ? 0.0 : U[i, k] / esd.rmet[i])
+            G[i, k] = esd.Wx[i] * esd.rmet[i] * esd.Wz[k] *
+                      ((PR[i, k] / esd.Pxi[k]) -
+                       ts_term * ((esd.rho_tbar[k] * ldiv) + esd.phiz[i, k]))
+        end
+    else
+        @inbounds for i in 1:iDim, k in 1:kDim
+            G[i, k] = esd.Wx[i] * esd.Wz[k] *
+                      ((PR[i, k] / esd.Pxi[k]) -
+                       ts_term * ((esd.rho_tbar[k] * esd.ux[i, k]) + esd.phiz[i, k]))
+        end
     end
     L = esd.L
     mul!(L, esd.M0x', G * esd.M0z)
@@ -386,11 +445,11 @@ function exact_si_solve!(hfields::AbstractMatrix{Float64}, esd::ExactSIData,
     # lid replacement overwrites the wall flux on the corner-plane rows.
     if !esd.ax0
         if esd.dirichlet_u[2]
-            L .+= ts_term .* esd.Nbx[2, :] *
+            L .+= (ts_term * esd.r_wall_r) .* esd.Nbx[2, :] *
                   transpose(esd.M0z' * (esd.Wz .* esd.rho_tbar .* esd.ubr))
         end
         if esd.dirichlet_u[1]
-            L .-= ts_term .* esd.Nbx[1, :] *
+            L .-= (ts_term * esd.r_wall_l) .* esd.Nbx[1, :] *
                   transpose(esd.M0z' * (esd.Wz .* esd.rho_tbar .* esd.ubl))
         end
     end

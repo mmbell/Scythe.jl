@@ -168,16 +168,22 @@ Reference-LINEAR horizontal velocity divergence — the horizontal part of ∇·
 linearized about the resting reference, whose product with the z-only reference
 coefficients forms the horizontal acoustic legs of the semi-implicit split
 (remainder subtraction and history staging in `mc_driver!`, implicit integration
-in `horizontal_si_correct!`). XZ: ∂u/∂x. The cylindrical forms belong to the
-later horizontal-SI phases and error until then, so the staged remainder can
-never silently disagree with the geometry's implicit solve.
+in `horizontal_si_correct!`; also the divergence load of the exact unsplit 2-D
+solve, `exact_si.jl`). XZ: ∂u/∂x. Axisym: the cylindrical radial divergence
+∂u/∂r + u/r = (1/r)∂(ru)/∂r — the v/λ azimuthal term is absent because vbar ≡ 0
+and the reference has no λ structure. RLR belongs to Stage 4 and still errors.
 """
 @inline function mc_linear_div!(ldiv, ::MCCartesianXZ, uv, vv, r)
     @. ldiv = uv.f_x
     return nothing
 end
+@inline function mc_linear_div!(ldiv, ::MCAxisymRZ, uv, vv, r)
+    @. ldiv = uv.f_x + (uv.f / r)
+    return nothing
+end
 @inline mc_linear_div!(ldiv, geom::MCGeometry, uv, vv, r) =
-    error("options[:horizontal_semiimplicit] is not implemented for $(typeof(geom))")
+    error("mc_linear_div! (reference-linear horizontal divergence) is not " *
+          "implemented for $(typeof(geom))")
 
 "Scalar advection -v·∇f (the 3D cylinder adds the azimuthal -(v/r)∂f/∂λ)."
 @inline function mc_advect!(ADV, ::Union{MCCartesianXZ, MCAxisymRZ}, u, w, vv, r, f_x, f_z, f_l)

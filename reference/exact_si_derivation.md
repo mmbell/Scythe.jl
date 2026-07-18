@@ -581,3 +581,88 @@ gates pass. Five places where the CODE corrected or refined this note:
   dense factorization was 40–60% of a step).
 - **G3 regression**: full suite **7655/7655**; 2-worker invariance 2.1e-12
   (≤ 1e-10); the two flag-error tests pass.
+
+---
+
+## 9. Stage 3 — axisymmetric (cylindrical r–z) radial metric (2026-07-18)
+
+The axisymmetric TC (`moist_compressible_axisym`, RiRk grid, i-coordinate = r)
+extends the XZ solve by the cylindrical radial Laplacian `(1/r)∂r(r∂r·)` and the
+cylindrical volume element `r dr dz`. The elimination §1 and the P⁻¹-scaled
+weighted-mass form §2 are unchanged in structure; the ONLY geometry switch is an
+`r`-weight on the RADIAL Galerkin blocks and load. Everything vertical is
+byte-identical (the vertical solve is geometry-agnostic).
+
+**Operator.** Re-weight only the radial (i) blocks by r (the radial coordinate at
+the i-mish points, which are Gauss points so never at r = 0):
+
+    Mᵣ = M0ᵣᵀ (W·r) M0ᵣ        (r-weighted radial mass)
+    Sᵣ = M1ᵣᵀ (W·r) M1ᵣ        (r-weighted radial stiffness — the cylindrical
+                                Laplacian by-parts ∫(∂rψ)(∂rφ) r dr)
+    A_axisym = kron(Mzw, Mᵣ) + Δτ²( kron(Sz, Mᵣ) + kron(Mz, Sᵣ) )
+
+The vertical blocks (Mzw = M0ᵀ(W/Pξ̄)M0, Sz, Mz) are unchanged; the r-weight lives
+entirely in the radial factor of every tensor block (the volume element factors
+as (r dr)·dz). The build function, the strong lid rows, and the whole
+solve/recovery structure are geometry-agnostic once Mᵣ/Sᵣ replace Mx/Sx.
+
+**Load.** The radial quadrature carries the cylindrical volume weight (Wr → Wr·r);
+the divergence gains the radial metric term u*/r (the strong linear radial
+divergence `lindiv_r u* = ∂r u* + u*/r`, = `mc_linear_div!` on `MCAxisymRZ`). Both
+the p′* identity term and the divergence term are multiplied through by r.
+
+**Boundary (§3-BC, r-weighted).** The radial-Laplacian by-parts flux is
+`[ψ·Δτ²·r·∂r p′]`, so the u-Dirichlet wall load is r-weighted by the wall radius:
+
+- **r = 0 axis: NO explicit row.** The by-parts flux `[ψ·r·∂r p′]_{r=0} = 0`
+  vanishes by the r-weight (cylindrical regularity for the axisym/n=0 problem) —
+  a simplification vs Cartesian, which needed a wall row at both ends. In code the
+  inner-wall load is weighted by r = iMin, which is 0 on the axis and kills it
+  automatically (and correctly r-weights a nested inner wall at iMin > 0).
+- **Outer wall r = R: u-Dirichlet** load r-weighted by R = iMax
+  (`+Δτ·R·ρ̄_t u*`).
+- **Lid/surface z: unchanged from Cartesian** (strong ∂z-value rows).
+
+**Recovery legs are geometry-free.** u = u* − (Δτ/ρ̄_t)∂r p′ (the M1ᵣ operator, no
+1/r); w/φ vertical recovery unchanged; and the slaved ρ_t/ρ_d/E_t legs use the
+pointwise pressure identity `δρ_t = δp/Pξ̄ = −Δτ·D` — because the solved p′ came
+from the cylindrical operator, δp/Pξ̄ automatically equals −Δτ times the
+*cylindrical* mass-flux divergence D, with ZERO code change to the recovery. (The
+plan's note that the slaved legs "use the cylindrical divergence" is realized
+through this identity, not an explicit divergence recompute.)
+
+**Cartesian bitwise.** The XZ path is a clean `else` branch in each of the three
+touched spots; the wall-load r-weights are 1.0 (`ts_term·1.0 ≡ ts_term`), so
+`options[:exact_si]` on XZ is byte-identical to `37740a4`.
+
+### Measured Stage-3 gate numbers (axisym, RiRk r–z)
+
+- **G3-unit / A≡0 plumbing** (`exact_si_zero_x`, isothermal axisym, iMin = 0,
+  20 steps vs vertical-only): **0.0** (bitwise) — the vertical solve is
+  geometry-agnostic, so this holds exactly as in XZ.
+- **G3-stability** (broadband u+w seed, resting axisym tile, iMin = 0 so the r = 0
+  axis column is exercised, Co_h 3, 300 s): decay on BOTH bases — isothermal
+  7.4e-5 → 2.1e-5, stratified 7.4e-5 → 2.9e-5. Vertical-ceiling no-regress
+  (Co_z ≈ 9 stratified, wide radial cells, iMin = 50 km): 5.5e-5 → 7.3e-6
+  (decay ×7.5). **PASS.**
+- **Operator correctness — large-R convergence to XZ** (one-step p′ increment,
+  identical seed/reference): the axisym solve → the XZ Cartesian solve as the
+  metric vanishes, with clean O(1/r) scaling: rel diff (du/dw/dp) ≈
+  6.6e-5/4.4e-5/1.2e-4 at R₀ = 1e6 m, ≈ 6.6e-7/4.4e-7/1.2e-6 at R₀ = 1e8,
+  ≈ 5.9e-9/5.5e-9/1.4e-8 at R₀ = 1e10 — a wrong r-factor or sign would not
+  converge. This is the strongest correctness check (not in the plan's gate list;
+  added this session).
+- **G3-regression**: full suite **7664/7664** (7655 baseline + 9 new axisym
+  exact-SI assertions); XZ `exact_si` gates unchanged (bitwise `else` branches);
+  flag-off untouched (all changes behind `options[:exact_si]` / axisym-only
+  methods).
+- **G3-payoff (nested axisym TC restart, `exact_si` on vs off through a CAPE
+  release): DEFERRED to Stage 5.** `exact_si` is blocked in nested runs
+  (`nesting.jl:187-188`) until Stage 5 wires the nested master solve, so the
+  literal nested-restart payoff cannot run at Stage 3; Stage 5's readiness gate
+  (nested `exact_si` TC through a CAPE release) IS this comparison. The user also
+  flagged (2026-07-18) that the comparison is confounded by a TC-initialization
+  moisture inconsistency (spurious near-surface/top condensate, noisy Q_ss at
+  t = 0 from the first-order thermal-wind integration and a T/E_t/Q_ss retrieval
+  mismatch), so a crash reproduction would not cleanly attribute to the acoustic
+  solver regardless. Diagnosis of that is the user's separate deferred session.
