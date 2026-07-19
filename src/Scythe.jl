@@ -93,6 +93,7 @@ include("mc_boundary_layer.jl")
 include("moist_compressible.jl")
 include("horizontal_si.jl")
 include("exact_si.jl")
+include("exact_si_rlr.jl")
 include("idealized.jl")
 include("nesting.jl")
 

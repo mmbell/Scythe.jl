@@ -782,18 +782,30 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
         etp2 = get_val_from(w1, :(collect(
             view(Scythe.ref_total_energy(mtile.ref_state), :, 1:2) .+
             view(Scythe.ref_pressure(mtile.ref_state), :, 1:2))))
-        esd = create_exact_si_data(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
-        npts = patch.params.iDim * patch.params.kDim
-        xsi_xstar = SharedArray{Float64,2}((npts, 3))
-        xsi_h = SharedArray{Float64,2}((npts, XSI_NPLANES))
-        xpatch = patch.ibasis.data[1, 1].mishPoints
-        kDim = model.grid_params.kDim
-        for w in workerids
-            x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
-            i1 = argmin(abs.(xpatch .- x1))
-            save_at(w, :xsi_rowstart, (i1 - 1) * kDim + 1)
-            save_at(w, :xsi_xstar, xsi_xstar)
-            save_at(w, :xsi_h, xsi_h)
+        if exact_si_is_rlr(model)
+            esd = create_exact_si_data_rlr(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+            npts = size(patch.physical, 1)
+            xsi_xstar = SharedArray{Float64,2}((npts, 4))
+            xsi_h = SharedArray{Float64,2}((npts, XSI_RLR_NPLANES))
+            for w in workerids
+                save_at(w, :xsi_rowstart, 1)
+                save_at(w, :xsi_xstar, xsi_xstar)
+                save_at(w, :xsi_h, xsi_h)
+            end
+        else
+            esd = create_exact_si_data(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+            npts = patch.params.iDim * patch.params.kDim
+            xsi_xstar = SharedArray{Float64,2}((npts, 3))
+            xsi_h = SharedArray{Float64,2}((npts, XSI_NPLANES))
+            xpatch = patch.ibasis.data[1, 1].mishPoints
+            kDim = model.grid_params.kDim
+            for w in workerids
+                x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
+                i1 = argmin(abs.(xpatch .- x1))
+                save_at(w, :xsi_rowstart, (i1 - 1) * kDim + 1)
+                save_at(w, :xsi_xstar, xsi_xstar)
+                save_at(w, :xsi_h, xsi_h)
+            end
         end
     end
 
@@ -867,7 +879,11 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         if esd !== nothing
             map(wait, [get_from(w, :(advanceTimestepA(mtile, sharedSpectral, $(t),
                 xsi_xstar, xsi_h, xsi_rowstart))) for w in workerids])
-            exact_si_solve!(xsi_h, esd, patch, model, t, xsi_xstar)
+            if esd isa ExactSIDataRLR
+                exact_si_solve_rlr!(xsi_h, esd, patch, model, t, xsi_xstar)
+            else
+                exact_si_solve!(xsi_h, esd, patch, model, t, xsi_xstar)
+            end
             adv = [get_from(w, :(advanceTimestepB(mtile, sharedSpectral, haloSend,
                 haloReceive, $(t), xsi_h, xsi_rowstart))) for w in workerids]
         else

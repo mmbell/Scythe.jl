@@ -961,6 +961,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_v_tendency!(expdot, geom, colstart, colend, S, u, w, uv, vv, pv, rho_t, r,
                        fcor, Khdiff)
     end
+    # Under the exact unsplit acoustic SI, cancel v's reference-linear azimuthal
+    # PGF from the AB3 remainder (RLR only). The v-leg AI2* history is the STORED
+    # applied increment (loaded in phase A, exact_si_load_history!) — the weak
+    # operator the unsplit solve actually applied, self-consistent per §8; a fresh
+    # pointwise −(1/ρ̄_t r)∂λp′ history would mismatch the weak solve (ε-chain).
+    if hsi_like
+        mc_stage_v_acoustic!(expdot, geom, colstart, colend, pv, rho_tbar, r)
+    end
 
     # ── Rayleigh sponge (momentum-only) ──
     # Klemp-Durran absorbing layer against gravity-wave reflection off the rigid lid:

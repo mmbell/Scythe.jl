@@ -146,6 +146,11 @@ rejected upstream by [`validate_exact_si_options`](@ref).
 @inline exact_si_is_axisym(model::ModelParameters) =
     model.equation_set == "moist_compressible_axisym"
 
+"Whether `options[:exact_si]` runs the RLR per-wavenumber Fourier path (exact_si_rlr.jl)."
+@inline exact_si_is_rlr(model::ModelParameters) =
+    model.equation_set == "moist_compressible_RLR" ||
+    model.grid_params.geometry == "RLR"
+
 # A RIGID Dirichlet u wall (real prescribed value: u = 0 on the axis and the
 # outer domain wall) — as opposed to a nested-interface FixedBC, whose value
 # slots are NaN (R3X, pinned by the parent). Only the rigid wall contributes the
@@ -166,13 +171,20 @@ function validate_exact_si_options(model::ModelParameters)
     uses_pressure_reference(model.equation_set) || error(
         "options[:exact_si] requires a moist_compressible (pressure-reference) " *
         "equation set")
-    (model.equation_set == "moist_compressible_RLR" ||
-     model.grid_params.geometry == "RLR") && error(
-        "options[:exact_si] on the RLR cylindrical set is Stage 4 (per-wavenumber " *
-        "solves); not yet implemented")
-    model.grid_params.geometry == "RiRk" || error(
-        "options[:exact_si] is only implemented for the RiRk grid (XZ or " *
-        "axisymmetric r–z); got geometry $(model.grid_params.geometry)")
+    if exact_si_is_rlr(model)
+        # RLR is WORK IN PROGRESS: the n=0 path is verified but the coupled n≥1
+        # azimuthal solve is not yet stable (exact_si_rlr.jl STATUS note). Gate it
+        # behind an explicit experimental opt-in so it cannot be used in production.
+        get(model.options, :xsi_rlr_experimental, false) === true || error(
+            "options[:exact_si] on the RLR cylinder is experimental and not yet " *
+            "stable at azimuthal wavenumber ≥ 1; set options[:xsi_rlr_experimental] " *
+            "= true to run the WIP solver (see exact_si_rlr.jl)")
+    else
+        model.grid_params.geometry == "RiRk" || error(
+            "options[:exact_si] is only implemented for the RiRk grid (XZ or " *
+            "axisymmetric r–z) and the RLR cylinder; got geometry " *
+            "$(model.grid_params.geometry)")
+    end
     get(model.options, :state_dependent_si, false) === true && error(
         "options[:exact_si] and options[:state_dependent_si] are structurally " *
         "incompatible: the 2-D solve is reference-linearized with a precomputed " *
@@ -574,6 +586,13 @@ function exact_si_apply_column!(mtile::ModelTile, colstart::Int64, colend::Int64
         view(mtile.var_np1, colstart:colend, vars["rho_d"]) .+= view(hfields, rows, 4)
         view(mtile.var_np1, colstart:colend, vars["rho_t"]) .+= view(hfields, rows, 5)
         view(mtile.var_np1, colstart:colend, vars["E_t"]) .+= view(hfields, rows, 6)
+        # RLR: apply the tangential-wind acoustic increment (plane 7). The v leg
+        # is integrated θ = 1 (implicit-only, no stored explicit history) — the
+        # self-consistent partner of the +n²/r² operator term (exact_si_rlr.jl);
+        # the stored-increment v history (plane 9) is future 2nd-order work.
+        if exact_si_is_rlr(model)
+            view(mtile.var_np1, colstart:colend, vars["v"]) .+= view(hfields, rows, 7)
+        end
         # w-leg stored-applied-increment history (the 2026-07-16 discipline)
         view(mtile.impdot_n, colstart:colend, w_index) .=
             view(hfields, rows, 2) ./ ts_term
@@ -610,9 +629,21 @@ function exact_si_load_history!(mtile::ModelTile, hfields::AbstractMatrix{Float6
     u_index = mtile.model.grid_params.vars["u"]
     n = size(mtile.hacdot_n, 1)
     rows = rowstart:(rowstart + n - 1)
+    # The u-leg history plane is 7 on the XZ/axisym feed, 8 on the RLR feed
+    # (which appends the v leg + v history).
+    rlr = exact_si_is_rlr(mtile.model)
+    uplane = rlr ? 8 : 7
     dst = view(mtile.hacdot_n, :, u_index)
-    copyto!(dst, view(hfields, rows, 7))
+    copyto!(dst, view(hfields, rows, uplane))
     t == 2 && copyto!(view(mtile.hacdot_nm1, :, u_index), dst)
+    # RLR: the tangential v leg carries the same stored-applied-increment history
+    # (plane 9 = δv/Δτ), loaded into hacdot's v column.
+    if rlr
+        v_index = mtile.model.grid_params.vars["v"]
+        dstv = view(mtile.hacdot_n, :, v_index)
+        copyto!(dstv, view(hfields, rows, 9))
+        t == 2 && copyto!(view(mtile.hacdot_nm1, :, v_index), dstv)
+    end
     return nothing
 end
 
@@ -649,7 +680,13 @@ function advanceTimestepA(mtile::ModelTile, sharedSpectral::SharedArray{Float64}
     rows = rowstart:(rowstart + n - 1)
     xstar[rows, 1] .= view(mtile.var_np1, :, vars["u"])
     xstar[rows, 2] .= view(mtile.var_np1, :, vars["w"])
-    xstar[rows, 3] .= view(mtile.var_np1, :, vars["p"])
+    if exact_si_is_rlr(mtile.model)
+        # RLR publishes the tangential wind too (column 3 = v*, 4 = p′*).
+        xstar[rows, 3] .= view(mtile.var_np1, :, vars["v"])
+        xstar[rows, 4] .= view(mtile.var_np1, :, vars["p"])
+    else
+        xstar[rows, 3] .= view(mtile.var_np1, :, vars["p"])
+    end
     return nothing
 end
 

@@ -434,6 +434,26 @@ end
     return nothing
 end
 
+"""
+Reference-linear azimuthal-PGF staging for the v leg under the exact unsplit
+acoustic SI (RLR only): (i) cancel the reference-linear azimuthal PGF
+−(1/(ρ̄_t r))∂λ p′ out of v's AB3 remainder so the patch-level solve integrates it
+IMPLICITLY (the azimuthal acoustic mode — the leg whose elimination produces the
++n²/r² operator term, exact_si_rlr.jl); and (ii) stage the FRESH AI2* explicit
+history level `L_v = −(1/(ρ̄_t r))∂λ p′` into hacdot[:,9], so v carries the same
+explicit acoustic history the pressure azimuthal-divergence leg does (LDIV's
+v_l/r term) — the SYMMETRIC AI2* treatment of the two halves of the azimuthal
+acoustic (without it the p leg has a history and v does not: unstable). Called
+AFTER `mc_v_tendency!` sets expdot[:,9]. No-op on every geometry whose v carries
+no azimuthal PGF (axisym: vbar ≡ 0 and no λ; XZ: no v).
+"""
+@inline mc_stage_v_acoustic!(expdot, ::MCGeometry, colstart, colend, pv, rho_tbar, r) = nothing
+@inline function mc_stage_v_acoustic!(expdot, ::MCCylindricalRLR, colstart, colend, pv, rho_tbar, r)
+    pp_l = pv.f_l
+    @. expdot[colstart:colend, 9] += (pp_l / r) / rho_tbar
+    return nothing
+end
+
 "Explicit vertical-diffusion staging of v (AI2* history channel), slot 9."
 @inline mc_v_diffdot!(diffdot, ::MCCartesianXZ, colstart, colend, Kvdiff, vv) = nothing
 @inline function mc_v_diffdot!(diffdot, ::MCWithV, colstart, colend, Kvdiff, vv)

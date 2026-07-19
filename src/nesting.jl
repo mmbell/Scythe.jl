@@ -184,15 +184,9 @@ function build_nest(nest::NestedModelParameters)
     get(nest.base.options, :horizontal_semiimplicit, false) === true && throw(ArgumentError(
         "options[:horizontal_semiimplicit] is not supported in nested runs yet " *
         "(single-patch only; nesting is a later phase of the horizontal SI plan)"))
-    # exact_si in nested runs: the axisym (and XZ) radial solve is wired per patch
-    # (two-phase master solve inside run_nested_patch, R3X freeze-parent δu = 0 at
-    # interfaces). The RLR per-wavenumber solve is a later phase and still errors.
-    if get(nest.base.options, :exact_si, false) === true
-        (nest.base.equation_set == "moist_compressible_RLR" ||
-         nest.base.grid_params.geometry == "RLR") && throw(ArgumentError(
-            "options[:exact_si] on the RLR cylindrical set is not supported in " *
-            "nested runs yet (the per-wavenumber solve is a later exact-SI phase)"))
-    end
+    # exact_si in nested runs: the axisym/XZ radial solve and the RLR
+    # per-wavenumber Fourier solve are both wired per patch (two-phase master
+    # solve inside run_nested_patch, R3X freeze-parent δu = 0 at interfaces).
 
     base = nest.base
     geometry = base.grid_params.geometry
@@ -758,18 +752,33 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         etp2 = get_val_from(w1, :(collect(
             view(Scythe.ref_total_energy(mtile.ref_state), :, 1:2) .+
             view(Scythe.ref_pressure(mtile.ref_state), :, 1:2))))
-        esd = create_exact_si_data(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
-        npts = patch.params.iDim * patch.params.kDim
-        xsi_xstar = SharedArray{Float64,2}((npts, 3))
-        xsi_h = SharedArray{Float64,2}((npts, XSI_NPLANES))
-        xpatch = patch.ibasis.data[1, 1].mishPoints
-        kDim = model.grid_params.kDim
-        for w in workerids
-            x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
-            i1 = argmin(abs.(xpatch .- x1))
-            save_at(w, :xsi_rowstart, (i1 - 1) * kDim + 1)
-            save_at(w, :xsi_xstar, xsi_xstar)
-            save_at(w, :xsi_h, xsi_h)
+        if exact_si_is_rlr(model)
+            # RLR: per-wavenumber Fourier solve on the full ragged patch (one
+            # worker per patch — the nesting RL/RLR constraint), predictors
+            # (u,w,v,p), XSI_RLR_NPLANES increment planes.
+            esd = create_exact_si_data_rlr(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+            npts = size(patch.physical, 1)
+            xsi_xstar = SharedArray{Float64,2}((npts, 4))
+            xsi_h = SharedArray{Float64,2}((npts, XSI_RLR_NPLANES))
+            for w in workerids
+                save_at(w, :xsi_rowstart, 1)
+                save_at(w, :xsi_xstar, xsi_xstar)
+                save_at(w, :xsi_h, xsi_h)
+            end
+        else
+            esd = create_exact_si_data(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+            npts = patch.params.iDim * patch.params.kDim
+            xsi_xstar = SharedArray{Float64,2}((npts, 3))
+            xsi_h = SharedArray{Float64,2}((npts, XSI_NPLANES))
+            xpatch = patch.ibasis.data[1, 1].mishPoints
+            kDim = model.grid_params.kDim
+            for w in workerids
+                x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
+                i1 = argmin(abs.(xpatch .- x1))
+                save_at(w, :xsi_rowstart, (i1 - 1) * kDim + 1)
+                save_at(w, :xsi_xstar, xsi_xstar)
+                save_at(w, :xsi_h, xsi_h)
+            end
         end
     end
 
@@ -828,7 +837,11 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
             map(wait, [get_from(w, :(Scythe.advance_nested_timestepA(mtile,
                 sharedSpectral, $(t), xsi_xstar, xsi_h, xsi_rowstart,
                 $(w_injs[w])))) for w in workerids])
-            exact_si_solve!(xsi_h, esd, patch, model, t, xsi_xstar)
+            if esd isa ExactSIDataRLR
+                exact_si_solve_rlr!(xsi_h, esd, patch, model, t, xsi_xstar)
+            else
+                exact_si_solve!(xsi_h, esd, patch, model, t, xsi_xstar)
+            end
             map(wait, [get_from(w, :(Scythe.advanceTimestepB(mtile, sharedSpectral,
                 haloSend, haloReceive, $(t), xsi_h, xsi_rowstart))) for w in workerids])
         else

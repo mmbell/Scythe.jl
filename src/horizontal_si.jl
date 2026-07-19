@@ -325,7 +325,12 @@ function horizontal_si_history!(mtile::ModelTile, colstart::Int64, colend::Int64
     vars = mtile.model.grid_params.vars
     ts = mtile.model.ts
     am2 = get(mtile.model.options, :hsi_scheme, "ai2s") == "am2"
-    for var in ("p", "rho_d", "rho_t", "u", "E_t")
+    # The RLR azimuthal acoustic makes v an implicit acoustic leg; apply its fresh
+    # explicit history too (staged by mc_stage_v_acoustic!), matching the pressure
+    # azimuthal-divergence leg — the symmetric AI2* the split requires.
+    leg_vars = exact_si_is_rlr(mtile.model) ?
+        ("p", "rho_d", "rho_t", "u", "E_t", "v") : ("p", "rho_d", "rho_t", "u", "E_t")
+    for var in leg_vars
         index = vars[var]
         nstar = view(mtile.var_np1, colstart:colend, index)
         dot_n = view(mtile.hacdot_n, colstart:colend, index)
