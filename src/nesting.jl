@@ -184,9 +184,15 @@ function build_nest(nest::NestedModelParameters)
     get(nest.base.options, :horizontal_semiimplicit, false) === true && throw(ArgumentError(
         "options[:horizontal_semiimplicit] is not supported in nested runs yet " *
         "(single-patch only; nesting is a later phase of the horizontal SI plan)"))
-    get(nest.base.options, :exact_si, false) === true && throw(ArgumentError(
-        "options[:exact_si] is not supported in nested runs yet " *
-        "(single-patch only; nesting is Stage 3 of the exact-SI plan)"))
+    # exact_si in nested runs: the axisym (and XZ) radial solve is wired per patch
+    # (two-phase master solve inside run_nested_patch, R3X freeze-parent δu = 0 at
+    # interfaces). The RLR per-wavenumber solve is a later phase and still errors.
+    if get(nest.base.options, :exact_si, false) === true
+        (nest.base.equation_set == "moist_compressible_RLR" ||
+         nest.base.grid_params.geometry == "RLR") && throw(ArgumentError(
+            "options[:exact_si] on the RLR cylindrical set is not supported in " *
+            "nested runs yet (the per-wavenumber solve is a later exact-SI phase)"))
+    end
 
     base = nest.base
     geometry = base.grid_params.geometry
@@ -580,6 +586,57 @@ function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{F
 end
 
 """
+    advance_nested_timestepA(mtile, sharedSpectral, t, xstar, hfields, rowstart, injections)
+
+Exact-SI phase A for a nested tile: `advanceTimestepA` (predictor stage + publish
+`(u, w, p′)*` to the patch-level solve) with the fine→coarse collar injection
+spliced in after the tile transform and before the columns advance — so the
+predictor's Galerkin loads near the interface already integrate child data, exactly
+as `advance_nested_timestep` does for the explicit path. Phase B is the geometry-
+agnostic [`advanceTimestepB`](@ref) (no collar; increments + end-of-step comm).
+"""
+function advance_nested_timestepA(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
+        t::Int64, xstar::AbstractMatrix{Float64}, hfields::AbstractMatrix{Float64},
+        rowstart::Int64, injections::Vector{Tuple{Vector{Int}, Array{Float64,3}}})
+
+    tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
+
+    # Fine→coarse feedback: inject child values at the collar mish points owned by
+    # this tile (all vars, all derivative slices), as in advance_nested_timestep.
+    for (rows, vals) in injections
+        nsl = size(vals, 3)
+        nv = size(vals, 2)
+        @inbounds for s in 1:nsl, v in 1:nv
+            for (r, row) in enumerate(rows)
+                mtile.tile.physical[row, v, s] = vals[r, v, s]
+            end
+        end
+    end
+
+    checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
+    state_minima_trace(mtile, t)
+    if t > 1
+        exact_si_load_history!(mtile, hfields, t, rowstart)
+    end
+
+    if num_columns(mtile.tile) > 0
+        Threads.@threads :static for c in 1:num_columns(mtile.tile)
+            advance_column(mtile, c, t)
+        end
+    else
+        advance_column(mtile, -1, t)
+    end
+
+    vars = mtile.model.grid_params.vars
+    n = size(mtile.var_np1, 1)
+    rows = rowstart:(rowstart + n - 1)
+    xstar[rows, 1] .= view(mtile.var_np1, :, vars["u"])
+    xstar[rows, 2] .= view(mtile.var_np1, :, vars["w"])
+    xstar[rows, 3] .= view(mtile.var_np1, :, vars["p"])
+    return nothing
+end
+
+"""
     run_nested_patch(patch, model, workerids, n_sub, parent_links, child_links)
 
 Time-integrate one nest patch on its worker group (runs on the group master).
@@ -683,6 +740,39 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
     flush(stdout)
     checkCFL(patch)
 
+    # ── Exact (unsplit) 2-D acoustic semi-implicit setup (options[:exact_si]) ──
+    # Per-patch analogue of the single-patch setup in run_model: build the
+    # patch-level solve data (the master runs on workerids[1]), the shared
+    # predictor-publication and solve-feed arrays, and each tile's patch row
+    # window. The R3X interface BCs (FixedBC/NaturalBC) are handled inside
+    # create_exact_si_data as homogeneous-natural rows (freeze-parent δu = 0).
+    xsi = get(model.options, :exact_si, false) === true
+    esd = nothing
+    xsi_xstar = nothing
+    xsi_h = nothing
+    if xsi
+        w1 = workerids[1]
+        Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
+        rho_t2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_t(mtile.ref_state), :, 1:2))))
+        rho_d2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1:2))))
+        etp2 = get_val_from(w1, :(collect(
+            view(Scythe.ref_total_energy(mtile.ref_state), :, 1:2) .+
+            view(Scythe.ref_pressure(mtile.ref_state), :, 1:2))))
+        esd = create_exact_si_data(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+        npts = patch.params.iDim * patch.params.kDim
+        xsi_xstar = SharedArray{Float64,2}((npts, 3))
+        xsi_h = SharedArray{Float64,2}((npts, XSI_NPLANES))
+        xpatch = patch.ibasis.data[1, 1].mishPoints
+        kDim = model.grid_params.kDim
+        for w in workerids
+            x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
+            i1 = argmin(abs.(xpatch .- x1))
+            save_at(w, :xsi_rowstart, (i1 - 1) * kDim + 1)
+            save_at(w, :xsi_xstar, xsi_xstar)
+            save_at(w, :xsi_h, xsi_h)
+        end
+    end
+
     # ── Main loop ────────────────────────────────────────────────────────────
     num_ts = round(Int, model.integration_time / model.ts)
     output_int = round(Int, model.output_interval / model.ts)
@@ -715,10 +805,12 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         # Child collar values for this step (child state at my time t-1)
         inj_vals = [take!(cl.up) for cl in child_links]
 
-        # Advance all tiles (with collar injection on the owning workers)
+        # Advance all tiles (with collar injection on the owning workers). Build
+        # each worker's collar-injection payload once; reused by both exact-SI
+        # phase A and the explicit single-phase advance.
         @turbo sharedSpectral .= 0.0
         put!(haloInit, haloInitBuffer)
-        futures = Future[]
+        w_injs = Dict{Int, Vector{Tuple{Vector{Int}, Array{Float64,3}}}}()
         for w in workerids
             w_inj = Tuple{Vector{Int}, Array{Float64,3}}[]
             for (li, _) in enumerate(child_links)
@@ -727,9 +819,25 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
                     push!(w_inj, (local_rows, inj_vals[li][sel, :, :]))
                 end
             end
-            push!(futures, get_from(w, :(Scythe.advance_nested_timestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), $(w_inj)))))
+            w_injs[w] = w_inj
         end
-        map(wait, futures)
+        if xsi
+            # Two-phase exact-SI: publish predictors (with collar injection),
+            # the master runs the unsplit patch solve, then apply increments and
+            # do the end-of-step communication (advanceTimestepB, geometry-agnostic).
+            map(wait, [get_from(w, :(Scythe.advance_nested_timestepA(mtile,
+                sharedSpectral, $(t), xsi_xstar, xsi_h, xsi_rowstart,
+                $(w_injs[w])))) for w in workerids])
+            exact_si_solve!(xsi_h, esd, patch, model, t, xsi_xstar)
+            map(wait, [get_from(w, :(Scythe.advanceTimestepB(mtile, sharedSpectral,
+                haloSend, haloReceive, $(t), xsi_h, xsi_rowstart))) for w in workerids])
+        else
+            futures = Future[]
+            for w in workerids
+                push!(futures, get_from(w, :(Scythe.advance_nested_timestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), $(w_injs[w])))))
+            end
+            map(wait, futures)
+        end
         haloReceiveBuffer .= take!(haloReceive)
         accumulate_at_map!(sharedSpectral, haloReceiveMap, haloReceiveBuffer)
 

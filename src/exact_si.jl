@@ -146,6 +146,13 @@ rejected upstream by [`validate_exact_si_options`](@ref).
 @inline exact_si_is_axisym(model::ModelParameters) =
     model.equation_set == "moist_compressible_axisym"
 
+# A RIGID Dirichlet u wall (real prescribed value: u = 0 on the axis and the
+# outer domain wall) — as opposed to a nested-interface FixedBC, whose value
+# slots are NaN (R3X, pinned by the parent). Only the rigid wall contributes the
+# exact_si boundary load; the R3X interface and the parent-collar Natural edge
+# are homogeneous-natural (∂r p′ = 0 ⇒ δu = 0, the freeze-parent condition).
+@inline _is_rigid_dirichlet(bc) = bc.u !== nothing && !isnan(bc.u)
+
 """
     validate_exact_si_options(model)
 
@@ -271,10 +278,17 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
     fact = build(1.25 * model.ts)
     fact_first = build(0.5 * model.ts)
 
+    # u side-wall / interface classification. Only a RIGID Dirichlet wall
+    # (a real u value, u = 0 on the axis and the outer domain wall) contributes
+    # the ∂r p′ = ρ̄_t u*/Δτ boundary load. Every other radial condition maps to
+    # a homogeneous-natural row (∂r p′ = 0 ⇒ δu = 0): a NESTED interface FixedBC
+    # (R3X, u = NaN — the parent pins the value, so freeze δu = 0 during the
+    # acoustic sub-step, exact_si_stage3_plan §Stage-5) or a parent-collar
+    # NaturalBC (free edge) or a Neumann u wall. Robin/periodic are unsupported.
     bcl = model.grid_params.BCL["u"]; bcr = model.grid_params.BCR["u"]
     for bc in (bcl, bcr)
-        (_is_dirichlet(bc) || bc.du !== nothing) || error(
-            "exact_si supports Dirichlet or Neumann u side walls only")
+        (bc.robin === nothing && !bc.periodic) || error(
+            "exact_si does not support Robin or periodic u side walls")
     end
 
     # Slaved-leg coefficient chains (the vertical solve's non-sd formulas)
@@ -298,7 +312,7 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
         fact, fact_first,
         Matrix(dx.M0), Matrix(dx.M1), collect(dx.W), Matrix(dx.Nb),
         Matrix(dz.M0), Matrix(dz.M1), collect(dz.W), Matrix(dz.Nb),
-        (_is_dirichlet(bcl), _is_dirichlet(bcr)), lid_rows == "strong", ax0,
+        (_is_rigid_dirichlet(bcl), _is_rigid_dirichlet(bcr)), lid_rows == "strong", ax0,
         axisym, rmet, r_wall_l, r_wall_r,
         collect(Pxi_prof), collect(rho_tb), c_d, c_d_z, c_e, c_e_z,
         deepcopy(patch.ibasis.data[1, u_index]), deepcopy(patch.ibasis.data[1, p_index]),
