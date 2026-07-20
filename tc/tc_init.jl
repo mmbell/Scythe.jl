@@ -47,7 +47,9 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
             BCL = axis_bc, BCR = wall_bc, BCB = bot_bc, BCT = top_bc,
             vars = Dict(v => i for (i, v) in enumerate(TC_VARS))),
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
-                               :Khdiff_heat => 0.0, :Kvdiff_heat => 0.0,
+                               :Khdiff_heat => KH_HEAT, :Pr_t => PR_T,
+                               :Khdiff_water => KH_WATER, :Sc_t => SC_T,
+                               :Kvdiff_heat => 0.0,
                                :Kvdiff_water => 0.0,
                                :tau_qss => TAU_QSS, :N_r => 1.0e-3, :N_0 => N_0_MP,
                                :alpha => SPONGE_ALPHA, :z_damp => Z_DAMP,
@@ -55,12 +57,18 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                :Cd => CD, :l_inf => L_INF,
                                :Ls => LS_SMAG, :K_min => K_MIN,
                                :Ck => CK, :SST => SST_K, :U_min => U_MIN),
+        # Acoustic solver: the vertical-only SI with the state-dependent acoustic
+        # linearization. options[:exact_si] is NOT used here -- see
+        # tc/EXACT_SI_VORTEX_FAILURE.md: on this balanced vortex it drives rho_d
+        # negative within ~4 timesteps, while the vertical-only SI runs the same
+        # initial conditions cleanly. exact_si is opt-in via tc_run_axisym.jl's
+        # --exact-si for further debugging. It would buy no timestep here in any
+        # case: the run's own Courant ladder puts the horizontal acoustic mode at
+        # Co 0.25/3.0 while the vertical convective ceiling binds at 2.51/2.88.
         options = merge(Dict{Symbol,Any}(:semiimplicit => true,
-                                         # State-dependent acoustic linearization: removes the
-                                         # convective SI ceiling that killed the first 6-h run
-                                         # at Co_z 4.1 (tc/SI_CONVECTIVE_CEILING.md)
                                          :state_dependent_si => true,
                                          :exact_reference_state => true,
+                                         :state_deviation => STATE_DEVIATION,
                                          :precipitation => true,
                                          :vertical_mixing => false,
                                          :louis_bl => true,
@@ -121,7 +129,11 @@ function init_tc!(nest)
                                          Springsteel.ref_rho_v(ref)[:, 1];
                                          Vmax = VMAX, RMW = RMW,
                                          alpha = RANKINE_ALPHA, v_top = V_TOP,
-                                         fcor = F_COR)
+                                         z_bt = Z_BAROTROPIC, fcor = F_COR, RH_core = RH_CORE,
+                                         r_moist = R_MOIST, z_moist = Z_MOIST,
+                                         RH_max = RH_INIT_MAX,
+                                         RH_bl = RH_BL, z_bl = Z_BL,
+                                         moist_profile = MOIST_PROFILE)
     println("Balanced vortex: Vmax = $(VMAX) m/s at $(RMW / 1000.0) km, " *
             "gradient-wind residual = $(round(flds.residual; sigdigits=3)) " *
             "(kink-limited at the RMW), supersaturated points = $(flds.n_supersat)")

@@ -13,6 +13,12 @@
 #                       ring-native azimuthal truncation, output in tc_rlr/
 #   --restart T         continue from the T-second JLD2 restarts in each nest's
 #                       output dir (warm restart: the AB3 history is rebuilt)
+#   --exact-si          use the exact 2-D SI instead of the vertical-only SI
+#                       (DEBUG ONLY: blows up on the balanced vortex, see
+#                       tc/EXACT_SI_VORTEX_FAILURE.md)
+#   --trace N           report the min rho_d/rho_dbar column every N steps (and
+#                       immediately whenever it drops below 0.5), so a blow-up
+#                       leaves a located trace instead of a bare log(negative)
 
 using Distributed
 
@@ -20,6 +26,8 @@ integration_time = 1800.0
 csv = false
 rlr = false
 restart_t = nothing
+trace = 0
+use_xsi = false
 let args = copy(ARGS)
     i = 1
     while i <= length(args)
@@ -27,6 +35,11 @@ let args = copy(ARGS)
             global csv = true
         elseif args[i] == "--rlr"
             global rlr = true
+        elseif args[i] == "--exact-si"
+            global use_xsi = true
+        elseif args[i] == "--trace"
+            global trace = parse(Int, args[i+1])
+            i += 1
         elseif args[i] == "--restart"
             global restart_t = args[i+1]
             i += 1
@@ -58,7 +71,16 @@ geometry = rlr ? "RLR" : "RiRk"
 run_outdir = rlr ? replace(OUTPUT_DIR, "tc_axisym" => "tc_rlr") : OUTPUT_DIR
 base = make_base(integration_time;
                  output_formats = csv ? [:csv, :netcdf] : OUTPUT_FORMATS,
-                 output_dir = run_outdir, geometry = geometry)
+                 output_dir = run_outdir, geometry = geometry,
+                 extra_options = merge(
+                     trace > 0 ? Dict{Symbol,Any}(:state_minima_trace => trace) :
+                                 Dict{Symbol,Any}(),
+                     # A/B lever: swap the vertical-only state-dependent SI for
+                     # the exact 2-D solve (they are mutually exclusive) so the
+                     # two can be compared at identical initial conditions.
+                     use_xsi ? Dict{Symbol,Any}(:exact_si => true,
+                                                :state_dependent_si => false) :
+                               Dict{Symbol,Any}()))
 nest = make_nest(base)
 
 if restart_t === nothing
