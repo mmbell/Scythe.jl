@@ -330,6 +330,13 @@ using Springsteel
                                               Vmax = 0.0, fcor = 3.775e-5)
         @test flds0.rho_t ≈ repeat(rho_tbar, 1, nr)            # exactly background
         @test flds0.n_supersat == 0
+        # With no vortex the pressure must be the REFERENCE pressure bitwise, not
+        # merely close: the hydrostatic integration is in perturbation form
+        # (dp'/dz = -rho_t' g), so rho_t' = 0 leaves p' = 0 identically. Rebuilding
+        # the full profile by quadrature instead accumulated error downward from
+        # the top -- on the TC's Dunion sounding that was 4.6 hPa and -12 K at the
+        # outer edge, which drove RH past saturation near the tropopause.
+        @test flds0.p == repeat(pbar, 1, nr)
 
         # ── balanced vortex: residual, warm core, low center ──
         flds = Scythe.balanced_vortex_fields(r_axis, z, pbar, rho_dbar, rho_vbar;

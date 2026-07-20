@@ -640,16 +640,90 @@ end
 # ── Balanced vortex initialization (tropical cyclone spin-up) ───────────────────
 
 """
-    modified_rankine_v(r, z; Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3)
+    modified_rankine_v(r, z; Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3, z_bt=0.0)
 
 Modified Rankine vortex tangential wind [m/s]: linear inside the radius of
 maximum wind, `Vmax (RMW/r)^alpha` outside, decaying linearly with height to
-zero at `v_top` (`v *= max(0, (v_top - z)/v_top)`).
+zero at `v_top`.
+
+`z_bt` makes the vortex BAROTROPIC (height-independent) below that level, with
+the linear decay to `v_top` starting from there:
+
+    v(z) = v(r)                              for z <= z_bt
+    v(z) = v(r)·(v_top − z)/(v_top − z_bt)   above
+
+`z_bt = 0` (default) recovers the plain linear profile exactly.
+
+Why it matters: `∂v/∂z = 0` implies `∂C/∂z = 0` (`C = v²/r + fv`), and the
+thermal-wind characteristic form solved by [`thermal_wind_lnrho`](@ref) is
+`d(ln ρ)/dr = −(1/g)∂C/∂z` along `dz/dr = C/g` — so a barotropic layer generates
+NO density anomaly at all. Without it the balanced vortex carries a low-level
+warm core peaking near 1 km (+3.9 K at the axis, +3.1 K at the surface for
+Vmax = 30), which pushes the surface air ABOVE the SST and reverses the sign of
+the surface enthalpy and moisture fluxes — the ocean then cools and dries the
+boundary layer instead of powering it, and the vortex simply spins down. Real
+TCs keep the warm core aloft and the boundary layer coupled to the sea surface.
+A barotropic (or slightly increasing) BL is also what the Louis scheme drives
+the flow toward anyway, with the supergradient jet near the BL top.
 """
-function modified_rankine_v(r, z; Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3)
+function modified_rankine_v(r, z; Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3,
+                            z_bt=0.0)
 
     vr = r <= RMW ? Vmax * (r / RMW) : Vmax * (RMW / r)^alpha
-    return vr * max(0.0, (v_top - z) / v_top)
+    z_bt <= 0.0 && return vr * max(0.0, (v_top - z) / v_top)   # legacy linear, bitwise
+    z <= z_bt && return vr
+    z >= v_top && return 0.0
+    # SMOOTHERSTEP taper above z_bt: S(t) = 6t^5 - 15t^4 + 10t^3 has S = S' = S''
+    # = 0 at t = 0 and S = 1, S' = S'' = 0 at t = 1, so v is C2 at BOTH z_bt and
+    # v_top -- no kink and no curvature jump anywhere.
+    #
+    # This matters more than it looks. The thermal-wind march solves
+    # d(ln rho)/dr = -(1/g) dC/dz along dz/dr = C/g with C = v^2/r + f v, so any
+    # discontinuity in dv/dz lands directly in the density field, and a jump in
+    # d2v/dz2 lands in its vertical gradient. A piecewise-LINEAR taper (dv/dz
+    # jumping 0 -> -vr/(v_top-z_bt) at z_bt) produced a d(dT)/dz spike of
+    # +0.695 K/km against ~-0.05 K/km either side, with a local T maximum just
+    # above z_bt, and seeded an exponentially growing deep mode centred there:
+    # max|u| in nest2 went 2.6 -> 8.7 -> 17.4 -> 93 m/s over hours 3-6 (e-folding
+    # < 1 h) while the otherwise identical z_bt = 0 run stayed bounded near
+    # 1 m/s. Preserved in tc/output/tc_500m_barotropic_KINK_unstable/. A cosine
+    # taper fixes dv/dz but still jumps d2v/dz2 and left a 0.16 -> 0.88 K/km step.
+    t = (z - z_bt) / (v_top - z_bt)
+    return vr * (1.0 - (t * t * t * (10.0 + (t * ((6.0 * t) - 15.0)))))
+end
+
+"""
+    re87_v(r, z; v_m=15.0, r_m=82.5e3, r_0=412.5e3, fcor=5.0e-5, z_sponge=15.0e3)
+
+Rotunno & Emanuel (1987, JAS 44, 542-561) eq. (37) initial tangential wind:
+
+    v(r,z) = (z_s - z)/z_s * { [ v_m^2 (r/r_m)^2 ( (2 r_m/(r+r_m))^3
+                                 - (2 r_m/(r_0+r_m))^3 ) + f^2 r^2/4 ]^(1/2) - f r/2 }
+
+`r_0` is the outer radius beyond which `v = 0` (the subtraction makes it vanish
+there EXACTLY), and `v_m`, `r_m` are approximately the maximum wind and its radius
+(exactly so as `r_0/r_m` and `v_m/(f r_m)` become large). Intensity decays linearly
+with height to zero at `z_sponge`, and `v = 0` above.
+
+WHY THIS PROFILE. The cubic `(2r_m/(r+r_m))^3` falloff plus the exact zero at `r_0`
+makes the vortex genuinely COMPACT, which is what keeps the thermal-wind warm
+anomaly small: RE87 report "a temperature adjustment of at most ~0.6 K at the
+vortex center" for their control (r_0 = 412.5 km, r_m = 82.5 km, v_m = 15 giving
+v_max ~ 12 m/s, T_surf = 26.3 C). The modified-Rankine profile with alpha = 0.3
+used here previously decays as r^-0.3 and was still 12 m/s at r = 1050 km, giving
+a +6.9 K surface warm anomaly -- which put the surface air ABOVE the SST and
+reversed the air-sea enthalpy and moisture fluxes, so the vortex could only decay.
+See tc/HANDOFF_2026-07-19.md.
+"""
+function re87_v(r, z; v_m=15.0, r_m=82.5e3, r_0=412.5e3, fcor=5.0e-5,
+                z_sponge=15.0e3)
+
+    (z >= z_sponge || r >= r_0) && return 0.0
+    a = (2.0 * r_m / (r + r_m))^3
+    b = (2.0 * r_m / (r_0 + r_m))^3
+    inner = (v_m * v_m * (r / r_m)^2 * (a - b)) + (0.25 * fcor * fcor * r * r)
+    v = sqrt(max(inner, 0.0)) - (0.5 * fcor * r)
+    return max(v, 0.0) * ((z_sponge - z) / z_sponge)
 end
 
 "Centered first derivative on a (possibly nonuniform) axis; one-sided at the ends."
@@ -723,8 +797,28 @@ and outer edge:
 3. `p` by downward hydrostatic integration from `p(r, z_top) = p̄(z_top)`
    (the vortex vanishes above `v_top`, so `ρ = ρ̄` there and the anchor is
    consistent).
-4. Moisture: the mixing ratio holds its ambient profile, `q_v(r,z) = q̄_v(z)`,
-   so `ρ_d = ρ_t/(1 + q̄_v)`, `ρ_v = ρ_t − ρ_d`, and `T` from the moist EOS.
+4. Moisture: by default the mixing ratio holds its ambient profile,
+   `q_v(r,z) = q̄_v(z)`, so `ρ_d = ρ_t/(1 + q̄_v)`, `ρ_v = ρ_t − ρ_d`, and `T`
+   from the moist EOS. Passing `RH_core` instead moistens the inner core toward
+   a target relative humidity (see below).
+
+# Inner-core moisture (`RH_core`)
+
+Holding `q̄_v` fixed in radius makes the core the *driest* column in RH terms —
+the warm core raises T at fixed vapor — which is backwards for a developing TC
+and loads the sounding with CIN that must be overcome by an explosive release.
+With `RH_core` set, the target humidity is blended smoothly from the environment
+to the core,
+
+    RH(r,z) = RH̄(z) + W(r,z)·(RH_core − RH̄(z)),   W = exp(−(r/r_moist)²)·τ(z)
+
+with `τ` a cosine taper to zero at `z_moist`, and the blend applied only where it
+*moistens* (`RH_core > RH̄`). The repartition holds ρ_t and p FIXED and moves
+water between the dry and vapor components, which is **exactly balance
+preserving**: gradient-wind and hydrostatic balance constrain only ρ_t and p, so
+moisture is a free knob here. `ρ_v = RH·ρ_vs(T,p)` is solved by fixed-point
+iteration because `T = p/((ρ_t−ρ_v)R_d + ρ_v R_v)` depends on the partition
+(more vapor ⇒ larger R_m ⇒ lower T ⇒ lower ρ_vs, a contracting feedback).
 
 `residual` is the max relative gradient-wind imbalance `|∂_r p − ρ_t C|` over
 the interior (scaled by the max `|∂_r p|`); `n_supersat` counts grid points
@@ -735,7 +829,11 @@ function balanced_vortex_fields(r_axis::AbstractVector, z::AbstractVector,
                                 pbar::AbstractVector, rho_dbar::AbstractVector,
                                 rho_vbar::AbstractVector;
                                 Vmax=15.0, RMW=50.0e3, alpha=0.3, v_top=15.0e3,
-                                fcor=3.775e-5)
+                                fcor=3.775e-5, RH_core=nothing, r_moist=150.0e3,
+                                z_moist=8.0e3, RH_max=0.98, RH_bl=nothing,
+                                z_bl=1.5e3, moist_profile=:gaussian, z_bt=0.0,
+                                vortex_profile=:rankine, v_m=15.0, r_m=82.5e3,
+                                r_0=412.5e3)
 
     nz = length(z)
     nr = length(r_axis)
@@ -746,7 +844,9 @@ function balanced_vortex_fields(r_axis::AbstractVector, z::AbstractVector,
     C = zeros(nz, nr)
     for j in 1:nr, k in 1:nz
         r = r_axis[j]
-        vv = modified_rankine_v(r, z[k]; Vmax, RMW, alpha, v_top)
+        vv = vortex_profile === :re87 ?
+             re87_v(r, z[k]; v_m, r_m, r_0, fcor, z_sponge = v_top) :
+             modified_rankine_v(r, z[k]; Vmax, RMW, alpha, v_top, z_bt)
         v[k, j] = vv
         C[k, j] = r > 0.0 ? ((vv * vv) / r) + (fcor * vv) : 0.0
     end
@@ -754,19 +854,115 @@ function balanced_vortex_fields(r_axis::AbstractVector, z::AbstractVector,
     lnrho = thermal_wind_lnrho(r_axis, z, C, log.(rho_tbar))
     rho_t = exp.(lnrho)
 
-    # Hydrostatic pressure, downward from the reference top
+    # Hydrostatic pressure in PERTURBATION form: dp'/dz = -rho_t' g integrated
+    # downward from p'(z_top) = 0, with p = pbar + p'. Integrating the FULL
+    # profile (trapezoid on rho_t g) instead does NOT reproduce the reference
+    # state's own spline hydrostatic solve, and the quadrature error accumulates
+    # from the top down: at the outer edge, where the vortex vanishes and the
+    # fields must reduce to the reference exactly, it left p 4.6 hPa low and T
+    # up to 12 K cold. Because q_v holds its ambient profile and rho_vs is
+    # exponentially T-sensitive, that cold bias drove RH from 0.32 to 1.09 near
+    # the tropopause -- the source of the initial supersaturation and of the
+    # spurious condensate layers. In perturbation form the quadrature error acts
+    # only on the (small) vortex perturbation, and rho_t' -> 0 in the far field
+    # makes it reduce to the reference identically.
     p = zeros(nz, nr)
     for j in 1:nr
+        pprime = 0.0
         p[nz, j] = pbar[nz]
         for k in (nz-1):-1:1
-            p[k, j] = p[k+1, j] + (0.5 * (rho_t[k, j] + rho_t[k+1, j]) *
-                                   gravity * (z[k+1] - z[k]))
+            pprime += 0.5 * ((rho_t[k, j] - rho_tbar[k]) +
+                             (rho_t[k+1, j] - rho_tbar[k+1])) *
+                      gravity * (z[k+1] - z[k])
+            p[k, j] = pbar[k] + pprime
         end
     end
 
     rho_d = rho_t ./ (1.0 .+ q_vbar)     # broadcast q̄_v(z) down the columns
     rho_v = rho_t .- rho_d
     Tk = p ./ ((rho_d .* Rd) .+ (rho_v .* Rv))
+
+    if RH_core !== nothing
+        # Environmental RH from the reference column itself
+        Tbar = pbar ./ ((rho_dbar .* Rd) .+ (rho_vbar .* Rv))
+        RHbar = rho_vbar ./ rho_v_sat.(Tbar, pbar ./ 100.0)
+        RHbl = RH_bl === nothing ? RH_core : RH_bl
+        for j in 1:nr, k in 1:nz
+            taper = z[k] >= z_moist ? 0.0 :
+                    0.5 * (1.0 + cos(pi * z[k] / z_moist))
+            # Radial weight. :gaussian peaks ON THE AXIS, which loads the most
+            # CAPE exactly where the cylindrical 1/r geometry makes convection
+            # easiest to trigger -- a small radial convergence u gives a large
+            # divergence u/r as r -> 0. In RE87/CM1-class runs the axis stays
+            # stable because the storm-scale secondary circulation builds from
+            # the BL AWAY from the axis, and once the eyewall ascends, mass
+            # continuity forces SUBSIDENCE at the axis. Pre-loading axis CAPE
+            # short-circuits that: the axis convects on its own before the eye
+            # can establish. (Measured in the crashed 1 km run: CAPE 5861 J/kg at
+            # r = 0 vs 3327 at 100 km -- maximum exactly where it is least wanted;
+            # the axis lit up at 6 h and ran away to w = 20.9 m/s by 8 h even
+            # though the eyewall had properly organized at r = 30-50 km by 7 h.)
+            #
+            # :vortex weights by the surface tangential wind instead -- zero at
+            # the axis, peak at the RMW, decaying outward -- so the initial
+            # moisture sits where the SURFACE FLUXES are strongest (fluxes scale
+            # with wind speed) and the eye starts dry and stable. The Gaussian
+            # still multiplies it to confine the moist annulus radially, since
+            # the modified-Rankine tail decays only as r^-alpha.
+            W = if moist_profile === :vortex
+                vsfc = vortex_profile === :re87 ?
+                       re87_v(r_axis[j], 0.0; v_m, r_m, r_0, fcor, z_sponge = v_top) :
+                       modified_rankine_v(r_axis[j], 0.0; Vmax, RMW, alpha, v_top, z_bt)
+                vscale = vortex_profile === :re87 ? v_m : Vmax
+                (vscale > 0.0 ? vsfc / vscale : 0.0) *
+                    exp(-((r_axis[j] / r_moist)^2)) * taper
+            else
+                exp(-((r_axis[j] / r_moist)^2)) * taper
+            end
+            # Boundary layer and free troposphere get separate targets. CAPE is
+            # set by the SURFACE parcel's theta_e, so moistening the BL inflates
+            # it; the free-troposphere target is what matters for keeping deep
+            # convection steady rather than intermittent (the Dunion MT sounding
+            # dries to RH ~0.48 at 5-8 km, and that dry layer is what makes
+            # explicit convection downdraft-driven and explosive).
+            RHz = z[k] <= z_bl ? RHbl :
+                  RHbl + ((RH_core - RHbl) * min(1.0, (z[k] - z_bl) / z_bl))
+            target = min(RHbar[k] + (W * (RHz - RHbar[k])), RH_max)
+            target <= RHbar[k] && continue          # moisten only, never dry out
+            # Fixed point on rho_v at FIXED rho_t and p (balance preserving)
+            rv = rho_v[k, j]
+            for _ in 1:100
+                T = p[k, j] / (((rho_t[k, j] - rv) * Rd) + (rv * Rv))
+                rvnew = target * rho_v_sat(T, p[k, j] / 100.0)
+                rvnew = clamp(rvnew, 0.0, 0.999 * rho_t[k, j])
+                abs(rvnew - rv) < 1.0e-14 && (rv = rvnew; break)
+                rv = rvnew
+            end
+            rv <= rho_v[k, j] && continue           # never remove vapor
+            rho_v[k, j] = rv
+            rho_d[k, j] = rho_t[k, j] - rv
+            Tk[k, j] = p[k, j] / ((rho_d[k, j] * Rd) + (rv * Rv))
+        end
+    end
+
+    # Never initialize at or above saturation. The reference sounding carries a
+    # stratospheric q_v FLOOR (0.01 g/kg in the Dunion MT profile) which becomes
+    # supersaturated wherever the vertical mish is too coarse to resolve the
+    # tropopause cold point: at 1 km cells the spline undershoots to 187 K (vs
+    # 199 K at 300 m), and rho_vs at 187 K is vanishingly small, so 33206
+    # work-grid points came out supersaturated at 15.5-20 km. Capping RH is
+    # resolution-general and physically correct -- supersaturated initial air
+    # just condenses immediately into spurious cloud. Like the core moistening,
+    # this holds rho_t and p FIXED and moves mass between the dry and vapor
+    # components, so it is exactly balance preserving. It is a no-op (bitwise)
+    # at resolutions that resolve the tropopause.
+    for j in 1:nr, k in 1:nz
+        cap = RH_max * rho_v_sat(Tk[k, j], p[k, j] / 100.0)
+        rho_v[k, j] <= cap && continue
+        rho_v[k, j] = cap
+        rho_d[k, j] = rho_t[k, j] - cap
+        Tk[k, j] = p[k, j] / ((rho_d[k, j] * Rd) + (cap * Rv))
+    end
 
     n_supersat = count(rho_v .> rho_v_sat.(Tk, p ./ 100.0))
     n_supersat == 0 ||
