@@ -480,6 +480,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     Kvdiff_heat = get(model.physical_params, :Kvdiff_heat, Kvdiff)
     Kvdiff_water = get(model.physical_params, :Kvdiff_water, 0.0)
     tau_qss = get(model.physical_params, :tau_qss, 10.0)
+    # Turbulent Prandtl number for the Smagorinsky heat diffusion (Khdiff_heat < 0
+    # sentinel, below). 1.0 = heat mixes with the same eddy diffusivity as momentum.
+    Pr_t = get(model.physical_params, :Pr_t, 1.0)
+    # Horizontal water-species mixing: 0.0 = off (default), < 0 = Smagorinsky
+    # K_smag/Sc_t. DIAGNOSTIC and NOT energy consistent -- see the block by slot 8.
+    Khdiff_water = get(model.physical_params, :Khdiff_water, 0.0)
+    Sc_t = get(model.physical_params, :Sc_t, 1.0)
 
     # Coriolis parameter (constant f-plane) for the cylindrical geometries; the
     # Cartesian slice carries no rotation and its methods never read it.
@@ -722,11 +729,39 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     sd_xx = S.sd_xx
     mc_sd_lap!(sd_xx, geom, p, rho_d, pv, rdv, r)
 
+    # Smagorinsky horizontal eddy viscosity (Ls > 0): flow-dependent K(strain)
+    # replaces the constant Khdiff in the momentum diffusion and its FRIC_KE
+    # energy sink below. Computed BEFORE the heat diffusion because heat can be
+    # tied to it (the Khdiff_heat < 0 sentinel below).
+    K_smag = S.K_smag
+    if use_smag
+        mc_smag_k!(K_smag, geom, uv, vv, r, Ls, K_min)
+    end
+
     # Horizontal diabatic heating [W/m^3] from the entropy diffusion: the source to internal
-    # energy is rho_d*T*(ds_t/dt)_diff = rho_d*T*Khdiff_heat*d2(s_t)/dx2. This is the
+    # energy is rho_d*T*(ds_t/dt)_diff = rho_d*T*K_heat*d2(s_t)/dx2. This is the
     # moist analogue of Straka's rho*T*ds_d source.
+    #
+    # Khdiff_heat < 0 is the SENTINEL (as with Cd < 0 for the wind-dependent drag) for
+    # "mix heat with the Smagorinsky eddy diffusivity K_smag/Pr_t" instead of a constant.
+    # Without it, a Smagorinsky run mixes MOMENTUM only and leaves the thermodynamic
+    # fields with no horizontal mixing whatsoever -- which on an axisymmetric grid is
+    # especially bad, since there are no asymmetries to provide radial mixing and the
+    # strong radial gradients of a TC then support undamped grid-scale buoyancy
+    # structure. Tying it to K_smag rather than a constant keeps it resolution-general
+    # (K scales with the resolved deformation, so it follows a nest refinement).
+    # NOTE the form is K*grad^2(s), not div(K grad s): the variable-K correction
+    # grad(K).grad(s) is dropped, exactly as the existing momentum diffusion does with
+    # K_smag (mc_u_kdiff!) -- consistent with the surrounding scheme, not a new
+    # approximation.
     QDOT_TH = S.QDOT_TH
-    @. QDOT_TH = rho_d * Tk * Khdiff_heat * sd_xx
+    if Khdiff_heat < 0.0
+        use_smag || error("physical_params[:Khdiff_heat] < 0 selects the Smagorinsky " *
+                          "heat diffusivity, which requires Ls > 0")
+        @. QDOT_TH = rho_d * Tk * (K_smag / Pr_t) * sd_xx
+    else
+        @. QDOT_TH = rho_d * Tk * Khdiff_heat * sd_xx
+    end
 
     # Horizontal frictional KE change [W/m^3]. Momentum diffusion is a resolved-KE SINK to
     # the subgrid (the future TKE shear production), NOT dissipative heating: with an eddy K
@@ -734,14 +769,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # to the far-smaller kinematic viscosity) is negligible. So E_t follows the KE down and
     # internal energy (T, p) is held. FRIC_KE is d(rho_t*ke)/dt from horizontal momentum
     # diffusion, added to E_t; p and Q_ss get NO friction term.
-    # Smagorinsky horizontal eddy viscosity (Ls > 0): flow-dependent K(strain)
-    # replaces the constant Khdiff in the momentum diffusion and its FRIC_KE
-    # energy sink below (heat keeps the constant Khdiff_heat).
-    K_smag = S.K_smag
-    if use_smag
-        mc_smag_k!(K_smag, geom, uv, vv, r, Ls, K_min)
-    end
-
     FRIC_KE = S.FRIC_KE
     if use_smag
         mc_fric_ke!(FRIC_KE, geom, rho_t, K_smag, uv, wv, vv, r)
@@ -950,6 +977,55 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_rp_x, rho_rp_z, rrv.f_l)
     @turbo FORCING .= @. (-rho_r * div) + Qdot_r + AUTO_COLL - Fr_z
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
+
+    # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
+    #
+    # *** DIAGNOSTIC / TEMPORARY -- NOT ENERGY CONSISTENT. READ BEFORE USING. ***
+    #
+    # Why it exists: an axisymmetric domain has no asymmetries to provide radial
+    # mixing, so the sharp moisture gradients a TC develops are damped by nothing at
+    # all -- until now the water species had NO horizontal diffusion whatsoever
+    # (slot 8's "no diffusion yet" note), while momentum had Smagorinsky. That
+    # leaves grid-scale structure in the water field free to grow.
+    #
+    # What is wrong with it: this is a bare K*grad^2 on the water species. Diffusing
+    # water MASS without transporting the internal energy and latent heat that mass
+    # carries is exactly the moist coupling deferred in
+    # reference/moist_compressible_diffusion_handoff.md. The proper form is a product
+    # rule through the retrieval's T sensitivities, sourcing E_t and p alongside the
+    # mass (the `M = p + E_t - rho_t(ke+gz)` enthalpy invariant: any transport must
+    # source BOTH). Because this does not, it WILL drift energy -- watch
+    # conservation_drift. It is a noise control to obtain a stable run, not physics,
+    # and it must be replaced by the full moist form before any production science.
+    #
+    # Khdiff_water < 0 selects the Smagorinsky K_smag/Sc_t (the Khdiff_heat sentinel
+    # convention); > 0 is a constant diffusivity. Same K*grad^2 (not div(K grad))
+    # approximation as the momentum and heat terms.
+    if Khdiff_water != 0.0
+        WLAP = S.KDIFF                    # both free again after slot 8
+        WLAP2 = S.FORCING
+        if Khdiff_water < 0.0
+            use_smag || error("physical_params[:Khdiff_water] < 0 selects the " *
+                              "Smagorinsky water diffusivity, which requires Ls > 0")
+            # Total water rho_w' = rho_t' - rho_d' (dry air is NOT mixed: only the
+            # water rides on rho_t here, so rho_d's own tendency is untouched).
+            mc_w_kdiff!(WLAP,  geom, K_smag, rtv, r)
+            mc_w_kdiff!(WLAP2, geom, K_smag, rdv, r)
+            @turbo expdot[colstart:colend,3] .+= @. (WLAP - WLAP2) / Sc_t
+            mc_w_kdiff!(WLAP, geom, K_smag, rrv, r)
+            @turbo expdot[colstart:colend,8] .+= @. WLAP / Sc_t
+            mc_w_kdiff!(WLAP, geom, K_smag, qsv, r)
+            @turbo expdot[colstart:colend,7] .+= @. WLAP / Sc_t
+        else
+            mc_w_kdiff!(WLAP,  geom, Khdiff_water, rtv, r)
+            mc_w_kdiff!(WLAP2, geom, Khdiff_water, rdv, r)
+            @turbo expdot[colstart:colend,3] .+= @. WLAP - WLAP2
+            mc_w_kdiff!(WLAP, geom, Khdiff_water, rrv, r)
+            @turbo expdot[colstart:colend,8] .+= WLAP
+            mc_w_kdiff!(WLAP, geom, Khdiff_water, qsv, r)
+            @turbo expdot[colstart:colend,7] .+= WLAP
+        end
+    end
 
     # Tangential momentum (slot 9, cylindrical geometries only — no method body
     # executes on the Cartesian slice): advection, azimuthal PGF (3D), Coriolis +
