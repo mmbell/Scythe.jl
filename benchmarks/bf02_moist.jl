@@ -105,10 +105,14 @@ function bf02_moist_model(opts::BenchmarkOptions)
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
                                :tau_qss => 10.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
-        options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                       :precipitation => false, :vertical_mixing => false,
-                       :horizontal_semiimplicit => opts.hsi,
-                       :exact_si => opts.xsi)
+        options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                         :exact_reference_state => true,
+                                         :precipitation => false,
+                                         :vertical_mixing => false,
+                                         :horizontal_semiimplicit => opts.hsi,
+                                         :exact_si => opts.xsi),
+                        opts.stage == STAGE_MC ? reference_state_options() :
+                                                 Dict{Symbol,Any}())
     else
         equation_set = "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,

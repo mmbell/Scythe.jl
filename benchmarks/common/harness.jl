@@ -52,6 +52,42 @@ const STAGE_PE_SIGMA = Symbol("pe-sigma")
 # flux-form prognostics; T is diagnosed and the vapor/cloud partition follows from Q_ss.
 const STAGE_MC = Symbol("mc")
 
+"""
+    reference_state_options() -> Dict{Symbol,Any}
+
+Opt-in reference-state fixes for the pressure-reference (`mc`) stages, selected by the
+environment variable `SCYTHE_REFSTATE`:
+
+    SCYTHE_REFSTATE=qss          options[:consistent_qss_reference]
+    SCYTHE_REFSTATE=hydro        options[:hydrostatic_reference]
+    SCYTHE_REFSTATE=qss,hydro    both  (also spelled "both")
+
+Empty by default, so every committed baseline is reproduced BITWISE unless the variable
+is set. See `tc/HANDOFF_REFERENCE_STATE.md`: these make the resting reference a discrete
+steady state (it condensed at rest, and its stored dp̄/dz was up to 17 % off hydrostatic
+balance), and they necessarily move the mc-stage baselines — which is what running the
+benchmarks under them is meant to quantify.
+
+`reference_state_hydrostatic()` reports just the hydrostatic half, for the benchmark's
+own `calculate_pressure_reference_state` call that writes the `.ref` file: the file
+carries values only, so the converged triple has to be written for the balance to
+survive the round trip.
+"""
+function reference_state_options()
+    spec = get(ENV, "SCYTHE_REFSTATE", "")
+    isempty(spec) && return Dict{Symbol,Any}()
+    parts = strip.(split(lowercase(spec), ','))
+    both = "both" in parts
+    opts = Dict{Symbol,Any}()
+    (both || "qss" in parts) && (opts[:consistent_qss_reference] = true)
+    (both || "hydro" in parts) && (opts[:hydrostatic_reference] = true)
+    isempty(opts) && error("SCYTHE_REFSTATE='$spec' matched nothing; use qss, hydro, " *
+                           "qss,hydro or both")
+    return opts
+end
+
+reference_state_hydrostatic() = get(reference_state_options(), :hydrostatic_reference, false)
+
 struct Target
     name::String
     value::Float64

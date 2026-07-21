@@ -119,8 +119,9 @@ function o01_model(opts::BenchmarkOptions)
                            :Kvdiff_water => KV_WATER,
                            :tau_qss => 10.0, :N_r => N_R, :N_0 => N_0_MP,
                            :alpha => 0.02, :z_damp => 17.0e3)
-    options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                   :precipitation => true, :vertical_mixing => false)
+    options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                                     :precipitation => true, :vertical_mixing => false),
+                    reference_state_options())
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
@@ -183,13 +184,24 @@ function o01_init!(model)
     z = gridpoints[1:kDim, 2]
     column = Scythe.reference_column(patch, model.grid_params)
 
-    ref_phys = Springsteel.calculate_pressure_reference_state(DUNION_SOUNDING, z, column)
+    # The .ref file carries VALUES only, so under :hydrostatic_reference the CONVERGED
+    # (p, rho_d, rho_v) triple has to be written for the balance to survive the round
+    # trip -- exact_pressure_reference_state re-integrates dp/dz = -g*rho_t from it.
+    hydro = reference_state_hydrostatic()
+    ref_phys = Springsteel.calculate_pressure_reference_state(DUNION_SOUNDING, z, column;
+                                                             hydrostatic = hydro)
     pbar = Springsteel.ref_pressure(ref_phys)[:, 1]
     rho_dbar = Springsteel.ref_rho_d(ref_phys)[:, 1]
     rho_vbar = Springsteel.ref_rho_v(ref_phys)[:, 1]
     Scythe.write_exact_ref_mc(model.ref_state_file, z, pbar, rho_dbar, rho_vbar,
                               zeros(kDim))
-    ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column)
+    ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column;
+                                                     hydrostatic = hydro)
+    # The ICs are stored as perturbations from Q̄_ss, so the bubble must be differenced
+    # against the SAME Q̄_ss createModelTile will add back.
+    if get(reference_state_options(), :consistent_qss_reference, false)
+        ref = Scythe.consistent_qss_reference(ref, z, column)
+    end
 
     # Hydrostatic sanity: residual of the balanced reference on its own column
     rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
