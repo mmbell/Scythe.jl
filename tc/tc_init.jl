@@ -22,7 +22,13 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                    initial_conditions=joinpath(output_dir, "tc_ics.csv"),
                    geometry="RiRk",
                    output_interval=OUTPUT_INTERVAL,
-                   extra_options=Dict{Symbol,Any}())
+                   extra_options=Dict{Symbol,Any}(),
+                   # Overrides merged over physical_params, so a diagnostic run
+                   # can switch an individual closure off (e.g. :Khdiff_heat =>
+                   # 0.0) without editing tc_params.jl -- which matters because
+                   # a restart re-reads tc_params.jl, so editing it while a run
+                   # is in flight silently changes what a later restart does.
+                   extra_physical=Dict{Symbol,Any}())
     axis_bc, wall_bc, bot_bc, top_bc = tc_boundary_conditions()
     mkpath(output_dir)
     return ModelParameters(
@@ -46,7 +52,7 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                 Dict(v => -1 for v in TC_VARS) : Dict{String,Int64}(),
             BCL = axis_bc, BCR = wall_bc, BCB = bot_bc, BCT = top_bc,
             vars = Dict(v => i for (i, v) in enumerate(TC_VARS))),
-        physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+        physical_params = merge(Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
                                :Khdiff_heat => KH_HEAT, :Pr_t => PR_T,
                                :Khdiff_water => KH_WATER, :Sc_t => SC_T,
                                :Kvdiff_heat => 0.0,
@@ -57,6 +63,7 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                :Cd => CD, :l_inf => L_INF,
                                :Ls => LS_SMAG, :K_min => K_MIN,
                                :Ck => CK, :SST => SST_K, :U_min => U_MIN),
+                                extra_physical),
         # Acoustic solver: the vertical-only SI with the state-dependent acoustic
         # linearization. options[:exact_si] is NOT used here -- see
         # tc/EXACT_SI_VORTEX_FAILURE.md: on this balanced vortex it drives rho_d
@@ -127,6 +134,8 @@ function init_tc!(nest)
                                          Springsteel.ref_pressure(ref)[:, 1],
                                          Springsteel.ref_rho_d(ref)[:, 1],
                                          Springsteel.ref_rho_v(ref)[:, 1];
+                                         vortex_profile = VORTEX_PROFILE,
+                                         v_m = V_M, r_m = R_M, r_0 = R_0,
                                          Vmax = VMAX, RMW = RMW,
                                          alpha = RANKINE_ALPHA, v_top = V_TOP,
                                          z_bt = Z_BAROTROPIC, fcor = F_COR, RH_core = RH_CORE,
@@ -134,7 +143,8 @@ function init_tc!(nest)
                                          RH_max = RH_INIT_MAX,
                                          RH_bl = RH_BL, z_bl = Z_BL,
                                          moist_profile = MOIST_PROFILE)
-    println("Balanced vortex: Vmax = $(VMAX) m/s at $(RMW / 1000.0) km, " *
+    println("Balanced vortex ($(VORTEX_PROFILE)): max v = " *
+            "$(round(maximum(flds.v); digits=2)) m/s, " *
             "gradient-wind residual = $(round(flds.residual; sigdigits=3)) " *
             "(kink-limited at the RMW), supersaturated points = $(flds.n_supersat)")
     pmin = minimum(flds.p[1, :])

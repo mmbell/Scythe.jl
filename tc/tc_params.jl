@@ -3,32 +3,58 @@
 # include this file. Edit and rerun tc_init to regenerate the initial
 # conditions.
 
-# Vortex (modified Rankine, gradient-wind + hydrostatically balanced)
-# Vmax doubled from 15 to 30 m/s (2026-07-19): at 15 m/s the frictional secondary
-# circulation supplied only ~0.016 m/s of lifting, three orders below the ~4.9 m/s
-# needed to punch through even 12 J/kg of CIN, so convection never triggered in 8 h.
-# Ekman convergence scales with the vortex, so a stronger vortex is the physical
-# lever on the trigger (rather than seeding an artificial bubble).
+# ── Vortex ──────────────────────────────────────────────────────────────────
+# Rotunno & Emanuel (1987, JAS 44, 542-561) eq. (37), gradient-wind +
+# hydrostatically balanced. See src/idealized.jl `re87_v`.
+#
+# WHY :re87 AND NOT MODIFIED RANKINE (2026-07-19). The modified-Rankine profile
+# with alpha = 0.3 is not compact: v was still 12 m/s at r = 1050 km, the DOMAIN
+# EDGE. With no true far field the thermal-wind warm anomaly integrates across the
+# whole domain and reaches +6.91 K at the surface on the axis. The Dunion
+# sounding/SST pairing offers only +0.52 K of air-sea disequilibrium, so that
+# anomaly put the surface air ~4.8 K ABOVE the SST and REVERSED the surface
+# enthalpy and moisture fluxes -- the ocean cooling and drying the boundary layer,
+# the inverse of WISHE. The vortex could only decay.
+#
+# The previous fix for that was Z_BAROTROPIC = 2 km (v height-independent below,
+# so no thermal-wind anomaly in the BL). It restored the flux sign but compressed
+# the vortex decay into 13 km instead of 15, and the resulting |dv/dz| drove dry
+# Ertel PV NEGATIVE over ~1350 work-grid points -- symmetrically unstable. The
+# model then overturned it with an exponentially growing circulation that looked
+# like a blow-up but was the physically correct response. A C2-smooth version was
+# WORSE (higher peak shear), which is what proved shear magnitude was the driver
+# rather than the piecewise-linear kink.
+#
+# Eq. (37)'s cubic falloff and EXACT zero at r_0 makes the vortex compact, so the
+# warm anomaly is +1.56-1.91 K instead of +6.91 K, and the linear-in-z decay is
+# PV-stable without any barotropic layer. Z_BAROTROPIC is retained only as a knob
+# and MUST stay 0: it was the sole source of the symmetric instability.
+const VORTEX_PROFILE = :re87
+const V_M = 15.0             # [m/s] -> v_max ~ 12.9 m/s, matching RE87's ~12
+const R_M = 82.5e3           # [m] radius of maximum wind (RE87 control value)
+# Outer radius, WIDENED from RE87's 412.5 km. A compact vortex has strongly
+# anticyclonic outer vorticity (zeta ~ -v_m/(r_0 - r_m)) and f + zeta goes negative
+# when f is small. RE87 ran f = 5e-5 (20 N); F_COR here is 3.775e-5 (15 N), where
+# r_0 = 412.5 km gives 4546 negative-PV points. Measured: r_0 = 800 km gives ZERO.
+const R_0 = 800.0e3          # [m] v = 0 exactly at and beyond this radius
+const V_TOP = 15.0e3         # [m] winds decay linearly to zero here
+const Z_BAROTROPIC = 0.0     # [m] MUST be 0 -- see above; nonzero => unstable PV
+# Legacy modified-Rankine knobs, used only when VORTEX_PROFILE = :rankine.
 const VMAX = 30.0            # [m/s] maximum tangential wind
 const RMW = 50.0e3           # [m] radius of maximum wind
 const RANKINE_ALPHA = 0.3    # outer decay exponent, v = VMAX (RMW/r)^alpha
-const V_TOP = 15.0e3         # [m] winds decay linearly to zero here
-# Barotropic depth: v is height-INDEPENDENT below this, so dC/dz = 0 there and the
-# thermal wind generates NO density anomaly in the boundary layer. Without it the
-# balanced vortex carries a low-level warm core peaking at ~1 km (+3.9 K at the
-# axis), which puts the surface air ABOVE the SST and REVERSES the surface
-# enthalpy/moisture fluxes -- measured at t=0: SST-T_air = -4.9 K and q_s(SST)-q_a
-# = -4.0 g/kg at the axis, i.e. the ocean cooling and drying the boundary layer
-# instead of powering it. That is why the vortex spun down and convection never
-# fired. A barotropic BL is also what the Louis scheme drives the flow toward.
-const Z_BAROTROPIC = 2.0e3   # [m]
 
 # Environment
 const F_COR = 2.0 * 7.292e-5 * sind(15.0)   # [1/s] Coriolis at 15 N (3.775e-5)
-# SST lowered 28 -> 27 C (2026-07-19) to moderate the surface fluxes: the first
-# spin-up intensified 21 -> 55 m/s in six hours (real RI is ~15 m/s/day), so the
-# forcing was too strong to let a real inner core organize before it blew up.
-const SST_K = 300.15                        # [K] fixed sea surface temp (27 C)
+# SST was lowered 28 -> 27 C to moderate the surface fluxes, then raised to 29.5 C
+# (2026-07-19) once the flux SIGN turned out to be the real problem. The Dunion
+# hum90 sounding's surface air is 299.63 K, so SST = 300.15 left only +0.52 K of
+# environmental air-sea disequilibrium -- less than the vortex's own surface warm
+# anomaly (+1.91 K with the RE87 profile), which flipped the flux sign at the axis.
+# 302.65 K keeps SST - T_air POSITIVE at every radius with ~0.7 K of margin.
+# (RE87 could run 26.3 C because their model-neutral Jordan sounding had
+# correspondingly cooler surface air; ours is a different sounding.)
+const SST_K = 302.65                        # [K] fixed sea surface temp (29.5 C)
 const SOUNDING = joinpath(@__DIR__, "..", "benchmarks", "reference_data",
                           "o01_rainfall", "dunion_MT_hum90.ref")
 
