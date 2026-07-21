@@ -349,7 +349,8 @@ using Springsteel
                            u_side_bc=DirichletBC(), precipitation=false, N_r=1.0e-3,
                            q_l=1.0e-3, alpha=0.0, z_damp=20.0e3,
                            equation_set="moist_compressible_XZ",
-                           iMin=0.0, iMax=2000.0, f=0.0)
+                           iMin=0.0, iMax=2000.0, f=0.0,
+                           consistent_qss=false)
         varlist = equation_set == "moist_compressible_XZ" ? Scythe.MC_VARS :
                                                             Scythe.MC_VARS_CYL
         vars = Dict(v => i for (i, v) in enumerate(varlist))
@@ -379,7 +380,9 @@ using Springsteel
                                    :Kvdiff_water => Kvdiff_water,
                                    :Kv_mudiff => 0.0, :tau_qss => tau_qss, :N_r => N_r,
                                    :alpha => alpha, :z_damp => z_damp, :f => f),
-            options = Dict(:semiimplicit => semiimplicit, :exact_reference_state => true,
+            options = Dict{Symbol,Any}(:semiimplicit => semiimplicit,
+                           :exact_reference_state => true,
+                           :consistent_qss_reference => consistent_qss,
                            :precipitation => precipitation, :vertical_mixing => false),
         )
         patch.physical .= 0.0
@@ -1716,6 +1719,55 @@ using Springsteel
             for slot in (2, 3, 4, 5, 7, 8)
                 @test maximum(abs.(pK.physical[:, slot, 1])) < 1.0e-10
             end
+        end
+    end
+
+    @testset "consistent_qss_reference: the resting base is an EXACT fixed point" begin
+        # THE GATE of tc/HANDOFF_REFERENCE_STATE.md. Springsteel builds Q_ssbar
+        # pointwise from the EOS temperature and then FITS it, but the equation set
+        # retrieves T from the FITTED (pbar, E_tbar, rho_tbar) -- so rho_v* differs,
+        # the clamped partition leaves a residual cloud, and qss_condensation_rates
+        # fires on a state that is supposed to be at rest. On the TC reference that
+        # was expdot[p] = 2.3 Pa/s with zero perturbation and zero physics.
+        #
+        # The crumb this removes is the one the "resting base is untouched by full
+        # moist diffusion" testset documents above ("the file-derived Q_ssbar vs the
+        # retrieved-T saturation differ at ~1e-17, so Qdot != 0 at rest even with
+        # diffusion off"). With the flag on it is not ~1e-17, it is EXACTLY zero.
+        for (dry, q_l) in ((true, 0.0), (false, 1.0e-3))
+            # OFF: the crumb is present (this is the defect, asserted so the test
+            # fails loudly if someone "fixes" it by changing the default).
+            mktempdir() do tmpdir
+                m0, p0, mod0, _ = make_mc_mtile(tmpdir; dry=dry, q_l=q_l,
+                                                consistent_qss=false)
+                step_mc!(m0, p0, mod0, 5)
+                @test maximum(abs.(p0.physical)) > 0.0
+            end
+            # ON: every prognostic slot stays bit-exactly zero. Not "small" -- zero.
+            mktempdir() do tmpdir
+                m1, p1, mod1, _ = make_mc_mtile(tmpdir; dry=dry, q_l=q_l,
+                                                consistent_qss=true)
+                step_mc!(m1, p1, mod1, 5)
+                @test maximum(abs.(p1.physical)) == 0.0
+            end
+        end
+    end
+
+    @testset "consistent_qss_reference: a saturated base keeps its cloud" begin
+        # The cloudy branch must put the level on the Q_ss = 0 manifold rather than
+        # forcing all the water into vapor -- that would destroy the base cloud which
+        # is exactly what makes a BF02-style saturated base neutrally buoyant.
+        mktempdir() do tmpdir
+            m, p, mod, _ = make_mc_mtile(tmpdir; dry=false, q_l=1.0e-3,
+                                         consistent_qss=true)
+            ref = m.ref_state
+            @test all(Springsteel.ref_qss(ref)[:, 1] .== 0.0)          # on the manifold
+            @test all(Springsteel.ref_rho_c(ref)[:, 1] .> 0.0)         # cloud retained
+            # ...and the dry base takes the other branch: subsaturated, so Q_ssbar < 0.
+        end
+        mktempdir() do tmpdir
+            m, p, mod, _ = make_mc_mtile(tmpdir; dry=true, consistent_qss=true)
+            @test all(Springsteel.ref_qss(m.ref_state)[:, 1] .< 0.0)
         end
     end
 
