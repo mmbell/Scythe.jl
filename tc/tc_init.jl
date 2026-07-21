@@ -8,12 +8,66 @@
 
 const TC_VARS = Scythe.MC_VARS_CYL
 
+# WHY THE VERTICAL BCs ARE **SecondDerivativeBC**, NOT NEUMANN (2026-07-21).
+# This is the dominant term in the drain documented in HANDOFF_2026-07-20.md.
+#
+# `NeumannBC()` maps to the cubic-B-spline R1T1 condition (Springsteel
+# factory.jl `_bc_to_spline_dict`), a HARD CONSTRAINT ON THE BASIS: the fitted
+# spline is forced to have ZERO DERIVATIVE at z = 0 and z = Z_TOP. A tropical
+# cyclone violates that at the surface in the two places it matters most:
+#
+#   hydrostatic balance   dp'/dz = -g rho_t' /= 0   (that IS the surface deficit)
+#   RE87 eq. (37)         dv/dz  = -V(r)/z_s  /= 0  (the vortex decays with height
+#                                                    starting AT the ground)
+#
+# so p', rho_t' and v were being projected into a space that cannot hold the
+# balanced state near the ground. The damage happens on the FIRST load, inside
+# load_initial_conditions!'s spectralTransform!/gridTransform!, before a single
+# timestep is taken -- so no initialization scheme, however accurate, can fix it.
+#
+# MEASURED (model_tests/tc_discrete_balance.jl section 5): max discrete
+# hydrostatic residual -(dp'/dz + g rho_t')/rho_t over each patch [m/s^2],
+# radial BCs held natural so only BCB/BCT varies --
+#
+#                            nest 1     nest 2     nest 3
+#     NeumannBC              0.1035     0.04825    0.008255
+#     SecondDerivativeBC     0.004559   0.002096   0.0003509     <- 23x better
+#     NaturalBC              0.000684   0.000512   0.000157      <- but UNSTABLE
+#
+# The gradient-wind residual is untouched by any of these (~1.9e-4 in nest 1),
+# as it must be: the vertical BC does not enter the radial derivative.
+#
+# WHY NOT NaturalBC, which is what the physics wants. It blows the run up:
+# `tc_balance_holdtest.jl 0.1 nophysics` dies on a non-finite spectral
+# coefficient at t = 41 s with p unconstrained at the ground, 166 s with rho_t,
+# and 21 s with either unconstrained at the lid. E_t, rho_d, u and v are each
+# individually fine -- it is specifically the VERTICAL ACOUSTIC PAIR (p, rho_t).
+# The Galerkin acoustic solve (`_assemble_spline_matrix`, semiimplicit.jl) takes
+# Neumann as its NATURAL weak-form condition and branches only on Dirichlet, so
+# leaving p'/rho_t' completely free at a wall desynchronizes the implicit and
+# explicit legs of the AI2* split there. SecondDerivativeBC keeps one constraint
+# on the basis while leaving dp'/dz FREE -- exactly the degree of freedom
+# hydrostatic balance needs -- and is stable.
+#
+# Nothing else consumes these: the vertical acoustic Helmholtz is assembled on
+# the **w** column (Dirichlet, kept; calc_Helmholtz_semiimplicit_matrix takes
+# Dirichlet by default and is called without BC arguments), and the
+# vertical-diffusion factorizations do read BCB/BCT but are built only when some
+# Kvdiff* > 0, which this config never sets.
+#
+# The RADIAL conditions are left alone and are correct as they stand: Neumann at
+# the axis (C = v^2/r + f v -> 0 there, so dp'/dr -> 0) and at the outer wall
+# (v == 0 beyond r_0 = 800 km), with u Dirichlet at both and v Dirichlet on the
+# axis. Nest junctions never see these -- build_nest gives them FixedBC/NaturalBC.
 function tc_boundary_conditions()
     scalar_bc = Dict(v => NeumannBC() for v in TC_VARS)
+    d2_bc = Dict(v => SecondDerivativeBC() for v in TC_VARS)
     axis_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "v" => DirichletBC()))
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC()))
-    bot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), "rho_r" => NaturalBC()))
-    top_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+    # w = 0 at the ground and at the rigid lid is the one genuine vertical BC.
+    # rho_r stays NaturalBC at the ground so rain can fall out of the domain.
+    bot_bc = merge(d2_bc, Dict("w" => DirichletBC(), "rho_r" => NaturalBC()))
+    top_bc = merge(d2_bc, Dict("w" => DirichletBC()))
     return axis_bc, wall_bc, bot_bc, top_bc
 end
 
