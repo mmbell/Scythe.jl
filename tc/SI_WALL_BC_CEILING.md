@@ -1,13 +1,60 @@
 # The wall boundary condition sets the SI timestep ceiling (2026-07-21)
 
+> # ⚠ CORRECTED 2026-07-21 (later): THE CEILING BELOW IS AN ARTIFACT
+>
+> **The d2 ceiling is not ts ≈ 0.75 s. It is between ts = 1.0 and ts = 1.25 s.**
+> Every measurement in this note was taken on a reference state that CONDENSED AT
+> REST — `expdot[p] = 2.3 Pa/s` everywhere, continuously, with zero perturbation and
+> zero physics (see `tc/HANDOFF_REFERENCE_STATE.md`). That was a persistent
+> grid-scale source feeding exactly the acoustic modes this note characterises, and
+> the acoustic solve amplified it faster at larger ts. The instability attributed to
+> the wall condition was largely the reference driving it.
+>
+> Note this document ALREADY CONTAINS the defect, in the section "A SECOND, smaller
+> defect: a ts- and BC-independent resting drift" (`-2.3 Pa at 900 s, -4.5 Pa at
+> 1800 s`). It was not smaller. It was the whole thing.
+>
+> Re-measured with `options[:consistent_qss_reference]` and
+> `options[:hydrostatic_reference]` on, using a SEEDED resting column
+> (`model_tests/tc_lid_drift_probe.jl`, `d2@<ts>+qss+hydro+seed`, 1e-4 w seed):
+>
+> | ts   | before (flags off) | after (flags on) |
+> |------|--------------------|------------------|
+> | 0.5  | max\|w\| 1.4e-3, drifting | **decays** 1.3e-5 → 1.0e-6 (1 h) |
+> | 0.85 | **3.5e-1, unstable**      | **decays** 6.9e-6 → 9.5e-7 (1 h) |
+> | 1.0  | —                         | **decays** 5.0e-6 → 7.6e-8 (3 h) |
+> | 1.25 | —                         | 6.98 m/s @ 900 s → NON-FINITE @ 1909 s |
+> | 1.5  | —                         | NON-FINITE @ 798 s |
+> | 2.0  | —                         | NON-FINITE @ 52 s |
+>
+> **The UNSEEDED probe is worthless for this question and was what misled the
+> re-measurement at first.** Once the reference is a discrete fixed point the
+> unseeded column is bit-exact zero at EVERY ts tested, including 2.0 — there is
+> nothing to grow, so it measures preservation, not stability. Always use `+seed`.
+>
+> Consequences for the rest of this note:
+> - `NEST_TS = 0.5` has a 2× margin, not a 0.75× deficit. It can likely go to 1.0,
+>   but a resting probe cannot license a production timestep — validate on
+>   `tc_balance_holdtest.jl 12 nophysics` first (finite amplitude).
+> - **The R1T1X rejection is void.** It was measured at ts = 1.0, which was above the
+>   CONTAMINATED ceiling and below the true one, i.e. in a regime that no longer
+>   exists. Re-take it.
+> - The "This is the spurious cooling" section is still directionally right — but the
+>   cooling had two contributors and the reference was one of them; the split has not
+>   been re-measured.
+>
+> What survives unchanged: the quartet must share one wall condition (the slaving
+> argument), the acoustic-vs-balance conflict analysis, and the R1T1X rationale.
+
 Companion to `tc/SI_VERTICAL_CEILING.md` (resting-base operator consistency, fixed)
 and `tc/SI_CONVECTIVE_CEILING.md` (the state-dependent ceiling). This note documents
 a **third** ceiling, upstream of both, and identifies the spurious cooling aloft as
 its symptom.
 
-**Headline: `SecondDerivativeBC` — the 2026-07-21 fix for the vortex drain — lowers
-the vertical-acoustic timestep ceiling from ts ≈ 2.0 s to ts ≈ 0.75 s. The production
-configuration runs at ts = 1.0 s, i.e. ABOVE its own stability ceiling.**
+**Headline (SUPERSEDED — see the correction above): `SecondDerivativeBC` — the
+2026-07-21 fix for the vortex drain — lowers the vertical-acoustic timestep ceiling
+from ts ≈ 2.0 s to ts ≈ 0.75 s. The production configuration runs at ts = 1.0 s,
+i.e. ABOVE its own stability ceiling.**
 
 ---
 

@@ -1,5 +1,32 @@
 # The state-dependent (convective) ceiling of the mc semi-implicit — TC crash diagnosis
 
+> # ⚠ TWO CORRECTIONS (2026-07-21, later)
+>
+> **1. E4 did not test what it says it tested.** The row labelled "condensation
+> inert (τ_qss 10⁹)" and the conclusion "NOT condensation heating" are unsupported.
+> `tau_qss` appears in exactly ONE place in the source — `qss_relaxation`
+> (`moist_compressible.jl`, slot 7), which projects `Q_ss` onto its water-mass
+> admissible interval and, per its own comment, **"is exactly zero wherever cloud
+> exists."** The latent heating comes from `Qdot + Qdot_r` via
+> `qss_condensation_rates`, whose timescale is `invtau_condensation` from the droplet
+> physics and which never sees `tau_qss`. So E4 left condensation FULLY ACTIVE in the
+> updraft and disabled only a term that was already zero there. To actually make
+> condensation inert, force `Qdot`/`Qdot_r` to zero.
+>
+> **2. Every run in this note used a reference state that condensed at rest.**
+> `expdot[p] = 2.3 Pa/s` with zero perturbation, zero physics and zero diffusion —
+> a persistent grid-scale source, present in the reference run and in E1–E4 alike
+> (see `tc/HANDOFF_REFERENCE_STATE.md`). It is now fixed behind
+> `options[:consistent_qss_reference]`. This matters especially because the note's
+> own leading hypothesis is about grid-scale staging mismatch growing with local
+> sharpness — and a spurious volumetric source is a way to manufacture exactly that
+> sharpness. The companion `tc/SI_WALL_BC_CEILING.md` ceiling moved by 2× when the
+> same defect was removed, so the Courant-dependence measured here (E1 vs E2 vs E3)
+> needs re-taking before its mechanism is trusted.
+>
+> The symptom, the traces and the diagnosis chain are all still real events that
+> need explaining; it is the ATTRIBUTIONS that are in question.
+
 Working note, 2026-07-16/17. Status: **MECHANISM PARTIALLY REVISED after the
 state-dependent-linearization test (see "Second round" below) — the amplifier is
 Courant-dependent but NOT the linearization-coefficient locality. Production runs

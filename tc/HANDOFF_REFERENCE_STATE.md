@@ -121,12 +121,52 @@ need `--legacy-qss`.
 
 ---
 
+## WHAT THE FIX ALREADY BOUGHT: the d2 wall ceiling was an artifact
+
+`tc/SI_WALL_BC_CEILING.md` put the `SecondDerivativeBC` ceiling at ts ≈ 0.75 s, and
+that is why `NEST_TS = 0.5`. Re-measured on the fixed reference with a SEEDED resting
+column (`d2@<ts>+qss+hydro+seed`):
+
+    ts    before (flags off)          after (flags on)
+    0.5   max|w| 1.4e-3, drifting     decays 1.3e-5 -> 1.0e-6   (1 h)
+    0.85  3.5e-1, UNSTABLE            decays 6.9e-6 -> 9.5e-7   (1 h)
+    1.0   --                          decays 5.0e-6 -> 7.6e-8   (3 h)
+    1.25  --                          6.98 m/s @ 900 s -> NON-FINITE @ 1909 s
+    1.5   --                          NON-FINITE @ 798 s
+    2.0   --                          NON-FINITE @ 52 s
+
+**The true ceiling is between 1.0 and 1.25 s, not 0.75.** `NEST_TS = 0.5` has a 2x
+margin. That note already contained the defect, under "A SECOND, smaller defect: a
+ts- and BC-independent resting drift" — it was not smaller, it was the whole thing.
+
+**Methodological warning, learned the hard way in this session.** The UNSEEDED probe
+says bit-exact zero at EVERY ts including 2.0, where the seeded run dies in 52 s. Once
+the reference is a discrete fixed point there is nothing to grow, so the unseeded
+column measures PRESERVATION, not STABILITY. Always use `+seed` for a ceiling.
+
+Do NOT raise `NEST_TS` on this evidence alone: a resting probe cannot license a
+production timestep — that is the exact error `SI_CONVECTIVE_CEILING.md` warns about
+("SI stability claims must also be tested against finite-amplitude states"). Validate
+on `tc_balance_holdtest.jl 12 nophysics` at 0.5 vs 1.0 first.
+
 ## WHAT IS STILL OPEN
 
 - **Promote the gate into `test/`** as a standing regression (one patch, zero
   perturbation, sounding-derived reference, assert bit-exact zero).
-- **Re-baseline BF02 and O01/rainfall with the flags ON** and check whether the fix
-  improves them or merely changes them. Not yet run.
+- **BF02's mc base state is NOT in discrete hydrostatic balance in the mc set's own
+  metric** — `:hydrostatic_reference` rejects it at 1.41 % over 10 km. This is not an
+  artifact of the reconstruction: the `rho_t` fit is accurate to 1.3e-6 and a plain
+  pointwise trapezoid gives the same -1.36 %. The cause is that `bf02_moist_base`
+  balances and reports the ENTROPY/LOG-DENSITY chain-rule form
+  `P_s·s_z + P_xi·xi_z + P_qv·q_v,z` (`src/idealized.jl:398`), which it satisfies to
+  3.8e-8, while the total-energy set uses `dp̄/dz = -g·ρ̄_t`. Same class of defect as
+  the TC reference had, in a different metric. Until it is rebuilt, BF02 can run
+  `+qss` but not `+hydro`.
+
+- **Re-take the E1-E4 crash matrix** (`tc/SI_CONVECTIVE_CEILING.md`) on the fixed
+  reference — and rebuild E4 first: `tau_qss` only controls `qss_relaxation`, which
+  is "exactly zero wherever cloud exists", so E4 never disabled condensation and its
+  "NOT condensation heating" conclusion does not follow.
 - **The balanced vortex's own discrete balance** is a separate defect and is NOT
   addressed here (see `project_tc_discrete_balance_root_cause`): its t = 0
   hydrostatic residual was 5.09e-3 m/s², built by a trapezoid rule on the work grid
