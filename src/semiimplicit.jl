@@ -231,9 +231,21 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         if uses_pressure_reference(model.equation_set)
             # The total-energy set (moist_compressible) consumes the pressure-based
             # reference (p, partial densities, E_t, Q_ss) directly.
+            # :hydrostatic_reference — build dp̄/dz to satisfy discrete hydrostatic
+            # balance EXACTLY rather than to spline-fit accuracy (17% off at the TC
+            # lid). Opt-in, off by default: it moves every pressure-reference baseline.
+            hydro = get(model.options, :hydrostatic_reference, false)::Bool
             ref_state = model.options[:exact_reference_state] ?
-                Springsteel.exact_pressure_reference_state(model.ref_state_file, z_values, ref_column) :
-                Springsteel.calculate_pressure_reference_state(model.ref_state_file, z_values, ref_column)
+                Springsteel.exact_pressure_reference_state(model.ref_state_file, z_values,
+                                                           ref_column; hydrostatic=hydro) :
+                Springsteel.calculate_pressure_reference_state(model.ref_state_file, z_values,
+                                                               ref_column; hydrostatic=hydro)
+            # Rebuild Q_ssbar through the model's own retrieval so the resting column is
+            # a discrete fixed point (see consistent_qss_reference). Opt-in, off by
+            # default: it moves every pressure-reference baseline (BF02, O01, Straka).
+            if get(model.options, :consistent_qss_reference, false)::Bool
+                ref_state = consistent_qss_reference(ref_state, z_values, ref_column)
+            end
         elseif (model.options[:exact_reference_state])
             ref_state = physical_ref ?
                 Springsteel.exact_reference_state(model.ref_state_file, z_values, ref_column) :

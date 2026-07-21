@@ -261,6 +261,140 @@ function mc_reference_diagnostics(ref_state, z)
 end
 
 """
+    consistent_qss_reference(ref, z, column) -> PressureReferenceState
+
+Rebuild the reference supersaturation density `Q_ssbar` so the RESTING state is a
+discrete fixed point of the equation set. Opt-in through
+`options[:consistent_qss_reference]`; off by default and bitwise inert when off.
+
+Springsteel builds `Q_ssbar = ρ_v − ρ_v*(T, p)` POINTWISE from the EOS temperature and
+then fits it. The equation set never sees those pointwise values: at run time it
+retrieves T from the FITTED `(p̄, Ē_t, ρ̄_t)` through [`retrieve_temperature`](@ref), so
+`ρ_v*` differs, the clamped partition leaves a residual cloud (measured
+`ρ_c = 1.5e-6 kg/m³` on the TC reference), `qss_condensation_rates` fires, and the
+resting column has `expdot[p] = 2.3 Pa/s` — the state condenses while at rest.
+
+The fix constructs `Q_ssbar` through the model's own pipeline, exactly as
+[`mc_reference_diagnostics`](@ref) already does for the diffusion path. `Q̇` is
+`Q_ss·invtau/(1+Q_s)` split between the channels, so there are exactly two ways to make
+it vanish identically, and which one applies depends on whether the base carries cloud.
+
+**Cloud-free levels** (`ρ̄_c = 0` — a subsaturated sounding: O01, the TC). Shut both
+gates in `qss_condensation_rates` by putting all the water in the vapor phase:
+
+    ρ_v,max = max(ρ̄_t − ρ̄_d, 0)
+    T       = retrieve_temperature(M, ρ̄_d, ρ̄_t, ·, p̄, T̄, 0)
+    Q_ssbar = ρ_v,max − ρ_v*(T, p̄)
+
+with `M = p̄ + Ē_t − ρ̄_t·g·z` (rest: `ke = 0`, `ρ_r = 0`). The retrieval is INDEPENDENT
+of `Q_ss` while the diagnostic clamp is active — the clamped `wfactor = ρ_v,max − ρ_w`
+is `−ρ_r = 0`, so `F(T)` loses its water term — which makes this a one-shot solve
+rather than a fixed-point iteration. The resting partition then gives `ρ_v = ρ_v,max`,
+hence `ρ_c = 0` to within the rounding of `(ρ_v,max − ρ_vs) + ρ_vs`, so
+`q_c ~ 1e-16 < 1e-8`, and `S = Q_ss/ρ_vs < 0`. Both gates shut, `invtau_c = 0`, and
+`invtau_r = 0` for `ρ_r = 0`, so the closure returns `(0.0, 0.0)` EXACTLY.
+
+**Condensate-bearing levels** (`ρ̄_c > 0` — a saturated base: Bryan & Fritsch 2002).
+Forcing the water into vapor there would DESTROY the base cloud, which is what makes
+that state neutrally buoyant. The cloud gate is necessarily open, so instead put the
+level exactly on the saturation manifold:
+
+    Q_ssbar = 0
+
+`Q̇ = Q_ss·invtau/(1+Q_s)` is then exactly zero whatever `invtau` is, and the partition
+keeps `ρ_v = ρ_v*(T, p̄)` with `ρ_c` the positive residual. This is the manifold the
+BF02 benchmark already intends its base to sit on; the pointwise-minus-fitted
+construction just missed it by the fit error.
+
+The VALUE slot is the raw target (not the filtered fit): the fixed point depends on it
+exactly, while the derivative slots — which come from a spline fit of those values —
+multiply `w ≡ 0` at rest and so cannot disturb it.
+
+Errors per level if the intended outcome is not actually reached: a cloud-free level
+that still shows cloud or supersaturation (i.e. the sounding is saturated but carries
+no `ρ̄_c`, which needs a condensate-bearing reference), or a condensate level whose
+cloud the clamp removes.
+"""
+function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
+                                  z::AbstractVector{Float64}, column)
+
+    pbar = ref_pressure(ref)
+    rho_dbar = Springsteel.ref_rho_d(ref)
+    rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
+    E_tbar = ref_total_energy(ref)
+    Tbar = ref.Tbar
+    n = length(z)
+    Q_ss_new = zeros(Float64, n)
+    for k in 1:n
+        p = pbar[k, 1]
+        rho_d = rho_dbar[k, 1]
+        rho_t = rho_tbar[k, 1]
+        rho_v_max = max(rho_t - rho_d, 0.0)
+        # Mirror the driver's per-point pipeline at rest (ke = 0, rho_r = 0).
+        M = p + E_tbar[k, 1] - (rho_t * (gravity * z[k]))
+        # A condensate-free reference fits rho_c from an all-zero vector, so this is
+        # EXACTLY 0.0 there; a saturated base (BF02) carries a positive profile.
+        cloudy = rho_cbar[k, 1] > 0.0
+
+        if cloudy
+            # Saturation manifold: Qdot = Q_ss*invtau/(1+Q_s) vanishes for ANY invtau.
+            Q_ss_new[k] = 0.0
+        else
+            # Any Q_ss on or above the clamp ceiling gives the same T (see the
+            # docstring); start from the ceiling implied by the reference's own Q_ssbar.
+            Tk = retrieve_temperature(M, rho_d, rho_t, rho_v_max, p, Tbar[k, 1], 0.0)
+            Q_ss_new[k] = rho_v_max - rho_v_sat(Tk, p / 100.0)
+        end
+
+        # VERIFY the run-time outcome through the driver's own expressions. In the
+        # cloud-free branch the retrieval is only Q_ss-independent while the clamp is
+        # strictly active, and `Q_ss + rho_vs` lands ON the clamp ceiling to within the
+        # rounding of the subtraction above, so T here can differ from the run's by
+        # ~1 ulp. That is harmless — what has to hold is the closure's behaviour, which
+        # is checked directly rather than assumed.
+        Tk_run = retrieve_temperature(M, rho_d, rho_t, Q_ss_new[k], p, Tbar[k, 1], 0.0)
+        rho_vs = rho_v_sat(Tk_run, p / 100.0)
+        rho_v = clamp(Q_ss_new[k] + rho_vs, 0.0, rho_v_max)
+        rho_c = rho_t - rho_d - rho_v
+        if cloudy
+            # Qdot is identically zero here; what must not happen is the clamp eating
+            # the base cloud, which would make the base state buoyant.
+            rho_c > 0.0 || error("consistent_qss_reference: the diagnostic clamp " *
+                "removes the base cloud at level $k (z = $(z[k]) m): rho_cbar = " *
+                "$(rho_cbar[k, 1]) kg/m^3 in the reference but the resting partition " *
+                "gives rho_c = $rho_c at T = $Tk_run K, p = $(p/100.0) hPa. The " *
+                "reference's (p, rho_d, rho_t, E_t) are not consistent with a " *
+                "saturated state.")
+        else
+            q_c = max(rho_c, 0.0) / rho_d
+            S = Q_ss_new[k] / rho_vs
+            # Exactly the two gates in `qss_condensation_rates`; failing either leaves
+            # invtau_c > 0 and the reference condenses at rest.
+            (q_c <= 1.0e-8 && S <= 1.0e-4) || error("consistent_qss_reference: the " *
+                "reference still condenses at level $k (z = $(z[k]) m): q_c = $q_c " *
+                "(needs <= 1e-8), S = $S (needs <= 1e-4), T = $Tk_run K, " *
+                "p = $(p/100.0) hPa. A saturated base state needs a condensate-bearing " *
+                "reference (rho_c > 0), not a condensing one.")
+        end
+    end
+
+    # Value slot EXACT (the fixed point depends on it bit-for-bit); derivative slots
+    # from a spline fit of those values (they multiply w == 0 at rest).
+    Q_ssbar = zeros(Float64, n, 3)
+    column.uMish[:] .= Q_ss_new
+    Btransform!(column)
+    Atransform!(column)
+    Q_ssbar[:, 1] .= Q_ss_new
+    Q_ssbar[:, 2] .= Ixtransform(column)
+    Q_ssbar[:, 3] .= Ixxtransform(column)
+
+    return Springsteel.PressureReferenceState(
+        ref.pbar, ref.rho_dbar, ref.rho_vbar, ref.rho_cbar, ref.rho_tbar,
+        ref.Tbar, ref.E_tbar, Q_ssbar, ref.sound_speed_sq)
+end
+
+"""
     dry_entropy_pd(p_Pa, rho_d)
 
 Dry-air specific entropy written as an explicit function of the prognostic pressure and
