@@ -289,21 +289,37 @@ installed.
 ## ROOT CAUSE OF THE RESIDUAL DRIFT: the reference state (2026-07-21)
 
 The "second, smaller defect" above — the ts- and BC-independent ~-9 Pa/h lid drift —
-is **entirely the sounding-derived reference state's own discrete hydrostatic
-inconsistency**. Not the BCs, not the SI, not the dynamics.
+comes **entirely from the reference state**. Not the BCs, not the SI, not the
+dynamics. TWO separate reference defects contribute; see the corrected control
+table below.
 
 ### The control
 
 `model_tests/tc_lid_drift_probe.jl`, resting column, zero perturbation, identical
 in every respect except which reference is written:
 
-    reference                p'(top) @ 1800 s   max|w|      int rho_t' dV
-    analytic (exact hydro)    0.000000e+00      0.0e+00     0.000000e+00
-    sounding-derived         -4.733e+00        1.2e-03      3.4e-03
+    reference                              p'(top) @ 1800 s   max|w|
+    analytic, exactly hydrostatic, DRY      0.000000e+00      0.0e+00
+    analytic, exactly hydrostatic, MOIST   -5.818e-01        5.4e-04
+    sounding-derived (moist, inconsistent) -4.733e+00        1.2e-03
 
-**Bit-exact zero** with a consistent reference. The equation set, the d2 wall
-conditions, the semi-implicit solve and the sponge are therefore all exonerated:
-they form a perfect discrete fixed point when the reference is one.
+**Bit-exact zero** for the dry, hydrostatically consistent reference. The equation
+set, the d2 wall conditions, the semi-implicit solve and the sponge are therefore
+all exonerated: they form a perfect discrete fixed point when the reference is one.
+
+But an EXACTLY hydrostatic reference still breaks that fixed point as soon as
+moisture is added (row 2), so the two defects below are independent and BOTH real.
+An earlier version of this section claimed the drift was "entirely" the hydrostatic
+inconsistency, on the strength of the dry control alone. That was wrong: the dry
+control cannot distinguish "hydrostatically consistent" from "dry", because
+expdot[w] is identically zero in EVERY configuration (buoyancy is perturbation-only)
+and the only nonzero tendency at rest is expdot[p], which the condensation closure
+feeds. The moist analytic control is what separates them.
+
+Attribution as it now stands: the moist/Q_ss defect accounts for ~12 % of the
+sounding case's drift at RH ~ 0.5; the remaining ~88 % is the sounding reference's
+additional problems (its hydrostatic inconsistency and its much higher RH, not yet
+separated from each other).
 
 ### The inconsistency
 
