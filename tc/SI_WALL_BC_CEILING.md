@@ -216,3 +216,23 @@ deficit grows. Candidate resolutions, none yet tested:
 3. carry `p'' = p' + g ∫ rho_t' dz` as the prognostic pressure, whose wall
    derivative vanishes identically — plain R1T1 then becomes exactly right and no
    inhomogeneous machinery (or feedback) exists at all. Cleanest; largest change.
+
+---
+
+## The resting ceiling does NOT transfer to the balanced vortex
+
+`prod@2.0` (R1T1X walls) is quiet indefinitely on the resting column, but the
+12 h nophysics hold test at `SCYTHE_TC_TS_SCALE=2.0` **died at t = 9840 s
+(2.73 h)** with a non-finite spectral coefficient on nest 3.
+
+This is `SI_CONVECTIVE_CEILING.md`'s standing lesson applied to the wall ceiling:
+**an SI stability claim measured on a resting base is an upper bound, not a
+timestep.** The run's own advisory called it correctly before it failed —
+"Consider ts <~ 1.5911 s", from the δ = 0.15 convective heuristic.
+
+So the resting-column table above brackets the WALL-CONDITION ceiling (which is
+what it was built to isolate, and where d2 at 0.75 s vs Neumann/R1T1X at 2.0 s is
+the real comparison). The production timestep is then set by the convective
+ceiling on top of it, which is a separate and lower limit.
+
+Failed run preserved at `tc/output/tc_holdtest_nophysics_r1t1x_ts20/`.

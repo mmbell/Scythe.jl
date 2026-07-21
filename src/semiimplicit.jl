@@ -994,8 +994,11 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     wall_bc = mc_wall_bc_active(mtile.tile)
     if t > 1 && wall_bc
         tau = get(mtile.model.options, :wall_bc_tau, 300.0)::Float64
-        update_mc_wall_bc!(mtile.tile, mtile.tile.physical;
-                           relax = min(1.0, mtile.model.ts / tau))
+        relax = min(1.0, mtile.model.ts / tau)
+        # tau = Inf (the shipped TC setting) freezes the wall data, so the whole
+        # update is a no-op scaled by zero — skip it rather than redo the i-basis
+        # fit, which allocates, on every step of every tile.
+        relax > 0.0 && update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax)
     end
 
     # Transform to local physical tile

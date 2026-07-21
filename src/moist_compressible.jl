@@ -499,6 +499,28 @@ vortex and evolves on hours, so filtering it over ~minutes loses nothing real.
 `relax = 1` remains the right choice for a one-shot initialization, where there is
 no loop to close.
 """
+# Radial spline used only to differentiate the wall profile: same knots as the
+# variable's i-basis but NATURAL boundary conditions, so neither a wall Dirichlet
+# nor a nesting R3X payload can bend the wall data. Cached per (domain, cells);
+# Springsteel caches the factorised template underneath, so a miss is cheap.
+const _WALL_DERIV_SPLINES = Dict{NTuple{3,Any}, Springsteel.CubicBSpline.Spline1D}()
+const _WALL_DERIV_LOCK = ReentrantLock()
+
+function _wall_deriv_spline(grid, v::Int)
+    isp = grid.ibasis.data[1, v]
+    sp = isp.params
+    key = (sp.xmin, sp.xmax, sp.num_cells)
+    lock(_WALL_DERIV_LOCK) do
+        get!(_WALL_DERIV_SPLINES, key) do
+            Springsteel.CubicBSpline.Spline1D(
+                Springsteel.CubicBSpline.SplineParameters(
+                    xmin = sp.xmin, xmax = sp.xmax, num_cells = sp.num_cells,
+                    BCL = Springsteel.CubicBSpline.R0,
+                    BCR = Springsteel.CubicBSpline.R0))
+        end
+    end
+end
+
 function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0)
     gp = grid.params
     kDim = gp.kDim
@@ -548,10 +570,15 @@ function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0)
     # evaluates the i-derivative BEFORE fitting in k, so its dr = 1 / dr = 2
     # passes need d(wall)/dr and d2(wall)/dr2 as their `ahat`; feeding them
     # level 1 asserts dg/dr = g and wrecks the radial pressure gradient in the
-    # boundary cell. Obtained by fitting the radial profile through p's OWN
-    # i-basis, so the derivative is the same discrete operator the transform
-    # applies to everything else.
-    isp = grid.ibasis.data[1, p_i]
+    # boundary cell.
+    #
+    # Differentiated through a CLEAN natural-BC spline, NOT the variable's own
+    # i-basis. A nested child patch carries an R3X junction condition whose
+    # `ahat` holds the PARENT's payload; fitting the wall profile through that
+    # spline would inject the parent's pressure data into the wall derivative and
+    # constrain the profile to the junction trio. Both nested hold tests died on
+    # nest 3, whose inner edge is exactly such a junction.
+    isp = _wall_deriv_spline(grid, p_i)
     for s in 1:2
         (s == 1 ? haskey(kcol.params.BCL, "X1") : haskey(kcol.params.BCR, "X1")) || continue
         @inbounds for r in 1:iDim
