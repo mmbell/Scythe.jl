@@ -283,3 +283,89 @@ signature: a fresh or nested grid silently carrying zero/foreign wall data while
 every static check still looked plausible. Before believing any future wall-BC
 measurement, assert that the object being measured actually has the wall data
 installed.
+
+---
+
+## ROOT CAUSE OF THE RESIDUAL DRIFT: the reference state (2026-07-21)
+
+The "second, smaller defect" above — the ts- and BC-independent ~-9 Pa/h lid drift —
+is **entirely the sounding-derived reference state's own discrete hydrostatic
+inconsistency**. Not the BCs, not the SI, not the dynamics.
+
+### The control
+
+`model_tests/tc_lid_drift_probe.jl`, resting column, zero perturbation, identical
+in every respect except which reference is written:
+
+    reference                p'(top) @ 1800 s   max|w|      int rho_t' dV
+    analytic (exact hydro)    0.000000e+00      0.0e+00     0.000000e+00
+    sounding-derived         -4.733e+00        1.2e-03      3.4e-03
+
+**Bit-exact zero** with a consistent reference. The equation set, the d2 wall
+conditions, the semi-implicit solve and the sponge are therefore all exonerated:
+they form a perfect discrete fixed point when the reference is one.
+
+### The inconsistency
+
+`-(d(pbar)/dz + g*rho_tbar)/rho_tbar` on the stored reference, TC grid:
+
+    z = 0.06 km   -2.0e-01        z = 17.6 km   +4.0e-01
+    z = 2.56 km   +2.2e-02        z = 20.1 km   +9.3e-01
+    z = 15.1 km   -1.7e-02        z = 22.6 km   +1.67e+00
+
+For scale, the balanced vortex's own hydrostatic residual is 5.09e-03 — the
+REFERENCE is ~300x worse than the state it carries. And it is not the spline: a
+centred finite difference of the same pbar agrees with the spline derivative to
+<1 % and disagrees with -g*rho_tbar identically (-16.1 % vs -17.0 % at 22.6 km).
+The stored analytic profiles are simply not in hydrostatic balance.
+
+### Why
+
+`Springsteel/src/reference_state.jl:572-581`, the refinement loop, closes only one
+way:
+
+    column.uMish .= -gravity .* rho_t
+    Btransform!(column); Atransform!(column)      # a FIT, with l_q smoothing
+    p_Pa = IInttransform(column, p_sfc)           # pbar := antiderivative of the FIT
+    Tk    = theta ./ (p_0 ./ p).^(Rd/Cpd)
+    rho_d = 100 .* (p .- e_v) ./ (Tk .* Rd)       # rho from p and THETA, not from dpbar/dz
+
+`pbar` is the antiderivative of the FITTED `-g*rho_t`, but `rho_t` is then
+recomputed from theta through the EOS. Nothing forces `d(pbar)/dz = -g*rho_tbar`
+discretely, so the two separate wherever the l_q-regularised fit cannot follow
+rho_t — above the tropopause, where the Dunion sounding has knots at only 14.2,
+16.6, 20.7 and 32 km against a 500 m model grid, and where rho is small so a fixed
+absolute fit error is a large relative one. The error switches on at 16.6 km and
+grows monotonically to the lid, which is exactly the vertical structure of the
+spurious cooling.
+
+### A SECOND reference-consistency defect
+
+At exact rest the equation set returns
+
+    expdot[p]    = 2.32e+00        Qdot   = 2.96e-06   (condensation ACTIVE)
+    expdot[Q_ss] = 1.30e-05        rho_c  = 1.48e-06   (cloud water EXISTS)
+    every other slot = 0.000000e+00
+
+Unchanged with `tau_qss = 1e9`, so it is the saturation closure, not the
+relaxation: the reference's `Q_ss` is not consistent with the T the model's own
+retrieval returns, so the resting state condenses. `mc_ref_diag` already does this
+kind of retrieval-consistent reference diagnosis for the DIFFUSION path; the
+condensation path has no equivalent.
+
+### The fix
+
+Make the reference a discrete fixed point by construction — the native-operator
+route. After `IInttransform`, derive `rho_tbar` from the SPLINE DERIVATIVE of the
+fitted `pbar` instead of recomputing it from theta, so `d(pbar)/dz = -g*rho_tbar`
+holds to round-off; then distribute that `rho_t` over `rho_d`/`rho_v` consistently
+with `q_v`. Separately, define `Q_ss_bar` through the model's retrieval so `Qdot`
+vanishes at rest.
+
+Caveat on the control: the analytic reference above is DRY, so it conflates
+"hydrostatically consistent" with "no moisture". An analytic MOIST reference is the
+sharper control and would separate the two defects. Both live in the same function.
+
+**This is the target for a multi-day run.** It is timestep-independent, so it does
+not trade against the timestep, and if the lid is where the marginal mode lives,
+removing its forcing may also lift the wall ceiling.
