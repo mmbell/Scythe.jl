@@ -3,6 +3,7 @@
 #
 #   julia --project=. tc/tc_postprocess.jl [--indir DIR] [--nests n1,n2,...]
 #                                          [--ref REFFILE] [--N0 8e6] [--Nc 100]
+#                                          [--legacy-qss]
 #
 # The raw <t>.nc snapshots written by a run carry only the PROGNOSTIC control
 # variables, and the moist-compressible set stores most of them as PERTURBATIONS
@@ -38,6 +39,8 @@ nests  = String[]                       # empty => auto-detect nest subdirectori
 reffile = nothing                       # default: <indir>/tc_exact.ref
 N0 = 8.0e6                               # [m^-4] Marshall-Palmer rain intercept
 Nc_cm3 = 100.0                           # [cm^-3] monodisperse cloud droplet count
+legacy_qss = false                       # --legacy-qss: for runs made BEFORE
+                                         # options[:consistent_qss_reference]
 let i = 1
     while i <= length(ARGS)
         a = ARGS[i]
@@ -46,6 +49,7 @@ let i = 1
         elseif a == "--ref";    global reffile = ARGS[i+1]; i += 2
         elseif a == "--N0";     global N0 = parse(Float64, ARGS[i+1]); i += 2
         elseif a == "--Nc";     global Nc_cm3 = parse(Float64, ARGS[i+1]); i += 2
+        elseif a == "--legacy-qss"; global legacy_qss = true; i += 1
         else error("Unknown argument: $a")
         end
     end
@@ -146,7 +150,21 @@ function reference_background(x, z_reg)
     q_v = rho_vbar ./ rho_dbar; q_l = rho_cbar ./ rho_dbar
     E_tbar = (rho_dbar .* Springsteel.Thermodynamics.internal_energy_bf02.(Tbar, q_v, q_l)) .+
              (rho_tbar .* Scythe.gravity .* z_reg)
-    Q_ssbar = rho_vbar .- Springsteel.Thermodynamics.rho_v_sat.(Tbar, pbar ./ 100.0)
+    # Q̄_ss must be built the way the RUN built it, or adding it back to the stored
+    # Q_ss' recovers the wrong total and corrupts T and the water partition. The TC
+    # configuration sets options[:consistent_qss_reference], which defines Q̄_ss through
+    # the model's own retrieval so the resting reference does not condense (see
+    # Scythe.consistent_qss_reference); the pointwise EOS form below it is what
+    # Springsteel stores by default and is NOT what the run used.
+    rho_v_max = max.(rho_tbar .- rho_dbar, 0.0)
+    M_bar = pbar .+ E_tbar .- (rho_tbar .* (Scythe.gravity .* z_reg))
+    T_ret = Scythe.retrieve_temperature.(M_bar, rho_dbar, rho_tbar, rho_v_max, pbar,
+                                         Tbar, 0.0)
+    Q_ssbar = if legacy_qss
+        rho_vbar .- Springsteel.Thermodynamics.rho_v_sat.(Tbar, pbar ./ 100.0)
+    else
+        rho_v_max .- Springsteel.Thermodynamics.rho_v_sat.(T_ret, pbar ./ 100.0)
+    end
     return (; pbar, rho_dbar, rho_tbar, E_tbar, Q_ssbar, Tbar)
 end
 

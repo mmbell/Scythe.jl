@@ -182,10 +182,34 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         # on hours, so freezing it is a good approximation over a spin-up; it does
         # go stale as the storm deepens, which is the open item in
         # tc/SI_WALL_BC_CEILING.md.
+        # REFERENCE STATE (2026-07-21, tc/HANDOFF_REFERENCE_STATE.md). Both of these
+        # are opt-in and off by default in the library, because they move every
+        # pressure-reference baseline; the TC run needs both.
+        #
+        # :consistent_qss_reference rebuilds Q̄_ss through the model's own retrieval so
+        # the reference does not CONDENSE at rest. Without it the resting column is not
+        # a discrete fixed point at all: expdot[p] = 2.3 Pa/s with zero perturbation,
+        # zero physics and zero diffusion, and p'(top) reaches -4.7 Pa in 30 min. With
+        # it the resting column is BIT-EXACT zero for at least 3 h
+        # (model_tests/tc_lid_drift_probe.jl d2@0.5+qss). This was 100 % of the resting
+        # drift -- the earlier 88/12 attribution to the hydrostatic imbalance was an
+        # artifact of comparing two different reference states.
+        #
+        # :hydrostatic_reference makes dp̄/dz = -g·ρ̄_t hold EXACTLY. It contributes
+        # nothing to the RESTING drift (measured: d2@0.5+hydro alone still drifts,
+        # d2@0.5+qss alone is already bit-exact) because every reference-derivative
+        # term in the tendencies multiplies w. It matters for the PERTURBATION
+        # dynamics: the equation set carries dp̄/dz = -g·ρ̄_t as an unstated assumption,
+        # so where the stored derivative violated it -- by up to 17 % above the
+        # tropopause, from a hydrostatic sweep truncated at 5 iterations mid-oscillation
+        # -- the model silently omitted a forcing of that size, and every reference
+        # gradient the perturbations advect (p_z = pp_z + p̄_z) was wrong by it.
         options = merge(Dict{Symbol,Any}(:semiimplicit => true,
                                          :wall_bc_tau => Inf,
                                          :state_dependent_si => true,
                                          :exact_reference_state => true,
+                                         :consistent_qss_reference => true,
+                                         :hydrostatic_reference => true,
                                          :state_deviation => STATE_DEVIATION,
                                          :precipitation => true,
                                          :vertical_mixing => false,
@@ -228,13 +252,35 @@ function init_tc!(nest)
     zcol = gp1.geometry == "RLR" ? 3 : 2       # z gridpoint column
     z = Scythe.getGridpoints(patch1)[1:kDim, zcol]
     column = Scythe.reference_column(patch1, gp1)
-    ref_phys = Springsteel.calculate_pressure_reference_state(SOUNDING, z, column)
+    # The .ref file carries VALUES only, so the hydrostatic balance has to survive the
+    # round trip through the density: write the CONVERGED (p, rho_d, rho_v) triple and
+    # let exact_pressure_reference_state re-integrate dp/dz = -g*rho_t from it. Writing
+    # the 5-sweep-truncated triple instead leaves p and rho_t mutually inconsistent by
+    # 27 % at the lid, which the reconstruction then rejects.
+    hydro = get(nest.base.options, :hydrostatic_reference, false)::Bool
+    ref_phys = Springsteel.calculate_pressure_reference_state(SOUNDING, z, column;
+                                                             hydrostatic = hydro)
     Scythe.write_exact_ref_mc(nest.base.ref_state_file, z,
                               Springsteel.ref_pressure(ref_phys)[:, 1],
                               Springsteel.ref_rho_d(ref_phys)[:, 1],
                               Springsteel.ref_rho_v(ref_phys)[:, 1],
                               zeros(kDim))
-    ref = Springsteel.exact_pressure_reference_state(nest.base.ref_state_file, z, column)
+    ref = Springsteel.exact_pressure_reference_state(nest.base.ref_state_file, z, column;
+                                                     hydrostatic = hydro)
+    if hydro
+        rt = Springsteel.ref_rho_t(ref)[:, 1]
+        resid = -(Springsteel.ref_pressure(ref)[:, 2] .+ (Scythe.gravity .* rt)) ./ rt
+        println("Reference hydrostatic residual: max = " *
+                "$(round(maximum(abs, resid); sigdigits=3)) m/s^2")
+    end
+    # The initial conditions are stored as PERTURBATIONS from Q̄_ss, so the vortex must
+    # be differenced against the SAME Q̄_ss createModelTile will add back. Applying the
+    # correction here (rather than only inside createModelTile) keeps the far field,
+    # where the vortex vanishes and the state must reduce to the reference exactly,
+    # at Q_ss' -> 0.
+    if get(nest.base.options, :consistent_qss_reference, false)::Bool
+        ref = Scythe.consistent_qss_reference(ref, z, column)
+    end
     println("Reference: sfc p = " *
             "$(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits=2)) hPa")
 
