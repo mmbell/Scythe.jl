@@ -236,3 +236,50 @@ the real comparison). The production timestep is then set by the convective
 ceiling on top of it, which is a separate and lower limit.
 
 Failed run preserved at `tc/output/tc_holdtest_nophysics_r1t1x_ts20/`.
+
+
+---
+
+## THE R1T1X CONFIGURATION IS WORSE THAN d2. DO NOT SHIP IT. (2026-07-21)
+
+Retracting an earlier claim in this note. R1T1X was reported as cutting the
+nest-1 discrete hydrostatic residual 0.1053 -> 0.00993 m/s^2. **That baseline was
+not the d2 configuration.** It was the half-applied R1T1X configuration itself,
+silently degraded to plain Neumann because `evaluate_tendencies` (and, at the
+time, `advanceTimestep` on its first step) builds a FRESH TILE whose `wall_du` is
+zero. The number being beaten was Neumann's, not d2's.
+
+Like for like, under the model's own operators at t = 0, nest 1:
+
+    config          gradient-wind      hydrostatic
+    all d2           4.670e-05          5.091e-03
+    R1T1X            3.062e-03          9.932e-03      65x and 2x WORSE
+
+and in flight, 12 h nophysics hold test, nest 1:
+
+    d2    @ ts 0.5    15.8 % of the deficit filled,   4.1 % of the wind lost
+    d2    @ ts 1.0    34 %                           20 %
+    R1T1X @ ts 1.0    95 %                           46 %
+
+The static and dynamic measurements agree once the baseline is right. The earlier
+"a better t = 0 residual bought a worse trajectory" framing was an artefact of the
+bad baseline and is withdrawn.
+
+**Why R1T1X loses.** Keeping the acoustic set operator-consistent forced `rho_d`,
+`rho_t`, `E_t` and `Q_ss` from `SecondDerivativeBC` onto homogeneous Neumann,
+which pins `d(rho_t')/dz = 0` at the ground. That is precisely the projection
+damage `HANDOFF_2026-07-21.md` identified for `p`, relocated to the densities —
+and it costs far more than the correct `p` wall condition gains. Second, untested
+suspect: the FROZEN wall derivative pinning `dp'/dz` to its t = 0 value while the
+vortex adjusts.
+
+**Shipped state:** `tc_init.jl` is back to `SecondDerivativeBC` on every scalar,
+with `NEST_TS = 0.5` (the ceiling result stands and is independent of all this).
+The R1T1X machinery is kept, tested and OFF.
+
+**Lesson for whoever picks this up.** Every one of the three integration bugs
+(state feedback, the `dr` axis, R3X contamination) and the bad baseline shared one
+signature: a fresh or nested grid silently carrying zero/foreign wall data while
+every static check still looked plausible. Before believing any future wall-BC
+measurement, assert that the object being measured actually has the wall data
+installed.

@@ -63,30 +63,48 @@ function tc_boundary_conditions()
     scalar_bc = Dict(v => NeumannBC() for v in TC_VARS)
     axis_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "v" => DirichletBC()))
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC()))
-    # ── VERTICAL WALLS ── see tc/SI_WALL_BC_CEILING.md for the measurements.
+    # ── VERTICAL WALLS ── see tc/SI_WALL_BC_CEILING.md for the full measurements.
     #
-    # THE ACOUSTIC SET (p, rho_d, rho_t, E_t, and Q_ss, which feeds the temperature
-    # retrieval) must ALL sit in the R1T1 subspace. That is what the semi-implicit
-    # acoustic solve implies: w is Dirichlet, so phi = rho_tbar w vanishes at the
-    # wall for all time and the implicit pair forces dp'/dz = 0 there for the
-    # ACOUSTIC part. Measured ceiling with the set on R1T1: ts ~ 2.0 s. On
-    # SecondDerivativeBC: ts ~ 0.75 s. Splitting the set across the two is far
-    # worse than either -- d2 on rho_t alone goes non-finite in 26 s.
+    # SecondDerivativeBC on every scalar. This is the 2026-07-21 configuration and
+    # it remains the best MEASURED one, but the timestep it needs is NOT 1.0 s:
+    # the resting-column probe (model_tests/tc_lid_drift_probe.jl) puts the wall
+    # ceiling at ts ~ 0.75 s with d2 walls versus ~2.0 s with the acoustic set on
+    # R1T1, and NEST_TS = 1.0 was above it. That instability -- not physics, not
+    # the initialization -- was ~77% of the spurious cooling aloft, ALL of the lid
+    # mass gain, and most of the adjustment transient. Hence NEST_TS = 0.5.
     #
-    # p ADDITIONALLY carries the inhomogeneous offset (R1T1X): the FULL w equation
-    # at the wall is the exact identity dp'/dz = -g rho_t', which IS the surface
-    # pressure deficit and which homogeneous Neumann sets to zero -- the drain of
-    # HANDOFF_2026-07-20.md. R1T1X keeps the R1T1 subspace (so the timestep ceiling
-    # is unaffected: ahat is an AFFINE offset) while carrying the true derivative.
-    # `update_mc_wall_bc!` refreshes it per column before every fit.
+    # WHY NOT THE R1T1X WALL CONDITION, which is built and tested. The exact
+    # compatibility condition at a rigid wall is dp'/dz = -g rho_t' (w is
+    # Dirichlet, so w == 0 for all time and the w equation collapses to an
+    # identity). CubicBSpline.R1T1X carries exactly that in an affine ahat while
+    # keeping R1T1's subspace. It is nonetheless WORSE THAN d2 ON BOTH COUNTS.
     #
-    # u, v and rho_r are NOT in the acoustic set and are measurably free (bitwise
-    # identical to all-Neumann at ts = 2.0). They get SecondDerivativeBC because
-    # they need it: RE87 eq. (37) has dv/dz = -V(r)/z_s /= 0 AT THE GROUND.
-    acoustic = ["p", "rho_d", "rho_t", "E_t", "Q_ss"]
-    vert = Dict{String,Any}(v => (v in acoustic ? NeumannBC() : SecondDerivativeBC())
-                            for v in TC_VARS)
-    vert["p"] = Springsteel.CubicBSpline.R1T1X
+    # t = 0 residuals under the model's own operators, nest 1
+    # (model_tests/tc_discrete_balance.jl section 1):
+    #
+    #                    gradient-wind      hydrostatic
+    #     all d2          4.670e-05          5.091e-03
+    #     R1T1X config    3.062e-03          9.932e-03
+    #
+    # 12 h nophysics hold test, nest 1:
+    #
+    #     d2   @ ts 0.5     15.8% of the deficit filled,  4.1% of the wind lost
+    #     d2   @ ts 1.0     34%                          20%
+    #     R1T1X@ ts 1.0     95%                          46%
+    #
+    # The leading suspect is NOT p itself but
+    # the four variables this configuration moved from d2 to homogeneous Neumann
+    # to keep the acoustic set consistent (rho_d, rho_t, E_t, Q_ss): Neumann
+    # forces d(rho_t')/dz = 0 at the ground, which is the same projection damage
+    # the 2026-07-21 handoff identified for p, relocated to the densities. Second
+    # suspect is the FROZEN wall derivative (:wall_bc_tau => Inf) pinning dp'/dz
+    # to its t = 0 value while the vortex adjusts. Neither has been isolated.
+    #
+    # The R1T1X machinery is kept and tested (Springsteel test/r1t1x.jl,
+    # Scythe mc_wall_bc_active / update_mc_wall_bc!); it is simply not enabled.
+    # Re-enable by setting vert["p"] = Springsteel.CubicBSpline.R1T1X and the
+    # acoustic set to NeumannBC() -- but ISOLATE the two suspects above first.
+    vert = Dict{String,Any}(v => SecondDerivativeBC() for v in TC_VARS)
     # w = 0 at the ground and at the rigid lid is the one genuine vertical BC.
     # rho_r stays NaturalBC at the ground so rain can fall out of the domain.
     bot_bc = merge(vert, Dict{String,Any}("w" => DirichletBC(), "rho_r" => NaturalBC()))
@@ -149,7 +167,9 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         # --exact-si for further debugging. It would buy no timestep here in any
         # case: the run's own Courant ladder puts the horizontal acoustic mode at
         # Co 0.25/3.0 while the vertical convective ceiling binds at 2.51/2.88.
-        # :wall_bc_tau = Inf FREEZES the R1T1X wall derivative at the value
+        # :wall_bc_tau is inert while the walls are SecondDerivativeBC (the
+        # R1T1X path is off); kept so re-enabling needs one edit, not two.
+        # Inf FREEZES the R1T1X wall derivative at the value
         # load_initial_conditions! computes from the balanced vortex. A frozen
         # (affine) offset is provably — and measurably — as stable as homogeneous
         # R1T1, whereas letting it track the state closes a feedback loop with the

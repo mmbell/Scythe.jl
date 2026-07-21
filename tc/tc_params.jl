@@ -197,7 +197,9 @@ const NUM_CELLS_K = _tc_coarse ? 50 : 84                      # 500 m vs 300 m c
 # ts ~ 0.75 s with SecondDerivativeBC walls and ~2.0 s with Neumann, so ts = 1.0
 # below is ABOVE its ceiling until the inhomogeneous-Neumann wall fix lands.
 const TS_SCALE = parse(Float64, get(ENV, "SCYTHE_TC_TS_SCALE", "1.0"))
-const NEST_TS = TS_SCALE .* (_tc_coarse ? [1.0, 1.0, 1.0] : [0.5, 0.5, 0.5])
+# 1.0 -> 0.5 (2026-07-21): ts = 1.0 is ABOVE the measured wall-condition ceiling
+# of ~0.75 s for SecondDerivativeBC walls. 0.5 is validated over 12 h.
+const NEST_TS = TS_SCALE .* (_tc_coarse ? [0.5, 0.5, 0.5] : [0.25, 0.25, 0.25])
 const STATE_DEVIATION = 0.15  # convective state deviation for the ts advisory
 const NEST_WORKERS = [1, 1, 1]
 

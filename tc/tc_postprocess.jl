@@ -1,0 +1,300 @@
+#!/usr/bin/env julia
+# Postprocess moist-compressible NetCDF output into derived physical products.
+#
+#   julia --project=. tc/tc_postprocess.jl [--indir DIR] [--nests n1,n2,...]
+#                                          [--ref REFFILE] [--N0 8e6] [--Nc 100]
+#
+# The raw <t>.nc snapshots written by a run carry only the PROGNOSTIC control
+# variables, and the moist-compressible set stores most of them as PERTURBATIONS
+# off a hydrostatic PressureReferenceState (p, rho_d, rho_t, E_t, Q_ss are primes;
+# u, w, v, rho_r are full). This script, for every snapshot in each nest:
+#
+#   1. reconstructs the z-only reference profiles on the netCDF's regular z grid
+#      by fitting the run's own reference column (from <indir>/tc_exact.ref) and
+#      evaluating the B-spline with SItransform — so background(z_reg) is exactly
+#      the model's reference spline, not an ad-hoc interpolation;
+#   2. adds the background back to recover the TOTAL control fields;
+#   3. retrieves temperature T with the model's nonlinear Newton retrieval
+#      (retrieve_temperature), then diagnoses vapor rho_v and cloud rho_c exactly
+#      as the model does (Q_ss + rho_v_sat, clamped; rho_c the residual);
+#   4. derives a simple S-band (Rayleigh) radar reflectivity from rho_c
+#      (monodisperse cloud) and rho_r (exponential Marshall-Palmer rain), and a
+#      rain rate from rho_r and the Ooyama (2001) terminal fall speed.
+#
+# Each <t>.nc becomes <t>_derived.nc in the same nest directory, holding the
+# primes, the reconstructed totals, the carried full fields, and the derived
+# products (T, rho_v, rho_c, reflectivity, rain_rate). Derivatives of the
+# control variables are passed through if present; derived products carry none.
+#
+# The input directory is configurable; it defaults to the axisymmetric TC run.
+
+using Scythe
+using Springsteel
+using NCDatasets
+
+# ── Arguments ────────────────────────────────────────────────────────────────
+indir  = joinpath(@__DIR__, "output", "tc_axisym")
+nests  = String[]                       # empty => auto-detect nest subdirectories
+reffile = nothing                       # default: <indir>/tc_exact.ref
+N0 = 8.0e6                               # [m^-4] Marshall-Palmer rain intercept
+Nc_cm3 = 100.0                           # [cm^-3] monodisperse cloud droplet count
+let i = 1
+    while i <= length(ARGS)
+        a = ARGS[i]
+        if a == "--indir";      global indir = ARGS[i+1];  i += 2
+        elseif a == "--nests";  global nests = split(ARGS[i+1], ","); i += 2
+        elseif a == "--ref";    global reffile = ARGS[i+1]; i += 2
+        elseif a == "--N0";     global N0 = parse(Float64, ARGS[i+1]); i += 2
+        elseif a == "--Nc";     global Nc_cm3 = parse(Float64, ARGS[i+1]); i += 2
+        else error("Unknown argument: $a")
+        end
+    end
+end
+isdir(indir) || error("Input directory not found: $indir")
+reffile === nothing && (reffile = joinpath(indir, "tc_exact.ref"))
+isfile(reffile) || error("Reference-state file not found: $reffile")
+
+# Auto-detect nests: subdirectories that contain at least one raw snapshot.
+if isempty(nests)
+    for d in sort(readdir(indir))
+        full = joinpath(indir, d)
+        isdir(full) || continue
+        any(f -> occursin(r"^\d", f) && endswith(f, ".nc") && !endswith(f, "_derived.nc"),
+            readdir(full)) && push!(nests, d)
+    end
+    isempty(nests) && error("No nest subdirectories with raw .nc snapshots under $indir")
+end
+println("Postprocessing $(length(nests)) nest(s) in $indir: $(join(nests, ", "))")
+
+const RHO_L = Springsteel.Thermodynamics.rho_l   # 1000 kg/m^3
+
+# ── S-band Rayleigh reflectivity ──────────────────────────────────────────────
+# Equivalent reflectivity factor Z = ∫ N(D) D^6 dD, converted to mm^6/m^3, then
+# dBZ = 10 log10(Z). Rain: exponential DSD n(D)=N0 exp(-λD) with the model's slope
+# λ = (π ρ_l N0 / ρ_r)^(1/4) (mp_slope), giving Z_r = 720 N0 / λ^7. Cloud: N_c
+# identical droplets of diameter D_c set by the mass, Z_c = N_c D_c^6. Cloud is
+# negligible in dBZ but included for completeness. Below REFL_FLOOR → NaN (no echo).
+const REFL_FLOOR_DBZ = -30.0
+function reflectivity_dBZ(rho_c, rho_r, N0, Nc_m3)
+    Z = 0.0                                                   # [m^6/m^3]
+    if rho_r > 1.0e-8
+        λ = (π * RHO_L * N0 / rho_r)^0.25                     # [1/m]
+        Z += 720.0 * N0 / λ^7
+    end
+    if rho_c > 1.0e-8
+        Dc = (6.0 * rho_c / (π * RHO_L * Nc_m3))^(1.0 / 3.0)  # [m]
+        Z += Nc_m3 * Dc^6
+    end
+    Z *= 1.0e18                                               # m^6/m^3 → mm^6/m^3
+    dBZ = 10.0 * log10(Z)
+    return dBZ < REFL_FLOOR_DBZ ? NaN : dBZ
+end
+
+# ── Reference column (shared: all nests use the same vertical grid) ───────────
+# Read the run's own reference column values (z p rho_d rho_v rho_c, p in Pa) and
+# fit the B-spline reference column so it can be evaluated on ANY z.
+reflines = readlines(reffile)
+nmish = length(reflines)
+zm  = Vector{Float64}(undef, nmish); pm  = similar(zm)
+rdm = similar(zm); rvm = similar(zm); rcm = similar(zm)
+for (i, l) in enumerate(reflines)
+    parts = split(l)
+    zm[i]  = parse(Float64, parts[1]); pm[i]  = parse(Float64, parts[2])
+    rdm[i] = parse(Float64, parts[3]); rvm[i] = parse(Float64, parts[4])
+    rcm[i] = parse(Float64, parts[5])
+end
+
+"""Fit `vals_mish` (in reference-column mish order) to `col` and evaluate at `z`."""
+function eval_ref(col, vals_mish, z)
+    col.uMish .= vals_mish
+    Springsteel.Btransform!(col)
+    Springsteel.Atransform!(col)
+    return Springsteel.SItransform(col, collect(z), zeros(Float64, length(z)))
+end
+
+"""
+Build the reference column for a nest's (regular) vertical grid `z_reg` and return
+the background profiles evaluated there: (pbar, rho_dbar, rho_tbar, E_tbar,
+Q_ssbar, Tbar). `mubar = nmish / (length(z_reg) - 1)`.
+"""
+function reference_background(x, z_reg)
+    n_i = length(x); n_k = length(z_reg)
+    mubar = round(Int, nmish / (n_k - 1))
+    mubar * (n_k - 1) == nmish ||
+        error("Cannot infer mubar: $nmish mish levels vs $(n_k-1) cells")
+    vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "v"]
+    bc = Dict(v => NeumannBC() for v in vars)
+    gp = Scythe.compute_derived_params(GridParameters(; geometry = "RiRk",
+        iMin = x[1], iMax = x[end], num_cells_i = max(n_i - 1, 1),
+        kMin = z_reg[1], kMax = z_reg[end], num_cells_k = n_k - 1, mubar = mubar,
+        BCL = bc, BCR = bc, BCB = bc, BCT = bc,
+        vars = Dict(v => i for (i, v) in enumerate(vars))))
+    patch = createGrid(gp)
+    column = Scythe.reference_column(patch, gp)
+    length(column.uMish) == nmish ||
+        error("Reference column mish ($(length(column.uMish))) ≠ ref file ($nmish)")
+
+    # Base profiles on the regular grid, then the derived reference exactly as
+    # Springsteel's _pressure_reference builds it (moist EOS, Emanuel constants).
+    pbar    = eval_ref(column, pm, z_reg)
+    rho_dbar = eval_ref(column, rdm, z_reg)
+    rho_vbar = eval_ref(column, rvm, z_reg)
+    rho_cbar = eval_ref(column, rcm, z_reg)
+    rho_tbar = rho_dbar .+ rho_vbar .+ rho_cbar
+    Rd = Springsteel.Thermodynamics.Rd; Rv = Springsteel.Thermodynamics.Rv
+    Tbar = pbar ./ ((rho_dbar .* Rd) .+ (rho_vbar .* Rv))
+    q_v = rho_vbar ./ rho_dbar; q_l = rho_cbar ./ rho_dbar
+    E_tbar = (rho_dbar .* Springsteel.Thermodynamics.internal_energy_bf02.(Tbar, q_v, q_l)) .+
+             (rho_tbar .* Scythe.gravity .* z_reg)
+    Q_ssbar = rho_vbar .- Springsteel.Thermodynamics.rho_v_sat.(Tbar, pbar ./ 100.0)
+    return (; pbar, rho_dbar, rho_tbar, E_tbar, Q_ssbar, Tbar)
+end
+
+# ── Per-snapshot derivation and write ─────────────────────────────────────────
+rd2d(ds, name, n_i, n_k) = coalesce.(Array(ds[name])[1, :, :], NaN)   # (n_i, n_k)
+
+function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
+    NCDataset(rawpath, "r") do ds
+        x = ds["x"][:]; z = ds["z"][:]
+        n_i = length(x); n_k = length(z)
+        has_v = haskey(ds, "v")
+
+        # Prognostic slots (primes for the reference-referenced ones; full otherwise)
+        pp    = rd2d(ds, "p", n_i, n_k);     rdp = rd2d(ds, "rho_d", n_i, n_k)
+        rtp   = rd2d(ds, "rho_t", n_i, n_k); Etp = rd2d(ds, "E_t", n_i, n_k)
+        Qssp  = rd2d(ds, "Q_ss", n_i, n_k)
+        u     = rd2d(ds, "u", n_i, n_k);     w   = rd2d(ds, "w", n_i, n_k)
+        rho_r = rd2d(ds, "rho_r", n_i, n_k)
+        v     = has_v ? rd2d(ds, "v", n_i, n_k) : zeros(n_i, n_k)
+
+        # Totals = prime + background(z), broadcast over radius
+        col(a) = reshape(a, 1, n_k)
+        p    = pp   .+ col(bg.pbar);     rho_d = rdp .+ col(bg.rho_dbar)
+        rho_t = rtp .+ col(bg.rho_tbar); E_t  = Etp .+ col(bg.E_tbar)
+        Q_ss = Qssp .+ col(bg.Q_ssbar)
+
+        # Nonlinear temperature retrieval (M is the enthalpy balance the model solves)
+        ke = has_v ? 0.5 .* (u .^ 2 .+ v .^ 2 .+ w .^ 2) : 0.5 .* (u .^ 2 .+ w .^ 2)
+        M  = p .+ E_t .- rho_t .* (ke .+ Scythe.gravity .* col(z))
+        T  = Scythe.retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, col(bg.Tbar), rho_r)
+
+        # Water partition (identical clamp to the model diagnostic)
+        rho_vs = Springsteel.Thermodynamics.rho_v_sat.(T, p ./ 100.0)
+        rho_v = clamp.(Q_ss .+ rho_vs, 0.0, max.(rho_t .- rho_d .- rho_r, 0.0))
+        rho_c = max.(rho_t .- rho_d .- rho_v .- rho_r, 0.0)
+
+        # Derived products
+        refl = reflectivity_dBZ.(rho_c, rho_r, N0, Nc_cm3 * 1.0e6)
+        Vt = Scythe.rain_terminal_velocity.(rho_r, rho_d, T)          # [m/s] ≤ 0
+        rain_rate = .-rho_r .* Vt .* 3600.0                          # [mm/hr] (ρ_l=1000)
+
+        # ── Write derived file ────────────────────────────────────────────────
+        NCDataset(outpath, "c") do out
+            out.attrib["Conventions"] = "CF-1.12"
+            out.attrib["title"] = "Scythe.jl moist-compressible derived products"
+            out.attrib["source"] = "tc/tc_postprocess.jl"
+            haskey(ds.attrib, "history") && (out.attrib["source_history"] = ds.attrib["history"])
+            out.attrib["reflectivity_N0_m4"] = N0
+            out.attrib["reflectivity_Nc_cm3"] = Nc_cm3
+
+            defDim(out, "time", 1); defDim(out, "x", n_i); defDim(out, "z", n_k)
+            tv = defVar(out, "time", Float64, ("time",))
+            tv.attrib["units"] = "seconds"; tv.attrib["long_name"] = "simulation time"
+            tv[1] = tsec
+            for (nm, src) in (("x", x), ("z", z))
+                cv = defVar(out, nm, Float64, (nm,)); cv[:] = src
+                for (k, vv) in ds[nm].attrib; cv.attrib[k] = vv; end
+            end
+
+            wr(name, data, units, long) = begin
+                dv = defVar(out, name, Float64, ("time", "x", "z"); fillvalue = NaN)
+                dv.attrib["units"] = units; dv.attrib["long_name"] = long
+                dv[1, :, :] = data
+            end
+
+            # Primes (perturbations off the hydrostatic reference)
+            wr("p_prime",     pp,   "Pa",     "pressure perturbation")
+            wr("rho_d_prime", rdp,  "kg m-3", "dry-air density perturbation")
+            wr("rho_t_prime", rtp,  "kg m-3", "total density perturbation")
+            wr("E_t_prime",   Etp,  "J m-3",  "total energy density perturbation")
+            wr("Q_ss_prime",  Qssp, "kg m-3", "supersaturation density perturbation")
+            # Totals (background added back)
+            wr("p",     p,     "Pa",     "total pressure")
+            wr("rho_d", rho_d, "kg m-3", "total dry-air density")
+            wr("rho_t", rho_t, "kg m-3", "total density")
+            wr("E_t",   E_t,   "J m-3",  "total energy density")
+            wr("Q_ss",  Q_ss,  "kg m-3", "supersaturation density")
+            # Carried full prognostic fields
+            wr("u", u, "m s-1", "radial velocity")
+            wr("w", w, "m s-1", "vertical velocity")
+            has_v && wr("v", v, "m s-1", "tangential velocity")
+            wr("rho_r", rho_r, "kg m-3", "rain water density")
+            # Derived products
+            wr("T",           T,         "K",        "temperature (nonlinear retrieval)")
+            wr("rho_v",       rho_v,     "kg m-3",   "water vapor density")
+            wr("rho_c",       rho_c,     "kg m-3",   "cloud water density")
+            wr("reflectivity", refl,     "dBZ",      "S-band equivalent radar reflectivity")
+            wr("rain_rate",   rain_rate, "mm hr-1",  "rain rate from sedimentation flux")
+
+            # 1-D reference background profiles (z only)
+            for (nm, prof, units) in (("pbar", bg.pbar, "Pa"),
+                                       ("rho_dbar", bg.rho_dbar, "kg m-3"),
+                                       ("rho_tbar", bg.rho_tbar, "kg m-3"),
+                                       ("E_tbar", bg.E_tbar, "J m-3"),
+                                       ("Q_ssbar", bg.Q_ssbar, "kg m-3"),
+                                       ("Tbar", bg.Tbar, "K"))
+                bv = defVar(out, nm, Float64, ("z",))
+                bv.attrib["units"] = units
+                bv.attrib["long_name"] = "reference-state $nm"
+                bv[:] = prof
+            end
+
+            # Pass through any control-variable derivative slots that were output
+            # (derived products get none). These are extra data variables in the
+            # source beyond the value slots handled above.
+            handled = Set(["time", "x", "z", "p", "rho_d", "rho_t", "u", "w",
+                           "E_t", "Q_ss", "rho_r", "v"])
+            for (vn, vv) in ds
+                (vn in handled) && continue
+                ndims(vv) == 3 || continue
+                dv = defVar(out, vn, Float64, ("time", "x", "z"); fillvalue = NaN)
+                for (k, av) in vv.attrib; dv.attrib[k] = av; end
+                dv[1, :, :] = coalesce.(Array(vv)[1, :, :], NaN)
+            end
+        end
+        return (; t = tsec, max_refl = maximum(x -> isnan(x) ? -Inf : x, refl),
+                  max_rain = maximum(rain_rate), max_v = has_v ? maximum(v) : NaN,
+                  Tmin = minimum(T), Tmax = maximum(T))
+    end
+end
+
+# ── Drive over nests and snapshots ────────────────────────────────────────────
+for nest in nests
+    ndir = joinpath(indir, nest)
+    raws = sort(filter(f -> occursin(r"^[0-9]", f) && endswith(f, ".nc") &&
+                            !endswith(f, "_derived.nc"), readdir(ndir)),
+                by = f -> parse(Float64, replace(f, ".nc" => "")))
+    isempty(raws) && (println("  $nest: no snapshots, skipping"); continue)
+
+    # Reference background from this nest's z grid (built once per nest)
+    local bg, z_reg
+    NCDataset(joinpath(ndir, raws[1]), "r") do ds
+        z_reg = ds["z"][:]
+        bg = reference_background(ds["x"][:], z_reg)
+    end
+
+    println("  $nest: $(length(raws)) snapshot(s)")
+    for f in raws
+        raw = joinpath(ndir, f)
+        out = joinpath(ndir, replace(f, ".nc" => "_derived.nc"))
+        tsec = parse(Float64, replace(f, ".nc" => ""))
+        s = process_snapshot(raw, out, bg, z_reg, tsec)
+        refl_str = isfinite(s.max_refl) ? "$(round(s.max_refl;digits=1)) dBZ" : "no echo"
+        println("    t=$(round(Int, tsec)) s: " *
+                "T∈[$(round(s.Tmin;digits=1)),$(round(s.Tmax;digits=1))] K  " *
+                "max_refl=$(refl_str)  " *
+                "max_rain=$(round(s.max_rain;digits=2)) mm/hr  " *
+                "max_v=$(round(s.max_v;digits=1)) m/s")
+    end
+end
+println("Done. Derived files written as <t>_derived.nc alongside each snapshot.")
