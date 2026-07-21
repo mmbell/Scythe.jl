@@ -435,6 +435,140 @@ import Springsteel: ref_pressure, ref_rho_t, ref_total_energy, ref_qss
 # positions used by the other XZ sets).
 const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
 
+# ── Rigid-wall pressure compatibility condition ───────────────────────────────
+
+"""
+    mc_wall_bc_active(grid) -> Bool
+
+True if `p` declares the inhomogeneous Neumann condition (`CubicBSpline.R1T1X`)
+at either vertical wall, i.e. this grid wants [`update_mc_wall_bc!`](@ref) called
+before every fit. Cheap enough for the per-step path: two `haskey` lookups.
+"""
+function mc_wall_bc_active(grid)
+    grid.kbasis isa Springsteel.SplineBasisArray || return false
+    haskey(grid.params.vars, "p") || return false
+    kcol = grid.kbasis.data[grid.params.vars["p"]]
+    return haskey(kcol.params.BCL, "X1") || haskey(kcol.params.BCR, "X1")
+end
+
+"""
+    update_mc_wall_bc!(grid, src)
+
+Install the exact rigid-wall compatibility condition on `p'` before a fit.
+
+`w` is Dirichlet at both vertical walls, so `w ≡ 0` there for ALL time. Along the
+wall that also kills the advection terms (`∂w/∂r = 0` because `w` vanishes at every
+radius, and `w ∂w/∂z = 0`), so the vertical momentum equation collapses to an
+identity rather than an evolution equation:
+
+    ∂p'/∂z |_wall  =  -g ρ_t' |_wall
+
+This is NOT an assumption of hydrostatic balance in the interior — only at the two
+rigid walls, where it is exact. (If vertical diffusion or a boundary-layer scheme is
+ever given a nonzero `w` tendency AT the wall, its contribution `ρ_t · ∂w/∂t|_wall`
+belongs on the right-hand side here; with `Kvdiff = 0` and `w` Dirichlet there is
+none, and the assertion in `mc_wall_bc_requires_no_w_forcing` guards the assumption.)
+
+Why it matters: a homogeneous `NeumannBC` is the special case `ρ_t' = 0`, which a
+balanced vortex violates precisely where its surface pressure deficit lives — that
+was the drain of `tc/HANDOFF_2026-07-20.md`. `SecondDerivativeBC` leaves `∂p'/∂z`
+free instead, which restores the balance but costs a factor ~2.7 in stable timestep,
+because the semi-implicit acoustic solve eliminates `w` (φ = ρ̄_t w is Dirichlet in
+the Helmholtz solve) and therefore cannot see a wall derivative the refit injects —
+see `tc/SI_WALL_BC_CEILING.md`. R1T1X resolves the conflict: the admissible subspace
+stays R1T1's, so the solve stays operator-consistent and the ceiling stays high,
+while the affine `ahat` offset carries the nonzero derivative the balance needs.
+
+`src` is a `(npts, nvars, nderiv)` physical array carrying the fitted field AND its
+z-derivatives (slots 1, 4, 5) — normally `grid.physical`. `ρ_t'` at the wall is a
+second-order Taylor step off the nearest mish point, since the mish never lands on
+the boundary itself. A 2-D `src` is accepted for tests but degrades to the value
+alone.
+
+`relax` ∈ (0, 1] is the fraction of the way the stored derivative moves toward the
+target on this call, i.e. a first-order filter with timescale `Δt/relax`. **It must
+be well below 1 in a run.** With `relax = 1` the wall derivative is recomputed from
+scratch every acoustic step, which closes a feedback loop — `∂p'/∂z|_wall` sets the
+wall pressure, the acoustic solve moves `ρ_t'` at the wall, which resets
+`∂p'/∂z|_wall` — and it is unstable: the stored value alternates sign step to step
+and the column goes non-finite in a few hundred steps (measured). The affine-offset
+argument for R1T1X's stability holds for a FIXED `ahat`; a state-dependent one adds
+an explicit path that has to be kept off the acoustic timescale. The physical
+justification is the same fact: the wall gradient is a property of the BALANCED
+vortex and evolves on hours, so filtering it over ~minutes loses nothing real.
+`relax = 1` remains the right choice for a one-shot initialization, where there is
+no loop to close.
+"""
+function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0)
+    gp = grid.params
+    kDim = gp.kDim
+    iDim = gp.iDim
+    vars = gp.vars
+    p_i = vars["p"]
+    rhot_i = vars["rho_t"]
+    kcol = grid.kbasis.data[p_i]
+    wall_du = grid.kbasis.wall_du
+
+    # rho_t' at the wall, estimated as the MEAN over the boundary cell (the three
+    # nearest mish points).
+    #
+    # NOT an extrapolation to the wall itself, which is what this did first — both
+    # a 3-point Lagrange fit through the mish values and a second-order Taylor step
+    # off the fitted derivatives. Both blow up, and for the same reason: they weight
+    # the near-wall curvature by d^2/2 ~ 1.6e3 m^2, which amplifies whatever
+    # grid-scale content sits in rho_t' near the boundary. That amplified signal
+    # becomes p's wall derivative, which drives the acoustic mode, which enlarges
+    # the near-wall grid-scale content — a loop with gain > 1 that no amount of time
+    # relaxation suppresses, because the TARGET is what is growing. Measured: the
+    # resting column goes non-finite in ~30 steps with either extrapolation, and is
+    # quiet indefinitely with `ahat` pinned to zero, so the feedback is the whole of
+    # the instability and the R1T1X plumbing is exonerated.
+    #
+    # A cell mean is a smoother rather than an amplifier. It is biased by O(dz) times
+    # the true gradient, which is the right trade: the wall condition needs to track
+    # the BALANCED state's wall value, not resolve a grid-scale feature.
+    if haskey(kcol.params.BCL, "X1")
+        @inbounds for r in 1:iDim
+            n = (r - 1) * kDim + 1
+            rt = (src[n, rhot_i, 1] + src[n+1, rhot_i, 1] + src[n+2, rhot_i, 1]) / 3
+            old = wall_du[r, p_i, 1, 1]
+            wall_du[r, p_i, 1, 1] = old + relax * ((-gravity * rt) - old)
+        end
+    end
+    if haskey(kcol.params.BCR, "X1")
+        @inbounds for r in 1:iDim
+            n = r * kDim
+            rt = (src[n, rhot_i, 1] + src[n-1, rhot_i, 1] + src[n-2, rhot_i, 1]) / 3
+            old = wall_du[r, p_i, 2, 1]
+            wall_du[r, p_i, 2, 1] = old + relax * ((-gravity * rt) - old)
+        end
+    end
+
+    # Radial derivatives of the wall data (levels 2 and 3). The 2-D transform
+    # evaluates the i-derivative BEFORE fitting in k, so its dr = 1 / dr = 2
+    # passes need d(wall)/dr and d2(wall)/dr2 as their `ahat`; feeding them
+    # level 1 asserts dg/dr = g and wrecks the radial pressure gradient in the
+    # boundary cell. Obtained by fitting the radial profile through p's OWN
+    # i-basis, so the derivative is the same discrete operator the transform
+    # applies to everything else.
+    isp = grid.ibasis.data[1, p_i]
+    for s in 1:2
+        (s == 1 ? haskey(kcol.params.BCL, "X1") : haskey(kcol.params.BCR, "X1")) || continue
+        @inbounds for r in 1:iDim
+            isp.uMish[r] = wall_du[r, p_i, s, 1]
+        end
+        Springsteel.CubicBSpline.SBtransform!(isp)
+        Springsteel.CubicBSpline.SAtransform!(isp)
+        d1 = Springsteel.CubicBSpline.SIxtransform(isp)
+        d2 = Springsteel.CubicBSpline.SIxxtransform(isp)
+        @inbounds for r in 1:iDim
+            wall_du[r, p_i, s, 2] = d1[r]
+            wall_du[r, p_i, s, 3] = d2[r]
+        end
+    end
+    return grid
+end
+
 # ── Equation set ───────────────────────────────────────────────────────────────
 
 """

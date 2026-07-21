@@ -61,13 +61,36 @@ const TC_VARS = Scythe.MC_VARS_CYL
 # axis. Nest junctions never see these -- build_nest gives them FixedBC/NaturalBC.
 function tc_boundary_conditions()
     scalar_bc = Dict(v => NeumannBC() for v in TC_VARS)
-    d2_bc = Dict(v => SecondDerivativeBC() for v in TC_VARS)
     axis_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "v" => DirichletBC()))
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC()))
+    # ── VERTICAL WALLS ── see tc/SI_WALL_BC_CEILING.md for the measurements.
+    #
+    # THE ACOUSTIC SET (p, rho_d, rho_t, E_t, and Q_ss, which feeds the temperature
+    # retrieval) must ALL sit in the R1T1 subspace. That is what the semi-implicit
+    # acoustic solve implies: w is Dirichlet, so phi = rho_tbar w vanishes at the
+    # wall for all time and the implicit pair forces dp'/dz = 0 there for the
+    # ACOUSTIC part. Measured ceiling with the set on R1T1: ts ~ 2.0 s. On
+    # SecondDerivativeBC: ts ~ 0.75 s. Splitting the set across the two is far
+    # worse than either -- d2 on rho_t alone goes non-finite in 26 s.
+    #
+    # p ADDITIONALLY carries the inhomogeneous offset (R1T1X): the FULL w equation
+    # at the wall is the exact identity dp'/dz = -g rho_t', which IS the surface
+    # pressure deficit and which homogeneous Neumann sets to zero -- the drain of
+    # HANDOFF_2026-07-20.md. R1T1X keeps the R1T1 subspace (so the timestep ceiling
+    # is unaffected: ahat is an AFFINE offset) while carrying the true derivative.
+    # `update_mc_wall_bc!` refreshes it per column before every fit.
+    #
+    # u, v and rho_r are NOT in the acoustic set and are measurably free (bitwise
+    # identical to all-Neumann at ts = 2.0). They get SecondDerivativeBC because
+    # they need it: RE87 eq. (37) has dv/dz = -V(r)/z_s /= 0 AT THE GROUND.
+    acoustic = ["p", "rho_d", "rho_t", "E_t", "Q_ss"]
+    vert = Dict{String,Any}(v => (v in acoustic ? NeumannBC() : SecondDerivativeBC())
+                            for v in TC_VARS)
+    vert["p"] = Springsteel.CubicBSpline.R1T1X
     # w = 0 at the ground and at the rigid lid is the one genuine vertical BC.
     # rho_r stays NaturalBC at the ground so rain can fall out of the domain.
-    bot_bc = merge(d2_bc, Dict("w" => DirichletBC(), "rho_r" => NaturalBC()))
-    top_bc = merge(d2_bc, Dict("w" => DirichletBC()))
+    bot_bc = merge(vert, Dict{String,Any}("w" => DirichletBC(), "rho_r" => NaturalBC()))
+    top_bc = merge(vert, Dict{String,Any}("w" => DirichletBC()))
     return axis_bc, wall_bc, bot_bc, top_bc
 end
 
@@ -126,7 +149,21 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         # --exact-si for further debugging. It would buy no timestep here in any
         # case: the run's own Courant ladder puts the horizontal acoustic mode at
         # Co 0.25/3.0 while the vertical convective ceiling binds at 2.51/2.88.
+        # :wall_bc_tau = Inf FREEZES the R1T1X wall derivative at the value
+        # load_initial_conditions! computes from the balanced vortex. A frozen
+        # (affine) offset is provably — and measurably — as stable as homogeneous
+        # R1T1, whereas letting it track the state closes a feedback loop with the
+        # acoustic mode that is unstable at ANY nonzero gain: the wall condition
+        # sets the net vertical force at the wall to zero, which removes the
+        # restoring force that would otherwise oppose a growing boundary mode.
+        # Smoothing the source and relaxing over 300 s only slows it (measured:
+        # non-finite at ~30 steps unsmoothed, ~900 steps smoothed+relaxed).
+        # Physically the wall gradient belongs to the BALANCED vortex and evolves
+        # on hours, so freezing it is a good approximation over a spin-up; it does
+        # go stale as the storm deepens, which is the open item in
+        # tc/SI_WALL_BC_CEILING.md.
         options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                         :wall_bc_tau => Inf,
                                          :state_dependent_si => true,
                                          :exact_reference_state => true,
                                          :state_deviation => STATE_DEVIATION,

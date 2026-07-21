@@ -613,11 +613,30 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
             "$(typeof(loaded)) spectral $(size(loaded.spectral)), grid is " *
             "$(typeof(patch)) spectral $(size(patch.spectral))")
         patch.spectral .= loaded.spectral
+        # The wall condition needs rho_t', which only exists after a first pass;
+        # take it from the unconditioned transform, then redo the fit with the
+        # walls set. Converged: the wall value of rho_t' is insensitive to p's
+        # own wall derivative.
         gridTransform!(patch)
+        if mc_wall_bc_active(patch)
+            update_mc_wall_bc!(patch, patch.physical)
+            gridTransform!(patch)
+        end
     else
         read_physical_grid(model.initial_conditions, patch)
         spectralTransform!(patch)
         gridTransform!(patch)
+        # Re-fit with the wall condition installed. This is the load that used to
+        # destroy the balanced vortex (tc/HANDOFF_2026-07-21.md): the damage lands
+        # here, on the first projection, before a single timestep is taken. The
+        # first pass exists only to produce the fitted z-derivatives the wall value
+        # is read from; rho_t' at the wall is insensitive to p's own condition, so
+        # one iteration suffices.
+        if mc_wall_bc_active(patch)
+            update_mc_wall_bc!(patch, patch.physical)
+            spectralTransform!(patch)
+            gridTransform!(patch)
+        end
     end
     return patch
 end
@@ -961,8 +980,37 @@ compute spectral tendencies, and exchange halo data with neighboring tiles.
 function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64)
 
+    # Rigid-wall pressure compatibility condition (R1T1X). The k-direction SA
+    # solve happens INSIDE tileTransform!, so the per-column wall derivative has
+    # to be installed first. It is read from `tile.physical`, i.e. the PREVIOUS
+    # step's fitted state — one step stale by construction, because the fitted
+    # z-derivatives it needs do not exist for var_np1 yet. That is deliberate as
+    # well as necessary: it keeps the wall condition off the acoustic timescale.
+    # On t == 1 load_initial_conditions! has already set the walls.
+    #
+    # `:wall_bc_tau` [s] is the relaxation timescale. It must stay well above the
+    # acoustic step (relax = ts/tau << 1) or the wall condition feeds back on
+    # itself and goes unstable — see update_mc_wall_bc!.
+    wall_bc = mc_wall_bc_active(mtile.tile)
+    if t > 1 && wall_bc
+        tau = get(mtile.model.options, :wall_bc_tau, 300.0)::Float64
+        update_mc_wall_bc!(mtile.tile, mtile.tile.physical;
+                           relax = min(1.0, mtile.model.ts / tau))
+    end
+
     # Transform to local physical tile
     tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
+
+    # First step: the TILE is a fresh grid, so its wall_du is still zero even
+    # though load_initial_conditions! set the PATCH's — and with :wall_bc_tau =
+    # Inf it would stay zero forever, silently degrading R1T1X to plain Neumann
+    # and losing the entire balance benefit. Seed it from the just-materialised
+    # state (relax = 1: this is an initialization, not a tracking update) and
+    # redo the transform. Costs one extra tileTransform! on step 1 only.
+    if t == 1 && wall_bc
+        update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax = 1.0)
+        tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
+    end
 
     # Trap a numerical blow-up early: scan the freshly transformed physical state
     # for non-finite values *before* feeding it into the NaN-blind spline solve in

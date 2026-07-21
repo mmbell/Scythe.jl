@@ -189,7 +189,15 @@ const NUM_CELLS_K = _tc_coarse ? 50 : 84                      # 500 m vs 300 m c
 # coarse), which is why RE87 (20 s) and BR09 (7.5 s) can step so much longer:
 # they sub-step the acoustics. Split-explicit acoustics + BR09's weak divergence
 # damper are the route past it.
-const NEST_TS = _tc_coarse ? [1.0, 1.0, 1.0] : [0.5, 0.5, 0.5]
+#
+# SCYTHE_TC_TS_SCALE multiplies every entry, so a diagnostic run can sweep the
+# timestep WITHOUT editing this file -- which matters because a restart re-reads
+# tc_params.jl, so an edit made while a run is in flight silently changes what a
+# later restart does. See tc/SI_WALL_BC_CEILING.md: the measured ceiling is
+# ts ~ 0.75 s with SecondDerivativeBC walls and ~2.0 s with Neumann, so ts = 1.0
+# below is ABOVE its ceiling until the inhomogeneous-Neumann wall fix lands.
+const TS_SCALE = parse(Float64, get(ENV, "SCYTHE_TC_TS_SCALE", "1.0"))
+const NEST_TS = TS_SCALE .* (_tc_coarse ? [1.0, 1.0, 1.0] : [0.5, 0.5, 0.5])
 const STATE_DEVIATION = 0.15  # convective state deviation for the ts advisory
 const NEST_WORKERS = [1, 1, 1]
 

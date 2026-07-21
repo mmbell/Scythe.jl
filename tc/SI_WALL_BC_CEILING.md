@@ -1,0 +1,218 @@
+# The wall boundary condition sets the SI timestep ceiling (2026-07-21)
+
+Companion to `tc/SI_VERTICAL_CEILING.md` (resting-base operator consistency, fixed)
+and `tc/SI_CONVECTIVE_CEILING.md` (the state-dependent ceiling). This note documents
+a **third** ceiling, upstream of both, and identifies the spurious cooling aloft as
+its symptom.
+
+**Headline: `SecondDerivativeBC` — the 2026-07-21 fix for the vortex drain — lowers
+the vertical-acoustic timestep ceiling from ts ≈ 2.0 s to ts ≈ 0.75 s. The production
+configuration runs at ts = 1.0 s, i.e. ABOVE its own stability ceiling.**
+
+---
+
+## The measurement
+
+`model_tests/tc_lid_drift_probe.jl`. ONE axisymmetric patch on the production TC
+vertical grid (50 cells to 25 km), the production Dunion reference state,
+**zero perturbation** (the state is exactly the reference — an exact hydrostatic
+steady state), no vortex, no physics, no diffusion. Anything that grows is numerical.
+
+All four acoustic-quartet variables (`p`, `rho_t`, `rho_d`, `E_t`) carry the same
+wall condition unless stated. 30-60 min of model time.
+
+### Wall condition vs. stability
+
+| walls (whole quartet) | ts   | max&#124;w&#124; from zero | verdict |
+|---|---|---|---|
+| `NeumannBC`          | 1.0  | 1.3e-3  | quiet |
+| `NeumannBC`          | 1.5  | 1.5e-3  | quiet |
+| `NeumannBC`          | 2.0  | 1.0e-2  | quiet |
+| `NeumannBC`          | 2.5  | —       | **NON-FINITE at 625 s** |
+| `NeumannBC`          | 3.0  | —       | **NaN at 246 s** |
+| `SecondDerivativeBC` | 0.5  | 1.4e-3  | quiet |
+| `SecondDerivativeBC` | 0.7  | 1.8e-3  | quiet |
+| `SecondDerivativeBC` | 0.85 | 4.3e-1  | **unstable** |
+| `SecondDerivativeBC` | 1.0  | 7.8e-1  | **unstable (production)** |
+
+The sponge is *suppressing* the instability, not causing it: at `d2 @ ts = 1.0` with
+`alpha = 0` the same run reaches max&#124;w&#124; = 3.0 m/s and is still growing at 1 h.
+Turning off `:state_dependent_si` does not help either (1.08 m/s) — this is not the
+convective/state-dependent ceiling.
+
+### Mixing conditions across the quartet is far WORSE than either uniformly
+
+At ts = 1.0, `d2` applied to a SUBSET with the rest Neumann:
+
+| `d2` applied to | outcome |
+|---|---|
+| `p` only            | unstable, max&#124;w&#124; 0.21 |
+| `rho_t` only        | **NON-FINITE at 26 s** |
+| `rho_d`, `E_t`      | **NON-FINITE at 45 s** |
+| `v` only            | quiet — identical to all-Neumann |
+| all four (production) | unstable but survives (0.78 m/s) |
+
+`v` is irrelevant; the quartet is everything. The semi-implicit slaves `rho_t'`,
+`rho_d'` and `E_t'` to the SAME solved `phi` through one discrete chain
+(`semiimplicit_adjustment_p`, `moist_compressible.jl:1386-1412`). If the four are
+refit into bases with DIFFERENT wall constraints, the slaving relation is broken
+differently for each and the coupled system desynchronizes immediately. **Whatever
+condition is chosen, the quartet must share it.**
+
+## Why Neumann is the acoustically consistent one
+
+`w` carries `DirichletBC` at both walls, so `phi = rho_tbar w = 0` there for all
+time, and the Helmholtz solve enforces exactly that (`_assemble_sd_helmholtz`,
+`dirichlet = (true, true)`). The implicit pair is
+
+    d(phi)/dt = -dp'/dz ,    dp'/dt = -Pxi(z) d(phi)/dz
+
+Evaluated at the wall, `phi = 0` for all time forces **`dp'/dz = 0` at the wall for
+the IMPLICIT ACOUSTIC PART**. That is precisely `NeumannBC` / R1T1. Gravity is not
+in the implicit pair — the buoyancy term `-g rho_t'/rho_t` sits in the explicit
+remainder — so the acoustic subsystem genuinely wants a homogeneous Neumann wall.
+
+`SecondDerivativeBC` leaves `dp'/dz` free at the wall. The refit can therefore inject
+a nonzero wall derivative every step into exactly the mode the Helmholtz solve cannot
+see, leaving that component under AB3's explicit weights — the same mechanism as
+`SI_VERTICAL_CEILING.md`, relocated to the wall, and with the same consequence: a
+Courant-type ceiling where there should be none.
+
+## Why the balanced vortex wants the opposite
+
+The FULL `w` equation at the wall (where `w = 0`, so advection vanishes) gives the
+exact compatibility condition
+
+    dp'/dz |_wall  =  -g rho_t' |_wall
+
+which is **nonzero and state-dependent** — it *is* the surface pressure deficit.
+`NeumannBC` is the special case `rho_t' = 0`, which is why it destroys the balanced
+vortex (0.10 m/s² hydrostatic residual, the drain of `HANDOFF_2026-07-20.md`).
+
+**So the two requirements genuinely conflict for any HOMOGENEOUS condition:** the
+acoustic solve needs the time-varying part of `dp'/dz` to vanish at the wall; the
+balanced state needs a static nonzero `dp'/dz` there. `SecondDerivativeBC` buys the
+balance and pays for it in timestep; `NeumannBC` does the reverse. Neither is right.
+
+The resolution is the **inhomogeneous Neumann condition** `dp'/dz|_wall = -g rho_t'|_wall`,
+which satisfies both: it is R1T1 (acoustically consistent, ceiling ts ≈ 2.0) with the
+hydrostatic wall value instead of zero.
+
+## This is the spurious cooling
+
+`tc/output/tc_holdtest_nophysics` (12 h, `d2` walls, ts = 1.0, no diabatic physics,
+max&#124;w&#124; = 0.04 m/s) cools ~1 K/h at 25 km and GAINS 2.7 %/h of dry-air density
+at the top level, uniformly in radius and identically in all three nests:
+
+    nest1, patch-mean dT over 12 h:  -12.6 K @ 25 km, -5.7 @ 21, -2.0 @ 15-13 km
+    top-level mean rho_d: +32.1 %,  E_t: +35.7 %
+
+Radius-independent and nest-independent = 1-D. `-5.7 K at 19.5 km in 11 h` in the
+full-physics run (`HANDOFF_2026-07-20.md`) is the same number. The probe reproduces
+the sign and the top-localization from a resting column at the production ts.
+
+## A SECOND, smaller defect: a ts- and BC-independent resting drift
+
+Every stable case above still drifts at the lid at the same rate:
+
+    p'(top)      -2.3 Pa at 900 s, -4.5 Pa at 1800 s      (linear, ~ -9 Pa/h)
+    rho_d'(top)  -0.09 % at 1800 s
+
+identical for `d2@0.5`, `d2@0.7`, `neumann@1.0` and `neumann@1.5`. Independent of the
+timestep => this is a **spatial** discretization error, not a time-integration one:
+the exact hydrostatic reference is not a discrete steady state at the lid. It is
+~15x too small to explain the 12 h run and is a separate, lower-priority item.
+
+## What this does NOT change
+
+- The 2026-07-21 diagnosis stands: `NeumannBC` really does destroy the balanced
+  vortex, and that really was the dominant cause of the drain. The error was
+  believing a homogeneous condition could serve both roles.
+- Do not simply revert to `NeumannBC`. That trades the cooling back for the drain.
+
+## Reproduce
+
+    julia --project=. model_tests/tc_lid_drift_probe.jl 1.0 base nosponge neumann noSI halfts
+    julia --project=. model_tests/tc_lid_drift_probe.jl 0.3 d2@0.7 d2@0.85 neumann@2.0 neumann@2.5
+    julia --project=. model_tests/tc_lid_drift_probe.jl 0.3 "d2:rho_t@1.0" "d2:v@1.0"
+
+    julia --project=. tc/tc_postprocess.jl --indir tc/output/tc_holdtest_nophysics
+    julia --project=. model_tests/tc_cooling_probe.jl
+
+---
+
+## CONFIRMED in the full nested run (2026-07-21)
+
+12 h `tc_balance_holdtest.jl nophysics`, identical in every respect except the
+timestep (`SCYTHE_TC_TS_SCALE`), nest 3 patch-mean, first 7 h:
+
+    ts = 1.0 (ABOVE the d2 ceiling)     ts = 0.5 (below it)
+    t[h]  T@25km   rho_d(lid)           T@25km   rho_d(lid)
+     0    231.98   3.3832e-02            231.98   3.3832e-02
+     7    224.99   3.9440e-02            230.34   3.3327e-02
+          -7.0 K    +16.6 %              -1.6 K    -1.5 %
+
+**~77 % of the spurious cooling, and ALL of the lid mass gain, is the timestep
+instability.** The sign of the mass drift even reverses. What survives at ts = 0.5
+is the small ts- and BC-independent drift of the second defect above.
+
+Output preserved: `tc/output/tc_holdtest_nophysics_ts05/`.
+
+---
+
+## The fix: R1T1X, and the feedback trap it walks into
+
+`CubicBSpline.R1T1X` (Springsteel) is a rank-1 inhomogeneous Neumann condition:
+the SAME `gammaBC` as R1T1 — hence the same admissible subspace and the same
+solver stability — with the boundary derivative carried in the affine `ahat`
+offset, set per column by `set_ahat_neumann!` / `set_wall_derivatives!`.
+
+Verified (Springsteel suite 41237/41237, `test/r1t1x.jl`):
+- the prescribed wall derivative is attained to ~1e-14;
+- `du = 0` reproduces the homogeneous R1T1 fit BITWISE;
+- `gammaBC` is element-wise identical to R1T1's;
+- the response is exactly linear in `du` (it is affine);
+- end-to-end through the RiRk grid transform, the near-wall vertical derivative
+  improves **409x** over homogeneous Neumann on a test field with a known nonzero
+  wall slope.
+
+Scythe side: `mc_wall_bc_active` / `update_mc_wall_bc!` (moist_compressible.jl),
+called from `advanceTimestep` and `load_initial_conditions!`.
+
+### The trap — a state-tracking wall derivative is unstable
+
+Setting `∂p'/∂z|wall = -g rho_t'|wall` from the CURRENT state each step closes a
+loop: the wall condition moves p' near the wall, the acoustic solve moves rho_t'
+there, which resets the wall condition. Measured on the resting column:
+
+| wall-derivative source | outcome |
+|---|---|
+| pinned to zero (`ahat` frozen at 0) | quiet indefinitely — R1T1X == R1T1 |
+| 3-point Lagrange extrapolation to the wall | non-finite in ~26 steps |
+| 2nd-order Taylor off the fitted derivatives | non-finite in ~30 steps |
+| cell-mean + 300 s relaxation | non-finite in ~900 steps |
+
+Smoothing and relaxation slow it; neither removes it, because the TARGET is what
+grows. Two mechanisms compound: the extrapolations weight near-wall curvature by
+`d²/2 ~ 1.6e3 m²`, amplifying grid-scale content (the cell mean fixes that part);
+and, more fundamentally, imposing `∂p'/∂z = -g rho_t'` makes the net vertical
+force at the wall exactly zero, removing the restoring force that would otherwise
+oppose a growing boundary mode. Neutral, not damped — so any numerical
+amplification is unopposed.
+
+### What ships, and what is open
+
+`tc/tc_init.jl` sets `:wall_bc_tau => Inf`, which FREEZES the wall derivative at
+the value `load_initial_conditions!` computes from the balanced vortex. A frozen
+offset is affine and provably (and measurably) as stable as R1T1, so the ceiling
+stays at ts ~ 2.0 while the balanced state remains representable.
+
+**Open:** a frozen value goes stale as the storm deepens and its true surface
+deficit grows. Candidate resolutions, none yet tested:
+1. refresh from a heavily time-averaged state on a slow (~hourly) cadence, far off
+   the acoustic timescale, accepting some drift;
+2. add an explicit damping term to the near-wall pressure so the boundary mode is
+   damped rather than neutral, then allow tracking;
+3. carry `p'' = p' + g ∫ rho_t' dz` as the prognostic pressure, whose wall
+   derivative vanishes identically — plain R1T1 then becomes exactly right and no
+   inhomogeneous machinery (or feedback) exists at all. Cleanest; largest change.
