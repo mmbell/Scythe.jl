@@ -815,9 +815,22 @@ event, ~2 % of the local `E_t` per step. A temperature bias becomes an equal-siz
 conservation bias. The amplitude is the problem; the bookkeeping is not.
 
 So the default is to MEASURE and WARN rather than to floor, and to read a large
-`worst_dT` as what it is: a request for more vertical nodes. The rate functions are all
-negative-safe already (`max(ρ_c, 0)`), so an undershoot is inert in the physics; what it
-is not is invisible.
+`worst_dT` as what it is: a request for more vertical nodes.
+
+**Not flooring is not the same as harmless.** The `max(ρ_c, 0)` guards live inside the RATE
+functions only ([`qss_condensation_rates`](@ref), autoconversion/collection), so an
+undershoot cannot manufacture condensation or precipitation. But the raw value feeds the
+continuity/advection terms AND `ρ_liq`, hence [`retrieve_temperature`](@ref) — so it drags
+the temperature with it by the same `L_v·δ/D`. Measured on `o01_rainfall` quick, the
+temperature attributable to negative liquid reaches **8.1 K** on the cloud flank at
+t = 50 min. (The pre-`ρ_c` formulation could not do this: its `ρ_v` was clamped to
+`[0, ρ_w − ρ_r]`, so the effective liquid the retrieval saw was `ρ_w − ρ_v ≥ ρ_r ≥ 0`.)
+
+The difference between flooring and not is therefore the SIGN STRUCTURE, not the presence
+of an error: unfloored, the anomaly oscillates with the ringing (cold on the undershoot,
+warm on the overshoot) and is dispersive; floored, only the negative lobes are touched and
+it becomes one-signed and cumulative. That is why one detonates and the other does not, and
+why the honest remedy for both is resolution.
 
 # The floor itself, when enabled
 
@@ -915,8 +928,9 @@ end
 Reduce `ModelTile.mc_water_stats` across threads: `(total, min_c, min_r, worst_dT,
 count)`. `total` is Σ|negative water| in kg/m³ summed over gridpoints and steps; `min_c`
 and `min_r` are the most negative condensate and rain densities the tile has held; and
-`worst_dT` [K] is the largest implied single-step latent-heat kick, the number that says
-whether the vertical resolution can represent the condensate spike (see
+`worst_dT` [K] is the largest `L_v·δ/D`, which is simultaneously the temperature anomaly
+the negative liquid imposes through the retrieval and the kick a floor would apply — the
+number that says whether the vertical resolution can represent the condensate spike (see
 [`clamp_water!`](@ref)). All zero on a run that never went negative.
 """
 function water_negativity_report(mtile::ModelTile)
@@ -964,10 +978,10 @@ function water_negativity_trace(mtile::ModelTile, t::Int64)
     applied = get(mtile.model.options, :clamp_water, false)::Bool
     @warn """Negative water: the vertical basis is undershooting a condensate spike.
       step $t: min rho_c = $(rep.min_c) kg/m^3, min rho_r = $(rep.min_r) kg/m^3
-      implied single-step latent-heat kick if floored: $(rep.worst_dT) K
+      |dT| from the negative liquid (= the kick if floored): $(rep.worst_dT) K
       $(rep.count) gridpoint-steps so far, $(rep.total) kg/m^3 total
-      $(applied ? "options[:clamp_water] is ON, so that kick IS being applied." :
-                  "options[:clamp_water] is off, so the physics is unaffected (all rate functions use max(rho,0)).")
+      $(applied ? "options[:clamp_water] is ON, so that kick IS being applied, one-signed." :
+                  "options[:clamp_water] is off, so this is the size of the COLD anomaly the negative liquid is currently imposing through the retrieval (oscillatory, not cumulative). Rate functions are guarded; the retrieval and advection are not.")
       This is a RESOLUTION signal, not a limiter problem: a positive-definite spike the
       column cannot represent undershoots on its flanks. Refine the vertical spacing
       where the cloud/rain gradients are sharpest. Flooring it instead rectifies a
