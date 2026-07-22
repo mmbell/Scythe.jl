@@ -1166,12 +1166,15 @@ using Springsteel
     end
 
     @testset "clamp_water! is a conservative phase change, not a mass source" begin
+        # The floor is opt-in (options[:clamp_water]); by default clamp_water! only
+        # MEASURES. These two testsets exercise the floor itself, so they enable it.
         # The positivity floor moves the deficit between the prognostic condensate and
         # the RESIDUAL vapor, so total water and E_t are untouched and the retrieval
         # supplies exactly the latent heat of the implied phase change. This is the
         # property that makes flooring negative water legitimate rather than a fudge.
         mktempdir() do tmpdir
             mtile, patch, model, _ = make_mc_mtile(tmpdir)
+            model.options[:clamp_water] = true
             vars = model.grid_params.vars
             kDim = model.grid_params.kDim
             rc_i = vars["rho_c"]; rr_i = vars["rho_r"]
@@ -1189,7 +1192,7 @@ using Springsteel
             mtile.var_np1[2, rc_i] = -rho_cbar[2]          # exactly zero cloud
             rw_before = [(mtile.var_np1[i, rt_i] + rho_tbar[mod1(i, kDim)]) -
                          (mtile.var_np1[i, rd_i] + rho_dbar[mod1(i, kDim)]) for i in 1:2]
-            before = Scythe.water_clamp_total(mtile)
+            before = Scythe.water_negativity_report(mtile).total
 
             Scythe.clamp_water!(mtile, 1, kDim)
 
@@ -1203,7 +1206,7 @@ using Springsteel
             # 3. An already-admissible point is left EXACTLY alone
             @test mtile.var_np1[2, rc_i] == -rho_cbar[2]
             # 4. The moved mass is accounted, not silent
-            @test Scythe.water_clamp_total(mtile) - before ≈
+            @test Scythe.water_negativity_report(mtile).total - before ≈
                   abs(deficit_c) + abs(deficit_r) rtol=1e-12
         end
     end
@@ -1213,6 +1216,7 @@ using Springsteel
         # negative). The excess comes out of cloud first, then rain.
         mktempdir() do tmpdir
             mtile, patch, model, _ = make_mc_mtile(tmpdir)
+            model.options[:clamp_water] = true
             vars = model.grid_params.vars
             kDim = model.grid_params.kDim
             rc_i = vars["rho_c"]; rr_i = vars["rho_r"]
@@ -1592,10 +1596,13 @@ using Springsteel
             # clamp_water! converts that negative rain to vapor: rho_r moves, rho_t
             # (total water) deliberately does not. So the residual is bounded by the
             # clamped mass, which is itself accounted rather than silent.
-            clamped = max(Scythe.water_clamp_total(m_on),
-                          Scythe.water_clamp_total(m_off))
-            @test maximum(abs.(d3 .- d8)) <= clamped + 1.0e-14
-            @test all(m_on.var_np1[:, 8] .>= 0.0)
+            @test maximum(abs.(d3 .- d8)) <= 1.0e-14
+            # The fitted bump undershoots negative on its flanks (the spline cannot
+            # represent a Gaussian spike exactly). That is MEASURED, not repaired:
+            # options[:clamp_water] is off by default precisely because flooring it
+            # would rectify the undershoot into one-signed latent heating.
+            @test Scythe.water_negativity_report(m_on).count > 0
+            @test Scythe.water_negativity_report(m_on).worst_dT < 1.0e-3
             # The bump falls: rain-weighted mean height decreases
             kDim = 32
             zs = gp[:, 2]
@@ -2065,9 +2072,7 @@ using Springsteel
             # but not rho_r, so the two solves' inputs differ at the ~1e-12 level
             # (signal > 1e-8); and the positivity floor converts the fitted bump's
             # negative edges to vapor, which moves rho_r but deliberately not rho_t.
-            clamped = max(Scythe.water_clamp_total(m_on),
-                          Scythe.water_clamp_total(m_off))
-            @test maximum(abs.(d3 .- d8)) < 1.0e-10 + clamped
+            @test maximum(abs.(d3 .- d8)) < 1.0e-10
             # Cloud is untouched: rain diffusion must not manufacture condensate
             @test maximum(abs.(m_on.var_np1[:, 9] .- m_off.var_np1[:, 9])) < 1.0e-18
             # Neumann solve conserves the column integral (trapezoid per column)

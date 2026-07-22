@@ -760,65 +760,82 @@ end
 # ── Water positivity ───────────────────────────────────────────────────────────
 
 """
+Row names of `ModelTile.mc_water_stats`, accumulated per thread by [`clamp_water!`](@ref):
+
+| row | meaning |
+|-----|---------|
+| `:total`   | Σ negative water encountered [kg/m³, summed over gridpoints and steps] |
+| `:min_c`   | most negative `ρ_c` seen [kg/m³] |
+| `:min_r`   | most negative `ρ_r` seen [kg/m³] |
+| `:worst_dT`| largest implied latent-heat kick of a single event [K] (see below) |
+| `:count`   | number of gridpoint-steps carrying negative water |
+| `:warned`  | internal: largest `worst_dT` already warned about (thread 1 only) |
+"""
+const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned)
+
+"""
     clamp_water!(mtile, colstart, colend)
 
-Floor the prognostic condensate and rain of one column at zero, and cap them by the
-water actually present. Negative water is not a state the equation set may hold.
+MEASURE the negative water in one column, and — only under
+`options[:clamp_water] = true` — floor it at zero.
 
-**This is conservative, not a fix-up.** `rho_t` is prognostic and the vapor is the
-residual `ρ_v = ρ_t − ρ_d − ρ_c − ρ_r`, so raising `ρ_c` from `−δ` to 0 lowers `ρ_v` by
-exactly `δ` — total water `ρ_w` never moves, `E_t` is untouched, and
-[`retrieve_temperature`](@ref) turns the `δ` increase in `ρ_liq` into precisely the
-latent heat of condensing `δ` of vapor. Mass, water and energy are conserved by
-construction; the floor is an adiabatic phase change, not a source term. (That is a
-direct consequence of keeping `ρ_t` prognostic — with the total density diagnosed as a
-sum, the same floor would create mass out of nothing.)
+# Why the measurement is the point
+
+Negative condensate is unphysical, so the instinct to clamp it is right. But a floor
+cannot manufacture resolution, and at this scheme's ringing amplitudes it does real
+damage.
+
+`ρ_c` and `ρ_r` are positive-definite fields with sharp, spiky structure — a rain shaft
+or a cloud core. A cubic B-spline column with too few nodes to resolve that spike
+UNDERSHOOTS on its flanks, and the undershoot scales with how badly the spike is
+under-resolved, not with roundoff. Flooring it then rectifies a zero-mean oscillation:
+only the negative lobes are touched, so each step converts `δ` of vapor to liquid and the
+retrieval faithfully releases `L_v·δ` of latent heat, one-signed and accumulating.
+
+The size of that kick follows from differentiating the closed-form retrieval
+([`retrieve_temperature`](@ref)) — `∂T/∂ρ_liq = L_v(T)/D` with
+`D = C_factor − ρ_liq(C_pv − C_l)` — so flooring `δ` implies
+
+    ΔT = L_v·δ / D          (`:worst_dT`, estimated with L_v0 and D ≈ C_factor)
+
+Two measured regimes, four orders of magnitude apart:
+
+- **Fit-level noise.** The balanced TC vortex moves ~5e-7 kg/m³ per column-step:
+  `ΔT ~ 1e-3 K`. A floor there is free and harmless.
+- **An unresolved spike.** `o01_rainfall`'s rain shafts reach `min(ρ_r) ≈ -1.8 g/m³` at
+  500 m vertical spacing — `ΔT ≈ 4.4 K` in a SINGLE step at low levels, and ~68 K in the
+  thin air aloft where it actually detonated. With the floor on, that run goes non-finite
+  at t ≈ 23 min as convection erupts (`T = 9 K`, `E_t < 0`, `ρ_vs = Inf`, `Qdot = NaN`);
+  with it off, the same run completes.
+
+Re-accounting the floor does not rescue the second regime, it only chooses which budget
+absorbs it. Holding `p` and subtracting `L_v(T)·δ` from `E_t` alongside the partition
+change leaves `T` exactly invariant — but that is a `L_v·δ ≈ 4.5 kJ/m³` energy sink per
+event, ~2 % of the local `E_t` per step. A temperature bias becomes an equal-sized
+conservation bias. The amplitude is the problem; the bookkeeping is not.
+
+So the default is to MEASURE and WARN rather than to floor, and to read a large
+`worst_dT` as what it is: a request for more vertical nodes. The rate functions are all
+negative-safe already (`max(ρ_c, 0)`), so an undershoot is inert in the physics; what it
+is not is invisible.
+
+# The floor itself, when enabled
 
 Two rules, in order, on the TOTALS (`ρ_c = ρ_c' + ρ̄_c`, so the perturbation floor is
 `−ρ̄_c`):
 
 1. `ρ_c, ρ_r ← max(·, 0)` — the deficit is borrowed from vapor.
-2. If `ρ_c + ρ_r > ρ_w` (i.e. `ρ_v < 0`), take the excess out of `ρ_c` first, then
-   `ρ_r` — evaporation. Only reachable from an already badly wrong water field.
+2. If `ρ_c + ρ_r > ρ_w` (i.e. `ρ_v < 0`), take the excess out of `ρ_c` first, then `ρ_r`.
 
-Why it is needed at all: the cubic-spline Galerkin filter and the AB3 advection both
-ring at grid scale near a sharp condensate edge, and O01 records `ρ_r` undershoots of
-~-1.8 g/m³ under its rain shafts. Applied to `var_np1` at the END of the column step
-(after the acoustic solve and the vertical diffusion), so the values entering the
-patch-level fit are admissible.
+Mass and total water are exactly conserved either way: `ρ_t` is prognostic and the vapor
+is the residual, so the floor only ever moves the partition. `E_t` is untouched, which is
+precisely why the retrieval turns it into latent heat.
 
-The water it moves is accumulated into `mtile.mc_water_clamp` and reported. A floor that
-fires steadily is a defect to chase — grid-scale ringing, a bad initial state, a timestep
-past its limit — and the point of making `ρ_c` prognostic was to stop hiding water
-bookkeeping inside a `max()`.
-
-!!! warning "This floor is NOT safe against Gibbs ringing — measured, 2026-07-22"
-    Conserving mass is not the same as being harmless. Flooring a spectrally-ringing
-    field RECTIFIES a zero-mean oscillation: only the negative lobes are touched, so
-    every step converts `δ` of vapor to liquid and the retrieval dutifully releases
-    `L_v δ` of latent heat. The bias is one-signed and accumulates.
-
-    `o01_rainfall` makes this fatal. Its rain shafts ring to `min(ρ_r) ≈ -1.8 g/m³` at
-    500 m resolution BY DESIGN (see the note in the benchmark config — every rate
-    function is negative-safe, so the undershoot is inert there). Rectifying that is a
-    latent-heat injection of order `L_v × 1.8e-3 ≈ 4.5 kJ/m³` per step, and the run goes
-    non-finite at t ≈ 23 min, right as convection erupts: `T = 9 K`, `E_t < 0`,
-    `ρ_vs = Inf`, `Qdot = NaN`. With `options[:clamp_water] = false` the same run
-    completes. Measured on this branch; do not re-enable without addressing it.
-
-    The fix is to make the floor thermodynamically NEUTRAL rather than
-    energy-conserving — a representation repair should not heat the air. Holding `p`
-    and subtracting `L_v(T)·δ` from `E_t` alongside the partition change leaves `T`
-    exactly invariant (differentiate the closed-form retrieval: `∂T/∂ρ_liq = L_v/D`).
-    That trades a latent-heat bias in `T` for an accounted `E_t` sink of the same size,
-    which is the honest place to put it. NOT YET IMPLEMENTED — pending a decision on
-    whether the state should be floored at all.
-
-`options[:clamp_water] = false` disables the floor entirely (default `true`).
+Applied to `var_np1` at the END of the column step (after the acoustic solve and the
+vertical diffusion), so the values entering the patch-level fit are admissible.
 """
 function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
 
-    get(mtile.model.options, :clamp_water, true)::Bool || return nothing
     vars = mtile.model.grid_params.vars
     rhod_i = vars["rho_d"]
     rhot_i = vars["rho_t"]
@@ -828,44 +845,135 @@ function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
     rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
     rho_tbar = view(ref_rho_t(mtile.ref_state), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
+    apply = get(mtile.model.options, :clamp_water, false)::Bool
 
     moved = 0.0
+    min_c = 0.0
+    min_r = 0.0
+    worst_dT = 0.0
+    nneg = 0.0
     @inbounds for (k, i) in enumerate(colstart:colend)
         rho_c = vnp1[i, rhoc_i] + rho_cbar[k]
         rho_r = vnp1[i, rhor_i]
-        if rho_c < 0.0
-            moved -= rho_c
-            rho_c = 0.0
+        negative = (rho_c < 0.0) || (rho_r < 0.0)
+        # The measurement fast-path: an admissible point costs two adds and a branch.
+        (negative || apply) || continue
+
+        rho_d = vnp1[i, rhod_i] + rho_dbar[k]
+        rho_w = (vnp1[i, rhot_i] + rho_tbar[k]) - rho_d
+
+        if negative
+            deficit = max(-rho_c, 0.0) + max(-rho_r, 0.0)
+            # Implied single-step latent-heat kick if this were floored
+            # (dT/d rho_liq = L_v/D). L_v0 and D ~ C_factor are the cheap
+            # conservative stand-ins; the point is the ORDER, which separates
+            # 1e-3 K noise from a 4 K detonation.
+            D = (rho_d * Cpd) + (rho_w * Cpv)
+            moved += deficit
+            nneg += 1.0
+            min_c = min(min_c, rho_c)
+            min_r = min(min_r, rho_r)
+            worst_dT = max(worst_dT, L_v0 * deficit / D)
         end
-        if rho_r < 0.0
-            moved -= rho_r
-            rho_r = 0.0
+
+        if apply
+            # Rule 1: no negative water. Rule 2 runs REGARDLESS of rule 1 — a
+            # condensate that exceeds the water present drives the residual vapor
+            # negative, which is just as inadmissible and needs no negative input
+            # to happen.
+            rho_c = max(rho_c, 0.0)
+            rho_r = max(rho_r, 0.0)
+            excess = (rho_c + rho_r) - rho_w
+            if excess > 0.0
+                moved += excess
+                take = min(excess, rho_c)
+                rho_c -= take
+                rho_r = max(rho_r - (excess - take), 0.0)
+            end
+            vnp1[i, rhoc_i] = rho_c - rho_cbar[k]
+            vnp1[i, rhor_i] = rho_r
         end
-        # Rule 2: the condensate cannot exceed the water that is there.
-        rho_w = (vnp1[i, rhot_i] + rho_tbar[k]) - (vnp1[i, rhod_i] + rho_dbar[k])
-        excess = (rho_c + rho_r) - rho_w
-        if excess > 0.0
-            moved += excess
-            take = min(excess, rho_c)
-            rho_c -= take
-            rho_r = max(rho_r - (excess - take), 0.0)
-        end
-        vnp1[i, rhoc_i] = rho_c - rho_cbar[k]
-        vnp1[i, rhor_i] = rho_r
     end
-    @inbounds mtile.mc_water_clamp[Threads.threadid()] += moved
+
+    if nneg > 0.0
+        st = mtile.mc_water_stats
+        tid = Threads.threadid()
+        @inbounds begin
+            st[1, tid] += moved
+            st[2, tid] = min(st[2, tid], min_c)
+            st[3, tid] = min(st[3, tid], min_r)
+            st[4, tid] = max(st[4, tid], worst_dT)
+            st[5, tid] += nneg
+        end
+    end
     return nothing
 end
 
 """
-    water_clamp_total(mtile) -> Float64
+    water_negativity_report(mtile) -> NamedTuple
 
-Total water mass density [kg/m³, summed over gridpoints and steps] moved by
-[`clamp_water!`](@ref) on this tile so far. Zero is the expected value; a growing number
-means the condensate field is ringing and wants investigating, not a larger tolerance.
+Reduce `ModelTile.mc_water_stats` across threads: `(total, min_c, min_r, worst_dT,
+count)`. `total` is Σ|negative water| in kg/m³ summed over gridpoints and steps; `min_c`
+and `min_r` are the most negative condensate and rain densities the tile has held; and
+`worst_dT` [K] is the largest implied single-step latent-heat kick, the number that says
+whether the vertical resolution can represent the condensate spike (see
+[`clamp_water!`](@ref)). All zero on a run that never went negative.
 """
-water_clamp_total(mtile::ModelTile) =
-    isempty(mtile.mc_water_clamp) ? 0.0 : sum(mtile.mc_water_clamp)
+function water_negativity_report(mtile::ModelTile)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return (total = 0.0, min_c = 0.0, min_r = 0.0,
+                                worst_dT = 0.0, count = 0.0)
+    return (total = sum(view(st, 1, :)),
+            min_c = minimum(view(st, 2, :)),
+            min_r = minimum(view(st, 3, :)),
+            worst_dT = maximum(view(st, 4, :)),
+            count = sum(view(st, 5, :)))
+end
+
+"""
+    water_negativity_trace(mtile, t)
+
+Warn, once per doubling, when the negative water in the condensate fields implies a
+latent-heat kick large enough to matter — i.e. when the vertical basis is failing to
+represent a positive-definite spike.
+
+Emitted from the single-threaded pre-column-loop slot next to
+[`state_minima_trace`](@ref), so printing is race-free. The threshold ladder starts at
+`options[:water_warn_dT]` (default 0.05 K, comfortably above the ~1e-3 K fit-level noise
+of a quiet column) and each subsequent warning needs a doubling, so a run that is simply
+under-resolved reports O(10) lines rather than one per step.
+
+The message names the remedy, because the remedy is not a limiter: a positive-definite
+spike that undershoots wants more vertical nodes. Flooring it instead converts the
+undershoot into one-signed latent heating (or, re-accounted, into an equal-sized energy
+sink) — see [`clamp_water!`](@ref) for the measured failure that motivates this.
+"""
+function water_negativity_trace(mtile::ModelTile, t::Int64)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    rep = water_negativity_report(mtile)
+    rep.worst_dT > 0.0 || return nothing
+    warn_dT = get(mtile.model.options, :water_warn_dT, 0.05)
+    @inbounds level = st[6, 1]
+    threshold = level == 0.0 ? warn_dT : 2.0 * level
+    rep.worst_dT >= threshold || return nothing
+    @inbounds st[6, 1] = rep.worst_dT
+
+    applied = get(mtile.model.options, :clamp_water, false)::Bool
+    @warn """Negative water: the vertical basis is undershooting a condensate spike.
+      step $t: min rho_c = $(rep.min_c) kg/m^3, min rho_r = $(rep.min_r) kg/m^3
+      implied single-step latent-heat kick if floored: $(rep.worst_dT) K
+      $(rep.count) gridpoint-steps so far, $(rep.total) kg/m^3 total
+      $(applied ? "options[:clamp_water] is ON, so that kick IS being applied." :
+                  "options[:clamp_water] is off, so the physics is unaffected (all rate functions use max(rho,0)).")
+      This is a RESOLUTION signal, not a limiter problem: a positive-definite spike the
+      column cannot represent undershoots on its flanks. Refine the vertical spacing
+      where the cloud/rain gradients are sharpest. Flooring it instead rectifies a
+      zero-mean oscillation into one-signed latent heating."""
+    return nothing
+end
 
 # ── Equation set ───────────────────────────────────────────────────────────────
 

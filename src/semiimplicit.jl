@@ -122,16 +122,17 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # temporaries. Empty for every other set. See `_allocate_sw_scratch` for why there is one
     # workspace per TILE here rather than one per thread as `mc_scratch` has.
     sw_scratch::SWS
-    # Water mass [kg/m^3, summed over gridpoints and steps] moved by the positivity floor
-    # of `clamp_water!`, accumulated per thread (same `@threads :static` ownership rule as
-    # `scratch_columns`) and summed on read. Length 0 for every non-mc set.
+    # Negative-water statistics for the mc sets, accumulated per thread (same
+    # `@threads :static` ownership rule as `scratch_columns`) and reduced on read by
+    # [`water_negativity_report`](@ref). `MC_WATER_STATS` names the rows; zero columns
+    # for every non-mc set.
     #
-    # This exists so the floor cannot be silent. A clamp that fires steadily is a defect
-    # report — grid-scale ringing in the condensate, a bad initial state, a timestep past
-    # its limit — and the whole point of making rho_c prognostic was to stop hiding water
-    # bookkeeping errors inside a max(). `run_model` logs it; the benchmark harness carries
-    # it into conservation_drift.
-    mc_water_clamp::Vector{Float64}
+    # Measured on EVERY step whether or not the positivity floor is applied, because the
+    # amount of negative water is a resolution diagnostic in its own right: a
+    # positive-definite cloud or rain spike that the vertical B-spline basis cannot
+    # resolve undershoots on the way in, and the size of that undershoot is the signal
+    # that the column wants more nodes. See `clamp_water!`.
+    mc_water_stats::Matrix{Float64}
 end
 
 """
@@ -404,7 +405,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_ref_diag,
         _allocate_sw_scratch(tile, model),
         uses_pressure_reference(model.equation_set) ?
-            zeros(Float64, Threads.maxthreadid()) : Float64[])
+            zeros(Float64, length(MC_WATER_STATS), Threads.maxthreadid()) :
+            zeros(Float64, length(MC_WATER_STATS), 0))
     return mtile
 end
 
@@ -1049,6 +1051,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # thread-safe, and halts the run cleanly instead of segfaulting in the solver.
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
 
     # Advance each column.
     #

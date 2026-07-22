@@ -561,6 +561,7 @@ function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{F
 
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
 
     if num_columns(mtile.tile) > 0
         Threads.@threads :static for c in 1:num_columns(mtile.tile)
@@ -609,6 +610,7 @@ function advance_nested_timestepA(mtile::ModelTile, sharedSpectral::SharedArray{
 
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
     if t > 1
         exact_si_load_history!(mtile, hfields, t, rowstart)
     end
