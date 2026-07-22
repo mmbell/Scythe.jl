@@ -957,13 +957,41 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     Q_s = S.Q_s;   @. Q_s = Q_s_energy(Tk, p, rho_d, q_v, q_l)
     Qdot = S.Qdot          # cloud channel
     Qdot_r = S.Qdot_r      # rain channel
-    for i in 1:length(Qdot)
-        Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
-                                                    rho_d[i], Tk[i], p_hPa[i], Q_s[i],
-                                                    model.ts, N_r; N_0=N_0)
-        if isnan(Qdot[i]) || isnan(Qdot_r[i])
-            error("Qdot is NaN at index $i, time $(t)!")
+    # `options[:condensation] = false` switches the phase change off ENTIRELY --
+    # both channels, condensation and evaporation. It is a DIAGNOSTIC control, not
+    # a physics option: `:precipitation => false` only zeroes N_r/N_0, which stops
+    # rain but leaves the cloud channel running, so a run advertised as "no
+    # physics" still evaporates cloud every step.
+    #
+    # WHY THAT MATTERS. rho_c is not prognostic -- it is the residual
+    # rho_t - rho_d - rho_v - rho_r, with rho_v = clamp(Q_ss + rho_vs, 0, rho_v_max)
+    # from the retrieval. In cloud-free air the true Q_ss sits exactly ON the
+    # ceiling Q_hi, so any fit-level error in the four fields that make up the
+    # residual puts rho_c slightly ABOVE zero and the model sees cloud that is not
+    # there. On the balanced TC vortex that is rho_c ~ 2e-6 kg/m^3 over ~15 % of
+    # nest 1, which evaporates at ~4e-6 kg/m^3/s and accounts for ALL of the t = 0
+    # pressure tendency (3.19 Pa/s measured, 3.3 predicted from
+    # (R_m/C_vt)(L_v - R_v C_pt T/R_m) Qdot).
+    #
+    # Being a diagnosed residual is what makes it a SUSTAINED sink rather than a
+    # startup transient: it is regenerated from the same persistent fit residual at
+    # every step and evaporated again, so the mass removed per unit time scales
+    # like rho_c/ts -- halving the timestep doubles the drain. Switch this off to
+    # separate "the initial state is not a discrete steady state" from "the
+    # cloud/vapor partition is being retrieved from a residual of nearly equal
+    # fitted fields".
+    if get(model.options, :condensation, true)::Bool
+        for i in 1:length(Qdot)
+            Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
+                                                        rho_d[i], Tk[i], p_hPa[i], Q_s[i],
+                                                        model.ts, N_r; N_0=N_0)
+            if isnan(Qdot[i]) || isnan(Qdot_r[i])
+                error("Qdot is NaN at index $i, time $(t)!")
+            end
         end
+    else
+        fill!(Qdot, 0.0)
+        fill!(Qdot_r, 0.0)
     end
 
     # Warm-rain conversion and sedimentation. Autoconversion + collection move cloud to
