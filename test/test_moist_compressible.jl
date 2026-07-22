@@ -1771,6 +1771,160 @@ using Springsteel
         end
     end
 
+    @testset "balanced_vortex_native!: the vortex is a discrete steady state" begin
+        # THE GATE of tc/HANDOFF_INITIALIZATION.md, and the direct analogue of the
+        # resting-fixed-point gate above: a balanced vortex is a steady state of the
+        # equation set, so at t = 0 the u tendency and the reconstructed w tendency
+        # should vanish. They cannot vanish exactly -- see below -- but they must be
+        # decisively better than the analytic construction they replace.
+        #
+        # WHY A RATIO AND NOT AN ABSOLUTE TOLERANCE. The achievable residual is set
+        # by how well the spline basis can hold the balanced state on THIS grid, so
+        # any absolute number would be a property of the test's own resolution and
+        # would have to be re-tuned for every grid. Both inits are built on the same
+        # patch from the same reference here, so the ratio isolates the thing under
+        # test. (On the shipped TC nest the same comparison gives 5.1x on the
+        # gradient-wind leg and 4.4x on the hydrostatic one.)
+        #
+        # WHY THE COLUMN IS MOIST. With rho_v == 0 the vapor field is degenerate --
+        # rho_v = rho_t - rho_d is then a difference of two nearly equal fitted
+        # fields, so ANY fit error is infinitely large in relative terms and the
+        # Q_ss/pressure tendencies stop measuring anything. A subsaturated moist
+        # column is both the realistic case and the discriminating one.
+        vortex = (; v_m = 15.0, r_m = 40.0e3, r_0 = 200.0e3, v_top = 10.0e3,
+                    fcor = 5.0e-5)
+
+        function moist_adiabatic_column(z; theta0 = 300.0)
+            exner = @. 1.0 - (gravity * z) / (Cpd * theta0)
+            Tk = theta0 .* exner
+            p_Pa = @. 100000.0 * exner^(Cpd / Rd)
+            rho_d = p_Pa ./ (Rd .* Tk)
+            q_v = @. 0.012 * exp(-z / 3000.0)
+            return (; z, Tk, p_Pa, rho_d, rho_v = rho_d .* q_v, rho_c = zeros(length(z)))
+        end
+
+        function make_vortex_patch(tmpdir, tag)
+            vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS_CYL))
+            scalar = Dict(v => NeumannBC() for v in keys(vars))
+            axis = merge(scalar, Dict("u" => DirichletBC(), "v" => DirichletBC()))
+            wall = merge(scalar, Dict("u" => DirichletBC()))
+            vert = Dict{String,Any}(v => SecondDerivativeBC() for v in keys(vars))
+            bot = merge(vert, Dict{String,Any}("w" => DirichletBC(),
+                                               "rho_r" => NaturalBC()))
+            top = merge(vert, Dict{String,Any}("w" => DirichletBC()))
+            gp0 = GridParameters(geometry = "RiRk", num_cells_i = 12,
+                                 iMin = 0.0, iMax = 300.0e3,
+                                 kMin = 0.0, kMax = 10.0e3, num_cells_k = 20,
+                                 BCL = axis, BCR = wall, BCB = bot, BCT = top,
+                                 vars = vars)
+            patch = createGrid(gp0)
+            gp = patch.params        # createGrid is what reconciles iDim/kDim/num_cells
+            z = Scythe.getGridpoints(patch)[1:gp.kDim, 2]
+            col = moist_adiabatic_column(z)
+            ref_file = joinpath(tmpdir, "vortex_$(tag).ref")
+            Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v,
+                                      col.rho_c)
+            model = ModelParameters(
+                ts = 0.5, integration_time = 1.0, output_interval = 1.0,
+                equation_set = "moist_compressible_axisym",
+                ref_state_file = ref_file, grid_params = gp,
+                physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                       :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                       :Kv_mudiff => 0.0, :tau_qss => 10.0,
+                                       :N_r => 1.0e-3, :alpha => 0.0,
+                                       :z_damp => 20.0e3, :f => vortex.fcor),
+                options = Dict{Symbol,Any}(:semiimplicit => true,
+                                           :exact_reference_state => true,
+                                           :state_dependent_si => true,
+                                           :precipitation => false,
+                                           :vertical_mixing => false))
+            ref = Springsteel.exact_pressure_reference_state(
+                      ref_file, z, Scythe.reference_column(patch, gp))
+            return gp, patch, model, ref, z
+        end
+
+        "The two balance residuals the equation set actually computes, plus every
+        other prognostic slot's tendency, after the SINGLE fit the model performs."
+        function vortex_residuals(gp, patch, model, ref)
+            spectralTransform!(patch)          # == load_initial_conditions!: ONE fit.
+            gridTransform!(patch)              # A second one would measure F∘F.
+            hrm = sparse(Int64[], Int64[], Float64[],
+                         size(patch.spectral, 1), size(patch.spectral, 2))
+            mtile = createModelTile(patch, patch, model, hrm)
+            kDim = gp.kDim
+            ncol = Scythe.num_columns(patch)
+            npts = ncol * kDim
+            for c in 1:ncol
+                cs = ((c - 1) * kDim) + 1
+                Scythe.physical_model(mtile, cs, cs + kDim - 1, 1)
+            end
+            rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
+            p_i = gp.vars["p"]; rt_i = gp.vars["rho_t"]
+            # Slot 4 IS the gradient-wind residual at rest: ADV = KDIFF = 0, so
+            # expdot[u] = -pp_x/rho_t + (f + v/r) v.
+            gw = maximum(abs, view(mtile.expdot_n, 1:npts, gp.vars["u"]))
+            # The w tendency has to be reconstructed: expdot slot 5 carries only the
+            # buoyancy half, the -pp_z/rho_t leg lives in the implicit acoustic solve.
+            hy = 0.0
+            i = 1
+            for _ in 1:ncol, k in 1:kDim
+                rtp = patch.physical[i, rt_i, 1]
+                hy = max(hy, abs(patch.physical[i, p_i, 4] + (gravity * rtp)) /
+                             (rtp + rho_tbar[k]))
+                i += 1
+            end
+            slots = [maximum(abs, view(mtile.expdot_n, 1:npts, s))
+                     for s in 1:size(mtile.expdot_n, 2)]
+            return gw, hy, slots
+        end
+
+        mktempdir() do tmpdir
+            # A single patch, so the nest topology is trivial: no interfaces, hence
+            # no R3X payloads to inherit. (The nested path is exercised by
+            # model_tests/tc_discrete_balance.jl, which needs a real 3-patch nest.)
+            topo = Scythe.NestTopology(Scythe.NestInterface[], [Int[]], [Int[]],
+                                       [1], [0.5])
+
+            gpN, pN, mN, refN, _ = make_vortex_patch(tmpdir, "native")
+            Scythe.balanced_vortex_native!([pN], topo, refN; zcol = 2,
+                                           fcor = vortex.fcor, vortex_profile = :re87,
+                                           v_m = vortex.v_m, r_m = vortex.r_m,
+                                           r_0 = vortex.r_0, v_top = vortex.v_top,
+                                           verbose = false)
+            gwN, hyN, slotsN = vortex_residuals(gpN, pN, mN, refN)
+
+            gpL, pL, mL, refL, zL = make_vortex_patch(tmpdir, "analytic")
+            r_axis = collect(0.0:1000.0:300.0e3)
+            flds = Scythe.balanced_vortex_fields(
+                       r_axis, zL, Springsteel.ref_pressure(refL)[:, 1],
+                       Springsteel.ref_rho_d(refL)[:, 1],
+                       Springsteel.ref_rho_v(refL)[:, 1];
+                       vortex_profile = :re87, v_m = vortex.v_m, r_m = vortex.r_m,
+                       r_0 = vortex.r_0, v_top = vortex.v_top, fcor = vortex.fcor)
+            pL.physical .= 0.0
+            Scythe.balanced_vortex_mc!(pL, Scythe.getGridpoints(pL), refL, flds,
+                                       r_axis; zcol = 2)
+            gwL, hyL, slotsL = vortex_residuals(gpL, pL, mL, refL)
+
+            # Both balance legs, decisively better than the analytic construction.
+            @test gwN < gwL / 1.4
+            @test hyN < hyL / 3.0
+            # The thermodynamic slots must not be traded away for the balance: the
+            # p and Q_ss tendencies at rest are the spurious-condensation channel,
+            # and an init whose Q_ss is inconsistent with the fitted rho_d/rho_t
+            # lights them up (that inconsistency cost a factor of 4 here before the
+            # targets were chained off settled FITTED values).
+            @test slotsN[gpN.vars["p"]] < slotsL[gpL.vars["p"]]
+            @test slotsN[gpN.vars["Q_ss"]] < slotsL[gpL.vars["Q_ss"]]
+            # Slots with no term that survives u = w = 0 must be at round-off.
+            for name in ("rho_d", "rho_t", "rho_r")
+                @test slotsN[gpN.vars[name]] == 0.0
+            end
+            @test slotsN[gpN.vars["E_t"]] < 1.0e-9
+            @test slotsN[gpN.vars["v"]] < 1.0e-6
+        end
+    end
+
     @testset "water diffusion: rain bump conserves mass and holds T" begin
         # Rain bump aloft in a cloud-free saturated column, ONLY Kvdiff_water active.
         # The on/off difference isolates the water solves: rho_d untouched bit-exactly,

@@ -104,7 +104,58 @@ function tc_boundary_conditions()
     # Scythe mc_wall_bc_active / update_mc_wall_bc!); it is simply not enabled.
     # Re-enable by setting vert["p"] = Springsteel.CubicBSpline.R1T1X and the
     # acoustic set to NeumannBC() -- but ISOLATE the two suspects above first.
-    vert = Dict{String,Any}(v => SecondDerivativeBC() for v in TC_VARS)
+    #
+    # SCYTHE_TC_WALL_BC selects the vertical wall condition WITHOUT editing this
+    # file, the same way SCYTHE_TC_TS_SCALE selects the timestep -- because a
+    # restart re-reads tc_params.jl/tc_init.jl, so an edit made while a run is in
+    # flight silently changes what a later restart does.
+    #
+    #   d2      (default) SecondDerivativeBC on every scalar -- the shipped config
+    #   natural NaturalBC on every scalar -- what the physics wants, historically
+    #           UNSTABLE (non-finite at t = 41 s)
+    #   r1t1x   p on CubicBSpline.R1T1X (the exact wall compatibility condition
+    #           dp'/dz = -g rho_t' carried in an affine ahat) with the acoustic set
+    #           on homogeneous Neumann
+    #
+    # BOTH non-default options were REJECTED on measurements that are now void.
+    # The `natural` blow-up and the R1T1X comparison were taken on a reference
+    # that condensed at rest (expdot[p] = 2.3 Pa/s with zero perturbation) and on
+    # an initialization out of discrete hydrostatic balance by 5e-3 m/s^2 -- i.e.
+    # a wall condition that leaves dp'/dz free was being asked to hold a state that
+    # was not in balance to begin with, and was blamed for the resulting growth.
+    # Both of those are fixed (tc/HANDOFF_REFERENCE_STATE.md,
+    # tc/HANDOFF_INITIALIZATION.md), so the rejections need re-taking rather than
+    # inheriting. What has NOT changed is the structural argument in the note above
+    # -- the Galerkin acoustic solve takes Neumann as its natural weak-form
+    # condition -- so `natural` may well still be unstable for a reason no
+    # initialization can fix. That is the question, not the assumption.
+    #
+    # There is now a measured PAYOFF to weigh it against: on the native init,
+    # relaxing d2 -> natural cuts the t = 0 hydrostatic residual in the wall cells
+    # by 10.65x (model_tests/tc_balance_floor.jl). It buys only 1.26x on the
+    # DOMAIN maximum, though, because re87_v's dv/dz jump at v_top is the next
+    # constraint -- round that off too (`z_round`) and the pair gives 5.51x.
+    wall_mode = get(ENV, "SCYTHE_TC_WALL_BC", "d2")
+    vert = if wall_mode == "natural"
+        Dict{String,Any}(v => NaturalBC() for v in TC_VARS)
+    elseif wall_mode == "r1t1x"
+        # The acoustic set goes to homogeneous Neumann to stay consistent with the
+        # affine p condition; everything else keeps d2. NOTE this is the very
+        # grouping the note above names as the leading suspect for R1T1X being
+        # worse than d2 -- Neumann forces d(rho_t')/dz = 0 at the ground -- so a
+        # re-test should also try leaving the densities on d2.
+        d = Dict{String,Any}(v => SecondDerivativeBC() for v in TC_VARS)
+        for v in ("rho_d", "rho_t", "E_t", "Q_ss")
+            d[v] = NeumannBC()
+        end
+        d["p"] = Springsteel.CubicBSpline.R1T1X
+        d
+    elseif wall_mode == "d2"
+        Dict{String,Any}(v => SecondDerivativeBC() for v in TC_VARS)
+    else
+        error("SCYTHE_TC_WALL_BC must be one of d2 | natural | r1t1x, got $(wall_mode)")
+    end
+    wall_mode == "d2" || @info "TC vertical wall condition: $(wall_mode) (non-default)"
     # w = 0 at the ground and at the rigid lid is the one genuine vertical BC.
     # rho_r stays NaturalBC at the ground so rain can fall out of the domain.
     bot_bc = merge(vert, Dict{String,Any}("w" => DirichletBC(), "rho_r" => NaturalBC()))
@@ -283,6 +334,43 @@ function init_tc!(nest)
     end
     println("Reference: sfc p = " *
             "$(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits=2)) hPa")
+
+    # ── NATIVE-GRID BALANCE (default) ──────────────────────────────────────────
+    # Solve the balance on the patches' own mish under the patches' own fit, so the
+    # DISCRETE residuals -- the ones the equation set actually computes -- are what
+    # gets minimized. The legacy path below balances on a foreign 500 m work grid
+    # with FD/Heun/trapezoid operators and transfers by linear interpolation; it
+    # reports 3.6e-4 while the model sees 5.1e-3. Set options[:native_vortex_init]
+    # = false to fall back to it for an A/B.
+    if get(nest.base.options, :native_vortex_init, true)::Bool
+        patches = [createGrid(m.grid_params) for m in models]
+        Scythe.balanced_vortex_native!(patches, topo, ref;
+                                       zcol = zcol, fcor = F_COR,
+                                       vortex_profile = VORTEX_PROFILE,
+                                       v_m = V_M, r_m = R_M, r_0 = R_0,
+                                       Vmax = VMAX, RMW = RMW,
+                                       alpha = RANKINE_ALPHA, v_top = V_TOP,
+                                       z_bt = Z_BAROTROPIC, RH_core = RH_CORE,
+                                       r_moist = R_MOIST, z_moist = Z_MOIST,
+                                       RH_max = RH_INIT_MAX,
+                                       RH_bl = RH_BL, z_bl = Z_BL,
+                                       moist_profile = MOIST_PROFILE)
+        for (p, m) in zip(patches, models)
+            gpts = Scythe.getGridpoints(p)
+            kDim1 = m.grid_params.kDim
+            if m === models[1]
+                pv = m.grid_params.vars["p"]
+                vv = m.grid_params.vars["v"]
+                println("Native vortex: max v = " *
+                        "$(round(maximum(p.physical[:, vv, 1]); digits=2)) m/s, " *
+                        "central surface p deficit = " *
+                        "$(round(p.physical[1, pv, 1] / 100.0, digits=2)) hPa " *
+                        "(axis mish point, z = $(round(gpts[1, zcol]; digits=1)) m)")
+            end
+            Scythe.write_ics_csv(m.initial_conditions, p, gpts)
+        end
+        return models, topo
+    end
 
     # Balanced vortex on the radial work grid x model mish vertical axis
     r_outer = gp1.geometry == "RLR" ? NEST_BOUNDARIES_RLR[end] : NEST_BOUNDARIES[end]

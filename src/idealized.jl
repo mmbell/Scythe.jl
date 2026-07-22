@@ -714,16 +714,43 @@ used here previously decays as r^-0.3 and was still 12 m/s at r = 1050 km, givin
 a +6.9 K surface warm anomaly -- which put the surface air ABOVE the SST and
 reversed the air-sea enthalpy and moisture fluxes, so the vortex could only decay.
 See tc/HANDOFF_2026-07-19.md.
+
+# `z_round` — rounding off the kink at `z_sponge`
+
+`(z_sponge − z)/z_sponge` truncated at zero leaves `dv/dz` DISCONTINUOUS at
+`z_sponge`, and that jump lands in the balanced density exactly the way
+[`modified_rankine_v`](@ref) documents for a piecewise-linear `z_bt` taper. It is
+measurable: with the native initialization the hydrostatic residual in the outer
+nests peaks at z = 15.25 km — the first mish point above `v_top = 15 km` — and
+once the wall condition is relaxed it becomes the binding floor over the whole
+domain (`model_tests/tc_balance_floor.jl`).
+
+`z_round ∈ (0, 1)` replaces the linear decay ABOVE `z_round·z_sponge` with the
+quintic Hermite that matches value and slope there and has zero value, slope AND
+curvature at `z_sponge`, so `v` is C² at both joins. The decay below is untouched,
+which is what keeps this from reintroducing the `z_bt` disease: a taper that
+flattened `dv/dz` near the GROUND would recreate the barotropic layer that drove
+dry Ertel PV negative (`tc/tc_params.jl`, `Z_BAROTROPIC` MUST stay 0).
+
+`z_round = 1.0` (the default) is the untouched linear profile, bitwise.
 """
 function re87_v(r, z; v_m=15.0, r_m=82.5e3, r_0=412.5e3, fcor=5.0e-5,
-                z_sponge=15.0e3)
+                z_sponge=15.0e3, z_round=1.0)
 
     (z >= z_sponge || r >= r_0) && return 0.0
     a = (2.0 * r_m / (r + r_m))^3
     b = (2.0 * r_m / (r_0 + r_m))^3
     inner = (v_m * v_m * (r / r_m)^2 * (a - b)) + (0.25 * fcor * fcor * r * r)
     v = sqrt(max(inner, 0.0)) - (0.5 * fcor * r)
-    return max(v, 0.0) * ((z_sponge - z) / z_sponge)
+    t = z / z_sponge
+    (z_round >= 1.0 || t <= z_round) && return max(v, 0.0) * (1.0 - t)
+    # Quintic Hermite on [z_round, 1] in t: value 1-z_round and slope -1 at the
+    # left join (matching the linear decay), value = slope = curvature = 0 at t = 1.
+    s = (t - z_round) / (1.0 - z_round)
+    s2 = s * s; s3 = s2 * s; s4 = s3 * s; s5 = s4 * s
+    A0 = 1.0 - (10.0 * s3) + (15.0 * s4) - (6.0 * s5)      # value basis
+    A1 = s - (6.0 * s3) + (8.0 * s4) - (3.0 * s5)          # slope basis
+    return max(v, 0.0) * (1.0 - z_round) * (A0 - A1)
 end
 
 "Centered first derivative on a (possibly nonuniform) axis; one-sided at the ends."
@@ -1038,4 +1065,617 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
         end
     end
     return patch
+end
+
+# ── NATIVE-GRID balanced vortex ────────────────────────────────────────────────
+#
+# WHY A SECOND CONSTRUCTION. `balanced_vortex_fields` above solves the balance
+# analytically on a foreign 500 m radial work grid (FD ∂/∂z, Heun march in r,
+# trapezoid hydrostatic integral) and `balanced_vortex_mc!` transfers it onto the
+# model by piecewise-LINEAR radial interpolation. It reports a gradient-wind
+# residual of 3.6e-4, but that number is measured with ITS OWN operators on ITS OWN
+# grid. Under the model's operators the hydrostatic residual is 5.1e-3 -- 14x
+# larger (model_tests/tc_discrete_balance.jl) -- and it is the largest imbalance
+# left in the TC system now that the reference state is an exact discrete fixed
+# point.
+#
+# The reason a "more accurate analytic solution" cannot close that gap is that the
+# model's fit is NOT INTERPOLATORY: l_q defaults to 2.0, so
+# spectralTransform!/gridTransform! smooth. Handing the model analytically balanced
+# VALUES leaves it balanced only to the fit error of a DERIVATIVE. The fix is to put
+# the fit inside the solve -- choose mish values so that the FITTED field is
+# balanced. This is the same move that made the reference state exact (Springsteel
+# `_hydrostatic_pressure_profile`: integrate, do not re-fit).
+#
+# THE EQUATIONS, in the model's own variables. The two residuals the equation set
+# actually computes are (mc_geometry.jl `mc_u_forcing!`, moist_compressible.jl
+# slots 4-5)
+#
+#     expdot[u] = -pp_x/ρ_t + (f + v/r)·v = -(pp_x - ρ_t·C)/ρ_t,  C = v²/r + f·v
+#     dw/dt     = -(pp_z + g·ρ_t')/ρ_t
+#
+# with pp_x, pp_z, v and ρ_t' all FITTED values. Eliminating ρ_t' between the two
+# gives ONE equation, and it is exactly LINEAR in p' -- no thermal-wind log-density
+# march, no nonlinearity:
+#
+#     ∂p'/∂r + (C/g)·∂p'/∂z = ρ̄_t·C ,     ρ_t' = -(1/g)·∂p'/∂z
+#
+# The characteristic slope C/g is ~2.6e-4 and the (C/g)·∂p'/∂z term is ~1 % of
+# ρ̄_t·C, so a Picard sweep -- correct p' by the radial antiderivative of the
+# current gradient-wind residual -- contracts at ~0.01 per iteration.
+#
+# THE NEST JUNCTION IS A RANK-3 CONSTRAINT, NOT AN ANCHOR. `apply_interface_payload!`
+# writes THREE border spline coefficients into the child's `ahat`, and
+# `set_ahat_r3x!` shows what they encode: u(x₀), u'(x₀) AND u''(x₀) -- for every
+# variable, not just p. A child solved in isolation with only its junction VALUE
+# matched would have its dp'/dr and d²p'/dr² overwritten on the first exchange,
+# which is precisely the discrepancy this function exists to remove. So every fit
+# inside a child's iteration runs with the parent's payload applied, in the same
+# spectralTransform! -> apply_interface_payload! -> gridTransform! order the model
+# itself uses, and patches are solved OUTERMOST FIRST so a child only ever inherits
+# a converged trio. Consistency at the junction is then INHERITED rather than
+# imposed: v and ρ_t are R3X'd too, so the child's fitted v and ρ_t at the junction
+# ARE the parent's, and a parent satisfying ∂p'/∂r = ρ_t·C there hands down the
+# right u'(x₀).
+
+"""
+    _nest_parent_order(topo, npatch) -> Vector{Int}
+
+Patch indices ordered so every patch follows all of its parents. Mirrors the
+interface-graph walk in `load_all_patches` (model_tests/tc_discrete_balance.jl),
+but over patches rather than interfaces.
+"""
+function _nest_parent_order(topo, npatch::Int)
+    order = Int[]
+    done = falses(npatch)
+    while length(order) < npatch
+        progressed = false
+        for i in 1:npatch
+            done[i] && continue
+            all(done[topo.interfaces[j].parent] for j in topo.parent_ifaces[i]) || continue
+            push!(order, i)
+            done[i] = true
+            progressed = true
+        end
+        progressed || error("nest interface graph has a cycle")
+    end
+    return order
+end
+
+"""
+    _native_radial_column(gp) -> Spline1D
+
+A natural-BC (R0) radial basis sharing the patch's own i-mish, for use as an
+integrator. Mirrors `Springsteel.natural_column`, which does the same for the
+VERTICAL basis: reference/integrand profiles can have nonzero boundary gradients,
+so the model variables' wall conditions must not be imposed on them.
+
+Every `grid.ibasis.data[z, v]` on a RiRk patch is built from exactly these
+parameters (Springsteel factory.jl), so the mish points coincide.
+
+`l_q = 0.0` IS LOAD-BEARING, and it is not the same knob as the model's `l_q`.
+Ooyama's Q-penalty is a smoothing constraint on the fitted curvature, and while it
+costs almost nothing on a VALUE fit (1e-4 relative) or a DERIVATIVE (7e-8), it
+wrecks the ANTIDERIVATIVE: measured on `exp(-(r/60 km)²)` over this patch's own
+15-cell radial basis, recovering `f` from `df/dr` via `IInttransform` is in error by
+**13 %** at `l_q = 2.0` and by 4e-5 at `l_q = 0.0`. With the smoothed integrator the
+Picard sweep below stalls at a gradient-wind residual of 2e-2 m/s² -- 1000x WORSE
+than the analytic init it replaces -- because the correction it applies is not the
+antiderivative of the residual it measured. This column is a private numerical
+tool, not a model field, so there is nothing for the penalty to regularize here.
+"""
+function _native_radial_column(gp)
+    return Spline1D(SplineParameters(
+        xmin = gp.iMin, xmax = gp.iMax, num_cells = gp.num_cells,
+        mubar = gp.mubar, quadrature = gp.quadrature, l_q = 0.0,
+        BCL = Springsteel.CubicBSpline.R0, BCR = Springsteel.CubicBSpline.R0))
+end
+
+"""
+    _native_fit!(patch, mish, payloads)
+
+The model's own fit operator: install `mish` as the patch's physical values, run
+`spectralTransform!`, apply every incoming R3X payload, then `gridTransform!`.
+
+This is exactly the chain `load_initial_conditions!` + the t = 0 interface exchange
+perform, so a state converged under this operator is reproduced bit-for-bit by
+writing `mish` to the IC file and letting the model load it. Note `mish` is kept
+SEPARATE from `patch.physical`: `gridTransform!` overwrites slice 1 with the
+FITTED values, so reusing the patch array as the control variable would silently
+iterate F∘F∘F… instead of F.
+"""
+function _native_fit!(patch, mish::AbstractMatrix{Float64}, payloads)
+    patch.physical[:, :, 1] .= mish
+    spectralTransform!(patch)
+    for (meta, payload) in payloads
+        Springsteel.apply_interface_payload!(meta, patch, payload)
+    end
+    gridTransform!(patch)
+    return patch.physical
+end
+
+"""
+    _radial_antiderivative!(out, G, rcol, kDim, ncol)
+
+Level-by-level radial antiderivative of `G`, shifted to vanish at the OUTERMOST
+mish point: `out(r) = ∫ G - ∫ G |_(r = r_end)`. Rows are the RiRk layout,
+`(c-1)*kDim + k`.
+
+Integrate, do not re-fit: `IInttransform` returns the antiderivative SPLINE of the
+fitted integrand, so `d(out)/dr` is the fit of `G` by construction. Re-fitting the
+integrated values instead is the defect that cost 17 % in the reference-state
+hydrostatic profile.
+"""
+function _radial_antiderivative!(out::AbstractVector{Float64}, G::AbstractVector{Float64},
+                                 rcol, kDim::Int, ncol::Int)
+    for k in 1:kDim
+        @inbounds for c in 1:ncol
+            rcol.uMish[c] = G[((c - 1) * kDim) + k]
+        end
+        Btransform!(rcol)
+        Atransform!(rcol)
+        A = IInttransform(rcol, 0.0)
+        @inbounds for c in 1:ncol
+            out[((c - 1) * kDim) + k] = A[c] - A[ncol]
+        end
+    end
+    return out
+end
+
+"""
+    _native_vertical_column(gp) -> Spline1D
+
+The vertical twin of [`_native_radial_column`](@ref): a natural-BC, unpenalized
+column on the patch's own k-mish, used to integrate the hydrostatic residual.
+`l_q = 0.0` for the same reason -- see that function.
+"""
+function _native_vertical_column(gp)
+    return Spline1D(SplineParameters(
+        xmin = gp.kMin, xmax = gp.kMax, num_cells = gp.num_cells_k,
+        mubar = gp.mubar, quadrature = gp.quadrature, l_q = 0.0,
+        BCL = Springsteel.CubicBSpline.R0, BCR = Springsteel.CubicBSpline.R0))
+end
+
+"""
+    _vertical_antiderivative!(out, H, kcol, kDim, ncol)
+
+Column-by-column vertical antiderivative of `H`, shifted to vanish at the TOP mish
+point. The top is the right anchor: the vortex vanishes above `v_top`, so `p'` is
+already zero there and the correction must not move it.
+"""
+function _vertical_antiderivative!(out::AbstractVector{Float64}, H::AbstractVector{Float64},
+                                   kcol, kDim::Int, ncol::Int)
+    for c in 1:ncol
+        base = (c - 1) * kDim
+        @inbounds for k in 1:kDim
+            kcol.uMish[k] = H[base + k]
+        end
+        Btransform!(kcol)
+        Atransform!(kcol)
+        A = IInttransform(kcol, 0.0)
+        @inbounds for k in 1:kDim
+            out[base + k] = A[k] - A[kDim]
+        end
+    end
+    return out
+end
+
+"""
+    _native_deconvolve!(mish, patch, vi, target, payloads; iters, verbose)
+
+Choose mish values for variable slot `vi` so that the FITTED field matches
+`target`, by Picard iteration `mish ← mish + (target − F·mish)`. Returns the best
+achieved `max|target − F·mish|`, and leaves `mish` at the best iterate.
+
+Why this is needed at all: with `l_q = 2.0` the fit smooths, so `F·target ≠ target`
+and simply writing the target leaves a value error that lands directly in the
+hydrostatic residual as `g·(ρ̂_t' − ρ_t')`.
+
+Why the BEST iterate rather than the last: at an R3X junction the border
+coefficients come from the parent and cannot be moved, and under a `d²/dz² = 0`
+wall the required curvature is not in the basis. In those rows `(I − F)` has a
+unit eigendirection, so the iteration stalls there (and the mish value drifts)
+while it converges everywhere else. Keeping the best iterate bounds the drift; the
+returned error is the honest floor.
+"""
+function _native_deconvolve!(mish::AbstractMatrix{Float64}, patch, vi::Int,
+                             target::AbstractVector{Float64}, payloads;
+                             iters::Int = 8)
+    npts = length(target)
+    best = fill(0.0, npts)
+    best .= view(mish, :, vi)
+    best_err = Inf
+    best_idx = 1
+    work = Vector{Float64}(undef, npts)
+    for _ in 1:iters
+        _native_fit!(patch, mish, payloads)
+        @inbounds for i in 1:npts
+            work[i] = target[i] - patch.physical[i, vi, 1]
+        end
+        idx = argmax(abs.(work))
+        err = abs(work[idx])
+        if err < best_err
+            best_err = err
+            best_idx = idx
+            best .= view(mish, :, vi)
+        end
+        @inbounds for i in 1:npts
+            mish[i, vi] += work[i]
+        end
+    end
+    mish[:, vi] .= best
+    _native_fit!(patch, mish, payloads)
+    return best_err, best_idx
+end
+
+"""
+    balanced_vortex_native!(patches, topo, ref; kwargs...) -> Vector{Matrix{Float64}}
+
+Solve the gradient-wind / hydrostatic balance for a tropical-cyclone vortex
+**on the model's own mish, under the model's own fit**, and return one
+`(npts, nvars)` matrix of mish values per patch, in the perturbation form
+`load_initial_conditions!` expects (i.e. ready for [`write_ics_csv`](@ref) once
+copied into `patch.physical[:, :, 1]`, which this function also does).
+
+`patches` are the real patch grids (real BCs), `topo` the `NestTopology` from
+`build_nest`, and `ref` the shared `PressureReferenceState` on the common vertical
+mish. The vortex profile keywords are the same as [`balanced_vortex_fields`](@ref).
+
+See the long comment above for the derivation. In outline, per patch, outermost
+first:
+
+1. `v` from `re87_v`/`modified_rankine_v`, fitted; `C = v²/r + f·v` from the
+   FITTED `v`, since that is the `v` the `u` tendency sees.
+2. Picard sweeps on `p'`: correct by the radial antiderivative of the current
+   gradient-wind residual `G = pp_x − ρ_t·C`, with `ρ_t'` re-derived from the
+   fitted `pp_z` each sweep and deconvolved so its FITTED value matches `−pp_z/g`.
+3. Moisture, `E_t` and `Q_ss` diagnosed pointwise from the converged `(p, ρ_t)` —
+   exactly balance preserving, since they hold `ρ_t` and `p` fixed — then
+   deconvolved so their fitted values match too.
+
+Prints the discrete residuals per patch (`verbose`), bucketed into interior, wall
+cells and junction cells, because the last two carry irreducible floors: a
+`d²/dz² = 0` wall cannot represent the balanced curvature, and an R3X junction
+inherits its trio from a coarser parent.
+"""
+function balanced_vortex_native!(patches::AbstractVector, topo,
+                                 ref::Springsteel.PressureReferenceState;
+                                 zcol::Int = 2, fcor = 3.775e-5,
+                                 vortex_profile = :re87, v_m = 15.0, r_m = 82.5e3,
+                                 r_0 = 412.5e3, Vmax = 15.0, RMW = 50.0e3,
+                                 alpha = 0.3, v_top = 15.0e3, z_bt = 0.0,
+                                 RH_core = nothing, r_moist = 150.0e3,
+                                 z_moist = 8.0e3, RH_max = 0.98, RH_bl = nothing,
+                                 z_bl = 1.5e3, moist_profile = :gaussian,
+                                 z_round = 1.0,
+                                 outer_iters::Int = 20, inner_iters::Int = 8,
+                                 tol = 1.0e-11, verbose::Bool = true)
+
+    npatch = length(patches)
+    pbar     = ref_pressure(ref)[:, 1]
+    rho_dbar = ref_rho_d(ref)[:, 1]
+    rho_vbar = ref_rho_v(ref)[:, 1]
+    rho_tbar = ref_rho_t(ref)[:, 1]
+    E_tbar   = ref_total_energy(ref)[:, 1]
+    Q_ssbar  = ref_qss(ref)[:, 1]
+    q_vbar   = rho_vbar ./ rho_dbar
+    Tbar     = pbar ./ ((rho_dbar .* Rd) .+ (rho_vbar .* Rv))
+    RHbar    = rho_vbar ./ rho_v_sat.(Tbar, pbar ./ 100.0)
+    RHbl     = RH_bl === nothing ? RH_core : RH_bl
+
+    mishes   = Vector{Matrix{Float64}}(undef, npatch)
+    payloads = [Vector{Any}() for _ in 1:npatch]   # incoming R3X data per patch
+    diag     = Vector{Any}(undef, npatch)
+
+    for ip in _nest_parent_order(topo, npatch)
+        patch = patches[ip]
+        gp    = patch.params
+        vars  = gp.vars
+        p_i = vars["p"]; rd_i = vars["rho_d"]; rt_i = vars["rho_t"]
+        u_i = vars["u"]; w_i = vars["w"];      et_i = vars["E_t"]
+        qs_i = vars["Q_ss"]; rr_i = vars["rho_r"]; v_i = vars["v"]
+
+        gpts = getGridpoints(patch)
+        kDim = gp.kDim
+        ncol = num_columns(patch)
+        npts = ncol * kDim
+        nvar = length(vars)
+        rmish = [gpts[((c - 1) * kDim) + 1, 1] for c in 1:ncol]
+        zmish = [gpts[k, zcol] for k in 1:kDim]
+        rcol  = _native_radial_column(gp)
+        kcol  = _native_vertical_column(gp)
+
+        # Which end of the patch anchors the radial integration: the side facing
+        # the parent for a child (its R3X trio fixes the level there), the far
+        # field for the root (where the compact vortex has p' == 0 exactly).
+        pifs = topo.parent_ifaces[ip]
+        anchor_right = isempty(pifs) ? true : (topo.interfaces[pifs[1]].child_side === :right)
+        anchor_c = anchor_right ? ncol : 1
+        parent_edge = if isempty(pifs)
+            nothing
+        else
+            itf = topo.interfaces[pifs[1]]
+            ev = Springsteel.evaluate_grid_ipoints(patches[itf.parent], [rmish[anchor_c]])
+            ev[1:kDim, p_i, 1]        # parent p' on the shared vertical mish
+        end
+
+        mish = zeros(Float64, npts, nvar)
+        # ── (1) tangential wind, then C from the FITTED v ──────────────────────
+        i = 1
+        for c in 1:ncol, k in 1:kDim
+            r = rmish[c]; z = zmish[k]
+            mish[i, v_i] = vortex_profile === :re87 ?
+                re87_v(r, z; v_m, r_m, r_0, fcor, z_sponge = v_top, z_round) :
+                modified_rankine_v(r, z; Vmax, RMW, alpha, v_top, z_bt)
+            i += 1
+        end
+        _native_fit!(patch, mish, payloads[ip])
+        vfit = copy(view(patch.physical, 1:npts, v_i, 1))
+        Cfit = similar(vfit)
+        i = 1
+        for c in 1:ncol, _ in 1:kDim
+            r = rmish[c]
+            Cfit[i] = r > 0.0 ? ((vfit[i] * vfit[i]) / r) + (fcor * vfit[i]) :
+                                fcor * vfit[i]
+            i += 1
+        end
+
+        # ── (2) Picard on p', with ρ_t' deconvolved from the fitted pp_z ───────
+        G     = Vector{Float64}(undef, npts)
+        H     = Vector{Float64}(undef, npts)
+        Phi   = Vector{Float64}(undef, npts)
+        Psi   = Vector{Float64}(undef, npts)
+        rhot_target = Vector{Float64}(undef, npts)
+        gw_res = Inf; hy_res = Inf; rt_fiterr = Inf; rt_fitidx = 1
+        for it in 1:outer_iters
+            _native_fit!(patch, mish, payloads[ip])
+            i = 1
+            for _ in 1:ncol, k in 1:kDim
+                rhot_target[i] = -patch.physical[i, p_i, 4] / gravity   # slot 4 = ∂z
+                i += 1
+            end
+            mish[:, rt_i] .= rhot_target
+            rt_fiterr, rt_fitidx = _native_deconvolve!(mish, patch, rt_i, rhot_target,
+                                                      payloads[ip]; iters = inner_iters)
+            # G = pp_x - ρ_t·C  ==  -ρ_t·expdot[u]   (the gradient-wind residual)
+            # H = pp_z + g·ρ_t'                      (the hydrostatic residual)
+            i = 1
+            gw_res = 0.0; hy_res = 0.0
+            for _ in 1:ncol, k in 1:kDim
+                rtp   = patch.physical[i, rt_i, 1]
+                rho_t = rtp + rho_tbar[k]
+                G[i]  = patch.physical[i, p_i, 2] - (rho_t * Cfit[i])
+                H[i]  = patch.physical[i, p_i, 4] + (gravity * rtp)
+                gw_res = max(gw_res, abs(G[i]) / rho_t)
+                hy_res = max(hy_res, abs(H[i]) / rho_t)
+                i += 1
+            end
+            verbose && println("    patch $ip sweep $it  |gw| = " *
+                               "$(round(gw_res; sigdigits=4))  |hyd| = " *
+                               "$(round(hy_res; sigdigits=4))  " *
+                               "(rho_t fit $(round(rt_fiterr; sigdigits=4)))")
+            max(gw_res, hy_res) < tol && break
+            # BOTH legs correct the SAME field p'. That is legitimate rather than
+            # over-determined because the two targets are compatible to the extent
+            # the discrete thermal-wind relation holds, and it is NECESSARY because
+            # the leftover ρ_t' fit error is not removable from ρ_t: the sounding's
+            # kinks (the Dunion MT profile has a level at 810 m, where d²ρ̄_t/dz²
+            # changes sign) reach ρ_t' through ρ̄_t·C, and a cubic spline cannot hold
+            # that curvature jump -- the ρ_t deconvolution stalls at 1.3e-4 kg/m³ no
+            # matter how many sweeps it is given (measured: identical at 8 and 40).
+            # Letting p' bend instead moves the error into ∂p'/∂z, where it costs
+            # only a small ∂r perturbation, because the fit error is localized in z
+            # and smooth in r.
+            _vertical_antiderivative!(Psi, H, kcol, kDim, ncol)
+            @inbounds for j in 1:npts
+                mish[j, p_i] -= Psi[j]
+            end
+            _native_fit!(patch, mish, payloads[ip])
+            i = 1
+            for _ in 1:ncol, k in 1:kDim
+                rho_t = patch.physical[i, rt_i, 1] + rho_tbar[k]
+                G[i]  = patch.physical[i, p_i, 2] - (rho_t * Cfit[i])
+                i += 1
+            end
+            _radial_antiderivative!(Phi, G, rcol, kDim, ncol)
+            # Re-anchor a child on its parent: R3X pins the junction trio, but the
+            # fit is a compromise between that and the mish values, so the DC mode
+            # converges slowly without this. A no-op for the root.
+            if parent_edge !== nothing
+                for k in 1:kDim
+                    dc = patch.physical[((anchor_c - 1) * kDim) + k, p_i, 1] - parent_edge[k]
+                    for c in 1:ncol
+                        Phi[((c - 1) * kDim) + k] += dc
+                    end
+                end
+            end
+            @inbounds for j in 1:npts
+                mish[j, p_i] -= Phi[j]
+            end
+        end
+        _native_fit!(patch, mish, payloads[ip])
+
+        # ── (3) moisture, E_t and Q_ss from the converged (p, ρ_t) ─────────────
+        rd_target = Vector{Float64}(undef, npts)
+        et_target = Vector{Float64}(undef, npts)
+        qs_target = Vector{Float64}(undef, npts)
+        n_supersat = 0
+        i = 1
+        for c in 1:ncol, k in 1:kDim
+            r = rmish[c]; z = zmish[k]
+            p     = patch.physical[i, p_i, 1] + pbar[k]
+            rho_t = patch.physical[i, rt_i, 1] + rho_tbar[k]
+            v     = vfit[i]
+            rho_d = rho_t / (1.0 + q_vbar[k])
+            rho_v = rho_t - rho_d
+            Tk    = p / ((rho_d * Rd) + (rho_v * Rv))
+            if RH_core !== nothing
+                rho_v, rho_d, Tk = _native_moisten(rho_v, rho_d, Tk, p, rho_t, r, z,
+                                                   RHbar[k], RHbl, RH_core, RH_max,
+                                                   r_moist, z_moist, z_bl, moist_profile,
+                                                   vortex_profile, v_m, r_m, r_0, fcor,
+                                                   Vmax, RMW, alpha, v_top, z_bt, z_round)
+            end
+            cap = RH_max * rho_v_sat(Tk, p / 100.0)
+            if rho_v > cap
+                rho_v = cap
+                rho_d = rho_t - cap
+                Tk = p / ((rho_d * Rd) + (cap * Rv))
+            end
+            rho_v > rho_v_sat(Tk, p / 100.0) && (n_supersat += 1)
+            q_v = rho_v / rho_d
+            E_t = (rho_d * internal_energy_bf02(Tk, q_v, 0.0)) +
+                  (rho_t * ((gravity * z) + (0.5 * v * v)))
+            rd_target[i] = rho_d - rho_dbar[k]
+            et_target[i] = E_t - E_tbar[k]
+            qs_target[i] = (rho_v - rho_v_sat(Tk, p / 100.0)) - Q_ssbar[k]
+            i += 1
+        end
+        mish[:, u_i] .= 0.0
+        mish[:, w_i] .= 0.0
+        mish[:, rr_i] .= 0.0
+
+        # CHAIN THE TARGETS OFF SETTLED FITTED VALUES, in dependency order. The
+        # model diagnoses vapor as ρ_v = ρ_t − ρ_d from the fields it actually
+        # holds, so a Q_ss built from the ρ_d TARGET is wrong by ρ_d's fit error
+        # (6.3e-4 kg/m³ here) -- which is the whole of the Q_ss floor, and shows up
+        # as a spurious condensation source in the p tendency. Settle ρ_d first,
+        # then re-derive ρ_v, T, E_t and Q_ss from the FITTED ρ_d and ρ_t.
+        mish[:, rd_i] .= rd_target
+        rd_err, _ = _native_deconvolve!(mish, patch, rd_i, rd_target, payloads[ip];
+                                        iters = inner_iters)
+        i = 1
+        for c in 1:ncol, k in 1:kDim
+            z = zmish[k]
+            p     = patch.physical[i, p_i, 1] + pbar[k]
+            rho_t = patch.physical[i, rt_i, 1] + rho_tbar[k]
+            rho_d = patch.physical[i, rd_i, 1] + rho_dbar[k]
+            rho_v = rho_t - rho_d
+            Tk    = p / ((rho_d * Rd) + (rho_v * Rv))
+            et_target[i] = ((rho_d * internal_energy_bf02(Tk, rho_v / rho_d, 0.0)) +
+                            (rho_t * ((gravity * z) + (0.5 * vfit[i] * vfit[i])))) - E_tbar[k]
+            qs_target[i] = (rho_v - rho_v_sat(Tk, p / 100.0)) - Q_ssbar[k]
+            i += 1
+        end
+        mish[:, et_i] .= et_target
+        mish[:, qs_i] .= qs_target
+        et_err, _ = _native_deconvolve!(mish, patch, et_i, et_target, payloads[ip];
+                                        iters = inner_iters)
+        qs_err, _ = _native_deconvolve!(mish, patch, qs_i, qs_target, payloads[ip];
+                                        iters = inner_iters)
+
+        # Final fit, then hand the converged trio down to this patch's children.
+        _native_fit!(patch, mish, payloads[ip])
+        for j in topo.child_ifaces[ip]
+            itf = topo.interfaces[j]
+            push!(payloads[itf.child], (itf.meta, compute_interface_payload(itf.meta, patch)))
+        end
+
+        diag[ip] = _native_residual_report(patch, ip, gp, kDim, ncol, rho_tbar, Cfit,
+                                           anchor_right, isempty(pifs), verbose)
+        verbose && println("    patch $ip rho_t fit floor at r = " *
+                           "$(round(gpts[rt_fitidx, 1] / 1e3; digits=1)) km, z = " *
+                           "$(round(gpts[rt_fitidx, zcol] / 1e3; digits=2)) km")
+        verbose && println("    patch $ip fit floors: rho_t $(round(rt_fiterr; sigdigits=3))  " *
+                           "rho_d $(round(rd_err; sigdigits=3))  " *
+                           "E_t $(round(et_err; sigdigits=3))  " *
+                           "Q_ss $(round(qs_err; sigdigits=3))  supersat $n_supersat")
+
+        # `write_ics_csv` reads slice 1, and the IC file must carry the CONTROL
+        # values, not the fitted ones -- the model re-fits on load.
+        patch.physical[:, :, 1] .= mish
+        mishes[ip] = mish
+    end
+    return mishes
+end
+
+# Inner-core moistening for the native path: blend RH from the environment toward
+# `RH_core` (`RHbl` below `z_bl`), holding ρ_t and p FIXED so the repartition is
+# exactly balance preserving -- gradient-wind and hydrostatic balance constrain only
+# ρ_t and p, so moisture is a free knob. The fixed point on ρ_v converges because
+# more vapor => larger R_m => lower T => lower ρ_vs, a contracting feedback.
+# Mirrors the block in `balanced_vortex_fields`; kept separate so that function
+# stays bitwise untouched.
+function _native_moisten(rho_v, rho_d, Tk, p, rho_t, r, z, RHbar, RHbl, RH_core,
+                         RH_max, r_moist, z_moist, z_bl, moist_profile,
+                         vortex_profile, v_m, r_m, r_0, fcor, Vmax, RMW, alpha,
+                         v_top, z_bt, z_round = 1.0)
+
+    taper = z >= z_moist ? 0.0 : 0.5 * (1.0 + cos(pi * z / z_moist))
+    W = if moist_profile === :vortex
+        vsfc = vortex_profile === :re87 ?
+               re87_v(r, 0.0; v_m, r_m, r_0, fcor, z_sponge = v_top, z_round) :
+               modified_rankine_v(r, 0.0; Vmax, RMW, alpha, v_top, z_bt)
+        vscale = vortex_profile === :re87 ? v_m : Vmax
+        (vscale > 0.0 ? vsfc / vscale : 0.0) * exp(-((r / r_moist)^2)) * taper
+    else
+        exp(-((r / r_moist)^2)) * taper
+    end
+    RHz = z <= z_bl ? RHbl : RHbl + ((RH_core - RHbl) * min(1.0, (z - z_bl) / z_bl))
+    target = min(RHbar + (W * (RHz - RHbar)), RH_max)
+    target <= RHbar && return (rho_v, rho_d, Tk)
+
+    rv = rho_v
+    for _ in 1:100
+        T = p / (((rho_t - rv) * Rd) + (rv * Rv))
+        rvnew = clamp(target * rho_v_sat(T, p / 100.0), 0.0, 0.999 * rho_t)
+        abs(rvnew - rv) < 1.0e-14 && (rv = rvnew; break)
+        rv = rvnew
+    end
+    rv <= rho_v && return (rho_v, rho_d, Tk)          # never remove vapor
+    rd = rho_t - rv
+    return (rv, rd, p / ((rd * Rd) + (rv * Rv)))
+end
+
+"""
+    _native_residual_report(patch, ip, gp, kDim, ncol, rho_tbar, Cfit,
+                            anchor_right, is_root, verbose) -> NamedTuple
+
+Discrete gradient-wind and hydrostatic residuals of the patch's FITTED state
+[m/s²], bucketed. The two boundary buckets exist because each carries a floor that
+the solve cannot remove and that must therefore be reported rather than averaged
+away:
+
+- `wall`   -- the end cells in z. `SecondDerivativeBC` forces `d²/dz² = 0` there,
+              and the balanced ρ_t' has nonzero curvature, so its deconvolution
+              stalls in those rows.
+- `junction` -- the end cells in r on the parent side of a child patch, whose
+              three border coefficients are the parent's and are not ours to move.
+"""
+function _native_residual_report(patch, ip, gp, kDim, ncol, rho_tbar, Cfit,
+                                 anchor_right, is_root, verbose)
+    vars = gp.vars
+    p_i = vars["p"]; rt_i = vars["rho_t"]
+    mubar = gp.mubar
+    npts = ncol * kDim
+    ures = Vector{Float64}(undef, npts)
+    wres = Vector{Float64}(undef, npts)
+    i = 1
+    for _ in 1:ncol, k in 1:kDim
+        rtp = patch.physical[i, rt_i, 1]
+        rho_t = rtp + rho_tbar[k]
+        ures[i] = -(patch.physical[i, p_i, 2] - (rho_t * Cfit[i])) / rho_t
+        wres[i] = -(patch.physical[i, p_i, 4] + (gravity * rtp)) / rho_t
+        i += 1
+    end
+    wall_k = vcat(1:mubar, (kDim - mubar + 1):kDim)
+    jrows = is_root ? Int[] :
+            (anchor_right ? [((c - 1) * kDim) + k for c in (ncol - mubar + 1):ncol for k in 1:kDim] :
+                            [((c - 1) * kDim) + k for c in 1:mubar for k in 1:kDim])
+    wrows = [((c - 1) * kDim) + k for c in 1:ncol for k in wall_k]
+    interior = setdiff(1:npts, union(wrows, jrows))
+    m(x, idx) = isempty(idx) ? 0.0 : maximum(abs, view(x, idx))
+    rep = (; gw_all = maximum(abs, ures), hy_all = maximum(abs, wres),
+             gw_int = m(ures, interior), hy_int = m(wres, interior),
+             gw_wall = m(ures, wrows),   hy_wall = m(wres, wrows),
+             gw_junc = m(ures, jrows),   hy_junc = m(wres, jrows))
+    if verbose
+        f(x) = string(round(x; sigdigits = 4))
+        println("    patch $ip residual [m/s^2]        gradient-wind    hydrostatic")
+        println("      all              " * rpad(f(rep.gw_all), 17) * f(rep.hy_all))
+        println("      interior         " * rpad(f(rep.gw_int), 17) * f(rep.hy_int))
+        println("      wall cells (z)   " * rpad(f(rep.gw_wall), 17) * f(rep.hy_wall))
+        is_root || println("      junction cells   " * rpad(f(rep.gw_junc), 17) * f(rep.hy_junc))
+    end
+    return rep
 end
