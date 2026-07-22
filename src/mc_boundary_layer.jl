@@ -87,7 +87,9 @@ end
     @inbounds (VD_v[i] - (tau_v * gz)) / rho_t[i]
 @inline _louis_add_v!(::MCCartesianXZ, expdot, j, dv) = nothing
 @inline function _louis_add_v!(::MCWithV, expdot, j, dv)
-    @inbounds expdot[j, 9] += dv
+    # Slot 10: rho_c was appended at 9, pushing the tangential wind to the end
+    # (see the MC_VARS_CYL comment in mc_geometry.jl).
+    @inbounds expdot[j, 10] += dv
     return nothing
 end
 
@@ -99,25 +101,28 @@ Louis boundary layer for one column of the total-energy set: eddy diffusivity
 `Kv = l(z)² |∂V/∂z|` with the Blackadar-blended length `l = 1/(1/(κz) + 1/l∞)`,
 applied to momentum (u, w, v), heat (the moist entropy s_t', in energy-flux form
 `F_h = ρ_d T Kv ∂z s_t'` so the column energy books telescope exactly) and water
-(total water ρ_w' and diagnostic vapor ρ_v'; rain is left to sedimentation).
+(total water ρ_w' and cloud ρ_c', with the vapor implied as the remainder; rain is
+left to sedimentation).
 Surface momentum drag `τ = ρ_t Cd |U₁| u₁` on the lowest mish-level wind
 ([`komori_cd`](@ref) when `Cd_param < 0`). With `surface_fluxes` on, the scalar
 surface nodes carry the bulk enthalpy/moisture fluxes over a fixed-`SST` sea:
 `F_sh = ρ_d1 C_pd Ck U₁ (SST − T₁)` into the heat column and
-`F_q = Ck U₁ (ρ_vs(SST, p₁) − ρ_v1)` into BOTH water columns (the surface source
-adds vapor), with the exchange wind floored by the gustiness minimum `U_min`.
+`F_q = Ck U₁ (ρ_vs(SST, p₁) − ρ_v1)` into the TOTAL-water column (the surface
+source adds vapor, and the vapor is the remainder), with the exchange wind floored
+by the gustiness minimum `U_min`.
 
 The increments are mapped onto the prognostic slots with the model's canonical
 consistent mappings: momentum/E_t via the FRIC_KE invariant (E_t follows the
 resolved KE down; no dissipative heating), heat via the QDOT_TH pattern (slot 1
 `(R_m/C_vt)·Q̇`, slot 6 `+Q̇`, slot 7 through the saturation chain rule), and the
 water sources via the fixed-T map of `_diffusion_water_step!` (slot 3 `+ρ̇_w`,
-slot 1 `+R_v T ρ̇_v`, slot 6 `+(C_pv T − L_v + ke + gz) ρ̇_w + (L_v − R_v T) ρ̇_v`,
-slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
+slot 9 `+ρ̇_c`, slot 1 `+R_v T ρ̇_v`, slot 6
+`+(C_pv T − L_v + ke + gz) ρ̇_w + (L_v − R_v T) ρ̇_v`, slot 7
+`+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`, with `ρ̇_v = ρ̇_w − ρ̇_c`).
 """
 @noinline function mc_louis_bl!(mtile::ModelTile, S, geom::MCGeometry,
                                 colstart::Int64, colend::Int64, z,
-                                uv, wv, vv, rtv, rdv, expdot,
+                                uv, wv, vv, rtv, rdv, rcv, expdot,
                                 l_inf::Float64, Cd_param::Float64,
                                 sfc_fac::Float64, surface_fluxes::Bool,
                                 Ck::Float64, SST::Float64, U_min::Float64)
@@ -204,27 +209,24 @@ slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
     Atransform!(col)
     Ixtransform(col, QDOT_V)
 
-    # Water: diagnostic vapor ρ_v' via its column fit (slot 3, the Kvdiff_water
-    # staging pattern); total water ρ_w' straight from the perturbation slots.
-    rho_v = S.rho_v
-    v_col = scratch_column(mtile, 3)
-    v_col.uMish .= rho_v .- mtile.mc_ref_diag.rho_vbar
-    Btransform!(v_col)
-    Atransform!(v_col)
-    rv_z = S.bl_rv_z
-    Ixtransform(v_col, rv_z)
-    VDOT_v = S.VDOT_v
-    col.uMish .= Kv .* rv_z
-    Btransform!(col)
-    Atransform!(col)
-    Ixtransform(col, VDOT_v)
-
+    # Water: total water ρ_w' and CLOUD ρ_c', both straight from the perturbation
+    # slots — every mixed species is prognostic, so the vapor is the implied
+    # remainder ρ̇_v = ρ̇_w − ρ̇_c (rain is left to sedimentation). This mirrors
+    # `_diffusion_water_step!`, and it is what retires the column fit of the
+    # DIAGNOSED ρ_v that used to be needed here (with its mc_ref_diag.rho_vbar
+    # subtraction to keep a resting base quiet).
     VDOT_w = S.VDOT_w
     rho_tp_z = rtv.f_z; rho_dp_z = rdv.f_z
     col.uMish .= Kv .* (rho_tp_z .- rho_dp_z)
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_w)
+
+    VDOT_c = S.VDOT_v            # (the ex-vapor scratch slot, now the cloud flux)
+    col.uMish .= Kv .* rcv.f_z
+    Btransform!(col)
+    Atransform!(col)
+    Ixtransform(col, VDOT_c)
 
     # Apply to the prognostic slots (all additive; explicit loop, not view
     # broadcasts — the SubArray elision lesson at this function size). The
@@ -243,15 +245,20 @@ slot 7 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`).
         expdot[j, 5] += dw
         _louis_add_v!(geom, expdot, j, dv)
 
-        # Heat (QDOT_TH pattern) and the fixed-T vapor pressure source
+        # Heat (QDOT_TH pattern) and the fixed-T vapor pressure source. The
+        # surface moisture flux adds VAPOR, so it enters total water only and
+        # reaches the vapor through the remainder; the cloud flux has no surface
+        # source (droplets do not evaporate off the sea surface).
         qdot = QDOT_V[i] + (F_sh * gz)
-        vdot_v = VDOT_v[i] + (F_q * gz)
         vdot_w = VDOT_w[i] + (F_q * gz)
+        vdot_c = VDOT_c[i]
+        vdot_v = vdot_w - vdot_c
         dT_v = qdot / (rho_d[i] * C_vt[i])
         dp_v = (R_m[i] / C_vt[i]) * qdot
         dp_q = Rv * Tk[i] * vdot_v
         expdot[j, 1] += dp_v + dp_q
         expdot[j, 3] += vdot_w
+        expdot[j, 9] += vdot_c
         expdot[j, 6] += qdot +
                         (((Cpv * Tk[i]) - Lv[i] + ke[i] + (gravity * z[i])) * vdot_w) +
                         ((Lv[i] - (Rv * Tk[i])) * vdot_v) +

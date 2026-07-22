@@ -53,7 +53,7 @@ z = reshape(df0.z, kDim, ncols)[:, 1]
 println("Found $(length(snaps)) snapshots, kDim=$kDim, ncols=$ncols")
 
 # ── Reference state (values only; the BCs of this throwaway grid are unused) ─
-vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
 scalar_bc = Dict(v => NeumannBC() for v in vars)
 gp = Scythe.compute_derived_params(GridParameters(;
     geometry = grid == "rz" ? "RZ" : "RiRk",
@@ -74,23 +74,15 @@ rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
 rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
 E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
 Q_ssbar = Springsteel.ref_qss(ref)[:, 1]
+rho_cbar = Springsteel.ref_rho_c(ref)[:, 1]
 Tbar = Springsteel.reference_temperature(ref)
 
-"""Diagnosed condensate and rain [g/m³] of one snapshot, (kDim, ncols)."""
+"""Condensate and rain [g/m³] of one snapshot, (kDim, ncols)."""
 function cloud_and_rain(path)
     df = CSV.read(path, DataFrame)
     nc = div(nrow(df), kDim)
-    p = df.p .+ repeat(pbar, nc)
-    rho_d = df.rho_d .+ repeat(rho_dbar, nc)
-    rho_t = df.rho_t .+ repeat(rho_tbar, nc)
-    E_t = df.E_t .+ repeat(E_tbar, nc)
-    Q_ss = df.Q_ss .+ repeat(Q_ssbar, nc)
-    ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
-    M = p .+ E_t .- rho_t .* (ke .+ Scythe.gravity .* df.z)
-    Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, repeat(Tbar, nc), df.rho_r)
-    rho_vs = Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0)
-    rho_v = clamp.(Q_ss .+ rho_vs, 0.0, max.(rho_t .- rho_d .- df.rho_r, 0.0))
-    rho_c = max.(rho_t .- rho_d .- rho_v .- df.rho_r, 0.0)
+    # Cloud is prognostic: read it, do not reconstruct it from a residual.
+    rho_c = df.rho_c .+ repeat(rho_cbar, nc)
     return reshape(1000.0 .* rho_c, kDim, ncols), reshape(1000.0 .* df.rho_r, kDim, ncols)
 end
 

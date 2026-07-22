@@ -29,21 +29,21 @@
 
 abstract type MCGeometry end
 
-"2D Cartesian x–z slice (RiRk/RZ geometry), 8 prognostic vars — the original XZ set."
+"2D Cartesian x–z slice (RiRk/RZ geometry), 9 prognostic vars — the original XZ set."
 struct MCCartesianXZ <: MCGeometry end
 
-"2D axisymmetric r–z cylinder on the same RiRk/RZ grid (x reinterpreted as r), 9 vars."
+"2D axisymmetric r–z cylinder on the same RiRk/RZ grid (x reinterpreted as r), 10 vars."
 struct MCAxisymRZ <: MCGeometry end
 
-"3D r–λ–z cylinder on the RLR grid (spline-r, Fourier-λ, spline-z), 9 vars."
+"3D r–λ–z cylinder on the RLR grid (spline-r, Fourier-λ, spline-z), 10 vars."
 struct MCCylindricalRLR <: MCGeometry end
 
-"3D Cartesian x–y–z box on the RRR grid (spline in all three directions), 9 vars."
+"3D Cartesian x–y–z box on the RRR grid (spline in all three directions), 10 vars."
 struct MCCartesianRRR <: MCGeometry end
 
 """
 3D spherical θ–λ–z shell on the SLR grid (spline-colatitude, Fourier-longitude,
-spline-z), 9 vars. Gridpoint column 1 is the colatitude θ [rad]; the transforms
+spline-z), 10 vars. Gridpoint column 1 is the colatitude θ [rad]; the transforms
 return the raw ∂/∂θ and ∂/∂λ, so every 1/a and 1/(a sinθ) metric factor is
 applied here (shallow-atmosphere: the metric radius is the constant
 `physical_params[:sphere_radius]`). u is the θ-ward wind, v the zonal wind, and
@@ -58,12 +58,15 @@ const MCCylinder = Union{MCAxisymRZ, MCCylindricalRLR}
 # metric/curvature terms differ, and those dispatch on the concrete trait.
 const MCWithV = Union{MCCylinder, MCCartesianRRR, MCSphericalSLR}
 
-# Canonical slot order for the 9-var variants (cylindrical and 3D Cartesian).
-# v is APPENDED (index 9), not inserted next to u/w: semiimplicit_adjustment_p
-# and diffusion_timestep_mc index variables by name, but the RHS kernel's view
-# slots, expdot/impdot indices and scratch_column keys are hardcoded literals
-# 1–8 — appending keeps every one valid and the XZ layout untouched.
-const MC_VARS_CYL = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "v"]
+# Canonical slot order for the 10-var variants (cylindrical and 3D Cartesian).
+# Both rho_c (index 9) and v (index 10) are APPENDED, not inserted next to their
+# relatives: semiimplicit_adjustment_p and diffusion_timestep_mc index variables
+# by name, but the RHS kernel's view slots, expdot/impdot indices and
+# scratch_column keys are hardcoded literals 1–8 — appending keeps every one
+# valid and the XZ layout untouched. rho_c precedes v so that slots 1–9 are
+# common to ALL geometries and v stays last, exactly as before.
+const MC_VARS_CYL = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r",
+                     "rho_c", "v"]
 
 @inline has_v(::MCCartesianXZ) = false
 @inline has_v(::MCWithV) = true
@@ -107,12 +110,12 @@ end
 """
     mc_v_views(geom, grid, colstart, colend)
 
-Derivative views of the second horizontal wind v (var 9, reference vbar ≡ 0 so the
+Derivative views of the second horizontal wind v (var 10, reference vbar ≡ 0 so the
 totals are the perturbation views), or `nothing` on the Cartesian slice.
 """
 @inline mc_v_views(::MCCartesianXZ, grid, colstart, colend) = nothing
 @inline mc_v_views(geom::MCWithV, grid, colstart, colend) =
-    mc_slot_views(grid, colstart, colend, 9, geom)
+    mc_slot_views(grid, colstart, colend, 10, geom)
 
 """
     mc_metric(geom, model, gridpoints, colstart, colend)
@@ -361,11 +364,11 @@ mc_smag_k!(K, geom::MCGeometry, uv, vv, r, Ls, K_min) =
           "cylindrical geometries (axisym, RLR); got $(typeof(geom))")
 
 """
-Tangential (v) momentum tendency, slot 9 — explicit-only (no impdot; vertical
+Tangential (v) momentum tendency, slot 10 — explicit-only (no impdot; vertical
 diffusion is handled by diffusion_timestep_mc like u/w). Advection, azimuthal PGF
 (3D only; pbar has no λ-dependence), Coriolis + curvature -u(f + v/r), and the
 λ-component of the cylindrical vector Laplacian. Reuses the S.ADV/FORCING/KDIFF
-accumulators after slot 8, like every other slot.
+accumulators after slot 9, like every other slot.
 """
 @inline mc_v_tendency!(expdot, ::MCCartesianXZ, colstart, colend, S,
                        u, w, uv, vv, pv, rho_t, r, fcor, Khdiff) = nothing
@@ -378,7 +381,7 @@ accumulators after slot 8, like every other slot.
     @turbo ADV .= @. (-u * v_x) + (-w * v_z)
     @turbo FORCING .= @. -u * (fcor + (v / r))
     @turbo KDIFF .= @. Khdiff * ((v_x / r) + v_xx - (v / (r * r)))
-    @turbo expdot[colstart:colend, 9] .= @. ADV + FORCING + KDIFF
+    @turbo expdot[colstart:colend, 10] .= @. ADV + FORCING + KDIFF
     return nothing
 end
 @inline function mc_v_tendency!(expdot, ::MCCylindricalRLR, colstart, colend, S,
@@ -393,7 +396,7 @@ end
     @turbo FORCING .= @. (-(pp_l / r) / rho_t) + (-u * (fcor + (v / r)))
     @turbo KDIFF .= @. Khdiff * ((v_x / r) + v_xx - (v / (r * r)) +
                                  (v_ll / (r * r)) + ((2.0 * u_l) / (r * r)))
-    @turbo expdot[colstart:colend, 9] .= @. ADV + FORCING + KDIFF
+    @turbo expdot[colstart:colend, 10] .= @. ADV + FORCING + KDIFF
     return nothing
 end
 
@@ -427,7 +430,7 @@ end
             j = colstart + i - 1
             expdot[j,4] += ray * u[i]
             expdot[j,5] += ray * w[i]
-            expdot[j,9] += ray * v[i]
+            expdot[j,10] += ray * v[i]
             expdot[j,6] += 2.0 * rho_t[i] * ray * ke[i]
         end
     end
@@ -440,25 +443,25 @@ acoustic SI (RLR only): (i) cancel the reference-linear azimuthal PGF
 −(1/(ρ̄_t r))∂λ p′ out of v's AB3 remainder so the patch-level solve integrates it
 IMPLICITLY (the azimuthal acoustic mode — the leg whose elimination produces the
 +n²/r² operator term, exact_si_rlr.jl); and (ii) stage the FRESH AI2* explicit
-history level `L_v = −(1/(ρ̄_t r))∂λ p′` into hacdot[:,9], so v carries the same
+history level `L_v = −(1/(ρ̄_t r))∂λ p′` into hacdot[:,10], so v carries the same
 explicit acoustic history the pressure azimuthal-divergence leg does (LDIV's
 v_l/r term) — the SYMMETRIC AI2* treatment of the two halves of the azimuthal
 acoustic (without it the p leg has a history and v does not: unstable). Called
-AFTER `mc_v_tendency!` sets expdot[:,9]. No-op on every geometry whose v carries
+AFTER `mc_v_tendency!` sets expdot[:,10]. No-op on every geometry whose v carries
 no azimuthal PGF (axisym: vbar ≡ 0 and no λ; XZ: no v).
 """
 @inline mc_stage_v_acoustic!(expdot, ::MCGeometry, colstart, colend, pv, rho_tbar, r) = nothing
 @inline function mc_stage_v_acoustic!(expdot, ::MCCylindricalRLR, colstart, colend, pv, rho_tbar, r)
     pp_l = pv.f_l
-    @. expdot[colstart:colend, 9] += (pp_l / r) / rho_tbar
+    @. expdot[colstart:colend, 10] += (pp_l / r) / rho_tbar
     return nothing
 end
 
-"Explicit vertical-diffusion staging of v (AI2* history channel), slot 9."
+"Explicit vertical-diffusion staging of v (AI2* history channel), slot 10."
 @inline mc_v_diffdot!(diffdot, ::MCCartesianXZ, colstart, colend, Kvdiff, vv) = nothing
 @inline function mc_v_diffdot!(diffdot, ::MCWithV, colstart, colend, Kvdiff, vv)
     v_zz = vv.f_zz
-    @turbo diffdot[colstart:colend, 9] .= @. Kvdiff * v_zz
+    @turbo diffdot[colstart:colend, 10] .= @. Kvdiff * v_zz
     return nothing
 end
 
@@ -534,7 +537,7 @@ end
     @turbo ADV .= @. (-u * v_x) + (-v * v_y) + (-w * v_z)
     @turbo FORCING .= @. (-pp_y / rho_t) + (-fcor * u)
     @turbo KDIFF .= @. Khdiff * (v_xx + v_yy)
-    @turbo expdot[colstart:colend, 9] .= @. ADV + FORCING + KDIFF
+    @turbo expdot[colstart:colend, 10] .= @. ADV + FORCING + KDIFF
     return nothing
 end
 
@@ -644,7 +647,7 @@ end
     @. KDIFF = Khdiff * (((v_xx + (v_x * (cos(theta) / sin(theta)))) / (a * a)) +
                          ((v_ll - v + (2.0 * cos(theta) * u_l)) /
                           (a * a * sin(theta) * sin(theta))))
-    @turbo expdot[colstart:colend, 9] .= @. ADV + FORCING + KDIFF
+    @turbo expdot[colstart:colend, 10] .= @. ADV + FORCING + KDIFF
     return nothing
 end
 

@@ -15,9 +15,9 @@
 #      evaluating the B-spline with SItransform — so background(z_reg) is exactly
 #      the model's reference spline, not an ad-hoc interpolation;
 #   2. adds the background back to recover the TOTAL control fields;
-#   3. retrieves temperature T with the model's nonlinear Newton retrieval
-#      (retrieve_temperature), then diagnoses vapor rho_v and cloud rho_c exactly
-#      as the model does (Q_ss + rho_v_sat, clamped; rho_c the residual);
+#   3. retrieves temperature T with the model's closed-form retrieval
+#      (retrieve_temperature) from the PROGNOSTIC condensate, then diagnoses the
+#      vapor exactly as the model does (rho_v = rho_t - rho_d - rho_c - rho_r);
 #   4. derives a simple S-band (Rayleigh) radar reflectivity from rho_c
 #      (monodisperse cloud) and rho_r (exponential Marshall-Palmer rain), and a
 #      rain rate from rho_r and the Ooyama (2001) terminal fall speed.
@@ -126,7 +126,7 @@ function reference_background(x, z_reg)
     mubar = round(Int, nmish / (n_k - 1))
     mubar * (n_k - 1) == nmish ||
         error("Cannot infer mubar: $nmish mish levels vs $(n_k-1) cells")
-    vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "v"]
+    vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c", "v"]
     bc = Dict(v => NeumannBC() for v in vars)
     gp = Scythe.compute_derived_params(GridParameters(; geometry = "RiRk",
         iMin = x[1], iMax = x[end], num_cells_i = max(n_i - 1, 1),
@@ -156,16 +156,15 @@ function reference_background(x, z_reg)
     # the model's own retrieval so the resting reference does not condense (see
     # Scythe.consistent_qss_reference); the pointwise EOS form below it is what
     # Springsteel stores by default and is NOT what the run used.
-    rho_v_max = max.(rho_tbar .- rho_dbar, 0.0)
     M_bar = pbar .+ E_tbar .- (rho_tbar .* (Scythe.gravity .* z_reg))
-    T_ret = Scythe.retrieve_temperature.(M_bar, rho_dbar, rho_tbar, rho_v_max, pbar,
-                                         Tbar, 0.0)
+    T_ret = Scythe.retrieve_temperature.(M_bar, rho_dbar, rho_tbar, rho_cbar)
     Q_ssbar = if legacy_qss
         rho_vbar .- Springsteel.Thermodynamics.rho_v_sat.(Tbar, pbar ./ 100.0)
     else
-        rho_v_max .- Springsteel.Thermodynamics.rho_v_sat.(T_ret, pbar ./ 100.0)
+        (rho_tbar .- rho_dbar .- rho_cbar) .-
+            Springsteel.Thermodynamics.rho_v_sat.(T_ret, pbar ./ 100.0)
     end
-    return (; pbar, rho_dbar, rho_tbar, E_tbar, Q_ssbar, Tbar)
+    return (; pbar, rho_dbar, rho_tbar, rho_cbar, E_tbar, Q_ssbar, Tbar)
 end
 
 # ── Per-snapshot derivation and write ─────────────────────────────────────────
@@ -182,24 +181,23 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
         rtp   = rd2d(ds, "rho_t", n_i, n_k); Etp = rd2d(ds, "E_t", n_i, n_k)
         Qssp  = rd2d(ds, "Q_ss", n_i, n_k)
         u     = rd2d(ds, "u", n_i, n_k);     w   = rd2d(ds, "w", n_i, n_k)
-        rho_r = rd2d(ds, "rho_r", n_i, n_k)
+        rho_r = rd2d(ds, "rho_r", n_i, n_k); rcp = rd2d(ds, "rho_c", n_i, n_k)
         v     = has_v ? rd2d(ds, "v", n_i, n_k) : zeros(n_i, n_k)
 
         # Totals = prime + background(z), broadcast over radius
         col(a) = reshape(a, 1, n_k)
         p    = pp   .+ col(bg.pbar);     rho_d = rdp .+ col(bg.rho_dbar)
         rho_t = rtp .+ col(bg.rho_tbar); E_t  = Etp .+ col(bg.E_tbar)
-        Q_ss = Qssp .+ col(bg.Q_ssbar)
+        Q_ss = Qssp .+ col(bg.Q_ssbar); rho_c = rcp .+ col(bg.rho_cbar)
 
-        # Nonlinear temperature retrieval (M is the enthalpy balance the model solves)
+        # Closed-form temperature retrieval from the PROGNOSTIC condensate (M is the
+        # enthalpy balance the model solves); the vapor is the residual.
         ke = has_v ? 0.5 .* (u .^ 2 .+ v .^ 2 .+ w .^ 2) : 0.5 .* (u .^ 2 .+ w .^ 2)
         M  = p .+ E_t .- rho_t .* (ke .+ Scythe.gravity .* col(z))
-        T  = Scythe.retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, col(bg.Tbar), rho_r)
-
-        # Water partition (identical clamp to the model diagnostic)
+        rho_liq = rho_c .+ rho_r
+        T  = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
         rho_vs = Springsteel.Thermodynamics.rho_v_sat.(T, p ./ 100.0)
-        rho_v = clamp.(Q_ss .+ rho_vs, 0.0, max.(rho_t .- rho_d .- rho_r, 0.0))
-        rho_c = max.(rho_t .- rho_d .- rho_v .- rho_r, 0.0)
+        rho_v = rho_t .- rho_d .- rho_liq
 
         # Derived products
         refl = reflectivity_dBZ.(rho_c, rho_r, N0, Nc_cm3 * 1.0e6)
@@ -271,7 +269,7 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
             # (derived products get none). These are extra data variables in the
             # source beyond the value slots handled above.
             handled = Set(["time", "x", "z", "p", "rho_d", "rho_t", "u", "w",
-                           "E_t", "Q_ss", "rho_r", "v"])
+                           "E_t", "Q_ss", "rho_r", "rho_c", "v"])
             for (vn, vv) in ds
                 (vn in handled) && continue
                 ndims(vv) == 3 || continue

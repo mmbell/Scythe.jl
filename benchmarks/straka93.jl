@@ -33,7 +33,7 @@ const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 # Linear dry-air-density variant: slot 2 is "rho_d" (rho_d') instead of "xi"
 const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 # Total-energy (moist_compressible) set
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
 function straka_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w"]
     stage == STAGE_PE_RHOD && return PE_VARS_RHOD

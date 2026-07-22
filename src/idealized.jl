@@ -1028,9 +1028,11 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     u_i = vars["u"]; w_i = vars["w"]; et_i = vars["E_t"]
     qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]; v_i = vars["v"]
+    rho_c_i = vars["rho_c"]
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
 
     nr = length(r_axis)
     i = 1
@@ -1060,6 +1062,10 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
+            # The balanced vortex carries no condensate: the whole point of the
+            # prognostic-rho_c formulation is that a subsaturated initial state
+            # starts at EXACTLY zero cloud and cannot have any manufactured for it.
+            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
             patch.physical[i, v_i, 1] = v
             i += 1
         end
@@ -1358,6 +1364,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
     rho_tbar = ref_rho_t(ref)[:, 1]
     E_tbar   = ref_total_energy(ref)[:, 1]
     Q_ssbar  = ref_qss(ref)[:, 1]
+    rho_cbar = Springsteel.ref_rho_c(ref)[:, 1]
     q_vbar   = rho_vbar ./ rho_dbar
     Tbar     = pbar ./ ((rho_dbar .* Rd) .+ (rho_vbar .* Rv))
     RHbar    = rho_vbar ./ rho_v_sat.(Tbar, pbar ./ 100.0)
@@ -1374,6 +1381,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         p_i = vars["p"]; rd_i = vars["rho_d"]; rt_i = vars["rho_t"]
         u_i = vars["u"]; w_i = vars["w"];      et_i = vars["E_t"]
         qs_i = vars["Q_ss"]; rr_i = vars["rho_r"]; v_i = vars["v"]
+        rc_i = vars["rho_c"]
 
         gpts = getGridpoints(patch)
         kDim = gp.kDim
@@ -1534,6 +1542,13 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         mish[:, u_i] .= 0.0
         mish[:, w_i] .= 0.0
         mish[:, rr_i] .= 0.0
+        # No condensate: the vortex is built subsaturated everywhere (the moistening
+        # caps rho_v at RH_max*rho_vs), and with rho_c prognostic that means EXACTLY
+        # zero cloud rather than "whatever four fitted fields leave over". The
+        # reference is condensate-free, so the perturbation is zero too.
+        for c in 1:ncol, k in 1:kDim
+            mish[((c - 1) * kDim) + k, rc_i] = -rho_cbar[k]
+        end
 
         # CHAIN THE TARGETS OFF SETTLED FITTED VALUES, in dependency order. The
         # model diagnoses vapor as ρ_v = ρ_t − ρ_d from the fields it actually

@@ -608,6 +608,9 @@ function exact_si_apply_column!(mtile::ModelTile, colstart::Int64, colend::Int64
     if Kvdiff > 0.0 || Kvdiff_heat > 0.0 || Kvdiff_water > 0.0
         diffusion_timestep_mc(mtile, colstart, colend, t)
     end
+    # Water positivity, LAST — the phase-B mirror of the call at the end of
+    # mc_driver! (which this path returns from early, at the end of phase A).
+    clamp_water!(mtile, colstart, colend)
     return nothing
 end
 

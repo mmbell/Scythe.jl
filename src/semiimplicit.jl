@@ -122,6 +122,16 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # temporaries. Empty for every other set. See `_allocate_sw_scratch` for why there is one
     # workspace per TILE here rather than one per thread as `mc_scratch` has.
     sw_scratch::SWS
+    # Water mass [kg/m^3, summed over gridpoints and steps] moved by the positivity floor
+    # of `clamp_water!`, accumulated per thread (same `@threads :static` ownership rule as
+    # `scratch_columns`) and summed on read. Length 0 for every non-mc set.
+    #
+    # This exists so the floor cannot be silent. A clamp that fires steadily is a defect
+    # report — grid-scale ringing in the condensate, a bad initial state, a timestep past
+    # its limit — and the whole point of making rho_c prognostic was to stop hiding water
+    # bookkeeping errors inside a max(). `run_model` logs it; the benchmark harness carries
+    # it into conservation_drift.
+    mc_water_clamp::Vector{Float64}
 end
 
 """
@@ -320,9 +330,11 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # factorization: the boundary conditions differ (straka93 free-slip u, bf02 no-slip;
     # w a rigid lid; scalars Neumann, rho_r possibly Natural at the surface for rain
     # outflow), and the coefficients are independent. s_t rides on the Neumann E_t
-    # column; rho_w' and rho_v' SHARE the rho_t operator so the implied cloud increment
-    # delta_rho_c = delta_rho_w - delta_rho_v - delta_rho_r is exactly the diffusion of
-    # rho_c. Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are
+    # column; the water species rho_w' (on the rho_t operator), rho_c' and rho_r each get
+    # their own solve, and the implied VAPOR increment delta_rho_v = delta_rho_w -
+    # delta_rho_c - delta_rho_r is exactly the diffusion of rho_v — the mirror image of
+    # the pre-prognostic-rho_c convention, which solved rho_v' and implied rho_c.
+    # Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are
     # cached, so `diffusion_timestep_mc` never factorizes per column.
     # Built only when a coefficient is positive: at K = 0 a vertical solve is not the
     # identity (it refits the column and reapplies the spectral filter), so the routine
@@ -347,7 +359,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
             water         = mc_matrix("rho_t", Kv_water_mc, 1.25),
             water_first   = mc_matrix("rho_t", Kv_water_mc, 0.5),
             water_r       = mc_matrix("rho_r", Kv_water_mc, 1.25),
-            water_r_first = mc_matrix("rho_r", Kv_water_mc, 0.5))
+            water_r_first = mc_matrix("rho_r", Kv_water_mc, 0.5),
+            water_c       = mc_matrix("rho_c", Kv_water_mc, 1.25),
+            water_c_first = mc_matrix("rho_c", Kv_water_mc, 0.5))
         # The cylindrical variants carry the tangential wind v (its own BCs) through
         # the same momentum solve as u/w.
         if haskey(model.grid_params.vars, "v")
@@ -388,7 +402,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         solve_load,
         mc_scratch,
         mc_ref_diag,
-        _allocate_sw_scratch(tile, model))
+        _allocate_sw_scratch(tile, model),
+        uses_pressure_reference(model.equation_set) ?
+            zeros(Float64, Threads.maxthreadid()) : Float64[])
     return mtile
 end
 

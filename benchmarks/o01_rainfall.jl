@@ -54,7 +54,7 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
 
 # HUMIDIFIED Dunion moist-tropical sounding (WRF input_sounding format): RH floors
 # of 0.90 (z <= 1.6 km) / 0.88 (<= 3.2 km) / 0.85 (<= 4.5 km) applied to the

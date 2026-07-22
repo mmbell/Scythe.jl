@@ -44,7 +44,7 @@ const PE_VARS_PD = ["s", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
 # Entropy-density variant: slot 1 carries sigma = rho_d*s instead of s
 const PE_VARS_SIGMA = ["sigma", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
 # Total-energy variant: prognostic p/rho_d/rho_t/E_t/Q_ss; rho_v and rho_c are diagnostic
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
 function bf02_moist_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
     stage == STAGE_MC && return MC_VARS

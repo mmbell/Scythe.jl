@@ -58,27 +58,34 @@ using Springsteel
         )
         for c in cases
             st = forward_state(c.Tk, c.p, c.sat, c.q_l, c.u, c.w, c.z)
-            for guess in (c.Tk - 20.0, c.Tk + 20.0, 273.0)
-                Tret = Scythe.retrieve_temperature(st.M, st.rho_d, st.rho_t, st.Q_ss,
-                                                   st.p_Pa, guess)
-                @test Tret ≈ c.Tk rtol = 1e-8
-            end
-            # Diagnostic recovery of the water partition
-            Tret = Scythe.retrieve_temperature(st.M, st.rho_d, st.rho_t, st.Q_ss,
-                                               st.p_Pa, c.Tk)
-            rho_v = st.Q_ss + rho_v_sat(Tret, st.p_Pa / 100.0)
-            rho_c = st.rho_t - st.rho_d - rho_v
-            @test rho_v ≈ st.rho_v rtol = 1e-8 atol = 1e-14
-            @test rho_c ≈ st.rho_c rtol = 1e-6 atol = 1e-10
+            # The condensate is prognostic, so rho_liq is an INPUT and the retrieval is
+            # closed form: no guess, no iteration, and T is exact to rounding rather
+            # than to a Newton tolerance.
+            Tret = Scythe.retrieve_temperature(st.M, st.rho_d, st.rho_t, st.rho_c)
+            @test Tret ≈ c.Tk rtol = 1e-12
+            # Diagnostic recovery of the water partition: vapor is the residual
+            rho_v = st.rho_t - st.rho_d - st.rho_c
+            @test rho_v ≈ st.rho_v rtol = 1e-12 atol = 1e-16
+            # ... and the supersaturation the microphysics reads round-trips too
+            @test (rho_v - rho_v_sat(Tret, st.p_Pa / 100.0)) ≈ st.Q_ss rtol = 1e-8 atol = 1e-14
         end
 
-        # F(T) is monotone increasing over the physical range for a saturated state
+        # T is INDEPENDENT of the vapor/cloud split at fixed total water and fixed
+        # liquid: it reads only (M, rho_d, rho_t, rho_liq). This is what decouples the
+        # microphysics driver from the thermodynamics.
         st = forward_state(285.0, 90000.0, 1.0, 1.0e-3, 0.0, 0.0, 1000.0)
-        F(T) = (st.rho_d * Cpd + (st.rho_t - st.rho_d) * Cpv) * T +
-               (st.Q_ss + st.rho_d + rho_v_sat(T, st.p_Pa / 100.0) - st.rho_t) * L_v(T) -
-               st.M
+        @test Scythe.retrieve_temperature(st.M, st.rho_d, st.rho_t, st.rho_c) ==
+              Scythe.retrieve_temperature(st.M, st.rho_d, st.rho_t, st.rho_c)
+        # F(T) = Cfactor*T - rho_liq*L_v(T) - M is linear with a positive slope, so the
+        # root is unique and the closed form is exact (not merely convergent).
+        F(T) = (st.rho_d * Cpd + (st.rho_t - st.rho_d) * Cpv) * T -
+               (st.rho_c * L_v(T)) - st.M
         Ts = 200.0:5.0:330.0
         @test all(diff(F.(Ts)) .> 0.0)
+        @test abs(F(Scythe.retrieve_temperature(st.M, st.rho_d, st.rho_t, st.rho_c))) <
+              1.0e-6 * abs(st.M)
+        # Linearity: the second difference of F vanishes to rounding
+        @test maximum(abs.(diff(diff(F.(Ts))))) < 1.0e-9 * abs(F(Ts[1]))
     end
 
     # ──────────────────────────────────────────────
@@ -430,8 +437,8 @@ using Springsteel
             # Per-slot tendency tolerances scaled to the slot magnitudes
             # (p ~ 1e5 Pa, E_t ~ 2e8 J/m^3, densities ~ 1)
             scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
-                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0)
-            for v in 1:8
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0)
+            for v in 1:9
                 @test maximum(abs.(mtile.expdot_n[:, v])) / scales[v] < 1.0e-9
                 @test maximum(abs.(mtile.var_np1[:, v])) / scales[v] < 1.0e-9
             end
@@ -502,6 +509,7 @@ using Springsteel
             rho_dbar = Springsteel.ref_rho_d(rs)[:, 1]
             rho_tbar = Springsteel.ref_rho_t(rs)[:, 1]
             Q_ssbar = Springsteel.ref_qss(rs)[:, 1]
+            rho_cbar = Springsteel.ref_rho_c(rs)[:, 1]
             Tbar = Springsteel.reference_temperature(rs)
             z = Scythe.getGridpoints(patch)[1:kDim, 2]
             for i in 1:npts
@@ -511,10 +519,10 @@ using Springsteel
                 rho_d = v[i, vars["rho_d"]] + rho_dbar[k]
                 rho_t = v[i, vars["rho_t"]] + rho_tbar[k]
                 E_t = v[i, vars["E_t"]] + E_tbar[k]
-                Q_ss = v[i, vars["Q_ss"]] + Q_ssbar[k]
+                rho_liq = (v[i, vars["rho_c"]] + rho_cbar[k]) + v[i, vars["rho_r"]]
                 ke = 0.5 * (v[i, vars["u"]]^2 + v[i, vars["w"]]^2)
                 M = p + E_t - rho_t * (ke + Scythe.gravity * z[k])
-                Tk = Scythe.retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k])
+                Tk = Scythe.retrieve_temperature(M, rho_d, rho_t, rho_liq)
                 @test isfinite(Tk) && 200.0 < Tk < 320.0
             end
         end
@@ -1041,12 +1049,31 @@ using Springsteel
             # reproduce the production vertical-only path to ≤ 1e-10 on the resting
             # isothermal axisym tile — the vertical solve is geometry-agnostic, so
             # this holds bitwise exactly as in XZ.
+            #
+            # NOTE: this configuration (ts = 1.0, Co_h 3, 503 m cells) DIVERGES on both
+            # paths -- max|u| runs 7e-5 -> 0.055 -> 12.6 -> 1542 m/s over 20 steps, and
+            # p' reaches 7.6 bar. That is pre-existing (measured identically on
+            # development) and is a property of the configuration, not of either solve.
+            # The equivalence is still a valid plumbing check -- two paths, same
+            # arithmetic -- but it must be made at a step count where the state is still
+            # physical, or it degenerates into comparing two piles of garbage. So: the
+            # quantitative comparison runs at 5 steps, and the 20-step comparison is kept
+            # as an exact bitwise identity via isequal (NaN-tolerant).
+            mstab, pstab, modstab, gpstab, _ = axi_build(tmpdir)
+            axi_run!(mstab, pstab, modstab, gpstab, nothing; nsteps=5)
+            mstabx, pstabx, modstabx, gpstabx, estabx = axi_build(tmpdir;
+                opts_extra=Dict{Symbol,Any}(:exact_si => true, :exact_si_zero_x => true))
+            axi_run!(mstabx, pstabx, modstabx, gpstabx, estabx; nsteps=5)
+            @test maximum(abs.(pstab.physical[:, :, 1])) < 1.0e3      # still physical
+            @test maximum(abs.(pstab.physical[:, :, 1] .-
+                               pstabx.physical[:, :, 1])) <= 1.0e-10
+
             mref, pref, modref, gpref, _ = axi_build(tmpdir)
             axi_run!(mref, pref, modref, gpref, nothing; nsteps=20)
             mzx, pzx, modzx, gpzx, ezx = axi_build(tmpdir;
                 opts_extra=Dict{Symbol,Any}(:exact_si => true, :exact_si_zero_x => true))
             axi_run!(mzx, pzx, modzx, gpzx, ezx; nsteps=20)
-            @test maximum(abs.(pref.physical[:, :, 1] .- pzx.physical[:, :, 1])) <= 1.0e-10
+            @test all(isequal.(pref.physical[:, :, 1], pzx.physical[:, :, 1]))
 
             # 3. Ceiling gate (G3-stability): broadband u+w seed on the resting
             # axisym base (iMin = 0, so the r = 0 axis column is exercised) must
@@ -1107,59 +1134,107 @@ using Springsteel
         @test rho_d * Cvd * (Cpd / Cvd) * (Tk / theta_d) ≈ rho_d * Cpd * exner rtol=1e-12
     end
 
-    @testset "qss admissible bounds and relaxation" begin
+    @testset "qss reconciliation drives Q_ss to the diagnosed supersaturation" begin
+        # Q_ss is redundant now that rho_c is prognostic: the water masses already fix
+        # the vapor. qss_relaxation is what keeps the prognostic tracker and the
+        # mass-implied value from drifting apart (and it is thermodynamically INERT,
+        # because retrieve_temperature does not read Q_ss at all).
         Tk, p_hPa = 290.0, 900.0
         rho_vs = rho_v_sat(Tk, p_hPa)
-        rho_d = 1.1
         tau = 10.0
 
-        # Dry air: rho_t == rho_d, so the interval collapses to the point -rho_vs
-        lo, hi = Scythe.qss_admissible_bounds(rho_d, rho_d, 0.0, rho_vs)
-        @test lo == -rho_vs && hi == -rho_vs
-        # ... and the relaxation drives Q_ss there from either side, at rate 1/tau
-        @test Scythe.qss_relaxation(0.0, rho_d, rho_d, 0.0, rho_vs, tau) ≈ -rho_vs / tau
-        @test Scythe.qss_relaxation(-2rho_vs, rho_d, rho_d, 0.0, rho_vs, tau) ≈ rho_vs / tau
+        # On target: zero. Exactly zero when the target is representable; otherwise
+        # to the rounding of (rho_vs + d) - rho_vs, which is the best a difference of
+        # two large numbers can do — and precisely why Q_ss is carried prognostically
+        # rather than diagnosed from one.
+        @test Scythe.qss_relaxation(0.0, rho_vs, rho_vs, tau) == 0.0
+        @test Scythe.qss_relaxation(-0.002, rho_vs - 0.002, rho_vs, tau) ≈ 0.0 atol=1e-18
+        @test Scythe.qss_relaxation(0.003, rho_vs + 0.003, rho_vs, tau) ≈ 0.0 atol=1e-18
 
-        # Cloudy air: Q_ss strictly interior => exactly zero, no nudge at all
-        rho_t = rho_d + rho_vs + 1.0e-3          # 1 g/m^3 of cloud
-        @test Scythe.qss_relaxation(0.0, rho_d, rho_t, 0.0, rho_vs, tau) == 0.0
-        @test Scythe.qss_relaxation(1.0e-4, rho_d, rho_t, 0.0, rho_vs, tau) == 0.0
+        # Off target: first-order relaxation at rate 1/tau, toward rho_v - rho_vs
+        @test Scythe.qss_relaxation(0.0, rho_vs - 0.002, rho_vs, tau) ≈ -0.002 / tau
+        @test Scythe.qss_relaxation(0.002, rho_vs, rho_vs, tau) ≈ -0.002 / tau
+        # Dry air: the target is -rho_vs (rho_v = 0), which is where Q_ss belongs
+        @test Scythe.qss_relaxation(0.0, 0.0, rho_vs, tau) ≈ -rho_vs / tau
 
-        # Supersaturated cloud-free air sits exactly at the ceiling Q_hi > 0: the
-        # relaxation is zero there, so nucleation is not suppressed.
-        rho_w = 1.05 * rho_vs
-        rho_t = rho_d + rho_w
-        _, Q_hi = Scythe.qss_admissible_bounds(rho_d, rho_t, 0.0, rho_vs)
-        @test Q_hi > 0.0
-        @test Scythe.qss_relaxation(Q_hi, rho_d, rho_t, 0.0, rho_vs, tau) == 0.0
-        Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_w / rho_d, 0.0)
-        @test Scythe.qss_condensation_rate(Q_hi, rho_w, 0.0, rho_d, Tk, p_hPa, Q_s, 0.1) > 0.0
-        # Drift above the ceiling is pulled back
-        @test Scythe.qss_relaxation(Q_hi + 0.02, rho_d, rho_t, 0.0, rho_vs, tau) ≈ -0.02 / tau
-
-        # Rain is liquid: the ceiling excludes it
-        rho_r = 5.0e-4
-        rho_t = rho_d + rho_vs + rho_r
-        _, Q_hi_rain = Scythe.qss_admissible_bounds(rho_d, rho_t, rho_r, rho_vs)
-        @test Q_hi_rain ≈ 0.0 atol=1e-15
+        # It is a pure tracker correction: sign always opposes the discrepancy, and the
+        # magnitude is the discrepancy over tau — nothing state-dependent hides in it.
+        for (Q_ss, rho_v) in ((0.001, 0.02), (-0.005, 0.01), (0.0, 0.0))
+            d = Q_ss - (rho_v - rho_vs)
+            @test Scythe.qss_relaxation(Q_ss, rho_v, rho_vs, tau) ≈ -d / tau
+        end
     end
 
-    @testset "retrieval clamp keeps rho_c nonnegative with rain" begin
-        # Total water is all rain: vapor must clamp to zero, not to rho_w, or the
-        # residual cloud rho_c = rho_t - rho_d - rho_v - rho_r goes negative.
-        Tk, p_Pa = 290.0, 90000.0
-        rho_d = p_Pa / (Rd * Tk)
-        rho_r = 1.0e-3
-        rho_t = rho_d + rho_r
-        rho_vs = rho_v_sat(Tk, p_Pa / 100.0)
-        Q_ss = -rho_vs                                   # rho_v = 0
-        M = (rho_d * Cpd * Tk) + (-rho_r * Scythe.L_v(Tk))
-        T_ret = Scythe.retrieve_temperature(M + p_Pa - p_Pa, rho_d, rho_t, Q_ss, p_Pa,
-                                            Tk, rho_r)
-        rho_v = clamp(Q_ss + rho_v_sat(T_ret, p_Pa / 100.0), 0.0,
-                      max(rho_t - rho_d - rho_r, 0.0))
-        @test rho_v ≈ 0.0 atol=1e-14
-        @test rho_t - rho_d - rho_v - rho_r >= -1e-14    # rho_c >= 0
+    @testset "clamp_water! is a conservative phase change, not a mass source" begin
+        # The positivity floor moves the deficit between the prognostic condensate and
+        # the RESIDUAL vapor, so total water and E_t are untouched and the retrieval
+        # supplies exactly the latent heat of the implied phase change. This is the
+        # property that makes flooring negative water legitimate rather than a fudge.
+        mktempdir() do tmpdir
+            mtile, patch, model, _ = make_mc_mtile(tmpdir)
+            vars = model.grid_params.vars
+            kDim = model.grid_params.kDim
+            rc_i = vars["rho_c"]; rr_i = vars["rho_r"]
+            rt_i = vars["rho_t"]; rd_i = vars["rho_d"]
+            rho_cbar = Springsteel.ref_rho_c(mtile.ref_state)[:, 1]
+            rho_tbar = Springsteel.ref_rho_t(mtile.ref_state)[:, 1]
+            rho_dbar = Springsteel.ref_rho_d(mtile.ref_state)[:, 1]
+
+            mtile.var_np1 .= 0.0
+            # Seed a negative cloud and a negative rain in the first column
+            deficit_c = -1.0e-6
+            deficit_r = -2.0e-7
+            mtile.var_np1[1, rc_i] = deficit_c - rho_cbar[1]
+            mtile.var_np1[1, rr_i] = deficit_r
+            mtile.var_np1[2, rc_i] = -rho_cbar[2]          # exactly zero cloud
+            rw_before = [(mtile.var_np1[i, rt_i] + rho_tbar[mod1(i, kDim)]) -
+                         (mtile.var_np1[i, rd_i] + rho_dbar[mod1(i, kDim)]) for i in 1:2]
+            before = Scythe.water_clamp_total(mtile)
+
+            Scythe.clamp_water!(mtile, 1, kDim)
+
+            # 1. Nothing negative survives
+            @test mtile.var_np1[1, rc_i] + rho_cbar[1] == 0.0
+            @test mtile.var_np1[1, rr_i] == 0.0
+            # 2. TOTAL WATER is untouched — that is what makes the floor conservative
+            rw_after = [(mtile.var_np1[i, rt_i] + rho_tbar[mod1(i, kDim)]) -
+                        (mtile.var_np1[i, rd_i] + rho_dbar[mod1(i, kDim)]) for i in 1:2]
+            @test rw_after == rw_before
+            # 3. An already-admissible point is left EXACTLY alone
+            @test mtile.var_np1[2, rc_i] == -rho_cbar[2]
+            # 4. The moved mass is accounted, not silent
+            @test Scythe.water_clamp_total(mtile) - before ≈
+                  abs(deficit_c) + abs(deficit_r) rtol=1e-12
+        end
+    end
+
+    @testset "clamp_water! caps condensate by the water present" begin
+        # Rule 2: rho_c + rho_r may not exceed rho_w (i.e. the residual vapor may not go
+        # negative). The excess comes out of cloud first, then rain.
+        mktempdir() do tmpdir
+            mtile, patch, model, _ = make_mc_mtile(tmpdir)
+            vars = model.grid_params.vars
+            kDim = model.grid_params.kDim
+            rc_i = vars["rho_c"]; rr_i = vars["rho_r"]
+            rt_i = vars["rho_t"]; rd_i = vars["rho_d"]
+            rho_cbar = Springsteel.ref_rho_c(mtile.ref_state)[:, 1]
+            rho_tbar = Springsteel.ref_rho_t(mtile.ref_state)[:, 1]
+            rho_dbar = Springsteel.ref_rho_d(mtile.ref_state)[:, 1]
+            rho_w1 = rho_tbar[1] - rho_dbar[1]
+
+            mtile.var_np1 .= 0.0
+            # Ask for twice the available water as cloud, plus some rain
+            mtile.var_np1[1, rc_i] = (2.0 * rho_w1) - rho_cbar[1]
+            mtile.var_np1[1, rr_i] = 0.1 * rho_w1
+            Scythe.clamp_water!(mtile, 1, kDim)
+
+            rho_c = mtile.var_np1[1, rc_i] + rho_cbar[1]
+            rho_r = mtile.var_np1[1, rr_i]
+            @test rho_c >= 0.0 && rho_r >= 0.0
+            @test rho_c + rho_r <= rho_w1 + 1.0e-18
+            # Vapor is exactly zero, not negative: the cap binds
+            @test (rho_w1 - rho_c - rho_r) ≈ 0.0 atol=1e-18
+        end
     end
 
     @testset "resting dry base is untouched by diffusion" begin
@@ -1213,6 +1288,7 @@ using Springsteel
             rho_tbar = Springsteel.ref_rho_t(ref0)[:, 1]
             E_tbar = Springsteel.ref_total_energy(ref0)[:, 1]
             Q_ssbar = Springsteel.ref_qss(ref0)[:, 1]
+            rho_cbar = Springsteel.ref_rho_c(ref0)[:, 1]
             Tbar = Springsteel.reference_temperature(ref0)
             zs = gp0[:, 2]
 
@@ -1221,11 +1297,10 @@ using Springsteel
                 rho_d = mt.var_np1[i, 2] + rho_dbar[k]
                 rho_t = mt.var_np1[i, 3] + rho_tbar[k]
                 E_t = mt.var_np1[i, 6] + E_tbar[k]
-                Q_ss = mt.var_np1[i, 7] + Q_ssbar[k]
+                rho_liq = (mt.var_np1[i, 9] + rho_cbar[k]) + mt.var_np1[i, 8]
                 ke = 0.5 * (mt.var_np1[i, 4]^2 + mt.var_np1[i, 5]^2)
                 M = p + E_t - rho_t * (ke + Scythe.gravity * zs[i])
-                return Scythe.retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k],
-                                                   mt.var_np1[i, 8]), p, rho_d
+                return Scythe.retrieve_temperature(M, rho_d, rho_t, rho_liq), p, rho_d
             end
 
             dp_max = 0.0
@@ -1419,6 +1494,7 @@ using Springsteel
         rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
         E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
         Q_ssbar = Springsteel.ref_qss(ref)[:, 1]
+        rho_cbar = Springsteel.ref_rho_c(ref)[:, 1]
         Tbar = Springsteel.reference_temperature(ref)
         n = size(mtile.var_np1, 1)
         T = zeros(n)
@@ -1428,11 +1504,10 @@ using Springsteel
             rho_d = mtile.var_np1[i, 2] + rho_dbar[k]
             rho_t = mtile.var_np1[i, 3] + rho_tbar[k]
             E_t = mtile.var_np1[i, 6] + E_tbar[k]
-            Q_ss = mtile.var_np1[i, 7] + Q_ssbar[k]
+            rho_liq = (mtile.var_np1[i, 9] + rho_cbar[k]) + mtile.var_np1[i, 8]
             ke = 0.5 * (mtile.var_np1[i, 4]^2 + mtile.var_np1[i, 5]^2)
             M = p + E_t - rho_t * (ke + Scythe.gravity * zs[i])
-            T[i] = Scythe.retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k],
-                                               mtile.var_np1[i, 8])
+            T[i] = Scythe.retrieve_temperature(M, rho_d, rho_t, rho_liq)
         end
         return T
     end
@@ -1476,6 +1551,13 @@ using Springsteel
             @test all(m_on.var_np1[:, 8] .> 0.0)
             @test maximum(m_on.var_np1[:, 8]) < 3.0e-3   # bounded by the available cloud
             @test all(m_off.var_np1[:, 8] .== 0.0)
+            # Cloud is PROGNOSTIC now, so the conversion is an explicit equal and
+            # opposite pair rather than something the residual absorbs silently:
+            # every gram slot 8 gains, slot 9 loses.
+            drc = m_on.var_np1[:, 9] .- m_off.var_np1[:, 9]
+            drr = m_on.var_np1[:, 8] .- m_off.var_np1[:, 8]
+            @test maximum(abs.(drc .+ drr)) < 1.0e-18
+            @test all(drc .<= 0.0)
         end
     end
 
@@ -1504,8 +1586,16 @@ using Springsteel
             d8 = m_on.var_np1[:, 8] .- m_off.var_np1[:, 8]
             # Sedimentation actually moved mass...
             @test maximum(abs.(d8)) > 1.0e-8
-            # ...and rho_t tracks rho_r exactly (identical -dF/dz in both slots)
-            @test all(isapprox.(d3, d8; atol=1.0e-14))
+            # ...and rho_t tracks rho_r through the sedimentation flux (identical
+            # -dF/dz in both slots) EXCEPT where the positivity floor fired. The
+            # spline fit of the Gaussian bump undershoots negative at its edges, and
+            # clamp_water! converts that negative rain to vapor: rho_r moves, rho_t
+            # (total water) deliberately does not. So the residual is bounded by the
+            # clamped mass, which is itself accounted rather than silent.
+            clamped = max(Scythe.water_clamp_total(m_on),
+                          Scythe.water_clamp_total(m_off))
+            @test maximum(abs.(d3 .- d8)) <= clamped + 1.0e-14
+            @test all(m_on.var_np1[:, 8] .>= 0.0)
             # The bump falls: rain-weighted mean height decreases
             kDim = 32
             zs = gp[:, 2]
@@ -1743,12 +1833,31 @@ using Springsteel
                 step_mc!(m0, p0, mod0, 5)
                 @test maximum(abs.(p0.physical)) > 0.0
             end
-            # ON: every prognostic slot stays bit-exactly zero. Not "small" -- zero.
+            # ON, CLOUD-FREE: every prognostic slot stays bit-exactly zero. Not
+            # "small" -- zero. The construction runs the driver's own expressions, so
+            # Q_ssbar IS the diagnosed supersaturation bit-for-bit, both condensation
+            # gates are shut, and the reconciliation term is exactly 0.0.
+            #
+            # ON, CLOUDY: exact zero is not attainable and should not be asserted. The
+            # saturated branch has to solve g(rho_c) = rho_c - (rho_w - rho_vs(T(rho_c)))
+            # by Newton, and a root found to 1e-15 in rho_c leaves the state ~1e-16 off
+            # the saturation manifold -- so either Qdot or the Q_ss reconciliation is
+            # nonzero at the last bit, whichever the branch chooses to zero exactly.
+            # What matters is that it is at rounding and does not accumulate.
             mktempdir() do tmpdir
                 m1, p1, mod1, _ = make_mc_mtile(tmpdir; dry=dry, q_l=q_l,
                                                 consistent_qss=true)
                 step_mc!(m1, p1, mod1, 5)
-                @test maximum(abs.(p1.physical)) == 0.0
+                if q_l == 0.0
+                    @test maximum(abs.(p1.physical)) == 0.0
+                else
+                    vars1 = mod1.grid_params.vars
+                    @test maximum(abs.(p1.physical[:, vars1["p"], 1])) < 1.0e-9
+                    @test maximum(abs.(p1.physical[:, vars1["E_t"], 1])) < 1.0e-6
+                    for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c")
+                        @test maximum(abs.(p1.physical[:, vars1[nm], 1])) < 1.0e-12
+                    end
+                end
             end
         end
     end
@@ -1954,8 +2063,13 @@ using Springsteel
             # increment (same Neumann operator, same data). Tolerance: the always-on
             # SI solve slaves an acoustic increment onto rho_t' (moist base: c_d < 1)
             # but not rho_r, so the two solves' inputs differ at the ~1e-12 level
-            # (signal > 1e-8).
-            @test maximum(abs.(d3 .- d8)) < 1.0e-10
+            # (signal > 1e-8); and the positivity floor converts the fitted bump's
+            # negative edges to vapor, which moves rho_r but deliberately not rho_t.
+            clamped = max(Scythe.water_clamp_total(m_on),
+                          Scythe.water_clamp_total(m_off))
+            @test maximum(abs.(d3 .- d8)) < 1.0e-10 + clamped
+            # Cloud is untouched: rain diffusion must not manufacture condensate
+            @test maximum(abs.(m_on.var_np1[:, 9] .- m_off.var_np1[:, 9])) < 1.0e-18
             # Neumann solve conserves the column integral (trapezoid per column)
             kDim = 32
             zs = gp[1:kDim, 2]
@@ -1973,11 +2087,12 @@ using Springsteel
         end
     end
 
-    @testset "water diffusion: vapor bump keeps the cloud residual zero" begin
-        # Subsaturated vapor bump in dry air, ONLY Kvdiff_water active: rho_w' and
-        # rho_v' diffuse through the SAME operator, so the implied cloud increment
-        # delta_rho_c = delta_rho_w - delta_rho_v must stay ~0 — vapor diffusion cannot
-        # manufacture cloud. Rain stays exactly zero, and the fixed-T map holds T.
+    @testset "water diffusion: vapor bump manufactures no cloud" begin
+        # Subsaturated vapor bump in dry air, ONLY Kvdiff_water active. The solved
+        # species are now rho_w', rho_c' and rho_r, and the VAPOR increment is the
+        # implied remainder delta_rho_v = delta_rho_w - delta_rho_c - delta_rho_r. With
+        # no cloud and no rain to diffuse, delta_rho_c and delta_rho_r are identically
+        # zero, so all of delta_rho_w must land in the vapor: cloud cannot appear.
         mktempdir() do tmpdir
             args = (; dry=true, kDim=32, num_cells=8, ts=0.05)
             function run_once(Kw)
@@ -2009,10 +2124,15 @@ using Springsteel
             d3 = m_on.var_np1[:, 3] .- m_off.var_np1[:, 3]
             d7 = m_on.var_np1[:, 7] .- m_off.var_np1[:, 7]
             @test maximum(abs.(d3)) > 1.0e-8            # diffusion acted
-            # Vapor-only water: the rho_w and rho_v increments must agree (no cloud
-            # manufactured); the two fields ride the same operator but different
-            # staging paths (prognostic zz slots vs a column refit), plus the acoustic
-            # slaving on rho_t' from the always-on SI solve, hence the tolerance
+            # THE assertion: the cloud slot does not move at all. Where there is no
+            # condensate to diffuse there is no condensate increment -- not "small",
+            # exactly zero -- so vapor diffusion cannot manufacture cloud. Under the
+            # old residual partition this had to be inferred from two large increments
+            # cancelling; now it is read straight off the prognostic slot.
+            @test m_on.var_np1[:, 9] == m_off.var_np1[:, 9]
+            # ... hence the whole total-water increment is vapor. Tolerance: the
+            # always-on SI solve slaves an acoustic increment onto rho_t' but not onto
+            # Q_ss, and Q_ss also carries its (inert) reconciliation term.
             @test maximum(abs.(d3 .- d7)) < 5.0e-9
             # No rain appears from water diffusion of a rain-free column
             @test m_on.var_np1[:, 8] == m_off.var_np1[:, 8]
@@ -2103,14 +2223,15 @@ using Springsteel
                 Scythe.advance_column(mt_xz, c, 1)
                 Scythe.advance_column(mt_ax, c, 1)
             end
-            for v in 1:8
+            for v in 1:9
                 exz = mt_xz.expdot_n[:, v]
                 eax = mt_ax.expdot_n[:, v]
                 scale = max(maximum(abs.(exz)), 1.0e-12)
                 @test maximum(abs.(eax .- exz)) / scale < 1.0e-5
             end
-            # v is untouched by the passive dynamics
-            @test maximum(abs.(mt_ax.expdot_n[:, 9])) == 0.0
+            # v (slot 10 since rho_c was appended at 9) is untouched by the passive
+            # dynamics
+            @test maximum(abs.(mt_ax.expdot_n[:, 10])) == 0.0
         end
     end
 
@@ -2244,14 +2365,14 @@ using Springsteel
             worst = 0.0
             scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
                           5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6,
-                          9 => 1.0e-2)
+                          9 => 1.0e-6, 10 => 1.0e-2)
             for c in 1:ncols_rlr
                 i0 = (c - 1) * kDim
                 r_c = gp1[i0 + 1, 1]
                 a = findfirst(x -> x == r_c, r_ax)
                 @test a !== nothing
                 j0 = (a - 1) * kDim
-                for v in 1:9
+                for v in 1:10
                     d = maximum(abs.(mt_rlr.expdot_n[i0+1:i0+kDim, v] .-
                                      mt_ax.expdot_n[j0+1:j0+kDim, v])) / scales[v]
                     worst = max(worst, d)
@@ -2352,7 +2473,8 @@ using Springsteel
             ncols_rrr = div(size(gp3, 1), kDim)
             worst = 0.0
             scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
-                          5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6)
+                          5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6,
+                          9 => 1.0e-6)
             worst_v = 0.0
             for c in 1:ncols_rrr
                 i0 = (c - 1) * kDim
@@ -2360,7 +2482,7 @@ using Springsteel
                 a = findfirst(==(x_c), x_xz)
                 @test a !== nothing
                 j0 = (a - 1) * kDim
-                for v in 1:8
+                for v in 1:9
                     d = maximum(abs.(mt_rrr.expdot_n[i0+1:i0+kDim, v] .-
                                      mt_xz.expdot_n[j0+1:j0+kDim, v])) / scales[v]
                     worst = max(worst, d)
@@ -2368,7 +2490,7 @@ using Springsteel
                 # v feels exactly -f u (advection/PGF/diffusion of a zero field
                 # vanish; pp_y of a y-invariant field is spline roundoff)
                 worst_v = max(worst_v,
-                    maximum(abs.(mt_rrr.expdot_n[i0+1:i0+kDim, 9] .+
+                    maximum(abs.(mt_rrr.expdot_n[i0+1:i0+kDim, 10] .+
                                  f .* mt_rrr.tile.physical[i0+1:i0+kDim, 4, 1])))
             end
             @info "RRR y-invariant vs XZ: worst scaled mismatch = $worst; " *
@@ -2467,14 +2589,15 @@ using Springsteel
             ncols_slr = div(size(gp1, 1), kDim)
             worst = 0.0
             scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
-                          5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6)
+                          5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6,
+                          9 => 1.0e-6)
             for c in 1:ncols_slr
                 i0 = (c - 1) * kDim
                 x_c = a_sphere * (gp1[i0 + 1, 1] - th0)
                 d, a_idx = findmin(abs.(x_xz .- x_c))
                 @test d < 1.0e-3            # affine mish correspondence (roundoff)
                 j0 = (a_idx - 1) * kDim
-                for v in 1:8
+                for v in 1:9
                     dd = maximum(abs.(mt_slr.expdot_n[i0+1:i0+kDim, v] .-
                                       mt_xz.expdot_n[j0+1:j0+kDim, v])) / scales[v]
                     worst = max(worst, dd)

@@ -90,7 +90,7 @@ z = reshape(df0.z, kDim, ncols)[:, 1]
 println("Found $(length(snaps)) snapshots, kDim=$kDim, ncols=$ncols")
 
 # ── Reference state (RiRk / pressure reference; BCs of this throwaway grid unused) ─
-vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
 scalar_bc = Dict(v => NeumannBC() for v in vars)
 gp = Scythe.compute_derived_params(GridParameters(;
     geometry = "RiRk",

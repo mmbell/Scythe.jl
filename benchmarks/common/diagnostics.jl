@@ -58,29 +58,28 @@ end
     mc_state(df, ref, kDim, ncols)
 
 Reconstruct the diagnostic thermodynamic state of the total-energy set
-(moist_compressible) from a perturbation output DataFrame: temperature from the
-Newton retrieval, then the diagnostic water partition. Returns
-`(Tk, p, rho_d, rho_v, rho_c, rho_t)` as flat vectors (z fastest), with p in Pa.
+(moist_compressible) from a perturbation output DataFrame: the closed-form
+temperature retrieval from the PROGNOSTIC condensate, then the residual vapor.
+Returns `(Tk, p, rho_d, rho_v, rho_c, rho_t)` as flat vectors (z fastest), with p
+in Pa.
 """
 function mc_state(df, ref, kDim, ncols)
     pbar = Springsteel.ref_pressure(ref)[:, 1]
     rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
     rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
+    rho_cbar = Springsteel.ref_rho_c(ref)[:, 1]
     E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
-    Q_ssbar = Springsteel.ref_qss(ref)[:, 1]
-    Tbar = Springsteel.reference_temperature(ref)
     p = df.p .+ repeat(pbar, ncols)
     rho_d = df.rho_d .+ repeat(rho_dbar, ncols)
     rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
     E_t = df.E_t .+ repeat(E_tbar, ncols)
-    Q_ss = df.Q_ss .+ repeat(Q_ssbar, ncols)
+    rho_c = df.rho_c .+ repeat(rho_cbar, ncols)
     ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
     M = p .+ E_t .- (rho_t .* (ke .+ Scythe.gravity .* df.z))
-    Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, Q_ss, p, repeat(Tbar, ncols), df.rho_r)
-    # Clamped partition, matching the equation set: vapor within [0, total water - rain]
-    rho_v = clamp.(Q_ss .+ Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0),
-                   0.0, max.(rho_t .- rho_d .- df.rho_r, 0.0))
-    rho_c = rho_t .- rho_d .- rho_v .- df.rho_r
+    rho_liq = rho_c .+ df.rho_r
+    Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
+    # Vapor is the residual of the prognostic water masses
+    rho_v = rho_t .- rho_d .- rho_liq
     return Tk, p, rho_d, rho_v, rho_c, rho_t
 end
 
@@ -276,8 +275,8 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
         if mc
             Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
             E_t = df.E_t .+ repeat(Springsteel.ref_total_energy(ref)[:, 1], ncols)
-            # Clamp for the entropy diagnostic: in dry air the diagnostic
-            # rho_v = Q_ss + rho_vs sits at 0 ± roundoff, and entropy() takes log(q_v).
+            # Clamp for the entropy diagnostic: in dry air the residual vapor sits at
+            # 0 ± roundoff, and entropy() takes log(q_v).
             q_v = max.(rho_v, 0.0) ./ rho_d
             q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
             water_mass = rho_t .- rho_d

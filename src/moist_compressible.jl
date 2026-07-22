@@ -1,12 +1,32 @@
 # Total-energy moist compressible equation set.
 #
 # Prognostic variables (XZ slice): p [Pa], rho_d, rho_t, u, w, E_t [J/m^3], Q_ss
-# [kg/m^3], rho_r. Temperature is diagnosed each step from a univariate Newton
-# retrieval on the Bryan & Fritsch (2002) total energy, then the water partition
-# follows diagnostically: rho_v = Q_ss + rho_vs(T, p), rho_c = rho_t - rho_d -
-# rho_v - rho_r. Because rho_v and rho_c are diagnostic, no separate condensation
-# adjustment step is needed - the vapor/cloud split is always consistent with the
-# prognostic supersaturation.
+# [kg/m^3], rho_r, rho_c. The CONDENSATE is prognostic and the VAPOR is the
+# residual rho_v = rho_t - rho_d - rho_c - rho_r; temperature then follows in
+# CLOSED FORM from the Bryan & Fritsch (2002) total energy (see
+# retrieve_temperature), with no iteration and no dependence on the partition.
+#
+# It used to be the other way round — rho_c the residual of four nearly-cancelling
+# fitted fields — and that was the defect diagnosed in
+# reference/HANDOFF_DIAGNOSED_CLOUD.md: in cloud-free air the true Q_ss sits
+# exactly ON its admissible ceiling, so fit-level error (~2e-6 kg/m^3) put rho_c
+# on the wrong side of zero, the closure evaporated cloud that was not there, and
+# because the residual was REGENERATED every step it was a sustained pressure sink
+# (3.19 Pa/s at t = 0 on the balanced TC vortex — all of the measured tendency).
+# Making the smallest field prognostic and the largest one the residual puts the
+# same fit error where it is harmless: 1e-6 against a vapor density of ~1e-2 is a
+# 5e-5 relative error in a field that no longer feeds back into temperature at all.
+#
+# Q_ss is therefore no longer thermodynamic — it is purely the microphysics'
+# supersaturation driver (smooth and advected, rather than a noisy difference of
+# two large numbers), reconciled toward the diagnosed rho_v - rho_vs(T,p) on
+# tau_qss by `qss_relaxation`.
+#
+# Negative water is not representable: `clamp_water!` floors rho_c and rho_r after
+# every column step. Because rho_t is prognostic and rho_v is the residual, that
+# floor is exactly a phase change — total water and E_t are untouched and the
+# retrieval supplies the matching latent heat — so it conserves mass, water and
+# energy by construction.
 #
 # The conserved quantities (rho_d, rho_t, E_t) are extensive flux-form prognostics,
 # so the Galerkin low-pass filter preserves their integrals (no Jensen drift). The
@@ -35,9 +55,9 @@ class of bug cannot be written here at all.
 """
 const MC_SCRATCH_SLOTS = (
     # ── moist_compressible_XZ ──
-    :p, :rho_d, :rho_t, :E_t, :Q_ss,                                  # totals
-    :p_z, :rho_d_z, :rho_t_z, :E_t_z, :Q_ss_z,                        # total vertical gradients
-    :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :rho_c, :q_v, :q_l,  # diagnostic state
+    :p, :rho_d, :rho_t, :E_t, :Q_ss, :rho_c,                          # totals
+    :p_z, :rho_d_z, :rho_t_z, :E_t_z, :Q_ss_z, :rho_c_z,              # total vertical gradients
+    :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :rho_liq, :q_v, :q_l, # diagnostic state
     :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
     :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
     :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
@@ -59,7 +79,7 @@ const MC_SCRATCH_SLOTS = (
     :si_p_nstar_z, :si_phi_z, :si_rhs, :si_c_d, :si_c_d_z, :si_c_e, :si_c_e_z,
     # ── diffusion_timestep_mc (df_ prefix) ──
     :df_u_star, :df_w_star, :df_p_star, :df_rho_d_star, :df_rho_t_star,
-    :df_E_t_star, :df_Q_ss_star, :df_ke_star, :df_M_star,
+    :df_E_t_star, :df_ke_star, :df_M_star,
     :df_T_star, :df_p_hPa_star, :df_drvs_dT, :df_drvs_dp,
     :df_rho_vs_star, :df_rho_v_star, :df_q_v_star, :df_q_l_star,
     :df_C_vt_star, :df_R_m_star, :df_Lv_star, :df_stp_star,
@@ -67,6 +87,7 @@ const MC_SCRATCH_SLOTS = (
     :df_dke, :df_dE_visc, :df_ds_t, :df_dT_h, :df_dE_h, :df_dp_h, :df_dQ_h,
     :df_rw_star, :df_rv_star, :df_rw_nstar, :df_rv_nstar, :df_rr_nstar,
     :df_rw_np1, :df_rv_np1, :df_drw, :df_drv, :df_drr, :df_dE_w,
+    :df_rc_star, :df_rc_nstar, :df_rc_np1, :df_drc, :df_rho_c_star, :df_rho_liq_star,
     # ── tangential wind v (cylindrical geometries; inert columns on the XZ slice) ──
     :df_v_star, :df_v_nstar, :df_v_np1)
 
@@ -122,67 +143,41 @@ function drho_vsat_dp(Tk, p_hPa)
 end
 
 """
-    retrieve_temperature(M, rho_d, rho_t, Q_ss, p_Pa, T_guess, rho_r=0.0; tol=1.0e-9, maxiter=25)
+    retrieve_temperature(M, rho_d, rho_t, rho_liq)
 
-Diagnose the temperature from the prognostic variables of the total-energy set by
-Newton iteration on
+Diagnose the temperature from the prognostic variables of the total-energy set. With the
+condensate prognostic the liquid density `ρ_liq = ρ_c + ρ_r` is KNOWN, so the Bryan &
+Fritsch (2002) energy identity
 
-    F(T) = (ρ_d C_pd + (ρ_t − ρ_d) C_pv) T + (Q_ss + ρ_d + ρ_vs(T,p) − ρ_t) L_v(T) − M
+    M = (ρ_d C_pd + ρ_w C_pv) T − ρ_liq L_v(T),    ρ_w = ρ_t − ρ_d
 
-where `M = p + E_t − ρ_t(v²/2 + gz)` [J/m³] is the available enthalpy density.
-F is monotone increasing in T (all dominant terms positive), so the root is unique;
-convergence from the reference or previous-step temperature takes 2-3 iterations.
-`tol` is the temperature increment tolerance [K].
+(where `M = p + E_t − ρ_t(v²/2 + gz)` [J/m³] is the available enthalpy density) contains no
+saturation density, and `L_v(T) = L_v0 + (C_pv − C_l)(T − T_0)` is linear in T. The root is
+therefore CLOSED FORM:
+
+    T = [M + ρ_liq (L_v0 − (C_pv − C_l) T_0)] / [(ρ_d C_pd + ρ_w C_pv) − ρ_liq (C_pv − C_l)]
+
+The denominator is `Cfactor + (C_l − C_pv) ρ_liq` with `C_l > C_pv`, hence strictly positive
+for any admissible state: there is no iteration, no tolerance, no guess, and no failure mode.
+
+(The liquid density is spelled `rho_liq`, not `rho_l`: `Springsteel.rho_l` is the bulk
+density of liquid water, 1000 kg/m³, used throughout `microphysics.jl`.)
+
+Note what is ABSENT. T depends only on `(M, ρ_d, ρ_t, ρ_liq)` — not on the vapor/cloud split,
+not on `Q_ss`, and not on `ρ_vs`. That is what decouples the microphysics driver from the
+thermodynamics: a `Q_ss` error is now thermodynamically inert. Latent heating still needs no
+source term — condensation raises `ρ_l` at fixed `E_t` and `ρ_t`, and this expression turns
+that into a warming of `δρ_l·L_v/Cfactor` automatically.
+
+This replaces a univariate Newton iteration on the same identity carrying an extra
+`ρ_vs(T,p)` term, whose clamped partition is what manufactured phantom cloud (see the file
+header). The two agree to ~1e-12 K wherever the old clamp was inactive.
 """
-function retrieve_temperature(M, rho_d, rho_t, Q_ss, p_Pa, T_guess, rho_r=0.0;
-                              tol=1.0e-9, maxiter=25)
+@inline function retrieve_temperature(M, rho_d, rho_t, rho_liq)
 
-    p_hPa = p_Pa / 100.0
     Cfactor = (rho_d * Cpd) + ((rho_t - rho_d) * Cpv)
-    rho_w = max(rho_t - rho_d, 0.0)                      # total water density
-    rho_v_max = max(rho_w - rho_r, 0.0)                  # rain is liquid, not vapor
-    Tk = T_guess
-    for _ in 1:maxiter
-        rho_vs = rho_v_sat(Tk, p_hPa)
-        # Clamped diagnostic partition: vapor cannot be negative, nor exceed the total
-        # water less the rain (otherwise the residual cloud rho_c = rho_w - rho_v - rho_r
-        # goes negative). Conservation lives in (rho_d, rho_t, E_t); the partition is pure
-        # bookkeeping, and the clamp makes the retrieval immune to Q_ss tracking
-        # drift where rho_vs → 0 (e.g. dry air, where wfactor = 0 exactly).
-        # `qss_admissible_bounds` relaxes the prognostic Q_ss onto exactly this interval.
-        rho_v = clamp(Q_ss + rho_vs, 0.0, rho_v_max)
-        wfactor = rho_v - rho_w                          # = -rho_l (liquid incl. rain)
-        F = (Cfactor * Tk) + (wfactor * L_v(Tk)) - M
-        dvdT = (0.0 < Q_ss + rho_vs) && (Q_ss + rho_vs < rho_v_max) ?
-               drho_vsat_dT(Tk, p_hPa) : 0.0
-        Fprime = Cfactor + (L_v(Tk) * dvdT) + (wfactor * (Cpv - Cl))
-        dT = -F / Fprime
-        Tk = clamp(Tk + dT, 150.0, 350.0)
-        if abs(dT) < tol
-            return Tk
-        end
-    end
-    return Tk
-end
-
-"""
-    qss_admissible_bounds(rho_d, rho_t, rho_r, rho_vs)
-
-Lower and upper bounds on the prognostic supersaturation density Q_ss = ρ_v − ρ_vs(T,p),
-implied by the water-mass constraint 0 ≤ ρ_v ≤ ρ_t − ρ_d − ρ_r:
-
-    Q_lo = −ρ_vs ,   Q_hi = max(ρ_t − ρ_d − ρ_r, 0) − ρ_vs
-
-In cloud-free air the true Q_ss sits exactly on `Q_hi`; in dry air the interval collapses
-to the single point −ρ_vs (Q_ss carries no information there, since ρ_v ≡ 0 regardless).
-Inside the interval — i.e. wherever cloud exists — Q_ss is load-bearing and untouched.
-This is the same interval [`retrieve_temperature`](@ref) clamps the diagnostic partition to.
-"""
-function qss_admissible_bounds(rho_d, rho_t, rho_r, rho_vs)
-
-    Q_lo = -rho_vs
-    Q_hi = max(rho_t - rho_d - rho_r, 0.0) - rho_vs
-    return Q_lo, max(Q_hi, Q_lo)
+    return (M + (rho_liq * (L_v0 - ((Cpv - Cl) * T_0)))) /
+           (Cfactor - (rho_liq * (Cpv - Cl)))
 end
 
 """
@@ -221,9 +216,8 @@ function mc_reference_diagnostics(ref_state, z)
     pbar = ref_pressure(ref_state)
     rho_dbar = ref_rho_d(ref_state)
     rho_tbar = ref_rho_t(ref_state)
+    rho_cbar = Springsteel.ref_rho_c(ref_state)
     E_tbar = ref_total_energy(ref_state)
-    Q_ssbar = ref_qss(ref_state)
-    Tbar = ref_state.Tbar
     n = length(z)
     s_tbar = zeros(Float64, n)
     rho_vbar = zeros(Float64, n)
@@ -232,17 +226,18 @@ function mc_reference_diagnostics(ref_state, z)
         p = pbar[k, 1]
         rho_d = rho_dbar[k, 1]
         rho_t = rho_tbar[k, 1]
-        Q_ss = Q_ssbar[k, 1]
+        # The condensate is PROGNOSTIC, so the resting cloud is the reference's own
+        # fitted profile (exactly 0.0 for a condensate-free base, which fits rho_c from
+        # an all-zero vector; positive on a saturated base such as BF02).
+        rho_c = rho_cbar[k, 1]
         # Mirror the equation set's per-point pipeline at rest (ke = 0, rho_r = 0);
-        # every expression must match moist_compressible_XZ bit-for-bit.
+        # every expression must match mc_driver! bit-for-bit.
         geo = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0)) + (gravity * z[k])
         M = p + (E_tbar[k, 1]) - (rho_t * geo)
-        Tk = retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar[k, 1], 0.0)
-        rho_vs = rho_v_sat(Tk, p / 100.0)
-        rho_v = clamp(Q_ss + rho_vs, 0.0, max(rho_t - rho_d - 0.0, 0.0))
-        rho_c = rho_t - rho_d - rho_v - 0.0
+        Tk = retrieve_temperature(M, rho_d, rho_t, rho_c)
+        rho_v = rho_t - rho_d - rho_c
         q_v = rho_v / rho_d
-        q_l = (max(rho_c, 0.0) + 0.0) / rho_d
+        q_l = rho_c / rho_d
         s_tbar[k] = moist_entropy_total(Tk, rho_d, q_v, q_l)
         rho_vbar[k] = rho_v
         # Local reference sound speed squared γ_m(z)·p̄(z)/ρ̄_t(z) for the acoustic
@@ -263,57 +258,57 @@ end
 """
     consistent_qss_reference(ref, z, column) -> PressureReferenceState
 
-Rebuild the reference supersaturation density `Q_ssbar` so the RESTING state is a
-discrete fixed point of the equation set. Opt-in through
+Rebuild the reference water partition (`Q_ssbar`, and on a cloudy base `rho_cbar`/`rho_vbar`)
+so the RESTING state is a discrete fixed point of the equation set. Opt-in through
 `options[:consistent_qss_reference]`; off by default and bitwise inert when off.
 
-Springsteel builds `Q_ssbar = ρ_v − ρ_v*(T, p)` POINTWISE from the EOS temperature and
-then fits it. The equation set never sees those pointwise values: at run time it
-retrieves T from the FITTED `(p̄, Ē_t, ρ̄_t)` through [`retrieve_temperature`](@ref), so
-`ρ_v*` differs, the clamped partition leaves a residual cloud (measured
-`ρ_c = 1.5e-6 kg/m³` on the TC reference), `qss_condensation_rates` fires, and the
-resting column has `expdot[p] = 2.3 Pa/s` — the state condenses while at rest.
+Springsteel builds its moisture profiles POINTWISE from the EOS temperature and then fits
+them. The equation set never sees those pointwise values: at run time it retrieves T from the
+FITTED `(p̄, Ē_t, ρ̄_t, ρ̄_c)` through [`retrieve_temperature`](@ref) and diagnoses
+`ρ_v = ρ̄_t − ρ̄_d − ρ̄_c` from the fitted densities, so both differ from the pointwise
+construction by the fit error. Two resting tendencies can survive that mismatch:
 
-The fix constructs `Q_ssbar` through the model's own pipeline, exactly as
-[`mc_reference_diagnostics`](@ref) already does for the diffusion path. `Q̇` is
-`Q_ss·invtau/(1+Q_s)` split between the channels, so there are exactly two ways to make
-it vanish identically, and which one applies depends on whether the base carries cloud.
+- `Q̇ = Q_ss·invtau/(1+Q_s)` — the phase change, wherever a gate in
+  [`qss_condensation_rates`](@ref) is open;
+- `QSSREL = −(Q_ss − (ρ_v − ρ_vs))/τ` — the [`qss_relaxation`](@ref) reconciliation, which is
+  thermodynamically inert (T does not read `Q_ss`) but is still a nonzero tendency at rest.
 
-**Cloud-free levels** (`ρ̄_c = 0` — a subsaturated sounding: O01, the TC). Shut both
-gates in `qss_condensation_rates` by putting all the water in the vapor phase:
+Killing both means making `Q_ssbar` equal the model's OWN diagnosed supersaturation, which is
+what this builds:
 
-    ρ_v,max = max(ρ̄_t − ρ̄_d, 0)
-    T       = retrieve_temperature(M, ρ̄_d, ρ̄_t, ·, p̄, T̄, 0)
-    Q_ssbar = ρ_v,max − ρ_v*(T, p̄)
+    ρ_c     = ρ̄_c (fitted)          M = p̄ + Ē_t − ρ̄_t·g·z        (rest: ke = 0, ρ_r = 0)
+    T       = retrieve_temperature(M, ρ̄_d, ρ̄_t, ρ_c)
+    Q_ssbar = (ρ̄_t − ρ̄_d − ρ_c) − ρ_v*(T, p̄)
 
-with `M = p̄ + Ē_t − ρ̄_t·g·z` (rest: `ke = 0`, `ρ_r = 0`). The retrieval is INDEPENDENT
-of `Q_ss` while the diagnostic clamp is active — the clamped `wfactor = ρ_v,max − ρ_w`
-is `−ρ_r = 0`, so `F(T)` loses its water term — which makes this a one-shot solve
-rather than a fixed-point iteration. The resting partition then gives `ρ_v = ρ_v,max`,
-hence `ρ_c = 0` to within the rounding of `(ρ_v,max − ρ_vs) + ρ_vs`, so
-`q_c ~ 1e-16 < 1e-8`, and `S = Q_ss/ρ_vs < 0`. Both gates shut, `invtau_c = 0`, and
-`invtau_r = 0` for `ρ_r = 0`, so the closure returns `(0.0, 0.0)` EXACTLY.
+**Cloud-free levels** (`ρ̄_c = 0` — a subsaturated sounding: O01, the TC) are done at that
+point. `q_c = 0 < 1e-8` and `S = Q_ssbar/ρ_vs < 0` shut both condensation gates, `invtau_r = 0`
+for `ρ_r = 0`, the closure returns `(0.0, 0.0)` EXACTLY, and `QSSREL` vanishes by construction.
+Note how much weaker the requirement is than it used to be: the condensate is prognostic, so a
+subsaturated base cannot manufacture cloud however the fit falls, and this is now a refinement
+rather than the load-bearing repair it was before.
 
-**Condensate-bearing levels** (`ρ̄_c > 0` — a saturated base: Bryan & Fritsch 2002).
-Forcing the water into vapor there would DESTROY the base cloud, which is what makes
-that state neutrally buoyant. The cloud gate is necessarily open, so instead put the
-level exactly on the saturation manifold:
+**Condensate-bearing levels** (`ρ̄_c > 0` — a saturated base: Bryan & Fritsch 2002) cannot be
+fixed by `Q_ssbar` alone. The cloud gate is necessarily open there, so `Q̇` vanishes only for
+`Q_ssbar = 0`, while `QSSREL` vanishes only for `Q_ssbar = ρ_v − ρ_vs`. Both hold together iff
+the base is EXACTLY saturated in the model's own arithmetic, so the PARTITION is what has to
+move: solve
 
-    Q_ssbar = 0
+    g(ρ_c) = ρ_c − (ρ̄_t − ρ̄_d − ρ_v*(T(ρ_c), p̄)) = 0
 
-`Q̇ = Q_ss·invtau/(1+Q_s)` is then exactly zero whatever `invtau` is, and the partition
-keeps `ρ_v = ρ_v*(T, p̄)` with `ρ_c` the positive residual. This is the manifold the
-BF02 benchmark already intends its base to sit on; the pointwise-minus-fitted
-construction just missed it by the fit error.
+for `ρ_c` by Newton, using `dT/dρ_c = L_v(T)/(C_factor − ρ_c(C_pv − C_l))` (differentiate the
+closed-form retrieval), then set `Q_ssbar = 0` and `ρ̄_v = ρ̄_t − ρ̄_d − ρ_c`. Fixed-point
+iteration is NOT usable here: `d/dρ_c` of the map is `−∂ρ_vs/∂T · L_v/C_factor ≈ −2.5`, so the
+naive iteration diverges. `ρ̄_t`, `ρ̄_d`, `p̄` and `Ē_t` are untouched, so this moves mass
+between the vapor and cloud slots at fixed total density — the hydrostatic balance and the
+buoyancy of the base are exactly preserved, which is the whole point of a BF02 base state.
 
-The VALUE slot is the raw target (not the filtered fit): the fixed point depends on it
-exactly, while the derivative slots — which come from a spline fit of those values —
-multiply `w ≡ 0` at rest and so cannot disturb it.
+The VALUE slots are the raw targets (not the filtered fit): the fixed point depends on them
+exactly, while the derivative slots — which come from a spline fit of those values — multiply
+`w ≡ 0` at rest and so cannot disturb it.
 
-Errors per level if the intended outcome is not actually reached: a cloud-free level
-that still shows cloud or supersaturation (i.e. the sounding is saturated but carries
-no `ρ̄_c`, which needs a condensate-bearing reference), or a condensate level whose
-cloud the clamp removes.
+Errors per level if the intended outcome is not actually reached: a cloud-free level that is
+actually supersaturated (which needs a condensate-bearing reference, not a condensing one), or
+a cloudy level whose Newton solve leaves no cloud (the sounding is not saturated there).
 """
 function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
                                   z::AbstractVector{Float64}, column)
@@ -323,74 +318,103 @@ function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
     rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
     E_tbar = ref_total_energy(ref)
-    Tbar = ref.Tbar
     n = length(z)
     Q_ss_new = zeros(Float64, n)
+    rho_c_new = zeros(Float64, n)
+    rho_v_new = zeros(Float64, n)
+    cloudy_levels = 0
     for k in 1:n
         p = pbar[k, 1]
+        p_hPa = p / 100.0
         rho_d = rho_dbar[k, 1]
         rho_t = rho_tbar[k, 1]
-        rho_v_max = max(rho_t - rho_d, 0.0)
+        rho_w = rho_t - rho_d
         # Mirror the driver's per-point pipeline at rest (ke = 0, rho_r = 0).
         M = p + E_tbar[k, 1] - (rho_t * (gravity * z[k]))
         # A condensate-free reference fits rho_c from an all-zero vector, so this is
         # EXACTLY 0.0 there; a saturated base (BF02) carries a positive profile.
-        cloudy = rho_cbar[k, 1] > 0.0
+        rho_c = rho_cbar[k, 1]
+        cloudy = rho_c > 0.0
 
         if cloudy
-            # Saturation manifold: Qdot = Q_ss*invtau/(1+Q_s) vanishes for ANY invtau.
+            cloudy_levels += 1
+            # Newton on g(rho_c) = rho_c - (rho_w - rho_vs(T(rho_c), p)), whose derivative
+            # is 1 + (drho_vs/dT)(dT/drho_c) with dT/drho_c = L_v(T)/D — see the docstring.
+            Cfactor = (rho_d * Cpd) + (rho_w * Cpv)
+            for _ in 1:50
+                Tk = retrieve_temperature(M, rho_d, rho_t, rho_c)
+                g = rho_c - (rho_w - rho_v_sat(Tk, p_hPa))
+                D = Cfactor - (rho_c * (Cpv - Cl))
+                gp = 1.0 + (drho_vsat_dT(Tk, p_hPa) * L_v(Tk) / D)
+                drc = -g / gp
+                rho_c += drc
+                abs(drc) < 1.0e-15 && break
+            end
+            rho_c_new[k] = rho_c
+            # On the saturation manifold BOTH the phase change and the reconciliation
+            # vanish; Q_ssbar = 0 exactly rather than the ~1e-19 the solve would leave.
             Q_ss_new[k] = 0.0
         else
-            # Any Q_ss on or above the clamp ceiling gives the same T (see the
-            # docstring); start from the ceiling implied by the reference's own Q_ssbar.
-            Tk = retrieve_temperature(M, rho_d, rho_t, rho_v_max, p, Tbar[k, 1], 0.0)
-            Q_ss_new[k] = rho_v_max - rho_v_sat(Tk, p / 100.0)
+            rho_c_new[k] = rho_c            # exactly 0.0
+            Tk = retrieve_temperature(M, rho_d, rho_t, rho_c)
+            Q_ss_new[k] = (rho_w - rho_c) - rho_v_sat(Tk, p_hPa)
         end
+        rho_v_new[k] = rho_w - rho_c_new[k]
 
-        # VERIFY the run-time outcome through the driver's own expressions. In the
-        # cloud-free branch the retrieval is only Q_ss-independent while the clamp is
-        # strictly active, and `Q_ss + rho_vs` lands ON the clamp ceiling to within the
-        # rounding of the subtraction above, so T here can differ from the run's by
-        # ~1 ulp. That is harmless — what has to hold is the closure's behaviour, which
-        # is checked directly rather than assumed.
-        Tk_run = retrieve_temperature(M, rho_d, rho_t, Q_ss_new[k], p, Tbar[k, 1], 0.0)
-        rho_vs = rho_v_sat(Tk_run, p / 100.0)
-        rho_v = clamp(Q_ss_new[k] + rho_vs, 0.0, rho_v_max)
-        rho_c = rho_t - rho_d - rho_v
+        # VERIFY the run-time outcome through the driver's own expressions, rather than
+        # assuming the algebra above reached it.
+        Tk_run = retrieve_temperature(M, rho_d, rho_t, rho_c_new[k])
+        rho_vs = rho_v_sat(Tk_run, p_hPa)
+        q_c = rho_c_new[k] / rho_d
+        S = Q_ss_new[k] / rho_vs
+        # QSSREL is inert but must still vanish for a true discrete fixed point; it is
+        # scaled by rho_vs so the tolerance means "a relative supersaturation of 1e-10".
+        rel = (Q_ss_new[k] - (rho_v_new[k] - rho_vs)) / rho_vs
         if cloudy
-            # Qdot is identically zero here; what must not happen is the clamp eating
-            # the base cloud, which would make the base state buoyant.
-            rho_c > 0.0 || error("consistent_qss_reference: the diagnostic clamp " *
-                "removes the base cloud at level $k (z = $(z[k]) m): rho_cbar = " *
-                "$(rho_cbar[k, 1]) kg/m^3 in the reference but the resting partition " *
-                "gives rho_c = $rho_c at T = $Tk_run K, p = $(p/100.0) hPa. The " *
+            # What must not happen is losing the base cloud, which is what makes a
+            # saturated base neutrally buoyant.
+            rho_c_new[k] > 0.0 || error("consistent_qss_reference: the saturation solve " *
+                "leaves no cloud at level $k (z = $(z[k]) m): rho_cbar = " *
+                "$(rho_cbar[k, 1]) kg/m^3 in the reference but the saturated partition " *
+                "gives rho_c = $(rho_c_new[k]) at T = $Tk_run K, p = $p_hPa hPa. The " *
                 "reference's (p, rho_d, rho_t, E_t) are not consistent with a " *
                 "saturated state.")
+            abs(rel) <= 1.0e-10 || error("consistent_qss_reference: the saturation " *
+                "solve did not converge at level $k (z = $(z[k]) m): rho_v - rho_vs = " *
+                "$(rho_v_new[k] - rho_vs) kg/m^3 (relative $rel), so the Q_ss " *
+                "reconciliation would fire on the resting base.")
         else
-            q_c = max(rho_c, 0.0) / rho_d
-            S = Q_ss_new[k] / rho_vs
             # Exactly the two gates in `qss_condensation_rates`; failing either leaves
             # invtau_c > 0 and the reference condenses at rest.
             (q_c <= 1.0e-8 && S <= 1.0e-4) || error("consistent_qss_reference: the " *
                 "reference still condenses at level $k (z = $(z[k]) m): q_c = $q_c " *
                 "(needs <= 1e-8), S = $S (needs <= 1e-4), T = $Tk_run K, " *
-                "p = $(p/100.0) hPa. A saturated base state needs a condensate-bearing " *
+                "p = $p_hPa hPa. A saturated base state needs a condensate-bearing " *
                 "reference (rho_c > 0), not a condensing one.")
         end
     end
 
-    # Value slot EXACT (the fixed point depends on it bit-for-bit); derivative slots
+    # Value slots EXACT (the fixed point depends on them bit-for-bit); derivative slots
     # from a spline fit of those values (they multiply w == 0 at rest).
-    Q_ssbar = zeros(Float64, n, 3)
-    column.uMish[:] .= Q_ss_new
-    Btransform!(column)
-    Atransform!(column)
-    Q_ssbar[:, 1] .= Q_ss_new
-    Q_ssbar[:, 2] .= Ixtransform(column)
-    Q_ssbar[:, 3] .= Ixxtransform(column)
+    fit3 = function (vals)
+        prof = zeros(Float64, n, 3)
+        column.uMish[:] .= vals
+        Btransform!(column)
+        Atransform!(column)
+        prof[:, 1] .= vals
+        prof[:, 2] .= Ixtransform(column)
+        prof[:, 3] .= Ixxtransform(column)
+        return prof
+    end
+
+    Q_ssbar = fit3(Q_ss_new)
+    # A cloud-free base leaves the partition untouched, so its profiles stay the objects
+    # they already were — no refit, hence no chance of perturbing a working reference.
+    rho_cbar_out = cloudy_levels == 0 ? ref.rho_cbar : fit3(rho_c_new)
+    rho_vbar_out = cloudy_levels == 0 ? ref.rho_vbar : fit3(rho_v_new)
 
     return Springsteel.PressureReferenceState(
-        ref.pbar, ref.rho_dbar, ref.rho_vbar, ref.rho_cbar, ref.rho_tbar,
+        ref.pbar, ref.rho_dbar, rho_vbar_out, rho_cbar_out, ref.rho_tbar,
         ref.Tbar, ref.E_tbar, Q_ssbar, ref.sound_speed_sq)
 end
 
@@ -566,8 +590,11 @@ end
 import Springsteel: ref_pressure, ref_rho_t, ref_total_energy, ref_qss
 
 # Canonical slot order for the total-energy set (u=4, w=5 in the shared-machinery
-# positions used by the other XZ sets).
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+# positions used by the other XZ sets). rho_c is APPENDED at 9 rather than placed
+# next to rho_r: slots 1-8 appear as hardcoded literals throughout the kernel, the
+# acoustic solvers and mc_boundary_layer.jl, and appending keeps every one valid
+# (the same rule MC_VARS_CYL follows for v — see the comment there).
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
 
 # ── Rigid-wall pressure compatibility condition ───────────────────────────────
 
@@ -730,6 +757,91 @@ function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0)
     return grid
 end
 
+# ── Water positivity ───────────────────────────────────────────────────────────
+
+"""
+    clamp_water!(mtile, colstart, colend)
+
+Floor the prognostic condensate and rain of one column at zero, and cap them by the
+water actually present. Negative water is not a state the equation set may hold.
+
+**This is conservative, not a fix-up.** `rho_t` is prognostic and the vapor is the
+residual `ρ_v = ρ_t − ρ_d − ρ_c − ρ_r`, so raising `ρ_c` from `−δ` to 0 lowers `ρ_v` by
+exactly `δ` — total water `ρ_w` never moves, `E_t` is untouched, and
+[`retrieve_temperature`](@ref) turns the `δ` increase in `ρ_liq` into precisely the
+latent heat of condensing `δ` of vapor. Mass, water and energy are conserved by
+construction; the floor is an adiabatic phase change, not a source term. (That is a
+direct consequence of keeping `ρ_t` prognostic — with the total density diagnosed as a
+sum, the same floor would create mass out of nothing.)
+
+Two rules, in order, on the TOTALS (`ρ_c = ρ_c' + ρ̄_c`, so the perturbation floor is
+`−ρ̄_c`):
+
+1. `ρ_c, ρ_r ← max(·, 0)` — the deficit is borrowed from vapor.
+2. If `ρ_c + ρ_r > ρ_w` (i.e. `ρ_v < 0`), take the excess out of `ρ_c` first, then
+   `ρ_r` — evaporation. Only reachable from an already badly wrong water field.
+
+Why it is needed at all: the cubic-spline Galerkin filter and the AB3 advection both
+ring at grid scale near a sharp condensate edge, and O01 records `ρ_r` undershoots of
+~-1.8 g/m³ under its rain shafts. Applied to `var_np1` at the END of the column step
+(after the acoustic solve and the vertical diffusion), so the values entering the
+patch-level fit are admissible.
+
+The water it moves is accumulated into `mtile.mc_water_clamp` and reported. A floor that
+fires steadily is a defect to chase — grid-scale ringing, a bad initial state, a timestep
+past its limit — and the point of making `ρ_c` prognostic was to stop hiding water
+bookkeeping inside a `max()`.
+"""
+function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    vars = mtile.model.grid_params.vars
+    rhod_i = vars["rho_d"]
+    rhot_i = vars["rho_t"]
+    rhor_i = vars["rho_r"]
+    rhoc_i = vars["rho_c"]
+    vnp1 = mtile.var_np1
+    rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
+    rho_tbar = view(ref_rho_t(mtile.ref_state), :, 1)
+    rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
+
+    moved = 0.0
+    @inbounds for (k, i) in enumerate(colstart:colend)
+        rho_c = vnp1[i, rhoc_i] + rho_cbar[k]
+        rho_r = vnp1[i, rhor_i]
+        if rho_c < 0.0
+            moved -= rho_c
+            rho_c = 0.0
+        end
+        if rho_r < 0.0
+            moved -= rho_r
+            rho_r = 0.0
+        end
+        # Rule 2: the condensate cannot exceed the water that is there.
+        rho_w = (vnp1[i, rhot_i] + rho_tbar[k]) - (vnp1[i, rhod_i] + rho_dbar[k])
+        excess = (rho_c + rho_r) - rho_w
+        if excess > 0.0
+            moved += excess
+            take = min(excess, rho_c)
+            rho_c -= take
+            rho_r = max(rho_r - (excess - take), 0.0)
+        end
+        vnp1[i, rhoc_i] = rho_c - rho_cbar[k]
+        vnp1[i, rhor_i] = rho_r
+    end
+    @inbounds mtile.mc_water_clamp[Threads.threadid()] += moved
+    return nothing
+end
+
+"""
+    water_clamp_total(mtile) -> Float64
+
+Total water mass density [kg/m³, summed over gridpoints and steps] moved by
+[`clamp_water!`](@ref) on this tile so far. Zero is the expected value; a growing number
+means the condensate field is ringing and wants investigating, not a larger tolerance.
+"""
+water_clamp_total(mtile::ModelTile) =
+    isempty(mtile.mc_water_clamp) ? 0.0 : sum(mtile.mc_water_clamp)
+
 # ── Equation set ───────────────────────────────────────────────────────────────
 
 """
@@ -738,14 +850,16 @@ end
 Total-energy moist compressible equation set — the geometry-generic master driver.
 Prognostic slots (perturbations vs the `PressureReferenceState` except u, w, rho_r,
 and v on the cylindrical geometries): p' [Pa], rho_d', rho_t', u, w, E_t' [J/m^3],
-Q_ss' [kg/m^3], rho_r (+ tangential v, slot 9, on the cylinders).
+Q_ss' [kg/m^3], rho_r, rho_c' (+ tangential v, slot 10, on the cylinders).
 
-Each step the temperature is retrieved from `retrieve_temperature`, the water
-partition follows diagnostically (rho_v = Q_ss + rho_vs, rho_c residual), and the
-condensation rate is the limited supersaturation relaxation. The energy equation
-carries no condensation source (exact first law); the pressure equation's
-condensation coefficient is (L_v - R_v*C_pt*T/R_m). See
-reference/Scythe_moist_compressible.tex.
+Each step the CLOSED-FORM `retrieve_temperature` gives T from the prognostic liquid
+density, the vapor follows as the residual rho_v = rho_t - rho_d - rho_c - rho_r, and
+the condensation rate is the limited supersaturation relaxation, which moves mass
+between rho_c and the vapor at fixed rho_t and E_t. The energy equation carries no
+condensation source (exact first law); the pressure equation's condensation
+coefficient is (L_v - R_v*C_pt*T/R_m). See reference/Scythe_moist_compressible.tex and,
+for why the condensate is prognostic rather than the residual it used to be,
+reference/HANDOFF_DIAGNOSED_CLOUD.md.
 
 Everything geometry-specific — the derivative-slot mapping, metric and curvature
 terms, and the tangential-wind machinery — is dispatched on the singleton `geom`
@@ -870,6 +984,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     etv = mc_slot_views(grid, colstart, colend, 6, geom)   # E_t'
     qsv = mc_slot_views(grid, colstart, colend, 7, geom)   # Q_ss'
     rrv = mc_slot_views(grid, colstart, colend, 8, geom)   # rho_r (rho_rbar = 0)
+    rcv = mc_slot_views(grid, colstart, colend, 9, geom)   # rho_c'
     vv  = mc_v_views(geom, grid, colstart, colend)         # tangential v (cylinders)
 
     pp = pv.f;      pp_x = pv.f_x;         pp_z = pv.f_z
@@ -880,6 +995,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     E_tp = etv.f;   E_tp_x = etv.f_x;      E_tp_z = etv.f_z
     Q_ssp = qsv.f;  Q_ssp_x = qsv.f_x;     Q_ssp_z = qsv.f_z
     rho_rp = rrv.f; rho_rp_x = rrv.f_x;    rho_rp_z = rrv.f_z; rho_rp_zz = rrv.f_zz
+    rho_cp = rcv.f; rho_cp_x = rcv.f_x;    rho_cp_z = rcv.f_z; rho_cp_zz = rcv.f_zz
 
     # Reference state (pressure-based). Views, not `[:,1]` copies: these are read-only and
     # loop-invariant, so copying them allocated a fresh kDim vector per column per timestep.
@@ -893,7 +1009,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     E_tbar_z = view(ref_total_energy(refstate),:,2)
     Q_ssbar = view(ref_qss(refstate),:,1)
     Q_ssbar_z = view(ref_qss(refstate),:,2)
-    Tbar = view(refstate.Tbar,:,1)
+    rho_cbar = view(Springsteel.ref_rho_c(refstate),:,1)
+    rho_cbar_z = view(Springsteel.ref_rho_c(refstate),:,2)
     # LOCAL reference sound-speed-squared profile γ̄_m(z)·p̄/ρ̄_t (see
     # mc_reference_diagnostics) — the acoustic linearization must use the local
     # value so the explicit remainder is O(perturbation) at every level; the
@@ -910,6 +1027,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     rho_t = S.rho_t; @. rho_t = rho_tp + rho_tbar
     E_t = S.E_t;     @. E_t = E_tp + E_tbar
     Q_ss = S.Q_ss;   @. Q_ss = Q_ssp + Q_ssbar
+    rho_c = S.rho_c; @. rho_c = rho_cp + rho_cbar
     rho_r = rho_rp
 
     # Total vertical gradients (perturbation + reference)
@@ -918,21 +1036,22 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     rho_t_z = S.rho_t_z; @. rho_t_z = rho_tp_z + rho_tbar_z
     E_t_z = S.E_t_z;     @. E_t_z = E_tp_z + E_tbar_z
     Q_ss_z = S.Q_ss_z;   @. Q_ss_z = Q_ssp_z + Q_ssbar_z
+    rho_c_z = S.rho_c_z; @. rho_c_z = rho_cp_z + rho_cbar_z
 
-    # Diagnostic thermodynamic state: T from the total-energy retrieval, then the
-    # water partition follows from the prognostic supersaturation.
+    # Diagnostic thermodynamic state. The condensate is PROGNOSTIC, so the liquid
+    # density is known and the temperature retrieval is closed-form; the vapor is the
+    # residual of the water masses. See the file header for why this direction and not
+    # the other one.
     ke = S.ke;   mc_ke!(ke, geom, u, w, vv)
     geo = S.geo; @. geo = ke + (gravity * z)
     M = S.M;     @. M = p + E_t - (rho_t * geo)
-    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, Q_ss, p, Tbar, rho_r)
+    rho_liq = S.rho_liq; @. rho_liq = rho_c + rho_r
+    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq)
     p_hPa = S.p_hPa;   @. p_hPa = p / 100.0
     rho_vs = S.rho_vs; @. rho_vs = rho_v_sat(Tk, p_hPa)
-    # Clamped diagnostic partition (see retrieve_temperature): vapor within
-    # [0, total water - rain], cloud the residual
-    rho_v = S.rho_v; @. rho_v = clamp(Q_ss + rho_vs, 0.0, max(rho_t - rho_d - rho_r, 0.0))
-    rho_c = S.rho_c; @. rho_c = rho_t - rho_d - rho_v - rho_r
+    rho_v = S.rho_v; @. rho_v = rho_t - rho_d - rho_liq
     q_v = S.q_v;     @. q_v = rho_v / rho_d
-    q_l = S.q_l;     @. q_l = (max(rho_c, 0.0) + rho_r) / rho_d
+    q_l = S.q_l;     @. q_l = rho_liq / rho_d
     C_vt = S.C_vt;   @. C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
     R_m = S.R_m;     @. R_m = Rd + (q_v * Rv)
     C_pt = S.C_pt;   @. C_pt = C_vt + R_m
@@ -950,9 +1069,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
 
     # Condensation: limited supersaturation relaxation with the energy-consistent
     # psychrometric factor, split between the cloud and rain channels in proportion to
-    # their inverse timescales (1/tau = 1/tau_c + 1/tau_r). rho_v and rho_c are
-    # diagnostic, so no separate condensation-adjustment step is needed after the
-    # timestep. With the rain channel inert (N_r = 0), Qdot is bit-identical to the
+    # their inverse timescales (1/tau = 1/tau_c + 1/tau_r). Qdot moves mass between the
+    # prognostic condensate (slot 9) and the residual vapor at fixed rho_t and E_t, so
+    # the latent heat comes out of the retrieval and no adjustment step is needed after
+    # the timestep. With the rain channel inert (N_r = 0), Qdot is bit-identical to the
     # single-category closure and Qdot_r is exactly zero.
     Q_s = S.Q_s;   @. Q_s = Q_s_energy(Tk, p, rho_d, q_v, q_l)
     Qdot = S.Qdot          # cloud channel
@@ -963,23 +1083,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # rain but leaves the cloud channel running, so a run advertised as "no
     # physics" still evaporates cloud every step.
     #
-    # WHY THAT MATTERS. rho_c is not prognostic -- it is the residual
-    # rho_t - rho_d - rho_v - rho_r, with rho_v = clamp(Q_ss + rho_vs, 0, rho_v_max)
-    # from the retrieval. In cloud-free air the true Q_ss sits exactly ON the
-    # ceiling Q_hi, so any fit-level error in the four fields that make up the
-    # residual puts rho_c slightly ABOVE zero and the model sees cloud that is not
-    # there. On the balanced TC vortex that is rho_c ~ 2e-6 kg/m^3 over ~15 % of
-    # nest 1, which evaporates at ~4e-6 kg/m^3/s and accounts for ALL of the t = 0
-    # pressure tendency (3.19 Pa/s measured, 3.3 predicted from
-    # (R_m/C_vt)(L_v - R_v C_pt T/R_m) Qdot).
-    #
-    # Being a diagnosed residual is what makes it a SUSTAINED sink rather than a
-    # startup transient: it is regenerated from the same persistent fit residual at
-    # every step and evaporated again, so the mass removed per unit time scales
-    # like rho_c/ts -- halving the timestep doubles the drain. Switch this off to
-    # separate "the initial state is not a discrete steady state" from "the
-    # cloud/vapor partition is being retrieved from a residual of nearly equal
-    # fitted fields".
+    # It was introduced to diagnose the phantom-cloud drain (see the file header),
+    # back when rho_c was the residual and a subsaturated column could carry
+    # ~2e-6 kg/m^3 of cloud that was not there, evaporate it, and have it regenerated
+    # from the same fit error on the next step. With rho_c prognostic that pathway is
+    # closed -- a subsaturated column has rho_c = 0 exactly and both gates shut, so
+    # this switch should now make NO difference to a cloud-free initial state. That is
+    # a useful regression check in its own right (model_tests/tc_discrete_balance.jl),
+    # and it remains the clean separator between "the initial state is not a discrete
+    # steady state" and "the moisture is doing something".
     if get(model.options, :condensation, true)::Bool
         for i in 1:length(Qdot)
             Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
@@ -996,7 +1108,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
 
     # Warm-rain conversion and sedimentation. Autoconversion + collection move cloud to
     # rain — a liquid-to-liquid exchange, thermodynamically inert (T, p, E_t, Q_ss all
-    # unmoved; cloud is the diagnostic residual, so only slot 8 carries a source). The
+    # unmoved; with the condensate prognostic it is now an equal and opposite pair of
+    # sources on slots 9 and 8, and rho_liq — hence the retrieval — does not move). The
     # sedimentation flux F_r = rho_r*Vt (Vt <= 0) moves rain mass AND the energy it
     # carries: e_l(T) + ke + gz per kg of liquid, with e_l = C_pv*T - L_v(T) in the
     # BF02 internal-energy convention. Its divergence sources rho_r, rho_t and E_t with
@@ -1283,13 +1396,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # heating as well as the divergence work (friction holds T, so it does not enter; the
     # VERTICAL diffusive heating is applied as a slaved δQ_ss inside diffusion_timestep_mc).
     # The condensation contribution is -Q̇_cond(1+Q_s) (= -Q_ss/τ when the rate is unlimited).
-    # QSSREL relaxes Q_ss onto the water-mass-admissible interval; it is exactly zero
-    # wherever cloud exists.
+    # QSSREL reconciles the prognostic Q_ss with the vapor the water masses actually imply
+    # (see qss_relaxation) — Q_ss is redundant now that rho_c is prognostic, and this is
+    # what keeps the two from drifting apart under splitting error.
     dT_nc = S.dT_nc; @. dT_nc = ((-p * div) + QDOT_TH) / (rho_d * C_vt)
     dp_nc = S.dp_nc; @. dp_nc = (-gamma_m * p * div) + ((R_m / C_vt) * QDOT_TH)
     SATF = S.SATF;   @. SATF = (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
     QSSREL = S.QSSREL
-    @. QSSREL = qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau_qss)
+    @. QSSREL = qss_relaxation(Q_ss, rho_v, rho_vs, tau_qss)
     mc_advect!(ADV, geom, u, w, vv, r, Q_ssp_x, Q_ss_z, qsv.f_l)
     FORCING .= @. (-Q_ss * div) + SATF - ((Qdot + Qdot_r) * (1.0 + Q_s)) + QSSREL
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
@@ -1300,6 +1414,22 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_rp_x, rho_rp_z, rrv.f_l)
     @turbo FORCING .= @. (-rho_r * div) + Qdot_r + AUTO_COLL - Fr_z
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
+
+    # Cloud partial density (slot 9): the same advective product-rule continuity as every
+    # other density, with the cloud-channel condensation as its source and autoconversion
+    # + collection as its sink (the equal and opposite pair of slot 8's AUTO_COLL). No
+    # sedimentation — cloud droplets do not fall in this scheme — and no rho_t source:
+    # condensation is INTERNAL to the water, moving mass between this slot and the
+    # residual vapor at fixed total density.
+    #
+    # This is the slot the whole formulation exists for. Because it is prognostic rather
+    # than a residual of rho_t - rho_d - rho_v - rho_r, cloud in subsaturated air can only
+    # arrive by advection or nucleation, and fit-level error in the density fields lands
+    # in the vapor (where it is 5e-5 of the field) instead of manufacturing condensate
+    # (where it was O(1) of the field). See reference/HANDOFF_DIAGNOSED_CLOUD.md.
+    mc_advect!(ADV, geom, u, w, vv, r, rho_cp_x, rho_c_z, rcv.f_l)
+    @turbo FORCING .= @. (-rho_c * div) + Qdot - AUTO_COLL
+    @turbo expdot[colstart:colend,9] .= @. ADV + FORCING
 
     # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
     #
@@ -1325,7 +1455,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # convention); > 0 is a constant diffusivity. Same K*grad^2 (not div(K grad))
     # approximation as the momentum and heat terms.
     if Khdiff_water != 0.0
-        WLAP = S.KDIFF                    # both free again after slot 8
+        WLAP = S.KDIFF                    # both free again after slot 9
         WLAP2 = S.FORCING
         if Khdiff_water < 0.0
             use_smag || error("physical_params[:Khdiff_water] < 0 selects the " *
@@ -1337,6 +1467,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             @turbo expdot[colstart:colend,3] .+= @. (WLAP - WLAP2) / Sc_t
             mc_w_kdiff!(WLAP, geom, K_smag, rrv, r)
             @turbo expdot[colstart:colend,8] .+= @. WLAP / Sc_t
+            mc_w_kdiff!(WLAP, geom, K_smag, rcv, r)
+            @turbo expdot[colstart:colend,9] .+= @. WLAP / Sc_t
             mc_w_kdiff!(WLAP, geom, K_smag, qsv, r)
             @turbo expdot[colstart:colend,7] .+= @. WLAP / Sc_t
         else
@@ -1345,6 +1477,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             @turbo expdot[colstart:colend,3] .+= @. WLAP - WLAP2
             mc_w_kdiff!(WLAP, geom, Khdiff_water, rrv, r)
             @turbo expdot[colstart:colend,8] .+= WLAP
+            mc_w_kdiff!(WLAP, geom, Khdiff_water, rcv, r)
+            @turbo expdot[colstart:colend,9] .+= WLAP
             mc_w_kdiff!(WLAP, geom, Khdiff_water, qsv, r)
             @turbo expdot[colstart:colend,7] .+= WLAP
         end
@@ -1386,7 +1520,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # saturation chain rule is linear), so the lines above stay frozen and
     # louis_bl = false is bit-identical. See mc_boundary_layer.jl.
     if louis_bl
-        mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv,
+        mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
                      expdot, l_inf, Cd_param, sfc_wind_factor,
                      surface_fluxes, Ck, SST, U_min)
     end
@@ -1396,8 +1530,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # second-derivative eigenvalues scale as N^4. The acoustic solver owns impdot[w],
     # impdot[p] and impdot[E_t], so these live in diffdot instead. Slot 6 (E_t) carries the
     # HEAT tendency in entropy space (not an energy tendency): diffusion_timestep_mc solves
-    # for s_t' and maps the increment onto (p, E_t, Q_ss). Slots 3/7/8 carry the water
-    # tendencies (total water rho_w' = rho_t' - rho_d', vapor rho_v', rain rho_r).
+    # for s_t' and maps the increment onto (p, E_t, Q_ss). Slots 3/8/9 carry the water
+    # tendencies (total water rho_w' = rho_t' - rho_d', rain rho_r, cloud rho_c').
     #
     # The heat variable is the full moist entropy s_t (vapor + liquid contribution), a
     # retrieval-dependent diagnostic; the resting base is still bit-preserved because
@@ -1426,19 +1560,16 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             @turbo diffdot[colstart:colend,6] .= Kvdiff_heat .* stage_zz
         end
         if Kvdiff_water > 0.0
-            # Total water and rain are combinations of prognostic slots, so their ∂zz
-            # comes straight from the grid's derivative slots; vapor is diagnosed, so it
-            # takes the column transform like s_t. rho_v' rides on rho_t's operator
-            # (scratch column 3) to match the implicit `water` matrix.
+            # EVERY diffused water species is now a combination of prognostic slots, so
+            # every ∂zz comes straight from the grid's derivative slots: total water
+            # rho_w' = rho_t' - rho_d', cloud, rain. The vapor increment is implied
+            # (delta_rho_v = delta_rho_w - delta_rho_c - delta_rho_r), which is what
+            # retires the column transform of the DIAGNOSED rho_v this block used to
+            # need — a fit of a diagnosed field, with the reference-profile subtraction
+            # required to keep the resting base quiet.
             @turbo diffdot[colstart:colend,3] .= @. Kvdiff_water * (rho_tp_zz - rho_dp_zz)
             @turbo diffdot[colstart:colend,8] .= @. Kvdiff_water * rho_rp_zz
-            v_col = scratch_column(mtile, 3)
-            v_col.uMish .= rho_v .- mtile.mc_ref_diag.rho_vbar
-            Btransform!(v_col)
-            Atransform!(v_col)
-            stage_zz = S.stage_zz
-            Ixxtransform(v_col, stage_zz)
-            @turbo diffdot[colstart:colend,7] .= Kvdiff_water .* stage_zz
+            @turbo diffdot[colstart:colend,9] .= @. Kvdiff_water * rho_cp_zz
         end
     end
 
@@ -1469,12 +1600,17 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     semiimplicit_adjustment_p(mtile, colstart, colend, t)
 
     # Implicit vertical diffusion of u, w (friction sink), the moist entropy s_t' (heat,
-    # slaved onto p, E_t, Q_ss) and the water species (rho_w', rho_v', rho_r). Skipped
+    # slaved onto p, E_t, Q_ss) and the water species (rho_w', rho_c', rho_r). Skipped
     # when every coefficient is zero: a vertical solve is not the identity there — it
     # refits the column and reapplies the spectral filter.
     if Kvdiff > 0.0 || Kvdiff_heat > 0.0 || Kvdiff_water > 0.0
         diffusion_timestep_mc(mtile, colstart, colend, t, geom)
     end
+
+    # Negative water is not a representable state (see clamp_water!). LAST, so that
+    # nothing downstream of it can reintroduce one: the acoustic solve and the vertical
+    # diffusion have both had their say by here.
+    clamp_water!(mtile, colstart, colend)
 
 end
 
@@ -1482,31 +1618,31 @@ end
 #    equation_set string to one of these by name; all keep the moist_compressible
 #    prefix so uses_pressure_reference gates their scratch/reference plumbing) ──
 
-"Total-energy moist compressible set on a Cartesian XZ slice (RiRk/RZ grid), 8 vars."
+"Total-energy moist compressible set on a Cartesian XZ slice (RiRk/RZ grid), 9 vars."
 moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCCartesianXZ())
 
 """
 Axisymmetric r–z cylinder on the RiRk/RZ grid (gridpoint column 1 reinterpreted as
 radius, so the domain must sit at r > 0), with prognostic tangential wind v
-(`MC_VARS_CYL`, 9 vars) and optional f-plane rotation (`physical_params[:f]`).
+(`MC_VARS_CYL`, 10 vars) and optional f-plane rotation (`physical_params[:f]`).
 """
 moist_compressible_axisym(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCAxisymRZ())
 
-"3D r–λ–z cylinder on the RLR grid (`MC_VARS_CYL`, 9 vars, f-plane rotation optional)."
+"3D r–λ–z cylinder on the RLR grid (`MC_VARS_CYL`, 10 vars, f-plane rotation optional)."
 moist_compressible_RLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCCylindricalRLR())
 
 """
-3D Cartesian x–y–z box on the RRR grid (`MC_VARS_CYL`, 9 vars: v is the y-wind,
+3D Cartesian x–y–z box on the RRR grid (`MC_VARS_CYL`, 10 vars: v is the y-wind,
 f-plane rotation optional — +f v / −f u with no curvature terms).
 """
 moist_compressible_RRR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCCartesianRRR())
 
 """
-3D spherical θ–λ–z shell on the SLR grid (`MC_VARS_CYL`, 9 vars: u is the
+3D spherical θ–λ–z shell on the SLR grid (`MC_VARS_CYL`, 10 vars: u is the
 θ-ward wind, v the zonal wind). Shallow atmosphere with metric radius
 `physical_params[:sphere_radius]` (default Earth) and full latitude-dependent
 Coriolis f = 2Ω cosθ from `physical_params[:Omega]` (NOT the cylinders' f-plane
@@ -1516,31 +1652,32 @@ moist_compressible_SLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int6
     mc_driver!(mtile, colstart, colend, t, MCSphericalSLR())
 
 """
-    qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau)
+    qss_relaxation(Q_ss, rho_v, rho_vs, tau)
 
-Relaxation of the prognostic supersaturation density onto the water-mass-admissible
-interval of [`qss_admissible_bounds`](@ref), `-(Q_ss - clamp(Q_ss, Q_lo, Q_hi))/τ`
-[kg/m³/s].
+Reconciliation of the prognostic supersaturation density toward its diagnosed value,
+`-(Q_ss - (ρ_v - ρ_vs))/τ` [kg/m³/s].
 
-This is a consistency restoration, not a numerical limiter: `Q_ss = ρ_v − ρ_vs` and the
-vapor density is bounded by the prognostic water masses, so an excursion outside
-`[Q_lo, Q_hi]` is discretization drift and nothing else. The term is
+With the condensate prognostic, the water masses already determine the vapor density
+(`ρ_v = ρ_t - ρ_d - ρ_c - ρ_r`), so `Q_ss = ρ_v - ρ_vs(T,p)` is formally REDUNDANT. It is
+carried prognostically anyway because it is the quantity the condensation closure reads, and
+a prognostic, advected `Q_ss` is smooth where the diagnosed difference of two large nearly
+equal numbers is not: the fit-level error that lands in ρ_v (~1e-6 kg/m³) is 5e-5 of ρ_v but
+would be a comparable fraction of the supersaturation itself near saturation, right at the
+1e-4 nucleation gate.
 
-- exactly zero in cloudy air, the strict interior of the interval, where Q_ss carries the
-  vapor/cloud partition and is load-bearing;
-- thermodynamically inert wherever it does fire, because `retrieve_temperature`'s clamp is
-  already saturated there and T therefore does not depend on Q_ss;
-- inactive on supersaturated cloud-free air, which sits exactly at the ceiling `Q_hi > 0`,
-  so nucleation is not suppressed;
-- free of any effect on the conserved rho_d, rho_t and E_t.
+Redundancy has to be reconciled or the two drift apart under splitting error, and this is
+that reconciliation — the "extra adjustment step on a slower timescale than the timestep" of
+reference/HANDOFF_DIAGNOSED_CLOUD.md. `τ = physical_params[:tau_qss]` (default 10 s) is
+deliberately long compared with the timestep, so the transport keeps the smooth field and
+only the accumulated inconsistency is removed.
 
-In dry air the interval is the single point `-ρ_vs`, which is where Q_ss belongs: with no
-water, ρ_v ≡ 0 regardless of Q_ss, and nothing else restores it.
+It is free of any effect on the conserved ρ_d, ρ_t and E_t, and — unlike its predecessor,
+which relaxed onto water-mass bounds — it is now thermodynamically inert unconditionally:
+[`retrieve_temperature`](@ref) does not read `Q_ss` at all.
 """
-function qss_relaxation(Q_ss, rho_d, rho_t, rho_r, rho_vs, tau)
+@inline function qss_relaxation(Q_ss, rho_v, rho_vs, tau)
 
-    Q_lo, Q_hi = qss_admissible_bounds(rho_d, rho_t, rho_r, rho_vs)
-    return -(Q_ss - clamp(Q_ss, Q_lo, Q_hi)) / tau
+    return -(Q_ss - (rho_v - rho_vs)) / tau
 end
 
 # ── Semi-implicit adjustment ───────────────────────────────────────────────────
@@ -1752,8 +1889,8 @@ end
     diffusion_timestep_mc(mtile, colstart, colend, t)
 
 Implicit vertical diffusion of `u` and `w` (momentum, `Kvdiff`), the moist entropy `s_t'`
-(heat, `Kvdiff_heat`) and the water species (`Kvdiff_water`: total water `rho_w'`, vapor
-`rho_v'`, rain `rho_r`) for the total-energy set, using the AI2* off-centered weights
+(heat, `Kvdiff_heat`) and the water species (`Kvdiff_water`: total water `rho_w'`, cloud
+`rho_c'`, rain `rho_r`) for the total-energy set, using the AI2* off-centered weights
 (`+1.25 N^{n+1} - 1.0 N^n + 0.75 N^{n-1}`) with the tendency history in `mtile.diffdot_*`.
 It needs its own tendency channel because the acoustic solve owns `impdot[w/p/E_t]`.
 The momentum, heat and water solves are gated independently on their coefficients: a K = 0
@@ -1765,9 +1902,10 @@ post-diffusion `w` — momentum diffusion is a force, not a mass flux, and they 
 advanced with the acoustic flux divergence (which conserves `∫rho_t'`). The residual is the
 usual O(ts·Kv) splitting error.
 
-The heat and water paths retrieve the post-acoustic temperature (the star state) with the
-full Newton retrieval; the resting base stays bit-preserved because the reference profiles
-`s_tbar`/`rho_vbar` come from the same pipeline (`mc_reference_diagnostics`).
+The heat and water paths retrieve the post-acoustic temperature (the star state) through
+the same closed-form retrieval `mc_driver!` uses; the resting base stays bit-preserved
+because the reference profile `s_tbar` comes from the same pipeline
+(`mc_reference_diagnostics`).
 
 Energy routing:
 
@@ -1782,8 +1920,8 @@ Energy routing:
   retrieval: `δF(T) ≡ 0` under this map), moving the partial pressure and the internal +
   potential energy the water carries:
   `δp = R_v T δρ_v`, `δE_t = (C_pv T − L_v + ke + gz) δρ_w + (L_v − R_v T) δρ_v`,
-  `δQ_ss = δρ_v − ∂ρ_vs/∂p · δp`, with `δρ_c = δρ_w − δρ_v − δρ_r` implicit in the
-  residual. Each species' Neumann solve conserves its own `∫ρ`; `∫E_t` is conserved only
+  `δQ_ss = δρ_v − ∂ρ_vs/∂p · δp`, with the VAPOR increment `δρ_v = δρ_w − δρ_c − δρ_r`
+  implied. Each species' Neumann solve conserves its own `∫ρ`; `∫E_t` is conserved only
   approximately (the exact multicomponent enthalpy flux needs a flux form the per-column
   architecture excludes — see the handoff doc; the residual is O(K_water × vertical
   variation of e_l + gz) and shows up in the energy-drift diagnostic).
@@ -1803,6 +1941,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     et_index = vars["E_t"]
     qss_index = vars["Q_ss"]
     rhor_index = vars["rho_r"]
+    rhoc_index = vars["rho_c"]
 
     ts = mtile.model.ts
 
@@ -1817,8 +1956,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
     rho_tbar = view(ref_rho_t(mtile.ref_state),:,1)
     E_tbar = view(ref_total_energy(mtile.ref_state),:,1)
-    Q_ssbar = view(ref_qss(mtile.ref_state),:,1)
-    Tbar = view(mtile.ref_state.Tbar,:,1)
+    rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state),:,1)
     z = view(mtile.tilepoints,colstart:colend,zcoord(geom))
 
     S = @inbounds mtile.mc_scratch[Threads.threadid()]
@@ -1835,6 +1973,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     et_v = view(vnp1,colstart:colend,et_index)
     qss_v = view(vnp1,colstart:colend,qss_index)
     rhor_v = view(vnp1,colstart:colend,rhor_index)
+    rhoc_v = view(vnp1,colstart:colend,rhoc_index)
 
     u_star = S.df_u_star; copyto!(u_star, u_v)
     w_star = S.df_w_star; copyto!(w_star, w_v)
@@ -1856,26 +1995,28 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     Lv_star = S.df_Lv_star
     ke_star = S.df_ke_star
     stp_star = S.df_stp_star
+    rho_c_star = S.df_rho_c_star
+    rho_liq_star = S.df_rho_liq_star
     if do_heat || do_water
         E_t_star = S.df_E_t_star;   @. E_t_star = et_v + E_tbar
-        Q_ss_star = S.df_Q_ss_star; @. Q_ss_star = qss_v + Q_ssbar
         mc_ke_star!(ke_star, geom, u_star, w_star, v_star)
         M_star = S.df_M_star
         @. M_star = p_star + E_t_star - (rho_t_star * (ke_star + (gravity * z)))
-        @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, Q_ss_star,
-                                         p_star, Tbar, rhor_v)
+        # Same closed-form retrieval and residual partition as mc_driver!: the
+        # condensate is prognostic, so the star state needs no iteration and no clamp.
+        @. rho_c_star = rhoc_v + rho_cbar
+        @. rho_liq_star = rho_c_star + rhor_v
+        @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, rho_liq_star)
         @. p_hPa_star = p_star / 100.0
         @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
         @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
         rho_vs_star = S.df_rho_vs_star
         @. rho_vs_star = rho_v_sat(T_star, p_hPa_star)
-        @. rho_v_star = clamp(Q_ss_star + rho_vs_star, 0.0,
-                              max(rho_t_star - rho_d_star - rhor_v, 0.0))
+        @. rho_v_star = rho_t_star - rho_d_star - rho_liq_star
         q_v_star = S.df_q_v_star
         q_l_star = S.df_q_l_star
         @. q_v_star = rho_v_star / rho_d_star
-        @. q_l_star = (max(rho_t_star - rho_d_star - rho_v_star - rhor_v, 0.0) + rhor_v) /
-                      rho_d_star
+        @. q_l_star = rho_liq_star / rho_d_star
         @. C_vt_star = Cvd + (q_v_star * Cvv) + (q_l_star * Cl)
         @. R_m_star = Rd + (q_v_star * Rv)
         @. Lv_star = L_v(T_star)
@@ -1980,7 +2121,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     dE_w = S.df_dE_w
     if do_water
         _diffusion_water_step!(mtile, S, col, mats, ts, t, colstart, colend, z,
-                               rhod_v, rhot_v, rhor_v, p_v, qss_v)
+                               rhod_v, rhot_v, rhor_v, rhoc_v, p_v, qss_v)
     end
 
     # E_t update: keep the single fused add when the historical pair ran (bit-identical
@@ -2004,11 +2145,12 @@ end
 
 """
     _diffusion_water_step!(mtile, S, col, mats, ts, t, colstart, colend, z,
-                           rhod_v, rhot_v, rhor_v, p_v, qss_v)
+                           rhod_v, rhot_v, rhor_v, rhoc_v, p_v, qss_v)
 
 The water-species half of [`diffusion_timestep_mc`](@ref): AM2/AI2* staging and
-implicit solves for rho_w' and rho_v' (both on the rho_t operator) and rho_r (its
-own), then the fixed-temperature increment maps onto rho_t, rho_r, p and Q_ss.
+implicit solves for rho_w' (on the rho_t operator), rho_c' and rho_r (each on its
+own), then the fixed-temperature increment maps onto rho_t, rho_c, rho_r, p and Q_ss,
+with the vapor increment implied as drho_v = drho_w - drho_c - drho_r.
 The energy increment lands in `S.df_dE_w`; the CALLER adds it to E_t so the
 historical dE_visc + dE_h fusion stays bit-identical. Star-state fields
 (`df_T_star` etc.) are read from the scratch where the caller computed them.
@@ -2020,63 +2162,68 @@ stopped eliding its SubArray — one 64-byte heap allocation per column per step
 @noinline function _diffusion_water_step!(mtile::ModelTile, S, col, mats,
                                           ts::Float64, t::Int64,
                                           colstart::Int64, colend::Int64, z,
-                                          rhod_v, rhot_v, rhor_v, p_v, qss_v)
+                                          rhod_v, rhot_v, rhor_v, rhoc_v, p_v, qss_v)
     vars = mtile.model.grid_params.vars
     rhot_index = vars["rho_t"]
-    qss_index = vars["Q_ss"]
     rhor_index = vars["rho_r"]
+    rhoc_index = vars["rho_c"]
 
     T_star = S.df_T_star
     Lv_star = S.df_Lv_star
     ke_star = S.df_ke_star
     drvs_dp = S.df_drvs_dp
-    rho_v_star = S.df_rho_v_star
     dE_w = S.df_dE_w
 
+    # Every diffused species is prognostic now: total water (on the rho_t operator),
+    # cloud and rain. The VAPOR increment is the implied remainder — the mirror of the
+    # old convention, which solved the diagnosed rho_v' and implied the cloud.
     rw_star = S.df_rw_star; @. rw_star = rhot_v - rhod_v
-    rv_star = S.df_rv_star; @. rv_star = rho_v_star - mtile.mc_ref_diag.rho_vbar
+    rc_star = S.df_rc_star; copyto!(rc_star, rhoc_v)
 
     rwdot_n = view(mtile.diffdot_n,colstart:colend,rhot_index)
     rwdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhot_index)
-    rvdot_n = view(mtile.diffdot_n,colstart:colend,qss_index)
-    rvdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,qss_index)
+    rcdot_n = view(mtile.diffdot_n,colstart:colend,rhoc_index)
+    rcdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhoc_index)
     rrdot_n = view(mtile.diffdot_n,colstart:colend,rhor_index)
     rrdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,rhor_index)
 
     rw_nstar = S.df_rw_nstar
-    rv_nstar = S.df_rv_nstar
+    rc_nstar = S.df_rc_nstar
     rr_nstar = S.df_rr_nstar
     if (t == 1)
         @. rw_nstar = rw_star + (ts * 0.5 * rwdot_n)
-        @. rv_nstar = rv_star + (ts * 0.5 * rvdot_n)
+        @. rc_nstar = rc_star + (ts * 0.5 * rcdot_n)
         @. rr_nstar = rhor_v + (ts * 0.5 * rrdot_n)
     else
         @. rw_nstar = rw_star - (ts * rwdot_n) + (ts * 0.75 * rwdot_nm1)
-        @. rv_nstar = rv_star - (ts * rvdot_n) + (ts * 0.75 * rvdot_nm1)
+        @. rc_nstar = rc_star - (ts * rcdot_n) + (ts * 0.75 * rcdot_nm1)
         @. rr_nstar = rhor_v - (ts * rrdot_n) + (ts * 0.75 * rrdot_nm1)
     end
     rwdot_nm1 .= rwdot_n
-    rvdot_nm1 .= rvdot_n
+    rcdot_nm1 .= rcdot_n
     rrdot_nm1 .= rrdot_n
 
     h_rw = (t == 1) ? mats.water_first : mats.water
+    h_rc = (t == 1) ? mats.water_c_first : mats.water_c
     h_rr = (t == 1) ? mats.water_r_first : mats.water_r
     rw_np1 = S.df_rw_np1
-    rv_np1 = S.df_rv_np1
+    rc_np1 = S.df_rc_np1
     _vertical_solve!(col, h_rw, rw_nstar, mtile)
     copyto!(rw_np1, Itransform!(col))
-    _vertical_solve!(col, h_rw, rv_nstar, mtile)
-    copyto!(rv_np1, Itransform!(col))
+    _vertical_solve!(col, h_rc, rc_nstar, mtile)
+    copyto!(rc_np1, Itransform!(col))
     _vertical_solve!(col, h_rr, rr_nstar, mtile)
     rr_np1 = Itransform!(col)
 
     drw = S.df_drw; @. drw = rw_np1 - rw_star
-    drv = S.df_drv; @. drv = rv_np1 - rv_star
+    drc = S.df_drc; @. drc = rc_np1 - rc_star
     drr = S.df_drr; @. drr = rr_np1 - rhor_v
+    drv = S.df_drv; @. drv = drw - drc - drr
     @. dE_w = (((Cpv * T_star) - Lv_star + ke_star + (gravity * z)) * drw) +
               ((Lv_star - (Rv * T_star)) * drv)
 
     rhot_v .+= drw
+    rhoc_v .+= drc
     rhor_v .+= drr
     p_v .+= Rv .* T_star .* drv
     qss_v .+= drv .- (drvs_dp .* (Rv .* T_star .* drv))
@@ -2119,8 +2266,10 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
+    rho_c_i = vars["rho_c"]
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
 
     i = 1
@@ -2145,6 +2294,7 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
+            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
             i += 1
         end
     end
@@ -2167,8 +2317,10 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
+    rho_c_i = vars["rho_c"]
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
 
     i = 1
@@ -2190,6 +2342,7 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
+            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
             i += 1
         end
     end
@@ -2214,8 +2367,10 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
+    rho_c_i = vars["rho_c"]
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
     rho_vbar = Springsteel.ref_rho_v(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
 
@@ -2250,6 +2405,7 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
+            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
             i += 1
         end
     end
@@ -2274,8 +2430,10 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
+    rho_c_i = vars["rho_c"]
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
 
     i = 1
@@ -2327,6 +2485,7 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
+            patch.physical[i, rho_c_i, 1] = rho_c - rho_cbar[k, 1]
             i += 1
         end
     end

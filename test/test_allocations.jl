@@ -24,7 +24,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                              equation_set = "moist_compressible_XZ")
         cyl = equation_set != "moist_compressible_XZ"
         vars = cyl ? Scythe.MC_VARS_CYL :
-                     ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r"]
+                     ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
         scalar_bc = Dict(v => NeumannBC() for v in vars)
         bc_side = merge(scalar_bc, Dict("u" => DirichletBC()))
         bc_topbot = merge(scalar_bc, Dict("w" => DirichletBC()))
@@ -129,7 +129,8 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test isconcretetype(MC)
         @test Set(fieldnames(MC)) ==
             Set((:u, :u_first, :w, :w_first, :heat, :heat_first,
-                 :water, :water_first, :water_r, :water_r_first))
+                 :water, :water_first, :water_r, :water_r_first,
+                 :water_c, :water_c_first))
         # The retrieved reference diagnostics for the moist diffusion are concrete too
         @test isconcretetype(fieldtype(MT, :mc_ref_diag))
     end
@@ -147,7 +148,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         # every variable, every column, every timestep — 93 allocations each, and 60% of all
         # per-column allocations. They now borrow a persistent per-thread column.
         @test isconcretetype(fieldtype(MT, :scratch_columns))
-        @test size(mtile.scratch_columns) == (Threads.maxthreadid(), 8)
+        @test size(mtile.scratch_columns) == (Threads.maxthreadid(), 9)
 
         # Distinct object per (thread, variable): `semiimplicit_adjustment_p` holds the p- and
         # w-columns live simultaneously (p_nstar aliases the p-column's uMish), so handing it

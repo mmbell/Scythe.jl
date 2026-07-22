@@ -14,7 +14,7 @@ using SparseArrays
 
 @testset "Louis boundary layer + Smagorinsky (mc)" begin
 
-    import Springsteel.Thermodynamics: rho_v_sat, Rd, Rv, Cpd, gravity
+    import Springsteel.Thermodynamics: rho_v_sat, Rd, Rv, Cpd, Cvv, gravity
 
     # ──────────────────────────────────────────────
     # 1. Pure pieces: mixing length, drag coefficient
@@ -188,17 +188,36 @@ using SparseArrays
     # 4. Resting state: the BL adds exactly nothing
     # ──────────────────────────────────────────────
     @testset "resting column: BL contribution is zero" begin
+        # Differenced on/off, per this file's design (see the header): the assertion is
+        # that the BOUNDARY LAYER adds nothing at rest, which is not the same as the
+        # equation set having no resting tendency at all.
+        #
+        # It matters here. This tile's base is a saturated cloudy column, and the
+        # reference's pointwise water partition is not bit-identical to the one the
+        # model diagnoses from the FITTED densities -- they differ by the spline fit
+        # error, ~9e-8 kg/m^3 of vapor. qss_relaxation reconciles that at 1/tau, so
+        # slot 7 carries a resting tendency of ~9e-9 kg/m^3/s that belongs to the
+        # equation set, not to the BL. It is thermodynamically inert (the retrieval
+        # does not read Q_ss), it is bounded by the fit error rather than accumulating,
+        # and options[:consistent_qss_reference] removes it at the source. Crucially
+        # the CONDENSATE tendency is ~4e-18: no cloud is being manufactured at rest,
+        # which is the property this whole formulation exists to guarantee.
         mktempdir() do tmpdir
-            mtile, patch, model, gp, z = make_bl_mtile(tmpdir; louis_bl=true)
-            ncols = div(size(patch.physical, 1), gp.kDim)
+            m_on, p_on, _, gp, _ = make_bl_mtile(tmpdir; louis_bl=true)
+            m_off, p_off, _, _, _ = make_bl_mtile(tmpdir; louis_bl=false)
+            ncols = div(size(p_on.physical, 1), gp.kDim)
             for c in 1:ncols
-                Scythe.advance_column(mtile, c, 1)
+                Scythe.advance_column(m_on, c, 1)
+                Scythe.advance_column(m_off, c, 1)
             end
             scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
-                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0)
-            for v in 1:9
-                @test maximum(abs.(mtile.expdot_n[:, v])) / scales[v] < 1.0e-9
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0, 10 => 1.0)
+            for v in 1:10
+                d = maximum(abs.(m_on.expdot_n[:, v] .- m_off.expdot_n[:, v]))
+                @test d / scales[v] < 1.0e-9
             end
+            # No spurious condensate at rest, absolutely (not just BL-differenced)
+            @test maximum(abs.(m_on.expdot_n[:, 9])) < 1.0e-16
         end
     end
 
@@ -249,7 +268,7 @@ using SparseArrays
             v_fit = patch.physical[rng, vars["v"], 1]
             rho_t = Springsteel.ref_rho_t(mtile.ref_state)[:, 1]
 
-            D4 = D[rng, 4]; D5 = D[rng, 5]; D9 = D[rng, 9]; D6 = D[rng, 6]
+            D4 = D[rng, 4]; D5 = D[rng, 5]; D9 = D[rng, 10]; D6 = D[rng, 6]
 
             # u and w carry no drag (u1 = 0) and no mixing (no shear)
             @test maximum(abs.(D4)) < 1.0e-10
@@ -301,7 +320,7 @@ using SparseArrays
         vz_fit = patch.physical[rng, vars["v"], 4]   # dz slot (2D grids: slot 4)
         rho_t = Springsteel.ref_rho_t(mtile.ref_state)[:, 1]
 
-        D9 = D[rng, 9]; D6 = D[rng, 6]
+        D9 = D[rng, 10]; D6 = D[rng, 6]
         @test maximum(abs.(D9)) > 0.0
 
         # Interior mixing conserves column momentum (zero boundary fluxes)
@@ -329,14 +348,32 @@ using SparseArrays
     @testset "interior scalar mixing: closed column books" begin
         V0 = 2.0
         H = 2000.0
+        # The vapor bump must be seeded as WATER MASS, not as Q_ss. Q_ss no longer
+        # carries the vapor: rho_v is the residual rho_t - rho_d - rho_c - rho_r, and
+        # the retrieval does not read Q_ss at all, so a Q_ss-only bump (what this test
+        # used to impose) moves no water, no energy and no temperature — it perturbs
+        # the supersaturation TRACKER and nothing else. Verified: with the old seed
+        # the total-water and cloud increments are identically 0.0.
+        #
+        # This is the T-invariant vapor seed of the water-diffusion testsets:
+        # drho_t = drho_v = seed at fixed rho_d, with the vapor partial pressure
+        # (dp = Rv*T*seed) and the vapor internal + potential energy
+        # (dE_t = (Cvv*T + g*z)*seed) added so the retrieval is untouched. Q_ss moves
+        # with it so the tracker stays consistent and the reconciliation stays quiet.
         set_moist! = (patch, vars, kDim, z) -> begin
+            col_bl = saturated_cloudy_column(z)
             for i in 1:size(patch.physical, 1)
                 k = mod1(i, kDim)
                 # Background shear so Kv > 0 (v(0) = 0: no drag), plus a vapor
                 # bump confined to the lower half with zero-gradient ends
                 patch.physical[i, vars["v"], 1] = V0 * sin(0.5 * pi * z[k] / H)^2
-                patch.physical[i, vars["Q_ss"], 1] =
-                    z[k] < 1000.0 ? 1.0e-4 * (1.0 + cos(pi * z[k] / 1000.0)) : 0.0
+                seed = z[k] < 1000.0 ? 1.0e-4 * (1.0 + cos(pi * z[k] / 1000.0)) : 0.0
+                Tref = col_bl.Tk[k]
+                patch.physical[i, vars["rho_t"], 1] += seed
+                patch.physical[i, vars["Q_ss"], 1] += seed
+                patch.physical[i, vars["p"], 1] += Rv * Tref * seed
+                patch.physical[i, vars["E_t"], 1] +=
+                    ((Cvv * Tref) + (gravity * z[k])) * seed
             end
             compensate_ke!(patch, vars, kDim, z)
         end
@@ -353,7 +390,7 @@ using SparseArrays
         w_fit = patch.physical[rng, vars["w"], 1]
 
         D1 = D[rng, 1]; D3 = D[rng, 3]; D4 = D[rng, 4]; D5 = D[rng, 5]
-        D6 = D[rng, 6]; D7 = D[rng, 7]; D9 = D[rng, 9]
+        D6 = D[rng, 6]; D7 = D[rng, 7]; D9 = D[rng, 10]
 
         # The moisture perturbation excites the vapor and heat channels
         @test maximum(abs.(D7)) > 0.0
