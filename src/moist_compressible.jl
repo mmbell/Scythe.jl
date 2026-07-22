@@ -605,11 +605,11 @@ none, and the assertion in `mc_wall_bc_requires_no_w_forcing` guards the assumpt
 
 Why it matters: a homogeneous `NeumannBC` is the special case `ρ_t' = 0`, which a
 balanced vortex violates precisely where its surface pressure deficit lives — that
-was the drain of `tc/HANDOFF_2026-07-20.md`. `SecondDerivativeBC` leaves `∂p'/∂z`
+was the drain of `reference/HANDOFF_2026-07-20.md`. `SecondDerivativeBC` leaves `∂p'/∂z`
 free instead, which restores the balance but costs a factor ~2.7 in stable timestep,
 because the semi-implicit acoustic solve eliminates `w` (φ = ρ̄_t w is Dirichlet in
 the Helmholtz solve) and therefore cannot see a wall derivative the refit injects —
-see `tc/SI_WALL_BC_CEILING.md`. R1T1X resolves the conflict: the admissible subspace
+see `reference/SI_WALL_BC_CEILING.md`. R1T1X resolves the conflict: the admissible subspace
 stays R1T1's, so the solve stays operator-consistent and the ceiling stays high,
 while the affine `ahat` offset carries the nonzero derivative the balance needs.
 
@@ -827,7 +827,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # convective (finite-amplitude) SI ceiling — the resting-reference form
     # leaves δ·Co_z of the grid-scale acoustic operator explicit in a core
     # whose state deviates by δ, fatal in TC deep convection at Co_z ≳ 4
-    # (tc/SI_CONVECTIVE_CEILING.md). Default OFF so existing configurations
+    # (reference/SI_CONVECTIVE_CEILING.md). Default OFF so existing configurations
     # are bit-identical; the TC configs enable it. Spline (RiRk) vertical only.
     sd_si = get(model.options, :state_dependent_si, false)::Bool
     l_inf = get(model.physical_params, :l_inf, 80.0)
@@ -1198,7 +1198,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # the slaved updates use. Every AI2* time level then sees the SAME discrete operator —
     # the pointwise product-rule staging used previously left the grid-scale difference
     # between the two operators under explicit weights, which imposed a vertical-acoustic
-    # Courant ceiling (see tc/SI_VERTICAL_CEILING.md). The single-φ-fit structure also
+    # Courant ceiling (see reference/SI_VERTICAL_CEILING.md). The single-φ-fit structure also
     # keeps the rho_d and rho_t histories bitwise identical under a dry reference
     # (c_d = 1, c_d_z = 0 exactly), so the two densities cannot drift apart in dry air.
     # Fresh evaluation every step (not stored solve increments) makes the history robust
@@ -1608,7 +1608,7 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # remainder/history staging in mc_driver! uses the SAME coefficients, so
     # the operator-consistency cancellation holds at finite amplitude — the
     # resting-reference form leaves δ·Co_z of the grid-scale operator explicit
-    # in a convective core with state deviation δ (tc/SI_CONVECTIVE_CEILING.md).
+    # in a convective core with state deviation δ (reference/SI_CONVECTIVE_CEILING.md).
     sd_si = get(mtile.model.options, :state_dependent_si, false)::Bool
     if sd_si && mtile.solve_data === nothing
         error("options[:state_dependent_si] requires the cubic B-spline (RiRk) " *
@@ -1628,7 +1628,7 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # operator chain the solve applies, so every AI2* level sees ONE operator (the old
     # subtract-AB3/add-implicit form mixed pointwise and fitted operators, leaving a
     # grid-scale residual under explicit weights — the vertical-acoustic Courant ceiling
-    # of tc/SI_VERTICAL_CEILING.md). The first step is AM2 trapezoidal (+0.5 Lⁿ with the
+    # of reference/SI_VERTICAL_CEILING.md). The first step is AM2 trapezoidal (+0.5 Lⁿ with the
     # ts_term = 0.5·ts solve); its history seed gives t == 2 the full AI2* weights.
     ts_term = (t == 1) ? 0.5 * ts : 1.25 * ts
     if apply_histories

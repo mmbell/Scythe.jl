@@ -156,7 +156,7 @@ multi-limit advisor**: it computes every known limit for the actual
 configuration — the horizontal acoustic Courant (explicit AB3, or the measured
 semi-implicit envelope when `options[:horizontal_semiimplicit]` is on), the
 CONVECTIVE vertical SI ceiling `Co_z ≤ 0.72/δ` (state-dependent linearization
-residual, tc/SI_CONVECTIVE_CEILING.md; δ from `options[:state_deviation]`,
+residual, reference/SI_CONVECTIVE_CEILING.md; δ from `options[:state_deviation]`,
 default 0.25), and the u/w advective Courants for the expected peak winds
 (`options[:u_max]`/`options[:w_max]`, defaults 90/25 m/s) — prints all margins,
 names the binding one, and warns only if it is exceeded. Resolution-agnostic by
@@ -189,7 +189,7 @@ function warn_timestep_stability(grid_params, ts::Float64;
         #   v_acoustic  the CONVECTIVE (state-dependent) vertical SI ceiling:
         #               the linearization is about the resting reference, so a
         #               local state deviation δ leaves δ·Co_z of the grid-scale
-        #               operator explicit (tc/SI_CONVECTIVE_CEILING.md). The
+        #               operator explicit (reference/SI_CONVECTIVE_CEILING.md). The
         #               advisory target is 0.72/δ with δ = `state_deviation`
         #               (default 0.25, TC deep convection; quiescent runs can
         #               pass a smaller δ).

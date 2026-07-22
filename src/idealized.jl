@@ -713,7 +713,7 @@ v_max ~ 12 m/s, T_surf = 26.3 C). The modified-Rankine profile with alpha = 0.3
 used here previously decays as r^-0.3 and was still 12 m/s at r = 1050 km, giving
 a +6.9 K surface warm anomaly -- which put the surface air ABOVE the SST and
 reversed the air-sea enthalpy and moisture fluxes, so the vortex could only decay.
-See tc/HANDOFF_2026-07-19.md.
+See reference/HANDOFF_2026-07-19.md.
 
 # `z_round` — rounding off the kink at `z_sponge`
 

@@ -179,7 +179,7 @@ const NUM_CELLS_K = _tc_coarse ? 50 : 84                      # 500 m vs 300 m c
 # and comfortably inside every other limit and any delta <~ 0.16. NOTE delta =
 # 0.25 was
 # calibrated on the pre-fix TC run whose init carried 40881 supersaturated
-# points (tc/SI_CONVECTIVE_CEILING.md derives it from that run, whose own note
+# points (reference/SI_CONVECTIVE_CEILING.md derives it from that run, whose own note
 # records rho_d deficits of 25-40% as "far beyond any physical warm anomaly").
 # With the initialization fixed the observed deficit is 4.4%, so delta is likely
 # nearer 0.05 and the ceiling correspondingly looser, so STATE_DEVIATION below
@@ -193,7 +193,7 @@ const NUM_CELLS_K = _tc_coarse ? 50 : 84                      # 500 m vs 300 m c
 # SCYTHE_TC_TS_SCALE multiplies every entry, so a diagnostic run can sweep the
 # timestep WITHOUT editing this file -- which matters because a restart re-reads
 # tc_params.jl, so an edit made while a run is in flight silently changes what a
-# later restart does. See tc/SI_WALL_BC_CEILING.md: the measured ceiling is
+# later restart does. See reference/SI_WALL_BC_CEILING.md: the measured ceiling is
 # ts ~ 0.75 s with SecondDerivativeBC walls and ~2.0 s with Neumann, so ts = 1.0
 # below is ABOVE its ceiling until the inhomogeneous-Neumann wall fix lands.
 const TS_SCALE = parse(Float64, get(ENV, "SCYTHE_TC_TS_SCALE", "1.0"))

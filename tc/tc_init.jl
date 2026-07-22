@@ -9,7 +9,7 @@
 const TC_VARS = Scythe.MC_VARS_CYL
 
 # WHY THE VERTICAL BCs ARE **SecondDerivativeBC**, NOT NEUMANN (2026-07-21).
-# This is the dominant term in the drain documented in HANDOFF_2026-07-20.md.
+# This is the dominant term in the drain documented in reference/HANDOFF_2026-07-20.md.
 #
 # `NeumannBC()` maps to the cubic-B-spline R1T1 condition (Springsteel
 # factory.jl `_bc_to_spline_dict`), a HARD CONSTRAINT ON THE BASIS: the fitted
@@ -63,7 +63,7 @@ function tc_boundary_conditions()
     scalar_bc = Dict(v => NeumannBC() for v in TC_VARS)
     axis_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "v" => DirichletBC()))
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC()))
-    # ── VERTICAL WALLS ── see tc/SI_WALL_BC_CEILING.md for the full measurements.
+    # ── VERTICAL WALLS ── see reference/SI_WALL_BC_CEILING.md for the full measurements.
     #
     # SecondDerivativeBC on every scalar. This is the 2026-07-21 configuration and
     # it remains the best MEASURED one, but the timestep it needs is NOT 1.0 s:
@@ -123,8 +123,8 @@ function tc_boundary_conditions()
     # an initialization out of discrete hydrostatic balance by 5e-3 m/s^2 -- i.e.
     # a wall condition that leaves dp'/dz free was being asked to hold a state that
     # was not in balance to begin with, and was blamed for the resulting growth.
-    # Both of those are fixed (tc/HANDOFF_REFERENCE_STATE.md,
-    # tc/HANDOFF_INITIALIZATION.md), so the rejections need re-taking rather than
+    # Both of those are fixed (reference/HANDOFF_REFERENCE_STATE.md,
+    # reference/HANDOFF_INITIALIZATION.md), so the rejections need re-taking rather than
     # inheriting. What has NOT changed is the structural argument in the note above
     # -- the Galerkin acoustic solve takes Neumann as its natural weak-form
     # condition -- so `natural` may well still be unstable for a reason no
@@ -212,7 +212,7 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                 extra_physical),
         # Acoustic solver: the vertical-only SI with the state-dependent acoustic
         # linearization. options[:exact_si] is NOT used here -- see
-        # tc/EXACT_SI_VORTEX_FAILURE.md: on this balanced vortex it drives rho_d
+        # reference/EXACT_SI_VORTEX_FAILURE.md: on this balanced vortex it drives rho_d
         # negative within ~4 timesteps, while the vertical-only SI runs the same
         # initial conditions cleanly. exact_si is opt-in via tc_run_axisym.jl's
         # --exact-si for further debugging. It would buy no timestep here in any
@@ -232,8 +232,8 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         # Physically the wall gradient belongs to the BALANCED vortex and evolves
         # on hours, so freezing it is a good approximation over a spin-up; it does
         # go stale as the storm deepens, which is the open item in
-        # tc/SI_WALL_BC_CEILING.md.
-        # REFERENCE STATE (2026-07-21, tc/HANDOFF_REFERENCE_STATE.md). Both of these
+        # reference/SI_WALL_BC_CEILING.md.
+        # REFERENCE STATE (2026-07-21, reference/HANDOFF_REFERENCE_STATE.md). Both of these
         # are opt-in and off by default in the library, because they move every
         # pressure-reference baseline; the TC run needs both.
         #

@@ -639,7 +639,7 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         spectralTransform!(patch)
         gridTransform!(patch)
         # Re-fit with the wall condition installed. This is the load that used to
-        # destroy the balanced vortex (tc/HANDOFF_2026-07-21.md): the damage lands
+        # destroy the balanced vortex (reference/HANDOFF_2026-07-21.md): the damage lands
         # here, on the first projection, before a single timestep is taken. The
         # first pass exists only to produce the fitted z-derivatives the wall value
         # is read from; rho_t' at the wall is insensitive to p's own condition, so

@@ -63,7 +63,7 @@ environment variable `SCYTHE_REFSTATE`:
     SCYTHE_REFSTATE=qss,hydro    both  (also spelled "both")
 
 Empty by default, so every committed baseline is reproduced BITWISE unless the variable
-is set. See `tc/HANDOFF_REFERENCE_STATE.md`: these make the resting reference a discrete
+is set. See `reference/HANDOFF_REFERENCE_STATE.md`: these make the resting reference a discrete
 steady state (it condensed at rest, and its stored dp̄/dz was up to 17 % off hydrostatic
 balance), and they necessarily move the mc-stage baselines — which is what running the
 benchmarks under them is meant to quantify.

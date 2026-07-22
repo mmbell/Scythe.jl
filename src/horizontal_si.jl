@@ -26,7 +26,7 @@
 #     ρ_t′^{n+1} = ρ_t′* − Δτ ρ̄_t ∂x u^{n+1}      (+ the ρ_d′/E_t′ analogues)
 #
 # Operator consistency across the AI2* time levels (THE stability requirement —
-# see tc/SI_VERTICAL_CEILING.md) is by construction:
+# see reference/SI_VERTICAL_CEILING.md) is by construction:
 #   • the solve reads u*, ∂x p′* through EXACTLY the model's read chain
 #     (per-z_b-block i-direction SA fit → evaluate, then per-i-point vertical
 #     SA fit → evaluate — the `gridTransform` chain), the same chain that

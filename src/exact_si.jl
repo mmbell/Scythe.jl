@@ -222,7 +222,7 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
 
     # Galerkin blocks. i-direction on p's side-wall basis (all z_b blocks share
     # one SplineParameters per var); k-direction on p's column basis. The mish
-    # operators are the model's own (operator consistency, SI_VERTICAL_CEILING).
+    # operators are the model's own (operator consistency, reference/SI_VERTICAL_CEILING.md).
     isp_p0 = patch.ibasis.data[1, p_index]
     dx = _rirk_solve_data(isp_p0)
     kcol_p0 = patch.kbasis.data[p_index]

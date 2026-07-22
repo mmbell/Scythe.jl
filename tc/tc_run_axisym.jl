@@ -15,7 +15,7 @@
 #                       output dir (warm restart: the AB3 history is rebuilt)
 #   --exact-si          use the exact 2-D SI instead of the vertical-only SI
 #                       (DEBUG ONLY: blows up on the balanced vortex, see
-#                       tc/EXACT_SI_VORTEX_FAILURE.md)
+#                       reference/EXACT_SI_VORTEX_FAILURE.md)
 #   --trace N           report the min rho_d/rho_dbar column every N steps (and
 #                       immediately whenever it drops below 0.5), so a blow-up
 #                       leaves a located trace instead of a bare log(negative)

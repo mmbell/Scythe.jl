@@ -567,7 +567,7 @@ using Springsteel
         # (history levels) with the fitted Galerkin operator (implicit level), leaving
         # a grid-scale residual under explicit weights that blew up above a VERTICAL
         # acoustic Courant of ~2.1-2.4 on the RiRk spline vertical (grid-scale,
-        # top-boundary-localized mode; tc/SI_VERTICAL_CEILING.md). With the
+        # top-boundary-localized mode; reference/SI_VERTICAL_CEILING.md). With the
         # spline-consistent history staging (single fitted-φ chain for the slaved
         # legs, stored applied increment for the w leg) the measured ceiling moves to
         # Co_z ≈ 9-18, past the explicit HORIZONTAL acoustic limit of any realistic
@@ -1723,7 +1723,7 @@ using Springsteel
     end
 
     @testset "consistent_qss_reference: the resting base is an EXACT fixed point" begin
-        # THE GATE of tc/HANDOFF_REFERENCE_STATE.md. Springsteel builds Q_ssbar
+        # THE GATE of reference/HANDOFF_REFERENCE_STATE.md. Springsteel builds Q_ssbar
         # pointwise from the EOS temperature and then FITS it, but the equation set
         # retrieves T from the FITTED (pbar, E_tbar, rho_tbar) -- so rho_v* differs,
         # the clamped partition leaves a residual cloud, and qss_condensation_rates
@@ -1772,7 +1772,7 @@ using Springsteel
     end
 
     @testset "balanced_vortex_native!: the vortex is a discrete steady state" begin
-        # THE GATE of tc/HANDOFF_INITIALIZATION.md, and the direct analogue of the
+        # THE GATE of reference/HANDOFF_INITIALIZATION.md, and the direct analogue of the
         # resting-fixed-point gate above: a balanced vortex is a steady state of the
         # equation set, so at t = 0 the u tendency and the reconstructed w tendency
         # should vanish. They cannot vanish exactly -- see below -- but they must be
