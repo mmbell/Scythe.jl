@@ -791,9 +791,34 @@ The water it moves is accumulated into `mtile.mc_water_clamp` and reported. A fl
 fires steadily is a defect to chase — grid-scale ringing, a bad initial state, a timestep
 past its limit — and the point of making `ρ_c` prognostic was to stop hiding water
 bookkeeping inside a `max()`.
+
+!!! warning "This floor is NOT safe against Gibbs ringing — measured, 2026-07-22"
+    Conserving mass is not the same as being harmless. Flooring a spectrally-ringing
+    field RECTIFIES a zero-mean oscillation: only the negative lobes are touched, so
+    every step converts `δ` of vapor to liquid and the retrieval dutifully releases
+    `L_v δ` of latent heat. The bias is one-signed and accumulates.
+
+    `o01_rainfall` makes this fatal. Its rain shafts ring to `min(ρ_r) ≈ -1.8 g/m³` at
+    500 m resolution BY DESIGN (see the note in the benchmark config — every rate
+    function is negative-safe, so the undershoot is inert there). Rectifying that is a
+    latent-heat injection of order `L_v × 1.8e-3 ≈ 4.5 kJ/m³` per step, and the run goes
+    non-finite at t ≈ 23 min, right as convection erupts: `T = 9 K`, `E_t < 0`,
+    `ρ_vs = Inf`, `Qdot = NaN`. With `options[:clamp_water] = false` the same run
+    completes. Measured on this branch; do not re-enable without addressing it.
+
+    The fix is to make the floor thermodynamically NEUTRAL rather than
+    energy-conserving — a representation repair should not heat the air. Holding `p`
+    and subtracting `L_v(T)·δ` from `E_t` alongside the partition change leaves `T`
+    exactly invariant (differentiate the closed-form retrieval: `∂T/∂ρ_liq = L_v/D`).
+    That trades a latent-heat bias in `T` for an accounted `E_t` sink of the same size,
+    which is the honest place to put it. NOT YET IMPLEMENTED — pending a decision on
+    whether the state should be floored at all.
+
+`options[:clamp_water] = false` disables the floor entirely (default `true`).
 """
 function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
 
+    get(mtile.model.options, :clamp_water, true)::Bool || return nothing
     vars = mtile.model.grid_params.vars
     rhod_i = vars["rho_d"]
     rhot_i = vars["rho_t"]
@@ -1098,7 +1123,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                                                         rho_d[i], Tk[i], p_hPa[i], Q_s[i],
                                                         model.ts, N_r; N_0=N_0)
             if isnan(Qdot[i]) || isnan(Qdot_r[i])
-                error("Qdot is NaN at index $i, time $(t)!")
+                error("Qdot is NaN at index $i, time $(t)!\n" *
+                      "  T = $(Tk[i]) K, p = $(p[i]) Pa, rho_d = $(rho_d[i]), " *
+                      "rho_t = $(rho_t[i]), rho_c = $(rho_c[i]), rho_r = $(rho_r[i])\n" *
+                      "  rho_liq = $(rho_liq[i]), rho_v = $(rho_v[i]), " *
+                      "rho_vs = $(rho_vs[i]), Q_ss = $(Q_ss[i]), Q_s = $(Q_s[i])\n" *
+                      "  M = $(M[i]), ke = $(ke[i]), E_t = $(E_t[i]), " *
+                      "Qdot = $(Qdot[i]), Qdot_r = $(Qdot_r[i])")
             end
         end
     else

@@ -55,10 +55,10 @@ function bf02_moist_vars(stage)
 end
 # Liquid water variable(s) per stage (PE splits liquid into cloud and rain; the
 # partial-density and entropy-density stages carry them as densities rho_c/rho_r;
-# the total-energy stage diagnoses liquid from Q_ss so no output column applies)
+# the total-energy stage now carries a PROGNOSTIC rho_c alongside rho_r)
 function liquid_vars(stage)
     stage == :legacy && return ["mu_l"]
-    stage == STAGE_MC && return String[]
+    stage == STAGE_MC && return ["rho_c", "rho_r"]
     stage in (STAGE_PE_RHOD_PD, STAGE_PE_SIGMA) && return ["rho_c", "rho_r"]
     return ["mu_c", "mu_r"]
 end
