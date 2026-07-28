@@ -133,6 +133,16 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # resolve undershoots on the way in, and the size of that undershoot is the signal
     # that the column wants more nodes. See `clamp_water!`.
     mc_water_stats::Matrix{Float64}
+    # Per-gridpoint history of each water channel's NET MICROPHYSICS tendency, three levels,
+    # `MC_MICRO_*` naming the three columns. Separate from `expdot_*` because the depletion
+    # caps have to bound what the PHASE CHANGES contribute to the next state, which by
+    # linearity of the AB3 operator is the increment evaluated on this history alone — the
+    # slot tendency also carries advection, compressibility and sedimentation, none of which
+    # a microphysical rate limiter has any business compensating for. Zero columns for every
+    # non-mc set. See `_ab3_sink_bound` and `_rotate_micro_history!`.
+    mc_micro_n::Matrix{Float64}
+    mc_micro_nm1::Matrix{Float64}
+    mc_micro_nm2::Matrix{Float64}
 end
 
 """
@@ -207,6 +217,14 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     diffdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     diffdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    # Microphysics sink history for the AB3-sized depletion caps (MC_MICRO_* columns).
+    # Three narrow columns per level, not a full variable-wide matrix: only the cloud, rain
+    # and vapor channels have a rate that can drive their species negative.
+    mc_micro_rows = uses_pressure_reference(model.equation_set) ? size(tile.physical,1) : 0
+    mc_micro_cols = uses_pressure_reference(model.equation_set) ? MC_MICRO_N : 0
+    mc_micro_n = zeros(Float64, mc_micro_rows, mc_micro_cols)
+    mc_micro_nm1 = zeros(Float64, mc_micro_rows, mc_micro_cols)
+    mc_micro_nm2 = zeros(Float64, mc_micro_rows, mc_micro_cols)
     # Setup-time validation of the exact (unsplit) 2-D semi-implicit option:
     # incompatible flags and unsupported geometries error loudly here, before
     # any allocation (defined in exact_si.jl; a no-op when the option is off).
@@ -415,7 +433,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         _allocate_sw_scratch(tile, model),
         uses_pressure_reference(model.equation_set) ?
             zeros(Float64, length(MC_WATER_STATS), Threads.maxthreadid()) :
-            zeros(Float64, length(MC_WATER_STATS), 0))
+            zeros(Float64, length(MC_WATER_STATS), 0),
+        mc_micro_n,
+        mc_micro_nm1,
+        mc_micro_nm2)
     return mtile
 end
 

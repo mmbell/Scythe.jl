@@ -60,6 +60,7 @@ const MC_SCRATCH_SLOTS = (
     :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :rho_liq, :q_v, :q_l, # diagnostic state
     :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
     :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
+    :cap_c, :cap_r, :cap_v,                        # AB3 depletion bounds (raw, see _ab3_sink_bound)
     :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
@@ -473,10 +474,14 @@ nucleation, minimum droplet radius) and the energy-consistent psychrometric fact
     Q̇_cond = Q_ss (1/τ) / (1 + Q_s)
 
 `rho_v` is the CLAMPED diagnostic vapor density. Evaporation is limited by the
-available cloud water (`≥ −max(rho_c,0)/ts`) so the diagnostic ρ_c cannot be driven
-negative; condensation is limited by the available vapor (`≤ rho_v/ts`), which kills
-phantom condensation in dry air where Q_ss tracking drift can otherwise indicate
-spurious supersaturation. Subsaturated cloud-free air returns zero.
+available cloud water so ρ_c cannot be driven negative, and condensation by the
+available vapor, which kills phantom condensation in dry air where Q_ss tracking
+drift can otherwise indicate spurious supersaturation. Subsaturated cloud-free air
+returns zero.
+
+This single-category delegate takes the DEFAULT (forward-Euler) bounds of
+[`qss_condensation_rates`](@ref), which is what it has always used and what its tests
+pin. Production passes the AB3-sized bounds explicitly — see [`_ab3_sink_bound`](@ref).
 """
 qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0) =
     qss_condensation_rates(Q_ss, rho_v, rho_c, 0.0, rho_d, Tk, p_hPa, Q_s, ts, 0.0,
@@ -503,16 +508,25 @@ unconditional, so no separate
 rain-evaporation parameterization (O01's `Q_evap`) is needed. The ventilation
 enhancement lives inside [`invtau_rain`](@ref).
 
-Limiters: cloud evaporation is bounded by the available cloud (`≥ −max(rho_c,0)/ts`),
-rain evaporation by the available rain (`≥ −max(rho_r,0)/ts`), and if the combined
-condensation would exceed the available vapor both channels are rescaled
-proportionally so `Qdot_c + Qdot_r ≤ max(rho_v,0)/ts`. With the rain channel inactive
-(`Qdot_r == 0`) the vapor cap reduces to the historical `min(Qdot, rho_v/ts)`, keeping
-the single-category [`qss_condensation_rate`](@ref) delegate bit-identical to its
-pre-rain behavior.
+Limiters: cloud evaporation is bounded below by `floor_c`, rain evaporation by `floor_r`, and
+if the combined condensation would exceed `ceil_v` both channels are rescaled proportionally.
+With the rain channel inactive (`Qdot_r == 0`) the vapor cap reduces to the historical
+`min(Qdot, ceil_v)`, keeping the single-category [`qss_condensation_rate`](@ref) delegate
+bit-identical to its pre-rain behavior.
+
+The three bounds default to the FORWARD-EULER budgets this function used to hard-code
+(`−max(rho_c,0)/ts`, `−max(rho_r,0)/ts`, `+max(rho_v,0)/ts`), which is what every unit-test
+caller and the single-category delegate get. The integrator is AB3, not Euler, so `mc_driver!`
+passes the exact three-level bounds instead — see [`_ab3_sink_bound`](@ref) for why that
+matters and by how much. Note the vapor ceiling is the SAME defect as the two condensate
+floors: it is what stops condensation removing more vapor than the residual holds, and until
+now it was Euler-sized and not even reachable by the `cap_factor` probe.
 """
 function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts,
-                                N_r, max_N_c=100.0; N_0=0.0, cap_factor=1.0)
+                                N_r, max_N_c=100.0; N_0=0.0, cap_factor=1.0,
+                                floor_c = -cap_factor * max(rho_c, 0.0) / ts,
+                                floor_r = -cap_factor * max(rho_r, 0.0) / ts,
+                                ceil_v = max(rho_v, 0.0) / ts)
 
     rho_vs = rho_v_sat(Tk, p_hPa)
     S = Q_ss / rho_vs                    # supersaturation (ratio - 1)
@@ -570,26 +584,17 @@ function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s
     Qdot_c = invtau_c == 0.0 ? 0.0 : Qdot * (invtau_c / invtau)
     Qdot_r = invtau_r == 0.0 ? 0.0 : Qdot * (invtau_r / invtau)
 
-    # No negative water: each condensate's evaporation limited by its own mass.
-    #
-    # `cap_factor` (default 1.0, bitwise inert) is the DIAGNOSTIC lever of
-    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md Stage 3. `rho/ts` is a FORWARD-EULER
-    # budget, but the tendency is integrated by AB3 with a leading weight of 23/12, so a sink
-    # sitting on this cap is multiplied by ~1.92 and lands the species at ~-0.92*rho. Setting
-    # cap_factor = 12/23 makes the cap AB3-sized for the worst case (no sink history), which
-    # discriminates that mechanism from a stiff relaxation. It is a probe, not a fix: it
-    # changes the physical rate, and the correct budget uses the actual three-level
-    # combination rather than a constant.
-    Qdot_c = max(Qdot_c, -cap_factor * max(rho_c, 0.0) / ts)
-    Qdot_r = max(Qdot_r, -cap_factor * max(rho_r, 0.0) / ts)
+    # No negative water: each condensate's evaporation limited by its own mass, sized for the
+    # integrator that will apply it (`floor_c`/`floor_r`; see the docstring).
+    Qdot_c = max(Qdot_c, floor_c)
+    Qdot_r = max(Qdot_r, floor_r)
 
     # Condensation limited by the available vapor. With the rain channel inactive this
     # is the historical min(); with both active the channels rescale proportionally.
-    cap = max(rho_v, 0.0) / ts
     if Qdot_r == 0.0
-        Qdot_c = min(Qdot_c, cap)
-    elseif Qdot_c + Qdot_r > cap
-        scale = cap / (Qdot_c + Qdot_r)
+        Qdot_c = min(Qdot_c, ceil_v)
+    elseif Qdot_c + Qdot_r > ceil_v
+        scale = ceil_v / (Qdot_c + Qdot_r)
         Qdot_c *= scale
         Qdot_r *= scale
     end
@@ -808,13 +813,24 @@ limiter sized for the wrong integrator from a stiff source term:
 | row | meaning |
 |-----|---------|
 | `:d_r_n`      | gridpoints in this thread's columns with `ρ_r > 0` |
-| `:d_r_cevap`  | of those, how many have the evaporation sink pinned at its `-ρ/ts` cap |
-| `:d_r_cauto`  | how many have `AUTO_COLL` pinned at `avail` (cloud block only; 0 for rain) |
-| `:d_r_eul`    | max forward-Euler depletion fraction `-ts·f_n/ρ`; the caps bound this by 1 |
+| `:d_r_cevap`  | of those, how many have the depletion sink pinned at its bound |
+| `:d_r_cauto`  | how many have `AUTO_COLL` pinned at `avail` (cloud block only; 0 for rain/vapor) |
+| `:d_r_eul`    | max forward-Euler depletion fraction `-ts·f_n/ρ` |
 | `:d_r_ab3`    | max ACTUAL depletion fraction `-(ρ^{n+1}-ρ)/ρ` under the run's AB3 weights |
 | `:d_r_neg`    | how many points the step actually drives negative (`:d_r_ab3 > 1` pointwise) |
 | `:d_r_stiff`  | how many exceed AB3's real-axis stability limit (0.545) with NO cap active |
+| `:d_r_infeas` | how many have an INADMISSIBLE HISTORY — the two previous sink levels alone already carry the point negative, so no bound on the current level can fix it and [`_ab3_sink_bound`](@ref) has been clamped at 0 |
+| `:d_r_mab3`   | max depletion fraction from the MICROPHYSICS ALONE, `-AB3(micro history)/ρ` |
+| `:d_r_mneg`   | how many points the microphysics alone would drive negative (`:d_r_mab3` past `MICRO_DEPLETION_TOL`) |
 | `:d_c_*`      | the same for `ρ_c` |
+| `:d_v_*`      | the same for the residual `ρ_v`, whose slot tendency is `f_3 - f_2 - f_8 - f_9` and whose depletion sink is the condensation `-(Qdot + Qdot_r)` |
+
+**Read `:d_*_mab3`, not `:d_*_ab3`, to judge the depletion bound.** `:d_*_ab3` is the fraction
+of the FULL slot tendency, so it is dominated by advection and `-ρ∇·v` at points carrying
+almost no condensate — where any fixed tendency divided by a near-zero `ρ` is large, and no
+microphysical limiter has, or should have, any purchase. `:d_*_mab3` is the part the bound
+governs, and under `water_cap_mode = :ab3` it is ≤ 1 by construction (`:d_*_mneg` = 0);
+under `:euler` it runs to ≈ 23/12, which is the defect the mode exists to reproduce.
 """
 const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :b_r_val, :b_r_adv, :b_r_cdiv, :b_r_src, :b_r_auto, :b_r_sed,
@@ -823,9 +839,11 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :b_c_div, :b_c_w, :b_c_z, :b_c_eul, :b_c_now,
                         :b_pre_r, :b_pre_c,
                         :d_r_n, :d_r_cevap, :d_r_cauto, :d_r_eul, :d_r_ab3,
-                        :d_r_neg, :d_r_stiff,
+                        :d_r_neg, :d_r_stiff, :d_r_infeas, :d_r_mab3, :d_r_mneg,
                         :d_c_n, :d_c_cevap, :d_c_cauto, :d_c_eul, :d_c_ab3,
-                        :d_c_neg, :d_c_stiff)
+                        :d_c_neg, :d_c_stiff, :d_c_infeas, :d_c_mab3, :d_c_mneg,
+                        :d_v_n, :d_v_cevap, :d_v_cauto, :d_v_eul, :d_v_ab3,
+                        :d_v_neg, :d_v_stiff, :d_v_infeas, :d_v_mab3, :d_v_mneg)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -842,8 +860,20 @@ First row of the per-step depletion census for each species; `MC_DEPLETION_N` ro
 same layout, written by [`water_depletion_probe!`](@ref).
 """
 const MC_DEPLETION_R = 31
-const MC_DEPLETION_C = 38
-const MC_DEPLETION_N = 7
+const MC_DEPLETION_C = 41
+const MC_DEPLETION_V = 51
+const MC_DEPLETION_N = 10
+"""
+Threshold for `:d_*_mneg`, the count of points the MICROPHYSICS alone drives negative.
+
+A point sitting exactly on its depletion bound lands at `1 + O(eps)`, not at 1: the `t ≥ 3`
+branch of [`_ab3_sink_bound`](@ref) divides by 23, which is not representable, so the bound
+cannot cancel the increment exactly. Counting `> 1.0` would therefore report every capped
+point as a violation. This threshold sits ~1e7 ULP above the rounding and ~1e9 below the
+`23/12` a forward-Euler-sized bound produces, so `:d_*_mneg` reads 0 under
+`water_cap_mode = :ab3` and the full capped population under `:euler`.
+"""
+const MICRO_DEPLETION_TOL = 1.0 + 1.0e-9
 """
 Per-STEP pre-fit minima (rows 29/30), written by `clamp_water!` and reset every step.
 
@@ -1282,10 +1312,11 @@ end
 
 The increment [`explicit_timestep`](@ref) applies to a prognostic slot at step `t`.
 
-One definition, so a diagnostic can never drift from the integrator it is measuring: Euler at
-`t = 1`, second-order Adams-Bashforth at `t = 2`, AB3 (Durran & Blossey 2012) thereafter. The
-leading AB3 weight is **23/12 ≈ 1.917**, which is what a sink capped at `-ρ/ts` — a forward-Euler
-budget — actually gets multiplied by.
+One definition, so neither a diagnostic nor a limiter can drift from the integrator it is sized
+for: Euler at `t = 1`, second-order Adams-Bashforth at `t = 2`, AB3 (Durran & Blossey 2012)
+thereafter. The leading AB3 weight is **23/12 ≈ 1.917**, which is what a sink capped at `-ρ/ts`
+— a forward-Euler budget — used to get multiplied by. [`_ab3_sink_bound`](@ref) is this same
+expression solved for the current level, and is how the water limiters are written now.
 """
 @inline _ab3_increment(ts::Float64, t::Int64, f_n::Float64, f_nm1::Float64, f_nm2::Float64) =
     t == 1 ? ts * f_n :
@@ -1293,62 +1324,175 @@ budget — actually gets multiplied by.
              (ts / 12.0) * ((23.0 * f_n) - (16.0 * f_nm1) + (5.0 * f_nm2))
 
 """
-    water_depletion_probe!(mtile, colstart, colend, t, precipitation, cap_factor,
-                           rho_c, rho_r, Qdot, Qdot_r, AUTO_COLL)
+    _ab3_sink_bound(ts, t, avail, s_nm1, s_nm2) -> Float64
 
-Census, over every gridpoint holding water, of how hard the step is depleting it.
+The most negative CURRENT-level sink [`explicit_timestep`](@ref) can apply at step `t` without
+carrying a species that has `avail ≥ 0` of itself below zero, given the two previous levels of
+that species' sink. **Returned UNCLAMPED** — see the clamp note below.
 
-Runs immediately before [`explicit_timestep`](@ref), so `expdot` is final for the step and the
-measured increment is the one actually applied. For each species it records how many points
-exist, how many have a sink pinned at its cap, the largest forward-Euler and largest ACTUAL
-depletion fractions, how many points the step drives negative outright, and how many exceed
-AB3's real-axis stability limit with no cap active.
+This is [`_ab3_increment`](@ref) solved for `s_n`, one branch per integrator branch:
 
-The two hypotheses this is built to separate:
+| `t` | increment | admissible `s_n` |
+|---|---|---|
+| 1 | `ts·s_n` | `−avail/ts` |
+| 2 | `(ts/2)(3 s_n − s_nm1)` | `(−2·avail/ts + s_nm1)/3` |
+| ≥3 | `(ts/12)(23 s_n − 16 s_nm1 + 5 s_nm2)` | `(−12·avail/ts + 16 s_nm1 − 5 s_nm2)/23` |
 
-- **cap-vs-integrator** — the limiters guarantee `ρ + ts·f_n ≥ 0`, so `:d_*_eul` is pinned at
-  1.0 at capped points while `:d_*_ab3` runs up to ≈ 23/12, and `:d_*_neg` tracks `:d_*_cevap`
-  + `:d_*_cauto`;
-- **stiff source** — `:d_*_stiff` is nonzero, i.e. points are being depleted faster than AB3
-  can stably integrate even before any cap engages.
+The `t = 1` branch is exactly the forward-Euler budget `−avail/ts` that every water limiter in
+this file used to be written with, at every step — and that is the defect. AB3's leading weight
+is 23/12, so a sink sitting on the Euler bound is applied at ≈1.92× and lands the species at
+≈ `−0.92·avail`. Measured on the quick O01 at 2.34–2.82× the local cloud, regenerated at
+100–190 fresh gridpoints on EVERY step from the first cloudy one onward (STAGE 3 of
+reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md). A constant `12/23` removes most of it
+(ACTUAL depletion fraction 2.345 → 1.223, STAGE 3b) but provably not all: `12/23` is only the
+right factor when the sink has no history, and the residual 0.223 is the history term — which
+is what the `t ≥ 3` branch above carries and no constant can.
 
-Gated on `options[:water_budget_trace]`; never called otherwise.
+**Scope: the MICROPHYSICS' own contribution.** By linearity of the AB3 operator, what the
+phase changes contribute to `ρ^{n+1}` is `_ab3_increment` evaluated on the sink history alone,
+so bounding that bounds what the physics removes — nothing more. Transport, the spectral refit
+and the acoustic solve can still carry a point negative; that is the positivity limiter's job,
+and deliberately not this one's. Making the microphysics surrender its sink to compensate a
+transport-generated negative would be a floor in all but name, at exactly the points STAGE 3b
+showed the caps have no purchase on.
+
+**Callers must clamp.** A bound `> 0` means the two history levels alone already drive the
+species negative, which limiting the current level cannot repair; forcing `s_n > 0` there would
+manufacture mass, the rectification `clamp_water!` documents as the reason not to floor the
+state. Every call site therefore applies `min(bound, 0.0)` (or `max` on the mirrored vapor
+ceiling) and the raw value is kept so [`_depletion_census!`](@ref) can count how often the
+clamp fires — a nonzero count is a real signal, not noise.
 """
-function water_depletion_probe!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
-                                precipitation::Bool, cap_factor::Float64,
-                                rho_c, rho_r, Qdot, Qdot_r, AUTO_COLL)
+@inline _ab3_sink_bound(ts::Float64, t::Int64, avail::Float64,
+                        s_nm1::Float64, s_nm2::Float64) =
+    t == 1 ? -avail / ts :
+    t == 2 ? ((-2.0 * avail / ts) + s_nm1) / 3.0 :
+             ((-12.0 * avail / ts) + (16.0 * s_nm1) - (5.0 * s_nm2)) / 23.0
 
-    size(mtile.mc_water_stats, 2) == 0 && return nothing
-    _depletion_census!(mtile, MC_DEPLETION_C, 9, colstart, t, cap_factor, rho_c, Qdot,
-                       precipitation ? AUTO_COLL : nothing, Qdot)
-    _depletion_census!(mtile, MC_DEPLETION_R, 8, colstart, t, cap_factor, rho_r, Qdot_r,
-                       nothing, Qdot)
+"""
+Columns of `ModelTile.mc_micro_n`/`mc_micro_nm1`/`mc_micro_nm2` — the per-gridpoint history of
+each water channel's NET MICROPHYSICS tendency, kept so the depletion caps can be written
+against the integrator's actual three-level combination ([`_ab3_sink_bound`](@ref)).
+
+| column | channel | value |
+|---|---|---|
+| `MC_MICRO_C` | cloud | `Qdot − AUTO_COLL` |
+| `MC_MICRO_R` | rain | `Qdot_r` (`AUTO_COLL` is a SOURCE for rain; omitting it only makes rain's budget more conservative) |
+| `MC_MICRO_V` | vapor | `−(Qdot + Qdot_r)` — condensation is internal to the water, so the residual vapor pays exactly what the two condensate channels gain |
+
+Rotated in lockstep with `expdot_n/nm1/nm2` by [`_rotate_micro_history!`](@ref), which runs
+immediately after `explicit_timestep`. Zero-initialized, so step 1 sees no history and its
+budget reduces to the forward-Euler one this code used to write everywhere.
+"""
+const MC_MICRO_C = 1
+const MC_MICRO_R = 2
+const MC_MICRO_V = 3
+const MC_MICRO_N = 3
+
+"""
+    _rotate_micro_history!(mtile, colstart, colend)
+
+Advance the microphysics sink history one level for this column, mirroring
+[`explicit_timestep`](@ref)'s rotation of `expdot_*` so the next step's cap sees exactly the two
+levels the integrator will weight.
+
+Called from `mc_driver!` immediately after `explicit_timestep` — which is once per column per
+step on BOTH paths, because the `exact_si` branch returns from `mc_driver!` further down, after
+this. A second rotation would silently shift the whole history by one step and mis-size every
+cap, so the placement is load-bearing.
+"""
+@inline function _rotate_micro_history!(mtile::ModelTile, colstart::Int64, colend::Int64)
+    n = mtile.mc_micro_n
+    nm1 = mtile.mc_micro_nm1
+    nm2 = mtile.mc_micro_nm2
+    size(n, 2) == 0 && return nothing
+    # Unconditional, unlike `explicit_timestep`'s `t == 1` branch which skips `nm2 .= nm1`:
+    # both levels are zero at t = 1, so the two are identical and the branch is not worth it.
+    @inbounds for c in 1:MC_MICRO_N, g in colstart:colend
+        nm2[g, c] = nm1[g, c]
+        nm1[g, c] = n[g, c]
+    end
     return nothing
 end
 
 """
-    _depletion_census!(mtile, species, slot, colstart, t, cap_factor, val, evap, aut, Qdot)
+    water_depletion_probe!(mtile, colstart, colend, t, precipitation,
+                           rho_c, rho_r, rho_v, Qdot, Qdot_r, AUTO_COLL,
+                           cap_c, cap_r, cap_v)
+
+Census, over every gridpoint holding water, of how hard the step is depleting it.
+
+Runs immediately before [`explicit_timestep`](@ref), so `expdot` is final for the step and the
+measured increment is the one actually applied. For each channel it records how many points
+exist, how many have a sink pinned at its bound, the largest forward-Euler and largest ACTUAL
+depletion fractions, how many points the step drives negative outright, how many exceed AB3's
+real-axis stability limit with no cap active, and how many carry an inadmissible history.
+
+The hypotheses this is built to separate:
+
+- **cap-vs-integrator** — under `water_cap_mode = :euler` the limiters guarantee only
+  `ρ + ts·f_n ≥ 0`, so `:d_*_eul` is pinned at 1.0 at capped points while `:d_*_ab3` runs up to
+  ≈ 23/12 and `:d_*_neg` tracks `:d_*_cevap` + `:d_*_cauto`. Under `:ab3` it is `:d_*_ab3` that
+  the bound holds at 1, and any remaining `:d_*_neg` is transport, not microphysics;
+- **stiff source** — `:d_*_stiff` is nonzero, i.e. points are being depleted faster than AB3
+  can stably integrate even before any cap engages;
+- **inadmissible history** — `:d_*_infeas` is nonzero, i.e. the previous two sink levels alone
+  carry the point negative, which no bound on the current level can repair.
+
+The VAPOR is censused alongside the two condensates. It is a residual, not a slot, so its
+tendency is assembled from the four densities' slots and its sink is the condensation that
+removes it. It has no bound of its own anywhere else in the model, which is exactly why it
+needs measuring.
+
+Gated on `options[:water_budget_trace]`; never called otherwise.
+"""
+function water_depletion_probe!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
+                                precipitation::Bool,
+                                rho_c, rho_r, rho_v, Qdot, Qdot_r, AUTO_COLL,
+                                cap_c, cap_r, cap_v)
+
+    size(mtile.mc_water_stats, 2) == 0 && return nothing
+    _depletion_census!(mtile, MC_DEPLETION_C, 9, MC_MICRO_C, colstart, t, rho_c, Qdot,
+                       precipitation ? AUTO_COLL : nothing, Qdot, cap_c)
+    _depletion_census!(mtile, MC_DEPLETION_R, 8, MC_MICRO_R, colstart, t, rho_r, Qdot_r,
+                       nothing, Qdot, cap_r)
+    _vapor_census!(mtile, colstart, t, rho_v, Qdot, Qdot_r, cap_v)
+    return nothing
+end
+
+"""
+    _depletion_census!(mtile, species, slot, channel, colstart, t, val, evap, aut, Qdot, cap)
 
 One species' pass for [`water_depletion_probe!`](@ref). Split out so each call specializes on
 its own argument types (`rho_c` is a scratch `Vector`, `rho_r` a grid `SubArray`), rather than
 being iterated as a heterogeneous tuple. `aut === nothing` skips the `AUTO_COLL` cap test,
 which is the correct behaviour for rain (where `AUTO_COLL` is a source, not a sink) and with
 precipitation off.
+
+`cap` is the RAW (unclamped) [`_ab3_sink_bound`](@ref) vector this step's rates were limited
+with. Reading the same array the limiter read makes the cap test bitwise exact under either
+`water_cap_mode` and makes `:d_*_infeas` (`cap > 0`, the clamp fired) directly countable.
+`channel` is this species' `MC_MICRO_*` column, which gives the microphysics-only fraction the
+bound actually governs.
 """
-function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, colstart::Int64,
-                            t::Int64, cap_factor::Float64, val, evap, aut, Qdot)
+function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, channel::Int64,
+                            colstart::Int64, t::Int64, val, evap, aut, Qdot, cap)
 
     st = mtile.mc_water_stats
     ts = mtile.model.ts
     expdot_n = mtile.expdot_n
     expdot_nm1 = mtile.expdot_nm1
     expdot_nm2 = mtile.expdot_nm2
+    micro_n = mtile.mc_micro_n
+    micro_nm1 = mtile.mc_micro_nm1
+    micro_nm2 = mtile.mc_micro_nm2
     # AB3's real-axis absolute-stability interval is (-0.545, 0]; a decay faster than that is
     # unstable under this integrator no matter how the sink is limited.
     AB3_REAL_LIMIT = 0.545
 
-    n = 0.0; n_cevap = 0.0; n_cauto = 0.0; n_neg = 0.0; n_stiff = 0.0
-    max_eul = 0.0; max_ab3 = 0.0
+    n = 0.0; n_cevap = 0.0; n_cauto = 0.0; n_neg = 0.0; n_stiff = 0.0; n_infeas = 0.0
+    n_mneg = 0.0
+    max_eul = 0.0; max_ab3 = 0.0; max_mab3 = 0.0
     @inbounds for i in eachindex(val)
         rho = val[i]
         rho > 0.0 || continue
@@ -1361,12 +1505,26 @@ function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, colst
         dep_eul > max_eul && (max_eul = dep_eul)
         dep_ab3 > max_ab3 && (max_ab3 = dep_ab3)
         dep_ab3 > 1.0 && (n_neg += 1.0)
-        # Cap detection is bitwise-exact: `max(x, -rho/ts)` returns the bound itself when it
-        # clips, and `min(auto + coll, avail)` returns `avail`.
-        capped = evap[i] == -cap_factor * rho / ts
+        # The MICROPHYSICS' own share of the same increment — the part `_ab3_sink_bound`
+        # governs, and the only fraction the depletion mode can be judged by.
+        dep_mab3 = -_ab3_increment(ts, t, micro_n[g, channel], micro_nm1[g, channel],
+                                   micro_nm2[g, channel]) / rho
+        dep_mab3 > max_mab3 && (max_mab3 = dep_mab3)
+        # Tolerance, not `> 1.0`: a point sitting exactly ON the bound lands at 1 + O(eps)
+        # (the bound divides by 23, so it cannot be exact), and counting those as violations
+        # would report every capped point. 1e-9 is ~1e7 ULP above that and ~1e9 below the
+        # 23/12 the `:euler` mode produces, so it separates the two without ambiguity.
+        dep_mab3 > MICRO_DEPLETION_TOL && (n_mneg += 1.0)
+        # Cap detection is bitwise-exact against the SAME array the limiter read:
+        # `max(x, floor)` returns the floor itself when it clips, and
+        # `min(auto + coll, avail)` returns `avail`.
+        raw = cap[i]
+        raw > 0.0 && (n_infeas += 1.0)
+        floor_i = min(raw, 0.0)
+        capped = evap[i] == floor_i
         capped && (n_cevap += 1.0)
         if aut !== nothing
-            avail = max((cap_factor * rho / ts) + Qdot[i], 0.0)
+            avail = max(Qdot[i] - floor_i, 0.0)
             if avail > 0.0 && aut[i] == avail
                 n_cauto += 1.0
                 capped = true
@@ -1375,6 +1533,14 @@ function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, colst
         (!capped && dep_eul > AB3_REAL_LIMIT) && (n_stiff += 1.0)
     end
 
+    _census_reduce!(st, species, n, n_cevap, n_cauto, max_eul, max_ab3, n_neg, n_stiff,
+                    n_infeas, max_mab3, n_mneg)
+    return nothing
+end
+
+"""Common per-thread accumulation for the depletion census blocks (same layout for all three)."""
+@inline function _census_reduce!(st, species::Int64, n, n_cevap, n_cauto, max_eul, max_ab3,
+                                 n_neg, n_stiff, n_infeas, max_mab3, n_mneg)
     tid = Threads.threadid()
     @inbounds begin
         st[species,     tid] += n
@@ -1384,7 +1550,81 @@ function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, colst
         st[species + 4, tid] = max(st[species + 4, tid], max_ab3)
         st[species + 5, tid] += n_neg
         st[species + 6, tid] += n_stiff
+        st[species + 7, tid] += n_infeas
+        st[species + 8, tid] = max(st[species + 8, tid], max_mab3)
+        st[species + 9, tid] += n_mneg
     end
+    return nothing
+end
+
+"""
+    _vapor_census!(mtile, colstart, t, rho_v, Qdot, Qdot_r, cap)
+
+The residual vapor's pass for [`water_depletion_probe!`](@ref), in the same layout as
+[`_depletion_census!`](@ref)'s two condensate blocks.
+
+The vapor is not a prognostic slot, so its tendency has to be assembled from the four
+densities that define it, `f_v = f_3 - f_2 - f_8 - f_9`, at each of the three time levels.
+That assembly is exact: all four use the same advective product-rule form with the same
+pointwise divergence, and both `-v·∇ρ` and `-ρ∇·v` are linear in ρ, so the residual of the
+tendencies IS the tendency of the residual. The sedimentation flux divergence cancels between
+slots 3 and 8 by construction, and `AUTO_COLL` between 8 and 9, leaving condensation as the
+vapor's only microphysical sink — which is what `cap` bounds.
+
+What this census will NOT see is anything applied outside `expdot`: the acoustic solve moves
+`rho_t` and `rho_d` but neither condensate, and the positivity limiter moves the condensates
+but not `rho_t`. Both land wholly in the vapor and both are measured elsewhere.
+"""
+function _vapor_census!(mtile::ModelTile, colstart::Int64, t::Int64, rho_v, Qdot, Qdot_r, cap)
+
+    st = mtile.mc_water_stats
+    ts = mtile.model.ts
+    e_n = mtile.expdot_n
+    e_1 = mtile.expdot_nm1
+    e_2 = mtile.expdot_nm2
+    AB3_REAL_LIMIT = 0.545
+
+    micro_n = mtile.mc_micro_n
+    micro_nm1 = mtile.mc_micro_nm1
+    micro_nm2 = mtile.mc_micro_nm2
+
+    n = 0.0; n_cap = 0.0; n_neg = 0.0; n_stiff = 0.0; n_infeas = 0.0; n_mneg = 0.0
+    max_eul = 0.0; max_ab3 = 0.0; max_mab3 = 0.0
+    @inbounds for i in eachindex(rho_v)
+        rho = rho_v[i]
+        rho > 0.0 || continue
+        n += 1.0
+        g = colstart + i - 1
+        f_n = e_n[g, 3] - e_n[g, 2] - e_n[g, 8] - e_n[g, 9]
+        f_1 = e_1[g, 3] - e_1[g, 2] - e_1[g, 8] - e_1[g, 9]
+        f_2 = e_2[g, 3] - e_2[g, 2] - e_2[g, 8] - e_2[g, 9]
+        delta = _ab3_increment(ts, t, f_n, f_1, f_2)
+        dep_eul = -(ts * f_n) / rho
+        dep_ab3 = -delta / rho
+        dep_eul > max_eul && (max_eul = dep_eul)
+        dep_ab3 > max_ab3 && (max_ab3 = dep_ab3)
+        dep_ab3 > 1.0 && (n_neg += 1.0)
+        dep_mab3 = -_ab3_increment(ts, t, micro_n[g, MC_MICRO_V], micro_nm1[g, MC_MICRO_V],
+                                   micro_nm2[g, MC_MICRO_V]) / rho
+        dep_mab3 > max_mab3 && (max_mab3 = dep_mab3)
+        # Tolerance, not `> 1.0`: a point sitting exactly ON the bound lands at 1 + O(eps)
+        # (the bound divides by 23, so it cannot be exact), and counting those as violations
+        # would report every capped point. 1e-9 is ~1e7 ULP above that and ~1e9 below the
+        # 23/12 the `:euler` mode produces, so it separates the two without ambiguity.
+        dep_mab3 > MICRO_DEPLETION_TOL && (n_mneg += 1.0)
+        raw = cap[i]
+        raw > 0.0 && (n_infeas += 1.0)
+        # The ceiling is the negated bound. The single-channel path hits it exactly
+        # (`min(Qdot_c, ceil_v)`); the two-channel rescale lands within rounding of it, so
+        # this is `>=` rather than `==` and is honest about that.
+        ceil_i = -min(raw, 0.0)
+        capped = ceil_i > 0.0 && (Qdot[i] + Qdot_r[i]) >= ceil_i
+        capped && (n_cap += 1.0)
+        (!capped && dep_eul > AB3_REAL_LIMIT) && (n_stiff += 1.0)
+    end
+
+    _census_reduce!(st, MC_DEPLETION_V, n, n_cap, 0.0, max_eul, max_ab3, n_neg, n_stiff,
+                    n_infeas, max_mab3, n_mneg)
     return nothing
 end
 
@@ -1502,15 +1742,19 @@ function water_budget_trace(mtile::ModelTile, t::Int64)
         # The depletion census: how widely, and how hard, the step is draining each species.
         # `euler` is bounded by 1 wherever a cap is the binding constraint; `ab3` is what the
         # integrator actually applies, and the gap between them is the leading AB3 weight.
-        for (name, off) in (("rho_r", MC_DEPLETION_R), ("rho_c", MC_DEPLETION_C))
+        for (name, off, sink) in (("rho_r", MC_DEPLETION_R, "evaporation"),
+                                  ("rho_c", MC_DEPLETION_C, "evaporation"),
+                                  ("rho_v", MC_DEPLETION_V, "condensation"))
             npts = sum(view(st, off, :))
             npts > 0.0 || continue
             @info """water depletion [$name] step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
               gridpoints with $name > 0: $(Int(npts))
-              sinks pinned at their cap: evaporation $(Int(sum(view(st, off + 1, :)))), auto+coll $(Int(sum(view(st, off + 2, :))))
-              max depletion fraction this step: Euler $(maximum(view(st, off + 3, :))), ACTUAL(AB3) $(maximum(view(st, off + 4, :)))
+              sinks pinned at their bound: $sink $(Int(sum(view(st, off + 1, :)))), auto+coll $(Int(sum(view(st, off + 2, :))))
+              MICROPHYSICS depletion fraction (what the bound governs): max $(maximum(view(st, off + 8, :))), points > 1: $(Int(sum(view(st, off + 9, :))))
+              FULL-tendency depletion fraction: Euler $(maximum(view(st, off + 3, :))), ACTUAL(AB3) $(maximum(view(st, off + 4, :)))
               points driven negative by the step: $(Int(sum(view(st, off + 5, :))))
-              points past AB3's 0.545 stability limit with NO cap active: $(Int(sum(view(st, off + 6, :))))"""
+              points past AB3's 0.545 stability limit with NO cap active: $(Int(sum(view(st, off + 6, :))))
+              points whose sink HISTORY alone is inadmissible (bound clamped at 0): $(Int(sum(view(st, off + 7, :))))"""
         end
 
         for (name, offset) in (("rho_r", MC_BUDGET_R), ("rho_c", MC_BUDGET_C))
@@ -1614,6 +1858,19 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Stage-3 diagnostic lever on the condensate depletion caps; see `qss_condensation_rates`.
     # 1.0 (the default) is bitwise inert.
     cap_factor = get(model.physical_params, :water_cap_factor, 1.0)
+    # How the water depletion budgets are sized. `:ab3` (the default) uses the integrator's
+    # actual three-level combination via `_ab3_sink_bound`. `:euler` pins the budget to the
+    # `t = 1` branch at every step, which reproduces the forward-Euler `rho/ts` caps this file
+    # carried before -- BITWISE, so it is the A/B lever for every measurement in
+    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md (runs A-H were all taken under it).
+    # In `:euler` the vapor ceiling also keeps its historical form, which did NOT read
+    # `cap_factor`; under `:ab3` all three channels see the probe.
+    # In `options`, not `physical_params`: this is a choice of DISCRETIZATION (which
+    # integrator the budget is written against), not a physical parameter, and
+    # `physical_params` is a Dict{Symbol,Float64} besides.
+    cap_euler = get(model.options, :water_cap_mode, :ab3)::Symbol === :euler
+    cap_t = cap_euler ? 1 : t
+    cap_vfac = cap_euler ? 1.0 : cap_factor
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
     N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
 
@@ -1792,12 +2049,38 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # a useful regression check in its own right (model_tests/tc_discrete_balance.jl),
     # and it remains the clean separator between "the initial state is not a discrete
     # steady state" and "the moisture is doing something".
+
+    # ── Depletion budgets ──────────────────────────────────────────────────────
+    # The three channels' bounds are sized HERE, against the integrator's own three-level
+    # combination (`_ab3_sink_bound`) rather than the forward-Euler `rho/ts` this code used to
+    # hard-code at every step. The raw (unclamped) bounds are kept in scratch because the
+    # AUTO_COLL joint cap below needs the cloud one, and the depletion census needs all three
+    # to detect a binding bound bitwise and to count the points whose sink history alone is
+    # already inadmissible.
+    cap_c = S.cap_c
+    cap_r = S.cap_r
+    cap_v = S.cap_v
+    micro_nm1 = mtile.mc_micro_nm1
+    micro_nm2 = mtile.mc_micro_nm2
+    @inbounds for i in eachindex(cap_c)
+        g = colstart + i - 1
+        cap_c[i] = _ab3_sink_bound(model.ts, cap_t, cap_factor * max(rho_c[i], 0.0),
+                                   micro_nm1[g, MC_MICRO_C], micro_nm2[g, MC_MICRO_C])
+        cap_r[i] = _ab3_sink_bound(model.ts, cap_t, cap_factor * max(rho_r[i], 0.0),
+                                   micro_nm1[g, MC_MICRO_R], micro_nm2[g, MC_MICRO_R])
+        # The vapor is a SINK channel too -- condensation removes it -- so its bound has the
+        # same form and is negated into a ceiling on `Qdot_c + Qdot_r` at the use site.
+        cap_v[i] = _ab3_sink_bound(model.ts, cap_t, cap_vfac * max(rho_v[i], 0.0),
+                                   micro_nm1[g, MC_MICRO_V], micro_nm2[g, MC_MICRO_V])
+    end
     if get(model.options, :condensation, true)::Bool
         for i in 1:length(Qdot)
             Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
                                                         rho_d[i], Tk[i], p_hPa[i], Q_s[i],
                                                         model.ts, N_r; N_0=N_0,
-                                                        cap_factor=cap_factor)
+                                                        floor_c=min(cap_c[i], 0.0),
+                                                        floor_r=min(cap_r[i], 0.0),
+                                                        ceil_v=-min(cap_v[i], 0.0))
             if isnan(Qdot[i]) || isnan(Qdot_r[i])
                 error("Qdot is NaN at index $i, time $(t)!\n" *
                       "  T = $(Tk[i]) K, p = $(p[i]) Pa, rho_d = $(rho_d[i]), " *
@@ -1836,21 +2119,21 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             auto = autoconversion_density(max(rho_c[i], 0.0), rho_d[i])
             coll = collection_density(max(rho_c[i], 0.0), rho_r[i], rho_d[i], Tk[i])
             # JOINT depletion cap: never convert more cloud than survives evaporation this
-            # step. Cloud has two independent sinks — evaporation (`Qdot`, capped at
-            # `-rho_c/ts` inside qss_condensation_rates) and conversion to rain
-            # (`AUTO_COLL`). Capping each at `rho_c/ts` SEPARATELY lets them sum to
-            # `2*rho_c/ts`, which drives rho_c to `-rho_c` in a single step — an O(1)
-            # negative, not a ringing lobe.
+            # step. Cloud has two independent sinks — evaporation (`Qdot`, floored at
+            # `min(cap_c, 0)` inside qss_condensation_rates) and conversion to rain
+            # (`AUTO_COLL`) — and they share ONE budget, `Qdot - AUTO_COLL >= min(cap_c, 0)`.
+            # Bounding each separately let them sum to twice the budget, which drives rho_c
+            # to `-rho_c` in a single step — an O(1) negative, not a ringing lobe.
             #
             # This was invisible until the positivity bound went in: the rate functions
             # guard with `max(rho_c, 0)` so the overshoot was inert, and its mass merged
             # into the accumulated refit undershoot. With the bound active the limiter has
             # to remove that negative EVERY step, paying for it by shaving the cloud, which
-            # destroys the cell. Budget: rho_c/ts + Qdot - AUTO_COLL >= 0.
+            # destroys the cell.
             #
             # Capping AUTO_COLL rather than rescaling Qdot keeps the p, E_t and Q_ss
             # couplings — which have already consumed Qdot — exactly as they were.
-            avail = max((cap_factor * max(rho_c[i], 0.0) / model.ts) + Qdot[i], 0.0)
+            avail = max(Qdot[i] - min(cap_c[i], 0.0), 0.0)
             AUTO_COLL[i] = min(auto + coll, avail)
         end
         Vt = S.Vt;       @. Vt = rain_terminal_velocity(rho_r, rho_d, Tk)
@@ -1871,6 +2154,19 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         fill!(AUTO_COLL, 0.0)
         fill!(Fr_z, 0.0)
         fill!(E_sed_z, 0.0)
+    end
+
+    # Record this step's net microphysics tendency per channel, so the NEXT step's depletion
+    # budget can be written against the integrator's actual three-level combination. Here,
+    # after the `precipitation` branch, because the cloud channel is not final until
+    # AUTO_COLL is. See `MC_MICRO_C` for the three channels and `_rotate_micro_history!` for
+    # when these become the history levels.
+    micro_n = mtile.mc_micro_n
+    @inbounds for i in eachindex(Qdot)
+        g = colstart + i - 1
+        micro_n[g, MC_MICRO_C] = Qdot[i] - AUTO_COLL[i]
+        micro_n[g, MC_MICRO_R] = Qdot_r[i]
+        micro_n[g, MC_MICRO_V] = -(Qdot[i] + Qdot_r[i])
     end
 
     div = S.div; mc_divergence!(div, geom, u, u_x, w_z, vv, r)
@@ -2308,10 +2604,16 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # them), so the increment measured is exactly the one applied — including the horizontal
     # water mixing and the boundary-layer contributions added after slot 8/9 were assembled.
     budget_trace && water_depletion_probe!(mtile, colstart, colend, t, precipitation,
-                                           cap_factor, rho_c, rho_r, Qdot, Qdot_r, AUTO_COLL)
+                                           rho_c, rho_r, rho_v, Qdot, Qdot_r, AUTO_COLL,
+                                           cap_c, cap_r, cap_v)
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
+    # ...and rotate the microphysics sink history with it, so the next step's depletion
+    # budgets see the same two levels the integrator will weight. Placed HERE, not further
+    # down, because the exact_si branch returns from this function below: this is the last
+    # point common to both paths, and it is reached exactly once per column per step.
+    _rotate_micro_history!(mtile, colstart, colend)
 
     # Explicit AI2* history levels of the HORIZONTAL acoustic legs: both
     # dimensions' history levels belong to the star state before either implicit

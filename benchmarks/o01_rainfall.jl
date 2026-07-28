@@ -109,7 +109,7 @@ function o01_model(opts::BenchmarkOptions)
     # the sedimentation flux do not coarsen with the horizontal grid). The top
     # 8 km (17-25 km) is the Rayleigh sponge; the 25 km lid (vs the historical
     # 20 km) buys a stratosphere-confined absorber above the 16.59 km tropopause.
-    num_cells_k = 100            # RiRk: 500 m cells
+    num_cells_k = 100            # RiRk: 250 m cells over the 25 km lid (kDim = 300)
     haskey(ENV, "SCYTHE_O01_NK") && (num_cells_k = parse(Int, ENV["SCYTHE_O01_NK"]))
     kDim = 300                  # RZ: Chebyshev points (untargeted fallback)
     output_interval = 60.0
@@ -152,6 +152,13 @@ function o01_model(opts::BenchmarkOptions)
     # worst case. Unset => 1.0, which is bitwise inert. See qss_condensation_rates.
     haskey(ENV, "SCYTHE_O01_CAPFAC") &&
         (physical_params[:water_cap_factor] = parse(Float64, ENV["SCYTHE_O01_CAPFAC"]))
+    # How the water depletion budgets are sized. Default :ab3 -- the integrator's actual
+    # three-level combination. `SCYTHE_O01_CAPMODE=euler` pins them to the forward-Euler
+    # `rho/ts` form, BITWISE, which is what runs A-H of
+    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md were taken under and therefore the A/B
+    # lever for every number in it. See `_ab3_sink_bound`.
+    haskey(ENV, "SCYTHE_O01_CAPMODE") &&
+        (options[:water_cap_mode] = Symbol(ENV["SCYTHE_O01_CAPMODE"]))
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
@@ -353,6 +360,13 @@ function o01_rain_diagnostics(model, ref, kDim)
     max_rc = 0.0
     min_rc = 0.0
     min_rv = Inf
+    # Total water rho_w = rho_t - rho_d, the quantity that separates the two ways the
+    # residual vapor can fail: rho_w < 0 is the SHADOW of a negative rho_c (rho_t carries
+    # the same cloud water, so the same spline undershoot appears in both and cancels in
+    # rho_v), whereas rho_v < 0 at healthy rho_w means the condensate has claimed more
+    # water than the column holds. See the STAGE 5 RESOLUTION of
+    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md.
+    min_rw = Inf
     times = Float64[]
     rate_int = Float64[]    # domain-integrated surface rain flux [kg/(m s) per unit y]
     eflux_int = Float64[]   # domain-integrated surface energy flux [J/(m s) per unit y]
@@ -361,12 +375,13 @@ function o01_rain_diagnostics(model, ref, kDim)
         df = CSV.read(path, DataFrame)
         ncols = div(nrow(df), kDim)
         surf = 1:kDim:nrow(df)
-        Tk, _, rho_d, rho_v, rho_c, _ = mc_state(df, ref, kDim, ncols)
+        Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
         max_rr = max(max_rr, maximum(df.rho_r))
         min_rr = min(min_rr, minimum(df.rho_r))
         max_rc = max(max_rc, maximum(rho_c))
         min_rc = min(min_rc, minimum(rho_c))
         min_rv = min(min_rv, minimum(rho_v))
+        min_rw = min(min_rw, minimum(rho_t .- rho_d))
         rr_s = max.(df.rho_r[surf], 0.0)
         Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
         R = -rr_s .* Vt                                       # kg/m²/s, >= 0
@@ -401,6 +416,7 @@ function o01_rain_diagnostics(model, ref, kDim)
         "max_rho_c_gm3" => 1000.0 * max_rc,
         "min_rho_c_gm3" => 1000.0 * min_rc,             # ditto, for the condensate
         "min_rho_v_gm3" => 1000.0 * min_rv,             # the residual vapor's headroom
+        "min_rho_w_gm3" => 1000.0 * min_rw,             # total water; separates the two failures
         "accum_rainfall_flux_mm" => accum_flux / width, # cross-check of the exact budget
         "precip_energy_gain_Jm2" => accum_E / width,    # predicted domain E_t gain
     )
@@ -555,6 +571,7 @@ function o01_nested_diagnostics(models, topo)
     max_rc = 0.0
     min_rc = 0.0
     min_rv = Inf
+    min_rw = Inf
     # w extrema over the WHOLE run (user decision 2026-07-14): the nested max_w
     # is defined as the run maximum, not the final-time value the single-grid
     # diagnostic reports. By the end of the hour the secondary cells have
@@ -575,7 +592,7 @@ function o01_nested_diagnostics(models, topo)
             gp = models[i].grid_params
             ncols = div(nrow(df), kDim)
             surf = 1:kDim:nrow(df)
-            Tk, _, rho_d, rho_v, rho_c, _ = mc_state(df, ref, kDim, ncols)
+            Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
             mask = masks[i]
             colmask = repeat(mask, inner = kDim)
             max_rr = max(max_rr, maximum(df.rho_r[colmask]))
@@ -583,6 +600,7 @@ function o01_nested_diagnostics(models, topo)
             max_rc = max(max_rc, maximum(rho_c[colmask]))
             min_rc = min(min_rc, minimum(rho_c[colmask]))
             min_rv = min(min_rv, minimum(rho_v[colmask]))
+            min_rw = min(min_rw, minimum((rho_t .- rho_d)[colmask]))
             max_w = max(max_w, maximum(df.w[colmask]))
             min_w = min(min_w, minimum(df.w[colmask]))
             rr_s = max.(df.rho_r[surf], 0.0) .* mask
@@ -618,6 +636,7 @@ function o01_nested_diagnostics(models, topo)
         "max_rho_c_gm3" => 1000.0 * max_rc,
         "min_rho_c_gm3" => 1000.0 * min_rc,
         "min_rho_v_gm3" => 1000.0 * min_rv,
+        "min_rho_w_gm3" => 1000.0 * min_rw,
         "accum_rainfall_flux_mm" => accum_flux / total_width,
         "precip_energy_gain_Jm2" => accum_E / total_width,
     )

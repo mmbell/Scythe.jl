@@ -148,6 +148,91 @@ using Springsteel
                                            Q_s, ts) == 0.0
     end
 
+    @testset "AB3-sized water depletion bounds" begin
+        # The defect these exist to fix: every water limiter used to be written as a
+        # forward-Euler budget while the integrator is AB3. reference/
+        # FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md STAGE 3.
+        @testset "the forward-Euler bound overshoots under AB3 by 23/12" begin
+            ts = 0.3
+            avail = 2.0e-3                       # kg/m^3 of cloud
+            euler_sink = -avail / ts             # the historical cap
+            landed = avail + Scythe._ab3_increment(ts, 5, euler_sink, 0.0, 0.0)
+            @test landed ≈ -avail * (23.0 / 12.0 - 1.0) rtol = 1.0e-12
+            @test landed / avail ≈ -0.9166666666 rtol = 1.0e-8
+        end
+
+        @testset "_ab3_sink_bound solves the increment exactly" begin
+            # The bound is defined by "the species lands exactly at zero", at every
+            # integrator branch and for arbitrary history.
+            for t in 1:5, ts in (0.075, 0.3, 1.0)
+                for (avail, s1, s2) in ((1.0e-3, 0.0, 0.0),
+                                        (1.0e-3, -2.0e-3, 5.0e-4),
+                                        (4.0e-2, 1.0e-2, -3.0e-3),
+                                        (0.0, -1.0e-4, 2.0e-4),
+                                        (7.5e-5, 1.0e-6, 1.0e-6))
+                    b = Scythe._ab3_sink_bound(ts, t, avail, s1, s2)
+                    landed = avail + Scythe._ab3_increment(ts, t, b, s1, s2)
+                    # Scale the tolerance by the terms actually being cancelled, not by
+                    # `avail` alone: with avail = 0 the balance is between the two history
+                    # contributions, whose magnitude is ts*|s|.
+                    scale = max(avail, ts * abs(s1), ts * abs(s2), 1.0e-12)
+                    @test isapprox(landed, 0.0; atol = 1.0e-13 * scale)
+                end
+            end
+        end
+
+        @testset "t = 1 reproduces the forward-Euler bound bitwise" begin
+            # This is what `water_cap_mode = :euler` pins to at every step, and it has to be
+            # BIT-identical or the A/B against runs A-H is not an A/B.
+            for ts in (0.075, 0.15, 0.3), cf in (1.0, 12.0 / 23.0, 0.5)
+                for rho in (0.0, 1.0e-9, 3.7e-3, 2.5)
+                    avail = cf * max(rho, 0.0)
+                    @test Scythe._ab3_sink_bound(ts, 1, avail, 1.0, -2.0) ===
+                          -cf * max(rho, 0.0) / ts
+                end
+            end
+        end
+
+        @testset "a positive bound means the history alone is inadmissible" begin
+            # `_ab3_sink_bound` returns the raw solve; callers clamp at 0. The clamp is only
+            # ever reached when even a ZERO current-level sink lands the species negative,
+            # which is what `:d_*_infeas` counts.
+            ts = 0.3
+            avail = 1.0e-5
+            s1 = 5.0e-4          # a large sink two levels back, weighted -16/12 at t >= 3
+            b = Scythe._ab3_sink_bound(ts, 5, avail, s1, 0.0)
+            @test b > 0.0
+            @test avail + Scythe._ab3_increment(ts, 5, 0.0, s1, 0.0) < 0.0
+            @test min(b, 0.0) == 0.0
+        end
+
+        @testset "qss_condensation_rates default bounds are the historical ones" begin
+            Tk = 285.0; p_hPa = 900.0; ts = 0.1
+            rho_vs = rho_v_sat(Tk, p_hPa)
+            rho_d = (100.0 * p_hPa - Rv * Tk * rho_vs) / (Rd * Tk)
+            Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_vs / rho_d, 1.0e-3)
+            for (Q_ss, rho_v, rho_c, rho_r) in (
+                    (-0.5 * rho_vs, 0.5 * rho_vs, 1.0e-4, 1.0e-3),
+                    (0.5 * rho_vs, 1.5 * rho_vs, 1.0e-4, 1.0e-3),
+                    (0.2 * rho_vs, 1.0e-9, 1.0e-4, 0.0),
+                    (-0.9 * rho_vs, 0.1 * rho_vs, 0.0, 1.0e-3))
+                for cf in (1.0, 12.0 / 23.0)
+                    base = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d,
+                                                         Tk, p_hPa, Q_s, ts, 1.0e-3;
+                                                         cap_factor = cf)
+                    expl = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d,
+                                                         Tk, p_hPa, Q_s, ts, 1.0e-3;
+                                                         cap_factor = cf,
+                                                         floor_c = -cf * max(rho_c, 0.0) / ts,
+                                                         floor_r = -cf * max(rho_r, 0.0) / ts,
+                                                         ceil_v = max(rho_v, 0.0) / ts)
+                    @test base[1] === expl[1]
+                    @test base[2] === expl[2]
+                end
+            end
+        end
+    end
+
     @testset "qss_condensation_rates cloud/rain split" begin
         Tk = 285.0; p_hPa = 900.0; ts = 0.1
         N_r = 1.0e-3   # #/cm^3
