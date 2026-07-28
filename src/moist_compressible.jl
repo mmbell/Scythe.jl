@@ -512,7 +512,7 @@ the single-category [`qss_condensation_rate`](@ref) delegate bit-identical to it
 pre-rain behavior.
 """
 function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts,
-                                N_r, max_N_c=100.0; N_0=0.0)
+                                N_r, max_N_c=100.0; N_0=0.0, cap_factor=1.0)
 
     rho_vs = rho_v_sat(Tk, p_hPa)
     S = Q_ss / rho_vs                    # supersaturation (ratio - 1)
@@ -570,9 +570,18 @@ function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s
     Qdot_c = invtau_c == 0.0 ? 0.0 : Qdot * (invtau_c / invtau)
     Qdot_r = invtau_r == 0.0 ? 0.0 : Qdot * (invtau_r / invtau)
 
-    # No negative water: each condensate's evaporation limited by its own mass
-    Qdot_c = max(Qdot_c, -max(rho_c, 0.0) / ts)
-    Qdot_r = max(Qdot_r, -max(rho_r, 0.0) / ts)
+    # No negative water: each condensate's evaporation limited by its own mass.
+    #
+    # `cap_factor` (default 1.0, bitwise inert) is the DIAGNOSTIC lever of
+    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md Stage 3. `rho/ts` is a FORWARD-EULER
+    # budget, but the tendency is integrated by AB3 with a leading weight of 23/12, so a sink
+    # sitting on this cap is multiplied by ~1.92 and lands the species at ~-0.92*rho. Setting
+    # cap_factor = 12/23 makes the cap AB3-sized for the worst case (no sink history), which
+    # discriminates that mechanism from a stiff relaxation. It is a probe, not a fix: it
+    # changes the physical rate, and the correct budget uses the actual three-level
+    # combination rather than a constant.
+    Qdot_c = max(Qdot_c, -cap_factor * max(rho_c, 0.0) / ts)
+    Qdot_r = max(Qdot_r, -cap_factor * max(rho_r, 0.0) / ts)
 
     # Condensation limited by the available vapor. With the rain channel inactive this
     # is the historical min(); with both active the channels rescale proportionally.
@@ -770,8 +779,197 @@ Row names of `ModelTile.mc_water_stats`, accumulated per thread by [`clamp_water
 | `:worst_dT`| largest implied latent-heat kick of a single event [K] (see below) |
 | `:count`   | number of gridpoint-steps carrying negative water |
 | `:warned`  | internal: largest `worst_dT` already warned about (thread 1 only) |
+
+Rows 7 onward are the per-step **production budget**, written by [`water_budget_probe!`](@ref)
+and reset every step by [`water_budget_trace`](@ref); they answer which term is driving the
+water negative, which rows 1-6 (cumulative extrema) structurally cannot. Each block records the
+term-by-term tendency AT the gridpoint where that species is most negative this step:
+
+| row | meaning |
+|-----|---------|
+| `:b_r_val`  | most negative `ρ_r` in this thread's columns this step [kg/m³] |
+| `:b_r_adv`  | `-v·∇ρ_r'` there [kg/m³/s] |
+| `:b_r_cdiv` | `-ρ_r ∇·v` there — the compressibility term, a sign-blind linear amplifier |
+| `:b_r_src`  | `Qdot_r` (rain-channel condensation/evaporation) there |
+| `:b_r_auto` | `AUTO_COLL` (autoconversion + collection from cloud) there |
+| `:b_r_sed`  | `-∂F_r/∂z` (sedimentation flux divergence) there |
+| `:b_r_div`  | `∇·v` there [1/s] |
+| `:b_r_w`    | `w` there [m/s] |
+| `:b_r_z`    | height of the point [m] |
+| `:b_r_eul`  | the FORWARD-EULER projection `ρ + ts·f_n` at that same point [kg/m³] |
+| `:b_r_now`  | the current value `ρ` at that same point [kg/m³] |
+| `:b_c_*`    | the same for `ρ_c`, with `:b_c_src` = `Qdot` and `:b_c_auto` = `-AUTO_COLL` |
+
+The final two blocks are the per-step **depletion census**, written by
+[`water_depletion_probe!`](@ref) just before `explicit_timestep`. The budget block above says
+what happens at ONE point; these say how widespread it is, and they are what separates a
+limiter sized for the wrong integrator from a stiff source term:
+
+| row | meaning |
+|-----|---------|
+| `:d_r_n`      | gridpoints in this thread's columns with `ρ_r > 0` |
+| `:d_r_cevap`  | of those, how many have the evaporation sink pinned at its `-ρ/ts` cap |
+| `:d_r_cauto`  | how many have `AUTO_COLL` pinned at `avail` (cloud block only; 0 for rain) |
+| `:d_r_eul`    | max forward-Euler depletion fraction `-ts·f_n/ρ`; the caps bound this by 1 |
+| `:d_r_ab3`    | max ACTUAL depletion fraction `-(ρ^{n+1}-ρ)/ρ` under the run's AB3 weights |
+| `:d_r_neg`    | how many points the step actually drives negative (`:d_r_ab3 > 1` pointwise) |
+| `:d_r_stiff`  | how many exceed AB3's real-axis stability limit (0.545) with NO cap active |
+| `:d_c_*`      | the same for `ρ_c` |
 """
-const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned)
+const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
+                        :b_r_val, :b_r_adv, :b_r_cdiv, :b_r_src, :b_r_auto, :b_r_sed,
+                        :b_r_div, :b_r_w, :b_r_z, :b_r_eul, :b_r_now,
+                        :b_c_val, :b_c_adv, :b_c_cdiv, :b_c_src, :b_c_auto, :b_c_sed,
+                        :b_c_div, :b_c_w, :b_c_z, :b_c_eul, :b_c_now,
+                        :b_pre_r, :b_pre_c,
+                        :d_r_n, :d_r_cevap, :d_r_cauto, :d_r_eul, :d_r_ab3,
+                        :d_r_neg, :d_r_stiff,
+                        :d_c_n, :d_c_cevap, :d_c_cauto, :d_c_eul, :d_c_ab3,
+                        :d_c_neg, :d_c_stiff)
+
+"""
+First row of the per-step budget block for each species in `mc_water_stats`.
+
+Both blocks are `MC_BUDGET_N` rows with the SAME layout, so one probe writes either. Cloud has
+no sedimentation, so `:b_c_sed` is always zero and is not printed — giving the two blocks
+different lengths silently walks off the end of the matrix into the next thread's column.
+"""
+const MC_BUDGET_R = 7
+const MC_BUDGET_C = 18
+const MC_BUDGET_N = 11
+"""
+First row of the per-step depletion census for each species; `MC_DEPLETION_N` rows each,
+same layout, written by [`water_depletion_probe!`](@ref).
+"""
+const MC_DEPLETION_R = 31
+const MC_DEPLETION_C = 38
+const MC_DEPLETION_N = 7
+"""
+Per-STEP pre-fit minima (rows 29/30), written by `clamp_water!` and reset every step.
+
+Rows 2/3 (`:min_c`, `:min_r`) are cumulative, so they cannot be differenced against the
+post-fit reconstruction to separate what the column step did from what the refit did. These
+can: `post_t - pre_t` is the refit's contribution and `pre_t - post_{t-1}` is the column
+step's, and the two sum to the step's change exactly.
+"""
+const MC_PRE_R = 29
+const MC_PRE_C = 30
+"""First budget row; rows `MC_BUDGET_FIRST:end` are reset every step."""
+const MC_BUDGET_FIRST = MC_BUDGET_R
+
+"""
+    positivity_reference_profile(name, ref_state) -> AbstractVector or nothing
+
+The reference profile a positivity-bounded prognostic is carried against, or `nothing` when
+the variable is a TOTAL and its bound needs no offset.
+
+`u, w, rho_r` are totals; `p, rho_d, rho_t, E_t, Q_ss, rho_c` are perturbations from the
+pressure reference (see the prognostic-slot semantics above). A zero bound on a PERTURBATION
+is not merely conservative, it is wrong: it would pin the field at or above its reference and
+forbid the cloud from ever evaporating below `ρ̄_c`. Hence anything not recognised here throws
+rather than silently taking the factory's constant bound.
+"""
+function positivity_reference_profile(name::AbstractString, ref_state)
+    name in ("rho_r", "u", "w", "v") && return nothing         # totals: no offset
+    prof = name == "rho_c" ? Springsteel.ref_rho_c(ref_state) :
+           name == "rho_d" ? ref_rho_d(ref_state) :
+           name == "rho_t" ? ref_rho_t(ref_state) :
+           error("positivity is declared for \"$name\", which is carried as a perturbation " *
+                 "from the reference state and has no offset rule here. A constant bound on " *
+                 "a perturbation pins the field at or above its reference — add the variable " *
+                 "to positivity_reference_profile before enabling it.")
+    # Springsteel returns the scalar 0.0 for reference states that carry no such profile.
+    prof isa Number && return nothing
+    return view(prof, :, 1)
+end
+
+"""
+    install_positivity_bounds!(grid, ref_state, model) -> Nothing
+
+Convert the declared physical positivity bounds into the reference-aware coefficient bounds
+each spline leg actually needs, overriding what the factory installed.
+
+The factory can only express a CONSTANT bound, which is exactly right for a total (`rho_r`,
+bound 0) and for a perturbation whose reference is identically zero (`rho_c` on a cloud-free
+base, which is every current configuration). It cannot express the bound for a perturbation
+against a nonzero reference, and that bound differs by leg:
+
+- **k-leg** — fits the field itself, so the bound is `-ρ̄(z)`, applied through the
+  support-minimum rule (`set_lower_bound_from_profile!`).
+- **i-leg** — fits the k-direction B-coefficients `⟨φ_z, u⟩`, so the bound is the CONSTANT
+  `-⟨φ_z, ρ̄⟩` for each mode `z`, i.e. the negated SB coefficients of the reference. This is
+  the scaling the RiRk factory refuses to guess at.
+
+A no-op when the reference is zero, so the common path is untouched.
+"""
+function install_positivity_bounds!(grid, ref_state, model::ModelParameters)
+
+    pos = model.grid_params.positivity
+    isempty(pos) && return nothing
+    grid.kbasis isa Springsteel.SplineBasisArray || return nothing
+    vars = model.grid_params.vars
+
+    for (name, v) in vars
+        spec = Springsteel._resolve_spline_filter(pos, name, :k)
+        spec_i = Springsteel._resolve_spline_filter(pos, name, :i)
+        (spec === nothing && spec_i === nothing) && continue
+        prof = positivity_reference_profile(name, ref_state)
+        prof === nothing && continue                 # total: the factory bound is correct
+        all(iszero, prof) && continue                # zero reference: likewise
+
+        if spec !== nothing
+            spec == 0.0 || error("positivity[\"$name\"][:k] = $spec: only a bound of 0.0 is " *
+                                 "supported for a variable carried against a reference.")
+            set_lower_bound_from_profile!(grid.kbasis.data[v], prof)
+        end
+        if spec_i !== nothing
+            spec_i == 0.0 || error("positivity[\"$name\"][:i] = $spec_i: only 0.0 is supported.")
+            # b̄_z = ⟨φ_z, ρ̄⟩ on the k basis. Safe to borrow the k-column's buffers: this
+            # runs at initialization, before any transform.
+            kcol = grid.kbasis.data[v]
+            kcol.uMish .= prof
+            SBtransform!(kcol)
+            bbar = copy(kcol.b)
+            b_iDim = model.grid_params.b_iDim
+            for z in 1:model.grid_params.b_kDim
+                set_lower_bound!(grid.ibasis.data[z, v], fill(-bbar[z], b_iDim))
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    _warn_unbounded_master_output(ref_state, model)
+
+Warn once when a reference-aware bound is in force on the workers but cannot be installed on
+the master's patch.
+
+The master builds its patch from `model.grid_params` alone (`initialize_model`), never
+constructing a reference state — only `createModelTile` does, per worker. So when a bounded
+perturbation has a NONZERO reference, the master's `gridTransform!` (output/CFL/restart
+cadence only) reconstructs without the offset bound. The dynamics are unaffected: the state's
+coefficients are bounded on the workers and it is those that are integrated. Only the written
+diagnostics can show an undershoot the model itself never saw.
+
+Silent for every current configuration, all of which have `ρ̄_c ≡ 0`.
+"""
+function _warn_unbounded_master_output(ref_state, model::ModelParameters)
+    pos = model.grid_params.positivity
+    isempty(pos) && return nothing
+    for (name, _) in model.grid_params.vars
+        Springsteel._resolve_spline_filter(pos, name, :k) === nothing &&
+            Springsteel._resolve_spline_filter(pos, name, :i) === nothing && continue
+        prof = positivity_reference_profile(name, ref_state)
+        (prof === nothing || all(iszero, prof)) && continue
+        @warn """Positivity bound on "$name" is reference-offset (ρ̄ is not identically zero).
+          The worker tiles and patches carry the correct bound, so the INTEGRATED state is
+          bounded. The master's patch is built without a reference state, so the output
+          written by gridTransform! is reconstructed unbounded and may show an undershoot the
+          model never integrated. See install_positivity_bounds!.""" maxlog = 1
+    end
+    return nothing
+end
 
 """
     clamp_water!(mtile, colstart, colend)
@@ -917,6 +1115,11 @@ function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
             st[3, tid] = min(st[3, tid], min_r)
             st[4, tid] = max(st[4, tid], worst_dT)
             st[5, tid] += nneg
+            # Per-STEP pre-fit minima for the production budget (reset each step by
+            # `water_budget_trace`); rows 2/3 above are cumulative and cannot be differenced
+            # against the post-fit reconstruction.
+            st[MC_PRE_C, tid] = min(st[MC_PRE_C, tid], min_c)
+            st[MC_PRE_R, tid] = min(st[MC_PRE_R, tid], min_r)
         end
     end
     return nothing
@@ -982,10 +1185,354 @@ function water_negativity_trace(mtile::ModelTile, t::Int64)
       $(rep.count) gridpoint-steps so far, $(rep.total) kg/m^3 total
       $(applied ? "options[:clamp_water] is ON, so that kick IS being applied, one-signed." :
                   "options[:clamp_water] is off, so this is the size of the COLD anomaly the negative liquid is currently imposing through the retrieval (oscillatory, not cumulative). Rate functions are guarded; the retrieval and advection are not.")
-      This is a RESOLUTION signal, not a limiter problem: a positive-definite spike the
-      column cannot represent undershoots on its flanks. Refine the vertical spacing
-      where the cloud/rain gradients are sharpest. Flooring it instead rectifies a
-      zero-mean oscillation into one-signed latent heating."""
+      GENERATOR (attributed 2026-07-26): the refit deposits a small undershoot every step
+      (~0.06% of peak) and NOTHING REMOVES IT — the projection is idempotent, so the deficit
+      persists and the next step adds another. It is neither one large Gibbs event nor
+      resolution nor the l_q filter. Contributions per step: refit ~90% (rho_r) / ~70%
+      (rho_c), transport the rest, microphysics zero.
+      REMEDY: constrain the fit — GridParameters.positivity, e.g.
+      Dict("rho_r" => Dict(:k => 0.0)), which makes an admissible state a fixed point of
+      the refit and conserves mass exactly. Set options[:water_budget_trace] to re-measure.
+      Flooring the state instead rectifies a two-signed excursion into one-signed latent
+      heating; see reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md (CORRECTION section)."""
+    return nothing
+end
+
+"""
+    water_budget_probe!(mtile, offset, slot, t, colstart, val, adv, div, src, aut, autsign,
+                        sed, w, z)
+
+Record the term-by-term tendency at the gridpoint where one water species is most negative.
+
+Called from `mc_driver!` immediately after that species' `expdot` is assembled, while its
+`ADV`/source scratch is still live (the buffers are reused by the next slot). Writes into the
+calling thread's column of `mc_water_stats`, keeping the worst point seen so far this step —
+`water_budget_trace` resets the block after printing, so the semantics are per-step, unlike
+rows 1-6.
+
+`offset` is `MC_BUDGET_R` or `MC_BUDGET_C`. `autsign` is `+1` for rain and `-1` for cloud (the
+same `AUTO_COLL` array is a source for one and a sink for the other); `sed` is `nothing` for
+cloud, which has no sedimentation. All arrays are column-block-local (1-based over
+`colstart:colend`).
+
+This exists because rows 1-6 record cumulative extrema and so cannot say WHICH operation
+drives the water negative — the question left open by
+`reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md`'s CORRECTION section.
+
+The worst point is selected on the **AB3-projected** value `ρ + Δ`, where `Δ` is the exact
+combination [`explicit_timestep`](@ref) will apply at this step (Euler at `t = 1`, AB2 at
+`t = 2`, AB3 thereafter) — NOT on the forward-Euler projection. That distinction is the whole
+reason this probe was blind: every water depletion limiter is sized so that `ρ + ts·f_n ≥ 0`
+exactly, so the Euler projection of a capped point is `0.0`, `0.0 < 0.0` is false, and the
+probe skipped precisely the points that produce the negative. Both projections are recorded
+(`:b_*_eul` alongside the selecting value) so their gap is readable directly.
+
+`Δ` is read from `expdot`/`expdot_nm1`/`expdot_nm2` at `slot`, which is exact at the call site
+for every configuration where nothing is added to that slot afterwards. The horizontal
+water mixing (`Khdiff_water`/Smagorinsky) and the Louis boundary layer both add to slot 8/9
+*after* this runs, so with either enabled the projection here understates them; the
+[`water_depletion_probe!`](@ref) census, which runs immediately before `explicit_timestep`,
+is exact in every configuration.
+"""
+@inline function water_budget_probe!(mtile::ModelTile, offset::Int64, slot::Int64, t::Int64,
+                                     colstart::Int64,
+                                     val, adv, div, src, aut, autsign::Float64, sed, w, z)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    ts = mtile.model.ts
+    expdot_n = mtile.expdot_n
+    expdot_nm1 = mtile.expdot_nm1
+    expdot_nm2 = mtile.expdot_nm2
+    j = 0
+    vmin = 0.0
+    dmin = 0.0
+    @inbounds for i in eachindex(val)
+        g = colstart + i - 1
+        delta = _ab3_increment(ts, t, expdot_n[g, slot], expdot_nm1[g, slot],
+                               expdot_nm2[g, slot])
+        projected = val[i] + delta
+        if projected < vmin
+            vmin = projected
+            dmin = delta
+            j = i
+        end
+    end
+    j == 0 && return nothing
+    tid = Threads.threadid()
+    @inbounds begin
+        vmin < st[offset, tid] || return nothing
+        st[offset,      tid] = vmin
+        st[offset +  1, tid] = adv[j]
+        st[offset +  2, tid] = -val[j] * div[j]
+        st[offset +  3, tid] = src[j]
+        st[offset +  4, tid] = autsign * aut[j]
+        st[offset +  5, tid] = sed === nothing ? 0.0 : -sed[j]
+        st[offset +  6, tid] = div[j]
+        st[offset +  7, tid] = w[j]
+        st[offset +  8, tid] = z[j]
+        st[offset +  9, tid] = val[j] + (ts * expdot_n[colstart + j - 1, slot])
+        st[offset + 10, tid] = val[j]
+    end
+    return nothing
+end
+
+"""
+    _ab3_increment(ts, t, f_n, f_nm1, f_nm2) -> Float64
+
+The increment [`explicit_timestep`](@ref) applies to a prognostic slot at step `t`.
+
+One definition, so a diagnostic can never drift from the integrator it is measuring: Euler at
+`t = 1`, second-order Adams-Bashforth at `t = 2`, AB3 (Durran & Blossey 2012) thereafter. The
+leading AB3 weight is **23/12 ≈ 1.917**, which is what a sink capped at `-ρ/ts` — a forward-Euler
+budget — actually gets multiplied by.
+"""
+@inline _ab3_increment(ts::Float64, t::Int64, f_n::Float64, f_nm1::Float64, f_nm2::Float64) =
+    t == 1 ? ts * f_n :
+    t == 2 ? (0.5 * ts) * ((3.0 * f_n) - f_nm1) :
+             (ts / 12.0) * ((23.0 * f_n) - (16.0 * f_nm1) + (5.0 * f_nm2))
+
+"""
+    water_depletion_probe!(mtile, colstart, colend, t, precipitation, cap_factor,
+                           rho_c, rho_r, Qdot, Qdot_r, AUTO_COLL)
+
+Census, over every gridpoint holding water, of how hard the step is depleting it.
+
+Runs immediately before [`explicit_timestep`](@ref), so `expdot` is final for the step and the
+measured increment is the one actually applied. For each species it records how many points
+exist, how many have a sink pinned at its cap, the largest forward-Euler and largest ACTUAL
+depletion fractions, how many points the step drives negative outright, and how many exceed
+AB3's real-axis stability limit with no cap active.
+
+The two hypotheses this is built to separate:
+
+- **cap-vs-integrator** — the limiters guarantee `ρ + ts·f_n ≥ 0`, so `:d_*_eul` is pinned at
+  1.0 at capped points while `:d_*_ab3` runs up to ≈ 23/12, and `:d_*_neg` tracks `:d_*_cevap`
+  + `:d_*_cauto`;
+- **stiff source** — `:d_*_stiff` is nonzero, i.e. points are being depleted faster than AB3
+  can stably integrate even before any cap engages.
+
+Gated on `options[:water_budget_trace]`; never called otherwise.
+"""
+function water_depletion_probe!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
+                                precipitation::Bool, cap_factor::Float64,
+                                rho_c, rho_r, Qdot, Qdot_r, AUTO_COLL)
+
+    size(mtile.mc_water_stats, 2) == 0 && return nothing
+    _depletion_census!(mtile, MC_DEPLETION_C, 9, colstart, t, cap_factor, rho_c, Qdot,
+                       precipitation ? AUTO_COLL : nothing, Qdot)
+    _depletion_census!(mtile, MC_DEPLETION_R, 8, colstart, t, cap_factor, rho_r, Qdot_r,
+                       nothing, Qdot)
+    return nothing
+end
+
+"""
+    _depletion_census!(mtile, species, slot, colstart, t, cap_factor, val, evap, aut, Qdot)
+
+One species' pass for [`water_depletion_probe!`](@ref). Split out so each call specializes on
+its own argument types (`rho_c` is a scratch `Vector`, `rho_r` a grid `SubArray`), rather than
+being iterated as a heterogeneous tuple. `aut === nothing` skips the `AUTO_COLL` cap test,
+which is the correct behaviour for rain (where `AUTO_COLL` is a source, not a sink) and with
+precipitation off.
+"""
+function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, colstart::Int64,
+                            t::Int64, cap_factor::Float64, val, evap, aut, Qdot)
+
+    st = mtile.mc_water_stats
+    ts = mtile.model.ts
+    expdot_n = mtile.expdot_n
+    expdot_nm1 = mtile.expdot_nm1
+    expdot_nm2 = mtile.expdot_nm2
+    # AB3's real-axis absolute-stability interval is (-0.545, 0]; a decay faster than that is
+    # unstable under this integrator no matter how the sink is limited.
+    AB3_REAL_LIMIT = 0.545
+
+    n = 0.0; n_cevap = 0.0; n_cauto = 0.0; n_neg = 0.0; n_stiff = 0.0
+    max_eul = 0.0; max_ab3 = 0.0
+    @inbounds for i in eachindex(val)
+        rho = val[i]
+        rho > 0.0 || continue
+        n += 1.0
+        g = colstart + i - 1
+        f_n = expdot_n[g, slot]
+        delta = _ab3_increment(ts, t, f_n, expdot_nm1[g, slot], expdot_nm2[g, slot])
+        dep_eul = -(ts * f_n) / rho
+        dep_ab3 = -delta / rho
+        dep_eul > max_eul && (max_eul = dep_eul)
+        dep_ab3 > max_ab3 && (max_ab3 = dep_ab3)
+        dep_ab3 > 1.0 && (n_neg += 1.0)
+        # Cap detection is bitwise-exact: `max(x, -rho/ts)` returns the bound itself when it
+        # clips, and `min(auto + coll, avail)` returns `avail`.
+        capped = evap[i] == -cap_factor * rho / ts
+        capped && (n_cevap += 1.0)
+        if aut !== nothing
+            avail = max((cap_factor * rho / ts) + Qdot[i], 0.0)
+            if avail > 0.0 && aut[i] == avail
+                n_cauto += 1.0
+                capped = true
+            end
+        end
+        (!capped && dep_eul > AB3_REAL_LIMIT) && (n_stiff += 1.0)
+    end
+
+    tid = Threads.threadid()
+    @inbounds begin
+        st[species,     tid] += n
+        st[species + 1, tid] += n_cevap
+        st[species + 2, tid] += n_cauto
+        st[species + 3, tid] = max(st[species + 3, tid], max_eul)
+        st[species + 4, tid] = max(st[species + 4, tid], max_ab3)
+        st[species + 5, tid] += n_neg
+        st[species + 6, tid] += n_stiff
+    end
+    return nothing
+end
+
+"""
+    _ileg_shortfall(v) -> Float64
+
+Accumulated positivity shortfall of variable slot `v`'s i-direction splines, or `NaN` when it
+cannot be read.
+
+The i-leg bound bites on the WORKER'S PATCH, not on the tile: every call site uses the 3-arg
+`splineTransform!(sharedSpectral, patch, mtile.tile)` (`semiimplicit.jl:793`, `:968`,
+`nesting.jl:740`, `:879`), which runs `SAtransform_bounded` on `patch.ibasis`. The tile's own
+i-splines carry the same bound but are never the ones solved, so their shortfall is
+identically zero and reporting it would be a lie of omission. `ModelTile` holds no reference
+to the patch — it is a worker-scope binding — hence the introspection, which is confined to
+this diagnostic and returns `NaN` (never a misleading `0.0`) whenever the lookup does not
+find a real spline patch.
+"""
+function _ileg_shortfall(v::Int64)
+    isdefined(Main, :patch) || return NaN
+    p = getfield(Main, :patch)
+    hasproperty(p, :ibasis) || return NaN
+    ib = p.ibasis
+    ib isa Springsteel.NoBasisArray && return 0.0
+    eltype(ib.data) <: Springsteel.CubicBSpline.Spline1D || return NaN
+    v <= size(ib.data, 2) || return NaN
+    return sum(Springsteel.CubicBSpline.bound_shortfall(ib.data[z, v])
+               for z in axes(ib.data, 1))
+end
+
+"""
+    water_budget_trace(mtile, t)
+
+Print the per-step water production budget, then reset it for the next step.
+
+Emitted from the same single-threaded pre-column-loop slot as
+[`water_negativity_trace`](@ref), so printing is race-free and the numbers describe the step
+that just finished. Gated on `options[:water_budget_trace]::Int` — the print interval in steps;
+absent or `0` disables it, and `water_budget_probe!` is then never called, so the hot path is
+untouched.
+
+Also reports the POST-reconstruction minimum from `tile.physical`, which is the step-matched
+partner of `clamp_water!`'s pre-fit measurement. Their difference is what the fit contributes
+per step, the quantity the previous attribution had no way to see (it read only the pre-fit
+number, and only from the console, where the run's `@warn` never appears — the worker's stderr
+goes to `<output_dir>/scythe_err.log`).
+"""
+function water_budget_trace(mtile::ModelTile, t::Int64)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    interval = get(mtile.model.options, :water_budget_trace, 0)::Int
+    interval > 0 || return nothing
+
+    if mod(t, interval) == 0
+        # Reduce across threads: the thread holding the most negative value owns the budget.
+        vars = mtile.model.grid_params.vars
+        # Positivity limiter health: nonzero shortfall means a column was infeasible (its
+        # total mass below the minimum an admissible field can carry), so the limiter
+        # created mass instead of redistributing it. This must stay at zero.
+        #
+        # PER SPECIES and per LEG. Summing over every variable hid which species was
+        # infeasible, and reading only the k-basis hid the i-leg entirely — the two together
+        # are why "bound_shortfall stays exactly 0.0" was recorded for a configuration whose
+        # k-leg shortfall reached 8e3 (see the STAGE 2 section of
+        # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md).
+        kb = mtile.tile.kbasis
+        kshort = (name) -> kb isa Springsteel.NoBasisArray ? 0.0 :
+            Springsteel.CubicBSpline.bound_shortfall(kb.data[vars[name]])
+        shortfall = join(("$name k=$(kshort(name)) i=$(_ileg_shortfall(vars[name]))"
+                          for name in ("rho_r", "rho_c")), ", ")
+        phys = mtile.tile.physical
+        kDim = mtile.model.grid_params.kDim
+        rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
+        rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
+        rho_tbar = view(ref_rho_t(mtile.ref_state), :, 1)
+        rr = vars["rho_r"]
+        rc = vars["rho_c"]
+        rd = vars["rho_d"]
+        rt = vars["rho_t"]
+        post_r = 0.0
+        post_c = 0.0
+        # The VAPOR is the residual rho_t - rho_d - rho_c - rho_r, so it is where any error
+        # the condensate is no longer allowed to absorb has to go. Forcing rho_c >= 0
+        # removes a reservoir the formulation was leaning on, and this is the number that
+        # says whether the vapor can take it.
+        post_v = Inf
+        @inbounds for i in axes(phys, 1)
+            k = mod1(i, kDim)
+            post_r = min(post_r, phys[i, rr, 1])
+            rho_c_tot = phys[i, rc, 1] + rho_cbar[k]
+            post_c = min(post_c, rho_c_tot)
+            post_v = min(post_v, (phys[i, rt, 1] + rho_tbar[k]) - (phys[i, rd, 1] + rho_dbar[k]) -
+                                 rho_c_tot - phys[i, rr, 1])
+        end
+
+        # Cloud-top diagnostic: the highest gridpoint carrying condensate, and the coldest
+        # temperature anywhere. A positivity limiter redistributes mass WITHIN a leg, so it
+        # can only move condensate along that leg — this is what shows whether it is
+        # depositing cloud at an altitude the energy budget cannot support.
+        z_all = view(mtile.tilepoints, :, size(mtile.tilepoints, 2))
+        z_cloud = -Inf
+        @inbounds for i in axes(phys, 1)
+            (phys[i, rc, 1] + rho_cbar[mod1(i, kDim)]) > 1.0e-6 && (z_cloud = max(z_cloud, z_all[i]))
+        end
+
+        # The summary always prints on the interval: with every species bounded the
+        # per-species blocks below fall silent, and the limiter health has to stay visible.
+        @info """water summary step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
+          positivity limiter shortfall (must be 0): $shortfall
+          post-fit(reconstruction) minima: rho_r = $post_r, rho_c = $post_c, rho_v = $post_v
+          pre-fit(var_np1) minima: rho_r = $(minimum(view(st, MC_PRE_R, :))), rho_c = $(minimum(view(st, MC_PRE_C, :)))
+          highest gridpoint with rho_c > 1e-6: $(isfinite(z_cloud) ? z_cloud : NaN) m"""
+
+        # The depletion census: how widely, and how hard, the step is draining each species.
+        # `euler` is bounded by 1 wherever a cap is the binding constraint; `ab3` is what the
+        # integrator actually applies, and the gap between them is the leading AB3 weight.
+        for (name, off) in (("rho_r", MC_DEPLETION_R), ("rho_c", MC_DEPLETION_C))
+            npts = sum(view(st, off, :))
+            npts > 0.0 || continue
+            @info """water depletion [$name] step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
+              gridpoints with $name > 0: $(Int(npts))
+              sinks pinned at their cap: evaporation $(Int(sum(view(st, off + 1, :)))), auto+coll $(Int(sum(view(st, off + 2, :))))
+              max depletion fraction this step: Euler $(maximum(view(st, off + 3, :))), ACTUAL(AB3) $(maximum(view(st, off + 4, :)))
+              points driven negative by the step: $(Int(sum(view(st, off + 5, :))))
+              points past AB3's 0.545 stability limit with NO cap active: $(Int(sum(view(st, off + 6, :))))"""
+        end
+
+        for (name, offset) in (("rho_r", MC_BUDGET_R), ("rho_c", MC_BUDGET_C))
+            tid = argmin(view(st, offset, :))
+            val = st[offset, tid]
+            val < 0.0 || continue
+            trm = (name == "rho_r" ?
+                   ("adv", "-rho*div", "Qdot_r", "auto+coll", "-dFr/dz") :
+                   ("adv", "-rho*div", "Qdot", "-auto-coll"))
+            budget = join(("$(trm[k])=$(st[offset + k, tid])" for k in 1:length(trm)), "  ")
+            @info """water budget [$name] step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
+              worst AB3-projected point: $name $(st[offset + 10, tid]) -> $val kg/m^3 at z = $(st[offset + 8, tid]) m
+              the FORWARD-EULER projection of the same point: $(st[offset + 9, tid]) kg/m^3
+              tendency terms [kg/m^3/s]: $budget
+              net explicit tendency: $(sum(st[offset + k, tid] for k in 1:5)) kg/m^3/s (x ts = $(mtile.model.ts * sum(st[offset + k, tid] for k in 1:5)))
+              local flow: div(v) = $(st[offset + 6, tid]) 1/s, w = $(st[offset + 7, tid]) m/s"""
+        end
+    end
+
+    # Reset the per-step block regardless of whether this was a print step, so the
+    # recorded worst point always belongs to the step just finished.
+    @inbounds fill!(view(st, MC_BUDGET_FIRST:length(MC_WATER_STATS), :), 0.0)
     return nothing
 end
 
@@ -1061,6 +1608,12 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # channel's timescale to the exponential (Marshall-Palmer) DSD closure (classic
     # value 8.0e6); absent, the monodisperse closure is bit-identical to before.
     precipitation = get(model.options, :precipitation, false)::Bool
+    # Negative-water production attribution; see `water_budget_probe!`. Hoisted out of the
+    # tendency block so the default path pays one Dict lookup per column, not two.
+    budget_trace = get(model.options, :water_budget_trace, 0)::Int > 0
+    # Stage-3 diagnostic lever on the condensate depletion caps; see `qss_condensation_rates`.
+    # 1.0 (the default) is bitwise inert.
+    cap_factor = get(model.physical_params, :water_cap_factor, 1.0)
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
     N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
 
@@ -1243,7 +1796,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         for i in 1:length(Qdot)
             Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
                                                         rho_d[i], Tk[i], p_hPa[i], Q_s[i],
-                                                        model.ts, N_r; N_0=N_0)
+                                                        model.ts, N_r; N_0=N_0,
+                                                        cap_factor=cap_factor)
             if isnan(Qdot[i]) || isnan(Qdot_r[i])
                 error("Qdot is NaN at index $i, time $(t)!\n" *
                       "  T = $(Tk[i]) K, p = $(p[i]) Pa, rho_d = $(rho_d[i]), " *
@@ -1281,8 +1835,23 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         for i in 1:length(AUTO_COLL)
             auto = autoconversion_density(max(rho_c[i], 0.0), rho_d[i])
             coll = collection_density(max(rho_c[i], 0.0), rho_r[i], rho_d[i], Tk[i])
-            # Shared depletion cap: never convert more cloud than exists this step
-            AUTO_COLL[i] = min(auto + coll, max(rho_c[i], 0.0) / model.ts)
+            # JOINT depletion cap: never convert more cloud than survives evaporation this
+            # step. Cloud has two independent sinks — evaporation (`Qdot`, capped at
+            # `-rho_c/ts` inside qss_condensation_rates) and conversion to rain
+            # (`AUTO_COLL`). Capping each at `rho_c/ts` SEPARATELY lets them sum to
+            # `2*rho_c/ts`, which drives rho_c to `-rho_c` in a single step — an O(1)
+            # negative, not a ringing lobe.
+            #
+            # This was invisible until the positivity bound went in: the rate functions
+            # guard with `max(rho_c, 0)` so the overshoot was inert, and its mass merged
+            # into the accumulated refit undershoot. With the bound active the limiter has
+            # to remove that negative EVERY step, paying for it by shaving the cloud, which
+            # destroys the cell. Budget: rho_c/ts + Qdot - AUTO_COLL >= 0.
+            #
+            # Capping AUTO_COLL rather than rescaling Qdot keeps the p, E_t and Q_ss
+            # couplings — which have already consumed Qdot — exactly as they were.
+            avail = max((cap_factor * max(rho_c[i], 0.0) / model.ts) + Qdot[i], 0.0)
+            AUTO_COLL[i] = min(auto + coll, avail)
         end
         Vt = S.Vt;       @. Vt = rain_terminal_velocity(rho_r, rho_d, Tk)
         Fr = S.Fr;       @. Fr = max(rho_r, 0.0) * Vt
@@ -1567,6 +2136,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_rp_x, rho_rp_z, rrv.f_l)
     @turbo FORCING .= @. (-rho_r * div) + Qdot_r + AUTO_COLL - Fr_z
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
+    # Production attribution (off unless options[:water_budget_trace] > 0). Must run HERE:
+    # ADV is reused by slot 9 two lines down.
+    budget_trace && water_budget_probe!(mtile, MC_BUDGET_R, 8, t, colstart, rho_r, ADV, div,
+                                        Qdot_r, AUTO_COLL, 1.0, Fr_z, w, z)
 
     # Cloud partial density (slot 9): the same advective product-rule continuity as every
     # other density, with the cloud-channel condensation as its source and autoconversion
@@ -1583,6 +2156,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_cp_x, rho_c_z, rcv.f_l)
     @turbo FORCING .= @. (-rho_c * div) + Qdot - AUTO_COLL
     @turbo expdot[colstart:colend,9] .= @. ADV + FORCING
+    # Cloud has no sedimentation channel, and its autoconversion sink is -AUTO_COLL.
+    budget_trace && water_budget_probe!(mtile, MC_BUDGET_C, 9, t, colstart, rho_c, ADV, div,
+                                        Qdot, AUTO_COLL, -1.0, nothing, w, z)
 
     # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
     #
@@ -1725,6 +2301,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             @turbo diffdot[colstart:colend,9] .= @. Kvdiff_water * rho_cp_zz
         end
     end
+
+    # Depletion census of the water species. HERE, not next to the tendency assembly: this is
+    # the last point at which `expdot` is still the tendency of the step about to be taken and
+    # `expdot_nm1`/`expdot_nm2` are still the previous two levels (`explicit_timestep` rotates
+    # them), so the increment measured is exactly the one applied — including the horizontal
+    # water mixing and the boundary-layer contributions added after slot 8/9 were assembled.
+    budget_trace && water_depletion_probe!(mtile, colstart, colend, t, precipitation,
+                                           cap_factor, rho_c, rho_r, Qdot, Qdot_r, AUTO_COLL)
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)

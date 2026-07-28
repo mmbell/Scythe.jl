@@ -281,6 +281,15 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
     scratch_columns = _allocate_scratch_columns(tile.kbasis, tile)
     solve_data, solve_rhs, solve_load = _allocate_solve_workspace(tile.kbasis, tile)
+    # Reference-aware positivity bounds, once the reference state exists. The k-leg lives on
+    # the tile and the i-leg on the worker's patch (`splineTransform!` builds the state's
+    # i-direction coefficients from `patch.ibasis`), so both need installing. AFTER
+    # `scratch_columns`, whose deepcopies are only used by `_vertical_solve!` — that writes
+    # `col.a` through `ldiv!` and never calls `SAtransform!`, so a bound there would be inert
+    # and only confusing. A no-op unless a bounded variable has a nonzero reference profile.
+    install_positivity_bounds!(tile, ref_state, model)
+    install_positivity_bounds!(patch, ref_state, model)
+    _warn_unbounded_master_output(ref_state, model)
     # Defined in moist_compressible.jl, which is included after this file — resolved at call
     # time, so the forward reference is fine.
     mc_scratch = _allocate_mc_scratch(tile, model)
@@ -1052,6 +1061,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
 
     # Advance each column.
     #

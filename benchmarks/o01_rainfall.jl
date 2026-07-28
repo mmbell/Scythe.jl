@@ -96,12 +96,22 @@ function o01_model(opts::BenchmarkOptions)
         num_cells_i = 75        # 2 km cells
         ts = 0.3
     end
+    # Negative-water attribution sweeps (reference/HANDOFF_NEGATIVE_WATER.md). These
+    # SCYTHE_O01_* knobs isolate one term at a time in the single-grid ablation matrix;
+    # ALL of them are no-ops when unset, so the committed config is bit-identical.
+    haskey(ENV, "SCYTHE_O01_NI") && (num_cells_i = parse(Int, ENV["SCYTHE_O01_NI"]))
+    # Timestep override, for separating a CFL/SI-ceiling violation from a physics error:
+    # if halving ts makes an unstable configuration stable, the instability is the ceiling,
+    # not the formulation. The water species feed the acoustic coefficient through q_l, so
+    # a change to the condensate CAN move that ceiling.
+    haskey(ENV, "SCYTHE_O01_TS") && (ts = parse(Float64, ENV["SCYTHE_O01_TS"]))
     # Vertical: 500 m nodal spacing to 25 km in BOTH modes (the rain physics and
     # the sedimentation flux do not coarsen with the horizontal grid). The top
     # 8 km (17-25 km) is the Rayleigh sponge; the 25 km lid (vs the historical
     # 20 km) buys a stratosphere-confined absorber above the 16.59 km tropopause.
-    num_cells_k = 50            # RiRk: 500 m cells
-    kDim = 150                  # RZ: Chebyshev points (untargeted fallback)
+    num_cells_k = 100            # RiRk: 500 m cells
+    haskey(ENV, "SCYTHE_O01_NK") && (num_cells_k = parse(Int, ENV["SCYTHE_O01_NK"]))
+    kDim = 300                  # RZ: Chebyshev points (untargeted fallback)
     output_interval = 60.0
 
     ts = vertical_ts(ts, opts)
@@ -122,6 +132,26 @@ function o01_model(opts::BenchmarkOptions)
     options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
                                      :precipitation => true, :vertical_mixing => false),
                     reference_state_options())
+    # Attribution knobs: toggle the water source terms ("0"/"1"). Unset => defaults
+    # (:precipitation on, :condensation on-by-absence), i.e. bit-identical.
+    envflag(k) = ENV[k] in ("1", "true", "yes")
+    haskey(ENV, "SCYTHE_O01_PRECIP") && (options[:precipitation] = envflag("SCYTHE_O01_PRECIP"))
+    haskey(ENV, "SCYTHE_O01_COND")   && (options[:condensation]  = envflag("SCYTHE_O01_COND"))
+    # Attribution: lower the negative-water warning threshold so the PRE-refit
+    # (clamp_water!) ladder prints every doubling, to compare against the POST-refit
+    # min_rho_r_gm3 from the output CSVs (the production-vs-ringing split).
+    haskey(ENV, "SCYTHE_O01_WARNDT") && (options[:water_warn_dT] = parse(Float64, ENV["SCYTHE_O01_WARNDT"]))
+    # Attribution: per-step term-by-term water production budget (see water_budget_probe!).
+    # Value = print interval in steps; unset/0 => probe never runs, bit-identical.
+    # NOTE the output lands in <output_dir>/scythe_err.log, NOT the console — Scythe.jl:136
+    # redirects the worker's stderr for the whole run.
+    haskey(ENV, "SCYTHE_O01_BUDGET") && (options[:water_budget_trace] = parse(Int, ENV["SCYTHE_O01_BUDGET"]))
+    # Stage-3 falsification lever: scales the condensate DEPLETION caps, which are written as
+    # forward-Euler budgets (`rho/ts`) while the integrator is AB3 with a leading weight of
+    # 23/12. `SCYTHE_O01_CAPFAC=0.5217391304347826` (= 12/23) makes them AB3-sized for the
+    # worst case. Unset => 1.0, which is bitwise inert. See qss_condensation_rates.
+    haskey(ENV, "SCYTHE_O01_CAPFAC") &&
+        (physical_params[:water_cap_factor] = parse(Float64, ENV["SCYTHE_O01_CAPFAC"]))
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
@@ -134,6 +164,66 @@ function o01_model(opts::BenchmarkOptions)
     # flux divergence remove it through z = 0.
     topbot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), "rho_r" => NaturalBC()))
 
+    # Attribution: sweep the cubic-spline filter length only on the water species.
+    # Unset => Dict("default" => 2.0), which equals the struct default, so bit-identical.
+    lq = merge(Dict("default" => 2.0),
+               haskey(ENV, "SCYTHE_O01_LQ") ?
+                   let x = parse(Float64, ENV["SCYTHE_O01_LQ"])
+                       Dict("rho_r" => x, "rho_c" => x)
+                   end : Dict{String,Float64}())
+
+    # Positivity of the rain density, imposed as a box constraint on the spline coefficients
+    # in BOTH directions (Springsteel `SAtransform_bounded!`). rho_r is a TOTAL, so the bound
+    # is 0 on each leg; its side/top/bottom BCs are Natural or Neumann, both of which leave
+    # the conservative clip-and-shrink exact.
+    #
+    # Both legs, not just :k. The k-leg alone gives positivity (it is the last leg), but the
+    # negative lobes are broad HORIZONTAL flanks, so whole columns can consist of nothing but
+    # spurious negative rain — and no non-negative spline has negative mass, leaving the
+    # k-leg no conservative fix. Bounding :i first removes those lobes where the donor mass
+    # actually is and guarantees every k-column arrives with non-negative mass. See the
+    # MULTI-DIMENSIONAL DESIGN note in Springsteel's CubicBSpline.jl and
+    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md.
+    # rho_c is carried as a PERTURBATION from rho_cbar, so its bound is -ρ̄_c, not 0. This
+    # sounding has no reference cloud (write_exact_ref_mc gets zeros(kDim) below), so the two
+    # coincide here; install_positivity_bounds! substitutes the reference-offset bound
+    # automatically on any configuration whose base state IS cloudy.
+    # DEFAULT IS RAIN ONLY. Bounding rho_c as well destabilizes this run — max_w 2.7 -> 36
+    # at t = 750 s with either leg alone, 78 with both. The cause is upstream of the limiter
+    # and is now measured (STAGE 3 of reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md): the
+    # cloud EVAPORATION limiter is a forward-Euler budget (`Qdot_c >= -rho_c/ts`) but the
+    # integrator is AB3 with a leading weight of 23/12, so 185-281 gridpoints per step sit on
+    # that cap and are then depleted by 2.3-2.8x the cloud present — ~150 points per step
+    # driven negative, forever. rho_r is exempt only because rain's sinks NEVER reach their
+    # cap (0 points, every run), which is the whole rho_r/rho_c asymmetry. The limiter then
+    # has to act at full strength every step, a floor in all but name.
+    #
+    # Two corrections to the Stage 2 note this replaces: `bound_shortfall` does NOT stay at
+    # 0 under mode `1` (the rho_c i-leg reaches 7.9e6; the old report summed only the k-basis),
+    # and the effect is INVARIANT under ts (2.339 at ts=0.075 vs 2.345 at ts=0.3), so it was
+    # never a CFL/ceiling problem.
+    #
+    # STAGE 3b/4: `SCYTHE_O01_CAPFAC=12/23` makes the cap AB3-sized and CLEARS the detonation —
+    # mode `1` then runs the full 3600 s with min_rho_c = 0, the limiter holding the same
+    # ~1e-8 fixed point rho_r reaches, and max_rho_r_gm3 13.12 FAIL -> 9.63 PASS. It is still
+    # NOT a shippable combination: the error relocates into the RESIDUAL vapor (min_rho_v
+    # -0.72 -> -1.85 g/m^3) and max_w runs to 29.6. Keep the default rain-only until the cap is
+    # written against the real three-level AB3 budget and the vapor residual has an answer.
+    #
+    # Modes: 0 = off, k = rain vertical leg only, r = rain both legs (the default),
+    # ck / ci = rain both legs plus cloud vertical / horizontal, 1 = both species both legs.
+    positivity = let mode = get(ENV, "SCYTHE_O01_POSITIVITY", "r")
+        mode == "0" ? Dict{String,Dict{Symbol,Float64}}() :
+        mode == "k" ? Dict("rho_r" => Dict(:k => 0.0)) :
+        mode == "ck" ? Dict("rho_r" => Dict(:i => 0.0, :k => 0.0),
+                            "rho_c" => Dict(:k => 0.0)) :
+        mode == "ci" ? Dict("rho_r" => Dict(:i => 0.0, :k => 0.0),
+                            "rho_c" => Dict(:i => 0.0)) :
+        mode == "1" ? Dict("rho_r" => Dict(:i => 0.0, :k => 0.0),
+                           "rho_c" => Dict(:i => 0.0, :k => 0.0)) :
+                      Dict("rho_r" => Dict(:i => 0.0, :k => 0.0))
+    end
+
     grid_params = GridParameters(;
         geometry = benchmark_geometry(opts),   # RZ (Chebyshev) or RiRk (B-spline) vertical
         iMin = 0.0,
@@ -142,6 +232,8 @@ function o01_model(opts::BenchmarkOptions)
         kMin = 0.0,
         kMax = 25.0e3,
         vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
+        l_q = lq,
+        positivity = positivity,
         BCL = side_bc,
         BCR = side_bc,
         BCB = topbot_bc,
@@ -151,7 +243,10 @@ function o01_model(opts::BenchmarkOptions)
 
     return ModelParameters(
         ts = ts,
-        integration_time = 3600.0,
+        # Attribution: shorten the run (negative water appears once cloud/rain form,
+        # ~24 min onset in quick mode). Unset => the full 3600 s, bit-identical.
+        integration_time = haskey(ENV, "SCYTHE_O01_TSTOP") ?
+                           parse(Float64, ENV["SCYTHE_O01_TSTOP"]) : 3600.0,
         output_interval = output_interval,
         equation_set = "moist_compressible_XZ",
         initial_conditions = joinpath(output_dir, "o01_ics.csv"),
@@ -251,6 +346,13 @@ function o01_rain_diagnostics(model, ref, kDim)
     onset = NaN
     max_rr = 0.0
     min_rr = 0.0
+    # The cloud undershoot was invisible in this CSV — only rain was reported — so every
+    # rho_c experiment had to be read out of scythe_err.log. min_rho_v goes with it: the
+    # vapor is the residual, so it is where any error rho_c is no longer allowed to absorb
+    # has to land.
+    max_rc = 0.0
+    min_rc = 0.0
+    min_rv = Inf
     times = Float64[]
     rate_int = Float64[]    # domain-integrated surface rain flux [kg/(m s) per unit y]
     eflux_int = Float64[]   # domain-integrated surface energy flux [J/(m s) per unit y]
@@ -259,9 +361,12 @@ function o01_rain_diagnostics(model, ref, kDim)
         df = CSV.read(path, DataFrame)
         ncols = div(nrow(df), kDim)
         surf = 1:kDim:nrow(df)
-        Tk, _, rho_d, _, _, _ = mc_state(df, ref, kDim, ncols)
+        Tk, _, rho_d, rho_v, rho_c, _ = mc_state(df, ref, kDim, ncols)
         max_rr = max(max_rr, maximum(df.rho_r))
         min_rr = min(min_rr, minimum(df.rho_r))
+        max_rc = max(max_rc, maximum(rho_c))
+        min_rc = min(min_rc, minimum(rho_c))
+        min_rv = min(min_rv, minimum(rho_v))
         rr_s = max.(df.rho_r[surf], 0.0)
         Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
         R = -rr_s .* Vt                                       # kg/m²/s, >= 0
@@ -293,6 +398,9 @@ function o01_rain_diagnostics(model, ref, kDim)
         "rain_onset_min" => onset / 60.0,
         "max_rho_r_gm3" => 1000.0 * max_rr,
         "min_rho_r_gm3" => 1000.0 * min_rr,             # spline undershoot monitor
+        "max_rho_c_gm3" => 1000.0 * max_rc,
+        "min_rho_c_gm3" => 1000.0 * min_rc,             # ditto, for the condensate
+        "min_rho_v_gm3" => 1000.0 * min_rv,             # the residual vapor's headroom
         "accum_rainfall_flux_mm" => accum_flux / width, # cross-check of the exact budget
         "precip_energy_gain_Jm2" => accum_E / width,    # predicted domain E_t gain
     )
@@ -348,9 +456,12 @@ end
 function o01_nest(opts::BenchmarkOptions)
     base = o01_model(opts)
     if opts.mode == :full
-        boundaries = [0.0, 50.0e3, 63.0e3, 87.0e3, 100.0e3, 150.0e3]
-        num_cells = [25, 13, 48, 13, 25]           # 2 | 1 | 0.5 | 1 | 2 km cells
-        ts = [0.6, 0.3, 0.15, 0.3, 0.6]
+        #boundaries = [0.0, 50.0e3, 63.0e3, 87.0e3, 100.0e3, 150.0e3]
+        #num_cells = [25, 13, 48, 13, 25]           # 2 | 1 | 0.5 | 1 | 2 km cells
+        #ts = [0.6, 0.3, 0.15, 0.3, 0.6]
+        boundaries = [0.0, 50.0e3, 64.0e3, 86.0e3, 100.0e3, 150.0e3]
+        num_cells = [50, 28, 88, 28, 50]           # 1 | 0.5 | 0.25 | 0.5 | 1 km cells
+        ts = [0.3, 0.15, 0.075, 0.15, 0.3]
     else
         boundaries = [0.0, 48.0e3, 64.0e3, 86.0e3, 102.0e3, 150.0e3]
         num_cells = [6, 4, 11, 4, 6]               # 8 | 4 | 2 | 4 | 8 km cells
@@ -441,6 +552,9 @@ function o01_nested_diagnostics(models, topo)
     onset = NaN
     max_rr = 0.0
     min_rr = 0.0
+    max_rc = 0.0
+    min_rc = 0.0
+    min_rv = Inf
     # w extrema over the WHOLE run (user decision 2026-07-14): the nested max_w
     # is defined as the run maximum, not the final-time value the single-grid
     # diagnostic reports. By the end of the hour the secondary cells have
@@ -461,11 +575,14 @@ function o01_nested_diagnostics(models, topo)
             gp = models[i].grid_params
             ncols = div(nrow(df), kDim)
             surf = 1:kDim:nrow(df)
-            Tk, _, rho_d, _, _, _ = mc_state(df, ref, kDim, ncols)
+            Tk, _, rho_d, rho_v, rho_c, _ = mc_state(df, ref, kDim, ncols)
             mask = masks[i]
             colmask = repeat(mask, inner = kDim)
             max_rr = max(max_rr, maximum(df.rho_r[colmask]))
             min_rr = min(min_rr, minimum(df.rho_r[colmask]))
+            max_rc = max(max_rc, maximum(rho_c[colmask]))
+            min_rc = min(min_rc, minimum(rho_c[colmask]))
+            min_rv = min(min_rv, minimum(rho_v[colmask]))
             max_w = max(max_w, maximum(df.w[colmask]))
             min_w = min(min_w, minimum(df.w[colmask]))
             rr_s = max.(df.rho_r[surf], 0.0) .* mask
@@ -498,6 +615,9 @@ function o01_nested_diagnostics(models, topo)
         "rain_onset_min" => onset / 60.0,
         "max_rho_r_gm3" => 1000.0 * max_rr,
         "min_rho_r_gm3" => 1000.0 * min_rr,
+        "max_rho_c_gm3" => 1000.0 * max_rc,
+        "min_rho_c_gm3" => 1000.0 * min_rc,
+        "min_rho_v_gm3" => 1000.0 * min_rv,
         "accum_rainfall_flux_mm" => accum_flux / total_width,
         "precip_energy_gain_Jm2" => accum_E / total_width,
     )

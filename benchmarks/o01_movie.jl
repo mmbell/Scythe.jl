@@ -37,7 +37,7 @@ nests = 0                       # 0 = auto-detect from the output directory
 field = "rho_c"                 # fill field: rho_c or rho_r
 fps = 8
 xlim = nothing                  # (lo, hi) km, or nothing for the full domain
-zlim = (0.0, 16.0)              # km
+zlim = (0.0, 17.0)              # km
 let i = 1
     while i <= length(ARGS)
         if ARGS[i] == "--mode"
@@ -211,7 +211,7 @@ xspan = xlim === nothing ? (0.0, 150.0) : xlim
 # Positive rain contours read best in a colour that contrasts the fill: white on
 # the dark viridis cloud (the original convention), black on the light diverging
 # rain map. Negative water is always dashed — magenta for rain, cyan for cloud.
-rain_pos_color = field == "rho_c" ? :white : :black
+rain_pos_color = field == "rho_c" ? :black : :white
 
 for (i, t) in enumerate(snap_times)
     fig = Figure(size = (1100, 460))
@@ -238,7 +238,7 @@ for (i, t) in enumerate(snap_times)
                      color = :cyan, linewidth = 1.2, linestyle = :dash)
         any(pat.rho_r .< rain_neg[end]) &&
             contour!(ax, pat.x, pat.z, pat.rho_r', levels = rain_neg,
-                     color = :magenta, linewidth = 1.4, linestyle = :dash)
+                     color = :black, linewidth = 1.4, linestyle = :dash)
         # Mark patch seams faintly so the nest layout is legible.
         nested && vlines!(ax, [pat.x[1], pat.x[end]]; color = (:gray, 0.3),
                           linewidth = 0.5)

@@ -667,6 +667,7 @@ function advanceTimestepA(mtile::ModelTile, sharedSpectral::SharedArray{Float64}
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
     if t > 1
         exact_si_load_history!(mtile, hfields, t, rowstart)
     end

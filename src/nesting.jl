@@ -338,6 +338,12 @@ function build_nest(nest::NestedModelParameters)
             fourier_filter = bgp.fourier_filter,
             chebyshev_filter = bgp.chebyshev_filter,
             spline_filter = bgp.spline_filter,
+            # Water positivity carries to every nest. The k-direction BCs (BCB/BCT) are
+            # shared with the base patch, so a vertical bound behaves identically on every
+            # nest. A HORIZONTAL bound would not: a child's i-direction BC is R3X, which
+            # pins its border coefficient trio to the parent's donated `ahat` and leaves
+            # the child nothing to adjust — `set_lower_bound!` rejects that BC outright.
+            positivity = bgp.positivity,
             patchOffsetL = ring_offset,
         )
 
@@ -562,6 +568,7 @@ function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{F
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
 
     if num_columns(mtile.tile) > 0
         Threads.@threads :static for c in 1:num_columns(mtile.tile)
@@ -611,6 +618,7 @@ function advance_nested_timestepA(mtile::ModelTile, sharedSpectral::SharedArray{
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
     if t > 1
         exact_si_load_history!(mtile, hfields, t, rowstart)
     end
