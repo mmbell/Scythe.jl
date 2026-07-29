@@ -22,6 +22,64 @@
 # two large numbers), reconciled toward the diagnosed rho_v - rho_vs(T,p) on
 # tau_qss by `qss_relaxation`.
 #
+# ── The vapor has TWO discrete representations, and they fail in disjoint regimes
+#
+# Because Q_ss is prognostic and the temperature retrieval never reads it, the
+# vapor can equally be retrieved as the SUPERSATURATION residual
+#
+#     res_qss   = Q_ss + rho_vs(T, p)     alongside
+#     res_rho_t = rho_t - rho_d - rho_c - rho_r    (the density-budget residual above)
+#
+# with no new prognostic and no change to the SI slaving. Neither is uniformly
+# better, and the failure is CONDITIONING, measured both ways on saved snapshots
+# (reference/HANDOFF_VAPOR_RETRIEVAL.md; both sweeps recorded in the header of
+# benchmarks/vapor_blend_diagnostic.jl):
+#
+#   * IN CLOUD res_rho_t cancels catastrophically — rho_c/rho_w reaches 1.0011 at
+#     the worst point, so the vapor is the small difference of two nearly equal
+#     large numbers, and the NOPRECIP storm's in-cloud negatives are 1184 of 1186;
+#   * IN DRY AIR res_qss cancels catastrophically — rho_v -> 0 forces Q_ss -> -rho_vs,
+#     which is the failure Scythe_moist_compressible.tex anticipates, and a straight
+#     swap is a NET REGRESSION on the shipped O01 default (1.11 % -> 2.61 % negative
+#     points) because the dry population dominates there.
+#
+# So the retrieval is a C¹ BLEND of the two, gated on `options[:vapor_retrieval]`
+# (`:blend`, the shipped default since 2026-07-29, or `:residual`, the pre-blend
+# density-budget route, which is retained as the bitwise A/B lever):
+#
+#     s = |Q_ss| / rho_vs
+#     w = w_cloud(rho_liq; l0, l1) * w_trust(s; t0, t1)
+#     rho_v = res_rho_t + f(w*(res_qss - res_rho_t); dcap*rho_vs)
+#
+# `w_cloud` smoothsteps UP in rho_liq and does the REGIME SELECTION; `w_trust`
+# smoothsteps DOWN in s and does nothing but reject a Q_ss that has GROSSLY
+# detached from the density budget (s ~ 1e10 and up). See `vapor_retrieval_blend`
+# for why the selector is cloudiness and not s (an s-only selector was measured and
+# refuted: it degenerates into a soft clamp on negative vapor), and why the trust
+# thresholds sit well above s = 1.
+#
+# `f` is the C¹ saturator `_blend_saturate`: the identity for |c| <= dcap*rho_vs/2,
+# bounded by dcap*rho_vs, odd and monotone. The cap is LOAD-BEARING, not a safety
+# belt — the uncapped blend detonates the NOPRECIP storm, because the partition gap
+# is unbounded RELATIVE to rho_vs (which collapses in the rising anvil) while
+# w_trust, a function of the supersaturation magnitude, is blind to it.
+#
+# THREE INVARIANTS SURVIVE THE BLEND, and they are what make it a partition rather
+# than a source:
+#
+#   1. rho_t is still the conserved mass and is untouched. The blended rho_v is a
+#      PARTITION read by the thermodynamic consumers (q_v -> C_vt, R_m, C_pt,
+#      gamma_m; Q_s_energy; the condensation closure's vapor bound; the surface
+#      moisture flux). `water_mass_drift_pct` is unchanged by construction.
+#   2. rho_d + rho_v + rho_c + rho_r no longer equals rho_t pointwise. That gap is
+#      deliberate: it is `w*(res_qss - res_rho_t) = -w*tau_qss*QSSREL` where the
+#      saturator is inert, and it is BOUNDED by `dcap*rho_vs` everywhere. (The
+#      `-tau_qss*QSSREL` relation is an identity, not a bound — see
+#      `qss_relaxation`; the bound is `dcap`.)
+#   3. `qss_relaxation` is ALWAYS fed `res_rho_t`, NEVER the blended vapor. Fed the
+#      blend it self-annihilates wherever w = 1 and the single mechanism tying Q_ss
+#      to the density budget vanishes precisely where it is load-bearing.
+#
 # Negative water is not representable: `clamp_water!` floors rho_c and rho_r after
 # every column step. Because rho_t is prognostic and rho_v is the residual, that
 # floor is exactly a phase change — total water and E_t are untouched and the
@@ -57,7 +115,7 @@ const MC_SCRATCH_SLOTS = (
     # ── moist_compressible_XZ ──
     :p, :rho_d, :rho_t, :E_t, :Q_ss, :rho_c,                          # totals
     :p_z, :rho_d_z, :rho_t_z, :E_t_z, :Q_ss_z, :rho_c_z,              # total vertical gradients
-    :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :rho_liq, :q_v, :q_l, # diagnostic state
+    :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :res_rho_t, :rho_liq, :q_v, :q_l, # diagnostic state
     :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
     :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
     :cap_c, :cap_r, :cap_v,                        # AB3 depletion bounds (raw, see _ab3_sink_bound)
@@ -236,6 +294,10 @@ function mc_reference_diagnostics(ref_state, z)
         geo = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0)) + (gravity * z[k])
         M = p + (E_tbar[k, 1]) - (rho_t * geo)
         Tk = retrieve_temperature(M, rho_d, rho_t, rho_c)
+        # The DENSITY residual under both `vapor_retrieval` modes, deliberately: at the
+        # resting fixed point the reference construction makes Q_ssbar exactly the diagnosed
+        # supersaturation, so res_qss ≡ res_rho_t here and the blend is the identity whatever
+        # weight it would compute. Writing the residual keeps this profile bitwise.
         rho_v = rho_t - rho_d - rho_c
         q_v = rho_v / rho_d
         q_l = rho_c / rho_d
@@ -280,6 +342,12 @@ what this builds:
     ρ_c     = ρ̄_c (fitted)          M = p̄ + Ē_t − ρ̄_t·g·z        (rest: ke = 0, ρ_r = 0)
     T       = retrieve_temperature(M, ρ̄_d, ρ̄_t, ρ_c)
     Q_ssbar = (ρ̄_t − ρ̄_d − ρ_c) − ρ_v*(T, p̄)
+
+The vapor here is the DENSITY residual under both `options[:vapor_retrieval]` modes, and that
+is not an omission: the construction above is precisely the statement `res_qss ≡ res_rho_t` at
+rest, so [`vapor_retrieval_blend`](@ref) is the IDENTITY on this state whatever weight it
+computes, and building the reference from the residual leaves the fixed point intact under
+`:blend` as well as `:residual`.
 
 **Cloud-free levels** (`ρ̄_c = 0` — a subsaturated sounding: O01, the TC) are done at that
 point. `q_c = 0 < 1e-8` and `S = Q_ssbar/ρ_vs < 0` shut both condensation gates, `invtau_r = 0`
@@ -824,6 +892,7 @@ limiter sized for the wrong integrator from a stiff source term:
 | `:d_r_mneg`   | how many points the microphysics alone would drive negative (`:d_r_mab3` past `MICRO_DEPLETION_TOL`) |
 | `:d_c_*`      | the same for `ρ_c` |
 | `:d_v_*`      | the same for the residual `ρ_v`, whose slot tendency is `f_3 - f_2 - f_8 - f_9` and whose depletion sink is the condensation `-(Qdot + Qdot_r)` |
+| `:v_gap`      | max over the tile this step of the VAPOR PARTITION GAP `\\|ρ_v − res_rho_t\\|` [kg/m³] — identically 0 under `options[:vapor_retrieval] = :residual`; under `:blend` it equals `w·τ_qss·\\|QSSREL\\|` where the correction is under half the cap, and is bounded by `dcap·ρ_vs` (default `0.02·ρ_vs`) wherever the saturator is active (see [`vapor_retrieval_blend`](@ref)) |
 
 **Read `:d_*_mab3`, not `:d_*_ab3`, to judge the depletion bound.** `:d_*_ab3` is the fraction
 of the FULL slot tendency, so it is dominated by advection and `-ρ∇·v` at points carrying
@@ -843,7 +912,8 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :d_c_n, :d_c_cevap, :d_c_cauto, :d_c_eul, :d_c_ab3,
                         :d_c_neg, :d_c_stiff, :d_c_infeas, :d_c_mab3, :d_c_mneg,
                         :d_v_n, :d_v_cevap, :d_v_cauto, :d_v_eul, :d_v_ab3,
-                        :d_v_neg, :d_v_stiff, :d_v_infeas, :d_v_mab3, :d_v_mneg)
+                        :d_v_neg, :d_v_stiff, :d_v_infeas, :d_v_mab3, :d_v_mneg,
+                        :v_gap)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -863,6 +933,15 @@ const MC_DEPLETION_R = 31
 const MC_DEPLETION_C = 41
 const MC_DEPLETION_V = 51
 const MC_DEPLETION_N = 10
+"""
+Row holding the per-step maximum vapor PARTITION GAP `max|ρ_v − res_rho_t|` over the tile.
+
+Sits AFTER the three `MC_DEPLETION_N`-row blocks, deliberately outside them: it is one scalar,
+not a fourth species, and giving the blocks a ragged length silently walks the census off the
+end of a thread's column. It lives in the per-step region (`MC_BUDGET_FIRST:end`), so it is
+reset every step and always describes the step just reported.
+"""
+const MC_VAPOR_GAP = 61
 """
 Threshold for `:d_*_mneg`, the count of points the MICROPHYSICS alone drives negative.
 
@@ -1417,7 +1496,7 @@ end
 
 """
     water_depletion_probe!(mtile, colstart, colend, t, precipitation,
-                           rho_c, rho_r, rho_v, Qdot, Qdot_r, AUTO_COLL,
+                           rho_c, rho_r, rho_v, res_rho_t, Qdot, Qdot_r, AUTO_COLL,
                            cap_c, cap_r, cap_v)
 
 Census, over every gridpoint holding water, of how hard the step is depleting it.
@@ -1444,11 +1523,16 @@ tendency is assembled from the four densities' slots and its sink is the condens
 removes it. It has no bound of its own anywhere else in the model, which is exactly why it
 needs measuring.
 
+`rho_v` is the vapor the step actually used (the BLENDED one under
+`options[:vapor_retrieval] = :blend`) and `res_rho_t` the density-budget residual; their
+maximum absolute difference is recorded as [`MC_VAPOR_GAP`](@ref MC_VAPOR_GAP), the partition
+gap. It is identically zero under `:residual`.
+
 Gated on `options[:water_budget_trace]`; never called otherwise.
 """
 function water_depletion_probe!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                                 precipitation::Bool,
-                                rho_c, rho_r, rho_v, Qdot, Qdot_r, AUTO_COLL,
+                                rho_c, rho_r, rho_v, res_rho_t, Qdot, Qdot_r, AUTO_COLL,
                                 cap_c, cap_r, cap_v)
 
     size(mtile.mc_water_stats, 2) == 0 && return nothing
@@ -1457,6 +1541,37 @@ function water_depletion_probe!(mtile::ModelTile, colstart::Int64, colend::Int64
     _depletion_census!(mtile, MC_DEPLETION_R, 8, MC_MICRO_R, colstart, t, rho_r, Qdot_r,
                        nothing, Qdot, cap_r)
     _vapor_census!(mtile, colstart, t, rho_v, Qdot, Qdot_r, cap_v)
+    _vapor_gap_census!(mtile, rho_v, res_rho_t)
+    return nothing
+end
+
+"""
+    _vapor_gap_census!(mtile, rho_v, res_rho_t)
+
+Record `max|ρ_v − res_rho_t|` over this column into [`MC_VAPOR_GAP`](@ref MC_VAPOR_GAP).
+
+The blend is a PARTITION, so `ρ_d + ρ_v + ρ_c + ρ_r` no longer sums to `ρ_t` pointwise; this is
+the size of that disagreement. Where the correction saturator is inactive it equals
+`w·τ_qss·|QSSREL|` (`res_qss − res_rho_t = −τ·QSSREL` exactly — see [`qss_relaxation`](@ref)),
+and everywhere it is bounded by `dcap·ρ_vs`, which is the guarantee worth checking: the
+identity relates the gap to the reconciliation RATE and bounds neither, and that
+misreading is what let the uncapped blend detonate the NOPRECIP storm (see
+[`vapor_retrieval_blend`](@ref)). Offline on the measured snapshots the uncapped gap reaches
+9.4e−4 kg/m³ in cloud, 4.3 % of the local vapor at the worst point.
+
+Under `options[:vapor_retrieval] = :residual` the two arrays hold identical doubles and this
+records exactly `0.0`, which is the cheapest possible confirmation that the option is inert.
+"""
+@inline function _vapor_gap_census!(mtile::ModelTile, rho_v, res_rho_t)
+
+    st = mtile.mc_water_stats
+    gap = 0.0
+    @inbounds for i in eachindex(rho_v)
+        d = abs(rho_v[i] - res_rho_t[i])
+        d > gap && (gap = d)
+    end
+    tid = Threads.threadid()
+    @inbounds st[MC_VAPOR_GAP, tid] = max(st[MC_VAPOR_GAP, tid], gap)
     return nothing
 end
 
@@ -1737,7 +1852,8 @@ function water_budget_trace(mtile::ModelTile, t::Int64)
           positivity limiter shortfall (must be 0): $shortfall
           post-fit(reconstruction) minima: rho_r = $post_r, rho_c = $post_c, rho_v = $post_v
           pre-fit(var_np1) minima: rho_r = $(minimum(view(st, MC_PRE_R, :))), rho_c = $(minimum(view(st, MC_PRE_C, :)))
-          highest gridpoint with rho_c > 1e-6: $(isfinite(z_cloud) ? z_cloud : NaN) m"""
+          highest gridpoint with rho_c > 1e-6: $(isfinite(z_cloud) ? z_cloud : NaN) m
+          vapor partition gap max|rho_v - res_rho_t| (0 unless :vapor_retrieval = :blend; bounded by dcap*rho_vs where the saturator bites): $(maximum(view(st, MC_VAPOR_GAP, :))) kg/m^3"""
 
         # The depletion census: how widely, and how hard, the step is draining each species.
         # `euler` is bounded by 1 wherever a cap is the binding constraint; `ab3` is what the
@@ -1871,6 +1987,36 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     cap_euler = get(model.options, :water_cap_mode, :ab3)::Symbol === :euler
     cap_t = cap_euler ? 1 : t
     cap_vfac = cap_euler ? 1.0 : cap_factor
+    # Which discrete representation the VAPOR is retrieved from. `:blend` (the default since
+    # 2026-07-29, and the state of every configuration that does not set the key) is the regime
+    # blend of `vapor_retrieval_blend`: the supersaturation residual in cloud, where the density
+    # budget cancels catastrophically, and the density residual in dry air, where the
+    # supersaturation residual does. `:residual` is the pre-blend density-budget route and is
+    # BITWISE the code that had no option at all -- retained as the A/B lever for every
+    # measurement taken under it. In `options`, not `physical_params`, for the same reason as
+    # `water_cap_mode`: it is a choice of DISCRETE REPRESENTATION, not a physical parameter.
+    vapor_retrieval = get(model.options, :vapor_retrieval, :blend)::Symbol
+    (vapor_retrieval === :residual || vapor_retrieval === :blend) ||
+        error("options[:vapor_retrieval] = :$(vapor_retrieval) is not recognized; " *
+              "use :blend (the regime-blended retrieval, the default; see " *
+              "vapor_retrieval_blend) or :residual (the pre-blend density-budget residual)")
+    vapor_blend = vapor_retrieval === :blend
+    # Blend thresholds. The rho_liq pair does the regime selection and the s pair rejects a
+    # detached Q_ss; see `_vapor_blend_weight` for why these are not tuned numbers (every band
+    # on the swept grid gave the same answer, the populations being ~8 decades apart in rho_liq)
+    # and why the trust thresholds sit above the s = 1 ceiling. Read unconditionally -- four
+    # Dict lookups per column, off the back of the one the option above already pays.
+    blend_l0 = get(model.physical_params, :vapor_blend_l0, 1.0e-6)
+    blend_l1 = get(model.physical_params, :vapor_blend_l1, 1.0e-4)
+    blend_t0 = get(model.physical_params, :vapor_blend_t0, 2.0)
+    blend_t1 = get(model.physical_params, :vapor_blend_t1, 5.0)
+    # The blend's CORRECTION CAP, `|rho_v - res_rho_t| <= dcap*rho_vs`, applied through the C¹
+    # saturator `_blend_saturate`. This is the load-bearing guard, not a safety belt: the
+    # uncapped blend detonates the NOPRECIP storm because the partition gap is unbounded
+    # RELATIVE to rho_vs (which collapses in the rising anvil) while `w_trust`, a function of
+    # the supersaturation magnitude s, never sees it. See `vapor_retrieval_blend`. `Inf`
+    # recovers the uncapped blend bitwise; `0.0` degenerates to `:residual`.
+    blend_dcap = get(model.physical_params, :vapor_blend_dcap, 0.02)
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
     N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
 
@@ -2006,7 +2152,19 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq)
     p_hPa = S.p_hPa;   @. p_hPa = p / 100.0
     rho_vs = S.rho_vs; @. rho_vs = rho_v_sat(Tk, p_hPa)
-    rho_v = S.rho_v; @. rho_v = rho_t - rho_d - rho_liq
+    # The DENSITY-BUDGET residual, always. `S.res_rho_t` is not an alias of `S.rho_v`: the
+    # reconciliation below must read this one whatever the retrieval is (see qss_relaxation),
+    # and the partition-gap census differences the two.
+    res_rho_t = S.res_rho_t; @. res_rho_t = rho_t - rho_d - rho_liq
+    # ... and `S.rho_v` is the vapor EVERY OTHER consumer reads. Under `:residual` it is a copy
+    # of the residual — a copy of identical doubles, so the whole option is bitwise inert.
+    rho_v = S.rho_v
+    if vapor_blend
+        @. rho_v = vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t,
+                                         blend_l0, blend_l1, blend_t0, blend_t1, blend_dcap)
+    else
+        @. rho_v = res_rho_t
+    end
     q_v = S.q_v;     @. q_v = rho_v / rho_d
     q_l = S.q_l;     @. q_l = rho_liq / rho_d
     C_vt = S.C_vt;   @. C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
@@ -2070,10 +2228,17 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                                    micro_nm1[g, MC_MICRO_R], micro_nm2[g, MC_MICRO_R])
         # The vapor is a SINK channel too -- condensation removes it -- so its bound has the
         # same form and is negated into a ceiling on `Qdot_c + Qdot_r` at the use site.
+        # DELIBERATELY the BLENDED `rho_v`, not `res_rho_t`: the bound exists to stop the
+        # closure over-depleting the vapor IT READS, and the closure two blocks down reads the
+        # blend. Sizing the budget off a different representation than the one being depleted
+        # would be the same class of mismatch `water_cap_mode` was written to fix.
         cap_v[i] = _ab3_sink_bound(model.ts, cap_t, cap_vfac * max(rho_v[i], 0.0),
                                    micro_nm1[g, MC_MICRO_V], micro_nm2[g, MC_MICRO_V])
     end
     if get(model.options, :condensation, true)::Bool
+        # The closure reads the BLENDED `rho_v` (unchanged by design): the vapor it evaporates
+        # into and its evaporation bound must be the same representation, and in cloud -- where
+        # the closure is actually active -- the blend is the better-conditioned one.
         for i in 1:length(Qdot)
             Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
                                                         rho_d[i], Tk[i], p_hPa[i], Q_s[i],
@@ -2417,11 +2582,21 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # QSSREL reconciles the prognostic Q_ss with the vapor the water masses actually imply
     # (see qss_relaxation) — Q_ss is redundant now that rho_c is prognostic, and this is
     # what keeps the two from drifting apart under splitting error.
+    #
+    # IT IS FED `res_rho_t`, NEVER `rho_v`. Under `:residual` the two are the same array
+    # contents so this is bitwise the old line; under `:blend` it is the one place the blended
+    # vapor must not be used, because `-(Q_ss - ((Q_ss + rho_vs) - rho_vs))/tau ≡ 0` — the term
+    # would SELF-ANNIHILATE wherever the blend fully trusts res_qss, i.e. exactly where the
+    # anchor to the water masses is load-bearing. Keeping it on the density budget is also what
+    # bounds the blend's partition gap, by the identity
+    #     res_qss - res_rho_t = Q_ss - (rho_v - rho_vs) = -tau_qss * QSSREL,
+    # so the disagreement between the two representations is tau_qss times the rate at which
+    # this term is removing it.
     dT_nc = S.dT_nc; @. dT_nc = ((-p * div) + QDOT_TH) / (rho_d * C_vt)
     dp_nc = S.dp_nc; @. dp_nc = (-gamma_m * p * div) + ((R_m / C_vt) * QDOT_TH)
     SATF = S.SATF;   @. SATF = (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
     QSSREL = S.QSSREL
-    @. QSSREL = qss_relaxation(Q_ss, rho_v, rho_vs, tau_qss)
+    @. QSSREL = qss_relaxation(Q_ss, res_rho_t, rho_vs, tau_qss)
     mc_advect!(ADV, geom, u, w, vv, r, Q_ssp_x, Q_ss_z, qsv.f_l)
     FORCING .= @. (-Q_ss * div) + SATF - ((Qdot + Qdot_r) * (1.0 + Q_s)) + QSSREL
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
@@ -2604,8 +2779,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # them), so the increment measured is exactly the one applied — including the horizontal
     # water mixing and the boundary-layer contributions added after slot 8/9 were assembled.
     budget_trace && water_depletion_probe!(mtile, colstart, colend, t, precipitation,
-                                           rho_c, rho_r, rho_v, Qdot, Qdot_r, AUTO_COLL,
-                                           cap_c, cap_r, cap_v)
+                                           rho_c, rho_r, rho_v, res_rho_t, Qdot, Qdot_r,
+                                           AUTO_COLL, cap_c, cap_r, cap_v)
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
@@ -2713,10 +2888,279 @@ only the accumulated inconsistency is removed.
 It is free of any effect on the conserved ρ_d, ρ_t and E_t, and — unlike its predecessor,
 which relaxed onto water-mass bounds — it is now thermodynamically inert unconditionally:
 [`retrieve_temperature`](@ref) does not read `Q_ss` at all.
+
+**`rho_v` here is ALWAYS the DENSITY-BUDGET residual `ρ_t − ρ_d − ρ_c − ρ_r`, never the
+blended vapor of [`vapor_retrieval_blend`](@ref).** Fed the blend, the term reads
+`−(Q_ss − ((Q_ss + ρ_vs) − ρ_vs))/τ ≡ 0` wherever the blend fully trusts the supersaturation
+residual: it SELF-ANNIHILATES, and the only mechanism tying `Q_ss` to the water masses
+disappears exactly where it is load-bearing (the `POSITIVITY=1` run reaches `|Q_ss|/ρ_vs ~ 2e26`
+*with* the reconciliation running). Keeping the anchor on the density budget is also what
+gives the blend's partition gap its meaning, through the identity
+
+    res_qss − res_rho_t = Q_ss − (ρ_v − ρ_vs) = −τ · QSSREL,
+
+i.e. the disagreement between the two representations of the vapor is τ times the
+reconciliation rate, and the reconciliation is what removes it.
+
+**That relation is an IDENTITY, not a bound, and it was read as one for a while.** It says the
+gap equals `τ·QSSREL`; it says nothing about the size of either, and in particular nothing
+about the gap RELATIVE to `ρ_vs` — which is the ratio the retrieval's conditioning actually
+depends on, and which grows without limit as `ρ_vs` collapses in a rising anvil (measured 0.46
+on the NOPRECIP storm). The blend's bound on that ratio is `dcap`, in
+[`vapor_retrieval_blend`](@ref); this identity is not a substitute for it.
 """
 @inline function qss_relaxation(Q_ss, rho_v, rho_vs, tau)
 
     return -(Q_ss - (rho_v - rho_vs)) / tau
+end
+
+"""
+    _blend_smoothstep(x)
+
+The unit smoothstep `x²(3 − 2x)` on a clamped argument: `0` for `x ≤ 0`, `1` for `x ≥ 1`, C¹
+across both ends because the cubic's derivative `6x(1−x)` vanishes there.
+
+Returns EXACTLY `0.0` and EXACTLY `1.0` outside the band (the clamp makes both flat regions
+bit-exact, not merely accurate), which is what lets [`vapor_retrieval_blend`](@ref) degenerate
+to a pure copy of one operand in each regime limit. The clamp is also load-bearing on the low
+side for a physical reason: spline ringing puts `rho_liq` a few times `1e-9` BELOW zero in
+clear air routinely, and an unclamped cubic would turn that into a NEGATIVE weight — an
+extrapolation past the density residual, not a blend.
+"""
+@inline function _blend_smoothstep(x)
+
+    y = clamp(x, 0.0, 1.0)
+    return y * y * (3.0 - 2.0 * y)
+end
+
+"""
+    _vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
+
+Weight `w ∈ [0,1]` given to the SUPERSATURATION residual `res_qss = Q_ss + ρ_vs` against the
+DENSITY-BUDGET residual `res_rho_t = ρ_t − ρ_d − ρ_c − ρ_r` in [`vapor_retrieval_blend`](@ref):
+
+    w = w_cloud(ρ_liq; l0, l1) · w_trust(s; t0, t1),        s = |Q_ss| / ρ_vs
+
+with `w_cloud` a smoothstep UP (0 at `ρ_liq ≤ l0`, 1 at `ρ_liq ≥ l1`) and `w_trust` a
+smoothstep DOWN (1 at `s ≤ t0`, 0 at `s ≥ t1`).
+
+# Why CLOUDINESS is the selector, and `s` is not
+
+`s` is exactly the conditioning number of the `res_qss` route — the ratio of the difference to
+the terms being differenced — so it is the natural candidate, and it was swept first. **The
+measurement refutes it** (benchmarks/vapor_blend_diagnostic.jl, first sweep):
+
+- `res_qss < 0` is ALGEBRAICALLY `s > 1` (it says `Q_ss < −ρ_vs`), and the measured minimum `s`
+  over the `res_qss`-negative points is `1.0000` on both runs. So no band with `s1 ≤ 1` can
+  import a single `res_qss` negative, and every band that does anything is pushed up against
+  `s = 1` — precisely where `res_qss` is WORST conditioned. An `s`-only selector is not
+  choosing a representation, it is acting as a **soft clamp on negative vapor**, and negative
+  water is a RESOLUTION DIAGNOSTIC that must not be clamped
+  (reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md).
+- The negatives are a 1–2 % tail sitting against that same ceiling in BOTH regimes (G2: every
+  `res_rho_t < 0` point has `s ≥ 0.9993`; NOPRECIP: `s ∈ [0.876, 1.057]`), so the regime
+  contrast the HANDOFF measured (in-cloud mean `s` 0.081 vs dry 0.73) is a statement about the
+  MEANS and the tail does not follow it. On the assigned grid the `s`-only blend reproduces the
+  `res_rho_t` counts and minima to the last digit: an exact no-op.
+
+`ρ_liq` does what `s` cannot, because the two populations are separated by ~**8 decades** in it:
+NOPRECIP's 719 rescued points have median `ρ_liq = 3.95e−3`, its 425 harmed points `2.3e−14`,
+and G2's 1017 harmed points all sit at `|ρ_liq| < 3e−9`. Every band on the whole `(l0,l1,t0,t1)`
+grid then gives G2's shipped behaviour unchanged (750 negatives, min −8.2546e−05, all dry) with
+NOPRECIP's `res_qss` in-cloud count and minimum EXACTLY (474 negatives, min −8.6932e−07). That
+insensitivity to every threshold is what a real regime separation looks like, and it is why the
+defaults `l0 = 1e−6`, `l1 = 1e−4 kg/m³` are not tuned numbers.
+
+# What `w_trust` is for, and why `t0 = 2` and not `t0 ≤ 1`
+
+`w_trust` is NOT a second selector, and — as the NOPRECIP detonation established — it is not
+the detachment guard either. Its ONE retained job is the GROSS-detachment exact zero: a `Q_ss`
+that has left the density budget by orders of magnitude, which does happen (the `POSITIVITY=1`
+run reaches `s ≈ 2e26`). Above `t1` the weight is IDENTICALLY zero (bitwise, via
+[`_blend_smoothstep`](@ref)'s clamp), so such a point is handed back to the density residual
+with no special-case logic and no `isfinite` test anywhere.
+
+**It does not see RELATIVE detachment, and must not be asked to.** `s` is the supersaturation
+magnitude, not `|res_qss − res_rho_t|/ρ_vs`: on the NOPRECIP storm the latter reached 0.46
+while `s` stayed in 0.02–0.46, so `w_trust ≡ 1` and the guard fired on ZERO points in 3600 s —
+and during the growth phase `s` is ANTI-CORRELATED with detachment. That protection is
+`dcap`, the C¹ correction cap of [`vapor_retrieval_blend`](@ref).
+
+The thresholds sit deliberately ABOVE the `s = 1` ceiling. Anything at or below 1 would make
+`w_trust` a SIGN selector, and the blend would become the soft clamp above. With `t0 = 2` the
+`res_qss` negatives at `s ∈ (1, t0]` are imported at FULL cloud weight, which is exactly the
+property that keeps this a choice between two representations of the vapor rather than a
+correction to one of them.
+
+# C¹, not merely continuous
+
+`ρ_v` feeds `q_v`, hence `C_vt`, `R_m`, `C_pt` and `γ_m`, hence the acoustic coefficient
+`γ_m p/ρ_t` the semi-implicit solve linearizes about. A hard regime switch would put a JUMP in
+the sound speed across a surface moving through the flow; a C⁰-only blend would put a kink in
+it. Both smoothsteps are flat at both ends, so the composite has a continuous gradient across
+all four thresholds.
+
+Thresholds come from `physical_params[:vapor_blend_l0/_l1/_t0/_t1]`.
+"""
+@inline function _vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
+
+    return _blend_smoothstep((rho_liq - l0) / (l1 - l0)) *
+           _blend_smoothstep((t1 - s) / (t1 - t0))
+end
+
+"""
+    _blend_saturate(c, m)
+
+The C¹ SATURATOR applied to the blend's correction `c = w·(res_qss − res_rho_t)` in
+[`vapor_retrieval_blend`](@ref), with cap `m = dcap·ρ_vs`. Odd, monotone, C¹ everywhere,
+EXACTLY the identity on the inner half of the band, and bounded by `m`:
+
+    f(c) = c                                   for |c| ≤ a
+    f(c) = sign(c)·(m − a²/|c|)                for |c| > a,        a ≡ m/2
+
+# Derivation
+
+The requirements are: identity for small `|c|` (the corrections that are the actual fix must
+pass through BIT-EXACT, not merely accurately — median 1.5e−3·ρ_vs, an order of magnitude
+under the cap), a hard bound `|f| ≤ m`, monotone, odd, and a CONTINUOUS DERIVATIVE at the
+junction so that `γ_m` — hence the acoustic coefficient the semi-implicit solve linearizes
+about — has no kink. Take the identity out to `|c| = a` and a rational Huber-style tail `g(x) = m − k/x`
+beyond it. Matching value and slope at `x = a`,
+
+    g(a)  = m − k/a  = a      ⟹  k = a(m − a)
+    g'(a) = k/a²     = 1      ⟹  k = a²
+
+which are consistent iff `a = m/2`, and then `k = a² = m²/4`. The junction is therefore not
+a free parameter: it is FORCED to half the cap by C¹ alone.
+
+# Properties (all asserted in test/test_moist_compressible.jl)
+
+* `f(c) = c` exactly for `|c| ≤ m/2` — no rounding, the argument is returned.
+* `f'(c) = a²/c² > 0` for `|c| > a`, and `f'(a⁻) = f'(a⁺) = 1`: monotone and C¹.
+* `|f| ≤ m` always, and `< m` strictly in exact arithmetic — the cap is a SUPREMUM approached
+  asymptotically (`f → m − m²/(4|c|)`), so a saturated point is not pinned at a corner. In
+  floating point, `|c| ≳ m/(4ε)` puts the subtrahend under one ulp of `m` and the tail rounds
+  onto the cap; that is the correct rounding of the supremum, and the bound still holds.
+* Odd: `f(−c) = −f(c)`, so the cap cannot bias the sign of the correction and therefore
+  cannot rectify negative vapor into positive (see [`vapor_retrieval_blend`](@ref)).
+* `m = Inf` (i.e. `dcap = Inf`) returns `c` for every finite `c`: the uncapped blend, bitwise.
+* `m = 0` returns `±0.0`: the density residual, i.e. `dcap = 0` degenerates to `:residual`.
+
+Contrast the C⁰ clamp this replaces (`clamp(c, −m, m)`), which was the diagnostic form: it has
+the same bound but a DISCONTINUOUS derivative at `|c| = m` and a dead zone beyond it, so a
+point sitting on the cap contributes nothing to `∂ρ_v/∂(state)` and the acoustic coefficient
+acquires a kink on a surface moving through the flow — the same defect the smoothsteps of
+[`_blend_smoothstep`](@ref) exist to avoid.
+"""
+@inline function _blend_saturate(c, m)
+
+    a = 0.5 * m
+    abs(c) <= a && return c
+    return copysign(m - (a * a) / abs(c), c)
+end
+
+"""
+    vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t, l0, l1, t0, t1, dcap)
+
+The regime-blended vapor density [kg/m³], under `options[:vapor_retrieval] = :blend`:
+
+    s   = |Q_ss| / ρ_vs
+    w   = _vapor_blend_weight(ρ_liq, s, l0, l1, t0, t1)
+    c   = w·((Q_ss + ρ_vs) − res_rho_t)                    the CORRECTION
+    ρ_v = res_rho_t + _blend_saturate(c, dcap·ρ_vs)
+
+This is the DEFAULT retrieval (since 2026-07-29): every configuration that does not set the key
+takes this path. `res_rho_t = ρ_t − ρ_d − ρ_c − ρ_r` is the density-budget residual — the
+pre-blend route, and what `options[:vapor_retrieval] = :residual` returns unconditionally, kept
+as the bitwise A/B lever against it. See the file header and
+[`_vapor_blend_weight`](@ref) for the two-regime measurement this exists to answer, and
+reference/HANDOFF_VAPOR_RETRIEVAL.md for the sweeps.
+
+# The cap is the load-bearing guard, and `w_trust` is not
+
+`dcap` (`physical_params[:vapor_blend_dcap]`, default **0.02**) bounds the correction RELATIVE
+TO THE SATURATION DENSITY, `|ρ_v − res_rho_t| ≤ dcap·ρ_vs`. It is not a safety belt: the
+uncapped blend DETONATES the `SCYTHE_O01_PRECIP=0` storm, and the cap is what the measurement
+says fixes it.
+
+The mechanism is a MISSING GUARD, not a bad weight. The partition gap `res_qss − res_rho_t` is
+a property of the `Q_ss` splitting and is identical in a `:blend` run and a `:residual` run —
+about `1e−4 kg/m³` in absolute terms, which is the number every sweep in the HANDOFF reports.
+But it is UNBOUNDED RELATIVE TO `ρ_vs`, and `ρ_vs` is not a constant: in the rising NOPRECIP
+anvil the air cools, `ρ_vs` collapses, and the measured ratio `(res_qss − res_rho_t)/ρ_vs`
+climbs secularly with the storm — 0.08 at t = 1980 s, **0.46** at t = 2040 s, ~0.8 through the
+mature phase. Two runs differing only in the last bits of the state detonated at the SAME
+step (6828), which is what a threshold crossing looks like and not what noise looks like.
+
+`w_trust` cannot see any of that. Its variable is `s = |Q_ss|/ρ_vs`, the SUPERSATURATION
+magnitude — measured `s` at the worst-detached points is 0.02–0.46, so `w_trust ≡ 1` exactly
+and the guard fired on ZERO points in 3600 s. Worse, `s` is ANTI-CORRELATED with detachment
+during the growth phase. **`s` is not a detachment measure**, and the identity
+
+    res_qss − res_rho_t = −τ_qss · QSSREL
+
+is exactly that — an identity relating the gap to the reconciliation RATE, not a bound on
+either. `w_trust` is therefore retained for ONE job only: the GROSS-detachment exact zero
+(`s ≈ 1e10` and up; the `POSITIVITY=1` run reaches `s ≈ 2e26`), where it hands the point back
+to the density residual bitwise with no `isfinite` test anywhere. The RELATIVE-detachment
+protection — the one the anvil needed — is `dcap`.
+
+`dcap = 0.02` was validated causally, not fitted: it touches 0 % of points before t ≈ 1680 s
+and about 10 % of active cloud after, the detonation is gone, the stability ladder matches the
+`:residual` control, and the MEDIAN correction is untouched (~1.5e−3·ρ_vs, an order of
+magnitude below the cap and well inside the identity region `m/2 = 0.01·ρ_vs`). `dcap = Inf` recovers the uncapped blend BITWISE; `dcap = 0` degenerates to
+`:residual`.
+
+# Exactness
+
+**The two regime limits are EXACT copies, not approximations.** `w == 0.0` returns
+`res_rho_t`, and `w == 1.0` with `|c| ≤ dcap·ρ_vs/2` returns `Q_ss + ρ_vs`, both bit-for-bit,
+so a run that never leaves one regime is bitwise the run that had only that representation.
+That is what makes `:residual` an A/B lever against the whole attribution campaign rather than
+an "agrees to 1e-14" comparison. [`_blend_saturate`](@ref) is the identity on the inner half of
+the band precisely so this survives the cap: the corrections that constitute the fix are three
+decades under it and pass through untouched.
+
+# It is still not a clamp on the VAPOR
+
+`t0 = 2` sits above the `s = 1` ceiling at which `res_qss` turns negative, so a fully trusted
+point can and must import a NEGATIVE vapor; the saturator is ODD, so it cannot rectify the
+sign of anything. Flooring `ρ_v` here would destroy the measurement
+reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md rests on and manufacture water on the way.
+What `dcap` bounds is the DISTANCE BETWEEN THE TWO REPRESENTATIONS, symmetrically, which is a
+statement about the discretization and not about the sign of the water.
+
+# What it costs
+
+`ρ_d + ρ_v + ρ_c + ρ_r` no longer equals `ρ_t` pointwise. On the measured snapshots every
+in-cloud point acquires a gap (G2, uncapped: 13632 points, max 9.39e−4, p99 1.95e−4, median
+1.02e−7 kg/m³). Under the shipped `dcap` that gap is additionally bounded by `dcap·ρ_vs`
+wherever the cap is active. [`qss_relaxation`](@ref) — which is fed `res_rho_t`, NEVER this
+blend — is what absorbs it. `ρ_t` itself is untouched, so nothing about the conserved water
+mass changes.
+"""
+@inline function vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t, l0, l1, t0, t1,
+                                       dcap = 0.02)
+
+    s = abs(Q_ss) / rho_vs
+    w = _vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
+    # Branch rather than lean on `1.0*x + 0.0*y == x`: the identity holds for finite operands
+    # but a branch is unconditional, says what it means, and costs nothing next to the
+    # `rho_v_sat` this runs beside.
+    w == 0.0 && return res_rho_t
+    c = w * ((Q_ss + rho_vs) - res_rho_t)
+    fc = _blend_saturate(c, dcap * rho_vs)
+    if fc === c
+        # THE IDENTITY REGION, `|c| ≤ dcap·ρ_vs/2` — where the fix actually lives (median
+        # correction ~1.5e-3·ρ_vs) and, for `dcap = Inf`, everywhere. Reached with the
+        # saturator provably inert, so the uncapped expressions below are bitwise what they
+        # always were, regime limits included.
+        w == 1.0 && return Q_ss + rho_vs
+        return (w * (Q_ss + rho_vs)) + ((1.0 - w) * res_rho_t)
+    end
+    # The saturating tail. Written as an increment off `res_rho_t` because that is what the
+    # cap is a statement about: the DISTANCE between the two representations.
+    return res_rho_t + fc
 end
 
 # ── Semi-implicit adjustment ───────────────────────────────────────────────────
@@ -3051,6 +3495,12 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
         rho_vs_star = S.df_rho_vs_star
         @. rho_vs_star = rho_v_sat(T_star, p_hPa_star)
+        # The DENSITY residual, under both `vapor_retrieval` modes THIS PHASE. The star state
+        # is an INCREMENTS-ONLY consumer -- everything built from it here is differenced
+        # against the same-form n-state quantity -- so the representation cancels to leading
+        # order. That is why this stayed on the residual while the blend was measured on the
+        # tendency path, and it is why it STAYS there now that `:blend` is the default: the
+        # argument is about the increment, not about which retrieval ships.
         @. rho_v_star = rho_t_star - rho_d_star - rho_liq_star
         q_v_star = S.df_q_v_star
         q_l_star = S.df_q_l_star

@@ -233,6 +233,444 @@ using Springsteel
         end
     end
 
+    # ──────────────────────────────────────────────
+    # 4b. Regime-blended vapor retrieval — WRITTEN BEFORE THE IMPLEMENTATION
+    # ──────────────────────────────────────────────
+    # The vapor is retrievable two ways, and the two ways fail in DISJOINT regimes
+    # (reference/HANDOFF_VAPOR_RETRIEVAL.md; both measured sweeps are recorded in the
+    # header of benchmarks/vapor_blend_diagnostic.jl):
+    #
+    #   res_rho_t = rho_t - rho_d - rho_c - rho_r    the DENSITY-BUDGET residual. Cancels
+    #                                                catastrophically IN CLOUD, where
+    #                                                rho_c/rho_w reaches 1.0011.
+    #   res_qss   = Q_ss + rho_vs(T, p)              the SUPERSATURATION residual. Cancels
+    #                                                catastrophically IN DRY AIR, where
+    #                                                rho_v -> 0 forces Q_ss -> -rho_vs.
+    #
+    # Neither wins outright — a straight swap to res_qss is a NET REGRESSION on the shipped
+    # O01 default (1.11 % -> 2.61 % negative points, because the dry population dominates
+    # there) while being 5.7x better in the NOPRECIP storm's cloud. So the retrieval is a
+    # C¹ BLEND of the two, selected on the two variables that separate the populations by
+    # ~8 decades in rho_liq:
+    #
+    #   w = w_cloud(rho_liq; l0, l1) * w_trust(s; t0, t1),      s = |Q_ss| / rho_vs
+    #   rho_v = w*res_qss + (1 - w)*res_rho_t
+    #
+    # w_cloud smoothsteps UP in rho_liq (there IS condensate, so res_rho_t is the route that
+    # cancels) and w_trust smoothsteps DOWN in s. `s` is exactly the conditioning number of
+    # the res_qss route — the ratio of the difference to the terms being differenced — and it
+    # is SELF-PROTECTING: when Q_ss detaches from the density budget (the POSITIVITY=1 run
+    # reaches s ~ 2e26) the weight goes to zero and the point is handed back to the density
+    # residual with no special-case logic.
+    #
+    # THESE TESTSETS ARE THE SPECIFICATION, and they run before `src/` knows any of it. Each
+    # is gated on an `isdefined` probe so that the missing Stage 2 API costs ONE countable
+    # failing test per testset instead of erroring the rest of the file out from under the
+    # suite. `@test_broken` is deliberately not used: these are requirements, not known bugs.
+
+    @testset "vapor blend weight: limits, range and monotonicity" begin
+        have = isdefined(Scythe, :_vapor_blend_weight)
+        @test have                    # ← the Stage 2 gate; see the block comment above
+        if have
+            # The shipped defaults (physical_params :vapor_blend_l0/_l1/_t0/_t1). They are
+            # passed EXPLICITLY here so that a later retuning of the defaults cannot silently
+            # change what these assertions mean.
+            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
+            W = (rho_liq, s) -> Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
+
+            # 1. Full trust in res_qss: thick cloud AND a supersaturation small compared with
+            #    the saturation density it is differenced against. EXACTLY 1.0, not 1 - eps —
+            #    the blend has to degenerate to a pure copy so the regime limits below can be
+            #    asserted with ===.
+            for rho_liq in (l1, 2.0e-4, 1.0e-3, 1.0), s in (0.0, 0.5, 1.0, t0)
+                @test W(rho_liq, s) === 1.0
+            end
+
+            # 2. No condensate -> no trust, at ANY s. NOTE THE NEGATIVES: spline ringing puts
+            #    rho_liq a few times 1e-9 BELOW zero in clear air routinely, and the clamp
+            #    inside the smoothstep is what stops that from becoming a negative weight
+            #    (i.e. an extrapolation past res_rho_t, not a blend).
+            for rho_liq in (-1.0e-3, -3.0e-9, 0.0, 1.0e-9, l0),
+                s in (0.0, 1.0, t0, 4.0, 1.0e10)
+                @test W(rho_liq, s) === 0.0
+            end
+
+            # 3. Detached Q_ss -> no trust, however cloudy the point is.
+            for s in (t1, 6.0, 1.0e10, 2.0e26), rho_liq in (0.0, 1.0e-5, 1.0e-3, 1.0)
+                @test W(rho_liq, s) === 0.0
+            end
+
+            # 4. A weight is a weight: in [0,1] and finite everywhere, including at the two
+            #    pathological inputs above.
+            rls = collect(range(-1.0e-5, 1.0e-3; length = 257))
+            ss = collect(range(0.0, 8.0; length = 257))
+            @test all(0.0 <= W(rl, s) <= 1.0 for rl in rls, s in ss)
+            @test all(isfinite(W(rl, s)) for rl in rls, s in ss)
+
+            # 5. Monotone in both arguments, on grids fine enough to resolve the smoothstep
+            #    interiors (the band is [l0, l1], four decades below the coarse grid's span).
+            #    The tolerance is one rounding of the cubic x^2(3-2x), not slack: the exact
+            #    function is monotone, and a non-monotone weight would mean the retrieval
+            #    could move AWAY from the better-conditioned route as the point gets cloudier.
+            rls_band = collect(range(-2.0e-6, 2.0e-4; length = 513))
+            for s in (0.0, 1.0, 2.5, 3.5, 4.5)
+                for grid in (rls, rls_band)
+                    @test all(diff([W(rl, s) for rl in grid]) .>= -1.0e-16)
+                end
+            end
+            for rl in (0.0, 5.0e-6, 5.0e-5, 1.0e-4, 1.0e-3)
+                @test all(diff([W(rl, s) for s in ss]) .<= 1.0e-16)
+            end
+        end
+    end
+
+    @testset "vapor blend weight: C¹ across all four thresholds" begin
+        # WHY C¹ AND NOT MERELY CONTINUOUS. rho_v feeds q_v, hence C_vt, R_m, C_pt and
+        # gamma_m, hence the acoustic coefficient gamma_m*p/rho_t that the semi-implicit
+        # solve linearizes about. A hard regime switch would put a JUMP in the sound speed
+        # across a surface moving through the flow; a C⁰-only blend would put a kink in it.
+        # The smoothstep x^2(3-2x) is flat at both ends, so the composite weight has a
+        # continuous gradient across every one of the four thresholds.
+        have = isdefined(Scythe, :_vapor_blend_weight)
+        @test have
+        if have
+            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
+            W = (rho_liq, s) -> Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
+            dl = l1 - l0
+            dt = t1 - t0
+
+            # ── the rho_liq thresholds, probed at s = 0 where w_trust ≡ 1 so w = w_cloud ──
+            hl = 1.0e-4 * dl
+            dWl = rl -> (W(rl + hl, 0.0) - W(rl - hl, 0.0)) / (2.0 * hl)
+            peak_l = 1.5 / dl                       # max |w'| of a unit smoothstep of width dl
+            for knot in (l0, l1)
+                # Flat AT the knot: both one-sided derivatives vanish there, which is what
+                # "C¹ across the threshold" means for a clamped smoothstep.
+                @test abs(dWl(knot)) < 1.0e-3 * peak_l
+                # ... and no jump in the derivative in a neighbourhood of it.
+                ds = [dWl(knot + j * 5.0e-4 * dl) for j in -5:5]
+                @test maximum(abs.(diff(ds))) < 1.0e-2 * peak_l
+            end
+            # Interior: the closed form 6x(1-x)/Δ, not merely "something smooth".
+            for x in (0.25, 0.5, 0.75)
+                @test dWl(l0 + x * dl) ≈ 6.0 * x * (1.0 - x) / dl rtol = 1.0e-6
+            end
+
+            # ── the s thresholds, probed at rho_liq >> l1 where w_cloud ≡ 1 so w = w_trust ──
+            ht = 1.0e-4 * dt
+            dWt = s -> (W(1.0e-3, s + ht) - W(1.0e-3, s - ht)) / (2.0 * ht)
+            peak_t = 1.5 / dt
+            for knot in (t0, t1)
+                @test abs(dWt(knot)) < 1.0e-3 * peak_t
+                ds = [dWt(knot + j * 5.0e-4 * dt) for j in -5:5]
+                @test maximum(abs.(diff(ds))) < 1.0e-2 * peak_t
+            end
+            for x in (0.25, 0.5, 0.75)
+                # w_trust steps DOWN, so the sign is negative and x = (t1 - s)/Δ.
+                @test dWt(t1 - x * dt) ≈ -6.0 * x * (1.0 - x) / dt rtol = 1.0e-6
+            end
+        end
+    end
+
+    @testset "vapor blend retrieval: the regime limits are exact copies" begin
+        have = isdefined(Scythe, :vapor_retrieval_blend)
+        @test have
+        if have
+            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
+            B = (Q_ss, rho_vs, rho_liq, res_rho_t) ->
+                Scythe.vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t, l0, l1, t0, t1)
+            rho_vs = rho_v_sat(290.0, 900.0)        # ~1.4e-2 kg/m^3
+            # The two candidates are deliberately DIFFERENT, by 4e-5 kg/m^3 — the order of
+            # the in-cloud partition gap the sweep measured (median 1.0e-7, p99 2.0e-4) — so
+            # "returns one of them exactly" is a real assertion rather than a tautology.
+            #
+            # AMENDED WITH THE CAP (Stage 2b): the separation must sit inside the saturator's
+            # IDENTITY REGION, |c| <= dcap*rho_vs/2 = 0.01*rho_vs = 1.44e-4 kg/m^3, because
+            # that is where the exact-copy guarantee lives and where the corrections that
+            # constitute the fix actually are (median ~1.5e-3*rho_vs). It was 4e-4 before the
+            # cap shipped, i.e. 2.8x outside; the assertions below prove the same property
+            # about the same code path, on a separation the shipped default reaches.
+            # `_blend_saturate`'s own testset covers the saturating tail.
+            Q_ss = -2.0e-5                          # s = 0.0014 << t0: res_qss is trusted
+            res_qss = Q_ss + rho_vs
+            res_rho_t = rho_vs + 4.0e-5             # |res_qss - res_rho_t| = 6.0e-5 < 1.44e-4
+
+            # 1. Thick cloud near saturation -> the supersaturation residual, EXACTLY.
+            for rho_liq in (l1, 5.0e-4, 8.0e-3)
+                @test B(Q_ss, rho_vs, rho_liq, res_rho_t) === res_qss
+            end
+            # 2. Condensate-free -> the density residual, EXACTLY, including at the small
+            #    negative rho_liq that spline ringing makes routine in clear air.
+            for rho_liq in (0.0, -3.0e-9, -1.0e-6, l0)
+                @test B(Q_ss, rho_vs, rho_liq, res_rho_t) === res_rho_t
+            end
+            # 3. Detached Q_ss -> the density residual, EXACTLY, however cloudy the point is.
+            #    Either sign: s is a magnitude.
+            @test B(1.0e10 * rho_vs, rho_vs, 8.0e-3, res_rho_t) === res_rho_t
+            @test B(-1.0e10 * rho_vs, rho_vs, 8.0e-3, res_rho_t) === res_rho_t
+
+            # 4. THE BLEND IS NOT A CLAMP. `res_qss < 0` is ALGEBRAICALLY `s > 1` (measured
+            #    min s over the res_qss-negative points: 1.0000 on both runs), and t0 = 2 sits
+            #    ABOVE that ceiling, so a fully trusted point can and must import a NEGATIVE
+            #    vapor. Negative water is a RESOLUTION DIAGNOSTIC (reference/
+            #    FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md): flooring it here would destroy the
+            #    measurement and manufacture water on the way.
+            #
+            #    AMENDED WITH THE CAP (Stage 2b): a negative res_qss can only be imported
+            #    EXACTLY where the correction is inside the identity region, so the density
+            #    residual here is itself negative — which is the configuration the rescue
+            #    actually runs in (NOPRECIP's rescued points are res_rho_t < 0 <= res_qss).
+            #    It was `Q_neg = -1.5*rho_vs` against `res_rho_t = rho_vs + 4e-4` before,
+            #    a correction of 2.1e-2 = 74x the whole cap; the property under test —
+            #    s > 1 imports at FULL weight and the result is NEGATIVE, i.e. the retrieval
+            #    is not a non-negativity constraint — is unchanged, and §6 below adds the
+            #    statement that the SATURATOR does not rectify it either.
+            res_rho_t_neg = -1.0e-4                 # the anvil configuration
+            Q_neg = -2.0e-4 - rho_vs                # res_qss = -2.0e-4; s = 1.014 in (1, t0)
+            @test abs(Q_neg) / rho_vs > 1.0         # ... genuinely past the res_qss ceiling
+            @test abs(Q_neg) / rho_vs < t0          # ... and still at full trust
+            @test B(Q_neg, rho_vs, 8.0e-3, res_rho_t_neg) === Q_neg + rho_vs
+            @test B(Q_neg, rho_vs, 8.0e-3, res_rho_t_neg) < 0.0
+
+            # 5. In between, it is the convex combination the weight function reports — no
+            #    third representation of the vapor anywhere in the transition.
+            #
+            #    AMENDED WITH THE CAP (Stage 2b): `s` and the correction are not independent
+            #    (s = Q/rho_vs, so a large s is a large res_qss), so the separation is now
+            #    taken RELATIVE to res_qss — a fixed 4e-5 gap at every s — which keeps every
+            #    point inside the identity region while sweeping exactly the same weights.
+            #    Previously `res_rho_t = rho_vs + 4e-4` was shared with §1, which at s = 4.5
+            #    made the correction 4.2e-3, 15x the cap.
+            if isdefined(Scythe, :_vapor_blend_weight)
+                for rho_liq in (5.0e-6, 2.0e-5, 8.0e-5), s in (0.0, 2.5, 3.5, 4.5)
+                    Q = s * rho_vs
+                    w = Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
+                    rrt = (Q + rho_vs) + 4.0e-5     # |c| <= 4.0e-5 < 1.44e-4 for every w
+                    @test B(Q, rho_vs, rho_liq, rrt) ≈
+                          (w * (Q + rho_vs)) + ((1.0 - w) * rrt) rtol = 1.0e-14
+                end
+            end
+
+            # 6. THE CAP IS ODD, SO IT IS NOT A RECTIFIER. Push the same fully trusted,
+            #    negative res_qss far outside the identity region: the result is SATURATED
+            #    (it no longer equals res_qss) but it is still on the res_qss side of the
+            #    density residual and still negative. A one-sided floor would show up here.
+            Q_far = -1.5 * rho_vs                   # res_qss = -0.5*rho_vs; s = 1.5 < t0
+            v_far = B(Q_far, rho_vs, 8.0e-3, res_rho_t_neg)
+            @test v_far != Q_far + rho_vs                       # saturated, not copied
+            @test v_far < res_rho_t_neg                         # ... on the res_qss side
+            @test res_rho_t_neg - v_far < 0.02 * rho_vs         # ... within the shipped cap
+            @test v_far < 0.0                                   # ... and still negative
+            # The mirror image: the Q_ss whose res_qss sits the same distance on the OTHER
+            # side of res_rho_t. Equal and opposite correction, so the cap has no sign bias.
+            Q_mirror = 2.0 * res_rho_t_neg - Q_far - 2.0 * rho_vs
+            @test abs(Q_mirror) / rho_vs < t0       # still fully trusted
+            @test (B(Q_mirror, rho_vs, 8.0e-3, res_rho_t_neg) - res_rho_t_neg) ≈
+                  -(v_far - res_rho_t_neg) rtol = 1.0e-14
+        end
+    end
+
+    # ──────────────────────────────────────────────
+    # 4c. The blend's C¹ CORRECTION SATURATOR (Stage 2b)
+    # ──────────────────────────────────────────────
+    # WHY THIS EXISTS. The uncapped blend of §4b DETONATES the NOPRECIP storm
+    # (SCYTHE_O01_PRECIP=0 SCYTHE_O01_VAPOR=blend), at the identical step 6828 in two runs
+    # differing only in the last bits of the state — a threshold crossing, not noise. The
+    # mechanism is a MISSING GUARD, not a bad weight:
+    #
+    #   * the partition gap `res_qss - res_rho_t` is a property of the Q_ss splitting and is
+    #     IDENTICAL in a :blend run and a :residual run, ~1e-4 kg/m^3 absolute;
+    #   * but it is UNBOUNDED RELATIVE to rho_vs, and rho_vs is not a constant: in the rising
+    #     anvil the air cools, rho_vs collapses, and gap/rho_vs climbed 0.08 (t = 1980 s) ->
+    #     0.46 (t = 2040 s) -> ~0.8 through the mature phase;
+    #   * `w_trust` is blind to that. Its variable s = |Q_ss|/rho_vs is the SUPERSATURATION
+    #     magnitude, measured 0.02-0.46 at the worst-detached points, so w_trust ≡ 1 and the
+    #     guard fired on ZERO points in 3600 s — and during growth s is ANTI-CORRELATED with
+    #     detachment. `s` is not a detachment measure;
+    #   * `res_qss - res_rho_t = -tau_qss*QSSREL` is an IDENTITY, not a bound. It relates the
+    #     gap to the reconciliation RATE and constrains neither.
+    #
+    # The bound is therefore imposed directly, on the correction, relative to rho_vs:
+    # |rho_v - res_rho_t| <= dcap*rho_vs with dcap = 0.02 shipped. That was validated
+    # CAUSALLY: 0 % of points touched before t ~ 1680 s, ~10 % of active cloud after, the
+    # detonation gone, the stability ladder matching the :residual control, and the median
+    # correction (~1.5e-3*rho_vs, an order of magnitude under the cap) untouched.
+    #
+    # It must be C¹ for the same reason the weight is (rho_v -> q_v -> gamma_m -> the acoustic
+    # coefficient the semi-implicit solve linearizes about), and EXACTLY the identity on the
+    # small corrections, because those are the fix. Both requirements together FORCE the
+    # junction to half the cap: matching value and slope of the Huber tail g(x) = m - k/x to
+    # the identity at x = a gives k = a(m - a) and k = a^2 simultaneously, i.e. a = m/2.
+    @testset "vapor blend saturator: identity region, bound, C¹, odd" begin
+        have = isdefined(Scythe, :_blend_saturate)
+        @test have
+        if have
+            F = Scythe._blend_saturate
+            rho_vs = rho_v_sat(290.0, 900.0)        # ~1.4393e-2 kg/m^3
+            m = 0.02 * rho_vs                       # the shipped cap, 2.8787e-4
+            a = 0.5 * m                             # 1.4393e-4
+
+            # 1. THE IDENTITY REGION IS EXACT, not accurate. The corrections that constitute
+            #    the fix live here (median ~1.5e-3*rho_vs = 2.2e-5, an order of magnitude
+            #    under the cap), so `===`: they must pass through with no rounding at all, which is what
+            #    keeps the regime limits of §4b bit-for-bit copies.
+            for c in (0.0, -0.0, 1.0e-18, -1.0e-18, 1.0e-6, -1.0e-6, 2.2e-5, -2.2e-5,
+                      0.5 * a, -0.5 * a, prevfloat(a), -prevfloat(a), a, -a)
+                @test F(c, m) === c
+            end
+            # ... on a fine sweep of the whole inner half, at three cap sizes.
+            for mm in (m, 1.0e-3, 1.0e-8), c in range(-0.5 * mm, 0.5 * mm; length = 401)
+                @test F(c, mm) === c
+            end
+
+            # 2. THE BOUND IS NEVER EXCEEDED, and is approached ASYMPTOTICALLY — no corner.
+            #    f -> m - m^2/(4|c|) in exact arithmetic, so the cap is a supremum rather than
+            #    a value the map attains. The bound asserted is `<=`, which is what the
+            #    retrieval needs and what holds in floating point: past |c| ~ m/(4*eps) the
+            #    subtrahend falls below one ulp of m and the tail ROUNDS ONTO the cap. That is
+            #    the correct rounding of a strict supremum, not a corner — the derivative is
+            #    still ~m^2/(4c^2) and vanishing, and the limit is approached from below.
+            for c in (nextfloat(a), 2.0 * a, 10.0 * m, 1.0e3 * m, 1.0e12 * m, 1.0e300)
+                @test abs(F(c, m)) <= m
+                @test abs(F(-c, m)) <= m
+            end
+            for c in (nextfloat(a), 2.0 * a, 10.0 * m, 1.0e3 * m, 1.0e12 * m)
+                @test abs(F(c, m)) < m                # resolvable: strictly under the cap
+                @test abs(F(-c, m)) < m
+            end
+            @test F(1.0e12 * m, m) ≈ m rtol = 1.0e-11
+            # ... and everywhere on a wide sweep spanning both regions.
+            cs = sort(vcat(range(-50.0 * m, 50.0 * m; length = 2001),
+                           [-1.0e6 * m, 1.0e6 * m]))
+            @test all(abs(F(c, m)) <= m for c in cs)
+            # The closed form itself, on the tail: sign(c)*(m - (m/2)^2/|c|).
+            for c in (1.3 * a, 2.0 * a, 7.0 * a, 1.0e4 * a)
+                @test F(c, m) ≈ m - (a * a) / c rtol = 1.0e-15
+                @test F(-c, m) ≈ -(m - (a * a) / c) rtol = 1.0e-15
+            end
+
+            # 3. C¹ AT THE JUNCTION ±m/2, by finite difference. The one-sided slopes must
+            #    BOTH be 1 there: the identity side by construction, the tail side because
+            #    g'(a) = a^2/a^2 = 1 is exactly what fixed the junction at half the cap.
+            #    A C⁰ clamp — the diagnostic form this replaces — fails this: its slope drops
+            #    from 1 to 0 across |c| = m.
+            h = 1.0e-6 * a
+            for knot in (a, -a)
+                left  = (F(knot, m) - F(knot - h, m)) / h
+                right = (F(knot + h, m) - F(knot, m)) / h
+                @test left ≈ 1.0 rtol = 1.0e-5
+                @test right ≈ 1.0 rtol = 1.0e-5
+                @test abs(right - left) < 1.0e-4          # no jump in the derivative
+            end
+            # No jump anywhere: the FD derivative is continuous across a neighbourhood of the
+            # junction, and matches the closed form a^2/c^2 on the tail.
+            for x in (1.5, 2.0, 4.0, 20.0)
+                c = x * a
+                fd = (F(c + h, m) - F(c - h, m)) / (2.0 * h)
+                @test fd ≈ (a * a) / (c * c) rtol = 1.0e-6
+            end
+            ds = [(F(a + (j + 1) * 1.0e-3 * a, m) - F(a + j * 1.0e-3 * a, m)) / (1.0e-3 * a)
+                  for j in -50:50]
+            @test maximum(abs.(diff(ds))) < 1.0e-2        # slope walks, never jumps
+
+            # 4. ODD, so the cap cannot rectify the sign of the correction — the property
+            #    that keeps it a bound on the DISTANCE BETWEEN TWO REPRESENTATIONS rather
+            #    than a non-negativity constraint on the vapor (which reference/
+            #    FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md forbids).
+            for c in vcat(collect(range(1.0e-9, 50.0 * m; length = 997)), [1.0e6 * m])
+                @test F(-c, m) === -F(c, m)
+            end
+
+            # 5. MONOTONE — a non-monotone saturator would make rho_v move the WRONG WAY as
+            #    the two representations separate further.
+            @test all(diff([F(c, m) for c in cs]) .>= 0.0)
+
+            # 6. dcap = Inf IS THE UNCAPPED BLEND, bitwise: the identity region is the whole
+            #    line. dcap = 0 is the density residual: the correction is annihilated.
+            for c in (0.0, 1.0e-9, -1.0e-9, 1.0, -1.0, 1.0e300, -1.0e300)
+                @test F(c, Inf) === c
+                @test F(c, 0.0) == 0.0
+            end
+        end
+    end
+
+    @testset "vapor blend retrieval: the cap through vapor_retrieval_blend" begin
+        have = isdefined(Scythe, :vapor_retrieval_blend) && isdefined(Scythe, :_blend_saturate)
+        @test have
+        if have
+            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
+            rho_vs = rho_v_sat(290.0, 900.0)
+            dcap = 0.02                              # the shipped physical_params default
+            B = (Q_ss, rho_liq, res_rho_t, args...) ->
+                Scythe.vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t,
+                                             l0, l1, t0, t1, args...)
+
+            # 1. THE DEFAULT IS THE SHIPPED CAP. The trailing argument's default and
+            #    `physical_params[:vapor_blend_dcap]` are the same number, so the unit-scale
+            #    calls above and the model are testing one configuration.
+            @test B(-1.0e-3, 8.0e-3, rho_vs + 5.0e-2) ===
+                  B(-1.0e-3, 8.0e-3, rho_vs + 5.0e-2, dcap)
+
+            # 2. dcap = Inf RECOVERS THE UNCAPPED BLEND BITWISE, at every weight — including
+            #    at corrections far outside any finite cap. This is the A/B lever: the
+            #    detonating configuration is still reachable, exactly.
+            for rho_liq in (0.0, 5.0e-6, 2.0e-5, 8.0e-5, 8.0e-3), s in (0.0, 0.5, 2.5, 4.5)
+                Q = s * rho_vs
+                w = Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
+                for rrt in (rho_vs + 4.0e-5, rho_vs + 4.0e-1, -1.0e-3)
+                    uncapped = w == 0.0 ? rrt :
+                               w == 1.0 ? Q + rho_vs :
+                               (w * (Q + rho_vs)) + ((1.0 - w) * rrt)
+                    @test B(Q, rho_liq, rrt, Inf) === uncapped
+                end
+            end
+
+            # 3. THE BOUND HOLDS POINTWISE, over a sweep that deliberately includes
+            #    separations of the order the NOPRECIP anvil reached (0.46*rho_vs, 23x the
+            #    cap) and the gross detachment w_trust is retained for.
+            for rho_liq in (-3.0e-9, 0.0, 5.0e-6, 2.0e-5, 8.0e-5, 8.0e-3),
+                s in (0.0, 0.5, 1.0, 1.5, 2.5, 3.5, 4.5, 6.0, 1.0e10, 2.0e26),
+                d in (-0.46 * rho_vs, -0.02 * rho_vs, -1.0e-7, 0.0,
+                      1.0e-7, 0.02 * rho_vs, 0.46 * rho_vs, 5.0)
+
+                Q = s * rho_vs
+                rrt = (Q + rho_vs) - d               # so the raw separation is exactly d
+                v = B(Q, rho_liq, rrt)
+                @test abs(v - rrt) <= dcap * rho_vs
+                @test isfinite(v)
+            end
+
+            # 4. GROSS DETACHMENT IS STILL BITWISE res_rho_t. The cap does not displace
+            #    `w_trust`'s one retained job: above t1 the weight is identically zero, so the
+            #    point is handed back to the density residual with no correction at all — not
+            #    a capped one.
+            for rrt in (rho_vs, -1.0e-3, 1.0e-2, 0.0)
+                @test B(1.0e10 * rho_vs, 8.0e-3, rrt) === rrt
+                @test B(-2.0e26 * rho_vs, 8.0e-3, rrt) === rrt
+                @test B(6.0 * rho_vs, 8.0e-3, rrt) === rrt
+            end
+
+            # 5. dcap = 0 DEGENERATES TO :residual, at every weight. Not a special case in the
+            #    code — the identity region collapses to the origin and the tail evaluates to
+            #    ±0.0 — but it is the statement that the cap family spans both endpoints.
+            for rho_liq in (0.0, 2.0e-5, 8.0e-3), s in (0.0, 1.5, 4.5)
+                @test B(s * rho_vs, rho_liq, rho_vs + 4.0e-4, 0.0) === rho_vs + 4.0e-4
+            end
+
+            # 6. THE CAP SCALES WITH rho_vs, not with an absolute density. That is the whole
+            #    point: the failure was a gap that was small in kg/m^3 and large relative to a
+            #    COLLAPSING rho_vs in the rising anvil.
+            for rvs in (1.0e-3, 1.0e-2, 3.0e-2)
+                # s = 0.5 (full trust), res_qss = 0.5*rvs, res_rho_t = -0.5*rvs, so the raw
+                # correction is 1.0*rvs — 100x the cap at every one of these scales.
+                v = Scythe.vapor_retrieval_blend(-0.5 * rvs, rvs, 8.0e-3, -0.5 * rvs,
+                                                 l0, l1, t0, t1, dcap)
+                @test abs(v + 0.5 * rvs) <= dcap * rvs
+                @test abs(v + 0.5 * rvs) > 0.9 * dcap * rvs     # saturated, not merely small
+            end
+        end
+    end
+
     @testset "qss_condensation_rates cloud/rain split" begin
         Tk = 285.0; p_hPa = 900.0; ts = 0.1
         N_r = 1.0e-3   # #/cm^3
@@ -1326,6 +1764,175 @@ using Springsteel
         end
     end
 
+    @testset "positivity bounds are available and inert for rho_d/rho_t" begin
+        # WHY THIS IS OFF BY DEFAULT, and what this testset is for.
+        #
+        # `install_positivity_bounds!` already understands "rho_d" and "rho_t" — both are
+        # carried as perturbations from a nonzero reference, so their bound is the
+        # reference-offset one (-ρ̄ through the support-minimum rule on the k-leg, the
+        # negated SB coefficients on the i-leg). Nothing about the machinery is
+        # species-specific. But NOTHING ENABLES IT, and that is deliberate:
+        #
+        #   * rho_d has no rate sinks at all, and rho_t's only sink is the fitted
+        #     sedimentation flux divergence, which is not a rate. The AB3 depletion-bound
+        #     machinery that sizes the rho_c/rho_r caps (`AB3_REAL_LIMIT` and friends) is
+        #     therefore vacuous for these two — there is no cap to size.
+        #   * The constraint that actually matters physically is rho_w = rho_t - rho_d >= 0,
+        #     a DIFFERENCE of two fields. It is not expressible as a per-field bound on
+        #     either one's spline coefficients, so bounding rho_d and rho_t individually
+        #     does not buy it.
+        #   * Both fields sit ~5 orders of magnitude away from zero in every configuration
+        #     run to date (min rho_d/ρ̄_d ≈ 1 - 5e-6 here).
+        #
+        # So the doctrine holds: measure, don't clamp. What this testset locks is that the
+        # option WORKS and is BIT-INERT when it does not bind, so that a future strongly
+        # convective run can turn it on (via `GridParameters.positivity`) without first
+        # having to debug the plumbing. See benchmarks/FUTURE_WORK.md.
+        function positivity_rirk(tmpdir, tag, positivity)
+            vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+            # Scalars take NeumannBC on all four sides — R1T1, which is bound-safe (the
+            # mirror a[1] = a[3] copies rather than combines, so a box constraint on the
+            # free coefficients implies it on the slaved ones). Springsteel's
+            # `set_lower_bound!` throws for anything else.
+            scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+            side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+            wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+            gp = GridParameters(geometry = "RiRk",
+                iMin = 0.0, iMax = 8.0e3, num_cells_i = 4,
+                kMin = 0.0, kMax = 4.0e3, num_cells_k = 8,
+                positivity = positivity,
+                BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
+                vars = vars)
+            ref_file = joinpath(tmpdir, "positivity_$(tag).ref")
+            model = ModelParameters(
+                ts = 0.25, integration_time = 5.0, output_interval = 5.0,
+                equation_set = "moist_compressible_XZ",
+                ref_state_file = ref_file, grid_params = gp,
+                physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                       :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                       :tau_qss => 10.0, :alpha => 0.0,
+                                       :z_damp => 20.0e3, :f => 0.0),
+                options = Dict{Symbol,Any}(:semiimplicit => true,
+                                           :exact_reference_state => true,
+                                           :precipitation => false))
+            gp = model.grid_params
+            patch = createGrid(gp)
+            z = Scythe.getGridpoints(patch)[1:gp.kDim, end]
+            col = saturated_cloudy_column_mc(z)
+            Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+            patch.physical .= 0.0
+            # Deterministic broadband w seed (irrational chirp), amplitude large enough to
+            # move every prognostic but far too small to threaten positive-definiteness.
+            w_i = gp.vars["w"]
+            for i in 1:size(patch.physical, 1)
+                patch.physical[i, w_i, 1] = 1.0e-2 * sin(0.5 * sqrt(2.0) * i^2)
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            hrm = sparse(Int64[], Int64[], Float64[],
+                         size(patch.spectral, 1), size(patch.spectral, 2))
+            mtile = createModelTile(patch, patch, model, hrm)
+            return mtile, patch, model, gp
+        end
+
+        function positivity_run!(mtile, patch, model, gp, nsteps)
+            kDim = gp.kDim
+            ncols = div(size(patch.physical, 1), kDim)
+            for t in 1:nsteps
+                for c in 1:ncols
+                    Scythe.advance_column(mtile, c, t)
+                end
+                Scythe.calcTendency(mtile)
+                gridTransform!(patch)
+            end
+            return patch
+        end
+
+        mktempdir() do tmpdir
+            pos = Dict("rho_d" => Dict(:i => 0.0, :k => 0.0),
+                       "rho_t" => Dict(:i => 0.0, :k => 0.0))
+            mB, pB, moB, gpB = positivity_rirk(tmpdir, "on", pos)
+            mO, pO, moO, gpO = positivity_rirk(tmpdir, "off",
+                                               Dict{String,Dict{Symbol,Float64}}())
+            vars = gpB.vars
+            kDim = gpB.kDim
+            rho_dbar = view(Springsteel.ref_rho_d(mB.ref_state), :, 1)
+            rho_tbar = view(Springsteel.ref_rho_t(mB.ref_state), :, 1)
+
+            # 1. The bounds installed at all, and installed as REFERENCE-OFFSET bounds
+            #    rather than the factory's constant 0 (which on a perturbation would pin
+            #    the field at or above its own reference).
+            for (name, bar) in (("rho_d", rho_dbar), ("rho_t", rho_tbar))
+                v = vars[name]
+                kcol = pB.kbasis.data[v]
+                @test length(kcol.lower) == kcol.params.bDim
+                # Support-minimum rule: L[i] = -min(ρ̄ over the 4 cells Bᵢ covers), so every
+                # entry lies in [-max ρ̄, -min ρ̄] and none of them is the factory's 0.
+                @test all(-maximum(bar) - 1e-12 .<= kcol.lower .<= -minimum(bar) + 1e-12)
+                @test maximum(kcol.lower) < 0.0
+                for z in axes(pB.ibasis.data, 1)
+                    @test length(pB.ibasis.data[z, v].lower) == gpB.b_iDim
+                end
+                # Control run: no bound anywhere.
+                @test isempty(pO.kbasis.data[v].lower)
+                @test isempty(pO.ibasis.data[1, v].lower)
+            end
+
+            nsteps = 20
+            # Exact 2-D mass integral: the mish points are Gauss nodes in BOTH directions,
+            # so the Gauss-weight quadrature on them integrates the spline representation
+            # exactly (the same rule the Galerkin solver uses). An unweighted point sum
+            # would confuse redistribution among unequally weighted nodes with a real drift.
+            cellw = (npts, ncells, len) -> begin
+                _, qw = Springsteel.CubicBSpline._quadrature_rule(div(npts, ncells),
+                                                                 gpB.quadrature)
+                repeat(qw .* (len / ncells), outer = ncells)
+            end
+            Wi = cellw(gpB.iDim, gpB.num_cells_i, gpB.iMax - gpB.iMin)
+            Wk = cellw(gpB.kDim, gpB.num_cells_k, gpB.kMax - gpB.kMin)
+            massfun = (p, name, bar) -> sum(Wi[div(i - 1, kDim) + 1] * Wk[mod1(i, kDim)] *
+                                            (p.physical[i, vars[name], 1] +
+                                             bar[mod1(i, kDim)])
+                                            for i in axes(p.physical, 1))
+            md0 = massfun(pB, "rho_d", rho_dbar)
+            mt0 = massfun(pB, "rho_t", rho_tbar)
+            positivity_run!(mB, pB, moB, gpB, nsteps)
+            positivity_run!(mO, pO, moO, gpO, nsteps)
+
+            @test all(isfinite.(pB.physical[:, :, 1]))
+
+            # 2. The limiter never had to act. A nonzero shortfall would mean a column was
+            #    INFEASIBLE (its total mass below what any admissible spline can carry), so
+            #    the limiter created mass instead of redistributing it. Read per leg: the
+            #    k-leg alone hid the i-leg entirely in the rho_c attribution (see
+            #    reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md).
+            for name in ("rho_d", "rho_t")
+                v = vars[name]
+                @test Springsteel.CubicBSpline.bound_shortfall(pB.kbasis.data[v]) == 0.0
+                @test sum(Springsteel.CubicBSpline.bound_shortfall(pB.ibasis.data[z, v])
+                          for z in axes(pB.ibasis.data, 1)) == 0.0
+            end
+            # ... because both fields stay ~5 orders of magnitude clear of zero.
+            @test minimum(pB.physical[i, vars["rho_d"], 1] / rho_dbar[mod1(i, kDim)] + 1.0
+                          for i in axes(pB.physical, 1)) > 0.99
+            @test minimum(pB.physical[i, vars["rho_t"], 1] / rho_tbar[mod1(i, kDim)] + 1.0
+                          for i in axes(pB.physical, 1)) > 0.99
+
+            # 3. BITWISE inert. `SAtransform_bounded!` is a conservative clip-and-shrink; a
+            #    non-binding bound must be the identity, not "almost" the identity. Any
+            #    drift here means the bounded solve is doing arithmetic the unbounded one
+            #    is not, which would silently change every run that enables it.
+            @test pB.physical == pO.physical
+            @test pB.spectral == pO.spectral
+
+            # 4. Mass. rho_d has no sinks whatsoever and rho_t's only sink (sedimentation)
+            #    is off here, so both domain integrals are conserved to rounding — and the
+            #    bounds neither created nor destroyed any of it.
+            @test abs(massfun(pB, "rho_d", rho_dbar) - md0) / md0 < 1e-12
+            @test abs(massfun(pB, "rho_t", rho_tbar) - mt0) / mt0 < 1e-12
+        end
+    end
+
     @testset "resting dry base is untouched by diffusion" begin
         # s_d' = 0 identically on the reference (s_d = C_vd ln p - C_pd ln rho_d is an
         # explicit function of p, rho_d, so at rest it equals s_dbar bit-for-bit), so every
@@ -1969,6 +2576,321 @@ using Springsteel
         mktempdir() do tmpdir
             m, p, mod, _ = make_mc_mtile(tmpdir; dry=true, consistent_qss=true)
             @test all(Springsteel.ref_qss(m.ref_state)[:, 1] .< 0.0)
+        end
+    end
+
+    # ──────────────────────────────────────────────
+    # 8b. Regime-blended vapor retrieval, ON THE MODEL — still written before src/ knows it
+    # ──────────────────────────────────────────────
+    # The unit-level specification is in section 4b. These four testsets pin the parts that
+    # only a running column can show: that the blend is what an unconfigured model runs (and
+    # that `:residual` still opts out of it), that the reconciliation is anchored to the
+    # DENSITY residual and not to the blended vapor, that the resting fixed point survives,
+    # and that the blend is a PARTITION rather than a mass source.
+
+    """
+    Small RiRk moist patch on a saturated cloudy base, with a deterministic broadband w
+    seed. `retrieval` is the `options[:vapor_retrieval]` value, or `nothing` to leave the
+    option ABSENT — absent and `:blend` must be the same run bitwise (see the testset
+    below), since `:blend` is the default. The
+    geometry is RiRk in both directions because the mish points are then Gauss nodes on
+    both legs, which is what makes the exact mass quadrature in the conservation testset
+    possible (same argument as the positivity testset's `cellw`).
+    """
+    function vapor_blend_rirk(tmpdir, tag; retrieval = nothing)
+        vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+        scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+        side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+        wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+        gp = GridParameters(geometry = "RiRk",
+            iMin = 0.0, iMax = 8.0e3, num_cells_i = 4,
+            kMin = 0.0, kMax = 4.0e3, num_cells_k = 8,
+            BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
+            vars = vars)
+        ref_file = joinpath(tmpdir, "vapor_blend_$(tag).ref")
+        opts = Dict{Symbol,Any}(:semiimplicit => true,
+                                :exact_reference_state => true,
+                                :precipitation => false)
+        # ABSENT is not a synonym for either value here: "no option" is the state every
+        # existing configuration file is in, and it is the one that has to stay bitwise
+        # equal to the shipped default (`:blend` since 2026-07-29).
+        retrieval === nothing || (opts[:vapor_retrieval] = retrieval)
+        model = ModelParameters(
+            ts = 0.25, integration_time = 5.0, output_interval = 5.0,
+            equation_set = "moist_compressible_XZ",
+            ref_state_file = ref_file, grid_params = gp,
+            physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                   :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                   :tau_qss => 10.0, :alpha => 0.0,
+                                   :z_damp => 20.0e3, :f => 0.0),
+            options = opts)
+        gp = model.grid_params
+        patch = createGrid(gp)
+        z = Scythe.getGridpoints(patch)[1:gp.kDim, end]
+        col = saturated_cloudy_column_mc(z)
+        Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+        patch.physical .= 0.0
+        # Deterministic broadband w seed (irrational chirp) — the same one the positivity
+        # testset uses. Large enough to move every prognostic and to make cloud, far too
+        # small to threaten positive-definiteness.
+        w_i = gp.vars["w"]
+        for i in 1:size(patch.physical, 1)
+            patch.physical[i, w_i, 1] = 1.0e-2 * sin(0.5 * sqrt(2.0) * i^2)
+        end
+        spectralTransform!(patch)
+        gridTransform!(patch)
+        hrm = sparse(Int64[], Int64[], Float64[],
+                     size(patch.spectral, 1), size(patch.spectral, 2))
+        mtile = createModelTile(patch, patch, model, hrm)
+        return mtile, patch, model, gp
+    end
+
+    """Advance every column of an RiRk vapor-blend patch for `nsteps` steps."""
+    function vapor_blend_run!(mtile, patch, gp, nsteps)
+        kDim = gp.kDim
+        ncols = div(size(patch.physical, 1), kDim)
+        for t in 1:nsteps
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, t)
+            end
+            Scythe.calcTendency(mtile)
+            gridTransform!(patch)
+        end
+        return patch
+    end
+
+    @testset "vapor retrieval: an absent option is bitwise :blend, and :residual opts out" begin
+        # The gate on the DEFAULT (flipped to `:blend` 2026-07-29, Stage 5). Two claims, and
+        # the second is what keeps the first from being vacuous:
+        #
+        #   (a) leaving the key ABSENT — the state of every configuration file that says
+        #       nothing — is the blend to the LAST BIT, not "agrees to 1e-14". The same
+        #       standard `water_cap_mode = :euler` is held to.
+        #   (b) `:residual` still selects the pre-blend density-budget route, and on THIS
+        #       state that is a genuinely different run. The base is saturated with
+        #       rho_c ~ 1.1e-3 kg/m^3, three decades above l1 = 1e-4, so w_cloud = 1 and the
+        #       blend is fully active; asserting equality here would be asserting the option
+        #       does nothing.
+        have = isdefined(Scythe, :vapor_retrieval_blend)
+        @test have                   # ← the Stage 2 gate
+        mktempdir() do tmpdir
+            mA, pA, moA, gpA = vapor_blend_rirk(tmpdir, "absent")
+            mB, pB, moB, gpB = vapor_blend_rirk(tmpdir, "blend"; retrieval = :blend)
+            mR, pR, moR, gpR = vapor_blend_rirk(tmpdir, "residual"; retrieval = :residual)
+            @test !haskey(moA.options, :vapor_retrieval)
+            @test moB.options[:vapor_retrieval] === :blend
+            @test moR.options[:vapor_retrieval] === :residual
+
+            nsteps = 12
+            vapor_blend_run!(mA, pA, gpA, nsteps)
+            vapor_blend_run!(mB, pB, gpB, nsteps)
+            vapor_blend_run!(mR, pR, gpR, nsteps)
+
+            @test all(isfinite.(pA.physical))
+            @test all(isfinite.(pR.physical))
+            # The seed actually did something — otherwise "bitwise equal" is vacuous.
+            @test maximum(abs.(pA.physical[:, gpA.vars["Q_ss"], 1])) > 0.0
+            # (a) absent === :blend, bitwise
+            @test pA.physical == pB.physical
+            @test pA.spectral == pB.spectral
+            # (b) :residual is a different integration on this cloudy state — and a nearby
+            #     one, since the two retrievals differ by the bounded partition gap and not
+            #     by a change of equation set.
+            @test pA.physical != pR.physical
+            qi = gpA.vars["Q_ss"]
+            dq = maximum(abs.(pA.physical[:, qi, 1] .- pR.physical[:, qi, 1]))
+            @test dq > 0.0
+            @test dq < 1.0e-2 * maximum(abs.(pA.physical[:, qi, 1]))
+        end
+    end
+
+    @testset "vapor retrieval: the reconciliation stays anchored to res_rho_t" begin
+        # THE ONE PLACE THE BLENDED VAPOR MUST NOT BE USED. qss_relaxation pulls the
+        # prognostic Q_ss toward the vapor the WATER MASSES imply:
+        #
+        #     QSSREL = -(Q_ss - (rho_v - rho_vs)) / tau_qss
+        #
+        # If `rho_v` there is the BLENDED vapor then wherever the blend trusts res_qss the
+        # term reads -(Q_ss - ((Q_ss + rho_vs) - rho_vs))/tau ≡ 0. It SELF-ANNIHILATES, and
+        # the single mechanism tying Q_ss to the density budget vanishes exactly where it is
+        # load-bearing — the POSITIVITY=1 run reaches |Q_ss|/rho_vs ~ 2e26 WITH the
+        # reconciliation running. So slot 7 is fed S.res_rho_t, never S.rho_v.
+        #
+        # THE DISCRIMINATOR. On a consistent-qss saturated base at rest with condensation
+        # switched off, slot 7's ENTIRE tendency is QSSREL: u = w = 0 so ADV = 0 and div = 0,
+        # which kills -Q_ss*div and every term of SATF; the diffusivities are zero so
+        # QDOT_TH = 0; and Qdot = Qdot_r = 0. Perturb Q_ss by dQ on a base whose cloud is
+        # thick (rho_liq ~ 9e-4 >> l1) and whose s = dQ/rho_vs stays under t0, so w = 1, and
+        # the two candidate anchors are 100 % apart:
+        #
+        #     anchored to res_rho_t (= rho_vs) : -(dQ - 0) /tau = -dQ/tau
+        #     anchored to the blend (= rho_vs + dQ) : -(dQ - dQ)/tau = 0
+        #
+        # The assertion is on the tendency itself, so it holds whatever helper Stage 2
+        # factors the retrieval into.
+        tau = 10.0
+        dQ = 5.0e-3        # kg/m^3; s = dQ/rho_vs runs 0.35 (bottom) to 0.65 (top) < t0 = 2
+        function qssrel_probe(tmpdir, mode)
+            mtile, patch, model, col = make_mc_mtile(tmpdir; consistent_qss = true,
+                                                     q_l = 1.0e-3, tau_qss = tau)
+            # Not physics — a diagnostic switch, and the whole point here: with the phase
+            # change off, slot 7 carries nothing but the reconciliation.
+            model.options[:condensation] = false
+            mode === nothing || (model.options[:vapor_retrieval] = mode)
+            gp = model.grid_params
+            qss_i = gp.vars["Q_ss"]
+            patch.physical[:, qss_i, 1] .= dQ
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            ncols = div(size(patch.physical, 1), gp.kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+            # Read Q_ss BACK from the mish: the spline round-trip is what the kernel saw,
+            # so the expected QSSREL is pointwise exact rather than "dQ up to the fit".
+            return (Q_ss = copy(patch.physical[:, qss_i, 1]),
+                    e7 = copy(mtile.expdot_n[:, qss_i]), col = col)
+        end
+
+        # The shipped route first: this is the calibration of the assertion, and it must
+        # pass BEFORE Stage 2 as well as after.
+        mktempdir() do tmpdir
+            r = qssrel_probe(tmpdir, :residual)
+            @test maximum(abs.(r.e7 .+ (r.Q_ss ./ tau))) < 1.0e-6 * dQ / tau
+            @test minimum(abs.(r.e7)) > 0.5 * dQ / tau          # nowhere near annihilated
+        end
+
+        have = isdefined(Scythe, :vapor_retrieval_blend) &&
+               isdefined(Scythe, :_vapor_blend_weight)
+        @test have                   # ← the Stage 2 gate
+        if have
+            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
+            mktempdir() do tmpdir
+                r = qssrel_probe(tmpdir, :blend)
+                # 1. The state really is in the full-trust regime, so the blend really does
+                #    differ from res_rho_t here. Without this the assertion below could pass
+                #    for the wrong reason (a blend that quietly returned res_rho_t).
+                k = div(length(r.col.z), 2)
+                rho_vs_k = rho_v_sat(r.col.Tk[k], r.col.p_Pa[k] / 100.0)
+                rho_liq_k = r.col.rho_c[k]
+                s_k = dQ / rho_vs_k
+                @test rho_liq_k > l1
+                @test s_k < t0
+                @test Scythe._vapor_blend_weight(rho_liq_k, s_k, l0, l1, t0, t1) === 1.0
+                # AMENDED WITH THE CAP (Stage 2b): dQ = 5e-3 is ~35x the shipped cap
+                # 0.02*rho_vs_k, so the shipped retrieval SATURATES here rather than copying
+                # res_qss. Both halves of the original claim are kept and separated: the
+                # uncapped blend still returns res_qss bit-for-bit, and the shipped one still
+                # makes a real import (it is NOT quietly returning res_rho_t, which is the
+                # failure mode this probe exists to exclude).
+                @test Scythe.vapor_retrieval_blend(dQ, rho_vs_k, rho_liq_k, rho_vs_k,
+                                                   l0, l1, t0, t1, Inf) === dQ + rho_vs_k
+                v_cap = Scythe.vapor_retrieval_blend(dQ, rho_vs_k, rho_liq_k, rho_vs_k,
+                                                     l0, l1, t0, t1)
+                @test v_cap > rho_vs_k                          # a real import
+                @test v_cap - rho_vs_k <= 0.02 * rho_vs_k       # ... bounded by the cap
+                @test v_cap - rho_vs_k > 0.9 * 0.02 * rho_vs_k  # ... and saturated
+                # 2. ... and the reconciliation is unmoved by that: still -dQ/tau, still not
+                #    the self-annihilating zero.
+                @test maximum(abs.(r.e7 .+ (r.Q_ss ./ tau))) < 1.0e-6 * dQ / tau
+                @test minimum(abs.(r.e7)) > 0.5 * dQ / tau
+            end
+        end
+    end
+
+    @testset "vapor retrieval: the resting fixed point is blend-invariant" begin
+        # The companion of the consistent_qss gate above. At rest the reference construction
+        # makes Q_ssbar EXACTLY the diagnosed supersaturation, i.e. res_qss = Q_ssbar + rho_vs
+        # is res_rho_t up to the rounding of one add — so the blend is the IDENTITY there,
+        # whatever weight it computes, and a base that was a discrete fixed point stays one.
+        # If enabling :blend moves the resting state, the blend is not a partition of the
+        # same vapor and everything downstream of it is suspect.
+        have = isdefined(Scythe, :vapor_retrieval_blend)
+        @test have                   # ← the Stage 2 gate
+        for (dry, q_l) in ((true, 0.0), (false, 1.0e-3))
+            res = mktempdir() do tmpdir
+                m, p, mod, _ = make_mc_mtile(tmpdir; dry = dry, q_l = q_l,
+                                             consistent_qss = true)
+                mod.options[:vapor_retrieval] = :residual
+                step_mc!(m, p, mod, 5)
+                (copy(p.physical), mod.grid_params.vars)
+            end
+            blend = mktempdir() do tmpdir
+                m, p, mod, _ = make_mc_mtile(tmpdir; dry = dry, q_l = q_l,
+                                             consistent_qss = true)
+                mod.options[:vapor_retrieval] = :blend
+                step_mc!(m, p, mod, 5)
+                copy(p.physical)
+            end
+            phys_res, vars = res
+            if q_l == 0.0
+                # DRY: rho_liq = 0 identically, so w_cloud = 0 and the blend is not merely
+                # the identity in value — it never evaluates res_qss at all. BITWISE, and
+                # the exact-zero fixed point is preserved.
+                @test blend == phys_res
+                @test maximum(abs.(blend)) == 0.0
+            else
+                # CLOUDY: exact zero is not attainable (the saturated branch solves for
+                # rho_c by Newton and lands ~1e-16 off the manifold), so the standard is the
+                # one the consistent_qss gate already sets — and enabling the blend must not
+                # loosen it. res_qss and res_rho_t differ here only by the rounding of
+                # (rho_v - rho_vs) + rho_vs, ~1 ulp of rho_vs.
+                @test maximum(abs.(blend[:, vars["p"], 1])) < 1.0e-9
+                @test maximum(abs.(blend[:, vars["E_t"], 1])) < 1.0e-6
+                for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c")
+                    @test maximum(abs.(blend[:, vars[nm], 1])) < 1.0e-12
+                end
+                # ... and the two modes agree with each other to the same standard.
+                @test maximum(abs.(blend[:, vars["p"], 1] .- phys_res[:, vars["p"], 1])) < 1.0e-9
+                @test maximum(abs.(blend[:, vars["E_t"], 1] .- phys_res[:, vars["E_t"], 1])) < 1.0e-6
+                for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c")
+                    @test maximum(abs.(blend[:, vars[nm], 1] .-
+                                       phys_res[:, vars[nm], 1])) < 1.0e-12
+                end
+            end
+        end
+    end
+
+    @testset "vapor retrieval: :blend is a partition, not a mass source" begin
+        # WHAT THE BLEND IS ALLOWED TO CHANGE. rho_d + rho_v + rho_c + rho_r no longer equals
+        # rho_t pointwise once the vapor is blended — that gap is deliberate, it is what the
+        # reconciliation absorbs, and on the measured snapshots it is at most 9.4e-4 kg/m^3
+        # in cloud. What it may NOT change is the CONSERVED masses: rho_d has no sinks at all
+        # and rho_t's only sink (sedimentation) is off here, so both domain integrals must
+        # still be conserved to rounding. A blend that moved either one would not be a
+        # partition of the water, it would be a source of it.
+        have = isdefined(Scythe, :vapor_retrieval_blend)
+        @test have                   # ← the Stage 2 gate
+        mktempdir() do tmpdir
+            m, p, mod, gp = vapor_blend_rirk(tmpdir, "blend"; retrieval = :blend)
+            vars = gp.vars
+            kDim = gp.kDim
+            rho_dbar = view(Springsteel.ref_rho_d(m.ref_state), :, 1)
+            rho_tbar = view(Springsteel.ref_rho_t(m.ref_state), :, 1)
+
+            # Exact 2-D mass integral on the Gauss nodes (the positivity testset's argument:
+            # an unweighted point sum would confuse redistribution among unequally weighted
+            # nodes with a real drift).
+            cellw = (npts, ncells, len) -> begin
+                _, qw = Springsteel.CubicBSpline._quadrature_rule(div(npts, ncells),
+                                                                  gp.quadrature)
+                repeat(qw .* (len / ncells), outer = ncells)
+            end
+            Wi = cellw(gp.iDim, gp.num_cells_i, gp.iMax - gp.iMin)
+            Wk = cellw(gp.kDim, gp.num_cells_k, gp.kMax - gp.kMin)
+            massfun = (pp, name, bar) -> sum(Wi[div(i - 1, kDim) + 1] * Wk[mod1(i, kDim)] *
+                                             (pp.physical[i, vars[name], 1] +
+                                              bar[mod1(i, kDim)])
+                                             for i in axes(pp.physical, 1))
+            md0 = massfun(p, "rho_d", rho_dbar)
+            mt0 = massfun(p, "rho_t", rho_tbar)
+
+            vapor_blend_run!(m, p, gp, 20)
+
+            @test all(isfinite.(p.physical))
+            @test maximum(abs.(p.physical[:, vars["Q_ss"], 1])) > 0.0   # the run is live
+            @test abs(massfun(p, "rho_d", rho_dbar) - md0) / md0 < 1.0e-12
+            @test abs(massfun(p, "rho_t", rho_tbar) - mt0) / mt0 < 1.0e-12
         end
     end
 

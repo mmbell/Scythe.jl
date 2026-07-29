@@ -158,6 +158,10 @@ slot 9 `+ρ̇_c`, slot 1 `+R_v T ρ̇_v`, slot 6
     F_q = 0.0
     if surface_fluxes
         Tk1 = Tk[1]
+        # `S.rho_v` is whatever `options[:vapor_retrieval]` produced in mc_driver! -- the
+        # BLENDED vapor under `:blend`, by design and unchanged here. The surface moisture
+        # flux is a disequilibrium against rho_v_sat(SST), i.e. a thermodynamic consumer of
+        # the partition, and it must read the same vapor the mixture thermodynamics did.
         rho_v1 = S.rho_v[1]
         p1_hPa = S.p_hPa[1]
         F_sh = rho_d[1] * Cpd * Ck * U1 * (SST - Tk1)
