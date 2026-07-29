@@ -98,6 +98,59 @@ associated with the Chebyshev vertical basis.
   200 m in the PE moist run vs 4.1 published). Ties into the
   Chebyshev-vs-spline vertical basis experiment above.
 
+## Positivity bounds for rho_d / rho_t: available, tested, and OFF
+
+The spline positivity limiter already supports the two prognostic densities.
+`positivity_reference_profile` (src/moist_compressible.jl) recognizes `"rho_d"`
+and `"rho_t"`, so `install_positivity_bounds!` installs the reference-offset
+bound on both legs (`-ρ̄(z)` via the support-minimum rule on the k-leg, the
+negated SB coefficients of ρ̄ on the i-leg), exactly as it does for `rho_c`. The
+MC scalar BCs are Neumann (R1T1), which is bound-safe, so nothing blocks it.
+
+**Nothing enables it, by design.** Three reasons:
+
+1. `rho_d` has no rate sinks whatsoever, and `rho_t`'s only sink is the fitted
+   sedimentation flux divergence — not a rate. The AB3 depletion-bound machinery
+   that had to be built for `rho_c`/`rho_r` (the forward-Euler cap that AB3's
+   23/12 leading weight overshoots by ~2.3x) is therefore vacuous here: there is
+   no cap to size, and no per-step depletion to bound.
+2. The constraint that actually matters is `rho_w = rho_t - rho_d >= 0`. It is a
+   DIFFERENCE of two independently fitted fields, so it is not expressible as a
+   bound on either one's spline coefficients. Bounding `rho_d` and `rho_t`
+   separately does not deliver it and never will.
+3. Both fields sit ~5 orders of magnitude from zero in every configuration run
+   to date. There is nothing to protect yet.
+
+Consistent with the project doctrine — measure, don't clamp — the state is
+monitored instead:
+
+- `options[:state_minima_trace]` (src/semiimplicit.jl) prints per-step minima of
+  `rho_d/ρ̄_d`, `rho_t/ρ̄_t` and `rho_w`, flagging the first two below half
+  reference and `rho_w` on any negative value.
+- `min_rho_d_frac` and `min_rho_w_gm3` are reported by `o01_rainfall.jl` (both
+  the single-grid and nested diagnostics) and by `bf02_moist.jl` at the MC
+  stage. Informational — neither has a pass/fail target.
+
+**To turn the bounds on** when strong convection makes them relevant, add the
+species to `GridParameters.positivity`, e.g.
+
+```julia
+positivity = Dict("rho_d" => Dict(:i => 0.0, :k => 0.0),
+                  "rho_t" => Dict(:i => 0.0, :k => 0.0))
+```
+
+(only `0.0` is accepted for a reference-carried variable; the offset is supplied
+automatically). The testset *"positivity bounds are available and inert for
+rho_d/rho_t"* in `test/test_moist_compressible.jl` locks that this installs
+cleanly, produces zero `bound_shortfall`, conserves both domain masses to
+rounding, and is **bitwise** identical to the unbounded run when it does not
+bind. Watch `bound_shortfall` after enabling: a nonzero value means a column was
+infeasible and the limiter created mass rather than redistributing it.
+
+The `rho_w >= 0` constraint stays a monitored diagnostic regardless. If it ever
+needs enforcing it has to be done in the water partition (see the negative-water
+attribution work), not in the spline fit.
+
 ## Dead implicit vertical momentum diffusion in the pe/pd/sigma sets
 
 `impdot[u] = Kvdiff * u_zz` is written by `primitive_equation_XZ`

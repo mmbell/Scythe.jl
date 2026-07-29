@@ -409,6 +409,19 @@ function bf02_moist_diagnostics(model)
         "min_supersat" => minimum(supersat),
         "theta_e_bubble_top_km" => theta_e_bubble_height(theta_e_p, z) / 1000.0,
     )
+    if opts.stage == STAGE_MC
+        # Positive-definiteness monitors for the prognostic density pair. Diagnostic only —
+        # no target, no clamp. rho_d has no rate sinks at all and rho_t's only sink is the
+        # fitted sedimentation flux divergence, so neither can be depleted the way rho_c is;
+        # min_rho_d_frac departing from 1 just says the dynamics are moving mass. The
+        # quantity with a meaningful zero is the water rho_w = rho_t - rho_d, and because it
+        # is a DIFFERENCE of two independently fitted fields no per-field spline bound can
+        # protect it. Both are measured, not enforced (benchmarks/FUTURE_WORK.md).
+        _, _, rho_d, _, _, rho_t = mc_state(df, ref, kDim, ncols)
+        diags["min_rho_d_frac"] =
+            minimum(rho_d ./ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols))
+        diags["min_rho_w_gm3"] = 1000.0 * minimum(rho_t .- rho_d)
+    end
     return merge(diags, conservation_drift(model, ref; liquid_vars=liquid_vars(opts.stage)))
 end
 

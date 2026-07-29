@@ -1949,12 +1949,25 @@ end
 
 Optional per-step blow-up-precursor diagnostic for the pressure-reference (mc)
 sets, gated on `options[:state_minima_trace] = interval::Int` (0/absent = off).
-Every `interval` steps — and on ANY step where the tile minimum of the full dry
-density `ρ_d = ρ_d' + ρ̄_d(z)` drops below half its reference — print that
-minimum with its location. One cheap pass over two variables; runs
-single-threaded before the column loop, so printing is race-free. Intended for
-short diagnostic reruns chasing positive-definiteness undershoots (the
-`log`-DomainError blow-up class); leave off in production.
+Every `interval` steps — and on ANY step where one of the tracked minima breaches
+its threshold — print those minima with their locations. One cheap pass over
+three variables; runs single-threaded before the column loop, so printing is
+race-free. Intended for short diagnostic reruns chasing positive-definiteness
+undershoots (the `log`-DomainError blow-up class); leave off in production.
+
+Three quantities, all reconstructed as full fields from perturbation + reference:
+
+- `ρ_d = ρ_d' + ρ̄_d(z)`, flagged below half its reference;
+- `ρ_t = ρ_t' + ρ̄_t(z)`, likewise;
+- `ρ_w = ρ_t - ρ_d`, the TOTAL WATER, flagged when it goes negative at all.
+
+The water is the one with a meaningful zero. `ρ_d` and `ρ_t` sit ~5 orders of
+magnitude clear of zero in every configuration run to date, so a half-reference
+breach in either is a blow-up, not a positive-definiteness problem. `ρ_w` is a
+DIFFERENCE of two prognostics, each fitted independently, so it can go negative
+from fit error alone while both parents stay healthy — and no per-field spline
+bound can prevent that, since `ρ_t - ρ_d ≥ 0` is not a constraint on either
+field's coefficients. Hence it is measured here rather than clamped anywhere.
 """
 function state_minima_trace(mtile::ModelTile, t::Int64)
     interval = Int(get(mtile.model.options, :state_minima_trace, 0))
@@ -1963,27 +1976,54 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
     vars = mtile.model.grid_params.vars
     kDim = mtile.model.grid_params.kDim
     rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
+    rho_tbar = view(ref_rho_t(mtile.ref_state), :, 1)
     rd = view(mtile.tile.physical, :, vars["rho_d"], 1)
+    rt = view(mtile.tile.physical, :, vars["rho_t"], 1)
     min_frac = Inf
     min_i = 1
+    min_tfrac = Inf
+    min_ti = 1
+    min_w = Inf
+    min_wi = 1
     @inbounds for i in eachindex(rd)
-        frac = rd[i] / rho_dbar[mod1(i, kDim)] + 1.0
+        k = mod1(i, kDim)
+        frac = rd[i] / rho_dbar[k] + 1.0
         if frac < min_frac
             min_frac = frac
             min_i = i
         end
+        tfrac = rt[i] / rho_tbar[k] + 1.0
+        if tfrac < min_tfrac
+            min_tfrac = tfrac
+            min_ti = i
+        end
+        w = (rt[i] + rho_tbar[k]) - (rd[i] + rho_dbar[k])
+        if w < min_w
+            min_w = w
+            min_wi = i
+        end
     end
-    low = min_frac < 0.5
+    low = min_frac < 0.5 || min_tfrac < 0.5 || min_w < 0.0
     if low || t % interval == 0
         k = mod1(min_i, kDim)
-        r = mtile.tilepoints[min_i, 1]
-        z = mtile.tilepoints[min_i, end]
+        loc = (i) -> "r=$(round(mtile.tilepoints[i, 1]; digits=1)) " *
+                     "z=$(round(mtile.tilepoints[i, end]; digits=1))"
         println("  rho_d trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
                 "min rho_d/ref=$(round(min_frac; digits=4)) " *
                 "(rho_d=$(round(rd[min_i] + rho_dbar[k]; sigdigits=4)), " *
                 "ref=$(round(rho_dbar[k]; sigdigits=4))) " *
-                "at r=$(round(r; digits=1)) z=$(round(z; digits=1))" *
-                (low ? "  << LOW" : ""))
+                "at $(loc(min_i))" *
+                (min_frac < 0.5 ? "  << LOW" : ""))
+        println("  rho_t trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min rho_t/ref=$(round(min_tfrac; digits=4)) " *
+                "(rho_t=$(round(rt[min_ti] + rho_tbar[mod1(min_ti, kDim)]; sigdigits=4)), " *
+                "ref=$(round(rho_tbar[mod1(min_ti, kDim)]; sigdigits=4))) " *
+                "at $(loc(min_ti))" *
+                (min_tfrac < 0.5 ? "  << LOW" : ""))
+        println("  rho_w trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min rho_w=$(round(1.0e3 * min_w; sigdigits=4)) g/m^3 " *
+                "at $(loc(min_wi))" *
+                (min_w < 0.0 ? "  << NEGATIVE WATER" : ""))
     end
     return nothing
 end
