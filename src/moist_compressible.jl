@@ -1109,6 +1109,23 @@ budget cannot account for it; `max_w` goes 9.87 → 17.4 → 46.5. The transform
 variables: nothing is ever repaired, and `n` is never modified ("n itself is untouched, so
 that the effect of m adjustments does not accumulate in the predicted n" — Ooyama §4d).
 
+**Measured in the model (2026-07-30, quick O01, 3600 s).** `min_rho_c_gm3` is 0 exactly, with
+no limiter and nothing repaired, and all five o01 target windows PASS (`max_w` 11.17,
+`peak_rain_rate` 78.67, `accum_rainfall_mm` 2.167, `max_rho_r_gm3` 12.65, `rain_onset_min` 24).
+Against the untransformed baseline: entropy production over the physical points 0.409 vs 0.520
+(−21 %), `energy_drift_pct` 0.153 vs 0.178, `water_mass_drift_pct` −3.55 vs −4.09,
+`min_rho_d_frac` 0.881 vs 0.884. For contrast, enforcing the SAME constraint with the spline
+limiter gives `max_w` 46.52, `min_rho_d_frac` 0.546 and an entropy production of 203.2 —
+390x the baseline. The constraint is affordable; the limiter's way of imposing it is not.
+
+The cost is in the water partition, and it is an UNMASKING rather than a new error. `min_rho_v`
+goes −0.724 → −1.199 and the negative-vapor count 750 → 4181. But under either enforcement the
+vapor deficit collapses onto the TOTAL-WATER deficit (`min_rho_v` − `min_rho_w`: −0.059 here,
+−0.034 under POSITIVITY=1, against **+0.353** in the baseline). The baseline's better-looking
+vapor was the negative cloud reservoir cancelling part of the `rho_t` − `rho_d` deficit. That
+deficit is a difference of two independently fitted fields, which `benchmarks/FUTURE_WORK.md`
+already records as not expressible as a bound on either — no condensate scheme can fix it.
+
 **Known costs, both measured.** `f` is convex near zero, so ringing rectifies into mass
 (+1.077 over 3600 s on the probe's transport arm, decelerating, and 3 % of the source-driven
 mass where a real source dominates); and a point whose `n` has ratcheted below zero carries a
@@ -1157,18 +1174,26 @@ control-variable transform, [`condensate_transform_mode`](@ref).
 | diagnostic | NOPRECIP `:none` | NOPRECIP `:diagnostic` | precip `:none` | precip `:diagnostic` |
 |---|---|---|---|---|
 | `min_rho_v_gm3` | −0.186 | **−1.58e-4** | −0.724 | −0.759 |
-| `entropy_prod_rate` | 3.606e7 | **2.495e6** | 2.861e4 | 2.640e4 |
+| `neg_rho_v_points` | 2033 | **0** | 750 | 716 |
+| `entropy_prod_rate` (over rho_v>0) | 34.81 | 44.91 | 0.520 | 0.470 |
 | `max_w` | 6.600 | 6.085 | 9.869 | 11.15 |
 | `peak_rain_rate_gm2s` | — | — | 59.94 | 68.64 |
 | `water_mass_drift_pct` | 1.07e-6 | 1.08e-6 | −4.093 | −3.674 |
 
-On the cloud-only storm the residual vapor's worst negative improves by **1180x** and the
-irreversible entropy production falls **14.5x** — which is the mechanism confirmed: a negative
-liquid density drives `rho_vs` down through `T`, manufacturing supersaturation and with it
-spurious phase change, and that is what the entropy production was measuring. With
-precipitation active the effect is smaller and mixed (entropy production −8 %, water and
-energy drift both improved, `max_w` +13 %, rain rate +15 %), because rain removes the
-condensate before the lobes grow as large.
+On the cloud-only storm the floor removes NEGATIVE VAPOR ENTIRELY — 2033 points to zero, the
+worst value improving 1180x — which is the mechanism confirmed: a negative liquid density
+drives `rho_vs` down through `T`, manufacturing supersaturation, and the vapor residual is
+where that lands. With precipitation active the effect is smaller and mixed (`max_w` +13 %,
+rain rate +15 %, water and energy drift both improved), because rain removes the condensate
+before the lobes grow as large.
+
+**Correction (2026-07-30).** An earlier version of this note claimed the irreversible entropy
+production fell 14.5x here. It did not. `mc_entropy_production` clamped `H` at `1e-12` where
+the vapor is negative, so its raw value tracked the NEGATIVE-VAPOR COUNT rather than the
+irreversibility: 94.7 % of the NOPRECIP total came from clamped points. Restricted to the
+points where the quantity exists, the floor RAISES production slightly (34.81 → 44.91) while
+eliminating every excluded point. The diagnostic now returns that count beside the rate so the
+two cannot be read apart again.
 
 Under a working [`condensate_transform_mode`](@ref) this floor should become INACTIVE — the
 recovered density is already non-negative — so a transformed run is the test of whether the

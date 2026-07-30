@@ -389,20 +389,30 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
         pct_change["water_mass_drift_pct"] = 0.0
     end
     if mc
-        pct_change["entropy_prod_rate"] = mc_entropy_production(model, ref)
+        sprod, n_neg_v = mc_entropy_production(model, ref)
+        pct_change["entropy_prod_rate"] = sprod
+        # The companion the rate cannot be read without: `entropy_prod_rate` is now summed
+        # only over rho_v > 0, so a run with many negative-vapor points reports a rate for a
+        # shrinking fraction of the domain. See mc_entropy_production.
+        pct_change["neg_rho_v_points"] = float(n_neg_v)
     end
     return pct_change
 end
 
 """
-    mc_entropy_production(model, ref) -> Float64
+    mc_entropy_production(model, ref) -> (rate, n_neg_rho_v)
 
 Second-law diagnostic for the total-energy set: the domain-integrated
 instantaneous entropy production rate ∫ρ_d R_v ln(H) q̇_cond dV [J/(K s)] at the
-final output time. Positive-definite for irreversible phase change (supersaturated
-condensation or subsaturated evaporation); zero for a saturation-adjustment
-scheme. The domain total entropy should rise at roughly this rate while the total
-energy stays constant.
+final output time, summed ONLY over the points where the vapor is positive and the
+quantity therefore exists. Positive-definite for irreversible phase change
+(supersaturated condensation or subsaturated evaporation); zero for a
+saturation-adjustment scheme. The domain total entropy should rise at roughly this
+rate while the total energy stays constant.
+
+Also returns the number of points EXCLUDED (rho_v <= 0). Read the two together: a
+falling rate that comes with a rising exclusion count is not an improvement in
+irreversibility, it is a shrinking domain.
 """
 function mc_entropy_production(model, ref)
     kDim = model.grid_params.kDim
@@ -422,7 +432,22 @@ function mc_entropy_production(model, ref)
     Qdot = Scythe.qss_condensation_rate.(Q_ss, rho_v, max.(rho_c, 0.0), rho_d,
                                          Tk, p ./ 100.0, Q_s, model.ts)
     sprod = Scythe.Rv .* log.(H) .* Qdot
-    return domain_integral(reshape(sprod, kDim, ncols), model)
+    # RESTRICT TO THE POINTS WHERE THE QUANTITY EXISTS. `ln(H)` is undefined for rho_v <= 0,
+    # and the `max(rho_v, 1e-12)` above turns each such point into ln(1e-12/rho_vs) ~ -30 --
+    # a large, entirely artificial contribution. Measured 2026-07-30 on the o01 quick runs:
+    # the clamped points supply 0 % of the total on the healthy configurations but 31 % under
+    # POSITIVITY=ck, 63 % under POSITIVITY=1, and 94-95 % on the NOPRECIP storm. Reporting
+    # the unrestricted sum made a run's entropy production track its NEGATIVE-VAPOR COUNT
+    # rather than its irreversibility, and two conclusions were drawn from it before the
+    # artifact was found (the corrected factors are in
+    # reference/FINDINGS_CONDENSATE_STAGE1.md §4).
+    #
+    # The excluded points are not a physical loss: no phase change there has a defined
+    # entropy production. Their COUNT is the diagnostic that matters, and it is reported
+    # separately as `neg_rho_v_points`.
+    ok = rho_v .> 0.0
+    sprod[.!ok] .= 0.0
+    return domain_integral(reshape(sprod, kDim, ncols), model), count(.!ok)
 end
 
 """
