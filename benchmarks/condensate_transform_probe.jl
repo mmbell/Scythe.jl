@@ -108,9 +108,43 @@
 # therefore removed by more physics in the model than it is here -- another
 # reason the F4 numbers above are an upper bound.
 #
-# VERDICT: H-smooth (Ooyama biased hyperbolic, strict inverse, Jacobian at the
-# recovered density) is the only candidate that survives. Q-quad and softplus are
-# out on source stiffness; log was already out on representation.
+# THE LIMITER PASSES THIS PROBE TOO -- AND THAT IS THE IMPORTANT NEGATIVE RESULT.
+# POSITIVITY=k, integrated on the same three arms:
+#
+#   arm         min_rho      max_rho     neg_mass   mass_drift   shortfall
+#   TRANSPORT  1.99e-46    2.9267e-03   0.0000e+00   +4.273e-07   0
+#   DRAIN      1.99e-46    2.9260e-03   0.0000e+00   -1.663e+00   0
+#   NUCLEATION 0.00e+00    1.0537e-02   0.0000e+00   +2.300e+01   0
+#
+# In a single column under prescribed transport the limiter is not merely
+# adequate, it is BETTER than the transform: positivity exact, mass conserved to
+# 4.3e-7 against the transform's +1.077, no blow-up anywhere, and it creates no
+# mass at all (shortfall 0 on every arm). Offline, on one refit, the two were
+# already indistinguishable (max|drho| 4.46e-5 vs 4.45e-5, 0.134 K each).
+#
+# So NOTHING measurable offline discriminates the limiter from the transform, and
+# the campaign's premise -- that the POSITIVITY=1 detonation lives in the manner
+# of enforcement -- is NOT supported by any measurement available without a run.
+#
+# The reason is structural and worth stating: this probe PRESCRIBES w. The loop
+# that actually detonates the model is
+#     d rho_c -> d T (via L_v/D) -> d rho_vs -> d Q_ss -> d condensation
+#             -> d buoyancy -> d w -> d rho_c
+# and a probe with imposed transport cannot close it. Both schemes inject into
+# that loop; the only measured difference is HOW MUCH temperature each moves per
+# refit, where the transform is 2.25x smaller than the two-leg limiter (0.134 K
+# vs 0.301 K) and indistinguishable from the one-leg limiter.
+#
+# VERDICT. Among the TRANSFORMS, H-smooth (Ooyama biased hyperbolic, strict
+# inverse, Jacobian at the recovered density) is the only survivor: Q-quad and
+# softplus are out on source stiffness, log was already out on representation.
+# Whether a transform is needed AT ALL over the existing limiter is a question no
+# offline measurement here can answer, and it must be settled by running the
+# limiter under the current head -- the o01 harness already supports it
+# (SCYTHE_O01_POSITIVITY=ck and =1). The comment at benchmarks/o01_rainfall.jl:237
+# recording "max_w 2.7 -> 36 with either leg alone" predates BOTH the AB3-exact
+# depletion caps (402da30) and the blended vapor retrieval (2a90b0e), so it is
+# not evidence about the code as it stands.
 #
 # Usage:
 #   julia --project=. benchmarks/condensate_transform_probe.jl [outdir]
@@ -139,7 +173,18 @@ spline_params(; l_q = 2.0) =
 struct Transform
     name::String
     g::Function; f::Function; J::Function
+    bounded::Bool          # use the spline positivity limiter instead of a transform
 end
+Transform(name, g, f, J) = Transform(name, g, f, J, false)
+
+# The rival enforcement: rho-space dynamics with Springsteel's coefficient box
+# constraint on the k leg (the only leg a single column has). This is handoff
+# Experiment 2 done DYNAMICALLY, which is the form that discriminates -- offline,
+# on one refit of a clean field, the limiter and the transform make
+# indistinguishable modifications (max|drho| 4.46e-5 vs 4.45e-5, 0.134 K each;
+# see condensate_transform_diagnostic.jl's EXPERIMENT 2 table). The difference,
+# if there is one, is in what 12 000 of those do to a trajectory.
+limiter_tf() = Transform("POSITIVITY=k", r -> r, n -> n, _ -> 1.0, true)
 
 bhyp(rho, mu)  = 0.5 * ((rho + mu) - (mu * mu) / (rho + mu))
 ahyp(n, mu)    = sqrt(n * n + mu * mu) + n - mu
@@ -209,10 +254,10 @@ end
 One fit->reconstruct round trip on the model's own basis, exactly as the
 per-timestep path does: values -> b -> a -> values and first derivative.
 """
-function refit!(sp, u)
+function refit!(sp, u; bounded = false)
     sp.uMish .= u
     SBtransform!(sp)
-    SAtransform!(sp)
+    bounded ? SAtransform_bounded!(sp) : SAtransform!(sp)
     SItransform!(sp)
     return copy(sp.uMish), SIxtransform(sp)
 end
@@ -261,7 +306,7 @@ function integrate(tf::Transform, arm::Symbol, z, sp, w, wz, rho_d, Tk, mass;
     # The state is the CONTROL variable at the mish; it is what AB3 advances and
     # what the refit fits. rho is only ever recovered from it.
     u = tf.g.(rho0)
-    u, _ = refit!(sp, u)
+    u, _ = refit!(sp, u; bounded = tf.bounded)
     dot_n = zeros(npt); dot_nm1 = zeros(npt); dot_nm2 = zeros(npt)
 
     rho_r = zeros(npt)                     # rain accumulates from the drain arm
@@ -276,7 +321,7 @@ function integrate(tf::Transform, arm::Symbol, z, sp, w, wz, rho_d, Tk, mass;
     mass_track = Float64[]
 
     for t in 1:nstep
-        uf, uz = refit!(sp, u)
+        uf, uz = refit!(sp, u; bounded = tf.bounded)
         u .= uf
         rho = tf.f.(uf)
         J = tf.J.(rho)
@@ -315,14 +360,14 @@ function integrate(tf::Transform, arm::Symbol, z, sp, w, wz, rho_d, Tk, mass;
         t in checkpoints && push!(mass_track, mass(rho_new) - mass0)
     end
 
-    ufin, _ = refit!(sp, u)
+    ufin, _ = refit!(sp, u; bounded = tf.bounded)
     rho_fin = tf.f.(ufin)
     return (; name = tf.name, arm, finished,
             min_rho = worst_min, max_rho = peak,
             final_min = minimum(rho_fin), final_max = maximum(rho_fin),
             neg_mass = mass(max.(-rho_fin, 0.0)), pos_mass = mass(max.(rho_fin, 0.0)),
             mass_drift = mass(rho_fin) - mass0, max_step = max_step_ratio, lag,
-            mass_track)
+            mass_track, shortfall = CubicBSpline.bound_shortfall(sp))
 end
 
 # ── driver ───────────────────────────────────────────────────────────────────
@@ -345,7 +390,7 @@ function main()
     src_amp = 1.0e-3 / 100.0
 
     MU = 1e-7
-    cands = [identity_tf(), hyp(MU), quadratic(MU), softplus(MU)]
+    cands = [identity_tf(), hyp(MU), quadratic(MU), softplus(MU), limiter_tf()]
 
     for arm in (:transport, :drain, :nucleation)
         println("\n" * "="^92)
@@ -356,7 +401,9 @@ function main()
                 "mass_drift", "lag(s)")
         base = nothing
         for tf in cands
-            r = integrate(tf, arm, z, Spline1D(spline_params()), w, wz, rho_d, Tk, mass;
+            col = tf.bounded ? Spline1D(spline_params(); lower = zeros(NC + 3)) :
+                               Spline1D(spline_params())
+            r = integrate(tf, arm, z, col, w, wz, rho_d, Tk, mass;
                           src_amp = src_amp, src_mask = src_mask)
             tf.name == "identity" && (base = r)
             flag = ""
@@ -370,6 +417,9 @@ function main()
                     tf.name, r.finished ? "yes" : "NO", r.min_rho, r.max_rho,
                     r.neg_mass, r.pos_mass, r.mass_drift,
                     isnan(r.lag) ? "-" : @sprintf("%.2f", r.lag), flag)
+            r.shortfall == 0.0 ||
+                @printf("%-22s        bound_shortfall (mass the limiter CREATED): %.4e\n",
+                        "", r.shortfall)
             # F4: does the mass injection saturate, or keep growing linearly?
             isempty(r.mass_track) ||
                 @printf("%-22s        mass at 900/1800/2700/3600 s: %s\n", "",

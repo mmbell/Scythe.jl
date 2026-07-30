@@ -135,6 +135,32 @@
 #     1.5667e-4 for H -- the transform adds nothing; the drift is the l_q filter's.
 #     log drifts 20x more.
 #
+# EXPERIMENT 2 DOES NOT DISCRIMINATE -- record this before anyone re-litigates it.
+# Scored on the identical round trip of the identical non-negative input (G2, t = 1200),
+# what each enforcement of rho_c >= 0 actually MOVES:
+#
+#   scheme      min_rho     mass_err   shortfall   max|drho|   dT_per_refit
+#   H-smooth  -9.98e-08     +4.558e+2      --      4.451e-05      0.1341 K
+#   POS=k      0.00e+00     +2.743e+2   4.07e-01   4.461e-05      0.1344 K
+#   POS=i     -2.43e-05     -7.3e-12    0.00e+00   1.196e-04      0.2988 K
+#   POS=ik     1.05e-26     -7.3e-12    0.00e+00   1.252e-04      0.3007 K
+#
+# H-smooth and the one-leg limiter make the SAME modification to three digits. The
+# two-leg limiter moves 2.8x more (the i leg redistributes horizontally) but conserves
+# mass EXACTLY (-7.3e-12) and creates none (shortfall 0), where the transform adds 456
+# and POS=k adds 274. On a clean non-negative input the limiter is therefore at least as
+# good as the transform on every axis measurable here, and better on mass.
+#
+# (The POS=k shortfall and its mass creation are the same number: 4.07e-01 in the k leg's
+# 1-D coefficient metric times the ~667 m horizontal quadrature weight is 2.7e+2. That
+# consistency is a useful check that `bound_shortfall` means what it says.)
+#
+# The 7.9e6 shortfall recorded for the real POSITIVITY=1 run therefore does NOT come from
+# the limiter's per-refit action on a good field. It comes from columns that arrive
+# already carrying negative total mass -- a property of the trajectory, not of the fit.
+# Nothing offline settles which scheme is better; see the VERDICT block in
+# condensate_transform_probe.jl.
+#
 # THE M2 GATE (does the vapor partition survive handing the reservoir back?). Replacing
 # the state's rho_c by the recovery moves min_rho_v from -8.25e-5 to -1.17e-4 (G2,
 # t = 3600), i.e. ~40% worse, and the transform arms differ from the identity arm by
@@ -254,7 +280,7 @@ The run's own grid and exact reference state, inferred from a snapshot's shape.
 match `benchmarks/o01_rainfall.jl` exactly or the round trip is not idempotent
 on the saved field (which the `P(saved)` check below verifies).
 """
-function build_patch(outdir, df0; l_q = 2.0)
+function build_patch(outdir, df0; l_q = 2.0, positivity = Dict{String,Dict{Symbol,Float64}}())
     ncols = length(unique(df0.r))
     kDim = nrow(df0) ÷ ncols
     vars = Scythe.MC_VARS
@@ -266,6 +292,7 @@ function build_patch(outdir, df0; l_q = 2.0)
         iMin = 0.0, iMax = 150.0e3, num_cells_i = ncols ÷ 3,
         kMin = 0.0, kMax = 25.0e3, num_cells_k = kDim ÷ 3,
         l_q = Dict("default" => l_q),
+        positivity = positivity,
         BCL = side_bc, BCR = side_bc, BCB = topbot_bc, BCT = topbot_bc,
         vars = Dict(v => i for (i, v) in enumerate(vars)),
     )
@@ -333,6 +360,8 @@ struct Row
     halo_n::Int               # M3
     edge_grad_err::Float64    # M4: |d/dz recovery - d/dz direct fit| on the edge band
     idem_drift::Float64       # M5: max |x - (f.P.g)^20(x)|, the smoother+transform defect
+    drho_vs_free::Float64     # E2: max |recovery - unbounded fit|, the modification made
+    dT_vs_free::Float64       # E2: the temperature that modification moves, per refit
     J_min::Float64            # M6
     J_max::Float64
     J_p99::Float64
@@ -428,6 +457,15 @@ function score(patch, gp, R, df, tf::Transform, mu, lq, label, t, mass; n_idem =
     liq_out = rho_out .+ rho_r
     dT_neg = dT_from_negative(M, rho_d, rho_t, liq_out)
 
+    # ── E2: the modification this enforcement makes, against the SAME unbounded
+    # fit the limiter arms are compared to. This is the apples-to-apples
+    # rectification measure: how much condensate the scheme moves per refit, and
+    # how much temperature that carries through dT/d rho_liq = L_v/D.
+    drho_vs_free = maximum(abs, rho_out .- fit_out)
+    T_free = Scythe.retrieve_temperature.(M, rho_d, rho_t, fit_out .+ rho_r)
+    T_out  = Scythe.retrieve_temperature.(M, rho_d, rho_t, liq_out)
+    dT_vs_free = maximum(abs, T_out .- T_free)
+
     # ── M2: what the vapor residual has to absorb ──
     rho_v_out = rho_t .- rho_d .- liq_out
     min_rho_v = minimum(rho_v_out)
@@ -470,8 +508,40 @@ function score(patch, gp, R, df, tf::Transform, mu, lq, label, t, mass; n_idem =
     return Row(label, t, tf.name, lq,
                minimum(rho_out), maximum(rho_out), mass(rho_out), mass(rho_p),
                neg_mass, dT_neg, min_rho_v, n_rho_v_neg,
-               halo_amp, halo_n, edge_grad_err, idem_drift,
+               halo_amp, halo_n, edge_grad_err, idem_drift, drho_vs_free, dT_vs_free,
                J_min, J_max, J_p99, src_amp)
+end
+
+# ── The LIMITER as a rival way of enforcing rho >= 0 (handoff Experiment 2) ──
+#
+# The transform and the spline positivity limiter enforce the SAME constraint by
+# different means, so the honest comparison scores them on the identical round
+# trip. That is what decides the campaign's GO/NO-GO question: does the measured
+# POSITIVITY=1 detonation (max_w 9.87 -> 46.5) live in the MANNER of enforcement
+# (a per-step, one-signed clip-and-shrink that CREATES mass wherever a column
+# arrives with negative total mass) or in the CONSTRAINT itself (the residual
+# vapor cannot absorb the relocation)? If the manner, the transform fixes it; if
+# the constraint, the transform reproduces it and the real fix is prognostic
+# rho_v.
+
+const LIMITER_ARMS = ["POS=k"  => Dict("rho_c" => Dict(:k => 0.0)),
+                      "POS=i"  => Dict("rho_c" => Dict(:i => 0.0)),
+                      "POS=ik" => Dict("rho_c" => Dict(:i => 0.0, :k => 0.0))]
+
+"""
+    limiter_shortfall(patch, gp) -> Float64
+
+Mass the limiter CREATED on this round trip -- the accumulated `D - H` of
+Springsteel's `_bound_free_space!` infeasible branch, summed over both legs. A
+fresh patch is used per measurement because the accumulator never resets.
+"""
+function limiter_shortfall(patch, gp)
+    v = gp.vars["rho_c"]
+    total = CubicBSpline.bound_shortfall(patch.kbasis.data[v])
+    for z in 1:gp.b_kDim
+        total += CubicBSpline.bound_shortfall(patch.ibasis.data[z, v])
+    end
+    return total
 end
 
 # ── M8: what a given mu costs in temperature, through the model's retrieval ───
@@ -544,6 +614,38 @@ function run_set(label, dir, rows, staterows)
         push!(staterows, state_row(R, df, label, t, mass0))
     end
 
+    # The limiter arms, at the shipped l_q, on the same round trip as everything
+    # else. A FRESH patch per snapshot: `bound_shortfall` never resets.
+    println("\n  Experiment 2 -- the LIMITER as a rival enforcement of rho_c >= 0")
+    @printf("  %-8s %6s %12s %12s %12s %12s %12s %12s\n", "arm", "t", "min_rho",
+            "neg_mass", "mass_err", "shortfall", "max|drho|", "dT_lim")
+    for t in TIMES
+        path = snapshot_path(dir, t)
+        path === nothing && continue
+        df = CSV.read(path, DataFrame)
+        all(isfinite, df.rho_c) || continue
+        M, rho_d, rho_t, rho_r, rho_c = thermo(R, df)
+        rho_p = max.(rho_c, 0.0)
+        pfree, gfree, _ = build_patch(dir, df0; l_q = 2.0)
+        mfree = mass_operator(gfree, R.ncols, R.kDim)
+        free, _ = project(pfree, rho_p, gfree.vars["rho_c"])
+        for (name, pos) in LIMITER_ARMS
+            pb, gb, _ = build_patch(dir, df0; l_q = 2.0, positivity = pos)
+            bounded, _ = project(pb, rho_p, gb.vars["rho_c"])
+            # The limiter's own pointwise modification, and the one-signed latent
+            # heat it implies through dT/d rho_liq = L_v/D. `dT_lim` is the
+            # temperature the limiter MOVES, not an error in the field: it is the
+            # rectification channel, measured.
+            d = bounded .- free
+            T_b = Scythe.retrieve_temperature.(M, rho_d, rho_t, bounded .+ rho_r)
+            T_f = Scythe.retrieve_temperature.(M, rho_d, rho_t, free .+ rho_r)
+            @printf("  %-8s %6.0f %+12.4e %12.4e %+12.3e %12.4e %12.4e %12.4e\n",
+                    name, t, minimum(bounded), mfree(max.(-bounded, 0.0)),
+                    mfree(bounded) - mfree(rho_p), limiter_shortfall(pb, gb),
+                    maximum(abs, d), maximum(abs, T_b .- T_f))
+        end
+    end
+
     for lq in LQ_GRID
         patch, gp, R = build_patch(dir, df0; l_q = lq)
         mass = mass_operator(gp, R.ncols, R.kDim)
@@ -593,6 +695,18 @@ function report(rows, staterows)
         @printf("%-22s %6.0f %+11.4e %11.4e %+11.3e %10.3e %+11.4e %7d\n",
                 r.tf, r.t, r.min_rho, r.neg_mass, r.mass - r.mass_in,
                 r.dT_neg, r.min_rho_v, r.n_rho_v_neg)
+    end
+
+    println("\n" * "="^78)
+    println("EXPERIMENT 2 -- what each enforcement MOVES per refit, vs the same")
+    println("unbounded fit. Compare these two columns directly with the POS=* table")
+    println("printed per set above: same baseline, same round trip, same metric.")
+    println("="^78)
+    @printf("%-22s %6s %14s %14s\n", "scheme", "t", "max|drho|", "dT_per_refit(K)")
+    for r in rows
+        (r.lq == 2.0 && occursin("1.0e-7", r.tf)) || r.tf == "identity" || continue
+        r.lq == 2.0 || continue
+        @printf("%-22s %6.0f %14.4e %14.4e\n", r.tf, r.t, r.drho_vs_free, r.dT_vs_free)
     end
 
     println("\n" * "="^78)
