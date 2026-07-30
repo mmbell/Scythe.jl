@@ -159,6 +159,45 @@ function o01_model(opts::BenchmarkOptions)
     # lever for every number in it. See `_ab3_sink_bound`.
     haskey(ENV, "SCYTHE_O01_CAPMODE") &&
         (options[:water_cap_mode] = Symbol(ENV["SCYTHE_O01_CAPMODE"]))
+    # Stage 0b of the vapor-retrieval decision (reference/HANDOFF_VAPOR_RETRIEVAL.md):
+    # the reconciliation `qss_relaxation` pulls Q_ss toward the DENSITY residual at rate 1/tau.
+    # The partition gap the regime-blended retrieval opens is algebraically
+    #     res_qss - res_rho_t = Q_ss - (rho_v - rho_vs) = -tau_qss * QSSREL,
+    # so a shorter tau shrinks the gap -- but the same relaxation drags Q_ss onto the
+    # residual that is CORRUPTED in cloud, which is where the blend's whole benefit comes
+    # from. This knob sweeps that tradeoff. Unset => 10.0, the committed default, bitwise.
+    haskey(ENV, "SCYTHE_O01_TAUQSS") &&
+        (physical_params[:tau_qss] = parse(Float64, ENV["SCYTHE_O01_TAUQSS"]))
+    # Which discrete representation the VAPOR is retrieved from. The regime blend
+    # (`Scythe.vapor_retrieval_blend`) -- the supersaturation residual `Q_ss + rho_vs` in cloud,
+    # where the density residual `rho_t - rho_d - rho_c - rho_r` cancels catastrophically, and
+    # the density residual in dry air, where res_qss does -- is the SHIPPED DEFAULT since
+    # 2026-07-29, so unset leaves the key absent and gets `:blend`. `SCYTHE_O01_VAPOR=residual`
+    # is the useful setting now: it opts OUT, back to the pre-blend density-budget route, which
+    # is BITWISE the code that had no option at all and is the A/B lever for every measurement
+    # taken under it. `=blend` is retained so the default can be pinned explicitly (it sets the
+    # key to the same value the default supplies). Any other value is an error in mc_driver!.
+    # See reference/HANDOFF_VAPOR_RETRIEVAL.md.
+    haskey(ENV, "SCYTHE_O01_VAPOR") &&
+        (options[:vapor_retrieval] = Symbol(ENV["SCYTHE_O01_VAPOR"]))
+    # The blend's TRUST band `(t0, t1)` on `s = |Q_ss|/rho_vs`, as "t0,t1". Unset => the
+    # committed (2.0, 5.0), bitwise. t0 <= 1 turns w_trust into a SIGN selector on res_qss
+    # (res_qss < 0 is algebraically s > 1), i.e. the soft clamp `_vapor_blend_weight`
+    # rejects -- useful only as a diagnostic isolation of the negative-import window.
+    if haskey(ENV, "SCYTHE_O01_BLEND_T0T1")
+        t0t1 = parse.(Float64, split(ENV["SCYTHE_O01_BLEND_T0T1"], ","))
+        physical_params[:vapor_blend_t0] = t0t1[1]
+        physical_params[:vapor_blend_t1] = t0t1[2]
+    end
+    # The blend's CORRECTION CAP, as a multiple of rho_vs: |rho_v - res_rho_t| <= dcap*rho_vs,
+    # applied through the C¹ saturator `Scythe._blend_saturate`. Unset => the shipped 0.02,
+    # bitwise. This is the guard that stops the NOPRECIP detonation: the partition gap is
+    # unbounded RELATIVE to rho_vs (which collapses in the rising anvil) while w_trust, a
+    # function of the supersaturation magnitude s, never sees it. `Inf` restores the uncapped
+    # blend (the detonating configuration) and `0.0` degenerates to :residual, so the knob
+    # sweeps the whole family. See `Scythe.vapor_retrieval_blend`.
+    haskey(ENV, "SCYTHE_O01_BLEND_DCAP") &&
+        (physical_params[:vapor_blend_dcap] = parse(Float64, ENV["SCYTHE_O01_BLEND_DCAP"]))
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
@@ -367,6 +406,14 @@ function o01_rain_diagnostics(model, ref, kDim)
     # water than the column holds. See the STAGE 5 RESOLUTION of
     # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md.
     min_rw = Inf
+    # Dry-density headroom, as a FRACTION of the reference (rho_d spans two decades over the
+    # column, so an absolute minimum would only ever report the model top). Diagnostic only:
+    # rho_d has no rate sinks at all, so it cannot be depleted the way rho_c is — a fraction
+    # that departs from 1 by more than rounding means the dynamics are moving mass, and one
+    # that approaches 0 is a blow-up, not a positive-definiteness problem. Positivity bounds
+    # for rho_d/rho_t exist and are tested but stay OFF (benchmarks/FUTURE_WORK.md); this is
+    # the number that would say when to reconsider.
+    min_rd_frac = Inf
     times = Float64[]
     rate_int = Float64[]    # domain-integrated surface rain flux [kg/(m s) per unit y]
     eflux_int = Float64[]   # domain-integrated surface energy flux [J/(m s) per unit y]
@@ -382,6 +429,8 @@ function o01_rain_diagnostics(model, ref, kDim)
         min_rc = min(min_rc, minimum(rho_c))
         min_rv = min(min_rv, minimum(rho_v))
         min_rw = min(min_rw, minimum(rho_t .- rho_d))
+        min_rd_frac = min(min_rd_frac,
+                          minimum(rho_d ./ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)))
         rr_s = max.(df.rho_r[surf], 0.0)
         Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
         R = -rr_s .* Vt                                       # kg/m²/s, >= 0
@@ -417,6 +466,7 @@ function o01_rain_diagnostics(model, ref, kDim)
         "min_rho_c_gm3" => 1000.0 * min_rc,             # ditto, for the condensate
         "min_rho_v_gm3" => 1000.0 * min_rv,             # the residual vapor's headroom
         "min_rho_w_gm3" => 1000.0 * min_rw,             # total water; separates the two failures
+        "min_rho_d_frac" => min_rd_frac,                # dry density / reference; 1 = untouched
         "accum_rainfall_flux_mm" => accum_flux / width, # cross-check of the exact budget
         "precip_energy_gain_Jm2" => accum_E / width,    # predicted domain E_t gain
     )
@@ -548,10 +598,73 @@ function o01_init_nested!(models, topo)
 end
 
 """
+    o01_nest_shortfall!(diags, models)
+
+Record each patch's accumulated k-leg positivity `bound_shortfall` — the mass the limiter
+had to CREATE because a whole spline column arrived with negative total mass, which no
+non-negative spline can represent. It must be watched on a nested run specifically: the child
+patches carry the vertical bound only (their i-BC is R3X, which `set_lower_bound!` rejects —
+see `build_nest`), and the i-leg is the one that removes the broad horizontal negative lobes
+before the k-leg ever sees them. A nonzero value is the leak that k-only bounding admits.
+
+Read from the live workers rather than the output CSVs: the shortfall lives on
+`mtile.tile.kbasis`, one accumulator per worker tile (the k-leg bites on the tile, the i-leg
+on the worker's patch — see `water_budget_trace`). Workers are matched to patches by the
+`output_dir` their model carries, so no group bookkeeping has to be threaded through the
+harness. Diagnostic only: no target, no gate.
+"""
+function o01_nest_shortfall!(diags, models)
+    n = length(models)
+    nest_of = Dict(models[i].output_dir => i for i in 1:n)
+    bounded = sort(unique(String[name for m in models
+                                 for (name, spec) in m.grid_params.positivity
+                                 if haskey(spec, :k)]))
+    isempty(bounded) && return diags
+    totals = Dict{Tuple{String,Int},Float64}((name, i) => 0.0 for name in bounded, i in 1:n)
+    for w in sort(workers())
+        # Guarded: this runs after a multi-hour integration, and a worker that somehow holds
+        # no tile must not take the whole diagnostic down with it — it is reported and
+        # skipped (leaving that patch's total short, which the warning says).
+        res = try
+            @fetchfrom w begin
+                mt = Main.mtile
+                vars = mt.model.grid_params.vars
+                kb = mt.tile.kbasis
+                (mt.model.output_dir,
+                 Dict{String,Float64}(
+                     name => (kb isa Springsteel.NoBasisArray ? NaN :
+                              Springsteel.CubicBSpline.bound_shortfall(kb.data[vars[name]]))
+                     for (name, spec) in mt.model.grid_params.positivity if haskey(spec, :k)))
+            end
+        catch err
+            @warn "bound_shortfall: worker $w could not be read; its patch's total is " *
+                  "incomplete" exception = err
+            continue
+        end
+        odir, sf = res
+        i = get(nest_of, odir, 0)
+        i == 0 && continue
+        for (name, v) in sf
+            haskey(totals, (name, i)) && (totals[(name, i)] += v)
+        end
+    end
+    total = 0.0
+    for name in bounded, i in 1:n
+        haskey(models[i].grid_params.positivity, name) || continue
+        v = totals[(name, i)]
+        diags["bound_shortfall_$(name)_n$i"] = v
+        total += v
+    end
+    diags["bound_shortfall_total"] = total
+    return diags
+end
+
+"""
 Nested rain + budget diagnostics: per-patch surface-rain series restricted to
 each patch's nominal region (collar cells excluded so abutting patches
 partition the domain exactly), summed/maxed across patches; masked domain
-integrals for the water and energy budgets.
+integrals for the water and energy budgets, and the per-patch k-leg positivity
+shortfall (see `o01_nest_shortfall!`).
 """
 function o01_nested_diagnostics(models, topo)
     ref, _, kDim = rebuild_reference(models[1])
@@ -572,6 +685,7 @@ function o01_nested_diagnostics(models, topo)
     min_rc = 0.0
     min_rv = Inf
     min_rw = Inf
+    min_rd_frac = Inf                         # see o01_rain_diagnostics for what this is for
     # w extrema over the WHOLE run (user decision 2026-07-14): the nested max_w
     # is defined as the run maximum, not the final-time value the single-grid
     # diagnostic reports. By the end of the hour the secondary cells have
@@ -601,6 +715,10 @@ function o01_nested_diagnostics(models, topo)
             min_rc = min(min_rc, minimum(rho_c[colmask]))
             min_rv = min(min_rv, minimum(rho_v[colmask]))
             min_rw = min(min_rw, minimum((rho_t .- rho_d)[colmask]))
+            min_rd_frac = min(min_rd_frac,
+                              minimum((rho_d ./
+                                       repeat(Springsteel.ref_rho_d(ref)[:, 1],
+                                              ncols))[colmask]))
             max_w = max(max_w, maximum(df.w[colmask]))
             min_w = min(min_w, minimum(df.w[colmask]))
             rr_s = max.(df.rho_r[surf], 0.0) .* mask
@@ -637,6 +755,7 @@ function o01_nested_diagnostics(models, topo)
         "min_rho_c_gm3" => 1000.0 * min_rc,
         "min_rho_v_gm3" => 1000.0 * min_rv,
         "min_rho_w_gm3" => 1000.0 * min_rw,
+        "min_rho_d_frac" => min_rd_frac,
         "accum_rainfall_flux_mm" => accum_flux / total_width,
         "precip_energy_gain_Jm2" => accum_E / total_width,
     )
@@ -666,6 +785,8 @@ function o01_nested_diagnostics(models, topo)
 
     diags["max_w"] = max_w
     diags["min_w"] = min_w
+
+    o01_nest_shortfall!(diags, models)
 
     return diags
 end

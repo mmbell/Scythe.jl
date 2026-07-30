@@ -268,6 +268,74 @@ using Springsteel
         @test ni.collar_rows[1:kDim] == collect(1:kDim)
     end
 
+    @testset "child patches take a k-only positivity bound" begin
+        # A child's i-BC is R3X (FixedBC): its border coefficient trio is pinned to the
+        # parent's donated ahat, so `set_lower_bound!` rejects an i-direction bound and the
+        # child's grid cannot even be built with one. `build_nest` must therefore hand the
+        # children a k-only copy of the declared positivity — and say so.
+        pos_vars = Dict("u" => 1, "w" => 2, "rho_r" => 3)
+        side = Dict("u" => DirichletBC(), "w" => DirichletBC(), "rho_r" => NeumannBC())
+        topbot = Dict("u" => NeumannBC(), "w" => DirichletBC(), "rho_r" => NaturalBC())
+        declared = Dict("rho_r" => Dict(:i => 0.0, :k => 0.0))
+        base_pos = ModelParameters(
+            ts = 0.6,
+            integration_time = 60.0,
+            output_interval = 60.0,
+            equation_set = "moist_compressible_XZ",
+            initial_conditions = "",
+            output_dir = "./output_nesttest_pos/",
+            grid_params = GridParameters(
+                geometry = "RiRk",
+                num_cells = 10, iMin = 0.0, iMax = 10.0,   # placeholder
+                kMin = 0.0, kMax = 20000.0, num_cells_k = 10,
+                positivity = declared,
+                BCL = side, BCR = side, BCB = topbot, BCT = topbot,
+                vars = pos_vars),
+        )
+        # 2 km | 1 km | 2 km: patch 2 is the only child (parents on both sides).
+        nest_pos = NestedModelParameters(
+            boundaries = [0.0, 40.0e3, 60.0e3, 100.0e3],
+            num_cells = [20, 20, 20],
+            ts = [0.6, 0.3, 0.6],
+            workers_per_patch = [1, 1, 1],
+            base = base_pos)
+
+        models_pos, _ = @test_logs (:warn, r"positivity") match_mode = :any build_nest(nest_pos)
+
+        @test models_pos[2].grid_params.BCL["rho_r"] == FixedBC()
+        @test models_pos[2].grid_params.BCR["rho_r"] == FixedBC()
+        @test models_pos[2].grid_params.positivity["rho_r"] == Dict(:k => 0.0)
+        # Parents keep both legs
+        @test models_pos[1].grid_params.positivity["rho_r"] == Dict(:i => 0.0, :k => 0.0)
+        @test models_pos[3].grid_params.positivity["rho_r"] == Dict(:i => 0.0, :k => 0.0)
+        # The caller's dict is untouched
+        @test declared == Dict("rho_r" => Dict(:i => 0.0, :k => 0.0))
+        @test base_pos.grid_params.positivity["rho_r"] == Dict(:i => 0.0, :k => 0.0)
+
+        # The child's grid builds, with the vertical bound installed and no i-leg bound
+        child = createGrid(models_pos[2].grid_params)
+        v = pos_vars["rho_r"]
+        @test length(child.kbasis.data[v].lower) == models_pos[2].grid_params.num_cells_k + 3
+        @test all(iszero, child.kbasis.data[v].lower)
+        @test isempty(child.ibasis.data[1, v].lower)
+        # ... and the parent's does carry the i-leg bound
+        parent = createGrid(models_pos[1].grid_params)
+        @test all(iszero, parent.ibasis.data[1, v].lower)
+        @test !isempty(parent.ibasis.data[1, v].lower)
+
+        # Why the filter is required: the same child parameters WITH the i bound throw.
+        gp_bad = GridParameters(
+            geometry = "RiRk",
+            iMin = 40.0e3, iMax = 60.0e3, num_cells = 20,
+            kMin = 0.0, kMax = 20000.0, num_cells_k = 10,
+            positivity = Dict("rho_r" => Dict(:i => 0.0, :k => 0.0)),
+            BCL = Dict(k => FixedBC() for k in keys(pos_vars)),
+            BCR = Dict(k => FixedBC() for k in keys(pos_vars)),
+            BCB = topbot, BCT = topbot,
+            vars = pos_vars)
+        @test_throws ErrorException createGrid(gp_bad)
+    end
+
     @testset "validation errors" begin
         # 4:1 junction ratio
         nest_bad = NestedModelParameters(

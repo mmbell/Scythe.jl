@@ -279,6 +279,23 @@ function build_nest(nest::NestedModelParameters)
     fixed_bc() = Dict{String,Any}(v => FixedBC() for v in all_vars)
     natural_bc() = Dict{String,Any}(v => NaturalBC() for v in all_vars)
 
+    # Species whose i-leg bound had to be dropped on a child patch (reported once below).
+    stripped_i = String[]
+    # A child's i-direction BC is R3X: its border coefficient trio is pinned to the parent's
+    # donated `ahat`, so a box constraint on the free coefficients does not imply the bound on
+    # the reconstruction and `set_lower_bound!` rejects the BC outright (Springsteel
+    # `_bound_safe`). Children therefore get a K-ONLY copy of the declared positivity; the
+    # k-direction BCs (BCB/BCT) are shared with the base patch, so the vertical bound behaves
+    # identically on every nest. The caller's dict is never mutated.
+    function child_positivity(pos)
+        out = Dict{String,Dict{Symbol,Float64}}()
+        for (name, spec) in pos
+            haskey(spec, :i) && push!(stripped_i, name)
+            out[name] = Dict{Symbol,Float64}(d => b for (d, b) in spec if d !== :i)
+        end
+        return out
+    end
+
     models = Vector{ModelParameters}(undef, n)
     gps = Vector{SpringsteelGridParameters}(undef, n)
     for i in 1:n
@@ -288,12 +305,14 @@ function build_nest(nest::NestedModelParameters)
         # Collar extensions where this patch is the parent
         bcl = (i == 1) ? base.grid_params.BCL : nothing
         bcr = (i == n) ? base.grid_params.BCR : nothing
+        is_child = false
         if i >= 2   # left junction j = i-1
             if junction_parent[i - 1] == i
                 iMin -= dx[i]; cells += 1      # parent: collar into the left child
                 bcl = natural_bc()             # free collar termination
             else
                 bcl = fixed_bc()               # child: R3X receives parent trio
+                is_child = true
             end
         end
         if i <= n - 1   # right junction j = i
@@ -302,6 +321,7 @@ function build_nest(nest::NestedModelParameters)
                 bcr = natural_bc()
             else
                 bcr = fixed_bc()
+                is_child = true
             end
         end
 
@@ -338,12 +358,11 @@ function build_nest(nest::NestedModelParameters)
             fourier_filter = bgp.fourier_filter,
             chebyshev_filter = bgp.chebyshev_filter,
             spline_filter = bgp.spline_filter,
-            # Water positivity carries to every nest. The k-direction BCs (BCB/BCT) are
-            # shared with the base patch, so a vertical bound behaves identically on every
-            # nest. A HORIZONTAL bound would not: a child's i-direction BC is R3X, which
-            # pins its border coefficient trio to the parent's donated `ahat` and leaves
-            # the child nothing to adjust — `set_lower_bound!` rejects that BC outright.
-            positivity = bgp.positivity,
+            # Water positivity carries to every nest, VERTICALLY. Parent patches (whose
+            # i-BCs are the base patch's own or a free collar termination) take the declared
+            # bound unchanged; child patches take the k-only copy built by
+            # `child_positivity` above, because their R3X i-BC cannot carry a bound.
+            positivity = is_child ? child_positivity(bgp.positivity) : bgp.positivity,
             patchOffsetL = ring_offset,
         )
 
@@ -363,6 +382,16 @@ function build_nest(nest::NestedModelParameters)
             physical_params = base.physical_params,
             options = base.options,
         )
+    end
+
+    if !isempty(stripped_i)
+        @warn "Nest: dropped the i-direction positivity bound on the child patches for " *
+              "$(join(sort(unique(stripped_i)), ", ")) — a child's i-BC is R3X (border trio " *
+              "pinned to the parent's donated ahat), which set_lower_bound! rejects. The " *
+              "children are bounded on the k-leg only, which is conservative WITHIN a " *
+              "column but cannot fix a column whose total mass is already negative: such a " *
+              "column is recorded as a `bound_shortfall` deficit (mass created by the " *
+              "limiter) instead. Monitor bound_shortfall on the nests."
     end
 
     # ── Interface metadata + collar geometry (throwaway driver-side grids) ──
