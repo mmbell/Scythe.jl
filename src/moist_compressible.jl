@@ -1279,7 +1279,7 @@ end
 """
     check_condensate_transform_ic(ref_state, model) -> Nothing
 
-Refuse to start a transformed run on a CLOUDY reference state.
+Warn once when a transformed run starts on a CLOUDY reference state.
 
 Slot 9 then carries `n' = bhyp(rho_c) - bhyp(ρ̄_c)`, and every producer of an initial
 condition has to know that: [`condensate_slot`](@ref) is the conversion, and the `*_mc!`
@@ -1290,9 +1290,12 @@ nothing can go wrong. On a cloudy reference an initial condition written in DENS
 silently reinterpreted as a control variable — off by a factor of two in the linear regime,
 and not detectable from the run.
 
-Guards the reference only. A cloudy PERTURBATION on a cloud-free reference is legitimate under
-either convention and cannot be distinguished here; the initializer keyword is what handles
-that, and `reference/FINDINGS_CONDENSATE_STAGE1.md` §6 records it as a Stage 4 item.
+It is a warning and not an error because a cloudy reference is a legitimate configuration --
+`bf02_moist` is one, and it threads the conversion -- and because the condition cannot be
+checked from the state: both conventions give exactly 0.0 where there is no cloud, and where
+there is cloud neither is distinguishable from the other without knowing the intended density.
+Refusing outright would block correct configurations to catch a mistake it cannot actually
+detect; naming the requirement is the most the model can honestly do.
 """
 function check_condensate_transform_ic(ref_state, model::ModelParameters)
     uses_pressure_reference(model.equation_set) || return nothing
@@ -1300,11 +1303,19 @@ function check_condensate_transform_ic(ref_state, model::ModelParameters)
     prof = Springsteel.ref_rho_c(ref_state)
     prof isa Number && return nothing
     all(iszero, view(prof, :, 1)) && return nothing
-    error("""options[:condensate_transform] is on and the reference state is CLOUDY
-      (ρ̄_c is not identically zero). Slot 9 then carries bhyp(rho_c) - bhyp(ρ̄_c), so the
-      initial condition must be written with `condensate_slot` (the `*_mc!` initializers
-      take `condensate_transform` / `condensate_mu` keywords). This combination has not been
-      validated; see reference/FINDINGS_CONDENSATE_STAGE1.md.""")
+    @warn """options[:condensate_transform] is on and the reference state is CLOUDY
+      (ρ̄_c is not identically zero). Slot 9 therefore carries bhyp(rho_c) - bhyp(ρ̄_c), NOT
+      the density perturbation, and the initial condition must have been written that way:
+      `condensate_slot` is the conversion and the `*_mc!` initializers take
+      `condensate_transform` / `condensate_mu` keywords for it. An initial condition written
+      in density is read here as a control variable and is wrong by roughly a factor of two
+      in the linear regime, with nothing in the run to show it.
+
+      This cannot be verified from the state -- both conventions give exactly 0.0 where
+      there is no cloud, and neither is distinguishable from the other where there is. It is
+      the configuration's responsibility. In-tree, `bf02_moist.jl` threads it; O01 and the
+      TC configurations have cloud-free references and are unaffected."""
+    return nothing
 end
 
 """

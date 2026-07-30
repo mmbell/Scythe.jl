@@ -3243,10 +3243,14 @@ using Springsteel
         end
     end
 
-    @testset "condensate transform: a cloudy reference is refused" begin
+    @testset "condensate transform: a cloudy reference warns" begin
         # The one silent-misreading hazard: an initial condition written in DENSITY on a
-        # cloudy reference would be reinterpreted as a control variable, off by a factor of
-        # two in the linear regime and undetectable from the run.
+        # cloudy reference is reinterpreted as a control variable, off by roughly a factor
+        # of two in the linear regime and undetectable from the run. The model cannot check
+        # it -- both conventions give exactly 0.0 where there is no cloud, and neither is
+        # distinguishable from the other where there is -- so it names the requirement and
+        # runs. It was an ERROR until 2026-07-30, which turned out to block bf02_moist,
+        # whose reference is legitimately cloudy and which threads the conversion.
         mktempdir() do tmpdir
             vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
             scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
@@ -3279,7 +3283,23 @@ using Springsteel
             spectralTransform!(patch); gridTransform!(patch)
             hrm = sparse(Int64[], Int64[], Float64[],
                          size(patch.spectral, 1), size(patch.spectral, 2))
-            @test_throws ErrorException createModelTile(patch, patch, model, hrm)
+            mt = @test_logs (:warn, r"reference state is CLOUDY") match_mode=:any createModelTile(patch, patch, model, hrm)
+            @test mt isa Scythe.ModelTile
+            # ... and a CLOUD-FREE reference must stay silent, or the warning is noise.
+            ref2 = joinpath(tmpdir, "ctrans_clear.ref")
+            Scythe.write_exact_ref_mc(ref2, z, col.p_Pa, col.rho_d, col.rho_v,
+                                      zeros(gp.kDim))
+            m2 = ModelParameters(
+                ts = 0.25, integration_time = 5.0, output_interval = 5.0,
+                equation_set = "moist_compressible_XZ",
+                ref_state_file = ref2, grid_params = gp0,
+                physical_params = model.physical_params, options = model.options)
+            p2 = createGrid(m2.grid_params)
+            p2.physical .= 0.0
+            spectralTransform!(p2); gridTransform!(p2)
+            @test Scythe.check_condensate_transform_ic(
+                Springsteel.exact_pressure_reference_state(
+                    ref2, z, Scythe.reference_column(p2, m2.grid_params)), m2) === nothing
         end
     end
 

@@ -116,9 +116,9 @@ function bf02_moist_model(opts::BenchmarkOptions)
         # Condensate control-variable transform (mc stage only; slot 9 is the cloud density
         # in every other set here). Unset => `:none`, bitwise the code that had no option.
         # See `Scythe.condensate_transform_mode` and
-        # reference/FINDINGS_CONDENSATE_STAGE1.md. BF02's initial condition is the moist
-        # buoyancy bubble on a CLOUD-FREE reference, so no initial-condition conversion is
-        # needed -- `bhyp(0) = 0` exactly.
+        # reference/FINDINGS_CONDENSATE_STAGE1.md. Unlike O01, BF02's reference is CLOUDY
+        # (the saturated moist-neutral sounding carries q_l > 0), so the initial condition
+        # DOES need conversion -- see the moist_buoyancy_bubble_mc! call below.
         if opts.stage == STAGE_MC
             haskey(ENV, "SCYTHE_BF02_CTRANS") &&
                 (options[:condensate_transform] = Symbol(ENV["SCYTHE_BF02_CTRANS"]))
@@ -240,9 +240,17 @@ function bf02_moist_init!(model)
         Scythe.write_exact_ref_mc(model.ref_state_file, z, p_Pa, base.rho_d,
                                   base.rho_d .* base.q_v, base.rho_d .* base.q_l)
         ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column)
+        # BF02's reference IS cloudy (base.q_l > 0 -- the saturated moist-neutral sounding),
+        # so under a condensate transform slot 9 must be written as bhyp(rho_c) - bhyp(rho_cbar)
+        # and not as the density perturbation. Threading the option here is what makes that
+        # happen; `condensate_slot` inside the initializer does the conversion.
         Scythe.moist_buoyancy_bubble_mc!(patch, gridpoints, base, ref;
                                          q_t=Q_T, xc=10000.0, xr=2000.0,
-                                         zc=2000.0, zr=2000.0, amp=2.0/300.0)
+                                         zc=2000.0, zr=2000.0, amp=2.0/300.0,
+                                         condensate_transform =
+                                             Scythe.condensate_transform_mode(model.options),
+                                         condensate_mu =
+                                             get(model.physical_params, :condensate_mu, 1.0e-7))
     elseif physical_stage
         Scythe.write_exact_ref_pd(model.ref_state_file, z, base.s, base.rho_d,
                                   base.rho_d .* base.q_v, base.rho_d .* base.q_l)
