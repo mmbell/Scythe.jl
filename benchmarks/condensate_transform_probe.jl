@@ -135,9 +135,63 @@
 # refit, where the transform is 2.25x smaller than the two-leg limiter (0.134 K
 # vs 0.301 K) and indistinguishable from the one-leg limiter.
 #
-# VERDICT. Among the TRANSFORMS, H-smooth (Ooyama biased hyperbolic, strict
-# inverse, Jacobian at the recovered density) is the only survivor: Q-quad and
-# softplus are out on source stiffness, log was already out on representation.
+# THE TWO H VARIANTS ARE INTERCHANGEABLE (added 2026-07-30, after the first
+# write-up singled out H-smooth on an argument rather than a measurement).
+# H-Ooyama is the PUBLISHED quasi-inverse (Eq. 4.20): same forward map, same
+# Jacobian, but rho pinned at exactly 0 for n <= 0 instead of relaxing to -mu,
+# at the cost of a kink in f sited exactly at the cloud edge. Run on all three
+# arms it is indistinguishable from H-smooth:
+#
+#   arm         metric        H-smooth      H-Ooyama
+#   TRANSPORT   max_rho      2.9376e-03    2.9376e-03
+#               mass_drift    +1.077e+00    +1.077e+00
+#               min_rho      -9.9975e-08    0.0000e+00
+#               neg_mass      8.0914e-04    0.0000e+00
+#   DRAIN       pos_mass      3.4900e-01    3.4911e-01
+#               mass_drift    -1.646e+00    -1.645e+00
+#   NUCLEATION  max_rho      1.2167e-02    1.2166e-02
+#               lag              0.30 s        0.30 s
+#
+# The kink causes no dynamical trouble at all. Both pass F1-F4 on every arm.
+#
+# THE CONTROL-VARIABLE EXCURSION -- the transform's own possible failure mode, and
+# the only quantity that could have separated the two. min(n) over the run:
+#
+#   arm         identity     H-smooth     H-Ooyama       Q-quad     softplus   POS=k
+#   TRANSPORT  -4.3339e-4   -2.0125e-4   -2.0123e-4   -4.0256e-4   -4.0521e-4  +2e-46
+#   DRAIN      -2.1568e-4   -1.0071e-4   -1.0072e-4   -2.0152e-4   -2.0160e-4  +2e-46
+#   NUCLEATION -1.2812e-3   -5.6572e-4   -5.6563e-4   -2.4795e+24  -2.4800e+06 +0.0
+#
+# The two H variants agree to four or five significant figures on every arm, so
+# the choice between them is free and must be made on other grounds.
+#
+# Two things this table says that matter beyond that choice:
+#
+#   * THE RATCHET DOES NOT RELOCATE INTO n -- IT IS THE SAME EXCURSION, HALVED BY
+#     OOYAMA'S FACTOR 0.5 (n ~ rho/2 in the linear regime). identity's rho reaches
+#     -4.334e-4; H's n reaches -2.013e-4, i.e. 2.15x smaller, which is exactly that
+#     factor. In rho-equivalent terms the excursion is UNCHANGED. The transform does
+#     not reduce the ringing -- it makes the ringing harmless, because rho = f(n) is
+#     bounded below by -mu whatever n does. That is the whole claim, and it should
+#     not be overstated into a claim about amplitude.
+#   * THE NUCLEATION LAG IS REAL AND MUST BE CENSUSED IN THE MODEL. The F3 number
+#     above (0.30 s, one step) is measured from n = 0 and is therefore a best case.
+#     Once n has ratcheted to -5.66e-4, a source of 1e-5 kg/m^3/s needs ~57 s to
+#     bring the recovered density back above 1e-6. For contrast the identity arm's
+#     rho reaches -1.28e-3 and needs ~128 s to climb back -- 2.2x longer, and
+#     carrying a -54 K-class cold anomaly the whole time, where the transformed
+#     point simply reads zero cloud. Better, but not free.
+#   * POSITIVITY=k holds min(n) at +2e-46: the limiter genuinely REMOVES the
+#     excursion rather than relocating it. That is its one structural advantage,
+#     and the o01 runs price it at a 250-1000x irreversible entropy source.
+#
+# VERDICT. Among the TRANSFORMS, the OOYAMA BIASED HYPERBOLIC FAMILY is the only
+# survivor: Q-quad and softplus are out on source stiffness, log was already out
+# on representation. Within the family H-smooth and H-Ooyama are measurably
+# equivalent; H-Ooyama is preferred as the shipped form because it delivers
+# rho >= 0 exactly at no measured dynamical cost and is the published, validated
+# map, with H-smooth retained as a one-branch variant for any future consumer that
+# needs f'' at the cloud edge (the water Laplacians, currently disabled).
 # Whether a transform is needed AT ALL over the existing limiter is a question no
 # offline measurement here can answer, and it must be settled by running the
 # limiter under the current head -- the o01 harness already supports it
@@ -193,6 +247,15 @@ dbhyp(rho, mu) = 0.5 * (1.0 + (mu * mu) / ((rho + mu) * (rho + mu)))
 identity_tf() = Transform("identity", r -> r, n -> n, _ -> 1.0)
 hyp(mu)       = Transform("H-smooth(mu=$mu)", r -> bhyp(r, mu), n -> ahyp(n, mu),
                           r -> dbhyp(max(r, 0.0), mu))
+# Ooyama's PUBLISHED quasi-inverse (Eq. 4.20): the strict inverse above for n >= 0,
+# identically zero below. Same forward map, same Jacobian; the only difference is
+# that rho is pinned at exactly 0 instead of relaxing to -mu, at the cost of a kink
+# in f at n = 0 (f'(0-) = 0, f'(0+) = 1) sited exactly at the cloud edge. It is NOT
+# a state repair -- the state is n, and n is never modified ("n itself is untouched,
+# so that the effect of m adjustments does not accumulate in the predicted n").
+hyp_ooyama(mu) = Transform("H-Ooyama(mu=$mu)", r -> bhyp(r, mu),
+                           n -> (n <= 0.0 ? 0.0 : ahyp(n, mu)),
+                           r -> dbhyp(max(r, 0.0), mu))
 quad_f(n, mu) = n <= -mu ? 0.0 : (n >= mu ? n : (n + mu)^2 / (4mu))
 quad_g(r, mu) = r >= mu ? r : 2.0 * sqrt(mu * max(r, 0.0)) - mu
 quad_J(r, mu) = (x = max(r, 0.0); x >= mu ? 1.0 : (x <= 0.0 ? 1e30 : sqrt(mu / x)))
@@ -314,6 +377,12 @@ function integrate(tf::Transform, arm::Symbol, z, sp, w, wz, rho_d, Tk, mass;
     lag = NaN
     mass0 = mass(tf.f.(u))
     peak = -Inf; worst_min = Inf
+    # How far the CONTROL variable ratchets below zero. This is the transform's own
+    # possible failure mode -- the reservoir relocating into n, where it is invisible
+    # in rho but sets the nucleation lag |n|/S -- and it is the only quantity that
+    # distinguishes H-smooth from Ooyama's quasi-inverse, since on the n < 0 branch
+    # the two recovered densities differ by at most mu.
+    worst_n = Inf
     finished = true
     # F4 needs to know whether the mass injection SATURATES or keeps growing, so
     # the trajectory is sampled rather than only differenced end to end.
@@ -351,6 +420,7 @@ function integrate(tf::Transform, arm::Symbol, z, sp, w, wz, rho_d, Tk, mass;
         !all(isfinite, u) && (finished = false; break)
 
         rho_new = tf.f.(u)
+        worst_n = min(worst_n, minimum(u))
         peak = max(peak, maximum(rho_new))
         worst_min = min(worst_min, minimum(rho_new))
         max_step_ratio = max(max_step_ratio, maximum(abs, rho_new .- rho))
@@ -367,7 +437,7 @@ function integrate(tf::Transform, arm::Symbol, z, sp, w, wz, rho_d, Tk, mass;
             final_min = minimum(rho_fin), final_max = maximum(rho_fin),
             neg_mass = mass(max.(-rho_fin, 0.0)), pos_mass = mass(max.(rho_fin, 0.0)),
             mass_drift = mass(rho_fin) - mass0, max_step = max_step_ratio, lag,
-            mass_track, shortfall = CubicBSpline.bound_shortfall(sp))
+            mass_track, shortfall = CubicBSpline.bound_shortfall(sp), worst_n)
 end
 
 # ── driver ───────────────────────────────────────────────────────────────────
@@ -390,7 +460,8 @@ function main()
     src_amp = 1.0e-3 / 100.0
 
     MU = 1e-7
-    cands = [identity_tf(), hyp(MU), quadratic(MU), softplus(MU), limiter_tf()]
+    cands = [identity_tf(), hyp(MU), hyp_ooyama(MU), quadratic(MU), softplus(MU),
+             limiter_tf()]
 
     for arm in (:transport, :drain, :nucleation)
         println("\n" * "="^92)
@@ -422,8 +493,8 @@ function main()
                         "", r.shortfall)
             # F4: does the mass injection saturate, or keep growing linearly?
             isempty(r.mass_track) ||
-                @printf("%-22s        mass at 900/1800/2700/3600 s: %s\n", "",
-                        join((@sprintf("%+.3e", m) for m in r.mass_track), "  "))
+                @printf("%-22s        mass at 900/1800/2700/3600 s: %s   min(n) = %+.4e\n", "",
+                        join((@sprintf("%+.3e", m) for m in r.mass_track), "  "), r.worst_n)
         end
     end
 end
