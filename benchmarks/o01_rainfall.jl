@@ -198,6 +198,30 @@ function o01_model(opts::BenchmarkOptions)
     # sweeps the whole family. See `Scythe.vapor_retrieval_blend`.
     haskey(ENV, "SCYTHE_O01_BLEND_DCAP") &&
         (physical_params[:vapor_blend_dcap] = parse(Float64, ENV["SCYTHE_O01_BLEND_DCAP"]))
+    # Whether the THERMODYNAMIC INTERFACE reads a floored rho_liq (Experiment 1 of
+    # reference/HANDOFF_CONDENSATE_REPRESENTATION.md). Unset => `:none`, bitwise the code
+    # that had no option. `=diagnostic` floors rho_liq at the retrieval, q_l, Q_s_energy,
+    # the entropy and E_sed ONLY, leaving the state, the continuity terms and the water
+    # partition raw -- it removes the -54 K-class cold anomaly the undershoot carries
+    # without touching the undershoot. See `Scythe.condensate_floor_mode` for why it is not
+    # `clamp_water!`, and reference/FINDINGS_CONDENSATE_STAGE1.md for what the anomaly costs.
+    haskey(ENV, "SCYTHE_O01_CFLOOR") &&
+        (options[:condensate_floor] = Symbol(ENV["SCYTHE_O01_CFLOOR"]))
+    # Which CONTROL VARIABLE slot 9 carries. Unset => `:none`, bitwise the code that had no
+    # option: the slot is the cloud density itself. `=bhyp` makes it Ooyama's biased
+    # hyperbolic control variable, so the recovered density is non-negative by construction
+    # and the spline undershoot can no longer reach the temperature retrieval -- the
+    # class-level fix for the negative-condensate reservoir, which reaches 2.75x the real
+    # cloud mass on this very run (reference/FINDINGS_CONDENSATE_STAGE1.md §1). `=bhyp_smooth`
+    # is the C^inf variant, bounded below by -mu rather than 0. NOTE the default POSITIVITY=r
+    # is rain-only, which is what the transform needs: declaring positivity for rho_c
+    # alongside it is refused (see install_positivity_bounds!).
+    haskey(ENV, "SCYTHE_O01_CTRANS") &&
+        (options[:condensate_transform] = Symbol(ENV["SCYTHE_O01_CTRANS"]))
+    # The transform's bias [kg/m^3]. Unset => 1e-7, Ooyama's own value, which costs at most
+    # 7.2e-3 K through the retrieval and that at the model top. Only meaningful with CTRANS.
+    haskey(ENV, "SCYTHE_O01_CMU") &&
+        (physical_params[:condensate_mu] = parse(Float64, ENV["SCYTHE_O01_CMU"]))
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
@@ -386,6 +410,9 @@ maximum rain density, and the time-integrated surface mass and energy fluxes
 ("surface" = the lowest mish level; Gauss nodes exclude z = 0 itself).
 """
 function o01_rain_diagnostics(model, ref, kDim)
+    # Slot 9 holds a control variable when the transform is on; `mc_state` needs to know.
+    ctf = Scythe.condensate_transform_mode(model.options)
+    cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
     gp = model.grid_params
     snaps = output_snapshots(model)
     peak_rate = 0.0
@@ -422,7 +449,8 @@ function o01_rain_diagnostics(model, ref, kDim)
         df = CSV.read(path, DataFrame)
         ncols = div(nrow(df), kDim)
         surf = 1:kDim:nrow(df)
-        Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+        Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
+                                                     transform = ctf, mu = cmu)
         max_rr = max(max_rr, maximum(df.rho_r))
         min_rr = min(min_rr, minimum(df.rho_r))
         max_rc = max(max_rc, maximum(rho_c))
@@ -668,6 +696,8 @@ shortfall (see `o01_nest_shortfall!`).
 """
 function o01_nested_diagnostics(models, topo)
     ref, _, kDim = rebuild_reference(models[1])
+    ctf = Scythe.condensate_transform_mode(models[1].options)
+    cmu = get(models[1].physical_params, :condensate_mu, 1.0e-7)
     n = length(models)
     masks = [nominal_col_mask(models[i], o01_nominal_bounds(models, topo, i)...)
              for i in 1:n]
@@ -706,7 +736,8 @@ function o01_nested_diagnostics(models, topo)
             gp = models[i].grid_params
             ncols = div(nrow(df), kDim)
             surf = 1:kDim:nrow(df)
-            Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+            Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
+                                                         transform = ctf, mu = cmu)
             mask = masks[i]
             colmask = repeat(mask, inner = kDim)
             max_rr = max(max_rr, maximum(df.rho_r[colmask]))

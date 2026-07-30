@@ -61,9 +61,11 @@ Reconstruct the diagnostic thermodynamic state of the total-energy set
 (moist_compressible) from a perturbation output DataFrame: the closed-form
 temperature retrieval from the PROGNOSTIC condensate, then the residual vapor.
 Returns `(Tk, p, rho_d, rho_v, rho_c, rho_t)` as flat vectors (z fastest), with p
-in Pa.
+in Pa. `transform` must be the run's `options[:condensate_transform]`: slot 9 then holds a
+control variable rather than a density, and reading it raw would be silently wrong by a
+factor of two in the linear regime.
 """
-function mc_state(df, ref, kDim, ncols)
+function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7)
     pbar = Springsteel.ref_pressure(ref)[:, 1]
     rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
     rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
@@ -73,7 +75,10 @@ function mc_state(df, ref, kDim, ncols)
     rho_d = df.rho_d .+ repeat(rho_dbar, ncols)
     rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
     E_t = df.E_t .+ repeat(E_tbar, ncols)
-    rho_c = df.rho_c .+ repeat(rho_cbar, ncols)
+    # Slot 9 is not necessarily a density: under `options[:condensate_transform]` the output
+    # column holds the CONTROL variable and the density has to be recovered, exactly as the
+    # kernel does. `:none` is the plain add, bit for bit.
+    rho_c = Scythe.recover_rho_c.(df.rho_c, repeat(rho_cbar, ncols), transform, mu)
     ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
     M = p .+ E_t .- (rho_t .* (ke .+ Scythe.gravity .* df.z))
     rho_liq = rho_c .+ df.rho_r
@@ -91,14 +96,16 @@ log-density perturbations plus the reference profile. Returns (theta_p, ncols)
 where theta_p is a (kDim, ncols) matrix with z varying fastest, matching the
 output ordering.
 """
-function theta_perturbation(df::DataFrame, ref, kDim::Int)
+function theta_perturbation(df::DataFrame, ref, kDim::Int;
+                            transform::Symbol = :none, mu = 1.0e-7)
     npts = nrow(df)
     ncols = div(npts, kDim)
 
     # Total-energy set (moist_compressible): retrieve T from the prognostic
     # (p, E_t, Q_ss, densities), then θ = T·(p_0/p)^(Rd/Cpd) directly.
     if "E_t" in names(df)
-        Tk, p, _, _, _, _ = mc_state(df, ref, kDim, ncols)
+        Tk, p, _, _, _, _ = mc_state(df, ref, kDim, ncols;
+                                     transform = transform, mu = mu)
         theta = Tk .* ((Scythe.p_0 .* 100.0) ./ p) .^ (Scythe.Rd / Scythe.Cpd)
         Tbar = Springsteel.reference_temperature(ref)
         pbar = Springsteel.ref_pressure(ref)[:, 1]
@@ -273,7 +280,9 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
         ncols = div(nrow(df), kDim)
 
         if mc
-            Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+            Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
+                transform = Scythe.condensate_transform_mode(model.options),
+                mu = get(model.physical_params, :condensate_mu, 1.0e-7))
             E_t = df.E_t .+ repeat(Springsteel.ref_total_energy(ref)[:, 1], ncols)
             # Clamp for the entropy diagnostic: in dry air the residual vapor sits at
             # 0 ± roundoff, and entropy() takes log(q_v).
@@ -400,7 +409,9 @@ function mc_entropy_production(model, ref)
     tag = string(round(model.integration_time; digits=2))
     df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
     ncols = div(nrow(df), kDim)
-    Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+    Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
+        transform = Scythe.condensate_transform_mode(model.options),
+        mu = get(model.physical_params, :condensate_mu, 1.0e-7))
     rho_vs = Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0)
     q_v = rho_v ./ rho_d
     q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d

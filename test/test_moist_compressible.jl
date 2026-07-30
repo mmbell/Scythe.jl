@@ -2894,6 +2894,395 @@ using Springsteel
         end
     end
 
+    # ── Diagnostic flooring of rho_liq ──────────────────────────────────────────────────
+    #
+    # `options[:condensate_floor]` (reference/HANDOFF_CONDENSATE_REPRESENTATION.md,
+    # Experiment 1). The spline undershoot puts rho_c a few 1e-4 BELOW zero on the flanks
+    # of a cloud; the raw value then enters the closed-form temperature retrieval, where
+    # dT/d rho_liq = L_v/D turns it into a cold anomaly reaching -54 K, and through
+    # rho_vs(T) into false supersaturation and false nucleation.
+    #
+    # `:diagnostic` floors rho_liq at the DIAGNOSTIC INTERFACE only -- the retrieval, q_l
+    # (hence C_vt / R_m / gamma_m), Q_s_energy, the entropy and the sedimentation energy --
+    # leaving the STATE and the CONTINUITY terms raw. That is what separates it from
+    # `clamp_water!`: it is memoryless, converts no mass, and cannot pump latent heat,
+    # because nothing it does is written back to a prognostic slot. The measured cost of
+    # NOT doing it is in reference/FINDINGS_CONDENSATE_STAGE1.md.
+    #
+    # Three claims below, and the third is the one that makes this not-a-clamp:
+    #   (a) an ABSENT option is `:none` bitwise -- every existing configuration is unmoved;
+    #   (b) where no liquid is negative the floor is INACTIVE, also bitwise, so it cannot
+    #       drift a healthy run;
+    #   (c) where liquid IS negative it changes the run, and the prognostic rho_c stays
+    #       negative afterwards -- the state was not repaired.
+
+    """
+    A `vapor_blend_rirk` patch whose rho_c perturbation is seeded NEGATIVE enough to drive
+    rho_liq below zero somewhere, which is what the floor exists for. `amp = 0.0` leaves the
+    healthy state (the floor is then inactive and must be bitwise inert).
+    """
+    function condensate_floor_rirk(tmpdir, tag; floor = nothing, amp = 2.0e-3)
+        mtile, patch, model, gp = vapor_blend_rirk(tmpdir, tag)
+        floor === nothing || (model.options[:condensate_floor] = floor)
+        if amp != 0.0
+            rc = gp.vars["rho_c"]
+            for i in axes(patch.physical, 1)
+                patch.physical[i, rc, 1] = -amp * (1.0 + sin(0.5 * sqrt(3.0) * i^2))
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+        end
+        return mtile, patch, model, gp
+    end
+
+    @testset "condensate floor: absent is bitwise :none, and an unknown value errors" begin
+        have = isdefined(Scythe, :condensate_floor_mode)
+        @test have                   # ← the Stage 2 gate
+        # The reader/validator in isolation, before any column runs it.
+        @test Scythe.condensate_floor_mode(Dict{Symbol,Any}()) == false
+        @test Scythe.condensate_floor_mode(Dict{Symbol,Any}(:condensate_floor => :none)) == false
+        @test Scythe.condensate_floor_mode(
+            Dict{Symbol,Any}(:condensate_floor => :diagnostic)) == true
+        @test_throws ErrorException Scythe.condensate_floor_mode(
+            Dict{Symbol,Any}(:condensate_floor => :clamp))
+        mktempdir() do tmpdir
+            mA, pA, moA, gpA = condensate_floor_rirk(tmpdir, "cf_absent")
+            mN, pN, moN, gpN = condensate_floor_rirk(tmpdir, "cf_none"; floor = :none)
+            @test !haskey(moA.options, :condensate_floor)
+            @test moN.options[:condensate_floor] === :none
+
+            vapor_blend_run!(mA, pA, gpA, 10)
+            vapor_blend_run!(mN, pN, gpN, 10)
+            @test all(isfinite.(pA.physical))
+            # Absent === :none, to the last bit.
+            @test pA.physical == pN.physical
+            @test pA.spectral == pN.spectral
+
+            # A value that is neither must be rejected at the first column, not silently
+            # taken as one of them.
+            mX, pX, moX, gpX = condensate_floor_rirk(tmpdir, "cf_bad"; floor = :clamp)
+            @test_throws ErrorException Scythe.advance_column(mX, 1, 1)
+        end
+    end
+
+    @testset "condensate floor: inert where no liquid is negative" begin
+        # The guarantee that keeps this from being a tuning knob: on a state whose liquid is
+        # non-negative everywhere the floor never binds, and `:diagnostic` is then the same
+        # integration as `:none` BITWISE -- not "to 1e-14".
+        mktempdir() do tmpdir
+            mN, pN, moN, gpN = condensate_floor_rirk(tmpdir, "cf_pos_none";
+                                                     floor = :none, amp = 0.0)
+            mD, pD, moD, gpD = condensate_floor_rirk(tmpdir, "cf_pos_diag";
+                                                     floor = :diagnostic, amp = 0.0)
+            rc, rr = gpN.vars["rho_c"], gpN.vars["rho_r"]
+            rho_cbar = view(Springsteel.ref_rho_c(mN.ref_state), :, 1)
+            kDim = gpN.kDim
+            liq = [pN.physical[i, rc, 1] + rho_cbar[mod1(i, kDim)] + pN.physical[i, rr, 1]
+                   for i in axes(pN.physical, 1)]
+            @test minimum(liq) >= 0.0            # the premise: nothing to floor
+
+            vapor_blend_run!(mN, pN, gpN, 10)
+            vapor_blend_run!(mD, pD, gpD, 10)
+            @test all(isfinite.(pN.physical))
+            @test pN.physical == pD.physical
+            @test pN.spectral == pD.spectral
+        end
+    end
+
+    @testset "condensate floor: it changes the run without repairing the state" begin
+        mktempdir() do tmpdir
+            mN, pN, moN, gpN = condensate_floor_rirk(tmpdir, "cf_neg_none"; floor = :none)
+            mD, pD, moD, gpD = condensate_floor_rirk(tmpdir, "cf_neg_diag";
+                                                     floor = :diagnostic)
+            rc, rr = gpN.vars["rho_c"], gpN.vars["rho_r"]
+            rho_cbar = view(Springsteel.ref_rho_c(mN.ref_state), :, 1)
+            kDim = gpN.kDim
+            liqfun = pp -> [pp.physical[i, rc, 1] + rho_cbar[mod1(i, kDim)] +
+                            pp.physical[i, rr, 1] for i in axes(pp.physical, 1)]
+            @test minimum(liqfun(pN)) < 0.0      # the premise: there IS something to floor
+
+            vapor_blend_run!(mN, pN, gpN, 10)
+            vapor_blend_run!(mD, pD, gpD, 10)
+            @test all(isfinite.(pN.physical))
+            @test all(isfinite.(pD.physical))
+            # (c1) it is a different integration ...
+            @test pN.physical != pD.physical
+            # (c2) ... and the STATE was not repaired: the prognostic liquid is still
+            #      negative afterwards. A floor that had been written back would show a
+            #      non-negative rho_liq here, and that is the clamp_water! failure mode --
+            #      one-signed, cumulative, and non-finite in 23 min on O01.
+            @test minimum(liqfun(pD)) < 0.0
+        end
+    end
+
+    # ── The condensate control-variable transform ───────────────────────────────────────
+    #
+    # `options[:condensate_transform]` — Ooyama (2001) Eq. 4.19/4.20/4.23, the class-level fix
+    # for the negative-condensate reservoir. Slot 9 carries n = bhyp(rho_c) and the density is
+    # recovered by ahyp; nothing is ever repaired, and n is never modified. The measurement
+    # that chose this family over softplus and the square-root class (both of which fit
+    # equally well and detonate on first nucleation) is in
+    # reference/FINDINGS_CONDENSATE_STAGE1.md §3.
+
+    @testset "bhyp/ahyp: the algebra Ooyama's Eq. 4.19-4.23 promises" begin
+        have = isdefined(Scythe, :bhyp) && isdefined(Scythe, :ahyp) &&
+               isdefined(Scythe, :dbhyp) && isdefined(Scythe, :ahyp_smooth)
+        @test have                   # ← the Stage 3 gate
+        mu = 1.0e-7
+
+        # The origin is exact in BOTH directions -- this is what makes a cloud-free initial
+        # condition need no conversion at all, and it is not an approximation.
+        @test Scythe.bhyp(0.0, mu) === 0.0
+        @test Scythe.ahyp(0.0, mu) === 0.0
+        @test Scythe.ahyp_smooth(0.0, mu) === 0.0
+
+        # Round trip over ten decades spanning the knee, both inverses.
+        for rho in (1.0e-12, 1.0e-9, mu, 1.0e-6, 1.0e-4, 1.0e-3, 1.0e-2, 1.0)
+            n = Scythe.bhyp(rho, mu)
+            @test isapprox(Scythe.ahyp_smooth(n, mu), rho; rtol = 1.0e-14, atol = 1.0e-300)
+            @test isapprox(Scythe.ahyp(n, mu), rho; rtol = 1.0e-14, atol = 1.0e-300)
+            # J is the derivative of the forward map, checked against a central difference
+            # in the linear regime where the step is well conditioned.
+            if rho >= 1.0e-6
+                h = 1.0e-4 * rho
+                fd = (Scythe.bhyp(rho + h, mu) - Scythe.bhyp(rho - h, mu)) / (2h)
+                @test isapprox(Scythe.dbhyp(rho, mu), fd; rtol = 1.0e-8)
+            end
+        end
+
+        # THE property the whole design rests on: J is bounded in [0.5, 1] on rho >= 0, so
+        # the source quotient cannot blow up at the cloud edge. softplus reaches 1e12 here
+        # and the square-root class 1e6; both detonate on first nucleation.
+        for rho in (0.0, 1.0e-12, mu, 1.0e-3, 1.0, 1.0e3)
+            J = Scythe.dbhyp(rho, mu)
+            @test 0.5 <= J <= 1.0
+        end
+        @test Scythe.dbhyp(0.0, mu) == 1.0          # the maximum, attained exactly at zero
+
+        # Range. The published quasi-inverse is non-negative everywhere; the strict inverse
+        # is bounded below by -mu, and approaches it rather than crossing it.
+        for n in (-1.0, -1.0e-2, -1.0e-4, -mu, -1.0e-12, 0.0, 1.0e-12, 1.0e-3, 1.0)
+            @test Scythe.ahyp(n, mu) >= 0.0
+            @test Scythe.ahyp_smooth(n, mu) > -mu
+        end
+        @test Scythe.ahyp_smooth(-1.0e6 * mu, mu) > -mu
+        # ... and the two agree exactly where Ooyama does not clip.
+        for n in (1.0e-9, 1.0e-6, 1.0e-3, 1.0)
+            @test Scythe.ahyp(n, mu) === Scythe.ahyp_smooth(n, mu)
+        end
+        # Monotonicity across the knee, which is what makes the map a change of variables.
+        ns = [-1.0e-3, -1.0e-5, -mu, 0.0, mu, 1.0e-5, 1.0e-3]
+        @test issorted([Scythe.ahyp_smooth(n, mu) for n in ns])
+
+        # Linear well above the knee: n -> rho/2 (Ooyama's factor 0.5 is what removes the
+        # coefficient from the inverse), so the ringing in n is HALF the ringing in rho --
+        # which is why the measured excursion moves by exactly 2.15x and not more. The
+        # approach is from ABOVE at relative distance mu/rho, so the tolerance has to be
+        # loose where the knee is still close and can tighten as it recedes.
+        @test isapprox(Scythe.bhyp(1.0e-3, mu) / 1.0e-3, 0.5; rtol = 2.0e-4)
+        @test isapprox(Scythe.bhyp(1.0, mu), 0.5; rtol = 1.0e-6)
+        @test isapprox(Scythe.dbhyp(1.0e-3, mu), 0.5; rtol = 1.0e-6)
+        @test Scythe.bhyp(1.0e-3, mu) > 0.5e-3          # ... and from above, not below
+
+        # condensate_slot: the initial-condition conversion, and the reason a cloud-free
+        # state on a cloud-free reference needs no threading anywhere.
+        @test Scythe.condensate_slot(0.0, 0.0, :none, mu) === 0.0
+        @test Scythe.condensate_slot(0.0, 0.0, :bhyp, mu) === 0.0
+        @test Scythe.condensate_slot(1.0e-3, 0.0, :none, mu) === 1.0e-3
+        @test Scythe.condensate_slot(1.0e-3, 0.0, :bhyp, mu) === Scythe.bhyp(1.0e-3, mu)
+    end
+
+    @testset "condensate transform: option gating" begin
+        @test Scythe.condensate_transform_mode(Dict{Symbol,Any}()) === :none
+        @test Scythe.condensate_transform_mode(
+            Dict{Symbol,Any}(:condensate_transform => :none)) === :none
+        @test Scythe.condensate_transform_mode(
+            Dict{Symbol,Any}(:condensate_transform => :bhyp)) === :bhyp
+        @test Scythe.condensate_transform_mode(
+            Dict{Symbol,Any}(:condensate_transform => :bhyp_smooth)) === :bhyp_smooth
+        @test_throws ErrorException Scythe.condensate_transform_mode(
+            Dict{Symbol,Any}(:condensate_transform => :ooyama))
+    end
+
+    """
+    A small RiRk moist patch on a CLOUD-FREE reference (which is what every benchmark
+    configuration has, and what the transform is validated on -- a cloudy reference is
+    refused by `check_condensate_transform_ic` until the initializers are threaded). The
+    rho_c slot is seeded with a broadband oscillation big enough that an untransformed run
+    carries a clearly negative cloud density.
+    """
+    function ctrans_rirk(tmpdir, tag; transform = nothing, positivity = nothing, amp = 3.0e-3)
+        vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+        scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+        side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+        wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+        gp = GridParameters(geometry = "RiRk",
+            iMin = 0.0, iMax = 8.0e3, num_cells_i = 4,
+            kMin = 0.0, kMax = 4.0e3, num_cells_k = 8,
+            positivity = positivity === nothing ?
+                Dict{String,Dict{Symbol,Float64}}() : positivity,
+            BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
+            vars = vars)
+        ref_file = joinpath(tmpdir, "ctrans_$(tag).ref")
+        opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                                :precipitation => false)
+        transform === nothing || (opts[:condensate_transform] = transform)
+        model = ModelParameters(
+            ts = 0.25, integration_time = 5.0, output_interval = 5.0,
+            equation_set = "moist_compressible_XZ",
+            ref_state_file = ref_file, grid_params = gp,
+            physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                   :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                   :tau_qss => 10.0, :alpha => 0.0,
+                                   :z_damp => 20.0e3, :f => 0.0),
+            options = opts)
+        gp = model.grid_params
+        patch = createGrid(gp)
+        z = Scythe.getGridpoints(patch)[1:gp.kDim, end]
+        col = saturated_cloudy_column_mc(z)
+        # CLOUD-FREE reference: the cloud lives entirely in the perturbation, so the slot
+        # convention is bhyp(rho_c) - bhyp(0) = bhyp(rho_c) and nothing has to be threaded.
+        Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v,
+                                  zeros(gp.kDim))
+        patch.physical .= 0.0
+        w_i = gp.vars["w"]; rc_i = gp.vars["rho_c"]
+        gpts = Scythe.getGridpoints(patch)
+        tf = transform === nothing ? :none : transform
+        # A SUB-CELL cloud spike: sigma = 250 m against a 500 m cell. That is the physical
+        # situation -- a convective condensate spike the column cannot resolve -- and it is
+        # what makes the fit undershoot on the flanks. A smooth seed does not ring at all on
+        # this coarse a column, and then the test asserts nothing.
+        for i in 1:size(patch.physical, 1)
+            patch.physical[i, w_i, 1] = 1.0e-2 * sin(0.5 * sqrt(2.0) * i^2)
+            zi = gpts[i, end]
+            rho_c = amp * exp(-((zi - 2000.0) / 250.0)^2)          # >= 0 by construction
+            patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rho_c, 0.0, tf, 1.0e-7)
+        end
+        spectralTransform!(patch)
+        gridTransform!(patch)
+        hrm = sparse(Int64[], Int64[], Float64[],
+                     size(patch.spectral, 1), size(patch.spectral, 2))
+        mtile = createModelTile(patch, patch, model, hrm)
+        return mtile, patch, model, gp
+    end
+
+    """Recovered cloud density from a patch's slot 9, under `transform`."""
+    function ctrans_rho_c(patch, gp, transform)
+        rc = gp.vars["rho_c"]
+        s = @view patch.physical[:, rc, 1]
+        transform === :none && return collect(s)
+        transform === :bhyp_smooth && return [Scythe.ahyp_smooth(x, 1.0e-7) for x in s]
+        return [Scythe.ahyp(x, 1.0e-7) for x in s]
+    end
+
+    @testset "condensate transform: absent is bitwise :none" begin
+        mktempdir() do tmpdir
+            mA, pA, moA, gpA = ctrans_rirk(tmpdir, "ct_absent")
+            mN, pN, moN, gpN = ctrans_rirk(tmpdir, "ct_none"; transform = :none)
+            @test !haskey(moA.options, :condensate_transform)
+            vapor_blend_run!(mA, pA, gpA, 10)
+            vapor_blend_run!(mN, pN, gpN, 10)
+            @test all(isfinite.(pA.physical))
+            @test pA.physical == pN.physical
+            @test pA.spectral == pN.spectral
+        end
+    end
+
+    @testset "condensate transform: the recovered density stays non-negative" begin
+        # THE GATE. The untransformed run's cloud goes clearly negative on this seed --
+        # that is the premise, and without it the test asserts nothing. Under `:bhyp` the
+        # recovered density is non-negative at every point and every step by construction,
+        # and under `:bhyp_smooth` it is bounded below by -mu.
+        mktempdir() do tmpdir
+            mu = 1.0e-7
+            mN, pN, moN, gpN = ctrans_rirk(tmpdir, "ct_g_none"; transform = :none)
+            mB, pB, moB, gpB = ctrans_rirk(tmpdir, "ct_g_bhyp"; transform = :bhyp)
+            mS, pS, moS, gpS = ctrans_rirk(tmpdir, "ct_g_smooth"; transform = :bhyp_smooth)
+
+            vapor_blend_run!(mN, pN, gpN, 20)
+            vapor_blend_run!(mB, pB, gpB, 20)
+            vapor_blend_run!(mS, pS, gpS, 20)
+
+            @test all(isfinite.(pN.physical))
+            @test all(isfinite.(pB.physical))
+            @test all(isfinite.(pS.physical))
+
+            rN = ctrans_rho_c(pN, gpN, :none)
+            rB = ctrans_rho_c(pB, gpB, :bhyp)
+            rS = ctrans_rho_c(pS, gpS, :bhyp_smooth)
+
+            @test minimum(rN) < -1.0e-6          # the premise: it really does go negative
+            @test minimum(rB) >= 0.0             # exactly, by construction
+            @test minimum(rS) > -mu              # bounded, and it does not reach the bound
+            # There is still cloud: a transform that annihilated the field would pass the
+            # bounds above and mean nothing.
+            @test maximum(rB) > 1.0e-4
+            @test maximum(rS) > 1.0e-4
+            # The two variants are two different INTEGRATIONS, not two readings of one field:
+            # they differ wherever n < 0 (by at most mu, which is all Ooyama's clip can move)
+            # and that difference then advects into the cloud. So the claim is not equality --
+            # the map-level identity `ahyp === ahyp_smooth` for n > 0 is asserted in the
+            # kernel testset above -- but that 20 steps of divergence stays bounded by the
+            # only thing that seeds it. Measured here: 5.4e-9, i.e. 0.05 mu.
+            @test maximum(abs, [b - s for (b, s) in zip(rB, rS) if b > 1.0e-6]) < mu
+        end
+    end
+
+    @testset "condensate transform: positivity on rho_c is refused" begin
+        # Two ways of enforcing the same constraint, and a coefficient bound would constrain
+        # the CONTROL variable rather than the density. That is a configuration error, not
+        # something to resolve silently by precedence.
+        mktempdir() do tmpdir
+            @test_throws ErrorException ctrans_rirk(tmpdir, "ct_pos"; transform = :bhyp,
+                positivity = Dict("rho_c" => Dict(:k => 0.0)))
+            # ... while rain keeps its bound alongside the transform: that asymmetry is
+            # deliberate, and rho_r is the control that shows the transform did no harm.
+            m, p, mo, gp = ctrans_rirk(tmpdir, "ct_pos_r"; transform = :bhyp,
+                positivity = Dict("rho_r" => Dict(:i => 0.0, :k => 0.0)))
+            @test mo.grid_params.positivity["rho_r"] == Dict(:i => 0.0, :k => 0.0)
+        end
+    end
+
+    @testset "condensate transform: a cloudy reference is refused" begin
+        # The one silent-misreading hazard: an initial condition written in DENSITY on a
+        # cloudy reference would be reinterpreted as a control variable, off by a factor of
+        # two in the linear regime and undetectable from the run.
+        mktempdir() do tmpdir
+            vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+            scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+            side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+            wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+            gp0 = GridParameters(geometry = "RiRk",
+                iMin = 0.0, iMax = 8.0e3, num_cells_i = 4,
+                kMin = 0.0, kMax = 4.0e3, num_cells_k = 8,
+                BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc, vars = vars)
+            ref_file = joinpath(tmpdir, "ctrans_cloudy.ref")
+            model = ModelParameters(
+                ts = 0.25, integration_time = 5.0, output_interval = 5.0,
+                equation_set = "moist_compressible_XZ",
+                ref_state_file = ref_file, grid_params = gp0,
+                physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                       :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
+                                       :tau_qss => 10.0, :alpha => 0.0,
+                                       :z_damp => 20.0e3, :f => 0.0),
+                options = Dict{Symbol,Any}(:semiimplicit => true,
+                                           :exact_reference_state => true,
+                                           :precipitation => false,
+                                           :condensate_transform => :bhyp))
+            gp = model.grid_params
+            patch = createGrid(gp)
+            z = Scythe.getGridpoints(patch)[1:gp.kDim, end]
+            col = saturated_cloudy_column_mc(z)
+            @test maximum(col.rho_c) > 0.0        # the premise: the reference IS cloudy
+            Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+            patch.physical .= 0.0
+            spectralTransform!(patch); gridTransform!(patch)
+            hrm = sparse(Int64[], Int64[], Float64[],
+                         size(patch.spectral, 1), size(patch.spectral, 2))
+            @test_throws ErrorException createModelTile(patch, patch, model, hrm)
+        end
+    end
+
     @testset "balanced_vortex_native!: the vortex is a discrete steady state" begin
         # THE GATE of reference/HANDOFF_INITIALIZATION.md, and the direct analogue of the
         # resting-fixed-point gate above: a balanced vortex is a steady state of the

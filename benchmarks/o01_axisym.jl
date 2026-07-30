@@ -176,6 +176,9 @@ function o01_rain_diagnostics(model, ref, kDim)
         df = CSV.read(path, DataFrame)
         ncols = div(nrow(df), kDim)
         surf = 1:kDim:nrow(df)
+        # Assumes options[:condensate_transform] = :none, which is the only state this
+        # script can produce (it exposes no transform knob). If one is added, pass
+        # `transform =` here -- slot 9 would otherwise be read as a density.
         Tk, _, rho_d, _, _, _ = mc_state(df, ref, kDim, ncols)
         max_rr = max(max_rr, maximum(df.rho_r))
         min_rr = min(min_rr, minimum(df.rho_r))

@@ -116,6 +116,8 @@ const MC_SCRATCH_SLOTS = (
     :p, :rho_d, :rho_t, :E_t, :Q_ss, :rho_c,                          # totals
     :p_z, :rho_d_z, :rho_t_z, :E_t_z, :Q_ss_z, :rho_c_z,              # total vertical gradients
     :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :res_rho_t, :rho_liq, :q_v, :q_l, # diagnostic state
+    :rho_liq_t,   # what the THERMODYNAMICS reads; == rho_liq unless condensate_floor_mode
+    :n_c, :n_c_z, :Jc,   # slot-9 control variable, its gradient, dn/drho (see bhyp/ahyp)
     :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
     :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
     :cap_c, :cap_r, :cap_v,                        # AB3 depletion bounds (raw, see _ab3_sink_bound)
@@ -993,6 +995,195 @@ function positivity_reference_profile(name::AbstractString, ref_state)
 end
 
 """
+    bhyp(rho, mu) -> n
+    ahyp(n, mu) -> rho
+    ahyp_smooth(n, mu) -> rho
+    dbhyp(rho, mu) -> dn/drho
+
+Ooyama (2001, JAS 58, 2073–2102) **biased hyperbolic transform** and its inverses, Eqs.
+4.19/4.20/4.23. `reference/ooyama_jas2001.pdf`.
+
+    n   = bhyp(rho)  = ½[(rho + μ) − μ²/(rho + μ)]
+    rho = ahyp(n)    = √(n² + μ²) + n − μ        (0 for n ≤ 0 — the published quasi-inverse)
+    J   = dn/drho    = ½[1 + μ²/(rho + μ)²]
+
+The map is linear (`n ≈ rho/2`; Ooyama's factor ½ is what removes the coefficient from the
+inverse) for `rho ≫ μ`, and stretches `rho` only where it is small enough to be
+meteorologically insignificant. `bhyp(0) = ahyp(0) = 0` exactly.
+
+**Why this family and not another.** Every monotone `f: ℝ → (0, ∞)` has `f′ → 0` as `n → −∞`,
+so the source quotient `S/f′` is unbounded at the cloud edge and an explicit step overshoots
+there. Ooyama biases the hyperbola instead, giving range `(−μ, ∞)`; evaluating `J` at the
+RECOVERED density (his Eqs. 4.21–4.22, `D_t n = (dn/drho)·[rho-space tendency]`) then keeps it
+in `[0.5, 1]` for `rho ≥ 0`. Measured: the softplus and quadratic-touchdown alternatives fit
+exactly as well and detonate on first nucleation with peaks of 1e7 and 1e25 against a baseline
+1.2e-2. See `reference/FINDINGS_CONDENSATE_STAGE1.md` §3 and
+`benchmarks/condensate_transform_probe.jl`.
+
+`ahyp_smooth` is the strict inverse everywhere — C^∞, range `(−μ, ∞)` — where `ahyp` is
+Ooyama's C⁰ quasi-inverse pinned at exactly 0 for `n ≤ 0`. Ooyama notes the strict inverse
+reaches at worst `−μ`, so the clip's adjustment never exceeds `μ`. The two are measurably
+equivalent (probe: transport peak 2.9376e-3 both, mass drift +1.077 both, nucleation peak
+1.2167e-2 vs 1.2166e-2); `ahyp` ships because it gives `rho ≥ 0` exactly, `ahyp_smooth` is
+retained for any consumer that needs `f″` at the cloud edge.
+
+`μ` is a partial DENSITY here (Ooyama's is a mixing ratio). At `μ = 1e-7 kg/m³` the residual
+negativity costs at most 7.2e-3 K, and that worst point is the model top where `rho_d ~ 0.04`
+shrinks the retrieval denominator; near the ground it is ~2.5e-4 K.
+"""
+#
+# **Both maps are written in cancellation-free form**, not as Eqs. 4.19/4.20 read. They are
+# the same functions algebraically:
+#
+#     ½[(ρ+μ) − μ²/(ρ+μ)]  =  ρ(ρ + 2μ) / (2(ρ + μ))
+#     √(n²+μ²) + n − μ      =  n + n² / (√(n²+μ²) + μ)
+#
+# The paper's forms subtract two nearly equal quantities when `ρ ≪ μ` and when `|n| ≪ μ`
+# respectively, and that is exactly the regime the whole transform exists to represent.
+# Measured over `ρ ∈ [1e-14, 1]`: the paper's forms give `bhyp(0) = 6.6e-24` instead of zero
+# and a round-trip relative error reaching 1.7e-9 at `ρ = 1e-14`; these give `bhyp(0) = 0.0`
+# exactly and a round trip good to 2.2e-16 everywhere. The exact zero is load-bearing --
+# `condensate_slot` relies on it so a cloud-free initial condition converts to exactly 0.0.
+@inline bhyp(rho, mu) = (rho * (rho + (2.0 * mu))) / (2.0 * (rho + mu))
+@inline ahyp_smooth(n, mu) = n + ((n * n) / (sqrt((n * n) + (mu * mu)) + mu))
+@inline ahyp(n, mu) = n <= 0.0 ? 0.0 : ahyp_smooth(n, mu)
+@inline dbhyp(rho, mu) = 0.5 * (1.0 + (mu * mu) / ((rho + mu) * (rho + mu)))
+
+"""
+    condensate_slot(rho_c, rho_cbar, transform, mu) -> slot value
+
+What an initial condition must write into slot 9 for a physical cloud density `rho_c` against
+a reference `rho_cbar`. Under `:none` that is the perturbation `rho_c - rho_cbar`; under a
+transform it is the CONTROL-variable deviation `bhyp(rho_c) - bhyp(rho_cbar)`, which is what
+Ooyama predicts (§4d: "actual prediction of n is performed in terms of its deviation n' from
+the background n̂ = bhyp(m̂)").
+
+A cloud-free initial condition on a cloud-free reference gives exactly `0.0` under both,
+because `bhyp(0) = 0` exactly — which is why every current benchmark configuration needs no
+initial-condition change to run transformed.
+"""
+@inline function condensate_slot(rho_c, rho_cbar, transform::Symbol, mu)
+    transform === :none && return rho_c - rho_cbar
+    return bhyp(rho_c, mu) - bhyp(rho_cbar, mu)
+end
+
+"""
+    recover_rho_c(slot, rho_cbar, transform, mu) -> rho_c
+
+The inverse of [`condensate_slot`](@ref): the physical cloud density a slot-9 value stands
+for. `:none` is the plain `slot + rho_cbar` the code always did, bit for bit.
+
+Module-level rather than a closure at the call sites: `clamp_water!` runs this once per
+gridpoint per step inside the loop the allocation tests hold at zero, and a captured closure
+there is exactly the kind of thing that stops eliding.
+"""
+@inline function recover_rho_c(slot, rho_cbar, transform::Symbol, mu)
+    transform === :none && return slot + rho_cbar
+    n = slot + bhyp(rho_cbar, mu)
+    return transform === :bhyp ? ahyp(n, mu) : ahyp_smooth(n, mu)
+end
+
+"""
+    condensate_transform_mode(options) -> Symbol
+
+Which control variable slot 9 carries. `:none` (the default, and the state of every
+configuration that does not set the key) means the slot IS the cloud density and the whole
+transform is bitwise absent. `:bhyp` means it carries `n = bhyp(rho_c)` and the density is
+recovered by [`ahyp`](@ref); `:bhyp_smooth` uses `ahyp_smooth` instead.
+
+**What the transform buys, and what it does not.** It does not reduce the ringing: the
+excursion simply happens in `n`, at the same amplitude in `rho`-equivalent terms (measured:
+`min(n)` = −2.01e-4 against the untransformed `min(rho)` = −4.33e-4, exactly Ooyama's factor
+½). What it buys is that the RECOVERED density is bounded below by `−μ` whatever `n` does, so
+the ringing can no longer feed the retrieval. That matters because the negative region is a
+**physics-free reservoir**: every rate function is `max(rho,0)`-guarded, so a negative point
+has no evaporation, no autoconversion and no collection, while the positive overshoot at the
+peak is consumed every step. On the shipped O01 quick run that reservoir reaches 2.75× the
+real cloud mass by t = 2400 s (`reference/FINDINGS_CONDENSATE_STAGE1.md` §1).
+
+**Why not the spline positivity limiter instead.** It removes the reservoir too, and offline
+the two are indistinguishable. Run, it costs a 250–1000× rise in entropy production
+(2.86e4 → 7.06e6 at `POSITIVITY=ck`, → 2.98e7 at `=1`) with the entropy drift flipping from
++0.08 % to −2.6 %, because a per-step coefficient repair is not a physical process and the
+budget cannot account for it; `max_w` goes 9.87 → 17.4 → 46.5. The transform is a change of
+variables: nothing is ever repaired, and `n` is never modified ("n itself is untouched, so
+that the effect of m adjustments does not accumulate in the predicted n" — Ooyama §4d).
+
+**Known costs, both measured.** `f` is convex near zero, so ringing rectifies into mass
+(+1.077 over 3600 s on the probe's transport arm, decelerating, and 3 % of the source-driven
+mass where a real source dominates); and a point whose `n` has ratcheted below zero carries a
+NUCLEATION LAG of `|n|/(J·S)` before cloud reappears — ~57 s at the worst measured excursion,
+against ~128 s for the untransformed field, which spends that time carrying a −54 K anomaly
+instead of reading zero cloud.
+"""
+@inline function condensate_transform_mode(options)
+    mode = get(options, :condensate_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp || mode === :bhyp_smooth) ||
+        error("options[:condensate_transform] = :$(mode) is not recognized; use :none " *
+              "(the default: slot 9 is the cloud density), :bhyp (Ooyama's biased " *
+              "hyperbolic control variable with his quasi-inverse) or :bhyp_smooth " *
+              "(the same forward map with the strict C^inf inverse)")
+    return mode
+end
+
+"""
+    condensate_floor_mode(options) -> Bool
+
+Whether `rho_liq` is floored at the DIAGNOSTIC INTERFACE. `true` for
+`options[:condensate_floor] = :diagnostic`; `false` for `:none`, which is the default and the
+state of every configuration that does not set the key.
+
+**What the floor is, and what it is not.** The spline undershoot puts `rho_c` a few `1e-4`
+below zero on the flanks of a cloud. The raw value then enters the closed-form temperature
+retrieval, where `∂T/∂ρ_liq = L_v/D` (Eq. of [`retrieve_temperature`](@ref)) turns it into a
+cold anomaly reaching −54 K on O01, and through `rho_vs(T)` into a collapsed saturation
+density, false supersaturation and false nucleation. `:diagnostic` replaces `rho_liq` by
+`max(rho_c, 0) + max(rho_r, 0)` at the retrieval, `q_l` (hence `C_vt`/`R_m`/`gamma_m`),
+`Q_s_energy`, the entropy and the sedimentation energy — and NOWHERE else.
+
+It is **not** [`clamp_water!`](@ref). Nothing is written back to a prognostic slot, so it is
+memoryless, converts no mass, and cannot pump latent heat: the continuity terms, the rate
+budgets and the state itself keep reading the raw value. `clamp_water!` rectifies a two-signed
+oscillation one step at a time and takes O01 non-finite in 23 min; this changes what the
+thermodynamics READS on the step it reads it, and leaves no trace.
+
+What it does NOT fix: the negative condensate is still there, still in continuity, and still
+accumulating (`reference/FINDINGS_CONDENSATE_STAGE1.md` §1 — the reservoir reaches 2.75x the
+real cloud mass). This addresses the consequence, not the cause. The cause needs the
+control-variable transform, [`condensate_transform_mode`](@ref).
+
+**Measured (2026-07-30, quick O01, 3600 s).** The win is where the cold anomalies live:
+
+| diagnostic | NOPRECIP `:none` | NOPRECIP `:diagnostic` | precip `:none` | precip `:diagnostic` |
+|---|---|---|---|---|
+| `min_rho_v_gm3` | −0.186 | **−1.58e-4** | −0.724 | −0.759 |
+| `entropy_prod_rate` | 3.606e7 | **2.495e6** | 2.861e4 | 2.640e4 |
+| `max_w` | 6.600 | 6.085 | 9.869 | 11.15 |
+| `peak_rain_rate_gm2s` | — | — | 59.94 | 68.64 |
+| `water_mass_drift_pct` | 1.07e-6 | 1.08e-6 | −4.093 | −3.674 |
+
+On the cloud-only storm the residual vapor's worst negative improves by **1180x** and the
+irreversible entropy production falls **14.5x** — which is the mechanism confirmed: a negative
+liquid density drives `rho_vs` down through `T`, manufacturing supersaturation and with it
+spurious phase change, and that is what the entropy production was measuring. With
+precipitation active the effect is smaller and mixed (entropy production −8 %, water and
+energy drift both improved, `max_w` +13 %, rain rate +15 %), because rain removes the
+condensate before the lobes grow as large.
+
+Under a working [`condensate_transform_mode`](@ref) this floor should become INACTIVE — the
+recovered density is already non-negative — so a transformed run is the test of whether the
+transform subsumes it.
+"""
+@inline function condensate_floor_mode(options)
+    mode = get(options, :condensate_floor, :none)::Symbol
+    (mode === :none || mode === :diagnostic) ||
+        error("options[:condensate_floor] = :$(mode) is not recognized; use :none " *
+              "(the default: rho_liq is read raw everywhere) or :diagnostic (floor " *
+              "rho_liq at the thermodynamic interface only, leaving state and continuity raw)")
+    return mode === :diagnostic
+end
+
+"""
     install_positivity_bounds!(grid, ref_state, model) -> Nothing
 
 Convert the declared physical positivity bounds into the reference-aware coefficient bounds
@@ -1014,6 +1205,18 @@ A no-op when the reference is zero, so the common path is untouched.
 function install_positivity_bounds!(grid, ref_state, model::ModelParameters)
 
     pos = model.grid_params.positivity
+    # The transform supersedes the limiter for the species it acts on: a box constraint on
+    # the CONTROL variable's coefficients would bound n, not rho_c, and the two are not the
+    # same constraint. Declaring both is a configuration error, not something to resolve
+    # silently by precedence. (Rain is untouched and keeps its bound — that asymmetry is
+    # deliberate: rho_r is healthy under POSITIVITY=r, min 0.0 exactly with shortfall 0 at
+    # every output time, and it is the control that shows the transform did no harm.)
+    if condensate_transform_mode(model.options) !== :none && haskey(pos, "rho_c")
+        error("positivity is declared for \"rho_c\" while options[:condensate_transform] " *
+              "is on. The transform makes the recovered density non-negative by " *
+              "construction; a coefficient bound would constrain the control variable " *
+              "instead, which is a different constraint. Drop \"rho_c\" from positivity.")
+    end
     isempty(pos) && return nothing
     grid.kbasis isa Springsteel.SplineBasisArray || return nothing
     vars = model.grid_params.vars
@@ -1046,6 +1249,37 @@ function install_positivity_bounds!(grid, ref_state, model::ModelParameters)
         end
     end
     return nothing
+end
+
+"""
+    check_condensate_transform_ic(ref_state, model) -> Nothing
+
+Refuse to start a transformed run on a CLOUDY reference state.
+
+Slot 9 then carries `n' = bhyp(rho_c) - bhyp(ρ̄_c)`, and every producer of an initial
+condition has to know that: [`condensate_slot`](@ref) is the conversion, and the `*_mc!`
+initializers take `condensate_transform`/`condensate_mu` keywords for it. On a cloud-free
+reference (`ρ̄_c ≡ 0`, which is every benchmark configuration to date) the conversion of a
+cloud-free state is exactly `0.0` under both conventions, so nothing has to be threaded and
+nothing can go wrong. On a cloudy reference an initial condition written in DENSITY would be
+silently reinterpreted as a control variable — off by a factor of two in the linear regime,
+and not detectable from the run.
+
+Guards the reference only. A cloudy PERTURBATION on a cloud-free reference is legitimate under
+either convention and cannot be distinguished here; the initializer keyword is what handles
+that, and `reference/FINDINGS_CONDENSATE_STAGE1.md` §6 records it as a Stage 4 item.
+"""
+function check_condensate_transform_ic(ref_state, model::ModelParameters)
+    uses_pressure_reference(model.equation_set) || return nothing
+    condensate_transform_mode(model.options) === :none && return nothing
+    prof = Springsteel.ref_rho_c(ref_state)
+    prof isa Number && return nothing
+    all(iszero, view(prof, :, 1)) && return nothing
+    error("""options[:condensate_transform] is on and the reference state is CLOUDY
+      (ρ̄_c is not identically zero). Slot 9 then carries bhyp(rho_c) - bhyp(ρ̄_c), so the
+      initial condition must be written with `condensate_slot` (the `*_mc!` initializers
+      take `condensate_transform` / `condensate_mu` keywords). This combination has not been
+      validated; see reference/FINDINGS_CONDENSATE_STAGE1.md.""")
 end
 
 """
@@ -1166,6 +1400,18 @@ function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
     rho_tbar = view(ref_rho_t(mtile.ref_state), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
     apply = get(mtile.model.options, :clamp_water, false)::Bool
+    # Slot 9 is not necessarily a density. Under a transform the measurement must report the
+    # RECOVERED cloud — that is the number that says whether the transform is doing its job
+    # in the model (it should never fall below -mu) — and the floor cannot be applied at all,
+    # because flooring the control variable is a different operation from flooring the
+    # density and would be a state repair of exactly the kind the transform exists to avoid.
+    ctrans = condensate_transform_mode(mtile.model.options)
+    cmu = get(mtile.model.physical_params, :condensate_mu, 1.0e-7)
+    if apply && ctrans !== :none
+        error("options[:clamp_water] with options[:condensate_transform] = :$(ctrans): the " *
+              "transform already bounds the recovered density below by -condensate_mu, and " *
+              "flooring the control variable instead would be a state repair. Drop one.")
+    end
 
     moved = 0.0
     min_c = 0.0
@@ -1173,7 +1419,7 @@ function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
     worst_dT = 0.0
     nneg = 0.0
     @inbounds for (k, i) in enumerate(colstart:colend)
-        rho_c = vnp1[i, rhoc_i] + rho_cbar[k]
+        rho_c = recover_rho_c(vnp1[i, rhoc_i], rho_cbar[k], ctrans, cmu)
         rho_r = vnp1[i, rhor_i]
         negative = (rho_c < 0.0) || (rho_r < 0.0)
         # The measurement fast-path: an admissible point costs two adds and a branch.
@@ -2017,6 +2263,28 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # the supersaturation magnitude s, never sees it. See `vapor_retrieval_blend`. `Inf`
     # recovers the uncapped blend bitwise; `0.0` degenerates to `:residual`.
     blend_dcap = get(model.physical_params, :vapor_blend_dcap, 0.02)
+    # Whether the thermodynamic interface reads a floored rho_liq. `:none` (the default) is
+    # bitwise the code that had no option; see `condensate_floor_mode` for why this is not a
+    # clamp. In `options` for the same reason as the two above: a choice of what the
+    # diagnostics READ, not a physical parameter.
+    cond_floor = condensate_floor_mode(model.options)
+    # Which control variable slot 9 carries. `:none` (the default) is bitwise the code that
+    # had no option: the branch below then multiplies by an exact 1.0 and divides by an exact
+    # 1.0, both of which are identity in IEEE. See `condensate_transform_mode`.
+    ctrans = condensate_transform_mode(model.options)
+    ctrans_on = ctrans !== :none
+    cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
+    if ctrans_on && budget_trace
+        # `water_budget_probe!` attributes slot 9's production to named channels and reports
+        # them in kg/m^3/s. Under a transform the ADV column is in CONTROL-VARIABLE units
+        # while the source columns are densities, so the rows would not sum to the tendency
+        # and the mismatch would be invisible. Refuse rather than print a wrong budget --
+        # this file has shipped one silently before (see `water_budget_trace`).
+        error("options[:water_budget_trace] with options[:condensate_transform] = " *
+              ":$(ctrans) is not implemented: the advective term is then in control-variable " *
+              "units and the source terms in density units, so the attribution does not " *
+              "close. Rescale the slot-9 columns by the Jacobian before enabling it.")
+    end
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
     N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
 
@@ -2130,7 +2398,32 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     rho_t = S.rho_t; @. rho_t = rho_tp + rho_tbar
     E_t = S.E_t;     @. E_t = E_tp + E_tbar
     Q_ss = S.Q_ss;   @. Q_ss = Q_ssp + Q_ssbar
-    rho_c = S.rho_c; @. rho_c = rho_cp + rho_cbar
+    # Slot 9. Under `:none` this is the cloud density and `Jc ≡ 1`; under a transform the slot
+    # carries the control variable `n' = n − n̄` with `n̄ = bhyp(ρ̄_c)` (Ooyama predicts the
+    # DEVIATION from the transformed background, §4d), and the density is recovered pointwise.
+    # `n̄` and `n̄_z` are formed here rather than cached because ρ̄_c is identically zero in
+    # every current configuration, making them exactly zero for two kDim-length operations.
+    n_c = S.n_c; n_c_z = S.n_c_z; Jc = S.Jc
+    rho_c = S.rho_c
+    if ctrans_on
+        @. n_c = rho_cp + bhyp(rho_cbar, cmu)
+        @. n_c_z = rho_cp_z + (dbhyp(rho_cbar, cmu) * rho_cbar_z)
+        if ctrans === :bhyp
+            @. rho_c = ahyp(n_c, cmu)
+        else
+            @. rho_c = ahyp_smooth(n_c, cmu)
+        end
+        # Evaluated at the RECOVERED density, clamped at zero for the argument only: that is
+        # what bounds J in [0.5, 1] and removes the source stiffness. Clamping the argument
+        # changes no state, no mass and no energy — it perturbs the tendency by at most a
+        # factor of two at points whose density is within μ of zero.
+        @. Jc = dbhyp(max(rho_c, 0.0), cmu)
+    else
+        @. n_c = rho_cp + rho_cbar
+        @. n_c_z = rho_cp_z + rho_cbar_z
+        copyto!(rho_c, n_c)
+        fill!(Jc, 1.0)
+    end
     rho_r = rho_rp
 
     # Total vertical gradients (perturbation + reference)
@@ -2139,7 +2432,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     rho_t_z = S.rho_t_z; @. rho_t_z = rho_tp_z + rho_tbar_z
     E_t_z = S.E_t_z;     @. E_t_z = E_tp_z + E_tbar_z
     Q_ss_z = S.Q_ss_z;   @. Q_ss_z = Q_ssp_z + Q_ssbar_z
-    rho_c_z = S.rho_c_z; @. rho_c_z = rho_cp_z + rho_cbar_z
+    # The DENSITY vertical gradient, f'(n)·∂z n = ∂z n / J — self-consistent with the recovered
+    # density because both come from the same fit. Under `:none`, J is exactly 1.0 and this is
+    # bitwise `rho_cp_z + rho_cbar_z`. Advection does NOT read this (it is transform-invariant
+    # and reads `n_c_z` directly); this exists for any consumer that wants dρ_c/dz.
+    rho_c_z = S.rho_c_z; @. rho_c_z = n_c_z / Jc
 
     # Diagnostic thermodynamic state. The condensate is PROGNOSTIC, so the liquid
     # density is known and the temperature retrieval is closed-form; the vapor is the
@@ -2149,7 +2446,21 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     geo = S.geo; @. geo = ke + (gravity * z)
     M = S.M;     @. M = p + E_t - (rho_t * geo)
     rho_liq = S.rho_liq; @. rho_liq = rho_c + rho_r
-    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq)
+    # What the THERMODYNAMICS reads. Under the default `:none` this is a copy of identical
+    # doubles, so the whole option is bitwise inert (same construction as `rho_v` under
+    # `:residual`). Under `:diagnostic` it is the floored liquid, and ONLY the consumers below
+    # see it: the retrieval, q_l -> C_vt/R_m/gamma_m, Q_s_energy, the entropy and E_sed.
+    # `rho_liq` itself stays raw, because two of its readers must NOT be floored --
+    # `res_rho_t` (flooring the water partition would manufacture vapor, which is a mass
+    # source, not a reading) and `_vapor_blend_weight` (whose smoothstep already clamps a
+    # small negative rho_liq to weight zero; see the TeX on Eq. blend_saturator).
+    rho_liq_t = S.rho_liq_t
+    if cond_floor
+        @. rho_liq_t = max(rho_c, 0.0) + max(rho_r, 0.0)
+    else
+        copyto!(rho_liq_t, rho_liq)
+    end
+    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq_t)
     p_hPa = S.p_hPa;   @. p_hPa = p / 100.0
     rho_vs = S.rho_vs; @. rho_vs = rho_v_sat(Tk, p_hPa)
     # The DENSITY-BUDGET residual, always. `S.res_rho_t` is not an alias of `S.rho_v`: the
@@ -2166,7 +2477,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @. rho_v = res_rho_t
     end
     q_v = S.q_v;     @. q_v = rho_v / rho_d
-    q_l = S.q_l;     @. q_l = rho_liq / rho_d
+    q_l = S.q_l;     @. q_l = rho_liq_t / rho_d      # thermodynamic reader: see rho_liq_t
     C_vt = S.C_vt;   @. C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
     R_m = S.R_m;     @. R_m = Rd + (q_v * Rv)
     C_pt = S.C_pt;   @. C_pt = C_vt + R_m
@@ -2624,8 +2935,16 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # arrive by advection or nucleation, and fit-level error in the density fields lands
     # in the vapor (where it is 5e-5 of the field) instead of manufacturing condensate
     # (where it was O(1) of the field). See reference/HANDOFF_DIAGNOSED_CLOUD.md.
-    mc_advect!(ADV, geom, u, w, vv, r, rho_cp_x, rho_c_z, rcv.f_l)
-    @turbo FORCING .= @. (-rho_c * div) + Qdot - AUTO_COLL
+    # ADVECTION IS TRANSFORM-INVARIANT: u·∇ρ_c = f'(n) u·∇n, and the tendency being formed is
+    # dn/dt = J·(dρ_c/dt), so the advective part is just −u·∇n. It therefore reads the control
+    # variable's OWN spline gradients — no chain rule, no f'', no reference-gradient round
+    # trip. Under `:none`, `n_c_z` is bitwise the old `rho_c_z` and `rho_cp_x` is unchanged.
+    #
+    # The rest picks up the Jacobian: dn/dt = J(ρ_c)·[−ρ_c ∇·u + Qdot − AUTO_COLL]. `Jc` is
+    # exactly 1.0 under `:none`, and multiplication by 1.0 is the identity in IEEE, so the
+    # default path is bit-for-bit the code that had no transform.
+    mc_advect!(ADV, geom, u, w, vv, r, rho_cp_x, n_c_z, rcv.f_l)
+    @turbo FORCING .= @. Jc * ((-rho_c * div) + Qdot - AUTO_COLL)
     @turbo expdot[colstart:colend,9] .= @. ADV + FORCING
     # Cloud has no sedimentation channel, and its autoconversion sink is -AUTO_COLL.
     budget_trace && water_budget_probe!(mtile, MC_BUDGET_C, 9, t, colstart, rho_c, ADV, div,
@@ -3487,8 +3806,30 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         @. M_star = p_star + E_t_star - (rho_t_star * (ke_star + (gravity * z)))
         # Same closed-form retrieval and residual partition as mc_driver!: the
         # condensate is prognostic, so the star state needs no iteration and no clamp.
-        @. rho_c_star = rhoc_v + rho_cbar
-        @. rho_liq_star = rho_c_star + rhor_v
+        # Slot 9 recovery, same rule as mc_driver!: the slot holds the control variable and
+        # the density is recovered pointwise. `:none` is bitwise `rhoc_v + rho_cbar`.
+        ct = condensate_transform_mode(mtile.model.options)
+        if ct === :none
+            @. rho_c_star = rhoc_v + rho_cbar
+        else
+            cmu_s = get(mtile.model.physical_params, :condensate_mu, 1.0e-7)
+            if ct === :bhyp
+                @. rho_c_star = ahyp(rhoc_v + bhyp(rho_cbar, cmu_s), cmu_s)
+            else
+                @. rho_c_star = ahyp_smooth(rhoc_v + bhyp(rho_cbar, cmu_s), cmu_s)
+            end
+        end
+        # Same thermodynamic interface as mc_driver!, so the same floor applies: T_star and
+        # q_l_star are read through it, and a star state that disagreed with the n state
+        # about what the liquid IS would put the difference into every increment built here.
+        # `:none` (the default) leaves this a copy of identical doubles -- bitwise inert.
+        # NOT applied to `rho_v_star` two lines down: that is the water partition, and
+        # flooring a partition manufactures vapor. See `condensate_floor_mode`.
+        if condensate_floor_mode(mtile.model.options)
+            @. rho_liq_star = max(rho_c_star, 0.0) + max(rhor_v, 0.0)
+        else
+            @. rho_liq_star = rho_c_star + rhor_v
+        end
         @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, rho_liq_star)
         @. p_hPa_star = p_star / 100.0
         @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
@@ -3501,11 +3842,13 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         # order. That is why this stayed on the residual while the blend was measured on the
         # tendency path, and it is why it STAYS there now that `:blend` is the default: the
         # argument is about the increment, not about which retrieval ships.
-        @. rho_v_star = rho_t_star - rho_d_star - rho_liq_star
+        # The RAW liquid, always: this is the water partition, and flooring a partition
+        # manufactures vapor rather than changing what the thermodynamics reads.
+        @. rho_v_star = rho_t_star - rho_d_star - (rho_c_star + rhor_v)
         q_v_star = S.df_q_v_star
         q_l_star = S.df_q_l_star
         @. q_v_star = rho_v_star / rho_d_star
-        @. q_l_star = rho_liq_star / rho_d_star
+        @. q_l_star = rho_liq_star / rho_d_star     # thermodynamic reader: floored if enabled
         @. C_vt_star = Cvd + (q_v_star * Cvv) + (q_l_star * Cl)
         @. R_m_star = Rd + (q_v_star * Rv)
         @. Lv_star = L_v(T_star)
@@ -3609,6 +3952,19 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     #    SubArray (one 64-byte allocation per column per step). ──
     dE_w = S.df_dE_w
     if do_water
+        # `_diffusion_water_step!` solves the implicit vertical diffusion for slot 9 as a
+        # DENSITY (`drc = rhoc_np1 - rhoc_star` feeds the mass and energy maps directly).
+        # Under a transform the slot is a control variable, so the solve would have to run in
+        # n-space and the increment be `ahyp(n_np1) - ahyp(n_star)`. That is not written yet,
+        # and `Kvdiff_water` is 0.0 in every shipped configuration (o01_rainfall.jl:89,
+        # tc/tc_init.jl:205), so the combination has never run. Fail loudly rather than
+        # silently solve the wrong equation for the cloud.
+        condensate_transform_mode(mtile.model.options) === :none ||
+            error("options[:condensate_transform] with physical_params[:Kvdiff_water] > 0 " *
+                  "is not implemented: the implicit water diffusion solves slot 9 as a " *
+                  "density, and under a transform it must be solved in the control " *
+                  "variable with the increment mapped through ahyp. Set Kvdiff_water = 0 " *
+                  "or implement the n-space solve in _diffusion_water_step!.")
         _diffusion_water_step!(mtile, S, col, mats, ts, t, colstart, colend, z,
                                rhod_v, rhot_v, rhor_v, rhoc_v, p_v, qss_v)
     end
@@ -3751,7 +4107,8 @@ tracking -ρ_v*(T, p̄) in the dry air.
 """
 function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                           ref::Springsteel.PressureReferenceState;
-                          xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0)
+                          xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0,
+                          condensate_transform::Symbol=:none, condensate_mu=1.0e-7)
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
@@ -3783,7 +4140,8 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
-            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             i += 1
         end
     end
@@ -3802,7 +4160,8 @@ energy at rest, and Q_ss' tracking `-ρ_v*(T, p̄)` in the dry air.
 """
 function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                                 ref::Springsteel.PressureReferenceState;
-                                xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0)
+                                xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0,
+                                condensate_transform::Symbol=:none, condensate_mu=1.0e-7)
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
@@ -3831,7 +4190,8 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
-            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             i += 1
         end
     end
@@ -3852,7 +4212,9 @@ are computed pointwise before subtracting the reference; rho_r = 0.
 function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                                       ref::Springsteel.PressureReferenceState;
                                       xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
-                                      dT_max=3.0, zcol=2)
+                                      dT_max=3.0, zcol=2,
+                                      condensate_transform::Symbol=:none,
+                                      condensate_mu=1.0e-7)
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
@@ -3894,7 +4256,8 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
-            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             i += 1
         end
     end
@@ -3915,7 +4278,8 @@ computed pointwise from (T, p, ρ_d, ρ_v, ρ_c) before subtracting the referenc
 function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                                    base, ref::Springsteel.PressureReferenceState; q_t=0.02,
                                    xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0,
-                                   amp=2.0/300.0)
+                                   amp=2.0/300.0,
+                                   condensate_transform::Symbol=:none, condensate_mu=1.0e-7)
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]
@@ -3974,7 +4338,8 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
             patch.physical[i, rho_r_i, 1] = 0.0
-            patch.physical[i, rho_c_i, 1] = rho_c - rho_cbar[k, 1]
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(rho_c, rho_cbar[k, 1], condensate_transform, condensate_mu)
             i += 1
         end
     end

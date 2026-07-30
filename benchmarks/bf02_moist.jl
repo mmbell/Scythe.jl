@@ -329,6 +329,9 @@ function moist_fields(df, ref, kDim, base, stage)
     if stage == STAGE_MC
         # Total-energy stage: retrieve (T, p) and the diagnostic water partition from
         # the prognostics, then reuse the transformed-variable theta_e diagnostic.
+        # Assumes options[:condensate_transform] = :none, which is the only state this
+        # script can produce (it exposes no transform knob). If one is added, pass
+        # `transform =` here -- slot 9 would otherwise be read as a density.
         Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
         q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
         q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d

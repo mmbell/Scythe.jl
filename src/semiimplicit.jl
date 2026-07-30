@@ -308,6 +308,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     install_positivity_bounds!(tile, ref_state, model)
     install_positivity_bounds!(patch, ref_state, model)
     _warn_unbounded_master_output(ref_state, model)
+    check_condensate_transform_ic(ref_state, model)
     # Defined in moist_compressible.jl, which is included after this file — resolved at call
     # time, so the forward reference is fine.
     mc_scratch = _allocate_mc_scratch(tile, model)
