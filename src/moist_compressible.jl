@@ -1541,10 +1541,21 @@ Emitted from the single-threaded pre-column-loop slot next to
 of a quiet column) and each subsequent warning needs a doubling, so a run that is simply
 under-resolved reports O(10) lines rather than one per step.
 
-The message names the remedy, because the remedy is not a limiter: a positive-definite
-spike that undershoots wants more vertical nodes. Flooring it instead converts the
-undershoot into one-signed latent heating (or, re-accounted, into an equal-sized energy
-sink) — see [`clamp_water!`](@ref) for the measured failure that motivates this.
+The message names the remedy. It is NOT a floor -- flooring converts the undershoot into
+one-signed latent heating (or, re-accounted, into an equal-sized energy sink); see
+[`clamp_water!`](@ref) for the measured failure. It is also no longer "more vertical
+nodes", which this docstring used to say: convective width collapses with the grid, so the
+spike stays at grid scale and the basis rings at a fixed RELATIVE amplitude. The remedy
+differs by species, and both are now measured
+(`reference/FINDINGS_CONDENSATE_STAGE1.md`):
+
+  * `rho_r` -- the spline coefficient bound (`GridParameters.positivity`), which is exact
+    and free here: rain carries no negative mass at any output time of any run.
+  * `rho_c` -- the control-variable transform ([`condensate_transform_mode`](@ref)). The
+    same coefficient bound applied to the cloud drives the O01 peak updraft from 9.9 to
+    46.5 m/s and the entropy production to 390x baseline, because it must repair the state
+    at the updraft on every step. The transform changes the variable instead and repairs
+    nothing.
 """
 function water_negativity_trace(mtile::ModelTile, t::Int64)
 
@@ -1566,15 +1577,17 @@ function water_negativity_trace(mtile::ModelTile, t::Int64)
       $(applied ? "options[:clamp_water] is ON, so that kick IS being applied, one-signed." :
                   "options[:clamp_water] is off, so this is the size of the COLD anomaly the negative liquid is currently imposing through the retrieval (oscillatory, not cumulative). Rate functions are guarded; the retrieval and advection are not.")
       GENERATOR (attributed 2026-07-26): the refit deposits a small undershoot every step
-      (~0.06% of peak) and NOTHING REMOVES IT — the projection is idempotent, so the deficit
-      persists and the next step adds another. It is neither one large Gibbs event nor
-      resolution nor the l_q filter. Contributions per step: refit ~90% (rho_r) / ~70%
-      (rho_c), transport the rest, microphysics zero.
-      REMEDY: constrain the fit — GridParameters.positivity, e.g.
-      Dict("rho_r" => Dict(:k => 0.0)), which makes an admissible state a fixed point of
-      the refit and conserves mass exactly. Set options[:water_budget_trace] to re-measure.
-      Flooring the state instead rectifies a two-signed excursion into one-signed latent
-      heating; see reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md (CORRECTION section)."""
+      (~0.06% of peak) and NOTHING REMOVES IT. Refined 2026-07-30: what makes it permanent
+      is that the negative region has no SINK — every rate is max(rho,0)-guarded, so a
+      negative point cannot evaporate, autoconvert or collect, while the positive overshoot
+      IS consumed every step. On the shipped O01 run the reservoir reaches 2.75x the real
+      cloud mass by t = 2400 s.
+      REMEDY, by species: rho_r takes the spline coefficient bound
+      (GridParameters.positivity, e.g. Dict("rho_r" => Dict(:k => 0.0))), which is exact and
+      free. rho_c takes options[:condensate_transform] = :bhyp — the SAME bound applied to
+      the cloud takes max_w 9.9 -> 46.5 and the entropy production to 390x, because it
+      repairs the state at the updraft every step. Flooring rectifies a two-signed excursion
+      into one-signed latent heating. See reference/FINDINGS_CONDENSATE_STAGE1.md."""
     return nothing
 end
 

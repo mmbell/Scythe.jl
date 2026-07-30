@@ -113,6 +113,20 @@ function bf02_moist_model(opts::BenchmarkOptions)
                                          :exact_si => opts.xsi),
                         opts.stage == STAGE_MC ? reference_state_options() :
                                                  Dict{Symbol,Any}())
+        # Condensate control-variable transform (mc stage only; slot 9 is the cloud density
+        # in every other set here). Unset => `:none`, bitwise the code that had no option.
+        # See `Scythe.condensate_transform_mode` and
+        # reference/FINDINGS_CONDENSATE_STAGE1.md. BF02's initial condition is the moist
+        # buoyancy bubble on a CLOUD-FREE reference, so no initial-condition conversion is
+        # needed -- `bhyp(0) = 0` exactly.
+        if opts.stage == STAGE_MC
+            haskey(ENV, "SCYTHE_BF02_CTRANS") &&
+                (options[:condensate_transform] = Symbol(ENV["SCYTHE_BF02_CTRANS"]))
+            haskey(ENV, "SCYTHE_BF02_CMU") &&
+                (physical_params[:condensate_mu] = parse(Float64, ENV["SCYTHE_BF02_CMU"]))
+            haskey(ENV, "SCYTHE_BF02_CFLOOR") &&
+                (options[:condensate_floor] = Symbol(ENV["SCYTHE_BF02_CFLOOR"]))
+        end
     else
         equation_set = "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
@@ -324,15 +338,14 @@ function theta_e_bubble_height(theta_e_p, z; threshold=THETA_E_BUBBLE_THRESHOLD)
 end
 
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
-function moist_fields(df, ref, kDim, base, stage)
+function moist_fields(df, ref, kDim, base, stage;
+                      ctransform::Symbol = :none, cmu = 1.0e-7)
     ncols = div(nrow(df), kDim)
     if stage == STAGE_MC
         # Total-energy stage: retrieve (T, p) and the diagnostic water partition from
         # the prognostics, then reuse the transformed-variable theta_e diagnostic.
-        # Assumes options[:condensate_transform] = :none, which is the only state this
-        # script can produce (it exposes no transform knob). If one is added, pass
-        # `transform =` here -- slot 9 would otherwise be read as a density.
-        Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols)
+        Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
+                                                     transform = ctransform, mu = cmu)
         q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
         q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
         s = Scythe.entropy.(Tk, rho_d, q_v)
@@ -401,7 +414,9 @@ function bf02_moist_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
     base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
-    theta_e_p, supersat, ncols = moist_fields(df, ref, kDim, base, opts.stage)
+    theta_e_p, supersat, ncols = moist_fields(df, ref, kDim, base, opts.stage;
+        ctransform = Scythe.condensate_transform_mode(model.options),
+        cmu = get(model.physical_params, :condensate_mu, 1.0e-7))
     z = reshape(df.z, kDim, ncols)[:, 1]
     diags = Dict(
         "max_theta_e_p" => maximum(theta_e_p),
@@ -437,7 +452,9 @@ if opts.plot
         df = read_final_output(model)
         ref, _, kDim = rebuild_reference(model)
         base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
-        theta_e_p, _, ncols = moist_fields(df, ref, kDim, base, opts.stage)
+        theta_e_p, _, ncols = moist_fields(df, ref, kDim, base, opts.stage;
+            ctransform = Scythe.condensate_transform_mode(model.options),
+            cmu = get(model.physical_params, :condensate_mu, 1.0e-7))
         x = reshape(df.r, kDim, ncols)[1, :]
         z = reshape(df.z, kDim, ncols)[:, 1]
         w = reshape(df.w, kDim, ncols)
