@@ -246,10 +246,18 @@ grid_suffix(opts::BenchmarkOptions) = opts.grid == :rz ? "" : "_$(opts.grid)"
 """Suffix distinguishing nested-run artifacts (`_n3`); empty for single-grid runs."""
 nest_suffix(opts::BenchmarkOptions) = opts.nests > 1 ? "_n$(opts.nests)" : ""
 
-"""Output directory for a benchmark variant (created if missing)."""
+"""
+Output directory for a benchmark variant (created if missing).
+
+`SCYTHE_BENCH_TAG` appends a run label, e.g. `_ladder_bhyp`. Sweeps otherwise all write to
+the same directory and have to be `mv`d afterwards — which is how every archived sweep here
+was made, and why the `output_dir` recorded inside those runs' own logs points somewhere
+else. Unset, the path is exactly what it always was, so no committed reference moves.
+"""
 function benchmark_output_dir(name::String, opts::BenchmarkOptions)
+    tag = get(ENV, "SCYTHE_BENCH_TAG", "")
     dir = joinpath(BENCHMARKS_DIR, "output",
-                   "$(name)_$(opts.mode)_$(opts.stage)$(grid_suffix(opts))$(nest_suffix(opts))")
+                   "$(name)_$(opts.mode)_$(opts.stage)$(grid_suffix(opts))$(nest_suffix(opts))$(tag)")
     mkpath(dir)
     return dir * "/"   # integrate_model concatenates paths with *
 end
@@ -343,12 +351,25 @@ end
     compare_reference(output_csv, reference_csv, varnames; rtol=1.0e-6)
 
 Compare the value columns of a model output CSV against a committed reference.
-Returns (pass, Dict of var => (rel_l2, max_abs_diff)).
+Returns (pass, Dict of var => (rel_l2, max_abs_diff)), or `(nothing, Dict())` when the two
+files do not carry the same variables at all — which is not a failure but an absence of a
+comparison, and must not be reported as either a pass or a regression.
 """
 function compare_reference(output_csv::String, reference_csv::String,
                            varnames::Vector{String}; rtol=1.0e-6)
     out = CSV.read(output_csv, DataFrame)
     ref = CSV.read(reference_csv, DataFrame)
+    # A run that declares a control-variable transform carries DIFFERENT prognostics from the
+    # committed (untransformed) reference — `nu_c` where the reference has `rho_c` — and the
+    # names say so. Comparing them column by column is meaningless: even where the physics is
+    # identical the values differ by the map. Skip, and say why.
+    missing_cols = setdiff(varnames, names(ref))
+    if !isempty(missing_cols)
+        println("  Reference comparison SKIPPED: this run carries $(missing_cols), which the " *
+                "committed reference does not. A transformed run is not comparable to an " *
+                "untransformed reference; judge it on its diagnostics and targets.")
+        return nothing, Dict{String,Tuple{Float64,Float64}}()
+    end
     if nrow(out) != nrow(ref)
         println("  Reference comparison: grid size mismatch " *
                 "($(nrow(out)) vs $(nrow(ref)) points)")
@@ -540,10 +561,11 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
                         name, rel, diff, rel <= 1.0e-6 ? "PASS" : "FAIL")
             end
         else
-            regression_ok, regression_stats = compare_reference(output_csv, ref_csv, varnames)
             println("\nRegression vs committed reference ($(basename(ref_csv))):")
+            regression_ok, regression_stats = compare_reference(output_csv, ref_csv, varnames)
             if isempty(regression_stats)
-                println("  FAIL (incomparable grids — no per-variable stats)")
+                regression_ok === nothing ||
+                    println("  FAIL (incomparable grids — no per-variable stats)")
             else
                 for var in varnames
                     rel_l2, max_abs = regression_stats[var]

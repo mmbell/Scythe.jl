@@ -1022,13 +1022,15 @@ fields are linearly interpolated in radius from `r_axis`.
 """
 function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                              ref::Springsteel.PressureReferenceState,
-                             flds, r_axis::AbstractVector; zcol=2)
+                             flds, r_axis::AbstractVector; zcol=2,
+                             condensate_transform::Symbol=:none, condensate_mu=1.0e-7,
+                             rain_transform::Symbol=:none, rain_mu=1.0e-7)
 
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     u_i = vars["u"]; w_i = vars["w"]; et_i = vars["E_t"]
-    qss_i = vars["Q_ss"]; rho_r_i = vars["rho_r"]; v_i = vars["v"]
-    rho_c_i = vars["rho_c"]
+    qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
+    rho_c_i = mc_slot(vars, "rho_c")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
@@ -1061,11 +1063,16 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, w_i, 1] = 0.0
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
             patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
-            patch.physical[i, rho_r_i, 1] = 0.0
+            patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
             # The balanced vortex carries no condensate: the whole point of the
             # prognostic-rho_c formulation is that a subsaturated initial state
             # starts at EXACTLY zero cloud and cannot have any manufactured for it.
-            patch.physical[i, rho_c_i, 1] = -rho_cbar[k, 1]
+            # Written through `condensate_slot`/`rain_slot` so the value is the one the
+            # declared control variable wants; both reduce to the plain form under `:none`,
+            # and on the condensate-free reference this vortex uses they agree exactly
+            # anyway (`bhyp(0) == 0`).
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             patch.physical[i, v_i, 1] = v
             i += 1
         end
@@ -1355,7 +1362,9 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
                                  z_bl = 1.5e3, moist_profile = :gaussian,
                                  z_round = 1.0,
                                  outer_iters::Int = 20, inner_iters::Int = 8,
-                                 tol = 1.0e-11, verbose::Bool = true)
+                                 tol = 1.0e-11, verbose::Bool = true,
+                                 condensate_transform::Symbol = :none, condensate_mu = 1.0e-7,
+                                 rain_transform::Symbol = :none, rain_mu = 1.0e-7)
 
     npatch = length(patches)
     pbar     = ref_pressure(ref)[:, 1]
@@ -1380,8 +1389,8 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         vars  = gp.vars
         p_i = vars["p"]; rd_i = vars["rho_d"]; rt_i = vars["rho_t"]
         u_i = vars["u"]; w_i = vars["w"];      et_i = vars["E_t"]
-        qs_i = vars["Q_ss"]; rr_i = vars["rho_r"]; v_i = vars["v"]
-        rc_i = vars["rho_c"]
+        qs_i = vars["Q_ss"]; rr_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
+        rc_i = mc_slot(vars, "rho_c")
 
         gpts = getGridpoints(patch)
         kDim = gp.kDim
@@ -1541,13 +1550,16 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         end
         mish[:, u_i] .= 0.0
         mish[:, w_i] .= 0.0
-        mish[:, rr_i] .= 0.0
+        mish[:, rr_i] .= rain_slot(0.0, rain_transform, rain_mu)
         # No condensate: the vortex is built subsaturated everywhere (the moistening
         # caps rho_v at RH_max*rho_vs), and with rho_c prognostic that means EXACTLY
         # zero cloud rather than "whatever four fitted fields leave over". The
-        # reference is condensate-free, so the perturbation is zero too.
+        # reference is condensate-free, so the perturbation is zero too. Written through
+        # `condensate_slot`/`rain_slot` so the value is the one the declared control variable
+        # wants; both reduce to the plain form under `:none`.
         for c in 1:ncol, k in 1:kDim
-            mish[((c - 1) * kDim) + k, rc_i] = -rho_cbar[k]
+            mish[((c - 1) * kDim) + k, rc_i] =
+                condensate_slot(0.0, rho_cbar[k], condensate_transform, condensate_mu)
         end
 
         # CHAIN THE TARGETS OFF SETTLED FITTED VALUES, in dependency order. The

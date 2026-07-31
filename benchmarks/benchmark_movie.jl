@@ -104,6 +104,9 @@ ref = Springsteel.exact_pressure_reference_state(joinpath(dir, cfg.reffile),
                                                  Scythe.getGridpoints(patch)[1:kDim, 2],
                                                  column)
 
+# What the water columns hold (see `detect_transforms`); `:none` for every run to date.
+trans = detect_transforms(dir)
+
 # Baseline θ_e profile for the moist perturbation (written by bf02_moist.jl)
 base = cfg.moist ? CSV.read(joinpath(dir, "base_profile.csv"), DataFrame) : nothing
 
@@ -117,9 +120,13 @@ function frame_fields(path)
         return theta_p, w
     end
     # Moist θ_e′: mc branch of bf02_moist.jl's moist_fields, gated to stage mc.
-    Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, nc)
+    # Slots 8/9 may hold control variables; `detect_transforms` reads the run's own log and
+    # `mc_water` (inside mc_state) cross-checks that against the column names.
+    Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r =
+        mc_state(df, ref, kDim, nc; transform = trans.ctrans, mu = trans.cmu,
+                 rain_transform = trans.rtrans, rain_mu = trans.rmu)
     q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
-    q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
+    q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
     s = Scythe.entropy.(Tk, rho_d, q_v)
     xi = Scythe.log_dry_density.(rho_d)
     mu = Scythe.mu_transform.(q_v)

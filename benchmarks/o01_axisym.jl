@@ -176,14 +176,19 @@ function o01_rain_diagnostics(model, ref, kDim)
         df = CSV.read(path, DataFrame)
         ncols = div(nrow(df), kDim)
         surf = 1:kDim:nrow(df)
-        # Assumes options[:condensate_transform] = :none, which is the only state this
-        # script can produce (it exposes no transform knob). If one is added, pass
-        # `transform =` here -- slot 9 would otherwise be read as a density.
-        Tk, _, rho_d, _, _, _ = mc_state(df, ref, kDim, ncols)
-        max_rr = max(max_rr, maximum(df.rho_r))
-        min_rr = min(min_rr, minimum(df.rho_r))
+        # Threaded from the model rather than assumed: this script exposes no transform
+        # knob today, so both modes are `:none` and this is the plain read bit for bit --
+        # but if one is ever added, slots 8/9 will be read correctly instead of as
+        # densities, and `mc_water`'s name check will catch the mismatch if not.
+        Tk, _, rho_d, _, _, _, rho_r = mc_state(df, ref, kDim, ncols;
+            transform = Scythe.condensate_transform_mode(model.options),
+            mu = get(model.physical_params, :condensate_mu, 1.0e-7),
+            rain_transform = Scythe.rain_transform_mode(model.options),
+            rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
+        max_rr = max(max_rr, maximum(rho_r))
+        min_rr = min(min_rr, minimum(rho_r))
         max_v = max(max_v, maximum(abs.(df.v)))
-        rr_s = max.(df.rho_r[surf], 0.0)
+        rr_s = max.(rho_r[surf], 0.0)
         Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
         R = -rr_s .* Vt
         pk = maximum(R)

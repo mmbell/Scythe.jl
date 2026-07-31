@@ -72,6 +72,34 @@ println("Postprocessing $(length(nests)) nest(s) in $indir: $(join(nests, ", "))
 
 const RHO_L = Springsteel.Thermodynamics.rho_l   # 1000 kg/m^3
 
+# ── What slots 8 and 9 hold ───────────────────────────────────────────────────
+# Under options[:condensate_transform] / [:rain_transform] the slot carries Ooyama's biased
+# hyperbolic control variable rather than a density, and the netCDF variable is NAMED for it
+# (nu_c / nu_r). The names decide; this only supplies the variant and the bias, which a name
+# cannot carry, read from the `show(ModelParameters)` on line 2 of the run's scythe_out.log.
+# Falls back to the model's own defaults, which is the state of every TC run to date.
+function detect_water_transforms(dir)
+    ctrans, rtrans = :bhyp, :bhyp          # only consulted when a nu_* variable is present
+    cmu, rmu = 1.0e-7, 1.0e-7
+    for cand in (joinpath(dir, "scythe_out.log"),
+                 (joinpath(dir, d, "scythe_out.log") for d in readdir(dir)
+                  if isdir(joinpath(dir, d)))...)
+        isfile(cand) || continue
+        txt = try read(cand, String) catch; "" end
+        m = match(r":condensate_transform\s*=>\s*:(\w+)", txt)
+        m === nothing || (ctrans = Symbol(m.captures[1]))
+        m = match(r":rain_transform\s*=>\s*:(\w+)", txt)
+        m === nothing || (rtrans = Symbol(m.captures[1]))
+        m = match(r":condensate_mu\s*=>\s*([0-9.eE+-]+)", txt)
+        m === nothing || (cmu = parse(Float64, m.captures[1]))
+        m = match(r":rain_mu\s*=>\s*([0-9.eE+-]+)", txt)
+        m === nothing || (rmu = parse(Float64, m.captures[1]))
+        break
+    end
+    return (ctrans = ctrans, cmu = cmu, rtrans = rtrans, rmu = rmu)
+end
+const WTRANS = detect_water_transforms(indir)
+
 # ── S-band Rayleigh reflectivity ──────────────────────────────────────────────
 # Equivalent reflectivity factor Z = ∫ N(D) D^6 dD, converted to mm^6/m^3, then
 # dBZ = 10 log10(Z). Rain: exponential DSD n(D)=N0 exp(-λD) with the model's slope
@@ -181,14 +209,24 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
         rtp   = rd2d(ds, "rho_t", n_i, n_k); Etp = rd2d(ds, "E_t", n_i, n_k)
         Qssp  = rd2d(ds, "Q_ss", n_i, n_k)
         u     = rd2d(ds, "u", n_i, n_k);     w   = rd2d(ds, "w", n_i, n_k)
-        rho_r = rd2d(ds, "rho_r", n_i, n_k); rcp = rd2d(ds, "rho_c", n_i, n_k)
+        # Slots 8 and 9 may carry Ooyama control variables rather than densities, and the
+        # netCDF variable NAME says which (Springsteel writes it from GridParameters.vars).
+        # Recover the densities here so everything below -- the retrieval, the reflectivity
+        # and the rain rate -- reads what it thinks it reads.
+        rname = haskey(ds, "nu_r") ? "nu_r" : "rho_r"
+        cname = haskey(ds, "nu_c") ? "nu_c" : "rho_c"
+        rtrans = rname == "nu_r" ? WTRANS.rtrans : :none
+        ctrans = cname == "nu_c" ? WTRANS.ctrans : :none
+        nu_r = rd2d(ds, rname, n_i, n_k); rcp = rd2d(ds, cname, n_i, n_k)
+        rho_r = Scythe.recover_rho_r.(nu_r, rtrans, WTRANS.rmu)
         v     = has_v ? rd2d(ds, "v", n_i, n_k) : zeros(n_i, n_k)
 
         # Totals = prime + background(z), broadcast over radius
         col(a) = reshape(a, 1, n_k)
         p    = pp   .+ col(bg.pbar);     rho_d = rdp .+ col(bg.rho_dbar)
         rho_t = rtp .+ col(bg.rho_tbar); E_t  = Etp .+ col(bg.E_tbar)
-        Q_ss = Qssp .+ col(bg.Q_ssbar); rho_c = rcp .+ col(bg.rho_cbar)
+        Q_ss = Qssp .+ col(bg.Q_ssbar)
+        rho_c = Scythe.recover_rho_c.(rcp, col(bg.rho_cbar), ctrans, WTRANS.cmu)
 
         # Closed-form temperature retrieval from the PROGNOSTIC condensate (M is the
         # enthalpy balance the model solves); the vapor is the residual.
@@ -269,7 +307,7 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
             # (derived products get none). These are extra data variables in the
             # source beyond the value slots handled above.
             handled = Set(["time", "x", "z", "p", "rho_d", "rho_t", "u", "w",
-                           "E_t", "Q_ss", "rho_r", "rho_c", "v"])
+                           "E_t", "Q_ss", "rho_r", "rho_c", "nu_r", "nu_c", "v"])
             for (vn, vv) in ds
                 (vn in handled) && continue
                 ndims(vv) == 3 || continue

@@ -116,7 +116,9 @@ function o01_model(opts::BenchmarkOptions)
 
     ts = vertical_ts(ts, opts)
 
-    vars = MC_VARS
+    # `vars` is resolved AFTER the transform options are parsed, below: a transformed slot is
+    # renamed (`rho_c` -> `nu_c`, `rho_r` -> `nu_r`) so that the output columns say what they
+    # hold. See `Scythe.mc_var_names`.
     # Rayleigh sponge (Durran-Klemp 1983 eq. 29 profile, momentum-only in mc):
     # onset at 17 km (just above the sounding's 16.59 km tropopause knot, so the
     # damping lives entirely in the high-static-stability stratosphere), 8 km =
@@ -222,6 +224,22 @@ function o01_model(opts::BenchmarkOptions)
     # 7.2e-3 K through the retrieval and that at the model top. Only meaningful with CTRANS.
     haskey(ENV, "SCYTHE_O01_CMU") &&
         (physical_params[:condensate_mu] = parse(Float64, ENV["SCYTHE_O01_CMU"]))
+    # The same pair for slot 8 (rain). Unset => `:none`, bitwise the code that had no option.
+    # `=bhyp` gives rain the treatment cloud already has. The design reason is nesting: the
+    # coefficient limiter below is exact and free for rain on a SINGLE grid, but a nested
+    # child's i-boundary is R3X, which the bound rejects, so children run with a k-only bound
+    # and a documented leak. The transform has no such restriction.
+    haskey(ENV, "SCYTHE_O01_RTRANS") &&
+        (options[:rain_transform] = Symbol(ENV["SCYTHE_O01_RTRANS"]))
+    haskey(ENV, "SCYTHE_O01_RMU") &&
+        (physical_params[:rain_mu] = parse(Float64, ENV["SCYTHE_O01_RMU"]))
+
+    # Slot names, now that the transforms are known. Everything keyed by NAME below — the BC
+    # dicts, l_q, positivity and vars itself — must use these, because a stale key is ignored
+    # silently rather than raising (`Scythe.check_mc_var_names` is the backstop).
+    vars = Scythe.mc_var_names(options)
+    rain_name = Scythe.rain_var_name(options)
+    cloud_name = Scythe.condensate_var_name(options)
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
@@ -232,14 +250,14 @@ function o01_model(opts::BenchmarkOptions)
     # fit at both: a Neumann fit would force a zero boundary flux derivative and
     # trap the falling rain at the surface instead of letting the sedimentation
     # flux divergence remove it through z = 0.
-    topbot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), "rho_r" => NaturalBC()))
+    topbot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), rain_name => NaturalBC()))
 
     # Attribution: sweep the cubic-spline filter length only on the water species.
     # Unset => Dict("default" => 2.0), which equals the struct default, so bit-identical.
     lq = merge(Dict("default" => 2.0),
                haskey(ENV, "SCYTHE_O01_LQ") ?
                    let x = parse(Float64, ENV["SCYTHE_O01_LQ"])
-                       Dict("rho_r" => x, "rho_c" => x)
+                       Dict(rain_name => x, cloud_name => x)
                    end : Dict{String,Float64}())
 
     # Positivity of the rain density, imposed as a box constraint on the spline coefficients
@@ -292,6 +310,18 @@ function o01_model(opts::BenchmarkOptions)
         mode == "1" ? Dict("rho_r" => Dict(:i => 0.0, :k => 0.0),
                            "rho_c" => Dict(:i => 0.0, :k => 0.0)) :
                       Dict("rho_r" => Dict(:i => 0.0, :k => 0.0))
+    end
+    # A transformed species may not also be bounded — the two impose different constraints
+    # and declaring both is refused by `install_positivity_bounds!`. POSITIVITY defaults to
+    # "r", so a transformed rain arm would otherwise need a second env var set in lockstep;
+    # drop it here instead and SAY SO, rather than resolve it silently. Nothing is dropped
+    # when no transform is declared, so the default configuration is bit-identical.
+    for (name, transformed) in (("rho_c", cloud_name != "rho_c"),
+                                ("rho_r", rain_name != "rho_r"))
+        (transformed && haskey(positivity, name)) || continue
+        delete!(positivity, name)
+        println("POSITIVITY: dropped \"$name\" — it is carried as a control variable " *
+                "(transform on), which a coefficient bound cannot constrain")
     end
 
     grid_params = GridParameters(;
@@ -410,9 +440,12 @@ maximum rain density, and the time-integrated surface mass and energy fluxes
 ("surface" = the lowest mish level; Gauss nodes exclude z = 0 itself).
 """
 function o01_rain_diagnostics(model, ref, kDim)
-    # Slot 9 holds a control variable when the transform is on; `mc_state` needs to know.
+    # Slots 8 and 9 hold control variables when their transforms are on; `mc_state` needs
+    # to know, and returns the recovered densities so nothing here reads a raw column.
     ctf = Scythe.condensate_transform_mode(model.options)
     cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
+    rtf = Scythe.rain_transform_mode(model.options)
+    rmu = get(model.physical_params, :rain_mu, 1.0e-7)
     gp = model.grid_params
     snaps = output_snapshots(model)
     peak_rate = 0.0
@@ -449,17 +482,18 @@ function o01_rain_diagnostics(model, ref, kDim)
         df = CSV.read(path, DataFrame)
         ncols = div(nrow(df), kDim)
         surf = 1:kDim:nrow(df)
-        Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
-                                                     transform = ctf, mu = cmu)
-        max_rr = max(max_rr, maximum(df.rho_r))
-        min_rr = min(min_rr, minimum(df.rho_r))
+        Tk, _, rho_d, rho_v, rho_c, rho_t, rho_r =
+            mc_state(df, ref, kDim, ncols; transform = ctf, mu = cmu,
+                     rain_transform = rtf, rain_mu = rmu)
+        max_rr = max(max_rr, maximum(rho_r))
+        min_rr = min(min_rr, minimum(rho_r))
         max_rc = max(max_rc, maximum(rho_c))
         min_rc = min(min_rc, minimum(rho_c))
         min_rv = min(min_rv, minimum(rho_v))
         min_rw = min(min_rw, minimum(rho_t .- rho_d))
         min_rd_frac = min(min_rd_frac,
                           minimum(rho_d ./ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)))
-        rr_s = max.(df.rho_r[surf], 0.0)
+        rr_s = max.(rho_r[surf], 0.0)
         Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
         R = -rr_s .* Vt                                       # kg/m²/s, >= 0
         pk = maximum(R)
@@ -618,9 +652,20 @@ function o01_init_nested!(models, topo)
         p = createGrid(m.grid_params)
         gpts = Scythe.getGridpoints(p)
         p.physical .= 0.0
+        # Slots 8 and 9 hold whatever control variable the run declares; the initializer
+        # writes through `rain_slot`/`condensate_slot`. This bubble is condensate-free on a
+        # condensate-free reference, so every convention agrees on exactly 0.0 — threaded
+        # anyway so the coupling is visible rather than a coincidence.
         Scythe.moist_temperature_bubble_mc!(p, gpts, ref;
                                             xc = 75.0e3, xr = 16.0e3,
-                                            zc = 500.0, zr = 3000.0, dT_max = 3.0)
+                                            zc = 500.0, zr = 3000.0, dT_max = 3.0,
+                                            condensate_transform =
+                                                Scythe.condensate_transform_mode(m.options),
+                                            condensate_mu =
+                                                get(m.physical_params, :condensate_mu, 1.0e-7),
+                                            rain_transform =
+                                                Scythe.rain_transform_mode(m.options),
+                                            rain_mu = get(m.physical_params, :rain_mu, 1.0e-7))
         Scythe.write_ics_csv(m.initial_conditions, p, gpts)
     end
 end
@@ -698,6 +743,8 @@ function o01_nested_diagnostics(models, topo)
     ref, _, kDim = rebuild_reference(models[1])
     ctf = Scythe.condensate_transform_mode(models[1].options)
     cmu = get(models[1].physical_params, :condensate_mu, 1.0e-7)
+    rtf = Scythe.rain_transform_mode(models[1].options)
+    rmu = get(models[1].physical_params, :rain_mu, 1.0e-7)
     n = length(models)
     masks = [nominal_col_mask(models[i], o01_nominal_bounds(models, topo, i)...)
              for i in 1:n]
@@ -736,12 +783,13 @@ function o01_nested_diagnostics(models, topo)
             gp = models[i].grid_params
             ncols = div(nrow(df), kDim)
             surf = 1:kDim:nrow(df)
-            Tk, _, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
-                                                         transform = ctf, mu = cmu)
+            Tk, _, rho_d, rho_v, rho_c, rho_t, rho_r =
+                mc_state(df, ref, kDim, ncols; transform = ctf, mu = cmu,
+                         rain_transform = rtf, rain_mu = rmu)
             mask = masks[i]
             colmask = repeat(mask, inner = kDim)
-            max_rr = max(max_rr, maximum(df.rho_r[colmask]))
-            min_rr = min(min_rr, minimum(df.rho_r[colmask]))
+            max_rr = max(max_rr, maximum(rho_r[colmask]))
+            min_rr = min(min_rr, minimum(rho_r[colmask]))
             max_rc = max(max_rc, maximum(rho_c[colmask]))
             min_rc = min(min_rc, minimum(rho_c[colmask]))
             min_rv = min(min_rv, minimum(rho_v[colmask]))
@@ -752,7 +800,7 @@ function o01_nested_diagnostics(models, topo)
                                               ncols))[colmask]))
             max_w = max(max_w, maximum(df.w[colmask]))
             min_w = min(min_w, minimum(df.w[colmask]))
-            rr_s = max.(df.rho_r[surf], 0.0) .* mask
+            rr_s = max.(rho_r[surf], 0.0) .* mask
             Vt = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Tk[surf])
             R = -rr_s .* Vt
             pk_t = max(pk_t, maximum(R))
@@ -834,7 +882,11 @@ if opts.plot
         x = reshape(df.r, kDim, ncols)[1, :]
         z = reshape(df.z, kDim, ncols)[:, 1]
         w = reshape(df.w, kDim, ncols)
-        rho_r = reshape(df.rho_r .* 1000.0, kDim, ncols)
+        # The plotted rain is the RECOVERED density, whatever slot 8 carries.
+        rho_r = reshape(Scythe.recover_rho_r.(first(water_column(df, "rho_r")),
+                                              Scythe.rain_transform_mode(model.options),
+                                              get(model.physical_params, :rain_mu, 1.0e-7)) .*
+                        1000.0, kDim, ncols)
         save_benchmark_figure(
             joinpath(model.output_dir, "o01_rainfall_$(opts.mode)_$(opts.stage)_final.png"),
             x, z,
@@ -852,7 +904,9 @@ if opts.nests == 1
                            model = model,
                            init! = o01_init!,
                            diagnostics = o01_diagnostics,
-                           varnames = MC_VARS,
+                           # The run's OWN slot names: a transform renames slots 8/9, and the
+                           # regression then reports itself skipped rather than KeyError.
+                           varnames = Scythe.mc_var_names(model.options),
                            plotter = plotter)
 else
     nest = o01_nest(opts)

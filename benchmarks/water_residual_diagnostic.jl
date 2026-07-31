@@ -65,12 +65,19 @@ rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
 rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
 rho_cbar = Springsteel.ref_rho_c(ref)[:, 1]
 
+# Slots 8/9 may hold Ooyama control variables rather than densities; the column NAMES say
+# which, and the run's log supplies the variant and the bias. Reading them raw is silently
+# wrong by a factor of two in the linear regime and invents negative water that is not there.
+include(joinpath(@__DIR__, "common", "diagnostics.jl"))
+const WTRANS = detect_transforms(outdir)
+
 """Totals from a perturbation snapshot: (rho_v, rho_c, rho_r), flat, z fastest."""
 function water(df)
     rho_d = df.rho_d .+ repeat(rho_dbar, ncols)
     rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
-    rho_c = df.rho_c .+ repeat(rho_cbar, ncols)
-    rho_r = df.rho_r
+    rho_c, rho_r = mc_water(df, rho_cbar, ncols;
+                            ctrans = WTRANS.ctrans, cmu = WTRANS.cmu,
+                            rtrans = WTRANS.rtrans, rmu = WTRANS.rmu)
     return (rho_t .- rho_d .- rho_c .- rho_r), rho_c, rho_r
 end
 

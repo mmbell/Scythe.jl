@@ -126,6 +126,16 @@ function bf02_moist_model(opts::BenchmarkOptions)
                 (physical_params[:condensate_mu] = parse(Float64, ENV["SCYTHE_BF02_CMU"]))
             haskey(ENV, "SCYTHE_BF02_CFLOOR") &&
                 (options[:condensate_floor] = Symbol(ENV["SCYTHE_BF02_CFLOOR"]))
+            # The rain pair. BF02 runs with `precipitation = false` and forms no rain at all,
+            # which is exactly why it is the useful CONTROL for the rain transform: it must
+            # change nothing, to the last bit.
+            haskey(ENV, "SCYTHE_BF02_RTRANS") &&
+                (options[:rain_transform] = Symbol(ENV["SCYTHE_BF02_RTRANS"]))
+            haskey(ENV, "SCYTHE_BF02_RMU") &&
+                (physical_params[:rain_mu] = parse(Float64, ENV["SCYTHE_BF02_RMU"]))
+            # The slot names follow the transforms; everything keyed by name below must use
+            # them (`Scythe.check_mc_var_names` is the backstop).
+            vars = Scythe.mc_var_names(options)
         end
     else
         equation_set = "primitive_equation_XZ"
@@ -250,7 +260,11 @@ function bf02_moist_init!(model)
                                          condensate_transform =
                                              Scythe.condensate_transform_mode(model.options),
                                          condensate_mu =
-                                             get(model.physical_params, :condensate_mu, 1.0e-7))
+                                             get(model.physical_params, :condensate_mu, 1.0e-7),
+                                         rain_transform =
+                                             Scythe.rain_transform_mode(model.options),
+                                         rain_mu =
+                                             get(model.physical_params, :rain_mu, 1.0e-7))
     elseif physical_stage
         Scythe.write_exact_ref_pd(model.ref_state_file, z, base.s, base.rho_d,
                                   base.rho_d .* base.q_v, base.rho_d .* base.q_l)
@@ -347,15 +361,17 @@ end
 
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
 function moist_fields(df, ref, kDim, base, stage;
-                      ctransform::Symbol = :none, cmu = 1.0e-7)
+                      ctransform::Symbol = :none, cmu = 1.0e-7,
+                      rtransform::Symbol = :none, rmu = 1.0e-7)
     ncols = div(nrow(df), kDim)
     if stage == STAGE_MC
         # Total-energy stage: retrieve (T, p) and the diagnostic water partition from
         # the prognostics, then reuse the transformed-variable theta_e diagnostic.
-        Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
-                                                     transform = ctransform, mu = cmu)
+        Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r =
+            mc_state(df, ref, kDim, ncols; transform = ctransform, mu = cmu,
+                     rain_transform = rtransform, rain_mu = rmu)
         q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
-        q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
+        q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
         s = Scythe.entropy.(Tk, rho_d, q_v)
         xi = Scythe.log_dry_density.(rho_d)
         mu = Scythe.mu_transform.(q_v)
@@ -424,7 +440,9 @@ function bf02_moist_diagnostics(model)
     base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
     theta_e_p, supersat, ncols = moist_fields(df, ref, kDim, base, opts.stage;
         ctransform = Scythe.condensate_transform_mode(model.options),
-        cmu = get(model.physical_params, :condensate_mu, 1.0e-7))
+        cmu = get(model.physical_params, :condensate_mu, 1.0e-7),
+        rtransform = Scythe.rain_transform_mode(model.options),
+        rmu = get(model.physical_params, :rain_mu, 1.0e-7))
     z = reshape(df.z, kDim, ncols)[:, 1]
     diags = Dict(
         "max_theta_e_p" => maximum(theta_e_p),
@@ -443,7 +461,11 @@ function bf02_moist_diagnostics(model)
         # quantity with a meaningful zero is the water rho_w = rho_t - rho_d, and because it
         # is a DIFFERENCE of two independently fitted fields no per-field spline bound can
         # protect it. Both are measured, not enforced (benchmarks/FUTURE_WORK.md).
-        _, _, rho_d, _, _, rho_t = mc_state(df, ref, kDim, ncols)
+        _, _, rho_d, _, _, rho_t, _ = mc_state(df, ref, kDim, ncols;
+            transform = Scythe.condensate_transform_mode(model.options),
+            mu = get(model.physical_params, :condensate_mu, 1.0e-7),
+            rain_transform = Scythe.rain_transform_mode(model.options),
+            rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
         diags["min_rho_d_frac"] =
             minimum(rho_d ./ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols))
         diags["min_rho_w_gm3"] = 1000.0 * minimum(rho_t .- rho_d)
@@ -462,7 +484,9 @@ if opts.plot
         base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
         theta_e_p, _, ncols = moist_fields(df, ref, kDim, base, opts.stage;
             ctransform = Scythe.condensate_transform_mode(model.options),
-            cmu = get(model.physical_params, :condensate_mu, 1.0e-7))
+            cmu = get(model.physical_params, :condensate_mu, 1.0e-7),
+            rtransform = Scythe.rain_transform_mode(model.options),
+            rmu = get(model.physical_params, :rain_mu, 1.0e-7))
         x = reshape(df.r, kDim, ncols)[1, :]
         z = reshape(df.z, kDim, ncols)[:, 1]
         w = reshape(df.w, kDim, ncols)
@@ -482,6 +506,10 @@ passed = run_benchmark("bf02_moist", opts;
                        model = model,
                        init! = bf02_moist_init!,
                        diagnostics = bf02_moist_diagnostics,
-                       varnames = bf02_moist_vars(opts.stage),
+                       # The run's OWN slot names: a transform renames slots 8/9 on the mc
+                       # stage, and the field regression then reports itself skipped.
+                       varnames = opts.stage == STAGE_MC ?
+                                  Scythe.mc_var_names(model.options) :
+                                  bf02_moist_vars(opts.stage),
                        plotter = plotter)
 exit(passed ? 0 : 1)

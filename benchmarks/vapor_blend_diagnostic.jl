@@ -100,6 +100,10 @@
 
 using Scythe, Springsteel, CSV, DataFrames, Printf
 
+# `detect_transforms` / `mc_water` / `water_column`: the shared inverse-map plumbing, so this
+# script cannot read a control variable as a density.
+include(joinpath(@__DIR__, "common", "diagnostics.jl"))
+
 const G2_DIR = joinpath(@__DIR__, "output", "o01_rainfall_quick_mc_rirk")
 
 # In-cloud threshold. 1e-6 kg/m^3 = 1e-3 g/m^3 is three orders below the cloud
@@ -208,7 +212,9 @@ function reference_profiles(outdir, df0)
             rho_tbar = Springsteel.ref_rho_t(ref)[:, 1],
             rho_cbar = Springsteel.ref_rho_c(ref)[:, 1],
             E_tbar   = Springsteel.ref_total_energy(ref)[:, 1],
-            Q_ssbar  = Springsteel.ref_qss(ref)[:, 1])
+            Q_ssbar  = Springsteel.ref_qss(ref)[:, 1],
+            # What slots 8/9 hold in THIS run (see `detect_transforms`).
+            trans    = detect_transforms(outdir))
 end
 
 """
@@ -222,8 +228,11 @@ function analyze(df, R)
     rho_t = df.rho_t .+ tile(R.rho_tbar)
     E_t   = df.E_t   .+ tile(R.E_tbar)
     Q_ss  = df.Q_ss  .+ tile(R.Q_ssbar)
-    rho_c = df.rho_c .+ tile(R.rho_cbar)
-    rho_r = df.rho_r                       # a TOTAL: no reference rain
+    # Slots 8/9 may hold Ooyama control variables rather than densities; the column NAMES
+    # say which, and `R.trans` carries the variant and bias read from the run's own log.
+    rho_c, rho_r = mc_water(df, R.rho_cbar, R.ncols;
+                            ctrans = R.trans.ctrans, cmu = R.trans.cmu,
+                            rtrans = R.trans.rtrans, rmu = R.trans.rmu)
 
     ke = 0.5 .* ((df.u .^ 2) .+ (df.w .^ 2))          # moist_compressible_XZ
     M = p .+ E_t .- (rho_t .* (ke .+ (Scythe.gravity .* df.z)))
@@ -252,7 +261,8 @@ function load_snapshot(label, outdir; tmax = 3600.0)
     for (t, path) in Iterators.reverse(snaps)
         t > tmax && continue
         df = CSV.read(path, DataFrame)
-        cols = (df.p, df.rho_d, df.rho_t, df.E_t, df.Q_ss, df.rho_c, df.rho_r, df.u, df.w)
+        cols = (df.p, df.rho_d, df.rho_t, df.E_t, df.Q_ss, df.u, df.w,
+                first(water_column(df, "rho_c")), first(water_column(df, "rho_r")))
         all(c -> all(isfinite, c), cols) || continue
         res_rho_t, res_qss, s, rho_liq, rho_vs, incloud = analyze(df, R)
         all(isfinite, res_qss) && all(isfinite, s) || continue

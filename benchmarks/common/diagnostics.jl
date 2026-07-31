@@ -55,17 +55,119 @@ function read_final_output(model)
 end
 
 """
+    water_column(df, role) -> (values, transformed::Bool)
+
+Fetch a water species' output column by ROLE (`"rho_c"` or `"rho_r"`), accepting either the
+density name or its transformed alias (`nu_c` / `nu_r`), and report which one was found.
+
+The output columns are the ONLY thing a postprocessor sees — Springsteel builds the CSV header
+straight from `GridParameters.vars` — so under a transform the name is what says the column
+holds a control variable rather than a density. Reading it raw is silently wrong by a factor of
+two in the linear regime and shows spurious negative lobes where the run's own diagnostics
+record a minimum of exactly zero. That is not hypothetical: it is what `o01_movie.jl` did.
+"""
+function water_column(df, role::AbstractString)
+    cols = names(df)
+    role in cols && return (df[!, role], false)
+    alias = role == "rho_c" ? "nu_c" : role == "rho_r" ? "nu_r" : ""
+    (alias != "" && alias in cols) && return (df[!, alias], true)
+    error("no column \"$role\"" * (alias == "" ? "" : " or \"$alias\"") *
+          " in this output (it has $(cols))")
+end
+
+"""
+    detect_transforms(dir) -> (ctrans, cmu, rtrans, rmu)
+
+Recover a completed run's water-transform configuration from its output directory.
+
+There is no manifest file: the only machine-readable record of a run's options is line 2 of
+`scythe_out.log`, which is a `show` of the whole `ModelParameters` (written by
+`semiimplicit.jl`). This regexes the four keys out of it, falling back to the model's own
+defaults (`:none`, `1e-7`) for anything absent — including the case of no log at all, which is
+the pre-transform state of every archived run.
+
+The COLUMN NAMES remain the authority on whether a transform is on; this only supplies the
+variant (`:bhyp` vs `:bhyp_smooth`) and the bias, which the names cannot carry. Consumers
+should cross-check the two, which `mc_water` does.
+"""
+function detect_transforms(dir::AbstractString)
+    ctrans, rtrans = :none, :none
+    cmu, rmu = 1.0e-7, 1.0e-7
+    log = joinpath(dir, "scythe_out.log")
+    if isfile(log)
+        txt = try
+            read(log, String)
+        catch
+            ""
+        end
+        m = match(r":condensate_transform\s*=>\s*:(\w+)", txt)
+        m === nothing || (ctrans = Symbol(m.captures[1]))
+        m = match(r":rain_transform\s*=>\s*:(\w+)", txt)
+        m === nothing || (rtrans = Symbol(m.captures[1]))
+        m = match(r":condensate_mu\s*=>\s*([0-9.eE+-]+)", txt)
+        m === nothing || (cmu = parse(Float64, m.captures[1]))
+        m = match(r":rain_mu\s*=>\s*([0-9.eE+-]+)", txt)
+        m === nothing || (rmu = parse(Float64, m.captures[1]))
+    end
+    return (ctrans = ctrans, cmu = cmu, rtrans = rtrans, rmu = rmu)
+end
+
+"""
+    mc_water(df, rho_cbar, ncols; ctrans, cmu, rtrans, rmu) -> (rho_c, rho_r)
+
+The recovered cloud and rain DENSITIES from an output DataFrame, whatever control variable the
+run carried. This is the one place the inverse maps are applied on the postprocessing side;
+every consumer of a water column should come through here rather than reading `df.rho_c`.
+
+The two disagreements are not symmetric, and are handled differently.
+
+A `nu_*` column with the mode `:none` is **refused**: the file says it holds a control
+variable and the caller intends to read it as a density, which is the exact failure this
+plumbing exists to prevent, and there is no evidence available to break the tie.
+
+A `rho_*` column with a transformed mode is **accepted with a warning**: that is the LEGACY
+layout, produced by every run made between the transform shipping and the slots being renamed,
+where the column kept the density name while holding the control variable. The run's own
+options record is the better evidence there, and refusing would make those archived runs
+unreadable.
+"""
+function mc_water(df, rho_cbar, ncols::Int;
+                  ctrans::Symbol = :none, cmu = 1.0e-7,
+                  rtrans::Symbol = :none, rmu = 1.0e-7)
+    craw, cnamed = water_column(df, "rho_c")
+    rraw, rnamed = water_column(df, "rho_r")
+    for (role, ctrl, named, mode) in (("cloud", "nu_c", cnamed, ctrans),
+                                      ("rain", "nu_r", rnamed, rtrans))
+        if named && mode === :none
+            error("the $role column is named \"$ctrl\", so it holds a control variable, but " *
+                  "the transform mode passed here is :none — it would be read as a density " *
+                  "and be wrong by a factor of two in the linear regime. Pass the run's own " *
+                  "mode (`detect_transforms` reads it from scythe_out.log).")
+        elseif !named && mode !== :none
+            @warn "$role column carries the density name while the run declares a " *
+                  "transform (:$(mode)) — reading it as a control variable. This is the " *
+                  "pre-rename output layout; runs made since carry the nu_* name." maxlog = 1
+        end
+    end
+    rho_c = Scythe.recover_rho_c.(craw, repeat(rho_cbar, ncols), ctrans, cmu)
+    rho_r = Scythe.recover_rho_r.(rraw, rtrans, rmu)
+    return rho_c, rho_r
+end
+
+"""
     mc_state(df, ref, kDim, ncols)
 
 Reconstruct the diagnostic thermodynamic state of the total-energy set
 (moist_compressible) from a perturbation output DataFrame: the closed-form
 temperature retrieval from the PROGNOSTIC condensate, then the residual vapor.
 Returns `(Tk, p, rho_d, rho_v, rho_c, rho_t)` as flat vectors (z fastest), with p
-in Pa. `transform` must be the run's `options[:condensate_transform]`: slot 9 then holds a
-control variable rather than a density, and reading it raw would be silently wrong by a
-factor of two in the linear regime.
+in Pa. `transform`/`rain_transform` must be the run's `options[:condensate_transform]` /
+`options[:rain_transform]`: the corresponding slot then holds a control variable rather than a
+density, and reading it raw would be silently wrong by a factor of two in the linear regime.
+Returns the recovered `rho_r` alongside, so callers never have to touch the raw column.
 """
-function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7)
+function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
+                  rain_transform::Symbol = :none, rain_mu = 1.0e-7)
     pbar = Springsteel.ref_pressure(ref)[:, 1]
     rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
     rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
@@ -75,17 +177,18 @@ function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7)
     rho_d = df.rho_d .+ repeat(rho_dbar, ncols)
     rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
     E_t = df.E_t .+ repeat(E_tbar, ncols)
-    # Slot 9 is not necessarily a density: under `options[:condensate_transform]` the output
-    # column holds the CONTROL variable and the density has to be recovered, exactly as the
-    # kernel does. `:none` is the plain add, bit for bit.
-    rho_c = Scythe.recover_rho_c.(df.rho_c, repeat(rho_cbar, ncols), transform, mu)
+    # Slots 8 and 9 are not necessarily densities: under a transform the output column holds
+    # the CONTROL variable and the density has to be recovered, exactly as the kernel does.
+    # `:none` is the plain add / plain read, bit for bit.
+    rho_c, rho_r = mc_water(df, rho_cbar, ncols; ctrans = transform, cmu = mu,
+                            rtrans = rain_transform, rmu = rain_mu)
     ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
     M = p .+ E_t .- (rho_t .* (ke .+ Scythe.gravity .* df.z))
-    rho_liq = rho_c .+ df.rho_r
+    rho_liq = rho_c .+ rho_r
     Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
     # Vapor is the residual of the prognostic water masses
     rho_v = rho_t .- rho_d .- rho_liq
-    return Tk, p, rho_d, rho_v, rho_c, rho_t
+    return Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r
 end
 
 """
@@ -97,15 +200,17 @@ where theta_p is a (kDim, ncols) matrix with z varying fastest, matching the
 output ordering.
 """
 function theta_perturbation(df::DataFrame, ref, kDim::Int;
-                            transform::Symbol = :none, mu = 1.0e-7)
+                            transform::Symbol = :none, mu = 1.0e-7,
+                            rain_transform::Symbol = :none, rain_mu = 1.0e-7)
     npts = nrow(df)
     ncols = div(npts, kDim)
 
     # Total-energy set (moist_compressible): retrieve T from the prognostic
     # (p, E_t, Q_ss, densities), then θ = T·(p_0/p)^(Rd/Cpd) directly.
     if "E_t" in names(df)
-        Tk, p, _, _, _, _ = mc_state(df, ref, kDim, ncols;
-                                     transform = transform, mu = mu)
+        Tk, p, _, _, _, _, _ = mc_state(df, ref, kDim, ncols;
+                                        transform = transform, mu = mu,
+                                        rain_transform = rain_transform, rain_mu = rain_mu)
         theta = Tk .* ((Scythe.p_0 .* 100.0) ./ p) .^ (Scythe.Rd / Scythe.Cpd)
         Tbar = Springsteel.reference_temperature(ref)
         pbar = Springsteel.ref_pressure(ref)[:, 1]
@@ -280,14 +385,16 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
         ncols = div(nrow(df), kDim)
 
         if mc
-            Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
+            Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r = mc_state(df, ref, kDim, ncols;
                 transform = Scythe.condensate_transform_mode(model.options),
-                mu = get(model.physical_params, :condensate_mu, 1.0e-7))
+                mu = get(model.physical_params, :condensate_mu, 1.0e-7),
+                rain_transform = Scythe.rain_transform_mode(model.options),
+                rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
             E_t = df.E_t .+ repeat(Springsteel.ref_total_energy(ref)[:, 1], ncols)
             # Clamp for the entropy diagnostic: in dry air the residual vapor sits at
             # 0 ± roundoff, and entropy() takes log(q_v).
             q_v = max.(rho_v, 0.0) ./ rho_d
-            q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
+            q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
             water_mass = rho_t .- rho_d
             # Total entropy (informational; NOT conserved under finite-τ condensation —
             # the second-law production ∫ρ_d R_v ln(H) q̇_cond ≥ 0 makes it rise while
@@ -419,12 +526,14 @@ function mc_entropy_production(model, ref)
     tag = string(round(model.integration_time; digits=2))
     df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
     ncols = div(nrow(df), kDim)
-    Tk, p, rho_d, rho_v, rho_c, rho_t = mc_state(df, ref, kDim, ncols;
+    Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r = mc_state(df, ref, kDim, ncols;
         transform = Scythe.condensate_transform_mode(model.options),
-        mu = get(model.physical_params, :condensate_mu, 1.0e-7))
+        mu = get(model.physical_params, :condensate_mu, 1.0e-7),
+        rain_transform = Scythe.rain_transform_mode(model.options),
+        rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
     rho_vs = Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0)
     q_v = rho_v ./ rho_d
-    q_l = (max.(rho_c, 0.0) .+ df.rho_r) ./ rho_d
+    q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
     Q_ssbar = Springsteel.ref_qss(ref)[:, 1]
     Q_ss = df.Q_ss .+ repeat(Q_ssbar, ncols)
     H = max.(rho_v, 1.0e-12) ./ rho_vs

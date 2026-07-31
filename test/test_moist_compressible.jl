@@ -3111,9 +3111,19 @@ using Springsteel
     rho_c slot is seeded with a broadband oscillation big enough that an untransformed run
     carries a clearly negative cloud density.
     """
-    function ctrans_rirk(tmpdir, tag; transform = nothing, positivity = nothing, amp = 3.0e-3)
-        vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
-        scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+    function ctrans_rirk(tmpdir, tag; transform = nothing, rain_transform = nothing,
+                         positivity = nothing, amp = 3.0e-3, precipitation = false,
+                         rain_amp = 0.0)
+        ref_file = joinpath(tmpdir, "ctrans_$(tag).ref")
+        opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                                :precipitation => precipitation)
+        transform === nothing || (opts[:condensate_transform] = transform)
+        rain_transform === nothing || (opts[:rain_transform] = rain_transform)
+        # The slot NAMES follow the declared transforms, and every name-keyed dict has to
+        # agree — `check_mc_var_names` refuses the configuration otherwise.
+        varnames = Scythe.mc_var_names(opts)
+        vars = Dict(v => i for (i, v) in enumerate(varnames))
+        scalar_bc = Dict(v => NeumannBC() for v in varnames)
         side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
         wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
         gp = GridParameters(geometry = "RiRk",
@@ -3123,10 +3133,6 @@ using Springsteel
                 Dict{String,Dict{Symbol,Float64}}() : positivity,
             BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
             vars = vars)
-        ref_file = joinpath(tmpdir, "ctrans_$(tag).ref")
-        opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
-                                :precipitation => false)
-        transform === nothing || (opts[:condensate_transform] = transform)
         model = ModelParameters(
             ts = 0.25, integration_time = 5.0, output_interval = 5.0,
             equation_set = "moist_compressible_XZ",
@@ -3145,9 +3151,12 @@ using Springsteel
         Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v,
                                   zeros(gp.kDim))
         patch.physical .= 0.0
-        w_i = gp.vars["w"]; rc_i = gp.vars["rho_c"]
+        w_i = gp.vars["w"]
+        rc_i = Scythe.mc_slot(gp.vars, "rho_c")
+        rr_i = Scythe.mc_slot(gp.vars, "rho_r")
         gpts = Scythe.getGridpoints(patch)
         tf = transform === nothing ? :none : transform
+        rtf = rain_transform === nothing ? :none : rain_transform
         # A SUB-CELL cloud spike: sigma = 250 m against a 500 m cell. That is the physical
         # situation -- a convective condensate spike the column cannot resolve -- and it is
         # what makes the fit undershoot on the flanks. A smooth seed does not ring at all on
@@ -3157,6 +3166,12 @@ using Springsteel
             zi = gpts[i, end]
             rho_c = amp * exp(-((zi - 2000.0) / 250.0)^2)          # >= 0 by construction
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rho_c, 0.0, tf, 1.0e-7)
+            # An equally sub-cell RAIN spike, sited lower so it is a distinct feature. Rain
+            # has no reference profile, so its slot is the control variable itself.
+            if rain_amp > 0.0
+                rho_r = rain_amp * exp(-((zi - 1200.0) / 250.0)^2)
+                patch.physical[i, rr_i, 1] = Scythe.rain_slot(rho_r, rtf, 1.0e-7)
+            end
         end
         spectralTransform!(patch)
         gridTransform!(patch)
@@ -3168,11 +3183,18 @@ using Springsteel
 
     """Recovered cloud density from a patch's slot 9, under `transform`."""
     function ctrans_rho_c(patch, gp, transform)
-        rc = gp.vars["rho_c"]
+        rc = Scythe.mc_slot(gp.vars, "rho_c")
         s = @view patch.physical[:, rc, 1]
         transform === :none && return collect(s)
         transform === :bhyp_smooth && return [Scythe.ahyp_smooth(x, 1.0e-7) for x in s]
         return [Scythe.ahyp(x, 1.0e-7) for x in s]
+    end
+
+    """Recovered rain density from a patch's slot 8, under `transform` (no reference)."""
+    function ctrans_rho_r(patch, gp, transform)
+        rr = Scythe.mc_slot(gp.vars, "rho_r")
+        s = @view patch.physical[:, rr, 1]
+        return [Scythe.recover_rho_r(x, transform, 1.0e-7) for x in s]
     end
 
     @testset "condensate transform: absent is bitwise :none" begin
@@ -3240,6 +3262,148 @@ using Springsteel
             m, p, mo, gp = ctrans_rirk(tmpdir, "ct_pos_r"; transform = :bhyp,
                 positivity = Dict("rho_r" => Dict(:i => 0.0, :k => 0.0)))
             @test mo.grid_params.positivity["rho_r"] == Dict(:i => 0.0, :k => 0.0)
+            # ... and the mirror: once RAIN is transformed too, its bound is refused for
+            # exactly the same reason.
+            @test_throws ErrorException ctrans_rirk(tmpdir, "rt_pos"; rain_transform = :bhyp,
+                positivity = Dict("rho_r" => Dict(:k => 0.0)))
+        end
+    end
+
+    @testset "water transforms: slot names and the configuration guard" begin
+        # A transformed slot no longer holds what its name says, and the name is what every
+        # consumer keys off -- Springsteel builds the output header from `vars`. The names
+        # therefore move with the transforms.
+        none = Dict{Symbol,Any}()
+        both = Dict{Symbol,Any}(:condensate_transform => :bhyp, :rain_transform => :bhyp)
+        cloud_only = Dict{Symbol,Any}(:condensate_transform => :bhyp_smooth)
+        rain_only = Dict{Symbol,Any}(:rain_transform => :bhyp)
+        @test Scythe.mc_var_names(none) == Scythe.MC_VARS
+        @test Scythe.mc_var_names(none; cyl = true) == Scythe.MC_VARS_CYL
+        @test Scythe.mc_var_names(both)[8:9] == ["nu_r", "nu_c"]
+        @test Scythe.mc_var_names(cloud_only)[8:9] == ["rho_r", "nu_c"]
+        @test Scythe.mc_var_names(rain_only)[8:9] == ["nu_r", "rho_c"]
+        @test Scythe.mc_var_names(both; cyl = true)[10] == "v"
+        @test Scythe.condensate_var_name(none) == "rho_c"
+        @test Scythe.rain_var_name(both) == "nu_r"
+        @test Scythe.rain_transform_mode(none) === :none
+        @test Scythe.rain_transform_mode(rain_only) === :bhyp
+        @test_throws ErrorException Scythe.rain_transform_mode(
+            Dict{Symbol,Any}(:rain_transform => :ooyama))
+
+        # `mc_slot` accepts either convention and raises rather than returning a wrong slot.
+        @test Scythe.mc_slot(Dict("rho_c" => 9, "rho_r" => 8), "rho_c") == 9
+        @test Scythe.mc_slot(Dict("nu_c" => 9, "nu_r" => 8), "rho_c") == 9
+        @test Scythe.mc_slot(Dict("nu_c" => 9, "nu_r" => 8), "rho_r") == 8
+        @test_throws ErrorException Scythe.mc_slot(Dict("p" => 1), "rho_c")
+
+        # THE SILENT-MISS GUARD. A stale name key in one of the four BC dicts, l_q or
+        # positivity is IGNORED by Springsteel's `_resolve_spline_filter` rather than raised,
+        # so a leftover "rho_r" => NaturalBC() under the rain transform would quietly put slot
+        # 8 back on the default Neumann fit -- which forces a zero boundary flux derivative
+        # and traps falling rain at the surface. That must be a configuration error.
+        mktempdir() do tmpdir
+            # Sanity: a correctly-named transformed configuration builds.
+            m, p, mo, gp = ctrans_rirk(tmpdir, "names_ok";
+                                       transform = :bhyp, rain_transform = :bhyp)
+            @test haskey(gp.vars, "nu_c") && haskey(gp.vars, "nu_r")
+            @test !haskey(gp.vars, "rho_c") && !haskey(gp.vars, "rho_r")
+            @test Scythe.check_mc_var_names(mo) === nothing
+
+            # ... and one with a stale l_q key does not.
+            stale = ModelParameters(
+                ts = mo.ts, integration_time = mo.integration_time,
+                output_interval = mo.output_interval,
+                equation_set = mo.equation_set, ref_state_file = mo.ref_state_file,
+                grid_params = GridParameters(geometry = "RiRk",
+                    iMin = 0.0, iMax = 8.0e3, num_cells_i = 4,
+                    kMin = 0.0, kMax = 4.0e3, num_cells_k = 8,
+                    l_q = Dict("default" => 2.0, "rho_r" => 1.0),
+                    BCL = gp.BCL, BCR = gp.BCR, BCB = gp.BCB, BCT = gp.BCT,
+                    vars = gp.vars),
+                physical_params = mo.physical_params, options = mo.options)
+            @test_throws ErrorException Scythe.check_mc_var_names(stale)
+            # With no transform declared the guard is a no-op, whatever the names are.
+            @test Scythe.check_mc_var_names(ModelParameters(
+                ts = mo.ts, integration_time = mo.integration_time,
+                output_interval = mo.output_interval,
+                equation_set = mo.equation_set, ref_state_file = mo.ref_state_file,
+                grid_params = stale.grid_params,
+                physical_params = mo.physical_params,
+                options = Dict{Symbol,Any}())) === nothing
+        end
+    end
+
+    @testset "rain transform: absent is bitwise :none" begin
+        mktempdir() do tmpdir
+            mA, pA, moA, gpA = ctrans_rirk(tmpdir, "rt_absent"; rain_amp = 2.0e-3,
+                                           precipitation = true)
+            mN, pN, moN, gpN = ctrans_rirk(tmpdir, "rt_none"; rain_transform = :none,
+                                           rain_amp = 2.0e-3, precipitation = true)
+            @test !haskey(moA.options, :rain_transform)
+            vapor_blend_run!(mA, pA, gpA, 10)
+            vapor_blend_run!(mN, pN, gpN, 10)
+            @test all(isfinite.(pA.physical))
+            @test pA.physical == pN.physical
+            @test pA.spectral == pN.spectral
+        end
+    end
+
+    @testset "rain transform: the recovered rain density stays non-negative" begin
+        # The rain analogue of the condensate gate, and it exercises the one term rain has
+        # that cloud does not: the sedimentation flux divergence, which reaches slot 8
+        # through the Jacobian while rho_t and E_t keep receiving it untransformed.
+        mktempdir() do tmpdir
+            mu = 1.0e-7
+            mN, pN, moN, gpN = ctrans_rirk(tmpdir, "rt_g_none"; rain_transform = :none,
+                                           rain_amp = 2.0e-3, precipitation = true)
+            mB, pB, moB, gpB = ctrans_rirk(tmpdir, "rt_g_bhyp"; rain_transform = :bhyp,
+                                           rain_amp = 2.0e-3, precipitation = true)
+            mS, pS, moS, gpS = ctrans_rirk(tmpdir, "rt_g_smooth";
+                                           rain_transform = :bhyp_smooth,
+                                           rain_amp = 2.0e-3, precipitation = true)
+            vapor_blend_run!(mN, pN, gpN, 20)
+            vapor_blend_run!(mB, pB, gpB, 20)
+            vapor_blend_run!(mS, pS, gpS, 20)
+
+            @test all(isfinite.(pN.physical))
+            @test all(isfinite.(pB.physical))
+            @test all(isfinite.(pS.physical))
+
+            rN = ctrans_rho_r(pN, gpN, :none)
+            rB = ctrans_rho_r(pB, gpB, :bhyp)
+            rS = ctrans_rho_r(pS, gpS, :bhyp_smooth)
+
+            @test minimum(rN) < -1.0e-6          # the premise: it really does go negative
+            @test minimum(rB) >= 0.0             # exactly, by construction
+            @test minimum(rS) > -mu
+            # There is still rain: a transform that annihilated the field would pass both
+            # bounds and mean nothing.
+            @test maximum(rB) > 1.0e-4
+            @test maximum(rS) > 1.0e-4
+        end
+    end
+
+    @testset "water transforms: the refused combinations" begin
+        # Each of these would run and produce plausible numbers while solving the wrong
+        # equation for a transformed slot. They fail loudly instead.
+        mktempdir() do tmpdir
+            for (tag, kw) in (("wt_kv_c", (; transform = :bhyp)),
+                              ("wt_kv_r", (; rain_transform = :bhyp)))
+                m, p, mo, gp = ctrans_rirk(tmpdir, tag; kw...)
+                # The implicit vertical water diffusion solves slots 8/9 as densities.
+                mo.physical_params[:Kvdiff_water] = 1.0
+                @test_throws ErrorException Scythe.diffusion_timestep_mc(
+                    m, 1, gp.kDim, 1, Scythe.MCCartesianXZ())
+                mo.physical_params[:Kvdiff_water] = 0.0
+                # The per-term production budget would mix control-variable and density units.
+                mo.options[:water_budget_trace] = 1
+                @test_throws ErrorException vapor_blend_run!(m, p, gp, 1)
+                delete!(mo.options, :water_budget_trace)
+                # clamp_water! would be a state repair on the control variable.
+                mo.options[:clamp_water] = true
+                @test_throws ErrorException Scythe.clamp_water!(m, 1, gp.kDim)
+                delete!(mo.options, :clamp_water)
+            end
         end
     end
 
@@ -3252,8 +3416,10 @@ using Springsteel
         # runs. It was an ERROR until 2026-07-30, which turned out to block bf02_moist,
         # whose reference is legitimately cloudy and which threads the conversion.
         mktempdir() do tmpdir
-            vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
-            scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+            # `:condensate_transform => :bhyp` below, so slot 9 is named nu_c.
+            varnames = Scythe.mc_var_names(Dict{Symbol,Any}(:condensate_transform => :bhyp))
+            vars = Dict(v => i for (i, v) in enumerate(varnames))
+            scalar_bc = Dict(v => NeumannBC() for v in varnames)
             side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
             wall_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
             gp0 = GridParameters(geometry = "RiRk",

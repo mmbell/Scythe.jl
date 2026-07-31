@@ -583,6 +583,19 @@ function run_set(label, dir, rows, staterows)
     df0path === nothing && (println("  no snapshot at t = $(TIMES[1]); skipping"); return)
     df0 = CSV.read(df0path, DataFrame)
 
+    # THIS SCRIPT REQUIRES AN UNTRANSFORMED RUN, by construction: it applies CANDIDATE
+    # transforms offline to a saved density field and scores them. Fed a run that already
+    # carries a control variable it would compose the map with itself and every number below
+    # would be a measurement of nothing. The column names say which kind of run this is.
+    for (dens, ctrl) in (("rho_c", "nu_c"), ("rho_r", "nu_r"))
+        ctrl in names(df0) &&
+            error("$dir carries \"$ctrl\": this run already applies the transform in the " *
+                  "model, and this script applies candidate transforms to a DENSITY field. " *
+                  "Point it at an untransformed run.")
+        dens in names(df0) ||
+            error("$dir has neither \"$dens\" nor \"$ctrl\"")
+    end
+
     # Basis validation. The TRUE test is at l_q = 0, where the refit is an exact
     # projection and the saved state is already in the spline space: a mismatch
     # there means this script's basis is not the run's and nothing below counts.
