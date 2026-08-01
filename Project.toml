@@ -23,6 +23,21 @@ Springsteel = "66b52f22-0fad-4358-9559-2105d4560aaf"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 SuiteSparse = "4607b0f0-06f3-5cda-b6b1-a6196a1729e9"
 
+# WHERE SPRINGSTEEL COMES FROM, portably.
+#
+# Springsteel is not registered, so its location has to be recorded somewhere. It used to live
+# ONLY in Manifest.toml, as an absolute path -- "/Users/mmbell/Development/Springsteel.jl" --
+# and Manifest.toml is gitignored. A fresh clone therefore had no way to resolve the dependency
+# at all: `Pkg.instantiate` would look for it in a registry, not find it, and fail. That is
+# invisible on the development machine, where the manifest already exists, and fatal anywhere
+# else, which is exactly where a cluster run happens.
+#
+# `[sources]` is tracked and the path is relative to THIS file, so it works on any machine (and
+# any OS) that checks the two repositories out side by side, which is the layout the sbatch
+# wrappers already assume ($HOME/Development/{Scythe,Springsteel}.jl).
+[sources]
+Springsteel = {path = "../Springsteel.jl"}
+
 [compat]
 LsqFit = "0.15.1"
 Random = "1.11.0"

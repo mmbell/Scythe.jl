@@ -58,6 +58,10 @@ ARGS=""
 [ -n "${RESTART_T:-}" ] && ARGS="$ARGS --restart $RESTART_T"
 [ "${TRACE:-0}" != "0" ] && ARGS="$ARGS --trace ${TRACE}"
 
+JULIA=${JULIA_BIN:-julia}
+. "$SCYTHE/tc/_preflight.sh"
+tc_preflight
+
 echo "=== Scythe TC run (node-per-patch) =============================="
 echo "  job         : ${SLURM_JOB_ID:-manual}"
 echo "  nodes       : ${SLURM_JOB_NODELIST:-unknown}"
@@ -69,7 +73,7 @@ echo "  extra args  : ${ARGS:-none}"
 echo "  started     : $(date)"
 echo "================================================================="
 
-julia --project=$SCYTHE $SCYTHE/tc/tc_run_axisym.jl $INTEGRATION_TIME $ARGS
+$JULIA --project=$SCYTHE $SCYTHE/tc/tc_run_axisym.jl $INTEGRATION_TIME $ARGS
 status=$?
 
 echo "=== finished: $(date) (exit $status) ==="
