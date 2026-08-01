@@ -6,7 +6,20 @@
 #   init_tc!(nest)                               -> writes shared reference +
 #                                                   per-patch balanced ICs
 
-const TC_VARS = Scythe.MC_VARS_CYL
+# The water transforms decide what slots 8 and 9 are NAMED (rho_r/rho_c untransformed,
+# nu_r/nu_c under a transform), and the name is the only thing a consumer sees --
+# Springsteel builds the CSV/netCDF header straight from GridParameters.vars. So every
+# name-keyed dict here (vars, the four BC dicts, l_q, positivity, spline_filter) has to
+# be built from `mc_var_names`, never from a literal: `_resolve_spline_filter` returns
+# `nothing` on a miss rather than raising, so a leftover "rho_r" key under the rain
+# transform would SILENTLY put slot 8 back on a Neumann fit -- which forces dF/dz = 0 at
+# the ground and traps the falling rain at the surface. `Scythe.check_mc_var_names`
+# (called from createModelTile) refuses a stale key, which is the backstop, not the plan.
+const TC_WATER_OPTS = Dict{Symbol,Any}(:condensate_transform => CONDENSATE_TRANSFORM,
+                                       :rain_transform => RAIN_TRANSFORM)
+const TC_VARS = Scythe.mc_var_names(TC_WATER_OPTS; cyl = true)
+const TC_RAIN_VAR = Scythe.rain_var_name(TC_WATER_OPTS)
+const TC_CLOUD_VAR = Scythe.condensate_var_name(TC_WATER_OPTS)
 
 # WHY THE VERTICAL BCs ARE **SecondDerivativeBC**, NOT NEUMANN (2026-07-21).
 # This is the dominant term in the drain documented in reference/HANDOFF_2026-07-20.md.
@@ -157,8 +170,11 @@ function tc_boundary_conditions()
     end
     wall_mode == "d2" || @info "TC vertical wall condition: $(wall_mode) (non-default)"
     # w = 0 at the ground and at the rigid lid is the one genuine vertical BC.
-    # rho_r stays NaturalBC at the ground so rain can fall out of the domain.
-    bot_bc = merge(vert, Dict{String,Any}("w" => DirichletBC(), "rho_r" => NaturalBC()))
+    # Rain stays NaturalBC at the ground so it can fall out of the domain. Keyed by
+    # TC_RAIN_VAR, not the literal "rho_r": under the rain transform the slot is named
+    # nu_r, and a stale key here is IGNORED rather than raising -- putting slot 8 back on
+    # a Neumann fit, which pins dF/dz = 0 at z = 0 and traps the rain at the surface.
+    bot_bc = merge(vert, Dict{String,Any}("w" => DirichletBC(), TC_RAIN_VAR => NaturalBC()))
     top_bc = merge(vert, Dict{String,Any}("w" => DirichletBC()))
     return axis_bc, wall_bc, bot_bc, top_bc
 end
@@ -255,7 +271,14 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         # tropopause, from a hydrostatic sweep truncated at 5 iterations mid-oscillation
         # -- the model silently omitted a forcing of that size, and every reference
         # gradient the perturbations advect (p_z = pp_z + p̄_z) was wrong by it.
-        options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+        #
+        # WATER CONTROL VARIABLES: TC_WATER_OPTS carries :condensate_transform and
+        # :rain_transform (see tc_params.jl). They must go in here, not just into the
+        # names above, or the model would read a control variable as a density -- and
+        # `check_mc_var_names` would catch it, because the names would then disagree.
+        # Declared BEFORE extra_options so a diagnostic run can still override them.
+        options = merge(TC_WATER_OPTS,
+                        Dict{Symbol,Any}(:semiimplicit => true,
                                          :wall_bc_tau => Inf,
                                          :state_dependent_si => true,
                                          :exact_reference_state => true,
@@ -354,7 +377,18 @@ function init_tc!(nest)
                                        r_moist = R_MOIST, z_moist = Z_MOIST,
                                        RH_max = RH_INIT_MAX,
                                        RH_bl = RH_BL, z_bl = Z_BL,
-                                       moist_profile = MOIST_PROFILE)
+                                       moist_profile = MOIST_PROFILE,
+                                       # The initial state is cloud- and rain-free, and
+                                       # condensate_slot(0) = rain_slot(0) = 0.0 EXACTLY
+                                       # in both conventions, so these are belt and
+                                       # braces today. Thread them anyway: the day a
+                                       # cloudy perturbation is added, an untreaded
+                                       # initializer would write a density into a
+                                       # control-variable slot and nothing would say so.
+                                       condensate_transform = CONDENSATE_TRANSFORM,
+                                       condensate_mu = 1.0e-7,
+                                       rain_transform = RAIN_TRANSFORM,
+                                       rain_mu = 1.0e-7)
         for (p, m) in zip(patches, models)
             gpts = Scythe.getGridpoints(p)
             kDim1 = m.grid_params.kDim
@@ -400,7 +434,10 @@ function init_tc!(nest)
         p = createGrid(m.grid_params)
         gpts = Scythe.getGridpoints(p)
         p.physical .= 0.0
-        Scythe.balanced_vortex_mc!(p, gpts, ref, flds, r_axis; zcol = zcol)
+        Scythe.balanced_vortex_mc!(p, gpts, ref, flds, r_axis; zcol = zcol,
+                                   condensate_transform = CONDENSATE_TRANSFORM,
+                                   condensate_mu = 1.0e-7,
+                                   rain_transform = RAIN_TRANSFORM, rain_mu = 1.0e-7)
         Scythe.write_ics_csv(m.initial_conditions, p, gpts)
     end
     return models, topo

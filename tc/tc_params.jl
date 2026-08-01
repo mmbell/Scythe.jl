@@ -122,17 +122,52 @@ const LS_SMAG = 500.0        # [m] Smagorinsky length scale
 const K_MIN = 25.0           # [m²/s] horizontal eddy viscosity floor
 const KH_HEAT = -1.0         # < 0 => Smagorinsky K/Pr_t (not a constant K)
 const PR_T = 1.0             # turbulent Prandtl number
-# Horizontal water mixing. TEMPORARY / NOT ENERGY CONSISTENT (see the long note in
-# moist_compressible.jl by slot 8): it diffuses water mass without transporting the
-# energy that mass carries, so it WILL drift energy. It is here because the water
-# species otherwise have no horizontal mixing at all, and the strong moisture
-# gradients a TC develops then support undamped grid-scale noise on an axisymmetric
-# grid. Noise control to obtain a stable run -- replace with the full moist
-# product-rule form before production science.
-const KH_WATER = -1.0        # < 0 => Smagorinsky K/Sc_t; 0.0 disables
+# Horizontal water mixing. OFF (2026-07-31, user decision). It is a bare K*grad^2 --
+# TEMPORARY / NOT ENERGY CONSISTENT (see the long note in moist_compressible.jl by
+# slot 8): it diffuses water mass without transporting the energy that mass carries,
+# so it WILL drift energy, and it is a very idealized turbulence closure that has to
+# be replaced regardless. It was switched on as pure noise control, on the reasoning
+# that the water species otherwise have no horizontal mixing at all; the spline filter
+# (l_q = 2.0 by default on every variable here) already serves part of that role, and
+# the negative-condensate reservoir that produced much of the grid-scale water
+# structure is gone under the transforms below. Turn it back on ONLY if a gate run
+# demonstrates that minimal diffusion is needed for computational stability, and say
+# so when you do.
+#
+# It is no longer refused under a transform: the mixing is applied to the slot, and
+# for rho >> mu, bhyp is exactly affine, so K*grad^2(nu) IS K*grad^2(rho)/2 to
+# relative O((mu/rho)^2) -- measured 3.7e-9 at rho_c = 2.3e-3 kg/m^3. The exact chain
+# rule was rejected: f''(0) = 1/mu over a 1.7 cm knee is not representable on a 500 m
+# cell. See the Khdiff_water block in src/moist_compressible.jl.
+const KH_WATER = 0.0         # < 0 => Smagorinsky K/Sc_t; 0.0 disables
 const SC_T = 1.0             # turbulent Schmidt number
 const N_0_MP = 8.0e6         # [m^-4] Marshall-Palmer intercept (exponential DSD)
 const TAU_QSS = 10.0         # [s] supersaturation relaxation
+
+# ── Water control variables (Ooyama 2001 Eq. 4.19-4.23) ─────────────────────
+# Slots 8 and 9 carry nu = bhyp(rho) instead of the density, so the RECOVERED
+# density is non-negative BY CONSTRUCTION -- no limiter, no clamp, nothing repaired.
+# Both species, because that is the only configuration available on a NEST: a child
+# patch's i-boundary is R3X, which the spline coefficient bound rejects, so a bounded
+# child runs on a k-only bound with a measured mass-creation leak
+# (bound_shortfall_total 573 on quick nested O01) while the transform has no such
+# restriction and delivers min rho = 0 exactly across the interface.
+#
+# Why this matters here specifically: the negative condensate was a PHYSICS-FREE
+# RESERVOIR (every microphysical rate is max(rho,0)-guarded, so a negative point has
+# no sink while the compensating positive overshoot is consumed every step), and it
+# fed the temperature retrieval directly through rho_liq. On quick O01 it reached
+# 2.75x the real cloud mass. reference/FINDINGS_CONDENSATE_STAGE1.md has the ladder.
+#
+# EXPECT the water partition to look WORSE, not better: min rho_v tracks min rho_w
+# once the negative condensate can no longer cancel part of the rho_t - rho_d
+# deficit. That deficit is a difference of two independently fitted fields and no
+# condensate scheme reaches it (benchmarks/FUTURE_WORK.md). It is an unmasking.
+#
+# mu stays at Ooyama's own 1e-7 kg/m^3: the sweep moved max_w by 0.34% between 1e-8
+# and 1e-7, and the retrieval cost is at most 7.2e-3 K, at the model top.
+const CONDENSATE_TRANSFORM = Symbol(get(ENV, "SCYTHE_TC_CTRANS", "bhyp"))
+const RAIN_TRANSFORM       = Symbol(get(ENV, "SCYTHE_TC_RTRANS", "bhyp"))
 
 # Sponge (Durran-Klemp 1983, stratosphere-confined)
 const SPONGE_ALPHA = 0.02    # [1/s]

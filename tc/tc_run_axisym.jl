@@ -116,10 +116,21 @@ if csv
         times = sort([parse(Float64, replace(f, "_physical.csv" => "")) for f in files])
         df = CSV.read(joinpath(m.output_dir, "$(times[end])_physical.csv"), DataFrame)
         finite = all(isfinite, Matrix(df[:, TC_VARS]))
+        # Slots 8/9 are named for what they HOLD, so read them through the recovery --
+        # `df.rho_r` would not exist under the rain transform, and reading the nu_r
+        # column raw would report roughly half the density in the linear regime (which
+        # is exactly how o01_movie.jl came to draw negative cloud over a run whose own
+        # diagnostics recorded min rho_c = 0).
+        rho_r = Scythe.recover_rho_r.(df[!, TC_RAIN_VAR], RAIN_TRANSFORM, 1.0e-7)
+        rho_c = Scythe.recover_rho_c.(df[!, TC_CLOUD_VAR], 0.0,
+                                      CONDENSATE_TRANSFORM, 1.0e-7)
         println("nest$i t=$(times[end]): finite=$(finite)" *
                 "  max|w|=$(round(maximum(abs.(df.w)); digits=3))" *
                 "  max|u|=$(round(maximum(abs.(df.u)); digits=3))" *
                 "  max v=$(round(maximum(df.v); digits=2))" *
-                "  max rho_r=$(round(1e3 * maximum(df.rho_r); digits=3)) g/m3")
+                "  rho_r=[$(round(1e3 * minimum(rho_r); digits=3)), " *
+                "$(round(1e3 * maximum(rho_r); digits=3))]" *
+                "  rho_c=[$(round(1e3 * minimum(rho_c); digits=3)), " *
+                "$(round(1e3 * maximum(rho_c); digits=3))] g/m3")
     end
 end
