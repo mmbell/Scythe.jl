@@ -131,7 +131,10 @@ const MC_SCRATCH_SLOTS = (
     :sd_pxi, :sd_alpha,                    # state-dependent acoustic linearization
     # ── Louis boundary layer + Smagorinsky closure (mc_boundary_layer.jl) ──
     :Kv, :K_smag, :VD_u, :VD_v, :VD_w, :QDOT_V, :VDOT_w, :VDOT_v,
-    :bl_s_z, :bl_rv_z,
+    # `bl_rho_cp_z` is the Louis BL's perturbation CLOUD-DENSITY gradient ∂z ρ_c', staged by
+    # `mc_driver!` only under a condensate transform (it is `rcv.f_z` otherwise). It reuses the
+    # column that was the retired diagnosed-ρ_v gradient.
+    :bl_s_z, :bl_rho_cp_z,
     # ── semiimplicit_adjustment_p (si_ prefix) ──
     # Deliberately NOT sharing the names above. The two functions' temporaries are not live at
     # the same time today, so sharing would work — but it would be an invisible coupling, and
@@ -256,10 +259,31 @@ Straka's dry-entropy diffusion), and the same integrand `conservation_drift` use
 total entropy. Because `∂s_t/∂T = C_vt/T` at fixed ρ_d and composition, a diffusive
 increment δs_t maps to a heating ρ_d·T·δs_t (= ρ_d C_vt δT). In dry air it reduces to
 `dry_entropy_pd(p, ρ_d)` up to a constant.
+
+**`q_v` IS READ THROUGH `max(q_v, 0)`, AND IT HAS TO BE.** `entropy` evaluates
+`q_v·R_v·ln(q_v ρ_d / ρ_v0)`, so a negative vapor mixing ratio is a `DomainError`, not a
+number — and the vapor is a RESIDUAL (`ρ_t − ρ_d − ρ_c − ρ_r`), so it goes negative wherever
+the difference of two independently fitted O(0.1 kg/m³) densities exceeds the vapor actually
+present. That is the tropopause: measured on the 3-nest TC initial state, 362 of 6750 nest-1
+points between 14.4 and 17.3 km, worst `ρ_v` = −4.5e-6 against a reference `ρ̄_v` of +1.5e-6
+there. It killed the first Louis-BL call of the first timestep. The same clamp, for the same
+stated reason, has always been on the diagnostics side of this (`benchmarks/common/diagnostics.jl`,
+"in dry air the residual vapor sits at 0 ± roundoff, and entropy() takes log(q_v)").
+
+This is the `condensate_floor = :diagnostic` pattern, not `clamp_water!`: nothing is written
+back, no mass is converted, no latent heat is pumped, and `s_t` is only ever read as a
+mixing control variable. It is also CONTINUOUS — `q ln q → 0` as `q → 0⁺`, so `entropy` has
+no kink at zero and the clamped points join the dry limit smoothly. What it does NOT do is
+make the negative vapor go away; that deficit is a property of fitting `ρ_t` and `ρ_d`
+independently, is expressible as a constraint on neither (`benchmarks/FUTURE_WORK.md`), and
+no condensate scheme reaches it.
+
+`q_l` is deliberately NOT clamped: nothing takes its log, a negative condensate must stay
+visible in the entropy budget, and under the water transforms it cannot be negative anyway.
 """
 function moist_entropy_total(Tk, rho_d, q_v, q_l)
 
-    return entropy(Tk, rho_d, q_v) + (q_l * Cl * log(Tk / T_0))
+    return entropy(Tk, rho_d, max(q_v, 0.0)) + (q_l * Cl * log(Tk / T_0))
 end
 
 """
@@ -3251,19 +3275,58 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # convention); > 0 is a constant diffusivity. Same K*grad^2 (not div(K grad))
     # approximation as the momentum and heat terms.
     if Khdiff_water != 0.0
-        # Same objection as `Kvdiff_water` in `_diffusion_water_step!`: this Laplacian is
-        # applied to the slot, and a transformed slot is not a density. K∇²ν is not K∇²ρ, and
-        # nothing downstream would reveal the difference. Refuse rather than mix the wrong
-        # field. (Latent today: Khdiff_water is 0.0 in every shipped configuration, and the
-        # one that sets it, TC, has never run transformed.)
-        (ctrans_on || rtrans_on) &&
-            error("physical_params[:Khdiff_water] != 0 with a water transform on " *
-                  "(condensate_transform = :$(ctrans), rain_transform = :$(rtrans)) is not " *
-                  "implemented: the horizontal mixing is applied to the slot, and a " *
-                  "transformed slot carries a control variable, not a density. Set " *
-                  "Khdiff_water = 0 or formulate the mixing in the recovered density.")
+        # UNDER A TRANSFORM THIS MIXES THE CONTROL VARIABLE, AND THAT IS THE INTENDED FORM.
+        # The Laplacian is applied to the slot, so with `condensate_transform`/`rain_transform`
+        # on it smooths ν rather than ρ. That is not an approximation to `K∇²ρ` — above the
+        # knee it IS `K∇²ρ`, because `bhyp` is exactly affine there:
+        #
+        #     bhyp(ρ) = (ρ + μ)/2 − μ²/(2(ρ + μ))        (algebra, not an expansion)
+        #
+        # so `∇²ν = ∇²ρ/2 + O(μ²)` and `f'(ν) = 2 + O(μ²/ρ²)`, and the implied density rate
+        # `f'(ν)·K∇²ν` agrees with `K∇²ρ` to relative O(μ²/ρ²). Measured on a Gaussian cloud at
+        # μ = 1e-7: 3.7e-9 at ρ_c = 2.3e-3, 2.6e-7 at 3.2e-4, 6.2e-4 at 5.8e-6, and only
+        # reaching 7.2e-2 at 3.7e-7 kg/m³ — a thousandth of the smallest meaningful cloud.
+        #
+        # WHY NOT THE EXACT CHAIN RULE `J·K·(f''(ν)|∇ν|² + f'(ν)∇²ν)`. Because `f''(0) = 1/μ`:
+        #
+        #     f'(ν)  = 2(ρ+μ)² / ((ρ+μ)² + μ²)          ∈ [1, 2]
+        #     f''(ν) = 8μ²(ρ+μ)³ / ((ρ+μ)² + μ²)³       → 1/μ = 1e7 as ρ → 0
+        #
+        # and the region where that term matters is `μ/|∇ρ| ≈ 1.7 cm` wide against a 500 m
+        # cell. Its magnitude there is `K·f''·|∇ν|²` ≈ 0.036 kg/m³/s at ρ = μ and 0.148 at
+        # ρ = 1e-8 — twelve to fifty times the entire cloud amplitude, per second. Analytically
+        # it is cancelled by `f'∇²ν`; discretely both come from a filtered, ringing spline fit
+        # at the one place the fit is worst, and nothing makes that cancellation survive. It is
+        # not a smoothing operator, it is a pointwise sample of an unresolvable knee, so it is
+        # deliberately NOT offered as an option — a branch that is unrunnable at the cloud edge
+        # is dead code that will be believed. (This also retires the stated reason for keeping
+        # `:bhyp_smooth` in reference/FINDINGS_CONDENSATE_STAGE1.md — "for any future consumer
+        # that needs f'' at the cloud edge, the water Laplacians". They do not need it.)
+        #
+        # Two consequences worth stating rather than leaving to be rediscovered:
+        #   * slot 3 (total water) is untransformed and keeps mixing in DENSITY space while
+        #     slots 8/9 mix in ν space, so the vapor residual absorbs the difference. That is
+        #     O(μ²/ρ²) above the knee — not a new inconsistency class.
+        #   * positivity survives whatever the mixing does, because it is a property of the
+        #     recovery, not of the operator: ν monotone in ρ and `ahyp` floored at 0 (`:bhyp`)
+        #     or −μ (`:bhyp_smooth`). The coefficient limiter this replaced could not say that
+        #     across a nest interface at all.
+        #
+        # Precedent inside the model: the Galerkin low-pass `l_q` (2.0 by default) and the
+        # spline filter are ALREADY applied to the slot, i.e. already smooth ν directly, and
+        # the whole transform validation ladder was run with them on.
         WLAP = S.KDIFF                    # both free again after slot 9
         WLAP2 = S.FORCING
+        # ACCUMULATED THROUGH AN EXPLICIT LOOP, not `expdot[colstart:colend,s] .+= …`.
+        # `.+=` on an indexed expression expands to `A[r] = A[r] .+ B`, and the READ
+        # materializes the slice: this block was allocating four times per column (measured;
+        # it is the only mc term that did, and it was never in the allocation gate because
+        # Khdiff_water is 0.0 in every shipped configuration). Same convention as the Louis
+        # BL's apply loop. It is also the only additive mc block, which is why `.=`
+        # everywhere else was fine.
+        # The two branches stay SEPARATE and each carries its own loops: hoisting the
+        # diffusivity into one variable would give it type `Union{Vector{Float64},Float64}`
+        # and box every use — the same trap the state-dependent SI hit.
         if Khdiff_water < 0.0
             use_smag || error("physical_params[:Khdiff_water] < 0 selects the " *
                               "Smagorinsky water diffusivity, which requires Ls > 0")
@@ -3271,23 +3334,42 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             # water rides on rho_t here, so rho_d's own tendency is untouched).
             mc_w_kdiff!(WLAP,  geom, K_smag, rtv, r)
             mc_w_kdiff!(WLAP2, geom, K_smag, rdv, r)
-            @turbo expdot[colstart:colend,3] .+= @. (WLAP - WLAP2) / Sc_t
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 3] += (WLAP[i] - WLAP2[i]) / Sc_t
+            end
+            # Slots 8 and 9 are the transformed ones: under a transform `rrv`/`rcv` are ν,
+            # and `K∇²ν` is the intended operator (see the block comment above). No
+            # Jacobian — the tendency is already in the slot's own units.
             mc_w_kdiff!(WLAP, geom, K_smag, rrv, r)
-            @turbo expdot[colstart:colend,8] .+= @. WLAP / Sc_t
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 8] += WLAP[i] / Sc_t
+            end
             mc_w_kdiff!(WLAP, geom, K_smag, rcv, r)
-            @turbo expdot[colstart:colend,9] .+= @. WLAP / Sc_t
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 9] += WLAP[i] / Sc_t
+            end
             mc_w_kdiff!(WLAP, geom, K_smag, qsv, r)
-            @turbo expdot[colstart:colend,7] .+= @. WLAP / Sc_t
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 7] += WLAP[i] / Sc_t
+            end
         else
             mc_w_kdiff!(WLAP,  geom, Khdiff_water, rtv, r)
             mc_w_kdiff!(WLAP2, geom, Khdiff_water, rdv, r)
-            @turbo expdot[colstart:colend,3] .+= @. WLAP - WLAP2
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 3] += WLAP[i] - WLAP2[i]
+            end
             mc_w_kdiff!(WLAP, geom, Khdiff_water, rrv, r)
-            @turbo expdot[colstart:colend,8] .+= WLAP
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 8] += WLAP[i]
+            end
             mc_w_kdiff!(WLAP, geom, Khdiff_water, rcv, r)
-            @turbo expdot[colstart:colend,9] .+= WLAP
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 9] += WLAP[i]
+            end
             mc_w_kdiff!(WLAP, geom, Khdiff_water, qsv, r)
-            @turbo expdot[colstart:colend,7] .+= WLAP
+            @inbounds for i in eachindex(WLAP)
+                expdot[colstart + i - 1, 7] += WLAP[i]
+            end
         end
     end
 
@@ -3327,9 +3409,23 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # saturation chain rule is linear), so the lines above stay frozen and
     # louis_bl = false is bit-identical. See mc_boundary_layer.jl.
     if louis_bl
+        if ctrans_on
+            # The BL's cloud eddy flux is a MASS flux, so it has to be built from the
+            # perturbation DENSITY gradient, not from the slot's. `rho_c_z` (line ~2703) is the
+            # total ∂z ρ_c = ∂z ν / J, and this is its first consumer — it was written for one.
+            #
+            # Staged HERE and not inside `mc_louis_bl!` because `rho_cbar_z` is a SubArray, and
+            # handing it to a @noinline callee is an escape that boxes once per column; the
+            # zero-allocation gate in test/test_allocations.jl exists for exactly that.
+            #
+            # NOT used on the `:none` path: there `rho_c_z` is `rho_cp_z + rho_cbar_z` and
+            # subtracting `rho_cbar_z` back off is not bitwise `rho_cp_z`. The callee keeps
+            # reading `rcv.f_z` directly when the transform is off, which is.
+            @. S.bl_rho_cp_z = rho_c_z - rho_cbar_z
+        end
         mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
                      expdot, l_inf, Cd_param, sfc_wind_factor,
-                     surface_fluxes, Ck, SST, U_min)
+                     surface_fluxes, Ck, SST, U_min, ctrans_on)
     end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──

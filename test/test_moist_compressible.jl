@@ -3059,6 +3059,39 @@ using Springsteel
         end
         @test Scythe.dbhyp(0.0, mu) == 1.0          # the maximum, attained exactly at zero
 
+        # f' = 1/J, the identity the LOUIS BL's cloud flux rests on: it recovers the
+        # density gradient as dz(nu)/J, so f'(nu) had better be exactly the reciprocal of
+        # the forward map's Jacobian. Bounded in [1, 2] by J in [0.5, 1] -- and that
+        # boundedness is why the BL admits an exact fix where the horizontal Laplacian does
+        # not (which needs f'', unbounded as 1/mu).
+        for rho in (1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0)
+            n = Scythe.bhyp(rho, mu)
+            h = 1.0e-5 * abs(n)
+            fp = (Scythe.ahyp_smooth(n + h, mu) - Scythe.ahyp_smooth(n - h, mu)) / (2h)
+            @test isapprox(fp, 1.0 / Scythe.dbhyp(rho, mu); rtol = 1.0e-7)
+            @test 1.0 <= fp <= 2.0 + 1.0e-9
+        end
+
+        # bhyp is EXACTLY AFFINE above the knee -- algebra, not an expansion:
+        #     bhyp(rho) = (rho + mu)/2 - mu^2/(2(rho + mu))
+        # This is why mixing the CONTROL VARIABLE with a Laplacian is not an approximation
+        # to mixing the density: a spline fit is linear, so K*grad^2(nu) is K*grad^2(rho)/2
+        # to relative O((mu/rho)^2), and the recovered density rate f'*K*grad^2(nu) is
+        # K*grad^2(rho). See the Khdiff_water block in src/moist_compressible.jl.
+        for rho in (1.0e-6, 1.0e-4, 1.0e-3, 1.0e-2, 1.0)
+            @test isapprox(Scythe.bhyp(rho, mu),
+                           (0.5 * (rho + mu)) - ((mu * mu) / (2.0 * (rho + mu)));
+                           rtol = 1.0e-15)
+            # The DEVIATION from exact affinity is bounded by mu^2/(rho+mu), i.e. it
+            # vanishes quadratically in mu/rho -- the bound the ν-space mixing relies on.
+            # The +8eps is round-off headroom, not slack in the identity: forming the
+            # difference of two O(rho) quantities cancels away all but ~eps*rho, and at
+            # rho >= 1e-2 that round-off is itself larger than the analytic bound.
+            @test abs((2.0 * Scythe.bhyp(rho, mu)) - (rho + mu)) <=
+                  ((mu * mu) / (rho + mu)) + (8.0 * eps(rho))
+            @test isapprox(Scythe.dbhyp(rho, mu), 0.5; rtol = 2.0 * (mu / rho)^2 + 1.0e-15)
+        end
+
         # Range. The published quasi-inverse is non-negative everywhere; the strict inverse
         # is bounded below by -mu, and approaches it rather than crossing it.
         for n in (-1.0, -1.0e-2, -1.0e-4, -mu, -1.0e-12, 0.0, 1.0e-12, 1.0e-3, 1.0)
@@ -3113,7 +3146,7 @@ using Springsteel
     """
     function ctrans_rirk(tmpdir, tag; transform = nothing, rain_transform = nothing,
                          positivity = nothing, amp = 3.0e-3, precipitation = false,
-                         rain_amp = 0.0)
+                         rain_amp = 0.0, xmod = false, Khdiff_water = 0.0, Sc_t = 1.0)
         ref_file = joinpath(tmpdir, "ctrans_$(tag).ref")
         opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
                                 :precipitation => precipitation)
@@ -3140,6 +3173,7 @@ using Springsteel
             physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
                                    :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
                                    :tau_qss => 10.0, :alpha => 0.0,
+                                   :Khdiff_water => Khdiff_water, :Sc_t => Sc_t,
                                    :z_damp => 20.0e3, :f => 0.0),
             options = opts)
         gp = model.grid_params
@@ -3161,15 +3195,22 @@ using Springsteel
         # situation -- a convective condensate spike the column cannot resolve -- and it is
         # what makes the fit undershoot on the flanks. A smooth seed does not ring at all on
         # this coarse a column, and then the test asserts nothing.
+        # `xmod` gives the seed HORIZONTAL structure. Off by default and then bitwise the
+        # z-only seed this fixture has always used. It is needed only by the Khdiff_water
+        # testset: `mc_w_kdiff!` on the Cartesian slice is `K*f_xx`, which is ~0 for a
+        # z-only field, so without it a horizontal-mixing test asserts nothing. One full
+        # cosine over the 8 km domain is well resolved on 4 cells' worth of nodes, so the
+        # two arms' fits stay comparable.
         for i in 1:size(patch.physical, 1)
             patch.physical[i, w_i, 1] = 1.0e-2 * sin(0.5 * sqrt(2.0) * i^2)
             zi = gpts[i, end]
-            rho_c = amp * exp(-((zi - 2000.0) / 250.0)^2)          # >= 0 by construction
+            xfac = xmod ? 1.0 + (0.5 * cos(2.0 * pi * gpts[i, 1] / 8.0e3)) : 1.0
+            rho_c = xfac * amp * exp(-((zi - 2000.0) / 250.0)^2)    # >= 0 by construction
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rho_c, 0.0, tf, 1.0e-7)
             # An equally sub-cell RAIN spike, sited lower so it is a distinct feature. Rain
             # has no reference profile, so its slot is the control variable itself.
             if rain_amp > 0.0
-                rho_r = rain_amp * exp(-((zi - 1200.0) / 250.0)^2)
+                rho_r = xfac * rain_amp * exp(-((zi - 1200.0) / 250.0)^2)
                 patch.physical[i, rr_i, 1] = Scythe.rain_slot(rho_r, rtf, 1.0e-7)
             end
         end
@@ -3404,6 +3445,107 @@ using Springsteel
                 @test_throws ErrorException Scythe.clamp_water!(m, 1, gp.kDim)
                 delete!(mo.options, :clamp_water)
             end
+        end
+    end
+
+    @testset "moist_entropy_total survives a negative vapor residual" begin
+        # `entropy` takes log(q_v*rho_d/rho_v0), and the vapor is a RESIDUAL, so it goes
+        # negative wherever the difference of two independently fitted densities exceeds
+        # the vapor present -- i.e. at the tropopause. Measured on the 3-nest TC initial
+        # state: 362 of 6750 nest-1 points between 14.4 and 17.3 km, worst rho_v = -4.5e-6
+        # against a reference rho_vbar of +1.5e-6 there. It threw a DomainError out of the
+        # first Louis-BL call of the first timestep.
+        Tk = 210.0; rho_d = 0.18
+        @test isfinite(Scythe.moist_entropy_total(Tk, rho_d, -2.5e-5, 0.0))
+        @test Scythe.moist_entropy_total(Tk, rho_d, -2.5e-5, 0.0) ==
+              Scythe.moist_entropy_total(Tk, rho_d, 0.0, 0.0)
+        # CONTINUOUS at zero, so the clamped points join the dry limit smoothly rather
+        # than stepping: q*ln(q) -> 0 as q -> 0+, so entropy has no kink there.
+        s0 = Scythe.moist_entropy_total(Tk, rho_d, 0.0, 0.0)
+        # The gap closes like q*|ln q| -- superlinearly in q but not linearly, so the
+        # tolerance has to carry the log factor rather than being a constant.
+        for q in (1.0e-6, 1.0e-8, 1.0e-10, 1.0e-12)
+            @test isapprox(Scythe.moist_entropy_total(Tk, rho_d, q, 0.0), s0;
+                           atol = 1.0e5 * q)
+        end
+        # and it is monotone: smaller q is closer to the dry limit
+        gaps = [abs(Scythe.moist_entropy_total(Tk, rho_d, q, 0.0) - s0)
+                for q in (1.0e-6, 1.0e-8, 1.0e-10, 1.0e-12)]
+        @test issorted(gaps; rev = true)
+        # q_l is NOT clamped: nothing takes its log, and a negative condensate has to stay
+        # visible in the entropy budget. It passes through as exactly its own term --
+        # note that term is POSITIVE for a negative q_l here, because Tk < T_0 makes
+        # log(Tk/T_0) negative; the claim is pass-through, not a sign.
+        @test Scythe.moist_entropy_total(Tk, rho_d, 1.0e-4, -1.0e-4) -
+              Scythe.moist_entropy_total(Tk, rho_d, 1.0e-4, 0.0) ≈
+              -1.0e-4 * Scythe.Cl * log(Tk / Scythe.T_0)
+        # Positive vapor is untouched -- the clamp is inert wherever the physics is sane.
+        @test Scythe.moist_entropy_total(300.0, 1.1, 0.015, 1.0e-3) ==
+              Scythe.entropy(300.0, 1.1, 0.015) +
+              (1.0e-3 * Scythe.Cl * log(300.0 / Scythe.T_0))
+    end
+
+    @testset "Khdiff_water under a water transform mixes the control variable" begin
+        # It used to REFUSE to run here. It no longer does, and the reason is measured in
+        # the bhyp algebra testset above: bhyp is exactly affine for rho >> mu, so
+        # K*grad^2(nu) IS K*grad^2(rho)/2 to relative O((mu/rho)^2), and the density rate
+        # the slot implies is the density mixing the term intends. The exact chain rule was
+        # rejected on f''(0) = 1/mu -- see the block comment in src/moist_compressible.jl.
+        #
+        # Isolated exactly by flipping Khdiff_water between two runs of the SAME tile:
+        # every other term cancels in the difference.
+        mktempdir() do tmpdir
+            K = 5.0
+            function kh_increment(tag; kw...)
+                m0, p0, mo0, gp0 = ctrans_rirk(tmpdir, "$(tag)_off";
+                                               xmod = true, Khdiff_water = 0.0, kw...)
+                m1, p1, _, gp1 = ctrans_rirk(tmpdir, "$(tag)_on";
+                                             xmod = true, Khdiff_water = K, kw...)
+                for (m, p, gp) in ((m0, p0, gp0), (m1, p1, gp1))
+                    ncols = div(size(p.physical, 1), gp.kDim)
+                    for c in 1:ncols
+                        Scythe.advance_column(m, c, 1)
+                    end
+                end
+                return m1.expdot_n .- m0.expdot_n, m1, p1, gp1
+            end
+
+            Dn, _, _, _ = kh_increment("khw_none"; rain_amp = 2.0e-3)
+            Db, mb, pb, gpb = kh_increment("khw_bhyp"; transform = :bhyp,
+                                           rain_transform = :bhyp, rain_amp = 2.0e-3)
+
+            # It runs at all — this is the gate the old error() closed.
+            @test all(isfinite.(Db))
+            @test maximum(abs.(Dn[:, 9])) > 0.0
+            @test maximum(abs.(Dn[:, 8])) > 0.0
+
+            # The transformed slots receive HALF the density Laplacian, which is the affine
+            # identity measured through the model rather than in isolation. The residual is
+            # the two arms' different spline fits of rho vs nu, not the analytic gap.
+            for s in (8, 9)
+                sc = maximum(abs.(Dn[:, s]))
+                @test isapprox(Db[:, s], 0.5 .* Dn[:, s]; atol = 1.0e-3 * sc)
+            end
+            # Slots 3 (total water) and 7 (Q_ss) are untransformed and must be untouched by
+            # the change of variables.
+            for s in (3, 7)
+                sc = maximum(abs.(Dn[:, s]))
+                @test isapprox(Db[:, s], Dn[:, s]; atol = 1.0e-3 * sc + 1.0e-300)
+            end
+
+            # Positivity survives the mixing, because it is a property of the RECOVERY, not
+            # of the operator. Step the transformed tile and check the recovered densities.
+            m, p, _, gp = ctrans_rirk(tmpdir, "khw_run"; transform = :bhyp,
+                                      rain_transform = :bhyp, rain_amp = 2.0e-3,
+                                      xmod = true, Khdiff_water = K)
+            vapor_blend_run!(m, p, gp, 20)
+            @test all(isfinite.(p.physical[:, :, 1]))
+            @test minimum(ctrans_rho_c(p, gp, :bhyp)) >= 0.0
+            @test minimum(ctrans_rho_r(p, gp, :bhyp)) >= 0.0
+
+            # The Smagorinsky sentinel still needs Ls > 0 — untested until now.
+            mk, pk, mok, gpk = ctrans_rirk(tmpdir, "khw_smag"; Khdiff_water = -1.0)
+            @test_throws ErrorException Scythe.advance_column(mk, 1, 1)
         end
     end
 

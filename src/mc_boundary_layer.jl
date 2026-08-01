@@ -94,8 +94,9 @@ end
 end
 
 """
-    mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv,
-                 expdot, l_inf, Cd_param, sfc_fac, surface_fluxes, Ck, SST, U_min)
+    mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
+                 expdot, l_inf, Cd_param, sfc_fac, surface_fluxes, Ck, SST, U_min,
+                 ctrans_on)
 
 Louis boundary layer for one column of the total-energy set: eddy diffusivity
 `Kv = l(z)² |∂V/∂z|` with the Blackadar-blended length `l = 1/(1/(κz) + 1/l∞)`,
@@ -119,13 +120,43 @@ water sources via the fixed-T map of `_diffusion_water_step!` (slot 3 `+ρ̇_w`,
 slot 9 `+ρ̇_c`, slot 1 `+R_v T ρ̇_v`, slot 6
 `+(C_pv T − L_v + ke + gz) ρ̇_w + (L_v − R_v T) ρ̇_v`, slot 7
 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`, with `ρ̇_v = ρ̇_w − ρ̇_c`).
+
+`ctrans_on` says whether slot 9 carries a control variable rather than the cloud density
+(`Scythe.condensate_transform_mode`). It changes exactly two things, and BOTH ARE REQUIRED FOR
+CORRECTNESS — before it existed this function was silently wrong under the transform:
+
+* the cloud eddy flux is built from the perturbation DENSITY gradient `∂z ρ_c'`
+  (`S.bl_rho_cp_z`, staged by `mc_driver!` from `S.rho_c_z = ∂z ν / J`) instead of from
+  `rcv.f_z`, because an eddy flux of cloud water is a MASS flux. Only `f' = 1/J ∈ [1, 2]` is
+  needed — never `f''`, which is what makes this exactly fixable where the horizontal
+  Laplacian is not;
+* the slot-9 increment is multiplied by `J`. Everything else — slots 1, 3, 6, 7 — is left
+  alone, because with the flux built in density space `ρ̇_w`, `ρ̇_c` and `ρ̇_v = ρ̇_w − ρ̇_c` are
+  all density rates again, which is what those slots want. (That subtraction was the real
+  damage: a ν-rate minus a density rate, fed to the pressure, energy and Q_ss channels.)
+
+With `ctrans_on = false` the flux line is the original one verbatim and `J ≡ 1.0`, so the
+default path is bit-identical.
+
+Rain is NOT affected: this function touches slot 8 only by borrowing its spline column as a
+basis, never its values, so `rain_transform` needs nothing here.
+
+Two limits worth knowing. With a CLOUDY reference (ρ̄_c ≠ 0) the resting state is quiet to
+~1e-16 relative rather than exactly, because `J` is evaluated at `ahyp(bhyp(ρ̄_c))` whose round
+trip is 2.2e-16; every current configuration has ρ̄_c ≡ 0 and
+`Scythe.check_condensate_transform_ic` warns otherwise. And where `ν < 0` under `:bhyp`, the
+reconstructed gradient is the SMOOTH branch's `ν_z/J`, not the clipped map's zero — deliberate:
+the clipped form would zero the flux at the cloud edge and forbid the BL from ever mixing cloud
+into cloud-free air, and the resulting increment is a bounded ν-space rate over a region
+carrying no cloud.
 """
 @noinline function mc_louis_bl!(mtile::ModelTile, S, geom::MCGeometry,
                                 colstart::Int64, colend::Int64, z,
                                 uv, wv, vv, rtv, rdv, rcv, expdot,
                                 l_inf::Float64, Cd_param::Float64,
                                 sfc_fac::Float64, surface_fluxes::Bool,
-                                Ck::Float64, SST::Float64, U_min::Float64)
+                                Ck::Float64, SST::Float64, U_min::Float64,
+                                ctrans_on::Bool)
     u = uv.f; u_z = uv.f_z
     w = wv.f; w_z = wv.f_z
     rho_t = S.rho_t
@@ -227,7 +258,15 @@ slot 9 `+ρ̇_c`, slot 1 `+R_v T ρ̇_v`, slot 6
     Ixtransform(col, VDOT_w)
 
     VDOT_c = S.VDOT_v            # (the ex-vapor scratch slot, now the cloud flux)
-    col.uMish .= Kv .* rcv.f_z
+    # Under a transform slot 9 is ν' = bhyp(ρ_c) − bhyp(ρ̄_c), and `Kv .* rcv.f_z` would fit
+    # `Kv ∂z ν'` — not a mass flux. `S.bl_rho_cp_z` is `∂z ρ_c'`, staged in mc_driver! from
+    # `S.rho_c_z = ∂z ν / J`, so VDOT_c is a DENSITY rate on both branches and everything
+    # downstream of it needs no further thought. See the docstring.
+    if ctrans_on
+        col.uMish .= Kv .* S.bl_rho_cp_z
+    else
+        col.uMish .= Kv .* rcv.f_z
+    end
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_c)
@@ -236,7 +275,7 @@ slot 9 `+ρ̇_c`, slot 1 `+R_v T ρ̇_v`, slot 6
     # broadcasts — the SubArray elision lesson at this function size). The
     # surface terms ride in on the analytic delivery profile g(z): drag −τ·g
     # into the momentum, F_sh·g into the heating, F_q·g into both water rates.
-    R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv
+    R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv; Jc = S.Jc
     drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp
     ke = S.ke
     @inbounds for i in eachindex(Kv)
@@ -262,7 +301,11 @@ slot 9 `+ρ̇_c`, slot 1 `+R_v T ρ̇_v`, slot 6
         dp_q = Rv * Tk[i] * vdot_v
         expdot[j, 1] += dp_v + dp_q
         expdot[j, 3] += vdot_w
-        expdot[j, 9] += vdot_c
+        # The one Jacobian: slot 9 holds ν, so a density rate reaches it as J·ρ̇_c. `Jc` is an
+        # exact 1.0 with no transform declared (mc_driver! `fill!(Jc, 1.0)`) and `1.0*x === x`
+        # for every double, so this line is bit-identical on the default path — the same
+        # argument the slot-9 FORCING makes in moist_compressible.jl.
+        expdot[j, 9] += Jc[i] * vdot_c
         expdot[j, 6] += qdot +
                         (((Cpv * Tk[i]) - Lv[i] + ke[i] + (gravity * z[i])) * vdot_w) +
                         ((Lv[i] - (Rv * Tk[i])) * vdot_v) +

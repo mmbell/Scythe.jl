@@ -95,16 +95,26 @@ using SparseArrays
         return (; z, Tk, p_Pa, rho_d, rho_v = zeros(n), rho_c = zeros(n))
     end
 
-    """Axisym RiRk tile with a Natural rho_r bottom (the surface-flux basis)."""
+    """Axisym RiRk tile with a Natural rho_r bottom (the surface-flux basis).
+
+    `ctrans` / `rtrans` select the water control-variable transforms. With both `:none`
+    (the default) every dict below is built from names identical to the old literals, so
+    the fixture is bitwise what it was."""
     function make_bl_mtile(tmpdir; louis_bl=true, Cd=-1.0, Ls=0.0, K_min=0.0,
                            sfc_wind_factor=1.0, l_inf=80.0, dry=false,
+                           ctrans=:none, rtrans=:none, cmu=1.0e-7, rmu=1.0e-7,
                            equation_set="moist_compressible_axisym")
-        varlist = equation_set == "moist_compressible_XZ" ? Scythe.MC_VARS :
-                                                            Scythe.MC_VARS_CYL
+        cyl = equation_set != "moist_compressible_XZ"
+        # Every name-keyed dict must come from mc_var_names, not a literal: a stale key is
+        # ignored silently rather than raising (Scythe.check_mc_var_names is the backstop).
+        opts_names = Dict{Symbol,Any}(:condensate_transform => ctrans,
+                                      :rain_transform => rtrans)
+        varlist = Scythe.mc_var_names(opts_names; cyl = cyl)
+        rain_name = Scythe.rain_var_name(opts_names)
         vars = Dict(v => i for (i, v) in enumerate(varlist))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
         side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
-        bot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), "rho_r" => NaturalBC()))
+        bot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), rain_name => NaturalBC()))
         top_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
         gp = GridParameters(geometry = "RiRk",
             iMin = 100.0e3, iMax = 125.6e3, num_cells_i = 8,
@@ -120,9 +130,13 @@ using SparseArrays
                                    :tau_qss => 10.0, :alpha => 0.0, :z_damp => 20.0e3,
                                    :f => 0.0, :Cd => Cd, :Ls => Ls, :K_min => K_min,
                                    :l_inf => l_inf,
+                                   :condensate_mu => cmu, :rain_mu => rmu,
                                    :sfc_wind_factor => sfc_wind_factor),
-            options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                           :precipitation => false, :louis_bl => louis_bl))
+            options = Dict{Symbol,Any}(:semiimplicit => true,
+                           :exact_reference_state => true,
+                           :precipitation => false, :louis_bl => louis_bl,
+                           :condensate_transform => ctrans,
+                           :rain_transform => rtrans))
         # gp.kDim is derived inside ModelParameters (compute_derived_params) — the
         # grid must come from model.grid_params, not the raw gp.
         gp = model.grid_params
@@ -403,6 +417,134 @@ using SparseArrays
         D6s = D6 .- rho_t .* ((u_fit .* D4) .+ (w_fit .* D5) .+ (v_fit .* D9))
         @test abs(trapz(z, D6s)) < 0.05 * trapz(z, abs.(D6s)) + 1.0e-30
         @test abs(trapz(z, D3)) < 0.05 * trapz(z, abs.(D3)) + 1.0e-30
+    end
+
+    # ──────────────────────────────────────────────
+    # 7b. Cloud mixing under the condensate transform
+    # ──────────────────────────────────────────────
+    @testset "Louis BL cloud mixing under the condensate transform" begin
+        import Springsteel.Thermodynamics: Cl
+        V0 = 2.0
+        H = 2000.0
+        mu = 1.0e-7
+
+        # A cloud BOUNDED AWAY FROM ZERO (5e-4 .. 1.5e-3 kg/m^3, i.e. rho_c >> mu
+        # everywhere) with zero end-slope so it is representable on the Neumann basis.
+        # That is deliberate and it is what makes this test sharp: where rho_c >> mu,
+        # bhyp is EXACTLY affine -- bhyp(rho) = (rho+mu)/2 - mu^2/(2(rho+mu)) -- and a
+        # spline fit is linear, so the two arms' fitted cloud fields agree to ~1e-8
+        # relative (measured ~5e-9 here) and every difference below is the SCHEME, not
+        # the fit. It is the same regime in which bf02_moist reproduces the untransformed
+        # run to twelve significant figures.
+        cloud(zk) = 1.0e-3 * (1.0 + (0.5 * cos(pi * zk / H)))
+
+        # Seed cloud as MASS, T-invariant: rho_t carries the same increment (so the vapor
+        # residual stays ~0 and the vapor rate is exactly zero in the CORRECT scheme --
+        # which is precisely the quantity the bug corrupts), liquid adds no partial
+        # pressure, and E_t takes the liquid internal + potential energy.
+        function set_cloud!(tf)
+            return (patch, vars, kDim, z) -> begin
+                col_bl = dry_adiabatic_column(z)
+                ci = Scythe.mc_slot(vars, "rho_c")
+                for i in 1:size(patch.physical, 1)
+                    k = mod1(i, kDim)
+                    patch.physical[i, vars["v"], 1] = V0 * sin(0.5 * pi * z[k] / H)^2
+                    rc = cloud(z[k])
+                    # rho_cbar == 0 on the dry base, so nu' = bhyp(rho_c) with no
+                    # background to subtract.
+                    patch.physical[i, ci, 1] = Scythe.condensate_slot(rc, 0.0, tf, mu)
+                    patch.physical[i, vars["rho_t"], 1] += rc
+                    patch.physical[i, vars["E_t"], 1] +=
+                        ((Cl * col_bl.Tk[k]) + (gravity * z[k])) * rc
+                end
+                compensate_ke!(patch, vars, kDim, z; dry=true)
+            end
+        end
+
+        Dn, patch, gp, z, mtile = bl_increment(set_cloud!(:none); Cd=0.0, dry=true,
+                                               ctrans=:none, cmu=mu)
+        Db, _, _, _, _ = bl_increment(set_cloud!(:bhyp); Cd=0.0, dry=true,
+                                      ctrans=:bhyp, cmu=mu)
+        kDim = gp.kDim
+        ncols = div(size(patch.physical, 1), kDim)
+        c = div(ncols, 2)
+        rng = ((c - 1) * kDim + 1):(c * kDim)
+
+        @test all(isfinite.(Db))
+        # The BL is genuinely mixing cloud, or nothing below means anything
+        @test maximum(abs.(Dn[rng, 9])) > 0.0
+
+        # THE BUG WITNESS. Slots 1 (p), 6 (E_t) and 7 (Q_ss) are fed through
+        # `vdot_v = vdot_w - vdot_c`. Before the fix `vdot_c` was a nu-space rate --
+        # here exactly half the density rate, since J == 0.5 for rho_c >> mu -- being
+        # subtracted from a density rate, so the transformed arm carried a spurious
+        # vapor tendency of 0.5*rhodot_c into all three. With the flux built in density
+        # space they agree. Slot 3 (total water) never saw the bug and is the control.
+        for s in (1, 3, 6, 7)
+            scale = maximum(abs.(Dn[rng, s]))
+            @test isapprox(Db[rng, s], Dn[rng, s]; atol = 1.0e-6 * scale + 1.0e-300)
+        end
+
+        # The Jacobian, at its exact linear-regime value: slot 9 holds nu, so it receives
+        # J*rhodot_c, and J == 0.5 + O((mu/rho)^2) here.
+        #
+        # NOTE this line does NOT discriminate the bug, and cannot: for rho_c >> mu the old
+        # code's Kv*dz(nu) IS half the density flux, so the two formulations agree on slot 9
+        # algebraically. Verified by reverting the fix -- slot 9 passes, slots 1/6/7 fail
+        # (slot 6 by more than a factor of two). The discrimination lives above; this is the
+        # consistency check that the Jacobian is applied once and in the right direction.
+        sc9 = maximum(abs.(Dn[rng, 9]))
+        @test isapprox(Db[rng, 9], 0.5 .* Dn[rng, 9]; atol = 1.0e-6 * sc9)
+
+        # Interior mixing with no surface cloud source conserves column cloud mass, in
+        # DENSITY terms -- i.e. after dividing the transformed slot's rate back by J.
+        d9 = Db[rng, 9] ./ 0.5
+        @test abs(trapz(z, d9)) < 0.05 * trapz(z, abs.(d9))
+
+        # Cloud-free reference AND no cloud perturbation => nu' == 0 => nu_z == 0 => the
+        # transformed BL adds EXACTLY zero to slot 9. Asserted as == 0.0, not a tolerance.
+        set_bare! = (patch, vars, kDim, z) -> begin
+            for i in 1:size(patch.physical, 1)
+                k = mod1(i, kDim)
+                patch.physical[i, vars["v"], 1] = V0 * sin(0.5 * pi * z[k] / H)^2
+            end
+            compensate_ke!(patch, vars, kDim, z; dry=true)
+        end
+        D0, _, _, _, _ = bl_increment(set_bare!; Cd=0.0, dry=true, ctrans=:bhyp, cmu=mu)
+        @test all(D0[:, 9] .== 0.0)
+
+        # Rain is deliberately out of scope: the BL borrows slot 8's spline column as a
+        # basis but never its values, so `rain_transform` needs nothing here.
+        Dr, _, _, _, _ = bl_increment(set_cloud!(:none); Cd=0.0, dry=true,
+                                      rtrans=:bhyp, rmu=mu)
+        @test all(Dr[:, 8] .== 0.0)
+    end
+
+    # ──────────────────────────────────────────────
+    # 7c. A negative vapor residual must not kill the column
+    # ──────────────────────────────────────────────
+    @testset "BL runs where the vapor residual is negative" begin
+        # The BL stages the moist entropy s_t as its heat control variable, and
+        # `entropy` takes log(q_v*rho_d/rho_v0). The vapor is the RESIDUAL
+        # rho_t - rho_d - rho_c - rho_r, so where the fit error of two O(0.1 kg/m^3)
+        # densities exceeds the vapor present -- the tropopause -- q_v goes negative and
+        # this used to throw a DomainError out of the first call of the first timestep.
+        # It is what stopped the 3-nest TC dead, transformed or not.
+        V0 = 2.0
+        H = 2000.0
+        set_negvapor! = (patch, vars, kDim, z) -> begin
+            for i in 1:size(patch.physical, 1)
+                k = mod1(i, kDim)
+                patch.physical[i, vars["v"], 1] = V0 * sin(0.5 * pi * z[k] / H)^2
+                # The dry base has rho_v == 0 exactly, so removing total water drives the
+                # residual straight below zero, which is the tropopause situation.
+                patch.physical[i, vars["rho_t"], 1] -= 5.0e-6
+            end
+            compensate_ke!(patch, vars, kDim, z; dry=true)
+        end
+        D, patch, gp, z, mtile = bl_increment(set_negvapor!; Cd=0.0, dry=true)
+        @test all(isfinite.(D))
+        @test maximum(abs.(D)) > 0.0        # it really did run the BL
     end
 
     # ──────────────────────────────────────────────

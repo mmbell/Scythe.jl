@@ -23,8 +23,9 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                              geometry = "RiRk", extra_options = Dict{Symbol,Any}(),
                              equation_set = "moist_compressible_XZ")
         cyl = equation_set != "moist_compressible_XZ"
-        vars = cyl ? Scythe.MC_VARS_CYL :
-                     ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
+        # From mc_var_names, not a literal, so the transformed slot names come along: with
+        # no transform declared it returns exactly the list this used to hardcode.
+        vars = Scythe.mc_var_names(extra_options; cyl = cyl)
         scalar_bc = Dict(v => NeumannBC() for v in vars)
         bc_side = merge(scalar_bc, Dict("u" => DirichletBC()))
         bc_topbot = merge(scalar_bc, Dict("w" => DirichletBC()))
@@ -287,6 +288,25 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                                                              :surface_fluxes => true))
         Scythe.moist_compressible_RLR(mtile_blr, 1, kDim_blr, 2)  # compile
         @test (@allocations Scythe.moist_compressible_RLR(mtile_blr, 1, kDim_blr, 2)) == 0
+
+        # WITH THE WATER TRANSFORMS ON. This is the arm the Louis-BL cloud fix is shaped
+        # around: the perturbation density gradient is staged in mc_driver!, where
+        # rho_cbar_z is already a live local, precisely so that a SubArray never escapes
+        # into the @noinline callee. Do this the other way and it boxes once per column.
+        # Khdiff_water is on here too, so the nu-space horizontal mixing is covered.
+        mtile_ct, kDim_ct = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                          extra_params = Dict(:f => 5.0e-5, :Cd => -1.0,
+                                                              :Ls => 200.0, :K_min => 5.0,
+                                                              :l_inf => 80.0, :Ck => 1.0e-3,
+                                                              :SST => 301.15, :U_min => 1.0,
+                                                              :Khdiff_water => -1.0,
+                                                              :Sc_t => 1.0),
+                                          extra_options = Dict{Symbol,Any}(
+                                              :louis_bl => true, :surface_fluxes => true,
+                                              :condensate_transform => :bhyp,
+                                              :rain_transform => :bhyp))
+        Scythe.moist_compressible_axisym(mtile_ct, 1, kDim_ct, 2)  # compile
+        @test (@allocations Scythe.moist_compressible_axisym(mtile_ct, 1, kDim_ct, 2)) == 0
     end
 
     @testset "per-column allocations stay zero on the 3D RLR cylinder" begin
