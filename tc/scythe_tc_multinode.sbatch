@@ -20,7 +20,10 @@
 #
 # Knobs (pass with --export=ALL,VAR=value):
 #   SCYTHE_TC_RES=coarse|fine   grid resolution (default coarse; see tc_params.jl)
-#   RESTART_T=<seconds>         chain from a previous run's JLD2 checkpoints
+#   RESTART_T=<seconds>         chain from a previous run's JLD2 checkpoints.
+#                               REQUIRES SCYTHE_TC_OUTDIR pointing at THAT run's tree --
+#                               --restart reads <T>.jld2 from the run's own output
+#                               directory and continues writing into it.
 #   TRACE=<n>                   min-rho_d trace every n steps (0 = off)
 #   SCYTHE_TC_OUTDIR=<path>     override the output tree entirely
 #
@@ -40,7 +43,14 @@ export SCYTHE_TC_RES=${SCYTHE_TC_RES:-coarse}
 SCYTHE=${SCYTHE_DIR:-$HOME/Development/Scythe.jl}
 INTEGRATION_TIME=${1:-432000}
 
-# Per-job output tree: never overwrite a previous run.
+# Per-job output tree: never overwrite a previous run. A restart CONTINUES an existing
+# tree and so must be told which one; a cold start pointed at an old run is stopped by
+# tc_output_dir rather than overwriting it.
+if [ -n "${RESTART_T:-}" ] && [ -z "${SCYTHE_TC_OUTDIR:-}" ]; then
+  echo "ERROR: RESTART_T=$RESTART_T needs SCYTHE_TC_OUTDIR set to the tree holding" >&2
+  echo "       nest*/${RESTART_T}.jld2 -- the default per-job tree would be empty." >&2
+  exit 2
+fi
 export SCYTHE_TC_OUTDIR=${SCYTHE_TC_OUTDIR:-$SCYTHE/tc/output/tc_${SCYTHE_TC_RES}_mn_${SLURM_JOB_ID:-manual}}
 mkdir -p "$SCYTHE_TC_OUTDIR"
 
