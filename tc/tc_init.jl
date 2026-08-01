@@ -179,6 +179,54 @@ function tc_boundary_conditions()
     return axis_bc, wall_bc, bot_bc, top_bc
 end
 
+"""
+    tc_output_dir(path; allow_existing = false) -> path
+
+Refuse to start a run that would OVERWRITE a preserved one, and say how to fix it.
+
+Model output is experimental data. The convention has always been to give every run its own
+tree and `mv` old ones aside, and every script here carries a tag knob for it -- but the
+convention was unenforced, and on 2026-07-31 a plain
+`julia model_tests/tc_balance_holdtest.jl 12 nophysics` silently overwrote 13 files of the
+preserved 2026-07-21 `tc_holdtest_nophysics` tree (the three `0.0.nc`, the logs, the ICs and
+`tc_exact.ref`) before it was noticed, and `tc_drain_onset.jl 10` replaced both
+`tc_drainonset_cond{on,off}_ts0.5` trees outright. Nothing reported either one: the writer
+just opens `<t>.nc` for writing.
+
+So this is now checked rather than remembered, the same way `check_mc_var_names` checks a
+convention that used to be remembered. It looks for real OUTPUT (`.nc`, `.jld2`, `*_physical.csv`,
+`*_gridded.csv`) anywhere under `path` and raises naming the knob to use. It does NOT count the
+initial conditions, the reference file or the logs, which every run legitimately rewrites.
+
+`allow_existing = true` is for a restart, which writes into its own tree by design.
+`SCYTHE_TC_FORCE_OUTDIR=1` overrides it for a deliberate re-run; that is a decision, so it is
+made once, out loud, on the command line.
+"""
+function tc_output_dir(path::AbstractString; allow_existing::Bool = false)
+    (allow_existing || get(ENV, "SCYTHE_TC_FORCE_OUTDIR", "0") == "1") && return path
+    isdir(path) || return path
+    found = String[]
+    for (root, _, files) in walkdir(path), f in files
+        (endswith(f, ".nc") || endswith(f, ".jld2") ||
+         endswith(f, "_physical.csv") || endswith(f, "_gridded.csv")) || continue
+        push!(found, joinpath(relpath(root, path), f))
+        length(found) >= 4 && break
+    end
+    isempty(found) && return path
+    error("""
+        refusing to write into $(path): it already holds model output
+        ($(join(first(found, 3), ", "))$(length(found) > 3 ? ", ..." : "")).
+
+        Model output is experimental data -- a run that took hours is not this script's to
+        overwrite, and the writer would clobber it file by file without a word. Either
+
+          * give this run its own tree (SCYTHE_TC_TAG / SCYTHE_TC_OUTDIR, per the script), or
+          * mv $(basename(path)) aside under a descriptive name first, or
+          * set SCYTHE_TC_FORCE_OUTDIR=1 if you really do mean to replace it.
+
+        Never rm -rf an output tree.""")
+end
+
 function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                    output_dir=OUTPUT_DIR,
                    initial_conditions=joinpath(output_dir, "tc_ics.csv"),

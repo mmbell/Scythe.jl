@@ -68,7 +68,11 @@ using CSV, DataFrames
 include(joinpath(@__DIR__, "tc_init.jl"))
 
 geometry = rlr ? "RLR" : "RiRk"
-run_outdir = rlr ? replace(OUTPUT_DIR, "tc_axisym" => "tc_rlr") : OUTPUT_DIR
+# A restart writes into its own tree by design; a cold start into a tree that already holds
+# output would overwrite a preserved run file by file without a word. SCYTHE_TC_OUTDIR (which
+# the sbatch wrappers always set) or SCYTHE_TC_FORCE_OUTDIR=1 are the ways past it.
+run_outdir = tc_output_dir(rlr ? replace(OUTPUT_DIR, "tc_axisym" => "tc_rlr") : OUTPUT_DIR;
+                           allow_existing = restart_t !== nothing)
 base = make_base(integration_time;
                  output_formats = csv ? [:csv, :netcdf] : OUTPUT_FORMATS,
                  output_dir = run_outdir, geometry = geometry,
