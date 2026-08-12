@@ -36,7 +36,8 @@ tc/output/
 
 # Internal scratch trees — not part of the release. model_tests is an incoherent
 # set of one-off probes (the benchmarks are the releasable test set); reference
-# holds working notes and third-party PDFs.
-model_tests/
-reference/
-pv_mixing/
+# holds working notes and third-party PDFs. Anchored to the repo root so that
+# test/reference/ (committed Fortran-derived reference values) is NOT shadowed.
+/model_tests/
+/reference/
+/pv_mixing/

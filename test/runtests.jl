@@ -5,6 +5,7 @@ using Scythe
     include("test_thermodynamics.jl")
     include("test_microphysics.jl")
     include("test_ishmael_tables.jl")
+    include("test_ishmael.jl")
     include("test_bf02_restoration.jl")
     include("test_partial_density.jl")
     include("test_sigma_entropy.jl")

@@ -1,0 +1,166 @@
+ Jensen_ISHMAEL lookup table 1 of 3
+ Jensen_ISHMAEL lookup table 2 of 3
+ Jensen_ISHMAEL lookup table 3 of 3
+ Jensen_ISHMAEL aggregation lookup table built
+ === ISHMAEL Fortran reference driver (Scythe.jl Stage S6a) ===
+ gammnu, i_gammnu, fourthirdspi =
+  6.00000000E+00  1.66666672E-01  4.18879032E+00
+ 
+ === var_check / capacitance_gamma / vaporgrow chain ===
+ 
+ --- point            1 : columnar T=-6C moderate
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.67149994E+02  8.50000000E+04  9.99999975E-06  1.20000005E+00  4.99999987E-05  1.50000007E-04  4.00000000E+02  2.00000000E+04
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  2.84318137E-03  2.70779198E-03  2.87205772E-03  4.99999523E-02 -1.00542307E-02  2.32422996E+00  1.68727183E-05  2.55384330E-05  2.33959388E-02  5.96260250E-01  6.50863047E-04  1.10803878E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  1.20000005E+00  1.69670548E-05  4.73726686E-05  2.38916891E-05  5.00000000E+01  2.00000000E+04  2.72753764E-10  7.61538999E-10  2.51188831E+01  1.05217735E+02  3.20000005E+00
+ capacitance_gamma output:
+  1.25456994E-04
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  3.35027501E-02  8.66201594E-02  1.58969983E-01  1.04550076E+00  1.00037217E+00  1.69726572E-05  4.74046974E-05  2.39030614E-05  1.01394162E-05  4.87974243E+02  1.20007205E+00  5.00000000E+01
+ 
+ --- point            2 : planar T=-12C moderate
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.61149994E+02  8.00000000E+04  9.99999975E-06  7.50000000E-01  1.50000007E-04  4.99999987E-05  3.00000000E+02  2.00000000E+04
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  1.74367952E-03  1.69289275E-03  1.90431077E-03  2.99999714E-02 -8.43513608E-02  4.53916997E-01  1.65642086E-05  2.60415763E-05  2.29688771E-02  5.96227884E-01  6.75989198E-04  1.06682003E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  7.50000000E-01  5.33649181E-05  1.11030395E-05  3.16216465E-05  5.00000000E+01  2.00000000E+04  6.32387864E-10  1.31573849E-10  1.77827943E-02  7.44883940E-02  2.75000000E+00
+ capacitance_gamma output:
+  1.48235355E-04
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  5.48652560E-02  1.05660081E-01  1.62697822E-01  1.21043015E+00  1.00183940E+00  5.33771199E-05  1.11043182E-05  3.16275582E-05  1.00785310E-05  7.00000000E+02  7.49988854E-01  5.00000000E+01
+ 
+ --- point            3 : density-clamp-high (>RHOI)
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.67149994E+02  8.50000000E+04  4.99999987E-05  1.00000000E+00  2.99999992E-05  2.99999992E-05  9.50000000E+02  5.00000000E+02
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  2.76194769E-03  2.70779198E-03  2.87205772E-03  1.99999809E-02 -3.83383632E-02  2.32422996E+00  1.68727183E-05  2.55384330E-05  2.33959388E-02  5.96260250E-01  6.50863047E-04  1.10803878E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  1.00000000E+00  6.00224848E-05  6.00224848E-05  6.00224848E-05  9.20000000E+02  5.00000000E+02  1.08121456E-10  1.08121456E-10  1.00000000E+00  4.18879032E+00  3.00000000E+00
+ capacitance_gamma output:
+  2.40089954E-04
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  1.60955811E+00  2.63640046E+00  3.60606527E+00  2.91656542E+00  1.06176782E+00  6.00240564E-05  6.00253334E-05  6.00247513E-05  5.00042661E-05  7.00000000E+02  1.00000525E+00  9.20000000E+02
+ 
+ --- point            4 : density-clamp-low (<50)
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.53149994E+02  7.00000000E+04  1.00000001E-07  8.99999976E-01  3.00000014E-04  2.69999990E-04  1.00000000E+01  1.00000000E+03
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  1.00997498E-03  9.18159087E-04  1.11715763E-03  1.00000024E-01 -9.59422588E-02  7.96458006E-01  1.61478620E-05  2.81321118E-05  2.23994609E-02  5.96075594E-01  7.48628052E-04  9.62966859E-01
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  8.99999976E-01  2.01238199E-05  1.18396629E-05  1.68624065E-05  5.00000000E+01  1.00000000E+03  4.79468592E-12  2.82090909E-12  1.99526161E-01  8.35773230E-01  2.90000010E+00
+ capacitance_gamma output:
+  6.65884727E-05
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  2.89112665E-02  6.72734231E-02  1.17027603E-01  1.04142416E+00  1.00037193E+00  2.01407838E-05  1.18479029E-05  1.68756560E-05  1.03302654E-07  7.00000000E+02  8.99983346E-01  5.00000000E+01
+ 
+ --- point            5 : homogeneous-freezing boundary T=-35C
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.38149994E+02  6.00000000E+04  1.99999999E-06  6.99999988E-01  1.99999995E-05  9.99999975E-06  5.00000000E+02  5.00000000E+05
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  2.66321847E-04  2.31584214E-04  3.26752255E-04  1.49999976E-01 -1.84942603E-01  1.12233996E+00  1.53512065E-05  2.93856046E-05  2.13318057E-02  5.95409811E-01  8.20206071E-04  8.77388418E-01
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  6.99999988E-01  1.03715265E-05  2.57685429E-06  6.52015797E-06  5.00000000E+01  5.00000000E+05  1.38594261E-10  3.44343894E-11  7.94328097E-03  3.32727395E-02  2.70000005E+00
+ capacitance_gamma output:
+  2.90601965E-05
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  3.65718897E-03  8.10619909E-03  1.37981111E-02  1.00246179E+00  1.00002348E+00  1.04072114E-05  2.58587102E-06  6.54350833E-06  2.30190017E-06  7.00000000E+02  7.00312018E-01  5.00000000E+01
+ 
+ --- point            6 : near 0C from below, T=-0.5C
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.72649994E+02  9.50000000E+04  4.99999987E-06  1.00000000E+00  9.99999975E-05  9.99999975E-05  2.00000000E+02  1.00000000E+04
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  3.87967541E-03  3.86037352E-03  3.88022349E-03  4.99999523E-03 -1.41263008E-04  9.55273509E-01  1.71527681E-05  2.37087534E-05  2.37874128E-02  5.96233308E-01  5.94261684E-04  1.21341479E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  1.00000000E+00  2.70962937E-05  2.70962937E-05  2.70962937E-05  5.00000000E+01  1.00000000E+04  1.98943459E-10  1.98943459E-10  1.00000000E+00  4.18879032E+00  3.00000000E+00
+ capacitance_gamma output:
+  1.08385175E-04
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  6.96419179E-02  1.58543691E-01  2.70125717E-01  1.16293216E+00  1.00126135E+00  2.70973287E-05  2.70972814E-05  2.70973142E-05  5.00790611E-06  7.00000000E+02  9.99999344E-01  5.00000000E+01
+ 
+ --- point            7 : above 0C, T=+2C (melting/passthrough)
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.75149994E+02  9.50000000E+04  4.99999987E-06  1.00000000E+00  9.99999975E-05  9.99999975E-05  2.00000000E+02  1.00000000E+04
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  4.74398769E-03  4.65352135E-03  4.65352135E-03  1.94404125E-02  1.94404125E-02  1.00000000E+00  1.72792097E-05  2.41036887E-05  2.39653550E-02  5.96204281E-01  5.99645718E-04  1.20238984E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  1.00000000E+00  2.70962937E-05  2.70962937E-05  2.70962937E-05  5.00000000E+01  1.00000000E+04  1.98943459E-10  1.98943459E-10  1.00000000E+00  4.18879032E+00  3.00000000E+00
+ capacitance_gamma output:
+  1.08385175E-04
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  6.94024488E-02  1.58233017E-01  2.69868404E-01  1.15991449E+00  1.00124383E+00  2.70962937E-05  2.70962937E-05  2.70962937E-05  4.99999442E-06  7.00000000E+02  1.00000000E+00  5.00000000E+01
+ 
+ --- point            8 : tiny ice (small-ice-limit branch)
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.63149994E+02  8.50000000E+04  9.99999972E-10  1.00000000E+00  1.99999999E-06  1.99999999E-06  9.20000000E+02  5.00000000E+07
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  1.94427010E-03  1.90614723E-03  2.10253987E-03  1.99999809E-02 -7.52755404E-02  8.63071024E-01  1.66673981E-05  2.48505203E-05  2.31112298E-02  5.96246123E-01  6.41118037E-04  1.12488151E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  1.00000000E+00  1.99999909E-06  1.99999909E-06  1.99999999E-06  9.20000000E+02  2.70303894E+02  2.16242832E-15  2.16242832E-15  1.00000000E+00  4.18879032E+00  3.00000000E+00
+ capacitance_gamma output:
+  7.99999725E-06
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  1.07312603E-02  2.91969702E-02  5.62195778E-02  1.00173581E+00  1.00001407E+00  2.03369541E-06  2.03098784E-06  2.03214609E-06  1.03728126E-09  7.00000000E+02  9.99240220E-01  9.20000000E+02
+ 
+ --- point            9 : large ice ani>=cni (large-ice-limit branch A)
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.65149994E+02  8.50000000E+04  4.99999989E-03  6.99999988E-01  2.00000009E-03  1.00000005E-03  5.00000000E+02  5.00000000E+02
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  2.38852645E-03  2.27478729E-03  2.46048626E-03  4.99999523E-02 -2.92461514E-02  1.61921000E+00  1.67702347E-05  2.51934271E-05  2.32535843E-02  5.96256912E-01  6.45997410E-04  1.11639655E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  6.99999988E-01  1.00000005E-03  6.30957293E-05  3.98107048E-04  8.45091858E+01  3.24900952E+03  2.04998656E-07  1.29345379E-08  7.94328097E-03  3.32727395E-02  2.70000005E+00
+ capacitance_gamma output:
+  2.61689140E-03
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  7.09150493E-01  9.24969494E-01  1.09805107E+00  6.18523026E+00  1.38163090E+00  1.00000715E-03  6.30964569E-05  3.98110453E-04  5.00105601E-03  7.00000000E+02  7.00000584E-01  8.45091858E+01
+ 
+ --- point           10 : large ice cni>ani (large-ice-limit branch B)
+ inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
+  2.65149994E+02  8.50000000E+04  4.99999989E-03  1.25000000E+00  1.00000005E-03  2.00000009E-03  5.00000000E+02  5.00000000E+02
+ derived: qv, qvi, qvs, sui, sup, igr, mu, dv, kt, nsch, npr, rhoair
+  2.38852645E-03  2.27478729E-03  2.46048626E-03  4.99999523E-02 -2.92461514E-02  1.61921000E+00  1.67702347E-05  2.51934271E-05  2.32535843E-02  5.96256912E-01  6.45997410E-04  1.11639655E+00
+ var_check outputs: dsdum, ani, cni, rni, rbdum, nidum, aidum, cidum, alphstr, alphv, betam
+  1.25000000E+00  1.58489303E-04  1.00000005E-03  2.92864366E-04  5.00000000E+01  4.93557666E+03  1.23976065E-07  7.82236157E-07  5.62341309E+01  2.35552979E+02  3.25000000E+00
+ capacitance_gamma output:
+  2.04556715E-03
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
+  6.00898385E-01  1.01514518E+00  1.40523350E+00  2.91584063E+00  1.06141651E+00  1.58489813E-04  1.00000529E-03  2.92865530E-04  5.00083156E-03  7.00000000E+02  1.25000036E+00  5.00000000E+01
+ 
+ === xm > 1e8 fall-speed fallback branch (standalone, bypasses var_check) ===
+ inputs: temp, ani, dsdum, rbdum, igr
+  2.33149994E+02  2.00000009E-03  1.00000000E+00  9.20000000E+02  1.22572994E+00
+ diagnostic xm (expect > 1e8 to confirm fallback branch):
+  6.13366784E+08
+ vaporgrow outputs: vtbarb, vtbarbm, vtbarbz
+  1.16323605E+01  1.55685453E+01  1.86877460E+01
+ 
+ === get_igr boundary sweep ===
+igr_pt  1 temp=  2.72850006E+02 igr=  9.73165154E-01
+igr_pt  2 temp=  2.72149994E+02 igr=  9.10547018E-01
+igr_pt  3 temp=  2.71649994E+02 igr=  8.64308476E-01
+igr_pt  4 temp=  2.67149994E+02 igr=  2.32422996E+00
+igr_pt  5 temp=  2.61149994E+02 igr=  4.53916997E-01
+igr_pt  6 temp=  2.53149994E+02 igr=  7.96458006E-01
+igr_pt  7 temp=  2.38149994E+02 igr=  1.12233996E+00
+igr_pt  8 temp=  2.14149994E+02 igr=  1.50086999E+00
+igr_pt  9 temp=  2.13649994E+02 igr=  1.50592494E+00
+igr_pt 10 temp=  2.13149994E+02 igr=  1.51098001E+00
+igr_pt 11 temp=  2.08149994E+02 igr=  1.51098001E+00
+ 
+ === access_lookup_table: itab (index 1, then 2) ===
+itab_pt  1 index=1 proc=  0.00000000E+00
+itab_pt  2 index=2 proc=  0.00000000E+00
+itab_pt  3 index=1 proc=  9.54035458E-29
+itab_pt  4 index=2 proc=  3.20868671E-21
+itab_pt  5 index=1 proc=  1.95277762E-19
+ 
+ === access_lookup_table: itabr (index 1..6 cycling) ===
+itabr_pt  1 index=1 proc=  0.00000000E+00
+itabr_pt  2 index=2 proc=  2.96468001E-23
+itabr_pt  3 index=3 proc=  1.27402430E-07
+itabr_pt  4 index=4 proc=  8.65409480E-11
+itabr_pt  5 index=5 proc=  1.83725740E-21
+ 
+ === driver complete ===
