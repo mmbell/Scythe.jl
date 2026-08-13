@@ -42,6 +42,13 @@ module module_mp_jensen_ishmael
   !.. needs to pass the real (post-jensen_ishmael_init) arrays by name.
   public :: var_check, capacitance_gamma, get_igr, access_lookup_table, vaporgrow, polysvp
   public :: itab, itabr, igrdata
+  !.. Stage S6b addition: wet_growth_check, aggregation, col1 needed by
+  !.. ref_driver.f90 for the riming/aggregation reference sections. coltab/
+  !.. coltabn (the module-level ice-ice collection tables built by
+  !.. jensen_ishmael_init's own mkcoltb call) are exposed too so the driver
+  !.. can pass the real post-init tables into aggregation() directly.
+  public :: wet_growth_check, aggregation, col1
+  public :: coltab, coltabn
   
   !.. Constants
   real, private, parameter ::     &
@@ -86,7 +93,10 @@ module module_mp_jensen_ishmael
   real, private, allocatable, dimension(:) :: gamma_tab
 
   !.. Aggregation lookup tables arrays
-  real, private, allocatable, dimension(:,:,:) :: coltab, coltabn
+  !.. Stage S6b: private attribute dropped (same reason as itab/itabr above)
+  !.. now that coltab/coltabn are re-exported via `public :: coltab,
+  !.. coltabn` above.
+  real, allocatable, dimension(:,:,:) :: coltab, coltabn
 
   !.. Added for double precision
   integer, parameter :: LUT_KIND_R4 = selected_real_kind(6) !.. 4 byte real

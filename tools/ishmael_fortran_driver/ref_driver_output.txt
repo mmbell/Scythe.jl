@@ -19,6 +19,16 @@
   1.25456994E-04
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   3.35027501E-02  8.66201594E-02  1.58969983E-01  1.04550076E+00  1.00037217E+00  1.69726572E-05  4.74046974E-05  2.39030614E-05  1.01394162E-05  4.87974243E+02  1.20007205E+00  5.00000000E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  2.00000009E-03  2.00000000E+08  4.48879511E-08  9.14028761E-21  1.42700304E-20
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  1.00000005E-03  1.00000000E+06  1.14305607E-10  4.65508491E-21  6.40468904E-21  1.52258706E-10
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  3.56017578E+02  3.46009324E-06  2.07203954E-07  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  4.50022561E-08  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  3.66969921E-08  4.87596183E-13  6.80693674E-13  1.13633415E+02  1.13637527E+02  1.12018501E+02
  
  --- point            2 : planar T=-12C moderate
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -31,6 +41,16 @@
   1.48235355E-04
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   5.48652560E-02  1.05660081E-01  1.62697822E-01  1.21043015E+00  1.00183940E+00  5.33771199E-05  1.11043182E-05  3.16275582E-05  1.00785310E-05  7.00000000E+02  7.49988854E-01  5.00000000E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  1.00000005E-03  1.00000000E+08  3.38150508E-10  1.48558589E-22  3.24513143E-22
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  5.00000024E-04  5.00000000E+05  1.48860681E-11  1.30796965E-21  1.68579823E-21  2.63609724E-11
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  2.98149048E+02  2.60145725E-06  1.65812438E-07  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  3.53036572E-10  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  3.12025517E-10  9.47966325E-15  3.94465446E-15  1.10234665E+02  1.10414688E+02  1.06145195E+02
  
  --- point            3 : density-clamp-high (>RHOI)
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -43,6 +63,16 @@
   2.40089954E-04
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   1.60955811E+00  2.63640046E+00  3.60606527E+00  2.91656542E+00  1.06176782E+00  6.00240564E-05  6.00253334E-05  6.00247513E-05  5.00042661E-05  7.00000000E+02  1.00000525E+00  9.20000000E+02
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  9.99999994E-09  1.00000000E+08  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  0.00000000E+00  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  9.20000000E+02  9.00000000E+02  9.00000000E+02
  
  --- point            4 : density-clamp-low (<50)
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -55,6 +85,16 @@
   6.65884727E-05
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   2.89112665E-02  6.72734231E-02  1.17027603E-01  1.04142416E+00  1.00037193E+00  2.01407838E-05  1.18479029E-05  1.68756560E-05  1.03302654E-07  7.00000000E+02  8.99983346E-01  5.00000000E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  2.00000009E-03  1.00000000E+08  1.89190243E-11  2.04021556E-22  3.10729660E-22
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  9.99999975E-05  1.00000000E+05  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  9.19864833E-01  1.02177111E-08  9.17448825E-11  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  1.89190243E-11  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  2.04057483E-11  4.48977649E-16  5.28303661E-16  1.04873619E+02  1.04873619E+02  9.00000000E+02
  
  --- point            5 : homogeneous-freezing boundary T=-35C
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -67,6 +107,16 @@
   2.90601965E-05
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   3.65718897E-03  8.10619909E-03  1.37981111E-02  1.00246179E+00  1.00002348E+00  1.04072114E-05  2.58587102E-06  6.54350833E-06  2.30190017E-06  7.00000000E+02  7.00312018E-01  5.00000000E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  5.00000024E-04  1.00000000E+08  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  1.99999995E-04  2.00000000E+05  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  4.83209564E+02  6.14143664E-06  1.73495818E-09  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  0.00000000E+00  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  5.00000000E+01  9.00000000E+02  9.00000000E+02
  
  --- point            6 : near 0C from below, T=-0.5C
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -79,6 +129,16 @@
   1.08385175E-04
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   6.96419179E-02  1.58543691E-01  2.70125717E-01  1.16293216E+00  1.00126135E+00  2.70973287E-05  2.70972814E-05  2.70973142E-05  5.00790611E-06  7.00000000E+02  9.99999344E-01  5.00000000E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  3.00000003E-03  5.00000000E+07  1.38657761E-08  1.88345665E-20  5.30403072E-20
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  3.00000003E-03  5.00000000E+05  1.08183330E-10  1.46950736E-20  3.87537639E-20  2.16149487E-10
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  3.12586853E+02  1.93342203E-05  1.41656713E-07  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  1.39739598E-08  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  9.49152668E-09  2.78455627E-14  2.78455627E-14  8.22701111E+02  8.22702454E+02  8.22530884E+02
  
  --- point            7 : above 0C, T=+2C (melting/passthrough)
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -91,6 +151,16 @@
   1.08385175E-04
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   6.94024488E-02  1.58233017E-01  2.69868404E-01  1.15991449E+00  1.00124383E+00  2.70962937E-05  2.70962937E-05  2.70962937E-05  4.99999442E-06  7.00000000E+02  1.00000000E+00  5.00000000E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  1.00000005E-03  1.00000000E+08  4.27053548E-09  2.95387247E-21  6.70704132E-21
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  1.00000005E-03  1.00000000E+06  2.45271553E-10  1.69651060E-20  4.37646560E-20  3.01456471E-10
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  1.41032120E+02  1.53518306E-06  6.56073098E-08  0.00000000E+00  0.00000000E+00  0.00000000E+00  6.56073098E-08  1.41032120E+02
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  4.51580684E-09  0
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  3.12981818E-09  0.00000000E+00  0.00000000E+00  9.00000000E+02  9.00000000E+02  9.00000000E+02
  
  --- point            8 : tiny ice (small-ice-limit branch)
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -103,6 +173,16 @@
   7.99999725E-06
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   1.07312603E-02  2.91969702E-02  5.62195778E-02  1.00173581E+00  1.00001407E+00  2.03369541E-06  2.03098784E-06  2.03214609E-06  1.03728126E-09  7.00000000E+02  9.99240220E-01  9.20000000E+02
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  1.00000005E-03  1.00000000E+08  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  9.99999975E-05  1.00000000E+05  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  0.00000000E+00  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  0.00000000E+00  0.00000000E+00  0.00000000E+00  9.20000000E+02  9.00000000E+02  9.00000000E+02
  
  --- point            9 : large ice ani>=cni (large-ice-limit branch A)
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -115,6 +195,16 @@
   2.61689140E-03
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   7.09150493E-01  9.24969494E-01  1.09805107E+00  6.18523026E+00  1.38163090E+00  1.00000715E-03  6.30964569E-05  3.98110453E-04  5.00105601E-03  7.00000000E+02  7.00000584E-01  8.45091858E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  1.00000005E-03  1.00000000E+08  1.07438996E-06  2.65322462E-18  2.60003033E-17
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  5.00000024E-04  5.00000000E+05  6.75755587E-07  3.33757980E-16  6.32207774E-15  9.61941510E-07
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  1.28831653E+03  2.21828559E-05  1.21114519E-03  2.21828559E-05  1.21114519E-03  1.28831653E+03  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  1.75014554E-06  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  1.43819875E-06  2.88522053E-11  3.64090138E-12  1.92845245E+02  1.68506775E+02  2.31541183E+02
  
  --- point           10 : large ice cni>ani (large-ice-limit branch B)
  inputs: temp, pres, qidum, dsdum0, ani0, cni0, rbdum0, nidum
@@ -127,6 +217,16 @@
   2.04556715E-03
  vaporgrow outputs: vtbarb, vtbarbm, vtbarbz, fvdum, fhdum, anf, cnf, rnf, iwcf, rdout, dsdumout, rbdum(inout)
   6.00898385E-01  1.01514518E+00  1.40523350E+00  2.91584063E+00  1.06141651E+00  1.58489813E-04  1.00000529E-03  2.92865530E-04  5.00083156E-03  7.00000000E+02  1.25000036E+00  5.00000000E+01
+ itab riming: qc, nc, rimesum, qi_qc_nrm, qi_qc_nrd
+  1.00000005E-03  1.00000000E+08  1.53687379E-05  2.49840772E-17  2.66297815E-16
+ itabr riming: qr(in), nr(final), rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn
+  5.00000024E-04  5.00000000E+05  4.49404797E-06  1.46114337E-15  4.95770112E-14  4.16459488E-06
+ itabr rates: numrateri, rainrateri, icerateri, dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+  3.65988129E+02  6.70543795E-06  1.78460396E-04  6.70543795E-06  1.78460396E-04  3.65988129E+02  0.00000000E+00  0.00000000E+00
+ wet_growth_check: rimetotal, dry_growth(1=dry,0=wet)
+  1.98627858E-05  1
+ riming growth: prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr
+  1.71317915E-05  1.12919694E-10  3.56237595E-10  2.09897797E+02  1.74479874E+02  3.31019989E+02
  
  === xm > 1e8 fall-speed fallback branch (standalone, bypasses var_check) ===
  inputs: temp, ani, dsdum, rbdum, igr
@@ -162,5 +262,67 @@ itabr_pt  2 index=2 proc=  2.96468001E-23
 itabr_pt  3 index=3 proc=  1.27402430E-07
 itabr_pt  4 index=4 proc=  8.65409480E-11
 itabr_pt  5 index=5 proc=  1.83725740E-21
+ 
+ === aggregation (+ col1) ===
+ 
+ --- agg point            1 : moderate planar+columnar, T=-15C
+ inputs: temp, rhoair, q1,n1,d1, q2,n2,d2, q3,n3,d3, rho1,rho2,phi1,phi2
+  2.58149994E+02  6.99999988E-01
+  1.00000005E-03  1.00000000E+05  1.99999995E-04
+  1.00000005E-03  1.00000000E+05  1.99999995E-04
+  9.99999975E-05  1.00000000E+03  5.00000024E-04
+  3.00000000E+02  3.00000000E+02  3.00000012E-01  3.00000000E+00
+ aggregation outputs: qagg1, qagg2, qagg3, nagg1, nagg2, nagg3, ddum3(out)
+ -6.30378906E-07 -6.30378906E-07  1.26075781E-06 -2.98987141E+01 -2.98987141E+01  2.88421726E+01  5.39060507E-04
+ 
+ --- agg point            2 : empty aggregates, dendritic growth zone T=-14C
+ inputs: temp, rhoair, q1,n1,d1, q2,n2,d2, q3,n3,d3, rho1,rho2,phi1,phi2
+  2.59149994E+02  6.99999988E-01
+  5.00000024E-04  5.00000000E+04  1.50000007E-04
+  5.00000024E-04  5.00000000E+04  1.50000007E-04
+  0.00000000E+00  0.00000000E+00  9.99999997E-07
+  2.50000000E+02  2.50000000E+02  4.00000006E-01  2.50000000E+00
+ aggregation outputs: qagg1, qagg2, qagg3, nagg1, nagg2, nagg3, ddum3(out)
+ -5.03308719E-08 -5.03308719E-08  1.00661744E-07 -3.57433772E+00 -3.57433772E+00  3.57433772E+00  3.55219119E-04
+ 
+ --- agg point            3 : warm near 0C, quasi-spherical, T=-1C
+ inputs: temp, rhoair, q1,n1,d1, q2,n2,d2, q3,n3,d3, rho1,rho2,phi1,phi2
+  2.72149994E+02  1.00000000E+00
+  1.00000005E-03  2.00000000E+04  3.00000014E-04
+  1.00000005E-03  2.00000000E+04  3.00000014E-04
+  5.00000024E-04  5.00000000E+02  7.99999980E-04
+  8.50000000E+02  8.50000000E+02  8.99999976E-01  1.10000002E+00
+ aggregation outputs: qagg1, qagg2, qagg3, nagg1, nagg2, nagg3, ddum3(out)
+ -4.34819381E-09 -4.34819381E-09  8.69638761E-09 -4.13798690E-02 -4.13798690E-02  1.03997700E-02  1.16754312E-03
+ 
+ --- agg point            4 : extreme oblate/prolate, T=-25C
+ inputs: temp, rhoair, q1,n1,d1, q2,n2,d2, q3,n3,d3, rho1,rho2,phi1,phi2
+  2.48149994E+02  5.50000012E-01
+  2.00000009E-03  1.00000000E+05  2.50000012E-04
+  2.00000009E-03  1.00000000E+05  2.50000012E-04
+  1.99999995E-04  2.00000000E+03  6.00000028E-04
+  1.00000000E+02  1.00000000E+02  5.00000007E-02  2.00000000E+01
+ aggregation outputs: qagg1, qagg2, qagg3, nagg1, nagg2, nagg3, ddum3(out)
+ -1.54249096E-06 -1.54249096E-06  3.08498193E-06 -4.87630920E+01 -4.87630920E+01  4.72504539E+01  5.40475070E-04
+ 
+ --- agg point            5 : large existing aggregate population, T=-18C
+ inputs: temp, rhoair, q1,n1,d1, q2,n2,d2, q3,n3,d3, rho1,rho2,phi1,phi2
+  2.55149994E+02  7.50000000E-01
+  9.99999975E-05  1.00000000E+03  9.99999975E-05
+  9.99999975E-05  1.00000000E+03  9.99999975E-05
+  2.00000009E-03  5.00000000E+03  1.00000005E-03
+  2.00000000E+02  2.00000000E+02  5.00000000E-01  2.00000000E+00
+ aggregation outputs: qagg1, qagg2, qagg3, nagg1, nagg2, nagg3, ddum3(out)
+ -1.34388247E-11 -1.34388247E-11  2.68776494E-11 -6.04582764E-03 -6.04582764E-03 -2.71197200E+00  8.60409637E-04
+ 
+ --- agg point            6 : very cold, small ice, T=-45C
+ inputs: temp, rhoair, q1,n1,d1, q2,n2,d2, q3,n3,d3, rho1,rho2,phi1,phi2
+  2.28149994E+02  4.00000006E-01
+  4.99999987E-05  1.00000000E+04  4.99999987E-05
+  4.99999987E-05  1.00000000E+04  4.99999987E-05
+  9.99999975E-06  1.00000000E+02  7.99999980E-05
+  4.00000000E+02  4.00000000E+02  4.00000006E-01  2.50000000E+00
+ aggregation outputs: qagg1, qagg2, qagg3, nagg1, nagg2, nagg3, ddum3(out)
+ -3.00627849E-14 -3.00627849E-14  6.01255631E-14 -5.81517161E-05 -5.81517161E-05  5.72866120E-05  5.41925954E-04
  
  === driver complete ===

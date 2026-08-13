@@ -475,3 +475,418 @@ const RV_ = 461.5                   # moist air gas constant, J kg^-1 K^-1 (Fort
         @test @allocated(Scythe.ishmael_rain_lambda(1.0e-3, 1.0e6)) == 0
     end
 end
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage S6b: ice-cloud/ice-rain collection (riming), rime density,
+# wet-growth check, aggregation.
+# ══════════════════════════════════════════════════════════════════════════
+@testset "ISHMAEL process rates (Stage S6b)" begin
+    if !isfile(ISHMAEL_JLD2_PATH2)
+        @warn "ISHMAEL tables data file missing; skipping Stage S6b tests entirely" path = ISHMAEL_JLD2_PATH2
+        @testset "Stage S6b (skipped: data file missing)" begin
+            @test_skip isfile(ISHMAEL_JLD2_PATH2)
+        end
+    else
+        tables_ = Scythe.load_ishmael_tables(ISHMAEL_JLD2_PATH2)
+
+        # ──────────────────────────────────────────────
+        # 1. ishmael_ice_cloud_riming
+        # ──────────────────────────────────────────────
+        @testset "ishmael_ice_cloud_riming: Fortran cross-check" begin
+            for pt in ISHMAEL_REF_POINTS
+                vc = pt.var_check
+                ri = pt.riming_input
+                ref = pt.itab_riming
+                r = Scythe.ishmael_ice_cloud_riming(tables_.itab, vc.rni, ri.qc, vc.deltastr,
+                    vc.rhobar, vc.ni, ri.nc, pt.derived.rhoair)
+                @test r.rimesum ≈ ref.rimesum rtol=1.0e-4 atol=1.0e-30
+                @test r.qi_qc_nrm ≈ ref.qi_qc_nrm rtol=1.0e-4 atol=1.0e-30
+                @test r.qi_qc_nrd ≈ ref.qi_qc_nrd rtol=1.0e-4 atol=1.0e-30
+            end
+        end
+
+        @testset "ishmael_ice_cloud_riming: physical checks" begin
+            pt = ISHMAEL_REF_POINTS[1]
+            vc = pt.var_check
+            ri = pt.riming_input
+            rhoair = pt.derived.rhoair
+
+            # Zero when qc <= 1e-7 (the itab riming gate)
+            r_dry = Scythe.ishmael_ice_cloud_riming(tables_.itab, vc.rni, 1.0e-8, vc.deltastr,
+                vc.rhobar, vc.ni, ri.nc, rhoair)
+            @test r_dry == (rimesum=0.0, qi_qc_nrm=0.0, qi_qc_nrd=0.0)
+
+            # Zero when ni (the "ni" moment, standing in for qi=0 upstream) is zero
+            r_noice = Scythe.ishmael_ice_cloud_riming(tables_.itab, vc.rni, ri.qc, vc.deltastr,
+                vc.rhobar, 0.0, ri.nc, rhoair)
+            @test r_noice.rimesum == 0.0
+
+            # rimesum never negative
+            for pt2 in ISHMAEL_REF_POINTS
+                vc2 = pt2.var_check
+                ri2 = pt2.riming_input
+                r2 = Scythe.ishmael_ice_cloud_riming(tables_.itab, vc2.rni, ri2.qc, vc2.deltastr,
+                    vc2.rhobar, vc2.ni, ri2.nc, pt2.derived.rhoair)
+                @test r2.rimesum >= 0.0
+            end
+        end
+
+        # ──────────────────────────────────────────────
+        # 2. ishmael_ice_rain_riming
+        # ──────────────────────────────────────────────
+        @testset "ishmael_ice_rain_riming: Fortran cross-check" begin
+            for pt in ISHMAEL_REF_POINTS
+                vc = pt.var_check
+                ri = pt.riming_input
+                ref = pt.itabr_riming
+                temp = pt.input.temp
+                r = Scythe.ishmael_ice_rain_riming(tables_.itabr, vc.rni, ri.qr, ri.nr, vc.deltastr,
+                    vc.rhobar, vc.ni, pt.derived.rhoair, temp, pt.input.qidum)
+                @test r.rimesumr ≈ ref.rimesumr rtol=1.0e-4 atol=1.0e-30
+                @test r.qi_qr_nrm ≈ ref.qi_qr_nrm rtol=1.0e-4 atol=1.0e-30
+                @test r.qi_qr_nrd ≈ ref.qi_qr_nrd rtol=1.0e-4 atol=1.0e-30
+                @test r.qi_qr_nrn ≈ ref.qi_qr_nrn rtol=1.0e-4 atol=1.0e-30
+                @test r.numrateri ≈ ref.numrateri rtol=1.0e-4 atol=1.0e-30
+                @test r.rainrateri ≈ ref.rainrateri rtol=1.0e-4 atol=1.0e-30
+                @test r.icerateri ≈ ref.icerateri rtol=1.0e-4 atol=1.0e-30
+                @test r.dQRfzri ≈ ref.dQRfzri rtol=1.0e-4 atol=1.0e-30
+                @test r.dQIfzri ≈ ref.dQIfzri rtol=1.0e-4 atol=1.0e-30
+                @test r.dNfzri ≈ ref.dNfzri rtol=1.0e-4 atol=1.0e-30
+                @test r.dQImltri ≈ ref.dQImltri rtol=1.0e-4 atol=1.0e-30
+                @test r.dNmltri ≈ ref.dNmltri rtol=1.0e-4 atol=1.0e-30
+            end
+        end
+
+        @testset "ishmael_ice_rain_riming: physical checks" begin
+            pt9 = ISHMAEL_REF_POINTS[9]   # freeze branch exercised here (qi, qr both > 1e-4, T<=T0)
+            vc = pt9.var_check
+            ri = pt9.riming_input
+            rhoair = pt9.derived.rhoair
+            temp = pt9.input.temp
+            @test temp <= ISHMAEL_REF_T0
+
+            # Freezing active when qr>0.1e-3 and qi>0.1e-3 (matches the reference point)
+            r_freeze = Scythe.ishmael_ice_rain_riming(tables_.itabr, vc.rni, ri.qr, ri.nr, vc.deltastr,
+                vc.rhobar, vc.ni, rhoair, temp, pt9.input.qidum)
+            @test r_freeze.dQIfzri > 0.0
+            @test r_freeze.dQImltri == 0.0   # melt branch inactive at T<=T0
+
+            # Freezing INACTIVE when qi drops below the 0.1 g/kg threshold, even
+            # though rainrateri/icerateri themselves are still computed/positive.
+            r_lowqi = Scythe.ishmael_ice_rain_riming(tables_.itabr, vc.rni, ri.qr, ri.nr, vc.deltastr,
+                vc.rhobar, vc.ni, rhoair, temp, 1.0e-5)
+            @test r_lowqi.dQIfzri == 0.0
+            @test r_lowqi.dQRfzri == 0.0
+            @test r_lowqi.dNfzri == 0.0
+
+            # Freezing INACTIVE when qr drops below the 0.1 g/kg threshold
+            r_lowqr = Scythe.ishmael_ice_rain_riming(tables_.itabr, vc.rni, 1.0e-5, ri.nr, vc.deltastr,
+                vc.rhobar, vc.ni, rhoair, temp, pt9.input.qidum)
+            @test r_lowqr.dQIfzri == 0.0
+
+            # Melting active (freezing inactive) above T0
+            pt7 = ISHMAEL_REF_POINTS[7]
+            @test pt7.input.temp > ISHMAEL_REF_T0
+            vc7 = pt7.var_check
+            ri7 = pt7.riming_input
+            r_warm = Scythe.ishmael_ice_rain_riming(tables_.itabr, vc7.rni, ri7.qr, ri7.nr, vc7.deltastr,
+                vc7.rhobar, vc7.ni, pt7.derived.rhoair, pt7.input.temp, pt7.input.qidum)
+            @test r_warm.dQImltri > 0.0
+            @test r_warm.dQRfzri == 0.0
+            @test r_warm.dQIfzri == 0.0
+            @test r_warm.dNfzri == 0.0
+
+            # Zero when qr <= QSMALL (outer gate)
+            r_dry = Scythe.ishmael_ice_rain_riming(tables_.itabr, vc.rni, 0.0, 0.0, vc.deltastr,
+                vc.rhobar, vc.ni, rhoair, temp, pt9.input.qidum)
+            @test r_dry == (rimesumr=0.0, qi_qr_nrm=0.0, qi_qr_nrd=0.0, qi_qr_nrn=0.0,
+                numrateri=0.0, rainrateri=0.0, icerateri=0.0, dQRfzri=0.0, dQIfzri=0.0, dNfzri=0.0,
+                dQImltri=0.0, dNmltri=0.0)
+        end
+
+        # ──────────────────────────────────────────────
+        # 3. ishmael_wet_growth_check
+        # ──────────────────────────────────────────────
+        @testset "ishmael_wet_growth_check: Fortran cross-check" begin
+            for pt in ISHMAEL_REF_POINTS
+                vc = pt.var_check
+                d = pt.derived
+                vg = pt.vaporgrow
+                wg = pt.wet_growth
+                temp = pt.input.temp
+                xxls = 3.15e6 - 2370.0 * temp + 0.3337e6
+                xxlv = 3.1484e6 - 2370.0 * temp
+                xxlf = xxls - xxlv
+                dry = Scythe.ishmael_wet_growth_check(NU_, temp, d.rhoair, xxlv, xxlf, d.qv, d.dv,
+                    d.kt, d.qvs, vg.fvdum, vg.fhdum, wg.rimetotal, vc.rni, vc.ni)
+                @test dry == wg.dry_growth
+            end
+        end
+
+        @testset "ishmael_wet_growth_check: physical checks" begin
+            pt = ISHMAEL_REF_POINTS[6]
+            vc = pt.var_check
+            d = pt.derived
+            vg = pt.vaporgrow
+            temp = pt.input.temp
+            xxls = 3.15e6 - 2370.0 * temp + 0.3337e6
+            xxlv = 3.1484e6 - 2370.0 * temp
+            xxlf = xxls - xxlv
+
+            # Very high rime rate -> wet growth (dry_growth = false)
+            dry_heavy = Scythe.ishmael_wet_growth_check(NU_, temp, d.rhoair, xxlv, xxlf, d.qv, d.dv,
+                d.kt, d.qvs, vg.fvdum, vg.fhdum, 1.0, vc.rni, vc.ni)
+            @test dry_heavy == false
+
+            # Negligible rime rate -> dry growth (dry_growth = true)
+            dry_light = Scythe.ishmael_wet_growth_check(NU_, temp, d.rhoair, xxlv, xxlf, d.qv, d.dv,
+                d.kt, d.qvs, vg.fvdum, vg.fhdum, 1.0e-30, vc.rni, vc.ni)
+            @test dry_light == true
+        end
+
+        # ──────────────────────────────────────────────
+        # 4. ishmael_macklin_rimec1 / ishmael_macklin_density / ishmael_riming_growth
+        # ──────────────────────────────────────────────
+        @testset "ishmael_macklin_density: range check" begin
+            for temp in (200.0, 230.0, 240.0, 250.0, 258.0, 263.0, 268.0, 270.0, 273.15, 275.0, 280.0)
+                rimec1 = Scythe.ishmael_macklin_rimec1(temp)
+                @test 0.0 < rimec1 <= 0.012
+                for ratio in (0.0, 1.0, 10.0, 100.0, 1000.0), dry in (true, false)
+                    g = Scythe.ishmael_macklin_density(rimec1, ratio, 1.0, temp, dry)
+                    @test 50.0 <= g <= 900.0
+                end
+            end
+        end
+
+        @testset "ishmael_riming_growth: Fortran cross-check" begin
+            for pt in ISHMAEL_REF_POINTS
+                vc = pt.var_check
+                d = pt.derived
+                ri = pt.riming_input
+                itab = pt.itab_riming
+                itabr = pt.itabr_riming
+                wg = pt.wet_growth
+                ref = pt.riming_growth
+                temp = pt.input.temp
+
+                r = Scythe.ishmael_riming_growth(2.0, vc.rni, vc.deltastr, vc.rhobar, vc.ni,
+                    vc.ani, vc.cni, temp, ri.qc, ri.nc, itab.qi_qc_nrm, itab.qi_qc_nrd, itab.rimesum,
+                    ri.qr, ri.nr, itabr.qi_qr_nrm, itabr.qi_qr_nrd, itabr.rimesumr, d.rhoair,
+                    wg.dry_growth, NU_, AO_, GAMMNU_, I_GAMMNU_, FOURTHIRDSPI_)
+
+                # prdr/ardr/crdr are differences of two nearly-equal O(nidum*rbdum*vi)
+                # quantities (iwcfr-iwci) -- single-precision Fortran cancellation
+                # noise is amplified well past the table-lookup values' own 1e-4
+                # rtol (worst observed: ~0.6%, see the Stage S6b report). gdenavg/
+                # gdenavgr/rhorimeout are NOT difference-based and match tightly.
+                @test r.prdr ≈ ref.prdr rtol=1.0e-2 atol=1.0e-25
+                @test r.ardr ≈ ref.ardr rtol=1.0e-2 atol=1.0e-25
+                @test r.crdr ≈ ref.crdr rtol=1.0e-2 atol=1.0e-25
+                @test r.rhorimeout ≈ ref.rhorimeout rtol=1.0e-4
+                @test r.gdenavg ≈ ref.gdenavg rtol=1.0e-4
+                @test r.gdenavgr ≈ ref.gdenavgr rtol=1.0e-4
+                @test r.dry_growth == wg.dry_growth
+            end
+        end
+
+        @testset "ishmael_riming_growth: physical checks" begin
+            pt = ISHMAEL_REF_POINTS[1]
+            vc = pt.var_check
+            d = pt.derived
+            temp = pt.input.temp
+
+            # No riming input (qc=qr=0, rimesum=rimesumr=0) -> prdr=ardr=crdr=0
+            r_none = Scythe.ishmael_riming_growth(2.0, vc.rni, vc.deltastr, vc.rhobar, vc.ni,
+                vc.ani, vc.cni, temp, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, d.rhoair,
+                true, NU_, AO_, GAMMNU_, I_GAMMNU_, FOURTHIRDSPI_)
+            @test r_none.prdr == 0.0
+            @test r_none.ardr == 0.0
+            @test r_none.crdr == 0.0
+
+            # T > T0 forces dry_growth = false regardless of the wet_growth_check input
+            pt7 = ISHMAEL_REF_POINTS[7]
+            vc7 = pt7.var_check
+            d7 = pt7.derived
+            ri7 = pt7.riming_input
+            itab7 = pt7.itab_riming
+            itabr7 = pt7.itabr_riming
+            r_warm = Scythe.ishmael_riming_growth(2.0, vc7.rni, vc7.deltastr, vc7.rhobar, vc7.ni,
+                vc7.ani, vc7.cni, pt7.input.temp, ri7.qc, ri7.nc, itab7.qi_qc_nrm, itab7.qi_qc_nrd,
+                itab7.rimesum, ri7.qr, ri7.nr, itabr7.qi_qr_nrm, itabr7.qi_qr_nrd, itabr7.rimesumr,
+                d7.rhoair, true, NU_, AO_, GAMMNU_, I_GAMMNU_, FOURTHIRDSPI_)   # dry_growth_pre=true
+            @test r_warm.dry_growth == false
+            @test r_warm.ardr == 0.0   # wet-growth branch: no axis growth
+            @test r_warm.crdr == 0.0
+
+            # Rates never negative (clamped in the Fortran)
+            for pt2 in ISHMAEL_REF_POINTS
+                vc2 = pt2.var_check
+                d2 = pt2.derived
+                ri2 = pt2.riming_input
+                itab2 = pt2.itab_riming
+                itabr2 = pt2.itabr_riming
+                wg2 = pt2.wet_growth
+                r2 = Scythe.ishmael_riming_growth(2.0, vc2.rni, vc2.deltastr, vc2.rhobar, vc2.ni,
+                    vc2.ani, vc2.cni, pt2.input.temp, ri2.qc, ri2.nc, itab2.qi_qc_nrm, itab2.qi_qc_nrd,
+                    itab2.rimesum, ri2.qr, ri2.nr, itabr2.qi_qr_nrm, itabr2.qi_qr_nrd, itabr2.rimesumr,
+                    d2.rhoair, wg2.dry_growth, NU_, AO_, GAMMNU_, I_GAMMNU_, FOURTHIRDSPI_)
+                @test r2.prdr >= 0.0
+                @test r2.ardr >= 0.0
+                @test r2.crdr >= 0.0
+            end
+        end
+
+        # ──────────────────────────────────────────────
+        # 5. Aggregation: ishmael_agg_table_index / ishmael_agg_efffact /
+        #    ishmael_col1 / ishmael_aggregation
+        # ──────────────────────────────────────────────
+        @testset "ishmael_agg_efffact: range + col1 base efficiency formula" begin
+            for rhoeffmax in (100.0, 400.0, 500.0, 900.0), phieffmax in (0.01, 0.03, 0.1, 0.5, 2.0)
+                e = Scythe.ishmael_agg_efffact(rhoeffmax, phieffmax)
+                @test 0.0 <= e <= 1.0
+            end
+
+            # col1's own base efficiency formula (before the DGZ 1.4x special
+            # case): eff = min(0.2, 10^(0.035*Tc-0.7)) is in [0, 0.2] for any Tc.
+            for tempC in (-60.0, -40.0, -20.0, -14.0, -5.0, 0.0, 10.0)
+                eff_base = min(0.2, 10.0^(0.035 * tempC - 0.7))
+                @test 0.0 <= eff_base <= 0.2
+            end
+        end
+
+        @testset "ishmael_aggregation: Fortran cross-check" begin
+            for pt in ISHMAEL_REF_AGGREGATION
+                r = Scythe.ishmael_aggregation(pt.dt, pt.rhoair, pt.temp, pt.q1, pt.n1, pt.d1,
+                    pt.q2, pt.n2, pt.d2, pt.q3, pt.n3, pt.d3, pt.rho1, pt.rho2, pt.phi1, pt.phi2,
+                    tables_.coltab, tables_.coltabn)
+                @test r.qagg1 ≈ pt.qagg1 rtol=1.0e-3 atol=1.0e-30
+                @test r.qagg2 ≈ pt.qagg2 rtol=1.0e-3 atol=1.0e-30
+                @test r.qagg3 ≈ pt.qagg3 rtol=1.0e-3 atol=1.0e-30
+                @test r.nagg1 ≈ pt.nagg1 rtol=1.0e-3 atol=1.0e-30
+                @test r.nagg2 ≈ pt.nagg2 rtol=1.0e-3 atol=1.0e-30
+                @test r.nagg3 ≈ pt.nagg3 rtol=1.0e-3 atol=1.0e-30
+                @test r.dnew3 ≈ pt.ddum3 rtol=1.0e-3 atol=1.0e-30
+            end
+        end
+
+        @testset "ishmael_aggregation: physical checks" begin
+            for pt in ISHMAEL_REF_AGGREGATION
+                r = Scythe.ishmael_aggregation(pt.dt, pt.rhoair, pt.temp, pt.q1, pt.n1, pt.d1,
+                    pt.q2, pt.n2, pt.d2, pt.q3, pt.n3, pt.d3, pt.rho1, pt.rho2, pt.phi1, pt.phi2,
+                    tables_.coltab, tables_.coltabn)
+
+                # Mass conservation: qagg sums to zero across the 3 live species
+                # (qagg1 and qagg2 are losses, qagg3 is the matching gain).
+                @test r.qagg1 + r.qagg2 + r.qagg3 ≈ 0.0 atol=1.0e-16
+
+                # Number strictly moves OUT of planar/columnar (never a gain from
+                # aggregation): nagg1, nagg2 <= 0 always.
+                @test r.nagg1 <= 0.0
+                @test r.nagg2 <= 0.0
+
+                @test r.qagg1 <= 0.0
+                @test r.qagg2 <= 0.0
+                @test r.qagg3 >= 0.0
+                @test r.dnew3 > 0.0
+            end
+
+            # A "normal" point (not dominated by pre-existing aggregate self-
+            # collection) should show nagg3 > 0: number actually accumulates in
+            # the aggregate category.
+            pt1 = ISHMAEL_REF_AGGREGATION[1]
+            r1 = Scythe.ishmael_aggregation(pt1.dt, pt1.rhoair, pt1.temp, pt1.q1, pt1.n1, pt1.d1,
+                pt1.q2, pt1.n2, pt1.d2, pt1.q3, pt1.n3, pt1.d3, pt1.rho1, pt1.rho2, pt1.phi1,
+                pt1.phi2, tables_.coltab, tables_.coltabn)
+            @test r1.nagg3 > 0.0
+
+            # No collection when both source categories are empty
+            r_empty = Scythe.ishmael_aggregation(2.0, 0.7, 258.0, 0.0, 0.0, 1.0e-6, 0.0, 0.0, 1.0e-6,
+                0.0, 0.0, 1.0e-6, 300.0, 300.0, 0.5, 2.0, tables_.coltab, tables_.coltabn)
+            @test r_empty.qagg1 == 0.0
+            @test r_empty.qagg2 == 0.0
+            @test r_empty.qagg3 == 0.0
+        end
+
+        # ──────────────────────────────────────────────
+        # 6. Pure diagnostic caps: ishmael_ni_cap / ishmael_agg_size_cap
+        # ──────────────────────────────────────────────
+        @testset "ishmael_ni_cap" begin
+            @test Scythe.ishmael_ni_cap(2.0e6, 1.0) == 1.0e6
+            @test Scythe.ishmael_ni_cap(5.0e5, 1.0) == 5.0e5   # below the cap: unchanged
+            @test Scythe.ishmael_ni_cap(3.0e6, 2.0) == 5.0e5   # cap = 1e6/rhoair
+        end
+
+        @testset "ishmael_agg_size_cap" begin
+            # Cap binds: ani=1mm > 0.5mm -> clamped, cni/ni re-derived
+            r = Scythe.ishmael_agg_size_cap(1.0e-3, 5.0e-4, 100.0, 1.0, 0.1e-6, 1.0e-3, 500.0,
+                4.0, 6.0)
+            @test r.ani == 0.5e-3
+            @test r.cni > 0.0
+            @test r.ni > 0.0
+            @test isfinite(r.ni)
+
+            # Cap does not bind: pass-through unchanged
+            r2 = Scythe.ishmael_agg_size_cap(1.0e-4, 5.0e-5, 100.0, 1.0, 0.1e-6, 1.0e-3, 500.0,
+                4.0, 6.0)
+            @test r2 == (ani=1.0e-4, cni=5.0e-5, ni=100.0)
+
+            # Boundary: exactly 0.5mm does NOT trigger the cap (strict >)
+            r3 = Scythe.ishmael_agg_size_cap(0.5e-3, 3.0e-4, 100.0, 1.0, 0.1e-6, 1.0e-3, 500.0,
+                4.0, 6.0)
+            @test r3.ani == 0.5e-3
+            @test r3 == (ani=0.5e-3, cni=3.0e-4, ni=100.0)   # unchanged: pass-through branch
+        end
+
+        # ──────────────────────────────────────────────
+        # 7. Zero-allocation hot-path checks
+        # ──────────────────────────────────────────────
+        @testset "Zero allocations (Stage S6b)" begin
+            vc = ISHMAEL_REF_POINTS[1].var_check
+            d = ISHMAEL_REF_POINTS[1].derived
+            ri = ISHMAEL_REF_POINTS[1].riming_input
+            temp = ISHMAEL_REF_POINTS[1].input.temp
+
+            Scythe.ishmael_ice_cloud_riming(tables_.itab, vc.rni, ri.qc, vc.deltastr, vc.rhobar,
+                vc.ni, ri.nc, d.rhoair)
+            @test @allocated(Scythe.ishmael_ice_cloud_riming(tables_.itab, vc.rni, ri.qc,
+                vc.deltastr, vc.rhobar, vc.ni, ri.nc, d.rhoair)) == 0
+
+            Scythe.ishmael_ice_rain_riming(tables_.itabr, vc.rni, ri.qr, ri.nr, vc.deltastr,
+                vc.rhobar, vc.ni, d.rhoair, temp, ISHMAEL_REF_POINTS[1].input.qidum)
+            @test @allocated(Scythe.ishmael_ice_rain_riming(tables_.itabr, vc.rni, ri.qr, ri.nr,
+                vc.deltastr, vc.rhobar, vc.ni, d.rhoair, temp,
+                ISHMAEL_REF_POINTS[1].input.qidum)) == 0
+
+            Scythe.ishmael_wet_growth_check(NU_, temp, d.rhoair, 2.5e6, 3.0e5, d.qv, d.dv, d.kt,
+                d.qvs, 1.1, 1.1, 1.0e-8, vc.rni, vc.ni)
+            @test @allocated(Scythe.ishmael_wet_growth_check(NU_, temp, d.rhoair, 2.5e6, 3.0e5,
+                d.qv, d.dv, d.kt, d.qvs, 1.1, 1.1, 1.0e-8, vc.rni, vc.ni)) == 0
+
+            itab1 = ISHMAEL_REF_POINTS[1].itab_riming
+            itabr1 = ISHMAEL_REF_POINTS[1].itabr_riming
+            Scythe.ishmael_riming_growth(2.0, vc.rni, vc.deltastr, vc.rhobar, vc.ni, vc.ani, vc.cni,
+                temp, ri.qc, ri.nc, itab1.qi_qc_nrm, itab1.qi_qc_nrd, itab1.rimesum, ri.qr, ri.nr,
+                itabr1.qi_qr_nrm, itabr1.qi_qr_nrd, itabr1.rimesumr, d.rhoair, true, NU_, AO_,
+                GAMMNU_, I_GAMMNU_, FOURTHIRDSPI_)
+            @test @allocated(Scythe.ishmael_riming_growth(2.0, vc.rni, vc.deltastr, vc.rhobar, vc.ni,
+                vc.ani, vc.cni, temp, ri.qc, ri.nc, itab1.qi_qc_nrm, itab1.qi_qc_nrd, itab1.rimesum,
+                ri.qr, ri.nr, itabr1.qi_qr_nrm, itabr1.qi_qr_nrd, itabr1.rimesumr, d.rhoair, true,
+                NU_, AO_, GAMMNU_, I_GAMMNU_, FOURTHIRDSPI_)) == 0
+
+            pt1 = ISHMAEL_REF_AGGREGATION[1]
+            Scythe.ishmael_aggregation(pt1.dt, pt1.rhoair, pt1.temp, pt1.q1, pt1.n1, pt1.d1, pt1.q2,
+                pt1.n2, pt1.d2, pt1.q3, pt1.n3, pt1.d3, pt1.rho1, pt1.rho2, pt1.phi1, pt1.phi2,
+                tables_.coltab, tables_.coltabn)
+            @test @allocated(Scythe.ishmael_aggregation(pt1.dt, pt1.rhoair, pt1.temp, pt1.q1, pt1.n1,
+                pt1.d1, pt1.q2, pt1.n2, pt1.d2, pt1.q3, pt1.n3, pt1.d3, pt1.rho1, pt1.rho2, pt1.phi1,
+                pt1.phi2, tables_.coltab, tables_.coltabn)) == 0
+
+            Scythe.ishmael_ni_cap(1.0e6, 1.0)
+            @test @allocated(Scythe.ishmael_ni_cap(1.0e6, 1.0)) == 0
+
+            Scythe.ishmael_agg_size_cap(1.0e-3, 5.0e-4, 100.0, 1.0, 0.1e-6, 1.0e-3, 500.0, 4.0, 6.0)
+            @test @allocated(Scythe.ishmael_agg_size_cap(1.0e-3, 5.0e-4, 100.0, 1.0, 0.1e-6, 1.0e-3,
+                500.0, 4.0, 6.0)) == 0
+        end
+    end
+end

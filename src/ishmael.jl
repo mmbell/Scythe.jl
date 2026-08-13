@@ -735,3 +735,755 @@ function ishmael_melting(temp::Float64, ni::Float64, ani::Float64, cni::Float64,
 
     return (qmlt=qmlt, nmlt=nmlt, amlt=amlt, cmlt=cmlt)
 end
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage S6b: ice-cloud/ice-rain collection (riming), rime density, wet-
+# growth check, and aggregation.
+#
+# EXCLUSION NOTE (applies to every function below): the Fortran's
+# over-depletion / rate-limiter blocks are NOT ported, by design decision
+# (the host model removes rate limiters -- ports the pure rates only):
+#   - the "do not over-deplete cloud water / rainwater from ice-cloud and
+#     ice-rain" block, module_mp_jensen_ishmael.F lines 1216-1242 (includes
+#     the known `tmpsum`-for-`tmpsumr` bug at line 1233, which is therefore
+#     also excluded, not fixed);
+#   - the broader per-species overdepletion/consistency blocks, lines
+#     1771-1976;
+#   - the "do not over-deplete from aggregation" `ratioagg` reconciliation
+#     in `aggregation`, lines 4400-4426.
+# Everything up to but NOT INCLUDING those blocks is ported below.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4a. ishmael_ice_cloud_riming -- itab lookup block (lines 1053-1106)
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    ishmael_ice_cloud_riming(itab, rni, qc, deltastr, rhobar, ni, nc, rhoair;
+                              QSMALL=1.0e-12) -> NamedTuple{(:rimesum,:qi_qc_nrm,:qi_qc_nrd)}
+
+Ice-cloud collection (riming) rate from the `itab` lookup table. Ports the
+index-computation-plus-lookup block, lines 1053-1106: builds the four
+log-space table coordinates `(rrni,rqci,rdsi,rrho)` (Fortran's own comment,
+lines 1055-1056: do not change this formula without rebuilding the offline
+table), the matching integer grid indices (Fortran `INT()` truncates
+toward zero, matched here by `trunc(Int, ...)`), clamps BOTH the float
+coordinates and the integer indices independently to the table's valid
+range `[1, size-1]` in each of the 4 dimensions (matching the Fortran's own
+two-stage clamp -- `int()` is taken of the RAW value, then float and int
+are each separately floored/capped), and interpolates via
+[`access_lookup_table`](@ref) at `index=1` (normalized riming rate,
+`qi_qc_nrm`) and `index=2` (normalized rime-density index, `qi_qc_nrd`).
+`rimesum` is the dimensional riming rate (kg m^-3 s^-1).
+
+Gated on `qc > 1e-7` -- a SEPARATE, coarser literal than the module's
+`QSMALL=1e-12` used below for the small-riming-rate cutoff; transcribed
+exactly as the Fortran writes it, not unified into one threshold. Returns
+all-zero when `qc <= 1e-7`, or when the raw riming rate maps to a mass
+mixing-ratio rate below `QSMALL` (lines 1101-1105).
+
+`qc` passes through the Fortran's own `exp(qc)-1` transform inside `rqci`
+(line 1058) verbatim -- transcribed per the Fortran's "do not change"
+comment, not independently re-derived.
+"""
+function ishmael_ice_cloud_riming(itab::Array{Float64,5}, rni::Float64, qc::Float64,
+                                   deltastr::Float64, rhobar::Float64, ni::Float64,
+                                   nc::Float64, rhoair::Float64; QSMALL::Float64=ISHMAEL_QSMALL)
+    if !(qc > 1.0e-7)
+        return (rimesum=0.0, qi_qc_nrm=0.0, qi_qc_nrd=0.0)
+    end
+
+    rrni_raw = 13.498 * log10(0.5e6 * rni)
+    rqci_raw = 8.776 * log10(1.0e7 * (exp(qc) - 1.0))
+    rdsi_raw = 50.0 * (deltastr - 0.5)
+    rrho_raw = 7.888 * log10(0.02 * rhobar)
+
+    irni = trunc(Int, rrni_raw)
+    iqci = trunc(Int, rqci_raw)
+    idsi = trunc(Int, rdsi_raw)
+    irho = trunc(Int, rrho_raw)
+
+    rrni = clamp(rrni_raw, 1.0, Float64(size(itab, 1) - 1))
+    rqci = clamp(rqci_raw, 1.0, Float64(size(itab, 2) - 1))
+    rdsi = clamp(rdsi_raw, 1.0, Float64(size(itab, 3) - 1))
+    rrho = clamp(rrho_raw, 1.0, Float64(size(itab, 4) - 1))
+
+    irni = clamp(irni, 1, size(itab, 1) - 1)
+    iqci = clamp(iqci, 1, size(itab, 2) - 1)
+    idsi = clamp(idsi, 1, size(itab, 3) - 1)
+    irho = clamp(irho, 1, size(itab, 4) - 1)
+
+    proc1 = access_lookup_table(itab, irni, iqci, idsi, irho, 1, rdsi, rrho, rqci, rrni)
+    proc2 = access_lookup_table(itab, irni, iqci, idsi, irho, 2, rdsi, rrho, rqci, rrni)
+
+    rimesum = max(proc1 * ni * nc * rhoair^2, 0.0)
+
+    if (rimesum / rhoair) < QSMALL
+        return (rimesum=0.0, qi_qc_nrm=0.0, qi_qc_nrd=0.0)
+    end
+
+    return (rimesum=rimesum, qi_qc_nrm=proc1, qi_qc_nrd=proc2)
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4b. ishmael_ice_rain_riming -- itabr lookup block (lines 1111-1214)
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    ishmael_ice_rain_riming(itabr, rni, qr, nr, deltastr, rhobar, ni, rhoair,
+                             temp, qi; QSMALL=1.0e-12, T0=273.15) -> NamedTuple
+
+Ice-rain collection rate from the `itabr` lookup table, PLUS the T<=T0
+freeze-ri / T>T0 melt-ri transfer branches that key off the same lookup.
+Ports lines 1111-1214: the rain DSD via [`ishmael_rain_lambda`](@ref)
+(`rrr` is the resulting mean radius, `0.5/lamr`), the four log-space table
+coordinates `(rrni,rrri,rdsi,rrho)` (same "do not change" comment as
+`itab`, and the same two-stage float/int clamp as
+[`ishmael_ice_cloud_riming`](@ref)), the 6-index lookup (`itabr`'s 5th
+dimension: 1=riming rate, 2=rime density, 3=rain-number loss, 4=ice-number
+tendency, 5=rain-mass tendency, 6=ice-mass tendency), the small-rate gate
+(lines 1174-1179), the `T<=T0` freeze branch (`dQRfzri`/`dQIfzri`/`dNfzri`,
+active only when BOTH `qr>0.1e-3` and `qi>0.1e-3`) vs. the `T>T0` melt
+branch (`dQImltri`/`dNmltri`), and the ice-rain rime-rate small-rate gate
+(lines 1206-1212).
+
+Returns zero for everything when `qr <= QSMALL` (the `RAIN_ICE.and.
+qr(k).gt.QSMALL` outer gate, line 1111 -- `RAIN_ICE` assumed true, same
+convention as `FREEZE_QC` in [`ishmael_homogeneous_freezing`](@ref)).
+"""
+function ishmael_ice_rain_riming(itabr::Array{Float64,5}, rni::Float64, qr::Float64, nr::Float64,
+                                  deltastr::Float64, rhobar::Float64, ni::Float64, rhoair::Float64,
+                                  temp::Float64, qi::Float64; QSMALL::Float64=ISHMAEL_QSMALL,
+                                  T0::Float64=ISHMAEL_T0)
+    if !(qr > QSMALL)
+        return (rimesumr=0.0, qi_qr_nrm=0.0, qi_qr_nrd=0.0, qi_qr_nrn=0.0,
+                numrateri=0.0, rainrateri=0.0, icerateri=0.0,
+                dQRfzri=0.0, dQIfzri=0.0, dNfzri=0.0, dQImltri=0.0, dNmltri=0.0)
+    end
+
+    dsd = ishmael_rain_lambda(qr, nr)
+    lamr = dsd.lamr
+    rrr = 0.5 * (1.0 / lamr)
+
+    rrni_raw = 13.498 * log10(0.5e6 * rni)
+    rrri_raw = 23.273 * log10(1.0e5 * rrr)
+    rdsi_raw = 50.0 * (deltastr - 0.5)
+    rrho_raw = 7.888 * log10(0.02 * rhobar)
+
+    irni = trunc(Int, rrni_raw)
+    irri = trunc(Int, rrri_raw)
+    idsi = trunc(Int, rdsi_raw)
+    irho = trunc(Int, rrho_raw)
+
+    rrni = clamp(rrni_raw, 1.0, Float64(size(itabr, 1) - 1))
+    rrri = clamp(rrri_raw, 1.0, Float64(size(itabr, 2) - 1))
+    rdsi = clamp(rdsi_raw, 1.0, Float64(size(itabr, 3) - 1))
+    rrho = clamp(rrho_raw, 1.0, Float64(size(itabr, 4) - 1))
+
+    irni = clamp(irni, 1, size(itabr, 1) - 1)
+    irri = clamp(irri, 1, size(itabr, 2) - 1)
+    idsi = clamp(idsi, 1, size(itabr, 3) - 1)
+    irho = clamp(irho, 1, size(itabr, 4) - 1)
+
+    procr1 = access_lookup_table(itabr, irni, irri, idsi, irho, 1, rdsi, rrho, rrri, rrni)
+    procr2 = access_lookup_table(itabr, irni, irri, idsi, irho, 2, rdsi, rrho, rrri, rrni)
+    procr3 = access_lookup_table(itabr, irni, irri, idsi, irho, 3, rdsi, rrho, rrri, rrni)
+    procr4 = access_lookup_table(itabr, irni, irri, idsi, irho, 4, rdsi, rrho, rrri, rrni)
+    procr5 = access_lookup_table(itabr, irni, irri, idsi, irho, 5, rdsi, rrho, rrri, rrni)
+    procr6 = access_lookup_table(itabr, irni, irri, idsi, irho, 6, rdsi, rrho, rrri, rrni)
+    procr = (procr1, procr2, procr3, procr4, procr5, procr6)
+
+    numrateri  = max(procr[4] * ni * nr * rhoair, 0.0)
+    rainrateri = max(procr[5] * ni * nr * rhoair, 0.0)
+    icerateri  = max(procr[6] * ni * nr * rhoair, 0.0)
+
+    if rainrateri < QSMALL || icerateri < QSMALL
+        numrateri = 0.0
+        rainrateri = 0.0
+        icerateri = 0.0
+    end
+
+    local dQRfzri, dQIfzri, dNfzri, dQImltri, dNmltri
+    if temp <= T0
+        if qr > 0.1e-3 && qi > 0.1e-3
+            dQRfzri, dQIfzri, dNfzri = rainrateri, icerateri, numrateri
+        else
+            dQRfzri, dQIfzri, dNfzri = 0.0, 0.0, 0.0
+        end
+        dQImltri, dNmltri = 0.0, 0.0
+    else
+        dQImltri, dNmltri = icerateri, numrateri
+        dQRfzri, dQIfzri, dNfzri = 0.0, 0.0, 0.0
+    end
+
+    rimesumr = max(procr[1] * ni * nr * rhoair^2, 0.0)
+    qi_qr_nrm, qi_qr_nrd, qi_qr_nrn = procr[1], procr[2], procr[3]
+
+    if (rimesumr / rhoair) < QSMALL
+        rimesumr, qi_qr_nrm, qi_qr_nrd, qi_qr_nrn = 0.0, 0.0, 0.0, 0.0
+    end
+
+    return (rimesumr=rimesumr, qi_qr_nrm=qi_qr_nrm, qi_qr_nrd=qi_qr_nrd, qi_qr_nrn=qi_qr_nrn,
+            numrateri=numrateri, rainrateri=rainrateri, icerateri=icerateri,
+            dQRfzri=dQRfzri, dQIfzri=dQIfzri, dNfzri=dNfzri, dQImltri=dQImltri, dNmltri=dNmltri)
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4c. ishmael_wet_growth_check -- Lamb & Verlinde (2011) wet-growth limit
+#     (lines 3537-3556)
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    ishmael_wet_growth_check(NU, temp, rhodum, xxlv, xxlf, qvdum, dv, kt, qs0,
+                              fvdum, fhdum, rimedum, rni, nidum;
+                              T0=273.15, CPW=4218.0) -> Bool
+
+Lamb and Verlinde (2011) wet-growth check: `true` for dry growth, `false`
+for wet growth. Ports `wet_growth_check`, lines 3537-3556, verbatim. The
+Fortran's `dgflag` is `INTENT(INOUT)` and is always reset to `.true.` by
+the caller immediately before the call (line 875, top of the vertical-
+level loop) -- this function reproduces that as a pure boolean return
+(there is no external state to mutate): dry growth (`true`) UNLESS
+`rimedum/rhodum > wetg`.
+
+Does NOT itself apply the `temp>T0 -> dry_growth=.false.` override (lines
+1300-1302) -- that line sits just after the `wet_growth_check` call in the
+host loop and is folded into [`ishmael_riming_growth`](@ref) instead (see
+that function's docstring), matching how this function mirrors ONLY the
+subroutine boundary.
+"""
+@inline function ishmael_wet_growth_check(NU::Float64, temp::Float64, rhodum::Float64,
+                                           xxlv::Float64, xxlf::Float64, qvdum::Float64, dv::Float64,
+                                           kt::Float64, qs0::Float64, fvdum::Float64, fhdum::Float64,
+                                           rimedum::Float64, rni::Float64, nidum::Float64;
+                                           T0::Float64=ISHMAEL_T0, CPW::Float64=ISHMAEL_CPW)
+    dum = nidum * NU * 2.0 * rni
+    wetg = 2.0 * ISHMAEL_PI * dum * (kt * fhdum * (T0 - temp) + rhodum * xxlv * dv * fvdum * (qs0 - qvdum)) /
+           (xxlf + CPW * (temp - T0))
+    return !(rimedum / rhodum > wetg)
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4d. ishmael_macklin_rimec1 / ishmael_macklin_density -- shared Macklin
+#     (1962) rime-density pieces used twice (ice-cloud lines 1312-1329 /
+#     1330-1342, ice-rain lines 1357-1374 / 1375-1387)
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    ishmael_macklin_rimec1(temp; T0=273.15) -> Float64
+
+Piecewise-linear-in-temperature Macklin (1962) rime-density coefficient
+`rimec1`, used identically for both ice-cloud (lines 1312-1329) and
+ice-rain (lines 1357-1374) riming -- ported once, called twice, since the
+Fortran itself duplicates this formula verbatim in both places.
+"""
+@inline function ishmael_macklin_rimec1(temp::Float64; T0::Float64=ISHMAEL_T0)
+    dTc = temp - T0
+    if dTc < -30.0
+        return 0.0036
+    elseif dTc < -20.0
+        dum = (abs(dTc) - 20.0) / 10.0
+        return dum * 0.0036 + (1.0 - dum) * 0.004
+    elseif dTc < -15.0
+        dum = (abs(dTc) - 15.0) / 5.0
+        return dum * 0.004 + (1.0 - dum) * 0.005
+    elseif dTc < -10.0
+        dum = (abs(dTc) - 10.0) / 5.0
+        return dum * 0.005 + (1.0 - dum) * 0.0066
+    elseif dTc < -5.0
+        dum = (abs(dTc) - 5.0) / 5.0
+        return dum * 0.0066 + (1.0 - dum) * 0.012
+    else
+        return 0.012
+    end
+end
+
+"""
+    ishmael_macklin_density(rimec1, nrd, nrm, temp, dry_growth; T0=273.15) -> Float64
+
+Macklin (1962) rime density `gdenavg`/`gdenavgr` (kg m^-3), clamped to
+`[50,900]`: `tanh`-based blend from `rimec1` and the `qi_x_nrd/qi_x_nrm`
+ratio, a near-0C warm-side blend toward 900, and a hard override to 900
+above 0C or under wet growth. Ports the shared averaging block (lines
+1330-1342 / 1375-1387) once; called twice (ice-cloud and ice-rain) by
+[`ishmael_riming_growth`](@ref).
+"""
+@inline function ishmael_macklin_density(rimec1::Float64, nrd::Float64, nrm::Float64,
+                                          temp::Float64, dry_growth::Bool; T0::Float64=ISHMAEL_T0)
+    dTc = temp - T0
+    gden = 1000.0 * (0.8 * tanh(rimec1 * nrd / nrm) + 0.1)
+    if dTc > -5.0 && dTc <= 0.0
+        dum = abs(dTc) / 5.0
+        gden = dum * gden + (1.0 - dum) * 900.0
+    end
+    if dTc > 0.0 || !dry_growth
+        gden = 900.0
+    end
+    return clamp(gden, 50.0, 900.0)
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4e. ishmael_riming_growth -- riming mass/axis growth rates
+#     (lines 1291-1507)
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    ishmael_riming_growth(dt, rni, deltastr, rbdum, nidum, ani, cni, temp,
+                           qc, nc, qi_qc_nrm, qi_qc_nrd, rimesum,
+                           qr, nr, qi_qr_nrm, qi_qr_nrd, rimesumr,
+                           rhoair, dry_growth_pre, NU, ao, gammnu, i_gammnu,
+                           fourthirdspi; T0=273.15, RHOI=920.0,
+                           QSMALL=1.0e-12) -> NamedTuple
+
+Ice riming mass and axis growth rates. Ports lines 1291-1507: the
+Macklin rime-density calls ([`ishmael_macklin_rimec1`](@ref) /
+[`ishmael_macklin_density`](@ref)) for ice-cloud and ice-rain separately,
+the riming r-axis growth `rnfr`, the post-riming volume `vfr`, the
+riming-fraction-weighted total rime density blend (`qcrimefrac`/
+`gdentotal`), the dry-growth axis-shape response (`phibr`/`phifr`
+branches, including the "don't flip prolate<->oblate" safety clamps), and
+the wet-growth branch (mass added, no axis growth). Returns
+`(prdr, ardr, crdr, rhorimeout, gdenavg, gdenavgr, dry_growth)`.
+
+# `dry_growth_pre` / the T>T0 override
+
+`dry_growth_pre` is the output of [`ishmael_wet_growth_check`](@ref)
+(computed by the caller, since that IS a true Fortran subroutine and is
+ported separately). This function applies the `temp>T0 -> dry_growth =
+false` override itself (lines 1300-1302), since that line is textually
+inside the 1291-1507 range this function covers: `dry_growth =
+dry_growth_pre && !(temp>T0)`.
+
+# `nidum` convention (mirrors the SEAM already documented in
+[`ishmael_deposition_partition`](@ref))
+
+`nidum` is `nim3dum = ni(cc,k)*rhoair(k)` (# m^-3), matching `iwci`'s own
+convention -- used for `prdr` (`(iwcfr-iwci)/rhoair/dt`) exactly as the
+Fortran does. The Fortran's `ardr`/`crdr` (lines 1485-1486) instead use
+`ni(cc,k)` (# kg^-1), NOT `nim3dum` -- but per the SAME seam decision
+`ishmael_deposition_partition` already made for its own `ard`/`crd`
+(documented there: "the density<->mixing-ratio conversion... is
+explicitly a LATER integration-stage concern"), this function reuses the
+single `nidum` (# m^-3) parameter for `ardr`/`crdr` too, for convention
+consistency across the module. `ardr`/`crdr` are therefore NOT expected to
+bit-match the true Fortran output; `prdr` IS.
+
+# An observed Fortran quirk, ported verbatim (not a documented task
+# exclusion, just an oddity worth flagging)
+
+When riming occurs (`rimetotal>0 && vfr>vi`), the Fortran computes a
+volume-blended `rhorimeout = rbdum*(vi/vfr) + gdentotal*(1-vi/vfr)`
+(clamped to `RHOI`) and uses THAT to form `iwcfr` -- but then
+IMMEDIATELY overwrites its own `rhorimeout` output with
+`min(gdentotal,RHOI)`, discarding the blended value entirely (lines
+1414-1418). This function reproduces that exactly: `rhorimeout` in the
+return value is `min(gdentotal,RHOI)`, NOT the blended density that
+actually fed `iwcfr`.
+"""
+function ishmael_riming_growth(dt::Float64, rni::Float64, deltastr::Float64, rbdum::Float64,
+                                nidum::Float64, ani::Float64, cni::Float64, temp::Float64,
+                                qc::Float64, nc::Float64, qi_qc_nrm::Float64, qi_qc_nrd::Float64,
+                                rimesum::Float64, qr::Float64, nr::Float64, qi_qr_nrm::Float64,
+                                qi_qr_nrd::Float64, rimesumr::Float64, rhoair::Float64,
+                                dry_growth_pre::Bool, NU::Float64, ao::Float64, gammnu::Float64,
+                                i_gammnu::Float64, fourthirdspi::Float64; T0::Float64=ISHMAEL_T0,
+                                RHOI::Float64=ISHMAEL_RHOI, QSMALL::Float64=ISHMAEL_QSMALL)
+    dry_growth = dry_growth_pre && !(temp > T0)
+
+    gam = gamma(NU + 2.0 + deltastr)
+    vi = fourthirdspi * rni^3 * gam * i_gammnu
+    iwci = nidum * rbdum * vi
+
+    rnfr = rni
+
+    gdenavg = 900.0
+    if qc > QSMALL && qi_qc_nrm > 0.0
+        rimec1 = ishmael_macklin_rimec1(temp; T0=T0)
+        gdenavg = ishmael_macklin_density(rimec1, qi_qc_nrd, qi_qc_nrm, temp, dry_growth; T0=T0)
+        rimedr = max((qi_qc_nrm / gdenavg) / (gam * i_gammnu * 4.0 * ISHMAEL_PI * rni^2), 0.0)
+        rnfr += max(rimedr * nc * rhoair, 0.0) * dt
+    end
+
+    gdenavgr = 900.0
+    if qr > QSMALL && qi_qr_nrm > 0.0
+        rimec1r = ishmael_macklin_rimec1(temp; T0=T0)
+        gdenavgr = ishmael_macklin_density(rimec1r, qi_qr_nrd, qi_qr_nrm, temp, dry_growth; T0=T0)
+        rimedrr = max((qi_qr_nrm / gdenavgr) / (gam * i_gammnu * 4.0 * ISHMAEL_PI * rni^2), 0.0)
+        rnfr += max(rimedrr * nr * rhoair, 0.0) * dt
+    end
+
+    vfr = fourthirdspi * rnfr^3 * gam * i_gammnu
+    vfr = max(vfr, vi)
+    rnfr = max(rnfr, rni)
+
+    rimetotal = rimesum + rimesumr
+
+    local iwcfr, rhorimeout
+    if rimetotal > 0.0 && vfr > vi
+        qcrimefrac = clamp(rimesum / rimetotal, 0.0, 1.0)
+        gdentotal = qcrimefrac * gdenavg + (1.0 - qcrimefrac) * gdenavgr
+        rhorimeout_blend = min(rbdum * (vi / vfr) + gdentotal * (1.0 - vi / vfr), RHOI)
+        iwcfr = rhorimeout_blend * vfr * nidum
+        rhorimeout = min(gdentotal, RHOI)   # see docstring: the blend is discarded here, per the Fortran
+    else
+        iwcfr = iwci
+        rnfr = rni
+        rhorimeout = rbdum
+    end
+
+    local prdr, ardr, crdr
+    if dry_growth
+        cnfr = cni
+        anfr = ani
+        phibr = 1.0
+        if rimetotal > 0.0 && vfr > vi
+            gam_m1 = gamma(NU - 1.0 + deltastr)
+            phibr = cni / ani * gam_m1 * i_gammnu
+            local phifr
+            if phibr == 1.0
+                phifr, anfr, cnfr = 1.0, rnfr, rnfr
+            elseif phibr > 1.25
+                phifr = phibr * ((rnfr / rni)^3)^(-0.5)
+                anfr = (ani / rni^1.5) * rnfr^1.5
+            elseif phibr < 0.8
+                phifr = phibr * (rnfr / rni)^3
+                cnfr = phifr * anfr * gammnu / gam_m1
+            else
+                phifr = phibr
+                anfr = ((vfr * gam_m1) / (fourthirdspi * phifr * gam))^(1.0 / 3.0)
+                cnfr = phifr * anfr * gammnu / gam_m1
+            end
+
+            if phibr <= 1.0 && phifr > 1.0
+                phifr = 0.99
+                anfr = ((vfr * gam_m1) / (fourthirdspi * phifr * gam))^(1.0 / 3.0)
+                cnfr = phifr * anfr * gammnu / gam_m1
+            end
+            if phibr >= 1.0 && phifr < 1.0
+                phifr = 1.01
+                anfr = ((vfr * gam_m1) / (fourthirdspi * phifr * gam))^(1.0 / 3.0)
+                cnfr = phifr * anfr * gammnu / gam_m1
+            end
+        end
+
+        cnfr = max(cnfr, cni)
+        anfr = max(anfr, ani)
+
+        prdr = (iwcfr - iwci) / rhoair / dt
+        ardr = (2.0 * (anfr - ani) * cni + (cnfr - cni) * ani) * ani * nidum / dt
+        crdr = (2.0 * (cnfr - cni) * ani + (anfr - ani) * cni) * cni * nidum / dt
+
+        prdr = max(prdr, 0.0)
+        ardr = max(ardr, 0.0)
+        crdr = max(crdr, 0.0)
+
+        if prdr == 0.0
+            ardr = 0.0
+            crdr = 0.0
+        end
+    else
+        prdr = (iwcfr - iwci) / rhoair / dt
+        ardr = 0.0
+        crdr = 0.0
+    end
+
+    return (prdr=prdr, ardr=ardr, crdr=crdr, rhorimeout=rhorimeout,
+            gdenavg=gdenavg, gdenavgr=gdenavgr, dry_growth=dry_growth)
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4f. Aggregation: table-index helper, col1, aggregation
+#     (lines 3988-4541)
+# ────────────────────────────────────────────────────────────────────────────
+
+const ISHMAEL_AGG_NDN    = 60
+const ISHMAEL_AGG_TABLO  = 1.0e-6
+const ISHMAEL_AGG_TABHI  = 1.0e-2
+# All 7 dstprms table-size columns (ISHMAEL_TABLO/ISHMAEL_TABHI in
+# ishmael_tables.jl) are the SAME [1e-6,1e-2] for every category, so
+# `dict(icat)` (mkcoltb/aggregation's per-category table-index scale
+# factor) reduces to one shared constant -- no need to carry a per-
+# category array through the 3 live categories used here.
+const ISHMAEL_AGG_DICT   = (ISHMAEL_AGG_NDN - 1) / (log(ISHMAEL_AGG_TABHI) - log(ISHMAEL_AGG_TABLO))
+const ISHMAEL_AGG_RICTMIN = 1.0001
+const ISHMAEL_AGG_RICTMAX = 0.9999 * ISHMAEL_AGG_NDN
+
+"""
+    ishmael_agg_table_index(dn) -> NamedTuple{(:ict,:wct1,:wct2)}
+
+Table-node index and interpolation weights for one aggregation category's
+characteristic diameter `dn`, ports lines 4188-4207 (the `rict`/`ict`/
+`wct1`/`wct2` computation, replicated 3x per category in the Fortran --
+ported once here since `ISHMAEL_TABLO`/`ISHMAEL_TABHI` are identical
+across categories, see [`ISHMAEL_AGG_DICT`](@ref)).
+"""
+@inline function ishmael_agg_table_index(dn::Float64)
+    rict = ISHMAEL_AGG_DICT * (log(max(1.0e-10, dn)) - log(ISHMAEL_AGG_TABLO)) + 1.0
+    rictmm = clamp(rict, ISHMAEL_AGG_RICTMIN, ISHMAEL_AGG_RICTMAX)
+    ict = trunc(Int, rictmm)
+    wct2 = rictmm - Float64(ict)
+    wct1 = 1.0 - wct2
+    return (ict=ict, wct1=wct1, wct2=wct2)
+end
+
+"""
+    ishmael_agg_efffact(rhoeffmax, phieffmax) -> Float64
+
+Shared density/shape collection-efficiency factor (`efffact = phieff *
+rhoeff`), ports the identical rhoeff/phieff block computed 5x in
+`aggregation` (lines 4214-4242, 4254-4281, 4289-4316, 4324-4351,
+4359-4386) -- once here. `rhoeff` reduces the efficiency for high-density
+(quasi-spherical / graupel-like) particles; `phieff` (Connolly et al.
+2012) reduces it for near-spherical shapes, boosted to 1 for very
+extreme (highly aspherical) shapes.
+"""
+@inline function ishmael_agg_efffact(rhoeffmax::Float64, phieffmax::Float64)
+    rhoeff = rhoeffmax <= 400.0 ? 1.0 : (-0.001923 * rhoeffmax + 1.76916)
+    rhoeff = clamp(rhoeff, 0.0, 1.0)
+
+    local phieff
+    if phieffmax <= 0.03
+        phieff = 1.0
+    elseif phieffmax < 0.5
+        phieff = 0.0001 * (phieffmax + 0.07)^(-4.0)
+    else
+        phieff = 0.0
+    end
+    if phieff <= 0.001
+        phieff = 0.0
+    end
+    phieff = clamp(phieff, 0.01, 1.0)
+
+    return phieff * rhoeff
+end
+
+"""
+    ishmael_col1(dtlt, efdum, tempC, dnx, enx, rx, dny, eny, rhoair,
+                 coltab, coltabn, pidx) -> NamedTuple{(:colamt,:deltan)}
+
+One collector(x)-collectee(y) pair's mass (`colamt`) and number
+(`deltan`) transfer over timestep `dtlt`, from the tabulated collection
+kernel `coltab`/`coltabn` (built by `mkcoltb`, ishmael_tables.jl). Ports
+`col1`, lines 4479-4541, SPECIALIZED to the 3 live categories (planar,
+columnar, aggregates) that `aggregation` ever calls it with: `cr=1.0`
+always (every live-category call in `aggregation` passes `cr=1.`),
+`mz=5` (aggregates) always (so the `mz.eq.5` dendritic-growth-zone
+efficiency-boost branch is unconditional here, using `tempC` -- all 3 live
+categories share the same air temperature, `t(k,mx)`, per
+`aggregation`'s own setup, lines 4137-4144), and `icf=5`/`ipris=5` always
+(so the number-transfer `deltan` blend, lines 4530-4536, always applies).
+The `mx.eq.1` (cloud) and `my.eq.6/7` (graupel/hail) branches never fire
+for planar/columnar/aggregates and are dropped. `qrxfer` (internal-energy
+transfer) is NOT ported: `aggregation`'s own `qagg1..3`/`nagg1..3`
+outputs never reference it, and the Fortran itself feeds it an
+effectively-unset local (`qq(k,3)` is assigned from `t(k,3)` ONE LINE
+BEFORE `t(k,3)` is itself set, lines 4137-4138).
+
+`colamt=min(colamt,rx)`/`colamtn=min(colamtn,enx)` (lines 4517, 4528) ARE
+kept -- this is a per-PAIR physical bound (one collection process cannot
+remove more mass/number than its own collector species has), distinct
+from the excluded CROSS-pair "over-depletion" reconciliation in
+`aggregation` itself (see the module-level exclusion note above).
+"""
+@inline function ishmael_col1(dtlt::Float64, efdum::Float64, tempC::Float64,
+                               dnx::Float64, enx::Float64, rx::Float64,
+                               dny::Float64, eny::Float64, rhoair::Float64,
+                               coltab::Array{Float64,3}, coltabn::Array{Float64,3}, pidx::Int)
+    eff = min(0.2, 10.0^(0.035 * tempC - 0.7)) * efdum
+    if abs(tempC + 14.0) <= 2.0
+        eff = 1.4 * efdum
+    end
+
+    ix = ishmael_agg_table_index(dnx)
+    iy = ishmael_agg_table_index(dny)
+
+    denfac = sqrt(1.0 / rhoair)
+    pref = dtlt * 0.785 * eff * denfac / rhoair   # cr=1.0 always in this specialization
+
+    local ctab, ctabn
+    @inbounds begin
+        ctab  = ix.wct1 * iy.wct1 * coltab[ix.ict,     iy.ict,     pidx] +
+                ix.wct2 * iy.wct1 * coltab[ix.ict + 1, iy.ict,     pidx] +
+                ix.wct1 * iy.wct2 * coltab[ix.ict,     iy.ict + 1, pidx] +
+                ix.wct2 * iy.wct2 * coltab[ix.ict + 1, iy.ict + 1, pidx]
+        ctabn = ix.wct1 * iy.wct1 * coltabn[ix.ict,     iy.ict,     pidx] +
+                ix.wct2 * iy.wct1 * coltabn[ix.ict + 1, iy.ict,     pidx] +
+                ix.wct1 * iy.wct2 * coltabn[ix.ict,     iy.ict + 1, pidx] +
+                ix.wct2 * iy.wct2 * coltabn[ix.ict + 1, iy.ict + 1, pidx]
+    end
+
+    colamt = min(pref * enx * eny * ctab, rx)
+    colamtn = min(pref * enx * eny * ctabn, enx)
+
+    wght = clamp(100.0 * abs(colamt) / max(1.0e-20, rx), 0.0, 1.0)
+    deltan = colamtn * (1.0 - wght) + wght * enx * colamt / max(1.0e-20, rx)
+
+    return (colamt=colamt, deltan=deltan)
+end
+
+"""
+    ishmael_aggregation(dt, rhoair, temp, q1, n1, d1, q2, n2, d2, q3, n3, d3,
+                         rho1, rho2, phi1, phi2, coltab, coltabn;
+                         T0=273.15) -> NamedTuple
+
+Ice-ice aggregation among the 3 live categories (1=planar, 2=columnar,
+3=aggregates -- matching `aggregation`'s own 3/4/5 category numbering).
+Ports `aggregation`, lines 3988-4474 (which itself calls `col1`, lines
+4479-4541, [`ishmael_col1`](@ref) here), SIMPLIFIED to the 6 live
+collection pairs (planar+columnar, planar+agg, columnar+agg,
+planar-self, columnar-self, agg-self) via 7 [`ishmael_col1`](@ref)
+sub-calls (planar+columnar needs 2: planar-collects-columnar AND
+columnar-collects-planar, both feeding the SAME "planar+columnar" named
+pair per the task framing). Uses [`ishmael_agg_efffact`](@ref) for each
+pair-group's collection efficiency (`rhoeffmax`/`phieffmax` combining the
+colliding species' `rho`/`phi`, per lines 4214-4242 etc -- self-collection
+of a category reuses that category's own cross-with-aggregates
+`rhoeffmax`/`phieffmax`, since the Fortran's formulas at lines 4324-4325/
+4359-4360 are textually identical to 4254-4255/4289-4290). Aggregate
+self-collection uses `efdum=1.0` (line 4393, no efficiency reduction).
+
+Returns `(qagg1, qagg2, qagg3, nagg1, nagg2, nagg3, dnew3)` -- these are
+**timestep-INTEGRATED amounts, not rates** (the Fortran's `colamt` already
+has `dtlt` baked in, and `mp_jensen_ishmael` adds `qagg`/`nagg` straight
+into `qi`/`ni` with no further `*dt`, line 2398) -- matching the Fortran's
+own return convention exactly, not converted to a rate here.
+
+`dnew3` (`ddum3`, the updated aggregate characteristic diameter) uses a
+LOCALLY-OVERRIDDEN mass-diameter relation (`cfmas=pi/6*50*0.2`,
+`pwmas=3.0`, lines 4092-4093 -- note the Fortran's own `3.14159` literal
+here, NOT the module's more-precise `PI=3.14159265`, transcribed as
+written), DIFFERENT from the `cfmas`/`pwmas` baked into `coltab`/`coltabn`
+at table-BUILD time (`ISHMAEL_CFMAS`/`ISHMAEL_PWMAS` in
+ishmael_tables.jl, used by `mkcoltb`) -- these are two independent,
+intentionally-different uses of "cfmas(5)" in the Fortran, both
+transcribed faithfully to their own call sites.
+
+EXCLUDED: the "do not over-deplete from aggregation" `ratioagg`
+reconciliation across the 3 pairs feeding category 3/4's sink (lines
+4400-4426) -- see the module-level exclusion note above. `qagg1`/`qagg2`
+are therefore the UNLIMITED sum of their 3 contributing pairs' `colamt`
+(each pair already individually bounded by [`ishmael_col1`](@ref)'s own
+`min(colamt,rx)`, but the 3-pair SUM is not re-bounded against `q1`/`q2`).
+"""
+function ishmael_aggregation(dt::Float64, rhoair::Float64, temp::Float64,
+                              q1::Float64, n1::Float64, d1::Float64,
+                              q2::Float64, n2::Float64, d2::Float64,
+                              q3::Float64, n3::Float64, d3::Float64,
+                              rho1::Float64, rho2::Float64, phi1::Float64, phi2::Float64,
+                              coltab::Array{Float64,3}, coltabn::Array{Float64,3};
+                              T0::Float64=ISHMAEL_T0)
+    tempC = temp - T0
+    en1 = n1 * rhoair
+    en2 = n2 * rhoair
+    en3 = n3 * rhoair
+
+    ip_34 = ISHMAEL_IPAIR[3, 4]; ip_43 = ISHMAEL_IPAIR[4, 3]
+    ip_35 = ISHMAEL_IPAIR[3, 5]; ip_45 = ISHMAEL_IPAIR[4, 5]
+    ip_33 = ISHMAEL_IPAIR[3, 3]; ip_44 = ISHMAEL_IPAIR[4, 4]
+    ip_55 = ISHMAEL_IPAIR[5, 5]
+
+    # planar+columnar
+    ef_pc = ishmael_agg_efffact(max(rho1, rho2), max(min(phi1, 1.0 / phi1), min(phi2, 1.0 / phi2)))
+    c_34 = ishmael_col1(dt, ef_pc, tempC, d1, en1, q1, d2, en2, rhoair, coltab, coltabn, ip_34)
+    c_43 = ishmael_col1(dt, ef_pc, tempC, d2, en2, q2, d1, en1, rhoair, coltab, coltabn, ip_43)
+
+    # planar+aggregates (also reused for planar self-collection, see docstring)
+    ef_pa = ishmael_agg_efffact(rho1, min(phi1, 1.0 / phi1))
+    c_35 = ishmael_col1(dt, ef_pa, tempC, d1, en1, q1, d3, en3, rhoair, coltab, coltabn, ip_35)
+    c_33 = ishmael_col1(dt, ef_pa, tempC, d1, en1, q1, d1, en1, rhoair, coltab, coltabn, ip_33)
+
+    # columnar+aggregates (also reused for columnar self-collection)
+    ef_ca = ishmael_agg_efffact(rho2, min(phi2, 1.0 / phi2))
+    c_45 = ishmael_col1(dt, ef_ca, tempC, d2, en2, q2, d3, en3, rhoair, coltab, coltabn, ip_45)
+    c_44 = ishmael_col1(dt, ef_ca, tempC, d2, en2, q2, d2, en2, rhoair, coltab, coltabn, ip_44)
+
+    # aggregate self-collection: efdum=1 (no efficiency reduction)
+    c_55 = ishmael_col1(dt, 1.0, tempC, d3, en3, q3, d3, en3, rhoair, coltab, coltabn, ip_55)
+
+    sink3 = c_34.colamt + c_35.colamt + c_33.colamt
+    sink4 = c_43.colamt + c_45.colamt + c_44.colamt
+
+    qagg1 = min(-sink3, 0.0)
+    qagg2 = min(-sink4, 0.0)
+    qagg3 = max(c_34.colamt + c_43.colamt + c_35.colamt + c_45.colamt + c_33.colamt + c_44.colamt, 0.0)
+
+    nagg1 = -(c_34.deltan + c_35.deltan + c_33.deltan)
+    nagg2 = -(c_43.deltan + c_45.deltan + c_44.deltan)
+    # NOTE: nagg3 deliberately does NOT include c_35.deltan/c_45.deltan
+    # (the planar+agg / columnar+agg number transfers), even though qagg3
+    # DOES include their colamt (mass transfer) above -- transcribed
+    # exactly from the Fortran (lines 4442-4443: `nagg3 = ncrossgain*
+    # enxfer(k,3,5) + ncrossgain*enxfer(k,4,5) + nselfgain*ppenxfer(k,3,5)
+    # + nselfgain*ppenxfer(k,4,5) - 0.5*ppenxfer(k,5,5)` -- no `paenxfer`
+    # term at all). Physically sensible despite looking asymmetric: a
+    # planar/columnar particle absorbed into an EXISTING aggregate adds
+    # its MASS to that aggregate but does not change the aggregate COUNT
+    # (it was already one aggregate); only planar+columnar collisions
+    # (genuinely forming a brand-new aggregate) and self-collection
+    # change the aggregate number.
+    nagg3_raw = 0.5 * (c_34.deltan + c_43.deltan) +
+                0.5 * (c_33.deltan + c_44.deltan) - 0.5 * c_55.deltan
+
+    # dnew3 (ddum3): computed from the RAW (still #/m^3-convention) nagg3,
+    # BEFORE the #/kg conversion below -- matches the Fortran's ordering
+    # (line 4452 precedes the nagg/rhoa division at line 4459).
+    pi_local = 3.14159        # the Fortran's own literal at this call site, see docstring
+    cfmas5_local = pi_local / 6.0 * 50.0 * 0.2
+    pwmas5_local = 3.0
+    gnu5 = 4.0
+    dnew3 = ((q3 + qagg3) * rhoair /
+             (max(en3 + nagg3_raw, ISHMAEL_QNSMALL) * cfmas5_local * (gamma(gnu5 + pwmas5_local) / gamma(gnu5))))^(1.0 / pwmas5_local)
+
+    nagg1 /= rhoair
+    nagg2 /= rhoair
+    nagg3 = nagg3_raw / rhoair
+
+    return (qagg1=qagg1, qagg2=qagg2, qagg3=qagg3, nagg1=nagg1, nagg2=nagg2, nagg3=nagg3, dnew3=dnew3)
+end
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4g. Pure diagnostic caps: ice number (line 2200), aggregate size
+#     (lines 2604-2612)
+# ────────────────────────────────────────────────────────────────────────────
+
+"""
+    ishmael_ni_cap(ni, rhoair) -> Float64
+
+Pure diagnostic cap on ice number mixing ratio `ni` (# kg^-1) to 1000
+per liter of air. Ports line 2200,
+`ni(cc,k)=min(ni(cc,k),(1000.*1000.*i_rhoair(k)))`, verbatim: `1000 L^-1 =
+1e6 m^-3`, divided by `rhoair` to convert to # kg^-1. The host decides
+when/whether to apply this cap -- this is the pure `min`, nothing more.
+"""
+@inline ishmael_ni_cap(ni::Float64, rhoair::Float64) = min(ni, 1.0e6 / rhoair)
+
+"""
+    ishmael_agg_size_cap(ani, cni, ni, dsdum, ao, qi, rbdum, NU, gammnu;
+                          QNSMALL=1.25e-7, fourthirdspi=4/3*PI) -> NamedTuple{(:ani,:cni,:ni)}
+
+Pure diagnostic cap on aggregate a-axis size to 0.5 mm ("implicit
+breakup"), with number re-diagnosis to keep mass `qi` consistent (`cni`
+re-derived from the capped `ani` via the fixed `deltastr` shape). Ports
+lines 2604-2612 verbatim. Does NOT include the PRECEDING re-derivation of
+`ani` from `qi`/`ni`/`rhobar`/`alphstr` (lines 2590-2601) -- pass in the
+caller's ALREADY-DIAGNOSED `ani`/`cni`/`ni` (the host decides how those
+were obtained; this is a pure diagnostic helper per the task framing).
+When `ani <= 0.5mm` the cap never binds and `(ani,cni,ni)` pass through
+UNCHANGED (the Fortran's own `if` guard, lines 2604-2612 -- nothing
+upstream of this cap is re-derived by this function either way).
+"""
+function ishmael_agg_size_cap(ani::Float64, cni::Float64, ni::Float64, dsdum::Float64,
+                               ao::Float64, qi::Float64, rbdum::Float64, NU::Float64,
+                               gammnu::Float64; QNSMALL::Float64=ISHMAEL_QNSMALL,
+                               fourthirdspi::Float64=4.0 / 3.0 * ISHMAEL_PI)
+    if ani > 0.5e-3
+        ani_out = 0.5e-3
+        cni_out = ao^(1.0 - dsdum) * ani_out^dsdum
+        gam = gamma(NU + 2.0 + dsdum)
+        ni_out = qi / (rbdum * fourthirdspi * ao^(1.0 - dsdum) * ani_out^(2.0 + dsdum) * gam / gammnu)
+        ni_out = max(ni_out, QNSMALL)
+        return (ani=ani_out, cni=cni_out, ni=ni_out)
+    else
+        return (ani=ani, cni=cni, ni=ni)
+    end
+end
