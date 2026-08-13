@@ -272,7 +272,10 @@ function o01_model(opts::BenchmarkOptions)
         (options[:ice_transform] = Symbol(ENV["SCYTHE_O01_ICETRANS"]))
     # The transform widths, as "mass,number,a,c" -- FOUR numbers, because mu is dimensional
     # and the four moment kinds are ten and nine decades apart (kg/m^3, #/m^3, m^3/m^3).
-    # Unset => (1e-7, 1e2, 1e-16, 1e-16). Only meaningful with ICETRANS.
+    # Unset => Scythe.MC_ICE_MU_DEFAULTS = (1e-12, 1e-2, 1e-16, 1e-16), each two to five
+    # decades below the moment it transforms (see there for the sizing principle and why
+    # the former (1e-7, 1e2, ...) made bhyp a bare positivity floor on this arm).
+    # Only meaningful with ICETRANS.
     if haskey(ENV, "SCYTHE_O01_ICEMU")
         imus = parse.(Float64, split(ENV["SCYTHE_O01_ICEMU"], ","))
         length(imus) == 4 || error("SCYTHE_O01_ICEMU takes four comma-separated widths " *

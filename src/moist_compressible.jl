@@ -1799,18 +1799,50 @@ const MC_ICE_VARS = ("rho_i1", "n_i1", "a_i1", "c_i1",
 The `physical_params` key holding the transform width `mu` for each entry of
 [`MC_ICE_VARS`](@ref), positionally. `mu` is DIMENSIONAL — it carries the units of the
 variable it transforms — so the four moment kinds cannot share one number the way the twelve
-slots share one transform FAMILY: mass is O(1e-7) kg/m³ at the threshold of meteorological
-relevance, number is O(1e2) #/m³, and the two volume moments are O(1e-16) m³/m³ (a 100 µm
-crystal is ~1e-12 m³ and a plausible concentration is 1e4 /m³).
+slots share one transform FAMILY: the mass, the number and the two volume moments are nine
+and ten decades apart (kg/m³, #/m³, m³/m³). Each width is set two to five decades BELOW the
+field it transforms — see [`MC_ICE_MU_DEFAULTS`](@ref) for the sizing principle, the
+measurement behind it, and what goes wrong when `mu` is set at or above the field amplitude.
 """
 const MC_ICE_MU_KEYS = (:mu_ice, :mu_ice_n, :mu_ice_a, :mu_ice_c,
                         :mu_ice,  :mu_ice_n, :mu_ice_a, :mu_ice_c,
                         :mu_ice,  :mu_ice_n, :mu_ice_a, :mu_ice_c)
 
-"""Defaults for [`MC_ICE_MU_KEYS`](@ref), positionally. See there for why they differ."""
-const MC_ICE_MU_DEFAULTS = (1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
-                            1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
-                            1.0e-7, 1.0e2, 1.0e-16, 1.0e-16)
+"""
+Defaults for [`MC_ICE_MU_KEYS`](@ref), positionally. See there for why they differ by moment
+kind, and the SIZING PRINCIPLE below for why they are the values they are. All four remain
+per-run tunables through `physical_params`.
+
+# The sizing principle: `mu` must sit WELL BELOW the field amplitude
+
+`bhyp` is a stretch that acts only where `rho ≲ mu`; above that it is affine
+(`bhyp(rho) → rho/2`) and `J → 1/2`. Sized correctly, the transform buys a recovered value
+bounded below by zero AND a genuine change of variables in the region that needs it. Sized
+too WIDE — `mu` at or above the field amplitude — `bhyp` degenerates: measured at the O01 ice
+arm's own amplitude (peak `rho_i1 = 2.7e-10` kg/m³ against the former `mu_ice = 1e-7`, i.e.
+`mu` 370x ABOVE the field), `bhyp(rho)/rho = 0.9987` and `J = 0.9973`. The map is the IDENTITY
+to 0.3 %, so nothing is stretched and nothing is smoothed; all that survives of the transform
+is `ahyp`'s hard floor at zero. That is a bare positivity clip on a two-signed spline
+excursion — exactly the flooring that `condensate_transform_mode` documents as rejected for
+the cloud ("Flooring rectifies a two-signed excursion into one-signed"), applied to the ice
+slot but NOT to slot 3, which keeps integrating the signed sum. The manufactured mass is the
+difference, and it lands in the residual vapor.
+
+So each width is set two to five decades BELOW the field scale it transforms:
+
+| moment | field scale (O01 ice arm) | `mu` | field/`mu` |
+|---|---|---|---|
+| mass `rho_i` | ~1e-9 kg/m³ | 1e-12 | 1e3 |
+| number `n_i` | ~1e3 #/m³ | 1e-2 | 1e5 |
+| volume `a_i`, `c_i` | ~`n·r³` = 1e3·(2e-5)³ = 8e-12 m³/m³ | 1e-16 | 1e4 |
+
+The two VOLUME widths are unchanged: at `n·r³` for a 20 µm crystal at 1e3 /m³ the field is
+already four decades above 1e-16, so they were correctly sized from the start and moving them
+for symmetry with the other two would be a change with no measurement behind it.
+"""
+const MC_ICE_MU_DEFAULTS = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16,
+                            1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16,
+                            1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)
 
 """
     ice_microphysics(options) -> Symbol
@@ -4081,15 +4113,51 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         e2 = _ice_effective(q2, n2, a2, c2, 2)
         e3 = _ice_effective(q3, n3, a3, c3, 3)
 
-        r1 = q1 > ISHMAEL_QSMALL ?
+        # ── THE POPULATION GATE ────────────────────────────────────────────────
+        # A species has a POPULATION at this gridpoint only where the CARRIED number is
+        # positive. Mass with no number is not a population: it is a state the transport can
+        # produce (four moments on four independent spline fits do not stay mutually
+        # realizable) and that nothing physical can. GROWTH WITHOUT ACTIVATION IS IMPOSSIBLE
+        # — deposition needs crystals to deposit onto, riming needs crystals to rime, and a
+        # fall speed is a property of particles. Ice begins by NUCLEATION, which creates
+        # number and mass together, and those channels are deliberately NOT gated here (see
+        # `q_nuc`/`n_nuc` below): activation is how ice is allowed to start.
+        #
+        # Why the CARRIED number and not `_ice_effective`'s. `_ice_effective` floors the
+        # incoming number at `ISHMAEL_QNSMALL` and hands the result to `ishmael_var_check`,
+        # whose small/large-ice limits then RE-DERIVE a number from the mass. At carried
+        # n = 0 that manufactures a phantom population — measured on the O01 ice arm: 744 /m³
+        # of 1 mm crystals at ρ_b = 50 kg/m³, the largest and lowest-density particle the
+        # scheme can represent, hence the FASTEST. Its fall speed is 5.27 m/s against
+        # 0.046 m/s for a physically consistent 20 µm population carrying the same mass
+        # (115x; 1646x at 5 µm), and it is INDEPENDENT of the mass, so the sedimentation flux
+        # `ρ_i·V` is linear in a density the number does not support. Measured consequence:
+        # 42-48 gridpoints per column falling at up to the 25 m/s cap, a fall-speed field
+        # that jumps 0 -> 5 -> 25 m/s between adjacent gridpoints, a spline fit of `ρ_i·V`
+        # that rings at an amplitude far above the ice present, and — with `ahyp` keeping
+        # only the positive lobes — a column ice mass that went 4.9e-8 -> 4.6e-5 -> 32.4
+        # kg/m² in three steps at t = 999 s while the cumulative deposition at the worst
+        # point was -3.5e-12 kg/m³. The mass was not deposited and did not arrive; it was
+        # manufactured by rates and speeds read off a population that was not there.
+        #
+        # The floor itself stays inside `_ice_effective` — `var_check` divides by the number
+        # and would fault without it — but NO RATE may see the population it implies, so the
+        # gate is applied here, at the rate boundary, and `_ice_empty_rates()` is every field
+        # EXACT `0.0`. That is what keeps the warm/ice-free inertness gate bitwise: a
+        # configuration with no ice takes the same branch it always did.
+        live1 = q1 > ISHMAEL_QSMALL && n1 > 0.0
+        live2 = q2 > ISHMAEL_QSMALL && n2 > 0.0
+        live3 = q3 > ISHMAEL_QSMALL && n3 > 0.0
+
+        r1 = live1 ?
              _ice_species_rates(tab, dt, e1, q1, n1, temp, rhoair, mu, dv, kt, nsch, npr,
                                 xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
                                 qc, nc, qr, nr, qv) : _ice_empty_rates()
-        r2 = q2 > ISHMAEL_QSMALL ?
+        r2 = live2 ?
              _ice_species_rates(tab, dt, e2, q2, n2, temp, rhoair, mu, dv, kt, nsch, npr,
                                 xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
                                 qc, nc, qr, nr, qv) : _ice_empty_rates()
-        r3 = q3 > ISHMAEL_QSMALL ?
+        r3 = live3 ?
              _ice_species_rates(tab, dt, e3, q3, n3, temp, rhoair, mu, dv, kt, nsch, npr,
                                 xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
                                 qc, nc, qr, nr, qv) : _ice_empty_rates()
@@ -4098,8 +4166,11 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         qagg1 = 0.0; qagg2 = 0.0; qagg3 = 0.0
         nagg1 = 0.0; nagg2 = 0.0; nagg3 = 0.0
         dnew3 = 0.0
-        agg_on = (temp <= T_0) &&
-                 (q1 > ISHMAEL_QSMALL || q2 > ISHMAEL_QSMALL || q3 > ISHMAEL_QSMALL)
+        # Aggregation collects crystals with crystals, so it too runs only on species that
+        # HAVE a population: the gated masses and numbers below are exactly zero for a
+        # species whose carried number is not positive, and a collection kernel with no
+        # collector and no collectee returns nothing.
+        agg_on = (temp <= T_0) && (live1 || live2 || live3)
         if agg_on
             dn1 = clamp(2.0 * ((e1.ai^2) / (e1.ci * e1.ni))^0.333333333333, 1.0e-6, 1.0e-2)
             dn2 = clamp(2.0 * ((e2.ci^2) / (e2.ai * e2.ni))^0.333333333333, 1.0e-6, 1.0e-2)
@@ -4108,8 +4179,11 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                          ISHMAEL_I_GAMMNU, 0.01, 100.0)
             phi2 = clamp(e2.ci / e2.ai * gamma(ISHMAEL_NU - 1.0 + e2.deltastr) *
                          ISHMAEL_I_GAMMNU, 0.01, 100.0)
-            ag = ishmael_aggregation(dt, rhoair, temp, q1, e1.ni, dn1, q2, e2.ni, dn2,
-                                     q3, e3.ni, dn3, e1.rhobar, e2.rhobar, phi1, phi2,
+            ag = ishmael_aggregation(dt, rhoair, temp,
+                                     live1 ? q1 : 0.0, live1 ? e1.ni : 0.0, dn1,
+                                     live2 ? q2 : 0.0, live2 ? e2.ni : 0.0, dn2,
+                                     live3 ? q3 : 0.0, live3 ? e3.ni : 0.0, dn3,
+                                     e1.rhobar, e2.rhobar, phi1, phi2,
                                      tab.coltab, tab.coltabn)
             qagg1 = ag.qagg1; qagg2 = ag.qagg2; qagg3 = ag.qagg3
             nagg1 = ag.nagg1; nagg2 = ag.nagg2; nagg3 = ag.nagg3
@@ -4168,6 +4242,7 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         cs = (c1, c2, c3)
         aggq = (qagg1, qagg2, qagg3)
         aggn = (nagg1, nagg2, nagg3)
+        lives = (live1, live2, live3)
         for k in 1:3
             rk = rs[k]
             ek = es[k]
@@ -4216,7 +4291,15 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
             # the fallback initialization, not a re-diagnosis of anything, so restoring toward
             # it would inject `QNSMALL/Δt` into a slot that must produce an EXACT zero — and
             # the whole zero-ice inertness gate rests on that.
-            if var_check_source && qs[k] > ISHMAEL_QSMALL
+            # GATED ON THE POPULATION, not merely on the mass. `ek.ni` at carried n = 0 is
+            # `var_check`'s re-derivation from the mass — the phantom population — so
+            # relaxing the carried number TOWARD it would inject number that no nucleation
+            # created, at 744/5 = 149 m⁻³ s⁻¹ on the O01 arm. That is the same
+            # growth-without-activation this gate exists to forbid, arriving through the
+            # consistency source instead of through a rate. A species that HAS a population
+            # still gets the full relaxation, so the drift this term was added to stop
+            # (n_i1 -> 2.2e9 m⁻³ against 5e-10 kg/m³) remains covered.
+            if var_check_source && lives[k]
                 nsrc += rhoair * (ek.ni - ns[k]) * i_tau_vc
                 asrc += rhoair * (ek.ai - as[k]) * i_tau_vc
                 csrc += rhoair * (ek.ci - cs[k]) * i_tau_vc
@@ -4429,10 +4512,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     ice_on = ice_registered(IS)
     itrans = ice_on ? ice_transform_mode(model.options) : :none
     itrans_on = itrans !== :none
-    imu_q = get(model.physical_params, :mu_ice, 1.0e-7)
-    imu_n = get(model.physical_params, :mu_ice_n, 1.0e2)
-    imu_a = get(model.physical_params, :mu_ice_a, 1.0e-16)
-    imu_c = get(model.physical_params, :mu_ice_c, 1.0e-16)
+    # Through `ice_mu`, so the four widths have ONE source of truth
+    # (`MC_ICE_MU_DEFAULTS`) and a default cannot be changed in one place and silently
+    # overridden by a literal in another.
+    imu_q = ice_mu(model.physical_params, 1)
+    imu_n = ice_mu(model.physical_params, 2)
+    imu_a = ice_mu(model.physical_params, 3)
+    imu_c = ice_mu(model.physical_params, 4)
     if ice_on && budget_trace
         # Same refusal as the rain number's, one category further out: the budget rows are
         # the three LIQUID mass channels, so neither the ice mass nor its three moments has
@@ -6606,7 +6692,7 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         rho_ice_t_star = S.df_rho_ice_t_star
         if ice_registered(mtile.mc_slots)
             it = ice_transform_mode(mtile.model.options)
-            imu_s = get(mtile.model.physical_params, :mu_ice, 1.0e-7)
+            imu_s = ice_mu(mtile.model.physical_params, 1)
             i1q_v = view(vnp1, colstart:colend, mtile.mc_slots.i1_q)
             i2q_v = view(vnp1, colstart:colend, mtile.mc_slots.i2_q)
             i3q_v = view(vnp1, colstart:colend, mtile.mc_slots.i3_q)

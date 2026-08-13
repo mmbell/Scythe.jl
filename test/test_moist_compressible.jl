@@ -4921,13 +4921,24 @@ using Springsteel
             @test haskey(Scythe.MC_NU_ALIAS, nm)
         end
         @test length(unique(values(Scythe.MC_NU_ALIAS))) == length(Scythe.MC_NU_ALIAS)
-        # Widths: mass, number, a, c — and the defaults are per KIND, not per slot
+        # Widths: mass, number, a, c — and the defaults are per KIND, not per slot.
+        # Each sits two to five decades BELOW the moment it transforms, so `bhyp` is a
+        # change of variables in its affine regime rather than a bare positivity floor;
+        # see `MC_ICE_MU_DEFAULTS` for the sizing principle and the measurement (at the
+        # former mass width of 1e-7 against a 2.7e-10 kg/m^3 field, `bhyp(rho)/rho` was
+        # 0.9987 and `J` 0.9973 — the identity to 0.3 %, i.e. no transform at all).
         pp = Dict{Symbol,Float64}()
         @test [Scythe.ice_mu(pp, j) for j in 1:12] ==
-              [1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
-               1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
-               1.0e-7, 1.0e2, 1.0e-16, 1.0e-16]
+              [1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16,
+               1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16,
+               1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16]
+        @test [Scythe.ice_mu(pp, j) for j in 1:12] == collect(Scythe.MC_ICE_MU_DEFAULTS)
         @test Scythe.ice_mu(Dict(:mu_ice_a => 3.0e-15), 3) == 3.0e-15
+        # The mass and number widths are below their field scales; the two volume widths
+        # were already correctly sized and are deliberately unmoved.
+        @test Scythe.ice_mu(pp, 1) < 1.0e-9      # vs ~1e-9 kg/m^3 of species-1 ice
+        @test Scythe.ice_mu(pp, 2) < 1.0e3       # vs ~1e3 #/m^3
+        @test Scythe.ice_mu(pp, 3) < 8.0e-12     # vs n*r^3 = 1e3*(2e-5)^3
 
         # All twelve are TOTALS: no reference profile to offset a bound against. The
         # transformed names are refused, like nu_c/nu_r/nu_nr.
@@ -5816,6 +5827,94 @@ using Springsteel
             row3 = Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * (Scythe.MC_STIFF_I3 - 1)
             @test maximum(view(m.mc_water_stats, row1, :)) > 0.0      # ice1 is loaded
             @test maximum(view(m.mc_water_stats, row3, :)) == 0.0     # ice3 is empty
+        end
+    end
+
+    # ── The POPULATION GATE ──────────────────────────────────────────────────────
+    #
+    # Growth without activation is impossible: deposition needs crystals to deposit onto,
+    # riming needs crystals to rime, and a fall speed is a property of particles. A slot
+    # holding MASS WITH NO NUMBER is not a population — it is a state four independent
+    # spline fits can produce and nothing physical can — so every RATE and every FALL SPEED
+    # must be an exact zero there, while NUCLEATION (which creates number and mass together)
+    # must still fire. See the gate comment in `mc_ice_sources!`.
+    @testset "ice: mass with no number is inert, but nucleation still fires" begin
+        mktempdir() do tmpdir
+            # A column carrying ice MASS with the number slot at exactly zero. Warm enough
+            # that no nucleation fires, so the only thing that could move the slots is a
+            # rate read off the phantom population var_check would manufacture.
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
+                                              rho_i = 1.0e-5, n_i = 0.0)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            # Every species-1 SOURCE is an exact zero: no rate may read a population that
+            # is not carried.
+            @test all(iszero, S.SRC_i1q)
+            @test all(iszero, S.SRC_i1n)
+            @test all(iszero, S.SRC_i1a)
+            @test all(iszero, S.SRC_i1c)
+            # The fall speeds the flux would have used are exactly zero, so nothing
+            # sediments off unsupported mass -- and `_ice_flux!` then short-circuits.
+            @test all(iszero, S.Vi1m)
+            @test all(iszero, S.Vi1n)
+            @test all(iszero, S.F_i1q_z)
+            # ...and no deposition timescale is ever formed on it.
+            @test all(iszero, S.invtau_i1)
+            @test all(iszero, S.Qdot_i1)
+        end
+
+        mktempdir() do tmpdir
+            # The SAME mass, now with a consistent number: the species is alive and the
+            # rates must be nonzero, or the gate would be vacuous.
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
+                                              rho_i = 1.0e-5, n_i = 5.0e4)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            @test any(!iszero, S.Vi1m)                    # a real population falls
+            @test any(!iszero, S.invtau_i1)               # and can exchange vapor
+        end
+
+        mktempdir() do tmpdir
+            # ACTIVATION IS NOT GATED: cold, supersaturated, and with NO ice at all, the
+            # nucleation channels must still create ice — number and mass together.
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 233.15, q_l = 1.0e-3,
+                                              rho_i = 0.0, n_i = 0.0)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            tgt = any(>(0.0), S.SRC_i1n) ? (S.SRC_i1q, S.SRC_i1n) : (S.SRC_i2q, S.SRC_i2n)
+            @test any(>(0.0), tgt[2])                     # crystals are created
+            @test any(>(0.0), tgt[1])                     # with mass, in the same cells
+            k = argmax(tgt[2])
+            @test tgt[1][k] > 0.0                         # never number without mass
+        end
+    end
+
+    @testset "ice: a decorrelated slot cannot grow, at any supersaturation" begin
+        # The defect state, driven as hard as the drive clip allows: mass present, number
+        # exactly zero, air strongly supersaturated over ice. Under the phantom population
+        # this grew without bound; gated, it must not move at all.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 243.15, q_l = 5.0e-3,
+                                              rho_i = 1.0e-4, n_i = 0.0)
+            for step in 1:5
+                Scythe.advance_column(m, 1, step)
+            end
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(iszero, S.Qdot_i1)                  # no deposition on nothing
+            @test all(iszero, S.invtau_i1)                # the timescale is never formed
+            @test all(iszero, S.Vi1m)                     # and no sedimentation either
+            @test all(iszero, S.F_i1q_z)
+            # The slot is NOT frozen solid: this air is cold and supersaturated, so
+            # NUCLEATION fires into species 1 and legitimately adds mass. What the gate
+            # guarantees is the author's principle itself -- mass never arrives without
+            # the number that carries it. Every cell that gains ice mass gains crystals.
+            for i in eachindex(S.SRC_i1q)
+                S.SRC_i1q[i] > 0.0 && @test S.SRC_i1n[i] > 0.0
+            end
+            # ...and the only mass source present IS the nucleation one: every
+            # population-dependent channel is an exact zero.
+            @test all(iszero, S.Qdot_i1)                  # deposition
+            @test all(iszero, S.SRC_i1a .* iszero.(S.SRC_i1n))   # no volume without number
         end
     end
 
