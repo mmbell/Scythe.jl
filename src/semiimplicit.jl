@@ -1091,6 +1091,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     state_minima_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && mc_stiffness_trace(mtile, t)
 
     # Advance each column.
     #

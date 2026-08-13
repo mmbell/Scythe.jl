@@ -121,7 +121,8 @@ const MC_SCRATCH_SLOTS = (
     :nu_r, :nu_r_z, :Jr, # slot-8 control variable, its gradient, dnu/drho (rain_transform_mode)
     :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
     :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
-    :cap_c, :cap_r, :cap_v,                        # AB3 depletion bounds (raw, see _ab3_sink_bound)
+    :cap_c, :cap_r, :cap_v,      # AB3 depletion bounds, DIAGNOSTIC ONLY (see _ab3_sink_bound)
+    :invtau_c, :invtau_r,        # per-channel relaxation rates, for `mc_stiffness_census!`
     :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
@@ -569,15 +570,14 @@ nucleation, minimum droplet radius) and the energy-consistent psychrometric fact
 
     Q̇_cond = Q_ss (1/τ) / (1 + Q_s)
 
-`rho_v` is the CLAMPED diagnostic vapor density. Evaporation is limited by the
-available cloud water so ρ_c cannot be driven negative, and condensation by the
-available vapor, which kills phantom condensation in dry air where Q_ss tracking
-drift can otherwise indicate spurious supersaturation. Subsaturated cloud-free air
-returns zero.
+Subsaturated cloud-free air returns zero: there are no droplets to evaporate.
+Supersaturated air nucleates (`S > 1e-4`) and condenses.
 
-This single-category delegate takes the DEFAULT (forward-Euler) bounds of
-[`qss_condensation_rates`](@ref), which is what it has always used and what its tests
-pin. Production passes the AB3-sized bounds explicitly — see [`_ab3_sink_bound`](@ref).
+No depletion cap of any kind is applied, so the rate is not a function of `ts` — `ts` is
+inert in the signature, kept because callers pass it positionally and the ice work will read
+it. `rho_v` IS read: it clips the drive to `min(Q_ss, ρ_v − ρ_v*)`, which is an identity in
+the continuum and is what stops a column whose prognostic `Q_ss` has detached from the density
+budget condensing vapor that is not there. See [`qss_condensation_rates`](@ref).
 """
 qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0) =
     qss_condensation_rates(Q_ss, rho_v, rho_c, 0.0, rho_d, Tk, p_hPa, Q_s, ts, 0.0,
@@ -585,7 +585,7 @@ qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100
 
 """
     qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts, N_r,
-                           max_N_c=100.0; N_0=0.0) -> (Qdot_c, Qdot_r)
+                           max_N_c=100.0; N_0=0.0) -> (Qdot_c, Qdot_r, invtau_c, invtau_r)
 
 Two-category condensation/evaporation rates [kg/m³/s] from the generalized
 supersaturation relaxation `1/τ = 1/τ_c + 1/τ_r` (see
@@ -599,33 +599,120 @@ air (rate ∝ `rho_r^{1/3}` under the monodisperse fixed-`N_r` closure, non-Lips
 at zero). The rain-channel timescale is [`invtau_rain`](@ref) by default; the
 keyword `N_0 > 0` [m⁻⁴] selects the exponential Marshall-Palmer closure
 [`invtau_rain_mp`](@ref) instead (`N_r` is then unused), leaving the split
-arithmetic, gate and limiters untouched. Rain evaporation in subsaturated air is
+arithmetic and gate untouched. Rain evaporation in subsaturated air is
 unconditional, so no separate
 rain-evaporation parameterization (O01's `Q_evap`) is needed. The ventilation
 enhancement lives inside [`invtau_rain`](@ref).
 
-Limiters: cloud evaporation is bounded below by `floor_c`, rain evaporation by `floor_r`, and
-if the combined condensation would exceed `ceil_v` both channels are rescaled proportionally.
-With the rain channel inactive (`Qdot_r == 0`) the vapor cap reduces to the historical
-`min(Qdot, ceil_v)`, keeping the single-category [`qss_condensation_rate`](@ref) delegate
-bit-identical to its pre-rain behavior.
+# No limiters
 
-The three bounds default to the FORWARD-EULER budgets this function used to hard-code
-(`−max(rho_c,0)/ts`, `−max(rho_r,0)/ts`, `+max(rho_v,0)/ts`), which is what every unit-test
-caller and the single-category delegate get. The integrator is AB3, not Euler, so `mc_driver!`
-passes the exact three-level bounds instead — see [`_ab3_sink_bound`](@ref) for why that
-matters and by how much. Note the vapor ceiling is the SAME defect as the two condensate
-floors: it is what stops condensation removing more vapor than the residual holds, and until
-now it was Euler-sized and not even reachable by the `cap_factor` probe.
+The rates are PURE. This function used to floor cloud evaporation at `−ρ_c/ts`, rain
+evaporation at `−ρ_r/ts`, and rescale both channels when the combined condensation exceeded
+`+ρ_v/ts` (later, the AB3-exact versions of the same three budgets, sized in `mc_driver!` by
+[`_ab3_sink_bound`](@ref)). All three are gone.
+
+The reason is stated in reference/Scythe_moist_compressible.tex, "Departures from the ISHMAEL
+implementation" §(b): a cap of the form `Q̇ ≥ −ρ/Δt` makes the RATE — and therefore the
+converged solution — a function of the time step, so the scheme is not consistent in the sense
+that refining `Δt` approaches the differential equation, because the equation being solved
+changes with `Δt`. The same argument that rejects ISHMAEL's semi-analytic step-mean growth
+rate rejects these.
+
+What replaces them:
+
+  * robustness against a transient negative condensate comes from the CONTROL-VARIABLE
+    transforms ([`condensate_transform_mode`](@ref), [`rain_transform_mode`](@ref)), which
+    bound the recovered density below by construction rather than by repairing a rate, and
+    from the prognostic-supersaturation recovery — a point driven past zero is subsaturated
+    on the next step and the closure stops removing vapor from it on its own;
+  * under-resolution of a stiff relaxation is REPORTED, by [`mc_stiffness_census!`](@ref),
+    which accumulates `max ts/τ` per channel and counts the gridpoints past `ts/τ = 1`. A run
+    with a large census is a run whose time step is wrong, and that is a statement for the
+    diagnostics to make, not one for the rates to absorb silently.
+
+The two channel inverse timescales are returned alongside the rates precisely so the census
+can be taken on the rates that were actually used, at no extra cost.
+
+`ts` no longer enters the returned rate at all. `rho_v` does — but through the DRIVE, not
+through a `Δt`-sized budget. See below.
+
+# The clipped drive (PROVISIONAL — pending author ratification)
+
+The closure is driven by
+
+    Q_ss_drive = min(Q_ss, max(ρ_v, 0) − ρ_v*)
+
+and `Q_ss_drive`, never the raw `Q_ss`, sets the saturation ratio `S` that gates Twomey
+nucleation and the droplet number, the rate `Q̇ = Q_ss_drive·(1/τ)/(1+Q_s)` and its split, and
+the sign test that gates the rain channel. The `Q_ss` PROGNOSTIC EQUATION and
+[`qss_relaxation`](@ref) are untouched — the clip lives only inside this rate closure.
+
+In the continuum this is an IDENTITY: `Q_ss ≡ ρ_v − ρ_v*`, so the `min` never binds and the
+clip is invisible. Discretely `Q_ss` is carried as an independent prognostic and can DETACH
+from the density budget, and the clip is the INSTANTANEOUS form of exactly the reconciliation
+`qss_relaxation` already applies on the `tau_qss` timescale. It is `ts`-free and depends on
+the state alone, so it is not a depletion cap and does not reintroduce the defect §(b)
+rejects: refining `Δt` still approaches the same differential equation.
+
+`ρ_v` here is the BLENDED vapor — the same variable the removed `ceil_v` bounded — which
+minimizes the behaviour change relative to the code this replaces.
+
+Why it is needed, measured 2026-08-12 by removing the three caps and restoring one at a time:
+
+  * removing `floor_c` and `floor_r` breaks NOTHING;
+  * removing `ceil_v` breaks two gates — "Q_ss relaxation is thermodynamically inert in dry
+    air", and the axisym `exact_si` ceiling gate, which detonates to a NEGATIVE TEMPERATURE
+    inside 300 steps on a resting DRY base.
+
+`ρ_v` appeared ONLY in the ceiling, so with it gone nothing coupled the closure to the vapor
+actually present, and the nucleation branch fired on a detached `S = Q_ss/ρ_v*` to condense
+vapor that was not there. The dry bases are the worst case precisely because `ρ_v*` is tiny
+(1.7e−6 kg/m³ at 195 K, 8.3e−4 at 250 K), so a noise-level `Q_ss'` reads as a large
+supersaturation. The ceiling's `Δt` dependence was incidental; its CONTENT — "you cannot
+condense vapor that is not there" — is physical and belongs in the closure. This is that
+content, written without `Δt`.
+
+**`S` must come from the clipped drive too**, which is why the clip is applied before `S` and
+not just at the rate: with `S` computed from the raw `Q_ss`, dry air with a positive `Q_ss'`
+still NUCLEATES (raw `S > 1e-4` opens the Twomey branch and sets `invtau_c > 0`), and the
+clipped, now-negative drive then evaporates the cloud that does not exist and manufactures
+vapor — the same hole with the sign reversed. Taking `S` from the drive shuts the branch and
+leaves dry air exactly inert.
+
+An existence gate (`ρ_v > 0`) was considered and rejected: the rate does not scale with `ρ_v`,
+so 1e−12 kg/m³ of residual vapor would still admit the full rate.
+
+**The EVAPORATION side is bounded by the vapor floor.** Where the retrieved vapor is NEGATIVE
+— which happens (the O01 quick run reaches `ρ_v = −7.2e−4 kg/m³` at ~750 points), it is a
+PARTITION ERROR, not a physical state — the `max(ρ_v, 0)` inside the clip floors the drive at
+`−ρ_v*`, the maximum-dryness (vapor-free air) evaporation drive. Without the floor the drive
+would be `ρ_v − ρ_v* < −ρ_v*`: evaporation at a rate set by the size of the partition error,
+which nothing bounds (a seeded `ρ_c' = 0.5 kg/m³` state put `ρ_v ≈ −0.5` and drove slots 7 and
+9 to O(1e3) kg/m³/s through exactly that branch before the floor was added). The floor is the
+evaporation-side mirror of the condensation clip — "air cannot be drier than vapor-free" next
+to "you cannot condense vapor that is not there" — and is equally `ts`-free and state-only.
+A prognostic `Q_ss` below `−ρ_v*` still passes through the `min` unfloored: the prognostic is
+advanced by the smooth multistep integrator and is not the pathology this floor addresses.
+
+The vapor's depletion remains CENSUSED (`:d_v_*` in [`water_depletion_probe!`](@ref)), which
+is where a failure of this argument would show up.
+
+[`water_depletion_probe!`](@ref) still compares the realized rates against the AB3-exact
+bounds and reports where the old caps WOULD have bound; that is a measurement, and nothing in
+the RHS path reads it.
 """
 function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts,
-                                N_r, max_N_c=100.0; N_0=0.0, cap_factor=1.0,
-                                floor_c = -cap_factor * max(rho_c, 0.0) / ts,
-                                floor_r = -cap_factor * max(rho_r, 0.0) / ts,
-                                ceil_v = max(rho_v, 0.0) / ts)
+                                N_r, max_N_c=100.0; N_0=0.0)
 
     rho_vs = rho_v_sat(Tk, p_hPa)
-    S = Q_ss / rho_vs                    # supersaturation (ratio - 1)
+    # THE DRIVE, clipped to the vapor actually present. In the continuum Q_ss IS rho_v - rho_vs
+    # and this is an identity; discretely the prognostic Q_ss can detach from the density
+    # budget, and this is the instantaneous form of the reconciliation `qss_relaxation` applies
+    # on the tau_qss timescale. `ts`-free and state-dependent only. The vapor is floored at
+    # zero inside the clip: air cannot be drier than vapor-free, so a NEGATIVE retrieved rho_v
+    # (a partition error) must not set the evaporation rate. See the docstring.
+    Q_ss_drive = min(Q_ss, max(rho_v, 0.0) - rho_vs)
+    S = Q_ss_drive / rho_vs              # supersaturation (ratio - 1)
     q_c = max(rho_c, 0.0) / rho_d
 
     # Cloud channel: droplet number and radius logic mirrors q_condensation
@@ -661,40 +748,32 @@ function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s
     # -> cloud -> autoconversion, and in cloud-free supersaturated air the ungated
     # channel grows rain from arbitrarily small seeds in finite time (the rate is
     # ∝ rho_r^{1/3} under the fixed-N_r monodisperse closure, non-Lipschitz at zero
-    # — the O01 spurious-blob pathway). Evaporation (Q_ss <= 0) is unconditional.
+    # — the O01 spurious-blob pathway). Evaporation (drive <= 0) is unconditional.
     # The channel timescale is monodisperse fixed-N_r by default; N_0 > 0 selects the
     # exponential (Marshall-Palmer) DSD closure. Both are non-Lipschitz at zero rain
     # (rho_r^{1/3} and rho_r^{1/2} respectively), so the gate applies to either.
-    invtau_r = (Q_ss > 0.0 && q_c <= 1.0e-8) ? 0.0 :
+    # The sign test reads the CLIPPED drive, like every other use: a column whose Q_ss has
+    # detached upward is not condensing onto rain either.
+    invtau_r = (Q_ss_drive > 0.0 && q_c <= 1.0e-8) ? 0.0 :
                (N_0 > 0.0 ? invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d) :
                             invtau_rain(Tk, p_hPa, N_r, rho_r))
     invtau = invtau_c + invtau_r
     if invtau == 0.0
-        return (0.0, 0.0)
+        return (0.0, 0.0, 0.0, 0.0)
     end
 
-    Qdot = Q_ss * invtau / (1.0 + Q_s)
+    Qdot = Q_ss_drive * invtau / (1.0 + Q_s)
     # An inactive channel gets an exact 0.0 (Qdot * 0.0 would be -0.0 for evaporation);
     # a lone active channel gets Qdot exactly (invtau/invtau == 1.0), which keeps the
     # single-category delegate bit-identical.
     Qdot_c = invtau_c == 0.0 ? 0.0 : Qdot * (invtau_c / invtau)
     Qdot_r = invtau_r == 0.0 ? 0.0 : Qdot * (invtau_r / invtau)
 
-    # No negative water: each condensate's evaporation limited by its own mass, sized for the
-    # integrator that will apply it (`floor_c`/`floor_r`; see the docstring).
-    Qdot_c = max(Qdot_c, floor_c)
-    Qdot_r = max(Qdot_r, floor_r)
-
-    # Condensation limited by the available vapor. With the rain channel inactive this
-    # is the historical min(); with both active the channels rescale proportionally.
-    if Qdot_r == 0.0
-        Qdot_c = min(Qdot_c, ceil_v)
-    elseif Qdot_c + Qdot_r > ceil_v
-        scale = ceil_v / (Qdot_c + Qdot_r)
-        Qdot_c *= scale
-        Qdot_r *= scale
-    end
-    return (Qdot_c, Qdot_r)
+    # No cap of any kind: the rate is the physics, and `ts` does not appear in it. The only
+    # bound anywhere in this function is the DRIVE clip at the top, which is `ts`-free.
+    # The channel timescales come back with the rates so `mc_stiffness_census!` can measure
+    # the stiffness the step is actually being asked to integrate.
+    return (Qdot_c, Qdot_r, invtau_c, invtau_r)
 end
 
 import Springsteel: ref_pressure, ref_rho_t, ref_total_energy, ref_qss
@@ -922,12 +1001,29 @@ limiter sized for the wrong integrator from a stiff source term:
 | `:d_v_*`      | the same for the residual `ρ_v`, whose slot tendency is `f_3 - f_2 - f_8 - f_9` and whose depletion sink is the condensation `-(Qdot + Qdot_r)` |
 | `:v_gap`      | max over the tile this step of the VAPOR PARTITION GAP `\\|ρ_v − res_rho_t\\|` [kg/m³] — identically 0 under `options[:vapor_retrieval] = :residual`; under `:blend` it equals `w·τ_qss·\\|QSSREL\\|` where the correction is under half the cap, and is bounded by `dcap·ρ_vs` (default `0.02·ρ_vs`) wherever the saturator is active (see [`vapor_retrieval_blend`](@ref)) |
 
-**Read `:d_*_mab3`, not `:d_*_ab3`, to judge the depletion bound.** `:d_*_ab3` is the fraction
+**Read `:d_*_mab3`, not `:d_*_ab3`, to judge the depletion.** `:d_*_ab3` is the fraction
 of the FULL slot tendency, so it is dominated by advection and `-ρ∇·v` at points carrying
 almost no condensate — where any fixed tendency divided by a near-zero `ρ` is large, and no
-microphysical limiter has, or should have, any purchase. `:d_*_mab3` is the part the bound
-governs, and under `water_cap_mode = :ab3` it is ≤ 1 by construction (`:d_*_mneg` = 0);
-under `:euler` it runs to ≈ 23/12, which is the defect the mode exists to reproduce.
+microphysical limiter has, or should have, any purchase. `:d_*_mab3` is the part a
+microphysical bound would govern; it is now a pure measurement (the depletion caps were
+removed — see [`qss_condensation_rates`](@ref)), so nothing holds it at 1 and its excursions
+above `MICRO_DEPLETION_TOL` are the reported cost of that removal rather than a defect.
+
+The LAST block is the **stiffness census**, written by [`mc_stiffness_census!`](@ref) on every
+step of every run (not gated on any trace) and reported by [`mc_stiffness_trace`](@ref):
+
+| row | meaning |
+|-----|---------|
+| `:s_c_max`  | running max over the run of `ts·(1/τ_c)`, the cloud condensation channel |
+| `:s_c_n`    | gridpoint-STEPS with `ts·(1/τ_c) > 1`, summed over the run |
+| `:s_r_max`  | the same for the rain channel |
+| `:s_r_n`    | the same for the rain channel |
+| `:s_warned` | internal: 1.0 once the once-per-run stiffness `@warn` has been emitted (thread 1 only) |
+
+Unlike every block above it, this one is CUMULATIVE — it sits after [`MC_VAPOR_GAP`](@ref
+MC_VAPOR_GAP) and outside the `MC_BUDGET_FIRST:MC_VAPOR_GAP` range `water_budget_trace` resets
+each step, because a stiffness excursion that happened at step 40 is still true at step 4000
+and the run-end warning has to be able to see it.
 """
 const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :b_r_val, :b_r_adv, :b_r_cdiv, :b_r_src, :b_r_auto, :b_r_sed,
@@ -941,7 +1037,8 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :d_c_neg, :d_c_stiff, :d_c_infeas, :d_c_mab3, :d_c_mneg,
                         :d_v_n, :d_v_cevap, :d_v_cauto, :d_v_eul, :d_v_ab3,
                         :d_v_neg, :d_v_stiff, :d_v_infeas, :d_v_mab3, :d_v_mneg,
-                        :v_gap)
+                        :v_gap,
+                        :s_c_max, :s_c_n, :s_r_max, :s_r_n, :s_warned)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -966,19 +1063,49 @@ Row holding the per-step maximum vapor PARTITION GAP `max|ρ_v − res_rho_t|` o
 
 Sits AFTER the three `MC_DEPLETION_N`-row blocks, deliberately outside them: it is one scalar,
 not a fourth species, and giving the blocks a ragged length silently walks the census off the
-end of a thread's column. It lives in the per-step region (`MC_BUDGET_FIRST:end`), so it is
-reset every step and always describes the step just reported.
+end of a thread's column. It lives in the per-step region
+(`MC_BUDGET_FIRST:MC_VAPOR_GAP`), so it is reset every step and always describes the step
+just reported. It is the LAST per-step row: everything after it is cumulative.
 """
 const MC_VAPOR_GAP = 61
 """
+The STIFFNESS CENSUS block of `mc_water_stats` — `MC_STIFF_N` rows per relaxation channel,
+then the once-per-run warning flag. Written by [`mc_stiffness_census!`](@ref).
+
+| constant | meaning |
+|---|---|
+| `MC_STIFF_C` / `MC_STIFF_R` | channel indices: cloud condensation, rain condensation/evaporation |
+| `MC_STIFF_CHANNELS` | how many channels the block holds |
+| `MC_STIFF_N` | rows per channel: `[max ts/τ, count of points past ts/τ = 1]` |
+| `MC_STIFF_FIRST` | first row of channel 1 |
+| `MC_STIFF_WARNED` | the flag row, one past the last channel |
+
+The ice channels (`i1`, `i2`, `i3`) append here: give each an index, raise
+`MC_STIFF_CHANNELS`, and add its name pair to `MC_WATER_STATS` and to
+[`MC_STIFF_NAMES`](@ref MC_STIFF_NAMES). Nothing else is sized by hand — the row arithmetic,
+the reduction and the report all run over `1:MC_STIFF_CHANNELS`.
+
+CUMULATIVE, unlike every block before it: `water_budget_trace` resets
+`MC_BUDGET_FIRST:MC_VAPOR_GAP` each step and this sits outside that range on purpose.
+"""
+const MC_STIFF_C = 1
+const MC_STIFF_R = 2
+const MC_STIFF_CHANNELS = 2
+const MC_STIFF_N = 2
+const MC_STIFF_FIRST = 62
+const MC_STIFF_WARNED = MC_STIFF_FIRST + (MC_STIFF_N * MC_STIFF_CHANNELS)
+"""Channel labels for the stiffness report, in `MC_STIFF_*` index order."""
+const MC_STIFF_NAMES = ("cloud", "rain")
+"""
 Threshold for `:d_*_mneg`, the count of points the MICROPHYSICS alone drives negative.
 
-A point sitting exactly on its depletion bound lands at `1 + O(eps)`, not at 1: the `t ≥ 3`
+A point sitting exactly on an AB3 depletion bound lands at `1 + O(eps)`, not at 1: the `t ≥ 3`
 branch of [`_ab3_sink_bound`](@ref) divides by 23, which is not representable, so the bound
-cannot cancel the increment exactly. Counting `> 1.0` would therefore report every capped
-point as a violation. This threshold sits ~1e7 ULP above the rounding and ~1e9 below the
-`23/12` a forward-Euler-sized bound produces, so `:d_*_mneg` reads 0 under
-`water_cap_mode = :ab3` and the full capped population under `:euler`.
+cannot cancel the increment exactly. Counting `> 1.0` would therefore report every such point
+as a violation. This threshold sits ~1e7 ULP above the rounding and ~1e9 below the `23/12` a
+forward-Euler-sized bound produces, which is what made it able to separate the two depletion
+modes when those existed. With the caps removed it is a pure reporting threshold on a pure
+measurement.
 """
 const MICRO_DEPLETION_TOL = 1.0 + 1.0e-9
 """
@@ -1900,7 +2027,7 @@ One definition, so neither a diagnostic nor a limiter can drift from the integra
 for: Euler at `t = 1`, second-order Adams-Bashforth at `t = 2`, AB3 (Durran & Blossey 2012)
 thereafter. The leading AB3 weight is **23/12 ≈ 1.917**, which is what a sink capped at `-ρ/ts`
 — a forward-Euler budget — used to get multiplied by. [`_ab3_sink_bound`](@ref) is this same
-expression solved for the current level, and is how the water limiters are written now.
+expression solved for the current level, and is how the water limiters USED to be written.
 """
 @inline _ab3_increment(ts::Float64, t::Int64, f_n::Float64, f_nm1::Float64, f_nm2::Float64) =
     t == 1 ? ts * f_n :
@@ -1922,6 +2049,14 @@ This is [`_ab3_increment`](@ref) solved for `s_n`, one branch per integrator bra
 | 2 | `(ts/2)(3 s_n − s_nm1)` | `(−2·avail/ts + s_nm1)/3` |
 | ≥3 | `(ts/12)(23 s_n − 16 s_nm1 + 5 s_nm2)` | `(−12·avail/ts + 16 s_nm1 − 5 s_nm2)/23` |
 
+**DIAGNOSTIC ONLY.** Nothing in the RHS path applies this to a rate any more: the depletion
+caps were removed because a bound of the form `Q̇ ≥ −ρ/Δt` makes the physics a function of the
+time step (see [`qss_condensation_rates`](@ref) and reference/Scythe_moist_compressible.tex
+§"Departures from the ISHMAEL implementation" (b)). It survives because
+[`_depletion_census!`](@ref) reports where the caps WOULD have bound, which is exactly the
+instrument that measures what removing them cost. The description below is therefore of a
+bound that is computed and compared against, never enforced.
+
 The `t = 1` branch is exactly the forward-Euler budget `−avail/ts` that every water limiter in
 this file used to be written with, at every step — and that is the defect. AB3's leading weight
 is 23/12, so a sink sitting on the Euler bound is applied at ≈1.92× and lands the species at
@@ -1940,12 +2075,11 @@ and deliberately not this one's. Making the microphysics surrender its sink to c
 transport-generated negative would be a floor in all but name, at exactly the points STAGE 3b
 showed the caps have no purchase on.
 
-**Callers must clamp.** A bound `> 0` means the two history levels alone already drive the
-species negative, which limiting the current level cannot repair; forcing `s_n > 0` there would
-manufacture mass, the rectification `clamp_water!` documents as the reason not to floor the
-state. Every call site therefore applies `min(bound, 0.0)` (or `max` on the mirrored vapor
-ceiling) and the raw value is kept so [`_depletion_census!`](@ref) can count how often the
-clamp fires — a nonzero count is a real signal, not noise.
+**Returned raw, clamped by the reader.** A bound `> 0` means the two history levels alone
+already drive the species negative, which limiting the current level could not have repaired.
+The census applies `min(bound, 0.0)` (or `max` on the mirrored vapor ceiling) before comparing
+and keeps the raw value so [`_depletion_census!`](@ref) can count how often that happens — a
+nonzero `:d_*_infeas` is a real signal, not noise.
 """
 @inline _ab3_sink_bound(ts::Float64, t::Int64, avail::Float64,
                         s_nm1::Float64, s_nm2::Float64) =
@@ -1955,8 +2089,12 @@ clamp fires — a nonzero count is a real signal, not noise.
 
 """
 Columns of `ModelTile.mc_micro_n`/`mc_micro_nm1`/`mc_micro_nm2` — the per-gridpoint history of
-each water channel's NET MICROPHYSICS tendency, kept so the depletion caps can be written
-against the integrator's actual three-level combination ([`_ab3_sink_bound`](@ref)).
+each water channel's NET MICROPHYSICS tendency.
+
+DIAGNOSTIC ONLY, like [`_ab3_sink_bound`](@ref) itself: the history exists so the census can
+evaluate the integrator's actual three-level combination on the microphysics alone
+(`:d_*_mab3`, and the would-have-bound comparison). It used to size the depletion caps, which
+are gone.
 
 | column | channel | value |
 |---|---|---|
@@ -2006,22 +2144,28 @@ end
 
 Census, over every gridpoint holding water, of how hard the step is depleting it.
 
+**PURE DIAGNOSTIC.** Nothing here is applied to any rate, and the caps it used to be built
+around no longer exist (see [`qss_condensation_rates`](@ref)). Its job now is to report where
+those caps WOULD have bound — which is the direct measurement of what removing them cost —
+alongside the depletion fractions the integrator actually applies.
+
 Runs immediately before [`explicit_timestep`](@ref), so `expdot` is final for the step and the
 measured increment is the one actually applied. For each channel it records how many points
-exist, how many have a sink pinned at its bound, the largest forward-Euler and largest ACTUAL
-depletion fractions, how many points the step drives negative outright, how many exceed AB3's
-real-axis stability limit with no cap active, and how many carry an inadmissible history.
+exist, how many have a sink at or past the AB3-exact bound, the largest forward-Euler and
+largest ACTUAL depletion fractions, how many points the step drives negative outright, how many
+exceed AB3's real-axis stability limit, and how many carry an inadmissible history.
 
-The hypotheses this is built to separate:
+What the counts now mean:
 
-- **cap-vs-integrator** — under `water_cap_mode = :euler` the limiters guarantee only
-  `ρ + ts·f_n ≥ 0`, so `:d_*_eul` is pinned at 1.0 at capped points while `:d_*_ab3` runs up to
-  ≈ 23/12 and `:d_*_neg` tracks `:d_*_cevap` + `:d_*_cauto`. Under `:ab3` it is `:d_*_ab3` that
-  the bound holds at 1, and any remaining `:d_*_neg` is transport, not microphysics;
-- **stiff source** — `:d_*_stiff` is nonzero, i.e. points are being depleted faster than AB3
-  can stably integrate even before any cap engages;
+- **would-have-bound** — `:d_*_cevap` and `:d_*_cauto` are the population the removed caps used
+  to act on, and `:d_*_mab3` (the microphysics' own depletion fraction) is free to run past 1
+  where they did; before removal the bound held it at 1 by construction. The excursion is the
+  cost, in the units the argument is made in;
+- **stiff source** — `:d_*_stiff` counts points depleted faster than AB3 can stably integrate.
+  Read it with [`mc_stiffness_census!`](@ref), which measures the same under-resolution at the
+  RATE rather than at the slot tendency and does so on every run;
 - **inadmissible history** — `:d_*_infeas` is nonzero, i.e. the previous two sink levels alone
-  carry the point negative, which no bound on the current level can repair.
+  carry the point negative.
 
 The VAPOR is censused alongside the two condensates. It is a residual, not a slot, so its
 tendency is assembled from the four densities' slots and its sink is the condensation that
@@ -2089,11 +2233,12 @@ being iterated as a heterogeneous tuple. `aut === nothing` skips the `AUTO_COLL`
 which is the correct behaviour for rain (where `AUTO_COLL` is a source, not a sink) and with
 precipitation off.
 
-`cap` is the RAW (unclamped) [`_ab3_sink_bound`](@ref) vector this step's rates were limited
-with. Reading the same array the limiter read makes the cap test bitwise exact under either
-`water_cap_mode` and makes `:d_*_infeas` (`cap > 0`, the clamp fired) directly countable.
-`channel` is this species' `MC_MICRO_*` column, which gives the microphysics-only fraction the
-bound actually governs.
+`cap` is the RAW (unclamped) [`_ab3_sink_bound`](@ref) vector for this species — a
+MEASUREMENT, not a limit: `mc_driver!` fills it only when this probe is on and no rate reads
+it. The tests below ask whether each rate is at or past its bound, i.e. where the removed caps
+would have bound, and `:d_*_infeas` (`cap > 0`) counts the points whose sink history alone is
+already inadmissible. `channel` is this species' `MC_MICRO_*` column, which gives the
+microphysics-only depletion fraction.
 """
 function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, channel::Int64,
                             colstart::Int64, t::Int64, val, evap, aut, Qdot, cap)
@@ -2135,17 +2280,23 @@ function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, chann
         # would report every capped point. 1e-9 is ~1e7 ULP above that and ~1e9 below the
         # 23/12 the `:euler` mode produces, so it separates the two without ambiguity.
         dep_mab3 > MICRO_DEPLETION_TOL && (n_mneg += 1.0)
-        # Cap detection is bitwise-exact against the SAME array the limiter read:
-        # `max(x, floor)` returns the floor itself when it clips, and
-        # `min(auto + coll, avail)` returns `avail`.
+        # WOULD-HAVE-BOUND detection. The caps are gone from the RHS (see
+        # `qss_condensation_rates`), so this no longer tests "did the limiter clip here"
+        # (bitwise `==` against the array the limiter read) but "would it have": the realized
+        # rate is at or past the AB3-exact bound. That is the measurement of what removing the
+        # caps costs, and the counts are directly comparable with the pre-removal ones, which
+        # were the same population by construction.
         raw = cap[i]
         raw > 0.0 && (n_infeas += 1.0)
         floor_i = min(raw, 0.0)
-        capped = evap[i] == floor_i
+        capped = evap[i] <= floor_i
         capped && (n_cevap += 1.0)
         if aut !== nothing
+            # `aut > 0` excludes the degenerate no-conversion point: with the budget exhausted
+            # (`avail == 0`) every nonzero conversion would have been clipped, but a zero one
+            # would not have been touched at all.
             avail = max(Qdot[i] - floor_i, 0.0)
-            if avail > 0.0 && aut[i] == avail
+            if aut[i] > 0.0 && aut[i] >= avail
                 n_cauto += 1.0
                 capped = true
             end
@@ -2227,16 +2378,14 @@ function _vapor_census!(mtile::ModelTile, colstart::Int64, t::Int64, rho_v, Qdot
         dep_mab3 = -_ab3_increment(ts, t, micro_n[g, MC_MICRO_V], micro_nm1[g, MC_MICRO_V],
                                    micro_nm2[g, MC_MICRO_V]) / rho
         dep_mab3 > max_mab3 && (max_mab3 = dep_mab3)
-        # Tolerance, not `> 1.0`: a point sitting exactly ON the bound lands at 1 + O(eps)
-        # (the bound divides by 23, so it cannot be exact), and counting those as violations
-        # would report every capped point. 1e-9 is ~1e7 ULP above that and ~1e9 below the
-        # 23/12 the `:euler` mode produces, so it separates the two without ambiguity.
+        # Tolerance, not `> 1.0`: a point sitting exactly ON the AB3 bound lands at
+        # 1 + O(eps) (the bound divides by 23, so it cannot be exact). See
+        # `MICRO_DEPLETION_TOL`.
         dep_mab3 > MICRO_DEPLETION_TOL && (n_mneg += 1.0)
         raw = cap[i]
         raw > 0.0 && (n_infeas += 1.0)
-        # The ceiling is the negated bound. The single-channel path hits it exactly
-        # (`min(Qdot_c, ceil_v)`); the two-channel rescale lands within rounding of it, so
-        # this is `>=` rather than `==` and is honest about that.
+        # The vapor's ceiling is the negated bound; this counts where the REMOVED ceiling
+        # would have clipped the combined condensation.
         ceil_i = -min(raw, 0.0)
         capped = ceil_i > 0.0 && (Qdot[i] + Qdot_r[i]) >= ceil_i
         capped && (n_cap += 1.0)
@@ -2245,6 +2394,127 @@ function _vapor_census!(mtile::ModelTile, colstart::Int64, t::Int64, rho_v, Qdot
 
     _census_reduce!(st, MC_DEPLETION_V, n, n_cap, 0.0, max_eul, max_ab3, n_neg, n_stiff,
                     n_infeas, max_mab3, n_mneg)
+    return nothing
+end
+
+"""
+    mc_stiffness_census!(mtile, ts, invtau_c, invtau_r)
+
+Accumulate the per-channel STIFFNESS of the supersaturation relaxation over this column:
+the running maximum of `ts·(1/τ)` and the number of gridpoints where it exceeds 1.
+
+This is what stands in place of the depletion caps. Those made the rate — hence the converged
+solution — a function of `ts`; see [`qss_condensation_rates`](@ref) and
+reference/Scythe_moist_compressible.tex §"Departures from the ISHMAEL implementation" (b).
+Under-resolution of a stiff relaxation is now REPORTED here instead of being absorbed there.
+
+`ts/τ > 1` is the honest threshold: the relaxation `Q̇ = Q_ss/τ` applied over a step of `ts`
+removes more than the whole supersaturation, so the discrete operator has overshot the fixed
+point it is relaxing toward and nothing about the step size can be called converged. (The
+integrator's own real-axis stability limit is tighter still — AB3 loses absolute stability at
+0.545 — and `:d_*_stiff` in the depletion census counts against that one. Both are measured;
+neither is enforced.)
+
+Runs on EVERY step of EVERY run, not behind a trace flag: the once-per-run warning in
+[`mc_stiffness_trace`](@ref) is unconditional and has to have something to read. The cost is
+two comparisons per gridpoint per channel and no allocation — the accumulators are rows of
+the preallocated `mtile.mc_water_stats`, indexed by `threadid()` under the same
+`@threads :static` ownership rule as every other probe in this file.
+
+Sized by `MC_STIFF_CHANNELS`, so the ice channels are added by widening that constant rather
+than by editing this function. NEVER touches a rate.
+"""
+@inline function mc_stiffness_census!(mtile::ModelTile, ts::Float64, invtau_c, invtau_r)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    tid = Threads.threadid()
+    _stiffness_channel!(st, tid, MC_STIFF_C, ts, invtau_c)
+    _stiffness_channel!(st, tid, MC_STIFF_R, ts, invtau_r)
+    return nothing
+end
+
+"""
+One channel's pass for [`mc_stiffness_census!`](@ref): reduce the column into thread-local
+scalars first, then touch the shared matrix twice. Split out so each call specializes on its
+own array type, as [`_depletion_census!`](@ref) is.
+"""
+@inline function _stiffness_channel!(st, tid::Int64, channel::Int64, ts::Float64, invtau)
+
+    mx = 0.0
+    n = 0.0
+    @inbounds for i in eachindex(invtau)
+        x = ts * invtau[i]
+        x > mx && (mx = x)
+        x > 1.0 && (n += 1.0)
+    end
+    row = MC_STIFF_FIRST + (MC_STIFF_N * (channel - 1))
+    @inbounds begin
+        st[row, tid] = max(st[row, tid], mx)
+        st[row + 1, tid] += n
+    end
+    return nothing
+end
+
+"""
+    mc_stiffness_trace(mtile, t)
+
+Report the [`mc_stiffness_census!`](@ref) accumulators, and warn ONCE per run if any channel
+has gone past `ts/τ = 1`.
+
+Called from the same single-threaded pre-column-loop slot as [`water_negativity_trace`](@ref)
+and [`water_budget_trace`](@ref), so the reduction across threads is race-free.
+
+Two independent outputs:
+
+  * the `@warn` is UNCONDITIONAL — it does not depend on `options[:stiffness_trace]`, because a
+    time step too large for the microphysics is not something a run should be able to hide by
+    leaving a diagnostic switched off. It fires on the first step at which the census shows an
+    exceedance and then never again (`:s_warned`, thread 1), so an under-resolved run reports
+    one line rather than one per step;
+  * `options[:stiffness_trace]::Int` is the periodic `@info`, in steps; absent or `0` disables
+    it. The census itself always runs, so switching this on mid-diagnosis costs nothing and
+    changes no number.
+
+Neither path touches a rate. The remedy for a large census is a smaller `ts` (or, where the
+stiffness is a resolved physical timescale rather than a numerical one, a formulation that
+does not relax on it) — never a limiter: see [`qss_condensation_rates`](@ref).
+"""
+function mc_stiffness_trace(mtile::ModelTile, t::Int64)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+
+    worst = 0.0
+    worst_ch = 0
+    @inbounds for ch in 1:MC_STIFF_CHANNELS
+        row = MC_STIFF_FIRST + (MC_STIFF_N * (ch - 1))
+        m = maximum(view(st, row, :))
+        m > worst && (worst = m; worst_ch = ch)
+    end
+
+    if worst > 1.0 && st[MC_STIFF_WARNED, 1] == 0.0
+        st[MC_STIFF_WARNED, 1] = 1.0
+        @warn """STIFF MICROPHYSICS: the condensation relaxation is not resolved by this time step.
+          step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
+          worst channel: $(MC_STIFF_NAMES[worst_ch]), max ts/tau = $worst (> 1 means the step
+          removes more than the whole supersaturation in one go)
+          This is REPORTED, not limited: the depletion caps that used to hide it made the
+          physics a function of ts (see qss_condensation_rates). The remedy is a smaller ts.
+          Set options[:stiffness_trace] = N to print the full per-channel census every N steps."""
+    end
+
+    interval = get(mtile.model.options, :stiffness_trace, 0)::Int
+    (interval > 0 && mod(t, interval) == 0) || return nothing
+
+    report = join(("$(MC_STIFF_NAMES[ch]): max ts/tau = " *
+                   "$(maximum(view(st, MC_STIFF_FIRST + MC_STIFF_N * (ch - 1), :)))" *
+                   ", gridpoint-steps past 1: " *
+                   "$(Int(sum(view(st, MC_STIFF_FIRST + MC_STIFF_N * (ch - 1) + 1, :))))"
+                   for ch in 1:MC_STIFF_CHANNELS), "\n  ")
+    @info """microphysics stiffness census step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
+  cumulative over the run so far; > 1 means the relaxation is under-resolved
+  $report"""
     return nothing
 end
 
@@ -2365,9 +2635,10 @@ function water_budget_trace(mtile::ModelTile, t::Int64)
           highest gridpoint with rho_c > 1e-6: $(isfinite(z_cloud) ? z_cloud : NaN) m
           vapor partition gap max|rho_v - res_rho_t| (0 unless :vapor_retrieval = :blend; bounded by dcap*rho_vs where the saturator bites): $(maximum(view(st, MC_VAPOR_GAP, :))) kg/m^3"""
 
-        # The depletion census: how widely, and how hard, the step is draining each species.
-        # `euler` is bounded by 1 wherever a cap is the binding constraint; `ab3` is what the
-        # integrator actually applies, and the gap between them is the leading AB3 weight.
+        # The depletion census: how widely, and how hard, the step is draining each species,
+        # and where the REMOVED depletion caps would have bound. `euler` is the forward-Euler
+        # fraction, `ab3` what the integrator actually applies; the gap between them is the
+        # leading AB3 weight.
         for (name, off, sink) in (("rho_r", MC_DEPLETION_R, "evaporation"),
                                   ("rho_c", MC_DEPLETION_C, "evaporation"),
                                   ("rho_v", MC_DEPLETION_V, "condensation"))
@@ -2375,11 +2646,11 @@ function water_budget_trace(mtile::ModelTile, t::Int64)
             npts > 0.0 || continue
             @info """water depletion [$name] step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
               gridpoints with $name > 0: $(Int(npts))
-              sinks pinned at their bound: $sink $(Int(sum(view(st, off + 1, :)))), auto+coll $(Int(sum(view(st, off + 2, :))))
-              MICROPHYSICS depletion fraction (what the bound governs): max $(maximum(view(st, off + 8, :))), points > 1: $(Int(sum(view(st, off + 9, :))))
+              sinks at or past the AB3 bound (where the REMOVED caps would have bound): $sink $(Int(sum(view(st, off + 1, :)))), auto+coll $(Int(sum(view(st, off + 2, :))))
+              MICROPHYSICS depletion fraction (uncapped): max $(maximum(view(st, off + 8, :))), points > 1: $(Int(sum(view(st, off + 9, :))))
               FULL-tendency depletion fraction: Euler $(maximum(view(st, off + 3, :))), ACTUAL(AB3) $(maximum(view(st, off + 4, :)))
               points driven negative by the step: $(Int(sum(view(st, off + 5, :))))
-              points past AB3's 0.545 stability limit with NO cap active: $(Int(sum(view(st, off + 6, :))))
+              points past AB3's 0.545 stability limit: $(Int(sum(view(st, off + 6, :))))
               points whose sink HISTORY alone is inadmissible (bound clamped at 0): $(Int(sum(view(st, off + 7, :))))"""
         end
 
@@ -2401,8 +2672,11 @@ function water_budget_trace(mtile::ModelTile, t::Int64)
     end
 
     # Reset the per-step block regardless of whether this was a print step, so the
-    # recorded worst point always belongs to the step just finished.
-    @inbounds fill!(view(st, MC_BUDGET_FIRST:length(MC_WATER_STATS), :), 0.0)
+    # recorded worst point always belongs to the step just finished. Stops at
+    # MC_VAPOR_GAP: the stiffness census after it is cumulative by design (an excursion at
+    # step 40 is still true at step 4000, and the once-per-run warning must be able to see
+    # it) and must not be cleared by a diagnostic that happens to be switched on.
+    @inbounds fill!(view(st, MC_BUDGET_FIRST:MC_VAPOR_GAP, :), 0.0)
     return nothing
 end
 
@@ -2418,7 +2692,7 @@ Q_ss' [kg/m^3], rho_r, rho_c' (+ tangential v, slot 10, on the cylinders).
 
 Each step the CLOSED-FORM `retrieve_temperature` gives T from the prognostic liquid
 density, the vapor follows as the residual rho_v = rho_t - rho_d - rho_c - rho_r, and
-the condensation rate is the limited supersaturation relaxation, which moves mass
+the condensation rate is the (uncapped) supersaturation relaxation, which moves mass
 between rho_c and the vapor at fixed rho_t and E_t. The energy equation carries no
 condensation source (exact first law); the pressure equation's condensation
 coefficient is (L_v - R_v*C_pt*T/R_m). See reference/Scythe_moist_compressible.tex and,
@@ -2481,30 +2755,21 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Negative-water production attribution; see `water_budget_probe!`. Hoisted out of the
     # tendency block so the default path pays one Dict lookup per column, not two.
     budget_trace = get(model.options, :water_budget_trace, 0)::Int > 0
-    # Stage-3 diagnostic lever on the condensate depletion caps; see `qss_condensation_rates`.
-    # 1.0 (the default) is bitwise inert.
-    cap_factor = get(model.physical_params, :water_cap_factor, 1.0)
-    # How the water depletion budgets are sized. `:ab3` (the default) uses the integrator's
-    # actual three-level combination via `_ab3_sink_bound`. `:euler` pins the budget to the
-    # `t = 1` branch at every step, which reproduces the forward-Euler `rho/ts` caps this file
-    # carried before -- BITWISE, so it is the A/B lever for every measurement in
-    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md (runs A-H were all taken under it).
-    # In `:euler` the vapor ceiling also keeps its historical form, which did NOT read
-    # `cap_factor`; under `:ab3` all three channels see the probe.
-    # In `options`, not `physical_params`: this is a choice of DISCRETIZATION (which
-    # integrator the budget is written against), not a physical parameter, and
-    # `physical_params` is a Dict{Symbol,Float64} besides.
-    cap_euler = get(model.options, :water_cap_mode, :ab3)::Symbol === :euler
-    cap_t = cap_euler ? 1 : t
-    cap_vfac = cap_euler ? 1.0 : cap_factor
+    # NOTE there is no depletion-cap plumbing here any more. `water_cap_factor` and
+    # `water_cap_mode` are gone with the caps they sized: a rate floored at `-rho/ts` makes
+    # the physics a function of the time step, which is the one thing a consistent scheme
+    # cannot do. The AB3 bounds survive as a MEASUREMENT inside `water_depletion_probe!` (it
+    # reports where they WOULD have bound), and the stiffness they used to hide is reported
+    # by `mc_stiffness_census!`. See `qss_condensation_rates` for the full argument.
     # Which discrete representation the VAPOR is retrieved from. `:blend` (the default since
     # 2026-07-29, and the state of every configuration that does not set the key) is the regime
     # blend of `vapor_retrieval_blend`: the supersaturation residual in cloud, where the density
     # budget cancels catastrophically, and the density residual in dry air, where the
     # supersaturation residual does. `:residual` is the pre-blend density-budget route and is
     # BITWISE the code that had no option at all -- retained as the A/B lever for every
-    # measurement taken under it. In `options`, not `physical_params`, for the same reason as
-    # `water_cap_mode`: it is a choice of DISCRETE REPRESENTATION, not a physical parameter.
+    # measurement taken under it. In `options`, not `physical_params`: it is a choice of
+    # DISCRETE REPRESENTATION, not a physical parameter (and `physical_params` is a
+    # Dict{Symbol,Float64} besides).
     vapor_retrieval = get(model.options, :vapor_retrieval, :blend)::Symbol
     (vapor_retrieval === :residual || vapor_retrieval === :blend) ||
         error("options[:vapor_retrieval] = :$(vapor_retrieval) is not recognized; " *
@@ -2781,7 +3046,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     drvs_dT = S.drvs_dT; @. drvs_dT = drho_vsat_dT(Tk, p_hPa)
     drvs_dp = S.drvs_dp; @. drvs_dp = drho_vsat_dp(Tk, p_hPa)
 
-    # Condensation: limited supersaturation relaxation with the energy-consistent
+    # Condensation: supersaturation relaxation with the energy-consistent
     # psychrometric factor, split between the cloud and rain channels in proportion to
     # their inverse timescales (1/tau = 1/tau_c + 1/tau_r). Qdot moves mass between the
     # prognostic condensate (slot 9) and the residual vapor at fixed rho_t and E_t, so
@@ -2807,44 +3072,41 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # and it remains the clean separator between "the initial state is not a discrete
     # steady state" and "the moisture is doing something".
 
-    # ── Depletion budgets ──────────────────────────────────────────────────────
-    # The three channels' bounds are sized HERE, against the integrator's own three-level
-    # combination (`_ab3_sink_bound`) rather than the forward-Euler `rho/ts` this code used to
-    # hard-code at every step. The raw (unclamped) bounds are kept in scratch because the
-    # AUTO_COLL joint cap below needs the cloud one, and the depletion census needs all three
-    # to detect a binding bound bitwise and to count the points whose sink history alone is
-    # already inadmissible.
+    # ── Depletion budgets: DIAGNOSTIC ONLY ─────────────────────────────────────
+    # These are the AB3-exact bounds the condensation rates used to be limited by. Nothing in
+    # the RHS reads them any more (see `qss_condensation_rates` for why the caps were removed);
+    # they are computed only when the depletion census is on, which then reports where they
+    # WOULD have bound -- the instrument that measures what removing them cost.
     cap_c = S.cap_c
     cap_r = S.cap_r
     cap_v = S.cap_v
-    micro_nm1 = mtile.mc_micro_nm1
-    micro_nm2 = mtile.mc_micro_nm2
-    @inbounds for i in eachindex(cap_c)
-        g = colstart + i - 1
-        cap_c[i] = _ab3_sink_bound(model.ts, cap_t, cap_factor * max(rho_c[i], 0.0),
-                                   micro_nm1[g, MC_MICRO_C], micro_nm2[g, MC_MICRO_C])
-        cap_r[i] = _ab3_sink_bound(model.ts, cap_t, cap_factor * max(rho_r[i], 0.0),
-                                   micro_nm1[g, MC_MICRO_R], micro_nm2[g, MC_MICRO_R])
-        # The vapor is a SINK channel too -- condensation removes it -- so its bound has the
-        # same form and is negated into a ceiling on `Qdot_c + Qdot_r` at the use site.
-        # DELIBERATELY the BLENDED `rho_v`, not `res_rho_t`: the bound exists to stop the
-        # closure over-depleting the vapor IT READS, and the closure two blocks down reads the
-        # blend. Sizing the budget off a different representation than the one being depleted
-        # would be the same class of mismatch `water_cap_mode` was written to fix.
-        cap_v[i] = _ab3_sink_bound(model.ts, cap_t, cap_vfac * max(rho_v[i], 0.0),
-                                   micro_nm1[g, MC_MICRO_V], micro_nm2[g, MC_MICRO_V])
+    if budget_trace
+        micro_nm1 = mtile.mc_micro_nm1
+        micro_nm2 = mtile.mc_micro_nm2
+        @inbounds for i in eachindex(cap_c)
+            g = colstart + i - 1
+            cap_c[i] = _ab3_sink_bound(model.ts, t, max(rho_c[i], 0.0),
+                                       micro_nm1[g, MC_MICRO_C], micro_nm2[g, MC_MICRO_C])
+            cap_r[i] = _ab3_sink_bound(model.ts, t, max(rho_r[i], 0.0),
+                                       micro_nm1[g, MC_MICRO_R], micro_nm2[g, MC_MICRO_R])
+            # The vapor is a SINK channel too -- condensation removes it -- so its bound has
+            # the same form and is negated into a ceiling on `Qdot_c + Qdot_r` at the use site.
+            # DELIBERATELY the BLENDED `rho_v`, not `res_rho_t`: the measurement is of the
+            # vapor the closure actually reads.
+            cap_v[i] = _ab3_sink_bound(model.ts, t, max(rho_v[i], 0.0),
+                                       micro_nm1[g, MC_MICRO_V], micro_nm2[g, MC_MICRO_V])
+        end
     end
+    invtau_c = S.invtau_c
+    invtau_r = S.invtau_r
     if get(model.options, :condensation, true)::Bool
-        # The closure reads the BLENDED `rho_v` (unchanged by design): the vapor it evaporates
-        # into and its evaporation bound must be the same representation, and in cloud -- where
-        # the closure is actually active -- the blend is the better-conditioned one.
+        # The closure reads the BLENDED `rho_v` (unchanged by design): in cloud -- where the
+        # closure is actually active -- the blend is the better-conditioned representation.
         for i in 1:length(Qdot)
-            Qdot[i], Qdot_r[i] = qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
-                                                        rho_d[i], Tk[i], p_hPa[i], Q_s[i],
-                                                        model.ts, N_r; N_0=N_0,
-                                                        floor_c=min(cap_c[i], 0.0),
-                                                        floor_r=min(cap_r[i], 0.0),
-                                                        ceil_v=-min(cap_v[i], 0.0))
+            Qdot[i], Qdot_r[i], invtau_c[i], invtau_r[i] =
+                qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
+                                       rho_d[i], Tk[i], p_hPa[i], Q_s[i],
+                                       model.ts, N_r; N_0=N_0)
             if isnan(Qdot[i]) || isnan(Qdot_r[i])
                 error("Qdot is NaN at index $i, time $(t)!\n" *
                       "  T = $(Tk[i]) K, p = $(p[i]) Pa, rho_d = $(rho_d[i]), " *
@@ -2858,7 +3120,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     else
         fill!(Qdot, 0.0)
         fill!(Qdot_r, 0.0)
+        fill!(invtau_c, 0.0)
+        fill!(invtau_r, 0.0)
     end
+    # Stiffness of the relaxation this step was asked to integrate, per channel. UNGATED: it
+    # is what stands in place of the depletion caps, and the once-per-run warning in
+    # `mc_stiffness_trace` has to be able to see an excursion whether or not anyone switched a
+    # diagnostic on. Reads the rates; changes none of them.
+    mc_stiffness_census!(mtile, model.ts, invtau_c, invtau_r)
 
     # Warm-rain conversion and sedimentation. Autoconversion + collection move cloud to
     # rain — a liquid-to-liquid exchange, thermodynamically inert (T, p, E_t, Q_ss all
@@ -2882,23 +3151,18 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         for i in 1:length(AUTO_COLL)
             auto = autoconversion_density(max(rho_c[i], 0.0), rho_d[i])
             coll = collection_density(max(rho_c[i], 0.0), rho_r[i], rho_d[i], Tk[i])
-            # JOINT depletion cap: never convert more cloud than survives evaporation this
-            # step. Cloud has two independent sinks — evaporation (`Qdot`, floored at
-            # `min(cap_c, 0)` inside qss_condensation_rates) and conversion to rain
-            # (`AUTO_COLL`) — and they share ONE budget, `Qdot - AUTO_COLL >= min(cap_c, 0)`.
-            # Bounding each separately let them sum to twice the budget, which drives rho_c
-            # to `-rho_c` in a single step — an O(1) negative, not a ringing lobe.
+            # The PURE conversion rate. This used to carry the joint cloud-depletion cap
+            # `min(auto + coll, max(Qdot - min(cap_c, 0), 0))` -- cloud's two sinks,
+            # evaporation and conversion to rain, sharing one `rho_c/ts`-sized budget. It went
+            # with the rest of the caps: it is a `ts`-dependent modification of a rate, so the
+            # equation being solved changed with the step size (see `qss_condensation_rates`).
+            # The cap's own justification -- that bounding the two sinks SEPARATELY let them
+            # sum to twice the budget -- was an argument for a joint budget over two
+            # independent ones, not an argument that either should exist.
             #
-            # This was invisible until the positivity bound went in: the rate functions
-            # guard with `max(rho_c, 0)` so the overshoot was inert, and its mass merged
-            # into the accumulated refit undershoot. With the bound active the limiter has
-            # to remove that negative EVERY step, paying for it by shaving the cloud, which
-            # destroys the cell.
-            #
-            # Capping AUTO_COLL rather than rescaling Qdot keeps the p, E_t and Q_ss
-            # couplings — which have already consumed Qdot — exactly as they were.
-            avail = max(Qdot[i] - min(cap_c[i], 0.0), 0.0)
-            AUTO_COLL[i] = min(auto + coll, avail)
+            # `water_depletion_probe!` still counts where this would have been pinned
+            # (`:d_c_cauto`), so the population the cap used to act on stays visible.
+            AUTO_COLL[i] = auto + coll
         end
         Vt = S.Vt;       @. Vt = rain_terminal_velocity(rho_r, rho_d, Tk)
         Fr = S.Fr;       @. Fr = max(rho_r, 0.0) * Vt

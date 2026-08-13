@@ -112,9 +112,9 @@ using Springsteel
     end
 
     # ──────────────────────────────────────────────
-    # 4. Condensation rate limiter
+    # 4. Condensation rate: gates and regimes (there is no limiter)
     # ──────────────────────────────────────────────
-    @testset "qss_condensation_rate limits" begin
+    @testset "qss_condensation_rate gates" begin
         Tk = 285.0; p_hPa = 900.0; ts = 0.1
         rho_vs = rho_v_sat(Tk, p_hPa)
         rho_d = (100.0 * p_hPa - Rv * Tk * rho_vs) / (Rd * Tk)
@@ -123,12 +123,19 @@ using Springsteel
         # Subsaturated, cloud-free: no droplets to evaporate -> zero
         @test Scythe.qss_condensation_rate(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, rho_d, Tk,
                                            p_hPa, Q_s, ts) == 0.0
-        # Strongly subsaturated with a little cloud: evaporation clamped by rho_c/ts
+        # Strongly subsaturated with a little cloud: the rate is the PHYSICS, and it is
+        # allowed to exceed rho_c/ts. That used to be clamped; the clamp made the rate a
+        # function of ts and was removed (see qss_condensation_rates).
         rho_c = 1.0e-6 * rho_d
         rate = Scythe.qss_condensation_rate(-0.5 * rho_vs, 0.5 * rho_vs, rho_c, rho_d, Tk,
                                             p_hPa, Q_s, ts)
-        @test rate ≈ -rho_c / ts
-        # Mildly subsaturated with plenty of cloud: physical evaporation, not clamped
+        @test rate < -rho_c / ts
+        # ...and it is bitwise independent of ts, which the clamped version was not.
+        for ts2 in (1.0e-3, 1.0, 1.0e6)
+            @test Scythe.qss_condensation_rate(-0.5 * rho_vs, 0.5 * rho_vs, rho_c, rho_d, Tk,
+                                               p_hPa, Q_s, ts2) === rate
+        end
+        # Mildly subsaturated with plenty of cloud: slow physical evaporation
         rho_c = 2.0e-3 * rho_d
         rate = Scythe.qss_condensation_rate(-1.0e-4 * rho_vs, (1.0 - 1.0e-4) * rho_vs, rho_c,
                                             rho_d, Tk, p_hPa, Q_s, ts)
@@ -142,8 +149,9 @@ using Springsteel
         # Nearly saturated, cloud-free (below nucleation threshold): zero
         @test Scythe.qss_condensation_rate(1.0e-5 * rho_vs, (1.0 + 1.0e-5) * rho_vs, 0.0,
                                            rho_d, Tk, p_hPa, Q_s, ts) == 0.0
-        # Dry air with spurious positive Q_ss drift (no actual vapor): the clamped
-        # rho_v = 0 kills phantom condensation entirely
+        # Dry air with spurious positive Q_ss drift: still exactly zero, but now because the
+        # DRIVE is clipped to min(Q_ss, rho_v - rho_vs) = -rho_vs < 0, not because a
+        # ts-sized ceiling clipped the rate. See the "clipped drive" testset below.
         @test Scythe.qss_condensation_rate(0.5 * rho_vs, 0.0, 0.0, rho_d, Tk, p_hPa,
                                            Q_s, ts) == 0.0
     end
@@ -182,8 +190,9 @@ using Springsteel
         end
 
         @testset "t = 1 reproduces the forward-Euler bound bitwise" begin
-            # This is what `water_cap_mode = :euler` pins to at every step, and it has to be
-            # BIT-identical or the A/B against runs A-H is not an A/B.
+            # The `t = 1` branch must reproduce the forward-Euler budget BITWISE: it is what
+            # the census reports the removed caps against, and what runs A-H of
+            # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md were measured under.
             for ts in (0.075, 0.15, 0.3), cf in (1.0, 12.0 / 23.0, 0.5)
                 for rho in (0.0, 1.0e-9, 3.7e-3, 2.5)
                     avail = cf * max(rho, 0.0)
@@ -206,30 +215,82 @@ using Springsteel
             @test min(b, 0.0) == 0.0
         end
 
-        @testset "qss_condensation_rates default bounds are the historical ones" begin
-            Tk = 285.0; p_hPa = 900.0; ts = 0.1
+        @testset "the depletion caps are GONE: rates are pure and ts-independent" begin
+            # The caps (`Qdot_c >= -rho_c/ts`, `Qdot_r >= -rho_r/ts`, and the joint vapor
+            # ceiling `Qdot_c + Qdot_r <= rho_v/ts`, later their AB3-exact forms) made the
+            # RATE — and hence the converged solution — a function of the time step. They were
+            # removed; reference/Scythe_moist_compressible.tex §"Departures from the ISHMAEL
+            # implementation" (b). This testset replaces the one that pinned their defaults.
+            Tk = 285.0; p_hPa = 900.0
             rho_vs = rho_v_sat(Tk, p_hPa)
             rho_d = (100.0 * p_hPa - Rv * Tk * rho_vs) / (Rd * Tk)
             Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_vs / rho_d, 1.0e-3)
+            N_r = 1.0e-3
+
+            # Every one of these states is a case the OLD floor/ceiling would have bound at
+            # ts = 0.1: a huge drive on a small reservoir, in each channel and in both signs.
             for (Q_ss, rho_v, rho_c, rho_r) in (
-                    (-0.5 * rho_vs, 0.5 * rho_vs, 1.0e-4, 1.0e-3),
-                    (0.5 * rho_vs, 1.5 * rho_vs, 1.0e-4, 1.0e-3),
-                    (0.2 * rho_vs, 1.0e-9, 1.0e-4, 0.0),
-                    (-0.9 * rho_vs, 0.1 * rho_vs, 0.0, 1.0e-3))
-                for cf in (1.0, 12.0 / 23.0)
-                    base = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d,
-                                                         Tk, p_hPa, Q_s, ts, 1.0e-3;
-                                                         cap_factor = cf)
-                    expl = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d,
-                                                         Tk, p_hPa, Q_s, ts, 1.0e-3;
-                                                         cap_factor = cf,
-                                                         floor_c = -cf * max(rho_c, 0.0) / ts,
-                                                         floor_r = -cf * max(rho_r, 0.0) / ts,
-                                                         ceil_v = max(rho_v, 0.0) / ts)
-                    @test base[1] === expl[1]
-                    @test base[2] === expl[2]
+                    (-0.5 * rho_vs, 0.5 * rho_vs, 1.0e-8 * rho_d, 1.0e-6),   # tiny cloud+rain
+                    (-0.5 * rho_vs, 0.5 * rho_vs, 2.0e-3 * rho_d, 1.0e-9),   # rain below RHO_R_MIN
+                    (0.5 * rho_vs, 1.0e-9, 2.0e-3 * rho_d, 1.0e-3),          # no vapor to give
+                    (-0.9 * rho_vs, 0.1 * rho_vs, 1.0e-7 * rho_d, 1.0e-3))
+                # 1. The returned rate IS drive*invtau/(1+Q_s), split by channel, exactly,
+                #    where `drive = min(Q_ss, rho_v - rho_vs)` is the ts-FREE clip.
+                Qc, Qr, itc, itr = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r,
+                                                                 rho_d, Tk, p_hPa, Q_s,
+                                                                 0.1, N_r)
+                drive = min(Q_ss, rho_v - rho_vs)
+                invtau = itc + itr
+                if invtau > 0.0
+                    Qdot = drive * invtau / (1.0 + Q_s)
+                    @test Qc === (itc == 0.0 ? 0.0 : Qdot * (itc / invtau))
+                    @test Qr === (itr == 0.0 ? 0.0 : Qdot * (itr / invtau))
+                    @test Qc + Qr ≈ Qdot
+                else
+                    @test Qc === 0.0 && Qr === 0.0
+                end
+
+                # 2. The rate does not depend on ts AT ALL — bitwise, across four decades.
+                for ts in (1.0e-3, 0.075, 0.3, 1.0, 1.0e6)
+                    r = Scythe.qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk,
+                                                      p_hPa, Q_s, ts, N_r)
+                    @test r[1] === Qc
+                    @test r[2] === Qr
+                    @test r[3] === itc
+                    @test r[4] === itr
                 end
             end
+
+            # 3. The unfloored evaporation genuinely EXCEEDS the old cap where the cap used to
+            #    bind — i.e. this is a behaviour change, not a no-op rename.
+            rho_c_small = 1.0e-7 * rho_d       # just above the q_c = 1e-8 existence gate
+            Qc, = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, rho_c_small, 0.0,
+                                                rho_d, Tk, p_hPa, Q_s, 0.1, N_r)
+            @test Qc < -rho_c_small / 0.1        # past the old forward-Euler floor
+            @test Qc < 0.0
+
+            # 4. The returned inverse timescales are the channel closures themselves.
+            rho_c = 2.0e-3 * rho_d
+            rho_r = 1.0e-3
+            Qc, Qr, itc, itr = Scythe.qss_condensation_rates(1.0e-3 * rho_vs,
+                                                             rho_vs + 1.0e-3 * rho_vs,
+                                                             rho_c, rho_r, rho_d, Tk, p_hPa,
+                                                             Q_s, 0.1, N_r)
+            @test itc === Scythe.invtau_condensation(Tk, p_hPa, 100.0,
+                              Scythe.cloud_droplet_radius(100.0, rho_c / rho_d, rho_d))
+            @test itr === Scythe.invtau_rain(Tk, p_hPa, N_r, rho_r)
+            # ...and the MP closure comes back through the same slot.
+            _, _, _, itr_mp = Scythe.qss_condensation_rates(1.0e-3 * rho_vs,
+                                                            rho_vs + 1.0e-3 * rho_vs,
+                                                            rho_c, rho_r, rho_d, Tk, p_hPa,
+                                                            Q_s, 0.1, N_r; N_0 = 8.0e6)
+            @test itr_mp === Scythe.invtau_rain_mp(Tk, p_hPa, 8.0e6, rho_r, rho_d)
+            # An inactive channel reports an exactly-zero timescale, not a small one.
+            _, _, itc0, itr0 = Scythe.qss_condensation_rates(1.0e-5 * rho_vs,
+                                                             rho_vs + 1.0e-5 * rho_vs,
+                                                             0.0, 0.0, rho_d, Tk, p_hPa,
+                                                             Q_s, 0.1, N_r)
+            @test itc0 === 0.0 && itr0 === 0.0
         end
     end
 
@@ -717,36 +778,49 @@ using Springsteel
             @test Qc + Qr ≈ Q_ss * (invtau_c + invtau_r) / (1.0 + Q_s)
         end
 
-        # Rain evaporates in subsaturated cloud-free air (the O01 Qevap analogue). The
-        # relaxation timescale is ~10 min, so a model step never clamps; the physical
-        # rate is negative and bounded by the available rain.
+        # Rain evaporates in subsaturated cloud-free air (the O01 Qevap analogue): the
+        # physical rate, with no bound of any kind on it.
         Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, 1.0e-3,
                                                rho_d, Tk, p_hPa, Q_s, ts, N_r)
         @test Qc == 0.0
-        @test -1.0e-3 / ts < Qr < 0.0
+        @test Qr < 0.0
         @test Qr ≈ -0.5 * rho_vs * Scythe.invtau_rain(Tk, p_hPa, N_r, 1.0e-3) / (1.0 + Q_s)
-        # With a long enough step the rho_r/ts clamp engages: no negative rain
-        ts_long = 1.0e6
-        Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, 1.0e-3,
-                                               rho_d, Tk, p_hPa, Q_s, ts_long, N_r)
-        @test Qc == 0.0
-        @test Qr ≈ -1.0e-3 / ts_long
+        # A long step no longer changes the rate: the `rho_r/ts` clamp that used to engage
+        # here is gone, so the same state gives the same rate bitwise at any ts.
+        for ts_long in (1.0, 1.0e6)
+            c2, r2 = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, 0.0, 1.0e-3,
+                                                   rho_d, Tk, p_hPa, Q_s, ts_long, N_r)
+            @test c2 === Qc
+            @test r2 === Qr
+        end
 
-        # No negative rain: evaporation never exceeds the available rho_r even when
-        # cloud has more to give.
+        # The rain channel's EXISTENCE threshold still gates it (that is a closure property,
+        # not a limiter): below RHO_R_MIN there is no channel at all.
         Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, rho_c, 1.0e-9,
                                                rho_d, Tk, p_hPa, Q_s, ts, N_r)
-        @test Qr == 0.0                # below RHO_R_MIN: channel inactive
+        @test Qr == 0.0
+        # Just above it the channel is live, and its rate is the closure's — which for a
+        # nearly-empty reservoir is far faster than `rho_r/ts`. That is the reported
+        # stiffness, not something to clip.
         Qc, Qr = Scythe.qss_condensation_rates(-0.5 * rho_vs, 0.5 * rho_vs, rho_c, 2.0e-8,
                                                rho_d, Tk, p_hPa, Q_s, ts, N_r)
-        @test Qr >= -2.0e-8 / ts
+        # The split is proportional, so each channel's rate is just Q_ss/(1+Q_s) times its
+        # OWN inverse timescale — the (invtau_c + invtau_r) factors cancel.
+        @test Qr ≈ -0.5 * rho_vs * Scythe.invtau_rain(Tk, p_hPa, N_r, 2.0e-8) / (1.0 + Q_s)
 
-        # Vapor cap rescales both channels proportionally: tiny vapor, strong drive
+        # The vapor enters through the DRIVE clip, not through a ts-sized ceiling. With a
+        # consistent vapor (rho_v = rho_vs + Q_ss) the clip is inert and the split is the
+        # proportional one; with almost no vapor the drive goes negative and the SAME
+        # condensate evaporates instead of growing. Both directions, same arithmetic.
+        Qc, Qr = Scythe.qss_condensation_rates(0.5 * rho_vs, 1.5 * rho_vs, rho_c, rho_r,
+                                               rho_d, Tk, p_hPa, Q_s, ts, N_r)
+        @test Qc / Qr ≈ invtau_c / invtau_r
+        @test Qc + Qr ≈ 0.5 * rho_vs * (invtau_c + invtau_r) / (1.0 + Q_s)
         rho_v_tiny = 1.0e-9
         Qc, Qr = Scythe.qss_condensation_rates(0.5 * rho_vs, rho_v_tiny, rho_c, rho_r,
                                                rho_d, Tk, p_hPa, Q_s, ts, N_r)
-        @test Qc + Qr ≈ rho_v_tiny / ts
-        @test Qc / Qr ≈ invtau_c / invtau_r
+        @test Qc < 0.0 && Qr < 0.0
+        @test Qc + Qr ≈ (rho_v_tiny - rho_vs) * (invtau_c + invtau_r) / (1.0 + Q_s)
     end
 
     @testset "Marshall-Palmer keyword selects the rain-channel closure" begin
@@ -846,6 +920,129 @@ using Springsteel
         @test Qr < 0.0
     end
 
+    @testset "the closure is driven by the CLIPPED drive min(Q_ss, max(rho_v,0) - rho_vs)" begin
+        # PROVISIONAL (pending author ratification): the ts-free replacement for the removed
+        # vapor ceiling. In the continuum Q_ss IS rho_v - rho_vs and the min never binds;
+        # discretely the prognostic Q_ss can detach from the density budget, and this is the
+        # instantaneous form of the reconciliation qss_relaxation applies on tau_qss.
+        Tk = 285.0; p_hPa = 900.0; ts = 0.1
+        N_r = 1.0e-3
+        rho_vs = rho_v_sat(Tk, p_hPa)
+        rho_d = (100.0 * p_hPa - Rv * Tk * rho_vs) / (Rd * Tk)
+        Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_vs / rho_d, 1.0e-3)
+
+        # (i) DRY AIR with a spuriously positive Q_ss: zero rates AND zero nucleation. The
+        #     second half is the load-bearing one — if S came from the raw Q_ss the Twomey
+        #     branch would open (invtau_c > 0) and the clipped, negative drive would then
+        #     evaporate cloud that does not exist and manufacture vapor.
+        for qss in (1.0e-4 * rho_vs, 0.02, 0.5 * rho_vs, 5.0 * rho_vs)
+            Qc, Qr, itc, itr = Scythe.qss_condensation_rates(qss, 0.0, 0.0, 0.0, rho_d, Tk,
+                                                             p_hPa, Q_s, ts, N_r)
+            @test Qc === 0.0
+            @test Qr === 0.0
+            @test itc === 0.0        # the nucleation branch never opened
+            @test itr === 0.0
+        end
+        # ...and with rain present in that dry column, still no deposition onto rain.
+        Qc, Qr, itc, _ = Scythe.qss_condensation_rates(0.5 * rho_vs, 0.0, 0.0, 1.0e-3, rho_d,
+                                                       Tk, p_hPa, Q_s, ts, N_r)
+        @test itc === 0.0
+        @test Qc === 0.0
+        @test Qr < 0.0               # the clipped drive is EVAPORATIVE, which is correct:
+                                     # rain in genuinely dry air does evaporate.
+
+        # (ii) INERT where the two representations agree — which is every consistent state,
+        #      so the clip changes nothing in a well-behaved column. Compared against the
+        #      unclipped formula in cloud and in clear air, both signs. NOT bitwise, and it
+        #      cannot be: the clip evaluates `(rho_vs + q) - rho_vs`, which differs from `q`
+        #      by one rounding of the LARGER number. The relative size of that error is
+        #      `eps*rho_vs/|Q_ss|`, so it GROWS as the supersaturation shrinks — 2e-16 at
+        #      |Q_ss| ~ rho_vs, but 2e-11 at |Q_ss| = 1e-5*rho_vs, which is the loosest case
+        #      swept here. That scaling is the real price of the clip in a consistent column
+        #      and is why the tolerance is 1e-9 rather than machine epsilon.
+        rho_c = 2.0e-3 * rho_d
+        rho_r = 1.0e-3
+        for qss in (1.0e-3 * rho_vs, 1.0e-5 * rho_vs, -1.0e-4 * rho_vs, -0.5 * rho_vs)
+            for (rc, rr) in ((rho_c, rho_r), (rho_c, 0.0), (0.0, rho_r))
+                Qc, Qr, itc, itr = Scythe.qss_condensation_rates(qss, rho_vs + qss, rc, rr,
+                                                                 rho_d, Tk, p_hPa, Q_s,
+                                                                 ts, N_r)
+                invtau = itc + itr
+                if invtau > 0.0
+                    unclipped = qss * invtau / (1.0 + Q_s)
+                    @test Qc ≈ (itc == 0.0 ? 0.0 : unclipped * (itc / invtau)) rtol = 1.0e-9
+                    @test Qr ≈ (itr == 0.0 ? 0.0 : unclipped * (itr / invtau)) rtol = 1.0e-9
+                    # An inactive channel is still EXACTLY zero, not merely small.
+                    itc == 0.0 && @test Qc === 0.0
+                    itr == 0.0 && @test Qr === 0.0
+                end
+            end
+        end
+
+        # (iii) Q_ss > rho_v - rho_vs > 0: BOTH drives condense, but the rate must use the
+        #       SMALLER one. A detached Q_ss cannot buy condensation the vapor cannot fund.
+        gap = 1.0e-3 * rho_vs                       # the honest supersaturation
+        detached = 0.5 * rho_vs                     # what the prognostic slot claims
+        @test detached > gap > 0.0
+        Qc, Qr, itc, itr = Scythe.qss_condensation_rates(detached, rho_vs + gap, rho_c,
+                                                         rho_r, rho_d, Tk, p_hPa, Q_s,
+                                                         ts, N_r)
+        @test Qc > 0.0 && Qr > 0.0                  # still condensing
+        @test Qc + Qr ≈ gap * (itc + itr) / (1.0 + Q_s)
+        honest = Scythe.qss_condensation_rates(gap, rho_vs + gap, rho_c, rho_r, rho_d, Tk,
+                                               p_hPa, Q_s, ts, N_r)
+        @test Qc ≈ honest[1] rtol = 1.0e-12         # the honest-drive rate (see (ii) on ULPs)
+        @test Qr ≈ honest[2] rtol = 1.0e-12
+        # ...and it is strictly less than the detached slot would have bought.
+        @test Qc + Qr < detached * (itc + itr) / (1.0 + Q_s)
+        clip_c = Qc; clip_r = Qr
+
+        # (iv) The EVAPORATION side is untouched whenever rho_v - rho_vs >= Q_ss, which is
+        #      every subsaturated state the density budget agrees with — including one where
+        #      the vapor is far ABOVE what Q_ss claims (the min then picks Q_ss).
+        for (qss, rho_v) in ((-0.5 * rho_vs, 0.5 * rho_vs),      # consistent
+                             (-0.5 * rho_vs, 3.0 * rho_vs),      # vapor-rich, Q_ss binds
+                             (-1.0e-4 * rho_vs, rho_vs))         # marginal
+            Qc, Qr, itc, itr = Scythe.qss_condensation_rates(qss, rho_v, rho_c, rho_r, rho_d,
+                                                             Tk, p_hPa, Q_s, ts, N_r)
+            @test Qc + Qr ≈ qss * (itc + itr) / (1.0 + Q_s)
+            @test Qc < 0.0 && Qr < 0.0
+        end
+
+        # (v) NEGATIVE retrieved vapor (a partition error, not a physical state): the
+        #     max(rho_v, 0) inside the clip floors the drive at -rho_vs, the maximum-dryness
+        #     evaporation drive — the rate must NOT scale with the size of the partition error.
+        for rho_v_neg in (-1.0e-6, -7.2e-4, -0.5)
+            Qc, Qr, itc, itr = Scythe.qss_condensation_rates(0.5 * rho_vs, rho_v_neg, rho_c,
+                                                             rho_r, rho_d, Tk, p_hPa, Q_s,
+                                                             ts, N_r)
+            invtau = itc + itr
+            @test invtau > 0.0                       # condensate present, channels open
+            @test Qc + Qr ≈ -rho_vs * invtau / (1.0 + Q_s) rtol = 1.0e-12
+            @test Qc < 0.0 && Qr < 0.0               # evaporative, independent of |rho_v_neg|
+        end
+        # ...identical rates for wildly different partition errors: the floor, bitwise.
+        r_small = Scythe.qss_condensation_rates(0.5 * rho_vs, -1.0e-9, rho_c, rho_r, rho_d,
+                                                Tk, p_hPa, Q_s, ts, N_r)
+        r_large = Scythe.qss_condensation_rates(0.5 * rho_vs, -1.0e3, rho_c, rho_r, rho_d,
+                                                Tk, p_hPa, Q_s, ts, N_r)
+        @test r_small[1] === r_large[1] && r_small[2] === r_large[2]
+        # ...but a prognostic Q_ss below -rho_vs still passes through the min unfloored (the
+        # prognostic is not the pathology the vapor floor addresses).
+        Qc, Qr, itc, itr = Scythe.qss_condensation_rates(-2.0 * rho_vs, 0.0, rho_c, rho_r,
+                                                         rho_d, Tk, p_hPa, Q_s, ts, N_r)
+        @test Qc + Qr ≈ -2.0 * rho_vs * (itc + itr) / (1.0 + Q_s) rtol = 1.0e-12
+
+        # The clip is ts-FREE: that is the whole point of preferring it to the ceiling. Taken
+        # on the BINDING state of (iii), where a ts-sized ceiling would have varied wildly.
+        for ts2 in (1.0e-3, 1.0, 1.0e6)
+            r = Scythe.qss_condensation_rates(detached, rho_vs + gap, rho_c, rho_r, rho_d,
+                                              Tk, p_hPa, Q_s, ts2, N_r)
+            @test r[1] === clip_c                   # BITWISE across four decades of ts
+            @test r[2] === clip_r
+        end
+    end
+
     # ──────────────────────────────────────────────
     # 5. Integration: equation set on a ModelTile
     # ──────────────────────────────────────────────
@@ -936,6 +1133,65 @@ using Springsteel
             gridTransform!(patch)
         end
         return patch
+    end
+
+    @testset "mc_stiffness_census! reports stiffness and changes nothing" begin
+        # The census is what stands in place of the removed depletion caps: it measures
+        # ts/tau per relaxation channel and REPORTS under-resolution instead of absorbing it.
+        mktempdir() do tmpdir
+            mtile, patch, model, _ = make_mc_mtile(tmpdir)
+            st = mtile.mc_water_stats
+            st .= 0.0
+            crow = Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * (Scythe.MC_STIFF_C - 1)
+            rrow = Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * (Scythe.MC_STIFF_R - 1)
+            tid = Threads.threadid()
+
+            # A BENIGN state: ts/tau under 1 everywhere. The max is recorded; nothing is
+            # counted as an exceedance.
+            itc = [0.1, 0.5, 0.9]
+            itr = [0.0, 0.2, 0.4]
+            before = copy(mtile.expdot_n)
+            Scythe.mc_stiffness_census!(mtile, 1.0, itc, itr)
+            @test st[crow, tid] == 0.9
+            @test st[crow + 1, tid] == 0.0
+            @test st[rrow, tid] == 0.4
+            @test st[rrow + 1, tid] == 0.0
+            # It is a MEASUREMENT: neither the rates it reads nor the tendencies move.
+            @test itc == [0.1, 0.5, 0.9]
+            @test itr == [0.0, 0.2, 0.4]
+            @test mtile.expdot_n == before
+
+            # A STIFF state: ts = 2 puts two cloud points past ts/tau = 1.
+            Scythe.mc_stiffness_census!(mtile, 2.0, [0.6, 0.51, 0.1], [0.05, 0.1, 0.2])
+            @test st[crow, tid] == 1.2            # running max over the run
+            @test st[crow + 1, tid] == 2.0        # 1.2 and 1.02 exceed; 0.2 does not
+            @test st[rrow, tid] == 0.4            # 2.0*0.2 ties the previous max
+            @test st[rrow + 1, tid] == 0.0        # rain still resolved
+
+            # Cumulative, and the max never regresses on a subsequent quiet step.
+            Scythe.mc_stiffness_census!(mtile, 1.0e-3, [0.6, 0.51, 0.1], [0.05, 0.1, 0.2])
+            @test st[crow, tid] == 1.2
+            @test st[crow + 1, tid] == 2.0
+
+            # The warning is UNCONDITIONAL (no :stiffness_trace needed) and fires ONCE.
+            model.options[:stiffness_trace] = 0
+            st[Scythe.MC_STIFF_WARNED, 1] = 0.0
+            st[crow, 1] = 5.0
+            @test_logs (:warn,) match_mode = :any Scythe.mc_stiffness_trace(mtile, 3)
+            @test st[Scythe.MC_STIFF_WARNED, 1] == 1.0
+            @test_logs Scythe.mc_stiffness_trace(mtile, 4)      # silent from here on
+            # ...and the periodic report is the separate, opt-in channel.
+            model.options[:stiffness_trace] = 2
+            @test_logs (:info,) match_mode = :any Scythe.mc_stiffness_trace(mtile, 4)
+            @test_logs Scythe.mc_stiffness_trace(mtile, 5)      # off-interval: nothing
+            delete!(model.options, :stiffness_trace)
+
+            # A benign run never warns at all.
+            st .= 0.0
+            Scythe.mc_stiffness_census!(mtile, 0.1, [0.5, 1.0], [0.1, 2.0])
+            @test_logs Scythe.mc_stiffness_trace(mtile, 6)
+            @test st[Scythe.MC_STIFF_WARNED, 1] == 0.0
+        end
     end
 
     @testset "reference routing" begin
@@ -2664,8 +2920,7 @@ using Springsteel
         # the second is what keeps the first from being vacuous:
         #
         #   (a) leaving the key ABSENT — the state of every configuration file that says
-        #       nothing — is the blend to the LAST BIT, not "agrees to 1e-14". The same
-        #       standard `water_cap_mode = :euler` is held to.
+        #       nothing — is the blend to the LAST BIT, not "agrees to 1e-14".
         #   (b) `:residual` still selects the pre-blend density-budget route, and on THIS
         #       state that is a genuinely different run. The base is saturated with
         #       rho_c ~ 1.1e-3 kg/m^3, three decades above l1 = 1e-4, so w_cloud = 1 and the
@@ -2693,14 +2948,31 @@ using Springsteel
             # (a) absent === :blend, bitwise
             @test pA.physical == pB.physical
             @test pA.spectral == pB.spectral
-            # (b) :residual is a different integration on this cloudy state — and a nearby
-            #     one, since the two retrievals differ by the bounded partition gap and not
-            #     by a change of equation set.
+            # (b) :residual is a different integration on this cloudy state, bounded by the
+            #     blend's own correction cap.
+            #
+            #     This bound USED to be "within 1% of |Q_ss|", i.e. the two retrievals were a
+            #     nearby pair. That is no longer true, and the reason is load-bearing: the
+            #     condensation closure now reads the retrieved vapor through the DRIVE clip
+            #     `min(Q_ss, rho_v - rho_vs)` (see qss_condensation_rates), where before it
+            #     read it only through a vapor ceiling that was almost never active. So the
+            #     retrieval choice is now FIRST-ORDER in the rate, and in near-saturated air
+            #     — where |Q_ss| is small and the partition gap is not — the gap dominates the
+            #     drive outright. Here |Q_ss| ~ 2.3e-7 while the blend may open a gap of
+            #     dcap*rho_vs ~ 2.9e-4, three decades larger, so the two runs' Q_ss fields
+            #     diverge by O(|Q_ss|) and a 1% bound is unmeetable BY CONSTRUCTION.
+            #
+            #     What still holds — and is the honest statement of "a different integration,
+            #     not a different equation set" — is that the divergence stays inside the
+            #     correction the blend is permitted to make.
             @test pA.physical != pR.physical
             qi = gpA.vars["Q_ss"]
             dq = maximum(abs.(pA.physical[:, qi, 1] .- pR.physical[:, qi, 1]))
             @test dq > 0.0
-            @test dq < 1.0e-2 * maximum(abs.(pA.physical[:, qi, 1]))
+            z_col = Scythe.getGridpoints(pA)[1:gpA.kDim, end]
+            rvs_max = maximum(saturated_cloudy_column_mc(z_col).rho_v)
+            dcap = get(moA.physical_params, :vapor_blend_dcap, 0.02)
+            @test dq <= dcap * rvs_max
         end
     end
 
@@ -4092,9 +4364,24 @@ using Springsteel
             r_ax = gp2[1:kDim:end, 1]
             ncols_rlr = div(size(gp1, 1), kDim)
             worst = 0.0
+            # Nominal per-slot magnitudes, kept as a FLOOR so a slot whose tendency is
+            # genuinely tiny is still held to an absolute standard rather than to a
+            # meaningless ratio of two near-zeros.
             scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
                           5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6,
                           9 => 1.0e-6, 10 => 1.0e-2)
+            # ...but the DENOMINATOR is the larger of that floor and the tendency actually
+            # produced, so this is a RELATIVE agreement test. It has to be: the seeded state
+            # opens the closure's evaporation branch at full maximum-dryness drive (the bump
+            # puts rho_c' at 0.5 kg/m^3, making the residual vapor about -0.5, so the clip's
+            # vapor floor pins the drive at -rho_vs — far beyond the seeded Q_ss scale).
+            # Judging the resulting tendency against a hardcoded 1e-6 scale measures nothing
+            # about whether the two geometries agree — and they agree here to roundoff
+            # RELATIVE. Keeping the fixed scale would have made this gate a hostage to the
+            # magnitude of whatever state the seed happens to produce.
+            per_slot = zeros(10)
+            denom = Dict(v => max(scales[v], maximum(abs.(mt_rlr.expdot_n[:, v])),
+                                  maximum(abs.(mt_ax.expdot_n[:, v]))) for v in 1:10)
             for c in 1:ncols_rlr
                 i0 = (c - 1) * kDim
                 r_c = gp1[i0 + 1, 1]
@@ -4103,11 +4390,13 @@ using Springsteel
                 j0 = (a - 1) * kDim
                 for v in 1:10
                     d = maximum(abs.(mt_rlr.expdot_n[i0+1:i0+kDim, v] .-
-                                     mt_ax.expdot_n[j0+1:j0+kDim, v])) / scales[v]
+                                     mt_ax.expdot_n[j0+1:j0+kDim, v])) / denom[v]
+                    per_slot[v] = max(per_slot[v], d)
                     worst = max(worst, d)
                 end
             end
-            @info "RLR WN0 vs axisym: worst scaled tendency mismatch = $worst"
+            @info "RLR WN0 vs axisym: worst scaled tendency mismatch = $worst" *
+                  "\n  per slot: " * join(("$v=$(per_slot[v])" for v in 1:10), " ")
             @test worst < 1.0e-6
             @test all(isfinite.(mt_rlr.expdot_n))
         end

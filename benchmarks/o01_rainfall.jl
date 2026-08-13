@@ -148,19 +148,15 @@ function o01_model(opts::BenchmarkOptions)
     # NOTE the output lands in <output_dir>/scythe_err.log, NOT the console — Scythe.jl:136
     # redirects the worker's stderr for the whole run.
     haskey(ENV, "SCYTHE_O01_BUDGET") && (options[:water_budget_trace] = parse(Int, ENV["SCYTHE_O01_BUDGET"]))
-    # Stage-3 falsification lever: scales the condensate DEPLETION caps, which are written as
-    # forward-Euler budgets (`rho/ts`) while the integrator is AB3 with a leading weight of
-    # 23/12. `SCYTHE_O01_CAPFAC=0.5217391304347826` (= 12/23) makes them AB3-sized for the
-    # worst case. Unset => 1.0, which is bitwise inert. See qss_condensation_rates.
-    haskey(ENV, "SCYTHE_O01_CAPFAC") &&
-        (physical_params[:water_cap_factor] = parse(Float64, ENV["SCYTHE_O01_CAPFAC"]))
-    # How the water depletion budgets are sized. Default :ab3 -- the integrator's actual
-    # three-level combination. `SCYTHE_O01_CAPMODE=euler` pins them to the forward-Euler
-    # `rho/ts` form, BITWISE, which is what runs A-H of
-    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md were taken under and therefore the A/B
-    # lever for every number in it. See `_ab3_sink_bound`.
-    haskey(ENV, "SCYTHE_O01_CAPMODE") &&
-        (options[:water_cap_mode] = Symbol(ENV["SCYTHE_O01_CAPMODE"]))
+    # Microphysics STIFFNESS census (see Scythe.mc_stiffness_census!): max ts/tau and the
+    # gridpoint-step count past ts/tau = 1, per relaxation channel. Value = print interval in
+    # steps; unset/0 => no printing. The census itself runs on EVERY run either way and warns
+    # once if any channel exceeds 1, so this knob only controls the periodic report and is
+    # bitwise inert. This is what replaced the SCYTHE_O01_CAPFAC/CAPMODE depletion-cap levers,
+    # which went with the caps themselves: a rate floored at `rho/ts` makes the physics a
+    # function of the time step. Output lands in <output_dir>/scythe_err.log, not the console.
+    haskey(ENV, "SCYTHE_O01_STIFFNESS") &&
+        (options[:stiffness_trace] = parse(Int, ENV["SCYTHE_O01_STIFFNESS"]))
     # Stage 0b of the vapor-retrieval decision (reference/HANDOFF_VAPOR_RETRIEVAL.md):
     # the reconciliation `qss_relaxation` pulls Q_ss toward the DENSITY residual at rate 1/tau.
     # The partition gap the regime-blended retrieval opens is algebraically
@@ -291,12 +287,12 @@ function o01_model(opts::BenchmarkOptions)
     # and the effect is INVARIANT under ts (2.339 at ts=0.075 vs 2.345 at ts=0.3), so it was
     # never a CFL/ceiling problem.
     #
-    # STAGE 3b/4: `SCYTHE_O01_CAPFAC=12/23` makes the cap AB3-sized and CLEARS the detonation —
-    # mode `1` then runs the full 3600 s with min_rho_c = 0, the limiter holding the same
-    # ~1e-8 fixed point rho_r reaches, and max_rho_r_gm3 13.12 FAIL -> 9.63 PASS. It is still
-    # NOT a shippable combination: the error relocates into the RESIDUAL vapor (min_rho_v
-    # -0.72 -> -1.85 g/m^3) and max_w runs to 29.6. Keep the default rain-only until the cap is
-    # written against the real three-level AB3 budget and the vapor residual has an answer.
+    # STAGE 3b/4 (HISTORICAL — the levers named here no longer exist): with the cap made
+    # AB3-sized, mode `1` ran the full 3600 s with min_rho_c = 0 and max_rho_r_gm3
+    # 13.12 FAIL -> 9.63 PASS, but the error relocated into the RESIDUAL vapor (min_rho_v
+    # -0.72 -> -1.85 g/m^3) and max_w ran to 29.6. The depletion caps have since been removed
+    # outright (see Scythe.qss_condensation_rates), so the paragraph above describes a
+    # configuration the code can no longer be put in; keep the default rain-only.
     #
     # Modes: 0 = off, k = rain vertical leg only, r = rain both legs (the default),
     # ck / ci = rain both legs plus cloud vertical / horizontal, 1 = both species both legs.
