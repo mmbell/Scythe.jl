@@ -245,6 +245,35 @@ function o01_model(opts::BenchmarkOptions)
     haskey(ENV, "SCYTHE_O01_NRMU") &&
         (physical_params[:mu_rain_n] = parse(Float64, ENV["SCYTHE_O01_NRMU"]))
 
+    # ICE. Unset => the key is absent => `:none` => no ice slots at all, bit-identical.
+    # "1"/"ishmael" appends the twelve ISHMAEL slots (three species x mass, number and the two
+    # spheroid volume moments) and turns on the ice thermodynamics: the rho_i term of the
+    # closed-form temperature retrieval, q_i*Ci in the mixture heat capacities and the entropy,
+    # and rho_i in the vapor residual. It REQUIRES SCYTHE_O01_RAIN_MOMENTS=2 and says so if it
+    # is missing (`Scythe.ice_microphysics`). NOTE that at this stage every ice PROCESS RATE
+    # and every ice FALL SPEED is zero, so ice-on with zero ice ICs is inert by construction --
+    # which is exactly what the regression against the ice-off run asserts.
+    haskey(ENV, "SCYTHE_O01_ICE") &&
+        (options[:ice_microphysics] =
+             ENV["SCYTHE_O01_ICE"] in ("1", "true", "yes", "ishmael") ? :ishmael : :none)
+    # The ice control-variable transform: ONE family key for all twelve slots (the moments of
+    # a species are ratios of each other -- see `Scythe.ice_transform_mode`), the ice sibling
+    # of RTRANS/NRTRANS.
+    haskey(ENV, "SCYTHE_O01_ICETRANS") &&
+        (options[:ice_transform] = Symbol(ENV["SCYTHE_O01_ICETRANS"]))
+    # The transform widths, as "mass,number,a,c" -- FOUR numbers, because mu is dimensional
+    # and the four moment kinds are ten and nine decades apart (kg/m^3, #/m^3, m^3/m^3).
+    # Unset => (1e-7, 1e2, 1e-16, 1e-16). Only meaningful with ICETRANS.
+    if haskey(ENV, "SCYTHE_O01_ICEMU")
+        imus = parse.(Float64, split(ENV["SCYTHE_O01_ICEMU"], ","))
+        length(imus) == 4 || error("SCYTHE_O01_ICEMU takes four comma-separated widths " *
+                                   "(mass,number,a,c); got \"$(ENV["SCYTHE_O01_ICEMU"])\"")
+        physical_params[:mu_ice]   = imus[1]
+        physical_params[:mu_ice_n] = imus[2]
+        physical_params[:mu_ice_a] = imus[3]
+        physical_params[:mu_ice_c] = imus[4]
+    end
+
     # Slot names, now that the transforms are known. Everything keyed by NAME below — the BC
     # dicts, l_q, positivity and vars itself — must use these, because a stale key is ignored
     # silently rather than raising (`Scythe.check_mc_var_names` is the backstop). `vars`
@@ -255,6 +284,12 @@ function o01_model(opts::BenchmarkOptions)
     rain_number_name = Scythe.rain_number_var_name(options)
     two_moment = Scythe.rain_moments(options) == 2
     cloud_name = Scythe.condensate_var_name(options)
+    # The twelve ice slot names in registration order (mass, number, a, c per species), under
+    # whatever ICETRANS declares. Empty of meaning unless ice is on; `ice_on` is the gate.
+    ice_on = Scythe.ice_microphysics(options) === :ishmael
+    # (Positionally, entries 1, 5, 9 are the three MASS slots -- the only ice slots whose flux
+    # reaches rho_t and E_t. Everything below applies to all twelve alike.)
+    ice_names = Scythe.ice_var_names(options)
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
@@ -270,6 +305,19 @@ function o01_model(opts::BenchmarkOptions)
     # they hold, or the count piles up at the ground while its mass leaves.
     topbot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), rain_name => NaturalBC()))
     two_moment && (topbot_bc[rain_number_name] = NaturalBC())
+    # Every ice slot takes the same free (Natural) fit, which is the rain mass's rule and the
+    # rain number's. For the three MASS slots it is load-bearing: their flux divergence is the
+    # only ice term that sources rho_t and E_t, so once the fall speeds are live it has to be
+    # able to carry ice out through z = 0 rather than piling it up at the ground with its mass
+    # still in the total-water budget. For the number and volume moments it is the n_r
+    # argument -- a Neumann fit would force zero flux derivative and leave the crystal count
+    # (and the volume it occupies) at the surface after its mass had left, which is a worse
+    # state than either.
+    if ice_on
+        for nm in ice_names
+            topbot_bc[nm] = NaturalBC()
+        end
+    end
 
     # Attribution: sweep the cubic-spline filter length only on the water species.
     # Unset => Dict("default" => 2.0), which equals the struct default, so bit-identical.
@@ -279,9 +327,19 @@ function o01_model(opts::BenchmarkOptions)
                        # The rain number takes the rain mass's filter length: the two are
                        # fitted on the same spike and a different low-pass on each would
                        # change the mean drop size at every wavenumber it separated them by.
-                       two_moment ? Dict(rain_name => x, cloud_name => x,
-                                         rain_number_name => x) :
-                                    Dict(rain_name => x, cloud_name => x)
+                       d = Dict(rain_name => x, cloud_name => x)
+                       two_moment && (d[rain_number_name] = x)
+                       # The ice slots take the water filter length too, and all twelve take
+                       # the SAME one: a species' four moments are fitted on the same spike
+                       # and separating them by wavenumber would change the recovered
+                       # aspect ratio phi = c/a and effective density at every scale the
+                       # filters differed on.
+                       if ice_on
+                           for nm in ice_names
+                               d[nm] = x
+                           end
+                       end
+                       d
                    end : Dict{String,Float64}())
 
     # Positivity of the rain density, imposed as a box constraint on the spline coefficients

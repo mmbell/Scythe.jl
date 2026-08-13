@@ -231,7 +231,11 @@ carrying no cloud.
     # the volumetric heating QDOT_V [W/m³].
     s_t = S.s_t
     q_v = S.q_v; q_l = S.q_l
-    @. s_t = moist_entropy_total(Tk, rho_d, q_v, q_l)
+    # `q_i` is staged by `mc_driver!` in the same scratch, and is an exact 0.0 column with ice
+    # off, so this is bitwise the pre-ice entropy. It is only ever reached with ice ON if the
+    # ice/louis_bl refusal in `mc_driver!` is removed — see there for what else must move
+    # first (the implied vapor tendency below is the blocker, not this line).
+    @. s_t = moist_entropy_total(Tk, rho_d, q_v, q_l, S.q_i)
     s_col = scratch_column(mtile, 6)
     s_col.uMish .= s_t .- mtile.mc_ref_diag.s_tbar
     Btransform!(s_col)

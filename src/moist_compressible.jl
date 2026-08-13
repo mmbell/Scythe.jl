@@ -130,6 +130,35 @@ const MC_SCRATCH_SLOTS = (
     # for the number sources. Allocated unconditionally, like every other name here: eight
     # kDim columns per thread against the ~90 already present.
     :n_r, :nu_nr, :nu_nr_z, :Jnr, :Vtn, :Fnr, :Fnr_z, :NR_SRC,
+    # ── Ice microphysics (options[:ice_microphysics] === :ishmael) ──────────────────────
+    # SEVEN columns per ice slot, in the order the slots are registered: the recovered
+    # quantity, the control variable and its gradient, the Jacobian, the process-source
+    # accumulator and the sedimentation flux with its divergence. That is the n_r shape with
+    # the fall speed dropped (the ISHMAEL speeds come out of one per-species call, so they
+    # are formed pointwise into the flux rather than staged in a column of their own).
+    #
+    # The names are `<species><moment>`: `i1q` is the MASS of species 1, `i1n` its number,
+    # `i1a`/`i1c` the two spheroid volume moments. Allocated unconditionally like everything
+    # else here — 90 kDim columns per thread on top of the ~100 already present, ~0.2 MB per
+    # thread at kDim = 300, and NOT conditional on the option, because a NamedTuple whose
+    # field set depended on a run-time option would make `ModelTile` non-concrete.
+    :i1q, :nu_i1q, :nu_i1q_z, :J_i1q, :SRC_i1q, :F_i1q, :F_i1q_z,
+    :i1n, :nu_i1n, :nu_i1n_z, :J_i1n, :SRC_i1n, :F_i1n, :F_i1n_z,
+    :i1a, :nu_i1a, :nu_i1a_z, :J_i1a, :SRC_i1a, :F_i1a, :F_i1a_z,
+    :i1c, :nu_i1c, :nu_i1c_z, :J_i1c, :SRC_i1c, :F_i1c, :F_i1c_z,
+    :i2q, :nu_i2q, :nu_i2q_z, :J_i2q, :SRC_i2q, :F_i2q, :F_i2q_z,
+    :i2n, :nu_i2n, :nu_i2n_z, :J_i2n, :SRC_i2n, :F_i2n, :F_i2n_z,
+    :i2a, :nu_i2a, :nu_i2a_z, :J_i2a, :SRC_i2a, :F_i2a, :F_i2a_z,
+    :i2c, :nu_i2c, :nu_i2c_z, :J_i2c, :SRC_i2c, :F_i2c, :F_i2c_z,
+    :i3q, :nu_i3q, :nu_i3q_z, :J_i3q, :SRC_i3q, :F_i3q, :F_i3q_z,
+    :i3n, :nu_i3n, :nu_i3n_z, :J_i3n, :SRC_i3n, :F_i3n, :F_i3n_z,
+    :i3a, :nu_i3a, :nu_i3a_z, :J_i3a, :SRC_i3a, :F_i3a, :F_i3a_z,
+    :i3c, :nu_i3c, :nu_i3c_z, :J_i3c, :SRC_i3c, :F_i3c, :F_i3c_z,
+    # Ice AGGREGATES over the three species: the total ice density (the retrieval's ρ_i),
+    # what the thermodynamics reads under `condensate_floor`, the mixing ratio q_i, the
+    # summed MASS flux divergence (the only ice flux that reaches ρ_t) and the ice
+    # sedimentation energy flux with its divergence (the only one that reaches E_t).
+    :rho_ice, :rho_ice_t, :rho_cond, :q_i, :Fi_z, :E_sed_i, :E_sed_i_z,
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
@@ -161,6 +190,10 @@ const MC_SCRATCH_SLOTS = (
     :df_rw_np1, :df_rv_np1, :df_drw, :df_drv, :df_drr, :df_dE_w,
     :df_rc_star, :df_rc_nstar, :df_rc_np1, :df_drc, :df_rho_c_star, :df_rho_r_star,
     :df_rho_liq_star,
+    # The ice mirror of `df_rho_liq_star`: the raw star-state ice mass (which the water
+    # PARTITION reads) and the one the thermodynamics reads (floored under
+    # `condensate_floor`), plus its mixing ratio for `C_vt_star`/`stp_star`.
+    :df_rho_ice_star, :df_rho_ice_t_star, :df_q_i_star,
     # ── tangential wind v (cylindrical geometries; inert columns on the XZ slice) ──
     :df_v_star, :df_v_nstar, :df_v_np1)
 
@@ -217,6 +250,7 @@ end
 
 """
     retrieve_temperature(M, rho_d, rho_t, rho_liq)
+    retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
 
 Diagnose the temperature from the prognostic variables of the total-energy set. With the
 condensate prognostic the liquid density `ρ_liq = ρ_c + ρ_r` is KNOWN, so the Bryan &
@@ -245,16 +279,49 @@ that into a warming of `δρ_l·L_v/Cfactor` automatically.
 This replaces a univariate Newton iteration on the same identity carrying an extra
 `ρ_vs(T,p)` term, whose clamped partition is what manufactured phantom cloud (see the file
 header). The two agree to ~1e-12 K wherever the old clamp was inactive.
+
+# The ice term
+
+With the ice masses prognostic (`options[:ice_microphysics] = :ishmael`; see
+[`ice_microphysics`](@ref)) the ice density `ρ_i = Σ_k ρ_{i,k}` is known too, and the SAME
+identity closes with one more affine latent term — `L_s(T) = L_{s0} + (C_pv − C_i)(T − T_0)`,
+the Kirchhoff linearization of the sublimation heat, added to the internal energy as
+`−ρ_i L_s(T)`:
+
+    T = [M + ρ_liq (L_v0 − (C_pv − C_l) T_0) + ρ_ice (L_s0 − (C_pv − C_i) T_0)]
+        / [C_f − ρ_liq (C_pv − C_l) − ρ_ice (C_pv − C_i)]
+
+`C_f = ρ_d C_pd + (ρ_t − ρ_d) C_pv` is UNCHANGED in form (`ρ_t` now includes the ice, and an
+ice mass that displaces vapor moves `C_f` not at all — see the derivation in
+reference/Scythe_moist_compressible.tex, Eq. T_retrieve_ice), and `C_i = 2106 > C_pv` exactly
+as `C_l > C_pv`, so the denominator stays strictly positive and the root stays unique. `T`
+still does not read `Q_ss`, the vapor/cloud split, or the distribution of the ice mass among
+species — deposition raises `ρ_i` at fixed `E_t`, `ρ_t` and this expression turns that into
+the warming `δρ_i L_s/D_i` by itself.
+
+**The 4-argument method DELEGATES with `rho_ice = 0.0` and that is BITWISE the pre-ice code.**
+The ice numerator term is `0.0 * (L_s0 − (C_pv−C_i)T_0)` = `+0.0`, added LAST (so the liquid
+sum is formed first and `x + 0.0 === x` for every double except `-0.0`, which `M + ρ_liq(...)`
+— an O(10⁵) J/m³ available enthalpy — cannot be); the denominator term is
+`0.0 * (C_pv − C_i)` = `-0.0` SUBTRACTED, and `x - (-0.0) === x` exactly. The associativity is
+therefore load-bearing, not cosmetic: `test_moist_compressible.jl` asserts the identity with
+`===` over a state sweep.
 """
-@inline function retrieve_temperature(M, rho_d, rho_t, rho_liq)
+@inline function retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
 
     Cfactor = (rho_d * Cpd) + ((rho_t - rho_d) * Cpv)
-    return (M + (rho_liq * (L_v0 - ((Cpv - Cl) * T_0)))) /
-           (Cfactor - (rho_liq * (Cpv - Cl)))
+    return ((M + (rho_liq * (L_v0 - ((Cpv - Cl) * T_0)))) +
+            (rho_ice * (L_s0 - ((Cpv - Ci) * T_0)))) /
+           ((Cfactor - (rho_liq * (Cpv - Cl))) - (rho_ice * (Cpv - Ci)))
 end
+
+@doc (@doc retrieve_temperature)
+@inline retrieve_temperature(M, rho_d, rho_t, rho_liq) =
+    retrieve_temperature(M, rho_d, rho_t, rho_liq, 0.0)
 
 """
     moist_entropy_total(Tk, rho_d, q_v, q_l)
+    moist_entropy_total(Tk, rho_d, q_v, q_l, q_i)
 
 Specific moist entropy per unit dry-air mass [J/(kg·K)], INCLUDING the liquid contribution
 that `entropy` omits:
@@ -287,11 +354,27 @@ no condensate scheme reaches it.
 
 `q_l` is deliberately NOT clamped: nothing takes its log, a negative condensate must stay
 visible in the entropy budget, and under the water transforms it cannot be negative anyway.
-"""
-function moist_entropy_total(Tk, rho_d, q_v, q_l)
 
-    return entropy(Tk, rho_d, max(q_v, 0.0)) + (q_l * Cl * log(Tk / T_0))
+# The ice term
+
+Ice enters with the identical structure and for the identical reason, `s_i = C_i ln(T/T_0)`
+integrated from `T ds_i = C_i dT` under the same incompressibility assumption used for the
+liquid (reference/Scythe_moist_compressible.tex, Eq. entropy_ice):
+
+    s_t = entropy(T, ρ_d, q_v) + q_l·C_l·log(T/T_0) + q_i·C_i·log(T/T_0)
+
+The 4-argument method delegates with `q_i = 0.0`, and the added term is then
+`0.0 * C_i * log(T/T_0)` = `±0.0` appended LAST, so `x + (±0.0) === x` for every double and
+the pre-ice path is bitwise. `q_i` is not clamped either, for `q_l`'s reasons.
+"""
+function moist_entropy_total(Tk, rho_d, q_v, q_l, q_i)
+
+    return (entropy(Tk, rho_d, max(q_v, 0.0)) + (q_l * Cl * log(Tk / T_0))) +
+           (q_i * Ci * log(Tk / T_0))
 end
+
+@doc (@doc moist_entropy_total)
+moist_entropy_total(Tk, rho_d, q_v, q_l) = moist_entropy_total(Tk, rho_d, q_v, q_l, 0.0)
 
 """
     mc_reference_diagnostics(ref_state, z) -> (s_tbar, rho_vbar)
@@ -324,7 +407,10 @@ function mc_reference_diagnostics(ref_state, z)
         # fitted profile (exactly 0.0 for a condensate-free base, which fits rho_c from
         # an all-zero vector; positive on a saturated base such as BF02).
         rho_c = rho_cbar[k, 1]
-        # Mirror the equation set's per-point pipeline at rest (ke = 0, rho_r = 0);
+        # Mirror the equation set's per-point pipeline at rest (ke = 0, rho_r = 0, and
+        # rho_i = 0 — there is no reference ice in any configuration or in the
+        # reference-state format, which is exactly why the ice slots are TOTALS; the 4-arg
+        # retrieval and entropy below are the ice ones with rho_i/q_i = 0.0, bitwise);
         # every expression must match mc_driver! bit-for-bit.
         geo = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0)) + (gravity * z[k])
         M = p + (E_tbar[k, 1]) - (rho_t * geo)
@@ -545,6 +631,7 @@ end
 
 """
     Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l)
+    Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, q_i)
 
 Energy-consistent psychrometric factor (dimensionless) for the supersaturation
 relaxation, built from the condensation-induced temperature and pressure tendencies
@@ -554,10 +641,20 @@ of the total-energy equation set (density form, no ln(H) term):
 
 The (1 + Q_s) factor cancels between the condensation rate and the saturation
 chain-rule terms, leaving −Q_ss/τ as the net supersaturation forcing.
-"""
-function Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l)
 
-    C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
+Ice reaches this only through the MIXTURE HEAT CAPACITY, `C_vt = C_vd + q_v C_vv + q_l C_l +
+q_i C_i` (reference/Scythe_moist_compressible.tex, Eq. mixture_C): a condensed phase performs
+no expansion work, so ice enters `C_vt` and `C_pt` exactly as liquid does, `R_m` is untouched
+because ice exerts no partial pressure, and the identity `C_pt = C_vt + R_m` — which is what
+collapses the pressure equation's coefficients — survives unchanged. The 5-argument method
+delegates with `q_i = 0.0`; `+ 0.0*C_i` appended last is bitwise the pre-ice `C_vt`.
+
+The OVER-ICE psychrometric factor of the deposition channel is a different quantity (it reads
+`∂ρ_i*/∂T` and `L_s`) and is not this function; it arrives with the deposition rates.
+"""
+function Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+
+    C_vt = Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)
     R_m = Rd + (q_v * Rv)
     C_pt = C_vt + R_m
     p_hPa = p_Pa / 100.0
@@ -566,6 +663,9 @@ function Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l)
            (drho_vsat_dp(Tk, p_hPa) * R_m * (Lv - (Rv * C_pt * Tk / R_m)))) / C_vt
     return Q_s
 end
+
+@doc (@doc Q_s_energy)
+Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l) = Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, 0.0)
 
 """
     qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
@@ -1143,22 +1243,27 @@ const MC_BUDGET_FIRST = MC_BUDGET_R
 The reference profile a positivity-bounded prognostic is carried against, or `nothing` when
 the variable is a TOTAL and its bound needs no offset.
 
-`u, w, rho_r, n_r` are totals; `p, rho_d, rho_t, E_t, Q_ss, rho_c` are perturbations from the
-pressure reference (see the prognostic-slot semantics above). A zero bound on a PERTURBATION
-is not merely conservative, it is wrong: it would pin the field at or above its reference and
-forbid the cloud from ever evaporating below `ρ̄_c`. Hence anything not recognised here throws
-rather than silently taking the factory's constant bound.
+`u, w, rho_r, n_r` and all twelve ice slots are totals; `p, rho_d, rho_t, E_t, Q_ss, rho_c`
+are perturbations from the pressure reference (see the prognostic-slot semantics above). A
+zero bound on a PERTURBATION is not merely conservative, it is wrong: it would pin the field
+at or above its reference and forbid the cloud from ever evaporating below `ρ̄_c`. Hence
+anything not recognised here throws rather than silently taking the factory's constant bound.
 
-The transformed names `nu_c`/`nu_r`/`nu_nr` deliberately fall through to the error. A
-coefficient bound on a control variable is a different constraint from a bound on the density,
-and [`install_positivity_bounds!`](@ref) refuses the combination before reaching here; this is
-the backstop for a configuration that somehow gets past it.
+The transformed names `nu_c`/`nu_r`/`nu_nr` and the twelve `nu_*` ice aliases deliberately
+fall through to the error. A coefficient bound on a control variable is a different constraint
+from a bound on the density, and [`install_positivity_bounds!`](@ref) refuses the combination
+before reaching here; this is the backstop for a configuration that somehow gets past it.
 """
 function positivity_reference_profile(name::AbstractString, ref_state)
     # `n_r` (the two-moment rain number) joins the totals: there is no reference number
     # density in any configuration or in the reference-state format, exactly as for rho_r.
     name in ("rho_r", "n_r", "u", "w", "v") && return nothing  # totals: no offset
-    name in ("nu_c", "nu_r", "nu_nr") &&
+    # ...and so do all twelve ice slots, for the same reason and one stronger: there is no
+    # resting ice field in any configuration, so `f̄ ≡ 0` is a property of the equation set
+    # rather than of the sounding (reference/Scythe_moist_compressible.tex, "The ice variables
+    # are carried as totals").
+    name in MC_ICE_VARS && return nothing
+    (name in ("nu_c", "nu_r", "nu_nr") || name in values(MC_NU_ALIAS)) &&
         error("positivity is declared for \"$name\", which is a CONTROL VARIABLE, not a " *
               "density: a box constraint on its coefficients would bound the transform of " *
               "the field rather than the field. The transform already makes the recovered " *
@@ -1318,6 +1423,67 @@ transforms are independent knobs on quantities that differ by ten orders of magn
 
 @doc (@doc rain_number_slot)
 @inline recover_n_r(slot, transform::Symbol, mu) = recover_total(slot, transform, mu)
+
+"""
+    _load_total_slot!(x, nu, nu_z, J, v, trans_on, trans, mu) -> Nothing
+
+Stage one TOTAL-form prognostic for the column: copy the control variable and its fitted
+vertical gradient out of the grid views, recover the quantity itself, and form the Jacobian
+`J = dν/dx` the source terms are multiplied by.
+
+This is the block slots 8/9 and `n_r` write out inline, factored so the twelve ice slots do
+not become twelve more copies of it. Under `:none` it is `copyto!` plus `fill!(J, 1.0)`, and
+`1.0 * x === x` for every double, so a transform-free ice slot takes exactly the untransformed
+continuity form.
+
+`@inline` and allocation-free: `x`, `nu`, `nu_z`, `J` are the caller's scratch columns and
+`v` is an `mc_slot_views` `NamedTuple` of `SubArray`s.
+"""
+@inline function _load_total_slot!(x, nu, nu_z, J, v, trans_on::Bool, trans::Symbol, mu)
+    copyto!(nu, v.f)
+    copyto!(nu_z, v.f_z)
+    if trans_on
+        if trans === :bhyp
+            @. x = ahyp(nu, mu)
+        else
+            @. x = ahyp_smooth(nu, mu)
+        end
+        @. J = dbhyp(max(x, 0.0), mu)
+    else
+        copyto!(x, nu)
+        fill!(J, 1.0)
+    end
+    return nothing
+end
+
+"""
+    _ice_flux!(mtile, F, F_z, x, w_fall, slot) -> Nothing
+
+Form one ice moment's sedimentation flux `F = max(x, 0)·W` and its fitted divergence `∂F/∂z`,
+on THAT SLOT'S OWN spline column — its own basis and its own boundary conditions, so a mass
+slot with a Natural bottom lets the crystals leave the domain while a moment with a different
+fit is not forced to agree with it.
+
+`w_fall` is the fall speed WEIGHTED BY THE MOMENT BEING TRANSPORTED (negative downward, like
+`Vt`), which is the whole reason each of the four moments gets its own flux: mass, number and
+the two volume moments fall at different rates and the distribution sorts as it descends.
+
+`max(x, 0)` mirrors the rain flux for the same reason: a spline undershoot must not sediment
+NEGATIVE ice upward. The rate functions guard themselves the same way.
+
+**This stage passes `w_fall = 0.0` at every call site**, so every flux and every divergence
+here is an exact zero and the ice only advects. The Mitchell-Heymsfield speeds replace the
+literals and nothing else.
+"""
+@inline function _ice_flux!(mtile::ModelTile, F, F_z, x, w_fall, slot::Int)
+    @. F = max(x, 0.0) * w_fall
+    col = scratch_column(mtile, slot)
+    col.uMish .= F
+    Btransform!(col)
+    Atransform!(col)
+    Ixtransform(col, F_z)
+    return nothing
+end
 
 """
     condensate_transform_mode(options) -> Symbol
@@ -1480,6 +1646,126 @@ separable. Meaningless unless `rain_moments == 2`, and inert then unless set.
     return mode
 end
 
+# ── Ice: the twelve appended species slots ───────────────────────────────────
+
+"""
+The ROLE names of the twelve ice prognostic slots, SPECIES-MAJOR and in registration order —
+the order [`mc_var_names`](@ref) appends them in and therefore the order their indices run in.
+
+Species `k ∈ {1, 2, 3}` are ISHMAEL's (Jensen et al. 2017) planar-nucleated crystals,
+columnar-nucleated crystals and aggregates. Each carries four PER-UNIT-VOLUME moments:
+
+| name | symbol | units | what it is |
+|---|---|---|---|
+| `rho_ik` | ρ_{i,k} | kg/m³ | mass density |
+| `n_ik`   | n_{i,k} | #/m³  | number density |
+| `a_ik`   | a_{i,k} = n⟨a²c⟩ | m³/m³ | spheroid volume moment; (4/3)π a is the volume fraction |
+| `c_ik`   | c_{i,k} = n⟨c²a⟩ | m³/m³ | the second volume moment; φ = c/a is the aspect ratio |
+
+The moments are carried multiplied by the number density, rather than as bare per-particle
+averages, precisely so that all four are DENSITIES and all four take the same continuity form
+as every other prognostic in the set (reference/Scythe_moist_compressible.tex, Eq.
+ice_moments). Two volume moments rather than one because deposition density and aspect ratio
+evolve independently: a crystal can gain mass without gaining volume, or change habit at
+constant mass.
+"""
+const MC_ICE_VARS = ("rho_i1", "n_i1", "a_i1", "c_i1",
+                     "rho_i2", "n_i2", "a_i2", "c_i2",
+                     "rho_i3", "n_i3", "a_i3", "c_i3")
+
+"""
+The `physical_params` key holding the transform width `mu` for each entry of
+[`MC_ICE_VARS`](@ref), positionally. `mu` is DIMENSIONAL — it carries the units of the
+variable it transforms — so the four moment kinds cannot share one number the way the twelve
+slots share one transform FAMILY: mass is O(1e-7) kg/m³ at the threshold of meteorological
+relevance, number is O(1e2) #/m³, and the two volume moments are O(1e-16) m³/m³ (a 100 µm
+crystal is ~1e-12 m³ and a plausible concentration is 1e4 /m³).
+"""
+const MC_ICE_MU_KEYS = (:mu_ice, :mu_ice_n, :mu_ice_a, :mu_ice_c,
+                        :mu_ice,  :mu_ice_n, :mu_ice_a, :mu_ice_c,
+                        :mu_ice,  :mu_ice_n, :mu_ice_a, :mu_ice_c)
+
+"""Defaults for [`MC_ICE_MU_KEYS`](@ref), positionally. See there for why they differ."""
+const MC_ICE_MU_DEFAULTS = (1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
+                            1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
+                            1.0e-7, 1.0e2, 1.0e-16, 1.0e-16)
+
+"""
+    ice_microphysics(options) -> Symbol
+
+Which ice scheme the moist-compressible set carries. `:none` (the default, and the state of
+every configuration that does not set the key) registers no ice slot at all and is BITWISE
+the code that had no ice. `:ishmael` appends the twelve slots of [`MC_ICE_VARS`](@ref) and
+turns on the ice thermodynamics — the `ρ_i` term of [`retrieve_temperature`](@ref), `q_i C_i`
+in the mixture heat capacities and the entropy, and `ρ_i` in the vapor residual.
+
+**Validation: `:ishmael` REQUIRES `options[:rain_moments] == 2`.** ISHMAEL's ice-rain physics
+— rain freezing, the collection of rain by ice, and the shedding and melting branches that run
+backwards through them — is defined against a rain size distribution with a prognostic
+intercept. Run against single-moment rain it would read a drop size that the rain closure does
+not actually carry, and the disagreement would be silent. The check is here rather than at
+first use so it fires at configuration time.
+
+**What this stage does and does not do.** The slots exist, they advect, they carry the
+thermodynamics and the sedimentation machinery — but every PROCESS RATE and every FALL SPEED
+is identically zero, so `:ishmael` with zero initial ice is inert to the rest of the state
+(and is asserted to be, at `~1e-10` against the ice-free run). The live physics arrives with
+the deposition, nucleation and riming rates.
+"""
+@inline function ice_microphysics(options)
+    mode = get(options, :ice_microphysics, :none)::Symbol
+    (mode === :none || mode === :ishmael) ||
+        error("options[:ice_microphysics] = :$(mode) is not recognized; use :none (the " *
+              "default: no ice slots, bitwise the liquid-only set) or :ishmael (the twelve " *
+              "ISHMAEL ice slots — three species x mass, number and two volume moments)")
+    if mode === :ishmael && rain_moments(options) != 2
+        error("options[:ice_microphysics] = :ishmael requires options[:rain_moments] = 2 " *
+              "(it is $(rain_moments(options))). The ISHMAEL ice-rain physics — rain " *
+              "freezing, ice collection of rain, shedding and melting — is defined against " *
+              "a rain DSD whose intercept comes from a prognostic (rho_r, n_r) pair; run " *
+              "against single-moment rain it would read a drop size the rain closure does " *
+              "not carry, and nothing downstream would notice.")
+    end
+    return mode
+end
+
+"""
+    ice_transform_mode(options) -> Symbol
+
+Which control variable the TWELVE ice slots carry — ONE family key, `options[:ice_transform]`,
+with the same three values and the same `:none` default as
+[`rain_transform_mode`](@ref)/[`condensate_transform_mode`](@ref).
+
+One key for twelve slots rather than twelve keys, because the moments of a species are not
+independently meaningful: `φ_k = c_{i,k}/a_{i,k}` and `ρ_{i,k}/(4/3 π a_{i,k})` are ratios of
+two slots, and transforming one member of a ratio while the other stays linear would put a
+habit diagnostic through two different low-pass filters. The WIDTHS still differ per moment
+kind — see [`MC_ICE_MU_KEYS`](@ref) — because `mu` is dimensional.
+
+All twelve are TOTALS (`f̄ ≡ 0`; there is no resting ice field for a perturbation to be
+measured against), so the transform pair is [`total_slot`](@ref)/[`recover_total`](@ref), the
+same one rain and the rain number use.
+"""
+@inline function ice_transform_mode(options)
+    mode = get(options, :ice_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp || mode === :bhyp_smooth) ||
+        error("options[:ice_transform] = :$(mode) is not recognized; use :none (the " *
+              "default: each slot is the ice density/number/volume moment itself), :bhyp " *
+              "(Ooyama's biased hyperbolic control variable with his quasi-inverse) or " *
+              ":bhyp_smooth (the same forward map with the strict C^inf inverse)")
+    return mode
+end
+
+"""
+    ice_mu(physical_params, j) -> Float64
+
+The transform width for the `j`-th entry of [`MC_ICE_VARS`](@ref), from
+[`MC_ICE_MU_KEYS`](@ref) with the [`MC_ICE_MU_DEFAULTS`](@ref) fallback. Setup-path only —
+`mc_driver!` reads the four distinct values once per column, not twelve.
+"""
+@inline ice_mu(physical_params, j::Int) =
+    get(physical_params, MC_ICE_MU_KEYS[j], MC_ICE_MU_DEFAULTS[j])
+
 # ── Slot NAMES under a transform ──────────────────────────────────────────────
 # A transformed slot no longer holds what its name says, and the name is what every consumer
 # keys off: Springsteel builds the CSV/netCDF column headers straight from `GridParameters.vars`
@@ -1489,7 +1775,17 @@ end
 # diagnostics recorded `min_rho_c = 0`. The transformed slots are therefore RENAMED, following
 # Ooyama's own notation, in which `mu` is the mixing ratio and `nu` its transform. (`n` was
 # considered and rejected: it reads as number concentration in a double-moment scheme.)
-const MC_NU_ALIAS = Dict("rho_c" => "nu_c", "rho_r" => "nu_r", "n_r" => "nu_nr")
+# The ice slots follow the same rule: `nu_` prefixed to a tag that says which moment of which
+# species the column holds (`nu_i1` mass, `nu_ni1` number, `nu_ai1`/`nu_ci1` the two volume
+# moments), so no two of the fifteen transformable slots can collide and no output column ever
+# claims to hold a density it does not.
+const MC_NU_ALIAS = Dict("rho_c" => "nu_c", "rho_r" => "nu_r", "n_r" => "nu_nr",
+                         "rho_i1" => "nu_i1", "n_i1" => "nu_ni1",
+                         "a_i1" => "nu_ai1", "c_i1" => "nu_ci1",
+                         "rho_i2" => "nu_i2", "n_i2" => "nu_ni2",
+                         "a_i2" => "nu_ai2", "c_i2" => "nu_ci2",
+                         "rho_i3" => "nu_i3", "n_i3" => "nu_ni3",
+                         "a_i3" => "nu_ai3", "c_i3" => "nu_ci3")
 
 """
     condensate_var_name(options) -> String
@@ -1511,6 +1807,19 @@ rain_number_var_name(options) =
     rain_number_transform_mode(options) === :none ? "n_r" : "nu_nr"
 
 """
+    ice_var_names(options) -> NTuple{12,String}
+
+The names the twelve ice slots carry under the current options: [`MC_ICE_VARS`](@ref) itself
+when `options[:ice_transform]` is `:none`, their [`MC_NU_ALIAS`](@ref) aliases under a
+transform. Empty of meaning unless `ice_microphysics(options) === :ishmael`, which is the only
+thing that registers them.
+"""
+@inline function ice_var_names(options)
+    on = ice_transform_mode(options) !== :none
+    return ntuple(j -> on ? MC_NU_ALIAS[MC_ICE_VARS[j]] : MC_ICE_VARS[j], 12)
+end
+
+"""
     mc_var_names(options; cyl = false) -> Vector{String}
 
 The ordered prognostic-slot names for the moist-compressible set under the current options —
@@ -1523,7 +1832,9 @@ throughout `mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`, so eve
 slot is APPENDED after that block and never inserted. Its index is therefore
 geometry-dependent (`n_r` is 10 on XZ and 11 on the cylinders) and must be resolved BY NAME —
 [`mc_slot`](@ref), cached once per tile in [`MCSlots`](@ref), never a per-column lookup. This
-is the pattern the ice categories follow.
+is the pattern the ice categories follow — and do follow: the twelve of
+[`MC_ICE_VARS`](@ref) are appended AFTER `n_r`, species-major, so on the XZ slice they run 11
+through 22 and on the cylinders 12 through 23.
 """
 function mc_var_names(options; cyl::Bool = false)
     names = copy(cyl ? MC_VARS_CYL : MC_VARS)
@@ -1532,6 +1843,13 @@ function mc_var_names(options; cyl::Bool = false)
     # ── APPENDED optional slots, in registration order. Absent by default, so the list
     #    every existing configuration gets back is bit-identical. ──
     rain_moments(options) == 2 && push!(names, rain_number_var_name(options))
+    # The ice family, after the rain number (which `ice_microphysics` requires be present),
+    # species-major so a species' four moments are contiguous.
+    if ice_microphysics(options) === :ishmael
+        for nm in ice_var_names(options)
+            push!(names, nm)
+        end
+    end
     return names
 end
 
@@ -1539,7 +1857,8 @@ end
     mc_slot(vars, role) -> Int
 
 The slot index of a water species by ROLE rather than by name, accepting either the density
-name or its transformed alias. `role` is `"rho_c"`, `"rho_r"` or `"n_r"`.
+name or its transformed alias. `role` is `"rho_c"`, `"rho_r"`, `"n_r"`, or any entry of
+[`MC_ICE_VARS`](@ref).
 
 Every `vars["rho_c"]`-style lookup in the kernel goes through this, so that a transformed
 configuration cannot produce a `KeyError` deep in a solver — and, more importantly, so that the
@@ -1576,6 +1895,34 @@ per-column path uses [`MCSlots`](@ref) instead; this is a name lookup.
 end
 
 """
+    mc_ice_slot_indices(vars) -> NTuple{12,Int}
+
+The indices of the twelve [`MC_ICE_VARS`](@ref) slots in registration order, each `0` when the
+configuration did not register it — [`mc_optional_slot`](@ref) twelve times, resolved once so
+an initializer does not do a name lookup per gridpoint.
+"""
+@inline mc_ice_slot_indices(vars) =
+    ntuple(j -> mc_optional_slot(vars, MC_ICE_VARS[j]), 12)
+
+"""
+    seed_ice_zero!(physical, i, ice_i) -> Nothing
+
+Seed every registered ice slot of gridpoint `i` with zero. A no-op for a configuration that
+registered none, so every existing initializer is unaffected.
+
+Zero is the right value under EVERY transform without threading a mode through, for the same
+reason `rain_slot(0.0, …) === 0.0`: `bhyp(0) == 0` exactly. And zero is the right PHYSICS for
+every idealized initializer in this file — a warm bubble and a balanced vortex have no ice to
+start with, and (with the process rates live) nucleation is what will put it there.
+"""
+@inline function seed_ice_zero!(physical, i::Int, ice_i::NTuple{12,Int})
+    @inbounds for s in ice_i
+        s > 0 && (physical[i, s, 1] = 0.0)
+    end
+    return nothing
+end
+
+"""
     check_mc_var_names(model) -> Nothing
 
 Refuse a configuration whose name-keyed `GridParameters` dicts disagree with the declared
@@ -1599,16 +1946,28 @@ function check_mc_var_names(model::ModelParameters)
     rtrans = rain_transform_mode(model.options)
     nrtrans = rain_number_transform_mode(model.options)
     nmoments = rain_moments(model.options)
-    (ctrans === :none && rtrans === :none && nrtrans === :none && nmoments == 1) &&
-        return nothing
+    # `ice_microphysics` is where the `:ishmael` ⇒ `rain_moments == 2` requirement is raised,
+    # so call it even on the early-return path: a configuration that declares ice against
+    # single-moment rain must fail HERE, at tile creation, and not at whatever later point
+    # something first reads a drop size that is not carried.
+    ice = ice_microphysics(model.options)
+    itrans = ice_transform_mode(model.options)
+    (ctrans === :none && rtrans === :none && nrtrans === :none && nmoments == 1 &&
+     ice === :none) && return nothing
 
     gp = model.grid_params
     expected = Set(mc_var_names(model.options;
-                                cyl = haskey(gp.vars, "v") && length(gp.vars) >= 10))
+                                cyl = haskey(gp.vars, "v") &&
+                                      gp.vars["v"] == 10))
     stale = String[]
     ctrans === :none || push!(stale, "rho_c")
     rtrans === :none || push!(stale, "rho_r")
     nrtrans === :none || push!(stale, "n_r")
+    if itrans !== :none
+        for nm in MC_ICE_VARS
+            push!(stale, nm)
+        end
+    end
 
     # The appended slots, in the other direction: declared by the options, so `vars` must
     # carry them. (Only `vars` — the BC/l_q/positivity dicts legitimately fall back to
@@ -1621,6 +1980,16 @@ function check_mc_var_names(model::ModelParameters)
                   "$(sort(collect(keys(gp.vars))))). The slot is APPENDED after the fixed " *
                   "1-9 (+v) block, so its index is geometry-dependent and only " *
                   "`Scythe.mc_var_names(options)` knows it — build `vars` from that.")
+    end
+    if ice === :ishmael
+        for nm in ice_var_names(model.options)
+            haskey(gp.vars, nm) ||
+                error("options[:ice_microphysics] = :ishmael declares the ice slot " *
+                      "\"$nm\", but grid_params.vars does not have it (it has " *
+                      "$(sort(collect(keys(gp.vars))))). All twelve are APPENDED after " *
+                      "n_r, so their indices are geometry-dependent and only " *
+                      "`Scythe.mc_var_names(options)` knows them — build `vars` from that.")
+        end
     end
 
     for (label, d) in (("vars", gp.vars), ("BCL", gp.BCL), ("BCR", gp.BCR),
@@ -1746,6 +2115,21 @@ function install_positivity_bounds!(grid, ref_state, model::ModelParameters)
                   "transform makes the recovered density non-negative by construction; a " *
                   "coefficient bound would constrain the control variable instead, which is " *
                   "a different constraint. Drop \"$name\" from positivity.")
+    end
+    # The twelve ice slots share ONE transform key (`ice_transform`; see
+    # `ice_transform_mode` for why the family is not twelve independent knobs), so the
+    # exclusivity is one mode against twelve names.
+    let imode = ice_transform_mode(model.options)
+        if imode !== :none
+            for name in MC_ICE_VARS
+                haskey(pos, name) &&
+                    error("positivity is declared for \"$name\" while " *
+                          "options[:ice_transform] is on. The transform makes the recovered " *
+                          "moment non-negative by construction; a coefficient bound would " *
+                          "constrain the control variable instead, which is a different " *
+                          "constraint. Drop \"$name\" from positivity.")
+            end
+        end
     end
     isempty(pos) && return nothing
     grid.kbasis isa Springsteel.SplineBasisArray || return nothing
@@ -1928,6 +2312,16 @@ precisely why the retrieval turns it into latent heat.
 
 Applied to `var_np1` at the END of the column step (after the acoustic solve and the
 vertical diffusion), so the values entering the patch-level fit are admissible.
+
+# What the MEASUREMENT covers
+
+`rho_c` and `rho_r` only, hence `min_c`/`min_r` and nothing else. The rain NUMBER and the
+twelve ICE slots are not measured here: this function's statistics are in kg/m³ and are
+converted to a latent-heat `worst_dT` through `L_v0/D`, which is a statement about mass. A
+negative ice moment is a different quantity with a different consequence (a negative `a_{i,k}`
+is a negative volume, not a negative heat), and reporting it in these rows would make
+`moved`/`worst_dT` mean two things at once. The ice slots are inert while every process rate
+is zero; a moment-aware negativity census belongs with the rates that can drive them there.
 """
 function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
 
@@ -1966,6 +2360,18 @@ function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
         error("options[:clamp_water] with options[:rain_moments] = 2: flooring rho_r " *
               "without flooring n_r alongside it leaves the column with drops that carry " *
               "no mass, which is a worse state than the negative one. A number-consistent " *
+              "floor is deferred; drop one.")
+    end
+    # Ice refuses it for BOTH of the above reasons at once, and a third. Rule 2 below balances
+    # the partition against `rho_w = rho_t - rho_d`, which with ice present is
+    # `rho_v + rho_liq + rho_ice` — so a floor that does not see the ice mass would attribute
+    # it to vapor and take the "excess" out of the liquid. And each ice species carries three
+    # further moments that a mass repair would have to move with it, or leave the column with
+    # crystals of no mass (or mass in no crystals).
+    if apply && ice_microphysics(mtile.model.options) === :ishmael
+        error("options[:clamp_water] with options[:ice_microphysics] = :ishmael: the floor " *
+              "balances the partition against rho_t - rho_d, which now includes the ice, and " *
+              "an ice mass repair would have to carry n/a/c with it. A moment-consistent " *
               "floor is deferred; drop one.")
     end
 
@@ -3034,6 +3440,64 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
               "column. Set Kvdiff_water = 0 or add the n_r solve to " *
               "`_diffusion_water_step!`.")
     end
+    # ── Ice (options[:ice_microphysics] === :ishmael; see `ice_microphysics`) ──
+    # Read from the SLOTS, on the same rule the rain number follows: `MCSlots` resolved the
+    # twelve appended indices by name once when the tile was built, and `ice_registered` is
+    # the same `> 0` test the writes below use, so "the slots exist" and "the ice runs"
+    # cannot disagree. ONE transform family covers all twelve; FOUR widths, because `mu`
+    # carries the units of what it transforms (see `ice_transform_mode`, `MC_ICE_MU_KEYS`).
+    IS = mtile.mc_slots
+    ice_on = ice_registered(IS)
+    itrans = ice_on ? ice_transform_mode(model.options) : :none
+    itrans_on = itrans !== :none
+    imu_q = get(model.physical_params, :mu_ice, 1.0e-7)
+    imu_n = get(model.physical_params, :mu_ice_n, 1.0e2)
+    imu_a = get(model.physical_params, :mu_ice_a, 1.0e-16)
+    imu_c = get(model.physical_params, :mu_ice_c, 1.0e-16)
+    if ice_on && budget_trace
+        # Same refusal as the rain number's, one category further out: the budget rows are
+        # the three LIQUID mass channels, so neither the ice mass nor its three moments has
+        # anywhere to report, and `MC_BUDGET_V`'s vapor row would stop closing the moment
+        # deposition existed.
+        error("options[:water_budget_trace] with options[:ice_microphysics] = :ishmael is " *
+              "not implemented: the budget rows are the liquid mass channels, so the ice " *
+              "mass and its number/volume moments have nowhere to report. Add ice blocks to " *
+              "`MC_WATER_STATS` before enabling it.")
+    end
+    if ice_on && Khdiff_water != 0.0
+        # The horizontal counterpart, refused for the same reason and one more. The block
+        # mixes rho_t, rho_d, rho_c and rho_r and takes the vapor Laplacian as the remainder
+        # — which with ice inside rho_t is not the vapor — and it is explicitly NOT energy
+        # consistent even for liquid (see the block itself). Mixing an ice MASS without its
+        # number and volume moments would also rescale every crystal the operator touches.
+        error("physical_params[:Khdiff_water] != 0 with options[:ice_microphysics] = " *
+              ":ishmael is not implemented: the horizontal water mixing implies the vapor " *
+              "from the liquid species, and mixing an ice mass without its n/a/c moments " *
+              "rescales the crystals of every column it touches. Set Khdiff_water = 0 or " *
+              "add the twelve ice Laplacians (and the energy consistency they need).")
+    end
+    if ice_on && Kvdiff_water > 0.0
+        # `_diffusion_water_step!` diffuses rho_t/rho_c/rho_r and IMPLIES the vapor as the
+        # remainder. With ice in rho_t that remainder is wrong by the ice mass, and nothing
+        # diffuses the ice or its moments — the diffused column would gain vapor it does not
+        # have and keep crystals whose volume moments the operator never touched.
+        error("physical_params[:Kvdiff_water] > 0 with options[:ice_microphysics] = " *
+              ":ishmael is not implemented: the implicit vertical water diffusion implies " *
+              "the vapor from rho_t - rho_d - rho_c - rho_r, which with ice present is not " *
+              "the vapor, and nothing diffuses the ice moments. Set Kvdiff_water = 0 or add " *
+              "the ice solves to `_diffusion_water_step!`.")
+    end
+    if ice_on && get(model.options, :louis_bl, false)::Bool
+        # The Louis BL mixes total water and cloud and takes the vapor as their difference
+        # (`vdot_v = vdot_w - vdot_c` in `mc_boundary_layer.jl`). With ice inside rho_t that
+        # difference attributes the ice flux to vapor, and the surface-flux ladder has no ice
+        # leg at all. Refuse rather than mix a partition that does not add up.
+        error("options[:louis_bl] with options[:ice_microphysics] = :ishmael is not " *
+              "implemented: the boundary layer implies the vapor tendency as " *
+              "rho_dot_w - rho_dot_c, which with ice in rho_t is not the vapor tendency, " *
+              "and nothing mixes the ice moments. Add the ice legs to " *
+              "`mc_boundary_layer_column!` before enabling it.")
+    end
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
     N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
     # Cloud droplet number [#/cm^3] of the condensation closure. Passed explicitly (it was
@@ -3116,6 +3580,22 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # same straight-line code every other slot's is and elides identically; nothing reads it
     # unless `rain_2m`. (Building it inside a runtime branch is what stops a view eliding.)
     nrv = mc_slot_views(grid, colstart, colend, rain_2m ? nr_i : 8, geom)
+    # The twelve APPENDED ice slots (11-22 on XZ, 12-23 on the cylinders), bound the same
+    # way and for the same reason: UNCONDITIONALLY, aliased to slot 8 when ice is off, so
+    # every one of these is the same straight-line `mc_slot_views` call the nine fixed slots
+    # make and elides identically. Nothing reads them unless `ice_on`.
+    i1qv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_q : 8, geom)
+    i1nv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_n : 8, geom)
+    i1av = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_a : 8, geom)
+    i1cv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_c : 8, geom)
+    i2qv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_q : 8, geom)
+    i2nv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_n : 8, geom)
+    i2av = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_a : 8, geom)
+    i2cv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_c : 8, geom)
+    i3qv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_q : 8, geom)
+    i3nv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_n : 8, geom)
+    i3av = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_a : 8, geom)
+    i3cv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_c : 8, geom)
 
     pp = pv.f;      pp_x = pv.f_x;         pp_z = pv.f_z
     rho_dp = rdv.f; rho_dp_x = rdv.f_x;    rho_dp_z = rdv.f_z; rho_dp_zz = rdv.f_zz
@@ -3222,6 +3702,28 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             fill!(Jnr, 1.0)
         end
     end
+    # The twelve appended ICE slots, each the same construction through the shared
+    # `_load_total_slot!`: all twelve are TOTALS (`f̄ ≡ 0`), so each slot IS its own control
+    # variable. One transform family, four widths — `mu` is dimensional and mass, number and
+    # the two volume moments are ten and nine decades apart (`MC_ICE_MU_KEYS`). Skipped
+    # entirely when ice is off, where none of these columns is ever read.
+    i1q = S.i1q; i1n = S.i1n; i1a = S.i1a; i1c = S.i1c
+    i2q = S.i2q; i2n = S.i2n; i2a = S.i2a; i2c = S.i2c
+    i3q = S.i3q; i3n = S.i3n; i3a = S.i3a; i3c = S.i3c
+    if ice_on
+        _load_total_slot!(i1q, S.nu_i1q, S.nu_i1q_z, S.J_i1q, i1qv, itrans_on, itrans, imu_q)
+        _load_total_slot!(i1n, S.nu_i1n, S.nu_i1n_z, S.J_i1n, i1nv, itrans_on, itrans, imu_n)
+        _load_total_slot!(i1a, S.nu_i1a, S.nu_i1a_z, S.J_i1a, i1av, itrans_on, itrans, imu_a)
+        _load_total_slot!(i1c, S.nu_i1c, S.nu_i1c_z, S.J_i1c, i1cv, itrans_on, itrans, imu_c)
+        _load_total_slot!(i2q, S.nu_i2q, S.nu_i2q_z, S.J_i2q, i2qv, itrans_on, itrans, imu_q)
+        _load_total_slot!(i2n, S.nu_i2n, S.nu_i2n_z, S.J_i2n, i2nv, itrans_on, itrans, imu_n)
+        _load_total_slot!(i2a, S.nu_i2a, S.nu_i2a_z, S.J_i2a, i2av, itrans_on, itrans, imu_a)
+        _load_total_slot!(i2c, S.nu_i2c, S.nu_i2c_z, S.J_i2c, i2cv, itrans_on, itrans, imu_c)
+        _load_total_slot!(i3q, S.nu_i3q, S.nu_i3q_z, S.J_i3q, i3qv, itrans_on, itrans, imu_q)
+        _load_total_slot!(i3n, S.nu_i3n, S.nu_i3n_z, S.J_i3n, i3nv, itrans_on, itrans, imu_n)
+        _load_total_slot!(i3a, S.nu_i3a, S.nu_i3a_z, S.J_i3a, i3av, itrans_on, itrans, imu_a)
+        _load_total_slot!(i3c, S.nu_i3c, S.nu_i3c_z, S.J_i3c, i3cv, itrans_on, itrans, imu_c)
+    end
 
     # Total vertical gradients (perturbation + reference)
     p_z = S.p_z;         @. p_z = pp_z + pbar_z
@@ -3243,6 +3745,18 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     geo = S.geo; @. geo = ke + (gravity * z)
     M = S.M;     @. M = p + E_t - (rho_t * geo)
     rho_liq = S.rho_liq; @. rho_liq = rho_c + rho_r
+    # The total ICE density, ρ_i = Σ_k ρ_{i,k} — the retrieval's second condensed mass and the
+    # third term of the vapor residual. Filled exactly where `rho_liq` is, and ZEROED (not
+    # left stale) when ice is off, because every consumer below reads it unconditionally: the
+    # `ρ_i = 0` arithmetic is EXACT (see `retrieve_temperature`), so an ice-free run is
+    # bitwise the code that had no ice, and one `fill!` per column is the price of not
+    # branching the whole thermodynamic block.
+    rho_ice = S.rho_ice
+    if ice_on
+        @. rho_ice = (i1q + i2q) + i3q
+    else
+        fill!(rho_ice, 0.0)
+    end
     # What the THERMODYNAMICS reads. Under the default `:none` this is a copy of identical
     # doubles, so the whole option is bitwise inert (same construction as `rho_v` under
     # `:residual`). Under `:diagnostic` it is the floored liquid, and ONLY the consumers below
@@ -3257,25 +3771,54 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     else
         copyto!(rho_liq_t, rho_liq)
     end
-    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq_t)
+    # The ice mirror of `rho_liq_t`, floored per species under `:diagnostic` for the same
+    # reason: a spline undershoot in one ice mass must not reach the retrieval as negative
+    # latent heat. `rho_ice` itself stays raw, because `res_rho_t` must see the water
+    # partition the continuity equations actually carry.
+    rho_ice_t = S.rho_ice_t
+    if cond_floor && ice_on
+        @. rho_ice_t = (max(i1q, 0.0) + max(i2q, 0.0)) + max(i3q, 0.0)
+    else
+        copyto!(rho_ice_t, rho_ice)
+    end
+    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq_t, rho_ice_t)
     p_hPa = S.p_hPa;   @. p_hPa = p / 100.0
     rho_vs = S.rho_vs; @. rho_vs = rho_v_sat(Tk, p_hPa)
     # The DENSITY-BUDGET residual, always. `S.res_rho_t` is not an alias of `S.rho_v`: the
     # reconciliation below must read this one whatever the retrieval is (see qss_relaxation),
     # and the partition-gap census differences the two.
-    res_rho_t = S.res_rho_t; @. res_rho_t = rho_t - rho_d - rho_liq
+    # ICE IS IN THE RESIDUAL: ρ_v = ρ_t − ρ_d − ρ_liq − ρ_ice (Eq. ice_mass of the TeX). With
+    # ice off `rho_ice` is an exact zero column and `x - 0.0 === x`, so this is bitwise the
+    # three-term residual it was.
+    res_rho_t = S.res_rho_t; @. res_rho_t = rho_t - rho_d - rho_liq - rho_ice
     # ... and `S.rho_v` is the vapor EVERY OTHER consumer reads. Under `:residual` it is a copy
     # of the residual — a copy of identical doubles, so the whole option is bitwise inert.
     rho_v = S.rho_v
+    # The blend's REGIME SELECTOR is the CONDENSED mass, and ice is condensed mass: the whole
+    # argument for the blend is that `rho_t - rho_d - <condensate>` cancels catastrophically
+    # where the condensate is large, which a cirrus anvil does to exactly the same degree a
+    # water cloud does. So the selector reads `rho_liq + rho_ice`. When ice is off this is
+    # ALIASED to `rho_liq` — the identical array, not a copy of it — so the argument the blend
+    # receives is bit-for-bit the one it received before ice existed.
+    rho_cond = rho_liq
+    if ice_on
+        rho_cond = S.rho_cond
+        @. rho_cond = rho_liq + rho_ice
+    end
     if vapor_blend
-        @. rho_v = vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t,
+        @. rho_v = vapor_retrieval_blend(Q_ss, rho_vs, rho_cond, res_rho_t,
                                          blend_l0, blend_l1, blend_t0, blend_t1, blend_dcap)
     else
         @. rho_v = res_rho_t
     end
     q_v = S.q_v;     @. q_v = rho_v / rho_d
     q_l = S.q_l;     @. q_l = rho_liq_t / rho_d      # thermodynamic reader: see rho_liq_t
-    C_vt = S.C_vt;   @. C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
+    q_i = S.q_i;     @. q_i = rho_ice_t / rho_d      # ditto; exactly 0.0 with ice off
+    # Ice enters the mixture heat capacity through `q_i C_i`, exactly as liquid does through
+    # `q_l C_l` — a condensed phase performs no expansion work (TeX Eq. mixture_C). `R_m` is
+    # untouched (ice exerts no partial pressure) and `C_pt = C_vt + R_m` still holds, so
+    # gamma_m and the acoustic coefficient change VALUE with q_i but not FORM.
+    C_vt = S.C_vt;   @. C_vt = Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)
     R_m = S.R_m;     @. R_m = Rd + (q_v * Rv)
     C_pt = S.C_pt;   @. C_pt = C_vt + R_m
     gamma_m = S.gamma_m; @. gamma_m = C_pt / C_vt
@@ -3297,7 +3840,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # the latent heat comes out of the retrieval and no adjustment step is needed after
     # the timestep. With the rain channel inert (N_r = 0), Qdot is bit-identical to the
     # single-category closure and Qdot_r is exactly zero.
-    Q_s = S.Q_s;   @. Q_s = Q_s_energy(Tk, p, rho_d, q_v, q_l)
+    Q_s = S.Q_s;   @. Q_s = Q_s_energy(Tk, p, rho_d, q_v, q_l, q_i)
     Qdot = S.Qdot          # cloud channel
     Qdot_r = S.Qdot_r      # rain channel
     # `options[:condensation] = false` switches the phase change off ENTIRELY --
@@ -3486,6 +4029,67 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         fill!(Fnr_z, 0.0)
     end
 
+    # ── Ice: process sources and sedimentation ─────────────────────────────────
+    #
+    # *** TRANSPORT ONLY. EVERY PROCESS RATE AND EVERY FALL SPEED HERE IS ZERO. ***
+    #
+    # The structure is final and the numbers are not. Each of the twelve slots gets a source
+    # accumulator `SRC_*` (the `Q̇_{i,k}`, `Ṅ_k`, `Ȧ_k`, `Ċ_k` of Eqs. ice_prog_mass..ice_prog_c)
+    # and a sedimentation flux `F_X = X·W_X` fitted on its OWN spline column, where `W_X` is the
+    # fall speed weighted by the very moment being transported — which is what makes the size
+    # distribution sort as it falls, and is why the four moments of a species cannot share one
+    # flux. This stage fills the sources with zeros and the speeds with a literal `0.0`, so the
+    # ice advects and does nothing else; the deposition/nucleation/riming rates and the
+    # Mitchell-Heymsfield fall speeds replace exactly those two things and nothing else.
+    #
+    # ONLY THE MASS FLUXES LEAVE THIS BLOCK. `Fi_z = Σ_k ∂F_{ρ,k}/∂z` is the ice sedimentation
+    # rate `Q̇_sed_i` that sources ρ_t, and `E_sed_i` is the energy it carries,
+    # `(C_pv T − L_s + ke + gz)` per kg — the ice mirror of the liquid `E_sed`, with `L_s` in
+    # place of `L_v` (TeX Eq. Et_ice). The number and volume fluxes carry neither mass nor
+    # energy and appear in no other equation, exactly as the rain number's does not.
+    Fi_z = S.Fi_z
+    E_sed_i_z = S.E_sed_i_z
+    if ice_on
+        # S8: the process rates land here, in place of these twelve `fill!`s.
+        fill!(S.SRC_i1q, 0.0); fill!(S.SRC_i1n, 0.0)
+        fill!(S.SRC_i1a, 0.0); fill!(S.SRC_i1c, 0.0)
+        fill!(S.SRC_i2q, 0.0); fill!(S.SRC_i2n, 0.0)
+        fill!(S.SRC_i2a, 0.0); fill!(S.SRC_i2c, 0.0)
+        fill!(S.SRC_i3q, 0.0); fill!(S.SRC_i3n, 0.0)
+        fill!(S.SRC_i3a, 0.0); fill!(S.SRC_i3c, 0.0)
+
+        # S8: replace each literal `0.0` with that moment's weighted fall speed (negative
+        # downward, as `Vt` is). Nothing else in this block changes.
+        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, 0.0, IS.i1_q)
+        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, 0.0, IS.i1_n)
+        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, 0.0, IS.i1_a)
+        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, 0.0, IS.i1_c)
+        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, 0.0, IS.i2_q)
+        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, 0.0, IS.i2_n)
+        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, 0.0, IS.i2_a)
+        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, 0.0, IS.i2_c)
+        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, 0.0, IS.i3_q)
+        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, 0.0, IS.i3_n)
+        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, 0.0, IS.i3_a)
+        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, 0.0, IS.i3_c)
+
+        # The two AGGREGATES that reach the conserved variables. `Fi_z` is summed from the
+        # three fitted mass-flux divergences rather than refitting their sum, so slot 3 and
+        # the three ice mass slots receive exactly the same discrete numbers and cannot drift
+        # apart — the telescoping argument slot 8 and slot 3 make for the rain.
+        @. Fi_z = (S.F_i1q_z + S.F_i2q_z) + S.F_i3q_z
+        E_sed_i = S.E_sed_i
+        @. E_sed_i = ((S.F_i1q + S.F_i2q) + S.F_i3q) *
+                     ((Cpv * Tk) - L_s(Tk) + ke + (gravity * z))
+        # Fitted on species 1's mass column: it is a MASS flux and takes a mass slot's basis
+        # and BCs (Natural at the bottom, so the energy can leave with the ice).
+        ei_col = scratch_column(mtile, IS.i1_q)
+        ei_col.uMish .= E_sed_i
+        Btransform!(ei_col)
+        Atransform!(ei_col)
+        Ixtransform(ei_col, E_sed_i_z)
+    end
+
     # Record this step's net microphysics tendency per channel, so the NEXT step's depletion
     # budget can be written against the integrator's actual three-level combination. Here,
     # after the `precipitation` branch, because the cloud channel is not final until
@@ -3607,6 +4211,19 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @turbo FORCING .= @. (-rho_t * div) + ((rho_tbar * w_z) + (rho_tbar_z * w)) - Fr_z
     end
     @turbo expdot[colstart:colend,3] .= @. ADV + FORCING
+    # The ICE sedimentation rate `Q̇_sed_i = Σ_k ∂F_{ρ,k}/∂z`, the second mass flux out of the
+    # total water (TeX Eq. ice_mass). Applied as a SEPARATE accumulation rather than folded
+    # into the expression above, so the ice-free path's `@turbo` expression is untouched
+    # byte-for-byte and the default run cannot move by an instruction-selection accident.
+    # Explicit loop, not `expdot[colstart:colend,3] .-= Fi_z`: an indexed broadcast-update
+    # reads its own target through `getindex`, which materializes a fresh column every call
+    # (measured: 2 allocations per line). Same reason the horizontal water mixing and the
+    # Louis BL write their additions this way.
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            expdot[colstart + i - 1, 3] -= Fi_z[i]
+        end
+    end
 
     # u momentum (slot 4): PGF directly from the prognostic pressure
     mc_advect!(ADV, geom, u, w, vv, r, u_x, u_z, uv.f_l)
@@ -3649,6 +4266,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     else
         @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE +
                                                (((E_tbar + pbar) * w_z) + ((E_tbar_z + pbar_z) * w))
+    end
+    # The energy the falling ICE carries out of the parcel, `(C_pv T − L_s + ke + gz)` per kg
+    # of ice (TeX Eq. Et_ice) — the ice mirror of `E_sed_z`, which `mc_et_work!` already
+    # applied for the liquid, and with the same sign. Separate accumulation for the same
+    # reason slot 3's is: the ice-free `@turbo` expressions above stay byte-identical.
+    if ice_on
+        @inbounds for i in eachindex(E_sed_i_z)      # explicit loop; see the slot-3 note
+            expdot[colstart + i - 1, 6] -= E_sed_i_z[i]
+        end
     end
 
     # ── AI2* acoustic history staging ──
@@ -3835,6 +4461,71 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_advect!(ADV, geom, u, w, vv, r, nrv.f_x, nu_nr_z, nrv.f_l)
         @turbo FORCING .= @. Jnr * ((-n_r * div) + NR_SRC - Fnr_z)
         @turbo expdot[colstart:colend, nr_i] .= @. ADV + FORCING
+    end
+
+    # ── The twelve ICE slots ───────────────────────────────────────────────────
+    #
+    # All twelve take the SAME form, which is the form every other total in the set takes
+    # (Eqs. ice_prog_mass..ice_prog_c):
+    #
+    #     ∂X/∂t = −u·∇X − X ∇·u + Ẋ − ∂F_X/∂z
+    #
+    # with the advection transform-invariant (it reads the control variable's own fitted
+    # gradients; `nu_*_z` is bitwise the density gradient under `:none`) and everything else
+    # through the Jacobian, exactly as slots 8 and 9 do. `SRC_*` is the process source and
+    # `F_*_z` the moment-weighted sedimentation flux divergence — BOTH IDENTICALLY ZERO at
+    # this stage, so what runs here is pure continuity transport.
+    #
+    # Nothing else in the set receives anything from a NUMBER or a VOLUME slot: only the three
+    # MASS fluxes reach ρ_t and E_t, and they did so above.
+    if ice_on
+        mc_advect!(ADV, geom, u, w, vv, r, i1qv.f_x, S.nu_i1q_z, i1qv.f_l)
+        @turbo FORCING .= @. S.J_i1q * ((-i1q * div) + S.SRC_i1q - S.F_i1q_z)
+        @turbo expdot[colstart:colend, IS.i1_q] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i1nv.f_x, S.nu_i1n_z, i1nv.f_l)
+        @turbo FORCING .= @. S.J_i1n * ((-i1n * div) + S.SRC_i1n - S.F_i1n_z)
+        @turbo expdot[colstart:colend, IS.i1_n] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i1av.f_x, S.nu_i1a_z, i1av.f_l)
+        @turbo FORCING .= @. S.J_i1a * ((-i1a * div) + S.SRC_i1a - S.F_i1a_z)
+        @turbo expdot[colstart:colend, IS.i1_a] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i1cv.f_x, S.nu_i1c_z, i1cv.f_l)
+        @turbo FORCING .= @. S.J_i1c * ((-i1c * div) + S.SRC_i1c - S.F_i1c_z)
+        @turbo expdot[colstart:colend, IS.i1_c] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2qv.f_x, S.nu_i2q_z, i2qv.f_l)
+        @turbo FORCING .= @. S.J_i2q * ((-i2q * div) + S.SRC_i2q - S.F_i2q_z)
+        @turbo expdot[colstart:colend, IS.i2_q] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2nv.f_x, S.nu_i2n_z, i2nv.f_l)
+        @turbo FORCING .= @. S.J_i2n * ((-i2n * div) + S.SRC_i2n - S.F_i2n_z)
+        @turbo expdot[colstart:colend, IS.i2_n] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2av.f_x, S.nu_i2a_z, i2av.f_l)
+        @turbo FORCING .= @. S.J_i2a * ((-i2a * div) + S.SRC_i2a - S.F_i2a_z)
+        @turbo expdot[colstart:colend, IS.i2_a] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2cv.f_x, S.nu_i2c_z, i2cv.f_l)
+        @turbo FORCING .= @. S.J_i2c * ((-i2c * div) + S.SRC_i2c - S.F_i2c_z)
+        @turbo expdot[colstart:colend, IS.i2_c] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3qv.f_x, S.nu_i3q_z, i3qv.f_l)
+        @turbo FORCING .= @. S.J_i3q * ((-i3q * div) + S.SRC_i3q - S.F_i3q_z)
+        @turbo expdot[colstart:colend, IS.i3_q] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3nv.f_x, S.nu_i3n_z, i3nv.f_l)
+        @turbo FORCING .= @. S.J_i3n * ((-i3n * div) + S.SRC_i3n - S.F_i3n_z)
+        @turbo expdot[colstart:colend, IS.i3_n] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3av.f_x, S.nu_i3a_z, i3av.f_l)
+        @turbo FORCING .= @. S.J_i3a * ((-i3a * div) + S.SRC_i3a - S.F_i3a_z)
+        @turbo expdot[colstart:colend, IS.i3_a] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3cv.f_x, S.nu_i3c_z, i3cv.f_l)
+        @turbo FORCING .= @. S.J_i3c * ((-i3c * div) + S.SRC_i3c - S.F_i3c_z)
+        @turbo expdot[colstart:colend, IS.i3_c] .= @. ADV + FORCING
     end
 
     # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
@@ -4057,7 +4748,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         end
         if Kvdiff_heat > 0.0
             s_t = S.s_t
-            @. s_t = moist_entropy_total(Tk, rho_d, q_v, q_l)
+            # `q_i C_i ln(T/T_0)` joins the liquid term (TeX Eq. entropy_ice); `q_i` is an
+            # exact 0.0 column with ice off, so this is bitwise the pre-ice `s_t`.
+            @. s_t = moist_entropy_total(Tk, rho_d, q_v, q_l, q_i)
             # ∂zz(s_t') from the column basis, so the explicit AI2* tendency and the implicit
             # Helmholtz operator use the same discrete ∂zz.
             s_col = scratch_column(mtile, 6)
@@ -4834,7 +5527,36 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         else
             @. rho_liq_star = rho_c_star + rho_r_star
         end
-        @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, rho_liq_star)
+        # The ICE mass of the star state, recovered from the three appended mass slots the
+        # same way slot 8 is (all three are TOTALS under one transform family). `Kvdiff_water`
+        # with ice is refused in `mc_driver!`, so nothing here DIFFUSES the ice — but the
+        # star-state thermodynamics still has to SEE it, or `T_star`, `C_vt_star` and
+        # `stp_star` would describe a column with the ice mass removed and the heat increment
+        # built from them would carry that error. Exact zeros with ice off, hence bitwise.
+        rho_ice_star = S.df_rho_ice_star
+        rho_ice_t_star = S.df_rho_ice_t_star
+        if ice_registered(mtile.mc_slots)
+            it = ice_transform_mode(mtile.model.options)
+            imu_s = get(mtile.model.physical_params, :mu_ice, 1.0e-7)
+            i1q_v = view(vnp1, colstart:colend, mtile.mc_slots.i1_q)
+            i2q_v = view(vnp1, colstart:colend, mtile.mc_slots.i2_q)
+            i3q_v = view(vnp1, colstart:colend, mtile.mc_slots.i3_q)
+            @. rho_ice_star = (recover_total(i1q_v, it, imu_s) +
+                               recover_total(i2q_v, it, imu_s)) +
+                              recover_total(i3q_v, it, imu_s)
+            if condensate_floor_mode(mtile.model.options)
+                @. rho_ice_t_star = (max(recover_total(i1q_v, it, imu_s), 0.0) +
+                                     max(recover_total(i2q_v, it, imu_s), 0.0)) +
+                                    max(recover_total(i3q_v, it, imu_s), 0.0)
+            else
+                copyto!(rho_ice_t_star, rho_ice_star)
+            end
+        else
+            fill!(rho_ice_star, 0.0)
+            fill!(rho_ice_t_star, 0.0)
+        end
+        @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, rho_liq_star,
+                                         rho_ice_t_star)
         @. p_hPa_star = p_star / 100.0
         @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
         @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
@@ -4848,15 +5570,17 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
         # argument is about the increment, not about which retrieval ships.
         # The RAW liquid, always: this is the water partition, and flooring a partition
         # manufactures vapor rather than changing what the thermodynamics reads.
-        @. rho_v_star = rho_t_star - rho_d_star - (rho_c_star + rho_r_star)
+        @. rho_v_star = rho_t_star - rho_d_star - (rho_c_star + rho_r_star) - rho_ice_star
         q_v_star = S.df_q_v_star
         q_l_star = S.df_q_l_star
+        q_i_star = S.df_q_i_star
         @. q_v_star = rho_v_star / rho_d_star
         @. q_l_star = rho_liq_star / rho_d_star     # thermodynamic reader: floored if enabled
-        @. C_vt_star = Cvd + (q_v_star * Cvv) + (q_l_star * Cl)
+        @. q_i_star = rho_ice_t_star / rho_d_star   # ditto; exactly 0.0 with ice off
+        @. C_vt_star = Cvd + (q_v_star * Cvv) + (q_l_star * Cl) + (q_i_star * Ci)
         @. R_m_star = Rd + (q_v_star * Rv)
         @. Lv_star = L_v(T_star)
-        @. stp_star = moist_entropy_total(T_star, rho_d_star, q_v_star, q_l_star)
+        @. stp_star = moist_entropy_total(T_star, rho_d_star, q_v_star, q_l_star, q_i_star)
         stp_star .-= mtile.mc_ref_diag.s_tbar
     end
 
@@ -5124,6 +5848,7 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -5154,6 +5879,7 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
             i += 1
         end
     end
@@ -5183,6 +5909,7 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
     # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -5210,6 +5937,7 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
             i += 1
         end
     end
@@ -5242,6 +5970,7 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
     # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -5282,6 +6011,7 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
             i += 1
         end
     end
@@ -5313,6 +6043,7 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
     # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -5370,6 +6101,7 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(rho_c, rho_cbar[k, 1], condensate_transform, condensate_mu)
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
             i += 1
         end
     end

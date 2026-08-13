@@ -35,11 +35,43 @@ that touches it).
 
 `0` means ABSENT. The driver tests `> 0` rather than re-reading the option, so the slot's
 existence and the physics that writes it cannot disagree.
+
+The ICE family is laid out flat and species-major, `i<k>_<moment>`, rather than as a nested
+`NTuple{3,NTuple{4,Int}}`: `mtile.mc_slots.i2_a` is then a plain field load with a literal
+offset, which is what the per-column driver wants, and [`ice_slots`](@ref) rebuilds the
+per-species 4-tuple for the loops of the process rates, which is what the microphysics wants.
+Both are free; a nested layout would have made the first one an index computation.
 """
 struct MCSlots
     "Prognostic rain number density [#/m³] under `options[:rain_moments] = 2`; 0 otherwise."
     n_r::Int
+    # ── Ice, `options[:ice_microphysics] = :ishmael` (12 slots, appended after n_r) ──
+    # Species 1 = planar-nucleated crystals. `_q` mass [kg/m³], `_n` number [#/m³],
+    # `_a`/`_c` the two spheroid volume moments [m³/m³]. See `MC_ICE_VARS`.
+    i1_q::Int; i1_n::Int; i1_a::Int; i1_c::Int
+    "Species 2 = columnar-nucleated crystals."
+    i2_q::Int; i2_n::Int; i2_a::Int; i2_c::Int
+    "Species 3 = aggregates."
+    i3_q::Int; i3_n::Int; i3_a::Int; i3_c::Int
 end
+
+"""All slots absent — the state of every configuration that declares no optional slot."""
+MCSlots() = MCSlots(0, ntuple(_ -> 0, 12)...)
+
+"""
+    ice_slots(s::MCSlots, k) -> NTuple{4,Int}
+
+The `(mass, number, a, c)` slot indices of ice species `k ∈ {1,2,3}`, all `0` when ice is not
+registered. The per-species view of the flat layout, for code that loops over species; the
+driver's straight-line blocks read the fields directly.
+"""
+@inline ice_slots(s::MCSlots, k::Int) =
+    k == 1 ? (s.i1_q, s.i1_n, s.i1_a, s.i1_c) :
+    k == 2 ? (s.i2_q, s.i2_n, s.i2_a, s.i2_c) :
+             (s.i3_q, s.i3_n, s.i3_a, s.i3_c)
+
+"""True when the twelve ice slots are registered. `mass of species 1 > 0` is the witness."""
+@inline ice_registered(s::MCSlots) = s.i1_q > 0
 
 """
     mc_slots(model) -> MCSlots
@@ -48,11 +80,16 @@ Resolve the appended slots of [`MCSlots`](@ref) from a model's options and `vars
 Every field is 0 for a non-mc equation set, and for an mc set that declares no optional slot.
 """
 function mc_slots(model::ModelParameters)
-    uses_pressure_reference(model.equation_set) || return MCSlots(0)
+    uses_pressure_reference(model.equation_set) || return MCSlots()
     vars = model.grid_params.vars
     # Defined in moist_compressible.jl, included after this file; resolved at call time.
     nr = rain_moments(model.options) == 2 ? mc_slot(vars, "n_r") : 0
-    return MCSlots(nr)
+    if ice_microphysics(model.options) !== :ishmael
+        return MCSlots(nr, ntuple(_ -> 0, 12)...)
+    end
+    # `MC_ICE_VARS` is species-major and in registration order, so the twelve resolved
+    # indices land on the twelve fields in declaration order with no reshuffling.
+    return MCSlots(nr, ntuple(j -> mc_slot(vars, MC_ICE_VARS[j]), 12)...)
 end
 
 """

@@ -278,6 +278,38 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations Scythe.moist_compressible_axisym(mtile_2t, 1, kDim_2t, 2)) == 0
     end
 
+    @testset "per-column allocations stay zero with ice microphysics" begin
+        # Twelve more appended slots, each with its own views, its own control-variable
+        # recovery, its own scratch columns and its own sedimentation flux transform — the
+        # widest the per-column path gets. Every index is resolved by NAME, and every one of
+        # those resolutions is a `Dict{String,Int}` hash that must have happened once, at
+        # tile creation, into `MCSlots`. This is what catches it if one creeps back in.
+        ice_opts = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael)
+        mtile_ice, kDim_ice = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3),
+                                            precipitation = true,
+                                            extra_options = ice_opts)
+        @test Scythe.ice_registered(mtile_ice.mc_slots)
+        @test Scythe.ice_slots(mtile_ice.mc_slots, 1) == (11, 12, 13, 14)
+        @test Scythe.ice_slots(mtile_ice.mc_slots, 3) == (19, 20, 21, 22)
+        moist_compressible_XZ(mtile_ice, 1, kDim_ice, 2)      # compile
+        diffusion_timestep_mc(mtile_ice, 1, kDim_ice, 2)
+
+        @test (@allocations moist_compressible_XZ(mtile_ice, 1, kDim_ice, 2)) == 0
+        @test (@allocations diffusion_timestep_mc(mtile_ice, 1, kDim_ice, 2)) == 0
+
+        # ...and with the ice control-variable transform on (twelve more recoveries and
+        # Jacobians per column), on the cylinder where all twelve slots shift by one.
+        mtile_it, kDim_it = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                          extra_params = Dict(:N_r => 1.0e-3,
+                                                              :mu_rain_n => 1.0),
+                                          precipitation = true,
+                                          extra_options = merge(ice_opts,
+                                              Dict{Symbol,Any}(:ice_transform => :bhyp)))
+        @test Scythe.ice_slots(mtile_it.mc_slots, 1) == (12, 13, 14, 15)
+        Scythe.moist_compressible_axisym(mtile_it, 1, kDim_it, 2)  # compile
+        @test (@allocations Scythe.moist_compressible_axisym(mtile_it, 1, kDim_it, 2)) == 0
+    end
+
     @testset "per-column allocations stay zero on the axisymmetric cylinder" begin
         # The cylindrical trait path binds the extra v views and metric terms; the
         # trait dispatch must stay compile-time (no boxing) and the v machinery in

@@ -1033,6 +1033,7 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     rho_c_i = mc_slot(vars, "rho_c")
     # APPENDED optional slots, seeded only where registered. Zero under every transform.
     n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
@@ -1077,6 +1078,7 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             patch.physical[i, v_i, 1] = v
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
             i += 1
         end
     end
@@ -1395,6 +1397,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         qs_i = vars["Q_ss"]; rr_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
         rc_i = mc_slot(vars, "rho_c")
         nr_i = mc_optional_slot(vars, "n_r")
+        ice_ii = mc_ice_slot_indices(vars)
 
         gpts = getGridpoints(patch)
         kDim = gp.kDim
@@ -1558,6 +1561,12 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         # The rain NUMBER slot, when the two-moment closure registered one. Zero for the same
         # reason rain is: a balanced vortex has no precipitation to carry drops for.
         nr_i > 0 && (mish[:, nr_i] .= 0.0)
+        # ...and the twelve ice slots, for the same reason: a balanced vortex is built
+        # subsaturated and warm-core, with no ice to start from. Zero is correct under every
+        # transform (`bhyp(0) == 0` exactly).
+        for s in ice_ii
+            s > 0 && (mish[:, s] .= 0.0)
+        end
         # No condensate: the vortex is built subsaturated everywhere (the moistening
         # caps rho_v at RH_max*rho_vs), and with rho_c prognostic that means EXACTLY
         # zero cloud rather than "whatever four fitted fields leave over". The

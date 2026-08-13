@@ -8,11 +8,20 @@
 # reconstruction expressed in those control variables.
 
 using Springsteel.Thermodynamics: Rd, Rv, Eps, Cvd, Cvv, Cpd, Cpv, Cl, Ci, gravity,
-    L_v0, rho_l, rho_i, T_0, p_0, q0, rho_d0, rho_v0,
+    L_v0, L_f0, L_s0, rho_l, rho_i, T_0, p_0, q0, rho_d0, rho_v0,
     sat_pressure_liquid, sat_pressure_ice, sat_pressure_liquid_buck,
     sat_pressure_liquid_buck_dT, sat_pressure_ice_buck, q_sat_liquid, q_sat_ice,
-    L_v, dewpoint, entropy, vapor_entropy, temperature, pressure, vapor_pressure,
+    L_v, L_f, L_s, rho_i_sat,
+    dewpoint, entropy, vapor_entropy, temperature, pressure, vapor_pressure,
     mixing_ratio, dry_density, log_dry_density, P_s, P_xi, P_qv
+
+# The ice latent-heat family (`L_f0`, `L_s0`, `L_f`, `L_s`) and the over-ice saturation
+# density (`rho_i_sat`) are imported here, alongside the liquid ones they mirror, for the
+# ice extension of the moist-compressible set: `retrieve_temperature`'s ice term reads
+# `L_s0` and `Ci` (see reference/Scythe_moist_compressible.tex §Ice Processes), and the
+# deposition/freezing rates of the next stage read `L_s`, `L_f` and `rho_i_sat`. Kirchhoff
+# makes `L_s0 = L_v0 + L_f0` exact by construction on the Springsteel side, so the three
+# linearizations are mutually consistent and `L_s(T) == L_v(T) + L_f(T)` identically.
 
 # `potential_temperature`, `reversible_theta_e`, `theta_rho` are NOT imported: Scythe
 # keeps transformed-variable (`s`, `xi`, `mu`) adapters of the same name below that

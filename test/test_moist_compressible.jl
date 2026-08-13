@@ -4860,4 +4860,400 @@ using Springsteel
             @test (z_num_1 - z_mass_1) > 1.0
         end
     end
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Ice microphysics: slot registration, thermodynamics, transport
+    # ──────────────────────────────────────────────────────────────────────────
+    #
+    # `options[:ice_microphysics] = :ishmael` appends TWELVE slots after `n_r` — three
+    # species x (mass, number, and the two spheroid volume moments). At this stage every
+    # process rate and every fall speed is zero, so what is under test is the state's
+    # EXISTENCE, its TRANSPORT, and the ice thermodynamics reducing exactly to the liquid
+    # one at zero ice.
+
+    @testset "ice_microphysics: slot registration" begin
+        base = Dict{Symbol,Any}()
+        two = Dict{Symbol,Any}(:rain_moments => 2)
+        ice = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael)
+
+        # Default: the option's existence changes no name list anywhere.
+        @test Scythe.ice_microphysics(base) === :none
+        @test Scythe.ice_microphysics(two) === :none
+        @test Scythe.mc_var_names(base) == Scythe.MC_VARS
+        @test Scythe.mc_var_names(two) == vcat(Scythe.MC_VARS, "n_r")
+        @test_throws ErrorException Scythe.ice_microphysics(
+            Dict{Symbol,Any}(:ice_microphysics => :morrison))
+
+        # THE VALIDATION: :ishmael against single-moment rain is refused at config time.
+        @test_throws ErrorException Scythe.ice_microphysics(
+            Dict{Symbol,Any}(:ice_microphysics => :ishmael))
+        @test Scythe.ice_microphysics(ice) === :ishmael
+
+        # APPENDED after n_r, species-major, never inserted.
+        names_xz = Scythe.mc_var_names(ice)
+        names_cyl = Scythe.mc_var_names(ice; cyl = true)
+        @test names_xz == vcat(Scythe.MC_VARS, "n_r", collect(Scythe.MC_ICE_VARS))
+        @test names_cyl == vcat(Scythe.MC_VARS_CYL, "n_r", collect(Scythe.MC_ICE_VARS))
+        @test names_xz[1:10] == vcat(Scythe.MC_VARS, "n_r")
+        @test length(names_xz) == 22 && length(names_cyl) == 23
+        # The geometry-dependent indices the driver must resolve BY NAME
+        @test findfirst(==("rho_i1"), names_xz) == 11
+        @test findfirst(==("c_i3"), names_xz) == 22
+        @test findfirst(==("rho_i1"), names_cyl) == 12
+        @test findfirst(==("c_i3"), names_cyl) == 23
+        # Species-major: a species' four moments are contiguous and in (q, n, a, c) order
+        @test Scythe.MC_ICE_VARS[1:4] == ("rho_i1", "n_i1", "a_i1", "c_i1")
+        @test Scythe.MC_ICE_VARS[5:8] == ("rho_i2", "n_i2", "a_i2", "c_i2")
+        @test Scythe.MC_ICE_VARS[9:12] == ("rho_i3", "n_i3", "a_i3", "c_i3")
+
+        # ONE transform family covering all twelve; FOUR widths, because mu is dimensional
+        tr = merge(ice, Dict{Symbol,Any}(:ice_transform => :bhyp))
+        @test Scythe.ice_transform_mode(ice) === :none
+        @test Scythe.ice_transform_mode(tr) === :bhyp
+        @test_throws ErrorException Scythe.ice_transform_mode(
+            Dict{Symbol,Any}(:ice_transform => :bogus))
+        @test Scythe.ice_var_names(ice) == Scythe.MC_ICE_VARS
+        @test Scythe.ice_var_names(tr) == ("nu_i1", "nu_ni1", "nu_ai1", "nu_ci1",
+                                           "nu_i2", "nu_ni2", "nu_ai2", "nu_ci2",
+                                           "nu_i3", "nu_ni3", "nu_ai3", "nu_ci3")
+        @test Scythe.mc_var_names(tr)[11:22] == collect(Scythe.ice_var_names(tr))
+        for nm in Scythe.MC_ICE_VARS
+            @test haskey(Scythe.MC_NU_ALIAS, nm)
+        end
+        @test length(unique(values(Scythe.MC_NU_ALIAS))) == length(Scythe.MC_NU_ALIAS)
+        # Widths: mass, number, a, c — and the defaults are per KIND, not per slot
+        pp = Dict{Symbol,Float64}()
+        @test [Scythe.ice_mu(pp, j) for j in 1:12] ==
+              [1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
+               1.0e-7, 1.0e2, 1.0e-16, 1.0e-16,
+               1.0e-7, 1.0e2, 1.0e-16, 1.0e-16]
+        @test Scythe.ice_mu(Dict(:mu_ice_a => 3.0e-15), 3) == 3.0e-15
+
+        # All twelve are TOTALS: no reference profile to offset a bound against. The
+        # transformed names are refused, like nu_c/nu_r/nu_nr.
+        for nm in Scythe.MC_ICE_VARS
+            @test Scythe.positivity_reference_profile(nm, nothing) === nothing
+            @test_throws ErrorException Scythe.positivity_reference_profile(
+                Scythe.MC_NU_ALIAS[nm], nothing)
+        end
+
+        # mc_slot resolves by ROLE through either name; mc_optional_slot answers 0.
+        vars_ice = Dict(v => i for (i, v) in enumerate(names_xz))
+        vars_tr = Dict(v => i for (i, v) in enumerate(Scythe.mc_var_names(tr)))
+        vars_1m = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+        @test Scythe.mc_slot(vars_ice, "rho_i2") == 15
+        @test Scythe.mc_slot(vars_tr, "rho_i2") == 15          # via the "nu_i2" alias
+        @test Scythe.mc_ice_slot_indices(vars_ice) == ntuple(j -> 10 + j, 12)
+        @test Scythe.mc_ice_slot_indices(vars_tr) == ntuple(j -> 10 + j, 12)
+        @test Scythe.mc_ice_slot_indices(vars_1m) == ntuple(_ -> 0, 12)
+        @test_throws ErrorException Scythe.mc_slot(vars_1m, "a_i3")
+
+        # The TOTAL-form transform pair is the shared helper for every mu kind, and
+        # bhyp(0) == 0 exactly is what lets every initializer seed a literal 0.0.
+        for (j, mu) in enumerate((1.0e-7, 1.0e2, 1.0e-16, 1.0e-16))
+            for mode in (:none, :bhyp, :bhyp_smooth)
+                @test Scythe.total_slot(0.0, mode, mu) === 0.0
+                x = (1.0e-4, 5.0e3, 2.0e-12, 1.0e-12)[j]
+                @test Scythe.recover_total(Scythe.total_slot(x, mode, mu), mode, mu) ≈ x rtol=1e-12
+            end
+        end
+    end
+
+    @testset "ice thermodynamics: the ice terms vanish EXACTLY at zero ice" begin
+        # The whole "ice-on with zero ice is inert" claim rests on this: the added terms are
+        # `+0.0` in the numerator and `-(-0.0)` in the denominator, both exact identities in
+        # IEEE — but only if the associativity puts them LAST. `===` is the test, not `≈`.
+        for M in (2.0e5, 3.5e5, 6.0e5, -1.0e4)
+            for rho_d in (0.3, 0.8, 1.2)
+                for rho_t in (rho_d, rho_d + 1.0e-6, rho_d + 0.02)
+                    for rho_liq in (0.0, 1.0e-9, 1.0e-4, 3.0e-3, -1.0e-6)
+                        @test Scythe.retrieve_temperature(M, rho_d, rho_t, rho_liq) ===
+                              Scythe.retrieve_temperature(M, rho_d, rho_t, rho_liq, 0.0)
+                    end
+                end
+            end
+        end
+        for Tk in (200.0, 253.15, 273.15, 300.0)
+            for rho_d in (0.3, 1.2)
+                for q_v in (0.0, 1.0e-6, 0.02)
+                    for q_l in (0.0, 1.0e-5, 3.0e-3)
+                        @test Scythe.moist_entropy_total(Tk, rho_d, q_v, q_l) ===
+                              Scythe.moist_entropy_total(Tk, rho_d, q_v, q_l, 0.0)
+                        @test Scythe.Q_s_energy(Tk, 8.0e4, rho_d, q_v, q_l) ===
+                              Scythe.Q_s_energy(Tk, 8.0e4, rho_d, q_v, q_l, 0.0)
+                    end
+                end
+            end
+        end
+    end
+
+    @testset "ice thermodynamics: the retrieval at rho_ice > 0" begin
+        # Independent evaluation of Eq. T_closed_form_ice — written out from the TeX, not
+        # refactored from the implementation — plus the two structural properties the
+        # derivation claims: dT/d rho_i = L_s/D_i, and freezing at fixed total condensate
+        # warms by L_f/D_i.
+        Cpd = Scythe.Cpd; Cpv = Scythe.Cpv; Cl = Scythe.Cl; Ci = Scythe.Ci
+        L_v0 = Scythe.L_v0; L_s0 = Scythe.L_s0; T_0 = Scythe.T_0
+        tex_T(M, rho_d, rho_t, rl, ri) =
+            (M + rl * (L_v0 - (Cpv - Cl) * T_0) + ri * (L_s0 - (Cpv - Ci) * T_0)) /
+            ((rho_d * Cpd + (rho_t - rho_d) * Cpv) - rl * (Cpv - Cl) - ri * (Cpv - Ci))
+        for M in (2.0e5, 3.5e5, 6.0e5)
+            for rho_d in (0.4, 1.2)
+                for rl in (0.0, 1.0e-4, 2.0e-3)
+                    for ri in (1.0e-7, 1.0e-4, 5.0e-3)
+                        rho_t = rho_d + 0.015
+                        T = Scythe.retrieve_temperature(M, rho_d, rho_t, rl, ri)
+                        @test T ≈ tex_T(M, rho_d, rho_t, rl, ri) rtol=1e-14
+                        # The denominator D_i = C_f + rl(Cl-Cpv) + ri(Ci-Cpv) is strictly
+                        # positive for any admissible state, so the root never fails.
+                        D = (rho_d * Cpd + (rho_t - rho_d) * Cpv) +
+                            rl * (Cl - Cpv) + ri * (Ci - Cpv)
+                        @test D > 0.0
+                        # dT/d rho_i = L_s(T)/D_i (TeX Eq. dTdrhoi), by finite difference
+                        h = 1.0e-9
+                        dT = (Scythe.retrieve_temperature(M, rho_d, rho_t, rl, ri + h) -
+                              Scythe.retrieve_temperature(M, rho_d, rho_t, rl, ri - h)) / (2h)
+                        @test dT ≈ Scythe.L_s(T) / D rtol=1e-5
+                        # FREEZING moves mass between the two condensed slots at fixed total
+                        # water, so the retrieval warms by L_f/D_i and by nothing else.
+                        dTf = (Scythe.retrieve_temperature(M, rho_d, rho_t, rl - h, ri + h) -
+                               Scythe.retrieve_temperature(M, rho_d, rho_t, rl + h, ri - h)) / (2h)
+                        @test dTf ≈ Scythe.L_f(T) / D rtol=1e-5
+                    end
+                end
+            end
+        end
+        # Ice makes the column WARMER than the same mass of liquid would (it released more
+        # latent heat getting there), and the two agree in the L_f -> 0 sense nowhere else.
+        T_liq = Scythe.retrieve_temperature(3.5e5, 1.0, 1.02, 3.0e-3, 0.0)
+        T_ice = Scythe.retrieve_temperature(3.5e5, 1.0, 1.02, 0.0, 3.0e-3)
+        @test T_ice > T_liq
+        # Kirchhoff: L_s == L_v + L_f identically, which is what makes the three
+        # linearizations mutually consistent.
+        for Tk in (220.0, 273.15, 305.0)
+            @test Scythe.L_s(Tk) ≈ Scythe.L_v(Tk) + Scythe.L_f(Tk) rtol=1e-14
+        end
+        # The mixture heat capacity takes ice through the same q*C as liquid
+        @test Scythe.Q_s_energy(260.0, 8.0e4, 1.0, 0.004, 0.0, 0.001) !=
+              Scythe.Q_s_energy(260.0, 8.0e4, 1.0, 0.004, 0.0, 0.0)
+        @test Scythe.moist_entropy_total(260.0, 1.0, 0.004, 0.0, 0.001) ≈
+              Scythe.moist_entropy_total(260.0, 1.0, 0.004, 0.0, 0.0) +
+              0.001 * Ci * log(260.0 / T_0) rtol=1e-14
+    end
+
+    @testset "ice: a tile caches the twelve slots by name" begin
+        mktempdir() do tmpdir
+            ice = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael)
+
+            m0, _, _, _ = make_mc_mtile(tmpdir)
+            @test !Scythe.ice_registered(m0.mc_slots)          # absent, and says so
+            @test Scythe.ice_slots(m0.mc_slots, 2) == (0, 0, 0, 0)
+
+            m, _, mod, _ = make_mc_mtile(tmpdir; precipitation = true, extra_options = ice)
+            @test Scythe.ice_registered(m.mc_slots)
+            @test m.mc_slots.n_r == 10
+            @test Scythe.ice_slots(m.mc_slots, 1) == (11, 12, 13, 14)
+            @test Scythe.ice_slots(m.mc_slots, 2) == (15, 16, 17, 18)
+            @test Scythe.ice_slots(m.mc_slots, 3) == (19, 20, 21, 22)
+            @test length(mod.grid_params.vars) == 22
+            # Concrete: resolving twelve more indices must not cost the tile its typing
+            @test isconcretetype(fieldtype(typeof(m), :mc_slots))
+            # Every ice slot got a scratch column of its own, so each flux is fitted on its
+            # own basis and its own BCs.
+            @test size(m.scratch_columns, 2) == 22
+
+            # Cylindrical: the same twelve, one index further out, resolved by name
+            m3, _, mod3, _ = make_mc_mtile(tmpdir; precipitation = true, iMin = 100.0,
+                iMax = 2100.0, equation_set = "moist_compressible_axisym",
+                extra_options = ice)
+            @test mod3.grid_params.vars["v"] == 10
+            @test m3.mc_slots.n_r == 11
+            @test Scythe.ice_slots(m3.mc_slots, 1) == (12, 13, 14, 15)
+            @test Scythe.ice_slots(m3.mc_slots, 3) == (20, 21, 22, 23)
+        end
+    end
+
+    @testset "ice: check_mc_var_names and the deferred-support guards" begin
+        mktempdir() do tmpdir
+            ice = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael)
+            m, _, mod, _ = make_mc_mtile(tmpdir; precipitation = true, extra_options = ice)
+            @test Scythe.check_mc_var_names(mod) === nothing
+
+            # A `vars` built from a stale name list has no slot for the tendency to land in.
+            gp_bad = deepcopy(mod.grid_params)
+            delete!(gp_bad.vars, "a_i2")
+            bad = ModelParameters(ts = mod.ts, equation_set = mod.equation_set,
+                                  ref_state_file = mod.ref_state_file,
+                                  grid_params = gp_bad,
+                                  physical_params = mod.physical_params,
+                                  options = mod.options)
+            @test_throws ErrorException Scythe.check_mc_var_names(bad)
+
+            # ... and the rain_moments requirement fires from check_mc_var_names too, which
+            # is what makes it a CONFIGURATION-time error rather than a first-use one.
+            gp_1m = deepcopy(mod.grid_params)
+            bad_1m = ModelParameters(ts = mod.ts, equation_set = mod.equation_set,
+                                     ref_state_file = mod.ref_state_file,
+                                     grid_params = gp_1m,
+                                     physical_params = mod.physical_params,
+                                     options = merge(mod.options,
+                                         Dict{Symbol,Any}(:rain_moments => 1)))
+            @test_throws ErrorException Scythe.check_mc_var_names(bad_1m)
+
+            kDim = mod.grid_params.kDim
+            # Each of these would run and produce plausible numbers while moving water mass
+            # that the ice is part of, without the ice. They refuse.
+            mod.options[:clamp_water] = true
+            @test_throws ErrorException Scythe.clamp_water!(m, 1, kDim)
+            delete!(mod.options, :clamp_water)
+            @test Scythe.clamp_water!(m, 1, kDim) === nothing   # measurement still runs
+
+            mod.options[:water_budget_trace] = 1
+            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            delete!(mod.options, :water_budget_trace)
+
+            mod.physical_params[:Kvdiff_water] = 1.0
+            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            mod.physical_params[:Kvdiff_water] = 0.0
+
+            mod.physical_params[:Khdiff_water] = 1.0
+            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            mod.physical_params[:Khdiff_water] = 0.0
+
+            mod.options[:louis_bl] = true
+            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            delete!(mod.options, :louis_bl)
+
+            @test Scythe.advance_column(m, 1, 1) === nothing
+
+            # A transformed ice slot may not ALSO carry a coefficient bound.
+            gp_pos = deepcopy(mod.grid_params)
+            gp_pos.positivity["rho_i1"] = Dict(:k => 0.0)
+            pos_model = ModelParameters(ts = mod.ts, equation_set = mod.equation_set,
+                                        ref_state_file = mod.ref_state_file,
+                                        grid_params = gp_pos,
+                                        physical_params = mod.physical_params,
+                                        options = merge(mod.options,
+                                            Dict{Symbol,Any}(:ice_transform => :bhyp)))
+            @test_throws ErrorException Scythe.install_positivity_bounds!(
+                m.tile, m.ref_state, pos_model)
+        end
+    end
+
+    @testset "ice: a seeded blob advects, all four moments together" begin
+        # TRANSPORT ONLY is the whole claim of this stage, so this is the test of it: seed a
+        # smooth Gaussian in all four moments of species 1, with the RAIN MASS seeded to the
+        # identical profile as a control, and integrate a few hundred steps of real flow with
+        # every process rate off.
+        #
+        # Slot 8 and the ice mass slot then obey the SAME discrete equation — pure continuity
+        # in a transform-free total — so they must stay equal to round-off. And the four ice
+        # moments differ only by their seeded constant, so their RATIOS must not move: that is
+        # the statement that mass, number and volume are being transported by one operator and
+        # not by four slightly different ones.
+        mktempdir() do tmpdir
+            kDim = 32
+            opts = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
+                                    :condensation => false)
+            m, patch, mod, col = make_mc_mtile(tmpdir; q_l = 0.0, kDim = kDim,
+                num_cells = 8, ts = 0.05, precipitation = false, extra_options = opts)
+            s = m.mc_slots
+            gpts = Scythe.getGridpoints(patch)
+            # Four constants nine decades apart, as the real moments are: mass [kg/m³],
+            # number [#/m³], and the two volume moments [m³/m³].
+            scale = (1.0e-4, 5.0e3, 2.0e-12, 1.0e-12)
+            for i in 1:size(patch.physical, 1)
+                z = gpts[i, 2]
+                g = exp(-((z - 1200.0) / 300.0)^2)
+                patch.physical[i, s.i1_q, 1] = scale[1] * g
+                patch.physical[i, s.i1_n, 1] = scale[2] * g
+                patch.physical[i, s.i1_a, 1] = scale[3] * g
+                patch.physical[i, s.i1_c, 1] = scale[4] * g
+                patch.physical[i, 8, 1] = scale[1] * g       # rho_r: the control tracer
+                patch.physical[i, 5, 1] = 5.0                # w: the flow that moves it
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+
+            q0 = copy(patch.physical[:, s.i1_q, 1])
+            sum0 = sum(q0)
+            @test sum0 > 0.0
+
+            step_mc!(m, patch, mod, 300)                     # 15 s of advection
+
+            @test all(isfinite.(patch.physical))
+            @test all(isfinite.(m.expdot_n))
+
+            q1 = @view patch.physical[:, s.i1_q, 1]
+            n1 = @view patch.physical[:, s.i1_n, 1]
+            a1 = @view patch.physical[:, s.i1_a, 1]
+            c1 = @view patch.physical[:, s.i1_c, 1]
+            rr = @view patch.physical[:, 8, 1]
+
+            # It actually MOVED: a test that passed on a stationary blob would prove nothing.
+            @test maximum(abs.(q1 .- q0)) > 0.01 * maximum(q0)
+
+            # The ice mass and the rain mass obeyed the same equation and stayed together.
+            @test maximum(abs.(q1 .- rr)) < 1.0e-12 * maximum(abs.(q1))
+
+            # RATIOS at the blob peak — and everywhere the blob is resolved — are fixed.
+            pk = argmax(q1)
+            @test n1[pk] / q1[pk] ≈ scale[2] / scale[1] rtol=1e-10
+            @test a1[pk] / q1[pk] ≈ scale[3] / scale[1] rtol=1e-10
+            @test c1[pk] / q1[pk] ≈ scale[4] / scale[1] rtol=1e-10
+            big = findall(>(0.05 * maximum(q1)), q1)
+            @test maximum(abs.((n1[big] ./ q1[big]) .- (scale[2] / scale[1]))) <
+                  1.0e-9 * (scale[2] / scale[1])
+            @test maximum(abs.((a1[big] ./ q1[big]) .- (scale[3] / scale[1]))) <
+                  1.0e-9 * (scale[3] / scale[1])
+
+            # The column integral is carried, not created: the advective product-rule form
+            # conserves it to the same order the rain does, which is the bar set here.
+            @test abs(sum(q1) - sum0) < 0.02 * sum0
+            @test sum(n1) / sum(q1) ≈ scale[2] / scale[1] rtol=1e-9
+
+            # The other TEN slots are finite and the ice slots produced no NaN anywhere.
+            for slot in 1:10
+                @test all(isfinite.(patch.physical[:, slot, 1]))
+            end
+            for slot in 11:22
+                @test all(isfinite.(patch.physical[:, slot, 1]))
+            end
+            # Species 2 and 3 were never seeded and no process can create them.
+            for slot in 15:22
+                @test all(patch.physical[:, slot, 1] .== 0.0)
+            end
+        end
+    end
+
+    @testset "ice: zero ice is inert on the column" begin
+        # The gate the O01 regression makes on a real storm, made here on a column: an ice-ON
+        # run with zero ice must reproduce an ice-OFF run's ten common slots, because the
+        # rho_i = 0 algebra is exact everywhere it was added.
+        mktempdir() do tmpdir
+            args = (; q_l = 3.0e-3, kDim = 16, num_cells = 8, precipitation = true)
+            two = Dict{Symbol,Any}(:rain_moments => 2)
+            ice = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael)
+            function run_once(opts)
+                m, patch, mod, _ = make_mc_mtile(tmpdir; args..., extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                for t in 1:5, c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                return m
+            end
+            m_off = run_once(two)
+            m_on = run_once(ice)
+            for slot in 1:10
+                @test m_on.var_np1[:, slot] == m_off.var_np1[:, slot]
+                @test m_on.expdot_n[:, slot] == m_off.expdot_n[:, slot]
+            end
+            # ...and the twelve ice slots are EXACTLY zero, not merely small.
+            for slot in 11:22
+                @test all(m_on.var_np1[:, slot] .== 0.0)
+                @test all(m_on.expdot_n[:, slot] .== 0.0)
+            end
+        end
+    end
+
 end
