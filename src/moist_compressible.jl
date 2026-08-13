@@ -124,6 +124,12 @@ const MC_SCRATCH_SLOTS = (
     :cap_c, :cap_r, :cap_v,      # AB3 depletion bounds, DIAGNOSTIC ONLY (see _ab3_sink_bound)
     :invtau_c, :invtau_r,        # per-channel relaxation rates, for `mc_stiffness_census!`
     :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
+    # Two-moment rain number (options[:rain_moments] == 2). Same six-way shape the mass
+    # slot has — control variable, its gradient, the Jacobian, the recovered density, the
+    # NUMBER-weighted fall speed, its flux and the flux divergence — plus one accumulator
+    # for the number sources. Allocated unconditionally, like every other name here: eight
+    # kDim columns per thread against the ~90 already present.
+    :n_r, :nu_nr, :nu_nr_z, :Jnr, :Vtn, :Fnr, :Fnr_z, :NR_SRC,
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
@@ -585,7 +591,8 @@ qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100
 
 """
     qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts, N_r,
-                           max_N_c=100.0; N_0=0.0) -> (Qdot_c, Qdot_r, invtau_c, invtau_r)
+                           max_N_c=100.0; N_0=0.0, rain_2m=false, n_r_density=0.0)
+        -> (Qdot_c, Qdot_r, invtau_c, invtau_r)
 
 Two-category condensation/evaporation rates [kg/m³/s] from the generalized
 supersaturation relaxation `1/τ = 1/τ_c + 1/τ_r` (see
@@ -598,9 +605,12 @@ rain channel grows rain from arbitrarily small seeds in cloud-free supersaturate
 air (rate ∝ `rho_r^{1/3}` under the monodisperse fixed-`N_r` closure, non-Lipschitz
 at zero). The rain-channel timescale is [`invtau_rain`](@ref) by default; the
 keyword `N_0 > 0` [m⁻⁴] selects the exponential Marshall-Palmer closure
-[`invtau_rain_mp`](@ref) instead (`N_r` is then unused), leaving the split
-arithmetic and gate untouched. Rain evaporation in subsaturated air is
-unconditional, so no separate
+[`invtau_rain_mp`](@ref) instead (`N_r` is then unused), and `rain_2m = true`
+with `n_r_density` [#/m³] selects the two-moment [`invtau_rain_2m`](@ref), whose
+DSD intercept comes from the prognostic mass/number pair rather than being
+prescribed (`N_r` and `N_0` are then both unused; see [`rain_moments`](@ref)).
+All three leave the split arithmetic and the cloud gate untouched. Rain
+evaporation in subsaturated air is unconditional, so no separate
 rain-evaporation parameterization (O01's `Q_evap`) is needed. The ventilation
 enhancement lives inside [`invtau_rain`](@ref).
 
@@ -702,7 +712,8 @@ bounds and reports where the old caps WOULD have bound; that is a measurement, a
 the RHS path reads it.
 """
 function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts,
-                                N_r, max_N_c=100.0; N_0=0.0)
+                                N_r, max_N_c=100.0; N_0=0.0,
+                                rain_2m::Bool=false, n_r_density=0.0)
 
     rho_vs = rho_v_sat(Tk, p_hPa)
     # THE DRIVE, clipped to the vapor actually present. In the continuum Q_ss IS rho_v - rho_vs
@@ -754,7 +765,12 @@ function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s
     # (rho_r^{1/3} and rho_r^{1/2} respectively), so the gate applies to either.
     # The sign test reads the CLIPPED drive, like every other use: a column whose Q_ss has
     # detached upward is not condensing onto rain either.
+    # `rain_2m` (options[:rain_moments] == 2) replaces the prescribed-DSD timescales with
+    # `invtau_rain_2m`, whose intercept comes from the prognostic (rho_r, n_r) pair. It is
+    # tested FIRST and defaults to `false`, so the single-moment arithmetic below — and the
+    # gate above it, which is unchanged and applies to all three closures — is bit-identical.
     invtau_r = (Q_ss_drive > 0.0 && q_c <= 1.0e-8) ? 0.0 :
+               rain_2m ? invtau_rain_2m(Tk, p_hPa, rho_r, n_r_density, rho_d) :
                (N_0 > 0.0 ? invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d) :
                             invtau_rain(Tk, p_hPa, N_r, rho_r))
     invtau = invtau_c + invtau_r
@@ -1127,20 +1143,22 @@ const MC_BUDGET_FIRST = MC_BUDGET_R
 The reference profile a positivity-bounded prognostic is carried against, or `nothing` when
 the variable is a TOTAL and its bound needs no offset.
 
-`u, w, rho_r` are totals; `p, rho_d, rho_t, E_t, Q_ss, rho_c` are perturbations from the
+`u, w, rho_r, n_r` are totals; `p, rho_d, rho_t, E_t, Q_ss, rho_c` are perturbations from the
 pressure reference (see the prognostic-slot semantics above). A zero bound on a PERTURBATION
 is not merely conservative, it is wrong: it would pin the field at or above its reference and
 forbid the cloud from ever evaporating below `ρ̄_c`. Hence anything not recognised here throws
 rather than silently taking the factory's constant bound.
 
-The transformed names `nu_c`/`nu_r` deliberately fall through to the error. A coefficient bound
-on a control variable is a different constraint from a bound on the density, and
-[`install_positivity_bounds!`](@ref) refuses the combination before reaching here; this is the
-backstop for a configuration that somehow gets past it.
+The transformed names `nu_c`/`nu_r`/`nu_nr` deliberately fall through to the error. A
+coefficient bound on a control variable is a different constraint from a bound on the density,
+and [`install_positivity_bounds!`](@ref) refuses the combination before reaching here; this is
+the backstop for a configuration that somehow gets past it.
 """
 function positivity_reference_profile(name::AbstractString, ref_state)
-    name in ("rho_r", "u", "w", "v") && return nothing         # totals: no offset
-    name in ("nu_c", "nu_r") &&
+    # `n_r` (the two-moment rain number) joins the totals: there is no reference number
+    # density in any configuration or in the reference-state format, exactly as for rho_r.
+    name in ("rho_r", "n_r", "u", "w", "v") && return nothing  # totals: no offset
+    name in ("nu_c", "nu_r", "nu_nr") &&
         error("positivity is declared for \"$name\", which is a CONTROL VARIABLE, not a " *
               "density: a box constraint on its coefficients would bound the transform of " *
               "the field rather than the field. The transform already makes the recovered " *
@@ -1247,27 +1265,59 @@ there is exactly the kind of thing that stops eliding.
 end
 
 """
-    rain_slot(rho_r, transform, mu) -> slot value
-    recover_rho_r(slot, transform, mu) -> rho_r
+    total_slot(value, transform, mu) -> slot value
+    recover_total(slot, transform, mu) -> value
 
-The rain (slot 8) pair of [`condensate_slot`](@ref) / [`recover_rho_c`](@ref), and simpler than
-they are: rain is carried as a TOTAL with no reference profile (`ρ̄_r ≡ 0` in every
-configuration and in the reference-state format itself), so there is no background to subtract
-and the slot IS the control variable rather than its deviation.
+The [`condensate_slot`](@ref) / [`recover_rho_c`](@ref) pair for a species carried as a
+TOTAL — one with no reference profile (`f̄ ≡ 0` in every configuration and in the
+reference-state format itself), so there is no background to subtract and the slot IS the
+control variable rather than its deviation.
 
-`rain_slot(0.0, …) == 0.0` exactly, because `bhyp(0) == 0` exactly, which is why no initial
-condition needs changing to run transformed — none of the `*_mc!` initializers seeds rain.
+Every total-form transform in the set shares this ONE implementation:
+[`rain_slot`](@ref)/[`recover_rho_r`](@ref) for the rain density and
+[`rain_number_slot`](@ref)/[`recover_n_r`](@ref) for the rain number are named aliases of
+it, not copies. Adding a species means adding the two aliases and a mode accessor, never
+another copy of the branch.
+
+`total_slot(0.0, …) == 0.0` exactly, because `bhyp(0) == 0` exactly, which is why no initial
+condition needs changing to run transformed — none of the `*_mc!` initializers seeds rain or
+rain number with anything but zero.
 """
-@inline function rain_slot(rho_r, transform::Symbol, mu)
-    transform === :none && return rho_r
-    return bhyp(rho_r, mu)
+@inline function total_slot(value, transform::Symbol, mu)
+    transform === :none && return value
+    return bhyp(value, mu)
 end
 
-@doc (@doc rain_slot)
-@inline function recover_rho_r(slot, transform::Symbol, mu)
+@doc (@doc total_slot)
+@inline function recover_total(slot, transform::Symbol, mu)
     transform === :none && return slot
     return transform === :bhyp ? ahyp(slot, mu) : ahyp_smooth(slot, mu)
 end
+
+"""
+    rain_slot(rho_r, transform, mu) -> slot value
+    recover_rho_r(slot, transform, mu) -> rho_r
+
+The rain-DENSITY (slot 8) names of [`total_slot`](@ref) / [`recover_total`](@ref).
+"""
+@inline rain_slot(rho_r, transform::Symbol, mu) = total_slot(rho_r, transform, mu)
+
+@doc (@doc rain_slot)
+@inline recover_rho_r(slot, transform::Symbol, mu) = recover_total(slot, transform, mu)
+
+"""
+    rain_number_slot(n_r, transform, mu) -> slot value
+    recover_n_r(slot, transform, mu) -> n_r
+
+The rain-NUMBER names of [`total_slot`](@ref) / [`recover_total`](@ref), for the
+`options[:rain_moments] = 2` slot. `mu` here is `physical_params[:mu_rain_n]`, which is in
+#/m³ and therefore has nothing to do with the `rain_mu` of the density slot — the two
+transforms are independent knobs on quantities that differ by ten orders of magnitude.
+"""
+@inline rain_number_slot(n_r, transform::Symbol, mu) = total_slot(n_r, transform, mu)
+
+@doc (@doc rain_number_slot)
+@inline recover_n_r(slot, transform::Symbol, mu) = recover_total(slot, transform, mu)
 
 """
     condensate_transform_mode(options) -> Symbol
@@ -1367,6 +1417,69 @@ reason to move rain onto it.
     return mode
 end
 
+"""
+    rain_moments(options) -> Int
+
+How many moments of the rain size distribution the set carries. `1` (the default, and the
+state of every configuration that does not set the key) is the single-moment Ooyama closure
+— mass only, with the drop number fixed by `physical_params[:N_r]` or the intercept
+`physical_params[:N_0]`. `2` adds the prognostic rain NUMBER density `n_r` [#/m³] as an
+APPENDED slot and switches the whole rain closure to the ISHMAEL/Morrison exponential-DSD
+family in microphysics.jl:
+
+| process | 1 moment (Ooyama) | 2 moments (ISHMAEL/Morrison) |
+|---|---|---|
+| autoconversion | [`autoconversion_density`](@ref) | [`rain_autoconversion_2m`](@ref) (KK2000) + its number source |
+| accretion | [`collection_density`](@ref) | [`rain_accretion_2m`](@ref) (KK2000), number-neutral |
+| self-collection / breakup | — | [`rain_selfcollection_2m`](@ref) (Beheng / Verlinde-Cotton) |
+| evaporation timescale | [`invtau_rain`](@ref) / [`invtau_rain_mp`](@ref) | [`invtau_rain_2m`](@ref) |
+| evaporation number loss | — | [`rain_number_evaporation_2m`](@ref) |
+| fall speed | [`rain_terminal_velocity`](@ref) | [`rain_fall_speeds_2m`](@ref), `vtrm` for mass and `vtrn` for number |
+
+The single-moment path is bitwise untouched by the option's presence: with the key absent
+the slot is not registered, no scratch is written, and every branch below tests a `Bool`
+that is `false`.
+
+**What the second moment buys.** `vtrm > vtrn` always (Γ(4+BR)/6 vs Γ(1+BR)), so mass
+outruns number down the column and the mean drop size sorts with height — the process the
+single-moment closure cannot represent at all, because it has only one number to fall with.
+
+**What is deferred.** `clamp_water!`'s floor, `water_budget_trace` and the implicit vertical
+water diffusion (`Kvdiff_water > 0`) all refuse to run with two moments rather than silently
+moving mass without its number; each says so where it refuses.
+"""
+@inline function rain_moments(options)
+    m = get(options, :rain_moments, 1)::Int
+    (m == 1 || m == 2) ||
+        error("options[:rain_moments] = $(m) is not recognized; use 1 (the default: " *
+              "single-moment rain mass, the Ooyama closure) or 2 (prognostic rain number " *
+              "n_r, the ISHMAEL/Morrison exponential-DSD closure)")
+    return m
+end
+
+"""
+    rain_number_transform_mode(options) -> Symbol
+
+Which control variable the rain-NUMBER slot carries, the `n_r` sibling of
+[`rain_transform_mode`](@ref) with the same three values and the same `:none` default. `n_r`
+is a TOTAL (`n̄_r ≡ 0`), so the transform pair is [`rain_number_slot`](@ref) /
+[`recover_n_r`](@ref) and its width is `physical_params[:mu_rain_n]` (default `1.0`, in
+#/m³ — the scale below which a number density is meteorologically meaningless, ten orders
+of magnitude away from the `rain_mu` of the density slot).
+
+Independent of `rain_transform`: mass and number ring independently and the arms have to be
+separable. Meaningless unless `rain_moments == 2`, and inert then unless set.
+"""
+@inline function rain_number_transform_mode(options)
+    mode = get(options, :rain_number_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp || mode === :bhyp_smooth) ||
+        error("options[:rain_number_transform] = :$(mode) is not recognized; use :none " *
+              "(the default: the slot is the rain number density n_r), :bhyp (Ooyama's " *
+              "biased hyperbolic control variable with his quasi-inverse) or :bhyp_smooth " *
+              "(the same forward map with the strict C^inf inverse)")
+    return mode
+end
+
 # ── Slot NAMES under a transform ──────────────────────────────────────────────
 # A transformed slot no longer holds what its name says, and the name is what every consumer
 # keys off: Springsteel builds the CSV/netCDF column headers straight from `GridParameters.vars`
@@ -1376,21 +1489,26 @@ end
 # diagnostics recorded `min_rho_c = 0`. The transformed slots are therefore RENAMED, following
 # Ooyama's own notation, in which `mu` is the mixing ratio and `nu` its transform. (`n` was
 # considered and rejected: it reads as number concentration in a double-moment scheme.)
-const MC_NU_ALIAS = Dict("rho_c" => "nu_c", "rho_r" => "nu_r")
+const MC_NU_ALIAS = Dict("rho_c" => "nu_c", "rho_r" => "nu_r", "n_r" => "nu_nr")
 
 """
     condensate_var_name(options) -> String
     rain_var_name(options) -> String
+    rain_number_var_name(options) -> String
 
-The name slot 9 / slot 8 carries under the current options: `"rho_c"` / `"rho_r"` untransformed,
-`"nu_c"` / `"nu_r"` under a transform. Use these — never a literal — when building the
-`vars`, `BCL`/`BCR`/`BCB`/`BCT`, `l_q`, `positivity` or `spline_filter` dicts of a
-`GridParameters`, all five of which are keyed by name.
+The name slot 9 / slot 8 / the appended rain-number slot carries under the current options:
+`"rho_c"` / `"rho_r"` / `"n_r"` untransformed, `"nu_c"` / `"nu_r"` / `"nu_nr"` under a
+transform. Use these — never a literal — when building the `vars`, `BCL`/`BCR`/`BCB`/`BCT`,
+`l_q`, `positivity` or `spline_filter` dicts of a `GridParameters`, all five of which are
+keyed by name.
 """
 condensate_var_name(options) =
     condensate_transform_mode(options) === :none ? "rho_c" : "nu_c"
 @doc (@doc condensate_var_name)
 rain_var_name(options) = rain_transform_mode(options) === :none ? "rho_r" : "nu_r"
+@doc (@doc condensate_var_name)
+rain_number_var_name(options) =
+    rain_number_transform_mode(options) === :none ? "n_r" : "nu_nr"
 
 """
     mc_var_names(options; cyl = false) -> Vector{String}
@@ -1399,11 +1517,21 @@ The ordered prognostic-slot names for the moist-compressible set under the curre
 [`MC_VARS`](@ref) (or `MC_VARS_CYL` for the 10-slot cylindrical/3-D variants) with slots 8 and
 9 renamed by [`rain_var_name`](@ref) / [`condensate_var_name`](@ref). With no transform declared
 this returns the canonical list unchanged, so every existing configuration is bit-identical.
+
+**Appending a slot.** Slots 1-9 (and `v` at 10 on the cylinders) appear as HARDCODED LITERALS
+throughout `mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`, so every optional
+slot is APPENDED after that block and never inserted. Its index is therefore
+geometry-dependent (`n_r` is 10 on XZ and 11 on the cylinders) and must be resolved BY NAME —
+[`mc_slot`](@ref), cached once per tile in [`MCSlots`](@ref), never a per-column lookup. This
+is the pattern the ice categories follow.
 """
 function mc_var_names(options; cyl::Bool = false)
     names = copy(cyl ? MC_VARS_CYL : MC_VARS)
     names[8] = rain_var_name(options)
     names[9] = condensate_var_name(options)
+    # ── APPENDED optional slots, in registration order. Absent by default, so the list
+    #    every existing configuration gets back is bit-identical. ──
+    rain_moments(options) == 2 && push!(names, rain_number_var_name(options))
     return names
 end
 
@@ -1411,11 +1539,14 @@ end
     mc_slot(vars, role) -> Int
 
 The slot index of a water species by ROLE rather than by name, accepting either the density
-name or its transformed alias. `role` is `"rho_c"` or `"rho_r"`.
+name or its transformed alias. `role` is `"rho_c"`, `"rho_r"` or `"n_r"`.
 
 Every `vars["rho_c"]`-style lookup in the kernel goes through this, so that a transformed
 configuration cannot produce a `KeyError` deep in a solver — and, more importantly, so that the
 lookup can never silently *succeed* against the wrong convention.
+
+This is a `Dict{String,Int}` lookup and must NOT appear in the per-column path: resolve
+appended slots once per tile through [`MCSlots`](@ref) instead.
 """
 @inline function mc_slot(vars, role::AbstractString)
     haskey(vars, role) && return vars[role]
@@ -1428,10 +1559,28 @@ lookup can never silently *succeed* against the wrong convention.
 end
 
 """
+    mc_optional_slot(vars, role) -> Int
+
+[`mc_slot`](@ref) for an APPENDED, optional slot: the index if the configuration registered
+it, `0` if it did not. Non-throwing, because absence is a legitimate answer here — the
+canonical nine-slot configuration has no `n_r` and no ice.
+
+For initializers and other setup code, which must seed a slot only if it exists. The
+per-column path uses [`MCSlots`](@ref) instead; this is a name lookup.
+"""
+@inline function mc_optional_slot(vars, role::AbstractString)
+    haskey(vars, role) && return vars[role]
+    alias = get(MC_NU_ALIAS, role, "")
+    (alias != "" && haskey(vars, alias)) && return vars[alias]
+    return 0
+end
+
+"""
     check_mc_var_names(model) -> Nothing
 
 Refuse a configuration whose name-keyed `GridParameters` dicts disagree with the declared
-transforms. A no-op when neither transform is on, so no existing configuration is affected.
+transforms and optional slots. A no-op when no transform is on and the slot list is the
+canonical one, so no existing configuration is affected.
 
 This exists because the failure it catches is SILENT. `vars` is the only one of the five
 name-keyed dicts whose miss is loud; `_resolve_spline_filter` returns `nothing` rather than
@@ -1440,11 +1589,18 @@ slot 8 on the default Neumann fit — which forces a zero flux derivative at the
 the falling rain at the surface instead of letting sedimentation carry it out of the domain.
 Likewise a stale `l_q` key removes the water filter the O01 configuration depends on for
 stability. Neither would raise anything; both would change the physics.
+
+An APPENDED optional slot is checked in the other direction too: `vars` must actually declare
+it. Nothing else can — the appended index is geometry-dependent, so a `vars` built from a
+stale name list has no slot for the tendency to land in.
 """
 function check_mc_var_names(model::ModelParameters)
     ctrans = condensate_transform_mode(model.options)
     rtrans = rain_transform_mode(model.options)
-    (ctrans === :none && rtrans === :none) && return nothing
+    nrtrans = rain_number_transform_mode(model.options)
+    nmoments = rain_moments(model.options)
+    (ctrans === :none && rtrans === :none && nrtrans === :none && nmoments == 1) &&
+        return nothing
 
     gp = model.grid_params
     expected = Set(mc_var_names(model.options;
@@ -1452,6 +1608,20 @@ function check_mc_var_names(model::ModelParameters)
     stale = String[]
     ctrans === :none || push!(stale, "rho_c")
     rtrans === :none || push!(stale, "rho_r")
+    nrtrans === :none || push!(stale, "n_r")
+
+    # The appended slots, in the other direction: declared by the options, so `vars` must
+    # carry them. (Only `vars` — the BC/l_q/positivity dicts legitimately fall back to
+    # "default" for a name they do not mention.)
+    if nmoments == 2
+        nrname = rain_number_var_name(model.options)
+        haskey(gp.vars, nrname) ||
+            error("options[:rain_moments] = 2 declares the prognostic rain number slot " *
+                  "\"$nrname\", but grid_params.vars does not have it (it has " *
+                  "$(sort(collect(keys(gp.vars))))). The slot is APPENDED after the fixed " *
+                  "1-9 (+v) block, so its index is geometry-dependent and only " *
+                  "`Scythe.mc_var_names(options)` knows it — build `vars` from that.")
+    end
 
     for (label, d) in (("vars", gp.vars), ("BCL", gp.BCL), ("BCR", gp.BCR),
                        ("BCB", gp.BCB), ("BCT", gp.BCT), ("l_q", gp.l_q),
@@ -1568,7 +1738,9 @@ function install_positivity_bounds!(grid, ref_state, model::ModelParameters)
     for (name, opt, mode) in (("rho_c", :condensate_transform,
                                condensate_transform_mode(model.options)),
                               ("rho_r", :rain_transform,
-                               rain_transform_mode(model.options)))
+                               rain_transform_mode(model.options)),
+                              ("n_r", :rain_number_transform,
+                               rain_number_transform_mode(model.options)))
         (mode !== :none && haskey(pos, name)) &&
             error("positivity is declared for \"$name\" while options[:$opt] is on. The " *
                   "transform makes the recovered density non-negative by construction; a " *
@@ -1784,6 +1956,17 @@ function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
               ":$(ctrans), rain_transform = :$(rtrans)): the transform already bounds the " *
               "recovered density below by -mu, and flooring the control variable instead " *
               "would be a state repair. Drop one.")
+    end
+    # Two-moment rain refuses the FLOOR for a different reason: raising rho_r to zero without
+    # touching n_r hands the column an infinite drop count at zero mass (and lowering it would
+    # be worse), so the repair would corrupt the very DSD the second moment exists to carry.
+    # The MEASUREMENT below is unaffected — it reads rho_c and rho_r only — so a two-moment
+    # run still gets its negative-water statistics.
+    if apply && rain_moments(mtile.model.options) == 2
+        error("options[:clamp_water] with options[:rain_moments] = 2: flooring rho_r " *
+              "without flooring n_r alongside it leaves the column with drops that carry " *
+              "no mass, which is a worse state than the negative one. A number-consistent " *
+              "floor is deferred; drop one.")
     end
 
     moved = 0.0
@@ -2820,8 +3003,44 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
               "source terms in density units, so the attribution does not close. Rescale " *
               "the transformed slot's columns by the Jacobian before enabling it.")
     end
+    # Two-moment rain (options[:rain_moments] == 2; see `rain_moments`). Read from the SLOT,
+    # not from the option: `MCSlots` resolved the appended index by name once when the tile
+    # was built, and `> 0` is the same test the writes below use, so "the slot exists" and
+    # "the physics runs" cannot disagree. Its own transform is independent of slot 8's.
+    nr_i = mtile.mc_slots.n_r
+    rain_2m = nr_i > 0
+    nrtrans = rain_2m ? rain_number_transform_mode(model.options) : :none
+    nrtrans_on = nrtrans !== :none
+    nrmu = get(model.physical_params, :mu_rain_n, 1.0)
+    if rain_2m && budget_trace
+        # `water_budget_probe!`/`water_depletion_probe!` write into fixed MASS rows
+        # (MC_BUDGET_R/C/V) and attribute kg/m^3/s. A NUMBER slot has no row, and its sources
+        # are #/m^3/s, so switching the closure to the two-moment rates would silently change
+        # what the rain MASS rows mean (`auto+coll` becomes KK2000) while the number budget
+        # went unreported entirely. Refuse rather than print a budget that does not close.
+        error("options[:water_budget_trace] with options[:rain_moments] = 2 is not " *
+              "implemented: the budget rows are the three MASS channels, so the rain " *
+              "number slot has nowhere to report and its sources are in #/m^3/s. Add a " *
+              "number block to `MC_WATER_STATS` before enabling it.")
+    end
+    if rain_2m && Kvdiff_water > 0.0
+        # `_diffusion_water_step!` diffuses rho_t/rho_c/rho_r and implies the vapor; nothing
+        # diffuses n_r. Mixing rain MASS without its NUMBER changes the mean drop size of
+        # every column it touches — the DSD would be a function of the diffusivity — and the
+        # fall speeds, the evaporation timescale and the self-collection all read that size.
+        error("physical_params[:Kvdiff_water] > 0 with options[:rain_moments] = 2 is not " *
+              "implemented: the implicit vertical water diffusion moves rho_r and would " *
+              "leave n_r behind, silently rescaling the drop size of every diffused " *
+              "column. Set Kvdiff_water = 0 or add the n_r solve to " *
+              "`_diffusion_water_step!`.")
+    end
     N_r = precipitation ? get(model.physical_params, :N_r, 1.0e-3) : 0.0
     N_0 = precipitation ? get(model.physical_params, :N_0, 0.0) : 0.0
+    # Cloud droplet number [#/cm^3] of the condensation closure. Passed explicitly (it was
+    # the positional default before, at the same value, so the default path is unchanged) so
+    # that the two-moment autoconversion can use the SAME number rather than a second,
+    # disagreeing one. See `rain_autoconversion_2m`.
+    max_N_c = get(model.physical_params, :max_N_c, 100.0)
 
     # Louis boundary layer (vertical mixing + surface drag; mc_boundary_layer.jl)
     # and Smagorinsky horizontal closure (Ls > 0 replaces the constant Khdiff in
@@ -2892,6 +3111,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     rrv = mc_slot_views(grid, colstart, colend, 8, geom)   # rho_r (rho_rbar = 0)
     rcv = mc_slot_views(grid, colstart, colend, 9, geom)   # rho_c'
     vv  = mc_v_views(geom, grid, colstart, colend)         # tangential v (cylinders)
+    # The APPENDED rain-number slot (10 on XZ, 11 on the cylinders — see `MCSlots`). Bound
+    # UNCONDITIONALLY, at slot 8 when the option is off, so the SubArray construction is the
+    # same straight-line code every other slot's is and elides identically; nothing reads it
+    # unless `rain_2m`. (Building it inside a runtime branch is what stops a view eliding.)
+    nrv = mc_slot_views(grid, colstart, colend, rain_2m ? nr_i : 8, geom)
 
     pp = pv.f;      pp_x = pv.f_x;         pp_z = pv.f_z
     rho_dp = rdv.f; rho_dp_x = rdv.f_x;    rho_dp_z = rdv.f_z; rho_dp_zz = rdv.f_zz
@@ -2977,6 +3201,26 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     else
         copyto!(rho_r, nu_r)
         fill!(Jr, 1.0)
+    end
+    # The appended rain-NUMBER slot, identical construction to slot 8 above: also a TOTAL
+    # (`n̄_r ≡ 0`), so the slot IS its control variable. Skipped entirely under the default
+    # single-moment configuration, where none of `n_r`/`nu_nr`/`Jnr` is ever read.
+    nu_nr = S.nu_nr; nu_nr_z = S.nu_nr_z; Jnr = S.Jnr
+    n_r = S.n_r
+    if rain_2m
+        copyto!(nu_nr, nrv.f)
+        copyto!(nu_nr_z, nrv.f_z)
+        if nrtrans_on
+            if nrtrans === :bhyp
+                @. n_r = ahyp(nu_nr, nrmu)
+            else
+                @. n_r = ahyp_smooth(nu_nr, nrmu)
+            end
+            @. Jnr = dbhyp(max(n_r, 0.0), nrmu)
+        else
+            copyto!(n_r, nu_nr)
+            fill!(Jnr, 1.0)
+        end
     end
 
     # Total vertical gradients (perturbation + reference)
@@ -3106,7 +3350,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             Qdot[i], Qdot_r[i], invtau_c[i], invtau_r[i] =
                 qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
                                        rho_d[i], Tk[i], p_hPa[i], Q_s[i],
-                                       model.ts, N_r; N_0=N_0)
+                                       model.ts, N_r, max_N_c; N_0=N_0,
+                                       rain_2m=rain_2m, n_r_density=n_r[i])
             if isnan(Qdot[i]) || isnan(Qdot_r[i])
                 error("Qdot is NaN at index $i, time $(t)!\n" *
                       "  T = $(Tk[i]) K, p = $(p[i]) Pa, rho_d = $(rho_d[i]), " *
@@ -3144,10 +3389,59 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # or Q_ss source: rain exerts no partial pressure, and the (small) sedimentation
     # dT/dt is omitted from the saturation chain rule below (absorbed by the
     # condensation relaxation).
+    #
+    # Under `rain_moments == 2` this whole closure switches to the ISHMAEL/Morrison
+    # exponential-DSD family and gains a NUMBER budget alongside it: `NR_SRC` collects
+    # autoconversion's number source, self-collection/breakup and the evaporation number
+    # loss, and `Vtn`/`Fnr`/`Fnr_z` are the number's own fall speed, flux and flux
+    # divergence, fitted on the n_r column (its own basis and BCs) rather than rho_r's.
+    # `Vt` then carries the MASS-weighted `vtrm` in place of `rain_terminal_velocity`, so
+    # rho_r, rho_t and E_t all still receive the same single mass flux divergence and the
+    # telescoping between them is untouched. Number carries no mass and no energy: `Fnr_z`
+    # sources the n_r slot and NOTHING else.
     AUTO_COLL = S.AUTO_COLL
     Fr_z = S.Fr_z
     E_sed_z = S.E_sed_z
-    if precipitation
+    NR_SRC = S.NR_SRC
+    Fnr_z = S.Fnr_z
+    if precipitation && rain_2m
+        Vt = S.Vt
+        Vtn = S.Vtn
+        for i in 1:length(AUTO_COLL)
+            # KK2000 autoconversion (mass + rain number) and accretion (mass only), then
+            # Beheng self-collection with Verlinde-Cotton breakup and the evaporation number
+            # loss. `Qdot_r` is already final here — the condensation block above ran with
+            # `invtau_rain_2m` — so the number loss is exactly proportional to the mass loss
+            # the same step applies.
+            auto, n_auto = rain_autoconversion_2m(rho_c[i], rho_d[i], max_N_c)
+            AUTO_COLL[i] = auto + rain_accretion_2m(rho_c[i], rho_r[i], rho_d[i])
+            NR_SRC[i] = n_auto + rain_selfcollection_2m(rho_r[i], n_r[i], rho_d[i]) +
+                        rain_number_evaporation_2m(Qdot_r[i], rho_r[i], n_r[i])
+            w_m, w_n = rain_fall_speeds_2m(rho_r[i], n_r[i], rho_d[i])
+            Vt[i] = w_m
+            Vtn[i] = w_n
+        end
+        Fr = S.Fr;       @. Fr = max(rho_r, 0.0) * Vt
+        E_sed = S.E_sed; @. E_sed = Fr * ((Cpv * Tk) - Lv + ke + (gravity * z))
+        Fnr = S.Fnr;     @. Fnr = max(n_r, 0.0) * Vtn
+        r_col = scratch_column(mtile, 8)
+        r_col.uMish .= Fr
+        Btransform!(r_col)
+        Atransform!(r_col)
+        Ixtransform(r_col, Fr_z)
+        r_col.uMish .= E_sed
+        Btransform!(r_col)
+        Atransform!(r_col)
+        Ixtransform(r_col, E_sed_z)
+        # The number flux on the n_r column: its OWN spline fit and its OWN boundary
+        # conditions, so a Natural bottom lets the drops leave the domain with the rain they
+        # carry rather than piling up at the ground.
+        nr_col = scratch_column(mtile, nr_i)
+        nr_col.uMish .= Fnr
+        Btransform!(nr_col)
+        Atransform!(nr_col)
+        Ixtransform(nr_col, Fnr_z)
+    elseif precipitation
         for i in 1:length(AUTO_COLL)
             auto = autoconversion_density(max(rho_c[i], 0.0), rho_d[i])
             coll = collection_density(max(rho_c[i], 0.0), rho_r[i], rho_d[i], Tk[i])
@@ -3182,6 +3476,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         fill!(AUTO_COLL, 0.0)
         fill!(Fr_z, 0.0)
         fill!(E_sed_z, 0.0)
+    end
+    # The number channels are zeroed OUTSIDE the branch above so that
+    # `precipitation && !rain_2m` (which never touches them) and `!precipitation && rain_2m`
+    # (advection-only rain number) both leave them at an exact zero. Two `fill!`s on a kDim
+    # column; the single-moment path never reads them either way.
+    if rain_2m && !precipitation
+        fill!(NR_SRC, 0.0)
+        fill!(Fnr_z, 0.0)
     end
 
     # Record this step's net microphysics tendency per channel, so the NEXT step's depletion
@@ -3515,6 +3817,26 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     budget_trace && water_budget_probe!(mtile, MC_BUDGET_C, 9, t, colstart, rho_c, ADV, div,
                                         Qdot, AUTO_COLL, -1.0, nothing, w, z)
 
+    # Rain NUMBER density (the appended slot, `options[:rain_moments] = 2`). The same
+    # continuity form every other total takes — transform-invariant advection of the control
+    # variable, everything else through the Jacobian:
+    #
+    #     ∂n_r/∂t = −u·∇n_r − n_r ∇·u + NPRC1 + nragg + npre − ∂F_n/∂z
+    #
+    # `NR_SRC` is the sum of the three number sources (autoconversion's NPRC1, Beheng
+    # self-collection/Verlinde-Cotton breakup, and the evaporation loss npre); `Fnr_z` is the
+    # NUMBER-weighted sedimentation flux divergence, fitted on this slot's own column. Nothing
+    # else in the set receives either term: a raindrop count is not mass and not energy, so
+    # rho_t and E_t keep taking only the mass flux `Fr_z` assembled for slot 8.
+    #
+    # Accretion contributes nothing here on purpose — it grows the drops that exist. See
+    # `rain_accretion_2m`, and `rain_moments` for the process table.
+    if rain_2m
+        mc_advect!(ADV, geom, u, w, vv, r, nrv.f_x, nu_nr_z, nrv.f_l)
+        @turbo FORCING .= @. Jnr * ((-n_r * div) + NR_SRC - Fnr_z)
+        @turbo expdot[colstart:colend, nr_i] .= @. ADV + FORCING
+    end
+
     # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
     #
     # *** DIAGNOSTIC / TEMPORARY -- NOT ENERGY CONSISTENT. READ BEFORE USING. ***
@@ -3616,6 +3938,19 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             @inbounds for i in eachindex(WLAP)
                 expdot[colstart + i - 1, 7] += WLAP[i] / Sc_t
             end
+            # The rain NUMBER mixes with the same coefficient as the rain MASS, and must:
+            # mixing one without the other rescales the mean drop size of every column the
+            # operator touches, and the fall speeds, evaporation timescale and
+            # self-collection all read that size. (This is the horizontal counterpart of the
+            # refusal the VERTICAL water diffusion raises for the same reason — there the
+            # solve is implicit and adding n_r to it is real work; here it is one more
+            # Laplacian.)
+            if rain_2m
+                mc_w_kdiff!(WLAP, geom, K_smag, nrv, r)
+                @inbounds for i in eachindex(WLAP)
+                    expdot[colstart + i - 1, nr_i] += WLAP[i] / Sc_t
+                end
+            end
         else
             mc_w_kdiff!(WLAP,  geom, Khdiff_water, rtv, r)
             mc_w_kdiff!(WLAP2, geom, Khdiff_water, rdv, r)
@@ -3633,6 +3968,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             mc_w_kdiff!(WLAP, geom, Khdiff_water, qsv, r)
             @inbounds for i in eachindex(WLAP)
                 expdot[colstart + i - 1, 7] += WLAP[i]
+            end
+            # Same coefficient as the rain mass — see the note in the Smagorinsky branch.
+            if rain_2m
+                mc_w_kdiff!(WLAP, geom, Khdiff_water, nrv, r)
+                @inbounds for i in eachindex(WLAP)
+                    expdot[colstart + i - 1, nr_i] += WLAP[i]
+                end
             end
         end
     end
@@ -4778,6 +5120,10 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
     rho_c_i = mc_slot(vars, "rho_c")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -4807,6 +5153,7 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             i += 1
         end
     end
@@ -4832,6 +5179,10 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
     rho_c_i = mc_slot(vars, "rho_c")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -4858,6 +5209,7 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
             patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             i += 1
         end
     end
@@ -4886,6 +5238,10 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
     rho_c_i = mc_slot(vars, "rho_c")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -4925,6 +5281,7 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
             patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             i += 1
         end
     end
@@ -4952,6 +5309,10 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
     rho_c_i = mc_slot(vars, "rho_c")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -5008,6 +5369,7 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
             patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(rho_c, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             i += 1
         end
     end

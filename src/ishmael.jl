@@ -57,6 +57,17 @@ const ISHMAEL_QNSMALL  = 1.25e-7    # smallest ice number, # kg^-1 (line 632)
 const ISHMAEL_LAMMINR  = 1.0 / 2800.0e-6   # min rain slope parameter, m^-1 (line 640)
 const ISHMAEL_LAMMAXR  = 1.0 / 20.0e-6     # max rain slope parameter, m^-1 (line 639)
 
+# Rain fall-speed and ventilation parameters (module parameter block, lines 66 and
+# 662-665). V(D) = AR*D^BR*(R0/rho_air)^0.5, and the per-drop ventilation factor is
+# F1R + F2R*Sc^(1/3)*Re^(1/2). Used by the two-moment warm-rain rate family in
+# microphysics.jl, which is why they live here beside LAMMINR/LAMMAXR rather than
+# being restated there: one home for the ISHMAEL parameter block.
+const ISHMAEL_R0  = 1.27494   # air density at 1000 mb, T = T0, kg m^-3 (line 66)
+const ISHMAEL_AR  = 149.1     # 'a' in the rain fallspeed-size relation, m^(1-BR)/s (line 662)
+const ISHMAEL_BR  = 0.5       # 'b' in the rain fallspeed-size relation (line 663)
+const ISHMAEL_F1R = 0.78      # rain ventilation coefficient (line 664)
+const ISHMAEL_F2R = 0.308     # rain ventilation coefficient (line 665)
+
 # ────────────────────────────────────────────────────────────────────────────
 # 1a. ishmael_fall_speeds -- Best-number/Mitchell-Heymsfield(2005) fall
 #     speeds (lines 3236-3296 inside vaporgrow, duplicated at 2623-2694 as

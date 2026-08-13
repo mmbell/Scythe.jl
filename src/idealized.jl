@@ -1031,6 +1031,8 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     u_i = vars["u"]; w_i = vars["w"]; et_i = vars["E_t"]
     qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
     rho_c_i = mc_slot(vars, "rho_c")
+    # APPENDED optional slots, seeded only where registered. Zero under every transform.
+    n_r_i = mc_optional_slot(vars, "n_r")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
@@ -1074,6 +1076,7 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             patch.physical[i, v_i, 1] = v
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             i += 1
         end
     end
@@ -1391,6 +1394,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         u_i = vars["u"]; w_i = vars["w"];      et_i = vars["E_t"]
         qs_i = vars["Q_ss"]; rr_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
         rc_i = mc_slot(vars, "rho_c")
+        nr_i = mc_optional_slot(vars, "n_r")
 
         gpts = getGridpoints(patch)
         kDim = gp.kDim
@@ -1551,6 +1555,9 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         mish[:, u_i] .= 0.0
         mish[:, w_i] .= 0.0
         mish[:, rr_i] .= rain_slot(0.0, rain_transform, rain_mu)
+        # The rain NUMBER slot, when the two-moment closure registered one. Zero for the same
+        # reason rain is: a balanced vortex has no precipitation to carry drops for.
+        nr_i > 0 && (mish[:, nr_i] .= 0.0)
         # No condensate: the vortex is built subsaturated everywhere (the moistening
         # caps rho_v at RH_max*rho_vs), and with rho_c prognostic that means EXACTLY
         # zero cloud rather than "whatever four fitted fields leave over". The

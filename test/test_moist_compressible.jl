@@ -1077,9 +1077,13 @@ using Springsteel
                            q_l=1.0e-3, alpha=0.0, z_damp=20.0e3,
                            equation_set="moist_compressible_XZ",
                            iMin=0.0, iMax=2000.0, f=0.0,
-                           consistent_qss=false)
-        varlist = equation_set == "moist_compressible_XZ" ? Scythe.MC_VARS :
-                                                            Scythe.MC_VARS_CYL
+                           consistent_qss=false, extra_options=Dict{Symbol,Any}(),
+                           extra_params=Dict{Symbol,Float64}())
+        # From `mc_var_names`, not the raw constant, so an option that APPENDS a slot (the
+        # two-moment rain number) brings its name along. With no such option declared this
+        # returns exactly MC_VARS / MC_VARS_CYL, so every existing caller is unchanged.
+        varlist = Scythe.mc_var_names(extra_options;
+                                      cyl = equation_set != "moist_compressible_XZ")
         vars = Dict(v => i for (i, v) in enumerate(varlist))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
         wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
@@ -1102,15 +1106,17 @@ using Springsteel
             ts = ts, integration_time = 1.0, output_interval = 1.0,
             equation_set = equation_set,
             ref_state_file = ref_file, grid_params = gp,
-            physical_params = Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff,
+            physical_params = merge(Dict(:Khdiff => Khdiff, :Kvdiff => Kvdiff,
                                    :Kvdiff_heat => (Kvdiff_heat === nothing ? Kvdiff : Kvdiff_heat),
                                    :Kvdiff_water => Kvdiff_water,
                                    :Kv_mudiff => 0.0, :tau_qss => tau_qss, :N_r => N_r,
                                    :alpha => alpha, :z_damp => z_damp, :f => f),
-            options = Dict{Symbol,Any}(:semiimplicit => semiimplicit,
+                                   extra_params),
+            options = merge(Dict{Symbol,Any}(:semiimplicit => semiimplicit,
                            :exact_reference_state => true,
                            :consistent_qss_reference => consistent_qss,
                            :precipitation => precipitation, :vertical_mixing => false),
+                           extra_options),
         )
         patch.physical .= 0.0
         spectralTransform!(patch)
@@ -4625,6 +4631,233 @@ using Springsteel
                   "(metric terms are O(L/2a) ≈ 2e-6)"
             @test worst < 1.0e-4
             @test all(isfinite.(mt_slr.expdot_n))
+        end
+    end
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Two-moment rain: slot registration and the column integration
+    # ──────────────────────────────────────────────────────────────────────────
+    #
+    # `options[:rain_moments] = 2` is the FIRST option that adds a prognostic slot to this
+    # equation set. Slots 1-9 (+v) are hardcoded literals in the kernel, so the new one is
+    # APPENDED and its index is geometry-dependent: 10 on the XZ slice, 11 wherever v is
+    # carried. The registration pattern the ice categories will reuse is what these test.
+
+    @testset "rain_moments: slot registration" begin
+        base = Dict{Symbol,Any}()
+        two = Dict{Symbol,Any}(:rain_moments => 2)
+
+        # Default: the option's very existence changes no name list anywhere.
+        @test Scythe.rain_moments(base) == 1
+        @test Scythe.mc_var_names(base) == Scythe.MC_VARS
+        @test Scythe.mc_var_names(base; cyl = true) == Scythe.MC_VARS_CYL
+        @test Scythe.rain_number_var_name(base) == "n_r"
+        @test_throws ErrorException Scythe.rain_moments(Dict{Symbol,Any}(:rain_moments => 3))
+
+        # Two moments: APPENDED, never inserted. The 1-9 (+v) prefix is untouched.
+        names_xz = Scythe.mc_var_names(two)
+        names_cyl = Scythe.mc_var_names(two; cyl = true)
+        @test names_xz == vcat(Scythe.MC_VARS, "n_r")
+        @test names_cyl == vcat(Scythe.MC_VARS_CYL, "n_r")
+        @test names_xz[1:9] == Scythe.MC_VARS
+        @test names_cyl[1:10] == Scythe.MC_VARS_CYL
+        # The index the driver must resolve by NAME, precisely because it moves
+        @test findfirst(==("n_r"), names_xz) == 10
+        @test findfirst(==("n_r"), names_cyl) == 11
+
+        # The number's own control-variable transform renames the slot, like the others
+        tr = Dict{Symbol,Any}(:rain_moments => 2, :rain_number_transform => :bhyp)
+        @test Scythe.rain_number_var_name(tr) == "nu_nr"
+        @test Scythe.mc_var_names(tr)[10] == "nu_nr"
+        @test Scythe.MC_NU_ALIAS["n_r"] == "nu_nr"
+        @test_throws ErrorException Scythe.rain_number_transform_mode(
+            Dict{Symbol,Any}(:rain_number_transform => :bogus))
+
+        # mc_slot resolves by ROLE through either name; mc_optional_slot answers 0 for
+        # a configuration that never registered it.
+        vars_xz = Dict(v => i for (i, v) in enumerate(names_xz))
+        vars_tr = Dict(v => i for (i, v) in enumerate(Scythe.mc_var_names(tr)))
+        vars_1m = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+        @test Scythe.mc_slot(vars_xz, "n_r") == 10
+        @test Scythe.mc_slot(vars_tr, "n_r") == 10       # via the "nu_nr" alias
+        @test Scythe.mc_optional_slot(vars_xz, "n_r") == 10
+        @test Scythe.mc_optional_slot(vars_tr, "n_r") == 10
+        @test Scythe.mc_optional_slot(vars_1m, "n_r") == 0
+        @test_throws ErrorException Scythe.mc_slot(vars_1m, "n_r")
+
+        # n_r is a TOTAL: no reference profile to offset a positivity bound against, like
+        # rho_r and unlike rho_c. The transformed name is refused, like nu_c/nu_r.
+        @test Scythe.positivity_reference_profile("n_r", nothing) === nothing
+        @test_throws ErrorException Scythe.positivity_reference_profile("nu_nr", nothing)
+
+        # The total-form transform pair is the SHARED helper, not a third copy
+        @test Scythe.rain_number_slot(0.0, :none, 1.0) === 0.0
+        @test Scythe.rain_number_slot(0.0, :bhyp, 1.0) === 0.0     # bhyp(0) == 0 exactly
+        for mode in (:none, :bhyp, :bhyp_smooth)
+            @test Scythe.rain_number_slot(1.0e3, mode, 1.0) ==
+                  Scythe.total_slot(1.0e3, mode, 1.0)
+            @test Scythe.rain_slot(1.0e-3, mode, 1.0e-7) ==
+                  Scythe.total_slot(1.0e-3, mode, 1.0e-7)
+            n = Scythe.rain_number_slot(1.0e3, mode, 1.0)
+            @test Scythe.recover_n_r(n, mode, 1.0) ≈ 1.0e3 rtol=1e-12
+        end
+    end
+
+    @testset "rain_moments: a tile caches the appended slot by name" begin
+        mktempdir() do tmpdir
+            m1, _, _, _ = make_mc_mtile(tmpdir)
+            @test m1.mc_slots.n_r == 0                      # absent, and says so
+
+            m2, _, mod2, _ = make_mc_mtile(tmpdir; precipitation = true,
+                extra_options = Dict{Symbol,Any}(:rain_moments => 2))
+            @test m2.mc_slots.n_r == 10
+            @test length(mod2.grid_params.vars) == 10
+            @test mod2.grid_params.vars["n_r"] == 10
+            # Concrete field: the resolution must not cost the ModelTile its type stability
+            @test isconcretetype(fieldtype(typeof(m2), :mc_slots))
+            # And the per-variable scratch columns grew with the slot, so the number flux
+            # has a column of its own to be fitted on.
+            @test size(m2.scratch_columns, 2) == 10
+
+            # Cylindrical: the same slot, one index further out, resolved by name
+            m3, _, mod3, _ = make_mc_mtile(tmpdir; precipitation = true, iMin = 100.0,
+                iMax = 2100.0, equation_set = "moist_compressible_axisym",
+                extra_options = Dict{Symbol,Any}(:rain_moments => 2))
+            @test m3.mc_slots.n_r == 11
+            @test mod3.grid_params.vars["v"] == 10
+        end
+    end
+
+    @testset "rain_moments: check_mc_var_names and the deferred-support guards" begin
+        mktempdir() do tmpdir
+            two = Dict{Symbol,Any}(:rain_moments => 2)
+
+            # A `vars` built from a STALE name list has no slot for the number tendency.
+            # `check_mc_var_names` says so; without it the failure is a KeyError in
+            # createModelTile with nothing to explain it.
+            m, _, mod, _ = make_mc_mtile(tmpdir; precipitation = true, extra_options = two)
+            gp_bad = deepcopy(mod.grid_params)
+            delete!(gp_bad.vars, "n_r")
+            bad = ModelParameters(ts = mod.ts, equation_set = mod.equation_set,
+                                  ref_state_file = mod.ref_state_file,
+                                  grid_params = gp_bad,
+                                  physical_params = mod.physical_params,
+                                  options = mod.options)
+            @test_throws ErrorException Scythe.check_mc_var_names(bad)
+            @test Scythe.check_mc_var_names(mod) === nothing
+
+            kDim = mod.grid_params.kDim
+            # Each of these would run and produce plausible numbers while moving rain MASS
+            # without its NUMBER (or reporting a budget with no row for it). They refuse.
+            mod.options[:clamp_water] = true
+            @test_throws ErrorException Scythe.clamp_water!(m, 1, kDim)
+            delete!(mod.options, :clamp_water)
+            # ... but the MEASUREMENT still runs: it reads rho_c/rho_r only.
+            @test Scythe.clamp_water!(m, 1, kDim) === nothing
+
+            mod.options[:water_budget_trace] = 1
+            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            delete!(mod.options, :water_budget_trace)
+
+            mod.physical_params[:Kvdiff_water] = 1.0
+            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            mod.physical_params[:Kvdiff_water] = 0.0
+            @test Scythe.advance_column(m, 1, 1) === nothing
+        end
+    end
+
+    @testset "rain_moments = 2: rain and its number form together" begin
+        # A cloudy column with no rain: KK2000 autoconversion is the only active process
+        # (accretion and self-collection need rain, sedimentation needs a fall speed), and
+        # it is the ONLY source of rain number in the scheme.
+        mktempdir() do tmpdir
+            args = (; q_l = 3.0e-3, kDim = 16, num_cells = 8)
+            two = Dict{Symbol,Any}(:rain_moments => 2)
+            function run_once(precip, opts)
+                m, _, mod, _ = make_mc_mtile(tmpdir; args..., precipitation = precip,
+                                             extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                for c in 1:ncols; Scythe.advance_column(m, c, 1); end
+                return m
+            end
+            m1 = run_once(true, Dict{Symbol,Any}())     # single moment, Ooyama
+            m2 = run_once(true, two)                    # two moments, KK2000
+            m2_off = run_once(false, two)               # same slots, no warm rain at all
+
+            @test all(isfinite.(m2.var_np1))
+            @test all(isfinite.(m2.expdot_n))
+            # Rain mass appears, and so does rain NUMBER, everywhere the cloud is
+            @test all(m2.var_np1[:, 8] .> 0.0)
+            @test all(m2.var_np1[:, 10] .> 0.0)
+            @test all(m2_off.var_np1[:, 8] .== 0.0)
+            @test all(m2_off.var_np1[:, 10] .== 0.0)
+
+            # Isolate the conversion by differencing against the precipitation-off arm, so
+            # the (unrelated) condensation source on slot 9 cancels out.
+            drr = m2.var_np1[:, 8] .- m2_off.var_np1[:, 8]
+            drc = m2.var_np1[:, 9] .- m2_off.var_np1[:, 9]
+            dnr = m2.var_np1[:, 10] .- m2_off.var_np1[:, 10]
+            # Cloud pays for the rain gram for gram (the equal-and-opposite AUTO_COLL pair)
+            @test all(drr .> 0.0)
+            @test all(drc .< 0.0)
+            @test maximum(abs.(drc .+ drr)) < 1.0e-18
+            # The number produced is the mass produced divided by a 25 micron drop
+            @test dnr[1] ≈ drr[1] / Scythe.RAIN_2M_M_AUTO rtol=1e-10
+            # Number is not mass and not energy: rho_t and E_t receive nothing from it,
+            # and autoconversion stays thermodynamically inert on both arms.
+            for slot in 1:7
+                @test m2.var_np1[:, slot] == m1.var_np1[:, slot]
+                @test m2.var_np1[:, slot] == m2_off.var_np1[:, slot]
+            end
+            # The closure really did change: KK2000 is not Ooyama's threshold form
+            @test m2.var_np1[1, 8] != m1.var_np1[1, 8]
+
+            # The single-moment arm has no number slot at all
+            @test size(m1.var_np1, 2) == 9
+        end
+    end
+
+    @testset "rain_moments = 2: mass sediments faster than number (size sorting)" begin
+        # THE point of the second moment. vtrm/vtrn = Γ(4+BR)/6/Γ(1+BR) = 1.88 for BR = 0.5,
+        # so a falling shaft leaves its drop COUNT behind and the mean drop size sorts with
+        # height. The single-moment closure cannot represent this at all: it has one fall
+        # speed and everything falls at it.
+        mktempdir() do tmpdir
+            kDim = 48
+            m, patch, mod, col = make_mc_mtile(tmpdir; q_l = 0.0, kDim = kDim,
+                num_cells = 8, ts = 0.05, precipitation = true,
+                extra_options = Dict{Symbol,Any}(:rain_moments => 2))
+            gpts = Scythe.getGridpoints(patch)
+            seed_rain_bump!(patch, gpts, col, kDim; rho_r0 = 1.0e-3, zc = 1200.0, zr = 300.0)
+            # Rain number PROPORTIONAL to the rain mass, so the two profiles start with the
+            # same shape and the same centroid: any later difference is the sorting.
+            for i in 1:size(patch.physical, 1)
+                patch.physical[i, 10, 1] = 1.0e6 * patch.physical[i, 8, 1]
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+
+            z = gpts[:, 2]
+            centroid(f) = sum(max.(f, 0.0) .* z) / sum(max.(f, 0.0))
+            z_mass_0 = centroid(patch.physical[:, 8, 1])
+            z_num_0 = centroid(patch.physical[:, 10, 1])
+            @test z_mass_0 ≈ z_num_0 rtol=1e-10          # same shape to begin with
+
+            # Fall speeds at the seeded state: |vtrm| > |vtrn|, which is the mechanism
+            w_m, w_n = Scythe.rain_fall_speeds_2m(1.0e-3, 1.0e3, col.rho_d[1])
+            @test abs(w_m) > abs(w_n) > 0.0
+
+            step_mc!(m, patch, mod, 120)                  # 6 s of sedimentation
+
+            @test all(isfinite.(patch.physical))
+            z_mass_1 = centroid(patch.physical[:, 8, 1])
+            z_num_1 = centroid(patch.physical[:, 10, 1])
+            # Both fall...
+            @test z_mass_1 < z_mass_0
+            @test z_num_1 < z_num_0
+            # ...and the mass falls FURTHER. That is size sorting, visible in the state.
+            @test z_mass_1 < z_num_1
+            @test (z_num_1 - z_mass_1) > 1.0
         end
     end
 end

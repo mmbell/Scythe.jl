@@ -230,11 +230,30 @@ function o01_model(opts::BenchmarkOptions)
     haskey(ENV, "SCYTHE_O01_RMU") &&
         (physical_params[:rain_mu] = parse(Float64, ENV["SCYTHE_O01_RMU"]))
 
+    # How many moments of the rain DSD to carry. Unset => the key is absent => 1, the
+    # single-moment Ooyama closure, bit-identical. "2" appends the prognostic rain number
+    # density n_r and switches the whole rain closure to ISHMAEL/Morrison (KK2000
+    # autoconversion + accretion, Beheng self-collection, the ventilated exponential-DSD
+    # evaporation timescale, and mass/number-weighted fall speeds that size-sort).
+    # See `Scythe.rain_moments`.
+    haskey(ENV, "SCYTHE_O01_RAIN_MOMENTS") &&
+        (options[:rain_moments] = parse(Int, ENV["SCYTHE_O01_RAIN_MOMENTS"]))
+    # The n_r control-variable transform, the number sibling of RTRANS. Its width is in
+    # #/m^3, not kg/m^3 — nothing to do with RMU.
+    haskey(ENV, "SCYTHE_O01_NRTRANS") &&
+        (options[:rain_number_transform] = Symbol(ENV["SCYTHE_O01_NRTRANS"]))
+    haskey(ENV, "SCYTHE_O01_NRMU") &&
+        (physical_params[:mu_rain_n] = parse(Float64, ENV["SCYTHE_O01_NRMU"]))
+
     # Slot names, now that the transforms are known. Everything keyed by NAME below — the BC
     # dicts, l_q, positivity and vars itself — must use these, because a stale key is ignored
-    # silently rather than raising (`Scythe.check_mc_var_names` is the backstop).
+    # silently rather than raising (`Scythe.check_mc_var_names` is the backstop). `vars`
+    # already carries the APPENDED n_r slot when RAIN_MOMENTS=2, so `scalar_bc` and every
+    # dict merged off it pick it up with no further edits.
     vars = Scythe.mc_var_names(options)
     rain_name = Scythe.rain_var_name(options)
+    rain_number_name = Scythe.rain_number_var_name(options)
+    two_moment = Scythe.rain_moments(options) == 2
     cloud_name = Scythe.condensate_var_name(options)
 
     output_dir = benchmark_output_dir("o01_rainfall", opts)
@@ -246,14 +265,23 @@ function o01_model(opts::BenchmarkOptions)
     # fit at both: a Neumann fit would force a zero boundary flux derivative and
     # trap the falling rain at the surface instead of letting the sedimentation
     # flux divergence remove it through z = 0.
+    # The rain NUMBER takes the same free fit as the rain mass, for the same reason: the
+    # number flux divergence has to be able to carry drops out through z = 0 with the water
+    # they hold, or the count piles up at the ground while its mass leaves.
     topbot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), rain_name => NaturalBC()))
+    two_moment && (topbot_bc[rain_number_name] = NaturalBC())
 
     # Attribution: sweep the cubic-spline filter length only on the water species.
     # Unset => Dict("default" => 2.0), which equals the struct default, so bit-identical.
     lq = merge(Dict("default" => 2.0),
                haskey(ENV, "SCYTHE_O01_LQ") ?
                    let x = parse(Float64, ENV["SCYTHE_O01_LQ"])
-                       Dict(rain_name => x, cloud_name => x)
+                       # The rain number takes the rain mass's filter length: the two are
+                       # fitted on the same spike and a different low-pass on each would
+                       # change the mean drop size at every wavenumber it separated them by.
+                       two_moment ? Dict(rain_name => x, cloud_name => x,
+                                         rain_number_name => x) :
+                                    Dict(rain_name => x, cloud_name => x)
                    end : Dict{String,Float64}())
 
     # Positivity of the rain density, imposed as a box constraint on the spline coefficients

@@ -1,5 +1,6 @@
 using Test
 using Scythe
+using SpecialFunctions: gamma
 
 @testset "Microphysics" begin
 
@@ -380,6 +381,237 @@ using Scythe
         # 7d. invtau_condensation positive for typical conditions
         invtau = Scythe.invtau_condensation(Tk, p, 100.0, 10.0)
         @test invtau > 0.0
+    end
+
+    # ──────────────────────────────────────────────
+    # 8. Two-moment warm rain (ISHMAEL / Morrison exponential DSD)
+    # ──────────────────────────────────────────────
+    #
+    # These are the density-form ports of module_mp_jensen_ishmael.F lines 1707-1785 and
+    # 2244-2247. Each testset states the Fortran form independently (the "twin"), in the
+    # Fortran's own MIXING-RATIO variables, and checks that the density-form function agrees
+    # exactly-to-roundoff. A twin that merely restated the Julia would test nothing; these
+    # restate the FORTRAN, so a units slip in the conversion is what they catch.
+    @testset "Two-moment warm rain" begin
+
+        RHOW = Scythe.ISHMAEL_RHOW
+        PI_I = Scythe.ISHMAEL_PI
+        AR = Scythe.ISHMAEL_AR
+        BR = Scythe.ISHMAEL_BR
+        R0 = Scythe.ISHMAEL_R0
+
+        # A representative rainy state: 1 g/m^3 of rain in 1000 drops per m^3
+        # (mean drop mass 1e-6 kg, D ~ 1.24 mm), 1 g/m^3 of cloud, near-surface air.
+        rho_d = 1.1
+        rho_r = 1.0e-3
+        n_r = 1.0e3
+        rho_c = 1.0e-3
+        Tk = 293.15
+        p_hPa = 1000.0
+
+        @testset "DSD slope: density form == mixing-ratio form" begin
+            q_r = rho_r / rho_d
+            nr_kg = n_r / rho_d
+            twin = Scythe.ishmael_rain_lambda(q_r, nr_kg)
+            dsd = Scythe.rain_dsd_2m(rho_r, n_r, rho_d)
+
+            # lamr is conversion-INVARIANT: the Fortran forms it from nr/qr, which is n_r/rho_r
+            @test dsd.lamr == twin.lamr
+            @test dsd.lamr ≈ (PI_I * RHOW * n_r / rho_r)^(1 / 3) rtol=1e-12
+            # n0rr and n_r carry exactly one factor of the air density
+            @test dsd.n0rr ≈ twin.n0rr * rho_d rtol=1e-14
+            @test dsd.n_r ≈ twin.nr * rho_d rtol=1e-14
+            @test dsd.q_r ≈ q_r rtol=1e-14
+
+            # Empty distribution: no NaN, no Inf leaking into the callers
+            empty = Scythe.rain_dsd_2m(0.0, 0.0, rho_d)
+            @test empty.n0rr == 0.0
+            @test empty.n_r == 0.0
+            @test isfinite(empty.lamr)
+            @test Scythe.rain_dsd_2m(-1.0e-6, -5.0, rho_d).n0rr == 0.0
+        end
+
+        @testset "KK2000 autoconversion (lines 1726-1734)" begin
+            N_c = 100.0                                  # #/cm^3
+            q_c = rho_c / rho_d
+            # Fortran: PRC = 1350 qc^2.47 (nc/1e6*rhoair)^(-1.79), and (nc/1e6*rhoair) IS
+            # the droplet number in #/cm^3.
+            PRC = 1350.0 * q_c^2.47 * N_c^(-1.79)
+            NPRC1 = PRC / (4.0 / 3.0 * PI_I * RHOW * (25.0e-6)^3)
+
+            Qdot, Ndot = Scythe.rain_autoconversion_2m(rho_c, rho_d, N_c)
+            @test Qdot ≈ PRC * rho_d rtol=1e-13
+            @test Ndot ≈ NPRC1 * rho_d rtol=1e-13
+            # The number source is the mass source divided by a 25 micron-RADIUS drop
+            @test Ndot ≈ Qdot / Scythe.RAIN_2M_M_AUTO rtol=1e-14
+            @test Scythe.RAIN_2M_M_AUTO ≈ (4 / 3) * pi * 1000.0 * (25.0e-6)^3 rtol=1e-6
+
+            # Threshold and negative-argument safety: exact zeros, not small numbers
+            below = 0.5 * Scythe.RAIN_2M_QC_AUTO * rho_d
+            @test Scythe.rain_autoconversion_2m(below, rho_d, N_c) === (0.0, 0.0)
+            @test Scythe.rain_autoconversion_2m(-1.0e-3, rho_d, N_c) === (0.0, 0.0)
+            @test Scythe.rain_autoconversion_2m(rho_c, rho_d, 0.0) === (0.0, 0.0)
+            # Monotone in cloud, and steeply so (exponent 2.47)
+            @test Scythe.rain_autoconversion_2m(2 * rho_c, rho_d, N_c)[1] >
+                  4 * Scythe.rain_autoconversion_2m(rho_c, rho_d, N_c)[1]
+            # More droplets for the same water => less autoconversion (exponent -1.79)
+            @test Scythe.rain_autoconversion_2m(rho_c, rho_d, 200.0)[1] <
+                  Scythe.rain_autoconversion_2m(rho_c, rho_d, 100.0)[1]
+        end
+
+        @testset "KK2000 accretion (lines 1736-1742)" begin
+            q_c = rho_c / rho_d
+            q_r = rho_r / rho_d
+            PRA = 67.0 * (q_c * q_r)^1.15
+            @test Scythe.rain_accretion_2m(rho_c, rho_r, rho_d) ≈ PRA * rho_d rtol=1e-13
+
+            below = 0.5 * Scythe.RAIN_2M_Q_MIN * rho_d
+            @test Scythe.rain_accretion_2m(below, rho_r, rho_d) === 0.0
+            @test Scythe.rain_accretion_2m(rho_c, below, rho_d) === 0.0
+            @test Scythe.rain_accretion_2m(-1.0e-3, rho_r, rho_d) === 0.0
+            @test Scythe.rain_accretion_2m(rho_c, -1.0e-3, rho_d) === 0.0
+        end
+
+        @testset "Beheng self-collection / Verlinde-Cotton breakup (lines 1744-1753)" begin
+            # Small drops (1/lamr < 300 micron): dum = 1, pure self-collection (a SINK).
+            # 0.1 g/m^3 in 1e5 drops/m^3 => mean mass 1e-9 kg, D ~ 124 micron.
+            rho_r_s = 1.0e-4
+            n_r_s = 1.0e5
+            dsd_s = Scythe.rain_dsd_2m(rho_r_s, n_r_s, rho_d)
+            @test 1.0 / dsd_s.lamr < 300.0e-6
+            twin_s = -5.78 * 1.0 * (n_r_s / rho_d) * (rho_r_s / rho_d) * rho_d * rho_d
+            got_s = Scythe.rain_selfcollection_2m(rho_r_s, n_r_s, rho_d)
+            @test got_s ≈ twin_s rtol=1e-12
+            @test got_s < 0.0
+
+            # Large drops (1/lamr >= 300 micron): breakup drives dum negative, so the term
+            # becomes a number SOURCE. This is the intended Verlinde-Cotton behaviour.
+            dsd_l = Scythe.rain_dsd_2m(rho_r, n_r, rho_d)
+            @test 1.0 / dsd_l.lamr >= 300.0e-6
+            dum_l = 2.0 - exp(2300.0 * ((1.0 / dsd_l.lamr) - 300.0e-6))
+            @test dum_l < 0.0
+            twin_l = -5.78 * dum_l * dsd_l.n_r * rho_r
+            @test Scythe.rain_selfcollection_2m(rho_r, n_r, rho_d) ≈ twin_l rtol=1e-12
+            @test Scythe.rain_selfcollection_2m(rho_r, n_r, rho_d) > 0.0
+
+            below = 0.5 * Scythe.RAIN_2M_Q_MIN * rho_d
+            @test Scythe.rain_selfcollection_2m(below, n_r, rho_d) === 0.0
+            @test Scythe.rain_selfcollection_2m(-1.0e-3, n_r, rho_d) === 0.0
+        end
+
+        @testset "Fall speeds and size sorting (lines 2244-2247)" begin
+            dsd = Scythe.rain_dsd_2m(rho_r, n_r, rho_d)
+            arn = AR * (R0 / rho_d)^0.5
+            vtrn = min(arn * gamma(1.0 + BR) / dsd.lamr^BR, 9.1)
+            vtrm = min(arn * gamma(4.0 + BR) / 6.0 / dsd.lamr^BR, 9.1)
+
+            w_m, w_n = Scythe.rain_fall_speeds_2m(rho_r, n_r, rho_d)
+            @test w_m ≈ -vtrm rtol=1e-13
+            @test w_n ≈ -vtrn rtol=1e-13
+
+            # SIZE SORTING: mass always outruns number. Γ(4.5)/6 = 1.6684 > Γ(1.5) = 0.8862.
+            @test abs(w_m) > abs(w_n)
+            @test w_m < w_n < 0.0
+            @test Scythe.RAIN_2M_GAMMA_4BR / 6.0 > Scythe.RAIN_2M_GAMMA_1BR
+
+            # Sorting holds across the whole size range the DSD clamp admits
+            for (rr, nn) in ((1.0e-5, 1.0e6), (1.0e-4, 1.0e5), (5.0e-3, 5.0e2))
+                a, b = Scythe.rain_fall_speeds_2m(rr, nn, rho_d)
+                @test abs(a) >= abs(b)
+                @test a <= 0.0 && b <= 0.0
+            end
+
+            # The 9.1 m/s cap binds at the large-drop end (LAMMINR = 1/2800 micron)
+            big_m, big_n = Scythe.rain_fall_speeds_2m(1.0e-2, 1.0, rho_d)
+            @test abs(big_m) <= Scythe.RAIN_2M_VT_MAX
+            @test abs(big_n) <= Scythe.RAIN_2M_VT_MAX
+            @test abs(big_m) ≈ Scythe.RAIN_2M_VT_MAX rtol=1e-12
+
+            # Rain-free and negative-argument: exactly still air
+            @test Scythe.rain_fall_speeds_2m(0.0, 0.0, rho_d) === (0.0, 0.0)
+            @test Scythe.rain_fall_speeds_2m(-1.0e-6, -5.0, rho_d) === (0.0, 0.0)
+            # Thinner air => faster fall (the (R0/rho)^0.5 density correction)
+            @test abs(Scythe.rain_fall_speeds_2m(rho_r, n_r, 0.4)[1]) >
+                  abs(Scythe.rain_fall_speeds_2m(rho_r, n_r, 1.1)[1])
+        end
+
+        @testset "invtau_rain_2m: ventilated exponential DSD (lines 1755-1763)" begin
+            dsd = Scythe.rain_dsd_2m(rho_r, n_r, rho_d)
+            p_Pa = p_hPa * 100.0
+            # ISHMAEL's own air properties, lines 1015-1019
+            mu_air = 1.496e-6 * Tk^1.5 / (Tk + 120.0)
+            dv = 8.794e-5 * Tk^1.81 / p_Pa
+            nsch = mu_air / (rho_d * dv)
+            arn = AR * (R0 / rho_d)^0.5
+            # n0rr in the Fortran is per kg, and the formula carries an explicit rhoair;
+            # the density form folds the two into n0rr [m^-4].
+            twin = 2.0 * PI_I * dsd.n0rr * dv *
+                   (Scythe.ISHMAEL_F1R / (dsd.lamr * dsd.lamr) +
+                    Scythe.ISHMAEL_F2R * (arn * rho_d / mu_air)^0.5 *
+                    nsch^(1 / 3) * gamma(2.5 + BR / 2) / dsd.lamr^(2.5 + BR / 2))
+
+            got = Scythe.invtau_rain_2m(Tk, p_hPa, rho_r, n_r, rho_d)
+            @test got ≈ twin rtol=1e-12
+            @test got > 0.0
+            # An inverse timescale: seconds, and a physically sane one for 1 g/m^3 of rain
+            @test 1.0e-5 < got < 1.0e-1
+
+            # More rain in the same number of drops (bigger drops) => slower relaxation per
+            # unit... no: more surface area overall, so a FASTER exchange. Monotone in mass.
+            @test Scythe.invtau_rain_2m(Tk, p_hPa, 2 * rho_r, n_r, rho_d) > got
+            # More drops holding the same mass => more surface area => faster still
+            @test Scythe.invtau_rain_2m(Tk, p_hPa, rho_r, 4 * n_r, rho_d) > got
+
+            below = 0.5 * Scythe.RAIN_2M_Q_MIN * rho_d
+            @test Scythe.invtau_rain_2m(Tk, p_hPa, below, n_r, rho_d) === 0.0
+            @test Scythe.invtau_rain_2m(Tk, p_hPa, -1.0e-3, n_r, rho_d) === 0.0
+            @test Scythe.invtau_rain_2m(Tk, p_hPa, rho_r, -5.0, rho_d) > 0.0   # floored n_r
+            # Same order of magnitude as the fixed-intercept Marshall-Palmer closure it
+            # replaces, at the classic N_0 (a units sanity check, not an identity).
+            mp = Scythe.invtau_rain_mp(Tk, p_hPa, 8.0e6, rho_r, rho_d)
+            @test 0.05 < got / mp < 20.0
+        end
+
+        @testset "Rain number loss to evaporation (lines 1780-1785)" begin
+            # Proportional to the mass loss, at fixed mean drop mass
+            Qdot_r = -1.0e-6
+            got = Scythe.rain_number_evaporation_2m(Qdot_r, rho_r, n_r)
+            @test got ≈ Qdot_r * n_r / rho_r rtol=1e-14
+            @test got < 0.0
+            # The fractional loss rates of mass and number are equal: mean mass invariant
+            @test got / n_r ≈ Qdot_r / rho_r rtol=1e-14
+
+            # Condensation ONTO rain makes no new drops
+            @test Scythe.rain_number_evaporation_2m(1.0e-6, rho_r, n_r) === 0.0
+            @test Scythe.rain_number_evaporation_2m(0.0, rho_r, n_r) === 0.0
+            # The RHO_R_MIN floor keeps a vanishing-mass column finite
+            @test isfinite(Scythe.rain_number_evaporation_2m(-1.0e-12, 0.0, n_r))
+            @test Scythe.rain_number_evaporation_2m(-1.0e-6, rho_r, -5.0) === 0.0
+        end
+
+        @testset "qss_condensation_rates rain channel is switchable" begin
+            # The two-moment channel replaces invtau_rain / invtau_rain_mp and nothing else:
+            # same split arithmetic, same cloud gate.
+            Q_ss = 1.0e-4; rho_v = 0.02; Q_s = 0.5
+            args = (Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, 0.5, 1.0e-3, 100.0)
+
+            one_m = Scythe.qss_condensation_rates(args...)
+            two_m = Scythe.qss_condensation_rates(args...; rain_2m = true, n_r_density = n_r)
+
+            # Default keywords are inert: rain_2m = false reproduces the 1-moment call
+            @test Scythe.qss_condensation_rates(args...; rain_2m = false,
+                                                n_r_density = n_r) === one_m
+            # And the 2-moment arm uses invtau_rain_2m for its rain channel
+            @test two_m[4] ≈ Scythe.invtau_rain_2m(Tk, p_hPa, rho_r, n_r, rho_d) rtol=1e-14
+            @test two_m[3] == one_m[3]          # cloud channel untouched
+            @test two_m[4] != one_m[4]          # rain channel replaced
+
+            # Dry, rain-free, cloud-free air stays exactly inert on both arms
+            dry = Scythe.qss_condensation_rates(0.0, 1.0e-6, 0.0, 0.0, rho_d, Tk, p_hPa,
+                                                Q_s, 0.5, 1.0e-3, 100.0;
+                                                rain_2m = true, n_r_density = 0.0)
+            @test dry === (0.0, 0.0, 0.0, 0.0)
+        end
     end
 
 end

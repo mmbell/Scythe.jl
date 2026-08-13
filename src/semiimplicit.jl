@@ -16,6 +16,46 @@ export createModelTile, advanceTimestep, advanceTimestepA, advanceTimestepB
 export initialize_model, run_model, finalize_model
 
 """
+    MCSlots
+
+Resolved indices of the moist-compressible set's OPTIONAL, APPENDED prognostic slots.
+
+Slots 1-9 (and `v` at 10 on the cylindrical/3-D variants) are hardcoded literals throughout
+`mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`. Everything switched on by an
+option is APPENDED after that block instead, so its index depends on the geometry — the rain
+number `n_r` is 10 on the XZ slice and 11 wherever `v` is carried — and the ONLY way to know
+it is by name, through `Scythe.mc_var_names(options)` and `mc_slot`.
+
+That lookup is a `Dict{String,Int}` hash and the driver runs once per COLUMN, so it is done
+exactly once, here, when the tile is built. A field per slot, all `Int`, all `0` when the
+slot is not registered: concrete, so `ModelTile` stays fully typed and the driver's
+`mtile.mc_slots.n_r` is a load, and extensible without adding a type parameter (which a
+`NamedTuple` field would have forced onto `ModelTile` and through every method signature
+that touches it).
+
+`0` means ABSENT. The driver tests `> 0` rather than re-reading the option, so the slot's
+existence and the physics that writes it cannot disagree.
+"""
+struct MCSlots
+    "Prognostic rain number density [#/m³] under `options[:rain_moments] = 2`; 0 otherwise."
+    n_r::Int
+end
+
+"""
+    mc_slots(model) -> MCSlots
+
+Resolve the appended slots of [`MCSlots`](@ref) from a model's options and `vars`, once.
+Every field is 0 for a non-mc equation set, and for an mc set that declares no optional slot.
+"""
+function mc_slots(model::ModelParameters)
+    uses_pressure_reference(model.equation_set) || return MCSlots(0)
+    vars = model.grid_params.vars
+    # Defined in moist_compressible.jl, included after this file; resolved at call time.
+    nr = rain_moments(model.options) == 2 ? mc_slot(vars, "n_r") : 0
+    return MCSlots(nr)
+end
+
+"""
     ModelTile
 
 Fundamental computational unit holding model state, tendencies, reference state,
@@ -110,6 +150,9 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # broadcast temporaries (`p = pp .+ pbar` and friends). Empty for every other set.
     # See `_allocate_mc_scratch` for why these are keyed by NAME rather than by index.
     mc_scratch::MSC
+    # Indices of the mc set's OPTIONAL, APPENDED prognostic slots, resolved by name ONCE
+    # here so the per-column driver never pays (nor risks) a name lookup. See `MCSlots`.
+    mc_slots::MCSlots
     # Consistently-retrieved diagnostics of the RESTING reference for the total-energy
     # set's vertical moist diffusion: s_tbar and rho_vbar computed through the SAME
     # retrieval pipeline the equation set runs each step, so at rest the diffused
@@ -437,6 +480,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         solve_rhs,
         solve_load,
         mc_scratch,
+        mc_slots(model),
         mc_ref_diag,
         _allocate_sw_scratch(tile, model),
         uses_pressure_reference(model.equation_set) ?

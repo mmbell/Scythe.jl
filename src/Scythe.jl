@@ -87,9 +87,14 @@ include("shallowWaterModels.jl")
 include("tcblModels.jl")
 include("primitive_equations.jl")
 include("io.jl")
-include("microphysics.jl")
+# The ISHMAEL port layer comes BEFORE microphysics.jl: the two-moment warm-rain rate
+# functions there build top-level constants out of the ISHMAEL parameter block
+# (ISHMAEL_RHOW, ISHMAEL_AR, ...), and a `const` initializer is evaluated at include
+# time, not at first call. Neither ishmael file references anything from microphysics.jl,
+# so the swap is inert in the other direction.
 include("ishmael_tables.jl")
 include("ishmael.jl")
+include("microphysics.jl")
 include("mc_geometry.jl")
 include("mc_boundary_layer.jl")
 include("moist_compressible.jl")

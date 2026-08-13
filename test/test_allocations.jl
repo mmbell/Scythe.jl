@@ -247,6 +247,37 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations diffusion_timestep_mc(mtile_mp, 1, kDim_mp, 2)) == 0
     end
 
+    @testset "per-column allocations stay zero with two-moment rain" begin
+        # `options[:rain_moments] = 2` APPENDS a prognostic slot whose index is resolved by
+        # NAME. That resolution is a `Dict{String,Int}` hash, and the driver runs once per
+        # COLUMN — so it is done once, at tile creation, into the concrete `MCSlots` field.
+        # If it ever creeps back into `mc_driver!` this test is what catches it, along with
+        # the appended slot's own views, scratch columns and flux transform.
+        mtile_2m, kDim_2m = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3),
+                                          precipitation = true,
+                                          extra_options = Dict{Symbol,Any}(
+                                              :rain_moments => 2))
+        @test mtile_2m.mc_slots.n_r == 10          # appended after the fixed 1-9 block
+        moist_compressible_XZ(mtile_2m, 1, kDim_2m, 2)  # compile
+        diffusion_timestep_mc(mtile_2m, 1, kDim_2m, 2)
+
+        @test (@allocations moist_compressible_XZ(mtile_2m, 1, kDim_2m, 2)) == 0
+        @test (@allocations diffusion_timestep_mc(mtile_2m, 1, kDim_2m, 2)) == 0
+
+        # ...and with the number's own control-variable transform on (an extra recovery
+        # and Jacobian per column), and on the cylinder where the slot moves to 11.
+        mtile_2t, kDim_2t = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                          extra_params = Dict(:N_r => 1.0e-3,
+                                                              :mu_rain_n => 1.0),
+                                          precipitation = true,
+                                          extra_options = Dict{Symbol,Any}(
+                                              :rain_moments => 2,
+                                              :rain_number_transform => :bhyp))
+        @test mtile_2t.mc_slots.n_r == 11
+        Scythe.moist_compressible_axisym(mtile_2t, 1, kDim_2t, 2)  # compile
+        @test (@allocations Scythe.moist_compressible_axisym(mtile_2t, 1, kDim_2t, 2)) == 0
+    end
+
     @testset "per-column allocations stay zero on the axisymmetric cylinder" begin
         # The cylindrical trait path binds the extra v views and metric terms; the
         # trait dispatch must stay compile-time (no boxing) and the v machinery in

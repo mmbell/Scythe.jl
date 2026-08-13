@@ -1554,6 +1554,268 @@ function invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d)
            f_ventilation_mp(lambda, rho_d, Tk)
 end
 
+# ── Two-moment warm rain: the ISHMAEL / Morrison exponential-DSD closure ───────
+#
+# Selected by `options[:rain_moments] = 2`, which adds the prognostic rain NUMBER
+# density n_r [#/m^3] as a slot of the moist-compressible set. Under that option the
+# WHOLE rain closure switches to the forms below; the single-moment (Ooyama) family
+# above is untouched and remains the default.
+#
+# Ported from `tools/ishmael_fortran_driver/module_mp_jensen_ishmael.F` (the CM1 r21.1
+# copy of Jensen et al.'s ISHMAEL), whose warm-rain block is Morrison's. Every function
+# cites the Fortran lines it came from. Two conventions differ from the Fortran and are
+# uniform here:
+#
+#  * DENSITY FORM. The Fortran carries mixing ratios (`qr` [kg/kg], `nr` [# /kg]); the
+#    driver carries partial densities (`rho_r` [kg/m^3], `n_r` [#/m^3]). The conversion
+#    is by the DRY density (`q = rho/rho_d`), the same convention `q_c = rho_c/rho_d`
+#    already uses throughout this file, and `rho_d` also stands in for the Fortran's
+#    moist `rhoair` in the fall-speed and ventilation factors. The exponential-DSD slope
+#    is invariant under the conversion (`nr/qr == n_r/rho_r`), which is why
+#    [`ishmael_rain_lambda`](@ref) — including its `LAMMINR`/`LAMMAXR` clamp and the
+#    `nr` re-diagnosis — is REUSED at the boundary rather than reimplemented.
+#  * NO `dt` ANYWHERE. The Fortran's over-depletion limiters (`min(NPRC1,NPRC)` with
+#    `NPRC <= nc/dt`, the `max(-1,·)` on the evaporation number loss, the saturation
+#    re-check on `pre`) are all `Δt`-dependent modifications of a RATE, which is exactly
+#    the defect `qss_condensation_rates` documents under "No limiters". They are not
+#    ported. The thresholds that are pure state tests (`qc >= 1e-6`, `qr >= 1e-8`, the
+#    9.1 m/s fall-speed cap) ARE ported.
+#
+# Negative-argument safety follows the rest of this file: every rate is `max(·,0)`-guarded
+# on the water it consumes and returns an exact `0.0` below its threshold, so a spline
+# undershoot is inert rather than a DomainError.
+#
+# There is no `f_ice` factor here. ISHMAEL's warm-rain block is liquid-only by
+# construction — its ice is a separate set of categories — so the Ooyama bulk ice
+# fraction has no place in it.
+
+"Cloud mixing ratio [kg/kg] below which KK2000 autoconversion is exactly zero (line 1727)."
+const RAIN_2M_QC_AUTO = 1.0e-6
+"""
+Mixing ratio [kg/kg] below which KK2000 accretion and Beheng self-collection are exactly
+zero (lines 1737, 1745).
+"""
+const RAIN_2M_Q_MIN = 1.0e-8
+"Rain fall-speed cap [m/s] applied to both moments (lines 2246-2247)."
+const RAIN_2M_VT_MAX = 9.1
+"""
+Mass [kg] of the 25 micron-RADIUS drop KK2000 assigns to each autoconverted raindrop,
+`(4/3)π ρ_w (25e-6)^3` (line 1730). Dividing the mass rate by it gives the number rate.
+"""
+const RAIN_2M_M_AUTO = (4.0 / 3.0) * ISHMAEL_PI * ISHMAEL_RHOW * (25.0e-6)^3
+"Γ(1+BR) — the number-weighted fall-speed moment of the exponential DSD (line 2244)."
+const RAIN_2M_GAMMA_1BR = gamma(1.0 + ISHMAEL_BR)
+"Γ(4+BR) — the mass-weighted fall-speed moment of the exponential DSD (line 2245)."
+const RAIN_2M_GAMMA_4BR = gamma(4.0 + ISHMAEL_BR)
+"Γ(5/2 + BR/2) — the ventilation moment of the exponential DSD (line 1760)."
+const RAIN_2M_GAMMA_VENT = gamma(2.5 + (0.5 * ISHMAEL_BR))
+
+"""
+    rain_dsd_2m(rho_r, n_r, rho_d) -> (q_r, lamr, n0rr, n_r)
+
+Exponential rain DSD `n(D) = n0rr exp(-lamr D)` in DENSITY form: the slope `lamr` [1/m],
+the intercept `n0rr` [m⁻⁴] and the clamp-consistent number density `n_r` [#/m³], plus the
+rain mixing ratio `q_r` [kg/kg] the ISHMAEL thresholds are stated in.
+
+The single implementation of the clamp lives in [`ishmael_rain_lambda`](@ref) (Fortran
+lines 1707-1722, the block duplicated five times there); this is the density-form boundary
+around it. `lamr` itself is conversion-invariant — the Fortran forms it from `nr/qr`, which
+equals `n_r/rho_r` — so only `n0rr` and `n_r` carry a factor of `rho_d`.
+
+Both water arguments are floored at zero, and a rain-free point returns `lamr = LAMMAXR`
+with `n0rr = n_r = 0.0`, so the callers' thresholds see an empty distribution rather than
+a `NaN`.
+"""
+@inline function rain_dsd_2m(rho_r, n_r, rho_d)
+
+    rd = max(rho_d, RHO_D_MIN)
+    q_r = max(rho_r, 0.0) / rd
+    dsd = ishmael_rain_lambda(q_r, max(n_r, 0.0) / rd)
+    return (q_r = q_r, lamr = dsd.lamr, n0rr = dsd.n0rr * rd, n_r = dsd.nr * rd)
+end
+
+"""
+    rain_autoconversion_2m(rho_c, rho_d, N_c) -> (Qdot, Ndot)
+
+Khairoutdinov & Kogan (2000) autoconversion of cloud to rain in density form (Fortran
+lines 1726-1734), returning the MASS rate [kg m⁻³ s⁻¹] and the rain NUMBER source
+[# m⁻³ s⁻¹]:
+
+    PRC   = 1350 q_c^2.47 N_c^{-1.79}          [1/s]   (line 1728)
+    Qdot  = PRC ρ_d                            [kg m^-3 s^-1]
+    Ndot  = Qdot / RAIN_2M_M_AUTO              [# m^-3 s^-1]  (line 1730)
+
+`N_c` is the cloud droplet number in **#/cm³**, the same unit — and, as the driver calls
+it, the same VALUE — the cloud condensation channel's `max_N_c` carries. The Fortran
+hardcodes 200 cm⁻³ (line 1031) instead; taking the number from the existing closure keeps
+one cloud droplet population per column rather than two that disagree, and a run that
+wants ISHMAEL's value sets `physical_params[:max_N_c] = 200.0`. The Fortran's exponent
+argument `(nc/1e6·ρ_air)` IS this quantity: `nc` is #/kg there, so `nc·ρ_air` is #/m³ and
+the `1e6` converts to #/cm³.
+
+Exactly `(0.0, 0.0)` below `q_c = RAIN_2M_QC_AUTO`, and for `N_c <= 0`.
+
+The Fortran's companion `NPRC` (the CLOUD number sink) and the `NPRC1 = min(NPRC1, NPRC)`
+cross-limit are not ported: `NPRC` is only meaningful with a prognostic cloud number,
+which this scheme does not carry, and its own `min(NPRC, nc/dt)` clamp is `Δt`-dependent.
+"""
+@inline function rain_autoconversion_2m(rho_c, rho_d, N_c)
+
+    rd = max(rho_d, RHO_D_MIN)
+    q_c = max(rho_c, 0.0) / rd
+    (q_c < RAIN_2M_QC_AUTO || N_c <= 0.0) && return (0.0, 0.0)
+    Qdot = 1350.0 * q_c^2.47 * N_c^(-1.79) * rd
+    return (Qdot, Qdot / RAIN_2M_M_AUTO)
+end
+
+"""
+    rain_accretion_2m(rho_c, rho_r, rho_d)
+
+Khairoutdinov & Kogan (2000) accretion of cloud water by rain in density form [kg m⁻³ s⁻¹]
+(Fortran lines 1736-1742): `PRA = 67 (q_c q_r)^1.15`, times `ρ_d`.
+
+Number-neutral, deliberately: ISHMAEL computes `NPRA` on line 1741 and never uses it (its
+own comment says so, because `nc` is not prognosed), and accretion cannot change the rain
+number in any case — it grows existing drops.
+
+Exactly `0.0` unless BOTH mixing ratios reach `RAIN_2M_Q_MIN`.
+"""
+@inline function rain_accretion_2m(rho_c, rho_r, rho_d)
+
+    rd = max(rho_d, RHO_D_MIN)
+    q_c = max(rho_c, 0.0) / rd
+    q_r = max(rho_r, 0.0) / rd
+    (q_c < RAIN_2M_Q_MIN || q_r < RAIN_2M_Q_MIN) && return 0.0
+    return 67.0 * (q_c * q_r)^1.15 * rd
+end
+
+"""
+    rain_selfcollection_2m(rho_r, n_r, rho_d)
+
+Rain self-collection (Beheng 1994) with the Verlinde & Cotton (1993) breakup rolloff, in
+density form [# m⁻³ s⁻¹] and always `<= 0` (Fortran lines 1744-1753):
+
+    dum   = 1                                    for 1/lamr <  300 μm
+    dum   = 2 − exp(2300 (1/lamr − 300e-6))      for 1/lamr >= 300 μm
+    Ndot  = −5.78 dum n_r ρ_r
+
+The density form is exact, not approximate: the Fortran's `−5.78 dum·nr·qr·ρ_air` is a
+`#/kg/s` rate, and multiplying it by `ρ_air` to get `#/m³/s` cancels the two conversion
+factors in `nr·qr` against it, leaving the product of the two densities. Breakup can drive
+`dum` negative at large drop sizes, which flips the sign and makes the term a number
+SOURCE — that is the intended Verlinde-Cotton behaviour and is not clipped.
+
+Exactly `0.0` below `q_r = RAIN_2M_Q_MIN`.
+"""
+@inline function rain_selfcollection_2m(rho_r, n_r, rho_d)
+
+    dsd = rain_dsd_2m(rho_r, n_r, rho_d)
+    dsd.q_r < RAIN_2M_Q_MIN && return 0.0
+    d_mean = 1.0 / dsd.lamr
+    dum = d_mean < 300.0e-6 ? 1.0 : 2.0 - exp(2300.0 * (d_mean - 300.0e-6))
+    return -5.78 * dum * dsd.n_r * max(rho_r, 0.0)
+end
+
+"""
+    rain_fall_speeds_2m(rho_r, n_r, rho_d) -> (w_m, w_n)
+
+Mass-weighted and number-weighted rain fall speeds [m/s, `<= 0`] for the exponential DSD
+(Fortran lines 2244-2247), with `arn = AR (R0/ρ_air)^{1/2}` (line 1016):
+
+    w_m = −min(arn Γ(4+BR) / 6 / lamr^BR, 9.1)
+    w_n = −min(arn Γ(1+BR)     / lamr^BR, 9.1)
+
+Returned NEGATIVE (downward), the sign convention [`rain_terminal_velocity`](@ref) already
+uses, so the driver's `F = max(ρ,0)·w` is unchanged.
+
+`|w_m| > |w_n|` always below the cap, because `Γ(4+BR)/6 > Γ(1+BR)` for `BR = 0.5`
+(1.6684 vs 0.8862): mass falls faster than number, which IS size sorting — the physical
+content the second moment buys. Both are capped at 9.1 m/s, and the cap can make them
+equal at very large drop sizes.
+
+Exactly `(0.0, 0.0)` below `q_r = RAIN_2M_Q_MIN`, so rain-free air has no flux.
+"""
+@inline function rain_fall_speeds_2m(rho_r, n_r, rho_d)
+
+    dsd = rain_dsd_2m(rho_r, n_r, rho_d)
+    dsd.q_r < RAIN_2M_Q_MIN && return (0.0, 0.0)
+    rd = max(rho_d, RHO_D_MIN)
+    arn = ISHMAEL_AR * sqrt(ISHMAEL_R0 / rd)
+    lam_br = dsd.lamr^ISHMAEL_BR
+    w_m = -min(arn * RAIN_2M_GAMMA_4BR / 6.0 / lam_br, RAIN_2M_VT_MAX)
+    w_n = -min(arn * RAIN_2M_GAMMA_1BR / lam_br, RAIN_2M_VT_MAX)
+    return (w_m, w_n)
+end
+
+"""
+    invtau_rain_2m(Tk, p_hPa, rho_r, n_r, rho_d)
+
+Ventilated inverse rain relaxation timescale [1/s] for the PROGNOSTIC exponential DSD —
+ISHMAEL's `epsr` (Fortran lines 1755-1763), in density form:
+
+    1/τ_r = 2π n0rr D_v [ F1R/lamr² + F2R (arn ρ_air/μ)^{1/2} Sc^{1/3} Γ(5/2+BR/2)
+                                      / lamr^{5/2+BR/2} ]
+
+with ISHMAEL's own air properties (lines 1015-1019), which are used rather than this
+file's Pruppacher-Klett `vapor_diffusivity` because the whole closure is the ISHMAEL one
+and the ventilation coefficients were fitted against these:
+
+    μ  = 1.496e-6 T^1.5/(T+120)      [kg m^-1 s^-1]   dynamic viscosity
+    D_v = 8.794e-5 T^1.81/p          [m^2 s^-1]       p in PASCALS
+    Sc  = μ/(ρ_air D_v)
+
+This is the two-moment sibling of [`invtau_rain`](@ref) (monodisperse, fixed `N_r`) and
+[`invtau_rain_mp`](@ref) (exponential DSD at a FIXED intercept `N_0`). The difference from
+the latter is that `n0rr` is now diagnosed from the prognostic (`ρ_r`, `n_r`) pair rather
+than prescribed, so the evaporation timescale responds to the drop SIZE the scheme is
+actually carrying.
+
+Returned non-negative and exactly `0.0` below `q_r = RAIN_2M_Q_MIN`. The condensation-side
+cloud gate lives in the caller [`qss_condensation_rates`](@ref), unchanged.
+"""
+function invtau_rain_2m(Tk, p_hPa, rho_r, n_r, rho_d)
+
+    dsd = rain_dsd_2m(rho_r, n_r, rho_d)
+    dsd.q_r < RAIN_2M_Q_MIN && return 0.0
+    rd = max(rho_d, RHO_D_MIN)
+    mu_air = 1.496e-6 * Tk^1.5 / (Tk + 120.0)
+    Dv = 8.794e-5 * Tk^1.81 / (p_hPa * 100.0)
+    Sc = mu_air / (rd * Dv)
+    arn = ISHMAEL_AR * sqrt(ISHMAEL_R0 / rd)
+    vent_exp = 2.5 + (0.5 * ISHMAEL_BR)
+    return 2.0 * ISHMAEL_PI * dsd.n0rr * Dv *
+           ((ISHMAEL_F1R / (dsd.lamr * dsd.lamr)) +
+            (ISHMAEL_F2R * sqrt(arn * rd / mu_air) * cbrt(Sc) *
+             RAIN_2M_GAMMA_VENT / dsd.lamr^vent_exp))
+end
+
+"""
+    rain_number_evaporation_2m(Qdot_r, rho_r, n_r)
+
+Rain number loss to evaporation [# m⁻³ s⁻¹] (Fortran lines 1780-1785):
+
+    Ndot = Q̇_r n_r / max(ρ_r, RHO_R_MIN)     when Q̇_r < 0
+    Ndot = 0                                  otherwise
+
+i.e. evaporation removes drops in proportion to the mass it removes, holding the mean drop
+mass fixed. This is the `Δt`-free limit of the Fortran's `dum = max(-1, pre·dt/qr);
+npre = dum·nr/dt`: with the `max(-1,·)` over-depletion limiter removed (it is a `Δt`-sized
+cap on a rate — see the section header), `npre` reduces to `pre·nr/qr`, which is this in
+density form.
+
+Zero for `Q̇_r >= 0` because condensation ONTO existing rain grows the drops present; it
+does not nucleate new ones. Rain number has exactly one source in this scheme, the
+autoconversion term of [`rain_autoconversion_2m`](@ref).
+"""
+@inline function rain_number_evaporation_2m(Qdot_r, rho_r, n_r)
+
+    # `n_r <= 0` returns an exact `0.0` rather than falling through to `Qdot_r*0.0`, which
+    # is `-0.0` for an evaporating column: no drops, no drops to lose, and the file's
+    # convention is that an inactive rate is exactly zero.
+    (Qdot_r >= 0.0 || n_r <= 0.0) && return 0.0
+    return Qdot_r * n_r / max(rho_r, RHO_R_MIN)
+end
+
 """
     droplet_growth_rate(Tk, p)
 
