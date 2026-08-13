@@ -81,18 +81,22 @@ end
 # Files for model integration
 include("thermodynamics.jl")
 include("reference_state.jl")
+# The ISHMAEL TABLE layer comes before semiimplicit.jl because `ModelTile` carries an
+# `IshmaelTables` field CONCRETELY (see `mc_ishmael_tables`): the struct definition has to
+# exist before the one that names it. ishmael_tables.jl is a leaf — SpecialFunctions, JLD2
+# and its own literals — so it can sit anywhere above its first user.
+include("ishmael_tables.jl")
 include("semiimplicit.jl")
 include("testModels.jl")
 include("shallowWaterModels.jl")
 include("tcblModels.jl")
 include("primitive_equations.jl")
 include("io.jl")
-# The ISHMAEL port layer comes BEFORE microphysics.jl: the two-moment warm-rain rate
+# The ISHMAEL process-rate layer comes BEFORE microphysics.jl: the two-moment warm-rain rate
 # functions there build top-level constants out of the ISHMAEL parameter block
 # (ISHMAEL_RHOW, ISHMAEL_AR, ...), and a `const` initializer is evaluated at include
 # time, not at first call. Neither ishmael file references anything from microphysics.jl,
 # so the swap is inert in the other direction.
-include("ishmael_tables.jl")
 include("ishmael.jl")
 include("microphysics.jl")
 include("mc_geometry.jl")

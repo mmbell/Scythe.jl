@@ -223,6 +223,12 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     mc_micro_n::Matrix{Float64}
     mc_micro_nm1::Matrix{Float64}
     mc_micro_nm2::Matrix{Float64}
+    # ISHMAEL's four collection lookup tables plus the inherent-growth-ratio curve, loaded
+    # ONCE here (44.5 MB of JLD2 plus a `mkcoltb` build) and read by the per-column ice
+    # microphysics through a plain field load. `EMPTY_ISHMAEL_TABLES` — not `nothing` —
+    # whenever ice is off, so the field stays CONCRETE and `mtile.ishmael_tables.itab`
+    # infers to `Array{Float64,5}` inside the driver. See `mc_ishmael_tables`.
+    ishmael_tables::IshmaelTables
 end
 
 """
@@ -525,8 +531,28 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
             zeros(Float64, length(MC_WATER_STATS), 0),
         mc_micro_n,
         mc_micro_nm1,
-        mc_micro_nm2)
+        mc_micro_nm2,
+        mc_ishmael_tables(model))
     return mtile
+end
+
+"""
+    mc_ishmael_tables(model) -> IshmaelTables
+
+The ISHMAEL lookup tables for this model, or [`EMPTY_ISHMAEL_TABLES`](@ref) when
+`options[:ice_microphysics]` is not `:ishmael`.
+
+Setup path only — once per tile, never per column. `physical_params[:ishmael_tables_path]`
+overrides the default `data/ishmael_tables.jld2`; a missing file is refused HERE, at tile
+construction, rather than at the first ice-bearing gridpoint several minutes into a run.
+"""
+function mc_ishmael_tables(model::ModelParameters)
+    uses_pressure_reference(model.equation_set) || return EMPTY_ISHMAEL_TABLES
+    # `ice_microphysics` is defined in moist_compressible.jl, included after this file;
+    # resolved at call time, exactly as `mc_slots` resolves `rain_moments`.
+    ice_microphysics(model.options) === :ishmael || return EMPTY_ISHMAEL_TABLES
+    return load_ishmael_tables_or_error(
+        get(model.physical_params, :ishmael_tables_path, ishmael_tables_path()))
 end
 
 """Extract nonzero row/col indices from a sparse map for SharedArray indexing."""

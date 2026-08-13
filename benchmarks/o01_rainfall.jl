@@ -250,12 +250,21 @@ function o01_model(opts::BenchmarkOptions)
     # spheroid volume moments) and turns on the ice thermodynamics: the rho_i term of the
     # closed-form temperature retrieval, q_i*Ci in the mixture heat capacities and the entropy,
     # and rho_i in the vapor residual. It REQUIRES SCYTHE_O01_RAIN_MOMENTS=2 and says so if it
-    # is missing (`Scythe.ice_microphysics`). NOTE that at this stage every ice PROCESS RATE
-    # and every ice FALL SPEED is zero, so ice-on with zero ice ICs is inert by construction --
-    # which is exactly what the regression against the ice-off run asserts.
+    # is missing (`Scythe.ice_microphysics`). The physics is LIVE: deposition through the
+    # shared prognostic Q_ss, the full ISHMAEL nucleation/riming/aggregation/melting set, and
+    # the Mitchell-Heymsfield fall speeds. Zero initial ice does NOT mean an inert run -- ice
+    # nucleates wherever the air is subfreezing and supersaturated, which above the bubble it
+    # is. The inertness that survives is on a WARM state, where every rate is gated off by a
+    # state test and the ten common slots reproduce the ice-off run bitwise.
     haskey(ENV, "SCYTHE_O01_ICE") &&
         (options[:ice_microphysics] =
              ENV["SCYTHE_O01_ICE"] in ("1", "true", "yes", "ishmael") ? :ishmael : :none)
+    # The var_check consistency source (default ON; see `Scythe.ice_microphysics`). Set to 0
+    # to carry the ice moments with no consistency restoration at all, which is the
+    # configuration that diverges at t ~ 1050 s and is kept switchable for exactly that
+    # measurement.
+    haskey(ENV, "SCYTHE_O01_ICEVARCHECK") &&
+        (options[:ice_var_check] = ENV["SCYTHE_O01_ICEVARCHECK"] in ("1", "true", "yes"))
     # The ice control-variable transform: ONE family key for all twelve slots (the moments of
     # a species are ratios of each other -- see `Scythe.ice_transform_mode`), the ice sibling
     # of RTRANS/NRTRANS.
@@ -272,6 +281,36 @@ function o01_model(opts::BenchmarkOptions)
         physical_params[:mu_ice_n] = imus[2]
         physical_params[:mu_ice_a] = imus[3]
         physical_params[:mu_ice_c] = imus[4]
+    end
+
+    # ── The ICE ARM'S PRODUCTION CONFIGURATION: all four water families transformed ──
+    #
+    # `SCYTHE_O01_ICE=1` turns the four control-variable transforms on by DEFAULT — cloud,
+    # rain mass, rain number and the twelve ice moments — because that is the configuration
+    # the ice physics is meant to be run in, not an option on top of it.
+    #
+    # The reason is the glaciation itself. Freezing an anvil is genuinely fast: homogeneous
+    # freezing, riming and ice-rain collection empty the liquid reservoirs on timescales of
+    # seconds, and an UNTRANSFORMED slot integrated explicitly through that overshoots below
+    # zero, at which point every `max(rho,0)`-guarded rate switches off and the negative
+    # region becomes a physics-free reservoir that nothing can drain (the mechanism
+    # reference/FINDINGS_CONDENSATE_STAGE1.md documents for the cloud). Measured on the first
+    # live ice arm: rho_r ran from -5e-4 to -62 kg/m^3 in twenty steps at t ~ 990 s, and
+    # thirding the step moved the divergence by 20 s, not by a factor of three.
+    #
+    # Under the biased hyperbolic transform the RECOVERED density is bounded below by -mu
+    # whatever the control variable does, so the collection rates vanish smoothly as a
+    # reservoir empties instead of changing sign, and the overshoot is returned through the
+    # vapor residual and the prognostic supersaturation. Nothing is repaired and nothing is
+    # clamped; it is a change of variables (Ooyama 2001 Eq. 4.19-4.23, `Scythe.bhyp`).
+    #
+    # Each is still individually overridable by its own env knob above, and NONE of this fires
+    # when ice is off, so the default path and the plain two-moment arm are untouched.
+    if Scythe.ice_microphysics(options) === :ishmael
+        haskey(ENV, "SCYTHE_O01_CTRANS")  || (options[:condensate_transform]   = :bhyp)
+        haskey(ENV, "SCYTHE_O01_RTRANS")  || (options[:rain_transform]         = :bhyp)
+        haskey(ENV, "SCYTHE_O01_NRTRANS") || (options[:rain_number_transform]  = :bhyp)
+        haskey(ENV, "SCYTHE_O01_ICETRANS")|| (options[:ice_transform]          = :bhyp)
     end
 
     # Slot names, now that the transforms are known. Everything keyed by NAME below — the BC
@@ -616,11 +655,83 @@ function o01_rain_diagnostics(model, ref, kDim)
     )
 end
 
+"""
+    o01_ice_diagnostics(model, ref, kDim) -> Dict
+
+Ice diagnostics over every output snapshot, for `options[:ice_microphysics] = :ishmael`.
+Returns an empty `Dict` when ice is off, so the caller can `merge` unconditionally.
+
+Per species (1 = planar-nucleated, 2 = columnar-nucleated, 3 = aggregates): the extreme mass
+density and the extreme number density over the whole run, the peak ice water path, and the
+HEIGHTS between which ice ever appears. The last is the physical gate — ice above the freezing
+level and only falling through below it — and it is reported as a height rather than a mask
+because that is what a Dunion-sounding run can be checked against by eye (the 0 °C level sits
+near 4.7 km).
+
+`min_rho_i*` is the spline-undershoot monitor, exactly as `min_rho_r_gm3` is for the rain, and
+the ice transform (`options[:ice_transform]`) is undone here when it is on — the CSV column is
+the control variable, not the density.
+"""
+function o01_ice_diagnostics(model, ref, kDim)
+    Scythe.ice_microphysics(model.options) === :ishmael && return _o01_ice_diags(model, ref, kDim)
+    return Dict{String,Float64}()
+end
+
+function _o01_ice_diags(model, ref, kDim)
+    itf = Scythe.ice_transform_mode(model.options)
+    names = Scythe.ice_var_names(model.options)
+    gp = model.grid_params
+    patch = createGrid(gp)
+    z = Scythe.getGridpoints(patch)[1:kDim, end]
+    d = Dict{String,Float64}()
+    maxq = zeros(3); minq = zeros(3); maxn = zeros(3)
+    iwp = 0.0
+    ztop = -Inf
+    zbot = Inf
+    for (_, path) in output_snapshots(model)
+        df = CSV.read(path, DataFrame)
+        ncols = div(nrow(df), kDim)
+        tot = zeros(nrow(df))
+        for k in 1:3
+            mu_q = Scythe.ice_mu(model.physical_params, 4 * (k - 1) + 1)
+            mu_n = Scythe.ice_mu(model.physical_params, 4 * (k - 1) + 2)
+            q = Scythe.recover_total.(df[!, names[4 * (k - 1) + 1]], itf, mu_q)
+            n = Scythe.recover_total.(df[!, names[4 * (k - 1) + 2]], itf, mu_n)
+            maxq[k] = max(maxq[k], maximum(q))
+            minq[k] = min(minq[k], minimum(q))
+            maxn[k] = max(maxn[k], maximum(n))
+            tot .+= max.(q, 0.0)
+        end
+        iwp = max(iwp, domain_integral(reshape(tot, kDim, ncols), model) /
+                       (gp.iMax - gp.iMin))
+        # Where the ice IS. The threshold is the LARGER of a fixed floor and 1% of this
+        # snapshot's own peak, so it reports the anvil at any loading: a fixed 1 mg/m^3 gate
+        # returns NaN for an early snapshot whose whole ice field is 3e-5 g/m^3, which says
+        # nothing about where the ice is.
+        thr = max(1.0e-14, 0.01 * maximum(tot))
+        live = findall(>(thr), reshape(tot, kDim, ncols))
+        if !isempty(live)
+            ztop = max(ztop, maximum(z[c.I[1]] for c in live))
+            zbot = min(zbot, minimum(z[c.I[1]] for c in live))
+        end
+    end
+    for k in 1:3
+        d["max_rho_i$(k)_gm3"] = 1000.0 * maxq[k]
+        d["min_rho_i$(k)_gm3"] = 1000.0 * minq[k]
+        d["max_n_i$(k)_perL"] = maxn[k] / 1000.0
+    end
+    d["max_ice_water_path_mm"] = iwp
+    d["ice_top_km"] = isfinite(ztop) ? ztop / 1000.0 : NaN
+    d["ice_base_km"] = isfinite(zbot) ? zbot / 1000.0 : NaN
+    return d
+end
+
 function o01_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
 
-    diags = o01_rain_diagnostics(model, ref, kDim)
+    diags = merge(o01_rain_diagnostics(model, ref, kDim),
+                  o01_ice_diagnostics(model, ref, kDim))
     diags["max_w"] = maximum(df.w)
     diags["min_w"] = minimum(df.w)
 

@@ -72,6 +72,26 @@ const ISHMAEL_GNU    = [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]           # gnu(icat)
 const ISHMAEL_PI = 3.14159265
 
 """
+    ISHMAEL_RMIN
+
+The SMALLEST ICE SIZE THE SCHEME RESOLVES, 2 μm (module_mp_jensen_ishmael.F lines 3157-3169).
+
+This is `var_check`'s mean-radius floor, and it is also the bottom of the domain the
+`itab`/`itabr` collection tables and the habit axis laws were fitted over — the two are the
+same number for the same reason, so it is defined ONCE here and cited from everywhere that
+needs it.
+
+Two rules follow from it, and both are enforced at the SOURCE rather than repaired afterwards:
+
+  * `var_check` re-diagnoses the number of any population whose mean radius falls below it
+    (fewer, larger crystals holding the same mass);
+  * every ice NUMBER source must seed crystals at or above it. DeMott seeds 2 μm spheres and
+    Hallett-Mossop seeds 5 μm splinters, so both comply by construction; the homogeneous
+    cloud-freezing leg is bounded against it in `_ice_homogeneous_rates`.
+"""
+const ISHMAEL_RMIN = 2.0e-6
+
+"""
     igrdata (60 values, -1 C to -60 C)
 
 Inherent growth ratio (IGR) data from Chen and Lamb (1994) / Lamb and Scott
@@ -147,6 +167,53 @@ function load_ishmael_tables(path::String)
     coltab, coltabn = mkcoltb()
 
     return IshmaelTables(itab, itabr, coltab, coltabn, copy(ISHMAEL_IGRDATA))
+end
+
+"""
+The ABSENT-tables value: every array empty, nothing loaded, `mkcoltb` never run.
+
+`ModelTile` carries its `IshmaelTables` CONCRETELY rather than as a
+`Union{IshmaelTables,Nothing}` — a `Union` field makes `mtile.ishmael_tables.itab` a
+type-unstable load inside the per-column driver, which is exactly the hot path that must
+allocate nothing. A run with no ice never reads this object (the driver's `ice_on` gate is
+`MCSlots`-resolved, not a table test), so the empty arrays are unreachable rather than
+merely harmless; a run WITH ice is refused at tile-construction time if the real tables
+cannot be loaded, so the sentinel can never reach the rate functions.
+
+`const` and shared by every ice-free tile in the process: it is immutable and its arrays are
+never indexed.
+"""
+const EMPTY_ISHMAEL_TABLES = IshmaelTables(zeros(Float64, 0, 0, 0, 0, 0),
+                                           zeros(Float64, 0, 0, 0, 0, 0),
+                                           zeros(Float64, 0, 0, 0),
+                                           zeros(Float64, 0, 0, 0),
+                                           Float64[])
+
+"""
+    ishmael_tables_path() -> String
+
+Default location of the ISHMAEL collection tables: `data/ishmael_tables.jld2` under the
+package root. The file is 44.5 MB and is gitignored — regenerate it with
+`tools/convert_ishmael_tables.jl` if it is absent.
+"""
+ishmael_tables_path() = joinpath(dirname(@__DIR__), "data", "ishmael_tables.jld2")
+
+"""
+    load_ishmael_tables_or_error(path = ishmael_tables_path()) -> IshmaelTables
+
+[`load_ishmael_tables`](@ref) with the "the file is not there" case turned into the message
+that says how to make it, rather than a bare `SystemError` from deep inside JLD2. Called
+once per tile, from the setup path, and only when `options[:ice_microphysics] = :ishmael`.
+"""
+function load_ishmael_tables_or_error(path::String = ishmael_tables_path())
+    isfile(path) || error(
+        "options[:ice_microphysics] = :ishmael needs the ISHMAEL collection tables and " *
+        "there is no file at\n    $path\n" *
+        "They are 44.5 MB and are deliberately NOT in the repository. Regenerate them from " *
+        "the CM1 Fortran source with\n" *
+        "    julia --project tools/convert_ishmael_tables.jl\n" *
+        "or point the run at an existing copy with physical_params[:ishmael_tables_path].")
+    return load_ishmael_tables(path)
 end
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -363,7 +430,7 @@ function ishmael_var_check(NU::Float64, ao::Float64, fourthirdspi::Float64, gamm
     gam = gamma(gamma_arg)                      # replaces gamma_tab(gi), lines 3129/3134-3135
 
     # Ice density check: keep rbdum in [50, RHOI] (lines 3131-3154)
-    if ani > 2.0e-6
+    if ani > ISHMAEL_RMIN
         rbdum = qidum * gammnu / (nidum * alphv * ani^betam * gam)
     else
         rbdum = RHOI
@@ -385,8 +452,8 @@ function ishmael_var_check(NU::Float64, ao::Float64, fourthirdspi::Float64, gamm
 
     # Small ice limit: rni >= 2 micron (lines 3156-3169)
     rni = (qidum * 3.0 / (nidum * rbdum * 4.0 * ISHMAEL_PI * (gam / gammnu)))^0.333333333333
-    if rni < 2.0e-6
-        rni = 2.0e-6
+    if rni < ISHMAEL_RMIN
+        rni = ISHMAEL_RMIN
         nidum = 3.0 * qidum * gammnu / (4.0 * ISHMAEL_PI * rbdum * rni^3 * gam)
         ani = ((qidum * gammnu) / (rbdum * nidum * alphv * gam))^(1.0 / betam)
         cni = ao^(1.0 - dsdum) * ani^dsdum

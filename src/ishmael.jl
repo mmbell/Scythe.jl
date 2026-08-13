@@ -54,6 +54,13 @@ const ISHMAEL_NU        = 4.0       # ice-distribution shape parameter (line 628
                                      # argument.
 const ISHMAEL_QSMALL   = 1.0e-12    # smallest ice mass, kg kg^-1 (line 631)
 const ISHMAEL_QNSMALL  = 1.25e-7    # smallest ice number, # kg^-1 (line 632)
+const ISHMAEL_QASMALL  = 1.0e-24    # smallest ice volume, m^3 kg^-1 (line 633)
+const ISHMAEL_AO       = 0.1e-6     # alphstr = ao^(1-deltastr), m (line 634)
+# The three derived combinations every ISHMAEL entry point takes as arguments, so the host
+# driver forms them once at include time rather than once per gridpoint. `gamma(4) = 6`.
+const ISHMAEL_GAMMNU        = gamma(ISHMAEL_NU)
+const ISHMAEL_I_GAMMNU      = 1.0 / ISHMAEL_GAMMNU
+const ISHMAEL_FOURTHIRDSPI  = 4.0 / 3.0 * ISHMAEL_PI
 const ISHMAEL_LAMMINR  = 1.0 / 2800.0e-6   # min rain slope parameter, m^-1 (line 640)
 const ISHMAEL_LAMMAXR  = 1.0 / 20.0e-6     # max rain slope parameter, m^-1 (line 639)
 
@@ -590,9 +597,17 @@ Bigg (1953) immersion freezing of rain drops below -4C. Ports lines
 Both rates are additionally clamped to not exceed the available `qr`/`nr`
 reservoir over one timestep (`min(...,qr*i_dt)`/`min(...,nr*i_dt)`, lines
 1572-1573).
+
+`reservoir_caps=false` omits those two `min`s, returning the bare Bigg
+rates. They are `Δt`-dependent modifications of a rate — refining `Δt`
+changes the equation being solved — and the moist-compressible host
+forbids those (reference/Scythe_moist_compressible.tex §Departures (b)),
+so it calls this with `reservoir_caps=false`. The default keeps the
+Fortran-faithful form for the reference harness and its tests.
 """
 function ishmael_bigg_freezing(temp::Float64, qr::Float64, nr::Float64, dt::Float64;
-                                QSMALL::Float64=ISHMAEL_QSMALL, T0::Float64=ISHMAEL_T0)
+                                QSMALL::Float64=ISHMAEL_QSMALL, T0::Float64=ISHMAEL_T0,
+                                reservoir_caps::Bool=true)
     if !(qr > QSMALL && temp < (T0 - 4.0))
         return (mbiggr=0.0, nbiggr=0.0)
     end
@@ -606,8 +621,10 @@ function ishmael_bigg_freezing(temp::Float64, qr::Float64, nr::Float64, dt::Floa
              (exp(0.66 * (T0 - temp)) - 1.0) / lamr^3 / lamr^3
     nbiggr = ISHMAEL_PI * 100.0 * nr_adj * (exp(0.66 * (T0 - temp)) - 1.0) / lamr^3
 
-    mbiggr = min(mbiggr, qr * i_dt)
-    nbiggr = min(nbiggr, nr_adj * i_dt)
+    if reservoir_caps
+        mbiggr = min(mbiggr, qr * i_dt)
+        nbiggr = min(nbiggr, nr_adj * i_dt)
+    end
 
     return (mbiggr=mbiggr, nbiggr=nbiggr)
 end
@@ -708,6 +725,18 @@ evaluates the qmlt formula BOTH ways (once with the correct level rhoair,
 once by deliberately substituting a different rhoair as the Fortran's
 buggy indexing would have used) and asserts this function matches the
 CORRECT one.
+
+# `reservoir_caps`
+
+`reservoir_caps=false` omits the three `Δt`-dependent clauses -- the
+`max(qmlt, -qi/dt)` reservoir floor, the `ai<1e-12 || ci<1e-12` branch that
+dumps the whole remaining mass in one step, and the `max(-ni/dt, ...)`
+number floor -- leaving the bare melting rate. Those clauses make the rate
+a function of the time step, which the moist-compressible host forbids
+(reference/Scythe_moist_compressible.tex, "Departures" (b)); it therefore
+calls this with `reservoir_caps=false` and re-forms the number leg on its
+own carried moments. The default keeps the Fortran-faithful form for the
+reference harness and its tests.
 """
 function ishmael_melting(temp::Float64, ni::Float64, ani::Float64, cni::Float64,
                           deltastr::Float64, rhobar::Float64, qi::Float64, ai::Float64,
@@ -716,7 +745,8 @@ function ishmael_melting(temp::Float64, ni::Float64, ani::Float64, cni::Float64,
                           xxlf::Float64, rimetotal::Float64, dQImltri::Float64,
                           dNmltri::Float64, dt::Float64, alphstr::Float64, gammnu::Float64,
                           i_gammnu::Float64, fourthirdspi::Float64;
-                          T0::Float64=ISHMAEL_T0, CPW::Float64=ISHMAEL_CPW)
+                          T0::Float64=ISHMAEL_T0, CPW::Float64=ISHMAEL_CPW,
+                          reservoir_caps::Bool=true)
     if !(temp > T0)
         return (qmlt=0.0, nmlt=0.0, amlt=0.0, cmlt=0.0)
     end
@@ -728,15 +758,18 @@ function ishmael_melting(temp::Float64, ni::Float64, ani::Float64, cni::Float64,
            (CPW / xxlf * (temp - T0) * (rimetotal / rhoair + dQImltri))
 
     qmlt = min(qmlt, 0.0)
-    qmlt = max(qmlt, -qi * i_dt)
+    if reservoir_caps
+        qmlt = max(qmlt, -qi * i_dt)
 
-    # Don't let small number mixing ratios (i.e. very large particles) cause
-    # ice to linger instead of precipitating (lines 1519-1524).
-    if qmlt < 0.0 && (ai < 1.0e-12 || ci < 1.0e-12)
-        qmlt = -qi * i_dt
+        # Don't let small number mixing ratios (i.e. very large particles) cause
+        # ice to linger instead of precipitating (lines 1519-1524).
+        if qmlt < 0.0 && (ai < 1.0e-12 || ci < 1.0e-12)
+            qmlt = -qi * i_dt
+        end
     end
 
-    nmlt = max(-ni * i_dt, ni * qmlt / qi - dNmltri)
+    nmlt = reservoir_caps ? max(-ni * i_dt, (ni * qmlt / qi) - dNmltri) :
+                            ((ni * qmlt / qi) - dNmltri)
 
     gam = gamma(ISHMAEL_NU + 2.0 + deltastr)
     tmpmelt = fourthirdspi * alphstr * gam * i_gammnu

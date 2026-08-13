@@ -5256,4 +5256,588 @@ using Springsteel
         end
     end
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # S8: the LIVE ice physics — deposition through the shared Q_ss, the ISHMAEL
+    # process set, the fall speeds, and the pressure/Q_ss/energy coupling.
+    # reference/Scythe_moist_compressible.tex §Ice Processes is the specification.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    """A supercooled mixed-phase column: liquid-saturated at about -15 C."""
+    function supercooled_column_mc(z; q_l = 1.0e-3, Tsurf = 258.15)
+        Tk = @. Tsurf - 0.005 * z
+        p_Pa = @. 70000.0 * exp(-z / 8000.0)
+        rho_v = rho_v_sat.(Tk, p_Pa ./ 100.0)
+        rho_d = (p_Pa .- (Rv .* Tk .* rho_v)) ./ (Rd .* Tk)
+        rho_c = q_l .* rho_d
+        return (; z, Tk, p_Pa, rho_d, rho_v, rho_c)
+    end
+
+    """
+    A resting mixed-phase tile: `make_mc_mtile`'s machinery on the supercooled column, with
+    ice species 1 seeded to `rho_i`/`n_i` and monodisperse-equivalent volume moments.
+    """
+    function make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3, rho_i = 1.0e-5,
+                            n_i = 5.0e4, r_i = 30.0e-6, rho_r = 0.0, n_r = 0.0,
+                            kDim = 16, ts = 0.1, extra_options = Dict{Symbol,Any}(),
+                            extra_params = Dict{Symbol,Float64}())
+        opts = merge(Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
+                                      :vapor_retrieval => :residual), extra_options)
+        varlist = Scythe.mc_var_names(opts; cyl = false)
+        vars = Dict(v => i for (i, v) in enumerate(varlist))
+        scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+        wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+        gp = GridParameters(geometry = "RZ", num_cells = 8,
+            iMin = 0.0, iMax = 2000.0, kMin = 0.0, kMax = 2000.0, kDim = kDim,
+            BCL = wall_bc, BCR = wall_bc, BCB = wall_bc, BCT = wall_bc, vars = vars)
+        patch = createGrid(gp)
+        z = Scythe.getGridpoints(patch)[1:kDim, 2]
+        col = supercooled_column_mc(z; q_l = q_l, Tsurf = Tsurf)
+        ref = joinpath(tmpdir, "ice_$(Tsurf)_$(q_l).ref")
+        Scythe.write_exact_ref_mc(ref, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+        model = ModelParameters(ts = ts, integration_time = 1.0, output_interval = 1.0,
+            equation_set = "moist_compressible_XZ", ref_state_file = ref, grid_params = gp,
+            physical_params = merge(Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kvdiff_heat => 0.0,
+                :Kvdiff_water => 0.0, :Kv_mudiff => 0.0, :tau_qss => 10.0, :N_r => 1.0e-3,
+                :alpha => 0.0, :z_damp => 20.0e3, :f => 0.0), extra_params),
+            options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                :exact_reference_state => true, :precipitation => true,
+                :vertical_mixing => false), opts))
+        patch.physical .= 0.0
+        s = Dict(v => i for (i, v) in vars)
+        for i in 1:size(patch.physical, 1)
+            patch.physical[i, vars["rho_i1"], 1] = rho_i
+            patch.physical[i, vars["n_i1"], 1] = n_i
+            patch.physical[i, vars["a_i1"], 1] = n_i * r_i^3
+            patch.physical[i, vars["c_i1"], 1] = n_i * r_i^3
+            patch.physical[i, 8, 1] = rho_r
+            patch.physical[i, vars["n_r"], 1] = n_r
+        end
+        spectralTransform!(patch)
+        gridTransform!(patch)
+        mtile = createModelTile(patch, patch, model, sparse(Int64[], Int64[], Float64[],
+            size(patch.spectral, 1), size(patch.spectral, 2)))
+        return mtile, patch, model, col
+    end
+
+    @testset "ice: 𝒟 and the deposition drive clip" begin
+        # TeX Eqs. Dwi and qss_ice_shift, and the ice mirror of the liquid clip in
+        # `qss_condensation_rates`.
+        p_hPa = 700.0
+
+        # 𝒟 = max(rho_vs - rho_i_sat, 0): EXACTLY zero above the triple point (the `max`
+        # closes it there), negligible AT it, positive below, peaking near -12 C (the
+        # classical WBF maximum). At T_0 itself the two Buck branches differ by 6e-5 of
+        # rho_vs rather than by nothing -- they are separate fits, not one function evaluated
+        # twice -- so this is a statement about the FORMULATION's internal consistency, which
+        # is the accuracy 𝒟 is only ever as good as (TeX §Departures (c)).
+        @test Scythe.ice_supersaturation_gap(Scythe.T_0, p_hPa) <
+              1.0e-4 * rho_v_sat(Scythe.T_0, p_hPa)
+        @test Scythe.ice_supersaturation_gap(Scythe.T_0 + 10.0, p_hPa) == 0.0
+        @test Scythe.ice_supersaturation_gap(Scythe.T_0 - 15.0, p_hPa) > 0.0
+        gaps = [Scythe.ice_supersaturation_gap(Scythe.T_0 + dT, p_hPa) for dT in -40.0:0.5:0.0]
+        peakT = (-40.0:0.5:0.0)[argmax(gaps)]
+        @test -16.0 < peakT < -8.0
+
+        for Tk in (268.15, 258.15, 243.15)
+            rvs = rho_v_sat(Tk, p_hPa)
+            rvsi = Springsteel.Thermodynamics.rho_i_sat(Tk, p_hPa)
+            D = rvs - rvsi
+            @test D > 0.0
+
+            # THE CONTINUUM IDENTITY. With Q_ss on the density budget the clip never binds
+            # and the drive is exactly the over-ice supersaturation density.
+            rho_v = 1.05 * rvs
+            @test Scythe.ice_deposition_drive(rho_v - rvs, rho_v, Tk, p_hPa) ≈
+                  rho_v - rvsi rtol = 1e-14
+
+            # DRY AIR IS INERT the same way the liquid channel is: whatever the detached
+            # prognostic says, the drive is the vapor-free-air maximum sublimation drive and
+            # no more, so nothing can deposit vapor that is not there.
+            @test Scythe.ice_deposition_drive(1.0, 0.0, Tk, p_hPa) == -rvsi
+
+            # THE NEGATIVE-VAPOR FLOOR: a partition error must not set the rate.
+            @test Scythe.ice_deposition_drive(1.0, -0.5, Tk, p_hPa) == -rvsi
+            # ...but a prognostic that has detached DOWNWARD passes through unfloored: it is
+            # advanced by the smooth multistep integrator and is not the pathology the floor
+            # addresses (the liquid clip's own rule).
+            @test Scythe.ice_deposition_drive(-0.9, -0.5, Tk, p_hPa) == -0.9 + D
+
+            # SUBLIMATION is the same expression, negative, with no case distinction.
+            sub = Scythe.ice_deposition_drive(0.5 * rvsi - rvs, 0.5 * rvsi, Tk, p_hPa)
+            @test sub < 0.0
+            @test sub ≈ -0.5 * rvsi rtol = 1e-14
+        end
+
+        # Above T_0 the gap closes, so the drive collapses onto the liquid one.
+        Tw = 290.0
+        rvsw = rho_v_sat(Tw, p_hPa)
+        @test Scythe.ice_deposition_drive(0.02 * rvsw, 1.02 * rvsw, Tw, p_hPa) ≈
+              1.02 * rvsw - Springsteel.Thermodynamics.rho_i_sat(Tw, p_hPa) rtol = 1e-14
+    end
+
+    @testset "Q_s_energy_ice is Q_s_energy with L_v -> L_s and nothing else" begin
+        # Independent transcription of TeX Eq. Qs_ice, written out rather than reusing the
+        # implementation's own factorization.
+        for (Tk, p_Pa, q_v, q_l, q_i) in ((258.15, 70000.0, 2.0e-3, 1.0e-3, 5.0e-4),
+                                          (243.15, 40000.0, 5.0e-4, 0.0, 2.0e-4),
+                                          (268.15, 85000.0, 3.5e-3, 2.0e-3, 0.0))
+            rho_d = p_Pa / (Rd * Tk)
+            C_vt = Cvd + q_v * Cvv + q_l * Cl + q_i * Scythe.Ci
+            R_m = Rd + q_v * Rv
+            C_pt = C_vt + R_m
+            Ls = Springsteel.Thermodynamics.L_s(Tk)
+            dT = Scythe.drho_vsat_dT(Tk, p_Pa / 100.0)
+            dp = Scythe.drho_vsat_dp(Tk, p_Pa / 100.0)
+            expect = (dT * (Ls - Rv * Tk) / rho_d +
+                      dp * R_m * (Ls - Rv * C_pt * Tk / R_m)) / C_vt
+            @test Scythe.Q_s_energy_ice(Tk, p_Pa, rho_d, q_v, q_l, q_i) ≈ expect rtol = 1e-14
+
+            # It is NOT Q_s re-evaluated over ice: the two saturation derivatives are the
+            # WATER ones in both terms. The only difference from the liquid factor is L.
+            Qs = Scythe.Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+            Lv = L_v(Tk)
+            # Both factors share the same two derivative slots, so their difference is the
+            # latent-heat difference times the same bracket coefficients -- exactly L_f.
+            Lf = Springsteel.Thermodynamics.L_f(Tk)
+            @test Scythe.Q_s_energy_ice(Tk, p_Pa, rho_d, q_v, q_l, q_i) - Qs ≈
+                  ((dT / rho_d) + (dp * R_m)) * Lf / C_vt rtol = 1e-12
+            @test Ls ≈ Lv + Lf rtol = 1e-14
+        end
+    end
+
+    @testset "ice: warm air with ice present is exactly inert" begin
+        # The state gate that keeps the bitwise inertness claim alive now that the physics is
+        # live: above T_0 the deposition channel is closed and aggregation does not run, so a
+        # WARM column with ice in it still produces exact zeros from those two channels.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 290.0, q_l = 1.0e-3)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(S.Tk .> Scythe.T_0)
+            # Deposition is identically zero above freezing (Eq. dep_rate is closed there).
+            @test all(S.Qdot_i1 .== 0.0)
+            @test all(S.Qdot_i2 .== 0.0)
+            @test all(S.Qdot_i3 .== 0.0)
+            # Species 2 and 3 have no ice, so every one of their rates is an EXACT zero and
+            # their fall speeds are too -- which is what lets `_ice_flux!` skip the fit.
+            for nm in (:SRC_i2q, :SRC_i2n, :SRC_i2a, :SRC_i2c,
+                       :SRC_i3q, :SRC_i3n, :SRC_i3a, :SRC_i3c,
+                       :F_i2q_z, :F_i2n_z, :F_i3q_z, :F_i3n_z, :Vi2m, :Vi2n, :Vi3m, :Vi3n)
+                @test all(getproperty(S, nm) .== 0.0)
+            end
+        end
+    end
+
+    @testset "ice: zero ice in WARM air is bitwise the ice-free run" begin
+        # The strict gate. Every rate is gated on a STATE test, so with no ice and T > T_0
+        # throughout, the ten common slots must match the ice-off run to the last bit --
+        # not to 1e-10.
+        mktempdir() do tmpdir
+            args = (; q_l = 3.0e-3, kDim = 16, num_cells = 8, precipitation = true)
+            two = Dict{Symbol,Any}(:rain_moments => 2)
+            ice = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael)
+            function run_once(opts)
+                m, patch, mod, _ = make_mc_mtile(tmpdir; args..., extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                for t in 1:5, c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                return m
+            end
+            m_off = run_once(two)
+            m_on = run_once(ice)
+            for slot in 1:10
+                @test m_on.var_np1[:, slot] == m_off.var_np1[:, slot]
+                @test m_on.expdot_n[:, slot] == m_off.expdot_n[:, slot]
+            end
+            for slot in 11:22
+                @test all(m_on.expdot_n[:, slot] .== 0.0)
+            end
+        end
+    end
+
+    @testset "ice: Wegener-Bergeron-Findeisen emerges from the shared Q_ss" begin
+        # TeX Eq. wbf_qs. A supercooled liquid cloud at -15 C with seeded ice: with the
+        # forcing F between the two thresholds, the ice grows while the liquid evaporates to
+        # feed it. Nothing arbitrates this -- both phases relax the SAME Q_ss, and the
+        # quasi-steady value sits between the water and ice saturations by construction.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                              rho_i = 1.0e-5, n_i = 5.0e4)
+            kDim = mod.grid_params.kDim
+            ncols = div(size(patch.physical, 1), kDim)
+            # Let Q_ss find its quasi-steady value against the two relaxations.
+            for t in 1:60
+                for c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                Scythe.calcTendency(m)
+                gridTransform!(patch)
+            end
+            Scythe.advance_column(m, 1, 61)
+            S = m.mc_scratch[Threads.threadid()]
+
+            @test all(S.Tk .< Scythe.T_0 - 10.0)
+            @test all(isfinite, S.Qdot_i1)
+            # THE SIGNATURE: ice grows, liquid evaporates, at the same gridpoints.
+            @test all(S.Qdot_i1 .> 0.0)
+            @test all(S.Qdot .< 0.0)
+            # ...and the quasi-steady state sits BETWEEN the two saturations, which is the
+            # same statement written on the state: subsaturated over water, supersaturated
+            # over ice, one reservoir, offset by 𝒟 (Eq. qss_ice_shift).
+            #
+            # Read off the two DRIVES, not the raw prognostic. Both closures are driven by
+            # the clipped drive, and here the prognostic Q_ss has detached upward from the
+            # density budget by ~7e-6 kg/m³ — which is exactly the detachment the clip exists
+            # to catch, and which the census would report if it mattered.
+            for i in eachindex(S.Tk)
+                D = Scythe.ice_supersaturation_gap(S.Tk[i], S.p_hPa[i])
+                drive_i = Scythe.ice_deposition_drive(S.Q_ss[i], S.rho_v[i], S.Tk[i],
+                                                      S.p_hPa[i])
+                drive_w = drive_i - D
+                @test D > 0.0
+                @test drive_w < 0.0          # the liquid is subsaturated and evaporating
+                @test drive_i > 0.0          # the ice is supersaturated and growing
+            end
+            # The two relaxations are both live -- the competition is between conductances,
+            # not between an active and an inert channel (Eq. wbf_qs).
+            @test all(S.invtau_c .> 0.0)
+            @test all(S.invtau_i1 .> 0.0)
+        end
+    end
+
+    @testset "ice: freezing heats T and p with the bare L_f" begin
+        # TeX Eqs. dThat_ice / dphat_ice / thermo_p_ice. `L_f·Q̇_freeze` sits inside BOTH
+        # non-condensation tendencies and inside the pressure equation's (R_m/C_vt) bracket,
+        # with NO -R_v C_pt T/R_m companion -- that companion is the work done by the vapor a
+        # phase change removes from the gas, and freezing removes none.
+        mktempdir() do tmpdir
+            # Rain at -15 C freezes by Bigg, and rimes onto the seeded ice: Q̇_freeze > 0.
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                              rho_i = 1.0e-5, n_i = 5.0e4,
+                                              rho_r = 1.0e-4, n_r = 1.0e3)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+
+            # It fired, and in the freezing direction.
+            @test maximum(S.FRZ_NET) > 0.0
+            # Q̇_freeze IS minus the liquid mass sink, exactly -- the structural statement
+            # that freezing sources neither rho_t nor rho_v.
+            @test S.FRZ_NET == -(S.ICE_C .+ S.ICE_R)
+
+            # dT_nc / dp_nc carry exactly L_f·Q̇_freeze over the ice-free expressions.
+            baseT = @. ((-S.p * S.div) + S.QDOT_TH) / (S.rho_d * S.C_vt)
+            basep = @. (-S.gamma_m * S.p * S.div) + ((S.R_m / S.C_vt) * S.QDOT_TH)
+            Lf = Springsteel.Thermodynamics.L_f.(S.Tk)
+            @test S.dT_nc .- baseT ≈ (Lf .* S.FRZ_NET) ./ (S.rho_d .* S.C_vt) rtol = 1e-12
+            @test S.dp_nc .- basep ≈ (S.R_m ./ S.C_vt) .* (Lf .* S.FRZ_NET) rtol = 1e-12
+
+            # The pressure equation itself. The column is at rest (u = w = 0), so the
+            # advective part of slot 1 is identically zero and expdot IS the forcing.
+            kDim = mod.grid_params.kDim
+            Ls = Springsteel.Thermodynamics.L_s.(S.Tk)
+            qdep = S.Qdot_i1 .+ S.Qdot_i2 .+ S.Qdot_i3
+            liquid = @. (S.R_m / S.C_vt) *
+                        (((S.Lv - (Rv * S.C_pt * S.Tk / S.R_m)) * (S.Qdot + S.Qdot_r)) +
+                         S.QDOT_TH)
+            icepart = @. (S.R_m / S.C_vt) *
+                         (((Ls - (Rv * S.C_pt * S.Tk / S.R_m)) * qdep) + (Lf * S.FRZ_NET))
+            # Everything else in the slot-1 forcing is the divergence work, which is zero at
+            # rest, plus the acoustic staging term, which is proportional to w.
+            @test m.expdot_n[1:kDim, 1] ≈ liquid .+ icepart rtol = 1e-8 atol = 1e-12
+            # The freezing piece is a pure heating and RAISES the pressure.
+            @test all(icepart[S.FRZ_NET .> 0.0] .> 0.0)
+        end
+    end
+
+    @testset "ice: total energy carries no phase-change source" begin
+        # TeX Eq. Et_ice: condensation, deposition and freezing appear NOWHERE in the total
+        # energy equation. The test is a perturbation one: change only Q_ss, which no other
+        # part of the state reads (the retrieval is independent of it, and `:residual` vapor
+        # is the density budget), and every phase-change rate moves while E_t's tendency must
+        # not move at all.
+        mktempdir() do tmpdir
+            function run_with(qss_scale)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                                  rho_i = 1.0e-5, n_i = 5.0e4,
+                                                  rho_r = 1.0e-4, n_r = 1.0e3)
+                kDim = mod.grid_params.kDim
+                for i in 1:size(patch.physical, 1)
+                    patch.physical[i, 7, 1] = qss_scale
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                Scythe.advance_column(m, 1, 2)
+                return m, kDim
+            end
+            m_a, kDim = run_with(+2.0e-4)     # strongly supersaturated: deposit and condense
+            m_b, _ = run_with(-2.0e-4)        # strongly subsaturated: sublimate and evaporate
+            Sa = m_a.mc_scratch[Threads.threadid()]
+
+            # The rates really did move, and in the right direction: the more supersaturated
+            # state condenses more (equivalently, evaporates less) and deposits more.
+            @test all(m_a.expdot_n[1:kDim, 9] .> m_b.expdot_n[1:kDim, 9])   # cloud
+            @test all(m_a.expdot_n[1:kDim, 11] .> m_b.expdot_n[1:kDim, 11]) # ice mass
+
+            # ...and E_t's tendency is BITWISE identical, because no phase change is a source
+            # of it. (rho_t likewise: phase changes are internal to the water.)
+            @test m_a.expdot_n[1:kDim, 6] == m_b.expdot_n[1:kDim, 6]
+            @test m_a.expdot_n[1:kDim, 3] == m_b.expdot_n[1:kDim, 3]
+        end
+    end
+
+    @testset "ice: the mass exchange closes exactly" begin
+        # The property Scythe's RESIDUAL vapor makes load-bearing: everything the ice gains
+        # that is not deposition must come out of the liquid, or the difference is silently
+        # manufactured vapor. This is the check that ISHMAEL's own splinter-mass leak (which
+        # the port closes deliberately) has not come back.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 265.15, q_l = 2.0e-3,
+                                              rho_i = 2.0e-5, n_i = 1.0e5,
+                                              rho_r = 3.0e-4, n_r = 2.0e3)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            dep = S.Qdot_i1 .+ S.Qdot_i2 .+ S.Qdot_i3
+            ice = S.SRC_i1q .+ S.SRC_i2q .+ S.SRC_i3q
+            liq = S.ICE_C .+ S.ICE_R
+            scale = maximum(abs.(ice)) + maximum(abs.(dep))
+            @test scale > 0.0
+            # Riming, splintering, freezing, melting and aggregation are all live here.
+            @test maximum(abs.(ice .- dep)) > 0.0
+            @test maximum(abs.((ice .- dep) .+ liq)) < 1.0e-12 * scale
+        end
+    end
+
+    @testset "ice: the impulse-form rates are finite rates, and NO rate sees ts" begin
+        # ISHMAEL writes homogeneous freezing and DeMott activation as `reservoir/Δt` -- the
+        # whole reservoir converted in one step. That is the depletion caps' defect with the
+        # sign reversed: the rate, and hence the converged solution, is a function of the step
+        # size. Both are relaxations on physical timescales here.
+        T_cold = Scythe.T_0 - 40.0            # below -35 C: homogeneous freezing is open
+        qc, nc, qr, nr = 1.0e-3, 4.0e8, 5.0e-4, 1.0e4
+
+        # ── Homogeneous freezing ──
+        # `qc = 1e-3` in `nc = 4e8` droplets is 8.4 micron drops, comfortably above r_min, so
+        # the mass-consistency bound does NOT bind and the drop-preserving transfer stands.
+        h1 = Scythe._ice_homogeneous_rates(T_cold, qc, nc, qr, nr, 5.0)
+        h2 = Scythe._ice_homogeneous_rates(T_cold, qc, nc, qr, nr, 10.0)
+        @test h1.mim ≈ qc / 5.0 rtol = 1e-14
+        @test h1.nim ≈ nc / 5.0 rtol = 1e-14
+        @test h1.mimr ≈ qr / 5.0 rtol = 1e-14
+        @test h1.nimr ≈ nr / 5.0 rtol = 1e-14
+        # Exact 1/tau scaling -- doubling the timescale halves every leg.
+        @test h2.mim ≈ 0.5 * h1.mim rtol = 1e-14
+        @test h2.nimr ≈ 0.5 * h1.nimr rtol = 1e-14
+        # Mass and number stay in the mean-droplet-mass ratio, so a frozen droplet becomes
+        # exactly one crystal of its own mass at ANY timescale.
+        @test h1.mim / h1.nim ≈ qc / nc rtol = 1e-14
+        @test h2.mim / h2.nim ≈ qc / nc rtol = 1e-14
+
+        # ── The seeded crystal is never below the smallest size the scheme resolves ──
+        # `ISHMAEL_RMIN` is `var_check`'s mean-radius floor AND the bottom of the itab/itabr
+        # table domain; a number source that seeds below it hands the habit laws a particle
+        # they were never fitted for, which is what detonated the first live ice arm.
+        rad(m, n) = (m / n / (Scythe.ISHMAEL_FOURTHIRDSPI * Scythe.ISHMAEL_RHOI))^(1 / 3)
+        @test Scythe.ISHMAEL_M_MIN ≈
+              Scythe.ISHMAEL_FOURTHIRDSPI * Scythe.ISHMAEL_RHOI * Scythe.ISHMAEL_RMIN^3 rtol = 1e-14
+        # A THIN anvil cloud is the case that violates it: the closure carries a FIXED droplet
+        # number whatever the content, so 1e-7 kg/kg in 1e8 droplets/m^3 is 0.2 micron.
+        thin = Scythe._ice_homogeneous_rates(T_cold, 1.0e-7, nc, 0.0, 0.0, 5.0)
+        @test thin.mim ≈ 1.0e-7 / 5.0 rtol = 1e-14          # the MASS transfers in full
+        @test thin.nim < nc / 5.0                            # ...the number is bounded
+        @test thin.nim ≈ thin.mim / Scythe.ISHMAEL_M_MIN rtol = 1e-14
+        @test rad(thin.mim, thin.nim) ≈ Scythe.ISHMAEL_RMIN rtol = 1e-9
+        # ...and over a sweep of cloud contents the implied crystal is NEVER sub-r_min, while
+        # the bound stays inactive wherever the droplets are genuinely resolvable.
+        bound_ever = false
+        for q in (1.0e-8, 1.0e-7, 1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3, 5.0e-3)
+            h = Scythe._ice_homogeneous_rates(T_cold, q, nc, 0.0, 0.0, 5.0)
+            @test rad(h.mim, h.nim) >= Scythe.ISHMAEL_RMIN * (1 - 1e-9)
+            @test h.mim ≈ q / 5.0 rtol = 1e-14               # mass is untouched throughout
+            h.nim < nc / 5.0 * (1 - 1e-12) && (bound_ever = true)
+        end
+        @test bound_ever                                      # it does bind somewhere
+        # Large droplets: the bound is exactly inactive, bitwise.
+        big = Scythe._ice_homogeneous_rates(T_cold, 5.0e-3, nc, 0.0, 0.0, 5.0)
+        @test big.nim == nc / 5.0
+
+        # THE RAIN LEG'S GUARD MUST NEVER BIND at any state the rain closure can be in:
+        # raindrops are two to three decades above r_min. It is a safety net, not physics.
+        for (q, n) in ((1.0e-6, 1.0e2), (1.0e-5, 1.0e3), (1.0e-4, 2.5e3),
+                       (1.0e-3, 2.5e4), (5.0e-3, 1.0e5), (1.0e-5, 2.5e5))
+            h = Scythe._ice_homogeneous_rates(T_cold, 0.0, 0.0, q, n, 5.0)
+            @test h.nimr == n / 5.0                           # unbound, bitwise
+            @test rad(h.mimr, h.nimr) > 10.0 * Scythe.ISHMAEL_RMIN
+        end
+
+        # VOLUME SEEDING is consistent with the seeded size, and is shared by every channel:
+        # `_ice_nucleation_volume` reads the SUMMED mass/number ratio, so bounding that ratio
+        # bounds the seeded axis. Below the r_min ratio it would clamp; at or above it, it
+        # tracks the mass.
+        vmin = Scythe._ice_nucleation_volume(thin.mim, thin.nim)
+        @test vmin > 0.0
+        @test Scythe._ice_nucleation_volume(2.0 * thin.mim, 2.0 * thin.nim) ≈
+              2.0 * vmin rtol = 1e-12                         # homogeneous of degree one
+        @test Scythe._ice_nucleation_volume(0.0, thin.nim) == 0.0
+        @test Scythe._ice_nucleation_volume(thin.mim, 0.0) == 0.0
+        # The -35 C threshold is a STATE test and still shuts it off exactly.
+        for T in (Scythe.T_0 - 35.0, Scythe.T_0 - 10.0, Scythe.T_0 + 5.0)
+            z = Scythe._ice_homogeneous_rates(T, qc, nc, qr, nr, 5.0)
+            @test z.mim == 0.0 && z.nim == 0.0 && z.mimr == 0.0 && z.nimr == 0.0
+        end
+        # ...and so does an empty reservoir.
+        z = Scythe._ice_homogeneous_rates(T_cold, 0.0, nc, 0.0, nr, 5.0)
+        @test z.mim == 0.0 && z.nim == 0.0 && z.mimr == 0.0 && z.nimr == 0.0
+
+        # ── DeMott activation ──
+        rhoair = 0.4
+        d1 = Scythe._ice_demott_rates(T_cold, 0.05, rhoair, 0.0, 1.0)
+        d2 = Scythe._ice_demott_rates(T_cold, 0.05, rhoair, 0.0, 2.0)
+        @test d1.nnuccd > 0.0
+        @test d2.nnuccd ≈ 0.5 * d1.nnuccd rtol = 1e-14          # 1/tau_act scaling
+        # New particles are 2 micron spheres of density RHOI, so the mass follows the number.
+        @test d1.mnuccd / d1.nnuccd ≈
+              Scythe.ISHMAEL_FOURTHIRDSPI * Scythe.ISHMAEL_RHOI * (2.0e-6)^3 rtol = 1e-14
+        # It is a DEFICIT rate: activation stops once the ice number reaches the available
+        # nuclei, which is what makes it self-limiting without any cap on the tendency.
+        n_target = d1.nnuccd * 1.0 * rhoair                      # back out n_IN [m^-3]
+        @test Scythe._ice_demott_rates(T_cold, 0.05, rhoair, n_target, 1.0).nnuccd == 0.0
+        @test Scythe._ice_demott_rates(T_cold, 0.05, rhoair, 2 * n_target, 1.0).nnuccd == 0.0
+        @test Scythe._ice_demott_rates(T_cold, 0.05, rhoair, 0.5 * n_target, 1.0).nnuccd ≈
+              0.5 * d1.nnuccd rtol = 1e-12
+        # The existing-ice CEILING is a measured concentration, not a Δt limiter, and stays:
+        # very cold air would activate past it, and does not.
+        cold = Scythe._ice_demott_rates(Scythe.T_0 - 70.0, 0.05, rhoair, 0.0, 1.0)
+        @test cold.nnuccd <= Scythe.ISHMAEL_IN_CEILING / (1.0 * rhoair) * (1 + 1e-12)
+        # The nucleation window is a state test.
+        @test Scythe._ice_demott_rates(Scythe.T_0 + 1.0, 0.05, rhoair, 0.0, 1.0).nnuccd == 0.0
+        @test Scythe._ice_demott_rates(T_cold, -0.01, rhoair, 0.0, 1.0).nnuccd == 0.0
+
+        # ── Neither function can see a timestep: it is not in the signature ──
+        @test !any(m -> :dt in Base.method_argnames(m),
+                   methods(Scythe._ice_homogeneous_rates))
+        @test !any(m -> :dt in Base.method_argnames(m), methods(Scythe._ice_demott_rates))
+
+        # ── Driver level: change ts by 10x on the SAME state ──
+        # With any `reservoir/Δt` left anywhere the nucleation-dominated sources would differ
+        # by a factor of ~10. What remains is the habit PARTITION (`ard`/`crd`/`prdr`/`qagg`),
+        # which is an increment divided by the same step -- a consistent first-order
+        # discretization -- so the agreement is close but not bitwise.
+        mktempdir() do tmpdir
+            function rates_at(ts)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                                  rho_i = 1.0e-5, n_i = 5.0e4,
+                                                  rho_r = 1.0e-4, n_r = 1.0e3, ts = ts)
+                Scythe.advance_column(m, 1, 2)
+                S = m.mc_scratch[Threads.threadid()]
+                return (Qdot_i = copy(S.Qdot_i1), q = copy(S.SRC_i1q),
+                        n = copy(S.SRC_i1n), c = copy(S.ICE_C), r = copy(S.ICE_R),
+                        f = copy(S.FRZ_NET))
+            end
+            a = rates_at(0.1)
+            b = rates_at(0.01)
+            # DEPOSITION contains no Δt at all: bitwise.
+            @test a.Qdot_i == b.Qdot_i
+            reldiff(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(x)), 1e-300)
+            for (nm, x, y) in (("SRC_i1q", a.q, b.q), ("SRC_i1n", a.n, b.n),
+                               ("ICE_C", a.c, b.c), ("ICE_R", a.r, b.r),
+                               ("FRZ_NET", a.f, b.f))
+                @test reldiff(x, y) < 0.05
+            end
+        end
+    end
+
+    @testset "ice: the var_check consistency source restores the moments" begin
+        # ISHMAEL's `var_check` writes back; this port carries the raw moments and reinstates
+        # the write-back as a source. Seed a MASS/NUMBER pair that no population can have --
+        # 5e9 crystals per m^3 holding 1e-9 kg/m^3, i.e. 9 nm "crystals" -- and the number
+        # source must be a large NEGATIVE one pulling it back toward the effective value.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                              rho_i = 1.0e-9, n_i = 5.0e9, r_i = 10.0e-6)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(S.SRC_i1n .< 0.0)
+            # It is a RESTORATION on a physical timescale, not a one-step wipe: the target is
+            # var_check's own re-diagnosis and the approach is `(n_eff − n)/tau_varcheck`, so
+            # a `tau_varcheck`-sized excursion removes an e-folding, not the whole excess.
+            tau_vc = get(mod.physical_params, :tau_varcheck, 5.0)
+            n_new = 5.0e9 .+ (tau_vc .* S.SRC_i1n)
+            @test all(n_new .>= 0.0)
+            @test maximum(n_new) < 1.0e8
+            # ...and it carries NO Δt: doubling tau halves the source, and the step is inert.
+            @test all(abs.(S.SRC_i1n) .< 5.0e9 / tau_vc * (1 + 1e-9))
+            # The MASS is untouched by it -- var_check never changes the mass, so the water
+            # exchange closure of the previous testset is unaffected.
+            dep = S.Qdot_i1 .+ S.Qdot_i2 .+ S.Qdot_i3
+            ice = S.SRC_i1q .+ S.SRC_i2q .+ S.SRC_i3q
+            scale = maximum(abs.(ice)) + maximum(abs.(dep))
+            @test maximum(abs.((ice .- dep) .+ (S.ICE_C .+ S.ICE_R))) < 1.0e-12 * scale
+        end
+        # ...and switching it off leaves the moments alone. Same state, no restoration.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                              rho_i = 1.0e-9, n_i = 5.0e9, r_i = 10.0e-6,
+                                              extra_options =
+                                                  Dict{Symbol,Any}(:ice_var_check => false))
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            # Without it the only number sink is sublimation, which here is orders of
+            # magnitude smaller than the inconsistency.
+            @test maximum(abs.(S.SRC_i1n)) < 1.0e8
+        end
+        # A LONGER tau is a weaker source, exactly proportionally.
+        mktempdir() do tmpdir
+            function src_at(tau)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                    rho_i = 1.0e-9, n_i = 5.0e9, r_i = 10.0e-6,
+                    extra_params = Dict{Symbol,Float64}(:tau_varcheck => tau))
+                Scythe.advance_column(m, 1, 2)
+                return copy(m.mc_scratch[Threads.threadid()].SRC_i1n)
+            end
+            s5 = src_at(5.0)
+            s10 = src_at(10.0)
+            @test maximum(abs.(s10 .- 0.5 .* s5)) < 1.0e-6 * maximum(abs.(s5))
+        end
+    end
+
+    @testset "ice: the stiffness census gains three channels" begin
+        @test Scythe.MC_STIFF_CHANNELS == 5
+        @test Scythe.MC_STIFF_NAMES == ("cloud", "rain", "ice1", "ice2", "ice3")
+        @test Scythe.MC_STIFF_WARNED ==
+              Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * Scythe.MC_STIFF_CHANNELS
+        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STIFF_WARNED
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, rho_i = 1.0e-5,
+                                              n_i = 5.0e4)
+            m.mc_water_stats .= 0.0
+            Scythe.advance_column(m, 1, 2)
+            row1 = Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * (Scythe.MC_STIFF_I1 - 1)
+            row3 = Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * (Scythe.MC_STIFF_I3 - 1)
+            @test maximum(view(m.mc_water_stats, row1, :)) > 0.0      # ice1 is loaded
+            @test maximum(view(m.mc_water_stats, row3, :)) == 0.0     # ice3 is empty
+        end
+    end
+
+    @testset "ice: each moment sediments at its own weighted speed" begin
+        # Mass falls faster than number (size sorting), and the a/c volume moments ride the
+        # mass-weighted speed. The number/mass ratio therefore CANNOT stay fixed the way it
+        # does under transport alone -- which is the point of giving each moment its own flux.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
+                                              rho_i = 1.0e-4, n_i = 2.0e4, r_i = 80.0e-6)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(S.Vi1m .< 0.0)                     # downward
+            @test all(S.Vi1n .< 0.0)
+            @test all(abs.(S.Vi1m) .> abs.(S.Vi1n))      # mass-weighted is the faster
+            @test all(abs.(S.Vi1m) .<= 25.0)             # the ported cap
+            # The two flux divergences are genuinely different fields.
+            @test S.F_i1q_z != S.F_i1n_z
+            # The empty species produce EXACT zeros and skip their spline fits entirely.
+            @test all(S.F_i2q_z .== 0.0)
+            @test all(S.F_i3c_z .== 0.0)
+        end
+    end
+
 end

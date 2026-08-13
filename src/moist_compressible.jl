@@ -159,6 +159,18 @@ const MC_SCRATCH_SLOTS = (
     # summed MASS flux divergence (the only ice flux that reaches ρ_t) and the ice
     # sedimentation energy flux with its divergence (the only one that reaches E_t).
     :rho_ice, :rho_ice_t, :rho_cond, :q_i, :Fi_z, :E_sed_i, :E_sed_i_z,
+    # ── Ice PHYSICS (S8): the process rates the twelve slots and the shared thermodynamics
+    # read. `Qdot_i<k>` is species k's deposition/sublimation rate [kg/m³/s] (TeX Eq.
+    # dep_rate) and `invtau_i<k>` its relaxation rate for the stiffness census; `Q_s_i` is
+    # the ice psychrometric factor `𝒬_{s,i}` (Eq. Qs_ice); `FRZ_NET` is the NET liquid→ice
+    # conversion `Q̇_freeze` [kg/m³/s] that heats T and p with the bare `L_f` (Eqs.
+    # dThat_ice/dphat_ice); `ICE_C`/`ICE_R`/`ICE_NR` are the back-reactions on the cloud
+    # mass, rain mass and rain number; `Vi<k>m`/`Vi<k>n` are the MASS- and NUMBER-weighted
+    # fall speeds (negative downward, like `Vt`), mass-weighted also carrying the `a`/`c`
+    # volume moments.
+    :Qdot_i1, :Qdot_i2, :Qdot_i3, :invtau_i1, :invtau_i2, :invtau_i3,
+    :Q_s_i, :FRZ_NET, :ICE_C, :ICE_R, :ICE_NR,
+    :Vi1m, :Vi1n, :Vi2m, :Vi2n, :Vi3m, :Vi3n,
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
     :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
@@ -668,6 +680,88 @@ end
 Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l) = Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, 0.0)
 
 """
+    Q_s_energy_ice(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+
+The ICE psychrometric factor `𝒬_{s,i}` (dimensionless), the deposition channel's counterpart
+of [`Q_s_energy`](@ref) (reference/Scythe_moist_compressible.tex, Eq. Qs_ice):
+
+    𝒬_{s,i} = [ ∂ρ_vs/∂T (L_s − R_v T)/ρ_d + ∂ρ_vs/∂p R_m (L_s − R_v C_pt T / R_m) ] / C_vt
+
+It is `Q_s_energy` with `L_v → L_s` **in both latent-heat slots and nowhere else**.
+
+**The two saturation derivatives stay OVER WATER.** `∂ρ_vs/∂T` and `∂ρ_vs/∂p` here are the
+derivatives of `ρ_v*`, the plane-water saturation density, in both factors — this is NOT
+`Q_s_energy` re-evaluated over ice. The factor measures how far the deposition heating moves
+the saturation *that `Q_ss` is defined against*, and `Q_ss ≡ ρ_v − ρ_v*` is defined over water
+at all temperatures (Eq. qss_ice_shift). The ice enters only through the latent heat that does
+the moving. Substituting `∂ρ_i*/∂T` here would break the exact cancellation of `(1 + 𝒬_{s,i})`
+between the deposition rate of Eq. dep_rate and the chain-rule terms of Eq. Qss_ice, which is
+what makes the supersaturation forcing energy-consistent.
+
+`C_vt` and `C_pt` are the ice-inclusive mixture capacities of Eq. mixture_C, exactly as in
+`Q_s_energy`; `R_m` is untouched, since ice exerts no partial pressure.
+"""
+function Q_s_energy_ice(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+
+    C_vt = Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)
+    R_m = Rd + (q_v * Rv)
+    C_pt = C_vt + R_m
+    p_hPa = p_Pa / 100.0
+    Ls = L_s(Tk)
+    return ((drho_vsat_dT(Tk, p_hPa) * (Ls - (Rv * Tk)) / rho_d) +
+            (drho_vsat_dp(Tk, p_hPa) * R_m * (Ls - (Rv * C_pt * Tk / R_m)))) / C_vt
+end
+
+"""
+    ice_supersaturation_gap(Tk, p_hPa) -> 𝒟
+
+`𝒟(T,p) = max(ρ_v*(T,p) − ρ_{v,i}*(T,p), 0)` [kg/m³], the offset between the water and ice
+saturation densities (reference/Scythe_moist_compressible.tex, Eq. Dwi).
+
+This is what makes the over-ice supersaturation an ALGEBRAIC function of the one prognostic
+`Q_ss` rather than a second prognostic: `ρ_v − ρ_{v,i}* = Q_ss + 𝒟` exactly (Eq. qss_ice_shift).
+It vanishes at the triple point, is positive below it because the ice branch of
+Clausius-Clapeyron is the steeper one, peaks near −12 °C, and the `max` carries it to zero
+above `T_0` where the ice cannot persist.
+
+BOTH branches come from the same Buck (1981) family with the same dry-air enhancement factor
+(`rho_v_sat` and `rho_i_sat` in Springsteel), which is the whole point: `𝒟` is a small
+difference of two large saturation densities and is only as good as the internal consistency
+of the two formulations (TeX §"Departures", (c)).
+"""
+@inline ice_supersaturation_gap(Tk, p_hPa) =
+    max(rho_v_sat(Tk, p_hPa) - rho_i_sat(Tk, p_hPa), 0.0)
+
+"""
+    ice_deposition_drive(Q_ss, rho_v, Tk, p_hPa) -> Q_ss_drive_i
+
+The DEPOSITION drive [kg/m³], the ice mirror of the liquid clip in
+[`qss_condensation_rates`](@ref):
+
+    Q_ss_drive_i = min(Q_ss + 𝒟, max(ρ_v, 0) − ρ_{v,i}*)
+
+In the continuum `Q_ss + 𝒟 ≡ ρ_v − ρ_{v,i}*` (Eq. qss_ice_shift) and the `min` never binds.
+Discretely `Q_ss` is an independent prognostic that can detach from the density budget, and
+this is the instantaneous, `Δt`-free form of the same reconciliation `qss_relaxation` applies
+on the `tau_qss` timescale — the identical argument, term for term, that the liquid clip
+rests on, applied to the identical vapor reservoir. Both phases must read the same clip or
+the shared-reservoir competition of Eq. wbf_qs is arbitrated twice.
+
+`max(ρ_v, 0)` is the same vapor floor for the same reason: a NEGATIVE retrieved `ρ_v` is a
+partition error, not a physical state, and must not set a sublimation rate whose magnitude is
+the size of that error. The floor puts the drive at `−ρ_{v,i}*`, the vapor-free-air maximum.
+
+The expression is SIGNED and needs no case distinction: where it is negative the air is
+subsaturated with respect to ice and the same formula returns sublimation (Eq. dep_rate).
+"""
+@inline function ice_deposition_drive(Q_ss, rho_v, Tk, p_hPa)
+
+    rho_vs_i = rho_i_sat(Tk, p_hPa)
+    return min(Q_ss + max(rho_v_sat(Tk, p_hPa) - rho_vs_i, 0.0),
+               max(rho_v, 0.0) - rho_vs_i)
+end
+
+"""
     qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
 
 Cloud condensation/evaporation rate [kg/m³/s] from the prognostic supersaturation
@@ -1154,7 +1248,9 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :d_v_n, :d_v_cevap, :d_v_cauto, :d_v_eul, :d_v_ab3,
                         :d_v_neg, :d_v_stiff, :d_v_infeas, :d_v_mab3, :d_v_mneg,
                         :v_gap,
-                        :s_c_max, :s_c_n, :s_r_max, :s_r_n, :s_warned)
+                        :s_c_max, :s_c_n, :s_r_max, :s_r_n,
+                        :s_i1_max, :s_i1_n, :s_i2_max, :s_i2_n, :s_i3_max, :s_i3_n,
+                        :s_warned)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -1206,12 +1302,15 @@ CUMULATIVE, unlike every block before it: `water_budget_trace` resets
 """
 const MC_STIFF_C = 1
 const MC_STIFF_R = 2
-const MC_STIFF_CHANNELS = 2
+const MC_STIFF_I1 = 3
+const MC_STIFF_I2 = 4
+const MC_STIFF_I3 = 5
+const MC_STIFF_CHANNELS = 5
 const MC_STIFF_N = 2
 const MC_STIFF_FIRST = 62
 const MC_STIFF_WARNED = MC_STIFF_FIRST + (MC_STIFF_N * MC_STIFF_CHANNELS)
 """Channel labels for the stiffness report, in `MC_STIFF_*` index order."""
-const MC_STIFF_NAMES = ("cloud", "rain")
+const MC_STIFF_NAMES = ("cloud", "rain", "ice1", "ice2", "ice3")
 """
 Threshold for `:d_*_mneg`, the count of points the MICROPHYSICS alone drives negative.
 
@@ -1471,12 +1570,35 @@ the two volume moments fall at different rates and the distribution sorts as it 
 `max(x, 0)` mirrors the rain flux for the same reason: a spline undershoot must not sediment
 NEGATIVE ice upward. The rate functions guard themselves the same way.
 
-**This stage passes `w_fall = 0.0` at every call site**, so every flux and every divergence
-here is an exact zero and the ice only advects. The Mitchell-Heymsfield speeds replace the
-literals and nothing else.
+`w_fall` is a COLUMN (the Mitchell-Heymsfield speeds of [`ishmael_fall_speeds`](@ref), already
+capped at 25 m/s inside that function and negated to Scythe's downward-negative convention),
+or a scalar `0.0` for a caller that wants the flux switched off.
+
+# The empty-species short circuit
+
+An ice species with no ice anywhere in the column has `w_fall ≡ 0` and `x ≡ 0`, and fitting a
+zero vector through the spline chain costs the same as fitting a real one — measured at S7 as
+1.7× the wall clock of the whole driver for twelve such fits per column. So the fit is GATED:
+if no level has both a nonzero fall speed and a nonzero (positive) amount, `F` and `F_z` are
+`fill!`ed with zeros and the transform is skipped. That is not an approximation — the product
+`max(x,0)·w` is identically zero over the column, the spline of the zero function is zero, and
+its derivative is zero — it is the same numbers reached without the arithmetic, which is what
+keeps the zero-ice inertness gate BITWISE rather than merely small.
 """
 @inline function _ice_flux!(mtile::ModelTile, F, F_z, x, w_fall, slot::Int)
     @. F = max(x, 0.0) * w_fall
+    live = false
+    @inbounds for i in eachindex(F)
+        if F[i] != 0.0
+            live = true
+            break
+        end
+    end
+    if !live
+        fill!(F, 0.0)          # sweeps any -0.0 the product may have produced
+        fill!(F_z, 0.0)
+        return nothing
+    end
     col = scratch_column(mtile, slot)
     col.uMish .= F
     Btransform!(col)
@@ -1706,11 +1828,32 @@ intercept. Run against single-moment rain it would read a drop size that the rai
 not actually carry, and the disagreement would be silent. The check is here rather than at
 first use so it fires at configuration time.
 
-**What this stage does and does not do.** The slots exist, they advect, they carry the
-thermodynamics and the sedimentation machinery — but every PROCESS RATE and every FALL SPEED
-is identically zero, so `:ishmael` with zero initial ice is inert to the rest of the state
-(and is asserted to be, at `~1e-10` against the ice-free run). The live physics arrives with
-the deposition, nucleation and riming rates.
+**The physics is LIVE.** Deposition and sublimation run through the shared prognostic `Q_ss`
+(TeX Eqs. dep_rate, Qss_ice_final), so the Wegener-Bergeron-Findeisen competition is a
+property of the equation set rather than an arbitration bolted onto it; the full ISHMAEL
+process set — DeMott/homogeneous/Bigg nucleation, Hallett-Mossop splintering, ice-cloud and
+ice-rain riming with the wet-growth branch, aggregation and melting — supplies the rest; the
+Mitchell-Heymsfield fall speeds sediment each moment at its own weighted speed. See
+[`mc_ice_sources!`](@ref).
+
+**Zero ice is still exactly inert where no ice can form.** Every rate is gated on a STATE
+test — `q_i ≤ QSMALL` for a species, `T ≤ T_0` for aggregation and deposition, the nucleation
+windows for the rest — so in air that is warm throughout with no initial ice, every ice source
+and every fall speed is an exact `0.0` and the ten common slots reproduce the ice-free run
+BITWISE. In SUBFREEZING supersaturated air it is not inert and must not be: DeMott nucleation
+fires, which is the physics.
+
+The tables (`data/ishmael_tables.jld2`, 44.5 MB, gitignored) are loaded once per tile at
+construction; a missing file is refused there rather than mid-run. See
+[`load_ishmael_tables_or_error`](@ref).
+
+**`options[:ice_var_check]` (default `true`) — FLAGGED FOR REVIEW.** ISHMAEL's `var_check`
+writes its moment-consistency re-diagnosis back into the state every step; this port evaluates
+the rates at the effective moments but carries the raw ones, and nothing else in the set
+restores them. The write-back is therefore reinstated as a SOURCE on the number and the two
+volume moments (never on the mass), which is a one-step state repair and carries a `Δt`.
+Setting this `false` removes it and reproduces the divergence it was added for — see the block
+in [`mc_ice_sources!`](@ref) for the measurement and the argument.
 """
 @inline function ice_microphysics(options)
     mode = get(options, :ice_microphysics, :none)::Symbol
@@ -3024,6 +3167,29 @@ than by editing this function. NEVER touches a rate.
 end
 
 """
+    mc_stiffness_census!(mtile, ts, invtau_i1, invtau_i2, invtau_i3)
+
+The ICE arm of [`mc_stiffness_census!`](@ref): the three deposition relaxations `1/τ_{i,k}` of
+TeX Eq. tau_ice, measured on exactly the rates the step used, with the same `ts/τ` yardstick
+and into the same block (`MC_STIFF_I1..I3`).
+
+A SEPARATE method rather than three more arguments to the liquid one, so an ice-free run does
+not pay three passes over three columns it would only find zeros in — and, more importantly,
+so those three channels report an exact zero rather than a zero that had to be computed.
+"""
+@inline function mc_stiffness_census!(mtile::ModelTile, ts::Float64,
+                                      invtau_i1, invtau_i2, invtau_i3)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    tid = Threads.threadid()
+    _stiffness_channel!(st, tid, MC_STIFF_I1, ts, invtau_i1)
+    _stiffness_channel!(st, tid, MC_STIFF_I2, ts, invtau_i2)
+    _stiffness_channel!(st, tid, MC_STIFF_I3, ts, invtau_i3)
+    return nothing
+end
+
+"""
 One channel's pass for [`mc_stiffness_census!`](@ref): reduce the column into thread-local
 scalars first, then touch the shared matrix twice. Split out so each call specializes on its
 own array type, as [`_depletion_census!`](@ref) is.
@@ -3266,6 +3432,819 @@ function water_budget_trace(mtile::ModelTile, t::Int64)
     # step 40 is still true at step 4000, and the once-per-run warning must be able to see
     # it) and must not be cleared by a diagnostic that happens to be switched on.
     @inbounds fill!(view(st, MC_BUDGET_FIRST:MC_VAPOR_GAP, :), 0.0)
+    return nothing
+end
+
+# ── Ice microphysics: the host-side integration of the ISHMAEL process library ────
+#
+# Everything below turns the ported Fortran rate functions (src/ishmael.jl,
+# src/ishmael_tables.jl) into the source terms of Eqs. ice_prog_mass..ice_prog_c of
+# reference/Scythe_moist_compressible.tex. Three conventions run through all of it:
+#
+#   UNITS. The ISHMAEL library is MIXING-RATIO internally (per kg of dry air), exactly as
+#   the Fortran is; Scythe is densities. The conversion happens at this boundary and only
+#   here: `q = ρ/ρ_d` going in, `× ρ_d` coming out. The one exception is the DEPOSITION
+#   rate, which is formed in density directly from `Q_ss` (Eq. dep_rate) because that is the
+#   form in which the `(1 + 𝒬_{s,i})` cancellation with the supersaturation equation happens.
+#
+#   STATE. Every rate is evaluated at the VAR_CHECK-EFFECTIVE moments — the Fortran's own
+#   `var_check` consistency clamps applied to the transported (ρ_i, n_i, a_i, c_i) — so the
+#   rate functions never see a moment set that does not describe a realizable population.
+#   `_ice_effective` is that map, and it is the only place the raw slots are read.
+#
+#   RATES, NOT UPDATES. The Fortran advances its state between process blocks and
+#   re-diagnoses in between. Scythe hands a multistep integrator pure tendencies, so every
+#   rate here is evaluated at the SAME state, summed, and returned. Where the Fortran's
+#   bookkeeping is expressed as a state update (the aggregation and nucleation volume
+#   moments) the increment is divided by the step and used as a rate, which is the same
+#   thing to the order the scheme is written in.
+
+# ── The impulse-form rates, converted to finite physical rates ────────────────
+#
+# Three of ISHMAEL's nucleation rates are written as `reservoir/Δt`: they convert the WHOLE
+# available reservoir in exactly one time step. That is the same defect as the depletion caps
+# the model already removed (TeX §Departures (b)) with the sign reversed — the rate, and hence
+# the converged solution, is a function of the step size, so refining `Δt` does not approach
+# any differential equation. It is also what detonated the first live ice arm: `n_c/Δt` at
+# `Δt = 0.3 s` injects 3.3e8 sub-micron crystals per m³ per second into the anvil, and the
+# resulting `1/τ_i ∝ n_i C̄` and ice-rain collection rate (∝ n_i n_r) both ran away. Measured:
+# the divergence sat at the SAME PHYSICAL TIME (986 s at ts = 0.3, 1007 s at ts = 0.1), which
+# is the signature of a state runaway rather than of an under-resolved step.
+#
+# Each is therefore rewritten as a relaxation on a physical timescale. The timescales are
+# `physical_params`, they are `Δt`-free, and the stiffness census reports when a step fails to
+# resolve them — which is the model's standing answer to a fast process.
+
+"""
+    ISHMAEL_IN_CEILING
+
+The DeMott existing-ice ceiling, 1.0e7 m⁻³. This is the Fortran's own `10000` compared against
+`n/1000` in m⁻³ (module_mp_jensen_ishmael.F line 1591) — a measured upper bound on activated
+ice nuclei, i.e. a STATE ceiling on a concentration, not a `Δt` limiter on a rate, so it stays.
+"""
+const ISHMAEL_IN_CEILING = 1.0e7
+
+"""
+    ISHMAEL_M_MIN
+
+The mass of the smallest ice crystal the scheme resolves: a sphere of radius
+[`ISHMAEL_RMIN`](@ref) at the bulk ice density `RHOI = 920 kg/m³` the Fortran assigns to every
+freshly nucleated or frozen particle (`rhobar = RHOI·nucfrac + (1−nucfrac)·rhobar`,
+module_mp_jensen_ishmael.F line 2246). It is the same particle DeMott seeds
+(`mnuccd/nnuccd = (4/3)π RHOI (2e-6)³`, line 1596), so the two channels agree by construction.
+"""
+const ISHMAEL_M_MIN = ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * ISHMAEL_RMIN^3
+
+"""
+    _ice_homogeneous_rates(temp, qc, nc, qr, nr, tau_hf) -> NamedTuple
+
+Homogeneous freezing below −35 °C as a finite relaxation: everything liquid freezes on the
+timescale `tau_hf` (`physical_params[:tau_homogeneous]`, default 5 s) rather than in one step.
+
+    ṁ = ρ_c/τ_hf,   ṅ = min( n_c/τ_hf , ṁ/m_min )
+
+and the same pair for the rain. The Fortran writes `mim = q_c/Δt`, `nim = n_c/Δt` (lines
+1545-1553), which makes the rate literally `1/Δt`; this is the `Δt`-free statement of the same
+physics — "all supercooled liquid freezes within seconds at −35 °C".
+
+# Why the number is bounded and the mass is not
+
+Every ice NUMBER source must seed crystals at or above the smallest size the scheme resolves,
+[`ISHMAEL_RMIN`](@ref) — which is `var_check`'s mean-radius floor and the bottom of the
+`itab`/`itabr` table domain at the same time. DeMott seeds 2 μm spheres and Hallett-Mossop
+seeds 5 μm splinters, so both comply already. One-crystal-per-droplet does NOT: the cloud
+closure carries a FIXED droplet number (`max_N_c`) regardless of the cloud content, so a thin
+anvil cloud freezing at −35 °C would hand the scheme 10⁸ m⁻³ crystals of sub-micron size —
+particles the habit laws and the collection tables were never fitted for, and whose
+`rimedr ∝ 1/r_ni²` axis growth at the clamped floor is unbounded. Measured, before this
+bound: the O01 ice arm made 6×10⁷ m⁻³ crystals of 0.13 μm at 990 s, and once the anvil met
+them the ice deposition timescale went from `ts/τ = 1.8e-4` to `36.5` in a hundred seconds.
+
+The `min` states the same physics ISHMAEL states with its `n_i ≤ 1000 L⁻¹` state cap, but at
+the SOURCE rather than by re-diagnosing the population afterwards: the frozen MASS transfers
+in full — no water is lost, and `Q̇_freeze` is untouched — and the number is what that mass
+supports at the minimum resolved crystal. It is state-dependent and `Δt`-free, so it is not a
+depletion cap: refining `Δt` still approaches the same differential equation.
+
+Where the droplets are LARGER than `r_min` (the ordinary case: 100 cm⁻³ in 1 g/m³ of cloud is
+13 μm) the bound does not bind and the drop-preserving transfer `ṅ = n_c/τ_hf` stands exactly.
+
+The RAIN leg carries the same `min` for symmetry and safety. Raindrops are three orders of
+magnitude above `r_min`, so it should never bind — `test_moist_compressible.jl` asserts it does
+not at typical rain states, which is what makes it a guard rather than a parameterization.
+
+The volume-moment seeding needs no change: [`_ice_nucleation_volume`](@ref) derives the
+characteristic axis from the summed mass/number ratio at density `RHOI` and is shared by every
+nucleation channel, so bounding the ratio here bounds the seeded size there too.
+
+The `-35 °C` threshold and the `QSMALL` existence gates are STATE tests and are unchanged.
+"""
+@inline function _ice_homogeneous_rates(temp::Float64, qc::Float64, nc::Float64,
+                                        qr::Float64, nr::Float64, tau_hf::Float64)
+
+    (temp < (T_0 - 35.0)) || return (mim = 0.0, nim = 0.0, mimr = 0.0, nimr = 0.0)
+    itau = 1.0 / tau_hf
+    cloud = qc > ISHMAEL_QSMALL
+    rain = qr > ISHMAEL_QSMALL
+    mim = cloud ? qc * itau : 0.0
+    mimr = rain ? qr * itau : 0.0
+    return (mim  = mim,
+            nim  = cloud ? min(nc * itau, mim / ISHMAEL_M_MIN) : 0.0,
+            mimr = mimr,
+            nimr = rain ? min(nr * itau, mimr / ISHMAEL_M_MIN) : 0.0)
+end
+
+"""
+    _ice_demott_rates(temp, sup, rhoair, n_ice, tau_act) -> NamedTuple
+
+DeMott et al. (2010) heterogeneous nucleation as a finite ACTIVATION rate:
+
+    ṅ = max( n_IN(T) − n_ice , 0 ) / τ_act
+
+with `n_IN` the DeMott ice-nuclei concentration [m⁻³] capped at [`ISHMAEL_IN_CEILING`](@ref),
+`n_ice` the ice number ALREADY present [m⁻³], and `τ_act` = `physical_params[:tau_activation]`
+(default 1 s). The mass follows the number at ISHMAEL's own new-particle size — 2 μm spheres
+of density `RHOI` (Fortran lines 1596-1597).
+
+Two things change from [`ishmael_nucleation_demott`](@ref), which stays as the Fortran wrote
+it for the reference harness:
+
+  * the rate is `deficit/τ_act`, not `deficit/Δt`;
+  * the deficit is taken in the UNCAPPED branch too. The Fortran activates the full `inrate`
+    every step until the ceiling binds, so a column that already holds the DeMott
+    concentration keeps nucleating; here activation stops when the ice number reaches it,
+    which is what "the available nuclei have been used up" means.
+
+The nucleation window (`T < T_0` and supersaturated over water) is a state test and is
+unchanged; `n_ice` is the CARRIED ice number, for the reason given in `_ice_species_rates`.
+"""
+@inline function _ice_demott_rates(temp::Float64, sup::Float64, rhoair::Float64,
+                                   n_ice::Float64, tau_act::Float64)
+
+    (temp < T_0 && sup >= 0.0) || return (mnuccd = 0.0, nnuccd = 0.0)
+
+    dT = 273.16 - temp
+    # The DeMott fit, verbatim (Fortran lines 1583-1588). `0.03` is the Chagnon and Junge
+    # (1962) large-aerosol number; the result is #/L and is converted to m⁻³ here.
+    n_IN = 1000.0 * 0.0000594 * dT^3.33 * 0.03^((0.0264 * dT) + 0.0033)
+    target = min(n_IN, ISHMAEL_IN_CEILING)
+    deficit = max(target - n_ice, 0.0)               # m⁻³
+    nnuccd = deficit / (tau_act * rhoair)            # # kg⁻¹ s⁻¹
+    # New particles are `r_min` spheres at `RHOI` — [`ISHMAEL_M_MIN`](@ref), the SAME crystal
+    # the homogeneous leg is bounded against, so the two channels seed one population.
+    mnuccd = nnuccd * ISHMAEL_M_MIN
+    return (mnuccd = mnuccd, nnuccd = nnuccd)
+end
+
+"""
+    _ice_effective(qi, ni, ai, ci, k) -> NamedTuple
+
+One ice species' EFFECTIVE moments: the incoming-volume floors of the Fortran host loop
+(module_mp_jensen_ishmael.F lines 1013-1032) followed by [`ishmael_var_check`](@ref).
+
+`qi`, `ni`, `ai`, `ci` are MIXING RATIOS (per kg dry air) and are assumed already floored at
+zero by the caller. Returns `var_check`'s tuple — `(deltastr, ani, cni, rni, rhobar, ni, ai,
+ci, alphstr, alphv, betam)` — which is what every rate function downstream takes.
+
+An EMPTY species (`qi ≤ QSMALL`) returns the Fortran's own top-of-loop initialization instead
+(lines 874-901): number and volumes at their floors, 2 μm spherical axes, `deltastr = 1`, and
+`rhobar = RHOI` except for the aggregate species, where it is 50 kg/m³. `var_check` cannot be
+run on an empty species — its density re-derivation divides by the mass — and the aggregation
+block still needs a well-defined characteristic diameter for a species that has no ice yet,
+because that is exactly the species aggregation CREATES.
+
+`k` is the species index; only `k == 3` (aggregates) reads it.
+"""
+@inline function _ice_effective(qi::Float64, ni::Float64, ai::Float64, ci::Float64, k::Int)
+
+    if !(qi > ISHMAEL_QSMALL)
+        return (deltastr = 1.0, ani = 2.0e-6, cni = 2.0e-6, rni = 2.0e-6,
+                rhobar = (k == 3 ? 50.0 : ISHMAEL_RHOI),
+                ni = ISHMAEL_QNSMALL, ai = ISHMAEL_QASMALL, ci = ISHMAEL_QASMALL,
+                alphstr = 1.0, alphv = ISHMAEL_FOURTHIRDSPI, betam = 3.0)
+    end
+
+    ni = max(ni, ISHMAEL_QNSMALL)
+    ai = max(ai, ISHMAEL_QASMALL)
+    ci = max(ci, ISHMAEL_QASMALL)
+    ani = max(((ai^2) / (ci * ni))^0.333333333333, 2.0e-6)
+    cni = max(((ci^2) / (ai * ni))^0.333333333333, 2.0e-6)
+    # Smallest bulk volume for which shape is meaningful: below it, assume spherical.
+    if ai < 1.0e-12 || ci < 1.0e-12
+        ai = min(ai, ci)
+        ci = ai
+        ani = (ai / ni)^0.3333333333
+        cni = (ci / ni)^0.3333333333
+    end
+    if ani < 2.0e-6 || cni < 2.0e-6
+        ani = 2.0e-6
+        cni = 2.0e-6
+    end
+    ci = cni^2 * ani * ni
+    ai = ani^2 * cni * ni
+    ds = (log(cni) - log(ISHMAEL_AO)) / (log(ani) - log(ISHMAEL_AO))
+    # `rbdum` in is irrelevant: var_check's first act is to re-derive it from (qi, ni, ani).
+    return ishmael_var_check(ISHMAEL_NU, ISHMAEL_AO, ISHMAEL_FOURTHIRDSPI, ISHMAEL_GAMMNU,
+                             qi, ds, ani, cni, ISHMAEL_RHOI, ni, ai, ci)
+end
+
+"""
+    _ice_species_rates(tab, dt, eff, qi, temp, rhoair, air, drive_i, Q_s_i, maxsui, igr,
+                       qc, nc, qr, nr, qv) -> NamedTuple
+
+Every per-species ice process rate at one gridpoint, in ISHMAEL's mixing-ratio units except
+where noted. `eff` is [`_ice_effective`](@ref)'s tuple, `qi` the species mass mixing ratio,
+and `air` a tuple of the level's temperature-dependent air properties (see the caller).
+
+The order is the Fortran's own, because several rates read each other: the two riming lookups
+first (they supply `rimesum`/`rimesumr`, which the wet-growth check and the melting rate both
+read), then the vapor coefficients, then deposition, riming growth, splintering, and melting.
+
+# Deposition: where the Q_ss closure meets the habit physics
+
+`invtau_i = 4π D_v n_i C̄ f_v` (TeX Eq. tau_ice, density form: `n_i` in #/m³, `C̄` in m, `D_v`
+in m²/s) and `Q̇_i = drive · invtau_i / (1 + 𝒬_{s,i})` (Eq. dep_rate) — the rate is Scythe's,
+not ISHMAEL's, which is departure (b) of the TeX: the semi-analytic step-mean integration is
+replaced by the explicit rate, because `Q_ss` is prognostic here and is advanced by the same
+multistep integrator as everything else.
+
+The HABIT physics is then ISHMAEL's, applied as a PARTITION of that realized rate (departure
+(d)). The seam is the Fortran's `afn`, whose relation to the mass rate is exact:
+`vaporgrow` integrates `r² → r² + 2·afn·(C̄/r)/ρ_dep·(Γ(ν)/Γ(ν+2+δ*))·Δt`, whose volume
+derivative is `dV/dt = 4π·afn·C̄/ρ_dep` per particle, so the species mass rate is
+`4π n_i C̄ afn` and
+
+    afn = Q̇_i / (4π n_i C̄)
+
+is the inversion that hands `ishmael_deposition_partition` exactly the growth Scythe's own
+supersaturation supports. (Substituting the Fortran's own `afn`, which is
+`D_v f_v (ρ_v − ρ_{v,i}*)/(1 + 𝒬_{s,i})` written through its diagnosed `sui`, recovers
+`Q̇_i = invtau_i·drive/(1+𝒬_{s,i})` identically — the two schemes' underlying mass rate is the
+same capacitance-diffusion expression, differing only in the supersaturation supplied to it.)
+
+`maxsui` — which of `{ρ_ice·igr, ρ_ice/igr, ρ_ice}` the deposition density blends toward — is
+the caller's, formed from the same clipped drives (see `mc_ice_sources!`).
+
+# What is deliberately NOT ported
+
+The Fortran's `if(abs(prd*dt) < QSMALL*0.01) prd = nrd = ard = crd = 0` smallness cutoff is a
+Δt-dependent modification of a rate and goes with the rest of them (TeX §Departures (b)). The
+`qi ≤ QSMALL` gate above it is a STATE test and is kept — it is what makes an empty species
+cost nothing and produce exact zeros.
+
+# EFFECTIVE moments versus CARRIED moments
+
+`eff` is the var_check-effective state and `ni_c` is the CARRIED number mixing ratio, and the
+distinction is load-bearing. In the Fortran the two are the same array: `var_check` has
+`INTENT(INOUT)` arguments and its re-diagnosis is WRITTEN BACK into the prognostic state, so
+an inconsistent moment set is repaired once and never seen again. Scythe cannot do that — a
+per-step state repair is exactly what this model rejects everywhere else — so `var_check` is
+used here as a pure map and the carried moments keep whatever transport and the sources gave
+them. They can therefore drift arbitrarily far from consistency, and nothing in the effective
+state feels it.
+
+The split that follows from that:
+
+  * KERNEL quantities — the axes, the mean radius, the bulk density, the capacitance, the
+    ventilation, the fall speeds, the collection lookups and aggregation — read the EFFECTIVE
+    moments, because a growth or collision rate is only meaningful for a realizable population.
+  * BUDGET quantities — how much NUMBER leaves when a given fraction of the MASS leaves — read
+    the CARRIED number, because "sublimating half the ice removes half the crystals" is a
+    statement about the crystals that are actually there. Reading the effective number here
+    makes the number sink proportional to a quantity the number itself does not appear in,
+    which leaves the carried number with no restoring channel at all: measured on the O01 ice
+    arm, `n_i1` reached 2.2e10 m⁻³ against 6.7e-11 kg/m³ of mass (9 nm "crystals") and the run
+    detonated at t ≈ 1050 s.
+
+The same rule sends the CARRIED number to the DeMott existing-ice cap in `mc_ice_sources!`:
+a cap that throttles nucleation on the ice already present must see the ice already present.
+"""
+function _ice_species_rates(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni_c::Float64,
+                            temp::Float64, rhoair::Float64,
+                            mu::Float64, dv::Float64, kt::Float64, nsch::Float64,
+                            npr::Float64, xxlv::Float64, xxlf::Float64, qs0::Float64,
+                            drive_i::Float64, Q_s_i::Float64, maxsui::Float64,
+                            igr::Float64, qc::Float64, nc::Float64, qr::Float64,
+                            nr::Float64, qv::Float64)
+
+    ani = eff.ani; cni = eff.cni; rni = eff.rni; ds = eff.deltastr
+    rhobar = eff.rhobar; ni = eff.ni; ai = eff.ai; ci = eff.ci; alphstr = eff.alphstr
+    nim3 = ni * rhoair                       # # m^-3, the Fortran's `nim3dum`
+
+    # ── Collection lookups (the itab/itabr families) ──
+    rc = ishmael_ice_cloud_riming(tab.itab, rni, qc, ds, rhobar, ni, nc, rhoair)
+    rr = ishmael_ice_rain_riming(tab.itabr, rni, qr, nr, ds, rhobar, ni, rhoair, temp, qi)
+    rimesum = rc.rimesum
+    rimesumr = rr.rimesumr
+    rimetotal = rimesum + rimesumr
+
+    # ── Capacitance, ventilation and the (uncapped) fall speeds the growth math reads ──
+    vc = ishmael_vapor_coefficients(ani, cni, ds, ISHMAEL_NU, ISHMAEL_I_GAMMNU, alphstr,
+                                    rhobar, rhoair, mu, nsch, npr)
+    capgam = vc.Cbar
+    fv = vc.fv
+    fh = vc.fh
+
+    # ── Deposition / sublimation (TeX Eqs. tau_ice, dep_rate) ──
+    invtau_i = 4.0 * pi * dv * nim3 * capgam * fv
+    # Above T_0 the deposition channel is closed: 𝒟 = 0 there, the ice cannot persist, and
+    # `vaporgrow` itself passes straight through (Fortran lines 3473-3479). Melting, not
+    # sublimation, is what removes ice above freezing.
+    Qdot = temp > T_0 ? 0.0 : drive_i * invtau_i / (1.0 + Q_s_i)
+    afn = (capgam > 0.0 && nim3 > 0.0) ? Qdot / (4.0 * pi * nim3 * capgam) : 0.0
+    dep = ishmael_deposition_partition(dt, ani, cni, rni, ds, rhobar, nim3, igr,
+                                       afn, maxsui, vc.vtrmi1, drive_i < 0.0, capgam,
+                                       dv, temp, ISHMAEL_AO, ISHMAEL_NU, ISHMAEL_GAMMNU,
+                                       ISHMAEL_I_GAMMNU, ISHMAEL_FOURTHIRDSPI)
+    # Sublimation removes particles as well as mass, IN PROPORTION (Fortran lines 1273-1276).
+    # The proportion is of the CARRIED number — see the docstring: this is the only sink the
+    # carried number has, and taking the fraction of a number that is not the one being
+    # transported leaves it unrestrained.
+    pq = Qdot / rhoair                       # the deposition rate as a mixing ratio rate
+    nrd = pq < 0.0 ? pq * ni_c / qi : 0.0
+
+    # ── Riming: wet-growth branch, then mass and axis growth ──
+    dry_growth_pre = ishmael_wet_growth_check(ISHMAEL_NU, temp, rhoair, xxlv, xxlf, qv, dv,
+                                              kt, qs0, fv, fh, rimetotal, rni, ni)
+    rg = ishmael_riming_growth(dt, rni, ds, rhobar, nim3, ani, cni, temp,
+                               qc, nc, rc.qi_qc_nrm, rc.qi_qc_nrd, rimesum,
+                               qr, nr, rr.qi_qr_nrm, rr.qi_qr_nrd, rimesumr,
+                               rhoair, dry_growth_pre, ISHMAEL_NU, ISHMAEL_AO,
+                               ISHMAEL_GAMMNU, ISHMAEL_I_GAMMNU, ISHMAEL_FOURTHIRDSPI)
+    # How the rime mass is split between the cloud and the rain reservoirs. The Fortran keeps
+    # this as `qcrimefrac(cc)`; `ishmael_riming_growth` forms the same ratio internally for
+    # the density blend but does not return it, so it is reformed here from the same two
+    # numbers (identical expression, lines 1394-1395).
+    qcrimefrac = rimetotal > 0.0 ? clamp(rimesum / rimetotal, 0.0, 1.0) : 0.0
+    # Hallett-Mossop: splinter mass comes OUT of this species' rime gain and goes to the
+    # nucleated species, so `prdr` shrinks while `prdr_pre` — the liquid that was actually
+    # collected — does not. The liquid sink is written against `prdr_pre`; see `mc_ice_sources!`.
+    sp = ishmael_rime_splintering(temp, rg.prdr)
+
+    # ── Melting ──
+    # `reservoir_caps=false`: the three `Δt`-dependent clauses inside the ported melting rate
+    # (the `-qi/Δt` floor, the `ai<1e-12` dump-it-all branch and the `-ni/Δt` number floor)
+    # are depletion caps and go with the rest of them.
+    ml = ishmael_melting(temp, ni, ani, cni, ds, rhobar, qi, ai, ci, kt, fh, rhoair,
+                         xxlv, dv, fv, qs0, qv, xxlf, rimetotal, rr.dQImltri, rr.dNmltri,
+                         dt, alphstr, ISHMAEL_GAMMNU, ISHMAEL_I_GAMMNU,
+                         ISHMAEL_FOURTHIRDSPI; reservoir_caps = false)
+    # The melting NUMBER loss is a budget leg, so it is re-formed on the CARRIED number —
+    # the Fortran's own expression (line 1527) evaluated on the crystals that are actually
+    # there rather than on the effective population the melting KERNEL (`ml.qmlt`, `ml.amlt`,
+    # `ml.cmlt`, which need number and size to agree) reads. No `Δt` floor, for the same
+    # reason the kernel above has none.
+    nmlt = ml.qmlt < 0.0 ? ((ml.qmlt * ni_c / qi) - rr.dNmltri) : ml.nmlt
+
+    # ── Fall speeds (the capped copy the host model keeps; size-sorting under melting) ──
+    # Evaluated at the SAME effective state as every rate above. The Fortran recomputes these
+    # after its sequential state update; there is no updated state here to recompute them on,
+    # and taking them at the state the tendency is being formed at is what a rate-based
+    # scheme means. Negated: `Vt` and every fall speed in this file is downward-NEGATIVE.
+    fs = ishmael_fall_speeds(ani, cni, ds, ISHMAEL_NU, ISHMAEL_I_GAMMNU, alphstr, rhobar,
+                             rhoair, mu; in_melting = (temp > T_0 && ml.qmlt < 0.0))
+
+    return (invtau_i = invtau_i, Qdot = Qdot, nrd = nrd, ard = dep.ard, crd = dep.crd,
+            prdr_pre = rg.prdr, prdr = sp.prdr, ardr = rg.ardr, crdr = rg.crdr,
+            qmult = sp.qmult, nmult = sp.nmult, qcrimefrac = qcrimefrac,
+            qmlt = ml.qmlt, nmlt = nmlt, amlt = ml.amlt, cmlt = ml.cmlt,
+            dQRfzri = rr.dQRfzri, dQIfzri = rr.dQIfzri, dNfzri = rr.dNfzri,
+            nrn_loss = rr.qi_qr_nrn * ni * nr * rhoair,
+            vtrm = -fs.vtrmi1, vtrn = -fs.vtrni1)
+end
+
+"""
+    _ice_empty_rates() -> NamedTuple
+
+The all-zero counterpart of [`_ice_species_rates`](@ref) for a species with no ice. Every
+field is an EXACT `0.0`, which is what keeps the warm/ice-free inertness gate bitwise: the
+source accumulators are sums of these, `x + 0.0 === x`, and `_ice_flux!` short-circuits its
+spline fit on a fall speed that is identically zero.
+"""
+@inline _ice_empty_rates() =
+    (invtau_i = 0.0, Qdot = 0.0, nrd = 0.0, ard = 0.0, crd = 0.0,
+     prdr_pre = 0.0, prdr = 0.0, ardr = 0.0, crdr = 0.0,
+     qmult = 0.0, nmult = 0.0, qcrimefrac = 0.0,
+     qmlt = 0.0, nmlt = 0.0, amlt = 0.0, cmlt = 0.0,
+     dQRfzri = 0.0, dQIfzri = 0.0, dNfzri = 0.0, nrn_loss = 0.0,
+     vtrm = 0.0, vtrn = 0.0)
+
+"""
+    _ice_agg_moments(eff, qi, ni_new, qi_new, rhoair, dt, dnew3, k) -> (Ȧ, Ċ)
+
+The `a`/`c` volume-moment rates [m³/m³/s] that accompany one species' aggregation mass and
+number transfer.
+
+ISHMAEL expresses this as a state update (Fortran lines 2404-2478), and it is the one place
+the port has to differentiate one: given the post-aggregation mass and number, the axes are
+re-diagnosed at CONSTANT `deltastr` and `rhobar` (the assumption stated in the Fortran's own
+comment — the loss of ice1/ice2 to aggregates does not significantly change the shape or
+density of what is left) and the moments follow by the product rule on `a_i = n⟨a²c⟩`,
+
+    δa_i = 2 n a c δa + n a² δc + a² c δn
+
+which is the Fortran's own three-term expression, divided here by the step.
+
+The AGGREGATE species under `forced3` is different and is not a perturbation: its shape is
+IMPOSED (ρ̄ = 50 kg/m³, aspect ratio 0.2, `a = ½·dnew3` from the collection kernel's own
+updated characteristic diameter), so its moments are assigned outright and the rate is the
+difference from where they were. `forced3` is set only when the aggregation block actually
+ran (there is no `dnew3` otherwise); a species-3 mass change from the ice-rain freezing
+transfer alone takes the ordinary constant-shape branch.
+
+The same function serves the NUCLEATION TRANSFER — the mass and number a non-nucleated
+species loses to the nucleated one when rain freezes onto it (Fortran lines 2330-2347 apply
+the identical three-term update for the identical reason). Aggregation and the transfer are
+combined into ONE new `(qi, ni)` by the caller and re-diagnosed once, rather than
+sequentially: with a rate-based scheme there is no intermediate state for the second
+re-diagnosis to be taken at.
+"""
+@inline function _ice_agg_moments(eff, ni_new::Float64, qi_new::Float64,
+                                  rhoair::Float64, dt::Float64, dnew3::Float64,
+                                  forced3::Bool)
+
+    (qi_new > ISHMAEL_QSMALL && ni_new > 0.0) || return (0.0, 0.0)
+    ds = eff.deltastr
+    ni = eff.ni
+    aniold = eff.ani
+    cniold = eff.cni
+
+    if forced3
+        # Forced aggregate shape (Fortran lines 2406-2416).
+        ani = 0.5 * dnew3
+        cni = 0.2 * ani * ISHMAEL_GAMMNU / gamma(ISHMAEL_NU - 1.0 + ds)
+        da = (ani^2 * cni * ni_new) - eff.ai
+        dc = (cni^2 * ani * ni_new) - eff.ci
+        return (rhoair * da / dt, rhoair * dc / dt)
+    end
+
+    alphstr = ISHMAEL_AO^(1.0 - ds)
+    gam = gamma(ISHMAEL_NU + 2.0 + ds)
+    ani = (qi_new / (ni_new * eff.rhobar * ISHMAEL_FOURTHIRDSPI * alphstr * gam *
+                     ISHMAEL_I_GAMMNU))^(1.0 / (2.0 + ds))
+    ani = max(ani, 2.0e-6)
+    cni = alphstr * ani^ds
+    da = (cniold * ni * 2.0 * aniold * (ani - aniold)) +
+         (ni * aniold^2 * (cni - cniold)) +
+         (aniold^2 * cniold * (ni_new - ni))
+    dc = (aniold * ni * 2.0 * cniold * (cni - cniold)) +
+         (ni * cniold^2 * (ani - aniold)) +
+         (cniold^2 * aniold * (ni_new - ni))
+    return (rhoair * da / dt, rhoair * dc / dt)
+end
+
+"""
+    _ice_nucleation_volume(Qnuc, Nnuc) -> Ȧ
+
+The `a` (and, for the spheres it makes, `c`) volume-moment source [m³/m³/s] that accompanies
+a nucleation mass rate `Qnuc` [kg/m³/s] and number rate `Nnuc` [#/m³/s].
+
+New ice particles are spheres of density `RHOI` (Fortran lines 1577-1601 for DeMott; frozen
+drops arrive with their own mass and number and the same relation sizes them). Inverting
+`Q = N·(4/3)π ρ_i a³ Γ(ν+3)/Γ(ν)` for the characteristic axis and forming `Ȧ = Ṅ⟨a²c⟩ =
+Ṅ a³ Γ(ν+3)/Γ(ν)` gives, before the clamps, simply
+
+    Ȧ = Q̇_nuc / ((4/3)π ρ_i)
+
+which is the bulk volume of the nucleated ice — consistent with the TeX's own reading of the
+moment, "⁴⁄₃π a_{i,k} is the volume fraction occupied by the species" (§Model variables with
+ice). The Fortran's `anuc` clamps to `[2 μm, 3 mm]` are applied to the characteristic axis
+before the moment is formed, which is why this is written the long way round rather than as
+the one-line identity.
+
+Zero when either rate is non-positive: a mass with no number, or a number with no mass, seeds
+no realizable population.
+"""
+@inline function _ice_nucleation_volume(Qnuc::Float64, Nnuc::Float64)
+
+    (Qnuc > 0.0 && Nnuc > 0.0) || return 0.0
+    gam3 = gamma(ISHMAEL_NU + 3.0)
+    a3 = (Qnuc * ISHMAEL_GAMMNU) / (ISHMAEL_RHOI * Nnuc * ISHMAEL_FOURTHIRDSPI * gam3)
+    anuc = clamp(cbrt(a3), 2.0e-6, 3.0e-3)
+    return Nnuc * anuc^3 * gam3 * ISHMAEL_I_GAMMNU
+end
+
+"""
+    mc_ice_sources!(S, tab, ts, max_N_c) -> Nothing
+
+Fill one column's ICE process sources. Reads and writes only the thread's `mc_scratch`
+workspace `S`, so it takes no views and no grid: every input (`Tk`, `p_hPa`, `rho_d`,
+`rho_v`, `rho_vs`, `Q_ss`, `rho_c`, `rho_r`, `n_r`, `Q_s_i`, and the twelve recovered ice
+moments) is already staged there by `mc_driver!`, and every output goes back to it.
+
+Written:
+
+| scratch | meaning |
+|---|---|
+| `SRC_i<k><m>` | the twelve process sources `Q̇_{i,k}+Q̇^ρ_k`, `Ṅ_k`, `Ȧ_k`, `Ċ_k` of TeX Eqs. ice_prog_mass..ice_prog_c [density units per second] |
+| `Qdot_i<k>` | species k's DEPOSITION rate alone [kg/m³/s] — slots 1 and 7 need it separately from the rest of the mass source |
+| `invtau_i<k>` | `1/τ_{i,k}` (Eq. tau_ice), for the stiffness census |
+| `FRZ_NET` | `Q̇_freeze`, the net liquid→ice conversion [kg/m³/s] |
+| `ICE_C`, `ICE_R`, `ICE_NR` | the back-reactions on cloud mass, rain mass and rain number |
+| `Vi<k>m`, `Vi<k>n` | mass- and number-weighted fall speeds [m/s, negative downward] |
+
+# Mass conservation, and the one place it forced a departure from the Fortran
+
+Scythe's vapor is a RESIDUAL, `ρ_v = ρ_t − ρ_d − ρ_l − ρ_i`. Any mismatch between the liquid
+mass this block removes and the ice mass it creates is therefore not a small bookkeeping
+error — it is silently manufactured or destroyed VAPOR, with no latent heat accounting and no
+diagnostic that would see it. So the freezing channels are written to satisfy
+
+    FRZ_NET ≡ −(ICE_C + ICE_R)
+
+structurally: `FRZ_NET` is not accumulated independently, it is that difference, which makes
+"freezing sources neither ρ_t nor ρ_v and cancels between the ρ_l and ρ_i equations" (TeX
+§Water categories) true by construction rather than by inspection.
+
+That required ONE change to ISHMAEL's own accounting. The Fortran subtracts the
+Hallett-Mossop splinter mass from the riming rate (`prdr := prdr − qmult`), gives the
+splinters to the nucleated species, and then debits the cloud and rain with the REDUCED
+`prdr` — so the ice gains `prdr + qmult` while the liquid loses only `prdr`. Here the liquid
+is debited with `prdr_pre`, the rime that was actually collected, so the two balance exactly.
+Nothing else about the splinter physics changes: the same mass and the same number still move
+to the same species.
+
+Everything else in the block is an exact exchange already: aggregation's three transfers sum
+to zero by construction (`qagg1 + qagg2 + qagg3 ≡ 0`), the ice-rain freezing transfer moves
+mass between two ice species, and deposition moves vapor, which the residual handles.
+
+# Gates
+
+`qi ≤ QSMALL` skips a species' whole rate block and returns exact zeros
+([`_ice_empty_rates`](@ref)); aggregation runs only for `T ≤ T_0` and only when some species
+has ice; deposition is zero above `T_0`. In air that is warm everywhere with no ice, every
+number this function writes is an exact `0.0` — which is what the bitwise inertness gate
+rests on.
+"""
+function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
+                         active::Bool, var_check_source::Bool,
+                         tau_hf::Float64, tau_act::Float64, tau_vc::Float64)
+
+    # `dt` reaches ONLY the habit-partition calls (`ishmael_deposition_partition`,
+    # `ishmael_riming_growth`, `ishmael_aggregation`, `_ice_agg_moments`), where it is a
+    # one-step INCREMENT that is immediately divided by the same step: `ard = δa/Δt`,
+    # `qagg/Δt`. Those are consistent first-order discretizations of a rate — they converge to
+    # the derivative as `Δt → 0` — and the TeX retains the habit physics verbatim as a
+    # PARTITION of a mass increment (§Departures (d)). NO rate law in this block is a function
+    # of the step: the three that were (`q_c/Δt`, `n_c/Δt`, the DeMott deficit/Δt) are now
+    # relaxations on `tau_hf`, `tau_act` and `tau_vc`, and every reservoir cap of the form
+    # `min(rate, ρ/Δt)` inside the ported functions is switched off at the call site.
+    dt = ts
+    i_dt = 1.0 / dt
+    i_tau_vc = 1.0 / tau_vc
+    Tk = S.Tk; p_hPa = S.p_hPa; rho_d = S.rho_d; rho_v = S.rho_v; rho_vs = S.rho_vs
+    Q_ss = S.Q_ss; rho_c = S.rho_c; rho_r = S.rho_r; n_r = S.n_r; Q_s_i = S.Q_s_i
+
+    # Per-species output columns, gathered once as homogeneous tuples so the species loop is
+    # an index rather than three copies of the same block. All `Vector{Float64}`, so the
+    # tuple is concrete and `SRCq[k]` costs nothing.
+    SRCq = (S.SRC_i1q, S.SRC_i2q, S.SRC_i3q)
+    SRCn = (S.SRC_i1n, S.SRC_i2n, S.SRC_i3n)
+    SRCa = (S.SRC_i1a, S.SRC_i2a, S.SRC_i3a)
+    SRCc = (S.SRC_i1c, S.SRC_i2c, S.SRC_i3c)
+    QDi  = (S.Qdot_i1, S.Qdot_i2, S.Qdot_i3)
+    ITi  = (S.invtau_i1, S.invtau_i2, S.invtau_i3)
+    Vm   = (S.Vi1m, S.Vi2m, S.Vi3m)
+    Vn   = (S.Vi1n, S.Vi2n, S.Vi3n)
+
+    if !active
+        for k in 1:3
+            fill!(SRCq[k], 0.0); fill!(SRCn[k], 0.0)
+            fill!(SRCa[k], 0.0); fill!(SRCc[k], 0.0)
+            fill!(QDi[k], 0.0);  fill!(ITi[k], 0.0)
+            fill!(Vm[k], 0.0);   fill!(Vn[k], 0.0)
+        end
+        fill!(S.FRZ_NET, 0.0); fill!(S.ICE_C, 0.0)
+        fill!(S.ICE_R, 0.0);   fill!(S.ICE_NR, 0.0)
+        return nothing
+    end
+
+    @inbounds for i in eachindex(Tk)
+
+        temp = Tk[i]
+        rhoair = rho_d[i]
+        ph = p_hPa[i]
+
+        # ── The level's air properties (Fortran lines 975-991), in SI ──
+        mu = 1.496e-6 * temp^1.5 / (temp + 120.0)
+        # `vapor_diffusivity` is the liquid channel's own D_v and returns cm²/s (the CGS the
+        # `invtau_condensation` chain works in); the ice timescale is assembled in SI, so it
+        # is converted here and NOWHERE else. Using the same function for both channels is
+        # what makes the shared-reservoir competition of Eq. wbf_qs a competition between two
+        # conductances rather than between two diffusivities.
+        dv = 1.0e-4 * vapor_diffusivity(temp, ph)
+        kt = 2.3823e-2 + (7.1177e-5 * (temp - T_0))
+        nsch = mu / (rhoair * dv)
+        npr  = mu / (rhoair * kt)
+        xxlv = L_v(temp)
+        xxlf = L_f(temp)
+        qs0 = rho_v_sat(T_0, ph) / rhoair
+        igr = get_igr(tab.igrdata, temp)
+        (temp - T_0) < -20.0 && (igr = 0.7)   # planar below -20 C (Bailey and Hallett)
+
+        # ── The liquid reservoirs, as ISHMAEL mixing ratios ──
+        qc = max(rho_c[i], 0.0) / rhoair
+        qr = max(rho_r[i], 0.0) / rhoair
+        nr = max(n_r[i], 0.0) / rhoair
+        qv = max(rho_v[i], 0.0) / rhoair
+        # The cloud droplet number is the HOST's (`max_N_c`, #/cm³), not ISHMAEL's hardcoded
+        # 200 cm⁻³: the same number the liquid condensation closure nucleates against, so the
+        # riming kernel collects the droplets the cloud channel actually made.
+        nc = 1.0e6 * max_N_c / rhoair
+
+        # ── The two drives (TeX Eqs. qss_ice_shift, Dwi) and the habit-density selector ──
+        rvs = rho_vs[i]
+        rvsi = rho_i_sat(temp, ph)
+        Dgap = max(rvs - rvsi, 0.0)
+        rv_floor = max(rho_v[i], 0.0)
+        drive_w = min(Q_ss[i], rv_floor - rvs)
+        drive_i = min(Q_ss[i] + Dgap, rv_floor - rvsi)
+        sup = drive_w / rvs
+        # `maxsui`, the Fortran's blend weight between the habit-limited and the solid-ice
+        # deposition density (lines 3327-3335), rewritten in the TeX's own variables:
+        # `sui·q_vi` is the over-ice supersaturation DENSITY (= drive_i) and `q_vs − q_vi` is
+        # `𝒟`, so the whole selector is a function of the two drives and needs none of the
+        # diagnosed-supersaturation pathway the port excluded.
+        maxsui = sup >= 0.0 ? 1.0 :
+                 (drive_i >= 0.0 && Dgap > 0.0) ? clamp(drive_i / Dgap, 0.0, 1.0) : 0.0
+        Qsi = Q_s_i[i]
+
+        # ── The three species: effective moments, then rates ──
+        q1 = max(S.i1q[i], 0.0) / rhoair; n1 = max(S.i1n[i], 0.0) / rhoair
+        a1 = max(S.i1a[i], 0.0) / rhoair; c1 = max(S.i1c[i], 0.0) / rhoair
+        q2 = max(S.i2q[i], 0.0) / rhoair; n2 = max(S.i2n[i], 0.0) / rhoair
+        a2 = max(S.i2a[i], 0.0) / rhoair; c2 = max(S.i2c[i], 0.0) / rhoair
+        q3 = max(S.i3q[i], 0.0) / rhoair; n3 = max(S.i3n[i], 0.0) / rhoair
+        a3 = max(S.i3a[i], 0.0) / rhoair; c3 = max(S.i3c[i], 0.0) / rhoair
+
+        e1 = _ice_effective(q1, n1, a1, c1, 1)
+        e2 = _ice_effective(q2, n2, a2, c2, 2)
+        e3 = _ice_effective(q3, n3, a3, c3, 3)
+
+        r1 = q1 > ISHMAEL_QSMALL ?
+             _ice_species_rates(tab, dt, e1, q1, n1, temp, rhoair, mu, dv, kt, nsch, npr,
+                                xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
+                                qc, nc, qr, nr, qv) : _ice_empty_rates()
+        r2 = q2 > ISHMAEL_QSMALL ?
+             _ice_species_rates(tab, dt, e2, q2, n2, temp, rhoair, mu, dv, kt, nsch, npr,
+                                xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
+                                qc, nc, qr, nr, qv) : _ice_empty_rates()
+        r3 = q3 > ISHMAEL_QSMALL ?
+             _ice_species_rates(tab, dt, e3, q3, n3, temp, rhoair, mu, dv, kt, nsch, npr,
+                                xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
+                                qc, nc, qr, nr, qv) : _ice_empty_rates()
+
+        # ── Aggregation (T ≤ T_0 only, and only if some species has ice to aggregate) ──
+        qagg1 = 0.0; qagg2 = 0.0; qagg3 = 0.0
+        nagg1 = 0.0; nagg2 = 0.0; nagg3 = 0.0
+        dnew3 = 0.0
+        agg_on = (temp <= T_0) &&
+                 (q1 > ISHMAEL_QSMALL || q2 > ISHMAEL_QSMALL || q3 > ISHMAEL_QSMALL)
+        if agg_on
+            dn1 = clamp(2.0 * ((e1.ai^2) / (e1.ci * e1.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            dn2 = clamp(2.0 * ((e2.ci^2) / (e2.ai * e2.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            dn3 = clamp(2.0 * ((e3.ai^2) / (e3.ci * e3.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            phi1 = clamp(e1.ci / e1.ai * gamma(ISHMAEL_NU - 1.0 + e1.deltastr) *
+                         ISHMAEL_I_GAMMNU, 0.01, 100.0)
+            phi2 = clamp(e2.ci / e2.ai * gamma(ISHMAEL_NU - 1.0 + e2.deltastr) *
+                         ISHMAEL_I_GAMMNU, 0.01, 100.0)
+            ag = ishmael_aggregation(dt, rhoair, temp, q1, e1.ni, dn1, q2, e2.ni, dn2,
+                                     q3, e3.ni, dn3, e1.rhobar, e2.rhobar, phi1, phi2,
+                                     tab.coltab, tab.coltabn)
+            qagg1 = ag.qagg1; qagg2 = ag.qagg2; qagg3 = ag.qagg3
+            nagg1 = ag.nagg1; nagg2 = ag.nagg2; nagg3 = ag.nagg3
+            dnew3 = ag.dnew3
+        end
+
+        # ── Nucleation, which happens outside the species loop ──
+        # All three are `Δt`-FREE: the two impulse forms (`reservoir/Δt`) are relaxations on
+        # physical timescales, and Bigg's two reservoir caps are dropped. See
+        # `_ice_homogeneous_rates` and `_ice_demott_rates`.
+        hf = _ice_homogeneous_rates(temp, qc, nc, qr, nr, tau_hf)
+        bg = ishmael_bigg_freezing(temp, qr, nr, dt; reservoir_caps = false)
+        # The activation deficit reads the CARRIED ice number, not the effective one: the
+        # ceiling exists to stop nucleation once the ice number is already at the DeMott
+        # concentration, and the number it has to compare against is the number being
+        # transported. (In the Fortran the two are the same array, because `var_check` writes
+        # back.) Species 3 is excluded, as the Fortran excludes it.
+        dm = _ice_demott_rates(temp, sup, rhoair, (n1 + n2) * rhoair, tau_act)
+
+        # WHICH species receives it: the inherent growth ratio decides the habit, so
+        # `igr ≤ 1` (plate-like growth, which the -20 C override forces below that
+        # temperature) nucleates into species 1 (planar) and `igr > 1` into species 2
+        # (columnar). Aggregates are never nucleated into. Fortran lines 2153-2196.
+        target = igr <= 1.0 ? 1 : 2
+        qIfz_in = target == 1 ? (r2.dQIfzri + r3.dQIfzri) : (r1.dQIfzri + r3.dQIfzri)
+        nIfz_in = target == 1 ? (r2.dNfzri + r3.dNfzri) : (r1.dNfzri + r3.dNfzri)
+        q_nuc = dm.mnuccd + hf.mim + hf.mimr + bg.mbiggr + qIfz_in +
+                (r1.qmult + r2.qmult + r3.qmult) +
+                (r1.dQRfzri + r2.dQRfzri + r3.dQRfzri)
+        n_nuc = dm.nnuccd + hf.nim + hf.nimr + bg.nbiggr + nIfz_in +
+                (r1.nmult + r2.nmult + r3.nmult)
+
+        # ── The liquid back-reactions, and Q̇_freeze as their exact negative ──
+        ice_c = -rhoair * (hf.mim + ((r1.prdr_pre * r1.qcrimefrac) +
+                                     (r2.prdr_pre * r2.qcrimefrac) +
+                                     (r3.prdr_pre * r3.qcrimefrac)))
+        ice_r = rhoair * ((-hf.mimr - bg.mbiggr) +
+                          (-(r1.prdr_pre * (1.0 - r1.qcrimefrac)) - r1.qmlt - r1.dQRfzri) +
+                          (-(r2.prdr_pre * (1.0 - r2.qcrimefrac)) - r2.qmlt - r2.dQRfzri) +
+                          (-(r3.prdr_pre * (1.0 - r3.qcrimefrac)) - r3.qmlt - r3.dQRfzri))
+        ice_nr = rhoair * ((-hf.nimr - bg.nbiggr) +
+                           (-r1.nrn_loss - r1.nmlt - r1.dNfzri) +
+                           (-r2.nrn_loss - r2.nmlt - r2.dNfzri) +
+                           (-r3.nrn_loss - r3.nmlt - r3.dNfzri))
+        S.ICE_C[i] = ice_c
+        S.ICE_R[i] = ice_r
+        S.ICE_NR[i] = ice_nr
+        S.FRZ_NET[i] = -(ice_c + ice_r)
+
+        # ── Assemble the twelve slot sources ──
+        rs = (r1, r2, r3)
+        es = (e1, e2, e3)
+        qs = (q1, q2, q3)
+        ns = (n1, n2, n3)
+        as = (a1, a2, a3)
+        cs = (c1, c2, c3)
+        aggq = (qagg1, qagg2, qagg3)
+        aggn = (nagg1, nagg2, nagg3)
+        for k in 1:3
+            rk = rs[k]
+            ek = es[k]
+            # Aggregation and the nucleation transfer both redistribute mass and number at
+            # (assumed) fixed shape and density, so they are combined into ONE new state and
+            # re-diagnosed once. The target species' nucleation GAIN is not here: new
+            # particles arrive with a size of their own (`_ice_nucleation_volume`).
+            is_target = k == target
+            dq_re = aggq[k] - (is_target ? 0.0 : rk.dQIfzri * dt)
+            dn_re = aggn[k] - (is_target ? 0.0 : rk.dNfzri * dt)
+            aagg = 0.0
+            cagg = 0.0
+            if dq_re != 0.0 || dn_re != 0.0
+                aagg, cagg = _ice_agg_moments(ek, ek.ni + dn_re, qs[k] + dq_re,
+                                              rhoair, dt, dnew3, k == 3 && agg_on)
+            end
+
+            qsrc = rk.Qdot + (rhoair * ((rk.prdr + rk.qmlt) + (aggq[k] * i_dt)))
+            nsrc = rhoair * ((rk.nrd + rk.nmlt) + (aggn[k] * i_dt))
+            asrc = ((rk.ard + rk.ardr) + (rhoair * rk.amlt)) + aagg
+            csrc = ((rk.crd + rk.crdr) + (rhoair * rk.cmlt)) + cagg
+
+            # ── The var_check CONSISTENCY SOURCE ────────────────────────────────
+            # `var_check` is ISHMAEL's own moment-consistency operator, and in the Fortran it
+            # has `INTENT(INOUT)` arguments: its re-diagnosis is WRITTEN BACK into the state
+            # every step. This port evaluates the rates at the effective moments but carries
+            # the raw ones, and four moments fitted by four independent splines, sedimenting
+            # at three different weighted speeds, do not stay a realizable population on their
+            # own. Nothing else in the set restores them. Measured on the O01 ice arm without
+            # this term: n_i1 reaches 2.2e9 m⁻³ against ~5e-10 kg/m³ of mass, the ice-rain
+            # collection rate (∝ n_i·n_r) goes stiff, and slot 8 diverges from −4e-3 to −62
+            # kg/m³ in six steps at t ≈ 1050 s.
+            #
+            # So the write-back is reinstated, as a SOURCE — a RELAXATION on a physical
+            # timescale, `Ẋ = (X_eff − X)/τ_vc` with `τ_vc = physical_params[:tau_varcheck]`
+            # (default 5 s), on the number and the two volume moments. It is `Δt`-FREE, like
+            # every other rate in this block: `(X_eff − X)/Δt` would have been a one-step state
+            # repair and would have made the tendency a function of the step size, which is
+            # exactly the defect the depletion caps were removed for.
+            #
+            # The MASS is untouched — `var_check` never changes it — so this cannot move
+            # water, cannot move energy, and cannot break the exchange closure above.
+            # `options[:ice_var_check] = false` removes it and reproduces the drift.
+            #
+            # GATED ON THE SPECIES EXISTING, like every other rate. An empty species' `eff` is
+            # the fallback initialization, not a re-diagnosis of anything, so restoring toward
+            # it would inject `QNSMALL/Δt` into a slot that must produce an EXACT zero — and
+            # the whole zero-ice inertness gate rests on that.
+            if var_check_source && qs[k] > ISHMAEL_QSMALL
+                nsrc += rhoair * (ek.ni - ns[k]) * i_tau_vc
+                asrc += rhoair * (ek.ai - as[k]) * i_tau_vc
+                csrc += rhoair * (ek.ci - cs[k]) * i_tau_vc
+            end
+
+            if is_target
+                qn = rhoair * q_nuc
+                nn = rhoair * n_nuc
+                vn = _ice_nucleation_volume(qn, nn)
+                qsrc += qn
+                nsrc += nn
+                asrc += vn
+                csrc += vn
+            else
+                qsrc -= rhoair * rk.dQIfzri
+                nsrc -= rhoair * rk.dNfzri
+            end
+
+            SRCq[k][i] = qsrc
+            SRCn[k][i] = nsrc
+            SRCa[k][i] = asrc
+            SRCc[k][i] = csrc
+            QDi[k][i] = rk.Qdot
+            ITi[k][i] = rk.invtau_i
+            Vm[k][i] = rk.vtrm
+            Vn[k][i] = rk.vtrn
+        end
+    end
     return nothing
 end
 
@@ -4031,16 +5010,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
 
     # ── Ice: process sources and sedimentation ─────────────────────────────────
     #
-    # *** TRANSPORT ONLY. EVERY PROCESS RATE AND EVERY FALL SPEED HERE IS ZERO. ***
-    #
-    # The structure is final and the numbers are not. Each of the twelve slots gets a source
-    # accumulator `SRC_*` (the `Q̇_{i,k}`, `Ṅ_k`, `Ȧ_k`, `Ċ_k` of Eqs. ice_prog_mass..ice_prog_c)
-    # and a sedimentation flux `F_X = X·W_X` fitted on its OWN spline column, where `W_X` is the
-    # fall speed weighted by the very moment being transported — which is what makes the size
-    # distribution sort as it falls, and is why the four moments of a species cannot share one
-    # flux. This stage fills the sources with zeros and the speeds with a literal `0.0`, so the
-    # ice advects and does nothing else; the deposition/nucleation/riming rates and the
-    # Mitchell-Heymsfield fall speeds replace exactly those two things and nothing else.
+    # Each of the twelve slots gets a source accumulator `SRC_*` (the `Q̇_{i,k}`, `Ṅ_k`, `Ȧ_k`,
+    # `Ċ_k` of Eqs. ice_prog_mass..ice_prog_c) and a sedimentation flux `F_X = X·W_X` fitted on
+    # its OWN spline column, where `W_X` is the fall speed weighted by the very moment being
+    # transported — which is what makes the size distribution sort as it falls, and is why the
+    # four moments of a species cannot share one flux.
     #
     # ONLY THE MASS FLUXES LEAVE THIS BLOCK. `Fi_z = Σ_k ∂F_{ρ,k}/∂z` is the ice sedimentation
     # rate `Q̇_sed_i` that sources ρ_t, and `E_sed_i` is the energy it carries,
@@ -4050,28 +5024,44 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     Fi_z = S.Fi_z
     E_sed_i_z = S.E_sed_i_z
     if ice_on
-        # S8: the process rates land here, in place of these twelve `fill!`s.
-        fill!(S.SRC_i1q, 0.0); fill!(S.SRC_i1n, 0.0)
-        fill!(S.SRC_i1a, 0.0); fill!(S.SRC_i1c, 0.0)
-        fill!(S.SRC_i2q, 0.0); fill!(S.SRC_i2n, 0.0)
-        fill!(S.SRC_i2a, 0.0); fill!(S.SRC_i2c, 0.0)
-        fill!(S.SRC_i3q, 0.0); fill!(S.SRC_i3n, 0.0)
-        fill!(S.SRC_i3a, 0.0); fill!(S.SRC_i3c, 0.0)
+        # The ice psychrometric factor (TeX Eq. Qs_ice) — `Q_s_energy` with L_v -> L_s in both
+        # latent slots, the two saturation derivatives still over WATER. Formed here rather
+        # than beside `Q_s` because nothing but the ice reads it.
+        @. S.Q_s_i = Q_s_energy_ice(Tk, p, rho_d, q_v, q_l, q_i)
+        # Every process rate: deposition through the shared prognostic supersaturation, the
+        # full ISHMAEL nucleation/riming/aggregation/melting set, and the twelve slot sources
+        # they assemble into. Reads and writes the scratch only; see `mc_ice_sources!`.
+        # `options[:condensation] = false` switches the ice phase changes off with the liquid
+        # ones, for the same reason: a run advertised as "no physics" must not glaciate.
+        mc_ice_sources!(S, mtile.ishmael_tables, model.ts, max_N_c,
+                        get(model.options, :condensation, true)::Bool,
+                        get(model.options, :ice_var_check, true)::Bool,
+                        get(model.physical_params, :tau_homogeneous, 5.0),
+                        get(model.physical_params, :tau_activation, 1.0),
+                        get(model.physical_params, :tau_varcheck, 5.0))
+        # The three deposition relaxations, on the rates the step actually used. Ungated, for
+        # the reason the liquid census is: the once-per-run under-resolution warning has to be
+        # able to see an excursion whether or not a diagnostic is switched on.
+        mc_stiffness_census!(mtile, model.ts, S.invtau_i1, S.invtau_i2, S.invtau_i3)
 
-        # S8: replace each literal `0.0` with that moment's weighted fall speed (negative
-        # downward, as `Vt` is). Nothing else in this block changes.
-        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, 0.0, IS.i1_q)
-        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, 0.0, IS.i1_n)
-        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, 0.0, IS.i1_a)
-        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, 0.0, IS.i1_c)
-        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, 0.0, IS.i2_q)
-        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, 0.0, IS.i2_n)
-        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, 0.0, IS.i2_a)
-        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, 0.0, IS.i2_c)
-        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, 0.0, IS.i3_q)
-        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, 0.0, IS.i3_n)
-        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, 0.0, IS.i3_a)
-        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, 0.0, IS.i3_c)
+        # Each moment's flux at ITS OWN weighted fall speed — mass-weighted for the mass and
+        # the two volume moments, number-weighted for the number. That is the whole reason
+        # the four moments of a species cannot share one flux: the distribution SORTS as it
+        # falls, and a number that sedimented at the mass-weighted speed would carry the small
+        # crystals down as fast as the large ones. `ishmael_fall_speeds` has already applied
+        # the 25 m/s cap and the melting size-sorting override.
+        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, S.Vi1m, IS.i1_q)
+        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, S.Vi1n, IS.i1_n)
+        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, S.Vi1m, IS.i1_a)
+        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, S.Vi1m, IS.i1_c)
+        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, S.Vi2m, IS.i2_q)
+        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, S.Vi2n, IS.i2_n)
+        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, S.Vi2m, IS.i2_a)
+        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, S.Vi2m, IS.i2_c)
+        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, S.Vi3m, IS.i3_q)
+        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, S.Vi3n, IS.i3_n)
+        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, S.Vi3m, IS.i3_a)
+        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, S.Vi3m, IS.i3_c)
 
         # The two AGGREGATES that reach the conserved variables. `Fi_z` is summed from the
         # three fitted mass-flux divergences rather than refitting their sum, so slot 3 and
@@ -4095,12 +5085,26 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # after the `precipitation` branch, because the cloud channel is not final until
     # AUTO_COLL is. See `MC_MICRO_C` for the three channels and `_rotate_micro_history!` for
     # when these become the history levels.
+    #
+    # The ICE arm is a SEPARATE loop, so the ice-free path keeps the three-line body it had.
+    # The cloud and rain channels gain the riming/freezing/melting back-reactions and the
+    # vapor channel gains the deposition, which is what makes the census (still a pure
+    # measurement — nothing in the RHS reads it) describe the water budget that ran.
     micro_n = mtile.mc_micro_n
     @inbounds for i in eachindex(Qdot)
         g = colstart + i - 1
         micro_n[g, MC_MICRO_C] = Qdot[i] - AUTO_COLL[i]
         micro_n[g, MC_MICRO_R] = Qdot_r[i]
         micro_n[g, MC_MICRO_V] = -(Qdot[i] + Qdot_r[i])
+    end
+    if ice_on
+        @inbounds for i in eachindex(Qdot)
+            g = colstart + i - 1
+            qdep = (S.Qdot_i1[i] + S.Qdot_i2[i]) + S.Qdot_i3[i]
+            micro_n[g, MC_MICRO_C] += S.ICE_C[i]
+            micro_n[g, MC_MICRO_R] += S.ICE_R[i]
+            micro_n[g, MC_MICRO_V] -= qdep
+        end
     end
 
     div = S.div; mc_divergence!(div, geom, u, u_x, w_z, vv, r)
@@ -4192,6 +5196,22 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                       ((R_m / C_vt) * (((Lv - (Rv * C_pt * Tk / R_m)) * (Qdot + Qdot_r)) + QDOT_TH))
     end
     @turbo expdot[colstart:colend,1] .= @. ADV + FORCING
+    # The ICE phase changes, inside the same `(R_m/C_vt)[...]` bracket (TeX Eq. thermo_p_ice).
+    # Deposition's coefficient is condensation's with `L_v -> L_s` and NOTHING else; freezing
+    # carries the bare `L_f` with NO `-R_v C_pt T/R_m` companion, because that companion is the
+    # work done by the vapor the phase change removes from the gas phase and freezing removes
+    # none. Accumulated separately, so the ice-free `@turbo` expression above stays
+    # byte-identical (the slot-3 rule); explicit loop, so the indexed update does not
+    # materialize a column (the slot-3 rule again).
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            qdep = (S.Qdot_i1[i] + S.Qdot_i2[i]) + S.Qdot_i3[i]
+            expdot[colstart + i - 1, 1] +=
+                (R_m[i] / C_vt[i]) *
+                (((L_s(Tk[i]) - (Rv * C_pt[i] * Tk[i] / R_m[i])) * qdep) +
+                 (L_f(Tk[i]) * S.FRZ_NET[i]))
+        end
+    end
 
     # Dry-air mass continuity (slot 2, advective product-rule form; no mass diffusion)
     mc_advect!(ADV, geom, u, w, vv, r, rho_dp_x, rho_d_z, rdv.f_l)
@@ -4383,14 +5403,39 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     #     res_qss - res_rho_t = Q_ss - (rho_v - rho_vs) = -tau_qss * QSSREL,
     # so the disagreement between the two representations is tau_qss times the rate at which
     # this term is removing it.
+    #
+    # FREEZING enters here and ONLY here on the chain-rule side. It moves no vapor, so it has
+    # no `-Q̇` of its own and no `(1 + 𝒬)` grouping to cancel against; it reaches Q_ss purely
+    # through the temperature and pressure it changes, which is why `L_f·Q̇_freeze` belongs
+    # inside BOTH non-condensation tendencies (TeX Eqs. dThat_ice, dphat_ice) rather than
+    # beside the relaxations. Physically: freezing in a mixed-phase cloud warms the air,
+    # raises ρ_v*, and drives the LIQUID subsaturated — the mechanism by which riming
+    # glaciates a cloud from the inside with no vapor having moved.
     dT_nc = S.dT_nc; @. dT_nc = ((-p * div) + QDOT_TH) / (rho_d * C_vt)
     dp_nc = S.dp_nc; @. dp_nc = (-gamma_m * p * div) + ((R_m / C_vt) * QDOT_TH)
+    if ice_on
+        @. dT_nc += (L_f(Tk) * S.FRZ_NET) / (rho_d * C_vt)
+        @. dp_nc += (R_m / C_vt) * (L_f(Tk) * S.FRZ_NET)
+    end
     SATF = S.SATF;   @. SATF = (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
     QSSREL = S.QSSREL
     @. QSSREL = qss_relaxation(Q_ss, res_rho_t, rho_vs, tau_qss)
     mc_advect!(ADV, geom, u, w, vv, r, Q_ssp_x, Q_ss_z, qsv.f_l)
     FORCING .= @. (-Q_ss * div) + SATF - ((Qdot + Qdot_r) * (1.0 + Q_s)) + QSSREL
     @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
+    # The DEPOSITION relaxation, `-Σ_k Q̇_{i,k}(1 + 𝒬_{s,i})` (TeX Eq. Qss_ice). Substituting
+    # Eq. dep_rate, the `(1 + 𝒬_{s,i})` cancels exactly as its liquid counterpart does and
+    # what is left is `-(Q_ss + 𝒟)/τ_i`: the ice contributes one further relaxation of the
+    # SAME shared supersaturation and no psychrometric factor survives into the prognostic
+    # equation. That shared reservoir is what makes the Wegener-Bergeron-Findeisen competition
+    # (Eq. wbf_qs) emergent rather than arbitrated — and is why ISHMAEL's mixed-phase
+    # deposition cap is dropped (TeX §Departures (a)).
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            expdot[colstart + i - 1, 7] -=
+                ((S.Qdot_i1[i] + S.Qdot_i2[i]) + S.Qdot_i3[i]) * (1.0 + S.Q_s_i[i])
+        end
+    end
 
     # Rain partial density (slot 8): rain-channel condensation/evaporation,
     # autoconversion + collection from cloud, and the sedimentation flux divergence
@@ -4411,6 +5456,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_rp_x, nu_r_z, rrv.f_l)
     @turbo FORCING .= @. Jr * ((-rho_r * div) + Qdot_r + AUTO_COLL - Fr_z)
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
+    # The ICE back-reaction on the rain: riming and Bigg/homogeneous freezing remove rain,
+    # melting ice returns it. Through `Jr`, like every other source on this slot; separate
+    # accumulation and explicit loop for the reasons slot 3 states.
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            expdot[colstart + i - 1, 8] += Jr[i] * S.ICE_R[i]
+        end
+    end
     # Production attribution (off unless options[:water_budget_trace] > 0). Must run HERE:
     # ADV is reused by slot 9 two lines down.
     budget_trace && water_budget_probe!(mtile, MC_BUDGET_R, 8, t, colstart, rho_r, ADV, div,
@@ -4439,6 +5492,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_cp_x, nu_c_z, rcv.f_l)
     @turbo FORCING .= @. Jc * ((-rho_c * div) + Qdot - AUTO_COLL)
     @turbo expdot[colstart:colend,9] .= @. ADV + FORCING
+    # The ICE back-reaction on the cloud: riming collection and homogeneous freezing, both
+    # sinks. There is no ice-to-cloud return channel — melting ice becomes rain, not cloud.
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            expdot[colstart + i - 1, 9] += Jc[i] * S.ICE_C[i]
+        end
+    end
     # Cloud has no sedimentation channel, and its autoconversion sink is -AUTO_COLL.
     budget_trace && water_budget_probe!(mtile, MC_BUDGET_C, 9, t, colstart, rho_c, ADV, div,
                                         Qdot, AUTO_COLL, -1.0, nothing, w, z)
@@ -4461,6 +5521,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_advect!(ADV, geom, u, w, vv, r, nrv.f_x, nu_nr_z, nrv.f_l)
         @turbo FORCING .= @. Jnr * ((-n_r * div) + NR_SRC - Fnr_z)
         @turbo expdot[colstart:colend, nr_i] .= @. ADV + FORCING
+        # The ICE back-reaction on the raindrop COUNT: drops lost to ice-rain collection,
+        # Bigg and homogeneous freezing, and drops gained from melting ice. This is the
+        # channel `ice_microphysics` requires `rain_moments == 2` for — with a prescribed
+        # rain DSD there is no number for the ice to remove.
+        if ice_on
+            @inbounds for i in eachindex(Fi_z)
+                expdot[colstart + i - 1, nr_i] += Jnr[i] * S.ICE_NR[i]
+            end
+        end
     end
 
     # ── The twelve ICE slots ───────────────────────────────────────────────────
