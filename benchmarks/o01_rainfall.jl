@@ -286,11 +286,23 @@ function o01_model(opts::BenchmarkOptions)
         physical_params[:mu_ice_c] = imus[4]
     end
 
-    # ── The ICE ARM'S PRODUCTION CONFIGURATION: all four water families transformed ──
+    # ── The ICE ARM'S PRODUCTION CONFIGURATION: rain, rain number and ice transformed;
+    #    CLOUD DELIBERATELY NOT (2026-08-14 author decision) ──
     #
-    # `SCYTHE_O01_ICE=1` turns the four control-variable transforms on by DEFAULT — cloud,
-    # rain mass, rain number and the twelve ice moments — because that is the configuration
-    # the ice physics is meant to be run in, not an option on top of it.
+    # `SCYTHE_O01_ICE=1` turns the rain-mass, rain-number and twelve-ice-moment transforms
+    # on by DEFAULT, because that is the configuration the ice physics is meant to be run
+    # in, not an option on top of it.
+    #
+    # The CLOUD transform stays :none in this arm. Measured (model_tests/
+    # ice_transform_ablation_compare.jl, pre- and post-gate ladders): the ahyp clamp on the
+    # cloud slot discards the negative half of the spline ringing, the residual vapor
+    # absorbs the discarded mass (8.3% deeper deficit over 23% more points), and the ice
+    # physics reading that vapor detonates the temperature retrieval at t ~ 1000 s —
+    # `min rho_c == 0.0 exactly` separates dying from surviving runs in all eight ladder
+    # arms, and cloud=:none with everything else transformed survives with zero stiffness
+    # exceedances. The principled fix (rho_t receives the increment each transformed slot
+    # actually REALIZED — recovered-delta bookkeeping) is a designed follow-up stage; until
+    # it lands, cloud+ice is an unsupported combination here.
     #
     # The reason is the glaciation itself. Freezing an anvil is genuinely fast: homogeneous
     # freezing, riming and ice-rain collection empty the liquid reservoirs on timescales of
@@ -310,7 +322,6 @@ function o01_model(opts::BenchmarkOptions)
     # Each is still individually overridable by its own env knob above, and NONE of this fires
     # when ice is off, so the default path and the plain two-moment arm are untouched.
     if Scythe.ice_microphysics(options) === :ishmael
-        haskey(ENV, "SCYTHE_O01_CTRANS")  || (options[:condensate_transform]   = :bhyp)
         haskey(ENV, "SCYTHE_O01_RTRANS")  || (options[:rain_transform]         = :bhyp)
         haskey(ENV, "SCYTHE_O01_NRTRANS") || (options[:rain_number_transform]  = :bhyp)
         haskey(ENV, "SCYTHE_O01_ICETRANS")|| (options[:ice_transform]          = :bhyp)
