@@ -266,30 +266,30 @@ function o01_model(opts::BenchmarkOptions)
         physical_params[:mu_ice_c] = imus[4]
     end
 
-    # ── The ICE ARM'S PRODUCTION CONFIGURATION: rain, rain number and ice transformed;
-    #    CLOUD DELIBERATELY NOT (2026-08-14 author decision) ──
+    # ── The ICE ARM'S PRODUCTION CONFIGURATION: ALL FOUR water transforms on, the cloud
+    #    included (restored 2026-08-19 under the prognostic vapor; measurement below) ──
     #
-    # `SCYTHE_O01_ICE=1` turns the rain-mass, rain-number and twelve-ice-moment transforms
-    # on by DEFAULT, because that is the configuration the ice physics is meant to be run
-    # in, not an option on top of it.
+    # `SCYTHE_O01_ICE=1` turns the cloud, rain-mass, rain-number and twelve-ice-moment
+    # transforms on by DEFAULT, because that is the configuration the ice physics is meant
+    # to be run in, not an option on top of it.
     #
-    # The CLOUD transform stays :none in this arm. Measured (model_tests/
-    # ice_transform_ablation_compare.jl, pre- and post-gate ladders): the ahyp clamp on the
-    # cloud slot discards the negative half of the spline ringing, the RESIDUAL vapor
-    # absorbed the discarded mass (8.3% deeper deficit over 23% more points), and the ice
-    # physics reading that vapor detonated the temperature retrieval at t ~ 1000 s —
-    # `min rho_c == 0.0 exactly` separated dying from surviving runs in all eight ladder
-    # arms, and cloud=:none with everything else transformed survived with zero stiffness
-    # exceedances.
+    # The CLOUD transform was DELIBERATELY :none from 2026-08-14 to 2026-08-19. Measured
+    # then (model_tests/ice_transform_ablation_compare.jl, pre- and post-gate ladders): the
+    # ahyp clamp on the cloud slot discards the negative half of the spline ringing, the
+    # RESIDUAL vapor absorbed the discarded mass (8.3% deeper deficit over 23% more points),
+    # and the ice physics reading that vapor detonated the temperature retrieval at
+    # t ~ 1000 s — `min rho_c == 0.0 exactly` separated dying from surviving runs in all
+    # eight ladder arms, and cloud=:none with everything else transformed survived.
     #
-    # STAGE A CHANGES THE PREMISE, AND THIS SETTING HAS NOT BEEN RE-MEASURED UNDER IT. The
-    # channel above ran through the vapor RESIDUAL: a clamped cloud slot moved mass that
-    # nothing else accounted for, and the residual was where it went. The vapor is prognostic
-    # now, so the discarded mass shows up as a reconciliation gap (`MC_VAPOR_GAP`) that the
-    # nudge removes on tau_rec instead of appearing instantly in the field the ice physics
-    # reads. That is the mechanism the handoff EXPECTS to have closed — but expecting is not
-    # measuring, so the arm keeps cloud=:none until the ladder is re-run. Re-running it is
-    # the first item of the S8/S9 re-closure.
+    # STAGE A (prognostic rho_v, 0957496) removed that channel's medium — the vapor is no
+    # longer a residual for the discarded mass to land in — and the RE-MEASUREMENT
+    # (2026-08-19, arms stageA_r6_ice vs stageA_r8_icebhyp) confirms the channel is gone:
+    # with the cloud transformed the arm no longer has a death mode of its own. Both arms
+    # now die of the SAME finding-4 glaciation stiffness, with the same single
+    # stiffness-census signature on channel ice1 (cloud :none at t = 1031.7 s, ts/tau 59.7;
+    # cloud :bhyp at t = 1002.6 s, ts/tau 23.6 — the ~30 s offset is supply timing at the
+    # -35 C level, not a mechanism difference). The stiffness itself is Stage B's problem;
+    # this setting is about which representation the arm carries when it gets there.
     #
     # The reason is the glaciation itself. Freezing an anvil is genuinely fast: homogeneous
     # freezing, riming and ice-rain collection empty the liquid reservoirs on timescales of
@@ -309,6 +309,7 @@ function o01_model(opts::BenchmarkOptions)
     # Each is still individually overridable by its own env knob above, and NONE of this fires
     # when ice is off, so the default path and the plain two-moment arm are untouched.
     if Scythe.ice_microphysics(options) === :ishmael
+        haskey(ENV, "SCYTHE_O01_CTRANS")  || (options[:condensate_transform]   = :bhyp)
         haskey(ENV, "SCYTHE_O01_RTRANS")  || (options[:rain_transform]         = :bhyp)
         haskey(ENV, "SCYTHE_O01_NRTRANS") || (options[:rain_number_transform]  = :bhyp)
         haskey(ENV, "SCYTHE_O01_ICETRANS")|| (options[:ice_transform]          = :bhyp)
