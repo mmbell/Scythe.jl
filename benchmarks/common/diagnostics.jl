@@ -91,8 +91,9 @@ variant (`:bhyp` vs `:bhyp_smooth`) and the bias, which the names cannot carry. 
 should cross-check the two, which `mc_water` does.
 """
 function detect_transforms(dir::AbstractString)
-    ctrans, rtrans = :none, :none
+    ctrans, rtrans, nrtrans = :none, :none, :none
     cmu, rmu = 1.0e-7, 1.0e-7
+    nrmu = 1.0                  # mu_rain_n default [#/m^3], see rain_number_transform_mode
     log = joinpath(dir, "scythe_out.log")
     if isfile(log)
         txt = try
@@ -108,8 +109,13 @@ function detect_transforms(dir::AbstractString)
         m === nothing || (cmu = parse(Float64, m.captures[1]))
         m = match(r":rain_mu\s*=>\s*([0-9.eE+-]+)", txt)
         m === nothing || (rmu = parse(Float64, m.captures[1]))
+        m = match(r":rain_number_transform\s*=>\s*:(\w+)", txt)
+        m === nothing || (nrtrans = Symbol(m.captures[1]))
+        m = match(r":mu_rain_n\s*=>\s*([0-9.eE+-]+)", txt)
+        m === nothing || (nrmu = parse(Float64, m.captures[1]))
     end
-    return (ctrans = ctrans, cmu = cmu, rtrans = rtrans, rmu = rmu)
+    return (ctrans = ctrans, cmu = cmu, rtrans = rtrans, rmu = rmu,
+            nrtrans = nrtrans, nrmu = nrmu)
 end
 
 """

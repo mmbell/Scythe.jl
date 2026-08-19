@@ -176,6 +176,15 @@ function o01_model(opts::BenchmarkOptions)
     # those chose between two DIAGNOSTIC vapors, and there is no diagnostic vapor any more.
     haskey(ENV, "SCYTHE_O01_TAUREC") &&
         (physical_params[:tau_rho_v_rec] = parse(Float64, ENV["SCYTHE_O01_TAUREC"]))
+    # Cloud droplet number ceiling [#/cm^3] for the Twomey activation branch AND the KK2000
+    # two-moment autoconversion (both read physical_params[:max_N_c]; the driver passes one
+    # number so a column carries ONE droplet population). Unset => 100.0, the closure's
+    # long-standing default, bitwise. The ISHMAEL Fortran hardcodes 200 cm^-3 in its KK2000
+    # (module_mp_jensen_ishmael.F:1031): PRC ~ N_c^-1.79, so `=200` cuts cloud->rain
+    # conversion ~3.4x and carries more cloud to the -35 C level — the S9 tuning arm
+    # (SCYTHE_BENCH_TAG it; answer-changing for the whole warm path, never a default flip).
+    haskey(ENV, "SCYTHE_O01_MAXNC") &&
+        (physical_params[:max_N_c] = parse(Float64, ENV["SCYTHE_O01_MAXNC"]))
     # Whether the THERMODYNAMIC INTERFACE reads a floored rho_liq (Experiment 1 of
     # reference/HANDOFF_CONDENSATE_REPRESENTATION.md). Unset => `:none`, bitwise the code
     # that had no option. `=diagnostic` floors rho_liq at the retrieval, q_l, Q_s_energy,
@@ -569,6 +578,14 @@ function o01_rain_diagnostics(model, ref, kDim)
     cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
     rtf = Scythe.rain_transform_mode(model.options)
     rmu = get(model.physical_params, :rain_mu, 1.0e-7)
+    # Rain NUMBER (two-moment arm only): min over the run of the recovered n_r, the
+    # negative-ringing monitor for the S9 positivity-vs-transform arm. The slot is a total
+    # (zero reference), so recovery is `recover_n_r` alone; the column is "n_r" or, under
+    # options[:rain_number_transform], its control-variable name "nu_nr". NaN when the run
+    # carries no rain number, so the row stays informational and never gates a 1-moment run.
+    nrtf = Scythe.rain_number_transform_mode(model.options)
+    nrmu = get(model.physical_params, :mu_rain_n, 1.0)
+    min_nr = NaN
     gp = model.grid_params
     snaps = output_snapshots(model)
     peak_rate = 0.0
@@ -614,6 +631,12 @@ function o01_rain_diagnostics(model, ref, kDim)
         max_rc = max(max_rc, maximum(rho_c))
         min_rc = min(min_rc, minimum(rho_c))
         min_rv = min(min_rv, minimum(rho_v))
+        nr_col = "nu_nr" in names(df) ? "nu_nr" : ("n_r" in names(df) ? "n_r" : "")
+        if !isempty(nr_col)
+            n_r = Scythe.recover_n_r.(df[!, nr_col], nrtf, nrmu)
+            m = minimum(n_r)
+            min_nr = isnan(min_nr) ? m : min(min_nr, m)
+        end
         min_rw = min(min_rw, minimum(rho_t .- rho_d))
         min_rd_frac = min(min_rd_frac,
                           minimum(rho_d ./ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)))
@@ -651,6 +674,7 @@ function o01_rain_diagnostics(model, ref, kDim)
         "max_rho_c_gm3" => 1000.0 * max_rc,
         "min_rho_c_gm3" => 1000.0 * min_rc,             # ditto, for the condensate
         "min_rho_v_gm3" => 1000.0 * min_rv,             # the prognostic vapor's headroom
+        "min_n_r_perm3" => min_nr,                      # rain-number ringing monitor (NaN if 1-moment)
         "min_rho_w_gm3" => 1000.0 * min_rw,             # total water; separates the two failures
         "min_rho_d_frac" => min_rd_frac,                # dry density / reference; 1 = untouched
         "accum_rainfall_flux_mm" => accum_flux / width, # cross-check of the exact budget
