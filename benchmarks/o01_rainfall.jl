@@ -1093,8 +1093,18 @@ end
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
+
+# Arm token, derived from the RESOLVED MODEL CONFIG -- never from SCYTHE_BENCH_TAG (a
+# free-text output_dir label with no bearing on which reference/windows a run is checked
+# against). The ISHMAEL ice arm carries 12 extra prognostic slots, a prognostic rain
+# number and (by default, see the ice-arm production-config block above) rain/rain-number/
+# ice control-variable transforms the warm default doesn't -- physically different output,
+# so it gets its own committed reference and its own (currently unseeded) target windows
+# via this token, rather than reading or overwriting the warm arm's. Empty for every other
+# configuration, so the default path stays exactly what it always was.
 if opts.nests == 1
     model = o01_model(opts)
+    arm = Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""
     passed = run_benchmark("o01_rainfall", opts;
                            model = model,
                            init! = o01_init!,
@@ -1102,12 +1112,15 @@ if opts.nests == 1
                            # The run's OWN slot names: a transform renames slots 8/9, and the
                            # regression then reports itself skipped rather than KeyError.
                            varnames = Scythe.mc_var_names(model.options),
-                           plotter = plotter)
+                           plotter = plotter,
+                           arm = arm)
 else
     nest = o01_nest(opts)
+    arm = Scythe.ice_microphysics(nest.base.options) === :ishmael ? "ice" : ""
     passed = run_nested_benchmark("o01_rainfall", opts;
                                   nest = nest,
                                   init! = o01_init_nested!,
-                                  diagnostics = o01_nested_diagnostics)
+                                  diagnostics = o01_nested_diagnostics,
+                                  arm = arm)
 end
 exit(passed ? 0 : 1)

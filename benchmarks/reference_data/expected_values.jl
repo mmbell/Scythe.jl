@@ -92,6 +92,17 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     # (o01_axisym/quick_mc_rirk_final.csv, 2026-07-16) is stale for the same reason —
     # it has no rho_c column at all, so compare_reference throws on it. Both are left
     # for the axisym owner; the values below are the untouched 2026-07-13 seeds.
+    # Ice arm (SCYTHE_O01_ICE=1 + SCYTHE_O01_RAIN_MOMENTS=2): arm-qualified key, looked up
+    # via load_targets(name, opts; arm="ice") -> "o01_rainfall_ice" (benchmarks/common/
+    # harness.jl). EMPTY on purpose (seeded 2026-08-19, values to follow at S9 close-out):
+    # the ice port (S8, 1357f81) only runs to the glaciation-onset divergence at t ~ 1031 s
+    # so far, which is not a stable configuration to draw sanity windows from yet. DO NOT
+    # borrow the warm o01_rainfall windows above -- the ice arm's rain/rain-number/ice
+    # control-variable transforms and the ice thermodynamics (rho_i in the temperature
+    # retrieval, mixture heat capacities, entropy, rho_t budget) make it a different run,
+    # and load_targets() will not fall back to the base case for exactly that reason: an
+    # armed run against this empty entry gets zero targets, not a spurious pass/fail.
+    "o01_rainfall_ice" => Dict{String,Tuple{Float64,Float64,Float64,String}}(),
     "o01_axisym" => Dict(
         "peak_rain_rate_gm2s" => (55.0, 35.0, 35.0, "o01_rainfall window (metric terms ~0.2%)"),
         "max_rho_r_gm3"       => (8.5,  4.0,  4.0,  "o01_rainfall window"),

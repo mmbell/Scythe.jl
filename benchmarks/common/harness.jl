@@ -247,6 +247,16 @@ grid_suffix(opts::BenchmarkOptions) = opts.grid == :rz ? "" : "_$(opts.grid)"
 nest_suffix(opts::BenchmarkOptions) = opts.nests > 1 ? "_n$(opts.nests)" : ""
 
 """
+Path/key suffix carrying an explicit ARM token (e.g. `"ice"`), derived by the caller from
+the resolved MODEL CONFIG -- never from `SCYTHE_BENCH_TAG`, which is a free-text run label
+for `output_dir` only and has nothing to do with which reference file or target windows a
+run is checked against. Empty when no arm is given (the default everywhere it is accepted),
+which is what keeps the plain (unarmed) path and target lookup exactly what they always
+were -- byte-identical, not merely equivalent.
+"""
+arm_suffix(arm::String) = isempty(arm) ? "" : "_$(arm)"
+
+"""
 Output directory for a benchmark variant (created if missing).
 
 `SCYTHE_BENCH_TAG` appends a run label, e.g. `_ladder_bhyp`. Sweeps otherwise all write to
@@ -266,14 +276,24 @@ end
 Committed regression reference path for a benchmark variant. Quick mode
 references store the full final-time fields (small grids); full mode stores
 the final scalar diagnostics (full fields are tens of MB).
+
+`arm` (default `""`, meaning "no arm") is an explicit token for a benchmark variant that
+carries genuinely different prognostics/physics from the case's default configuration --
+e.g. `"ice"` for `o01_rainfall`'s ISHMAEL arm, which appends 12 ice slots plus a prognostic
+rain number and turns on transforms the default doesn't carry. It inserts an `arm_suffix`
+segment ahead of `_final`/`_diagnostics` (e.g. `quick_mc_rirk_ice_final.csv`), so an armed
+run reads and writes its OWN committed reference and can never collide with, or
+`--update-reference`-overwrite, the unarmed default's file. With the default `arm=""` this
+function returns EXACTLY what it always has -- `arm_suffix("")` is the empty string, so the
+unarmed path is untouched, byte-for-byte.
 """
-function reference_csv_path(name::String, opts::BenchmarkOptions)
+function reference_csv_path(name::String, opts::BenchmarkOptions; arm::String="")
     if opts.mode == :full
         return joinpath(REFERENCE_DATA_DIR, name,
-                        "full_$(opts.stage)$(grid_suffix(opts))_diagnostics.csv")
+                        "full_$(opts.stage)$(grid_suffix(opts))$(arm_suffix(arm))_diagnostics.csv")
     end
     return joinpath(REFERENCE_DATA_DIR, name,
-                    "$(opts.mode)_$(opts.stage)$(grid_suffix(opts))_final.csv")
+                    "$(opts.mode)_$(opts.stage)$(grid_suffix(opts))$(arm_suffix(arm))_final.csv")
 end
 
 """Write a full-mode regression reference: target diagnostics as name,value rows."""
@@ -316,17 +336,31 @@ function compare_diagnostics_reference(path::String, diags::Dict{String,Float64}
 end
 
 """
-    load_targets(name, opts) -> Vector{Target}
+    load_targets(name, opts; arm="") -> Vector{Target}
 
 Load published target values for a benchmark. Quick mode and the primitive
 equation stage use the wider quick tolerances.
+
+`arm` (default `""`) looks the targets up under the ARM-QUALIFIED key `"\$(name)_\$(arm)"`
+instead of `name` -- e.g. `"o01_rainfall_ice"` for the ISHMAEL arm of `o01_rainfall`. There
+is deliberately NO fallback to the base `name` entry when the arm-qualified key is missing
+or its Dict is empty: an armed run's diagnostics differ physically from the unarmed case
+(different closures, different prognostics), so borrowing the warm windows would silently
+check the wrong physics against the wrong numbers. Absent arm-specific windows, an armed
+run gets NO targets at all -- an empty `Vector{Target}` -- rather than the warm case's. With
+the default `arm=""` this looks up `name` exactly as before and still errors if it is
+undefined, so the unarmed path's behavior is unchanged.
 """
-function load_targets(name::String, opts::BenchmarkOptions)
-    haskey(BENCHMARK_EXPECTED, name) || error("No expected values defined for $name")
+function load_targets(name::String, opts::BenchmarkOptions; arm::String="")
+    key = isempty(arm) ? name : "$(name)_$(arm)"
+    if !haskey(BENCHMARK_EXPECTED, key)
+        isempty(arm) && error("No expected values defined for $name")
+        return Target[]
+    end
     use_quick_tol = opts.mode == :quick ||
                     opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_MC)
     targets = Target[]
-    for (diag, (value, atol_full, atol_quick, source)) in BENCHMARK_EXPECTED[name]
+    for (diag, (value, atol_full, atol_quick, source)) in BENCHMARK_EXPECTED[key]
         atol = use_quick_tol ? atol_quick : atol_full
         push!(targets, Target(diag, value, atol, source))
     end
@@ -395,6 +429,16 @@ end
 Write a committed regression reference from a model output CSV, keeping only
 the coordinate and value columns (dropping derivative columns) at 10
 significant digits.
+
+`varnames` already carries the run's OWN slot names (e.g. `o01_rainfall.jl` resolves them
+via `Scythe.mc_var_names(model.options)`), so a control-variable transform's renamed slots
+-- `nu_c`/`nu_r`/the twelve `nu_i*` ice moments under the `MC_NU_ALIAS` naming -- are written
+under those names, not the untransformed `rho_*` names. This is deliberate: the ice arm's
+reference stores the TRANSFORMED control variables it actually integrated, and
+`compare_reference` above already handles this correctly with no changes needed here --
+it compares `varnames` by name against whatever columns the committed reference has, and
+skips (rather than false-failing) when a run's `nu_*` names aren't present in an untransformed
+reference.
 """
 function write_reference(output_csv::String, reference_csv::String,
                          varnames::Vector{String})
@@ -497,19 +541,28 @@ function write_diagnostics_csv(path::String, diags::Dict{String,Float64},
 end
 
 """
-    run_benchmark(name, opts; model, init!, diagnostics, varnames) -> Bool
+    run_benchmark(name, opts; model, init!, diagnostics, varnames, arm="") -> Bool
 
 Run a benchmark end-to-end: initialize, integrate, verify, report, record.
 Returns true if all targets pass and the regression comparison (when a
 committed reference exists) is within tolerance.
+
+`arm` (default `""`) is threaded straight through to [`reference_csv_path`](@ref) and
+[`load_targets`](@ref): it is the caller's job to derive it from the RESOLVED model config
+(e.g. `Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""`), never from
+`SCYTHE_BENCH_TAG`. Because both of those default to `arm=""` and return their unarmed
+result unchanged in that case, an unarmed call to this function (the default) reads/writes
+exactly the reference file and target windows it always did -- an armed call can never see,
+let alone overwrite with `--update-reference`, the unarmed default's committed reference.
 """
 function run_benchmark(name::String, opts::BenchmarkOptions;
                        model, init!::Function, diagnostics::Function,
-                       varnames::Vector{String}, plotter=nothing)
+                       varnames::Vector{String}, plotter=nothing, arm::String="")
 
     println("═"^70)
+    arm_tag = isempty(arm) ? "" : "  arm=$(arm)"
     println("Benchmark: $name  mode=$(opts.mode)  stage=$(opts.stage)  grid=$(opts.grid)  " *
-            "equation_set=$(model.equation_set)")
+            "equation_set=$(model.equation_set)$(arm_tag)")
     nsteps = round(Int, model.integration_time / model.ts)
     println("Grid: num_cells=$(model.grid_params.num_cells) kDim=$(model.grid_params.kDim)  " *
             "ts=$(model.ts) s  steps=$nsteps")
@@ -531,7 +584,7 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
         plotter(model)
     end
 
-    targets = load_targets(name, opts)
+    targets = load_targets(name, opts; arm=arm)
     target_pass = check_targets(diags, targets)
     report_table(name, opts, diags, targets, target_pass)
     diag_csv = write_diagnostics_csv(joinpath(model.output_dir, "diagnostics.csv"),
@@ -542,10 +595,14 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
     # Regression comparison against committed reference output
     final_tag = string(round(model.integration_time; digits=2))
     output_csv = joinpath(model.output_dir, "$(final_tag)_physical.csv")
-    ref_csv = reference_csv_path(name, opts)
+    ref_csv = reference_csv_path(name, opts; arm=arm)
     regression_ok = nothing
     regression_stats = Dict{String,Tuple{Float64,Float64}}()
     if opts.update_reference
+        # ref_csv already carries the arm suffix (empty for an unarmed run), so
+        # `--update-reference` on an ARMED run writes ONLY its own arm-qualified path and
+        # can never clobber the unarmed default's committed reference -- this follows
+        # automatically from `reference_csv_path`'s `arm` keyword, not from any check here.
         if opts.mode == :full
             write_diagnostics_reference(ref_csv, diags, targets)
         else
@@ -618,7 +675,7 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
 end
 
 """
-    run_nested_benchmark(name, opts; nest, init!, diagnostics) -> Bool
+    run_nested_benchmark(name, opts; nest, init!, diagnostics, arm="") -> Bool
 
 Nested-grid counterpart of [`run_benchmark`](@ref): builds the nest, runs
 `init!(models, topo)`, integrates via `integrate_nested_model`, and checks
@@ -626,16 +683,22 @@ Nested-grid counterpart of [`run_benchmark`](@ref): builds the nest, runs
 Regression uses the scalar-diagnostics reference (per-nest field CSVs are not
 committed); the reference file carries the `_n<nests>` suffix so single-grid
 references are untouched.
+
+`arm` (default `""`) behaves exactly as in [`run_benchmark`](@ref): it is threaded through
+to [`load_targets`](@ref) and appended (via `arm_suffix`) to this function's own inline
+reference-path construction below, ahead of `_diagnostics.csv`. Unarmed calls (`arm=""`,
+the default) are unaffected -- byte-identical path and target lookup.
 """
 function run_nested_benchmark(name::String, opts::BenchmarkOptions;
-                              nest, init!::Function, diagnostics::Function)
+                              nest, init!::Function, diagnostics::Function, arm::String="")
 
     models, topo = build_nest(nest)
     n = length(models)
 
     println("═"^70)
+    arm_tag = isempty(arm) ? "" : "  arm=$(arm)"
     println("Benchmark: $name  mode=$(opts.mode)  stage=$(opts.stage)  grid=$(opts.grid)  " *
-            "nests=$(opts.nests) ($(n) patches)  equation_set=$(nest.base.equation_set)")
+            "nests=$(opts.nests) ($(n) patches)  equation_set=$(nest.base.equation_set)$(arm_tag)")
     for (i, m) in enumerate(models)
         nsteps = round(Int, m.integration_time / m.ts)
         println("  nest$i: [$(m.grid_params.iMin/1000), $(m.grid_params.iMax/1000)] km  " *
@@ -653,7 +716,7 @@ function run_nested_benchmark(name::String, opts::BenchmarkOptions;
     println("Computing diagnostics...")
     diags = diagnostics(models, topo)
 
-    targets = load_targets(name, opts)
+    targets = load_targets(name, opts; arm=arm)
     target_pass = check_targets(diags, targets)
     report_table(name, opts, diags, targets, target_pass)
     diag_csv = write_diagnostics_csv(joinpath(nest.base.output_dir, "diagnostics.csv"),
@@ -662,9 +725,12 @@ function run_nested_benchmark(name::String, opts::BenchmarkOptions;
     targets_ok = all(values(target_pass))
 
     ref_csv = joinpath(REFERENCE_DATA_DIR, name,
-                       "$(opts.mode)_$(opts.stage)$(grid_suffix(opts))$(nest_suffix(opts))_diagnostics.csv")
+                       "$(opts.mode)_$(opts.stage)$(grid_suffix(opts))$(nest_suffix(opts))$(arm_suffix(arm))_diagnostics.csv")
     regression_ok = nothing
     if opts.update_reference
+        # As in run_benchmark: ref_csv already carries the arm suffix (empty when unarmed),
+        # so this can never write the unarmed default's path -- it follows from arm_suffix,
+        # not from a check here.
         write_diagnostics_reference(ref_csv, diags, targets)
         println("\nUpdated regression reference: $ref_csv")
     elseif isfile(ref_csv)
