@@ -270,7 +270,7 @@ log_tf(mu) = Transform("log(mu=$(mu))", r -> log(max(r, mu) / mu),
 
 candidates(mu) = [hyp_smooth(mu), hyp_ooyama(mu), softplus(mu), quadratic(mu), log_tf(mu)]
 
-# ── grid + reference rebuild (mirrors benchmarks/vapor_blend_diagnostic.jl:185) ──
+# ── grid + reference rebuild ──
 
 """
     build_patch(outdir, df0; l_q) -> (patch, grid_params, R)

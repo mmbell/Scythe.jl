@@ -54,7 +54,8 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
+const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c",
+                 "rho_v"]
 
 # HUMIDIFIED Dunion moist-tropical sounding (WRF input_sounding format): RH floors
 # of 0.90 (z <= 1.6 km) / 0.88 (<= 3.2 km) / 0.85 (<= 4.5 km) applied to the
@@ -157,45 +158,24 @@ function o01_model(opts::BenchmarkOptions)
     # function of the time step. Output lands in <output_dir>/scythe_err.log, not the console.
     haskey(ENV, "SCYTHE_O01_STIFFNESS") &&
         (options[:stiffness_trace] = parse(Int, ENV["SCYTHE_O01_STIFFNESS"]))
-    # Stage 0b of the vapor-retrieval decision (reference/HANDOFF_VAPOR_RETRIEVAL.md):
-    # the reconciliation `qss_relaxation` pulls Q_ss toward the DENSITY residual at rate 1/tau.
-    # The partition gap the regime-blended retrieval opens is algebraically
-    #     res_qss - res_rho_t = Q_ss - (rho_v - rho_vs) = -tau_qss * QSSREL,
-    # so a shorter tau shrinks the gap -- but the same relaxation drags Q_ss onto the
-    # residual that is CORRUPTED in cloud, which is where the blend's whole benefit comes
-    # from. This knob sweeps that tradeoff. Unset => 10.0, the committed default, bitwise.
+    # First link of the reconciliation chain Q_ss -> rho_v -> the rho_t budget: the timescale
+    # on which `Scythe.qss_relaxation` pulls the prognostic Q_ss onto the supersaturation the
+    # PROGNOSTIC vapor implies. A shorter tau keeps the two tied together at the cost of the
+    # advected Q_ss's smoothness -- and Q_ss is carried precisely because near saturation the
+    # supersaturation is four decades below the vapor, right at the 1e-4 nucleation gate.
+    # This knob sweeps that tradeoff. Unset => 10.0, the committed default, bitwise.
     haskey(ENV, "SCYTHE_O01_TAUQSS") &&
         (physical_params[:tau_qss] = parse(Float64, ENV["SCYTHE_O01_TAUQSS"]))
-    # Which discrete representation the VAPOR is retrieved from. The regime blend
-    # (`Scythe.vapor_retrieval_blend`) -- the supersaturation residual `Q_ss + rho_vs` in cloud,
-    # where the density residual `rho_t - rho_d - rho_c - rho_r` cancels catastrophically, and
-    # the density residual in dry air, where res_qss does -- is the SHIPPED DEFAULT since
-    # 2026-07-29, so unset leaves the key absent and gets `:blend`. `SCYTHE_O01_VAPOR=residual`
-    # is the useful setting now: it opts OUT, back to the pre-blend density-budget route, which
-    # is BITWISE the code that had no option at all and is the A/B lever for every measurement
-    # taken under it. `=blend` is retained so the default can be pinned explicitly (it sets the
-    # key to the same value the default supplies). Any other value is an error in mc_driver!.
-    # See reference/HANDOFF_VAPOR_RETRIEVAL.md.
-    haskey(ENV, "SCYTHE_O01_VAPOR") &&
-        (options[:vapor_retrieval] = Symbol(ENV["SCYTHE_O01_VAPOR"]))
-    # The blend's TRUST band `(t0, t1)` on `s = |Q_ss|/rho_vs`, as "t0,t1". Unset => the
-    # committed (2.0, 5.0), bitwise. t0 <= 1 turns w_trust into a SIGN selector on res_qss
-    # (res_qss < 0 is algebraically s > 1), i.e. the soft clamp `_vapor_blend_weight`
-    # rejects -- useful only as a diagnostic isolation of the negative-import window.
-    if haskey(ENV, "SCYTHE_O01_BLEND_T0T1")
-        t0t1 = parse.(Float64, split(ENV["SCYTHE_O01_BLEND_T0T1"], ","))
-        physical_params[:vapor_blend_t0] = t0t1[1]
-        physical_params[:vapor_blend_t1] = t0t1[2]
-    end
-    # The blend's CORRECTION CAP, as a multiple of rho_vs: |rho_v - res_rho_t| <= dcap*rho_vs,
-    # applied through the C¹ saturator `Scythe._blend_saturate`. Unset => the shipped 0.02,
-    # bitwise. This is the guard that stops the NOPRECIP detonation: the partition gap is
-    # unbounded RELATIVE to rho_vs (which collapses in the rising anvil) while w_trust, a
-    # function of the supersaturation magnitude s, never sees it. `Inf` restores the uncapped
-    # blend (the detonating configuration) and `0.0` degenerates to :residual, so the knob
-    # sweeps the whole family. See `Scythe.vapor_retrieval_blend`.
-    haskey(ENV, "SCYTHE_O01_BLEND_DCAP") &&
-        (physical_params[:vapor_blend_dcap] = parse(Float64, ENV["SCYTHE_O01_BLEND_DCAP"]))
+    # The second link of the same chain: the timescale on which the PROGNOSTIC vapor is
+    # reconciled with the vapor the conserved rho_t budget implies (`Scythe.rho_v_reconcile`).
+    # Unset => 10.0, the committed default, bitwise. Short tau_rec projects rho_v onto the
+    # density budget every few steps and throws away the transported field's smoothness --
+    # which is the thing the prognostic vapor was introduced to buy; long tau_rec lets the
+    # partition drift (watch the reconciliation gap in the water summary). This knob sweeps
+    # that tradeoff, and it is the one that replaced SCYTHE_O01_VAPOR/BLEND_T0T1/BLEND_DCAP:
+    # those chose between two DIAGNOSTIC vapors, and there is no diagnostic vapor any more.
+    haskey(ENV, "SCYTHE_O01_TAUREC") &&
+        (physical_params[:tau_rho_v_rec] = parse(Float64, ENV["SCYTHE_O01_TAUREC"]))
     # Whether the THERMODYNAMIC INTERFACE reads a floored rho_liq (Experiment 1 of
     # reference/HANDOFF_CONDENSATE_REPRESENTATION.md). Unset => `:none`, bitwise the code
     # that had no option. `=diagnostic` floors rho_liq at the retrieval, q_l, Q_s_energy,
@@ -249,7 +229,7 @@ function o01_model(opts::BenchmarkOptions)
     # "1"/"ishmael" appends the twelve ISHMAEL slots (three species x mass, number and the two
     # spheroid volume moments) and turns on the ice thermodynamics: the rho_i term of the
     # closed-form temperature retrieval, q_i*Ci in the mixture heat capacities and the entropy,
-    # and rho_i in the vapor residual. It REQUIRES SCYTHE_O01_RAIN_MOMENTS=2 and says so if it
+    # and rho_i in the rho_t water budget. It REQUIRES SCYTHE_O01_RAIN_MOMENTS=2 and says so if it
     # is missing (`Scythe.ice_microphysics`). The physics is LIVE: deposition through the
     # shared prognostic Q_ss, the full ISHMAEL nucleation/riming/aggregation/melting set, and
     # the Mitchell-Heymsfield fall speeds. Zero initial ice does NOT mean an inert run -- ice
@@ -295,14 +275,21 @@ function o01_model(opts::BenchmarkOptions)
     #
     # The CLOUD transform stays :none in this arm. Measured (model_tests/
     # ice_transform_ablation_compare.jl, pre- and post-gate ladders): the ahyp clamp on the
-    # cloud slot discards the negative half of the spline ringing, the residual vapor
-    # absorbs the discarded mass (8.3% deeper deficit over 23% more points), and the ice
-    # physics reading that vapor detonates the temperature retrieval at t ~ 1000 s —
-    # `min rho_c == 0.0 exactly` separates dying from surviving runs in all eight ladder
-    # arms, and cloud=:none with everything else transformed survives with zero stiffness
-    # exceedances. The principled fix (rho_t receives the increment each transformed slot
-    # actually REALIZED — recovered-delta bookkeeping) is a designed follow-up stage; until
-    # it lands, cloud+ice is an unsupported combination here.
+    # cloud slot discards the negative half of the spline ringing, the RESIDUAL vapor
+    # absorbed the discarded mass (8.3% deeper deficit over 23% more points), and the ice
+    # physics reading that vapor detonated the temperature retrieval at t ~ 1000 s —
+    # `min rho_c == 0.0 exactly` separated dying from surviving runs in all eight ladder
+    # arms, and cloud=:none with everything else transformed survived with zero stiffness
+    # exceedances.
+    #
+    # STAGE A CHANGES THE PREMISE, AND THIS SETTING HAS NOT BEEN RE-MEASURED UNDER IT. The
+    # channel above ran through the vapor RESIDUAL: a clamped cloud slot moved mass that
+    # nothing else accounted for, and the residual was where it went. The vapor is prognostic
+    # now, so the discarded mass shows up as a reconciliation gap (`MC_VAPOR_GAP`) that the
+    # nudge removes on tau_rec instead of appearing instantly in the field the ice physics
+    # reads. That is the mechanism the handoff EXPECTS to have closed — but expecting is not
+    # measuring, so the arm keeps cloud=:none until the ladder is re-run. Re-running it is
+    # the first item of the S8/S9 re-closure.
     #
     # The reason is the glaciation itself. Freezing an anvil is genuinely fast: homogeneous
     # freezing, riming and ice-rain collection empty the liquid reservoirs on timescales of
@@ -316,7 +303,7 @@ function o01_model(opts::BenchmarkOptions)
     # Under the biased hyperbolic transform the RECOVERED density is bounded below by -mu
     # whatever the control variable does, so the collection rates vanish smoothly as a
     # reservoir empties instead of changing sign, and the overshoot is returned through the
-    # vapor residual and the prognostic supersaturation. Nothing is repaired and nothing is
+    # prognostic vapor and supersaturation. Nothing is repaired and nothing is
     # clamped; it is a change of variables (Ooyama 2001 Eq. 4.19-4.23, `Scythe.bhyp`).
     #
     # Each is still individually overridable by its own env knob above, and NONE of this fires
@@ -588,18 +575,19 @@ function o01_rain_diagnostics(model, ref, kDim)
     max_rr = 0.0
     min_rr = 0.0
     # The cloud undershoot was invisible in this CSV — only rain was reported — so every
-    # rho_c experiment had to be read out of scythe_err.log. min_rho_v goes with it: the
-    # vapor is the residual, so it is where any error rho_c is no longer allowed to absorb
-    # has to land.
+    # rho_c experiment had to be read out of scythe_err.log. min_rho_v goes with it: it is
+    # read off the PROGNOSTIC vapor slot now, so it reports the transported field's own
+    # undershoot rather than the accumulated error of four others.
     max_rc = 0.0
     min_rc = 0.0
     min_rv = Inf
-    # Total water rho_w = rho_t - rho_d, the quantity that separates the two ways the
-    # residual vapor can fail: rho_w < 0 is the SHADOW of a negative rho_c (rho_t carries
-    # the same cloud water, so the same spline undershoot appears in both and cancels in
-    # rho_v), whereas rho_v < 0 at healthy rho_w means the condensate has claimed more
-    # water than the column holds. See the STAGE 5 RESOLUTION of
-    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md.
+    # Total water rho_w = rho_t - rho_d, still worth reporting beside the vapor even though
+    # the vapor is no longer assembled from it. It was the quantity that separated the two
+    # ways a RESIDUAL vapor could fail (rho_w < 0 was the shadow of a negative rho_c, which
+    # cancels in the residual; rho_v < 0 at healthy rho_w meant the condensate had claimed
+    # more water than the column held — see the STAGE 5 RESOLUTION of
+    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md). Now the two are independent fields,
+    # and rho_w - (rho_v + rho_c + rho_r) is the reconciliation gap instead.
     min_rw = Inf
     # Dry-density headroom, as a FRACTION of the reference (rho_d spans two decades over the
     # column, so an absolute minimum would only ever report the model top). Diagnostic only:
@@ -661,7 +649,7 @@ function o01_rain_diagnostics(model, ref, kDim)
         "min_rho_r_gm3" => 1000.0 * min_rr,             # spline undershoot monitor
         "max_rho_c_gm3" => 1000.0 * max_rc,
         "min_rho_c_gm3" => 1000.0 * min_rc,             # ditto, for the condensate
-        "min_rho_v_gm3" => 1000.0 * min_rv,             # the residual vapor's headroom
+        "min_rho_v_gm3" => 1000.0 * min_rv,             # the prognostic vapor's headroom
         "min_rho_w_gm3" => 1000.0 * min_rw,             # total water; separates the two failures
         "min_rho_d_frac" => min_rd_frac,                # dry density / reference; 1 = untouched
         "accum_rainfall_flux_mm" => accum_flux / width, # cross-check of the exact budget

@@ -3,9 +3,10 @@ using Scythe
 using Springsteel
 
 # Tests for the total-energy moist compressible equation set moist_compressible_XZ
-# (src/moist_compressible.jl): prognostic p, rho_d, rho_t, u, w, E_t, Q_ss, rho_r
-# with T diagnosed from a univariate Newton retrieval and rho_v = Q_ss + rho_vs(T,p),
-# rho_c = rho_t - rho_d - rho_v - rho_r recovered diagnostically.
+# (src/moist_compressible.jl): prognostic p, rho_d, rho_t, u, w, E_t, Q_ss, rho_r, rho_c
+# and rho_v — every water species is a slot — with T from the closed-form BF02 retrieval
+# on the condensed masses, and the two redundancies (Q_ss against rho_v, rho_v against the
+# rho_t budget) removed by the slow nudges of the reconciliation chain.
 
 @testset "moist_compressible (total energy)" begin
 
@@ -294,443 +295,6 @@ using Springsteel
         end
     end
 
-    # ──────────────────────────────────────────────
-    # 4b. Regime-blended vapor retrieval — WRITTEN BEFORE THE IMPLEMENTATION
-    # ──────────────────────────────────────────────
-    # The vapor is retrievable two ways, and the two ways fail in DISJOINT regimes
-    # (reference/HANDOFF_VAPOR_RETRIEVAL.md; both measured sweeps are recorded in the
-    # header of benchmarks/vapor_blend_diagnostic.jl):
-    #
-    #   res_rho_t = rho_t - rho_d - rho_c - rho_r    the DENSITY-BUDGET residual. Cancels
-    #                                                catastrophically IN CLOUD, where
-    #                                                rho_c/rho_w reaches 1.0011.
-    #   res_qss   = Q_ss + rho_vs(T, p)              the SUPERSATURATION residual. Cancels
-    #                                                catastrophically IN DRY AIR, where
-    #                                                rho_v -> 0 forces Q_ss -> -rho_vs.
-    #
-    # Neither wins outright — a straight swap to res_qss is a NET REGRESSION on the shipped
-    # O01 default (1.11 % -> 2.61 % negative points, because the dry population dominates
-    # there) while being 5.7x better in the NOPRECIP storm's cloud. So the retrieval is a
-    # C¹ BLEND of the two, selected on the two variables that separate the populations by
-    # ~8 decades in rho_liq:
-    #
-    #   w = w_cloud(rho_liq; l0, l1) * w_trust(s; t0, t1),      s = |Q_ss| / rho_vs
-    #   rho_v = w*res_qss + (1 - w)*res_rho_t
-    #
-    # w_cloud smoothsteps UP in rho_liq (there IS condensate, so res_rho_t is the route that
-    # cancels) and w_trust smoothsteps DOWN in s. `s` is exactly the conditioning number of
-    # the res_qss route — the ratio of the difference to the terms being differenced — and it
-    # is SELF-PROTECTING: when Q_ss detaches from the density budget (the POSITIVITY=1 run
-    # reaches s ~ 2e26) the weight goes to zero and the point is handed back to the density
-    # residual with no special-case logic.
-    #
-    # THESE TESTSETS ARE THE SPECIFICATION, and they run before `src/` knows any of it. Each
-    # is gated on an `isdefined` probe so that the missing Stage 2 API costs ONE countable
-    # failing test per testset instead of erroring the rest of the file out from under the
-    # suite. `@test_broken` is deliberately not used: these are requirements, not known bugs.
-
-    @testset "vapor blend weight: limits, range and monotonicity" begin
-        have = isdefined(Scythe, :_vapor_blend_weight)
-        @test have                    # ← the Stage 2 gate; see the block comment above
-        if have
-            # The shipped defaults (physical_params :vapor_blend_l0/_l1/_t0/_t1). They are
-            # passed EXPLICITLY here so that a later retuning of the defaults cannot silently
-            # change what these assertions mean.
-            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
-            W = (rho_liq, s) -> Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
-
-            # 1. Full trust in res_qss: thick cloud AND a supersaturation small compared with
-            #    the saturation density it is differenced against. EXACTLY 1.0, not 1 - eps —
-            #    the blend has to degenerate to a pure copy so the regime limits below can be
-            #    asserted with ===.
-            for rho_liq in (l1, 2.0e-4, 1.0e-3, 1.0), s in (0.0, 0.5, 1.0, t0)
-                @test W(rho_liq, s) === 1.0
-            end
-
-            # 2. No condensate -> no trust, at ANY s. NOTE THE NEGATIVES: spline ringing puts
-            #    rho_liq a few times 1e-9 BELOW zero in clear air routinely, and the clamp
-            #    inside the smoothstep is what stops that from becoming a negative weight
-            #    (i.e. an extrapolation past res_rho_t, not a blend).
-            for rho_liq in (-1.0e-3, -3.0e-9, 0.0, 1.0e-9, l0),
-                s in (0.0, 1.0, t0, 4.0, 1.0e10)
-                @test W(rho_liq, s) === 0.0
-            end
-
-            # 3. Detached Q_ss -> no trust, however cloudy the point is.
-            for s in (t1, 6.0, 1.0e10, 2.0e26), rho_liq in (0.0, 1.0e-5, 1.0e-3, 1.0)
-                @test W(rho_liq, s) === 0.0
-            end
-
-            # 4. A weight is a weight: in [0,1] and finite everywhere, including at the two
-            #    pathological inputs above.
-            rls = collect(range(-1.0e-5, 1.0e-3; length = 257))
-            ss = collect(range(0.0, 8.0; length = 257))
-            @test all(0.0 <= W(rl, s) <= 1.0 for rl in rls, s in ss)
-            @test all(isfinite(W(rl, s)) for rl in rls, s in ss)
-
-            # 5. Monotone in both arguments, on grids fine enough to resolve the smoothstep
-            #    interiors (the band is [l0, l1], four decades below the coarse grid's span).
-            #    The tolerance is one rounding of the cubic x^2(3-2x), not slack: the exact
-            #    function is monotone, and a non-monotone weight would mean the retrieval
-            #    could move AWAY from the better-conditioned route as the point gets cloudier.
-            rls_band = collect(range(-2.0e-6, 2.0e-4; length = 513))
-            for s in (0.0, 1.0, 2.5, 3.5, 4.5)
-                for grid in (rls, rls_band)
-                    @test all(diff([W(rl, s) for rl in grid]) .>= -1.0e-16)
-                end
-            end
-            for rl in (0.0, 5.0e-6, 5.0e-5, 1.0e-4, 1.0e-3)
-                @test all(diff([W(rl, s) for s in ss]) .<= 1.0e-16)
-            end
-        end
-    end
-
-    @testset "vapor blend weight: C¹ across all four thresholds" begin
-        # WHY C¹ AND NOT MERELY CONTINUOUS. rho_v feeds q_v, hence C_vt, R_m, C_pt and
-        # gamma_m, hence the acoustic coefficient gamma_m*p/rho_t that the semi-implicit
-        # solve linearizes about. A hard regime switch would put a JUMP in the sound speed
-        # across a surface moving through the flow; a C⁰-only blend would put a kink in it.
-        # The smoothstep x^2(3-2x) is flat at both ends, so the composite weight has a
-        # continuous gradient across every one of the four thresholds.
-        have = isdefined(Scythe, :_vapor_blend_weight)
-        @test have
-        if have
-            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
-            W = (rho_liq, s) -> Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
-            dl = l1 - l0
-            dt = t1 - t0
-
-            # ── the rho_liq thresholds, probed at s = 0 where w_trust ≡ 1 so w = w_cloud ──
-            hl = 1.0e-4 * dl
-            dWl = rl -> (W(rl + hl, 0.0) - W(rl - hl, 0.0)) / (2.0 * hl)
-            peak_l = 1.5 / dl                       # max |w'| of a unit smoothstep of width dl
-            for knot in (l0, l1)
-                # Flat AT the knot: both one-sided derivatives vanish there, which is what
-                # "C¹ across the threshold" means for a clamped smoothstep.
-                @test abs(dWl(knot)) < 1.0e-3 * peak_l
-                # ... and no jump in the derivative in a neighbourhood of it.
-                ds = [dWl(knot + j * 5.0e-4 * dl) for j in -5:5]
-                @test maximum(abs.(diff(ds))) < 1.0e-2 * peak_l
-            end
-            # Interior: the closed form 6x(1-x)/Δ, not merely "something smooth".
-            for x in (0.25, 0.5, 0.75)
-                @test dWl(l0 + x * dl) ≈ 6.0 * x * (1.0 - x) / dl rtol = 1.0e-6
-            end
-
-            # ── the s thresholds, probed at rho_liq >> l1 where w_cloud ≡ 1 so w = w_trust ──
-            ht = 1.0e-4 * dt
-            dWt = s -> (W(1.0e-3, s + ht) - W(1.0e-3, s - ht)) / (2.0 * ht)
-            peak_t = 1.5 / dt
-            for knot in (t0, t1)
-                @test abs(dWt(knot)) < 1.0e-3 * peak_t
-                ds = [dWt(knot + j * 5.0e-4 * dt) for j in -5:5]
-                @test maximum(abs.(diff(ds))) < 1.0e-2 * peak_t
-            end
-            for x in (0.25, 0.5, 0.75)
-                # w_trust steps DOWN, so the sign is negative and x = (t1 - s)/Δ.
-                @test dWt(t1 - x * dt) ≈ -6.0 * x * (1.0 - x) / dt rtol = 1.0e-6
-            end
-        end
-    end
-
-    @testset "vapor blend retrieval: the regime limits are exact copies" begin
-        have = isdefined(Scythe, :vapor_retrieval_blend)
-        @test have
-        if have
-            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
-            B = (Q_ss, rho_vs, rho_liq, res_rho_t) ->
-                Scythe.vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t, l0, l1, t0, t1)
-            rho_vs = rho_v_sat(290.0, 900.0)        # ~1.4e-2 kg/m^3
-            # The two candidates are deliberately DIFFERENT, by 4e-5 kg/m^3 — the order of
-            # the in-cloud partition gap the sweep measured (median 1.0e-7, p99 2.0e-4) — so
-            # "returns one of them exactly" is a real assertion rather than a tautology.
-            #
-            # AMENDED WITH THE CAP (Stage 2b): the separation must sit inside the saturator's
-            # IDENTITY REGION, |c| <= dcap*rho_vs/2 = 0.01*rho_vs = 1.44e-4 kg/m^3, because
-            # that is where the exact-copy guarantee lives and where the corrections that
-            # constitute the fix actually are (median ~1.5e-3*rho_vs). It was 4e-4 before the
-            # cap shipped, i.e. 2.8x outside; the assertions below prove the same property
-            # about the same code path, on a separation the shipped default reaches.
-            # `_blend_saturate`'s own testset covers the saturating tail.
-            Q_ss = -2.0e-5                          # s = 0.0014 << t0: res_qss is trusted
-            res_qss = Q_ss + rho_vs
-            res_rho_t = rho_vs + 4.0e-5             # |res_qss - res_rho_t| = 6.0e-5 < 1.44e-4
-
-            # 1. Thick cloud near saturation -> the supersaturation residual, EXACTLY.
-            for rho_liq in (l1, 5.0e-4, 8.0e-3)
-                @test B(Q_ss, rho_vs, rho_liq, res_rho_t) === res_qss
-            end
-            # 2. Condensate-free -> the density residual, EXACTLY, including at the small
-            #    negative rho_liq that spline ringing makes routine in clear air.
-            for rho_liq in (0.0, -3.0e-9, -1.0e-6, l0)
-                @test B(Q_ss, rho_vs, rho_liq, res_rho_t) === res_rho_t
-            end
-            # 3. Detached Q_ss -> the density residual, EXACTLY, however cloudy the point is.
-            #    Either sign: s is a magnitude.
-            @test B(1.0e10 * rho_vs, rho_vs, 8.0e-3, res_rho_t) === res_rho_t
-            @test B(-1.0e10 * rho_vs, rho_vs, 8.0e-3, res_rho_t) === res_rho_t
-
-            # 4. THE BLEND IS NOT A CLAMP. `res_qss < 0` is ALGEBRAICALLY `s > 1` (measured
-            #    min s over the res_qss-negative points: 1.0000 on both runs), and t0 = 2 sits
-            #    ABOVE that ceiling, so a fully trusted point can and must import a NEGATIVE
-            #    vapor. Negative water is a RESOLUTION DIAGNOSTIC (reference/
-            #    FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md): flooring it here would destroy the
-            #    measurement and manufacture water on the way.
-            #
-            #    AMENDED WITH THE CAP (Stage 2b): a negative res_qss can only be imported
-            #    EXACTLY where the correction is inside the identity region, so the density
-            #    residual here is itself negative — which is the configuration the rescue
-            #    actually runs in (NOPRECIP's rescued points are res_rho_t < 0 <= res_qss).
-            #    It was `Q_neg = -1.5*rho_vs` against `res_rho_t = rho_vs + 4e-4` before,
-            #    a correction of 2.1e-2 = 74x the whole cap; the property under test —
-            #    s > 1 imports at FULL weight and the result is NEGATIVE, i.e. the retrieval
-            #    is not a non-negativity constraint — is unchanged, and §6 below adds the
-            #    statement that the SATURATOR does not rectify it either.
-            res_rho_t_neg = -1.0e-4                 # the anvil configuration
-            Q_neg = -2.0e-4 - rho_vs                # res_qss = -2.0e-4; s = 1.014 in (1, t0)
-            @test abs(Q_neg) / rho_vs > 1.0         # ... genuinely past the res_qss ceiling
-            @test abs(Q_neg) / rho_vs < t0          # ... and still at full trust
-            @test B(Q_neg, rho_vs, 8.0e-3, res_rho_t_neg) === Q_neg + rho_vs
-            @test B(Q_neg, rho_vs, 8.0e-3, res_rho_t_neg) < 0.0
-
-            # 5. In between, it is the convex combination the weight function reports — no
-            #    third representation of the vapor anywhere in the transition.
-            #
-            #    AMENDED WITH THE CAP (Stage 2b): `s` and the correction are not independent
-            #    (s = Q/rho_vs, so a large s is a large res_qss), so the separation is now
-            #    taken RELATIVE to res_qss — a fixed 4e-5 gap at every s — which keeps every
-            #    point inside the identity region while sweeping exactly the same weights.
-            #    Previously `res_rho_t = rho_vs + 4e-4` was shared with §1, which at s = 4.5
-            #    made the correction 4.2e-3, 15x the cap.
-            if isdefined(Scythe, :_vapor_blend_weight)
-                for rho_liq in (5.0e-6, 2.0e-5, 8.0e-5), s in (0.0, 2.5, 3.5, 4.5)
-                    Q = s * rho_vs
-                    w = Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
-                    rrt = (Q + rho_vs) + 4.0e-5     # |c| <= 4.0e-5 < 1.44e-4 for every w
-                    @test B(Q, rho_vs, rho_liq, rrt) ≈
-                          (w * (Q + rho_vs)) + ((1.0 - w) * rrt) rtol = 1.0e-14
-                end
-            end
-
-            # 6. THE CAP IS ODD, SO IT IS NOT A RECTIFIER. Push the same fully trusted,
-            #    negative res_qss far outside the identity region: the result is SATURATED
-            #    (it no longer equals res_qss) but it is still on the res_qss side of the
-            #    density residual and still negative. A one-sided floor would show up here.
-            Q_far = -1.5 * rho_vs                   # res_qss = -0.5*rho_vs; s = 1.5 < t0
-            v_far = B(Q_far, rho_vs, 8.0e-3, res_rho_t_neg)
-            @test v_far != Q_far + rho_vs                       # saturated, not copied
-            @test v_far < res_rho_t_neg                         # ... on the res_qss side
-            @test res_rho_t_neg - v_far < 0.02 * rho_vs         # ... within the shipped cap
-            @test v_far < 0.0                                   # ... and still negative
-            # The mirror image: the Q_ss whose res_qss sits the same distance on the OTHER
-            # side of res_rho_t. Equal and opposite correction, so the cap has no sign bias.
-            Q_mirror = 2.0 * res_rho_t_neg - Q_far - 2.0 * rho_vs
-            @test abs(Q_mirror) / rho_vs < t0       # still fully trusted
-            @test (B(Q_mirror, rho_vs, 8.0e-3, res_rho_t_neg) - res_rho_t_neg) ≈
-                  -(v_far - res_rho_t_neg) rtol = 1.0e-14
-        end
-    end
-
-    # ──────────────────────────────────────────────
-    # 4c. The blend's C¹ CORRECTION SATURATOR (Stage 2b)
-    # ──────────────────────────────────────────────
-    # WHY THIS EXISTS. The uncapped blend of §4b DETONATES the NOPRECIP storm
-    # (SCYTHE_O01_PRECIP=0 SCYTHE_O01_VAPOR=blend), at the identical step 6828 in two runs
-    # differing only in the last bits of the state — a threshold crossing, not noise. The
-    # mechanism is a MISSING GUARD, not a bad weight:
-    #
-    #   * the partition gap `res_qss - res_rho_t` is a property of the Q_ss splitting and is
-    #     IDENTICAL in a :blend run and a :residual run, ~1e-4 kg/m^3 absolute;
-    #   * but it is UNBOUNDED RELATIVE to rho_vs, and rho_vs is not a constant: in the rising
-    #     anvil the air cools, rho_vs collapses, and gap/rho_vs climbed 0.08 (t = 1980 s) ->
-    #     0.46 (t = 2040 s) -> ~0.8 through the mature phase;
-    #   * `w_trust` is blind to that. Its variable s = |Q_ss|/rho_vs is the SUPERSATURATION
-    #     magnitude, measured 0.02-0.46 at the worst-detached points, so w_trust ≡ 1 and the
-    #     guard fired on ZERO points in 3600 s — and during growth s is ANTI-CORRELATED with
-    #     detachment. `s` is not a detachment measure;
-    #   * `res_qss - res_rho_t = -tau_qss*QSSREL` is an IDENTITY, not a bound. It relates the
-    #     gap to the reconciliation RATE and constrains neither.
-    #
-    # The bound is therefore imposed directly, on the correction, relative to rho_vs:
-    # |rho_v - res_rho_t| <= dcap*rho_vs with dcap = 0.02 shipped. That was validated
-    # CAUSALLY: 0 % of points touched before t ~ 1680 s, ~10 % of active cloud after, the
-    # detonation gone, the stability ladder matching the :residual control, and the median
-    # correction (~1.5e-3*rho_vs, an order of magnitude under the cap) untouched.
-    #
-    # It must be C¹ for the same reason the weight is (rho_v -> q_v -> gamma_m -> the acoustic
-    # coefficient the semi-implicit solve linearizes about), and EXACTLY the identity on the
-    # small corrections, because those are the fix. Both requirements together FORCE the
-    # junction to half the cap: matching value and slope of the Huber tail g(x) = m - k/x to
-    # the identity at x = a gives k = a(m - a) and k = a^2 simultaneously, i.e. a = m/2.
-    @testset "vapor blend saturator: identity region, bound, C¹, odd" begin
-        have = isdefined(Scythe, :_blend_saturate)
-        @test have
-        if have
-            F = Scythe._blend_saturate
-            rho_vs = rho_v_sat(290.0, 900.0)        # ~1.4393e-2 kg/m^3
-            m = 0.02 * rho_vs                       # the shipped cap, 2.8787e-4
-            a = 0.5 * m                             # 1.4393e-4
-
-            # 1. THE IDENTITY REGION IS EXACT, not accurate. The corrections that constitute
-            #    the fix live here (median ~1.5e-3*rho_vs = 2.2e-5, an order of magnitude
-            #    under the cap), so `===`: they must pass through with no rounding at all, which is what
-            #    keeps the regime limits of §4b bit-for-bit copies.
-            for c in (0.0, -0.0, 1.0e-18, -1.0e-18, 1.0e-6, -1.0e-6, 2.2e-5, -2.2e-5,
-                      0.5 * a, -0.5 * a, prevfloat(a), -prevfloat(a), a, -a)
-                @test F(c, m) === c
-            end
-            # ... on a fine sweep of the whole inner half, at three cap sizes.
-            for mm in (m, 1.0e-3, 1.0e-8), c in range(-0.5 * mm, 0.5 * mm; length = 401)
-                @test F(c, mm) === c
-            end
-
-            # 2. THE BOUND IS NEVER EXCEEDED, and is approached ASYMPTOTICALLY — no corner.
-            #    f -> m - m^2/(4|c|) in exact arithmetic, so the cap is a supremum rather than
-            #    a value the map attains. The bound asserted is `<=`, which is what the
-            #    retrieval needs and what holds in floating point: past |c| ~ m/(4*eps) the
-            #    subtrahend falls below one ulp of m and the tail ROUNDS ONTO the cap. That is
-            #    the correct rounding of a strict supremum, not a corner — the derivative is
-            #    still ~m^2/(4c^2) and vanishing, and the limit is approached from below.
-            for c in (nextfloat(a), 2.0 * a, 10.0 * m, 1.0e3 * m, 1.0e12 * m, 1.0e300)
-                @test abs(F(c, m)) <= m
-                @test abs(F(-c, m)) <= m
-            end
-            for c in (nextfloat(a), 2.0 * a, 10.0 * m, 1.0e3 * m, 1.0e12 * m)
-                @test abs(F(c, m)) < m                # resolvable: strictly under the cap
-                @test abs(F(-c, m)) < m
-            end
-            @test F(1.0e12 * m, m) ≈ m rtol = 1.0e-11
-            # ... and everywhere on a wide sweep spanning both regions.
-            cs = sort(vcat(range(-50.0 * m, 50.0 * m; length = 2001),
-                           [-1.0e6 * m, 1.0e6 * m]))
-            @test all(abs(F(c, m)) <= m for c in cs)
-            # The closed form itself, on the tail: sign(c)*(m - (m/2)^2/|c|).
-            for c in (1.3 * a, 2.0 * a, 7.0 * a, 1.0e4 * a)
-                @test F(c, m) ≈ m - (a * a) / c rtol = 1.0e-15
-                @test F(-c, m) ≈ -(m - (a * a) / c) rtol = 1.0e-15
-            end
-
-            # 3. C¹ AT THE JUNCTION ±m/2, by finite difference. The one-sided slopes must
-            #    BOTH be 1 there: the identity side by construction, the tail side because
-            #    g'(a) = a^2/a^2 = 1 is exactly what fixed the junction at half the cap.
-            #    A C⁰ clamp — the diagnostic form this replaces — fails this: its slope drops
-            #    from 1 to 0 across |c| = m.
-            h = 1.0e-6 * a
-            for knot in (a, -a)
-                left  = (F(knot, m) - F(knot - h, m)) / h
-                right = (F(knot + h, m) - F(knot, m)) / h
-                @test left ≈ 1.0 rtol = 1.0e-5
-                @test right ≈ 1.0 rtol = 1.0e-5
-                @test abs(right - left) < 1.0e-4          # no jump in the derivative
-            end
-            # No jump anywhere: the FD derivative is continuous across a neighbourhood of the
-            # junction, and matches the closed form a^2/c^2 on the tail.
-            for x in (1.5, 2.0, 4.0, 20.0)
-                c = x * a
-                fd = (F(c + h, m) - F(c - h, m)) / (2.0 * h)
-                @test fd ≈ (a * a) / (c * c) rtol = 1.0e-6
-            end
-            ds = [(F(a + (j + 1) * 1.0e-3 * a, m) - F(a + j * 1.0e-3 * a, m)) / (1.0e-3 * a)
-                  for j in -50:50]
-            @test maximum(abs.(diff(ds))) < 1.0e-2        # slope walks, never jumps
-
-            # 4. ODD, so the cap cannot rectify the sign of the correction — the property
-            #    that keeps it a bound on the DISTANCE BETWEEN TWO REPRESENTATIONS rather
-            #    than a non-negativity constraint on the vapor (which reference/
-            #    FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md forbids).
-            for c in vcat(collect(range(1.0e-9, 50.0 * m; length = 997)), [1.0e6 * m])
-                @test F(-c, m) === -F(c, m)
-            end
-
-            # 5. MONOTONE — a non-monotone saturator would make rho_v move the WRONG WAY as
-            #    the two representations separate further.
-            @test all(diff([F(c, m) for c in cs]) .>= 0.0)
-
-            # 6. dcap = Inf IS THE UNCAPPED BLEND, bitwise: the identity region is the whole
-            #    line. dcap = 0 is the density residual: the correction is annihilated.
-            for c in (0.0, 1.0e-9, -1.0e-9, 1.0, -1.0, 1.0e300, -1.0e300)
-                @test F(c, Inf) === c
-                @test F(c, 0.0) == 0.0
-            end
-        end
-    end
-
-    @testset "vapor blend retrieval: the cap through vapor_retrieval_blend" begin
-        have = isdefined(Scythe, :vapor_retrieval_blend) && isdefined(Scythe, :_blend_saturate)
-        @test have
-        if have
-            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
-            rho_vs = rho_v_sat(290.0, 900.0)
-            dcap = 0.02                              # the shipped physical_params default
-            B = (Q_ss, rho_liq, res_rho_t, args...) ->
-                Scythe.vapor_retrieval_blend(Q_ss, rho_vs, rho_liq, res_rho_t,
-                                             l0, l1, t0, t1, args...)
-
-            # 1. THE DEFAULT IS THE SHIPPED CAP. The trailing argument's default and
-            #    `physical_params[:vapor_blend_dcap]` are the same number, so the unit-scale
-            #    calls above and the model are testing one configuration.
-            @test B(-1.0e-3, 8.0e-3, rho_vs + 5.0e-2) ===
-                  B(-1.0e-3, 8.0e-3, rho_vs + 5.0e-2, dcap)
-
-            # 2. dcap = Inf RECOVERS THE UNCAPPED BLEND BITWISE, at every weight — including
-            #    at corrections far outside any finite cap. This is the A/B lever: the
-            #    detonating configuration is still reachable, exactly.
-            for rho_liq in (0.0, 5.0e-6, 2.0e-5, 8.0e-5, 8.0e-3), s in (0.0, 0.5, 2.5, 4.5)
-                Q = s * rho_vs
-                w = Scythe._vapor_blend_weight(rho_liq, s, l0, l1, t0, t1)
-                for rrt in (rho_vs + 4.0e-5, rho_vs + 4.0e-1, -1.0e-3)
-                    uncapped = w == 0.0 ? rrt :
-                               w == 1.0 ? Q + rho_vs :
-                               (w * (Q + rho_vs)) + ((1.0 - w) * rrt)
-                    @test B(Q, rho_liq, rrt, Inf) === uncapped
-                end
-            end
-
-            # 3. THE BOUND HOLDS POINTWISE, over a sweep that deliberately includes
-            #    separations of the order the NOPRECIP anvil reached (0.46*rho_vs, 23x the
-            #    cap) and the gross detachment w_trust is retained for.
-            for rho_liq in (-3.0e-9, 0.0, 5.0e-6, 2.0e-5, 8.0e-5, 8.0e-3),
-                s in (0.0, 0.5, 1.0, 1.5, 2.5, 3.5, 4.5, 6.0, 1.0e10, 2.0e26),
-                d in (-0.46 * rho_vs, -0.02 * rho_vs, -1.0e-7, 0.0,
-                      1.0e-7, 0.02 * rho_vs, 0.46 * rho_vs, 5.0)
-
-                Q = s * rho_vs
-                rrt = (Q + rho_vs) - d               # so the raw separation is exactly d
-                v = B(Q, rho_liq, rrt)
-                @test abs(v - rrt) <= dcap * rho_vs
-                @test isfinite(v)
-            end
-
-            # 4. GROSS DETACHMENT IS STILL BITWISE res_rho_t. The cap does not displace
-            #    `w_trust`'s one retained job: above t1 the weight is identically zero, so the
-            #    point is handed back to the density residual with no correction at all — not
-            #    a capped one.
-            for rrt in (rho_vs, -1.0e-3, 1.0e-2, 0.0)
-                @test B(1.0e10 * rho_vs, 8.0e-3, rrt) === rrt
-                @test B(-2.0e26 * rho_vs, 8.0e-3, rrt) === rrt
-                @test B(6.0 * rho_vs, 8.0e-3, rrt) === rrt
-            end
-
-            # 5. dcap = 0 DEGENERATES TO :residual, at every weight. Not a special case in the
-            #    code — the identity region collapses to the origin and the tail evaluates to
-            #    ±0.0 — but it is the statement that the cap family spans both endpoints.
-            for rho_liq in (0.0, 2.0e-5, 8.0e-3), s in (0.0, 1.5, 4.5)
-                @test B(s * rho_vs, rho_liq, rho_vs + 4.0e-4, 0.0) === rho_vs + 4.0e-4
-            end
-
-            # 6. THE CAP SCALES WITH rho_vs, not with an absolute density. That is the whole
-            #    point: the failure was a gap that was small in kg/m^3 and large relative to a
-            #    COLLAPSING rho_vs in the rising anvil.
-            for rvs in (1.0e-3, 1.0e-2, 3.0e-2)
-                # s = 0.5 (full trust), res_qss = 0.5*rvs, res_rho_t = -0.5*rvs, so the raw
-                # correction is 1.0*rvs — 100x the cap at every one of these scales.
-                v = Scythe.vapor_retrieval_blend(-0.5 * rvs, rvs, 8.0e-3, -0.5 * rvs,
-                                                 l0, l1, t0, t1, dcap)
-                @test abs(v + 0.5 * rvs) <= dcap * rvs
-                @test abs(v + 0.5 * rvs) > 0.9 * dcap * rvs     # saturated, not merely small
-            end
-        end
-    end
 
     @testset "qss_condensation_rates cloud/rain split" begin
         Tk = 285.0; p_hPa = 900.0; ts = 0.1
@@ -923,18 +487,25 @@ using Springsteel
     @testset "the closure is driven by the CLIPPED drive min(Q_ss, max(rho_v,0) - rho_vs)" begin
         # PROVISIONAL (pending author ratification): the ts-free replacement for the removed
         # vapor ceiling. In the continuum Q_ss IS rho_v - rho_vs and the min never binds;
-        # discretely the prognostic Q_ss can detach from the density budget, and this is the
-        # instantaneous form of the reconciliation qss_relaxation applies on tau_qss.
+        # discretely the two prognostics can detach, and this is the instantaneous form of
+        # the reconciliation `qss_relaxation` applies on tau_qss.
+        #
+        # `rho_v` IS THE PROGNOSTIC VAPOR SLOT now, not a residual of the density budget.
+        # Nothing about the clip changed with it -- these are the same gates against the
+        # same argument -- but what they mean did: the clip compares two transported fields
+        # rather than a transported one against a reassembled one, and `MC_QSS_GAP` is the
+        # run-time census of exactly the quantity it acts on.
         Tk = 285.0; p_hPa = 900.0; ts = 0.1
         N_r = 1.0e-3
         rho_vs = rho_v_sat(Tk, p_hPa)
         rho_d = (100.0 * p_hPa - Rv * Tk * rho_vs) / (Rd * Tk)
         Q_s = Scythe.Q_s_energy(Tk, 100.0 * p_hPa, rho_d, rho_vs / rho_d, 1.0e-3)
 
-        # (i) DRY AIR with a spuriously positive Q_ss: zero rates AND zero nucleation. The
-        #     second half is the load-bearing one — if S came from the raw Q_ss the Twomey
-        #     branch would open (invtau_c > 0) and the clipped, negative drive would then
-        #     evaporate cloud that does not exist and manufacture vapor.
+        # (i) DRY AIR with a spuriously positive Q_ss: zero rates AND zero nucleation. THIS
+        #     GATE IS LOAD-BEARING and survives the prognostic vapor unchanged — if S came
+        #     from the raw Q_ss the Twomey branch would open (invtau_c > 0) and the clipped,
+        #     negative drive would then evaporate cloud that does not exist and manufacture
+        #     vapor.
         for qss in (1.0e-4 * rho_vs, 0.02, 0.5 * rho_vs, 5.0 * rho_vs)
             Qc, Qr, itc, itr = Scythe.qss_condensation_rates(qss, 0.0, 0.0, 0.0, rho_d, Tk,
                                                              p_hPa, Q_s, ts, N_r)
@@ -951,7 +522,7 @@ using Springsteel
         @test Qr < 0.0               # the clipped drive is EVAPORATIVE, which is correct:
                                      # rain in genuinely dry air does evaporate.
 
-        # (ii) INERT where the two representations agree — which is every consistent state,
+        # (ii) INERT where the two prognostics agree — which is every consistent state,
         #      so the clip changes nothing in a well-behaved column. Compared against the
         #      unclipped formula in cloud and in clear air, both signs. NOT bitwise, and it
         #      cannot be: the clip evaluates `(rho_vs + q) - rho_vs`, which differs from `q`
@@ -1009,7 +580,7 @@ using Springsteel
             @test Qc < 0.0 && Qr < 0.0
         end
 
-        # (v) NEGATIVE retrieved vapor (a partition error, not a physical state): the
+        # (v) NEGATIVE vapor (an unresolved spike's undershoot, not a physical state): the
         #     max(rho_v, 0) inside the clip floors the drive at -rho_vs, the maximum-dryness
         #     evaporation drive — the rate must NOT scale with the size of the partition error.
         for rho_v_neg in (-1.0e-6, -7.2e-4, -0.5)
@@ -1220,15 +791,70 @@ using Springsteel
                 Scythe.advance_column(mtile, c, 1)
             end
             # Per-slot tendency tolerances scaled to the slot magnitudes
-            # (p ~ 1e5 Pa, E_t ~ 2e8 J/m^3, densities ~ 1)
+            # (p ~ 1e5 Pa, E_t ~ 2e8 J/m^3, densities ~ 1). Slot 10 is the prognostic
+            # vapor, which is a density like slots 2/3/8/9.
             scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
-                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0)
-            for v in 1:9
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0, 10 => 1.0)
+            for v in 1:10
                 @test maximum(abs.(mtile.expdot_n[:, v])) / scales[v] < 1.0e-9
                 @test maximum(abs.(mtile.var_np1[:, v])) / scales[v] < 1.0e-9
             end
             @test all(isfinite.(mtile.var_np1))
+
+            # THE RECONCILIATION GAP IS IDENTICALLY ZERO AT REST, BITWISE — not small,
+            # zero. That is the property the whole prognostic-vapor construction rests on:
+            # the slot is carried against the DERIVED reference rho_tbar - rho_dbar -
+            # rho_cbar (`Scythe.vapor_slot`), which is the same expression `res_rho_t`
+            # reassembles from the same three fitted columns, so `rho_v_reconcile` returns
+            # an exact 0.0 and the resting base stays a discrete fixed point. Reading the
+            # per-thread scratch is legitimate here: the loop above ran serially on this
+            # thread, so these columns hold the last column's state.
+            S = mtile.mc_scratch[Threads.threadid()]
+            @test S.res_rho_t == S.rho_v          # `==` on Float64, deliberately
+            @test all(iszero, S.VREC)
+            # The vapor slot's tendency is then the phase change and nothing else. On this
+            # SATURATED base that is not identically zero: the fitted rho_vbar and
+            # rho_vs(T_retrieved) differ at the fit level, so the closure runs at ~1e-17 —
+            # the same reference-state crumb the "resting base is untouched by full moist
+            # diffusion" testset documents, and the one `consistent_qss_reference` removes.
+            # What must be exactly zero is the TRANSPORT and the NUDGE, and they are.
+            rv_i = mtile.mc_slots.rho_v
+            @test maximum(abs.(mtile.expdot_n[:, rv_i])) < 1.0e-16
+            @test mtile.expdot_n[:, rv_i] == -mtile.expdot_n[:, 9]   # phase change only
         end
+    end
+
+    """
+    Supersaturate the lower half of every column by `dq` (a mixing-ratio increment), as a
+    PHYSICALLY CONSISTENT water perturbation.
+
+    A Q_ss-only bump is not one and no longer does anything: Q_ss is the microphysics'
+    tracker, the retrieval never reads it, and the condensation drive is clipped by what the
+    VAPOR can actually fund — `min(Q_ss, max(rho_v,0) - rho_vs)`. Adding supersaturation
+    means adding water, so the seed moves rho_v and rho_t together and compensates p and E_t
+    (`dp = R_v T dm`, `dE_t = (C_vv T + g z) dm`) so the temperature retrieval is untouched
+    and the state stays at rest. This is the same T-invariant vapor seed the water-diffusion
+    and boundary-layer testsets use.
+    """
+    function supersaturate_lower_half!(patch, mtile, model, col, dq)
+        kDim = model.grid_params.kDim
+        vars = model.grid_params.vars
+        rho_dbar = Springsteel.ref_rho_d(mtile.ref_state)[:, 1]
+        z = Scythe.getGridpoints(patch)[1:kDim, 2]
+        for i in 1:size(patch.physical, 1)
+            k = mod1(i, kDim)
+            k <= div(kDim, 2) || continue
+            dm = rho_dbar[k] * dq
+            Tref = col.Tk[k]
+            patch.physical[i, vars["Q_ss"], 1] = dm
+            patch.physical[i, vars["rho_v"], 1] = dm
+            patch.physical[i, vars["rho_t"], 1] = dm
+            patch.physical[i, vars["p"], 1] = Rv * Tref * dm
+            patch.physical[i, vars["E_t"], 1] = ((Cvv * Tref) + (Scythe.gravity * z[k])) * dm
+        end
+        spectralTransform!(patch)
+        gridTransform!(patch)
+        return patch
     end
 
     @testset "condensation closure at rest" begin
@@ -1238,18 +864,8 @@ using Springsteel
             vars = model.grid_params.vars
             qss_i = vars["Q_ss"]
 
-            # Supersaturate the lower half of every column by a small, realistic amount
-            rho_dbar = Springsteel.ref_rho_d(mtile.ref_state)[:, 1]
-            dq = 5.0e-5
             npts = size(patch.physical, 1)
-            for i in 1:npts
-                k = mod1(i, kDim)
-                if k <= div(kDim, 2)
-                    patch.physical[i, qss_i, 1] = rho_dbar[k] * dq
-                end
-            end
-            spectralTransform!(patch)
-            gridTransform!(patch)
+            supersaturate_lower_half!(patch, mtile, model, col, 5.0e-5)
 
             ncols = div(npts, kDim)
             for c in 1:ncols
@@ -1919,11 +1535,14 @@ using Springsteel
         @test rho_d * Cvd * (Cpd / Cvd) * (Tk / theta_d) ≈ rho_d * Cpd * exner rtol=1e-12
     end
 
-    @testset "qss reconciliation drives Q_ss to the diagnosed supersaturation" begin
-        # Q_ss is redundant now that rho_c is prognostic: the water masses already fix
-        # the vapor. qss_relaxation is what keeps the prognostic tracker and the
-        # mass-implied value from drifting apart (and it is thermodynamically INERT,
-        # because retrieve_temperature does not read Q_ss at all).
+    @testset "qss reconciliation drives Q_ss to the prognostic vapor's supersaturation" begin
+        # Q_ss is redundant now that EVERY water species is prognostic: rho_v - rho_vs(T,p)
+        # already fixes it. `qss_relaxation` is what keeps the prognostic tracker and the
+        # prognostic vapor from drifting apart (and it is thermodynamically INERT, because
+        # retrieve_temperature does not read Q_ss at all). Its `rho_v` argument is the
+        # PROGNOSTIC SLOT — feeding it the retrieval was once forbidden, because one branch
+        # of the retrieval was built out of Q_ss + rho_vs and the term self-annihilated; a
+        # transported slot is not that by construction, so the anchor is real.
         Tk, p_hPa = 290.0, 900.0
         rho_vs = rho_v_sat(Tk, p_hPa)
         tau = 10.0
@@ -1950,13 +1569,100 @@ using Springsteel
         end
     end
 
+    @testset "rho_v_reconcile: the second link of the chain" begin
+        # The vapor nudge, `(res_rho_t - rho_v)/tau_rec`. rho_t stays prognostic as the
+        # conservation anchor, so the set carries one redundancy and its whole content is
+        # the gap delta = res_rho_t - rho_v. This removes it at rate 1/tau_rec — a drift
+        # correction, never a projection back onto the budget.
+        tau_rec = 10.0
+
+        # On target: EXACTLY zero, whatever the value. Nothing to remove and no rounding to
+        # introduce, because the two arguments are the same double.
+        for x in (0.0, 1.0e-8, 1.2e-2, -3.0e-4)
+            @test Scythe.rho_v_reconcile(x, x, tau_rec) === 0.0
+        end
+
+        # Off target: first-order relaxation at 1/tau_rec, signed toward res_rho_t.
+        @test Scythe.rho_v_reconcile(1.2e-2, 1.1e-2, tau_rec) ≈ 1.0e-3 / tau_rec
+        @test Scythe.rho_v_reconcile(1.1e-2, 1.2e-2, tau_rec) ≈ -1.0e-3 / tau_rec
+        for (res, rv) in ((1.0e-2, 9.0e-3), (5.0e-3, 6.0e-3), (0.0, -1.0e-6))
+            @test Scythe.rho_v_reconcile(res, rv, tau_rec) ≈ (res - rv) / tau_rec
+        end
+
+        # The RATE is 1/tau_rec and nothing else: halving tau doubles it exactly, and the
+        # law is ts-free (no timestep appears in it anywhere).
+        d = 1.0e-3
+        @test Scythe.rho_v_reconcile(1.2e-2, 1.2e-2 - d, 5.0) ===
+              2.0 * Scythe.rho_v_reconcile(1.2e-2, 1.2e-2 - d, 10.0)
+
+        # It is ODD in the gap and carries no floor: a negative vapor is nudged UP toward
+        # the budget rather than clamped, which is the standing rule that negative water is
+        # a resolution diagnostic and never a state to enforce.
+        @test Scythe.rho_v_reconcile(0.0, -1.0e-3, tau_rec) > 0.0
+        @test Scythe.rho_v_reconcile(1.0e-3, 0.0, tau_rec) ===
+              -Scythe.rho_v_reconcile(-1.0e-3, 0.0, tau_rec)
+    end
+
+    @testset "the vapor nudge decays a seeded gap at 1/tau_rec and is inert in T" begin
+        # The nudge ON A COLUMN: seed delta != 0 by moving the vapor slot alone (which
+        # leaves rho_t, rho_d and rho_c untouched, so `res_rho_t` is unchanged and the whole
+        # of delta is the seed), then check the tendency it produces and that the
+        # temperature retrieval does not notice.
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            kDim = model.grid_params.kDim
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            rv_i = mtile.mc_slots.rho_v
+            tau_rec = get(model.physical_params, :tau_rho_v_rec, 10.0)
+
+            # The resting temperature field, for the inertness check below.
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+            T_rest = copy(mtile.mc_scratch[Threads.threadid()].Tk)
+
+            # A uniform seed: rho_v' -> rho_v' - d everywhere. Written to the mish and NOT
+            # refit, so the seed is exactly d at every point (a refit would smooth it and
+            # the expected tendency would stop being a single number).
+            d = 1.0e-5
+            for i in 1:npts
+                patch.physical[i, rv_i, 1] -= d
+            end
+
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 2)
+            end
+            S = mtile.mc_scratch[Threads.threadid()]
+
+            # delta is the seed, to the last bit: nothing else moved.
+            @test all(x -> x ≈ d, S.res_rho_t .- S.rho_v)
+            # ...and the nudge is delta/tau_rec, restoring (positive: vapor was removed).
+            @test all(x -> x ≈ d / tau_rec, S.VREC)
+            @test all(>(0.0), S.VREC)
+
+            # THERMODYNAMICALLY INERT. retrieve_temperature reads rho_t, the condensed
+            # masses and E_t — never the vapor — so a gap of this size must not move T at
+            # all. Bitwise, because the retrieval's inputs are the same doubles.
+            @test S.Tk == T_rest
+            # The conserved slots take nothing from it either.
+            @test maximum(abs.(mtile.expdot_n[:, model.grid_params.vars["rho_t"]])) == 0.0
+            @test maximum(abs.(mtile.expdot_n[:, model.grid_params.vars["rho_d"]])) == 0.0
+            @test maximum(abs.(mtile.expdot_n[:, model.grid_params.vars["E_t"]])) == 0.0
+        end
+    end
+
     @testset "clamp_water! is a conservative phase change, not a mass source" begin
         # The floor is opt-in (options[:clamp_water]); by default clamp_water! only
         # MEASURES. These two testsets exercise the floor itself, so they enable it.
-        # The positivity floor moves the deficit between the prognostic condensate and
-        # the RESIDUAL vapor, so total water and E_t are untouched and the retrieval
-        # supplies exactly the latent heat of the implied phase change. This is the
-        # property that makes flooring negative water legitimate rather than a fudge.
+        # The positivity floor moves the deficit out of the prognostic condensates while
+        # leaving rho_t, rho_d and E_t untouched, so it only ever moves the PARTITION and
+        # the retrieval supplies exactly the latent heat of the implied phase change. This
+        # is the property that makes flooring negative water legitimate rather than a fudge.
+        # The vapor's half of that phase change now arrives through the reconciliation
+        # nudge (the vapor is prognostic and this function does not touch it), so the
+        # partition closes on tau_rec instead of within the step; what is asserted below —
+        # total water conserved exactly — is unaffected, and is the load-bearing claim.
         mktempdir() do tmpdir
             mtile, patch, model, _ = make_mc_mtile(tmpdir)
             model.options[:clamp_water] = true
@@ -1997,8 +1703,8 @@ using Springsteel
     end
 
     @testset "clamp_water! caps condensate by the water present" begin
-        # Rule 2: rho_c + rho_r may not exceed rho_w (i.e. the residual vapor may not go
-        # negative). The excess comes out of cloud first, then rain.
+        # Rule 2: rho_c + rho_r may not exceed rho_w (i.e. the water budget may not imply a
+        # negative vapor). The excess comes out of cloud first, then rain.
         mktempdir() do tmpdir
             mtile, patch, model, _ = make_mc_mtile(tmpdir)
             model.options[:clamp_water] = true
@@ -2021,7 +1727,7 @@ using Springsteel
             rho_r = mtile.var_np1[1, rr_i]
             @test rho_c >= 0.0 && rho_r >= 0.0
             @test rho_c + rho_r <= rho_w1 + 1.0e-18
-            # Vapor is exactly zero, not negative: the cap binds
+            # The implied vapor is exactly zero, not negative: the cap binds
             @test (rho_w1 - rho_c - rho_r) ≈ 0.0 atol=1e-18
         end
     end
@@ -2749,7 +2455,12 @@ using Springsteel
             mK, pK, modK, _ = make_mc_mtile(tmpdir; dry=true,
                                             Kvdiff=75.0, Kvdiff_water=75.0, Khdiff=0.0)
             step_mc!(mK, pK, modK, 3)
-            for slot in (1, 2, 3, 4, 5, 6, 8)
+            # Slot 10 is the prognostic VAPOR, which now has a diffusion leg of its own
+            # in `_diffusion_water_step!` — its own AI2*/AM2 staging and its own
+            # factorization — instead of being the implied remainder of the other three.
+            # Its resting perturbation is zero for the same reason theirs is, and the leg
+            # must not disturb that.
+            for slot in (1, 2, 3, 4, 5, 6, 8, 10)
                 @test maximum(abs.(pK.physical[:, slot, 1])) == 0.0
             end
             # Q_ss carries a pre-existing ~1e-18 tracking crumb (file Tbar vs retrieved-T
@@ -2767,7 +2478,7 @@ using Springsteel
             step_mc!(mK, pK, modK, 3)
             @test maximum(abs.(pK.physical[:, 1, 1])) < 1.0e-9    # p [Pa]
             @test maximum(abs.(pK.physical[:, 6, 1])) < 1.0e-8    # E_t [J/m^3]
-            for slot in (2, 3, 4, 5, 7, 8)
+            for slot in (2, 3, 4, 5, 7, 8, 10)
                 @test maximum(abs.(pK.physical[:, slot, 1])) < 1.0e-10
             end
         end
@@ -2815,7 +2526,8 @@ using Springsteel
                     vars1 = mod1.grid_params.vars
                     @test maximum(abs.(p1.physical[:, vars1["p"], 1])) < 1.0e-9
                     @test maximum(abs.(p1.physical[:, vars1["E_t"], 1])) < 1.0e-6
-                    for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c")
+                    for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c",
+                               "rho_v")
                         @test maximum(abs.(p1.physical[:, vars1[nm], 1])) < 1.0e-12
                     end
                 end
@@ -2842,24 +2554,24 @@ using Springsteel
     end
 
     # ──────────────────────────────────────────────
-    # 8b. Regime-blended vapor retrieval, ON THE MODEL — still written before src/ knows it
+    # 8b. A running cloudy column: the shared harness
     # ──────────────────────────────────────────────
-    # The unit-level specification is in section 4b. These four testsets pin the parts that
-    # only a running column can show: that the blend is what an unconfigured model runs (and
-    # that `:residual` still opts out of it), that the reconciliation is anchored to the
-    # DENSITY residual and not to the blended vapor, that the resting fixed point survives,
-    # and that the blend is a PARTITION rather than a mass source.
+    # This section used to hold the regime-blended vapor retrieval's model-level gates. The
+    # blend is retired — the vapor is a prognostic slot, so there is no diagnostic left to
+    # choose a representation for — and what survives it is the HARNESS: a small saturated
+    # RiRk patch that actually makes cloud, used by the condensate-floor, condensate- and
+    # rain-transform, and prognostic-vapor testsets below.
 
     """
     Small RiRk moist patch on a saturated cloudy base, with a deterministic broadband w
-    seed. `retrieval` is the `options[:vapor_retrieval]` value, or `nothing` to leave the
-    option ABSENT — absent and `:blend` must be the same run bitwise (see the testset
-    below), since `:blend` is the default. The
-    geometry is RiRk in both directions because the mish points are then Gauss nodes on
-    both legs, which is what makes the exact mass quadrature in the conservation testset
-    possible (same argument as the positivity testset's `cellw`).
+    seed. The geometry is RiRk in both directions because the mish points are then Gauss
+    nodes on both legs, which is what makes the exact mass quadrature in the conservation
+    testsets possible (same argument as the positivity testset's `cellw`).
+
+    `extra_opts` is merged into `options` — how a caller asks for a transform, a floor, or a
+    retired key it expects to be refused.
     """
-    function vapor_blend_rirk(tmpdir, tag; retrieval = nothing)
+    function cloudy_rirk(tmpdir, tag; extra_opts = Dict{Symbol,Any}())
         vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
         side_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
@@ -2869,14 +2581,10 @@ using Springsteel
             kMin = 0.0, kMax = 4.0e3, num_cells_k = 8,
             BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc,
             vars = vars)
-        ref_file = joinpath(tmpdir, "vapor_blend_$(tag).ref")
-        opts = Dict{Symbol,Any}(:semiimplicit => true,
-                                :exact_reference_state => true,
-                                :precipitation => false)
-        # ABSENT is not a synonym for either value here: "no option" is the state every
-        # existing configuration file is in, and it is the one that has to stay bitwise
-        # equal to the shipped default (`:blend` since 2026-07-29).
-        retrieval === nothing || (opts[:vapor_retrieval] = retrieval)
+        ref_file = joinpath(tmpdir, "cloudy_$(tag).ref")
+        opts = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                      :exact_reference_state => true,
+                                      :precipitation => false), extra_opts)
         model = ModelParameters(
             ts = 0.25, integration_time = 5.0, output_interval = 5.0,
             equation_set = "moist_compressible_XZ",
@@ -2907,8 +2615,8 @@ using Springsteel
         return mtile, patch, model, gp
     end
 
-    """Advance every column of an RiRk vapor-blend patch for `nsteps` steps."""
-    function vapor_blend_run!(mtile, patch, gp, nsteps)
+    """Advance every column of an RiRk cloudy patch for `nsteps` steps."""
+    function cloudy_run!(mtile, patch, gp, nsteps)
         kDim = gp.kDim
         ncols = div(size(patch.physical, 1), kDim)
         for t in 1:nsteps
@@ -2921,256 +2629,250 @@ using Springsteel
         return patch
     end
 
-    @testset "vapor retrieval: an absent option is bitwise :blend, and :residual opts out" begin
-        # The gate on the DEFAULT (flipped to `:blend` 2026-07-29, Stage 5). Two claims, and
-        # the second is what keeps the first from being vacuous:
-        #
-        #   (a) leaving the key ABSENT — the state of every configuration file that says
-        #       nothing — is the blend to the LAST BIT, not "agrees to 1e-14".
-        #   (b) `:residual` still selects the pre-blend density-budget route, and on THIS
-        #       state that is a genuinely different run. The base is saturated with
-        #       rho_c ~ 1.1e-3 kg/m^3, three decades above l1 = 1e-4, so w_cloud = 1 and the
-        #       blend is fully active; asserting equality here would be asserting the option
-        #       does nothing.
-        have = isdefined(Scythe, :vapor_retrieval_blend)
-        @test have                   # ← the Stage 2 gate
+
+    # ──────────────────────────────────────────────
+    # 8c. The PROGNOSTIC VAPOR (Stage A)
+    # ──────────────────────────────────────────────
+    # The vapor is a slot, not a retrieval. What that has to buy, and what it must not cost:
+    #
+    #   * registration — it is in the CONSTANTS, so every list built by enumerating them
+    #     carries it, and a `vars` dict built from a stale name list must fail LOUDLY at
+    #     tile creation rather than writing the vapor tendency into whatever is at that index;
+    #   * conservation — condensation is now an equal and opposite pair of SLOT sources, and
+    #     rho_t must not move at all;
+    #   * the nudge — a drift correction on tau_rec that is thermodynamically inert (its own
+    #     testset, up with `qss_relaxation`);
+    #   * the tombstone — a configuration that still selects a retired retrieval must stop.
+
+    @testset "rho_v is registered in the canonical slot lists" begin
+        # In `MC_VARS` / `MC_VARS_CYL`, NOT in `mc_var_names`'s optional block: the vapor is
+        # prognostic in every configuration of this set, and the model_tests / tc configs
+        # that enumerate the constants literally have to pick it up with no edit.
+        @test Scythe.MC_VARS[10] == "rho_v"
+        @test Scythe.MC_VARS_CYL[11] == "rho_v"
+        @test length(Scythe.MC_VARS) == 10
+        @test length(Scythe.MC_VARS_CYL) == 11
+        # The appended OPTIONAL slots shift out by one behind it.
+        base = Dict{Symbol,Any}()
+        two = Dict{Symbol,Any}(:rain_moments => 2)
+        @test Scythe.mc_var_names(base) == Scythe.MC_VARS
+        @test Scythe.mc_var_names(base; cyl = true) == Scythe.MC_VARS_CYL
+        @test findfirst(==("n_r"), Scythe.mc_var_names(two)) == 11
+        @test findfirst(==("n_r"), Scythe.mc_var_names(two; cyl = true)) == 12
+
+        # `mc_slot` resolves it by name on both geometries.
+        vars_xz = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+        vars_cyl = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS_CYL))
+        @test Scythe.mc_slot(vars_xz, "rho_v") == 10
+        @test Scythe.mc_slot(vars_cyl, "rho_v") == 11
+        # ...and a STALE list has no slot for it, which must throw rather than resolve to 0.
+        stale = Dict(v => i for (i, v) in
+                     enumerate(["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss",
+                                "rho_r", "rho_c"]))
+        @test_throws ErrorException Scythe.mc_slot(stale, "rho_v")
+    end
+
+    @testset "a stale vars dict fails at tile creation, not later" begin
+        # `mc_slots` resolves rho_v with the THROWING lookup for every mc set, so a
+        # configuration built from a pre-Stage-A name list stops at `createModelTile`. The
+        # alternative — a 0 index, the optional-slot convention — would have the vapor
+        # tendency written nowhere and the run proceed.
         mktempdir() do tmpdir
-            mA, pA, moA, gpA = vapor_blend_rirk(tmpdir, "absent")
-            mB, pB, moB, gpB = vapor_blend_rirk(tmpdir, "blend"; retrieval = :blend)
-            mR, pR, moR, gpR = vapor_blend_rirk(tmpdir, "residual"; retrieval = :residual)
-            @test !haskey(moA.options, :vapor_retrieval)
-            @test moB.options[:vapor_retrieval] === :blend
-            @test moR.options[:vapor_retrieval] === :residual
-
-            nsteps = 12
-            vapor_blend_run!(mA, pA, gpA, nsteps)
-            vapor_blend_run!(mB, pB, gpB, nsteps)
-            vapor_blend_run!(mR, pR, gpR, nsteps)
-
-            @test all(isfinite.(pA.physical))
-            @test all(isfinite.(pR.physical))
-            # The seed actually did something — otherwise "bitwise equal" is vacuous.
-            @test maximum(abs.(pA.physical[:, gpA.vars["Q_ss"], 1])) > 0.0
-            # (a) absent === :blend, bitwise
-            @test pA.physical == pB.physical
-            @test pA.spectral == pB.spectral
-            # (b) :residual is a different integration on this cloudy state, bounded by the
-            #     blend's own correction cap.
-            #
-            #     This bound USED to be "within 1% of |Q_ss|", i.e. the two retrievals were a
-            #     nearby pair. That is no longer true, and the reason is load-bearing: the
-            #     condensation closure now reads the retrieved vapor through the DRIVE clip
-            #     `min(Q_ss, rho_v - rho_vs)` (see qss_condensation_rates), where before it
-            #     read it only through a vapor ceiling that was almost never active. So the
-            #     retrieval choice is now FIRST-ORDER in the rate, and in near-saturated air
-            #     — where |Q_ss| is small and the partition gap is not — the gap dominates the
-            #     drive outright. Here |Q_ss| ~ 2.3e-7 while the blend may open a gap of
-            #     dcap*rho_vs ~ 2.9e-4, three decades larger, so the two runs' Q_ss fields
-            #     diverge by O(|Q_ss|) and a 1% bound is unmeetable BY CONSTRUCTION.
-            #
-            #     What still holds — and is the honest statement of "a different integration,
-            #     not a different equation set" — is that the divergence stays inside the
-            #     correction the blend is permitted to make.
-            @test pA.physical != pR.physical
-            qi = gpA.vars["Q_ss"]
-            dq = maximum(abs.(pA.physical[:, qi, 1] .- pR.physical[:, qi, 1]))
-            @test dq > 0.0
-            z_col = Scythe.getGridpoints(pA)[1:gpA.kDim, end]
-            rvs_max = maximum(saturated_cloudy_column_mc(z_col).rho_v)
-            dcap = get(moA.physical_params, :vapor_blend_dcap, 0.02)
-            @test dq <= dcap * rvs_max
+            vars = Dict(v => i for (i, v) in
+                        enumerate(["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss",
+                                   "rho_r", "rho_c"]))
+            scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+            wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+            gp = GridParameters(geometry = "RZ", num_cells = 8,
+                iMin = 0.0, iMax = 2000.0, kMin = 0.0, kMax = 2000.0, kDim = 16,
+                BCL = wall_bc, BCR = wall_bc, BCB = wall_bc, BCT = wall_bc, vars = vars)
+            patch = createGrid(gp)
+            z = Scythe.getGridpoints(patch)[1:gp.kDim, 2]
+            col = dry_adiabatic_column_mc(z)
+            ref_file = joinpath(tmpdir, "stale.ref")
+            Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+            model = ModelParameters(
+                ts = 0.1, integration_time = 1.0, output_interval = 1.0,
+                equation_set = "moist_compressible_XZ",
+                ref_state_file = ref_file, grid_params = gp,
+                physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0),
+                options = Dict{Symbol,Any}(:semiimplicit => true,
+                                           :exact_reference_state => true))
+            patch.physical .= 0.0
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            hrm = sparse(Int64[], Int64[], Float64[],
+                         size(patch.spectral, 1), size(patch.spectral, 2))
+            @test_throws ErrorException createModelTile(patch, patch, model, hrm)
         end
     end
 
-    @testset "vapor retrieval: the reconciliation stays anchored to res_rho_t" begin
-        # THE ONE PLACE THE BLENDED VAPOR MUST NOT BE USED. qss_relaxation pulls the
-        # prognostic Q_ss toward the vapor the WATER MASSES imply:
-        #
-        #     QSSREL = -(Q_ss - (rho_v - rho_vs)) / tau_qss
-        #
-        # If `rho_v` there is the BLENDED vapor then wherever the blend trusts res_qss the
-        # term reads -(Q_ss - ((Q_ss + rho_vs) - rho_vs))/tau ≡ 0. It SELF-ANNIHILATES, and
-        # the single mechanism tying Q_ss to the density budget vanishes exactly where it is
-        # load-bearing — the POSITIVITY=1 run reaches |Q_ss|/rho_vs ~ 2e26 WITH the
-        # reconciliation running. So slot 7 is fed S.res_rho_t, never S.rho_v.
-        #
-        # THE DISCRIMINATOR. On a consistent-qss saturated base at rest with condensation
-        # switched off, slot 7's ENTIRE tendency is QSSREL: u = w = 0 so ADV = 0 and div = 0,
-        # which kills -Q_ss*div and every term of SATF; the diffusivities are zero so
-        # QDOT_TH = 0; and Qdot = Qdot_r = 0. Perturb Q_ss by dQ on a base whose cloud is
-        # thick (rho_liq ~ 9e-4 >> l1) and whose s = dQ/rho_vs stays under t0, so w = 1, and
-        # the two candidate anchors are 100 % apart:
-        #
-        #     anchored to res_rho_t (= rho_vs) : -(dQ - 0) /tau = -dQ/tau
-        #     anchored to the blend (= rho_vs + dQ) : -(dQ - dQ)/tau = 0
-        #
-        # The assertion is on the tendency itself, so it holds whatever helper Stage 2
-        # factors the retrieval into.
-        tau = 10.0
-        dQ = 5.0e-3        # kg/m^3; s = dQ/rho_vs runs 0.35 (bottom) to 0.65 (top) < t0 = 2
-        function qssrel_probe(tmpdir, mode)
-            mtile, patch, model, col = make_mc_mtile(tmpdir; consistent_qss = true,
-                                                     q_l = 1.0e-3, tau_qss = tau)
-            # Not physics — a diagnostic switch, and the whole point here: with the phase
-            # change off, slot 7 carries nothing but the reconciliation.
-            model.options[:condensation] = false
-            mode === nothing || (model.options[:vapor_retrieval] = mode)
-            gp = model.grid_params
-            qss_i = gp.vars["Q_ss"]
-            patch.physical[:, qss_i, 1] .= dQ
-            spectralTransform!(patch)
-            gridTransform!(patch)
-            ncols = div(size(patch.physical, 1), gp.kDim)
+    @testset "positivity_reference_profile serves rho_v the DERIVED profile" begin
+        # The vapor is a PERTURBATION, so a constant zero bound on it would pin the field at
+        # or above its reference — the same trap rho_c is protected from. Its offset is the
+        # DERIVED rho_tbar - rho_dbar - rho_cbar, which is what the slot is carried against;
+        # reading Springsteel's independently fitted ref_rho_v here would put a fit-level
+        # disagreement into the bound.
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            ref = mtile.ref_state
+            prof = Scythe.positivity_reference_profile("rho_v", ref)
+            @test prof !== nothing
+            expected = Springsteel.ref_rho_t(ref)[:, 1] .-
+                       Springsteel.ref_rho_d(ref)[:, 1] .-
+                       Springsteel.ref_rho_c(ref)[:, 1]
+            @test collect(prof) == expected                # bitwise, not approximately
+            # ...and it is the SAME profile mc_reference_diagnostics built for the driver.
+            @test collect(prof) == mtile.mc_ref_diag.rho_vbar
+        end
+    end
+
+    @testset "options[:vapor_retrieval] is a tombstone" begin
+        # The retired retrieval selector. A configuration that still sets it was tuned
+        # against a representation this equation set no longer has, so it must stop rather
+        # than run under a silently different one.
+        mktempdir() do tmpdir
+            m, p, mod, gp = cloudy_rirk(tmpdir, "tomb";
+                                        extra_opts = Dict{Symbol,Any}(
+                                            :vapor_retrieval => :blend))
+            @test_throws ErrorException cloudy_run!(m, p, gp, 1)
+        end
+        mktempdir() do tmpdir
+            m, p, mod, gp = cloudy_rirk(tmpdir, "tomb_res";
+                                        extra_opts = Dict{Symbol,Any}(
+                                            :vapor_retrieval => :residual))
+            @test_throws ErrorException cloudy_run!(m, p, gp, 1)
+        end
+        # The blend itself is gone with the option.
+        @test !isdefined(Scythe, :vapor_retrieval_blend)
+        @test !isdefined(Scythe, :_vapor_blend_weight)
+        @test !isdefined(Scythe, :_blend_saturate)
+        @test !isdefined(Scythe, :_blend_smoothstep)
+    end
+
+    @testset "condensation moves rho_v and rho_c equal and opposite, rho_t untouched" begin
+        # THE CONSERVATION STATEMENT of the prognostic vapor. Phase change used to move one
+        # slot and let the residual absorb the other side; it is now a pair of slot sources,
+        # and rho_t — the conservation anchor — takes NOTHING from it.
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            rv_i = mtile.mc_slots.rho_v
+            rc_i = vars["rho_c"]
+
+            # The T-invariant supersaturation seed — a live cloud-channel condensation with
+            # no rain, no sedimentation and no wind.
+            supersaturate_lower_half!(patch, mtile, model, col, 5.0e-5)
             for c in 1:ncols
                 Scythe.advance_column(mtile, c, 1)
             end
-            # Read Q_ss BACK from the mish: the spline round-trip is what the kernel saw,
-            # so the expected QSSREL is pointwise exact rather than "dQ up to the fit".
-            return (Q_ss = copy(patch.physical[:, qss_i, 1]),
-                    e7 = copy(mtile.expdot_n[:, qss_i]), col = col)
-        end
 
-        # The shipped route first: this is the calibration of the assertion, and it must
-        # pass BEFORE Stage 2 as well as after.
+            perturbed = [i for i in 1:npts if mod1(i, kDim) <= div(kDim, 2)]
+            @test all(mtile.expdot_n[perturbed, rc_i] .> 0.0)     # cloud is being made
+            @test all(mtile.expdot_n[perturbed, rv_i] .< 0.0)     # ...out of the vapor
+            # EQUAL AND OPPOSITE. The vapor's source is -Qdot and the cloud's is +Qdot, both
+            # accumulated from the same rate, so they cancel exactly; the only thing left in
+            # the sum is the reconciliation nudge, and on this consistent seed that is
+            # twelve decades below the phase change itself.
+            scale = maximum(abs.(mtile.expdot_n[:, rc_i]))
+            @test scale > 0.0
+            @test maximum(abs.(mtile.expdot_n[:, rv_i] .+ mtile.expdot_n[:, rc_i])) <
+                  1.0e-8 * scale
+            # The conserved anchor does not move.
+            @test maximum(abs.(mtile.expdot_n[:, vars["rho_t"]])) == 0.0
+            @test maximum(abs.(mtile.expdot_n[:, vars["rho_d"]])) == 0.0
+            @test maximum(abs.(mtile.expdot_n[:, vars["E_t"]])) == 0.0
+        end
+    end
+
+    @testset "sedimentation leaves the reconciliation gap unchanged" begin
+        # Falling rain moves rho_r AND rho_t by the SAME fitted flux divergence, and moves
+        # neither the vapor nor the cloud. `res_rho_t = rho_t - rho_d - rho_liq - rho_ice`
+        # is therefore invariant under it, and so is delta = res_rho_t - rho_v: a
+        # sedimentation-only step must not feed the nudge at all.
         mktempdir() do tmpdir
-            r = qssrel_probe(tmpdir, :residual)
-            @test maximum(abs.(r.e7 .+ (r.Q_ss ./ tau))) < 1.0e-6 * dQ / tau
-            @test minimum(abs.(r.e7)) > 0.5 * dQ / tau          # nowhere near annihilated
-        end
+            mtile, patch, model, col = make_mc_mtile(tmpdir; precipitation=true, q_l=0.0,
+                extra_options = Dict{Symbol,Any}(:condensation => false))
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            rv_i = mtile.mc_slots.rho_v
+            rr_i = vars["rho_r"]
 
-        have = isdefined(Scythe, :vapor_retrieval_blend) &&
-               isdefined(Scythe, :_vapor_blend_weight)
-        @test have                   # ← the Stage 2 gate
-        if have
-            l0, l1, t0, t1 = 1.0e-6, 1.0e-4, 2.0, 5.0
-            mktempdir() do tmpdir
-                r = qssrel_probe(tmpdir, :blend)
-                # 1. The state really is in the full-trust regime, so the blend really does
-                #    differ from res_rho_t here. Without this the assertion below could pass
-                #    for the wrong reason (a blend that quietly returned res_rho_t).
-                k = div(length(r.col.z), 2)
-                rho_vs_k = rho_v_sat(r.col.Tk[k], r.col.p_Pa[k] / 100.0)
-                rho_liq_k = r.col.rho_c[k]
-                s_k = dQ / rho_vs_k
-                @test rho_liq_k > l1
-                @test s_k < t0
-                @test Scythe._vapor_blend_weight(rho_liq_k, s_k, l0, l1, t0, t1) === 1.0
-                # AMENDED WITH THE CAP (Stage 2b): dQ = 5e-3 is ~35x the shipped cap
-                # 0.02*rho_vs_k, so the shipped retrieval SATURATES here rather than copying
-                # res_qss. Both halves of the original claim are kept and separated: the
-                # uncapped blend still returns res_qss bit-for-bit, and the shipped one still
-                # makes a real import (it is NOT quietly returning res_rho_t, which is the
-                # failure mode this probe exists to exclude).
-                @test Scythe.vapor_retrieval_blend(dQ, rho_vs_k, rho_liq_k, rho_vs_k,
-                                                   l0, l1, t0, t1, Inf) === dQ + rho_vs_k
-                v_cap = Scythe.vapor_retrieval_blend(dQ, rho_vs_k, rho_liq_k, rho_vs_k,
-                                                     l0, l1, t0, t1)
-                @test v_cap > rho_vs_k                          # a real import
-                @test v_cap - rho_vs_k <= 0.02 * rho_vs_k       # ... bounded by the cap
-                @test v_cap - rho_vs_k > 0.9 * 0.02 * rho_vs_k  # ... and saturated
-                # 2. ... and the reconciliation is unmoved by that: still -dQ/tau, still not
-                #    the self-annihilating zero.
-                @test maximum(abs.(r.e7 .+ (r.Q_ss ./ tau))) < 1.0e-6 * dQ / tau
-                @test minimum(abs.(r.e7)) > 0.5 * dQ / tau
+            # A T-invariant rain bump: rho_r, rho_t and E_t move together, so the water
+            # PARTITION is consistent to begin with and delta starts at the fit floor.
+            seed_rain_bump!(patch, Scythe.getGridpoints(patch), col, kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
             end
+
+            # The run is live: rain is falling.
+            @test maximum(abs.(mtile.expdot_n[:, rr_i])) > 0.0
+            # rho_t receives the same flux divergence, so it moves too...
+            @test maximum(abs.(mtile.expdot_n[:, vars["rho_t"]])) > 0.0
+            # ...and slot 3 and slot 8 receive IDENTICAL discrete numbers from it, which is
+            # what makes res_rho_t invariant under sedimentation. (With condensation off,
+            # both slots carry only -Fr_z here: nothing is moving and there is no phase
+            # change, so the two expressions reduce to the same term.)
+            @test mtile.expdot_n[:, vars["rho_t"]] == mtile.expdot_n[:, rr_i]
+            # THE POINT: the vapor takes nothing from sedimentation. No phase change (the
+            # closure is switched off), and no nudge to feed, because the falling mass
+            # leaves the reconciliation gap where it was. What is left is the fit-level
+            # disagreement between the separately fitted rho_t and rho_r bumps, twelve
+            # decades under the rain tendency itself.
+            @test maximum(abs.(mtile.expdot_n[:, rv_i])) <
+                  1.0e-10 * maximum(abs.(mtile.expdot_n[:, rr_i]))
         end
     end
 
-    @testset "vapor retrieval: the resting fixed point is blend-invariant" begin
-        # The companion of the consistent_qss gate above. At rest the reference construction
-        # makes Q_ssbar EXACTLY the diagnosed supersaturation, i.e. res_qss = Q_ssbar + rho_vs
-        # is res_rho_t up to the rounding of one add — so the blend is the IDENTITY there,
-        # whatever weight it computes, and a base that was a discrete fixed point stays one.
-        # If enabling :blend moves the resting state, the blend is not a partition of the
-        # same vapor and everything downstream of it is suspect.
-        have = isdefined(Scythe, :vapor_retrieval_blend)
-        @test have                   # ← the Stage 2 gate
-        for (dry, q_l) in ((true, 0.0), (false, 1.0e-3))
-            res = mktempdir() do tmpdir
-                m, p, mod, _ = make_mc_mtile(tmpdir; dry = dry, q_l = q_l,
-                                             consistent_qss = true)
-                mod.options[:vapor_retrieval] = :residual
-                step_mc!(m, p, mod, 5)
-                (copy(p.physical), mod.grid_params.vars)
-            end
-            blend = mktempdir() do tmpdir
-                m, p, mod, _ = make_mc_mtile(tmpdir; dry = dry, q_l = q_l,
-                                             consistent_qss = true)
-                mod.options[:vapor_retrieval] = :blend
-                step_mc!(m, p, mod, 5)
-                copy(p.physical)
-            end
-            phys_res, vars = res
-            if q_l == 0.0
-                # DRY: rho_liq = 0 identically, so w_cloud = 0 and the blend is not merely
-                # the identity in value — it never evaluates res_qss at all. BITWISE, and
-                # the exact-zero fixed point is preserved.
-                @test blend == phys_res
-                @test maximum(abs.(blend)) == 0.0
-            else
-                # CLOUDY: exact zero is not attainable (the saturated branch solves for
-                # rho_c by Newton and lands ~1e-16 off the manifold), so the standard is the
-                # one the consistent_qss gate already sets — and enabling the blend must not
-                # loosen it. res_qss and res_rho_t differ here only by the rounding of
-                # (rho_v - rho_vs) + rho_vs, ~1 ulp of rho_vs.
-                @test maximum(abs.(blend[:, vars["p"], 1])) < 1.0e-9
-                @test maximum(abs.(blend[:, vars["E_t"], 1])) < 1.0e-6
-                for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c")
-                    @test maximum(abs.(blend[:, vars[nm], 1])) < 1.0e-12
-                end
-                # ... and the two modes agree with each other to the same standard.
-                @test maximum(abs.(blend[:, vars["p"], 1] .- phys_res[:, vars["p"], 1])) < 1.0e-9
-                @test maximum(abs.(blend[:, vars["E_t"], 1] .- phys_res[:, vars["E_t"], 1])) < 1.0e-6
-                for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c")
-                    @test maximum(abs.(blend[:, vars[nm], 1] .-
-                                       phys_res[:, vars[nm], 1])) < 1.0e-12
-                end
-            end
-        end
-    end
-
-    @testset "vapor retrieval: :blend is a partition, not a mass source" begin
-        # WHAT THE BLEND IS ALLOWED TO CHANGE. rho_d + rho_v + rho_c + rho_r no longer equals
-        # rho_t pointwise once the vapor is blended — that gap is deliberate, it is what the
-        # reconciliation absorbs, and on the measured snapshots it is at most 9.4e-4 kg/m^3
-        # in cloud. What it may NOT change is the CONSERVED masses: rho_d has no sinks at all
-        # and rho_t's only sink (sedimentation) is off here, so both domain integrals must
-        # still be conserved to rounding. A blend that moved either one would not be a
-        # partition of the water, it would be a source of it.
-        have = isdefined(Scythe, :vapor_retrieval_blend)
-        @test have                   # ← the Stage 2 gate
+    @testset "the vapor census reads the slot, ice included" begin
+        # `_vapor_census!` used to assemble the vapor tendency as f_3 - f_2 - f_8 - f_9,
+        # which was exact for the liquid-only set and had NO ice term — so with ice
+        # registered it silently attributed the deposition sink to nothing. It reads the
+        # slot now, so the depletion fraction it reports is the one the integrator applied,
+        # whatever the phase changes were.
         mktempdir() do tmpdir
-            m, p, mod, gp = vapor_blend_rirk(tmpdir, "blend"; retrieval = :blend)
-            vars = gp.vars
-            kDim = gp.kDim
-            rho_dbar = view(Springsteel.ref_rho_d(m.ref_state), :, 1)
-            rho_tbar = view(Springsteel.ref_rho_t(m.ref_state), :, 1)
+            mtile, patch, model, col = make_mc_mtile(tmpdir;
+                extra_options = Dict{Symbol,Any}(:water_budget_trace => 1))
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            rv_i = mtile.mc_slots.rho_v
 
-            # Exact 2-D mass integral on the Gauss nodes (the positivity testset's argument:
-            # an unweighted point sum would confuse redistribution among unequally weighted
-            # nodes with a real drift).
-            cellw = (npts, ncells, len) -> begin
-                _, qw = Springsteel.CubicBSpline._quadrature_rule(div(npts, ncells),
-                                                                  gp.quadrature)
-                repeat(qw .* (len / ncells), outer = ncells)
+            supersaturate_lower_half!(patch, mtile, model, col, 5.0e-5)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
             end
-            Wi = cellw(gp.iDim, gp.num_cells_i, gp.iMax - gp.iMin)
-            Wk = cellw(gp.kDim, gp.num_cells_k, gp.kMax - gp.kMin)
-            massfun = (pp, name, bar) -> sum(Wi[div(i - 1, kDim) + 1] * Wk[mod1(i, kDim)] *
-                                             (pp.physical[i, vars[name], 1] +
-                                              bar[mod1(i, kDim)])
-                                             for i in axes(pp.physical, 1))
-            md0 = massfun(p, "rho_d", rho_dbar)
-            mt0 = massfun(p, "rho_t", rho_tbar)
 
-            vapor_blend_run!(m, p, gp, 20)
-
-            @test all(isfinite.(p.physical))
-            @test maximum(abs.(p.physical[:, vars["Q_ss"], 1])) > 0.0   # the run is live
-            @test abs(massfun(p, "rho_d", rho_dbar) - md0) / md0 < 1.0e-12
-            @test abs(massfun(p, "rho_t", rho_tbar) - mt0) / mt0 < 1.0e-12
+            st = mtile.mc_water_stats
+            # The census counted the vapor points and measured a nonzero depletion, and the
+            # Euler fraction it reports is the slot's own tendency over the field.
+            @test sum(view(st, Scythe.MC_DEPLETION_V, :)) > 0.0
+            @test maximum(view(st, Scythe.MC_DEPLETION_V + 3, :)) > 0.0
+            # Both reconciliation-chain gaps are recorded, and on a CONSISTENT seed both
+            # are at rounding: the seed moves rho_v and rho_t together (so the density
+            # budget still implies the vapor carried) and moves Q_ss with them (so the
+            # tracker still implies the supersaturation carried). A seed that moved only
+            # one of the three would show up here as a gap of its own size, which is
+            # exactly what this census exists to report.
+            # `dm`, the water the seed moved, is the scale both are measured against.
+            dm = 5.0e-5 * maximum(Springsteel.ref_rho_d(mtile.ref_state)[:, 1])
+            # The vapor gap is at ROUNDING: rho_v and rho_t took the same increment.
+            @test maximum(view(st, Scythe.MC_VAPOR_GAP, :)) < 1.0e-8 * dm
+            # The Q_ss gap is not zero and should not be: the seed's pressure compensation
+            # moves rho_vs(T, p) a little, so Q_ss = dm and rho_v - rho_vs differ by that
+            # saturation shift. It is four decades under the water moved, which is the
+            # statement that the seed is consistent — a seed that moved only one of the
+            # three would put its whole size here.
+            @test maximum(view(st, Scythe.MC_QSS_GAP, :)) < 1.0e-3 * dm
         end
     end
+
 
     # ── Diagnostic flooring of rho_liq ──────────────────────────────────────────────────
     #
@@ -3195,12 +2897,12 @@ using Springsteel
     #       negative afterwards -- the state was not repaired.
 
     """
-    A `vapor_blend_rirk` patch whose rho_c perturbation is seeded NEGATIVE enough to drive
+    A `cloudy_rirk` patch whose rho_c perturbation is seeded NEGATIVE enough to drive
     rho_liq below zero somewhere, which is what the floor exists for. `amp = 0.0` leaves the
     healthy state (the floor is then inactive and must be bitwise inert).
     """
     function condensate_floor_rirk(tmpdir, tag; floor = nothing, amp = 2.0e-3)
-        mtile, patch, model, gp = vapor_blend_rirk(tmpdir, tag)
+        mtile, patch, model, gp = cloudy_rirk(tmpdir, tag)
         floor === nothing || (model.options[:condensate_floor] = floor)
         if amp != 0.0
             rc = gp.vars["rho_c"]
@@ -3229,8 +2931,8 @@ using Springsteel
             @test !haskey(moA.options, :condensate_floor)
             @test moN.options[:condensate_floor] === :none
 
-            vapor_blend_run!(mA, pA, gpA, 10)
-            vapor_blend_run!(mN, pN, gpN, 10)
+            cloudy_run!(mA, pA, gpA, 10)
+            cloudy_run!(mN, pN, gpN, 10)
             @test all(isfinite.(pA.physical))
             # Absent === :none, to the last bit.
             @test pA.physical == pN.physical
@@ -3259,8 +2961,8 @@ using Springsteel
                    for i in axes(pN.physical, 1)]
             @test minimum(liq) >= 0.0            # the premise: nothing to floor
 
-            vapor_blend_run!(mN, pN, gpN, 10)
-            vapor_blend_run!(mD, pD, gpD, 10)
+            cloudy_run!(mN, pN, gpN, 10)
+            cloudy_run!(mD, pD, gpD, 10)
             @test all(isfinite.(pN.physical))
             @test pN.physical == pD.physical
             @test pN.spectral == pD.spectral
@@ -3279,8 +2981,8 @@ using Springsteel
                             pp.physical[i, rr, 1] for i in axes(pp.physical, 1)]
             @test minimum(liqfun(pN)) < 0.0      # the premise: there IS something to floor
 
-            vapor_blend_run!(mN, pN, gpN, 10)
-            vapor_blend_run!(mD, pD, gpD, 10)
+            cloudy_run!(mN, pN, gpN, 10)
+            cloudy_run!(mD, pD, gpD, 10)
             @test all(isfinite.(pN.physical))
             @test all(isfinite.(pD.physical))
             # (c1) it is a different integration ...
@@ -3521,8 +3223,8 @@ using Springsteel
             mA, pA, moA, gpA = ctrans_rirk(tmpdir, "ct_absent")
             mN, pN, moN, gpN = ctrans_rirk(tmpdir, "ct_none"; transform = :none)
             @test !haskey(moA.options, :condensate_transform)
-            vapor_blend_run!(mA, pA, gpA, 10)
-            vapor_blend_run!(mN, pN, gpN, 10)
+            cloudy_run!(mA, pA, gpA, 10)
+            cloudy_run!(mN, pN, gpN, 10)
             @test all(isfinite.(pA.physical))
             @test pA.physical == pN.physical
             @test pA.spectral == pN.spectral
@@ -3540,9 +3242,9 @@ using Springsteel
             mB, pB, moB, gpB = ctrans_rirk(tmpdir, "ct_g_bhyp"; transform = :bhyp)
             mS, pS, moS, gpS = ctrans_rirk(tmpdir, "ct_g_smooth"; transform = :bhyp_smooth)
 
-            vapor_blend_run!(mN, pN, gpN, 20)
-            vapor_blend_run!(mB, pB, gpB, 20)
-            vapor_blend_run!(mS, pS, gpS, 20)
+            cloudy_run!(mN, pN, gpN, 20)
+            cloudy_run!(mB, pB, gpB, 20)
+            cloudy_run!(mS, pS, gpS, 20)
 
             @test all(isfinite.(pN.physical))
             @test all(isfinite.(pB.physical))
@@ -3659,8 +3361,8 @@ using Springsteel
             mN, pN, moN, gpN = ctrans_rirk(tmpdir, "rt_none"; rain_transform = :none,
                                            rain_amp = 2.0e-3, precipitation = true)
             @test !haskey(moA.options, :rain_transform)
-            vapor_blend_run!(mA, pA, gpA, 10)
-            vapor_blend_run!(mN, pN, gpN, 10)
+            cloudy_run!(mA, pA, gpA, 10)
+            cloudy_run!(mN, pN, gpN, 10)
             @test all(isfinite.(pA.physical))
             @test pA.physical == pN.physical
             @test pA.spectral == pN.spectral
@@ -3680,9 +3382,9 @@ using Springsteel
             mS, pS, moS, gpS = ctrans_rirk(tmpdir, "rt_g_smooth";
                                            rain_transform = :bhyp_smooth,
                                            rain_amp = 2.0e-3, precipitation = true)
-            vapor_blend_run!(mN, pN, gpN, 20)
-            vapor_blend_run!(mB, pB, gpB, 20)
-            vapor_blend_run!(mS, pS, gpS, 20)
+            cloudy_run!(mN, pN, gpN, 20)
+            cloudy_run!(mB, pB, gpB, 20)
+            cloudy_run!(mS, pS, gpS, 20)
 
             @test all(isfinite.(pN.physical))
             @test all(isfinite.(pB.physical))
@@ -3716,7 +3418,7 @@ using Springsteel
                 mo.physical_params[:Kvdiff_water] = 0.0
                 # The per-term production budget would mix control-variable and density units.
                 mo.options[:water_budget_trace] = 1
-                @test_throws ErrorException vapor_blend_run!(m, p, gp, 1)
+                @test_throws ErrorException cloudy_run!(m, p, gp, 1)
                 delete!(mo.options, :water_budget_trace)
                 # clamp_water! would be a state repair on the control variable.
                 mo.options[:clamp_water] = true
@@ -3726,7 +3428,7 @@ using Springsteel
         end
     end
 
-    @testset "moist_entropy_total survives a negative vapor residual" begin
+    @testset "moist_entropy_total survives a negative vapor" begin
         # `entropy` takes log(q_v*rho_d/rho_v0), and the vapor is a RESIDUAL, so it goes
         # negative wherever the difference of two independently fitted densities exceeds
         # the vapor present -- i.e. at the tropopause. Measured on the 3-nest TC initial
@@ -3816,7 +3518,7 @@ using Springsteel
             m, p, _, gp = ctrans_rirk(tmpdir, "khw_run"; transform = :bhyp,
                                       rain_transform = :bhyp, rain_amp = 2.0e-3,
                                       xmod = true, Khdiff_water = K)
-            vapor_blend_run!(m, p, gp, 20)
+            cloudy_run!(m, p, gp, 20)
             @test all(isfinite.(p.physical[:, :, 1]))
             @test minimum(ctrans_rho_c(p, gp, :bhyp)) >= 0.0
             @test minimum(ctrans_rho_r(p, gp, :bhyp)) >= 0.0
@@ -4095,11 +3797,13 @@ using Springsteel
     end
 
     @testset "water diffusion: vapor bump manufactures no cloud" begin
-        # Subsaturated vapor bump in dry air, ONLY Kvdiff_water active. The solved
-        # species are now rho_w', rho_c' and rho_r, and the VAPOR increment is the
-        # implied remainder delta_rho_v = delta_rho_w - delta_rho_c - delta_rho_r. With
-        # no cloud and no rain to diffuse, delta_rho_c and delta_rho_r are identically
-        # zero, so all of delta_rho_w must land in the vapor: cloud cannot appear.
+        # Subsaturated vapor bump in dry air, ONLY Kvdiff_water active. Four species are
+        # solved now — rho_w', rho_v', rho_c' and rho_r — and the vapor increment is SOLVED
+        # rather than implied. With no cloud and no rain to diffuse, delta_rho_c and
+        # delta_rho_r are identically zero, so the whole total-water increment must be
+        # vapor: cloud cannot appear. rho_w and rho_v see the same profile through the same
+        # Neumann operator here, so the two increments agree and no reconciliation gap
+        # opens — which is what makes `d3 ≈ d7` still the right assertion.
         mktempdir() do tmpdir
             args = (; dry=true, kDim=32, num_cells=8, ts=0.05)
             function run_once(Kw)
@@ -4115,6 +3819,9 @@ using Springsteel
                     Tref = col.Tk[k]
                     patch.physical[i, 7, 1] += seed
                     patch.physical[i, 3, 1] += seed
+                    # ...and the VAPOR SLOT: `drho_t = drho_v = seed` is what makes this a
+                    # vapor bump rather than a reconciliation gap.
+                    patch.physical[i, 10, 1] += seed
                     patch.physical[i, 1, 1] += Rv * Tref * seed
                     patch.physical[i, 6, 1] += ((Cvv * Tref) + (Scythe.gravity * zi)) * seed
                 end
@@ -4141,6 +3848,11 @@ using Springsteel
             # always-on SI solve slaves an acoustic increment onto rho_t' but not onto
             # Q_ss, and Q_ss also carries its (inert) reconciliation term.
             @test maximum(abs.(d3 .- d7)) < 5.0e-9
+            # The VAPOR SLOT took that increment directly, and it is the same one rho_w
+            # took: same profile, same Neumann operator, same data.
+            d10 = m_on.var_np1[:, 10] .- m_off.var_np1[:, 10]
+            @test maximum(abs.(d10)) > 1.0e-8           # the vapor leg ran
+            @test maximum(abs.(d3 .- d10)) < 5.0e-9
             # No rain appears from water diffusion of a rain-free column
             @test m_on.var_np1[:, 8] == m_off.var_np1[:, 8]
             # Fixed-T map holds the retrieval
@@ -4166,8 +3878,9 @@ using Springsteel
                 Scythe.advance_column(mtile, c, 1)
             end
             scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
-                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0)
-            for v in 1:9
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0, 10 => 1.0,
+                          11 => 1.0)
+            for v in 1:11               # ...including v (10) and the vapor (11)
                 @test maximum(abs.(mtile.expdot_n[:, v])) / scales[v] < 1.0e-9
                 @test maximum(abs.(mtile.var_np1[:, v])) / scales[v] < 1.0e-9
             end
@@ -4373,28 +4086,29 @@ using Springsteel
             # Nominal per-slot magnitudes, kept as a FLOOR so a slot whose tendency is
             # genuinely tiny is still held to an absolute standard rather than to a
             # meaningless ratio of two near-zeros.
+            # Slot 11 is the prognostic vapor on both cylinders (RLR and axisym share
+            # MC_VARS_CYL), so the whole list lines up index for index.
             scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2,
                           5 => 1.0e-2, 6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6,
-                          9 => 1.0e-6, 10 => 1.0e-2)
+                          9 => 1.0e-6, 10 => 1.0e-2, 11 => 1.0e-6)
             # ...but the DENOMINATOR is the larger of that floor and the tendency actually
-            # produced, so this is a RELATIVE agreement test. It has to be: the seeded state
-            # opens the closure's evaporation branch at full maximum-dryness drive (the bump
-            # puts rho_c' at 0.5 kg/m^3, making the residual vapor about -0.5, so the clip's
-            # vapor floor pins the drive at -rho_vs — far beyond the seeded Q_ss scale).
-            # Judging the resulting tendency against a hardcoded 1e-6 scale measures nothing
-            # about whether the two geometries agree — and they agree here to roundoff
-            # RELATIVE. Keeping the fixed scale would have made this gate a hostage to the
-            # magnitude of whatever state the seed happens to produce.
-            per_slot = zeros(10)
+            # produced, so this is a RELATIVE agreement test. It has to be: the seed puts
+            # rho_c' at 0.5 kg/m^3, three decades above anything physical here, and the
+            # closure's evaporation branch then runs at a drive nothing about the seeded
+            # Q_ss scale predicts. Judging the resulting tendency against a hardcoded 1e-6
+            # scale measures nothing about whether the two geometries agree — and they agree
+            # here to roundoff RELATIVE. Keeping the fixed scale would have made this gate a
+            # hostage to the magnitude of whatever state the seed happens to produce.
+            per_slot = zeros(11)
             denom = Dict(v => max(scales[v], maximum(abs.(mt_rlr.expdot_n[:, v])),
-                                  maximum(abs.(mt_ax.expdot_n[:, v]))) for v in 1:10)
+                                  maximum(abs.(mt_ax.expdot_n[:, v]))) for v in 1:11)
             for c in 1:ncols_rlr
                 i0 = (c - 1) * kDim
                 r_c = gp1[i0 + 1, 1]
                 a = findfirst(x -> x == r_c, r_ax)
                 @test a !== nothing
                 j0 = (a - 1) * kDim
-                for v in 1:10
+                for v in 1:11
                     d = maximum(abs.(mt_rlr.expdot_n[i0+1:i0+kDim, v] .-
                                      mt_ax.expdot_n[j0+1:j0+kDim, v])) / denom[v]
                     per_slot[v] = max(per_slot[v], d)
@@ -4402,7 +4116,7 @@ using Springsteel
                 end
             end
             @info "RLR WN0 vs axisym: worst scaled tendency mismatch = $worst" *
-                  "\n  per slot: " * join(("$v=$(per_slot[v])" for v in 1:10), " ")
+                  "\n  per slot: " * join(("$v=$(per_slot[v])" for v in 1:11), " ")
             @test worst < 1.0e-6
             @test all(isfinite.(mt_rlr.expdot_n))
         end
@@ -4659,16 +4373,16 @@ using Springsteel
         names_cyl = Scythe.mc_var_names(two; cyl = true)
         @test names_xz == vcat(Scythe.MC_VARS, "n_r")
         @test names_cyl == vcat(Scythe.MC_VARS_CYL, "n_r")
-        @test names_xz[1:9] == Scythe.MC_VARS
-        @test names_cyl[1:10] == Scythe.MC_VARS_CYL
+        @test names_xz[1:10] == Scythe.MC_VARS
+        @test names_cyl[1:11] == Scythe.MC_VARS_CYL
         # The index the driver must resolve by NAME, precisely because it moves
-        @test findfirst(==("n_r"), names_xz) == 10
-        @test findfirst(==("n_r"), names_cyl) == 11
+        @test findfirst(==("n_r"), names_xz) == 11
+        @test findfirst(==("n_r"), names_cyl) == 12
 
         # The number's own control-variable transform renames the slot, like the others
         tr = Dict{Symbol,Any}(:rain_moments => 2, :rain_number_transform => :bhyp)
         @test Scythe.rain_number_var_name(tr) == "nu_nr"
-        @test Scythe.mc_var_names(tr)[10] == "nu_nr"
+        @test Scythe.mc_var_names(tr)[11] == "nu_nr"
         @test Scythe.MC_NU_ALIAS["n_r"] == "nu_nr"
         @test_throws ErrorException Scythe.rain_number_transform_mode(
             Dict{Symbol,Any}(:rain_number_transform => :bogus))
@@ -4678,10 +4392,10 @@ using Springsteel
         vars_xz = Dict(v => i for (i, v) in enumerate(names_xz))
         vars_tr = Dict(v => i for (i, v) in enumerate(Scythe.mc_var_names(tr)))
         vars_1m = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
-        @test Scythe.mc_slot(vars_xz, "n_r") == 10
-        @test Scythe.mc_slot(vars_tr, "n_r") == 10       # via the "nu_nr" alias
-        @test Scythe.mc_optional_slot(vars_xz, "n_r") == 10
-        @test Scythe.mc_optional_slot(vars_tr, "n_r") == 10
+        @test Scythe.mc_slot(vars_xz, "n_r") == 11
+        @test Scythe.mc_slot(vars_tr, "n_r") == 11       # via the "nu_nr" alias
+        @test Scythe.mc_optional_slot(vars_xz, "n_r") == 11
+        @test Scythe.mc_optional_slot(vars_tr, "n_r") == 11
         @test Scythe.mc_optional_slot(vars_1m, "n_r") == 0
         @test_throws ErrorException Scythe.mc_slot(vars_1m, "n_r")
 
@@ -4710,20 +4424,23 @@ using Springsteel
 
             m2, _, mod2, _ = make_mc_mtile(tmpdir; precipitation = true,
                 extra_options = Dict{Symbol,Any}(:rain_moments => 2))
-            @test m2.mc_slots.n_r == 10
-            @test length(mod2.grid_params.vars) == 10
-            @test mod2.grid_params.vars["n_r"] == 10
+            # 11, not 10: the prognostic vapor is the unconditional appended slot at 10.
+            @test m2.mc_slots.rho_v == 10
+            @test m2.mc_slots.n_r == 11
+            @test length(mod2.grid_params.vars) == 11
+            @test mod2.grid_params.vars["n_r"] == 11
             # Concrete field: the resolution must not cost the ModelTile its type stability
             @test isconcretetype(fieldtype(typeof(m2), :mc_slots))
             # And the per-variable scratch columns grew with the slot, so the number flux
             # has a column of its own to be fitted on.
-            @test size(m2.scratch_columns, 2) == 10
+            @test size(m2.scratch_columns, 2) == 11
 
             # Cylindrical: the same slot, one index further out, resolved by name
             m3, _, mod3, _ = make_mc_mtile(tmpdir; precipitation = true, iMin = 100.0,
                 iMax = 2100.0, equation_set = "moist_compressible_axisym",
                 extra_options = Dict{Symbol,Any}(:rain_moments => 2))
-            @test m3.mc_slots.n_r == 11
+            @test m3.mc_slots.rho_v == 11
+            @test m3.mc_slots.n_r == 12
             @test mod3.grid_params.vars["v"] == 10
         end
     end
@@ -4783,20 +4500,23 @@ using Springsteel
             m1 = run_once(true, Dict{Symbol,Any}())     # single moment, Ooyama
             m2 = run_once(true, two)                    # two moments, KK2000
             m2_off = run_once(false, two)               # same slots, no warm rain at all
+            # BY NAME: the number slot is APPENDED after the unconditional vapor slot, so
+            # its index is 11 here and there is no literal that stays right.
+            nr = m2.mc_slots.n_r
 
             @test all(isfinite.(m2.var_np1))
             @test all(isfinite.(m2.expdot_n))
             # Rain mass appears, and so does rain NUMBER, everywhere the cloud is
             @test all(m2.var_np1[:, 8] .> 0.0)
-            @test all(m2.var_np1[:, 10] .> 0.0)
+            @test all(m2.var_np1[:, nr] .> 0.0)
             @test all(m2_off.var_np1[:, 8] .== 0.0)
-            @test all(m2_off.var_np1[:, 10] .== 0.0)
+            @test all(m2_off.var_np1[:, nr] .== 0.0)
 
             # Isolate the conversion by differencing against the precipitation-off arm, so
             # the (unrelated) condensation source on slot 9 cancels out.
             drr = m2.var_np1[:, 8] .- m2_off.var_np1[:, 8]
             drc = m2.var_np1[:, 9] .- m2_off.var_np1[:, 9]
-            dnr = m2.var_np1[:, 10] .- m2_off.var_np1[:, 10]
+            dnr = m2.var_np1[:, nr] .- m2_off.var_np1[:, nr]
             # Cloud pays for the rain gram for gram (the equal-and-opposite AUTO_COLL pair)
             @test all(drr .> 0.0)
             @test all(drc .< 0.0)
@@ -4812,8 +4532,9 @@ using Springsteel
             # The closure really did change: KK2000 is not Ooyama's threshold form
             @test m2.var_np1[1, 8] != m1.var_np1[1, 8]
 
-            # The single-moment arm has no number slot at all
-            @test size(m1.var_np1, 2) == 9
+            # The single-moment arm has no number slot at all (10 = the fixed nine plus
+            # the unconditional vapor)
+            @test size(m1.var_np1, 2) == 10
         end
     end
 
@@ -4828,11 +4549,12 @@ using Springsteel
                 num_cells = 8, ts = 0.05, precipitation = true,
                 extra_options = Dict{Symbol,Any}(:rain_moments => 2))
             gpts = Scythe.getGridpoints(patch)
+            nr = m.mc_slots.n_r                          # BY NAME: 11, after the vapor slot
             seed_rain_bump!(patch, gpts, col, kDim; rho_r0 = 1.0e-3, zc = 1200.0, zr = 300.0)
             # Rain number PROPORTIONAL to the rain mass, so the two profiles start with the
             # same shape and the same centroid: any later difference is the sorting.
             for i in 1:size(patch.physical, 1)
-                patch.physical[i, 10, 1] = 1.0e6 * patch.physical[i, 8, 1]
+                patch.physical[i, nr, 1] = 1.0e6 * patch.physical[i, 8, 1]
             end
             spectralTransform!(patch)
             gridTransform!(patch)
@@ -4840,7 +4562,7 @@ using Springsteel
             z = gpts[:, 2]
             centroid(f) = sum(max.(f, 0.0) .* z) / sum(max.(f, 0.0))
             z_mass_0 = centroid(patch.physical[:, 8, 1])
-            z_num_0 = centroid(patch.physical[:, 10, 1])
+            z_num_0 = centroid(patch.physical[:, nr, 1])
             @test z_mass_0 ≈ z_num_0 rtol=1e-10          # same shape to begin with
 
             # Fall speeds at the seeded state: |vtrm| > |vtrn|, which is the mechanism
@@ -4851,7 +4573,7 @@ using Springsteel
 
             @test all(isfinite.(patch.physical))
             z_mass_1 = centroid(patch.physical[:, 8, 1])
-            z_num_1 = centroid(patch.physical[:, 10, 1])
+            z_num_1 = centroid(patch.physical[:, nr, 1])
             # Both fall...
             @test z_mass_1 < z_mass_0
             @test z_num_1 < z_num_0
@@ -4894,13 +4616,13 @@ using Springsteel
         names_cyl = Scythe.mc_var_names(ice; cyl = true)
         @test names_xz == vcat(Scythe.MC_VARS, "n_r", collect(Scythe.MC_ICE_VARS))
         @test names_cyl == vcat(Scythe.MC_VARS_CYL, "n_r", collect(Scythe.MC_ICE_VARS))
-        @test names_xz[1:10] == vcat(Scythe.MC_VARS, "n_r")
-        @test length(names_xz) == 22 && length(names_cyl) == 23
+        @test names_xz[1:11] == vcat(Scythe.MC_VARS, "n_r")
+        @test length(names_xz) == 23 && length(names_cyl) == 24
         # The geometry-dependent indices the driver must resolve BY NAME
-        @test findfirst(==("rho_i1"), names_xz) == 11
-        @test findfirst(==("c_i3"), names_xz) == 22
-        @test findfirst(==("rho_i1"), names_cyl) == 12
-        @test findfirst(==("c_i3"), names_cyl) == 23
+        @test findfirst(==("rho_i1"), names_xz) == 12
+        @test findfirst(==("c_i3"), names_xz) == 23
+        @test findfirst(==("rho_i1"), names_cyl) == 13
+        @test findfirst(==("c_i3"), names_cyl) == 24
         # Species-major: a species' four moments are contiguous and in (q, n, a, c) order
         @test Scythe.MC_ICE_VARS[1:4] == ("rho_i1", "n_i1", "a_i1", "c_i1")
         @test Scythe.MC_ICE_VARS[5:8] == ("rho_i2", "n_i2", "a_i2", "c_i2")
@@ -4916,7 +4638,7 @@ using Springsteel
         @test Scythe.ice_var_names(tr) == ("nu_i1", "nu_ni1", "nu_ai1", "nu_ci1",
                                            "nu_i2", "nu_ni2", "nu_ai2", "nu_ci2",
                                            "nu_i3", "nu_ni3", "nu_ai3", "nu_ci3")
-        @test Scythe.mc_var_names(tr)[11:22] == collect(Scythe.ice_var_names(tr))
+        @test Scythe.mc_var_names(tr)[12:23] == collect(Scythe.ice_var_names(tr))
         for nm in Scythe.MC_ICE_VARS
             @test haskey(Scythe.MC_NU_ALIAS, nm)
         end
@@ -4952,10 +4674,10 @@ using Springsteel
         vars_ice = Dict(v => i for (i, v) in enumerate(names_xz))
         vars_tr = Dict(v => i for (i, v) in enumerate(Scythe.mc_var_names(tr)))
         vars_1m = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
-        @test Scythe.mc_slot(vars_ice, "rho_i2") == 15
-        @test Scythe.mc_slot(vars_tr, "rho_i2") == 15          # via the "nu_i2" alias
-        @test Scythe.mc_ice_slot_indices(vars_ice) == ntuple(j -> 10 + j, 12)
-        @test Scythe.mc_ice_slot_indices(vars_tr) == ntuple(j -> 10 + j, 12)
+        @test Scythe.mc_slot(vars_ice, "rho_i2") == 16
+        @test Scythe.mc_slot(vars_tr, "rho_i2") == 16          # via the "nu_i2" alias
+        @test Scythe.mc_ice_slot_indices(vars_ice) == ntuple(j -> 11 + j, 12)
+        @test Scythe.mc_ice_slot_indices(vars_tr) == ntuple(j -> 11 + j, 12)
         @test Scythe.mc_ice_slot_indices(vars_1m) == ntuple(_ -> 0, 12)
         @test_throws ErrorException Scythe.mc_slot(vars_1m, "a_i3")
 
@@ -5062,25 +4784,27 @@ using Springsteel
 
             m, _, mod, _ = make_mc_mtile(tmpdir; precipitation = true, extra_options = ice)
             @test Scythe.ice_registered(m.mc_slots)
-            @test m.mc_slots.n_r == 10
-            @test Scythe.ice_slots(m.mc_slots, 1) == (11, 12, 13, 14)
-            @test Scythe.ice_slots(m.mc_slots, 2) == (15, 16, 17, 18)
-            @test Scythe.ice_slots(m.mc_slots, 3) == (19, 20, 21, 22)
-            @test length(mod.grid_params.vars) == 22
+            @test m.mc_slots.rho_v == 10
+            @test m.mc_slots.n_r == 11
+            @test Scythe.ice_slots(m.mc_slots, 1) == (12, 13, 14, 15)
+            @test Scythe.ice_slots(m.mc_slots, 2) == (16, 17, 18, 19)
+            @test Scythe.ice_slots(m.mc_slots, 3) == (20, 21, 22, 23)
+            @test length(mod.grid_params.vars) == 23
             # Concrete: resolving twelve more indices must not cost the tile its typing
             @test isconcretetype(fieldtype(typeof(m), :mc_slots))
             # Every ice slot got a scratch column of its own, so each flux is fitted on its
             # own basis and its own BCs.
-            @test size(m.scratch_columns, 2) == 22
+            @test size(m.scratch_columns, 2) == 23
 
             # Cylindrical: the same twelve, one index further out, resolved by name
             m3, _, mod3, _ = make_mc_mtile(tmpdir; precipitation = true, iMin = 100.0,
                 iMax = 2100.0, equation_set = "moist_compressible_axisym",
                 extra_options = ice)
             @test mod3.grid_params.vars["v"] == 10
-            @test m3.mc_slots.n_r == 11
-            @test Scythe.ice_slots(m3.mc_slots, 1) == (12, 13, 14, 15)
-            @test Scythe.ice_slots(m3.mc_slots, 3) == (20, 21, 22, 23)
+            @test m3.mc_slots.rho_v == 11
+            @test m3.mc_slots.n_r == 12
+            @test Scythe.ice_slots(m3.mc_slots, 1) == (13, 14, 15, 16)
+            @test Scythe.ice_slots(m3.mc_slots, 3) == (21, 22, 23, 24)
         end
     end
 
@@ -5223,15 +4947,15 @@ using Springsteel
             @test abs(sum(q1) - sum0) < 0.02 * sum0
             @test sum(n1) / sum(q1) ≈ scale[2] / scale[1] rtol=1e-9
 
-            # The other TEN slots are finite and the ice slots produced no NaN anywhere.
-            for slot in 1:10
+            # The other ELEVEN slots are finite and the ice slots produced no NaN anywhere.
+            for slot in 1:(s.i1_q - 1)
                 @test all(isfinite.(patch.physical[:, slot, 1]))
             end
-            for slot in 11:22
+            for slot in s.i1_q:(s.i1_q + 11)
                 @test all(isfinite.(patch.physical[:, slot, 1]))
             end
             # Species 2 and 3 were never seeded and no process can create them.
-            for slot in 15:22
+            for slot in s.i2_q:(s.i1_q + 11)
                 @test all(patch.physical[:, slot, 1] .== 0.0)
             end
         end
@@ -5255,12 +4979,13 @@ using Springsteel
             end
             m_off = run_once(two)
             m_on = run_once(ice)
-            for slot in 1:10
+            i1q = m_on.mc_slots.i1_q                    # 12: the first ice slot
+            for slot in 1:(i1q - 1)                     # the eleven common slots
                 @test m_on.var_np1[:, slot] == m_off.var_np1[:, slot]
                 @test m_on.expdot_n[:, slot] == m_off.expdot_n[:, slot]
             end
             # ...and the twelve ice slots are EXACTLY zero, not merely small.
-            for slot in 11:22
+            for slot in i1q:(i1q + 11)
                 @test all(m_on.var_np1[:, slot] .== 0.0)
                 @test all(m_on.expdot_n[:, slot] .== 0.0)
             end
@@ -5291,8 +5016,10 @@ using Springsteel
                             n_i = 5.0e4, r_i = 30.0e-6, rho_r = 0.0, n_r = 0.0,
                             kDim = 16, ts = 0.1, extra_options = Dict{Symbol,Any}(),
                             extra_params = Dict{Symbol,Float64}())
-        opts = merge(Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
-                                      :vapor_retrieval => :residual), extra_options)
+        # No `:vapor_retrieval` here: it was the ice arm's opt-out from the regime-blended
+        # retrieval, and there is no retrieval left to opt out of — the vapor is a slot.
+        opts = merge(Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael),
+                     extra_options)
         varlist = Scythe.mc_var_names(opts; cyl = false)
         vars = Dict(v => i for (i, v) in enumerate(varlist))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
@@ -5322,6 +5049,12 @@ using Springsteel
             patch.physical[i, vars["c_i1"], 1] = n_i * r_i^3
             patch.physical[i, 8, 1] = rho_r
             patch.physical[i, vars["n_r"], 1] = n_r
+            # The seeded condensate comes OUT OF THE VAPOR, which the prognostic slot has
+            # to be told: rho_t is untouched here, so leaving rho_v at its reference would
+            # make the seed a reconciliation gap of its own size rather than a partition.
+            # (Under the retired residual retrieval this subtraction was implicit — the
+            # vapor WAS rho_t minus the condensates.)
+            patch.physical[i, vars["rho_v"], 1] = -(rho_i + rho_r)
         end
         spectralTransform!(patch)
         gridTransform!(patch)
@@ -5457,11 +5190,12 @@ using Springsteel
             end
             m_off = run_once(two)
             m_on = run_once(ice)
-            for slot in 1:10
+            i1q = m_on.mc_slots.i1_q                    # 12: the first ice slot, by name
+            for slot in 1:(i1q - 1)                     # the eleven common slots
                 @test m_on.var_np1[:, slot] == m_off.var_np1[:, slot]
                 @test m_on.expdot_n[:, slot] == m_off.expdot_n[:, slot]
             end
-            for slot in 11:22
+            for slot in i1q:(i1q + 11)
                 @test all(m_on.expdot_n[:, slot] .== 0.0)
             end
         end
@@ -5588,7 +5322,8 @@ using Springsteel
             # The rates really did move, and in the right direction: the more supersaturated
             # state condenses more (equivalently, evaporates less) and deposits more.
             @test all(m_a.expdot_n[1:kDim, 9] .> m_b.expdot_n[1:kDim, 9])   # cloud
-            @test all(m_a.expdot_n[1:kDim, 11] .> m_b.expdot_n[1:kDim, 11]) # ice mass
+            i1q = m_a.mc_slots.i1_q                                         # 12, by name
+            @test all(m_a.expdot_n[1:kDim, i1q] .> m_b.expdot_n[1:kDim, i1q])  # ice mass
 
             # ...and E_t's tendency is BITWISE identical, because no phase change is a source
             # of it. (rho_t likewise: phase changes are internal to the water.)

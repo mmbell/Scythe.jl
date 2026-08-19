@@ -17,7 +17,7 @@
 #   2. adds the background back to recover the TOTAL control fields;
 #   3. retrieves temperature T with the model's closed-form retrieval
 #      (retrieve_temperature) from the PROGNOSTIC condensate, then diagnoses the
-#      vapor exactly as the model does (rho_v = rho_t - rho_d - rho_c - rho_r);
+#      vapor from its own prognostic slot, exactly as the model does;
 #   4. derives a simple S-band (Rayleigh) radar reflectivity from rho_c
 #      (monodisperse cloud) and rho_r (exponential Marshall-Palmer rain), and a
 #      rain rate from rho_r and the Ooyama (2001) terminal fall speed.
@@ -154,7 +154,8 @@ function reference_background(x, z_reg)
     mubar = round(Int, nmish / (n_k - 1))
     mubar * (n_k - 1) == nmish ||
         error("Cannot infer mubar: $nmish mish levels vs $(n_k-1) cells")
-    vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c", "v"]
+    vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c", "v",
+            "rho_v"]
     bc = Dict(v => NeumannBC() for v in vars)
     gp = Scythe.compute_derived_params(GridParameters(; geometry = "RiRk",
         iMin = x[1], iMax = x[end], num_cells_i = max(n_i - 1, 1),
@@ -229,13 +230,21 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
         rho_c = Scythe.recover_rho_c.(rcp, col(bg.rho_cbar), ctrans, WTRANS.cmu)
 
         # Closed-form temperature retrieval from the PROGNOSTIC condensate (M is the
-        # enthalpy balance the model solves); the vapor is the residual.
+        # enthalpy balance the model solves).
         ke = has_v ? 0.5 .* (u .^ 2 .+ v .^ 2 .+ w .^ 2) : 0.5 .* (u .^ 2 .+ w .^ 2)
         M  = p .+ E_t .- rho_t .* (ke .+ Scythe.gravity .* col(z))
         rho_liq = rho_c .+ rho_r
         T  = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
         rho_vs = Springsteel.Thermodynamics.rho_v_sat.(T, p ./ 100.0)
-        rho_v = rho_t .- rho_d .- rho_liq
+        # The vapor is its OWN prognostic slot, carried against the derived reference
+        # rho_tbar - rho_dbar - rho_cbar (`Scythe.vapor_slot`). Files written before it
+        # became prognostic have no such variable; those fall back to the density residual,
+        # which is what the model then meant by the vapor. The two now differ by the
+        # reconciliation gap, so the fallback must not be used on a new file.
+        rho_v = haskey(ds, "rho_v") ?
+            rd2d(ds, "rho_v", n_i, n_k) .+
+                col(bg.rho_tbar .- bg.rho_dbar .- bg.rho_cbar) :
+            rho_t .- rho_d .- rho_liq
 
         # Derived products
         refl = reflectivity_dBZ.(rho_c, rho_r, N0, Nc_cm3 * 1.0e6)
@@ -307,7 +316,8 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
             # (derived products get none). These are extra data variables in the
             # source beyond the value slots handled above.
             handled = Set(["time", "x", "z", "p", "rho_d", "rho_t", "u", "w",
-                           "E_t", "Q_ss", "rho_r", "rho_c", "nu_r", "nu_c", "v"])
+                           "E_t", "Q_ss", "rho_r", "rho_c", "nu_r", "nu_c", "v",
+                           "rho_v"])
             for (vn, vv) in ds
                 (vn in handled) && continue
                 ndims(vv) == 3 || continue

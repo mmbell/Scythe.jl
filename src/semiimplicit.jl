@@ -18,13 +18,13 @@ export initialize_model, run_model, finalize_model
 """
     MCSlots
 
-Resolved indices of the moist-compressible set's OPTIONAL, APPENDED prognostic slots.
+Resolved indices of the moist-compressible set's APPENDED prognostic slots.
 
 Slots 1-9 (and `v` at 10 on the cylindrical/3-D variants) are hardcoded literals throughout
-`mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`. Everything switched on by an
-option is APPENDED after that block instead, so its index depends on the geometry — the rain
-number `n_r` is 10 on the XZ slice and 11 wherever `v` is carried — and the ONLY way to know
-it is by name, through `Scythe.mc_var_names(options)` and `mc_slot`.
+`mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`. Everything after that block is
+APPENDED, so its index depends on the geometry — the prognostic vapor `rho_v` is 10 on the XZ
+slice and 11 wherever `v` is carried, and the rain number `n_r` one further out again — and
+the ONLY way to know it is by name, through `Scythe.mc_var_names(options)` and `mc_slot`.
 
 That lookup is a `Dict{String,Int}` hash and the driver runs once per COLUMN, so it is done
 exactly once, here, when the tile is built. A field per slot, all `Int`, all `0` when the
@@ -33,8 +33,11 @@ slot is not registered: concrete, so `ModelTile` stays fully typed and the drive
 `NamedTuple` field would have forced onto `ModelTile` and through every method signature
 that touches it).
 
-`0` means ABSENT. The driver tests `> 0` rather than re-reading the option, so the slot's
-existence and the physics that writes it cannot disagree.
+`0` means ABSENT for the OPTIONAL slots. The driver tests `> 0` rather than re-reading the
+option, so the slot's existence and the physics that writes it cannot disagree. `rho_v` is
+the exception: it is not optional, so it is resolved with the THROWING [`mc_slot`](@ref) for
+every moist-compressible set and a `vars` dict that lacks it fails here, at tile creation,
+rather than writing the vapor tendency into whatever slot happened to be at that index.
 
 The ICE family is laid out flat and species-major, `i<k>_<moment>`, rather than as a nested
 `NTuple{3,NTuple{4,Int}}`: `mtile.mc_slots.i2_a` is then a plain field load with a literal
@@ -43,6 +46,11 @@ per-species 4-tuple for the loops of the process rates, which is what the microp
 Both are free; a nested layout would have made the first one an index computation.
 """
 struct MCSlots
+    """
+    Prognostic vapor density perturbation ρ_v' [kg/m³] — 10 on the XZ slice, 11 wherever `v`
+    is carried. Present in EVERY moist-compressible configuration (0 only for a non-mc set).
+    """
+    rho_v::Int
     "Prognostic rain number density [#/m³] under `options[:rain_moments] = 2`; 0 otherwise."
     n_r::Int
     # ── Ice, `options[:ice_microphysics] = :ishmael` (12 slots, appended after n_r) ──
@@ -55,8 +63,8 @@ struct MCSlots
     i3_q::Int; i3_n::Int; i3_a::Int; i3_c::Int
 end
 
-"""All slots absent — the state of every configuration that declares no optional slot."""
-MCSlots() = MCSlots(0, ntuple(_ -> 0, 12)...)
+"""All slots absent — the state of every NON-mc equation set."""
+MCSlots() = MCSlots(0, 0, ntuple(_ -> 0, 12)...)
 
 """
     ice_slots(s::MCSlots, k) -> NTuple{4,Int}
@@ -77,19 +85,22 @@ driver's straight-line blocks read the fields directly.
     mc_slots(model) -> MCSlots
 
 Resolve the appended slots of [`MCSlots`](@ref) from a model's options and `vars`, once.
-Every field is 0 for a non-mc equation set, and for an mc set that declares no optional slot.
+Every field is 0 for a non-mc equation set, and the OPTIONAL fields are 0 for an mc set that
+declares no optional slot. `rho_v` is not optional and is resolved with the throwing
+[`mc_slot`](@ref): a `vars` dict built from a stale name list must fail here.
 """
 function mc_slots(model::ModelParameters)
     uses_pressure_reference(model.equation_set) || return MCSlots()
     vars = model.grid_params.vars
     # Defined in moist_compressible.jl, included after this file; resolved at call time.
+    rv = mc_slot(vars, "rho_v")
     nr = rain_moments(model.options) == 2 ? mc_slot(vars, "n_r") : 0
     if ice_microphysics(model.options) !== :ishmael
-        return MCSlots(nr, ntuple(_ -> 0, 12)...)
+        return MCSlots(rv, nr, ntuple(_ -> 0, 12)...)
     end
     # `MC_ICE_VARS` is species-major and in registration order, so the twelve resolved
     # indices land on the twelve fields in declaration order with no reshuffling.
-    return MCSlots(nr, ntuple(j -> mc_slot(vars, MC_ICE_VARS[j]), 12)...)
+    return MCSlots(rv, nr, ntuple(j -> mc_slot(vars, MC_ICE_VARS[j]), 12)...)
 end
 
 """
@@ -196,8 +207,9 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # perturbations s_t' and rho_v' are zero BIT-FOR-BIT and diffusion cannot cook the
     # base (the reference's own Tbar is not bit-identical to the retrieved T). Empty
     # vectors for every other equation set.
-    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar, :Pxi_prof),
-                            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}}}
+    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar, :rho_vbar_z, :Pxi_prof),
+                            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64},
+                                  Vector{Float64}}}
     # One NamedTuple of full-tile-length work vectors for `Twoway_PV_mixing`'s 13 broadcast
     # temporaries. Empty for every other set. See `_allocate_sw_scratch` for why there is one
     # workspace per TILE here rather than one per thread as `mc_scratch` has.
@@ -404,7 +416,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_reference_diagnostics(ref_state,
                                  tilepoints[1:model.grid_params.kDim, end])
     else
-        (s_tbar = Float64[], rho_vbar = Float64[], Pxi_prof = Float64[])
+        (s_tbar = Float64[], rho_vbar = Float64[], rho_vbar_z = Float64[],
+         Pxi_prof = Float64[])
     end
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
@@ -446,10 +459,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # factorization: the boundary conditions differ (straka93 free-slip u, bf02 no-slip;
     # w a rigid lid; scalars Neumann, rho_r possibly Natural at the surface for rain
     # outflow), and the coefficients are independent. s_t rides on the Neumann E_t
-    # column; the water species rho_w' (on the rho_t operator), rho_c' and rho_r each get
-    # their own solve, and the implied VAPOR increment delta_rho_v = delta_rho_w -
-    # delta_rho_c - delta_rho_r is exactly the diffusion of rho_v — the mirror image of
-    # the pre-prognostic-rho_c convention, which solved rho_v' and implied rho_c.
+    # column; the water species rho_w' (on the rho_t operator), rho_v', rho_c' and rho_r
+    # each get their own solve. Nothing is implied — the vapor is prognostic, so it is
+    # solved like the others and the four increments reconcile through the nudge rather
+    # than closing pointwise (see `_diffusion_water_step!`).
     # Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are
     # cached, so `diffusion_timestep_mc` never factorizes per column.
     # Built only when a coefficient is positive: at K = 0 a vertical solve is not the
@@ -483,7 +496,13 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
             water_r       = mc_matrix(rname,   Kv_water_mc, 1.25),
             water_r_first = mc_matrix(rname,   Kv_water_mc, 0.5),
             water_c       = mc_matrix(cname,   Kv_water_mc, 1.25),
-            water_c_first = mc_matrix(cname,   Kv_water_mc, 0.5))
+            water_c_first = mc_matrix(cname,   Kv_water_mc, 0.5),
+            # The prognostic VAPOR carries no transform, so its name is fixed. Its own
+            # factorization for the same reason cloud and rain have theirs: the boundary
+            # conditions are per-variable, and the vapor increment is solved rather than
+            # implied now (see `_diffusion_water_step!`).
+            water_v       = mc_matrix("rho_v", Kv_water_mc, 1.25),
+            water_v_first = mc_matrix("rho_v", Kv_water_mc, 0.5))
         # The cylindrical variants carry the tangential wind v (its own BCs) through
         # the same momentum solve as u/w.
         if haskey(model.grid_params.vars, "v")

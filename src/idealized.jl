@@ -1031,6 +1031,8 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     u_i = vars["u"]; w_i = vars["w"]; et_i = vars["E_t"]
     qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
     rho_c_i = mc_slot(vars, "rho_c")
+    # The prognostic VAPOR slot, present in every configuration of this set (see `MC_VARS`).
+    rho_v_i = mc_slot(vars, "rho_v")
     # APPENDED optional slots, seeded only where registered. Zero under every transform.
     n_r_i = mc_optional_slot(vars, "n_r")
     ice_i = mc_ice_slot_indices(vars)
@@ -1076,6 +1078,12 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             # anyway (`bhyp(0) == 0`).
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            # The prognostic vapor, against the DERIVED reference ρ̄_t − ρ̄_d − ρ̄_c — the
+            # same expression `mc_reference_diagnostics` and `res_rho_t` form, so the
+            # reconciliation nudge starts from the vortex's own partition and not from a
+            # fit-level disagreement about what the reference vapor is.
+            patch.physical[i, rho_v_i, 1] =
+                vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1])
             patch.physical[i, v_i, 1] = v
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             seed_ice_zero!(patch.physical, i, ice_i)
@@ -1396,6 +1404,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         u_i = vars["u"]; w_i = vars["w"];      et_i = vars["E_t"]
         qs_i = vars["Q_ss"]; rr_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
         rc_i = mc_slot(vars, "rho_c")
+        rv_i = mc_slot(vars, "rho_v")
         nr_i = mc_optional_slot(vars, "n_r")
         ice_ii = mc_ice_slot_indices(vars)
 
@@ -1521,6 +1530,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
 
         # ── (3) moisture, E_t and Q_ss from the converged (p, ρ_t) ─────────────
         rd_target = Vector{Float64}(undef, npts)
+        rv_target = Vector{Float64}(undef, npts)
         et_target = Vector{Float64}(undef, npts)
         qs_target = Vector{Float64}(undef, npts)
         n_supersat = 0
@@ -1595,13 +1605,22 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
             rho_d = patch.physical[i, rd_i, 1] + rho_dbar[k]
             rho_v = rho_t - rho_d
             Tk    = p / ((rho_d * Rd) + (rho_v * Rv))
+            # The vapor is PROGNOSTIC, so it gets a target and a deconvolution of its own,
+            # chained off the settled ρ_t/ρ_d exactly as E_t and Q_ss are. Seeding it from
+            # the same (ρ_t, ρ_d) pair those two read is what keeps the initial state's
+            # partition and its reconciliation gap consistent to the fit floor rather than
+            # to the difference between two independently deconvolved fields.
+            rv_target[i] = vapor_slot(rho_v, rho_tbar[k], rho_dbar[k], rho_cbar[k])
             et_target[i] = ((rho_d * internal_energy_bf02(Tk, rho_v / rho_d, 0.0)) +
                             (rho_t * ((gravity * z) + (0.5 * vfit[i] * vfit[i])))) - E_tbar[k]
             qs_target[i] = (rho_v - rho_v_sat(Tk, p / 100.0)) - Q_ssbar[k]
             i += 1
         end
+        mish[:, rv_i] .= rv_target
         mish[:, et_i] .= et_target
         mish[:, qs_i] .= qs_target
+        rv_err, _ = _native_deconvolve!(mish, patch, rv_i, rv_target, payloads[ip];
+                                        iters = inner_iters)
         et_err, _ = _native_deconvolve!(mish, patch, et_i, et_target, payloads[ip];
                                         iters = inner_iters)
         qs_err, _ = _native_deconvolve!(mish, patch, qs_i, qs_target, payloads[ip];
@@ -1621,6 +1640,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
                            "$(round(gpts[rt_fitidx, zcol] / 1e3; digits=2)) km")
         verbose && println("    patch $ip fit floors: rho_t $(round(rt_fiterr; sigdigits=3))  " *
                            "rho_d $(round(rd_err; sigdigits=3))  " *
+                           "rho_v $(round(rv_err; sigdigits=3))  " *
                            "E_t $(round(et_err; sigdigits=3))  " *
                            "Q_ss $(round(qs_err; sigdigits=3))  supersat $n_supersat")
 

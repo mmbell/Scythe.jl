@@ -225,13 +225,26 @@ using SparseArrays
                 Scythe.advance_column(m_off, c, 1)
             end
             scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
-                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0, 10 => 1.0)
-            for v in 1:10
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0, 10 => 1.0,
+                          11 => 1.0)                       # 11 = the prognostic vapor
+            for v in 1:11
                 d = maximum(abs.(m_on.expdot_n[:, v] .- m_off.expdot_n[:, v]))
                 @test d / scales[v] < 1.0e-9
             end
-            # No spurious condensate at rest, absolutely (not just BL-differenced)
-            @test maximum(abs.(m_on.expdot_n[:, 9])) < 1.0e-16
+            # The BL adds EXACTLY nothing to the cloud at rest, and this is the sharper
+            # statement than an absolute bound: at rest the Louis diffusivity is
+            # `l^2 |dV/dz| = 0`, so every eddy flux is an exact zero and the on/off runs
+            # agree bit for bit.
+            @test m_on.expdot_n[:, 9] == m_off.expdot_n[:, 9]
+            # The ABSOLUTE residual is not zero on this SATURATED base, and it is not the
+            # BL's. The fitted reference vapor and rho_vs(T_retrieved) disagree at the fit
+            # level, so the condensation closure runs at ~1e-8 kg/m^3/s with no
+            # perturbation anywhere — the reference-state crumb `consistent_qss_reference`
+            # exists to remove (see its testsets in test_moist_compressible.jl). It used to
+            # be masked here: the retired regime-blended retrieval made rho_v equal
+            # Q_ss + rho_vs identically in cloud, so the drive clip returned Q_ssbar = 0
+            # exactly and the crumb was invisible rather than absent.
+            @test maximum(abs.(m_on.expdot_n[:, 9])) < 1.0e-7
         end
     end
 
@@ -384,6 +397,10 @@ using SparseArrays
                 seed = z[k] < 1000.0 ? 1.0e-4 * (1.0 + cos(pi * z[k] / 1000.0)) : 0.0
                 Tref = col_bl.Tk[k]
                 patch.physical[i, vars["rho_t"], 1] += seed
+                # ...and the VAPOR SLOT, which is prognostic: `drho_t = drho_v = seed` is
+                # the whole point of the T-invariant seed, and leaving rho_v behind would
+                # make the bump a reconciliation gap rather than a moisture perturbation.
+                patch.physical[i, vars["rho_v"], 1] += seed
                 patch.physical[i, vars["Q_ss"], 1] += seed
                 patch.physical[i, vars["p"], 1] += Rv * Tref * seed
                 patch.physical[i, vars["E_t"], 1] +=
@@ -417,6 +434,24 @@ using SparseArrays
         D6s = D6 .- rho_t .* ((u_fit .* D4) .+ (w_fit .* D5) .+ (v_fit .* D9))
         @test abs(trapz(z, D6s)) < 0.05 * trapz(z, abs.(D6s)) + 1.0e-30
         @test abs(trapz(z, D3)) < 0.05 * trapz(z, abs.(D3)) + 1.0e-30
+
+        # THE VAPOR FLUX LANDS ON THE VAPOR SLOT. The closure mixes TOTAL water and CLOUD;
+        # the vapor's share of that flux is `vdot_v = vdot_w - vdot_c`, which used to be
+        # inferred after the fact from the other two and is now applied to slot rho_v
+        # directly. With no condensate transform the cloud Jacobian is an exact 1.0, so the
+        # three legs agree BITWISE and the closure opens no reconciliation gap at all.
+        rv_i = vars["rho_v"]
+        Drv = D[rng, rv_i]; Dc = D[rng, vars["rho_c"]]
+        @test maximum(abs.(Drv)) > 0.0                   # the leg is live
+        # Not `==`: D3 and Dc are each an on/off DIFFERENCE, so `D3 .- Dc` reassociates
+        # what the kernel computed as `vdot_w - vdot_c` in one expression. The agreement is
+        # eleven decades under the signal, which is that reassociation and nothing else.
+        sc = maximum(abs.(Drv))
+        @test maximum(abs.(Drv .- (D3 .- Dc))) < 1.0e-9 * sc
+        @test all(isfinite.(Drv))
+        # ...and it conserves the column vapor for the same reason slot 3 conserves total
+        # water: interior mixing with zero surface nodes moves it around, not in or out.
+        @test abs(trapz(z, Drv)) < 0.05 * trapz(z, abs.(Drv)) + 1.0e-30
     end
 
     # ──────────────────────────────────────────────
@@ -521,24 +556,29 @@ using SparseArrays
     end
 
     # ──────────────────────────────────────────────
-    # 7c. A negative vapor residual must not kill the column
+    # 7c. A negative vapor must not kill the column
     # ──────────────────────────────────────────────
-    @testset "BL runs where the vapor residual is negative" begin
+    @testset "BL runs where the vapor is negative" begin
         # The BL stages the moist entropy s_t as its heat control variable, and
-        # `entropy` takes log(q_v*rho_d/rho_v0). The vapor is the RESIDUAL
-        # rho_t - rho_d - rho_c - rho_r, so where the fit error of two O(0.1 kg/m^3)
-        # densities exceeds the vapor present -- the tropopause -- q_v goes negative and
-        # this used to throw a DomainError out of the first call of the first timestep.
+        # `entropy` takes log(q_v*rho_d/rho_v0). Negative vapor is a RESOLUTION
+        # DIAGNOSTIC and is never clamped, so q_v does go negative -- at the tropopause,
+        # where the vapor present is smaller than the undershoot of an unresolved spike --
+        # and this used to throw a DomainError out of the first call of the first timestep.
         # It is what stopped the 3-nest TC dead, transformed or not.
+        #
+        # The seed is now on the VAPOR SLOT itself. It used to remove total water and let
+        # the residual go negative; with rho_v prognostic that would move rho_t and leave
+        # the vapor alone, i.e. it would test the reconciliation gap instead of the
+        # negative vapor. The dry base has rho_vbar == 0 exactly, so a negative
+        # perturbation IS a negative vapor.
         V0 = 2.0
         H = 2000.0
         set_negvapor! = (patch, vars, kDim, z) -> begin
             for i in 1:size(patch.physical, 1)
                 k = mod1(i, kDim)
                 patch.physical[i, vars["v"], 1] = V0 * sin(0.5 * pi * z[k] / H)^2
-                # The dry base has rho_v == 0 exactly, so removing total water drives the
-                # residual straight below zero, which is the tropopause situation.
                 patch.physical[i, vars["rho_t"], 1] -= 5.0e-6
+                patch.physical[i, vars["rho_v"], 1] -= 5.0e-6
             end
             compensate_ke!(patch, vars, kDim, z; dry=true)
         end

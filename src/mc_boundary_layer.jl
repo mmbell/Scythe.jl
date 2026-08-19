@@ -102,24 +102,29 @@ Louis boundary layer for one column of the total-energy set: eddy diffusivity
 `Kv = l(z)² |∂V/∂z|` with the Blackadar-blended length `l = 1/(1/(κz) + 1/l∞)`,
 applied to momentum (u, w, v), heat (the moist entropy s_t', in energy-flux form
 `F_h = ρ_d T Kv ∂z s_t'` so the column energy books telescope exactly) and water
-(total water ρ_w' and cloud ρ_c', with the vapor implied as the remainder; rain is
-left to sedimentation).
+(total water ρ_w' and cloud ρ_c'; rain is left to sedimentation).
 Surface momentum drag `τ = ρ_t Cd |U₁| u₁` on the lowest mish-level wind
 ([`komori_cd`](@ref) when `Cd_param < 0`). With `surface_fluxes` on, the scalar
 surface nodes carry the bulk enthalpy/moisture fluxes over a fixed-`SST` sea:
 `F_sh = ρ_d1 C_pd Ck U₁ (SST − T₁)` into the heat column and
 `F_q = Ck U₁ (ρ_vs(SST, p₁) − ρ_v1)` into the TOTAL-water column (the surface
-source adds vapor, and the vapor is the remainder), with the exchange wind floored
-by the gustiness minimum `U_min`.
+source adds vapor, so it reaches both ρ_w and the vapor slot), with the exchange
+wind floored by the gustiness minimum `U_min`.
 
 The increments are mapped onto the prognostic slots with the model's canonical
 consistent mappings: momentum/E_t via the FRIC_KE invariant (E_t follows the
 resolved KE down; no dissipative heating), heat via the QDOT_TH pattern (slot 1
 `(R_m/C_vt)·Q̇`, slot 6 `+Q̇`, slot 7 through the saturation chain rule), and the
 water sources via the fixed-T map of `_diffusion_water_step!` (slot 3 `+ρ̇_w`,
-slot 9 `+ρ̇_c`, slot 1 `+R_v T ρ̇_v`, slot 6
+slot 9 `+ρ̇_c`, the vapor slot `+ρ̇_v`, slot 1 `+R_v T ρ̇_v`, slot 6
 `+(C_pv T − L_v + ke + gz) ρ̇_w + (L_v − R_v T) ρ̇_v`, slot 7
 `+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`, with `ρ̇_v = ρ̇_w − ρ̇_c`).
+
+`ρ̇_v` is still built as `ρ̇_w − ρ̇_c` and that is deliberate: this closure mixes TOTAL water,
+so the vapor's share of that flux is what the total carries minus what the cloud carries.
+What has changed is where it LANDS — it now sources the prognostic vapor slot directly
+instead of being inferred from the other two after the fact. The three legs stay mutually
+consistent by construction, so the reconciliation gap this closure opens is exactly zero.
 
 `ctrans_on` says whether slot 9 carries a control variable rather than the cloud density
 (`Scythe.condensate_transform_mode`). It changes exactly two things, and BOTH ARE REQUIRED FOR
@@ -189,10 +194,10 @@ carrying no cloud.
     F_q = 0.0
     if surface_fluxes
         Tk1 = Tk[1]
-        # `S.rho_v` is whatever `options[:vapor_retrieval]` produced in mc_driver! -- the
-        # BLENDED vapor under `:blend`, by design and unchanged here. The surface moisture
-        # flux is a disequilibrium against rho_v_sat(SST), i.e. a thermodynamic consumer of
-        # the partition, and it must read the same vapor the mixture thermodynamics did.
+        # `S.rho_v` is the PROGNOSTIC vapor mc_driver! staged for this column. The surface
+        # moisture flux is a disequilibrium against rho_v_sat(SST), i.e. a thermodynamic
+        # consumer of the partition, and it must read the same vapor the mixture
+        # thermodynamics did.
         rho_v1 = S.rho_v[1]
         p1_hPa = S.p_hPa[1]
         F_sh = rho_d[1] * Cpd * Ck * U1 * (SST - Tk1)
@@ -249,11 +254,11 @@ carrying no cloud.
     Ixtransform(col, QDOT_V)
 
     # Water: total water ρ_w' and CLOUD ρ_c', both straight from the perturbation
-    # slots — every mixed species is prognostic, so the vapor is the implied
-    # remainder ρ̇_v = ρ̇_w − ρ̇_c (rain is left to sedimentation). This mirrors
-    # `_diffusion_water_step!`, and it is what retires the column fit of the
-    # DIAGNOSED ρ_v that used to be needed here (with its mc_ref_diag.rho_vbar
-    # subtraction to keep a resting base quiet).
+    # slots. The vapor's share of the TOTAL-water flux is ρ̇_v = ρ̇_w − ρ̇_c (rain is left
+    # to sedimentation) — a decomposition of one eddy flux, not a retrieval of a field —
+    # and it now SOURCES the prognostic vapor slot rather than being inferred from the
+    # other two. Because all three legs come out of the same two column fits, this
+    # closure leaves the partition exactly closed and opens no reconciliation gap.
     VDOT_w = S.VDOT_w
     rho_tp_z = rtv.f_z; rho_dp_z = rdv.f_z
     col.uMish .= Kv .* (rho_tp_z .- rho_dp_z)
@@ -280,6 +285,8 @@ carrying no cloud.
     # surface terms ride in on the analytic delivery profile g(z): drag −τ·g
     # into the momentum, F_sh·g into the heating, F_q·g into both water rates.
     R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv; Jc = S.Jc
+    # Resolved once per tile in `MCSlots`, so this is a field load and not a name lookup.
+    rv_i = mtile.mc_slots.rho_v
     drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp
     ke = S.ke
     @inbounds for i in eachindex(Kv)
@@ -293,9 +300,9 @@ carrying no cloud.
         _louis_add_v!(geom, expdot, j, dv)
 
         # Heat (QDOT_TH pattern) and the fixed-T vapor pressure source. The
-        # surface moisture flux adds VAPOR, so it enters total water only and
-        # reaches the vapor through the remainder; the cloud flux has no surface
-        # source (droplets do not evaporate off the sea surface).
+        # surface moisture flux adds VAPOR, so it enters the TOTAL-water leg only and
+        # reaches the vapor slot through the ρ̇_w − ρ̇_c decomposition below; the cloud
+        # flux has no surface source (droplets do not evaporate off the sea surface).
         qdot = QDOT_V[i] + (F_sh * gz)
         vdot_w = VDOT_w[i] + (F_q * gz)
         vdot_c = VDOT_c[i]
@@ -315,6 +322,10 @@ carrying no cloud.
                         ((Lv[i] - (Rv * Tk[i])) * vdot_v) +
                         (rho_t[i] * (((u[i] * du) + (w[i] * dw)) +
                                      (_louis_v(geom, vv, i) * dv)))
+        # The prognostic VAPOR slot takes the vapor's share of the flux directly. No
+        # Jacobian: it is an untransformed perturbation (see `Scythe.vapor_slot`), so a
+        # density rate reaches it unmodified — the one water slot for which that is true.
+        expdot[j, rv_i] += vdot_v
         expdot[j, 7] += vdot_v - (drvs_dT[i] * dT_v) -
                         (drvs_dp[i] * (dp_v + dp_q))
     end

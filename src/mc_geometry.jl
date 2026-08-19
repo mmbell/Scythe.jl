@@ -65,8 +65,13 @@ const MCWithV = Union{MCCylinder, MCCartesianRRR, MCSphericalSLR}
 # scratch_column keys are hardcoded literals 1–8 — appending keeps every one
 # valid and the XZ layout untouched. rho_c precedes v so that slots 1–9 are
 # common to ALL geometries and v stays last, exactly as before.
+#
+# rho_v (the prognostic vapor) is appended AFTER v, on the same rule: slots 1-10 keep
+# their hardcoded literal positions and the XZ layout stays aligned with this one through
+# slot 9. It sits in the constant rather than in `mc_var_names`'s optional block because
+# it is not optional — see the comment on `MC_VARS`.
 const MC_VARS_CYL = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r",
-                     "rho_c", "v"]
+                     "rho_c", "v", "rho_v"]
 
 @inline has_v(::MCCartesianXZ) = false
 @inline has_v(::MCWithV) = true

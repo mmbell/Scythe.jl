@@ -157,14 +157,22 @@ end
 """
     mc_state(df, ref, kDim, ncols)
 
-Reconstruct the diagnostic thermodynamic state of the total-energy set
-(moist_compressible) from a perturbation output DataFrame: the closed-form
-temperature retrieval from the PROGNOSTIC condensate, then the residual vapor.
+Reconstruct the thermodynamic state of the total-energy set (moist_compressible) from a
+perturbation output DataFrame: the closed-form temperature retrieval from the prognostic
+condensate, and the vapor read off its own prognostic slot.
 Returns `(Tk, p, rho_d, rho_v, rho_c, rho_t)` as flat vectors (z fastest), with p
 in Pa. `transform`/`rain_transform` must be the run's `options[:condensate_transform]` /
 `options[:rain_transform]`: the corresponding slot then holds a control variable rather than a
 density, and reading it raw would be silently wrong by a factor of two in the linear regime.
 Returns the recovered `rho_r` alongside, so callers never have to touch the raw column.
+
+**The vapor comes from the `rho_v` COLUMN**, added to the DERIVED reference
+`rho_tbar - rho_dbar - rho_cbar` the slot is carried against (`Scythe.vapor_slot`). Output
+written before the vapor became prognostic has no such column, and for those files this falls
+back to the density residual `rho_t - rho_d - rho_liq` — which is what the model used to mean
+by the vapor. The two are no longer the same number: their difference is the reconciliation
+gap (`Scythe.rho_v_reconcile`), so a residual read of a post-Stage-A file would report a drift
+diagnostic in place of the field.
 """
 function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
                   rain_transform::Symbol = :none, rain_mu = 1.0e-7)
@@ -186,8 +194,10 @@ function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
     M = p .+ E_t .- (rho_t .* (ke .+ Scythe.gravity .* df.z))
     rho_liq = rho_c .+ rho_r
     Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
-    # Vapor is the residual of the prognostic water masses
-    rho_v = rho_t .- rho_d .- rho_liq
+    # The vapor is a prognostic slot; see the docstring for the pre-Stage-A fallback.
+    rho_v = "rho_v" in names(df) ?
+        df.rho_v .+ repeat(rho_tbar .- rho_dbar .- rho_cbar, ncols) :
+        rho_t .- rho_d .- rho_liq
     return Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r
 end
 

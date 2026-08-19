@@ -121,17 +121,19 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
     end
 
     @testset "mc_diffusion_matrices stays concrete despite mixed factorization types" begin
-        # The ten entries are NOT all the same concrete type — differing BCs flip
+        # The fourteen entries are NOT all the same concrete type — differing BCs flip
         # `factorize`'s symmetry detection, so `u` is a BunchKaufman while `w` is an LU on
         # RiRk. A Dict would have to widen to the abstract `Factorization` join; a
         # NamedTuple is concrete AND heterogeneous.
         MC = fieldtype(MT, :mc_diffusion_matrices)
         @test MC <: NamedTuple
         @test isconcretetype(MC)
+        # `water_v` is the prognostic vapor's own solve: its increment is solved rather
+        # than implied from the other three (see `_diffusion_water_step!`).
         @test Set(fieldnames(MC)) ==
             Set((:u, :u_first, :w, :w_first, :heat, :heat_first,
                  :water, :water_first, :water_r, :water_r_first,
-                 :water_c, :water_c_first))
+                 :water_c, :water_c_first, :water_v, :water_v_first))
         # The retrieved reference diagnostics for the moist diffusion are concrete too
         @test isconcretetype(fieldtype(MT, :mc_ref_diag))
     end
@@ -149,7 +151,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         # every variable, every column, every timestep — 93 allocations each, and 60% of all
         # per-column allocations. They now borrow a persistent per-thread column.
         @test isconcretetype(fieldtype(MT, :scratch_columns))
-        @test size(mtile.scratch_columns) == (Threads.maxthreadid(), 9)
+        @test size(mtile.scratch_columns) == (Threads.maxthreadid(), 10)
 
         # Distinct object per (thread, variable): `semiimplicit_adjustment_p` holds the p- and
         # w-columns live simultaneously (p_nstar aliases the p-column's uMish), so handing it
@@ -221,8 +223,9 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
 
     @testset "per-column allocations stay zero with rain and water diffusion" begin
         # The warm-rain microphysics (sedimentation column transforms) and the
-        # water-species diffusion (three extra vertical solves + fixed-T maps) are
-        # branches the base configuration never runs; guard them separately.
+        # water-species diffusion (FOUR extra vertical solves + fixed-T maps -- the vapor
+        # gained one of its own when it became prognostic) are branches the base
+        # configuration never runs; guard them separately.
         mtile_w, kDim_w = build_mc_tile(extra_params = Dict(:Kvdiff_water => 25.0,
                                                             :N_r => 1.0e-3),
                                         precipitation = true)
@@ -257,7 +260,8 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                           precipitation = true,
                                           extra_options = Dict{Symbol,Any}(
                                               :rain_moments => 2))
-        @test mtile_2m.mc_slots.n_r == 10          # appended after the fixed 1-9 block
+        @test mtile_2m.mc_slots.rho_v == 10        # the unconditional vapor slot
+        @test mtile_2m.mc_slots.n_r == 11          # appended after it
         moist_compressible_XZ(mtile_2m, 1, kDim_2m, 2)  # compile
         diffusion_timestep_mc(mtile_2m, 1, kDim_2m, 2)
 
@@ -273,7 +277,8 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                           extra_options = Dict{Symbol,Any}(
                                               :rain_moments => 2,
                                               :rain_number_transform => :bhyp))
-        @test mtile_2t.mc_slots.n_r == 11
+        @test mtile_2t.mc_slots.rho_v == 11        # after v on the cylinder
+        @test mtile_2t.mc_slots.n_r == 12
         Scythe.moist_compressible_axisym(mtile_2t, 1, kDim_2t, 2)  # compile
         @test (@allocations Scythe.moist_compressible_axisym(mtile_2t, 1, kDim_2t, 2)) == 0
     end
@@ -289,8 +294,8 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                             precipitation = true,
                                             extra_options = ice_opts)
         @test Scythe.ice_registered(mtile_ice.mc_slots)
-        @test Scythe.ice_slots(mtile_ice.mc_slots, 1) == (11, 12, 13, 14)
-        @test Scythe.ice_slots(mtile_ice.mc_slots, 3) == (19, 20, 21, 22)
+        @test Scythe.ice_slots(mtile_ice.mc_slots, 1) == (12, 13, 14, 15)
+        @test Scythe.ice_slots(mtile_ice.mc_slots, 3) == (20, 21, 22, 23)
         moist_compressible_XZ(mtile_ice, 1, kDim_ice, 2)      # compile
         diffusion_timestep_mc(mtile_ice, 1, kDim_ice, 2)
 
@@ -305,7 +310,7 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                           precipitation = true,
                                           extra_options = merge(ice_opts,
                                               Dict{Symbol,Any}(:ice_transform => :bhyp)))
-        @test Scythe.ice_slots(mtile_it.mc_slots, 1) == (12, 13, 14, 15)
+        @test Scythe.ice_slots(mtile_it.mc_slots, 1) == (13, 14, 15, 16)
         Scythe.moist_compressible_axisym(mtile_it, 1, kDim_it, 2)  # compile
         @test (@allocations Scythe.moist_compressible_axisym(mtile_it, 1, kDim_it, 2)) == 0
     end
