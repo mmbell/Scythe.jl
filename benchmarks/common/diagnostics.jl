@@ -113,6 +113,37 @@ function detect_transforms(dir::AbstractString)
 end
 
 """
+    detect_ice_transform(dir) -> (itrans, imu)
+
+Recover a completed run's ISHMAEL ice-mass transform configuration from its output
+directory, mirroring [`detect_transforms`](@ref). The twelve ice slots share ONE
+transform-family key (`options[:ice_transform]`), and — for the MASS moment specifically
+(the first of `Scythe.MC_ICE_VARS`' four per species) — ONE width key: `Scythe.MC_ICE_MU_KEYS`
+is `:mu_ice` at positions 1, 5 and 9 (`rho_i1`/`rho_i2`/`rho_i3`), so a single `mu` recovers
+all three mass columns; the number and volume moments are not read by this script (see
+`benchmarks/o01_movie.jl`'s ice view, which draws mass only). Falls back to `:none` /
+`Scythe.MC_ICE_MU_DEFAULTS[1]` (1e-12) for anything absent from the log, including no log
+at all.
+"""
+function detect_ice_transform(dir::AbstractString)
+    itrans = :none
+    imu = Scythe.MC_ICE_MU_DEFAULTS[1]
+    log = joinpath(dir, "scythe_out.log")
+    if isfile(log)
+        txt = try
+            read(log, String)
+        catch
+            ""
+        end
+        m = match(r":ice_transform\s*=>\s*:(\w+)", txt)
+        m === nothing || (itrans = Symbol(m.captures[1]))
+        m = match(r":mu_ice\s*=>\s*([0-9.eE+-]+)", txt)
+        m === nothing || (imu = parse(Float64, m.captures[1]))
+    end
+    return (itrans = itrans, imu = imu)
+end
+
+"""
     mc_water(df, rho_cbar, ncols; ctrans, cmu, rtrans, rmu) -> (rho_c, rho_r)
 
 The recovered cloud and rain DENSITIES from an output DataFrame, whatever control variable the
@@ -152,6 +183,43 @@ function mc_water(df, rho_cbar, ncols::Int;
     rho_c = Scythe.recover_rho_c.(craw, repeat(rho_cbar, ncols), ctrans, cmu)
     rho_r = Scythe.recover_rho_r.(rraw, rtrans, rmu)
     return rho_c, rho_r
+end
+
+"""
+    mc_ice(df; itrans, imu) -> (rho_i1, rho_i2, rho_i3)
+
+The recovered ISHMAEL ice-mass densities [kg/m³] for the three species — planar, columnar,
+aggregate — whatever control variable the run carries. Mirrors [`mc_water`](@ref): the column
+NAME (`rho_i1`/`nu_i1`, etc.) decides whether a transform is on, and the same two
+disagreements are handled the same way — a `nu_*` column read with `itrans = :none` is
+refused (would be read as a control variable), a `rho_*` column read under a declared
+transform is accepted with a warning (a pre-rename layout, mirroring the legacy cloud/rain
+case, should one ever exist for ice).
+
+Unlike cloud, the ice mass slots are TOTALS — `f̄ ≡ 0`, no reference profile exists for a
+crystal population — so recovery is `Scythe.recover_total` alone (the same pair rain and rain
+number use), with no `rho_cbar`-style background to add back.
+"""
+function mc_ice(df; itrans::Symbol = :none, imu = 1.0e-12)
+    cols = names(df)
+    species = ntuple(3) do s
+        role, alias = "rho_i$s", "nu_i$s"
+        raw, named = role in cols ? (df[!, role], false) :
+                     alias in cols ? (df[!, alias], true) :
+                     error("no column \"$role\" or \"$alias\" in this output (it has $cols)")
+        if named && itrans === :none
+            error("the ice-$s (mass) column is named \"$alias\", so it holds a control " *
+                  "variable, but the transform mode passed here is :none — it would be read " *
+                  "as a density and be wrong by construction. Pass the run's own mode " *
+                  "(`detect_ice_transform` reads it from scythe_out.log).")
+        elseif !named && itrans !== :none
+            @warn "ice-$s column carries the density name while the run declares a " *
+                  "transform (:$(itrans)) — reading it as a control variable. This is the " *
+                  "pre-rename layout, if one ever exists for ice." maxlog = 1
+        end
+        Scythe.recover_total.(raw, itrans, imu)
+    end
+    return species
 end
 
 """

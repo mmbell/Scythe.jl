@@ -6,9 +6,10 @@
 # are drawn on one shared axis, finest last so it wins in the collar overlaps.
 #
 #   julia --project=. benchmarks/o01_movie.jl [--mode full] [--grid rirk]
-#         [--nests 1|3] [--dir NAME_OR_PATH] [--field rho_c|rho_r]
+#         [--nests 1|3] [--dir NAME_OR_PATH] [--field rho_c|rho_r|ice]
 #         [--xlim lo,hi] [--zlim lo,hi] [--fps 8]
 #         [--ctrans none|bhyp|bhyp_smooth] [--rtrans ...] [--cmu X] [--rmu X]
+#         [--icetrans none|bhyp|bhyp_smooth] [--icemu X]
 #
 # Reads benchmarks/output/o01_rainfall_<mode>_mc<gridsuffix><nestsuffix>/ and
 # writes o01_rainfall_<mode>_<grid><nestsuffix>_<field>.mp4 there. Grid
@@ -38,6 +39,23 @@
 # --field rho_r instead fills rain with a diverging map so its (larger)
 # undershoots read blue directly. --xlim 64,86 zooms to the fine nest, where the
 # undershoots concentrate.
+#
+# --field ice keeps the rho_c fill and rho_r contours of the default view — same
+# thresholds, same levels — and adds the three ISHMAEL ice MASS densities (the
+# planar/columnar/aggregate species of Scythe.MC_ICE_VARS: i1/i2/i3) as their own line
+# contours, in a colour family chosen to stay legible against both viridis and white:
+# dodgerblue (planar), purple (columnar), darkorange (aggregate). No number or
+# axis-moment slot is drawn — the point is "where is ice vs liquid", not the DSD. The
+# ice slots carry their own control variable under options[:ice_transform] (default
+# :bhyp), one family key for all twelve slots but a per-moment mu (Scythe.MC_ICE_MU_KEYS/
+# MC_ICE_MU_DEFAULTS); the mass moment's mu is the SAME key (:mu_ice) for all three
+# species, so this script reads and applies just the one. Ice mass is a TOTAL (no
+# reference profile, unlike cloud), so recovery is the bare inverse map. Contour levels
+# are a fixed g/m³ ladder (0.01/0.05/0.2/0.5/1/2), clipped per species to that species'
+# own domain max over the whole run — a species that never reaches the first rung draws
+# nothing, which is the answer ("this species is absent"), not a missing feature. A run
+# with no ice columns (options[:ice_microphysics] = :none) errors out by name rather
+# than silently drawing an empty ice view.
 
 using CSV
 using DataFrames
@@ -50,7 +68,7 @@ using Springsteel
 mode = "full"
 grid = "rirk"
 nests = 0                       # 0 = auto-detect from the output directory
-field = "rho_c"                 # fill field: rho_c or rho_r
+field = "rho_c"                 # fill field: rho_c, rho_r, or ice (rho_c fill + ice contours)
 fps = 8
 xlim = nothing                  # (lo, hi) km, or nothing for the full domain
 zlim = (0.0, 17.0)              # km
@@ -59,6 +77,8 @@ ctrans_arg = nothing            # transform overrides; nothing = detect (see bel
 rtrans_arg = nothing
 cmu_arg = nothing
 rmu_arg = nothing
+icetrans_arg = nothing          # ice-mass transform override; nothing = detect
+icemu_arg = nothing
 let i = 1
     while i <= length(ARGS)
         if ARGS[i] == "--mode"
@@ -85,12 +105,16 @@ let i = 1
             global cmu_arg = parse(Float64, ARGS[i+1]); i += 2
         elseif ARGS[i] == "--rmu"
             global rmu_arg = parse(Float64, ARGS[i+1]); i += 2
+        elseif ARGS[i] == "--icetrans"
+            global icetrans_arg = Symbol(ARGS[i+1]); i += 2
+        elseif ARGS[i] == "--icemu"
+            global icemu_arg = parse(Float64, ARGS[i+1]); i += 2
         else
             error("Unknown argument: $(ARGS[i])")
         end
     end
 end
-field in ("rho_c", "rho_r") || error("--field must be rho_c or rho_r")
+field in ("rho_c", "rho_r", "ice") || error("--field must be rho_c, rho_r or ice")
 
 # ── Locate the run, and its patches ─────────────────────────────────────────
 suffix = grid == "rz" ? "" : "_$(grid)"
@@ -158,7 +182,7 @@ end
 # disagree, which is the guard that stops this script from ever again reading a control
 # variable as a density.
 include(joinpath(@__DIR__, "common", "diagnostics.jl"))
-transform_cfg = let det = detect_transforms(dir),
+transform_cfg = let det = detect_transforms(dir), det_ice = detect_ice_transform(dir),
                     hdr = names(CSV.read(first_path, DataFrame; limit = 1))
     # A nu_* column always means transformed (the log then supplies only the variant). Absent
     # one, the log still decides: the runs made before the slots were renamed carry the
@@ -167,22 +191,46 @@ transform_cfg = let det = detect_transforms(dir),
          ("nu_c" in hdr ? (det.ctrans === :none ? :bhyp : det.ctrans) : det.ctrans)
     rt = rtrans_arg !== nothing ? rtrans_arg :
          ("nu_r" in hdr ? (det.rtrans === :none ? :bhyp : det.rtrans) : det.rtrans)
+    # Ice mirrors cloud/rain: the nu_i1 name is authoritative, the log only supplies the
+    # variant and the mass mu (Scythe.MC_ICE_MU_KEYS[1] == :mu_ice for all three species).
+    it = icetrans_arg !== nothing ? icetrans_arg :
+         ("nu_i1" in hdr ? (det_ice.itrans === :none ? :bhyp : det_ice.itrans) : det_ice.itrans)
     (ctrans = ct, cmu = something(cmu_arg, det.cmu),
-     rtrans = rt, rmu = something(rmu_arg, det.rmu))
+     rtrans = rt, rmu = something(rmu_arg, det.rmu),
+     itrans = it, imu = something(icemu_arg, det_ice.imu))
+end
+# --field ice needs the three ice-mass columns to exist at all; check by NAME (either the
+# density name or its nu_* alias) and name exactly what is missing rather than letting the
+# failure surface deep inside the render loop as an opaque KeyError.
+if field == "ice"
+    hdr = names(CSV.read(first_path, DataFrame; limit = 1))
+    missing_ice = [ "$role/$alias" for (role, alias) in
+                    (("rho_i1", "nu_i1"), ("rho_i2", "nu_i2"), ("rho_i3", "nu_i3"))
+                    if !(role in hdr) && !(alias in hdr) ]
+    isempty(missing_ice) ||
+        error("--field ice needs the three ISHMAEL ice-mass columns, but this run has none " *
+              "of " * join(missing_ice, ", ") * " in $dir — it was very likely run with " *
+              "options[:ice_microphysics] = :none (or an older layout). Columns present: " *
+              "$hdr")
 end
 water_desc(col, mode, mu) = mode === :none ? "$col (density)" :
     "$col (control variable, $(mode), mu = $(mu)" *
     (startswith(col, "nu_") ? ")" : "; pre-rename layout)")
 let hdr = names(CSV.read(first_path, DataFrame; limit = 1))
+    ice_desc = field == "ice" ? ", ice mass (i1/i2/i3) = " *
+        water_desc("nu_i1" in hdr ? "nu_i1" : "rho_i1", transform_cfg.itrans,
+                   transform_cfg.imu) : ""
     println("Water columns: cloud = " *
             water_desc("nu_c" in hdr ? "nu_c" : "rho_c",
                        transform_cfg.ctrans, transform_cfg.cmu) *
             ", rain = " *
             water_desc("nu_r" in hdr ? "nu_r" : "rho_r",
-                       transform_cfg.rtrans, transform_cfg.rmu))
+                       transform_cfg.rtrans, transform_cfg.rmu) * ice_desc)
 end
 
-"""Read one patch snapshot; return (x[km] (ncol), z[km] (kDim), field2d, rho_c2d, rho_r2d)."""
+"""Read one patch snapshot; return (x[km] (ncol), z[km] (kDim), field2d, rho_c2d, rho_r2d,
+i1/i2/i3 2d). The three ice-mass fields are `nothing` unless `--field ice` is active — the
+liquid-only runs this script also serves carry no ice columns to recover them from."""
 function read_patch(path, rho_cbar)
     df = CSV.read(path, DataFrame)
     zc = df.z
@@ -194,9 +242,17 @@ function read_patch(path, rho_cbar)
     rc, rr = mc_water(df, rho_cbar, ncol;
                       ctrans = transform_cfg.ctrans, cmu = transform_cfg.cmu,
                       rtrans = transform_cfg.rtrans, rmu = transform_cfg.rmu)
+    i1 = i2 = i3 = nothing
+    if field == "ice"
+        ri1, ri2, ri3 = mc_ice(df; itrans = transform_cfg.itrans, imu = transform_cfg.imu)
+        i1 = reshape(1000.0 .* ri1, kDim, ncol)
+        i2 = reshape(1000.0 .* ri2, kDim, ncol)
+        i3 = reshape(1000.0 .* ri3, kDim, ncol)
+    end
     return (x = x, z = z, kDim = kDim, ncol = ncol,
             rho_c = reshape(1000.0 .* rc, kDim, ncol),
-            rho_r = reshape(1000.0 .* rr, kDim, ncol))
+            rho_r = reshape(1000.0 .* rr, kDim, ncol),
+            i1 = i1, i2 = i2, i3 = i3)
 end
 kDim0 = let zc = CSV.read(first_path, DataFrame).z
     findfirst(i -> zc[i+1] < zc[i], 1:length(zc)-1)
@@ -231,40 +287,61 @@ println("Found $(length(snap_times)) snapshots, field = $field")
 # One pass over every patch and snapshot to fix a stable, shared colour range so
 # the movie does not re-scale frame to frame. The FILLED field sets it. rho_c
 # fills with a sequential viridis (vivid cloud, the original look); rho_r fills
-# with a diverging map centred on zero so its (large) undershoots read blue.
+# with a diverging map centred on zero so its (large) undershoots read blue. The
+# ice view fills with rho_c too (same thresholds/levels as --field rho_c) and, in
+# the same pass, tracks each ice species' own domain max — the ABSOLUTE g/m³ ladder
+# below is then clipped per species so it is stable across frames and an absent
+# species draws nothing.
 snap_path(p, t) = joinpath(dir, patch_dirs[p], "$(t)_physical.csv")
-fld(pat) = field == "rho_c" ? pat.rho_c : pat.rho_r
+fld(pat) = field == "rho_r" ? pat.rho_r : pat.rho_c
 vmax_pos = 0.0
 vmin_neg = 0.0
+imax1 = imax2 = imax3 = 0.0
 for t in snap_times, p in 1:npatch
-    f = fld(read_patch(snap_path(p, t), rho_cbar))
+    pat = read_patch(snap_path(p, t), rho_cbar)
+    f = fld(pat)
     global vmax_pos = max(vmax_pos, maximum(f))
     global vmin_neg = min(vmin_neg, minimum(f))
+    if field == "ice"
+        global imax1 = max(imax1, maximum(pat.i1))
+        global imax2 = max(imax2, maximum(pat.i2))
+        global imax3 = max(imax3, maximum(pat.i3))
+    end
 end
-if field == "rho_c"
-    # Sequential, positive; the anvil saturates via extendhigh so the low cloud
-    # is not crushed. The fill STARTS at a small cloud threshold (not zero), so
-    # the sub-threshold representation noise that the prognostic cloud carries
-    # across the whole domain stays blank white rather than flickering across the
-    # first band (the zebra artefact of a fill boundary sitting on zero). Negative
-    # cloud is shown by its own dashed contours, below.
-    cthresh = 0.05                          # g/m³ — below this is "no cloud"
-    cmax = max(0.7 * vmax_pos, 0.4)
-    levels = range(cthresh, cmax; length = 30)
-    fill_cmap = :viridis
-else
+if field == "rho_r"
     # Diverging, symmetric, clipped a little tighter than the positive peak so
     # the smaller negative rain still reads at contrast.
     cmax = max(0.6 * vmax_pos, -vmin_neg, 0.2)
     levels = range(-cmax, cmax; length = 41)
     fill_cmap = :balance
+else
+    # Sequential, positive; the anvil saturates via extendhigh so the low cloud
+    # is not crushed. The fill STARTS at a small cloud threshold (not zero), so
+    # the sub-threshold representation noise that the prognostic cloud carries
+    # across the whole domain stays blank white rather than flickering across the
+    # first band (the zebra artefact of a fill boundary sitting on zero). Negative
+    # cloud is shown by its own dashed contours, below. Shared verbatim by --field
+    # ice, which fills the same rho_c and only adds the ice line contours on top.
+    cthresh = 0.05                          # g/m³ — below this is "no cloud"
+    cmax = max(0.7 * vmax_pos, 0.4)
+    levels = range(cthresh, cmax; length = 30)
+    fill_cmap = :viridis
 end
 rain_pos = [0.5, 1.0, 2.0, 4.0, 8.0]        # rho_r POSITIVE contours [g/m³]
 rain_neg = [-4.0, -2.0, -1.0, -0.5]         # rho_r NEGATIVE (unphysical) contours
 cloud_neg = [-0.6, -0.3, -0.1]              # rho_c NEGATIVE (unphysical) contours
+# Ice-mass contour levels: one fixed ladder, clipped to each species' OWN domain max so a
+# species that never reaches the first rung draws nothing rather than an empty legend entry.
+ice_ladder = [0.01, 0.05, 0.2, 0.5, 1.0, 2.0]           # g/m³
+ice_levels1 = filter(l -> l <= imax1, ice_ladder)       # i1 = planar
+ice_levels2 = filter(l -> l <= imax2, ice_ladder)       # i2 = columnar
+ice_levels3 = filter(l -> l <= imax3, ice_ladder)       # i3 = aggregate
 println(@sprintf("fill = %s, range %s  (peak +%.2f, min %.3f)", field,
-                 field == "rho_c" ? "0..$(round(cmax; digits=2))" :
-                                    "±$(round(cmax; digits=2))", vmax_pos, vmin_neg))
+                 field == "rho_r" ? "±$(round(cmax; digits=2))" :
+                                    "0..$(round(cmax; digits=2))", vmax_pos, vmin_neg))
+field == "ice" && println(@sprintf(
+    "ice species max (g/m³) over the run: i1(planar) %.4f, i2(columnar) %.4f, i3(aggregate) %.4f",
+    imax1, imax2, imax3))
 
 # ── Frames ──────────────────────────────────────────────────────────────────
 framedir = joinpath(dir, "movie_frames")
@@ -283,13 +360,16 @@ end
 xspan = xlim === nothing ? (0.0, 150.0) : xlim
 
 # Positive rain contours read best in a colour that contrasts the fill: white on
-# the dark viridis cloud (the original convention), black on the light diverging
-# rain map. Negative water is always dashed — magenta for rain, cyan for cloud.
-rain_pos_color = field == "rho_c" ? :black : :white
+# the dark viridis cloud (the original convention, shared by --field ice since it
+# fills the same rho_c), black on the light diverging rain map. Negative water is
+# always dashed — magenta for rain, cyan for cloud.
+rain_pos_color = field == "rho_r" ? :white : :black
 
 conv_note = let bits = String[]
     transform_cfg.ctrans === :none || push!(bits, "ρ_c via $(transform_cfg.ctrans)⁻¹")
     transform_cfg.rtrans === :none || push!(bits, "ρ_r via $(transform_cfg.rtrans)⁻¹")
+    field == "ice" && transform_cfg.itrans !== :none &&
+        push!(bits, "ρ_i via $(transform_cfg.itrans)⁻¹")
     isempty(bits) ? "" : "   [" * join(bits, ", ") * "]"
 end
 
@@ -298,12 +378,13 @@ for (i, t) in enumerate(snap_times)
     ax = Axis(fig[1, 1], xlabel = "x (km)", ylabel = "z (km)")
     local cf = nothing
     minc = Inf; minr = Inf
+    max1 = max2 = max3 = 0.0
     for p in draw_order
         pat = read_patch(snap_path(p, t), rho_cbar)
         minc = min(minc, minimum(pat.rho_c)); minr = min(minr, minimum(pat.rho_r))
         cf = contourf!(ax, pat.x, pat.z, fld(pat)',
                        levels = levels, extendhigh = :auto,
-                       extendlow = field == "rho_c" ? nothing : :auto,
+                       extendlow = field == "rho_r" ? :auto : nothing,
                        colormap = fill_cmap)
         # Positive rain as line contours over the filled cloud (the original view).
         contour!(ax, pat.x, pat.z, pat.rho_r', levels = rain_pos,
@@ -319,19 +400,42 @@ for (i, t) in enumerate(snap_times)
         any(pat.rho_r .< rain_neg[end]) &&
             contour!(ax, pat.x, pat.z, pat.rho_r', levels = rain_neg,
                      color = :black, linewidth = 1.4, linestyle = :dash)
+        # The three ISHMAEL ice-mass species, each its own colour family, drawn LAST so
+        # they sit on top of everything else — the point of this view is "where is ice",
+        # so it has to read at a glance over the liquid fill and the undershoot contours.
+        if field == "ice"
+            max1 = max(max1, maximum(pat.i1)); max2 = max(max2, maximum(pat.i2))
+            max3 = max(max3, maximum(pat.i3))
+            isempty(ice_levels1) ||
+                contour!(ax, pat.x, pat.z, pat.i1', levels = ice_levels1,
+                        color = :dodgerblue, linewidth = 1.3)
+            isempty(ice_levels2) ||
+                contour!(ax, pat.x, pat.z, pat.i2', levels = ice_levels2,
+                        color = :purple, linewidth = 1.3)
+            isempty(ice_levels3) ||
+                contour!(ax, pat.x, pat.z, pat.i3', levels = ice_levels3,
+                        color = :darkorange, linewidth = 1.3)
+        end
         # Mark patch seams faintly so the nest layout is legible.
         nested && vlines!(ax, [pat.x[1], pat.x[end]]; color = (:gray, 0.3),
                           linewidth = 0.5)
     end
     # State the CONVENTION alongside the minima. Under a transform these read 0.000 by
     # construction, and a reader has to be able to tell that from a run that simply had no
-    # undershoot.
-    ax.title = @sprintf("O01 warm rain — t = %d min    min ρ_c = %.3f, min ρ_r = %.3f g/m³%s",
-                        round(Int, t / 60), minc, minr, conv_note)
+    # undershoot. The ice view adds each species' current-frame max alongside them.
+    ice_bit = field == "ice" ? @sprintf("   max ρ_i1 = %.3f, ρ_i2 = %.3f, ρ_i3 = %.3f g/m³",
+                                        max1, max2, max3) : ""
+    ax.title = @sprintf("O01 warm rain — t = %d min    min ρ_c = %.3f, min ρ_r = %.3f g/m³%s%s",
+                        round(Int, t / 60), minc, minr, ice_bit, conv_note)
     xlims!(ax, xspan...); ylims!(ax, zlim...)
-    lbl = field == "rho_c" ?
-        "ρ_c (g/m³)   [lines: ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]" :
+    lbl = if field == "rho_r"
         "ρ_r (g/m³)   [blue<0; lines ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
+    elseif field == "ice"
+        "ρ_c (g/m³)   [lines: ρ_r>0 black; ice mass i1 planar dodgerblue, i2 columnar " *
+        "purple, i3 aggregate darkorange; dashed magenta ρ_r<0, cyan ρ_c<0]"
+    else
+        "ρ_c (g/m³)   [lines: ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
+    end
     Colorbar(fig[1, 2], cf, label = lbl)
     frame = joinpath(framedir, "frame_" * lpad(i - 1, 4, '0') * ".png")
     save(frame, fig)
