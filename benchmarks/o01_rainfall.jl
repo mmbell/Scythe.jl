@@ -106,6 +106,22 @@ function o01_model(opts::BenchmarkOptions)
     # not the formulation. The water species feed the acoustic coefficient through q_l, so
     # a change to the condensate CAN move that ceiling.
     haskey(ENV, "SCYTHE_O01_TS") && (ts = parse(Float64, ENV["SCYTHE_O01_TS"]))
+    # The ice arm's production timestep is 0.15 s (author decision 2026-08-20). Stage B
+    # integrates every microphysical relaxation consistently at any ts (per-donor J0
+    # realization; the donor census verifies), and at ts=0.15 the ice arm runs the full
+    # 3600 s through glaciation with every donor bounded. The quick default ts=0.3 still
+    # dies at t=2454.9 s through a chain the integrator cannot own: water-partition
+    # detachment at the 13 km glaciation front (independently advected ice moments at
+    # 4.1x the conserved rho_t anchor, rho_v absorbing -8.4 g/m^3 as the closing
+    # residual) -> 363 K retrieval -> vertical-acoustic SI ceiling breach (Co_w = 2.08
+    # against the 1.59x margin). That detachment is a transport/representation problem,
+    # the named next-stage target; evidence preserved under
+    # benchmarks/output/o01_rainfall_quick_mc_rirkstageB* (2026-08-20). SCYTHE_O01_TS
+    # overrides this default, which is how the ts=0.3 chain stays reproducible.
+    if get(ENV, "SCYTHE_O01_ICE", "") in ("1", "true", "yes", "ishmael") &&
+       !haskey(ENV, "SCYTHE_O01_TS")
+        ts = 0.15
+    end
     # Vertical: 500 m nodal spacing to 25 km in BOTH modes (the rain physics and
     # the sedimentation flux do not coarsen with the horizontal grid). The top
     # 8 km (17-25 km) is the Rayleigh sponge; the 25 km lid (vs the historical
