@@ -716,7 +716,19 @@ function run_nested_benchmark(name::String, opts::BenchmarkOptions;
     println("Computing diagnostics...")
     diags = diagnostics(models, topo)
 
-    targets = load_targets(name, opts; arm=arm)
+    # A nested run is judged against ITS OWN window key when one is seeded
+    # (e.g. "o01_rainfall_n3"), falling back to the base case's windows otherwise.
+    # The nested diagnostics define max_w/min_w as the extrema over EVERY output
+    # snapshot (user decision 2026-07-14), while the single-grid diagnostics report
+    # the final snapshot only — so windows derived from single-grid values are a
+    # different unit and the nested arm could never pass them regardless of the
+    # model (measured 2026-08-20: the single grid's own run-maximum w is 65.1 m/s
+    # against its reported final-time 16.5).
+    nested_key = "$(name)$(nest_suffix(opts))"
+    targets_name = haskey(BENCHMARK_EXPECTED,
+                          isempty(arm) ? nested_key : "$(nested_key)_$(arm)") ?
+                   nested_key : name
+    targets = load_targets(targets_name, opts; arm=arm)
     target_pass = check_targets(diags, targets)
     report_table(name, opts, diags, targets, target_pass)
     diag_csv = write_diagnostics_csv(joinpath(nest.base.output_dir, "diagnostics.csv"),

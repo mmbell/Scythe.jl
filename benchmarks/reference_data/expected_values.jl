@@ -103,6 +103,24 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     # and load_targets() will not fall back to the base case for exactly that reason: an
     # armed run against this empty entry gets zero targets, not a spurious pass/fail.
     "o01_rainfall_ice" => Dict{String,Tuple{Float64,Float64,Float64,String}}(),
+    # Nested 3-level arm (--nests 3): its OWN windows, looked up by the nest-qualified
+    # key in run_nested_benchmark. Two reasons it cannot borrow the single-grid windows
+    # above: (1) max_w/min_w are the RUN-MAXIMUM over all snapshots on the nested arm
+    # (user decision 2026-07-14) vs the final snapshot on the single grid — a different
+    # unit (the single grid's own run-maximum is 65.1 m/s against its reported
+    # final-time 16.5); (2) the fine nests resolve the convective core (1|0.5|0.25 km
+    # since 82a0fde), which legitimately rains ~25% more than the 500 m single grid.
+    # Centers/spreads from the four preserved nested full runs 2026-07-22..08-20
+    # (n3_stage5_pre, n3_ladder_none, n3_ladder_bhyp, and the 2026-08-20 re-seed):
+    # accum 3.85-4.05, max_rho_r 19.9-21.3, max_w 41.9-44.6 — family spread ~5%.
+    # PROVISIONAL: author review at the S9 close-out.
+    "o01_rainfall_n3" => Dict(
+        "peak_rain_rate_gm2s" => (175.0, 50.0, 60.0, "seeded 2026-08-20 (nested family; single-grid full 118 + refinement)"),
+        "max_rho_r_gm3"       => (20.5,  4.0,  5.0,  "seeded 2026-08-20 (nested family 19.9-21.3)"),
+        "max_w"               => (43.0,  8.0, 10.0,  "seeded 2026-08-20 (RUN-MAX definition; family 41.9-44.6)"),
+        "rain_onset_min"      => (26.0,  6.0,  8.0,  "seeded 2026-08-20 (family 24-25; single grid 23-31)"),
+        "accum_rainfall_mm"   => (3.95,  1.0,  1.2,  "seeded 2026-08-20 (nested family 3.85-4.05)"),
+    ),
     "o01_axisym" => Dict(
         "peak_rain_rate_gm2s" => (55.0, 35.0, 35.0, "o01_rainfall window (metric terms ~0.2%)"),
         "max_rho_r_gm3"       => (8.5,  4.0,  4.0,  "o01_rainfall window"),
