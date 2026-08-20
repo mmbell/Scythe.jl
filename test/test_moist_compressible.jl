@@ -877,9 +877,24 @@ using Springsteel
             @test maximum(abs.(mtile.expdot_n[:, vars["E_t"]])) == 0.0
             @test maximum(abs.(mtile.expdot_n[:, vars["rho_t"]])) == 0.0
             @test maximum(abs.(mtile.expdot_n[:, vars["rho_d"]])) == 0.0
-            # Latent heating raises pressure; supersaturation relaxes
-            @test all(mtile.expdot_n[perturbed, vars["p"]] .> 0.0)
+            # Latent heating raises pressure; supersaturation relaxes.
+            #
+            # THE HEATING IS NO LONGER A TENDENCY TERM. Condensation relaxes `Q_ss`, so it is
+            # withheld from the multistep and applied as a direct increment at the step-mean
+            # rate (`relaxation_adjustment_qss!`), carrying the same `(R_m/C_vt)(L_v −
+            # R_vC_ptT/R_m)` bracket slot 1 carried it in. The physical statement is unchanged
+            # and is read off that increment instead. The scratch holds the LAST column
+            # advanced, and every column carries the same lower-half seed, so its lower half is
+            # the perturbed set.
+            S = mtile.mc_scratch[Threads.threadid()]
+            half = div(kDim, 2)
+            @test all(S.Qdot_bar[1:half] .> 0.0)         # condensing
+            @test all(S.etd_d1[1:half] .> 0.0)           # ...and that raises the pressure
+            # The supersaturation relaxes: downward in what the multistep still carries, and
+            # downward in the value the exponential update actually writes.
             @test all(mtile.expdot_n[perturbed, qss_i] .< 0.0)
+            @test all(mtile.var_np1[perturbed, qss_i] .<
+                      mtile.tile.physical[perturbed, qss_i, 1])
             @test all(isfinite.(mtile.var_np1))
         end
     end
@@ -2771,16 +2786,29 @@ using Springsteel
             end
 
             perturbed = [i for i in 1:npts if mod1(i, kDim) <= div(kDim, 2)]
-            @test all(mtile.expdot_n[perturbed, rc_i] .> 0.0)     # cloud is being made
-            @test all(mtile.expdot_n[perturbed, rv_i] .< 0.0)     # ...out of the vapor
-            # EQUAL AND OPPOSITE. The vapor's source is -Qdot and the cloud's is +Qdot, both
-            # accumulated from the same rate, so they cancel exactly; the only thing left in
-            # the sum is the reconciliation nudge, and on this consistent seed that is
-            # twelve decades below the phase change itself.
-            scale = maximum(abs.(mtile.expdot_n[:, rc_i]))
+            # MEASURED ON THE APPLIED INCREMENT, not on `expdot`. Condensation is one half of
+            # the `Q_ss` relaxation pair, so it no longer travels through the multistep at all:
+            # it is applied directly, at the step-mean rate, by `relaxation_adjustment_qss!`.
+            # `var_np1 − physical` is the whole advance these two slots receive over the step —
+            # the multistep part plus that increment — and nothing else touches them here (no
+            # acoustic leg, no diffusion, and the positivity clamp is inert on positive water).
+            # The conservation statement is the same one, integrated: what the cloud gains, the
+            # vapor loses.
+            d_rc = mtile.var_np1[:, rc_i] .- mtile.tile.physical[:, rc_i, 1]
+            d_rv = mtile.var_np1[:, rv_i] .- mtile.tile.physical[:, rv_i, 1]
+            @test all(d_rc[perturbed] .> 0.0)     # cloud is being made
+            @test all(d_rv[perturbed] .< 0.0)     # ...out of the vapor
+            # EQUAL AND OPPOSITE. The vapor's increment is -Qdot_bar*ts and the cloud's is
+            # +Qdot_bar*ts, both built from the SAME step-mean rate, so they cancel exactly;
+            # the only thing left in the sum is the reconciliation nudge, and on this
+            # consistent seed that is twelve decades below the phase change itself.
+            scale = maximum(abs.(d_rc))
             @test scale > 0.0
-            @test maximum(abs.(mtile.expdot_n[:, rv_i] .+ mtile.expdot_n[:, rc_i])) <
-                  1.0e-8 * scale
+            @test maximum(abs.(d_rv .+ d_rc)) < 1.0e-8 * scale
+            # The rate-level statement behind it, exact by construction: every consumer is fed
+            # from one step-mean rate per channel.
+            S = mtile.mc_scratch[Threads.threadid()]
+            @test S.VAPOR_SRC == -((S.Qdot_bar .+ S.Qdot_r_bar) .+ S.Qdep_bar)
             # The conserved anchor does not move.
             @test maximum(abs.(mtile.expdot_n[:, vars["rho_t"]])) == 0.0
             @test maximum(abs.(mtile.expdot_n[:, vars["rho_d"]])) == 0.0
@@ -3674,9 +3702,21 @@ using Springsteel
             kDim = gp.kDim
             ncol = Scythe.num_columns(patch)
             npts = ncol * kDim
+            # The EFFECTIVE slot-1 tendency, accumulated per column. The condensation and
+            # deposition heating is no longer a term in `expdot[.,1]`: it is withheld with the
+            # rest of the relaxation pair and applied as the direct increment `etd_d1` over the
+            # step (`relaxation_adjustment_qss!`). The spurious-condensation channel this
+            # residual exists to see therefore lives in `expdot + etd_d1/ts`, and the scratch
+            # column has to be read inside the loop because it is overwritten per column.
+            p_eff = 0.0
             for c in 1:ncol
                 cs = ((c - 1) * kDim) + 1
                 Scythe.physical_model(mtile, cs, cs + kDim - 1, 1)
+                Ssc = mtile.mc_scratch[Threads.threadid()]
+                for k in 1:kDim
+                    p_eff = max(p_eff, abs(mtile.expdot_n[cs + k - 1, gp.vars["p"]] +
+                                           (Ssc.etd_d1[k] / model.ts)))
+                end
             end
             rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
             p_i = gp.vars["p"]; rt_i = gp.vars["rho_t"]
@@ -3695,6 +3735,7 @@ using Springsteel
             end
             slots = [maximum(abs, view(mtile.expdot_n, 1:npts, s))
                      for s in 1:size(mtile.expdot_n, 2)]
+            slots[gp.vars["p"]] = p_eff
             return gw, hy, slots
         end
 
@@ -5277,21 +5318,29 @@ using Springsteel
             @test S.dT_nc .- baseT ≈ (Lf .* S.FRZ_NET) ./ (S.rho_d .* S.C_vt) rtol = 1e-12
             @test S.dp_nc .- basep ≈ (S.R_m ./ S.C_vt) .* (Lf .* S.FRZ_NET) rtol = 1e-12
 
-            # The pressure equation itself. The column is at rest (u = w = 0), so the
-            # advective part of slot 1 is identically zero and expdot IS the forcing.
+            # The pressure equation itself, which is now in TWO pieces and the split is the
+            # point of the test. FREEZING relaxes nothing and moves no vapor, so it stays on
+            # the multistep and is the ONLY phase change left in `expdot[.,1]`; CONDENSATION
+            # and DEPOSITION relax the shared `Q_ss`, are withheld with it, and come back as
+            # the direct increment `etd_d1` at the step-mean rate. The column is at rest
+            # (u = w = 0), so the advective part of slot 1 is identically zero, the divergence
+            # work vanishes and the acoustic staging term is proportional to w.
             kDim = mod.grid_params.kDim
             Ls = Springsteel.Thermodynamics.L_s.(S.Tk)
-            qdep = S.Qdot_i1 .+ S.Qdot_i2 .+ S.Qdot_i3
-            liquid = @. (S.R_m / S.C_vt) *
-                        (((S.Lv - (Rv * S.C_pt * S.Tk / S.R_m)) * (S.Qdot + S.Qdot_r)) +
-                         S.QDOT_TH)
-            icepart = @. (S.R_m / S.C_vt) *
-                         (((Ls - (Rv * S.C_pt * S.Tk / S.R_m)) * qdep) + (Lf * S.FRZ_NET))
-            # Everything else in the slot-1 forcing is the divergence work, which is zero at
-            # rest, plus the acoustic staging term, which is proportional to w.
-            @test m.expdot_n[1:kDim, 1] ≈ liquid .+ icepart rtol = 1e-8 atol = 1e-12
-            # The freezing piece is a pure heating and RAISES the pressure.
-            @test all(icepart[S.FRZ_NET .> 0.0] .> 0.0)
+            thermal = @. (S.R_m / S.C_vt) * S.QDOT_TH
+            frz = @. (S.R_m / S.C_vt) * (Lf * S.FRZ_NET)
+            @test m.expdot_n[1:kDim, 1] ≈ thermal .+ frz rtol = 1e-8 atol = 1e-12
+            # The freezing piece carries the BARE L_f — no -R_v C_pt T/R_m companion — and is
+            # a pure heating that RAISES the pressure.
+            @test all(frz[S.FRZ_NET .> 0.0] .> 0.0)
+            # The withheld heating, at the step-mean rate, with the companion that freezing
+            # does not get: deposition's coefficient is condensation's with L_v -> L_s.
+            ts = mod.ts
+            want_d1 = @. ts * (S.R_m / S.C_vt) *
+                          (((S.Lv - (Rv * S.C_pt * S.Tk / S.R_m)) *
+                            (S.Qdot_bar + S.Qdot_r_bar)) +
+                           ((Ls - (Rv * S.C_pt * S.Tk / S.R_m)) * S.Qdep_bar))
+            @test S.etd_d1 ≈ want_d1 rtol = 1e-12 atol = 1e-300
         end
     end
 
@@ -5320,10 +5369,18 @@ using Springsteel
             Sa = m_a.mc_scratch[Threads.threadid()]
 
             # The rates really did move, and in the right direction: the more supersaturated
-            # state condenses more (equivalently, evaporates less) and deposits more.
-            @test all(m_a.expdot_n[1:kDim, 9] .> m_b.expdot_n[1:kDim, 9])   # cloud
+            # state condenses more (equivalently, evaporates less) and deposits more. Read off
+            # the ADVANCE rather than off `expdot`: the two phase changes are withheld from the
+            # multistep and applied directly at the step-mean rate, and the two runs differ
+            # only in slot 7 — which nothing else on these slots reads — so the difference in
+            # `var_np1` IS the difference in the phase change. (`m_a` and `m_b` are separate
+            # tiles with separate scratch, so the step-mean columns are comparable too.)
             i1q = m_a.mc_slots.i1_q                                         # 12, by name
-            @test all(m_a.expdot_n[1:kDim, i1q] .> m_b.expdot_n[1:kDim, i1q])  # ice mass
+            @test all(m_a.var_np1[1:kDim, 9] .> m_b.var_np1[1:kDim, 9])     # cloud
+            @test all(m_a.var_np1[1:kDim, i1q] .> m_b.var_np1[1:kDim, i1q]) # ice mass
+            Sb = m_b.mc_scratch[Threads.threadid()]
+            @test all(Sa.Qdot_bar .> Sb.Qdot_bar)
+            @test all(Sa.Qdep_bar .> Sb.Qdep_bar)
 
             # ...and E_t's tendency is BITWISE identical, because no phase change is a source
             # of it. (rho_t likewise: phase changes are internal to the water.)
@@ -5349,9 +5406,348 @@ using Springsteel
             scale = maximum(abs.(ice)) + maximum(abs.(dep))
             @test scale > 0.0
             # Riming, splintering, freezing, melting and aggregation are all live here.
-            @test maximum(abs.(ice .- dep)) > 0.0
-            @test maximum(abs.((ice .- dep) .+ liq)) < 1.0e-12 * scale
+            @test maximum(abs.(ice)) > 0.0
+            # THE CLOSURE IS NOW TWO STATEMENTS, because the deposition leg no longer travels
+            # through `SRC_i*q`: it is the ice half of the `Q_ss` relaxation pair, withheld
+            # from the multistep and applied at the step-mean rate. So `ice` here is exactly
+            # the NON-deposition ice mass source, and
+            #   (i) everything the ice gains that is not deposition comes out of the liquid;
+            @test maximum(abs.(ice .+ liq)) < 1.0e-12 * scale
+            #   (ii) the vapor pays exactly what the condensation and deposition channels gain,
+            #        at the SAME step-mean rate every consumer is fed from — which is what
+            #        makes the transfer identical for all of them by construction.
+            @test S.VAPOR_SRC == -((S.Qdot_bar .+ S.Qdot_r_bar) .+ S.Qdep_bar)
+            @test maximum(abs.(S.Qdep_bar)) > 0.0
         end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # The STIFF RELAXATION INTEGRATOR at the driver level. TeX §"Integration of the
+    # relaxation pair in the stiff limit"; the scalar coefficient math is exercised
+    # on its own in test_etd_relaxation.jl.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "stiff relaxation: dry air takes the classical multistep, bitwise" begin
+        # "wherever λ = 0 — air with no droplets, no rain, and no ice, which is the entire dry
+        # path — Eq. etd_ab3 IS the third-order multistep, bitwise, so the scheme change
+        # touches nothing outside the condensate-bearing points" (TeX, first property). This
+        # is that sentence as a gate: zero λ, zero increments, and a slot-7 advance
+        # reconstructed independently and compared with `===`.
+        mktempdir() do tmpdir
+            mtile, patch, model, _ = make_mc_mtile(tmpdir; dry = true)
+            kDim = model.grid_params.kDim
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+            S = mtile.mc_scratch[Threads.threadid()]
+            @test all(S.etd_lam .== 0.0)
+            @test all(S.Qdot_bar .== 0.0)
+            @test all(S.Qdot_r_bar .== 0.0)
+            @test all(S.Qdep_bar .== 0.0)
+            for col in (S.etd_d1, S.etd_d8, S.etd_d9, S.etd_dv)
+                @test all(col .== 0.0)
+            end
+            # The Euler branch of the first step, rebuilt from the tendency the integrator
+            # was handed. Bitwise, because the adjustment must not touch this slot at all.
+            for i in 1:npts
+                @test mtile.var_np1[i, 7] ===
+                      patch.physical[i, 7, 1] + (model.ts * mtile.expdot_n[i, 7])
+            end
+        end
+    end
+
+    @testset "stiff relaxation: the fixed point IS the quasi-steady state (Eq. wbf_qs)" begin
+        # "its fixed point is N/λ = Q_ss^qs of Eq. wbf_qs at every x, not merely
+        # asymptotically" (TeX, third property), with `λ = τ^{-1} + τ_i^{-1}` the denominator
+        # of Eq. wbf_qs and `N = F − 𝒟/τ_i` its numerator. A big step on a numerous, tiny ice
+        # population puts `x = λΔt` far into the stiff regime, where the classical multistep
+        # (real-axis limit 0.545) could not have taken a step at all.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                              rho_i = 1.0e-6, n_i = 5.0e9, r_i = 10.0e-6,
+                                              rho_r = 1.0e-4, n_r = 1.0e3, ts = 100.0)
+            kDim = mod.grid_params.kDim
+            # OFF THE CLIP BOUNDARY, deliberately. The reference column is exactly
+            # liquid-saturated, so `Q_ss` and `ρ_v − ρ_v*` are the same number to within the
+            # retrieval's own round-off, and the vapor-availability clip binds or not by
+            # accident. A CLIPPED channel is a constant flux that contributes nothing to λ
+            # (TeX), which is precisely NOT the regime under test, so the column is given a
+            # large vapor excess — 1e-3 against a saturation density of ~1.6e-3 — which leaves
+            # `min(Q_ss, ρ_v − ρ_v*) = Q_ss` by two orders of magnitude on both channels. The
+            # liquid then sits at zero drive while the ice sees `Q_ss + 𝒟 > 0`: the
+            # Wegener-Bergeron-Findeisen window, with both conductances live in λ.
+            rv_i = m.mc_slots.rho_v
+            for i in 1:size(patch.physical, 1)
+                patch.physical[i, rv_i, 1] = 1.0e-3
+            end
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            Scythe.advance_column(m, 1, 1)
+            S = m.mc_scratch[Threads.threadid()]
+            ts = mod.ts
+            Q_ssbar = Springsteel.ref_qss(m.ref_state)[:, 1]
+
+            # λ is the sum of the UNCLIPPED conductances; on this vapor-rich state nothing is
+            # clipped, so it is all of them, assembled in the same order the driver does.
+            @test all(S.etd_dep_a .== 1.0)
+            lam_all = S.invtau_c .+ S.invtau_r .+
+                      (S.invtau_i1 .+ S.invtau_i2 .+ S.invtau_i3)
+            @test S.etd_lam == lam_all
+            x = S.etd_lam .* ts
+            @test minimum(x) > 0.545         # every point is past AB3's real-axis limit
+            @test maximum(x) > 30.0          # and the worst is deep in the stiff regime
+
+            # At t = 1 the extrapolant is the constant N^n, so the update is exactly
+            # Q^{n+1} − N/λ = e^{−x}(Q^n − N/λ): the fixed point is N/λ at EVERY x, and the
+            # approach to it is the exact propagator's. `N/λ` here IS Eq. wbf_qs — `N` is the
+            # tendency slot 7 carries (F − 𝒟/τ_i, the two relaxations withheld) and `λ` is its
+            # denominator.
+            qn = patch.physical[1:kDim, 7, 1] .+ Q_ssbar
+            qnp1 = m.var_np1[1:kDim, 7] .+ Q_ssbar
+            nn = m.expdot_n[1:kDim, 7]
+            qqs = nn ./ S.etd_lam
+            @test maximum(abs.((qnp1 .- qqs) .- (exp.(-x) .* (qn .- qqs)))) <=
+                  1.0e-9 * maximum(abs.(qqs))
+            # ...and where the step is genuinely stiff the exponential has closed the gap
+            # completely: one step lands on the Korolev-Mazin quasi-steady state regardless of
+            # history, which the classical multistep could not have reached at all.
+            stiff = findall(x .> 30.0)
+            @test !isempty(stiff)
+            @test qnp1[stiff] ≈ qqs[stiff] rtol = 1e-6
+            # The step-MEAN the consumers are fed approaches the same state, but
+            # ALGEBRAICALLY rather than exponentially, and that difference is the physics: a
+            # trajectory that starts at Q^n and relaxes onto N/λ inside the step spends O(1/x)
+            # of that step away from it, so with the t = 1 constant extrapolant
+            #
+            #     Q̄ = J0 Q^n + Δt J1 N = (N/λ)(1 − 1/x) + Q^n/x + O(1/x²) .
+            #
+            # It is the MEAN of the trajectory, not its endpoint, and it is the mean that every
+            # consumer must see for Eq. qss_stepmean to close — feeding them the endpoint would
+            # over-count the transfer by exactly this 1/x.
+            @test S.etd_qbar[stiff] ≈
+                  (qqs[stiff] .* (1.0 .- (1.0 ./ x[stiff]))) .+ (qn[stiff] ./ x[stiff]) rtol = 5e-3
+            @test S.etd_qbar[stiff] ≈ qqs[stiff] rtol = 5.0 / minimum(x[stiff])
+        end
+    end
+
+    @testset "stiff relaxation: the step-mean closes the exchange with ice present" begin
+        # Every consumer is fed from ONE step-mean rate per channel, so "the vapor removed,
+        # the mass deposited, and the heat released are identical by construction" (TeX,
+        # "The step-mean closes the exchange"). Checked on the INCREMENTS the adjustment
+        # actually applies, in density units — the transformed slots carry their own Jacobian,
+        # so the density increment of a slot is its slot increment divided by that Jacobian.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                              rho_i = 1.0e-5, n_i = 5.0e4,
+                                              rho_r = 1.0e-4, n_r = 1.0e3)
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            ts = mod.ts
+            @test maximum(abs.(S.Qdot_bar)) > 0.0
+            @test maximum(abs.(S.Qdep_bar)) > 0.0
+
+            gained = (S.etd_d9 ./ S.Jc) .+ (S.etd_d8 ./ S.Jr) .+
+                     (S.etd_di1 ./ S.J_i1q) .+ (S.etd_di2 ./ S.J_i2q) .+
+                     (S.etd_di3 ./ S.J_i3q)
+            lost = S.etd_dv
+            scale = maximum(abs.(lost))
+            @test scale > 0.0
+            # VAPOR REMOVED = Σ CONDENSATE GAINED. Equivalently: the sum of every water
+            # increment the adjustment applies is zero, i.e. ρ_t is untouched by it — which
+            # is what keeps ρ_t the conservation anchor. (ρ_d is not a water slot at all and
+            # the adjustment never names it.)
+            @test maximum(abs.(gained .+ lost)) < 1.0e-12 * scale
+            # HEAT CONSISTENCY: the slot-1 increment is the same three rates through the
+            # pressure equation's own bracket, and nothing else.
+            Ls = Springsteel.Thermodynamics.L_s.(S.Tk)
+            want = @. ts * (S.R_m / S.C_vt) *
+                       (((S.Lv - (Rv * S.C_pt * S.Tk / S.R_m)) *
+                         (S.Qdot_bar + S.Qdot_r_bar)) +
+                        ((Ls - (Rv * S.C_pt * S.Tk / S.R_m)) * S.Qdep_bar))
+            @test S.etd_d1 == want
+
+            # MOMENT/MASS CONSISTENCY of the habit partition: the a/c (and sublimation-n)
+            # increments are the partition of the SAME realized mass increment the mass slot
+            # received — recomputed here, independently, from the stashed state-n inputs and
+            # the applied mass increment itself. Zero mass increment ⇒ zero moment increment.
+            habs = ((S.hab1_ani, S.hab1_cni, S.hab1_rni, S.hab1_ds, S.hab1_rb,
+                     S.hab1_nim3, S.hab1_vt, S.hab1_cg, S.hab1_niq,
+                     S.etd_di1, S.J_i1q, S.etd_da1, S.J_i1a, S.etd_dc1, S.J_i1c,
+                     S.etd_dn1, S.J_i1n),
+                    (S.hab2_ani, S.hab2_cni, S.hab2_rni, S.hab2_ds, S.hab2_rb,
+                     S.hab2_nim3, S.hab2_vt, S.hab2_cg, S.hab2_niq,
+                     S.etd_di2, S.J_i2q, S.etd_da2, S.J_i2a, S.etd_dc2, S.J_i2c,
+                     S.etd_dn2, S.J_i2n),
+                    (S.hab3_ani, S.hab3_cni, S.hab3_rni, S.hab3_ds, S.hab3_rb,
+                     S.hab3_nim3, S.hab3_vt, S.hab3_cg, S.hab3_niq,
+                     S.etd_di3, S.J_i3q, S.etd_da3, S.J_i3a, S.etd_dc3, S.J_i3c,
+                     S.etd_dn3, S.J_i3n))
+            any_partition = false
+            for (ani, cni, rni, ds, rb, nim3, vt, cg, niq,
+                 dq, Jq, da, Ja, dc, Jc_, dn, Jn) in habs
+                for i in eachindex(dq)
+                    qk = dq[i] / (ts * Jq[i])              # the realized mass rate
+                    if dq[i] == 0.0 || cg[i] <= 0.0
+                        @test da[i] == 0.0
+                        @test dc[i] == 0.0
+                        @test dn[i] == 0.0
+                        continue
+                    end
+                    any_partition = true
+                    afn = qk / (4.0 * pi * nim3[i] * cg[i])
+                    dp = Scythe.ishmael_deposition_partition(ts, ani[i], cni[i], rni[i],
+                            ds[i], rb[i], nim3[i], S.hab_igr[i], afn, S.hab_maxsui[i],
+                            vt[i], qk < 0.0, cg[i], S.hab_dv[i], S.Tk[i],
+                            Scythe.ISHMAEL_AO, Scythe.ISHMAEL_NU, Scythe.ISHMAEL_GAMMNU,
+                            Scythe.ISHMAEL_I_GAMMNU, Scythe.ISHMAEL_FOURTHIRDSPI)
+                    @test da[i] ≈ ts * Ja[i] * dp.ard rtol = 1e-12
+                    @test dc[i] ≈ ts * Jc_[i] * dp.crd rtol = 1e-12
+                    if qk < 0.0
+                        @test dn[i] ≈ ts * Jn[i] * (qk * niq[i]) rtol = 1e-12
+                    else
+                        @test dn[i] == 0.0
+                    end
+                end
+            end
+            @test any_partition                      # the case actually exercised the path
+        end
+    end
+
+    @testset "stiff relaxation: a one-step glaciation burst does not ring the moments" begin
+        # The measured death of the first ETD ice arm (t = 1031.4 s): the nucleation burst
+        # makes the deposition conductance jump from ~1e-6 to ~70 ts/tau IN ONE STEP; with
+        # the habit-moment sources on the multistep at the instantaneous rate, AB3 applied
+        # +23/12 of the spike and then -16/12 of it, ringing the freshly created a/c moments
+        # negative and driving the effective-axis construction to a negative Reynolds number.
+        # The partition now rides the step-mean direct increments, so a burst-scale
+        # conductance must produce moments that stay finite and non-negative through the
+        # steps that follow the spike. The state: a dense, small-crystal population (the
+        # post-homogeneous-freezing signature) in supersaturated air at -35 C.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = Scythe.T_0 - 35.0,
+                                              q_l = 2.0e-3, rho_i = 5.0e-4, n_i = 1.0e8,
+                                              rho_r = 0.0, n_r = 0.0)
+            IS = m.mc_slots
+            for step in 1:3
+                Scythe.advance_column(m, 1, step)
+                for sl in (IS.i1_q, IS.i1_a, IS.i1_c, IS.i1_n,
+                           IS.i2_q, IS.i2_a, IS.i2_c, IS.i2_n,
+                           IS.i3_q, IS.i3_a, IS.i3_c, IS.i3_n, 7, IS.rho_v)
+                    col = view(m.var_np1, :, sl)
+                    @test all(isfinite, col)
+                end
+                # The moments the partition feeds must not be rung negative by the burst:
+                # the increments are one-sided (deposition) and the multistep carries only
+                # the bounded non-deposition legs, so any negative here is transport-scale
+                # ringing, orders below the burst amplitude. Bound it at a tiny fraction of
+                # the species mass actually present.
+                for (qs, asl, csl) in ((IS.i1_q, IS.i1_a, IS.i1_c),
+                                       (IS.i2_q, IS.i2_a, IS.i2_c),
+                                       (IS.i3_q, IS.i3_a, IS.i3_c))
+                    qmax = maximum(view(m.var_np1, :, qs))
+                    qmax <= 0.0 && continue
+                    amin = minimum(view(m.var_np1, :, asl))
+                    cmin = minimum(view(m.var_np1, :, csl))
+                    ascale = maximum(abs.(view(m.var_np1, :, asl)))
+                    if ascale > 0.0
+                        @test amin > -1.0e-6 * ascale
+                        @test cmin > -1.0e-6 * max(ascale, maximum(abs.(view(m.var_np1, :, csl))))
+                    end
+                end
+            end
+        end
+    end
+
+    @testset "ice: one realization factor per donor reservoir, and it bounds the donor" begin
+        # THE ACCEPTANCE PROPERTY of the per-donor construction. Three statements, in the
+        # order they have to hold.
+
+        # 1. `J₀` is the coefficient it claims to be: exactly 1 with no sink, strictly
+        #    bounding at any conductance, and converging to 1 as the step is refined.
+        @test Scythe.relaxation_realization(0.0, 1.0e-3, 0.3) === 1.0
+        @test Scythe.relaxation_realization(1.0, 0.0, 0.3) === 1.0
+        for (rate, res) in ((1.0e-9, 1.0e-3), (1.0e-4, 1.0e-4), (48.4, 1.88e-5),
+                            (2.9e9, 2.84e-7), (1.2e7, 6.0e-11))
+            f = Scythe.relaxation_realization(rate, res, 0.3)
+            # The converted mass never exceeds the reservoir, at any conductance. Two
+            # floating-point caveats, and both are why the bound is stated as `1 + eps`:
+            # the mathematical statement is strict (`1 − e^{−x} < 1`) but SATURATES at exactly
+            # 1.0 in Float64 once x ≳ 37 — the whole reservoir converts, which is right — and
+            # re-forming `rate·f·Δt/q` redoes the same divide and multiply that went into `f`,
+            # so the round trip can land a couple of ulp above. The census uses the same
+            # `1 + 1e-9` for the same reason.
+            @test 0.0 < rate * f * 0.3 / res <= 1.0 + 1.0e-9
+            # ...and it IS the exact exponential depletion, not a clamp
+            kdt = rate / res * 0.3
+            @test rate * f * 0.3 / res ≈ -expm1(-kdt) rtol = 1e-12
+        end
+        # Δt → 0 recovers the bare rate: an integrator coefficient, not a rate law.
+        for dt in (1.0e-2, 1.0e-4, 1.0e-6)
+            # κ = 1 here, so J₀(dt) = 1 − dt/2 + dt²/6 − …: first order in the step, and the
+            # residual shrinks WITH the step, which is what "converges to the same equation"
+            # means. Asserted as such rather than against a fixed tolerance.
+            f = Scythe.relaxation_realization(1.0e-4, 1.0e-4, dt)
+            @test abs(f - (1.0 - 0.5 * dt)) < dt * dt
+            @test f < 1.0
+        end
+        @test Scythe.relaxation_realization(1.0e-4, 1.0e-4, 1.0e-6) >
+              Scythe.relaxation_realization(1.0e-4, 1.0e-4, 1.0e-2)
+
+        # 2. THE SHARE RULE. Several sinks on one donor take one exponential depletion between
+        #    them, in proportion to their rates — so the SUM is bounded, which is what
+        #    per-leg factors could not do (measured: realized rain depletion pinned at 3.0).
+        rates = (0.7, 0.2, 5.0, 0.05)
+        q = 1.0e-5
+        ktot = sum(rates) / q
+        f = Scythe.relaxation_realization(sum(rates), q, 0.3)
+        @test sum(r * f for r in rates) * 0.3 / q ≈ -expm1(-ktot * 0.3) rtol = 1e-12
+        @test sum(r * f for r in rates) * 0.3 / q <= 1.0 + 1.0e-9
+        # each sink keeps its share of the total
+        for r in rates
+            @test (r * f) / (sum(rates) * f) ≈ r / sum(rates) rtol = 1e-14
+        end
+
+        # 3. THE TWO-PASS RIMING ARGUMENT. `prdr ∝ rnfr³ − rni³`, so bounding the RADIUS
+        #    increment against the linear-limit conductance leaks through the cubic (measured
+        #    2.0 reservoirs at p99, 13.0 at max). Forming κ from the pass-one NONLINEAR
+        #    `prdr₀` puts the second pass in the linear-or-below regime, where the response is
+        #    sublinear in the scale factor and therefore `prdr(f) ≤ f·prdr₀` — which is what
+        #    makes the realized riming mass bounded by its share of the reservoir.
+        base = (dt = 0.3, rni = 2.0e-5, deltastr = 1.0, rbdum = 400.0, nidum = 5.0e4,
+                ani = 2.0e-5, cni = 2.0e-5, temp = 258.15)
+        rim = (qc = 1.0e-3, nc = 2.0e8, nrm = 3.0e-9, nrd = 3.0e-10,
+               qr = 5.0e-5, nr = 1.0e3)
+        growth(fc, fr) = Scythe.ishmael_riming_growth(
+            base.dt, base.rni, base.deltastr, base.rbdum, base.nidum, base.ani, base.cni,
+            base.temp, rim.qc, rim.nc, rim.nrm, rim.nrd, 5.0e-4,
+            rim.qr, rim.nr, rim.nrm, rim.nrd, 5.0e-4, 1.0, true,
+            Scythe.ISHMAEL_NU, Scythe.ISHMAEL_AO, Scythe.ISHMAEL_GAMMNU,
+            Scythe.ISHMAEL_I_GAMMNU, Scythe.ISHMAEL_FOURTHIRDSPI;
+            f_rime_c = fc, f_rime_r = fr)
+
+        prdr0 = growth(1.0, 1.0).prdr
+        @test prdr0 > 0.0
+        # sublinearity of the realized mass in the scale factor, across four decades
+        for f in (0.5, 0.1, 1.0e-2, 1.0e-3, 1.0e-4)
+            @test growth(f, f).prdr <= f * prdr0 * (1.0 + 1.0e-9)
+        end
+        # ...hence the bound: with κ formed from prdr₀ the realized mass is under the share
+        qdon = 1.0e-6                                   # a donor far too small for prdr0*dt
+        fq = Scythe.relaxation_realization(prdr0, qdon, base.dt)
+        @test growth(fq, fq).prdr * base.dt <= qdon * (1.0 + 1.0e-9)
+        # and the axis partners come from the SAME realized growth, so they move with it
+        g1 = growth(1.0, 1.0); gf = growth(1.0e-3, 1.0e-3)
+        @test gf.ardr <= g1.ardr && gf.crdr <= g1.crdr
+        @test (gf.prdr == 0.0) == (gf.ardr == 0.0 && gf.crdr == 0.0)
+        # unit factors are the Fortran path, bitwise
+        @test growth(1.0, 1.0).prdr === Scythe.ishmael_riming_growth(
+            base.dt, base.rni, base.deltastr, base.rbdum, base.nidum, base.ani, base.cni,
+            base.temp, rim.qc, rim.nc, rim.nrm, rim.nrd, 5.0e-4,
+            rim.qr, rim.nr, rim.nrm, rim.nrd, 5.0e-4, 1.0, true,
+            Scythe.ISHMAEL_NU, Scythe.ISHMAEL_AO, Scythe.ISHMAEL_GAMMNU,
+            Scythe.ISHMAEL_I_GAMMNU, Scythe.ISHMAEL_FOURTHIRDSPI).prdr
     end
 
     @testset "ice: the impulse-form rates are finite rates, and NO rate sees ts" begin
@@ -5466,9 +5862,22 @@ using Springsteel
 
         # ── Driver level: change ts by 10x on the SAME state ──
         # With any `reservoir/Δt` left anywhere the nucleation-dominated sources would differ
-        # by a factor of ~10. What remains is the habit PARTITION (`ard`/`crd`/`prdr`/`qagg`),
-        # which is an increment divided by the same step -- a consistent first-order
-        # discretization -- so the agreement is close but not bitwise.
+        # by a factor of ~10, and the sources would not converge as the step is refined. Two
+        # things legitimately remain, and neither is a rate law:
+        #
+        #   * the habit PARTITION (`ard`/`crd`/`prdr`/`qagg`), an increment divided by the same
+        #     step -- a consistent first-order discretization;
+        #   * the REALIZATION of the two freezing relaxations (`_freeze_realization`, the
+        #     `J₀(κΔt)` factor on `mim`/`mimr`/`mbig`). `κ` is the parameterization's own
+        #     conductance and carries no step; `J₀` is an integrator coefficient of exactly the
+        #     kind `b₁₋₃` are, and it is applied TO a rate rather than written INTO one.
+        #
+        # So the contract this block enforces is not "the sources are step-independent" -- that
+        # was only ever true because the stiff freezing channel was being integrated wrongly --
+        # but the two statements that actually distinguish a `Δt`-free rate law from a
+        # depletion cap: the sources CONVERGE as the step is refined, at first order, and the
+        # DEPOSITION rate (which the exponential integrator handles elsewhere, not here) is
+        # bitwise independent of the step.
         mktempdir() do tmpdir
             function rates_at(ts)
                 m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
@@ -5482,13 +5891,21 @@ using Springsteel
             end
             a = rates_at(0.1)
             b = rates_at(0.01)
-            # DEPOSITION contains no Δt at all: bitwise.
+            c = rates_at(0.001)
+            # DEPOSITION contains no Δt at all: bitwise, at both refinements.
             @test a.Qdot_i == b.Qdot_i
+            @test b.Qdot_i == c.Qdot_i
             reldiff(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(x)), 1e-300)
-            for (nm, x, y) in (("SRC_i1q", a.q, b.q), ("SRC_i1n", a.n, b.n),
-                               ("ICE_C", a.c, b.c), ("ICE_R", a.r, b.r),
-                               ("FRZ_NET", a.f, b.f))
-                @test reldiff(x, y) < 0.05
+            for (nm, x, y, z) in (("SRC_i1q", a.q, b.q, c.q), ("SRC_i1n", a.n, b.n, c.n),
+                                  ("ICE_C", a.c, b.c, c.c), ("ICE_R", a.r, b.r, c.r),
+                                  ("FRZ_NET", a.f, b.f, c.f))
+                coarse = reldiff(x, y)
+                fine = reldiff(y, z)
+                # Bounded at every step (no `reservoir/Δt` anywhere)...
+                @test coarse < 0.2
+                # ...and CONVERGENT: refining the step by 10 shrinks the disagreement by
+                # roughly the same factor, which a `Δt` in a rate law would not do.
+                @test fine <= 0.2 * coarse + 1.0e-12
             end
         end
     end
@@ -5518,7 +5935,9 @@ using Springsteel
             dep = S.Qdot_i1 .+ S.Qdot_i2 .+ S.Qdot_i3
             ice = S.SRC_i1q .+ S.SRC_i2q .+ S.SRC_i3q
             scale = maximum(abs.(ice)) + maximum(abs.(dep))
-            @test maximum(abs.((ice .- dep) .+ (S.ICE_C .+ S.ICE_R))) < 1.0e-12 * scale
+            # `SRC_i*q` is the non-deposition ice mass source (the deposition leg is withheld
+            # with the rest of the relaxation pair), so the liquid must balance it alone.
+            @test maximum(abs.(ice .+ (S.ICE_C .+ S.ICE_R))) < 1.0e-12 * scale
         end
         # ...and switching it off leaves the moments alone. Same state, no restoration.
         mktempdir() do tmpdir
@@ -5552,7 +5971,10 @@ using Springsteel
         @test Scythe.MC_STIFF_NAMES == ("cloud", "rain", "ice1", "ice2", "ice3")
         @test Scythe.MC_STIFF_WARNED ==
               Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * Scythe.MC_STIFF_CHANNELS
-        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STIFF_WARNED
+        # The stiffness block is no longer last: the DONOR-DEPLETION block appends after it.
+        @test Scythe.MC_DONOR_FIRST == Scythe.MC_STIFF_WARNED + 1
+        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_DONOR_WARNED
+        @test Scythe.MC_DONOR_CHANNELS == length(Scythe.MC_DONOR_NAMES)
         mktempdir() do tmpdir
             m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, rho_i = 1.0e-5,
                                               n_i = 5.0e4)

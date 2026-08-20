@@ -46,9 +46,12 @@ Random = "1.11.0"
 julia = "1.7"
 
 [extras]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Springsteel = "66b52f22-0fad-4358-9559-2105d4560aaf"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Springsteel", "NCDatasets"]
+test = ["Test", "Springsteel", "NCDatasets", "Printf", "Dates", "Distributed"]

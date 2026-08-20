@@ -64,6 +64,45 @@ const ISHMAEL_FOURTHIRDSPI  = 4.0 / 3.0 * ISHMAEL_PI
 const ISHMAEL_LAMMINR  = 1.0 / 2800.0e-6   # min rain slope parameter, m^-1 (line 640)
 const ISHMAEL_LAMMAXR  = 1.0 / 20.0e-6     # max rain slope parameter, m^-1 (line 639)
 
+"""
+    relaxation_realization(rate, reservoir, dt) -> Float64
+
+`J₀(κΔt) = (1 − e^{−κΔt})/(κΔt)` at `κ = rate/reservoir`: the step-mean realization factor of a
+conversion that is a RELAXATION of its donor reservoir. The one implementation of the one
+coefficient — the freezing legs, the collection legs and the riming growth in
+`moist_compressible.jl` all call this, and it is the same `J₀` `etd_step_weights` builds the
+supersaturation pair's step-mean from. It lives here because `ishmael_riming_growth` must apply
+it inside its own growth integration, and `ishmael.jl` is included first.
+
+# Why this is an integrator coefficient and not a rate law
+
+`κ` is what the parameterization supplies and carries no step. `J₀` multiplies a rate; it is
+never written into one, and `J₀ → 1` as `Δt → 0`, so the scheme converges to the same
+differential equation — exactly the standing served by `b₁₋₃` in the multistep. What it buys is
+at the other end: `κΔt·J₀ = 1 − e^{−κΔt} < 1` for every `κ`, so the converted mass is strictly
+less than the reservoir BY CONSTRUCTION — no `min`, no branch, no discontinuity as a reservoir
+empties — which is what a stiff conversion needs and what a depletion cap (a `Δt` in a rate
+law, and a kink) cannot give.
+
+# The SHARE rule
+
+Where several sinks draw on one donor the conductance is the donor's TOTAL, `κ_tot = Σ_j κ_j`,
+and each sink is realized as `rate_j · J₀(κ_tot Δt)`: one exponential depletion of the
+reservoir, shared out in proportion to the rates that caused it. That is the same combined-rate
+doctrine the TeX derivation uses for the supersaturation pair (`λ = Σ τ⁻¹`, with each channel
+taking its share of the one propagator), and it is what makes the SUM over sinks bounded rather
+than each sink separately.
+
+Returns an exact `1.0` where the rate or the reservoir is zero, which is what keeps the
+conversion-free path bitwise. `-expm1(-x)/x` is accurate to round-off at every `x > 0`.
+"""
+@inline function relaxation_realization(rate::Float64, reservoir::Float64, dt::Float64)
+    (rate > 0.0 && reservoir > 0.0) || return 1.0
+    x = (rate / reservoir) * dt
+    x < 1.0e-8 && return 1.0 - 0.5 * x
+    return -expm1(-x) / x
+end
+
 # Rain fall-speed and ventilation parameters (module parameter block, lines 66 and
 # 662-665). V(D) = AR*D^BR*(R0/rho_air)^0.5, and the per-drop ventilation factor is
 # F1R + F2R*Sc^(1/3)*Re^(1/2). Used by the two-moment warm-rain rate family in
@@ -1131,8 +1170,31 @@ function ishmael_riming_growth(dt::Float64, rni::Float64, deltastr::Float64, rbd
                                 qi_qr_nrd::Float64, rimesumr::Float64, rhoair::Float64,
                                 dry_growth_pre::Bool, NU::Float64, ao::Float64, gammnu::Float64,
                                 i_gammnu::Float64, fourthirdspi::Float64; T0::Float64=ISHMAEL_T0,
-                                RHOI::Float64=ISHMAEL_RHOI, QSMALL::Float64=ISHMAEL_QSMALL)
+                                RHOI::Float64=ISHMAEL_RHOI, QSMALL::Float64=ISHMAEL_QSMALL,
+                                f_rime_c::Float64=1.0, f_rime_r::Float64=1.0)
     dry_growth = dry_growth_pre && !(temp > T0)
+
+    # ── Realization of the two COLLECTION relaxations (`f_rime_c`, `f_rime_r`) ───────────
+    #
+    # Riming is a relaxation of the reservoir it collects from, and at anvil temperatures a
+    # violently stiff one: measured on the O01 ice arm at t = 2457.0 s, the rain leg's
+    # `κΔt = 7.7e5` at a point holding `q_r = 1.9e-5 kg/kg`, and one step later that gridpoint
+    # carried 73.7 kg/kg of ice with the rain slot at zero and `res_ρ_t = −1.14 kg/m³` — the
+    # created-mass receipt, the rain slot's overshoot having recovered at −μ under `:bhyp`.
+    #
+    # The factors are the CALLER's, not this function's, because a donor's conductance is the
+    # sum over every sink drawing on it — including the other two ice species' riming and the
+    # freezing and collection legs — and none of that is visible from inside one species'
+    # growth. See `_ice_donor_factors` in moist_compressible.jl. What IS this function's job is
+    # where they are applied: to the two RADIUS INCREMENTS and nowhere else, so that `prdr`,
+    # `ardr` and `crdr` are all read off the same realized `rnfr`/`anfr`/`cnfr`. Scaling the
+    # mass afterwards would desynchronize the axes from it.
+    #
+    # Rime drawn from CLOUD realizes on `q_c`'s factor and rime drawn from RAIN on `q_r`'s, so
+    # a saturated rain reservoir does not throttle the cloud collection or vice versa.
+    #
+    # Both default to `1.0`, which is bitwise the Fortran: the reference harness and its
+    # fidelity tests call this function exactly as they always did.
 
     gam = gamma(NU + 2.0 + deltastr)
     vi = fourthirdspi * rni^3 * gam * i_gammnu
@@ -1145,7 +1207,7 @@ function ishmael_riming_growth(dt::Float64, rni::Float64, deltastr::Float64, rbd
         rimec1 = ishmael_macklin_rimec1(temp; T0=T0)
         gdenavg = ishmael_macklin_density(rimec1, qi_qc_nrd, qi_qc_nrm, temp, dry_growth; T0=T0)
         rimedr = max((qi_qc_nrm / gdenavg) / (gam * i_gammnu * 4.0 * ISHMAEL_PI * rni^2), 0.0)
-        rnfr += max(rimedr * nc * rhoair, 0.0) * dt
+        rnfr += f_rime_c * max(rimedr * nc * rhoair, 0.0) * dt
     end
 
     gdenavgr = 900.0
@@ -1153,18 +1215,25 @@ function ishmael_riming_growth(dt::Float64, rni::Float64, deltastr::Float64, rbd
         rimec1r = ishmael_macklin_rimec1(temp; T0=T0)
         gdenavgr = ishmael_macklin_density(rimec1r, qi_qr_nrd, qi_qr_nrm, temp, dry_growth; T0=T0)
         rimedrr = max((qi_qr_nrm / gdenavgr) / (gam * i_gammnu * 4.0 * ISHMAEL_PI * rni^2), 0.0)
-        rnfr += max(rimedrr * nr * rhoair, 0.0) * dt
+        rnfr += f_rime_r * max(rimedrr * nr * rhoair, 0.0) * dt
     end
 
     vfr = fourthirdspi * rnfr^3 * gam * i_gammnu
     vfr = max(vfr, vi)
     rnfr = max(rnfr, rni)
 
-    rimetotal = rimesum + rimesumr
+    # The rime SPLIT is between the two realized collections, not the two nominal ones: if
+    # one donor's relaxation saturates and the other's does not, the mass actually collected
+    # comes in a different ratio, and this ratio is what both the density blend below and the
+    # caller's liquid debit are built from. With `realize_collection=false` both factors are
+    # 1.0 and this is bitwise `rimesum/(rimesum+rimesumr)`, as the Fortran has it.
+    rimesum_r = f_rime_c * rimesum
+    rimesumr_r = f_rime_r * rimesumr
+    rimetotal = rimesum_r + rimesumr_r
 
     local iwcfr, rhorimeout
     if rimetotal > 0.0 && vfr > vi
-        qcrimefrac = clamp(rimesum / rimetotal, 0.0, 1.0)
+        qcrimefrac = clamp(rimesum_r / rimetotal, 0.0, 1.0)
         gdentotal = qcrimefrac * gdenavg + (1.0 - qcrimefrac) * gdenavgr
         rhorimeout_blend = min(rbdum * (vi / vfr) + gdentotal * (1.0 - vi / vfr), RHOI)
         iwcfr = rhorimeout_blend * vfr * nidum
@@ -1232,7 +1301,8 @@ function ishmael_riming_growth(dt::Float64, rni::Float64, deltastr::Float64, rbd
     end
 
     return (prdr=prdr, ardr=ardr, crdr=crdr, rhorimeout=rhorimeout,
-            gdenavg=gdenavg, gdenavgr=gdenavgr, dry_growth=dry_growth)
+            gdenavg=gdenavg, gdenavgr=gdenavgr, dry_growth=dry_growth,
+            rimesum_r=rimesum_r, rimesumr_r=rimesumr_r)
 end
 
 # ────────────────────────────────────────────────────────────────────────────
