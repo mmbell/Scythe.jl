@@ -50,10 +50,16 @@ include(joinpath(@__DIR__, "..", "benchmarks", "common", "harness.jl"))
     end
 
     @testset "load_targets: armed lookup does NOT fall back to the warm windows" begin
-        # "o01_rainfall_ice" is seeded in expected_values.jl as an EMPTY Dict (ice windows
-        # not yet measured) -- an armed run must get NO targets, not the warm case's.
+        # "o01_rainfall_ice" carries its OWN 11 windows (seeded 2026-08-20 from the first
+        # full-3600 s production ice run) -- an armed run must get exactly those, never the
+        # warm case's: the ice arm's centers (accum 3.4, max_w 7.1) are physically different
+        # numbers from the warm ones (2.476, 9.98), which is the whole reason arm-qualified
+        # keys exist.
         ice_targets = load_targets("o01_rainfall", quick_opts; arm="ice")
-        @test isempty(ice_targets)
+        @test length(ice_targets) == 11
+        ice_names = [t.name for t in ice_targets]
+        @test "max_rho_i1_gm3" in ice_names          # a window the warm case cannot have
+        @test !("max_n_i1_perL" in ice_names)        # deliberately unwindowed (§2c family)
         # An arm with no entry in BENCHMARK_EXPECTED at all behaves the same way: empty,
         # not an error and not a silent fallback to "o01_rainfall".
         @test isempty(load_targets("o01_rainfall", quick_opts; arm="nonexistent_arm"))

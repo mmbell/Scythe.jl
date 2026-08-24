@@ -5242,6 +5242,123 @@ using Springsteel
         end
     end
 
+    @testset "ice: anchor reconciliation — inert when admissible, proportional when not" begin
+        # Stage C (TeX §Reconciliation of the condensate partition). Three driver-level
+        # claims: (1) on an ADMISSIBLE mixed-phase column the device is bitwise absent —
+        # every tendency identical with the source on or off, and the census silent;
+        # (2) on a DETACHED column (ice beyond the anchor headroom) it removes with ONE
+        # shared factor across a species' four moments and touches no other slot's
+        # tendency assembly; (3) the census records the defect whether or not the source
+        # is applied — the off switch is a forensic tool, not a blindfold.
+        mktempdir() do tmpdir
+            on = Dict{Symbol,Any}()                                   # default: source on
+            off = Dict{Symbol,Any}(:ice_anchor_source => false)
+            function run_ice(opts; rho_i)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; rho_i = rho_i,
+                                                  extra_options = opts)
+                Scythe.advance_column(m, 1, 2)
+                return m
+            end
+
+            # (1) admissible: the default seed sits far inside the headroom.
+            m_on = run_ice(on; rho_i = 1.0e-5)
+            m_off = run_ice(off; rho_i = 1.0e-5)
+            @test m_on.expdot_n == m_off.expdot_n
+            @test m_on.var_np1 == m_off.var_np1
+            st = m_on.mc_water_stats
+            @test all(view(st, Scythe.MC_ANCHOR_GAP, :) .== 0.0)
+            @test all(view(st, Scythe.MC_ANCHOR_PTS, :) .== 0.0)
+            @test all(view(st, Scythe.MC_ANCHOR_REMOVED, :) .== 0.0)
+
+            # (2) detached: ice at ~2x the anchor headroom (the headroom here is the
+            # reference vapor plus cloud, ~2.4e-3 kg/m^3).
+            m_on = run_ice(on; rho_i = 5.0e-3)
+            m_off = run_ice(off; rho_i = 5.0e-3)
+            tid = Threads.threadid()
+            S_on = m_on.mc_scratch[tid]
+            S_off = m_off.mc_scratch[tid]
+            dq = S_off.SRC_i1q .- S_on.SRC_i1q          # what the device removed: phi*max(m,0)
+            dn = S_off.SRC_i1n .- S_on.SRC_i1n
+            da = S_off.SRC_i1a .- S_on.SRC_i1a
+            dc = S_off.SRC_i1c .- S_on.SRC_i1c
+            @test maximum(dq) > 0.0                     # it removes, somewhere
+            @test all(dq .>= 0.0)                       # and ONLY removes
+            @test all(dn .>= 0.0)
+            for i in eachindex(dq)
+                dq[i] > 0.0 || continue
+                q = max(S_on.i1q[i], 0.0)
+                phi = dq[i] / q
+                # one factor, four moments — the proportional-carriage statement
+                @test dn[i] ≈ phi * max(S_on.i1n[i], 0.0) rtol = 1e-12
+                @test da[i] ≈ phi * max(S_on.i1a[i], 0.0) rtol = 1e-12
+                @test dc[i] ≈ phi * max(S_on.i1c[i], 0.0) rtol = 1e-12
+                # bounded by dt/tau at the default tau = 10 s
+                @test phi <= 1.0 / 10.0 + eps()
+            end
+            # No other slot's tendency is assembled differently in the same step: the
+            # device writes the twelve SRC_i* and nothing else.
+            i1q_slot = m_on.mc_slots.i1_q
+            for slot in 1:(i1q_slot - 1)
+                @test m_on.expdot_n[:, slot] == m_off.expdot_n[:, slot]
+            end
+
+            # (3) the census saw the same defect in BOTH runs; only the removal differs.
+            st_on = m_on.mc_water_stats
+            st_off = m_off.mc_water_stats
+            @test maximum(view(st_on, Scythe.MC_ANCHOR_GAP, :)) > 0.0
+            @test maximum(view(st_on, Scythe.MC_ANCHOR_GAP, :)) ==
+                  maximum(view(st_off, Scythe.MC_ANCHOR_GAP, :))
+            @test sum(view(st_on, Scythe.MC_ANCHOR_PTS, :)) ==
+                  sum(view(st_off, Scythe.MC_ANCHOR_PTS, :)) > 0.0
+            @test sum(view(st_on, Scythe.MC_ANCHOR_REMOVED, :)) > 0.0
+            @test sum(view(st_off, Scythe.MC_ANCHOR_REMOVED, :)) == 0.0
+
+            # (4) the READER-SIDE CAP: on the detached column the retrieval reads the
+            # anchor-capped partition and the phantom L_s credit is gone; with the cap
+            # ablated it reads the full credit. On the admissible column the cap never
+            # binds and the two configurations are bitwise identical.
+            m_nf = run_ice(Dict{Symbol,Any}(:ice_anchor_floor => false); rho_i = 5.0e-3)
+            S_nf = m_nf.mc_scratch[tid]
+            @test maximum(S_nf.Tk) - maximum(S_on.Tk) > 5.0
+            @test all(S_on.Tk .<= S_nf.Tk .+ 1.0e-12)
+            m_nf_ok = run_ice(Dict{Symbol,Any}(:ice_anchor_floor => false); rho_i = 1.0e-5)
+            m_ok = run_ice(on; rho_i = 1.0e-5)
+            @test m_ok.expdot_n == m_nf_ok.expdot_n
+            @test m_ok.var_np1 == m_nf_ok.var_np1
+
+            # (5) the SEDIMENTATION anchor share: on the detached column the flux
+            # assemblies transport the anchor-supported part — one factor, all moments,
+            # so F ratios across a species' moments are those of the uncapped fluxes —
+            # and on the admissible column the factor is exactly 1.0 and the fluxes are
+            # bitwise identical.
+            m_nx = run_ice(Dict{Symbol,Any}(:ice_anchor_flux => false); rho_i = 5.0e-3)
+            S_nx = m_nx.mc_scratch[tid]
+            m_x = run_ice(on; rho_i = 5.0e-3)
+            S_x = m_x.mc_scratch[tid]
+            @test any(S_x.anchor_f .< 1.0)      # it binds somewhere on this column
+            @test all(0.0 .<= S_x.anchor_f .<= 1.0)
+            for i in eachindex(S_x.anchor_f)
+                f = S_x.anchor_f[i]
+                @test S_x.F_i1q[i] ≈ f * S_nx.F_i1q[i] rtol = 1e-12
+                @test S_x.F_i1n[i] ≈ f * S_nx.F_i1n[i] rtol = 1e-12
+            end
+            m_nx_ok = run_ice(Dict{Symbol,Any}(:ice_anchor_flux => false); rho_i = 1.0e-5)
+            @test m_ok.expdot_n == m_nx_ok.expdot_n
+            @test m_ok.var_np1 == m_nx_ok.var_np1
+
+            # (6) the RATE-SIDE share: on the detached column the process rates see the
+            # anchor-supported population (deposition on the shared surface differs from
+            # the raw-population rates); on the admissible column the factor is 1.0 and
+            # the configurations are bitwise identical.
+            m_nr = run_ice(Dict{Symbol,Any}(:ice_anchor_rates => false); rho_i = 5.0e-3)
+            S_nr = m_nr.mc_scratch[tid]
+            @test any(S_x.Qdot_i1 .!= S_nr.Qdot_i1)
+            m_nr_ok = run_ice(Dict{Symbol,Any}(:ice_anchor_rates => false); rho_i = 1.0e-5)
+            @test m_ok.expdot_n == m_nr_ok.expdot_n
+            @test m_ok.var_np1 == m_nr_ok.var_np1
+        end
+    end
+
     @testset "ice: Wegener-Bergeron-Findeisen emerges from the shared Q_ss" begin
         # TeX Eq. wbf_qs. A supercooled liquid cloud at -15 C with seeded ice: with the
         # forcing F between the two thresholds, the ice grows while the liquid evaporates to
@@ -5971,9 +6088,13 @@ using Springsteel
         @test Scythe.MC_STIFF_NAMES == ("cloud", "rain", "ice1", "ice2", "ice3")
         @test Scythe.MC_STIFF_WARNED ==
               Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * Scythe.MC_STIFF_CHANNELS
-        # The stiffness block is no longer last: the DONOR-DEPLETION block appends after it.
+        # The stiffness block is no longer last: the DONOR-DEPLETION block appends after it,
+        # and the ANCHOR-RECONCILIATION census (Stage C) after that.
         @test Scythe.MC_DONOR_FIRST == Scythe.MC_STIFF_WARNED + 1
-        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_DONOR_WARNED
+        @test Scythe.MC_ANCHOR_GAP == Scythe.MC_DONOR_WARNED + 1
+        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_ANCHOR_WARNED
+        @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_GAP] == :a_gap
+        @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_REMOVED] == :a_rem
         @test Scythe.MC_DONOR_CHANNELS == length(Scythe.MC_DONOR_NAMES)
         mktempdir() do tmpdir
             m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, rho_i = 1.0e-5,

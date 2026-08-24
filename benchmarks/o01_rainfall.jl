@@ -192,6 +192,42 @@ function o01_model(opts::BenchmarkOptions)
     # those chose between two DIAGNOSTIC vapors, and there is no diagnostic vapor any more.
     haskey(ENV, "SCYTHE_O01_TAUREC") &&
         (physical_params[:tau_rho_v_rec] = parse(Float64, ENV["SCYTHE_O01_TAUREC"]))
+    # The third link of the chain (Stage C): the timescale on which the advected ice
+    # PARTITION is reconciled with the water the conserved rho_t anchor supports
+    # (`Scythe.ice_anchor_rate`; TeX §Reconciliation of the condensate partition). Unset =>
+    # 10.0, the committed default, bitwise. Sized by measurement: at the recorded
+    # transport-phase feed (<= 1.7e-6 kg/m^3/s across the three preserved dying runs) the
+    # detachment equilibrates at F*tau -- a ~0.16 K retrieval excursion at 10 s, thirty
+    # times under the 5 K ship-the-cap criterion. Ice-arm only; inert (and the knob
+    # meaningless) with ice off.
+    haskey(ENV, "SCYTHE_O01_TAUANCHOR") &&
+        (physical_params[:tau_ice_anchor] = parse(Float64, ENV["SCYTHE_O01_TAUANCHOR"]))
+    # The anchor-reconciliation SOURCE switch. Unset => on (the committed default). `=0`
+    # drops the removal while the MC_ANCHOR_* census keeps measuring the defect -- the
+    # bitwise reproduction of the unreconciled §2c configuration, for forensics:
+    #   SCYTHE_O01_ICE=1 SCYTHE_O01_RAIN_MOMENTS=2 SCYTHE_O01_ANCHOR=0 SCYTHE_O01_TS=0.3
+    # reproduces the 2454.9 s detachment death.
+    haskey(ENV, "SCYTHE_O01_ANCHOR") &&
+        (options[:ice_anchor_source] = ENV["SCYTHE_O01_ANCHOR"] != "0")
+    # The reader-side leg of the same reconciliation: the thermodynamic interface's
+    # rho_ice_t capped at the anchor headroom (the `condensate_floor` device class —
+    # readers only, no write-back, no mass conversion). Unset => on (the committed
+    # default): the terminal §2c burst is a per-step fit oscillation at the front that no
+    # tau-relaxation outruns, and the cap is what breaks its retrieval amplifier. `=0`
+    # drops the cap (state and census unaffected) for forensics.
+    haskey(ENV, "SCYTHE_O01_ANCHORFLOOR") &&
+        (options[:ice_anchor_floor] = ENV["SCYTHE_O01_ANCHORFLOOR"] != "0")
+    # The sedimentation leg of the same reconciliation: the flux assemblies transport the
+    # anchor-supported share of each ice moment (one factor per gridpoint, all twelve
+    # fluxes, telescoping preserved exactly), so phantom mass cannot move rho_t or E_t by
+    # falling. Unset => on (the committed default). `=0` drops it for forensics.
+    haskey(ENV, "SCYTHE_O01_ANCHORFLUX") &&
+        (options[:ice_anchor_flux] = ENV["SCYTHE_O01_ANCHORFLUX"] != "0")
+    # The rate-side leg: every ISHMAEL process rate reads the anchor-supported share of
+    # the ice population (same single factor; per-particle state untouched; melt on
+    # phantom ice is the channel it closes). Unset => on. `=0` drops it for forensics.
+    haskey(ENV, "SCYTHE_O01_ANCHORRATES") &&
+        (options[:ice_anchor_rates] = ENV["SCYTHE_O01_ANCHORRATES"] != "0")
     # Cloud droplet number ceiling [#/cm^3] for the Twomey activation branch AND the KK2000
     # two-moment autoconversion (both read physical_params[:max_N_c]; the driver passes one
     # number so a column carries ONE droplet population). Unset => 100.0, the closure's

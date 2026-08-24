@@ -10,6 +10,7 @@ using Scythe
     include("test_partial_density.jl")
     include("test_sigma_entropy.jl")
     include("test_etd_relaxation.jl")
+    include("test_ice_anchor_reconcile.jl")
     include("test_moist_compressible.jl")
     include("test_louis_bl.jl")
     include("test_surface_fluxes.jl")
