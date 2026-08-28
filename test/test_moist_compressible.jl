@@ -5052,9 +5052,14 @@ using Springsteel
     """
     A resting mixed-phase tile: `make_mc_mtile`'s machinery on the supercooled column, with
     ice species 1 seeded to `rho_i`/`n_i` and monodisperse-equivalent volume moments.
+    Species 2 (columnar) is seeded the same way from `rho_i2`/`n_i2`/`r_i2`, which default to
+    an EMPTY population: the aggregation kernel's cross-species pairs need a second live
+    species, and DeMott nucleation only ever fills one of the two habits (the one the
+    inherent growth ratio selects at the column's temperature).
     """
     function make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3, rho_i = 1.0e-5,
                             n_i = 5.0e4, r_i = 30.0e-6, rho_r = 0.0, n_r = 0.0,
+                            rho_i2 = 0.0, n_i2 = 0.0, r_i2 = 30.0e-6,
                             kDim = 16, ts = 0.1, extra_options = Dict{Symbol,Any}(),
                             extra_params = Dict{Symbol,Float64}())
         # No `:vapor_retrieval` here: it was the ice arm's opt-out from the regime-blended
@@ -5088,6 +5093,10 @@ using Springsteel
             patch.physical[i, vars["n_i1"], 1] = n_i
             patch.physical[i, vars["a_i1"], 1] = n_i * r_i^3
             patch.physical[i, vars["c_i1"], 1] = n_i * r_i^3
+            patch.physical[i, vars["rho_i2"], 1] = rho_i2
+            patch.physical[i, vars["n_i2"], 1] = n_i2
+            patch.physical[i, vars["a_i2"], 1] = n_i2 * r_i2^3
+            patch.physical[i, vars["c_i2"], 1] = n_i2 * r_i2^3
             patch.physical[i, 8, 1] = rho_r
             patch.physical[i, vars["n_r"], 1] = n_r
             # The seeded condensate comes OUT OF THE VAPOR, which the prognostic slot has
@@ -5095,7 +5104,7 @@ using Springsteel
             # make the seed a reconciliation gap of its own size rather than a partition.
             # (Under the retired residual retrieval this subtraction was implicit — the
             # vapor WAS rho_t minus the condensates.)
-            patch.physical[i, vars["rho_v"], 1] = -(rho_i + rho_r)
+            patch.physical[i, vars["rho_v"], 1] = -((rho_i + rho_i2) + rho_r)
         end
         spectralTransform!(patch)
         gridTransform!(patch)
@@ -5239,6 +5248,188 @@ using Springsteel
             for slot in i1q:(i1q + 11)
                 @test all(m_on.expdot_n[:, slot] .== 0.0)
             end
+        end
+    end
+
+    @testset "ice: the attribution census is inert — warm path and default-off" begin
+        # Stage 0a. The block REPORTS and never limits, so two independent statements have
+        # to hold: (1) with the option ON, a WARM ice-free column is still bitwise the
+        # ice-free run AND every attribution row is an exact 0.0 — every write in the block
+        # is gated on a state test that column fails identically; (2) with ice actually
+        # running, switching the option on changes no tendency and no state at all, because
+        # the only thing it writes is `mc_water_stats`.
+        mktempdir() do tmpdir
+            # (1) the warm gate, the ":5216 pattern" with the census switched on in BOTH.
+            args = (; q_l = 3.0e-3, kDim = 16, num_cells = 8, precipitation = true)
+            two = Dict{Symbol,Any}(:rain_moments => 2, :ice_attr_census => true)
+            ice = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
+                                   :ice_attr_census => true)
+            function run_warm(opts)
+                m, patch, mod, _ = make_mc_mtile(tmpdir; args..., extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                for t in 1:5, c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                return m
+            end
+            m_off = run_warm(two)
+            m_on = run_warm(ice)
+            i1q = m_on.mc_slots.i1_q
+            for slot in 1:(i1q - 1)
+                @test m_on.var_np1[:, slot] == m_off.var_np1[:, slot]
+                @test m_on.expdot_n[:, slot] == m_off.expdot_n[:, slot]
+            end
+            @test all(view(m_on.mc_water_stats,
+                           Scythe.MC_ATTR_FIRST:Scythe.MC_ATTR_LAST, :) .== 0.0)
+            @test all(view(m_off.mc_water_stats,
+                           Scythe.MC_ATTR_FIRST:Scythe.MC_ATTR_LAST, :) .== 0.0)
+        end
+
+        # (2) default-off on a COLD ice column: the census writes only into the stats.
+        mktempdir() do tmpdir
+            function run_cold(opts)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 250.15, rho_i = 1.0e-3,
+                                                  n_i = 1.0e6, rho_r = 1.0e-4, n_r = 1.0e3,
+                                                  ts = 1.0, extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                for t in 1:4, c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                return m
+            end
+            m_plain = run_cold(Dict{Symbol,Any}())
+            m_attr = run_cold(Dict{Symbol,Any}(:ice_attr_census => true))
+            @test m_plain.expdot_n == m_attr.expdot_n
+            @test m_plain.var_np1 == m_attr.var_np1
+            # ...and the default really is off: nothing was written.
+            @test all(view(m_plain.mc_water_stats,
+                           Scythe.MC_ATTR_FIRST:Scythe.MC_ATTR_LAST, :) .== 0.0)
+        end
+    end
+
+    @testset "ice: the attribution census partitions the q_r donor breach" begin
+        # The identity block A is built on: at every breach point exactly ONE of the five
+        # q_r debit channels is credited (the largest debit), so their counts sum to the
+        # `MC_DONOR_QR` count and no leg is blamed twice. And the two bounds that say the
+        # shares are shares: no single leg exceeds the net depletion, and the sum of the
+        # four true debits (`MC_ATTR_QR_ALL`, which is the net PLUS the melt credit) is at
+        # least it.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 250.15, rho_i = 1.0e-3,
+                                              n_i = 1.0e6, rho_r = 1.0e-4, n_r = 1.0e3,
+                                              ts = 1.0,
+                                              extra_options = Dict{Symbol,Any}(
+                                                  :ice_attr_census => true))
+            ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+            m.mc_water_stats .= 0.0
+            for t in 1:6, c in 1:ncols
+                Scythe.advance_column(m, c, t)
+            end
+            st = m.mc_water_stats
+            drow = Scythe.MC_DONOR_FIRST + Scythe.MC_DONOR_N * (Scythe.MC_DONOR_QR - 1)
+            arow(ch) = Scythe.MC_ATTR_FIRST + Scythe.MC_ATTR_N * (ch - 1)
+            dmax = maximum(view(st, drow, :))
+            dcount = sum(view(st, drow + 1, :))
+            # PRECONDITION: this state actually breaches, or the identities below are
+            # trivially true and prove nothing. Measured on this fixture: 78 breach points
+            # at max 1.0000000000000002 -- the SATURATED rain donor, `1 - exp(-kappa*dt)`
+            # rounding to 1.0 and the division landing one ULP over it, and Bigg freezing
+            # carrying the largest debit at all 78. That is exactly why block A's gate has
+            # to be `mc_donor_census!`'s expression character for character: at one ULP the
+            # two forms disagree about which points are breach points, and the partition
+            # below then misses by a handful of counts.
+            @test dcount > 0.0
+            @test dmax > 1.0
+            legs = Scythe.MC_ATTR_QR_HOM:Scythe.MC_ATTR_QR_COLL
+            acount = sum(sum(view(st, arow(ch) + 1, :)) for ch in legs)
+            amax = maximum(maximum(view(st, arow(ch), :)) for ch in legs)
+            @test acount == dcount                       # the partition
+            @test amax <= dmax + 1.0e-12                 # a share is a share
+            @test maximum(view(st, arow(Scythe.MC_ATTR_QR_ALL), :)) >= dmax - 1.0e-12
+            # The melt CREDIT is never counted (it adds rain; it cannot be the largest
+            # debit), and the sub-part channel keeps its own run-max.
+            @test sum(view(st, arow(Scythe.MC_ATTR_QR_MELT) + 1, :)) == 0.0
+            @test maximum(view(st, arow(Scythe.MC_ATTR_QR_RIMEX), :)) <=
+                  maximum(view(st, arow(Scythe.MC_ATTR_QR_RIME), :)) + 1.0e-12
+        end
+    end
+
+    @testset "ice: aggregation is realized against the ice donors" begin
+        # Stage 1. Aggregation used to be counted in the ice donors' conductance and then
+        # applied UNSCALED, on the claim that `qagg3` could not be decomposed into the two
+        # donors it came from. It can: the recipient gains exactly what the donors lose. So
+        # `mc_ice_sources!` now runs the kernel TWICE — once at unit factors to form the
+        # conductance, once at `f_ice1`/`f_ice2` to apply it — and forms `qagg3` in the
+        # caller as `-(qagg1 + qagg2)`. Two claims: the donor census is back under 1, and
+        # the cross-species exchange closes on the REALIZED numbers.
+        mktempdir() do tmpdir
+            drow(ch) = Scythe.MC_DONOR_FIRST + Scythe.MC_DONOR_N * (ch - 1)
+            arow(ch) = Scythe.MC_ATTR_FIRST + Scythe.MC_ATTR_N * (ch - 1)
+
+            # (1) The STIFF cold driver: both habits carrying ice at 1e-3 kg/m^3 and
+            # 1e6 /m^3 (the ice-number cap), a full second of timestep, cloud water present
+            # so riming and the anchor are live too. Aggregation is ACTIVE here — the
+            # planar/columnar cross pairs and both self-collections all fire — which is what
+            # makes the bound a statement rather than a tautology.
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 259.15,
+                                              rho_i = 1.0e-3, n_i = 1.0e6,
+                                              rho_i2 = 1.0e-3, n_i2 = 1.0e6, ts = 1.0,
+                                              extra_options = Dict{Symbol,Any}(
+                                                  :ice_attr_census => true))
+            ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+            m.mc_water_stats .= 0.0
+            for t in 1:4, c in 1:ncols
+                Scythe.advance_column(m, c, t)
+            end
+            st = m.mc_water_stats
+            i1max = maximum(view(st, drow(Scythe.MC_DONOR_I1), :))
+            i2max = maximum(view(st, drow(Scythe.MC_DONOR_I2), :))
+            # ACTIVE: the melt legs are exactly zero in this column (it is below `T_0`
+            # throughout), so these numbers ARE the realized aggregation draw.
+            @test i1max > 0.0
+            @test i2max > 0.0
+            # ...and BOUNDED, which is the whole of Stage 1.
+            @test i1max <= 1.0 + 1.0e-9
+            @test i2max <= 1.0 + 1.0e-9
+            @test maximum(view(st, drow(Scythe.MC_DONOR_I3), :)) <= 1.0 + 1.0e-9
+            # The attribution census reads the same realized increment, so its aggregation
+            # channels are under the bound too (they were the ones that convicted it).
+            @test maximum(view(st, arow(Scythe.MC_ATTR_AGG1), :)) > 0.0
+            @test maximum(view(st, arow(Scythe.MC_ATTR_AGG1), :)) <= 1.0 + 1.0e-9
+            @test maximum(view(st, arow(Scythe.MC_ATTR_AGG2), :)) <= 1.0 + 1.0e-9
+        end
+
+        # (2) The EXCHANGE, on a column where aggregation is the only thing moving ice mass:
+        # no cloud and no rain (so no riming), below `T_0` (so no melting), and the
+        # deposition mass is withheld from the slot sources by construction. Species 1's and
+        # 2's mass sources are then their realized aggregation losses exactly, and species
+        # 3's is the gain — which must be their exact negative, because the caller forms it
+        # that way rather than taking the kernel's own six-term sum.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 259.15, q_l = 0.0,
+                                              rho_i = 1.0e-5, n_i = 1.0e6,
+                                              rho_i2 = 1.0e-5, n_i2 = 1.0e6, ts = 1.0)
+            ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+            for t in 1:4, c in 1:ncols
+                Scythe.advance_column(m, c, t)
+            end
+            S = m.mc_scratch[Threads.threadid()]
+            s1 = S.SRC_i1q; s2 = S.SRC_i2q; s3 = S.SRC_i3q
+            scale = max(maximum(abs, s1), maximum(abs, s2), maximum(abs, s3))
+            @test scale > 0.0                            # aggregation ran
+            # The donors only lose, the recipient only gains, and species 3 gains WHEREVER
+            # species 1's aggregation part is negative.
+            @test all(s1 .<= 0.0)
+            @test all(s2 .<= 0.0)
+            @test all(s3 .>= 0.0)
+            for i in eachindex(s1)
+                s1[i] < 0.0 || continue
+                @test s3[i] > 0.0
+            end
+            # The closure itself. Not "to round-off in the kernel's summation order" — the
+            # caller subtracts what the donors lost, so this is zero to the last bit of the
+            # three multiplications that carry it.
+            @test maximum(abs, s1 .+ s2 .+ s3) <= 1.0e-14 * scale
         end
     end
 
@@ -6092,9 +6283,18 @@ using Springsteel
         # and the ANCHOR-RECONCILIATION census (Stage C) after that.
         @test Scythe.MC_DONOR_FIRST == Scythe.MC_STIFF_WARNED + 1
         @test Scythe.MC_ANCHOR_GAP == Scythe.MC_DONOR_WARNED + 1
-        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_ANCHOR_WARNED
+        # ...and the per-channel ATTRIBUTION block (Stage 0a) after THAT, which is what the
+        # last row of `MC_WATER_STATS` now is.
+        @test Scythe.MC_ATTR_FIRST == Scythe.MC_ANCHOR_WARNED + 1
+        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_ATTR_LAST
+        @test Scythe.MC_ATTR_CHANNELS == length(Scythe.MC_ATTR_NAMES)
+        @test Scythe.MC_ATTR_WARM_PTS ==
+              Scythe.MC_ATTR_FIRST + Scythe.MC_ATTR_N * Scythe.MC_ATTR_CHANNELS
+        @test Scythe.MC_ATTR_LAST == Scythe.MC_ATTR_WARM_PTS + 4
         @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_GAP] == :a_gap
         @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_REMOVED] == :a_rem
+        @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_FIRST] == :x_hom
+        @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_WARM_HELD] == :x_wheld
         @test Scythe.MC_DONOR_CHANNELS == length(Scythe.MC_DONOR_NAMES)
         mktempdir() do tmpdir
             m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, rho_i = 1.0e-5,

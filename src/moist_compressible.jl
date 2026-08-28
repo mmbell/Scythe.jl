@@ -1331,7 +1331,17 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :p_i1_max, :p_i1_n, :p_i2_max, :p_i2_n, :p_i3_max, :p_i3_n,
                         :p_s1_max, :p_s1_n, :p_s2_max, :p_s2_n, :p_s3_max, :p_s3_n,
                         :p_warned,
-                        :a_gap, :a_pts, :a_rem, :a_warned)
+                        :a_gap, :a_pts, :a_rem, :a_warned,
+                        :x_hom, :x_hom_n, :x_bigg, :x_bigg_n,
+                        :x_rime, :x_rime_n, :x_rimex, :x_rimex_n,
+                        :x_coll, :x_coll_n, :x_melt, :x_melt_n,
+                        :x_all, :x_all_n, :x_evap, :x_evap_n, :x_comb, :x_comb_n,
+                        :x_mlt1, :x_mlt1_n, :x_agg1, :x_agg1_n,
+                        :x_mlt2, :x_mlt2_n, :x_agg2, :x_agg2_n,
+                        :x_asat, :x_asat_n,
+                        :x_wrc, :x_wrc_n, :x_wrr, :x_wrr_n,
+                        :x_wmlt, :x_wmlt_n, :x_wmri, :x_wmri_n,
+                        :x_wpts, :x_wmass, :x_wfa, :x_wdfa, :x_wheld)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -1418,10 +1428,12 @@ Under the construction of [`_ice_donor_factors`](@ref) that is `1 − e^{−κ_t
 three liquid donors, identically, so a reading above `1` is not a resolution statement — it is
 the construction failing, and the number to watch when a new sink is added to a reservoir.
 
-The three ICE reservoirs are censused too and are NOT scaled by anything: melting and
-aggregation have never been measured to exceed their reservoirs (`ki ≤ 0.005`, `ka ≤ 1` with
-aggregation internally bounded), so no factor is imposed on legs the data has not convicted.
-The check exists so that if that ever changes it is reported rather than discovered as a wall.
+The three ICE reservoirs are scaled by the same construction: `mc_ice_sources!` forms one
+conductance per species over melting, aggregation and sublimation, and every one of those legs
+is realized at it, so a reading above `1` there means the same thing it means for the liquid.
+Aggregation joined that construction when the census convicted it at 1.33 reservoirs of `q_i1`
+per step, in a SECOND pass through `ishmael_aggregation` at the donors' factors (TeX
+§donor_relax); before that it was counted in `κ_tot` but applied unscaled.
 
 REPORTED, NEVER ENFORCED — as with every census in this file.
 """
@@ -1475,6 +1487,147 @@ const MC_ANCHOR_PTS = MC_DONOR_WARNED + 2
 const MC_ANCHOR_REMOVED = MC_DONOR_WARNED + 3
 @doc (@doc MC_ANCHOR_GAP)
 const MC_ANCHOR_WARNED = MC_DONOR_WARNED + 4
+"""
+The ATTRIBUTION CENSUS of `mc_water_stats` — the per-CHANNEL decomposition of the two
+depletion breaches the `MC_DONOR_*` block convicts (TeX §"Donor relaxation and its
+realization", §"Reconciliation of the condensate partition"), written by
+[`mc_attr_census!`](@ref) and reported by [`mc_stiffness_trace`](@ref).
+
+`MC_DONOR_*` says WHICH reservoir a step over-draws and by how much. It cannot say WHICH LEG
+did it, and on the ice arm that is the whole question: the q_r breach could be riming, Bigg,
+homogeneous freezing, ice-rain collection or (uncensused anywhere else) rain evaporation, and
+the q_i1 breach could be melting or aggregation. This block answers "which one" and nothing
+else. Same `[run-max, count]` layout as the two blocks above it, `MC_ATTR_N` rows per channel,
+then a five-scalar TAIL that is not a channel.
+
+The four measurement sites, in the order the step visits them:
+
+| block | site | what it decomposes |
+|---|---|---|
+| A | `mc_ice_sources!`, at the q_r breach points only | the six legs of `−ICE_R` against `q_r` |
+| B | the ETD pre-compute, beside the sublimation census | rain EVAPORATION at the APPLIED step-mean, alone and combined with the ice draw |
+| C | `mc_ice_sources!` | the q_i1/q_i2 split between MELT and AGGREGATION |
+| D | `mc_ice_sources!`, `T > T_0 + 2` K | the above-freezing riming/melting loop, and the anchor share's withholding |
+
+Block A's counts PARTITION the `MC_DONOR_QR` count exactly: at every breach point
+(`−ICE_R·Δt/(ρ_a q_r) > 1`) exactly one of channels `MC_ATTR_QR_HOM … MC_ATTR_QR_COLL` is
+credited, the one carrying the LARGEST debit, so `Σ` of those five counts is the number of
+breach points and no leg can be blamed twice. `MC_ATTR_QR_RIMEX` is a SUB-PART of
+`MC_ATTR_QR_RIME` — the rain rime the realized pass debits IN EXCESS of the share the
+conductance was formed on (`f_qr·prdr0_r`), the split-plus-density cross term — so it can only
+win that argmax where the conductance share is negative; it is in the block for its run-max,
+and a nonzero count there is itself the finding. `MC_ATTR_QR_MELT` is a CREDIT, not a debit
+(melting ADDS rain), so it records a run-max and is never counted; `MC_ATTR_QR_ALL` is the sum
+of the four true debits, which is `MC_DONOR_QR` plus the melt credit and therefore an upper
+bound on it, point by point.
+
+`MC_ATTR_AGG1_SAT` counts the gridpoint-steps at which species 1's aggregation increment takes
+its ENTIRE mass (`−qagg1 ≥ q1(1−10⁻¹²)`) — the caller-side proxy for `ishmael_col1`'s per-pair
+`min(colamt, rx)` cap binding, which is invisible from here because the seven pairs are summed
+inside `ishmael_aggregation`. Its run-max row is by construction `MC_ATTR_AGG1`'s; the row
+exists for its COUNT, which is what says whether removing those caps would move anything —
+`options[:ice_agg_caps] = false` (env `SCYTHE_O01_AGGCAPS=0`) is the switch that removes them,
+and this count is the measurement it is meant to be read against.
+
+The five-scalar TAIL, over `T > T_0` gridpoints that carry ice (block D, the melting-level
+question): gridpoint-steps, the summed RAW ice density (an unweighted gridpoint-sum proxy, the
+same weighting as every domain sum in this census family), the count and run-max of the
+rate-side anchor share `f_a` biting, and the WITHHELD MELT `Σ(1/f_a − 1)|Σ q̇_mlt| ρ_a Δt` —
+melting is linear in the population at fixed per-particle state, so `q̇_mlt/f_a` is what the
+RAW population would have melted and the difference is what the anchor share held back. Read
+together they decide whether sub-melting-level ice is anchor-REAL (`f_a = 1`, the withheld
+melt zero) or detached, which is the question Stage 3's leg-D exemption turns on.
+
+CUMULATIVE, like the stiffness, donor and anchor blocks. OPT-IN, unlike all three:
+`mc_water_stats` is always allocated, so the block is written only where
+`options[:ice_attr_census]` is true (default false, env `SCYTHE_O01_ATTR=1`) and is otherwise
+never touched — an explicit flag is what makes an eighteen-channel census zero-cost on the
+runs that are not asking the question.
+
+REPORTED, NEVER LIMITED, and exactly `0.0` on the warm/dry path: every write is gated on a
+state test that a warm ice-free column fails identically (no breach, no ice mass, no
+above-freezing ice), so switching the option on cannot move a rate, a slot or a bit.
+"""
+const MC_ATTR_QR_HOM = 1
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_BIGG = 2
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_RIME = 3
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_RIMEX = 4
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_COLL = 5
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_MELT = 6
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_ALL = 7
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_EVAP = 8
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_COMB = 9
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_MLT1 = 10
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_AGG1 = 11
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_MLT2 = 12
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_AGG2 = 13
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_AGG1_SAT = 14
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_RIME_C = 15
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_RIME_R = 16
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_MELT = 17
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_MLTRI = 18
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_CHANNELS = 18
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_N = 2
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_FIRST = MC_ANCHOR_WARNED + 1
+"""
+The five-scalar TAIL of the attribution census, over `T > T_0` gridpoints carrying ice.
+Not channels: they are sums and counts of the POPULATION, not of a depletion fraction, so
+they sit after the `MC_ATTR_CHANNELS` `[max, count]` pairs rather than inside them.
+
+| constant | quantity |
+|---|---|
+| `MC_ATTR_WARM_PTS`  | gridpoint-steps with `T > T_0` and `Σ_k ρ_{i,k} > 0` |
+| `MC_ATTR_WARM_MASS` | `Σ` of the RAW ice density over those points [kg/m³ · gridpoint-steps] |
+| `MC_ATTR_WARM_FA`   | how many of them had the rate-side anchor share `f_a < 1` |
+| `MC_ATTR_WARM_DFA`  | run-max of `1 − f_a` there |
+| `MC_ATTR_WARM_HELD` | `Σ(1/f_a − 1)·\\|Σ_k q̇_mlt\\|·ρ_a·Δt`, the melt the anchor share withheld |
+"""
+const MC_ATTR_WARM_PTS = MC_ATTR_FIRST + (MC_ATTR_N * MC_ATTR_CHANNELS)
+@doc (@doc MC_ATTR_WARM_PTS)
+const MC_ATTR_WARM_MASS = MC_ATTR_WARM_PTS + 1
+@doc (@doc MC_ATTR_WARM_PTS)
+const MC_ATTR_WARM_FA = MC_ATTR_WARM_PTS + 2
+@doc (@doc MC_ATTR_WARM_PTS)
+const MC_ATTR_WARM_DFA = MC_ATTR_WARM_PTS + 3
+@doc (@doc MC_ATTR_WARM_PTS)
+const MC_ATTR_WARM_HELD = MC_ATTR_WARM_PTS + 4
+@doc (@doc MC_ATTR_WARM_PTS)
+const MC_ATTR_LAST = MC_ATTR_WARM_HELD
+"""Channel labels for the attribution report, in `MC_ATTR_*` index order."""
+const MC_ATTR_NAMES = ("q_r: homogeneous (mimr)", "q_r: Bigg (mbig)",
+                       "q_r: rain riming (realized)",
+                       "q_r: rain riming EXCESS over the conductance share",
+                       "q_r: ice-rain collection", "q_r: melt CREDIT (max only)",
+                       "q_r: all debits, no melt credit",
+                       "q_r: rain evaporation (applied step-mean)",
+                       "q_r: ice + evaporation combined",
+                       "q_i1: melting", "q_i1: aggregation",
+                       "q_i2: melting", "q_i2: aggregation",
+                       "q_i1: aggregation SATURATES the species mass (cap-binding proxy)",
+                       "T>T_0+2: cloud riming share of q_c",
+                       "T>T_0+2: rain riming share of q_r",
+                       "T>T_0+2: melting share of q_ice",
+                       "T>T_0+2: dQImltri share of q_ice")
 """
 Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
 1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
@@ -3561,6 +3714,32 @@ the stiffness census.
 end
 
 """
+    mc_attr_census!(st, tid, channel, x, count_it)
+
+One channel's write for the ATTRIBUTION census: raise the channel's run-max to `x`, and add a
+gridpoint-step to its count when `count_it`. See [`MC_ATTR_QR_HOM`](@ref) for what the block
+means and why the count is a separate argument rather than `x > 1`.
+
+The two are decoupled BECAUSE the block A channels are counted by ARGMAX, not by threshold:
+the count records which leg carried the largest debit at a breach point, so the five counts
+partition the `MC_DONOR_QR` count, while every channel still reports the run-max of its own
+share. `MC_ATTR_QR_MELT` (a credit) passes `false` always, and `MC_ATTR_AGG1_SAT` passes the
+cap-binding test rather than a depletion test.
+
+Allocation-free and loop-free: it runs once per channel per gridpoint inside
+`mc_ice_sources!`'s hot loop, which `test_allocations.jl` holds at zero.
+"""
+@inline function mc_attr_census!(st, tid::Int64, channel::Int64, x::Float64,
+                                 count_it::Bool)
+    row = MC_ATTR_FIRST + (MC_ATTR_N * (channel - 1))
+    @inbounds begin
+        x > st[row, tid] && (st[row, tid] = x)
+        count_it && (st[row + 1, tid] += 1.0)
+    end
+    return nothing
+end
+
+"""
     ice_anchor_rate(rho_t, rho_d, rho_liq, rho_ice, tau_anchor) -> (phi, delta)
 
 The rate law of the ANCHOR RECONCILIATION — the third tier of the reconciliation chain
@@ -3743,9 +3922,10 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
           realized on that reservoir's TOTAL conductance (_ice_donor_factors), so the applied
           fraction is 1 - exp(-kappa_tot*dt) < 1 identically. A reading above 1 there means a
           sink was added to a donor without being added to its conductance.
-          The three ICE donors are censused but NOT scaled -- melting and aggregation have not
-          been measured to exceed their reservoirs. A reading above 1 there is the signal to
-          bring them into the same construction.
+          The three ICE donors are realized the same way -- melting, aggregation and
+          sublimation are all shares of one per-species conductance (mc_ice_sources!) -- so a
+          reading above 1 there says the same thing: a sink is drawing on a reservoir it was
+          never added to the conductance of.
           REPORTED, NOT LIMITED: no rate is clamped and no state is written back."""
     end
 
@@ -3780,13 +3960,27 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
                     ", gridpoint-steps past 1: " *
                     "$(Int(sum(view(st, MC_DONOR_FIRST + MC_DONOR_N * (ch - 1) + 1, :))))"
                     for ch in 1:MC_DONOR_CHANNELS), "\n  ")
+    # The per-channel ATTRIBUTION block, only where it was asked for. It ATTRIBUTES; it does
+    # not convict, so there is no warning path here and nothing prints when the option is off
+    # (the rows are then identically zero and printing them would be noise).
+    areport = ""
+    if get(mtile.model.options, :ice_attr_census, false)::Bool
+        achan = join(("$(MC_ATTR_NAMES[ch]): max = " *
+                      "$(maximum(view(st, MC_ATTR_FIRST + MC_ATTR_N * (ch - 1), :)))" *
+                      ", gridpoint-steps: " *
+                      "$(Int(sum(view(st, MC_ATTR_FIRST + MC_ATTR_N * (ch - 1) + 1, :))))"
+                      for ch in 1:MC_ATTR_CHANNELS), "\n  ")
+        areport = """\n  attribution of the donor breaches, per channel (block A's five q_r counts partition the q_r donor count):
+  $achan
+  above T_0 carrying ice: gridpoint-steps = $(Int(sum(view(st, MC_ATTR_WARM_PTS, :)))), sum rho_ice (raw slots) = $(sum(view(st, MC_ATTR_WARM_MASS, :))) kg/m^3, points with f_a < 1 = $(Int(sum(view(st, MC_ATTR_WARM_FA, :)))), max (1 - f_a) = $(maximum(view(st, MC_ATTR_WARM_DFA, :))), withheld melt = $(sum(view(st, MC_ATTR_WARM_HELD, :))) kg/m^3"""
+    end
     @info """microphysics stiffness census step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
   cumulative over the run so far; > 1 means the relaxation is under-resolved
   $report
   donor depletion actually applied (must stay <= 1 for the three liquid donors):
   $dreport
   anchor reconciliation (partition defect delta_part; 0 until glaciation onset):
-  max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))"""
+  max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))$areport"""
     return nothing
 end
 
@@ -4631,6 +4825,7 @@ rests on.
 """
 function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                          active::Bool, var_check_source::Bool, anchor_rates::Bool,
+                         attr_census::Bool, agg_caps::Bool,
                          tau_hf::Float64, tau_act::Float64, tau_vc::Float64,
                          stats, stats_tid::Int64)
 
@@ -4651,6 +4846,11 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
     stx = stats
     tid_x = stats_tid
     census_on = size(stx, 2) > 0
+    # The per-channel ATTRIBUTION block (`MC_ATTR_*`) is OPT-IN on top of that: eighteen
+    # channels and a five-scalar tail are not something a run that is not asking the question
+    # should pay for, and `mc_water_stats` is allocated either way, so the flag is what makes
+    # it free. Reported, never limiting; exactly zero on the warm/ice-free path.
+    attr_on = census_on && attr_census
     Tk = S.Tk; p_hPa = S.p_hPa; rho_d = S.rho_d; rho_v = S.rho_v; rho_vs = S.rho_vs
     Q_ss = S.Q_ss; rho_c = S.rho_c; rho_r = S.rho_r; n_r = S.n_r; Q_s_i = S.Q_s_i
 
@@ -4881,11 +5081,16 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         qagg1 = 0.0; qagg2 = 0.0; qagg3 = 0.0
         nagg1 = 0.0; nagg2 = 0.0; nagg3 = 0.0
         dnew3 = 0.0
+        # The kernel's geometry arguments, hoisted: they are formed once, at state n, and
+        # read by BOTH aggregation passes (the second one is below the donor factors).
+        dn1 = 0.0; dn2 = 0.0; dn3 = 0.0; phi1 = 0.0; phi2 = 0.0
         # Aggregation collects crystals with crystals, so it too runs only on species that
         # HAVE a population: the gated masses and numbers below are exactly zero for a
         # species whose carried number is not positive, and a collection kernel with no
         # collector and no collectee returns nothing.
         agg_on = (temp <= T_0) && (live1 || live2 || live3)
+        # PASS ONE, at unit factors. Its only consumer is `sink1`/`sink2` below: this is the
+        # draw aggregation WOULD take, which is what the conductance has to be formed on.
         if agg_on
             dn1 = clamp(2.0 * ((e1.ai^2) / (e1.ci * e1.ni))^0.333333333333, 1.0e-6, 1.0e-2)
             dn2 = clamp(2.0 * ((e2.ci^2) / (e2.ai * e2.ni))^0.333333333333, 1.0e-6, 1.0e-2)
@@ -4894,15 +5099,15 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                          ISHMAEL_I_GAMMNU, 0.01, 100.0)
             phi2 = clamp(e2.ci / e2.ai * gamma(ISHMAEL_NU - 1.0 + e2.deltastr) *
                          ISHMAEL_I_GAMMNU, 0.01, 100.0)
-            ag = ishmael_aggregation(dt, rhoair, temp,
-                                     live1 ? q1 : 0.0, live1 ? e1.ni : 0.0, dn1,
-                                     live2 ? q2 : 0.0, live2 ? e2.ni : 0.0, dn2,
-                                     live3 ? q3 : 0.0, live3 ? e3.ni : 0.0, dn3,
-                                     e1.rhobar, e2.rhobar, phi1, phi2,
-                                     tab.coltab, tab.coltabn)
-            qagg1 = ag.qagg1; qagg2 = ag.qagg2; qagg3 = ag.qagg3
-            nagg1 = ag.nagg1; nagg2 = ag.nagg2; nagg3 = ag.nagg3
-            dnew3 = ag.dnew3
+            ag1 = ishmael_aggregation(dt, rhoair, temp,
+                                      live1 ? q1 : 0.0, live1 ? e1.ni : 0.0, dn1,
+                                      live2 ? q2 : 0.0, live2 ? e2.ni : 0.0, dn2,
+                                      live3 ? q3 : 0.0, live3 ? e3.ni : 0.0, dn3,
+                                      e1.rhobar, e2.rhobar, phi1, phi2,
+                                      tab.coltab, tab.coltabn)
+            qagg1 = ag1.qagg1; qagg2 = ag1.qagg2; qagg3 = ag1.qagg3
+            nagg1 = ag1.nagg1; nagg2 = ag1.nagg2; nagg3 = ag1.nagg3
+            dnew3 = ag1.dnew3
         end
 
         # The activation deficit reads the CARRIED ice number, not the effective one: the
@@ -4938,14 +5143,16 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # sites, so the ice a species loses to melting and the ice it loses to sublimation are
         # shares of one exponential depletion rather than two independent ones.
         #
-        # AGGREGATION is counted in the conductance but is NOT scaled. Its transfer is
-        # cross-species — species 3 gains exactly what 1 and 2 lose — and `ishmael_aggregation`
-        # returns the three per-species increments without decomposing which donor each part of
-        # `qagg3` came from, so scaling 1 and 2 by different factors would break the closure it
-        # is built on. It is bounded on its own (measured `ka ≤ 1.0` with no exceedance, the
-        # routine's own internal limit), so counting it in `κ_tot` makes the factor stricter
-        # for the legs that ARE scaled and leaves nothing manufactured. The census keeps
-        # watching it.
+        # AGGREGATION is counted in the conductance AND realized at the factor, in the SECOND
+        # pass through `ishmael_aggregation` just below. This block used to argue that `qagg3`
+        # is not decomposable into its donors, so scaling species 1 and 2 by different factors
+        # would break the closure aggregation is built on. That was wrong twice over: the
+        # routine's own recipient gain IS the sum of the two donors' losses, so re-forming it
+        # HERE as `−(qagg1 + qagg2)` closes the exchange at whatever the donors realized; and
+        # the claim that aggregation was bounded on its own did not survive the measurement
+        # (`q_i1(melt+agg)` at 1.33 reservoirs per step on the Stage-C quick run, 814
+        # gridpoint-steps past 1). Over-depleting species 1/2 while the `:bhyp` control
+        # variable recovers the slot at −μ is mass CREATED in species 3.
         sink1 = (max(-r1.qmlt, 0.0) + max(-qagg1, 0.0) * i_dt) + max(-r1.Qdot, 0.0) / rhoair
         sink2 = (max(-r2.qmlt, 0.0) + max(-qagg2, 0.0) * i_dt) + max(-r2.Qdot, 0.0) / rhoair
         sink3 = (max(-r3.qmlt, 0.0) + max(-qagg3, 0.0) * i_dt) + max(-r3.Qdot, 0.0) / rhoair
@@ -4954,6 +5161,33 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         f_i3 = relaxation_realization(sink3, q3, dt)
         S.f_ice1[i] = f_i1; S.f_ice2[i] = f_i2; S.f_ice3[i] = f_i3
         FIC = (f_i1, f_i2, f_i3)
+
+        # ── AGGREGATION, PASS TWO: the REALIZED collection ────────────────────────────────
+        # The mirror of the riming construction. Pass one ran at unit factors and existed
+        # only to put aggregation's draw into `sink1`/`sink2`; the factors are formed now, so
+        # the collection is re-integrated with each donor species' three pairs scaled by ITS
+        # factor, at the hook the Fortran's `ratioagg` occupied. Nothing downstream changes
+        # text — the census, the a/c moment re-diagnosis and the slot assembly read these
+        # same names — and the chain is not circular: pass one → `f_ik` → pass two → census
+        # → assembly. `qagg3` is formed HERE as the exact negative of what the two donors
+        # lost, rather than taken from the routine's own six-term sum (which closes to
+        # round-off, not exactly), so the cross-species exchange closes on the realized
+        # numbers. The NUMBER rides the mass factor inside the routine, which keeps the
+        # surviving per-particle mass invariant.
+        if agg_on
+            ag2 = ishmael_aggregation(dt, rhoair, temp,
+                                      live1 ? q1 : 0.0, live1 ? e1.ni : 0.0, dn1,
+                                      live2 ? q2 : 0.0, live2 ? e2.ni : 0.0, dn2,
+                                      live3 ? q3 : 0.0, live3 ? e3.ni : 0.0, dn3,
+                                      e1.rhobar, e2.rhobar, phi1, phi2,
+                                      tab.coltab, tab.coltabn;
+                                      f_agg1 = f_i1, f_agg2 = f_i2,
+                                      reservoir_caps = agg_caps)
+            qagg1 = ag2.qagg1; qagg2 = ag2.qagg2
+            qagg3 = -(qagg1 + qagg2)
+            nagg1 = ag2.nagg1; nagg2 = ag2.nagg2; nagg3 = ag2.nagg3
+            dnew3 = ag2.dnew3
+        end
         # Is the ice channel a SINK of ice at state n? Frozen here, like every other
         # classification the step freezes, and it is what decides whether the donor factor
         # belongs in the conductance at all: `f_ice<k>` bounds an ice sink, and deposition is
@@ -5036,6 +5270,136 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                              MC_DONOR_QFLOOR, dt)
             mc_donor_census!(stx, tid_x, MC_DONOR_I3, max(-MLQ[3], 0.0) - qagg3 * i_dt, q3,
                              MC_DONOR_QFLOOR, dt)
+        end
+
+        # ── The ATTRIBUTION CENSUS (opt-in; see `MC_ATTR_QR_HOM`) ─────────────────────────
+        # Blocks A, C and D; block B is at the ETD pre-compute, where the APPLIED step-mean
+        # evaporation exists. Nothing below writes anything but `stx`.
+        if attr_on
+            # ── BLOCK A: the six legs of the q_r debit, AT THE BREACH POINTS ONLY ─────────
+            # The gate is the `MC_DONOR_QR` number itself, re-formed from the same `ice_r`
+            # the census above read, so "breach point" means exactly what that block means
+            # by it and the counts below partition its count.
+            if qr > MC_DONOR_QFLOOR
+                iqr = dt / qr
+                # Formed EXPRESSION FOR EXPRESSION as `mc_donor_census!` forms it
+                # (`realized * dt / reservoir`), so "breach point" is the same set of points
+                # to the last bit and the counts below cannot drift off its count.
+                if (-ice_r / rhoair) * dt / qr > 1.0
+                    # The four TRUE debits, in the order `ice_r` accumulates them, plus the
+                    # rime EXCESS (a sub-part of the third) and the melt CREDIT.
+                    rime_r = ((r1.prdr_pre * (1.0 - r1.qcrimefrac)) +
+                              (r2.prdr_pre * (1.0 - r2.qcrimefrac))) +
+                             (r3.prdr_pre * (1.0 - r3.qcrimefrac))
+                    d_hom = mimr * iqr
+                    d_big = mbig * iqr
+                    d_rim = rime_r * iqr
+                    # The conductance was formed on the UNIT pass's split (`prdr0_r`,
+                    # `qcf0 = rimesum/rimetotal`); the debit is taken from the REALIZED
+                    # pass's (`prdr_pre`, `qcrimefrac`), whose split and rime-density blend
+                    # move whenever `f_qc != f_qr`. This is that difference.
+                    d_rix = (rime_r - f_qr * ((p1.prdr0_r + p2.prdr0_r) + p3.prdr0_r)) * iqr
+                    d_col = ((RfzQ[1] + RfzQ[2]) + RfzQ[3]) * iqr
+                    d_mlt = -((MLQ[1] + MLQ[2]) + MLQ[3]) * iqr
+                    # WHICH leg is the largest debit here. Strict `>`, so a tie goes to the
+                    # earlier channel and exactly one channel is credited per breach point.
+                    bch = MC_ATTR_QR_HOM
+                    best = d_hom
+                    d_big > best && (best = d_big; bch = MC_ATTR_QR_BIGG)
+                    d_rim > best && (best = d_rim; bch = MC_ATTR_QR_RIME)
+                    d_rix > best && (best = d_rix; bch = MC_ATTR_QR_RIMEX)
+                    d_col > best && (best = d_col; bch = MC_ATTR_QR_COLL)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_HOM, d_hom,
+                                    bch == MC_ATTR_QR_HOM)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_BIGG, d_big,
+                                    bch == MC_ATTR_QR_BIGG)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_RIME, d_rim,
+                                    bch == MC_ATTR_QR_RIME)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_RIMEX, d_rix,
+                                    bch == MC_ATTR_QR_RIMEX)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_COLL, d_col,
+                                    bch == MC_ATTR_QR_COLL)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_MELT, d_mlt, false)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_ALL,
+                                    ((d_hom + d_big) + (d_rim + d_col)), false)
+                end
+            end
+
+            # ── BLOCK C: the q_i1/q_i2 split between MELTING and AGGREGATION ─────────────
+            # `qagg_k` is already a per-step INCREMENT (the Fortran's own construction), so
+            # it is divided by the reservoir directly while the melting RATE carries a `dt`.
+            if q1 > MC_DONOR_QFLOOR
+                xm1 = max(-MLQ[1], 0.0) * dt / q1
+                xa1 = -qagg1 / q1
+                mc_attr_census!(stx, tid_x, MC_ATTR_MLT1, xm1, xm1 > 1.0)
+                mc_attr_census!(stx, tid_x, MC_ATTR_AGG1, xa1, xa1 > 1.0)
+                # The caller-side proxy for `ishmael_col1`'s per-pair `min(colamt, rx)`: the
+                # seven pairs are summed inside `ishmael_aggregation`, so the only thing
+                # visible from here is the SUM taking the whole species mass.
+                mc_attr_census!(stx, tid_x, MC_ATTR_AGG1_SAT, xa1,
+                                -qagg1 >= q1 * (1.0 - 1.0e-12))
+            end
+            if q2 > MC_DONOR_QFLOOR
+                xm2 = max(-MLQ[2], 0.0) * dt / q2
+                xa2 = -qagg2 / q2
+                mc_attr_census!(stx, tid_x, MC_ATTR_MLT2, xm2, xm2 > 1.0)
+                mc_attr_census!(stx, tid_x, MC_ATTR_AGG2, xa2, xa2 > 1.0)
+            end
+
+            # ── BLOCK D: what runs ABOVE the melting level ────────────────────────────────
+            # Riming is the only liquid->ice channel with no temperature gate, and above
+            # `T_0` riming -> ice -> melt is a closed loop: both legs are recorded, plus
+            # `dQImltri`, which is NOT a transfer — it is the collected liquid's sensible
+            # heat inside `ishmael_melting` (ishmael.jl) — so the loop can be read as a loop.
+            # `T_0 + 2` K, not `T_0`: two degrees of margin puts the channels well clear of
+            # the freezing level itself, where all of this is ordinary physics.
+            if temp > T_0 + 2.0
+                rime_c = ((r1.prdr_pre * r1.qcrimefrac) + (r2.prdr_pre * r2.qcrimefrac)) +
+                         (r3.prdr_pre * r3.qcrimefrac)
+                rime_rw = ((r1.prdr_pre * (1.0 - r1.qcrimefrac)) +
+                           (r2.prdr_pre * (1.0 - r2.qcrimefrac))) +
+                          (r3.prdr_pre * (1.0 - r3.qcrimefrac))
+                if qc > MC_DONOR_QFLOOR
+                    xwc = rime_c * dt / qc
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_RIME_C, xwc, xwc > 1.0)
+                end
+                if qr > MC_DONOR_QFLOOR
+                    xwr = rime_rw * dt / qr
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_RIME_R, xwr, xwr > 1.0)
+                end
+                q_ice = (q1 + q2) + q3
+                if q_ice > MC_DONOR_QFLOOR
+                    xwm = -((MLQ[1] + MLQ[2]) + MLQ[3]) * dt / q_ice
+                    xwi = ((p1.rr.dQImltri + p2.rr.dQImltri) + p3.rr.dQImltri) * dt / q_ice
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_MELT, xwm, xwm > 1.0)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_MLTRI, xwi, xwi > 1.0)
+                end
+            end
+
+            # ── BLOCK D's TAIL: the sub-melting-level population, and what `f_a` withheld ──
+            # The RAW slots, not the anchor-shared `q_k`: the question is how much ice the
+            # transport actually put below the melting level, and `f_a` is the second half
+            # of the answer rather than part of the first.
+            if temp > T_0
+                rho_ice_raw = (max(S.i1q[i], 0.0) + max(S.i2q[i], 0.0)) + max(S.i3q[i], 0.0)
+                if rho_ice_raw > 0.0
+                    @inbounds begin
+                        stx[MC_ATTR_WARM_PTS, tid_x] += 1.0
+                        stx[MC_ATTR_WARM_MASS, tid_x] += rho_ice_raw
+                        if fa < 1.0
+                            stx[MC_ATTR_WARM_FA, tid_x] += 1.0
+                            dfa = 1.0 - fa
+                            dfa > stx[MC_ATTR_WARM_DFA, tid_x] &&
+                                (stx[MC_ATTR_WARM_DFA, tid_x] = dfa)
+                            # Melting is linear in the population at fixed per-particle
+                            # state, so `q̇_mlt/f_a` is what the RAW population would melt.
+                            fa > 0.0 && (stx[MC_ATTR_WARM_HELD, tid_x] +=
+                                ((1.0 / fa) - 1.0) *
+                                abs((MLQ[1] + MLQ[2]) + MLQ[3]) * rhoair * dt)
+                        end
+                    end
+                end
+            end
         end
 
         # ── Assemble the twelve slot sources ──
@@ -5249,6 +5613,18 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool
     # The rate-side leg (see the read block in `mc_ice_sources!`): ditto.
     ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool
+    # The per-channel ATTRIBUTION census (`MC_ATTR_*`), opt-in and default OFF: it decomposes
+    # the `MC_DONOR_*` breaches by LEG, which is a Stage-0 measurement rather than a standing
+    # diagnostic. Writes only into `mc_water_stats`; no rate, state or slot is a function of
+    # it. Env `SCYTHE_O01_ATTR=1` in benchmarks/o01_rainfall.jl.
+    ice_attr = get(model.options, :ice_attr_census, false)::Bool
+    # The PER-PAIR reservoir caps inside `ishmael_col1` (`min(colamt, q)`, `min(colamtn, n)`):
+    # the `min(rate, ρ/Δt)` class every other ported call site switches off, still standing in
+    # the aggregation kernel because the pair sums had nothing else bounding them. They do now
+    # (the donor factors), so this is the switch that can retire them once the census has
+    # measured what they move. Default ON — bitwise the caps the Fortran has. Env
+    # `SCYTHE_O01_AGGCAPS=0` in benchmarks/o01_rainfall.jl.
+    ice_agg_caps = get(model.options, :ice_agg_caps, true)::Bool
     # Turbulent Prandtl number for the Smagorinsky heat diffusion (Khdiff_heat < 0
     # sentinel, below). 1.0 = heat mixes with the same eddy diffusivity as momentum.
     Pr_t = get(model.physical_params, :Pr_t, 1.0)
@@ -6053,7 +6429,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_ice_sources!(S, mtile.ishmael_tables, model.ts, max_N_c,
                         get(model.options, :condensation, true)::Bool,
                         get(model.options, :ice_var_check, true)::Bool,
-                        ice_anchor_rts,
+                        ice_anchor_rts, ice_attr, ice_agg_caps,
                         get(model.physical_params, :tau_homogeneous, 5.0),
                         get(model.physical_params, :tau_activation, 1.0),
                         get(model.physical_params, :tau_varcheck, 5.0),
@@ -7026,6 +7402,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     stx = mtile.mc_water_stats
     tid_x = Threads.threadid()
     census_on = size(stx, 2) > 0
+    # Block B of the ATTRIBUTION census (`MC_ATTR_QR_EVAP`/`MC_ATTR_QR_COMB`), opt-in with
+    # the other three blocks.
+    attr_on = census_on && ice_attr
     @inbounds for i in eachindex(etd_lam)
         g = colstart + i - 1
         invtau_l = invtau_c[i] + invtau_r[i]
@@ -7111,6 +7490,24 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                 mc_donor_census!(stx, tid_x, MC_DONOR_S3,
                                  max(-q3, 0.0) / rho_d[i], S.i3q[i] / rho_d[i],
                                  MC_DONOR_QFLOOR, ts)
+                # ── BLOCK B of the attribution census: RAIN EVAPORATION on the same
+                # reservoir the ice legs draw on. `_ice_donor_factors` has no evaporation
+                # term, so `MC_DONOR_QR` cannot see this draw at all — it is a SECOND,
+                # uncensused over-draw, and the two have to be read together before either
+                # is convicted. Taken at the APPLIED step-mean `qr_bar` (the number the slot
+                # actually receives), not at the instantaneous `Qdot_r`, and in DENSITY
+                # units, which is what `ρ_r` and `ICE_R` are already in. The combined
+                # channel is the total fraction of the rain the step removes.
+                if attr_on
+                    rr_i = rho_r[i]
+                    if rr_i > MC_DONOR_QFLOOR * rho_d[i]
+                        ev = max(-qr_bar, 0.0)
+                        xe = ev * ts / rr_i
+                        xa = (-S.ICE_R[i] + ev) * ts / rr_i
+                        mc_attr_census!(stx, tid_x, MC_ATTR_QR_EVAP, xe, xe > 1.0)
+                        mc_attr_census!(stx, tid_x, MC_ATTR_QR_COMB, xa, xa > 1.0)
+                    end
+                end
             end
             # ── The habit partition of the SAME realized increment (TeX §Departures (d)) ──
             # `ishmael_deposition_partition` distributes a mass increment over the two axes;

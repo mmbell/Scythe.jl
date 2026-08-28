@@ -833,7 +833,11 @@ end
 #   - the broader per-species overdepletion/consistency blocks, lines
 #     1771-1976;
 #   - the "do not over-deplete from aggregation" `ratioagg` reconciliation
-#     in `aggregation`, lines 4400-4426.
+#     in `aggregation`, lines 4400-4426 -- the LIMITER is not ported, but
+#     its HOOK is: `ishmael_aggregation` takes one realization factor per
+#     donor species and applies it exactly there (see that docstring), so
+#     the host bounds the pair sums with its own exponential realization
+#     instead of with a `dt`-shaped ratio.
 # Everything up to but NOT INCLUDING those blocks is ported below.
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1373,7 +1377,8 @@ end
 
 """
     ishmael_col1(dtlt, efdum, tempC, dnx, enx, rx, dny, eny, rhoair,
-                 coltab, coltabn, pidx) -> NamedTuple{(:colamt,:deltan)}
+                 coltab, coltabn, pidx, reservoir_caps=true)
+        -> NamedTuple{(:colamt,:deltan)}
 
 One collector(x)-collectee(y) pair's mass (`colamt`) and number
 (`deltan`) transfer over timestep `dtlt`, from the tabulated collection
@@ -1393,16 +1398,25 @@ outputs never reference it, and the Fortran itself feeds it an
 effectively-unset local (`qq(k,3)` is assigned from `t(k,3)` ONE LINE
 BEFORE `t(k,3)` is itself set, lines 4137-4138).
 
-`colamt=min(colamt,rx)`/`colamtn=min(colamtn,enx)` (lines 4517, 4528) ARE
-kept -- this is a per-PAIR physical bound (one collection process cannot
-remove more mass/number than its own collector species has), distinct
-from the excluded CROSS-pair "over-depletion" reconciliation in
-`aggregation` itself (see the module-level exclusion note above).
+`colamt=min(colamt,rx)`/`colamtn=min(colamtn,enx)` (lines 4517, 4528) are
+kept BY DEFAULT -- a per-PAIR physical bound (one collection process
+cannot remove more mass/number than its own collector species has),
+distinct from the CROSS-pair "over-depletion" reconciliation in
+`aggregation` itself, which this port replaces with the caller's
+realization factors (see [`ishmael_aggregation`](@ref)).
+
+`reservoir_caps=false` drops both. They are the `min(rate, q/dtlt)` class
+this port switches off at every other call site -- a `dtlt` inside a rate
+law -- and once the caller bounds the pair SUMS against each species' own
+conductance the per-pair cap is no longer what keeps the draw admissible.
+The default is `true`, bitwise the Fortran; the switch exists so the
+class can be removed where it has been measured, not assumed away.
 """
 @inline function ishmael_col1(dtlt::Float64, efdum::Float64, tempC::Float64,
                                dnx::Float64, enx::Float64, rx::Float64,
                                dny::Float64, eny::Float64, rhoair::Float64,
-                               coltab::Array{Float64,3}, coltabn::Array{Float64,3}, pidx::Int)
+                               coltab::Array{Float64,3}, coltabn::Array{Float64,3}, pidx::Int,
+                               reservoir_caps::Bool=true)
     eff = min(0.2, 10.0^(0.035 * tempC - 0.7)) * efdum
     if abs(tempC + 14.0) <= 2.0
         eff = 1.4 * efdum
@@ -1426,8 +1440,10 @@ from the excluded CROSS-pair "over-depletion" reconciliation in
                 ix.wct2 * iy.wct2 * coltabn[ix.ict + 1, iy.ict + 1, pidx]
     end
 
-    colamt = min(pref * enx * eny * ctab, rx)
-    colamtn = min(pref * enx * eny * ctabn, enx)
+    colamt_raw = pref * enx * eny * ctab
+    colamtn_raw = pref * enx * eny * ctabn
+    colamt = reservoir_caps ? min(colamt_raw, rx) : colamt_raw
+    colamtn = reservoir_caps ? min(colamtn_raw, enx) : colamtn_raw
 
     wght = clamp(100.0 * abs(colamt) / max(1.0e-20, rx), 0.0, 1.0)
     deltan = colamtn * (1.0 - wght) + wght * enx * colamt / max(1.0e-20, rx)
@@ -1472,12 +1488,35 @@ ishmael_tables.jl, used by `mkcoltb`) -- these are two independent,
 intentionally-different uses of "cfmas(5)" in the Fortran, both
 transcribed faithfully to their own call sites.
 
-EXCLUDED: the "do not over-deplete from aggregation" `ratioagg`
-reconciliation across the 3 pairs feeding category 3/4's sink (lines
-4400-4426) -- see the module-level exclusion note above. `qagg1`/`qagg2`
-are therefore the UNLIMITED sum of their 3 contributing pairs' `colamt`
-(each pair already individually bounded by [`ishmael_col1`](@ref)'s own
-`min(colamt,rx)`, but the 3-pair SUM is not re-bounded against `q1`/`q2`).
+THE REALIZATION HOOK, `f_agg1`/`f_agg2`: the Fortran's "do not
+over-deplete from aggregation" `ratioagg` reconciliation across the 3
+pairs feeding category 3/4's sink (lines 4400-4426) is NOT ported -- it
+is a rate limiter, and this port removes rate limiters (module-level
+exclusion note above). What IS ported is its HOOK. The caller supplies
+one factor per DONOR SPECIES and it is applied exactly where `ratioagg`
+was applied, right after the seven [`ishmael_col1`](@ref) calls, to each
+contributing pair's `(colamt, deltan)`: species 1's three pairs
+(planar+columnar, planar+aggregates, planar self) by `f_agg1`, species
+2's three by `f_agg2`, aggregate self-collection (`c_55`, which moves
+nothing between species) untouched. The host forms those factors from
+each species' TOTAL sink conductance (`mc_ice_sources!`), so the 3-pair
+SUM ends up bounded against `q1`/`q2` by the same exponential
+realization every other donor in the set uses, rather than by a
+`dt`-shaped ratio. Both default to `1.0` and `1.0*x` is `x` to the bit,
+so the default call is the Fortran unchanged.
+
+Two deliberate DEPARTURES from `ratioagg`. (1) It scales the mass
+transfer only, leaving the number transfer at its unlimited value; here
+the NUMBER RIDES THE MASS FACTOR. A pair's `(colamt, deltan)` is one
+collision count, so scaling both keeps the surviving per-particle mass
+invariant, where the mass-only form drifts number without mass. (2) Its
+own guard is a `min(1, q/sink)` truncation; the caller's factor is an
+exponential realization, and no truncation is ported with the hook.
+
+`reservoir_caps` is passed through to the six MASS pairs (see
+[`ishmael_col1`](@ref)). `c_55` always keeps its own caps: aggregate
+self-collection has no conductance in this construction, so the per-pair
+bound is the only thing standing behind it.
 """
 function ishmael_aggregation(dt::Float64, rhoair::Float64, temp::Float64,
                               q1::Float64, n1::Float64, d1::Float64,
@@ -1485,7 +1524,9 @@ function ishmael_aggregation(dt::Float64, rhoair::Float64, temp::Float64,
                               q3::Float64, n3::Float64, d3::Float64,
                               rho1::Float64, rho2::Float64, phi1::Float64, phi2::Float64,
                               coltab::Array{Float64,3}, coltabn::Array{Float64,3};
-                              T0::Float64=ISHMAEL_T0)
+                              T0::Float64=ISHMAEL_T0,
+                              f_agg1::Float64=1.0, f_agg2::Float64=1.0,
+                              reservoir_caps::Bool=true)
     tempC = temp - T0
     en1 = n1 * rhoair
     en2 = n2 * rhoair
@@ -1498,21 +1539,40 @@ function ishmael_aggregation(dt::Float64, rhoair::Float64, temp::Float64,
 
     # planar+columnar
     ef_pc = ishmael_agg_efffact(max(rho1, rho2), max(min(phi1, 1.0 / phi1), min(phi2, 1.0 / phi2)))
-    c_34 = ishmael_col1(dt, ef_pc, tempC, d1, en1, q1, d2, en2, rhoair, coltab, coltabn, ip_34)
-    c_43 = ishmael_col1(dt, ef_pc, tempC, d2, en2, q2, d1, en1, rhoair, coltab, coltabn, ip_43)
+    c_34 = ishmael_col1(dt, ef_pc, tempC, d1, en1, q1, d2, en2, rhoair,
+                        coltab, coltabn, ip_34, reservoir_caps)
+    c_43 = ishmael_col1(dt, ef_pc, tempC, d2, en2, q2, d1, en1, rhoair,
+                        coltab, coltabn, ip_43, reservoir_caps)
 
     # planar+aggregates (also reused for planar self-collection, see docstring)
     ef_pa = ishmael_agg_efffact(rho1, min(phi1, 1.0 / phi1))
-    c_35 = ishmael_col1(dt, ef_pa, tempC, d1, en1, q1, d3, en3, rhoair, coltab, coltabn, ip_35)
-    c_33 = ishmael_col1(dt, ef_pa, tempC, d1, en1, q1, d1, en1, rhoair, coltab, coltabn, ip_33)
+    c_35 = ishmael_col1(dt, ef_pa, tempC, d1, en1, q1, d3, en3, rhoair,
+                        coltab, coltabn, ip_35, reservoir_caps)
+    c_33 = ishmael_col1(dt, ef_pa, tempC, d1, en1, q1, d1, en1, rhoair,
+                        coltab, coltabn, ip_33, reservoir_caps)
 
     # columnar+aggregates (also reused for columnar self-collection)
     ef_ca = ishmael_agg_efffact(rho2, min(phi2, 1.0 / phi2))
-    c_45 = ishmael_col1(dt, ef_ca, tempC, d2, en2, q2, d3, en3, rhoair, coltab, coltabn, ip_45)
-    c_44 = ishmael_col1(dt, ef_ca, tempC, d2, en2, q2, d2, en2, rhoair, coltab, coltabn, ip_44)
+    c_45 = ishmael_col1(dt, ef_ca, tempC, d2, en2, q2, d3, en3, rhoair,
+                        coltab, coltabn, ip_45, reservoir_caps)
+    c_44 = ishmael_col1(dt, ef_ca, tempC, d2, en2, q2, d2, en2, rhoair,
+                        coltab, coltabn, ip_44, reservoir_caps)
 
     # aggregate self-collection: efdum=1 (no efficiency reduction)
-    c_55 = ishmael_col1(dt, 1.0, tempC, d3, en3, q3, d3, en3, rhoair, coltab, coltabn, ip_55)
+    c_55 = ishmael_col1(dt, 1.0, tempC, d3, en3, q3, d3, en3, rhoair,
+                        coltab, coltabn, ip_55, true)
+
+    # ── The caller's realization factors, at the `ratioagg` hook (see the docstring) ──
+    # One factor per DONOR SPECIES, on the pairs that draw from it, mass and number
+    # together. `1.0*x === x`, so unit factors leave every line below bitwise the Fortran.
+    c_34 = (colamt = f_agg1 * c_34.colamt, deltan = f_agg1 * c_34.deltan)
+    c_35 = (colamt = f_agg1 * c_35.colamt, deltan = f_agg1 * c_35.deltan)
+    c_33 = (colamt = f_agg1 * c_33.colamt, deltan = f_agg1 * c_33.deltan)
+    c_43 = (colamt = f_agg2 * c_43.colamt, deltan = f_agg2 * c_43.deltan)
+    c_45 = (colamt = f_agg2 * c_45.colamt, deltan = f_agg2 * c_45.deltan)
+    c_44 = (colamt = f_agg2 * c_44.colamt, deltan = f_agg2 * c_44.deltan)
+    # `c_55` is untouched: aggregate self-collection takes from species 3 and gives to
+    # species 3, so no donor reservoir realizes it.
 
     sink3 = c_34.colamt + c_35.colamt + c_33.colamt
     sink4 = c_43.colamt + c_45.colamt + c_44.colamt

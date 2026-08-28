@@ -807,6 +807,81 @@ end
             @test r_empty.qagg3 == 0.0
         end
 
+        @testset "ishmael_aggregation: the caller's realization factors" begin
+            # Stage 1. The Fortran's `ratioagg` over-depletion reconciliation is not ported,
+            # but its HOOK is: one factor per DONOR SPECIES, applied to that species' three
+            # pairs right after the seven `col1` calls. The host forms those factors from
+            # each species' total sink conductance, so the three-pair sum ends up bounded
+            # against `q1`/`q2` by an exponential realization instead of a dt-shaped ratio.
+            aggr(pt; kw...) = Scythe.ishmael_aggregation(pt.dt, pt.rhoair, pt.temp,
+                pt.q1, pt.n1, pt.d1, pt.q2, pt.n2, pt.d2, pt.q3, pt.n3, pt.d3,
+                pt.rho1, pt.rho2, pt.phi1, pt.phi2, tables_.coltab, tables_.coltabn; kw...)
+
+            # The DEFAULT is the Fortran unchanged -- to the BIT, not to a tolerance. That
+            # is what lets the cross-check above stand untouched: `1.0*x === x`.
+            for pt in ISHMAEL_REF_AGGREGATION
+                r0 = aggr(pt)
+                r1 = aggr(pt; f_agg1 = 1.0, f_agg2 = 1.0, reservoir_caps = true)
+                for nm in (:qagg1, :qagg2, :qagg3, :nagg1, :nagg2, :nagg3, :dnew3)
+                    @test getproperty(r1, nm) === getproperty(r0, nm)
+                end
+            end
+
+            # Each factor is LINEAR in its own donor's transfer, mass AND number together
+            # (a pair's `(colamt, deltan)` is one collision count, so scaling both is what
+            # keeps the surviving per-particle mass invariant), and the exchange still
+            # closes: species 3 gains exactly what 1 and 2 lose.
+            for pt in ISHMAEL_REF_AGGREGATION
+                r0 = aggr(pt)
+                rf = aggr(pt; f_agg1 = 0.3, f_agg2 = 0.7)
+                @test rf.qagg1 ≈ 0.3 * r0.qagg1 rtol=1.0e-14 atol=1.0e-30
+                @test rf.qagg2 ≈ 0.7 * r0.qagg2 rtol=1.0e-14 atol=1.0e-30
+                @test rf.nagg1 ≈ 0.3 * r0.nagg1 rtol=1.0e-14 atol=1.0e-30
+                @test rf.nagg2 ≈ 0.7 * r0.nagg2 rtol=1.0e-14 atol=1.0e-30
+                @test rf.qagg1 + rf.qagg2 + rf.qagg3 ≈ 0.0 atol=1.0e-16
+                # The recipient's gain rides the factors with the donors, and the third
+                # species is never a donor to itself here.
+                @test rf.qagg3 <= r0.qagg3 + 1.0e-30
+            end
+
+            # `reservoir_caps = false` removes the per-pair `min(colamt, rx)` bound, so the
+            # draw can only grow (the losses are negative, hence `<=`). At the Fortran
+            # reference points the caps do not bind, so this is an equality there; the
+            # binding case is below.
+            for pt in ISHMAEL_REF_AGGREGATION
+                r0 = aggr(pt)
+                rn = aggr(pt; reservoir_caps = false)
+                @test rn.qagg1 <= r0.qagg1
+                @test rn.qagg2 <= r0.qagg2
+            end
+
+            # `c_55` -- aggregate SELF-collection -- keeps its caps even under
+            # `reservoir_caps = false`: it takes from species 3 and gives to species 3, so
+            # no donor reservoir realizes it and the per-pair bound is all it has. Build a
+            # point where that bound bites hard: 1e9 aggregates per kg on 1e-2 kg/kg.
+            let pt = ISHMAEL_REF_AGGREGATION[1], n3b = 1.0e9, q3b = 1.0e-2
+                ip55 = Scythe.ISHMAEL_IPAIR[5, 5]
+                en3 = n3b * pt.rhoair
+                tC = pt.temp - Scythe.ISHMAEL_T0
+                ccap = Scythe.ishmael_col1(pt.dt, 1.0, tC, pt.d3, en3, q3b, pt.d3, en3,
+                    pt.rhoair, tables_.coltab, tables_.coltabn, ip55, true)
+                craw = Scythe.ishmael_col1(pt.dt, 1.0, tC, pt.d3, en3, q3b, pt.d3, en3,
+                    pt.rhoair, tables_.coltab, tables_.coltabn, ip55, false)
+                @test craw.colamt > ccap.colamt          # uncapped, this pair runs away
+                @test ccap.colamt == q3b                 # capped, it takes the reservoir
+                @test ccap.deltan <= en3 * (1.0 + 1.0e-12)
+                # ...and through the public entry point with the caps switched OFF, the
+                # aggregate number sink is STILL the capped one: `nagg3 >= -n3/2`, the
+                # `-0.5*c_55.deltan` term at its bound. Uncapped it would be ~2e7 times that.
+                r = Scythe.ishmael_aggregation(pt.dt, pt.rhoair, pt.temp,
+                    pt.q1, pt.n1, pt.d1, pt.q2, pt.n2, pt.d2, q3b, n3b, pt.d3,
+                    pt.rho1, pt.rho2, pt.phi1, pt.phi2, tables_.coltab, tables_.coltabn;
+                    reservoir_caps = false)
+                @test r.nagg3 >= -0.5 * n3b * (1.0 + 1.0e-12)
+                @test r.nagg3 < 0.0                      # the cap is what it is sitting on
+            end
+        end
+
         # ──────────────────────────────────────────────
         # 6. Pure diagnostic caps: ishmael_ni_cap / ishmael_agg_size_cap
         # ──────────────────────────────────────────────
@@ -880,6 +955,15 @@ end
             @test @allocated(Scythe.ishmael_aggregation(pt1.dt, pt1.rhoair, pt1.temp, pt1.q1, pt1.n1,
                 pt1.d1, pt1.q2, pt1.n2, pt1.d2, pt1.q3, pt1.n3, pt1.d3, pt1.rho1, pt1.rho2, pt1.phi1,
                 pt1.phi2, tables_.coltab, tables_.coltabn)) == 0
+
+            Scythe.ishmael_aggregation(pt1.dt, pt1.rhoair, pt1.temp, pt1.q1, pt1.n1, pt1.d1, pt1.q2,
+                pt1.n2, pt1.d2, pt1.q3, pt1.n3, pt1.d3, pt1.rho1, pt1.rho2, pt1.phi1, pt1.phi2,
+                tables_.coltab, tables_.coltabn; f_agg1 = 0.3, f_agg2 = 0.7,
+                reservoir_caps = false)
+            @test @allocated(Scythe.ishmael_aggregation(pt1.dt, pt1.rhoair, pt1.temp, pt1.q1, pt1.n1,
+                pt1.d1, pt1.q2, pt1.n2, pt1.d2, pt1.q3, pt1.n3, pt1.d3, pt1.rho1, pt1.rho2, pt1.phi1,
+                pt1.phi2, tables_.coltab, tables_.coltabn; f_agg1 = 0.3, f_agg2 = 0.7,
+                reservoir_caps = false)) == 0
 
             Scythe.ishmael_ni_cap(1.0e6, 1.0)
             @test @allocated(Scythe.ishmael_ni_cap(1.0e6, 1.0)) == 0

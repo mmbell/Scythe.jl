@@ -228,6 +228,27 @@ function o01_model(opts::BenchmarkOptions)
     # phantom ice is the channel it closes). Unset => on. `=0` drops it for forensics.
     haskey(ENV, "SCYTHE_O01_ANCHORRATES") &&
         (options[:ice_anchor_rates] = ENV["SCYTHE_O01_ANCHORRATES"] != "0")
+    # The per-channel ATTRIBUTION census (`Scythe.MC_ATTR_*`): which LEG the `MC_DONOR_*`
+    # breaches come from -- the six q_r legs at the breach points, rain evaporation at the
+    # applied step-mean, the q_i melt/aggregation split, and what runs above the melting
+    # level. Unset => off, and the run is bitwise the committed one: the block writes only
+    # into `mc_water_stats` and every write is gated on a state test a warm ice-free column
+    # fails identically. Read it in the stiffness trace (`options[:stiffness_trace]`).
+    haskey(ENV, "SCYTHE_O01_ATTR") && (options[:ice_attr_census] = envflag("SCYTHE_O01_ATTR"))
+    # The PER-PAIR reservoir caps inside the aggregation kernel (`Scythe.ishmael_col1`'s
+    # `min(colamt, q)` / `min(colamtn, n)`): a `dt` inside a rate law, the `min(rate, rho/dt)`
+    # class this port removes at every other ISHMAEL call site. They stood because nothing
+    # else bounded the three-pair sums; the donor realization factors now do (Stage 1). Unset
+    # => on, bitwise the Fortran's caps. `=0` retires the class on the aggregation kernel too
+    # -- an answer-changing forensic arm, to be read against the MC_DONOR_I1/I2 census and
+    # SCYTHE_O01_ATTR's MC_ATTR_AGG1_SAT count (which is what says whether they bind at all).
+    haskey(ENV, "SCYTHE_O01_AGGCAPS") &&
+        (options[:ice_agg_caps] = ENV["SCYTHE_O01_AGGCAPS"] != "0")
+    # The attribution block is PRINTED only by the periodic stiffness trace, so asking for
+    # the census without a trace interval would integrate an hour and report nothing: the
+    # knob supplies the production interval (4000 steps) unless one was given explicitly.
+    get(options, :ice_attr_census, false) && !haskey(options, :stiffness_trace) &&
+        (options[:stiffness_trace] = 4000)
     # Cloud droplet number ceiling [#/cm^3] for the Twomey activation branch AND the KK2000
     # two-moment autoconversion (both read physical_params[:max_N_c]; the driver passes one
     # number so a column carries ONE droplet population). Unset => 100.0, the closure's
