@@ -5312,8 +5312,16 @@ using Springsteel
         # q_r debit channels is credited (the largest debit), so their counts sum to the
         # `MC_DONOR_QR` count and no leg is blamed twice. And the two bounds that say the
         # shares are shares: no single leg exceeds the net depletion, and the sum of the
-        # four true debits (`MC_ATTR_QR_ALL`, which is the net PLUS the melt credit) is at
-        # least it.
+        # four true debits (`MC_ATTR_QR_ALL`) is at least the largest of them.
+        #
+        # `MC_ATTR_QR_ALL >= MC_DONOR_QR` was the third bound here until Stage 2b, on the
+        # reading that the four debits are the net ice draw PLUS the melt credit. That
+        # census row is no longer the ice draw: it is the COMBINED draw, ice legs plus the
+        # realized evaporation (TeX §donor_relax), and block A decomposes only the ice half
+        # — evaporation has block B to itself, at the applied step-mean. The two rows are
+        # therefore no longer comparable in either direction at a point (`QR_ALL` drops the
+        # melt credit, `MC_DONOR_QR` adds the evaporation), and the bound that survives is
+        # the one internal to block A.
         mktempdir() do tmpdir
             m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 250.15, rho_i = 1.0e-3,
                                               n_i = 1.0e6, rho_r = 1.0e-4, n_r = 1.0e3,
@@ -5345,7 +5353,9 @@ using Springsteel
             amax = maximum(maximum(view(st, arow(ch), :)) for ch in legs)
             @test acount == dcount                       # the partition
             @test amax <= dmax + 1.0e-12                 # a share is a share
-            @test maximum(view(st, arow(Scythe.MC_ATTR_QR_ALL), :)) >= dmax - 1.0e-12
+            # The sum of the four debits is at least the largest single one — pointwise, so
+            # the run-maxima inherit it whichever points they were taken at.
+            @test maximum(view(st, arow(Scythe.MC_ATTR_QR_ALL), :)) >= amax - 1.0e-12
             # The melt CREDIT is never counted (it adds rain; it cannot be the largest
             # debit), and the sub-part channel keeps its own run-max.
             @test sum(view(st, arow(Scythe.MC_ATTR_QR_MELT) + 1, :)) == 0.0
@@ -5430,6 +5440,214 @@ using Springsteel
             # caller subtracts what the donors lost, so this is zero to the last bit of the
             # three multiplications that carry it.
             @test maximum(abs, s1 .+ s2 .+ s3) <= 1.0e-14 * scale
+        end
+    end
+
+
+    @testset "rain evaporation joins the rain donor's realization (Stage 2b)" begin
+        # TeX §donor_relax, "The rain reservoir has a third sink that lived outside its
+        # conductance". Rain evaporation is integrated on the `Q_ss` relaxation pair, whose
+        # propagator bounds the SUPERSATURATION and not the rain: the vapor deficit sets the
+        # step-mean and nothing set it by the rain that is there. The ice legs were realized
+        # on a conductance that did not contain it, so two draws on ONE reservoir summed
+        # without either knowing of the other. The cure is the one sublimation already had:
+        # `kappa_ev = max(-Qdot_r, 0)/rho_r` joins the rain donor's total, one factor is formed
+        # over all of it, and the realized `f_r/tau_r` replaces `1/tau_r` in lambda, in N and
+        # in the rain transfer at once.
+
+        # ── (1) THE FACTOR ITSELF, at the function ────────────────────────────────────────
+        # `kev = 0` is the pre-Stage-2b construction BITWISE — which is the whole content of
+        # `options[:rain_evap_realization] = false` — and a positive `kev` shrinks BOTH rain
+        # moments' factors while leaving the cloud's alone.
+        let hf = (mim = 1.0e-4, mimr = 2.0e-4, nimr = 3.0),
+            bg = (mbiggr = 5.0e-4, nbiggr = 7.0),
+            pz = Scythe._ice_empty_pre(),
+            qc = 1.0e-3, qr = 5.0e-4, nr = 100.0, dt = 1.0
+
+            f0 = Scythe._ice_donor_factors(hf, bg, pz, pz, pz, qc, qr, nr, 0.0, dt)
+            @test f0[1] === Scythe.relaxation_realization(hf.mim, qc, dt)
+            @test f0[2] === Scythe.relaxation_realization(hf.mimr + bg.mbiggr, qr, dt)
+            @test f0[3] === Scythe.relaxation_realization(hf.nimr + bg.nbiggr, nr, dt)
+
+            kev = 0.3
+            f1 = Scythe._ice_donor_factors(hf, bg, pz, pz, pz, qc, qr, nr, kev, dt)
+            @test f1[1] === f0[1]                 # the CLOUD channel is not touched
+            @test f1[2] < f0[2]                   # the rain MASS donor now sees the third sink
+            @test f1[3] < f0[3]                   # ...and so does the rain NUMBER donor
+            # BOUNDED BY CONSTRUCTION: the combined realized draw of every sink on the
+            # reservoir, evaporation included, is `1 - exp(-kappa_tot dt) < 1`.
+            @test ((hf.mimr + bg.mbiggr) + kev * qr) * f1[2] * dt / qr <= 1.0
+            @test ((hf.nimr + bg.nbiggr) + kev * nr) * f1[3] * dt / nr <= 1.0
+
+            # With evaporation the ONLY sink the factor is `J_0(kappa_ev dt)`, and it is the
+            # SAME number for mass and number: `rain_number_evaporation_2m` is
+            # `Qdot_r n_r / max(rho_r, RHO_R_MIN)`, i.e. the identical conductance acting on
+            # the number, unlike Bigg (whose number conductance is a twentieth of its mass
+            # one) which is why the two moments need separate factors at all.
+            hz = (mim = 0.0, mimr = 0.0, nimr = 0.0)
+            bz = (mbiggr = 0.0, nbiggr = 0.0)
+            f2 = Scythe._ice_donor_factors(hz, bz, pz, pz, pz, qc, qr, nr, kev, dt)
+            @test f2[1] === 1.0
+            @test f2[2] ≈ -expm1(-kev * dt) / (kev * dt) rtol = 1e-14
+            @test f2[3] ≈ f2[2] rtol = 1e-14
+            # ...and a dead reservoir keeps an exact 1.0, whatever the conductance.
+            @test Scythe._ice_donor_factors(hz, bz, pz, pz, pz, 0.0, 0.0, 0.0,
+                                            kev, dt) === (1.0, 1.0, 1.0)
+        end
+
+        # The evaporation number sink is EXACTLY proportional to the mass sink, which is what
+        # licenses one conductance for two moments (`_ice_donor_factors`, the note beside
+        # `ev_n`).
+        for (Qr, rr, nn) in ((-3.0e-6, 1.0e-3, 5.0e2), (-1.0e-5, 2.0e-4, 1.0e3))
+            @test Scythe.rain_number_evaporation_2m(Qr, rr, nn) ≈
+                  (Qr / rr) * nn rtol = 1e-14
+        end
+
+        """One step of a warm rain shaft evaporating into the dry adiabat."""
+        function evap_run(tmpdir, ts; evapreal = true, nsteps = 1)
+            eo = Dict{Symbol,Any}(:rain_evap_realization => evapreal)
+            m, patch, model, col = make_mc_mtile(tmpdir; dry = true, kDim = 32,
+                                                 num_cells = 8, ts = ts,
+                                                 precipitation = true, extra_options = eo)
+            gp = Scythe.getGridpoints(patch)
+            seed_rain_bump!(patch, gp, col, model.grid_params.kDim)
+            ncols = div(size(patch.physical, 1), model.grid_params.kDim)
+            for t in 1:nsteps
+                for c in 1:ncols; Scythe.advance_column(m, c, t); end
+                t < nsteps && (Scythe.calcTendency(m); gridTransform!(patch))
+            end
+            return m, patch, model
+        end
+
+        # ── (2) THE DRY PATH IS BITWISE ───────────────────────────────────────────────────
+        # No rain, no conductance, no factor: `kappa_ev` is an exact 0.0 and `f_rain` an exact
+        # 1.0 everywhere, so the fold into `invtau_r`/`Qdot_r` is `1.0 * x === x` and slot 7
+        # still takes the classical Euler branch it took before the stage.
+        mktempdir() do tmpdir
+            m, patch, model, _ = make_mc_mtile(tmpdir; dry = true)
+            npts = size(patch.physical, 1)
+            ncols = div(npts, model.grid_params.kDim)
+            for c in 1:ncols
+                Scythe.advance_column(m, c, 1)
+            end
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(S.kappa_ev .=== 0.0)
+            @test all(S.f_rain .=== 1.0)
+            @test all(S.Qdot_r .=== 0.0)
+            @test all(S.etd_lam .== 0.0)
+            for i in 1:npts
+                @test m.var_np1[i, 7] ===
+                      patch.physical[i, 7, 1] + (model.ts * m.expdot_n[i, 7])
+            end
+        end
+
+        # ── (3) THE KNOB OFF IS THE PREVIOUS BEHAVIOUR, BITWISE ───────────────────────────
+        # `options[:rain_evap_realization] = false` forces `kappa_ev = 0` and NOTHING else.
+        # Every consequence then collapses to an identity: the rain donor's factor is an
+        # exact 1.0, so the fold of `f_rain` into `invtau_r`/`Qdot_r` is a multiplication by
+        # one (`1.0 * x === x` for every finite `x`, `-0.0` included), and
+        # `_ice_donor_factors` adds an exact 0.0 to a sum of non-negative rates. That is the
+        # bitwise-restoration claim, checked here as the identity it rests on; the
+        # end-to-end comparison against the pre-stage tree was run offline on this same
+        # fixture and reproduced `var_np1` exactly.
+        mktempdir() do tmpdir
+            m, patch, model = evap_run(tmpdir, 0.05; evapreal = false, nsteps = 3)
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(S.kappa_ev .=== 0.0)
+            @test all(S.f_rain .=== 1.0)
+            @test all(x -> 1.0 * x === x, S.invtau_r)
+            @test all(x -> 1.0 * x === x, S.Qdot_r)
+            # ...and this column really does evaporate, or the claim is about nothing.
+            @test minimum(S.Qdot_r) < 0.0
+        end
+
+        # ── (4) THE WARM ANSWER MOVES, BOUNDED AND CONVERGENT IN ts ──────────────────────
+        # "The factor is not ice-gated: `kappa_ev` is a warm-path quantity, so `f_r < 1`
+        # wherever rain evaporates, and the warm answer moves by the amount `J_0` differs
+        # from one at the stiffest evaporating points" (TeX). `J_0 -> 1` as `dt -> 0`, so the
+        # move is an integrator coefficient and not a rate law: it must shrink with the step,
+        # at first order, exactly as the freezing realization's does.
+        #
+        # Measured on this fixture, one step, `d` the relative change in the slot increment:
+        #
+        #   ts        d(rho_r)   d(Q_ss)    d(qr_bar)   1 - f_min   kappa_ev*ts
+        #   0.05      2.47e-4    1.10e-3    7.96e-4     0.105       0.227
+        #   0.005     2.64e-5    1.18e-4    8.51e-5     0.0113      0.0227
+        #   0.0005    2.66e-6    1.19e-5    8.56e-6     0.00113     0.00227
+        #
+        # — a per-mille-level move at the production-sized step, shrinking by ten for ten,
+        # which is `1 - J_0 ~ kappa_ev*dt/2` and nothing else. (This shaft is far stiffer
+        # than the O01 production configuration, where the TeX records the rain channel's
+        # `dt/tau_r` at no more than 0.04.)
+        mktempdir() do tmpdir
+            reldiff(x, y) = maximum(abs.(x .- y)) / max(maximum(abs.(x)), 1e-300)
+            function shift_at(ts)
+                # OFF first, then ON, so the per-thread scratch left behind belongs to the
+                # realized run and `f_rain` below is the factor that actually acted.
+                m_of, _, _ = evap_run(tmpdir, ts; evapreal = false)
+                m_on, _, _ = evap_run(tmpdir, ts; evapreal = true)
+                S_on = m_on.mc_scratch[Threads.threadid()]
+                # The two runs' own slot INCREMENTS — what the rain and the supersaturation
+                # actually received over the step — rather than the states, whose difference
+                # would be swamped by the base profile.
+                return (d8 = reldiff(m_of.var_np1[:, 8] .- m_of.tile.physical[:, 8, 1],
+                                     m_on.var_np1[:, 8] .- m_on.tile.physical[:, 8, 1]),
+                        d7 = reldiff(m_of.var_np1[:, 7] .- m_of.tile.physical[:, 7, 1],
+                                     m_on.var_np1[:, 7] .- m_on.tile.physical[:, 7, 1]),
+                        fmin = minimum(S_on.f_rain))
+            end
+            coarse = shift_at(0.05)
+            mid    = shift_at(0.005)
+            fine   = shift_at(0.0005)
+            # IT MOVES: the factor is strictly below one somewhere, and both the rain
+            # increment and the supersaturation increment differ.
+            @test coarse.d8 > 0.0
+            @test coarse.d7 > 0.0
+            @test coarse.fmin < 1.0                # `f_r < 1` wherever rain evaporates
+            @test coarse.fmin > 0.0
+            @test fine.fmin > coarse.fmin          # ...and `J_0 -> 1` as the step is refined
+            # BOUNDED: `1 - J_0` is at most `kappa_ev dt / 2`, which at this configuration is
+            # a per-cent-level effect and nowhere near a reservoir.
+            @test coarse.d8 < 0.05
+            @test coarse.d7 < 0.05
+            # CONVERGENT: refining the step by ten shrinks the disagreement by at least five,
+            # which a `dt` written into a rate law would not do.
+            @test mid.d8 <= 0.2 * coarse.d8 + 1.0e-14
+            @test fine.d8 <= 0.2 * mid.d8 + 1.0e-14
+            @test mid.d7 <= 0.2 * coarse.d7 + 1.0e-14
+            @test fine.d7 <= 0.2 * mid.d7 + 1.0e-14
+        end
+
+        # ── (5) THE INVARIANT THE STAGE EXISTS FOR ───────────────────────────────────────
+        # On the Stage 0a attribution fixture the two draws on the rain used to sum to 1.0012
+        # reservoirs per step over 1296 gridpoint-steps while `MC_DONOR_QR`, which saw the ice
+        # half alone, reported a dutiful 1.0. Both readings must now be under one: the census
+        # row because it measures the COMBINED draw, and the independent block-B reading —
+        # taken at the APPLIED step-mean rather than at the frozen rate the factor was formed
+        # on — because the two draws are shares of one exponential depletion.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 250.15, rho_i = 1.0e-3,
+                                              n_i = 1.0e6, rho_r = 1.0e-4, n_r = 1.0e3,
+                                              ts = 1.0,
+                                              extra_options = Dict{Symbol,Any}(
+                                                  :ice_attr_census => true))
+            ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+            m.mc_water_stats .= 0.0
+            for t in 1:6, c in 1:ncols
+                Scythe.advance_column(m, c, t)
+            end
+            st = m.mc_water_stats
+            drow(ch) = Scythe.MC_DONOR_FIRST + Scythe.MC_DONOR_N * (ch - 1)
+            arow(ch) = Scythe.MC_ATTR_FIRST + Scythe.MC_ATTR_N * (ch - 1)
+            # ACTIVE: the rain donor is genuinely being drawn on here, and evaporation is
+            # part of the draw — otherwise the bounds below are vacuous.
+            @test maximum(view(st, drow(Scythe.MC_DONOR_QR), :)) > 0.5
+            @test maximum(view(st, arow(Scythe.MC_ATTR_QR_EVAP), :)) > 0.0
+            # ...and BOUNDED, which is the whole of Stage 2b.
+            @test maximum(view(st, drow(Scythe.MC_DONOR_QR), :)) <= 1.0 + 1.0e-9
+            @test maximum(view(st, arow(Scythe.MC_ATTR_QR_COMB), :)) <= 1.0 + 1.0e-9
+            # The number donor is under the same bound with the number sink in ITS total.
+            @test maximum(view(st, drow(Scythe.MC_DONOR_NR), :)) <= 1.0 + 1.0e-9
         end
     end
 

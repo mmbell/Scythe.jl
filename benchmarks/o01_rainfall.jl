@@ -244,6 +244,19 @@ function o01_model(opts::BenchmarkOptions)
     # SCYTHE_O01_ATTR's MC_ATTR_AGG1_SAT count (which is what says whether they bind at all).
     haskey(ENV, "SCYTHE_O01_AGGCAPS") &&
         (options[:ice_agg_caps] = ENV["SCYTHE_O01_AGGCAPS"] != "0")
+    # RAIN EVAPORATION in the rain donor's conductance (Stage 2b; TeX §donor_relax, "The rain
+    # reservoir has a third sink that lived outside its conductance"). Unset => on, the
+    # committed construction: `kappa_ev = max(-Qdot_r,0)/rho_r` joins `kappa_tot`, one factor
+    # `J_0(kappa_tot dt)` is formed over all of it, and the realized `f_r/tau_r` replaces
+    # `1/tau_r` in lambda, in N and in the rain transfer at once. It is NOT ice-gated -- the
+    # conductance is a warm-path quantity -- so this knob moves the warm answer too. `=0`
+    # forces `kappa_ev = 0` and nothing else, which is the pre-Stage-2b behaviour BITWISE on
+    # every path: the factors go back to the ice-leg-only expression and the fold becomes a
+    # multiplication by an exact 1.0. Forensic arm, to be read against `SCYTHE_O01_ATTR`'s
+    # MC_ATTR_QR_COMB (1.0012 reservoirs over 1296 gridpoint-steps with it off) and the
+    # MC_DONOR_QR row, which only measures the combined draw with it on.
+    haskey(ENV, "SCYTHE_O01_EVAPREAL") &&
+        (options[:rain_evap_realization] = ENV["SCYTHE_O01_EVAPREAL"] != "0")
     # The attribution block is PRINTED only by the periodic stiffness trace, so asking for
     # the census without a trace interval would integrate an hour and report nothing: the
     # knob supplies the production interval (4000 steps) unless one was given explicitly.

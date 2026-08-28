@@ -126,6 +126,17 @@ const MC_SCRATCH_SLOTS = (
     :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
     :cap_c, :cap_r, :cap_v,      # AB3 depletion bounds, DIAGNOSTIC ONLY (see _ab3_sink_bound)
     :invtau_c, :invtau_r,        # per-channel relaxation rates, for `mc_stiffness_census!`
+    # ── Stage 2b: the RAIN DONOR's evaporation conductance and its realization factor ──
+    # `kappa_ev` is `max(−Q̇_r, 0)/ρ_r` at the frozen state — the rain's evaporation sink
+    # expressed as a conductance on its own reservoir (TeX §donor_relax, "The rain reservoir
+    # has a third sink"), written beside the condensation closure where `Q̇_r` and `ρ_r` are
+    # both known and read again inside `mc_ice_sources!`, which needs it to complete the rain
+    # donor's TOTAL. `f_rain` is that donor's factor `J₀(κ_tot Δt)`: the warm-path value
+    # `J₀(κ_ev Δt)` where there is no ice, OVERWRITTEN with the full ice-plus-evaporation
+    # factor at every gridpoint the ice loop visits. It is folded into `invtau_r`/`Qdot_r`
+    # themselves before λ and N are formed, so the pair, the slot and the census all read the
+    # one realized conductance. Exactly 1.0 wherever the rain does not evaporate.
+    :kappa_ev, :f_rain,
     :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
     # Two-moment rain number (options[:rain_moments] == 2). Same six-way shape the mass
     # slot has — control variable, its gradient, the Jacobian, the recovered density, the
@@ -196,9 +207,11 @@ const MC_SCRATCH_SLOTS = (
     #    in the stiff limit"; see `relaxation_adjustment_qss!`). The two relaxations are
     #    WITHHELD from the multistep, so slot 7's `expdot` carries `N` alone and these columns
     #    carry everything the exponential propagator and the step-mean consumers need.
-    #    `etd_lam` is the LIQUID conductance that survives the clip (λ's liquid half, written
-    #    beside the condensation closure) and `etd_nl` its clipped-channel constant flux, the
-    #    liquid `N` piece. The ICE half is carried as the affine decomposition of its drive,
+    #    `etd_lam` is the LIQUID conductance that survives the clip (λ's liquid half) and
+    #    `etd_nl` its clipped-channel constant flux, the liquid `N` piece. Both are written
+    #    BELOW the ice block rather than beside the condensation closure, because the rain
+    #    channel's conductance is not final until the rain donor's realization factor is
+    #    (Stage 2b; see `f_rain`). The ICE half is carried as the affine decomposition of its drive,
     #    `drive_i = etd_dep_a·Q_ss + etd_dep_b` (written by `mc_ice_sources!`, where the two
     #    drives live): `a = 1, b = 𝒟` unclipped, `a = 0, b = drive_i` clipped, `a = b = 0`
     #    above `T_0` where the channel is shut. λ's ice half is then `a·Σ_k τ_{i,k}^{-1}` and
@@ -1428,6 +1441,13 @@ Under the construction of [`_ice_donor_factors`](@ref) that is `1 − e^{−κ_t
 three liquid donors, identically, so a reading above `1` is not a resolution statement — it is
 the construction failing, and the number to watch when a new sink is added to a reservoir.
 
+The rain's row counts EVERY sink on the reservoir, not only the ice ones: rain EVAPORATION —
+which is integrated on the `Q_ss` relaxation pair, whose propagator bounds the supersaturation
+and not the rain — joined `κ_tot` in Stage 2b (TeX §donor_relax), so `MC_DONOR_QR` is the
+combined realized draw and the bound above is a statement about the number that is actually
+taken. Before that it read the ice half alone: a dutiful 1.0 on the Stage 0a fixture while the
+two halves together took 1.0012 reservoirs, which `MC_ATTR_QR_COMB` had to be built to see.
+
 The three ICE reservoirs are scaled by the same construction: `mc_ice_sources!` forms one
 conductance per species over melting, aggregation and sublimation, and every one of those legs
 is realized at it, so a reading above `1` there means the same thing it means for the liquid.
@@ -1451,7 +1471,7 @@ const MC_DONOR_N = 2
 const MC_DONOR_FIRST = MC_STIFF_WARNED + 1
 const MC_DONOR_WARNED = MC_DONOR_FIRST + (MC_DONOR_N * MC_DONOR_CHANNELS)
 """Donor labels for the depletion report, in `MC_DONOR_*` index order."""
-const MC_DONOR_NAMES = ("q_c", "q_r", "n_r", "q_i1(melt+agg)", "q_i2(melt+agg)",
+const MC_DONOR_NAMES = ("q_c", "q_r(ice+evap)", "n_r", "q_i1(melt+agg)", "q_i2(melt+agg)",
                         "q_i3(melt+agg)", "q_i1(subl)", "q_i2(subl)", "q_i3(subl)")
 """
 The ANCHOR-RECONCILIATION census of `mc_water_stats` — the third reconciliation tier's
@@ -1509,8 +1529,9 @@ The four measurement sites, in the order the step visits them:
 | C | `mc_ice_sources!` | the q_i1/q_i2 split between MELT and AGGREGATION |
 | D | `mc_ice_sources!`, `T > T_0 + 2` K | the above-freezing riming/melting loop, and the anchor share's withholding |
 
-Block A's counts PARTITION the `MC_DONOR_QR` count exactly: at every breach point
-(`−ICE_R·Δt/(ρ_a q_r) > 1`) exactly one of channels `MC_ATTR_QR_HOM … MC_ATTR_QR_COLL` is
+Block A's counts PARTITION the `MC_DONOR_QR` count exactly: at every breach point (the
+combined `(−ICE_R/ρ_a + f_r κ_ev q_r)·Δt/q_r > 1` of Stage 2b, `mc_donor_census!`'s own
+expression character for character) exactly one of channels `MC_ATTR_QR_HOM … MC_ATTR_QR_COLL` is
 credited, the one carrying the LARGEST debit, so `Σ` of those five counts is the number of
 breach points and no leg can be blamed twice. `MC_ATTR_QR_RIMEX` is a SUB-PART of
 `MC_ATTR_QR_RIME` — the rain rime the realized pass debits IN EXCESS of the share the
@@ -1518,8 +1539,18 @@ conductance was formed on (`f_qr·prdr0_r`), the split-plus-density cross term �
 win that argmax where the conductance share is negative; it is in the block for its run-max,
 and a nonzero count there is itself the finding. `MC_ATTR_QR_MELT` is a CREDIT, not a debit
 (melting ADDS rain), so it records a run-max and is never counted; `MC_ATTR_QR_ALL` is the sum
-of the four true debits, which is `MC_DONOR_QR` plus the melt credit and therefore an upper
-bound on it, point by point.
+of the four true debits, which is `MC_DONOR_QR`'s ice half plus the melt credit and therefore
+an upper bound on that half, point by point.
+
+Block B (`MC_ATTR_QR_EVAP`, `MC_ATTR_QR_COMB`) is unchanged in DEFINITION and changed in what
+it is expected to read. It reports the APPLIED step-mean evaporation `q̄_r` — the number the
+rain slot actually receives, which is the propagator's and not the frozen rate — alone and
+added to the ice draw. Since Stage 2b the evaporation conductance is inside `κ_tot`, so the
+combined number is expected `≤ 1`: the two draws are shares of one exponential depletion
+rather than two independent ones. It was 1.0012 over 1296 gridpoint-steps on the Stage 0a
+fixture before that, which is the measurement the stage exists to answer. It remains an
+independent reading of the bound — taken at the applied step-mean rather than at the frozen
+rate the factor was formed on — and therefore still reports rather than limits.
 
 `MC_ATTR_AGG1_SAT` counts the gridpoint-steps at which species 1's aggregation increment takes
 its ENTIRE mass (`−qagg1 ≥ q1(1−10⁻¹²)`) — the caller-side proxy for `ishmael_col1`'s per-pair
@@ -3921,7 +3952,9 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
           For the three LIQUID donors this must not happen: every sink on a reservoir is
           realized on that reservoir's TOTAL conductance (_ice_donor_factors), so the applied
           fraction is 1 - exp(-kappa_tot*dt) < 1 identically. A reading above 1 there means a
-          sink was added to a donor without being added to its conductance.
+          sink was added to a donor without being added to its conductance. The rain's total
+          includes EVAPORATION as well as the ice legs (Stage 2b), which is why its row is
+          the combined draw.
           The three ICE donors are realized the same way -- melting, aggregation and
           sublimation are all shares of one per-species conductance (mc_ice_sources!) -- so a
           reading above 1 there says the same thing: a sink is drawing on a reservoir it was
@@ -4204,7 +4237,7 @@ module_mp_jensen_ishmael.F line 2246). It is the same particle DeMott seeds
 const ISHMAEL_M_MIN = ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * ISHMAEL_RMIN^3
 
 """
-    _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, dt) -> (f_qc, f_qr, f_nr)
+    _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt) -> (f_qc, f_qr, f_nr)
 
 The realization factor of each LIQUID DONOR RESERVOIR at one gridpoint: cloud mass, rain mass,
 rain number. One factor per reservoir, formed from that reservoir's TOTAL sink conductance over
@@ -4227,9 +4260,41 @@ the supersaturation pair, where `λ = Σ τ⁻¹` and each channel takes its sha
 
   * `q_c`  homogeneous freezing `ṁ_hf,c`, and the CLOUD half of every species' riming;
   * `q_r`  homogeneous freezing `ṁ_hf,r`, Bigg `ṁ_Bigg`, the RAIN half of every species'
-           riming, and every species' ice-rain collection `dQRfzri`;
-  * `n_r`  the number partners of the same: `ṅ_hf,r`, `ṅ_Bigg`, `dNfzri`, and the drops riming
-           removes (`nrn_loss`).
+           riming, every species' ice-rain collection `dQRfzri`, and — since Stage 2b —
+           EVAPORATION, through the conductance `kev` the caller supplies;
+  * `n_r`  the number partners of the same: `ṅ_hf,r`, `ṅ_Bigg`, `dNfzri`, the drops riming
+           removes (`nrn_loss`), and the evaporation number sink at the same `kev`.
+
+# EVAPORATION is a sink of the rain like any other (Stage 2b)
+
+`kev = max(−Q̇_r, 0)/ρ_r` is the rain-channel evaporation of `qss_condensation_rates` written
+as a conductance on the rain (TeX §donor_relax, "The rain reservoir has a third sink that
+lived outside its conductance"). It was outside every conductance in this file: the
+exponential propagator of the relaxation pair bounds `Q_ss`, not `ρ_r`, so the vapor DEFICIT
+limited the applied evaporation and nothing limited it by the rain that is there. The ice legs
+were then realized on a conductance that did not contain it, and the two draws on ONE
+reservoir summed without either knowing of the other — measured on the Stage 0a fixture at a
+combined `MC_ATTR_QR_COMB` of 1.0012 over 1296 gridpoint-steps while `MC_DONOR_QR` itself, which
+saw only the ice half, read 1.0. Adding it to `κ_tot` is the closure sublimation already had on
+the ice side, and the SAME realized number then goes into `λ`, into `N` and into the rain
+transfer (the fold of `f_rain` into `invtau_r`/`Qdot_r` in `mc_driver!`).
+
+The NUMBER sink is exactly proportional to the mass sink — `rain_number_evaporation_2m` is
+`Q̇_r·n_r/max(ρ_r, RHO_R_MIN)`, i.e. the same `κ_ev` acting on `n_r` — so the number donor takes
+the IDENTICAL conductance rather than a scaled one (contrast Bigg, whose number conductance is
+a twentieth of its mass conductance, which is why the two moments need separate factors at
+all). The two agree exactly above `RHO_R_MIN`; in the decade between the census floor and it
+the number's true conductance is the SMALLER of the two, so `κ_ev` over-states it and the
+factor errs toward realizing more — the safe direction, on a reservoir with no rain in it. It is added to `f_nr`'s total, which is what the ICE number legs are realized on; the
+number sink itself is applied through `NR_SRC` on the multistep, beside self-collection, which
+carries no conductance either.
+
+`kev` is passed as a CONDUCTANCE, not as a rate: `κ_evΔt` is dimensionless in either unit
+system, and multiplying by the caller's `qr`/`nr` here is what puts it in the same
+mixing-ratio units as every other leg of the sum. `kev = 0.0` restores the pre-Stage-2b
+factors bitwise — `relaxation_realization` returns an exact `1.0` at a zero rate, and adding
+an exact `0.0` to a sum of non-negative rates is the identity — which is what
+`options[:rain_evap_realization] = false` uses.
 
 Mass and number are separate reservoirs with separate conductances, and get separate factors:
 Bigg's number conductance is `1/20` of its mass conductance (`ṅ/ṁ = λ_r³/20πρ_w` against
@@ -4256,15 +4321,21 @@ Every factor is an exact `1.0` where its reservoir has no sink, which is what ke
 conversion-free path — and the whole warm and dry path, where this block never runs — bitwise.
 """
 @inline function _ice_donor_factors(hf, bg, p1, p2, p3, qc::Float64, qr::Float64,
-                                    nr::Float64, dt::Float64)
+                                    nr::Float64, kev::Float64, dt::Float64)
     rim_c = (p1.prdr0_c + p2.prdr0_c) + p3.prdr0_c
     rim_r = (p1.prdr0_r + p2.prdr0_r) + p3.prdr0_r
     col_q = (p1.rr.dQRfzri + p2.rr.dQRfzri) + p3.rr.dQRfzri
     col_n = (p1.rr.dNfzri + p2.rr.dNfzri) + p3.rr.dNfzri
     nrn   = (p1.nrn_loss + p2.nrn_loss) + p3.nrn_loss
+    # The two EVAPORATION legs, in the mixing-ratio units this sum is taken in. One
+    # conductance, two moments: the number sink is `κ_ev n_r` because
+    # `rain_number_evaporation_2m` is proportional to the mass loss with exactly this
+    # constant of proportionality.
+    ev_r = kev * qr
+    ev_n = kev * nr
     f_qc = relaxation_realization(hf.mim + rim_c, qc, dt)
-    f_qr = relaxation_realization(((hf.mimr + bg.mbiggr) + rim_r) + col_q, qr, dt)
-    f_nr = relaxation_realization(((hf.nimr + bg.nbiggr) + nrn) + col_n, nr, dt)
+    f_qr = relaxation_realization((((hf.mimr + bg.mbiggr) + rim_r) + col_q) + ev_r, qr, dt)
+    f_nr = relaxation_realization((((hf.nimr + bg.nbiggr) + nrn) + col_n) + ev_n, nr, dt)
     return (f_qc, f_qr, f_nr)
 end
 
@@ -4825,7 +4896,7 @@ rests on.
 """
 function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                          active::Bool, var_check_source::Bool, anchor_rates::Bool,
-                         attr_census::Bool, agg_caps::Bool,
+                         attr_census::Bool, agg_caps::Bool, rain_evap_real::Bool,
                          tau_hf::Float64, tau_act::Float64, tau_vc::Float64,
                          stats, stats_tid::Int64)
 
@@ -5061,7 +5132,32 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # `hf` and `bg` are needed here, so they move ahead of the species loop's remains.
         hf = _ice_homogeneous_rates(temp, qc, nc, qr, nr, tau_hf)
         bg = ishmael_bigg_freezing(temp, qr, nr, dt; reservoir_caps = false)
-        (f_qc, f_qr, f_nr) = _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, dt)
+        # The rain's EVAPORATION conductance, staged beside the condensation closure where
+        # `Q̇_r` and `ρ_r` are both known (Stage 2b; `kappa_ev` in the scratch doc). It is the
+        # third sink of the rain reservoir and it is not ice-gated — this loop merely COMPLETES
+        # the rain donor's total where ice legs also draw. Zero, hence inert, wherever the rain
+        # is not evaporating or `options[:rain_evap_realization]` is off.
+        kev = S.kappa_ev[i]
+        (f_qc, f_qr, f_nr) = _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt)
+        # The rain donor's factor now covers every sink on the reservoir, so it — not the
+        # warm-path `J₀(κ_evΔt)` this overwrites — is what the fold below the ice block puts
+        # into `invtau_r`/`Qdot_r`, and hence into λ, into `N` and into the rain transfer.
+        # Written for EVERY gridpoint of the column, exactly as `f_ice<k>` is: the loop has no
+        # ice gate, and a point with no ice contributes no ice legs, so the value written
+        # there is bitwise the warm one it replaces.
+        #
+        # GATED on the stage's own switch, and this is the whole of what the switch does to
+        # the fold. `rain_evap_real = false` leaves the column at the exact `1.0` the
+        # condensation block wrote, so the rain CONDUCTANCE is unrealized exactly as it was
+        # before Stage 2b, while `kev = 0` independently takes `f_qr`/`f_nr` back to their
+        # ice-leg-only values for the legs that always carried them. The two together are the
+        # bitwise restoration; realizing `τ_r^{-1}` at the ice legs' factor without the
+        # evaporation in it would be neither the old behaviour nor the new construction.
+        rain_evap_real && (S.f_rain[i] = f_qr)
+        # The realized EVAPORATION draw, in the same mixing-ratio units and with the same
+        # factor the ice legs carry. Formed here because the census below is the one place the
+        # ice half and the evaporation half of one reservoir's draw can be added together.
+        ev_real = f_qr * (kev * qr)
 
         # ── PHASE C: the growth at the realized collection, and everything downstream ─────
         r1 = live1 ?
@@ -5260,7 +5356,13 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         if census_on
             mc_donor_census!(stx, tid_x, MC_DONOR_QC, -ice_c / rhoair, qc,
                              MC_DONOR_QFLOOR, dt)
-            mc_donor_census!(stx, tid_x, MC_DONOR_QR, -ice_r / rhoair, qr,
+            # STAGE 2b: the COMBINED realized draw on the rain — the ice legs (`ice_r`)
+            # PLUS the realized evaporation. That sum, not either half, is what
+            # `1 − e^{−κ_totΔt} < 1` bounds, so censusing it is what makes the block's
+            # invariant ("no realized donor may exceed one reservoir per step") the thing
+            # actually measured. Before Stage 2b this row saw the ice half alone and read a
+            # dutiful 1.0 while the two halves together took 1.0012 reservoirs.
+            mc_donor_census!(stx, tid_x, MC_DONOR_QR, (-ice_r / rhoair) + ev_real, qr,
                              MC_DONOR_QFLOOR, dt)
             mc_donor_census!(stx, tid_x, MC_DONOR_NR, -ice_nr / rhoair, nr,
                              MC_DONOR_NFLOOR, dt)
@@ -5284,8 +5386,12 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                 iqr = dt / qr
                 # Formed EXPRESSION FOR EXPRESSION as `mc_donor_census!` forms it
                 # (`realized * dt / reservoir`), so "breach point" is the same set of points
-                # to the last bit and the counts below cannot drift off its count.
-                if (-ice_r / rhoair) * dt / qr > 1.0
+                # to the last bit and the counts below cannot drift off its count. Since
+                # Stage 2b that expression is the COMBINED draw, so the gate carries the
+                # realized evaporation too; the six legs decomposed below stay the ice ones
+                # (evaporation has block B to itself, at the APPLIED step-mean), and with the
+                # evaporation now inside `κ_tot` the gate is expected never to open at all.
+                if ((-ice_r / rhoair) + ev_real) * dt / qr > 1.0
                     # The four TRUE debits, in the order `ice_r` accumulates them, plus the
                     # rime EXCESS (a sub-part of the third) and the melt CREDIT.
                     rime_r = ((r1.prdr_pre * (1.0 - r1.qcrimefrac)) +
@@ -5625,6 +5731,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # measured what they move. Default ON — bitwise the caps the Fortran has. Env
     # `SCYTHE_O01_AGGCAPS=0` in benchmarks/o01_rainfall.jl.
     ice_agg_caps = get(model.options, :ice_agg_caps, true)::Bool
+    # STAGE 2b: whether RAIN EVAPORATION joins the rain donor's conductance (TeX §donor_relax,
+    # "The rain reservoir has a third sink that lived outside its conductance"). Default ON —
+    # the committed construction, and the one that makes `MC_DONOR_QR`'s "≤ 1 by construction"
+    # invariant true of the combined draw rather than of the ice half alone. `false` forces
+    # `κ_ev = 0` and nothing else, which takes every rain factor back to the ice-leg-only
+    # expression and the fold below the ice block back to a multiplication by an exact `1.0`
+    # — i.e. it restores the pre-Stage-2b answer BITWISE, on the warm path as well as the ice
+    # one. Forensics only. Env `SCYTHE_O01_EVAPREAL=0` in benchmarks/o01_rainfall.jl.
+    rain_evap_real = get(model.options, :rain_evap_realization, true)::Bool
     # Turbulent Prandtl number for the Smagorinsky heat diffusion (Khdiff_heat < 0
     # sentinel, below). 1.0 = heat mixes with the same eddy diffusivity as momentum.
     Pr_t = get(model.physical_params, :Pr_t, 1.0)
@@ -6225,6 +6340,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # `qss_condensation_rates` reads, so the two cannot disagree by so much as an ulp.
     etd_lam = S.etd_lam
     etd_nl = S.etd_nl
+    kappa_ev = S.kappa_ev
+    f_rain = S.f_rain
     if get(model.options, :condensation, true)::Bool
         # The closure reads the PROGNOSTIC `rho_v` (the call site is unchanged; what it is
         # handed is now a transported slot rather than a difference of five fitted fields,
@@ -6244,23 +6361,40 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                       "  M = $(M[i]), ke = $(ke[i]), E_t = $(E_t[i]), " *
                       "Qdot = $(Qdot[i]), Qdot_r = $(Qdot_r[i])")
             end
-            invtau = invtau_c[i] + invtau_r[i]
-            drive_cap = max(rho_v[i], 0.0) - rho_vs[i]
-            if drive_cap < Q_ss[i]
-                etd_lam[i] = 0.0
-                etd_nl[i] = -drive_cap * invtau
-            else
-                etd_lam[i] = invtau
-                etd_nl[i] = 0.0
+            # ── The RAIN DONOR's EVAPORATION CONDUCTANCE (Stage 2b) ──────────────────
+            # `κ_ev = max(−Q̇_r, 0)/ρ_r` at the frozen state: the rain's third sink, written
+            # on its own reservoir so it can join the donor total `_ice_donor_factors` forms
+            # (TeX §donor_relax). CONDENSATION onto rain is a source and contributes nothing,
+            # so the `max` is a sign test and not a limiter; below the census floor there is
+            # no reservoir to divide by and the conductance is an exact zero, which is what
+            # keeps the rain-free path — and the whole dry path — bitwise.
+            #
+            # The λ/N classification has moved OUT of this loop, because `invtau_r` is not
+            # final here. The rain donor's total needs the ice legs, which do not exist until
+            # `mc_ice_sources!` has run, and λ, N and the rain transfer must all read the ONE
+            # realized conductance. See the fold below the ice block.
+            kev = 0.0
+            if rain_evap_real && Qdot_r[i] < 0.0 &&
+               rho_r[i] > MC_DONOR_QFLOOR * rho_d[i]
+                kev = -Qdot_r[i] / rho_r[i]
             end
+            kappa_ev[i] = kev
+            # The WARM-PATH factor. Evaporation is not ice-gated, so the rain donor has a
+            # factor wherever it evaporates whether or not any ice exists; where ice does
+            # exist `mc_ice_sources!` overwrites this with the full-conductance one, and with
+            # no ice legs the value it writes is bitwise this one. Formed through the same
+            # `relaxation_realization(rate, reservoir, dt)` the ice loop calls, on the same
+            # `q_r`, so the two expressions cannot drift apart.
+            qr_i = max(rho_r[i], 0.0) / rho_d[i]
+            f_rain[i] = relaxation_realization(kev * qr_i, qr_i, model.ts)
         end
     else
         fill!(Qdot, 0.0)
         fill!(Qdot_r, 0.0)
         fill!(invtau_c, 0.0)
         fill!(invtau_r, 0.0)
-        fill!(etd_lam, 0.0)
-        fill!(etd_nl, 0.0)
+        fill!(kappa_ev, 0.0)
+        fill!(f_rain, 1.0)
     end
     # Stiffness of the relaxation this step was asked to integrate, per channel. UNGATED: it
     # is what stands in place of the depletion caps, and the once-per-run warning in
@@ -6304,9 +6438,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         for i in 1:length(AUTO_COLL)
             # KK2000 autoconversion (mass + rain number) and accretion (mass only), then
             # Beheng self-collection with Verlinde-Cotton breakup and the evaporation number
-            # loss. `Qdot_r` is already final here — the condensation block above ran with
-            # `invtau_rain_2m` — so the number loss is exactly proportional to the mass loss
-            # the same step applies.
+            # loss, at the FROZEN `Qdot_r` (the rain donor's realization factor is folded into
+            # that column below the ice block, after this loop has read it; the number's own
+            # factor `f_nr` realizes the ICE number legs, and this sink stays on the multistep
+            # beside self-collection, which carries no conductance either — see
+            # `_ice_donor_factors`).
             #
             # It is proportional to the `n`-RATE, not to the step-mean the mass now moves at
             # (the rain condensation/evaporation channel is half of the withheld `Q_ss`
@@ -6429,7 +6565,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_ice_sources!(S, mtile.ishmael_tables, model.ts, max_N_c,
                         get(model.options, :condensation, true)::Bool,
                         get(model.options, :ice_var_check, true)::Bool,
-                        ice_anchor_rts, ice_attr, ice_agg_caps,
+                        ice_anchor_rts, ice_attr, ice_agg_caps, rain_evap_real,
                         get(model.physical_params, :tau_homogeneous, 5.0),
                         get(model.physical_params, :tau_activation, 1.0),
                         get(model.physical_params, :tau_varcheck, 5.0),
@@ -6496,6 +6632,57 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         Btransform!(ei_col)
         Atransform!(ei_col)
         Ixtransform(ei_col, E_sed_i_z)
+    end
+
+    # ── The REALIZED RAIN CONDUCTANCE, and the liquid λ/N split taken on it (Stage 2b) ────
+    #
+    # HERE, and not beside the condensation closure where it used to be, because `f_rain` is
+    # not final until `mc_ice_sources!` has completed the rain donor's total: the reservoir's
+    # sinks are the ice legs AND the evaporation, and the TeX's closure is that ONE realized
+    # conductance `f_r τ_r^{-1}` replaces `τ_r^{-1}` in λ, in N and in the rain-channel
+    # transfer at once (§donor_relax, "The rain reservoir has a third sink"). Nothing between
+    # the closure and this point reads either column except `mc_stiffness_census!`, which
+    # measures the stiffness the step was ASKED to integrate and therefore wants the
+    # unrealized one.
+    #
+    # The factor is folded into `invtau_r` and `Qdot_r` THEMSELVES, exactly as the ice folds
+    # `f_ice<k>` into `invtau_i<k>`, so every consumer downstream — λ, the `N` remainder just
+    # below, the step-mean split in the ETD pre-compute and the `qr_bar` the rain slot
+    # receives — reads the one number with no opportunity to disagree. `f_rain` is an exact
+    # `1.0` wherever the rain has no sink, and `1.0 * x === x` for every `x`, so the warm
+    # non-evaporating path and the whole dry path are untouched bitwise.
+    #
+    # The split itself is UNCHANGED, term for term: it is a statement about the DRIVE CLIP
+    # and nothing else (see the block beside the closure). A clipped channel's drive does not
+    # depend on `Q_ss`, so its whole — now realized — flux belongs in `N`; an unclipped one's
+    # whole realized conductance belongs in λ.
+    #
+    # `evap_now` is the exact mirror of the ice's `sub_now`, and for the same reason: a donor
+    # factor bounds a SINK, and rain CONDENSATION is a source. Where the channel is condensing
+    # at state `n` the factor does not belong in its conductance at all — `κ_ev` is already an
+    # exact zero there by its own `max`, but the rain donor's factor also carries the ice legs,
+    # and scaling a source by the rate at which freezing empties the reservoir would be a
+    # bound applied to the wrong sign. FROZEN at state `n`, like every classification the step
+    # freezes.
+    if get(model.options, :condensation, true)::Bool
+        @inbounds for i in eachindex(invtau_r)
+            evap_now = Qdot_r[i] < 0.0
+            fr = f_rain[i]
+            invtau_r[i] = evap_now ? fr * invtau_r[i] : invtau_r[i]
+            Qdot_r[i] = evap_now ? fr * Qdot_r[i] : Qdot_r[i]
+            invtau = invtau_c[i] + invtau_r[i]
+            drive_cap = max(rho_v[i], 0.0) - rho_vs[i]
+            if drive_cap < Q_ss[i]
+                etd_lam[i] = 0.0
+                etd_nl[i] = -drive_cap * invtau
+            else
+                etd_lam[i] = invtau
+                etd_nl[i] = 0.0
+            end
+        end
+    else
+        fill!(etd_lam, 0.0)
+        fill!(etd_nl, 0.0)
     end
 
     # Record this step's net microphysics tendency per channel, so the NEXT step's depletion
@@ -7373,6 +7560,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     #
     #   λ  = τ_c^{-1} + τ_r^{-1} + Σ_k τ_{i,k}^{-1}, counting only the channels whose drive is
     #        UNCLIPPED at state n — a clipped channel's flux is constant and lives in N;
+    #        the rain and ice conductances entering here are the REALIZED ones (see below);
     #   x  = λΔt, and (e^{−x}, b, J0, g) = `etd_step_weights(x, t)`;
     #   Q_ss^{n+1} = e^{−x} Q_ss^n + Δt(b1 N^n + b2 N^{n−1} + b3 N^{n−2})     (Eq. etd_ab3)
     #   Q̄_ss      = J0 Q_ss^n + Δt(g1 N^n + g2 N^{n−1} + g3 N^{n−2})         (Eq. qss_stepmean)
@@ -7432,6 +7620,25 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # ── The step-mean LIQUID rates (TeX Eq. simple_cond at Q̄_ss) ──
         # The channel split is `qss_condensation_rates`' own, expression for expression, so a
         # clipped or inactive channel returns the same exact zeros it does.
+        #
+        # ── THE RAIN CONDUCTANCE λ SEES IS THE REALIZED ONE ──────────────────────────────
+        # Nothing is scaled HERE, exactly as nothing is scaled on the sublimation leg below.
+        # Rain evaporation is a sink of the RAIN, and the propagator above bounds `Q_ss` and
+        # not `ρ_r`: the vapor deficit sets the step-mean, and before Stage 2b nothing set it
+        # by the rain that is there — while the ice legs were realized on a conductance that
+        # did not contain the evaporation, so the two draws on one reservoir summed without
+        # either knowing of the other (1.0012 reservoirs per step, measured). The rain donor's
+        # factor `f_rain` now covers every sink on the reservoir and is folded into
+        # `invtau_r`/`Qdot_r` themselves, below the ice block, so the realized conductance
+        # `f_r τ_r^{-1}` is ALREADY in the `λ` this step propagated with, in the `N` it
+        # carried, and in the `invtau_r` the split below shares out — one number, three
+        # consumers, and the psychrometric cancellation goes through unchanged because the
+        # factor multiplies the already-cancelled conductance. The clipped/unclipped
+        # classification is untouched: it is a statement about the drive, not about the rate,
+        # and the fold applies only where the channel is a SINK of the rain at state `n` —
+        # the `evap_now` mirror of `sub_now`, since a donor factor bounds a draw and rain
+        # condensation is a source. (The CLOUD channel is not realized: `q_c` carries its own
+        # donor factor for the ice legs and its evaporation is not part of this construction.)
         qc_bar = 0.0
         qr_bar = 0.0
         if clipped_l
@@ -7491,13 +7698,17 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                                  max(-q3, 0.0) / rho_d[i], S.i3q[i] / rho_d[i],
                                  MC_DONOR_QFLOOR, ts)
                 # ── BLOCK B of the attribution census: RAIN EVAPORATION on the same
-                # reservoir the ice legs draw on. `_ice_donor_factors` has no evaporation
-                # term, so `MC_DONOR_QR` cannot see this draw at all — it is a SECOND,
-                # uncensused over-draw, and the two have to be read together before either
-                # is convicted. Taken at the APPLIED step-mean `qr_bar` (the number the slot
-                # actually receives), not at the instantaneous `Qdot_r`, and in DENSITY
-                # units, which is what `ρ_r` and `ICE_R` are already in. The combined
-                # channel is the total fraction of the rain the step removes.
+                # reservoir the ice legs draw on. Its DEFINITION is unchanged by Stage 2b
+                # and what it is expected to read is not: `_ice_donor_factors` now carries
+                # the evaporation conductance, so this draw is inside `MC_DONOR_QR` and the
+                # combined number is expected `≤ 1` — one exponential depletion shared out,
+                # not two independent ones. It was the block that convicted the omission
+                # (1.0012 reservoirs over 1296 gridpoint-steps on the Stage 0a fixture) and
+                # it stays as the INDEPENDENT reading of the bound: taken at the APPLIED
+                # step-mean `qr_bar` (the number the slot actually receives, already carrying
+                # `f_rain`) rather than at the frozen `Qdot_r` the factor was formed on, and
+                # in DENSITY units, which is what `ρ_r` and `ICE_R` are already in. The
+                # combined channel is the total fraction of the rain the step removes.
                 if attr_on
                     rr_i = rho_r[i]
                     if rr_i > MC_DONOR_QFLOOR * rho_d[i]
