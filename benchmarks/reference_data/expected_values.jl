@@ -113,17 +113,25 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     # transient (per-crystal ~5e-21 kg) of the transport-decorrelation family recorded
     # at the S9 close-out; window it only after that family is addressed.
     "o01_rainfall_ice" => Dict(
-        "peak_rain_rate_gm2s"   => (63.0, 25.0, 30.0, "seeded 2026-08-20 (ice production run)"),
-        "max_rho_r_gm3"         => (8.2,  3.5,  4.0,  "seeded 2026-08-20 (ice production run)"),
-        "max_w"                 => (7.1,  3.0,  3.5,  "seeded 2026-08-20 (ice production run)"),
-        "rain_onset_min"        => (23.0, 6.0,  8.0,  "seeded 2026-08-20 (ice production run)"),
-        "accum_rainfall_mm"     => (3.4,  1.2,  1.4,  "seeded 2026-08-20 (ice production run)"),
-        "max_ice_water_path_mm" => (3.5,  1.5,  1.8,  "seeded 2026-08-20 (ice production run)"),
-        "ice_base_km"           => (3.6,  1.5,  1.5,  "seeded 2026-08-20; 0C level ~4.7 km, fallout below"),
-        "ice_top_km"            => (19.1, 2.5,  2.5,  "seeded 2026-08-20 (anvil top above tropopause 16.6 km)"),
-        "max_rho_i1_gm3"        => (4.55, 2.0,  2.3,  "seeded 2026-08-20 (planar)"),
-        "max_rho_i2_gm3"        => (4.17, 2.0,  2.3,  "seeded 2026-08-20 (columnar)"),
-        "max_rho_i3_gm3"        => (3.32, 1.7,  2.0,  "seeded 2026-08-20 (aggregates)"),
+        # Re-centered 2026-08-31 on the Stage D seeding run (tag stageD_final_reseed):
+        # donor bounds sealed (aggregation, evaporation, ice-number legs), the population
+        # and minimum-crystal reconciliations in, Bigg/self-collection phantom-DSD gates
+        # in, seed :local. First RESOLVED ice arm (ice1 ts/tau 0.96, 0 past 1); the
+        # number-without-mass family is CLOSED (max_n_i1 1.8e5 /L vs 8.5e14 pre-Stage-D)
+        # — n_i windows are now drawable, an author decision recorded for the next stage.
+        # Old (2026-08-20) centers were drawn on the pre-reconciliation physics whose ice
+        # cloud was ~70% number-less mass (FINDINGS §5e); tolerances kept.
+        "peak_rain_rate_gm2s"   => (50.1, 25.0, 30.0, "seeded 2026-08-31 (Stage D final)"),
+        "max_rho_r_gm3"         => (12.1, 3.5,  4.0,  "seeded 2026-08-31 (supercooled rain survives to melt)"),
+        "max_w"                 => (4.7,  3.0,  3.5,  "seeded 2026-08-31 (Stage D final)"),
+        "rain_onset_min"        => (23.0, 6.0,  8.0,  "seeded 2026-08-31 (unchanged since 2026-08-20)"),
+        "accum_rainfall_mm"     => (3.7,  1.2,  1.4,  "seeded 2026-08-31 (Stage D final)"),
+        "max_ice_water_path_mm" => (2.56, 1.5,  1.8,  "seeded 2026-08-31 (live cloud, phantom mass gone)"),
+        "ice_base_km"           => (4.7,  1.5,  1.5,  "seeded 2026-08-31; 0C level ~4.7 km, melt closes AT the level"),
+        "ice_top_km"            => (17.4, 2.5,  2.5,  "seeded 2026-08-31 (anvil top above tropopause 16.6 km)"),
+        "max_rho_i1_gm3"        => (4.27, 2.0,  2.3,  "seeded 2026-08-31 (planar)"),
+        "max_rho_i2_gm3"        => (4.68, 2.0,  2.3,  "seeded 2026-08-31 (columnar)"),
+        "max_rho_i3_gm3"        => (0.56, 1.7,  2.0,  "seeded 2026-08-31 (aggregates; less aggregation without the phantom crystals)"),
     ),
     # Nested 3-level arm (--nests 3): its OWN windows, looked up by the nest-qualified
     # key in run_nested_benchmark. Two reasons it cannot borrow the single-grid windows
