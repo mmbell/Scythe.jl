@@ -66,6 +66,24 @@ include(joinpath(@__DIR__, "..", "benchmarks", "common", "harness.jl"))
         # The unarmed lookup for a genuinely undefined case still errors, exactly as before.
         @test_throws ErrorException load_targets("no_such_benchmark_case", quick_opts)
     end
+
+    @testset "load_targets: full mode prefers the mode-qualified ice windows" begin
+        # "o01_rainfall_ice_full" (seeded 2026-09-01 from the accepted full run) wins in
+        # full mode: the 4x-resolution storm is not the quick storm re-run finer (accum
+        # 0.90 vs 3.7), so its windows carry their own centers. Quick mode is untouched,
+        # and an arm/case with no _full entry falls through to its ordinary key.
+        full_opts = BenchmarkOptions(:full, STAGE_MC, :rirk, 1, false, false, 1.0, 1,
+                                     false, false)
+        ice_full = Dict(t.name => t for t in load_targets("o01_rainfall", full_opts; arm="ice"))
+        @test length(ice_full) == 11
+        @test ice_full["accum_rainfall_mm"].value == 0.90       # the _full center
+        @test ice_full["ice_top_km"].value == 19.97             # capped-scan seeding
+        ice_quick = Dict(t.name => t for t in load_targets("o01_rainfall", quick_opts; arm="ice"))
+        @test ice_quick["accum_rainfall_mm"].value == 3.7       # quick key unchanged
+        # The warm case has no _full entry: full mode reads the ordinary key.
+        warm_full = [t.name for t in load_targets("o01_rainfall", full_opts)]
+        @test "peak_rain_rate_gm2s" in warm_full
+    end
 end
 
 # Micro smoke test of the Straka density current configuration: a few seconds

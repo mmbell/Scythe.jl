@@ -353,6 +353,15 @@ undefined, so the unarmed path's behavior is unchanged.
 """
 function load_targets(name::String, opts::BenchmarkOptions; arm::String="")
     key = isempty(arm) ? name : "$(name)_$(arm)"
+    # A mode-qualified window set wins where one exists (the nested-arm precedent): the
+    # full-resolution ice storm is not the quick storm re-run finer (accum 0.90 vs 3.7 on
+    # the accepted 2026-09-01 run -- more water held in the anvil, hour-1 rain delayed),
+    # so its windows carry their own centers. The rtol-1e-6 diagnostics reference stays
+    # deliberately unseeded for the ice arm: its run-to-run spread (FINDINGS 4d', open
+    # question in HANDOFF_REPRODUCIBILITY.md) makes that comparison meaningless.
+    if opts.mode == :full && haskey(BENCHMARK_EXPECTED, "$(key)_full")
+        key = "$(key)_full"
+    end
     if !haskey(BENCHMARK_EXPECTED, key)
         isempty(arm) && error("No expected values defined for $name")
         return Target[]

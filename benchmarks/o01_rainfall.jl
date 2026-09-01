@@ -869,6 +869,9 @@ function o01_ice_diagnostics(model, ref, kDim)
     return Dict{String,Float64}()
 end
 
+# See the Z cap comment inside _o01_ice_diags. 17 km (the O01 sponge base) + 3 km.
+const Z_ICEDIAG_CAP = 20.0e3
+
 function _o01_ice_diags(model, ref, kDim)
     itf = Scythe.ice_transform_mode(model.options)
     names = Scythe.ice_var_names(model.options)
@@ -901,9 +904,16 @@ function _o01_ice_diags(model, ref, kDim)
         # returns NaN for an early snapshot whose whole ice field is 3e-5 g/m^3, which says
         # nothing about where the ice is.
         thr = max(1.0e-14, 0.01 * maximum(tot))
+        # The scan is capped at Z_ICEDIAG_CAP: the DK83 sponge occupies z > 17 km on the
+        # O01 case, and the accepted full-resolution run showed ~0.1 mg/m^3 of number-less
+        # trace mass accumulating against the model lid inside it (fit ringing at the
+        # boundary, inert to every rate: FINDINGS 5m), which put ice_top at the lid while
+        # the physical overshoot topped out at ~20 km. The cap sits 3 km above the sponge
+        # base so the overshoot stays readable and only the lid trace is excluded.
         live = findall(>(thr), reshape(tot, kDim, ncols))
         if !isempty(live)
-            ztop = max(ztop, maximum(z[c.I[1]] for c in live))
+            ztop = max(ztop, maximum(z[c.I[1]] for c in live if z[c.I[1]] <= Z_ICEDIAG_CAP;
+                                     init = -Inf))
             zbot = min(zbot, minimum(z[c.I[1]] for c in live))
         end
     end

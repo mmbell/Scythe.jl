@@ -112,6 +112,26 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     # are DELIBERATELY not windowed: max_n_i1 reads 8.5e14 /L — a number-without-mass
     # transient (per-crystal ~5e-21 kg) of the transport-decorrelation family recorded
     # at the S9 close-out; window it only after that family is addressed.
+    # FULL-mode ice windows (load_targets prefers "<key>_full" in full mode). Seeded from
+    # the accepted 2026-09-01 full run (the author's overnight run on the Stage D physics;
+    # fields/movie review: physical anvil at the tropopause, transient downburst ice below
+    # the melting level, ~0.1 mg/m^3 lid trace excluded by the ice_top cap). ONE
+    # REALIZATION: the run-to-run spread question is OPEN (HANDOFF_REPRODUCIBILITY.md) --
+    # revisit the atols once reproducibility is settled. Tolerances copied from the quick
+    # set (both columns; stage mc reads the quick column).
+    "o01_rainfall_ice_full" => Dict(
+        "peak_rain_rate_gm2s"   => (84.8,  25.0, 30.0, "seeded 2026-09-01 (accepted full run)"),
+        "max_rho_r_gm3"         => (15.7,  3.5,  4.0,  "seeded 2026-09-01 (accepted full run)"),
+        "max_w"                 => (6.4,   3.0,  3.5,  "seeded 2026-09-01 (accepted full run)"),
+        "rain_onset_min"        => (26.0,  6.0,  8.0,  "seeded 2026-09-01 (accepted full run)"),
+        "accum_rainfall_mm"     => (0.90,  1.2,  1.4,  "seeded 2026-09-01 (hour-1 rain delayed at 4x resolution)"),
+        "max_ice_water_path_mm" => (4.63,  1.5,  1.8,  "seeded 2026-09-01 (more water held in the anvil)"),
+        "ice_base_km"           => (2.63,  1.5,  1.5,  "seeded 2026-09-01 (transient downburst ice below 0C)"),
+        "ice_top_km"            => (19.97, 2.5,  2.5,  "seeded 2026-09-01 (overshoot; scan capped at 20 km)"),
+        "max_rho_i1_gm3"        => (10.04, 2.0,  2.3,  "seeded 2026-09-01 (planar)"),
+        "max_rho_i2_gm3"        => (7.13,  2.0,  2.3,  "seeded 2026-09-01 (columnar)"),
+        "max_rho_i3_gm3"        => (1.08,  1.7,  2.0,  "seeded 2026-09-01 (aggregates)"),
+    ),
     "o01_rainfall_ice" => Dict(
         # Re-centered 2026-08-31 on the Stage D seeding run (tag stageD_final_reseed):
         # donor bounds sealed (aggregation, evaporation, ice-number legs), the population
