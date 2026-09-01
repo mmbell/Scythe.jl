@@ -193,6 +193,17 @@ const MC_SCRATCH_SLOTS = (
     # pre-compute, which is where the sublimation half of that sink is realized. One factor,
     # two application sites, because the two halves of the sink are computed in two places.
     :f_ice1, :f_ice2, :f_ice3,
+    # `f_isn<k>` is the RESIDUAL number realization the sublimation number sink still has to
+    # apply at its own site: the ice NUMBER donor's factor divided by whatever MASS factor
+    # `invtau_i<k>` is already carrying there (`f_ice<k>` where the step-n classification
+    # said the channel is a sink, `1.0` where it did not). One column rather than a second
+    # division in the ETD pre-compute, and an exact `1.0` — hence bitwise inert — wherever
+    # `options[:ice_number_realization]` is off. A RATIO, so it is not itself bounded by one
+    # — below the melting level the number conductance is the SMALLER of the two and this
+    # column reads slightly ABOVE 1, making up what the mass factor under-realized. What is
+    # bounded is the product, which is the donor's own `J₀(κ_{n,k}Δt)`. See
+    # `mc_ice_sources!`.
+    :f_isn1, :f_isn2, :f_isn3,
     :Vi1m, :Vi1n, :Vi2m, :Vi2n, :Vi3m, :Vi3n,
     :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
     :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
@@ -1343,6 +1354,7 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :p_qc_max, :p_qc_n, :p_qr_max, :p_qr_n, :p_nr_max, :p_nr_n,
                         :p_i1_max, :p_i1_n, :p_i2_max, :p_i2_n, :p_i3_max, :p_i3_n,
                         :p_s1_max, :p_s1_n, :p_s2_max, :p_s2_n, :p_s3_max, :p_s3_n,
+                        :p_n1_max, :p_n1_n, :p_n2_max, :p_n2_n, :p_n3_max, :p_n3_n,
                         :p_warned,
                         :a_gap, :a_pts, :a_rem, :a_warned,
                         :x_hom, :x_hom_n, :x_bigg, :x_bigg_n,
@@ -1354,7 +1366,8 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :x_asat, :x_asat_n,
                         :x_wrc, :x_wrc_n, :x_wrr, :x_wrr_n,
                         :x_wmlt, :x_wmlt_n, :x_wmri, :x_wmri_n,
-                        :x_wpts, :x_wmass, :x_wfa, :x_wdfa, :x_wheld)
+                        :x_wpts, :x_wmass, :x_wfa, :x_wdfa, :x_wheld,
+                        :o_max, :o_pts, :o_rain, :o_seed, :o_warned)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -1455,6 +1468,13 @@ Aggregation joined that construction when the census convicted it at 1.33 reserv
 per step, in a SECOND pass through `ishmael_aggregation` at the donors' factors (TeX
 §donor_relax); before that it was counted in `κ_tot` but applied unscaled.
 
+The three ICE NUMBER rows ([`MC_DONOR_N1`](@ref)) are the newest and the only ones that are
+not bounded by construction in the default configuration: a species' number is its own
+reservoir with its own conductance, and until `options[:ice_number_realization]` is switched
+on its three legs are realized at the species' MASS factor. Whether that over-draws is the
+question the rows exist to answer, so they are censused in BOTH modes and the over-depletion
+warning is gated on the switch rather than on the reading.
+
 REPORTED, NEVER ENFORCED — as with every census in this file.
 """
 const MC_DONOR_QC = 1
@@ -1466,13 +1486,46 @@ const MC_DONOR_I3 = 6
 const MC_DONOR_S1 = 7
 const MC_DONOR_S2 = 8
 const MC_DONOR_S3 = 9
-const MC_DONOR_CHANNELS = 9
+"""
+The three ICE NUMBER reservoirs (Stage 1b). Each species' NUMBER is a donor in its own
+right — three legs draw on it (aggregation's number transfer, the melt number `nmlt`, and
+the sublimation number sink of the deposition channel's habit partition) — and until this
+block none of them was censused anywhere. The mass rows above cannot stand in for them:
+`colamt` and `colamtn` come from two different offline tables integrating two different
+moments of the collection kernel (`mkcoltb`, ishmael_tables.jl), and the melt number leg
+carries `dNmltri`, which has no mass partner at all, so the fraction of the number a step
+removes is an independent state function of the fraction of the mass it removes.
+
+REPORTED, NEVER ENFORCED, like every row of this block — and unlike the six above, these
+three are NOT bounded by construction unless `options[:ice_number_realization]` is on. With
+it off (the default) the number legs ride the MASS factor, which is the state the census
+exists to measure; with it on each species' number carries its own `J₀(κ_{n,k}Δt)` and the
+row is `1 − e^{−κ_{n,k}Δt} < 1` for the same reason the mass rows are.
+
+Two caveats, both on species 3 and both stated rather than hidden. (a) With
+`options[:ice_agg_caps] = false` the conductance is formed on the CAPPED unit pass and
+realized on the uncapped one, exactly as the mass side already is. (b) `nagg3` is a NET
+count — new aggregates from the planar/columnar pairs MINUS aggregate self-collection — and
+only the self-collection half is species 3's own to realize (`f_aggn3`). The conductance is
+formed on the net loss, so where the two halves nearly cancel the `n_i3` row is bounded by
+the aggregation term alone rather than by `1 − e^{−κ_{n,3}Δt}`. Decomposing it would mean
+returning the seven pairs' number transfers separately, which is a larger change to the
+ported kernel than the reading justifies today.
+"""
+const MC_DONOR_N1 = 10
+@doc (@doc MC_DONOR_N1)
+const MC_DONOR_N2 = 11
+@doc (@doc MC_DONOR_N1)
+const MC_DONOR_N3 = 12
+const MC_DONOR_CHANNELS = 12
 const MC_DONOR_N = 2
 const MC_DONOR_FIRST = MC_STIFF_WARNED + 1
 const MC_DONOR_WARNED = MC_DONOR_FIRST + (MC_DONOR_N * MC_DONOR_CHANNELS)
 """Donor labels for the depletion report, in `MC_DONOR_*` index order."""
 const MC_DONOR_NAMES = ("q_c", "q_r(ice+evap)", "n_r", "q_i1(melt+agg)", "q_i2(melt+agg)",
-                        "q_i3(melt+agg)", "q_i1(subl)", "q_i2(subl)", "q_i3(subl)")
+                        "q_i3(melt+agg)", "q_i1(subl)", "q_i2(subl)", "q_i3(subl)",
+                        "n_i1(melt+agg+subl)", "n_i2(melt+agg+subl)",
+                        "n_i3(melt+agg+subl)")
 """
 The ANCHOR-RECONCILIATION census of `mc_water_stats` — the third reconciliation tier's
 diagnostic (TeX §"Reconciliation of the condensate partition"), written by
@@ -1659,6 +1712,45 @@ const MC_ATTR_NAMES = ("q_r: homogeneous (mimr)", "q_r: Bigg (mbig)",
                        "T>T_0+2: rain riming share of q_r",
                        "T>T_0+2: melting share of q_ice",
                        "T>T_0+2: dQImltri share of q_ice")
+"""
+The POPULATION-RECONCILIATION census of `mc_water_stats` — the FOURTH reconciliation tier's
+diagnostic (TeX §"Reconciliation of the population"), written by
+[`_ice_population_reconcile!`](@ref) and reported by [`mc_stiffness_trace`](@ref).
+
+| constant | quantity |
+|---|---|
+| `MC_POP_MAX`    | run-maximum of the number-less mass `ρ^∅_{i,k}` over species and points [kg/m³] |
+| `MC_POP_PTS`    | cumulative (gridpoint × species)-steps with `ρ^∅ > 0` |
+| `MC_POP_RAIN`   | cumulative mass returned to the RAIN above `T_0`, `Σ (ρ^∅/τ_pop)·Δt` [kg/m³ · gridpoint-steps] |
+| `MC_POP_SEED`   | cumulative ICE number seeded below `T_0`, `Σ (ρ^∅/(m_seed τ_pop))·Δt` [#/m³ · gridpoint-steps]; `m_seed` is `ISHMAEL_M_MIN` or the large-crystal mass, per `options[:ice_population_seed]` |
+| `MC_POP_WARNED` | internal: 1.0 once the once-per-run number-less-mass `@info` has fired |
+
+CUMULATIVE, and written on every ice step whether or not the SOURCE is applied, exactly as
+the `MC_ANCHOR_*` block is: `options[:ice_population_source] = false` — and
+`options[:condensation] = false`, which switches this transfer off with the other phase
+changes — stop the transfer, never the measurement.
+
+The rain NUMBER seeded above `T_0` is not a row of its own because it is not independent:
+the warm branch seeds one drop per [`RAIN_2M_M_AUTO`](@ref) of returned mass, so it is
+`MC_POP_RAIN / RAIN_2M_M_AUTO` exactly.
+
+`MC_POP_MAX` is what neither `MC_VAPOR_GAP` nor `MC_ANCHOR_GAP` can see: the anchor share of
+a number-less mass is measured to be exactly one (the water is real; only its phase
+REPRESENTATION is unusable), so the partition census reads zero at precisely the points this
+one convicts. Read `MC_POP_RAIN` against the surface rain accumulation and `MC_POP_SEED`
+against the ice number path — a secular contribution from either says `τ_pop` is too short.
+"""
+const MC_POP_MAX = MC_ATTR_LAST + 1
+@doc (@doc MC_POP_MAX)
+const MC_POP_PTS = MC_ATTR_LAST + 2
+@doc (@doc MC_POP_MAX)
+const MC_POP_RAIN = MC_ATTR_LAST + 3
+@doc (@doc MC_POP_MAX)
+const MC_POP_SEED = MC_ATTR_LAST + 4
+@doc (@doc MC_POP_MAX)
+const MC_POP_WARNED = MC_ATTR_LAST + 5
+"""Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
+const MC_POP_LAST = MC_POP_WARNED
 """
 Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
 1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
@@ -3880,6 +3972,442 @@ function _ice_anchor_reconcile!(S, st, tid::Int64, rho_t, rho_d, rho_liq, rho_ic
 end
 
 """
+    ice_population_rate(rho_ik, n_ik, rho_a, tau_pop) -> (rate, rho_empty)
+
+The NUMBER-LESS MASS of one ice species at one gridpoint and the rate at which it is returned
+to a representation the physics can act on — the fourth and last tier of the reconciliation
+chain (TeX §"Reconciliation of the population", Eq. class `ρ^∅_{i,k}/τ_pop`).
+
+The defect this measures is the exact complement of the POPULATION GATE in
+[`mc_ice_sources!`](@ref). That gate says a species has a population only where its CARRIED
+number is positive, and where it does not, no rate acts: not deposition, not riming, not
+melting, and no fall speed, because a fall speed is a property of particles. The gate is
+right — it is what stopped the manufactured populations of the transport-decorrelated state
+from growing, riming and falling at speeds the mass never earned — and it has one consequence
+the same measurement records: mass with no number is also exempt from every device that could
+REMOVE it. Measured on the full-resolution O01 ice column, the ice below the melting level is
+number-less at 97–99.9% by mass over the final half hour, the largest concentrations sitting
+at the surface at 300 K; the timestep-limited quick configuration reproduces it at 99%.
+
+The anchor share of that mass is exactly one throughout, so this is NOT the phantom of
+[`ice_anchor_rate`](@ref): it is water the equations own, in a phase representation the
+equations cannot act on. Hence a separate tier, and hence the RAW carried moments here —
+`f_a` is the rate-side share for PROCESS rates, and the TeX's division of labour leaves the
+transport and the reconciliation sources alone reading the raw slots.
+
+    ρ^∅_{i,k} = max(ρ_{i,k}, 0)   where   ρ_{i,k} > QSMALL·ρ_a  and  n_{i,k} ≤ 0
+              = 0                 otherwise
+
+The mass test is the mixing-ratio one the gate itself uses (`q_k > ISHMAEL_QSMALL`), written
+in densities so no division is needed; the TeX's `ρ_{i,k} > 0` is sharpened to it for exactly
+that reason, and the difference is 1e-12 kg/kg of round-off either way.
+
+Both branches of the transfer are `Δt`-free (a rate, not a state repair; the removed or
+seeded fraction per step is bounded by `Δt/τ_pop ≪ 1`), one-sided, and exactly `(0.0, 0.0)`
+wherever every species with mass carries number — which is every gridpoint of the warm and
+dry paths and the interior of every healthy ice cloud, so those paths are untouched bitwise.
+"""
+@inline function ice_population_rate(rho_ik::Float64, n_ik::Float64, rho_a::Float64,
+                                     tau_pop::Float64)
+    (rho_ik > ISHMAEL_QSMALL * rho_a && n_ik <= 0.0) || return (0.0, 0.0)
+    rho_empty = max(rho_ik, 0.0)
+    return (rho_empty / tau_pop, rho_empty)
+end
+
+"""
+    _ice_population_seed_large(q, k) -> (n, a, c)
+
+The LARGEST-CRYSTAL, FEWEST-PARTICLE population the scheme admits for a species-`k` mass
+mixing ratio `q` [kg/kg]: the number and the two volume moments (`# kg⁻¹`, `m³ kg⁻¹`,
+`m³ kg⁻¹`) [`ishmael_var_check`](@ref) re-diagnoses when the carried number is at its floor
+and the mass is all that is known.
+
+This is the second of the two seedings [`_ice_population_reconcile!`](@ref) can give
+number-less ice below `T_0` (`options[:ice_population_seed] = :large`), and it is ISHMAEL's
+OWN answer to the question: the port never carries a `(q, n)` pair the moment checker would
+reject, so a species that arrives with mass and no number is one `var_check` call away from a
+realizable population, and this is that call. Nothing is re-derived here — the body is
+[`_ice_effective`](@ref) at the floors, which is the Fortran host loop's incoming-moment
+initialization (module_mp_jensen_ishmael.F lines 1013-1032) followed by `var_check` (lines
+3101-3196) — so the seeded `(n, a, c)` is EXACTLY the state the next step diagnoses, and the
+population is a FIXED POINT of the checker rather than something it has to repair.
+
+# The rule the floors produce, and why it is the large end
+
+At `n = QNSMALL`, `a = c = QASMALL` the incoming axes are the 2 μm sphere, so `δ* = 1` exactly
+and the species is spherical. `var_check` then walks its clamps in order:
+
+  * the bulk density `ρ̄ = q Γ(ν) / (n α_v a_n^{2+δ*} Γ(ν+2+δ*))` is enormous at that number
+    and is CLAMPED to the species ceiling (lines 3131-3154) — `RHOI = 920 kg/m³` for the
+    planar and columnar species, [`ISHMAEL_RHO_AGG`](@ref) `= 50 kg/m³` for the aggregates.
+    That ceiling is the ONLY place the three species differ, and it is the whole of the
+    "different density/axis relations" the aggregate block asserts by hand;
+  * the characteristic axis is re-derived from the mass at that density and, for any mass
+    past `q ≈ 5.8e-11` kg/kg (planar/columnar; `≈ 3.1e-12` for the lighter aggregates),
+    exceeds the 1 mm cap, so the LARGE-ICE LIMIT fires (lines 3171-3193) and returns
+
+        a_n = c_n = 1 mm,   n = q Γ(ν) / ((4/3)π ρ̄ a_n³ Γ(ν+3)),   a_i = c_i = n a_n³
+
+    i.e. one crystal per `m_large = (4/3)π ρ̄ (1 mm)³ Γ(ν+3)/Γ(ν)` — 4.62e-4 kg for the
+    planar and columnar species, 2.51e-5 kg for the aggregates, against
+    [`ISHMAEL_M_MIN`](@ref) `= 3.08e-14 kg` for the 2 μm seeding: a factor of 1.5e10 and
+    8.2e8 fewer particles for the same mass;
+  * below that mass the large-ice cap does not bind and the `QNSMALL` floor is itself the
+    answer — the same statement, the FEWEST particles the scheme admits for the mass, written
+    by whichever clamp is the binding one.
+
+The aggregate's OTHER axis rules — the 0.2 aspect ratio and the 0.5 mm implicit-breakup cap
+of the "Final check on aggregates" block (lines 2600-2639) — are deliberately NOT applied.
+They are that block's update of an EXISTING characteristic axis, they need an incoming `a_n`
+this function does not have, and the Fortran closes the block with `var_check` (line 2644),
+which is the authority the seed has to satisfy and is what is called here.
+
+`(0.0, 0.0, 0.0)` for a mass at or below `QSMALL`: `var_check` divides by the mass and cannot
+be run on a species that has none.
+"""
+@inline function _ice_population_seed_large(q::Float64, k::Int)
+
+    q > ISHMAEL_QSMALL || return (0.0, 0.0, 0.0)
+    eff = _ice_effective(q, 0.0, 0.0, 0.0, k,
+                         k == 3 ? ISHMAEL_RHO_AGG : ISHMAEL_RHOI)
+    return (eff.ni, eff.ai, eff.ci)
+end
+
+"""
+    _ice_live_span(Qk, Nk, rho_d, idx) -> (first, last)
+
+The first and last index of `idx` at which species `k` is LIVE — mass past the population
+gate's own threshold and a positive carried number, on the RAW slots `Qk`/`Nk`, which is
+exactly the complement of [`ice_population_rate`](@ref)'s support test.
+
+One O(n) sweep per species per column, computed once by [`_ice_population_reconcile!`](@ref)
+before its gridpoint loop, and it is what makes the `:local` seeding's nearest-live search
+cheap. `(0, 0)` when the species is live NOWHERE in the column — the pure-dead column, which
+the search then never enters.
+"""
+@inline function _ice_live_span(Qk, Nk, rho_d, idx)
+
+    first = 0
+    last = 0
+    @inbounds for j in idx
+        (Qk[j] > ISHMAEL_QSMALL * rho_d[j] && Nk[j] > 0.0) || continue
+        first == 0 && (first = j)
+        last = j
+    end
+    return (first, last)
+end
+
+"""
+    _ice_live_neighbour(Qk, Nk, rho_d, i, first, last) -> j
+
+The index of the NEAREST gridpoint to `i` IN THE SAME COLUMN at which species `k` is live,
+or `0` when the species is live nowhere in it. `first`/`last` are that species'
+[`_ice_live_span`](@ref).
+
+The search walks outward from `i` in both directions along the column index — which is the
+VERTICAL index, because the physics is called one column at a time (`advance_column` strides
+`colstart:colend` by `kDim`, and every `mc_scratch` slot is one `kDim` column of that call).
+Ties go to the LOWER index, arbitrarily but deterministically: the two neighbours of a
+one-point negative lobe are the same population on either side of it, so there is nothing to
+choose between them.
+
+Cost. The span bounds it on three sides: a point below `first` or above `last` is answered
+without a walk at all, and between them the walk terminates at the first live point, so the
+work is the local gap between live points and not the column length. A column in which the
+species has NO live point costs the span sweep alone. The pathological O(n) walk needs a
+dead point in the interior of a gap the length of the column, which is a live population at
+each end and nothing in between.
+"""
+@inline function _ice_live_neighbour(Qk, Nk, rho_d, i::Int, first::Int, last::Int)
+
+    first == 0 && return 0
+    i <= first && return first
+    i >= last && return last
+    @inbounds for d in 1:max(i - first, last - i)
+        j = i - d
+        if j >= first && Qk[j] > ISHMAEL_QSMALL * rho_d[j] && Nk[j] > 0.0
+            return j
+        end
+        j = i + d
+        if j <= last && Qk[j] > ISHMAEL_QSMALL * rho_d[j] && Nk[j] > 0.0
+            return j
+        end
+    end
+    return 0                      # unreachable: `first < i < last` guarantees a hit
+end
+
+"""
+    _ice_population_seed_local(q, m_nb, a_nb, c_nb, k) -> (n, a, c)
+
+The population a species-`k` mass mixing ratio `q` [kg/kg] has when its crystals are THE
+CRYSTALS OF ITS OWN NEIGHBOURS: `m_nb`, `a_nb`, `c_nb` are the per-crystal mass [kg] and the
+two per-crystal volume moments [m³] of the same species at the nearest gridpoint in the
+column where it is live (`ρ_{i,k}/n_{i,k}`, `a_{i,k}/n_{i,k}`, `c_{i,k}/n_{i,k}` on the raw
+slots), and the seeded population carries the same mass, habit and bulk density per particle.
+
+This is the third of the three seedings [`_ice_population_reconcile!`](@ref) can give
+number-less ice below `T_0` (`options[:ice_population_seed] = :local`), and the argument for
+it is a measurement of what the dead mass IS. Number-less mass is the NEGATIVE LOBE of the
+number moment's spline ringing at cloud edges and gradients — the mass-without-number face of
+the transport-decorrelation family whose other face is the 3e13 /L number spikes sitting
+right beside it. The crystals that lobe lost are the crystals next door, so the per-crystal
+state next door is the seed, and neither of the two ends the other seedings pick is: `:min`
+puts ~1e12 2 μm crystals/m³ on it and thins the cloud threefold, `:large` puts one 1 mm
+crystal per 4.6e-4 kg on it, too sparse to survive the number field's own ringing.
+
+# The clamps, and why the seed is realizable
+
+`m_nb` is read off RAW transported slots, so it is not itself guaranteed admissible — the
+same ringing that emptied this point can have corrupted the ratio at that one. It is clamped
+to `[ISHMAEL_M_MIN, ISHMAEL_M_LARGE[k]]`: never below the 2 μm crystal, never above the
+1 mm sphere `:large` would seed. The volume moments are scaled by the SAME factor, which is
+the isotropic rescale — per-crystal volume is linear in per-crystal mass at fixed bulk
+density — so a bound clamp changes the SIZE of the inherited crystal and neither its bulk
+density nor its aspect ratio.
+
+`ISHMAEL_M_MIN` is the mass of ONE 2 μm sphere, and it is the LOOSER of the two limits at
+that end: `var_check`'s own small-ice floor is on the distribution's mean radius, so the
+smallest per-crystal mass it admits at `RHOI` is `M_MIN·Γ(ν+3)/Γ(ν)`, 120 times larger. A
+`:local` seed at the lower clamp therefore comes out at the checker's floor rather than at
+`:min`'s number — a realizable population where `:min` seeds `ρ^∅/m_min` and leaves the next
+read to repair it. That is the clamps' division of labour: they bound the RAW ratio into
+something sane, and the checker has the last word on what is representable.
+
+The triple is then put through [`_ice_effective`](@ref), exactly as
+[`_ice_population_seed_large`](@ref) is, so what is seeded is what `var_check` will diagnose
+from it and the population is a FIXED POINT of the checker rather than something it has to
+repair. The default `rhomax` is used for ALL three species — unlike `:large`, which hands the
+aggregate its own 50 kg/m³ ceiling — because the neighbour's own state came through the
+default-ceiling path in [`mc_ice_sources!`](@ref), and re-clamping it here would change the
+habit this seeding exists to inherit. Where the mass clamp does not bind and the neighbour is
+itself a checked population, `var_check` is the identity on the seed to a few parts in 1e11
+(the port's truncated `^0.333333333333` cube roots), so the seeded per-crystal state IS the
+neighbour's.
+
+`(0.0, 0.0, 0.0)` for a mass at or below `QSMALL`, on `_ice_population_seed_large`'s rule and
+for its reason.
+"""
+@inline function _ice_population_seed_local(q::Float64, m_nb::Float64, a_nb::Float64,
+                                            c_nb::Float64, k::Int)
+
+    (q > ISHMAEL_QSMALL && m_nb > 0.0) || return (0.0, 0.0, 0.0)
+    m_loc = clamp(m_nb, ISHMAEL_M_MIN, @inbounds ISHMAEL_M_LARGE[k])
+    # The isotropic rescale under a bound clamp: per-crystal volume is linear in per-crystal
+    # mass at fixed bulk density, so the two volume moments carry the same factor the mass
+    # does and the crystal changes size without changing density or aspect ratio.
+    vscale = m_loc / m_nb
+    n = q / m_loc
+    eff = _ice_effective(q, n, (n * vscale) * a_nb, (n * vscale) * c_nb, k)
+    return (eff.ni, eff.ai, eff.ci)
+end
+
+"""
+    _ice_population_reconcile!(S, st, tid, Tk, rho_d, tau_pop, apply, ts, seed = :min)
+
+One column's pass of the POPULATION reconciliation: measure the number-less ice mass of every
+species at every gridpoint into the `MC_POP_*` census, and — when `apply` — return it to the
+representation the environment dictates.
+
+Runs immediately after [`_ice_anchor_reconcile!`](@ref), in the same slot and for the same
+reason: the process sources are assembled, nothing has read them yet, and the twelve `SRC_i*`
+accumulators plus the three liquid back-reactions are all that either device writes. A
+separate pass rather than a block inside `mc_ice_sources!`'s gridpoint loop, on three grounds:
+it reads the RAW slots (`mc_ice_sources!`'s per-species locals are the `f_a`-shared ones, and
+the TeX's division of labour puts the reconciliation sources on the raw side with the
+transport); it is a reconciliation and not a rate, so its off-switch, its census and its
+`τ` belong beside leg A's rather than inside the ISHMAEL port; and the dead species whose
+slots it writes are exactly the ones `_ice_empty_rates()` fills with hard zeros, so a pass
+that only ever ADDS to those zeros cannot disturb the bitwise inertness gates.
+
+# The two branches, and why the environment picks between them
+
+ABOVE `T_0` the water is liquid. The mass transfers to the RAIN with `L_f` absorbed exactly
+as a melt would: `SRC_i<k>q` loses `ρ^∅/τ_pop`, `ICE_R` gains it with the melt legs' own sign
+convention (`ice_r` is credited `−MLQ` there, and `MLQ ≤ 0`), and `FRZ_NET ≡ −(ICE_C + ICE_R)`
+therefore falls by the same number — so the transfer appears in `dT_nc`/`dp_nc` as a cooling
+of `L_f` per unit mass, which is what melting ice is. Mass and energy close by construction
+because the identity is maintained as a difference, not accumulated independently.
+
+The rain NUMBER has no melt analogue to copy: `MLN` maps melted crystals one-to-one onto
+drops, and here there are no crystals. The rule the two-moment rain closure already uses for
+a mass source that arrives with no number of its own is AUTOCONVERSION's
+(`rain_autoconversion_2m`, `Ṅ = Q̇/RAIN_2M_M_AUTO`), so that is what is mirrored: one 25 μm
+drop per [`RAIN_2M_M_AUTO`](@ref) of returned mass, seeded into `ICE_NR` — the same slot,
+sign and units the melt credit uses. The a/c VOLUME moments of the dead species are relaxed
+by the SAME fraction `1/τ_pop` (leg A's shared-factor rule), so the species leaves in one
+piece; its number is already `≤ 0` and `max(n, 0) = 0` gives it nothing to relax.
+
+BELOW `T_0` the water is ice that has lost its crystals to the transport, and it is given
+them back — always as number alone, at one of TWO crystals. NO mass moves either way, no
+latent heat is released, and nothing enters `λ` or `N`: this branch creates number and
+nothing else.
+
+`options[:ice_population_seed]` picks the crystal. `:min` and `:large` are the two ends of
+the same statement about the dead mass; `:local` is the third answer, and it is the one the
+DEFECT rather than the mass argues for.
+
+`:min` — the SMALLEST crystal the scheme resolves,
+
+    ṅ_{i,k} = ρ^∅_{i,k} / (m_min τ_pop),   m_min = ISHMAEL_M_MIN (the 2 μm sphere)
+
+with the volume moments from [`_ice_nucleation_volume`](@ref) at that mass/number pair, so
+`a` and `c` describe the 2 μm spheres every nucleation channel of the port already seeds. It
+is the source-side statement of the principle the `min(n/τ, ṁ/m_min)` bound in
+[`_ice_homogeneous_rates`](@ref) states at the nucleation channels — no ice number may be
+created below the minimum resolved crystal — and it is the FASTEST RESPONSE: smallest
+particles, slowest fall, largest surface per unit mass, so the population sublimates within
+seconds if the air is subsaturated and grows if it is not.
+
+`:large` — the particles the dead mass ACTUALLY IS. Number-less mass is what SIZE SORTING
+leaves behind: the mass-weighted fall speed outran the number-weighted one, so what is
+sitting there is the big end of a distribution whose number has gone somewhere else. Seeding
+it as 2 μm spheres puts ~1e12 crystals/m³ on 6e-3 kg/m³ of it, a deposition surface stiff
+enough to sublimate inside one step (measured `ts/τ` 31 on ice1, 0.36 → 9.7 on ice3) and to
+thin the ice cloud threefold. [`_ice_population_seed_large`](@ref) instead asks `var_check`
+what population that mass has when its number is at the floor — ISHMAEL's own re-diagnosis,
+the 1 mm large-ice limit at the species' bulk density — and seeds THAT, `ṅ = ρ^∅/(m_large
+τ_pop)` with `m_large = ρ^∅/n_large` and the `a`/`c` moments carried along at the same
+per-crystal size, so the seeded triple is a fixed point of the checker.
+
+`:local` — THE NEIGHBOURS' CRYSTALS. Both of the above read the dead mass and ask what
+particles a mass of that size is; neither reads the DEFECT. The defect is the negative lobe
+of the number moment's spline ringing at cloud edges and gradients — the mass-without-number
+face of the transport-decorrelation family whose other face is the 3e13 /L number spikes
+sitting right next to it — so the crystals this point has lost are not a size to be derived
+from its mass at all: they are the crystals of the same species one gridpoint away. The seed
+is therefore the per-crystal state of the NEAREST LIVE gridpoint of that species IN THIS
+COLUMN ([`_ice_live_neighbour`](@ref)), `ṅ = ρ^∅/(m_loc τ_pop)` with `m_loc = ρ_{i,k}/n_{i,k}`
+there, and the `a`/`c` moments at that neighbour's own per-crystal axes so the seeded
+population has its habit ([`_ice_population_seed_local`](@ref), which clamps `m_loc` into
+`[ISHMAEL_M_MIN, ISHMAEL_M_LARGE[k]]` and passes the triple through `var_check`). Where the
+species is live NOWHERE in the column the seeding falls back to `:min`: that is the pure-dead
+case, there is no habit anywhere to inherit, and the fastest-responding population is the
+right one for a column that has to resolve itself from its own thermodynamics.
+
+Whichever of the three is chosen, the moments are realizable again and the rates, the
+consistency source and the sedimentation own the species from the next step on.
+
+The DEFAULT is `:local`, and it is chosen BY MEASUREMENT and not by argument
+(reference/FINDINGS_ISHMAEL_S8S9.md §§5f-5j, quick production, 3600 s). `:min` reconciles the
+dead mass (whole-cloud dead fraction 70% → 3%) but pays for it with a deposition surface stiff
+enough to sublimate the seeded population inside a step, and the cloud it leaves is a third of
+the unreconciled one (IWP 3.43 → 1.07, ice top 18.8 → 15.4 km, 6/11 windows). `:large` seeds one
+crystal per 4.6e-4 kg — 5.4e5 /m³ over the whole run against 4.5e12 for `:min` — which does not
+survive the number field's own ringing: the mass is dead again the next step and the cloud
+stays 72% dead, its windows passing only because nothing was reconciled. `:local` keeps the
+cloud at its unreconciled magnitude (IWP 3.30, ice top 19.2 km) and reconciles it: with the
+minimum-crystal bound and the rain population gate in place it reads 2.7% dead mass at 3600 s,
+9/11 windows, and `max n_i1` 1.7e5 /L against 9.4e13 /L before Stage 3 (§5j). Its earlier
+re-glaciation defect (69% dead at 3600 s with species 1's number lost through the glaciated
+hour) was the Bigg number pump, not the seeding, and is gone with it. `:min` and `:large`
+remain selectable and unchanged.
+
+`apply = false` (`options[:ice_population_source] = false`, and also
+`options[:condensation] = false`) keeps the census and drops both transfers, reproducing the
+unreconciled tree bitwise while still reporting the defect.
+"""
+function _ice_population_reconcile!(S, st, tid::Int64, Tk, rho_d,
+                                    tau_pop::Float64, apply::Bool, ts::Float64,
+                                    seed::Symbol = :min)
+
+    itau = 1.0 / tau_pop
+    Q = (S.i1q, S.i2q, S.i3q)
+    N = (S.i1n, S.i2n, S.i3n)
+    A = (S.i1a, S.i2a, S.i3a)
+    C = (S.i1c, S.i2c, S.i3c)
+    SRCq = (S.SRC_i1q, S.SRC_i2q, S.SRC_i3q)
+    SRCn = (S.SRC_i1n, S.SRC_i2n, S.SRC_i3n)
+    SRCa = (S.SRC_i1a, S.SRC_i2a, S.SRC_i3a)
+    SRCc = (S.SRC_i1c, S.SRC_i2c, S.SRC_i3c)
+    seed_large = seed === :large
+    seed_local = seed === :local
+    # The `:local` seeding's LIVE SPANS, one sweep per species over this column, taken before
+    # the gridpoint loop because every seeded point reads them and none of them writes the
+    # raw slots. `(0, 0)` per species otherwise: the tuple is built unconditionally so the
+    # loop below stays one shape, and the branch that reads it is the one `:local` enters.
+    idx = eachindex(Tk)
+    spans = seed_local ?
+        (_ice_live_span(Q[1], N[1], rho_d, idx), _ice_live_span(Q[2], N[2], rho_d, idx),
+         _ice_live_span(Q[3], N[3], rho_d, idx)) :
+        ((0, 0), (0, 0), (0, 0))
+    worst = 0.0
+    pts = 0.0
+    to_rain = 0.0
+    seeded = 0.0
+    @inbounds for i in eachindex(Tk)
+        warm = Tk[i] > T_0
+        rhoair = rho_d[i]
+        for k in 1:3
+            rate, rho_empty = ice_population_rate(Q[k][i], N[k][i], rhoair, tau_pop)
+            rho_empty > 0.0 || continue
+            rho_empty > worst && (worst = rho_empty)
+            pts += 1.0
+            apply || continue
+            if warm
+                # The species leaves as rain, one shared factor across the moments it has.
+                SRCq[k][i] -= rate
+                SRCa[k][i] -= itau * max(A[k][i], 0.0)
+                SRCc[k][i] -= itau * max(C[k][i], 0.0)
+                nseed = rate / RAIN_2M_M_AUTO
+                S.ICE_R[i] += rate
+                S.ICE_NR[i] += nseed
+                # `FRZ_NET ≡ −(ICE_C + ICE_R)`, maintained as the difference it is defined
+                # to be: the ice→rain transfer ABSORBS L_f, so the freeze net falls.
+                S.FRZ_NET[i] -= rate
+                to_rain += rate * ts
+            else
+                # Number only: no mass moves, so no latent heat and nothing in λ or N.
+                nb = 0
+                if seed_local
+                    # The crystals next door: the nearest gridpoint of THIS column at which
+                    # this species still has a population. `nb == 0` is the pure-dead column
+                    # and falls through to the `:min` branch below.
+                    sp = @inbounds spans[k]
+                    nb = _ice_live_neighbour(Q[k], N[k], rho_d, i, sp[1], sp[2])
+                end
+                if seed_large || nb > 0
+                    # `:large` — the size-sorted particles the dead mass IS: `var_check`'s own
+                    # re-diagnosis of it at the floor number. `:local` — the same mass at the
+                    # per-crystal mass, habit and bulk density of the live neighbour. Both
+                    # rules are non-linear in the mass (the large-ice cap on one, the clamps
+                    # and the checker on the other), so the MIXING RATIO is formed and the
+                    # answer converted back rather than the rule rescaled.
+                    q_empty = rho_empty / rhoair
+                    if seed_large
+                        nl, al, cl = _ice_population_seed_large(q_empty, k)
+                    else
+                        nnb = @inbounds N[k][nb]
+                        nl, al, cl = _ice_population_seed_local(q_empty,
+                                         (@inbounds Q[k][nb]) / nnb, (@inbounds A[k][nb]) / nnb,
+                                         (@inbounds C[k][nb]) / nnb, k)
+                    end
+                    nseed = (nl * rhoair) * itau
+                    aseed = (al * rhoair) * itau
+                    cseed = (cl * rhoair) * itau
+                else
+                    nseed = rate / ISHMAEL_M_MIN
+                    aseed = _ice_nucleation_volume(rate, nseed)
+                    cseed = aseed
+                end
+                SRCn[k][i] += nseed
+                SRCa[k][i] += aseed
+                SRCc[k][i] += cseed
+                seeded += nseed * ts
+            end
+        end
+    end
+    if size(st, 2) > 0
+        @inbounds begin
+            worst > st[MC_POP_MAX, tid] && (st[MC_POP_MAX, tid] = worst)
+            st[MC_POP_PTS, tid] += pts
+            st[MC_POP_RAIN, tid] += to_rain
+            st[MC_POP_SEED, tid] += seeded
+        end
+    end
+    return nothing
+end
+
+"""
     mc_stiffness_trace(mtile, t)
 
 Report the [`mc_stiffness_census!`](@ref) accumulators, and warn ONCE per run if any channel
@@ -3940,7 +4468,14 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
     # is not "unresolved", it is the realization construction failing to bound a reservoir.
     dworst = 0.0
     dworst_ch = 0
-    @inbounds for ch in 1:MC_DONOR_CHANNELS
+    # The three ICE NUMBER rows join the CONVICTION only once their realization is on. With
+    # it off those legs ride the species' MASS factor by construction, so a reading above 1
+    # there is the measurement this stage was built to take and not a broken invariant — it
+    # is reported in `dreport` either way, and warned about only where the construction
+    # claims to bound it.
+    ice_n_real = get(mtile.model.options, :ice_number_realization, false)::Bool
+    dlast = ice_n_real ? MC_DONOR_CHANNELS : MC_DONOR_N1 - 1
+    @inbounds for ch in 1:dlast
         m = maximum(view(st, MC_DONOR_FIRST + (MC_DONOR_N * (ch - 1)), :))
         m > dworst && (dworst = m; dworst_ch = ch)
     end
@@ -3955,10 +4490,14 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
           sink was added to a donor without being added to its conductance. The rain's total
           includes EVAPORATION as well as the ice legs (Stage 2b), which is why its row is
           the combined draw.
-          The three ICE donors are realized the same way -- melting, aggregation and
+          The three ICE MASS donors are realized the same way -- melting, aggregation and
           sublimation are all shares of one per-species conductance (mc_ice_sources!) -- so a
           reading above 1 there says the same thing: a sink is drawing on a reservoir it was
           never added to the conductance of.
+          The three ICE NUMBER donors (n_i1/n_i2/n_i3) are in this loop ONLY when
+          options[:ice_number_realization] is on, which is what gives them a conductance of
+          their own; with it off their legs ride the species' MASS factor and a reading above
+          1 there is a measurement, not a defect. Both modes print in the census below.
           REPORTED, NOT LIMITED: no rate is clamped and no state is written back."""
     end
 
@@ -3978,6 +4517,26 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
           "ON (tau_anchor = $(get(mtile.model.physical_params, :tau_ice_anchor, 10.0)) s) and holds it at drift scale" :
           "OFF (options[:ice_anchor_source] = false): the defect is measured and NOT removed").
           Cumulative census in the stiffness trace: max delta_part, gridpoint-steps, removed mass."""
+    end
+
+    # The POPULATION census: announce the FIRST number-less ice mass once per run. Like the
+    # anchor's, an @info and not a warning — four moments on four independent fits at three
+    # weighted fall speeds do not stay mutually realizable, and the reconciliation source is
+    # what returns the orphaned mass to a representation the rates can act on.
+    pmax = maximum(view(st, MC_POP_MAX, :))
+    if pmax > 0.0 && st[MC_POP_WARNED, 1] == 0.0
+        st[MC_POP_WARNED, 1] = 1.0
+        psrc_on = get(mtile.model.options, :ice_population_source, true)::Bool
+        pseed = get(mtile.model.options, :ice_population_seed, :local)::Symbol
+        @info """NUMBER-LESS ICE MASS: a species carries mass with no crystals.
+          step $t (t = $(round(t * mtile.model.ts; digits=1)) s), max rho_empty so far = $pmax kg/m^3
+          The population gate (mc_ice_sources!) correctly refuses every rate and every fall
+          speed on mass that carries no number; the same mass is then exempt from every
+          device that could remove it. This is the transport-side defect of the population
+          (TeX §Reconciliation of the population). The reconciliation source is $(psrc_on ?
+          "ON (tau_pop = $(get(mtile.model.physical_params, :tau_ice_population, 10.0)) s): above T_0 the mass returns to the rain with L_f, below T_0 it is given crystals (options[:ice_population_seed] = :$(pseed) — $(pseed === :large ? "var_check's large-ice re-diagnosis of the dead mass, the size-sorted particles it came from" : pseed === :local ? "the per-crystal mass and habit of the nearest live gridpoint of the same species in the column, the crystals the ringing's negative lobe lost" : "the 2 um sphere, the smallest the scheme resolves"))" :
+          "OFF (options[:ice_population_source] = false): the defect is measured and NOT removed").
+          Cumulative census in the stiffness trace: max rho_empty, gridpoint-steps, mass to rain, number seeded."""
     end
 
     interval = get(mtile.model.options, :stiffness_trace, 0)::Int
@@ -4010,10 +4569,13 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
     @info """microphysics stiffness census step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
   cumulative over the run so far; > 1 means the relaxation is under-resolved
   $report
-  donor depletion actually applied (must stay <= 1 for the three liquid donors):
+  donor depletion actually applied (must stay <= 1 for the liquid and ice-MASS donors; the
+  three ice-NUMBER rows are bounded only under options[:ice_number_realization]):
   $dreport
   anchor reconciliation (partition defect delta_part; 0 until glaciation onset):
-  max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))$areport"""
+  max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))
+  population reconciliation (number-less ice mass rho_empty; 0 while every species with mass carries number):
+  max rho_empty = $(maximum(view(st, MC_POP_MAX, :))) kg/m^3, (gridpoint x species)-steps = $(Int(sum(view(st, MC_POP_PTS, :)))), mass to rain = $(sum(view(st, MC_POP_RAIN, :))) kg/m^3, ice number seeded = $(sum(view(st, MC_POP_SEED, :))) /m^3 (seed = :$(get(mtile.model.options, :ice_population_seed, :local)))$areport"""
     return nothing
 end
 
@@ -4237,6 +4799,40 @@ module_mp_jensen_ishmael.F line 2246). It is the same particle DeMott seeds
 const ISHMAEL_M_MIN = ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * ISHMAEL_RMIN^3
 
 """
+    ISHMAEL_RHO_AGG
+
+The bulk density of the AGGREGATE species, 50 kg/m³ — the Fortran's own forced value below
+`T_0` (`rhobar(ICE3) = 50.`, module_mp_jensen_ishmael.F line 2603, opening the "Final check on
+aggregates" block) and, not by coincidence, the lower bound `var_check` holds every species
+above (lines 3131-3154). [`_ice_effective`](@ref) already hands it to an EMPTY aggregate;
+[`_ice_population_seed_large`](@ref) is the one place a species that HAS mass is given it.
+"""
+const ISHMAEL_RHO_AGG = 50.0
+
+"""
+    ISHMAEL_M_LARGE
+
+The per-crystal mass of the `:large` seeding, one entry per species [kg]: the mass of a
+1 mm sphere at the species' bulk density, `m_large = (4/3)π ρ̄ a_max³ Γ(ν+3)/Γ(ν)` with
+`a_max = 1 mm` — 4.62e-4 kg for the planar and columnar species at `RHOI`, 2.51e-5 kg for
+the aggregates at [`ISHMAEL_RHO_AGG`](@ref).
+
+This is [`_ice_population_seed_large`](@ref)'s own answer written as a mass, and it is the
+LARGEST per-crystal mass `var_check` admits: the mass is maximized over the checker's
+admissible set at the sphere (`ρ̄ = ρ_max`, `a_n = c_n = 1 mm`), because any aspect ratio
+other than one puts the shorter axis inside the cap. [`_ice_population_seed_local`](@ref)
+clamps its inherited per-crystal mass against it, so a crystal read out of ringing-corrupted
+slots can never seed a coarser population than `:large` would — and `:local`'s number is
+therefore bracketed by the other two seedings by construction.
+"""
+const ISHMAEL_M_LARGE = let a3 = 1.0e-3^3,
+                            g = gamma(ISHMAEL_NU + 3.0) * ISHMAEL_I_GAMMNU
+    (ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * a3 * g,
+     ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * a3 * g,
+     ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHO_AGG * a3 * g)
+end
+
+"""
     _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt) -> (f_qc, f_qr, f_nr)
 
 The realization factor of each LIQUID DONOR RESERVOIR at one gridpoint: cloud mass, rain mass,
@@ -4296,7 +4892,10 @@ factors bitwise — `relaxation_realization` returns an exact `1.0` at a zero ra
 an exact `0.0` to a sum of non-negative rates is the identity — which is what
 `options[:rain_evap_realization] = false` uses.
 
-Mass and number are separate reservoirs with separate conductances, and get separate factors:
+Mass and number are separate reservoirs with separate conductances, and get separate factors —
+the ICE species are the same statement in the same shape (`options[:ice_number_realization]`,
+Stage 1b; see the number-donor block in [`mc_ice_sources!`](@ref)), and this is where the rule
+was first forced:
 Bigg's number conductance is `1/20` of its mass conductance (`ṅ/ṁ = λ_r³/20πρ_w` against
 `n_r/q_r = λ_r³/πρ_w`), so realizing the number on the MASS factor would freeze all of the
 rain's mass while removing a twentieth of its drops — mass without number, precisely the state
@@ -4306,6 +4905,20 @@ construction, so one factor serves both there.
 
 `dQIfzri`, the ice that changes species because it collected rain, rides `f_qr`: it is the same
 collision events, so it is a share of the rain reservoir's sink like its partners.
+
+# The price of two factors, and where it is paid
+
+Two factors on one pair of moments is right for the RESERVOIRS and wrong for the CRYSTALS: a
+number rate and its mass partner scaled by `f_nr` and `f_qr` no longer stand in the ratio the
+kernel wrote them in, so any bound of the form `ṅ ≤ ṁ/m_min` stated at the RATE does not
+survive this function. `min` commutes with one shared factor and with nothing else. Measured at
+the anvil top (reference/FINDINGS_ISHMAEL_S8S9.md §5i): `f_nr = 1.0` — `relaxation_realization`
+at a zero reservoir, correct for a factor and catastrophic for a bound — against `f_qr` at
+1.8e-19, the same Bigg collisions realized seventeen orders apart, ~1e15 m⁻³ s⁻¹ of crystals
+created carrying a millionth of `ISHMAEL_M_MIN` each. The bound is therefore restated on the
+REALIZED pair, in [`mc_ice_sources!`](@ref)'s slot assembly where both factors exist, and this
+function is left to do the one job it is for. `f_nr` is NOT the place to fix it: clamping a
+donor factor to its partner's would under-realize every healthy number sink on the reservoir.
 
 # Riming enters through `prdr₀`, not through `rimesum`
 
@@ -4394,6 +5007,18 @@ The RAIN leg carries the same `min` for symmetry and safety. Raindrops are three
 magnitude above `r_min`, so it should never bind — `test_moist_compressible.jl` asserts it does
 not at typical rain states, which is what makes it a guard rather than a parameterization.
 
+# The bound is stated here and ENFORCED at the assembly
+
+This `min` is a statement about two rates, and it holds for the rates this function returns.
+It does NOT survive realization: `mimr` is scaled by the rain-MASS donor factor and `nimr` by
+the rain-NUMBER one ([`_ice_donor_factors`](@ref) — two reservoirs, two conductances), and
+`min` commutes with one shared factor and no more. The cloud pair shares `f_qc` and is safe by
+that accident; the rain pair is not, and neither is Bigg, which carries no rate-level bound at
+all. So the invariant this docstring argues for is re-applied to the REALIZED legs in
+[`mc_ice_sources!`](@ref)'s slot assembly, over every ice number source at once
+(reference/FINDINGS_ISHMAEL_S8S9.md §5i). What is written here still stands and still binds
+first; the assembly is what makes it an invariant rather than a property of one call.
+
 The volume-moment seeding needs no change: [`_ice_nucleation_volume`](@ref) derives the
 characteristic axis from the summed mass/number ratio at density `RHOI` and is shared by every
 nucleation channel, so bounding the ratio here bounds the seeded size there too.
@@ -4458,7 +5083,7 @@ unchanged; `n_ice` is the CARRIED ice number, for the reason given in `_ice_spec
 end
 
 """
-    _ice_effective(qi, ni, ai, ci, k) -> NamedTuple
+    _ice_effective(qi, ni, ai, ci, k, rhomax = ISHMAEL_RHOI) -> NamedTuple
 
 One ice species' EFFECTIVE moments: the incoming-volume floors of the Fortran host loop
 (module_mp_jensen_ishmael.F lines 1013-1032) followed by [`ishmael_var_check`](@ref).
@@ -4475,8 +5100,15 @@ block still needs a well-defined characteristic diameter for a species that has 
 because that is exactly the species aggregation CREATES.
 
 `k` is the species index; only `k == 3` (aggregates) reads it.
+
+`rhomax` is the CEILING `var_check` clamps the bulk density against (its `RHOI` argument),
+and defaults to the bulk ice density every existing call site uses, so they are unchanged.
+The one caller that passes anything else is [`_ice_population_seed_large`](@ref), which hands
+the AGGREGATE species its own 50 kg/m³ (module_mp_jensen_ishmael.F line 2603, and the same
+number this function's own empty-species fallback gives it two lines above).
 """
-@inline function _ice_effective(qi::Float64, ni::Float64, ai::Float64, ci::Float64, k::Int)
+@inline function _ice_effective(qi::Float64, ni::Float64, ai::Float64, ci::Float64, k::Int,
+                                rhomax::Float64 = ISHMAEL_RHOI)
 
     if !(qi > ISHMAEL_QSMALL)
         return (deltastr = 1.0, ani = 2.0e-6, cni = 2.0e-6, rni = 2.0e-6,
@@ -4506,12 +5138,12 @@ because that is exactly the species aggregation CREATES.
     ds = (log(cni) - log(ISHMAEL_AO)) / (log(ani) - log(ISHMAEL_AO))
     # `rbdum` in is irrelevant: var_check's first act is to re-derive it from (qi, ni, ani).
     return ishmael_var_check(ISHMAEL_NU, ISHMAEL_AO, ISHMAEL_FOURTHIRDSPI, ISHMAEL_GAMMNU,
-                             qi, ds, ani, cni, ISHMAEL_RHOI, ni, ai, ci)
+                             qi, ds, ani, cni, ISHMAEL_RHOI, ni, ai, ci; RHOI = rhomax)
 end
 
 """
     _ice_species_pre(tab, dt, eff, qi, temp, rhoair, air, drive_i, Q_s_i, maxsui, igr,
-                       qc, nc, qr, nr, qv) -> NamedTuple
+                       qc, nc, qr, nr, qv, shed) -> NamedTuple
 
 Every per-species ice process rate at one gridpoint, in ISHMAEL's mixing-ratio units except
 where noted. `eff` is [`_ice_effective`](@ref)'s tuple, `qi` the species mass mixing ratio,
@@ -4586,7 +5218,7 @@ function _ice_species_pre(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni_
                             npr::Float64, xxlv::Float64, xxlf::Float64, qs0::Float64,
                             drive_i::Float64, Q_s_i::Float64, maxsui::Float64,
                             igr::Float64, qc::Float64, nc::Float64, qr::Float64,
-                            nr::Float64, qv::Float64)
+                            nr::Float64, qv::Float64, shed::Bool)
 
     ani = eff.ani; cni = eff.cni; rni = eff.rni; ds = eff.deltastr
     rhobar = eff.rhobar; ni = eff.ni; alphstr = eff.alphstr
@@ -4645,11 +5277,19 @@ function _ice_species_pre(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni_
     # The unit-realization split, which is the Fortran's own `qcrimefrac`; it says how much of
     # `prdr₀` each donor is being asked for.
     qcf0 = rimetotal > 0.0 ? clamp(rimesum / rimetotal, 0.0, 1.0) : 0.0
+    # SHED (TeX §Departures (e)). Above `T_0` a crystal that collects liquid sheds it, so
+    # there is no liquid→ice conversion to put into either donor's conductance. The kernels
+    # above still ran and `rimetotal` still reaches the melting rate's sensible-heat term
+    # through `pre.rimesum`/`pre.rimesumr`; what is zeroed is the CONSUMER side. Exactly the
+    # unshed values below `T_0` (branch not taken), so the sub-freezing path — and every
+    # `ishmael.jl` fidelity test, which calls the ported kernels directly — is bitwise.
+    shed_now = shed && (temp > T_0)
 
     return (rc = rc, rr = rr, vc = vc, rimesum = rimesum, rimesumr = rimesumr,
             capgam = capgam, fv = fv, fh = fh, invtau_i = invtau_i, Qdot = Qdot, niq = niq,
             dry_growth_pre = dry_growth_pre,
-            prdr0_c = rg0.prdr * qcf0, prdr0_r = rg0.prdr * (1.0 - qcf0),
+            prdr0_c = shed_now ? 0.0 : rg0.prdr * qcf0,
+            prdr0_r = shed_now ? 0.0 : rg0.prdr * (1.0 - qcf0),
             nrn_loss = rr.qi_qr_nrn * ni * nr * rhoair)
 end
 
@@ -4663,12 +5303,18 @@ formed across all three species by [`_ice_donor_factors`](@ref) and the phase-A 
 
 Returns the same NamedTuple the single-pass `_ice_species_rates` used to, so `mc_ice_sources!`
 downstream of the factors is unchanged.
+
+`shed` (`options[:ice_shed_above_t0]`) is TeX §Departures (e): above `T_0` the collection
+kernels still run — so `rimetotal` and `dQImltri` still reach the melting rate's sensible-heat
+term — but every riming OUTPUT is zeroed, so no mass leaves the cloud or the rain, no axis
+grows on rime and no `L_f` is released. Below `T_0` the branch is not taken and every
+returned field is bit-for-bit the unshed one.
 """
 function _ice_species_post(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni_c::Float64,
                            temp::Float64, rhoair::Float64, mu::Float64, dv::Float64,
                            kt::Float64, xxlv::Float64, xxlf::Float64, qs0::Float64,
                            qc::Float64, nc::Float64, qr::Float64, nr::Float64, qv::Float64,
-                           pre, f_qc::Float64, f_qr::Float64)
+                           pre, f_qc::Float64, f_qr::Float64, shed::Bool)
 
     ani = eff.ani; cni = eff.cni; rni = eff.rni; ds = eff.deltastr
     rhobar = eff.rhobar; ni = eff.ni; ai = eff.ai; ci = eff.ci; alphstr = eff.alphstr
@@ -4695,6 +5341,48 @@ function _ice_species_post(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni
     # collected — does not. The liquid sink is written against `prdr_pre`; see `mc_ice_sources!`.
     sp = ishmael_rime_splintering(temp, rg.prdr)
 
+    # ── SHED ABOVE THE FREEZING LEVEL (TeX §Departures (e)) ──────────────────────────────
+    #
+    # ISHMAEL's collection kernels carry no temperature gate: above `T_0` the riming branch
+    # switches to wet growth (`dry_growth = dry_growth_pre && !(temp > T_0)` in
+    # `ishmael_riming_growth`) and the collected liquid is added to the ice mass, on the
+    # understanding that it sits as water on the crystal surface and that the melting rate,
+    # which carries the sensible heat of the collected liquid, will return it. In ISHMAEL's
+    # host that is a free bookkeeping loan: the latent-heat update for freezing is gated to
+    # `T ≤ T_0`, so the transfer has no thermodynamic content.
+    #
+    # Here it is not free. `FRZ_NET ≡ −(ICE_C + ICE_R)` is SIGNED BY THE PARTITION, so mass
+    # moving from the rain slot to an ice slot releases `L_f` wherever it happens, and the
+    # census of the timestep-limited configuration found the wet-growth branch taking the
+    # WHOLE of the rain into the ice in a single step two degrees above freezing, with the
+    # melt returning it at its own realized rate and the latent heat of the exchange cycling
+    # through the temperature (`MC_ATTR_WARM_RIME_R`/`MC_ATTR_WARM_MELT` are that loop).
+    #
+    # The departure states the physics directly: above `T_0` a crystal that collects liquid
+    # SHEDS it, and there is no liquid-to-ice conversion at all. The collection rate is still
+    # evaluated — `rimetotal` below is the unshed one, so `ishmael_melting` keeps the sensible
+    # heat of the liquid that struck the crystal, and `dQImltri` is untouched — but no mass
+    # leaves the rain or the cloud, no axis grows on rime, and no `L_f` is released. What is
+    # then left in `FRZ_NET` above `T_0` is melting alone (negative): homogeneous freezing is
+    # gated to `T < T_0 − 35`, Bigg to `T < T_0 − 4`, and `ishmael_ice_rain_riming` already
+    # routes `dQRfzri/dQIfzri/dNfzri` to zero and `dQImltri/dNmltri` to the collection above
+    # `T_0`. That is the sign property the positive-definiteness of the ice entropy production
+    # rests on, and the one the wet-growth transfer had violated.
+    #
+    # Applied HERE, at the consumer, and not by gating the ported kernel: `ishmael.jl` is a
+    # verbatim port with its own fidelity tests, and the reference harness must stay bitwise.
+    # Below `T_0` the branch is not taken and every value is the unshed one, bit for bit.
+    shed_now = shed && (temp > T_0)
+    prdr_pre_v = shed_now ? 0.0 : rg.prdr
+    prdr_v     = shed_now ? 0.0 : sp.prdr
+    ardr_v     = shed_now ? 0.0 : rg.ardr
+    crdr_v     = shed_now ? 0.0 : rg.crdr
+    # Hallett-Mossop is already zero outside [265.16, 270.16] K and so above `T_0`; these two
+    # are zeroed for the statement, not for the arithmetic.
+    qmult_v    = shed_now ? 0.0 : sp.qmult
+    nmult_v    = shed_now ? 0.0 : sp.nmult
+    qcrimefrac_v = shed_now ? 0.0 : qcrimefrac
+
     # ── Melting ──
     # `reservoir_caps=false`: the three `Δt`-dependent clauses inside the ported melting rate
     # (the `-qi/Δt` floor, the `ai<1e-12` dump-it-all branch and the `-ni/Δt` number floor)
@@ -4720,8 +5408,8 @@ function _ice_species_post(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni
 
     return (invtau_i = pre.invtau_i, Qdot = pre.Qdot, niq = pre.niq, capgam = pre.capgam,
             vtrmi1 = pre.vc.vtrmi1,
-            prdr_pre = rg.prdr, prdr = sp.prdr, ardr = rg.ardr, crdr = rg.crdr,
-            qmult = sp.qmult, nmult = sp.nmult, qcrimefrac = qcrimefrac,
+            prdr_pre = prdr_pre_v, prdr = prdr_v, ardr = ardr_v, crdr = crdr_v,
+            qmult = qmult_v, nmult = nmult_v, qcrimefrac = qcrimefrac_v,
             qmlt = ml.qmlt, nmlt = nmlt, amlt = ml.amlt, cmlt = ml.cmlt,
             dQRfzri = rr.dQRfzri, dQIfzri = rr.dQIfzri, dNfzri = rr.dNfzri,
             nrn_loss = pre.nrn_loss,
@@ -4857,6 +5545,7 @@ Written:
 | `FRZ_NET` | `Q̇_freeze`, the net liquid→ice conversion [kg/m³/s] |
 | `ICE_C`, `ICE_R`, `ICE_NR` | the back-reactions on cloud mass, rain mass and rain number |
 | `Vi<k>m`, `Vi<k>n` | mass- and number-weighted fall speeds [m/s, negative downward] |
+| `f_ice<k>`, `f_isn<k>` | species k's MASS donor factor, and the residual factor its sublimation NUMBER sink still owes its own reservoir (Stage 1b) — both read again in the ETD pre-compute |
 
 # Mass conservation, and the one place it forced a departure from the Fortran
 
@@ -4893,10 +5582,33 @@ mass between two ice species, and deposition moves vapor, which the vapor slot t
 has ice; deposition is zero above `T_0`. In air that is warm everywhere with no ice, every
 number this function writes is an exact `0.0` — which is what the bitwise inertness gate
 rests on.
+
+The RAIN POPULATION GATE is the same statement about the liquid side
+(`options[:rain_population_gate]`, default true): where the CARRIED rain number is not
+positive, the kernels that read a rain SIZE DISTRIBUTION see no rain. `ishmael_rain_lambda`
+floors the number at `QNSMALL` and clamps the slope, so a mass-without-number rain slot is
+handed to every DSD consumer as 2800 μm drops — the largest the scheme admits, and the pump
+that dead-ended the anvil through Bigg freezing (reference/FINDINGS_ISHMAEL_S8S9.md §5i).
+`ishmael_ice_rain_riming` self-gates (every rate it returns carries a factor of the carried
+`n_r`); Bigg does not, and is the one kernel the gate has to switch off.
+
+The POPULATION GATE below (mass with no carried number is not a population, so no rate acts
+on it) leaves that mass exempt from every device that could REMOVE it as well. That is a
+representation error of the transport and not a rate, and it is repaired one level up by
+[`_ice_population_reconcile!`](@ref), which runs after this function and is the only thing
+that writes into a gated species' slots — the fourth tier of the reconciliation chain, TeX
+§"Reconciliation of the population".
+
+Above `T_0` the ISHMAEL collection kernels still run, but there is no liquid→ice conversion:
+`shed` (`options[:ice_shed_above_t0]`, default true) zeroes the riming rates, their axis
+partners, their liquid debits and their share of the donor conductances at the CONSUMER
+(`_ice_species_pre`/`_ice_species_post`), so the melting rate keeps the sensible heat of the
+liquid that struck the crystal while no mass and no `L_f` move — TeX §Departures (e).
 """
 function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                          active::Bool, var_check_source::Bool, anchor_rates::Bool,
                          attr_census::Bool, agg_caps::Bool, rain_evap_real::Bool,
+                         shed::Bool, ice_n_real::Bool, rain_pop_gate::Bool,
                          tau_hf::Float64, tau_act::Float64, tau_vc::Float64,
                          stats, stats_tid::Int64)
 
@@ -4962,6 +5674,7 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # inert value is the identity. (With `active = false` the conductances are zero and
         # the leg is zero anyway; this keeps the column meaningful rather than relying on it.)
         fill!(S.f_ice1, 1.0); fill!(S.f_ice2, 1.0); fill!(S.f_ice3, 1.0)
+        fill!(S.f_isn1, 1.0); fill!(S.f_isn2, 1.0); fill!(S.f_isn3, 1.0)
         fill!(S.etd_dep_a, 0.0); fill!(S.etd_dep_b, 0.0)
         for k in 1:3
             fill!(habANI[k], 0.0); fill!(habCNI[k], 0.0); fill!(habRNI[k], 0.0)
@@ -5004,6 +5717,54 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # 200 cm⁻³: the same number the liquid condensation closure nucleates against, so the
         # riming kernel collects the droplets the cloud channel actually made.
         nc = 1.0e6 * max_N_c / rhoair
+        # ── THE RAIN POPULATION GATE ───────────────────────────────────────────────────
+        # The ice population gate's statement, applied to the RAIN: a rate may not act on a
+        # size distribution the CARRIED number does not support. `nr` is `max(n_r, 0)/ρ_a`
+        # just above, so `nr > 0` is exactly `n_r > 0` — the drops the transport is carrying,
+        # not a floored or re-diagnosed stand-in for them.
+        #
+        # The measurement (reference/FINDINGS_ISHMAEL_S8S9.md §5i): at the anvil top the two
+        # rain moments decorrelate on their independent spline fits — `n_r` rings to EXACTLY
+        # zero while `ρ_r` keeps ~1e-8 kg/kg at 15 km and 192–203 K, rain mass without rain
+        # number where there is no rain. `ishmael_rain_lambda` then FLOORS the number at
+        # `QNSMALL` and the resulting slope falls into the `lamr < LAMMINR` clamp, so every
+        # kernel that reads the DSD is handed a phantom population of 2800 μm drops — the
+        # largest particle the scheme admits, the same failure the ice population gate exists
+        # to forbid, arriving on the rain and from INSIDE a kernel. Bigg, evaluated 30–40 K
+        # below its validity on that phantom, was the number pump that dead-ended the anvil.
+        #
+        # WHICH kernels need this gate, and which already self-gate:
+        #   * `ishmael_bigg_freezing` NEEDS it. Its only existence test is `q_r > QSMALL`
+        #     (plus `T < T_0 − 4`), and the floored `nr_adj` it freezes is the DSD's, not the
+        #     carried number's, so at `n_r = 0` it returns a large rate rather than nothing.
+        #   * `ishmael_ice_rain_riming` (`p_k.rr`) SELF-GATES and is left alone: every rate it
+        #     returns carries a factor of the CARRIED `nr` it was passed (`procr·n_i·n_r·ρ_a`
+        #     for the four collection moments, `procr[1]·n_i·n_r·ρ_a²` for `rimesumr`, which
+        #     then trips its own `QSMALL` test and zeroes `qi_qr_nrm/nrd/nrn` with it), so at
+        #     `nr = 0` the whole returned tuple is exact zeros — and with it `nrn_loss`, the
+        #     rain-riming branch of `ishmael_riming_growth` (gated on `qi_qr_nrm > 0`) and
+        #     every ice–rain leg of the donor conductances.
+        #   * The WARM two-moment closures in `microphysics.jl` read the same DSD through
+        #     `rain_dsd_2m` and were audited with it. `rain_selfcollection_2m` needed the same
+        #     gate and carries its own (the clamped breakup rolloff `dum = −312` turns it into
+        #     a number SOURCE on the phantom, which is how a gated rain slot gets a positive
+        #     number back and un-gates Bigg on the next step); `rain_number_evaporation_2m`
+        #     already tested `n_r <= 0`; `invtau_rain_2m` and `rain_fall_speeds_2m` are
+        #     CLAMP-BOUNDED — `n0rr ∝ q_r` at `LAMMINR` makes the first a sink 1.7e3 too SLOW
+        #     rather than a source, and the second is bounded to the 3.4x between the two ends
+        #     of the clamp — and are deliberately left ungated, since gating either would
+        #     strand rain mass that no reconciliation exists to return (their docstrings carry
+        #     the measurements).
+        #   * `_ice_homogeneous_rates` is NOT a DSD consumer and is out of this gate's scope:
+        #     `ṁ = q_r/τ_hf` needs no size distribution, and its number leg is already
+        #     `min(n_r/τ_hf, ṁ/m_min)`, which is exactly `0` at `n_r = 0`. The rain MASS it
+        #     freezes without number is the ordinary mass-without-number defect the population
+        #     reconciliation handles one level up, not a phantom-DSD rate.
+        #
+        # Bitwise inert wherever `n_r > 0`, which is all healthy rain — the branch is not
+        # taken and `bg` is the same call it always was. `options[:rain_population_gate]`,
+        # default TRUE; env `SCYTHE_O01_RAINGATE=0` is forensic only.
+        live_r = (!rain_pop_gate) || nr > 0.0
 
         # ── The two drives (TeX Eqs. qss_ice_shift, Dwi) and the habit-density selector ──
         rvs = rho_vs[i]
@@ -5118,20 +5879,24 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         p1 = live1 ?
              _ice_species_pre(tab, dt, e1, q1, n1, temp, rhoair, mu, dv, kt, nsch, npr,
                               xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
-                              qc, nc, qr, nr, qv) : _ice_empty_pre()
+                              qc, nc, qr, nr, qv, shed) : _ice_empty_pre()
         p2 = live2 ?
              _ice_species_pre(tab, dt, e2, q2, n2, temp, rhoair, mu, dv, kt, nsch, npr,
                               xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
-                              qc, nc, qr, nr, qv) : _ice_empty_pre()
+                              qc, nc, qr, nr, qv, shed) : _ice_empty_pre()
         p3 = live3 ?
              _ice_species_pre(tab, dt, e3, q3, n3, temp, rhoair, mu, dv, kt, nsch, npr,
                               xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
-                              qc, nc, qr, nr, qv) : _ice_empty_pre()
+                              qc, nc, qr, nr, qv, shed) : _ice_empty_pre()
 
         # ── PHASE B: the three liquid donors' conductances, and their one factor each ──────
         # `hf` and `bg` are needed here, so they move ahead of the species loop's remains.
         hf = _ice_homogeneous_rates(temp, qc, nc, qr, nr, tau_hf)
-        bg = ishmael_bigg_freezing(temp, qr, nr, dt; reservoir_caps = false)
+        # Bigg, behind the RAIN POPULATION GATE (see `live_r` above): with no carried drops
+        # there is no rain DSD to freeze, and the exact zeros keep it out of `f_qr`/`f_nr`
+        # and out of `q_nuc`/`n_nuc` alike.
+        bg = live_r ? ishmael_bigg_freezing(temp, qr, nr, dt; reservoir_caps = false) :
+                      (mbiggr = 0.0, nbiggr = 0.0)
         # The rain's EVAPORATION conductance, staged beside the condensation closure where
         # `Q̇_r` and `ρ_r` are both known (Stage 2b; `kappa_ev` in the scratch doc). It is the
         # third sink of the rain reservoir and it is not ice-gated — this loop merely COMPLETES
@@ -5162,15 +5927,18 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # ── PHASE C: the growth at the realized collection, and everything downstream ─────
         r1 = live1 ?
              _ice_species_post(tab, dt, e1, q1, n1, temp, rhoair, mu, dv, kt,
-                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p1, f_qc, f_qr) :
+                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p1, f_qc, f_qr,
+                               shed) :
              _ice_empty_rates()
         r2 = live2 ?
              _ice_species_post(tab, dt, e2, q2, n2, temp, rhoair, mu, dv, kt,
-                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p2, f_qc, f_qr) :
+                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p2, f_qc, f_qr,
+                               shed) :
              _ice_empty_rates()
         r3 = live3 ?
              _ice_species_post(tab, dt, e3, q3, n3, temp, rhoair, mu, dv, kt,
-                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p3, f_qc, f_qr) :
+                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p3, f_qc, f_qr,
+                               shed) :
              _ice_empty_rates()
 
         # ── Aggregation (T ≤ T_0 only, and only if some species has ice to aggregate) ──
@@ -5258,6 +6026,58 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         S.f_ice1[i] = f_i1; S.f_ice2[i] = f_i2; S.f_ice3[i] = f_i3
         FIC = (f_i1, f_i2, f_i3)
 
+        # ── The ICE NUMBER donors: one conductance per species' NUMBER ─────────────────────
+        #
+        # A species' number is a SEPARATE RESERVOIR from its mass, and the three legs that
+        # draw on it are not proportional to the three that draw on the mass:
+        #
+        #   * AGGREGATION's number transfer comes from `coltabn`, the mass transfer from
+        #     `coltab` — two offline tables integrating two different MOMENTS of the same
+        #     collision kernel (`mkcoltb`, ishmael_tables.jl). A pair's `(colamt, deltan)` is
+        #     one collision count, which is what the single-factor hook was argued from, but
+        #     the FRACTION OF THE RESERVOIR each moment loses is not the same number.
+        #     Measured at unit factors on the stiff-cold two-habit fixture (ρ_i = 1e-3,
+        #     n_i = 1e6, T = 259.15 K, Δt = 1 s): κ_q = 1.77e-4 /s against κ_n = 8.21e-5 /s,
+        #     κ_n/κ_q = 0.464; 0.377 at n_i = 1e9; 0.201 on an anvil-like 1e-4 kg/m³,
+        #     5e7 /m³, 240 K state. Here the number kernel is the SLOWER one, so the mass
+        #     factor OVER-realizes the number transfer by up to 5x — and nothing in the
+        #     tables promises it stays on that side of 1 elsewhere.
+        #   * MELTING's number leg is `nmlt = q̇_mlt·(n/q) − dNmltri`. The first term is the
+        #     mass leg's exact number partner; `dNmltri` — the drops the crystal collected
+        #     and is now melting off — is a number sink with NO mass partner in this
+        #     reservoir at all, so κ_{n,melt} > κ_{q,melt} strictly.
+        #   * SUBLIMATION is the one leg where the two conductances agree exactly: the number
+        #     leaves in proportion to the mass, `ṅ = q̇·(n/q)` (`niq`, Fortran lines
+        #     1273-1276), so its contribution to κ_n is its contribution to κ_q identically.
+        #
+        # The construction is the rain's, exactly: the rain MASS and the rain NUMBER are
+        # already two donors with two factors (`f_qr`/`f_nr`) precisely because Bigg's number
+        # conductance is a twentieth of its mass conductance, and realizing the number on the
+        # mass factor there would freeze all of the rain's mass while removing a twentieth of
+        # its drops. This is the ice mirror of that argument, and it is the same failure mode
+        # in the other direction: MASS WITHOUT NUMBER, which is the state the population gate
+        # exists to forbid and which the population reconciliation then has to re-seed.
+        #
+        # The reservoir is the CARRIED number `n_k`, not `e_k.ni` — the budget/kernel split
+        # of `_ice_species_pre`: a kernel rate is meaningful only on a realizable population,
+        # but "how much of the number leaves" is a statement about the number that is there.
+        # Aggregation's number rate is formed on the effective number and applied to the
+        # carried slot, so the carried slot is what has to bound it.
+        #
+        # GATED, default OFF (`options[:ice_number_realization]`, env `SCYTHE_O01_ICENREAL=1`):
+        # with the switch off every factor here is set to that species' MASS factor, which is
+        # what each of these legs already carried, so the whole block is bitwise inert and the
+        # census below measures the state as it stands.
+        nsub1 = (max(-r1.Qdot, 0.0) / rhoair) * r1.niq
+        nsub2 = (max(-r2.Qdot, 0.0) / rhoair) * r2.niq
+        nsub3 = (max(-r3.Qdot, 0.0) / rhoair) * r3.niq
+        nsink1 = (max(-nagg1, 0.0) * i_dt + max(-r1.nmlt, 0.0)) + nsub1
+        nsink2 = (max(-nagg2, 0.0) * i_dt + max(-r2.nmlt, 0.0)) + nsub2
+        nsink3 = (max(-nagg3, 0.0) * i_dt + max(-r3.nmlt, 0.0)) + nsub3
+        f_n1 = ice_n_real ? relaxation_realization(nsink1, n1, dt) : f_i1
+        f_n2 = ice_n_real ? relaxation_realization(nsink2, n2, dt) : f_i2
+        f_n3 = ice_n_real ? relaxation_realization(nsink3, n3, dt) : f_i3
+
         # ── AGGREGATION, PASS TWO: the REALIZED collection ────────────────────────────────
         # The mirror of the riming construction. Pass one ran at unit factors and existed
         # only to put aggregation's draw into `sink1`/`sink2`; the factors are formed now, so
@@ -5268,8 +6088,8 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # → assembly. `qagg3` is formed HERE as the exact negative of what the two donors
         # lost, rather than taken from the routine's own six-term sum (which closes to
         # round-off, not exactly), so the cross-species exchange closes on the realized
-        # numbers. The NUMBER rides the mass factor inside the routine, which keeps the
-        # surviving per-particle mass invariant.
+        # numbers. The NUMBER is scaled inside the routine at the NUMBER donors' factors
+        # (`f_aggn<k>`), which are the mass ones exactly when `ice_number_realization` is off.
         if agg_on
             ag2 = ishmael_aggregation(dt, rhoair, temp,
                                       live1 ? q1 : 0.0, live1 ? e1.ni : 0.0, dn1,
@@ -5278,6 +6098,14 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                                       e1.rhobar, e2.rhobar, phi1, phi2,
                                       tab.coltab, tab.coltabn;
                                       f_agg1 = f_i1, f_agg2 = f_i2,
+                                      f_aggn1 = f_n1, f_aggn2 = f_n2,
+                                      # Species 3's own number factor reaches the kernel
+                                      # ONLY through aggregate self-collection, which is the
+                                      # one pair that carried no factor at all before this
+                                      # stage — hence the explicit `1.0` with the switch off
+                                      # rather than `f_n3`, which is `f_i3` there and would
+                                      # not be the behaviour being reproduced.
+                                      f_aggn3 = ice_n_real ? f_n3 : 1.0,
                                       reservoir_caps = agg_caps)
             qagg1 = ag2.qagg1; qagg2 = ag2.qagg2
             qagg3 = -(qagg1 + qagg2)
@@ -5293,9 +6121,36 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # AND by the rain slot that gains it, so the melt exchange closes exactly as the freeze
         # exchange does.
         MLQ = (f_i1 * r1.qmlt, f_i2 * r2.qmlt, f_i3 * r3.qmlt)
-        MLN = (f_i1 * r1.nmlt, f_i2 * r2.nmlt, f_i3 * r3.nmlt)
+        # The melt NUMBER rides the NUMBER donor's factor, not the mass one — the two are
+        # different reservoirs and `nmlt` carries `dNmltri`, a number sink with no mass
+        # partner (see the number-donor block above). `f_n<k> = f_i<k>` with the switch off,
+        # so this line is bitwise what it was. The rain gains exactly `−MLN[k]` drops through
+        # `ice_nr` below, as it always did: the exchange still closes on ONE name per leg,
+        # and it is the number of drops the melt actually produced. Mass conservation is
+        # untouched either way — the number carries none.
+        MLN = (f_n1 * r1.nmlt, f_n2 * r2.nmlt, f_n3 * r3.nmlt)
+        # The two AXIS moments stay on the MASS factor. `amlt`/`cmlt` are volume moments of
+        # the melting crystal and their number part (`a_i·nmlt/n_i`) is inseparable from
+        # their mass part inside `ishmael_melting`; the moment set's consistency is repaired
+        # by the `var_check` source rather than by splitting this rate.
         MLA = (f_i1 * r1.amlt, f_i2 * r2.amlt, f_i3 * r3.amlt)
         MLC = (f_i1 * r1.cmlt, f_i2 * r2.cmlt, f_i3 * r3.cmlt)
+        # ── What the SUBLIMATION number sink still has to apply, at its own site ───────────
+        # The habit partition's number sink lives in the ETD pre-compute, where the step-mean
+        # deposition rate exists, and it is formed there as `q̄_k·(n_k/q_k)` — so it already
+        # carries whatever factor `invtau_i<k>` carries, which is `f_i<k>` where `sub_now`
+        # classified the channel as a sink and nothing where it did not. What is written here
+        # is the RESIDUAL: multiply by this and the leg is realized at `f_n<k>` exactly, one
+        # number for one reservoir. An exact `1.0` with the switch off, so that site is
+        # bitwise. The guard is for the overflow corner of `J₀`: `relaxation_realization`
+        # returns a true `0.0` once `κΔt` overflows to `Inf`, and there the leg it would
+        # divide into is an exact zero anyway.
+        S.f_isn1[i] = !ice_n_real ? 1.0 :
+                      (sub_now ? (f_i1 > 0.0 ? f_n1 / f_i1 : 1.0) : f_n1)
+        S.f_isn2[i] = !ice_n_real ? 1.0 :
+                      (sub_now ? (f_i2 > 0.0 ? f_n2 / f_i2 : 1.0) : f_n2)
+        S.f_isn3[i] = !ice_n_real ? 1.0 :
+                      (sub_now ? (f_i3 > 0.0 ? f_n3 / f_i3 : 1.0) : f_n3)
 
         target = igr <= 1.0 ? 1 : 2
         # ── ONE realization factor per DONOR RESERVOIR, over ALL of that donor's legs ───────
@@ -5316,12 +6171,82 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # cannot come apart. `dQIfzri` is the ICE that moved species because it collected
         # rain — the same collision events — so it rides the rain-mass factor with its
         # partners rather than carrying one of its own.
-        mim  = f_qc * hf.mim;    nim  = f_qc * hf.nim
-        mimr = f_qr * hf.mimr;   nimr = f_nr * hf.nimr
-        mbig = f_qr * bg.mbiggr; nbig = f_nr * bg.nbiggr
+        #
+        # ── THE MINIMUM-CRYSTAL BOUND ON EVERY REALIZED ICE-NUMBER SOURCE ────────────────
+        #
+        # [`_ice_homogeneous_rates`](@ref) states the rule: every ice NUMBER source must seed
+        # crystals at or above the smallest size the scheme resolves, so a number rate is
+        # `min(n/τ, ṁ/m_min)` — the mass transfers in full and the number is what that mass
+        # supports at [`ISHMAEL_M_MIN`](@ref). It is the SOURCE-side twin of the POPULATION
+        # GATE above ("no rate may act on a population the CARRIED number does not support"),
+        # and it is stated there at the RATE. The rate is not where it survives.
+        #
+        # A number leg and its mass partner are realized at DIFFERENT donor factors wherever
+        # they draw on different reservoirs, and `min` does not commute with two of them:
+        # `f·min(a, b) = min(f·a, f·b)` for ONE shared `f ≥ 0`, but `min(f_n·a, f_q·b)` is
+        # bounded by neither when `f_n ≫ f_q`. That is exactly the anvil-top pathology
+        # (reference/FINDINGS_ISHMAEL_S8S9.md §5i), four stacked failures in one term:
+        # the rain slots decorrelate at 15 km — `n_r` rings to EXACTLY zero while `q_r` stays
+        # ~1e-8 kg/kg at 192–203 K; `ishmael_bigg_freezing` gates on `q_r` alone, so
+        # `ishmael_rain_lambda` floors the number at `QNSMALL` and lands in the
+        # `lamr < LAMMINR` clamp — a PHANTOM DSD of 2800 μm drops, the largest the scheme
+        # admits, where there is no rain at all; Bigg is then evaluated 30–40 K outside its
+        # validity, `exp(0.66ΔT) ~ 1e21`; and the number leg is realized at
+        # `f_nr = relaxation_realization(rate, 0.0, dt) = 1.0` — the zero-reservoir guard,
+        # which is correct for a factor and catastrophic for a bound — while `f_qr` clamps
+        # the mass leg to 1.8e-19…2.3e-17. The SAME collisions, realized seventeen to
+        # nineteen orders apart. What reached species 1 was ~1e15 m⁻³ s⁻¹ of crystals
+        # carrying 1e-6·`M_MIN` each (`n₁` at 1.5e16 m⁻³ against `q₁ = 0` exactly, immortal
+        # because every sink is live-gated), and the ringing of that spike through the number
+        # moment's spline fit is the mass-without-number lobe that made 70% of the quick
+        # arm's ice cloud — and 99% of the rejected full-mode run's — dead mass.
+        #
+        # So the bound is restated HERE, on the REALIZED pair, where both factors exist:
+        #
+        #     n_leg ≤ m_leg / ISHMAEL_M_MIN
+        #
+        # Δt-FREE (a relation between two simultaneous rates, not a depletion cap — refining
+        # the step still approaches the same differential equation), one-sided, and EXACTLY
+        # INERT wherever the number source already respects its mass partner, which is
+        # everywhere the two factors agree. It carries NO off-switch: like the population
+        # gate it is an invariant of the representation, not a parameterization choice.
+        #
+        # Leg by leg:
+        #   * `nim` (homogeneous CLOUD freezing) is bounded at the rate and realized at the
+        #     SAME `f_qc` as `mim`, so the `min` cannot bind beyond rounding. Written anyway,
+        #     so that the invariant does not rest on the two factors staying equal.
+        #   * `nimr` (homogeneous RAIN freezing) carries `f_nr` against `f_qr`: two factors,
+        #     so the rate-level `min(n_r/τ_hf, ṁ/m_min)` does NOT survive realization, and
+        #     this is where it is restored. §5i measured this leg contributing exactly 0 at
+        #     the pathological points — the rate-level bound doing its job at `n_r = 0`, the
+        #     bound Bigg lacks — and this keeps that true after the factors.
+        #   * `nbig` (Bigg) is the measured pump: no rate-level bound of any kind.
+        #   * `FzN` (ice–rain collection) is the drops that froze onto a crystal and moved it
+        #     to another species. The mass those `FzN[k]` particles carry to the destination
+        #     is `RfzQ[k]`, the RAIN mass frozen (new ice), PLUS `IfzQ[k]`, that species' own
+        #     ice — a species TRANSFER rather than new mass, but mass moving with the same
+        #     particles, hence part of what they weigh once they arrive. Both ride `f_qr`, so
+        #     their sum is the crystal mass the number must be supported by and it is what
+        #     the bound divides. This leg was never the pathology: the kernel self-gates at
+        #     `n_r = 0` (every `procr` rate carries a factor `nr`). It is bounded for the same
+        #     reason the homogeneous ones are — an invariant may not rest on a kernel's
+        #     internals.
+        #   * `dm.nnuccd`/`dm.mnuccd` (DeMott) and `r_k.nmult`/`r_k.qmult` (Hallett-Mossop)
+        #     need nothing. `mnuccd ≡ nnuccd·ISHMAEL_M_MIN` by construction and the splinter
+        #     pair is 350 crystals per mg at the 5 μm mass; decisively, NEITHER pair is
+        #     multiplied by a realization factor at all — both enter `q_nuc`/`n_nuc` bare —
+        #     so there is no second factor to break the ratio.
+        mim  = f_qc * hf.mim
+        nim  = min(f_qc * hf.nim, mim / ISHMAEL_M_MIN)
+        mimr = f_qr * hf.mimr
+        nimr = min(f_nr * hf.nimr, mimr / ISHMAEL_M_MIN)
+        mbig = f_qr * bg.mbiggr
+        nbig = min(f_nr * bg.nbiggr, mbig / ISHMAEL_M_MIN)
         RfzQ = (f_qr * r1.dQRfzri, f_qr * r2.dQRfzri, f_qr * r3.dQRfzri)
         IfzQ = (f_qr * r1.dQIfzri, f_qr * r2.dQIfzri, f_qr * r3.dQIfzri)
-        FzN  = (f_nr * r1.dNfzri, f_nr * r2.dNfzri, f_nr * r3.dNfzri)
+        FzN  = (min(f_nr * r1.dNfzri, (RfzQ[1] + IfzQ[1]) / ISHMAEL_M_MIN),
+                min(f_nr * r2.dNfzri, (RfzQ[2] + IfzQ[2]) / ISHMAEL_M_MIN),
+                min(f_nr * r3.dNfzri, (RfzQ[3] + IfzQ[3]) / ISHMAEL_M_MIN))
         NRN  = (f_nr * r1.nrn_loss, f_nr * r2.nrn_loss, f_nr * r3.nrn_loss)
         qIfz_in = target == 1 ? (IfzQ[2] + IfzQ[3]) : (IfzQ[1] + IfzQ[3])
         nIfz_in = target == 1 ? (FzN[2] + FzN[3]) : (FzN[1] + FzN[3])
@@ -5372,6 +6297,30 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                              MC_DONOR_QFLOOR, dt)
             mc_donor_census!(stx, tid_x, MC_DONOR_I3, max(-MLQ[3], 0.0) - qagg3 * i_dt, q3,
                              MC_DONOR_QFLOOR, dt)
+            # ── The three ICE NUMBER reservoirs (Stage 1b) ────────────────────────────────
+            # The same three legs on the other moment, at the numbers the step applies:
+            # aggregation's REALIZED number transfer (`nagg<k>` is pass two's, and already a
+            # per-step increment, so it is divided by the reservoir directly while the two
+            # rates carry a `Δt`), the realized melt number `MLN`, and the sublimation number
+            # sink at whatever factor it will be applied with — `f_n<k>` under the switch,
+            # and what `invtau_i<k>` alone carries without it.
+            #
+            # The sublimation term is the STATE-n instantaneous rate, not the step-mean one
+            # the ETD site applies; that is the same approximation the ice MASS conductance
+            # is formed on (`sink<k>` above), and its own step-mean reading is the
+            # `MC_DONOR_S*` block. Reported, never limiting, in both modes.
+            nsr1 = (ice_n_real ? f_n1 : (sub_now ? f_i1 : 1.0)) * nsub1
+            nsr2 = (ice_n_real ? f_n2 : (sub_now ? f_i2 : 1.0)) * nsub2
+            nsr3 = (ice_n_real ? f_n3 : (sub_now ? f_i3 : 1.0)) * nsub3
+            mc_donor_census!(stx, tid_x, MC_DONOR_N1,
+                             (max(-MLN[1], 0.0) + max(-nagg1, 0.0) * i_dt) + nsr1, n1,
+                             MC_DONOR_NFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_N2,
+                             (max(-MLN[2], 0.0) + max(-nagg2, 0.0) * i_dt) + nsr2, n2,
+                             MC_DONOR_NFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_N3,
+                             (max(-MLN[3], 0.0) + max(-nagg3, 0.0) * i_dt) + nsr3, n3,
+                             MC_DONOR_NFLOOR, dt)
         end
 
         # ── The ATTRIBUTION CENSUS (opt-in; see `MC_ATTR_QR_HOM`) ─────────────────────────
@@ -5719,6 +6668,34 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool
     # The rate-side leg (see the read block in `mc_ice_sources!`): ditto.
     ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool
+    # The POPULATION reconciliation — the FOURTH tier of the chain (TeX §"Reconciliation of
+    # the population"): ice mass whose carried number is not positive is orphaned by the
+    # population gate, exempt from every rate AND from every device that could remove it, and
+    # is returned here to a representation the physics can act on — rain above `T_0` with
+    # `L_f` absorbed, 2 μm crystals below it. `ice_pop_src` gates the SOURCE only; the
+    # `MC_POP_*` census measures the defect either way. Env `SCYTHE_O01_POPSRC=0`.
+    tau_pop = get(model.physical_params, :tau_ice_population, 10.0)
+    ice_pop_src = get(model.options, :ice_population_source, true)::Bool
+    # WHICH crystal the below-`T_0` branch seeds: `:min` (the 2 μm sphere, the fastest
+    # response), `:large` (`var_check`'s own re-diagnosis of the dead mass at the floor
+    # number — the size-sorted particles the mass came from; `_ice_population_seed_large`)
+    # or `:local` (the per-crystal mass, habit and bulk density of the nearest live
+    # gridpoint of the same species in the column — the crystals the ringing's negative
+    # lobe lost, which are the ones next door; `_ice_population_seed_local`).
+    # DEFAULT `:local`, chosen by measurement (reference/FINDINGS_ISHMAEL_S8S9.md §§5f-5j):
+    # it is the only seed that both reconciles the dead mass and leaves the ice cloud at its
+    # unreconciled magnitude. Env `SCYTHE_O01_POPSEED` selects `:min` or `:large`.
+    pop_seed = get(model.options, :ice_population_seed, :local)::Symbol
+    pop_seed in (:min, :large, :local) ||
+        error("options[:ice_population_seed] = :$(pop_seed) is not recognized; use :min " *
+              "(the 2 um sphere), :large (var_check's large-ice re-diagnosis) or :local " *
+              "(the nearest live neighbour's crystals in the same column)")
+    # TeX §Departures (e): above `T_0` a crystal that collects liquid SHEDS it. The collection
+    # kernels still run — the melting rate keeps the sensible heat of the liquid that struck
+    # the crystal — but no mass leaves the cloud or the rain and no `L_f` is released.
+    # Applied at the CONSUMER (`_ice_species_pre`/`_ice_species_post`), never by gating the
+    # ported kernel, so the reference harness stays bitwise. Env `SCYTHE_O01_SHED=0`.
+    ice_shed = get(model.options, :ice_shed_above_t0, true)::Bool
     # The per-channel ATTRIBUTION census (`MC_ATTR_*`), opt-in and default OFF: it decomposes
     # the `MC_DONOR_*` breaches by LEG, which is a Stage-0 measurement rather than a standing
     # diagnostic. Writes only into `mc_water_stats`; no rate, state or slot is a function of
@@ -5740,6 +6717,24 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # — i.e. it restores the pre-Stage-2b answer BITWISE, on the warm path as well as the ice
     # one. Forensics only. Env `SCYTHE_O01_EVAPREAL=0` in benchmarks/o01_rainfall.jl.
     rain_evap_real = get(model.options, :rain_evap_realization, true)::Bool
+    # STAGE 1b: whether each ICE SPECIES' NUMBER is realized on its OWN donor conductance
+    # rather than on its mass factor (TeX §donor_relax; see the number-donor block in
+    # `mc_ice_sources!`). Default OFF — `false` sets every number factor to the species' mass
+    # factor and every `f_isn<k>` to an exact `1.0`, which is what the three number legs
+    # (aggregation's `deltan`, the melt number, the sublimation number sink) already carried,
+    # so the answer is BITWISE the pre-Stage-1b one. The `MC_DONOR_N*` census rows are written
+    # in BOTH modes: what they read with the switch off is the measurement the switch exists
+    # to answer. Env `SCYTHE_O01_ICENREAL=1` in benchmarks/o01_rainfall.jl.
+    ice_n_real = get(model.options, :ice_number_realization, false)::Bool
+    # STAGE 3e: the RAIN POPULATION GATE — where the CARRIED rain number is not positive, the
+    # kernels that read a rain SIZE DISTRIBUTION see no rain (see the `live_r` block in
+    # `mc_ice_sources!`, and reference/FINDINGS_ISHMAEL_S8S9.md §5i for the 2800 μm phantom
+    # DSD it forbids). Default ON: it is the rain's statement of the ice population gate, and
+    # it is bitwise inert wherever `n_r > 0`. `false` restores the phantom-DSD answer for
+    # forensics and NOTHING else — the minimum-crystal bound on the realized number sources
+    # that ships with it has no switch, being an invariant rather than a parameterization.
+    # Env `SCYTHE_O01_RAINGATE=0` in benchmarks/o01_rainfall.jl.
+    rain_pop_gate = get(model.options, :rain_population_gate, true)::Bool
     # Turbulent Prandtl number for the Smagorinsky heat diffusion (Khdiff_heat < 0
     # sentinel, below). 1.0 = heat mixes with the same eddy diffusivity as momentum.
     Pr_t = get(model.physical_params, :Pr_t, 1.0)
@@ -6565,7 +7560,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_ice_sources!(S, mtile.ishmael_tables, model.ts, max_N_c,
                         get(model.options, :condensation, true)::Bool,
                         get(model.options, :ice_var_check, true)::Bool,
-                        ice_anchor_rts, ice_attr, ice_agg_caps, rain_evap_real,
+                        ice_anchor_rts, ice_attr, ice_agg_caps, rain_evap_real, ice_shed,
+                        ice_n_real, rain_pop_gate,
                         get(model.physical_params, :tau_homogeneous, 5.0),
                         get(model.physical_params, :tau_activation, 1.0),
                         get(model.physical_params, :tau_varcheck, 5.0),
@@ -6584,6 +7580,25 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         _ice_anchor_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
                                rho_t, rho_d, rho_liq, rho_ice,
                                tau_anchor, ice_anchor_src, model.ts)
+
+        # The POPULATION RECONCILIATION — the fourth and last tier, in the same slot and for
+        # the same reason as the third: the process sources are assembled and nothing has
+        # read them yet. It is the exact complement of the population gate above — mass whose
+        # carried number is not positive, which no rate may act on and which no device could
+        # therefore remove — returned to a representation the equations can use: rain above
+        # `T_0` with `L_f` absorbed through `FRZ_NET`, 2 μm crystals below it, on `τ_pop`.
+        # Census `MC_POP_*`; TeX §"Reconciliation of the population".
+        # Switched off with the liquid phase changes by `options[:condensation] = false`,
+        # for the same reason `mc_ice_sources!` is: BOTH branches move water between
+        # categories (the warm one moves mass and `L_f`, the cold one creates crystals), and
+        # a run advertised as "no physics" — the transport-only fixtures included — must not.
+        # That is the one difference from leg A, which is a pure bookkeeping projection and
+        # runs regardless. The CENSUS is unaffected either way.
+        _ice_population_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
+                                   Tk, rho_d, tau_pop,
+                                   ice_pop_src && get(model.options, :condensation,
+                                                      true)::Bool,
+                                   model.ts, pop_seed)
 
         # The SEDIMENTATION ANCHOR SHARE (a leg of the partition reconciliation, TeX
         # §Reconciliation of the condensate partition). At a detached point the slots carry
@@ -7732,6 +8747,12 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             # worth of it is laid onto the spheroid. Gated on `capgam > 0` — an exact 0.0 for
             # a gated species — so the zero-ice path is untouched, bitwise.
             subl = drive_bar < 0.0
+            # `f_isn<k>` is the ice NUMBER donor's residual factor (Stage 1b): the sublimation
+            # number sink is `q̄_k·(n_k/q_k)`, so it arrives here already carrying the MASS
+            # factor that `invtau_i<k>` folded in, and this is what takes it the rest of the
+            # way to its own reservoir's `J₀(κ_{n,k}Δt)`. An exact `1.0` unless
+            # `options[:ice_number_realization]` is on, so the three lines below are bitwise
+            # what they were. See the number-donor block in `mc_ice_sources!`.
             cg1 = S.hab1_cg[i]
             if cg1 > 0.0 && q1 != 0.0
                 afn1 = q1 / (4.0 * pi * S.hab1_nim3[i] * cg1)
@@ -7742,7 +8763,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                         ISHMAEL_I_GAMMNU, ISHMAEL_FOURTHIRDSPI)
                 S.etd_da1[i] = ts * S.J_i1a[i] * dp1.ard
                 S.etd_dc1[i] = ts * S.J_i1c[i] * dp1.crd
-                S.etd_dn1[i] = q1 < 0.0 ? ts * S.J_i1n[i] * (q1 * S.hab1_niq[i]) : 0.0
+                S.etd_dn1[i] = q1 < 0.0 ?
+                    ts * S.J_i1n[i] * (q1 * S.hab1_niq[i] * S.f_isn1[i]) : 0.0
             else
                 S.etd_da1[i] = 0.0; S.etd_dc1[i] = 0.0; S.etd_dn1[i] = 0.0
             end
@@ -7756,7 +8778,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                         ISHMAEL_I_GAMMNU, ISHMAEL_FOURTHIRDSPI)
                 S.etd_da2[i] = ts * S.J_i2a[i] * dp2.ard
                 S.etd_dc2[i] = ts * S.J_i2c[i] * dp2.crd
-                S.etd_dn2[i] = q2 < 0.0 ? ts * S.J_i2n[i] * (q2 * S.hab2_niq[i]) : 0.0
+                S.etd_dn2[i] = q2 < 0.0 ?
+                    ts * S.J_i2n[i] * (q2 * S.hab2_niq[i] * S.f_isn2[i]) : 0.0
             else
                 S.etd_da2[i] = 0.0; S.etd_dc2[i] = 0.0; S.etd_dn2[i] = 0.0
             end
@@ -7770,7 +8793,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                         ISHMAEL_I_GAMMNU, ISHMAEL_FOURTHIRDSPI)
                 S.etd_da3[i] = ts * S.J_i3a[i] * dp3.ard
                 S.etd_dc3[i] = ts * S.J_i3c[i] * dp3.crd
-                S.etd_dn3[i] = q3 < 0.0 ? ts * S.J_i3n[i] * (q3 * S.hab3_niq[i]) : 0.0
+                S.etd_dn3[i] = q3 < 0.0 ?
+                    ts * S.J_i3n[i] * (q3 * S.hab3_niq[i] * S.f_isn3[i]) : 0.0
             else
                 S.etd_da3[i] = 0.0; S.etd_dc3[i] = 0.0; S.etd_dn3[i] = 0.0
             end

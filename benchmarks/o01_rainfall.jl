@@ -244,6 +244,20 @@ function o01_model(opts::BenchmarkOptions)
     # SCYTHE_O01_ATTR's MC_ATTR_AGG1_SAT count (which is what says whether they bind at all).
     haskey(ENV, "SCYTHE_O01_AGGCAPS") &&
         (options[:ice_agg_caps] = ENV["SCYTHE_O01_AGGCAPS"] != "0")
+    # ICE NUMBER REALIZATION (Stage 1b): each species' NUMBER as a donor reservoir of its
+    # own, with its own conductance over the three legs that draw on it (aggregation's
+    # `deltan`, the melt number `nmlt`, the sublimation number sink) instead of riding the
+    # species' MASS factor. The two are not proportional -- `colamt` and `colamtn` come from
+    # two offline tables integrating two different moments of the collection kernel (measured
+    # kappa_n/kappa_q = 0.46 on the stiff-cold fixture, 0.20 on an anvil-like state), and the
+    # melt number carries `dNmltri`, a number sink with no mass partner. Unset => OFF, the
+    # committed default and BITWISE the pre-Stage-1b answer on every path. `=1` turns it on.
+    # Read it against the three new MC_DONOR_N1/N2/N3 census rows, which are written in BOTH
+    # modes: what they read with this off is the measurement, what they read with it on is
+    # `1 - exp(-kappa_n dt) <= 1` by construction. The question it was built for is the
+    # glaciated hour's number-less ice mass -- the MC_POP_MAX/MC_POP_SEED rows.
+    haskey(ENV, "SCYTHE_O01_ICENREAL") &&
+        (options[:ice_number_realization] = envflag("SCYTHE_O01_ICENREAL"))
     # RAIN EVAPORATION in the rain donor's conductance (Stage 2b; TeX §donor_relax, "The rain
     # reservoir has a third sink that lived outside its conductance"). Unset => on, the
     # committed construction: `kappa_ev = max(-Qdot_r,0)/rho_r` joins `kappa_tot`, one factor
@@ -257,6 +271,71 @@ function o01_model(opts::BenchmarkOptions)
     # MC_DONOR_QR row, which only measures the combined draw with it on.
     haskey(ENV, "SCYTHE_O01_EVAPREAL") &&
         (options[:rain_evap_realization] = ENV["SCYTHE_O01_EVAPREAL"] != "0")
+    # The POPULATION-reconciliation timescale [s], the fourth tier of the reconciliation
+    # chain (Stage 3a; TeX §"Reconciliation of the population"). Unset => 10.0, the
+    # tau_anchor class, bitwise. Ice-arm only.
+    haskey(ENV, "SCYTHE_O01_TAUPOP") &&
+        (physical_params[:tau_ice_population] = parse(Float64, ENV["SCYTHE_O01_TAUPOP"]))
+    # The population-reconciliation SOURCE switch. Unset => on (the committed default): ice
+    # mass whose carried number is not positive is orphaned by the population gate — no rate
+    # may act on it, so no device can remove it either — and is returned to a representation
+    # the equations can use, as rain with L_f above T_0 and as 2 um crystals below it. `=0`
+    # drops both transfers while the MC_POP_* census keeps measuring the defect: the bitwise
+    # reproduction of the unreconciled tree, in which the sub-melting-level ice is 97-99.9%
+    # number-less by mass over the final half hour.
+    haskey(ENV, "SCYTHE_O01_POPSRC") &&
+        (options[:ice_population_source] = ENV["SCYTHE_O01_POPSRC"] != "0")
+    # WHICH crystal the below-T_0 branch of that source seeds. Unset => `:local`, the
+    # committed default (author decision 2026-08-31, on the measurements below and in
+    # reference/FINDINGS_ISHMAEL_S8S9.md 5f-5j). `=min` is the 2 um sphere, the smallest the
+    # scheme resolves, the fastest-responding population and the slowest-falling one; it
+    # reconciles the dead mass but pays a deposition surface stiff enough to sublimate the
+    # seed inside a step and leaves a third of the cloud (IWP 3.43 -> 1.07, ice top 18.8 ->
+    # 15.4 km). `=large` seeds instead what
+    # var_check re-diagnoses from the dead mass at the floor number -- the 1 mm large-ice
+    # limit at the species' bulk density, i.e. the SIZE-SORTED particles the number-less mass
+    # actually is (its mass-weighted fall speed outran its number-weighted one). The 2 um
+    # seeding puts ~1e12 crystals/m^3 on the 6e-3 kg/m^3 dead masses this run carries, a
+    # deposition surface stiff enough to sublimate within a step in subsaturated air (ts/tau
+    # 31 on ice1, 9.7 on ice3) and measured thinning the ice cloud 3x; `=large` is ~1.5e10
+    # times fewer particles for the same mass, and was measured leaving the cloud 72% dead at
+    # 3600 s -- too sparse to survive the number field's own transport ringing, so the mass is
+    # dead again the next step, its windows passing only because nothing was reconciled. The
+    # DEFAULT `:local` is the seed those two measurements motivate: the dead mass is the
+    # NEGATIVE LOBE of the number moment's ringing (its other face is the 3e13 /L number
+    # spikes beside it), so the crystals it lost are the crystals NEXT DOOR -- the per-crystal
+    # mass, habit and bulk density of the nearest gridpoint in the same column where that
+    # species is still live, clamped between the `:min` and `:large` crystals and put through
+    # var_check. It keeps the cloud at its unreconciled magnitude (IWP 3.30, ice top 19.2 km)
+    # and, with the Stage 3e minimum-crystal bound and rain population gate, reconciles it:
+    # 2.7% dead mass at 3600 s, 9/11 windows, max n_i1 1.7e5 /L. Either non-default arm is
+    # answer-changing on the ice path and bitwise inert on the warm and dry ones.
+    haskey(ENV, "SCYTHE_O01_POPSEED") &&
+        (options[:ice_population_seed] = Symbol(ENV["SCYTHE_O01_POPSEED"]))
+    # The RAIN POPULATION GATE (Stage 3e; FINDINGS 5i). Unset => ON, the committed default:
+    # where the CARRIED rain number is not positive, the kernels that need a rain SIZE
+    # DISTRIBUTION see no rain. ishmael_rain_lambda floors nr at QNSMALL and clamps the slope
+    # to LAMMINR, so a rain slot that rang to mass-without-number is handed to every DSD
+    # consumer as 2800 um drops -- the largest particle the scheme admits, at 192-203 K where
+    # Bigg's exp(0.66 dT) is 1e21. That was the number pump: ~1e15 /m^3/s of ice crystals at a
+    # millionth of the minimum resolved mass, and the anvil 70-99% dead mass behind it.
+    # Bigg is the only kernel this switches off -- ishmael_ice_rain_riming self-gates, every
+    # rate it returns carrying a factor of the carried nr. Bitwise inert wherever n_r > 0, so
+    # `=0` is a forensic arm and not an ablation of anything the healthy storm uses. The
+    # minimum-crystal bound on the realized ice-number sources that ships with it has NO
+    # switch: it is an invariant, like the ice population gate.
+    haskey(ENV, "SCYTHE_O01_RAINGATE") &&
+        (options[:rain_population_gate] = ENV["SCYTHE_O01_RAINGATE"] != "0")
+    # SHED ABOVE THE FREEZING LEVEL (Stage 3b; TeX §Departures (e)): above T_0 a crystal that
+    # collects liquid sheds it, so there is no liquid-to-ice conversion — the collection rate
+    # is still evaluated, so the melting rate keeps the sensible heat of the liquid that
+    # struck the crystal, but no mass leaves the cloud or the rain and no L_f is released.
+    # Unset => on (the committed default). `=0` restores ISHMAEL's ungated wet-growth
+    # transfer, which the census caught taking the whole of the rain into the ice in a single
+    # step two degrees above freezing; read it against SCYTHE_O01_ATTR's MC_ATTR_WARM_RIME_R
+    # and MC_ATTR_WARM_MELT, which are that loop. Inert below T_0, bitwise.
+    haskey(ENV, "SCYTHE_O01_SHED") &&
+        (options[:ice_shed_above_t0] = ENV["SCYTHE_O01_SHED"] != "0")
     # The attribution block is PRINTED only by the periodic stiffness trace, so asking for
     # the census without a trace interval would integrate an hour and report nothing: the
     # knob supplies the production interval (4000 steps) unless one was given explicitly.

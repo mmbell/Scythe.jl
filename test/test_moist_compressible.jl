@@ -5057,9 +5057,14 @@ using Springsteel
     species, and DeMott nucleation only ever fills one of the two habits (the one the
     inherent growth ratio selects at the column's temperature).
     """
+    # `n_i_levels`: restrict species 1's NUMBER (and its two volume moments) to those
+    # vertical levels of every column, leaving its MASS uniform. That is a column with a
+    # live population over part of its depth and number-less mass over the rest — the
+    # fixture the `:local` seeding needs, and the shape the transport's ringing actually
+    # makes. `nothing` (the default) is the uniform column every other test uses.
     function make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3, rho_i = 1.0e-5,
                             n_i = 5.0e4, r_i = 30.0e-6, rho_r = 0.0, n_r = 0.0,
-                            rho_i2 = 0.0, n_i2 = 0.0, r_i2 = 30.0e-6,
+                            rho_i2 = 0.0, n_i2 = 0.0, r_i2 = 30.0e-6, n_i_levels = nothing,
                             kDim = 16, ts = 0.1, extra_options = Dict{Symbol,Any}(),
                             extra_params = Dict{Symbol,Float64}())
         # No `:vapor_retrieval` here: it was the ice arm's opt-out from the regime-blended
@@ -5089,10 +5094,11 @@ using Springsteel
         patch.physical .= 0.0
         s = Dict(v => i for (i, v) in vars)
         for i in 1:size(patch.physical, 1)
+            n_here = (n_i_levels === nothing || mod1(i, kDim) in n_i_levels) ? n_i : 0.0
             patch.physical[i, vars["rho_i1"], 1] = rho_i
-            patch.physical[i, vars["n_i1"], 1] = n_i
-            patch.physical[i, vars["a_i1"], 1] = n_i * r_i^3
-            patch.physical[i, vars["c_i1"], 1] = n_i * r_i^3
+            patch.physical[i, vars["n_i1"], 1] = n_here
+            patch.physical[i, vars["a_i1"], 1] = n_here * r_i^3
+            patch.physical[i, vars["c_i1"], 1] = n_here * r_i^3
             patch.physical[i, vars["rho_i2"], 1] = rho_i2
             patch.physical[i, vars["n_i2"], 1] = n_i2
             patch.physical[i, vars["a_i2"], 1] = n_i2 * r_i2^3
@@ -5651,6 +5657,207 @@ using Springsteel
         end
     end
 
+    @testset "ice: the ice NUMBER is a donor reservoir of its own" begin
+        # STAGE 1b. A species' NUMBER and its MASS are two reservoirs, and the three legs
+        # that draw on the number are not proportional to the three that draw on the mass:
+        # aggregation's `deltan` comes from `coltabn` and its `colamt` from `coltab` (two
+        # offline tables, two moments of one kernel), the melt number carries `dNmltri` — the
+        # collected drops, a number sink with NO mass partner — and only sublimation's two
+        # conductances agree, exactly (`niq = n/q`). Until this stage all three number legs
+        # rode the MASS factor, on the claim that a pair's `(colamt, deltan)` is one collision
+        # count. It is; that does not make the two RESERVOIR FRACTIONS equal.
+        #
+        # Four claims: (1) the kernel takes the two moments' factors separately and the
+        # defaults are the old single-factor form bitwise; (2) the option is OFF by default
+        # and absent-vs-false is bitwise; (3) the new census rows read the number draw in both
+        # modes; (4) on a state where the number leg genuinely over-draws, the switch is what
+        # puts it back under one reservoir per step.
+        drow(ch) = Scythe.MC_DONOR_FIRST + Scythe.MC_DONOR_N * (ch - 1)
+
+        # ── (1) THE KERNEL HOOK ─────────────────────────────────────────────────────────
+        # `ishmael_aggregation` now scales `colamt` by `f_agg<k>` and `deltan` by
+        # `f_aggn<k>`. Mass and number must move independently, and the defaults
+        # (`f_aggn<k> = f_agg<k>`, `f_aggn3 = 1`) must reproduce the shipped behaviour to the
+        # bit — that is what makes the whole stage opt-in.
+        let
+            tab = Scythe.load_ishmael_tables_or_error()
+            rhoair = 0.95; dt = 1.0; temp = 259.15
+            q = 1.0e-3 / rhoair; n = 1.0e6 / rhoair; a = 1.0e6 * (30.0e-6)^3 / rhoair
+            e1 = Scythe._ice_effective(q, n, a, a, 1)
+            e2 = Scythe._ice_effective(q, n, a, a, 2)
+            e3 = Scythe._ice_effective(0.0, 0.0, 0.0, 0.0, 3)
+            d1 = clamp(2.0 * ((e1.ai^2) / (e1.ci * e1.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            d2 = clamp(2.0 * ((e2.ci^2) / (e2.ai * e2.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            phi1 = clamp(e1.ci / e1.ai * Scythe.gamma(Scythe.ISHMAEL_NU - 1.0 + e1.deltastr) *
+                         Scythe.ISHMAEL_I_GAMMNU, 0.01, 100.0)
+            phi2 = clamp(e2.ci / e2.ai * Scythe.gamma(Scythe.ISHMAEL_NU - 1.0 + e2.deltastr) *
+                         Scythe.ISHMAEL_I_GAMMNU, 0.01, 100.0)
+            agg(; kw...) = Scythe.ishmael_aggregation(dt, rhoair, temp,
+                                q, e1.ni, d1, q, e2.ni, d2, 0.0, 0.0, 1.0e-4,
+                                e1.rhobar, e2.rhobar, phi1, phi2,
+                                tab.coltab, tab.coltabn; kw...)
+            base = agg()
+            # ACTIVE: this state aggregates in both moments, or nothing below is a statement.
+            @test base.qagg1 < 0.0
+            @test base.nagg1 < 0.0
+            # THE MEASUREMENT the stage rests on: the two conductances are different numbers.
+            # `kappa_n/kappa_q` here is ~0.46 — the number kernel is the SLOWER one at this
+            # state, so the mass factor OVER-realizes the number transfer by a factor of two.
+            # It is the INEQUALITY that matters, not its direction: two reservoirs, two
+            # conductances, and neither bounds the other.
+            kq = -base.qagg1 / dt / q
+            kn = -base.nagg1 / dt / n
+            @test !(kq ≈ kn)
+            @test 0.1 < kn / kq < 0.9
+            # The defaults ride the mass factor, bitwise — the pre-Stage-1b hook.
+            @test agg(f_agg1 = 0.4, f_agg2 = 0.7) ==
+                  agg(f_agg1 = 0.4, f_agg2 = 0.7, f_aggn1 = 0.4, f_aggn2 = 0.7,
+                      f_aggn3 = 1.0)
+            # ...and the two moments then separate: halving ONLY the number factor halves
+            # `nagg1` and leaves `qagg1` untouched to the bit.
+            half = agg(f_aggn1 = 0.5)
+            @test half.qagg1 == base.qagg1
+            @test half.nagg1 ≈ 0.5 * base.nagg1 rtol=1.0e-14
+            # ...and the mass factor alone moves the mass and not the number.
+            hq = agg(f_agg1 = 0.5, f_aggn1 = 1.0)
+            @test hq.qagg1 ≈ 0.5 * base.qagg1 rtol=1.0e-14
+            @test hq.nagg1 == base.nagg1
+            # Unit factors are the Fortran, to the bit.
+            @test agg(f_agg1 = 1.0, f_agg2 = 1.0, f_aggn1 = 1.0, f_aggn2 = 1.0,
+                      f_aggn3 = 1.0) == base
+        end
+
+        # ── (2) DEFAULT OFF, AND BITWISE ────────────────────────────────────────────────
+        # The option absent and the option explicitly `false` must be the same run, and both
+        # must be the run that existed before the number factors did. The second half of that
+        # cannot be asserted from inside the suite, so what is asserted is the part that can
+        # be: the switch is inert until it is thrown, and throwing it changes the answer.
+        mktempdir() do tmpdir
+            function run_cold(opts)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 259.15,
+                                                  rho_i = 1.0e-3, n_i = 1.0e6,
+                                                  rho_i2 = 1.0e-3, n_i2 = 1.0e6, ts = 1.0,
+                                                  extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                m.mc_water_stats .= 0.0
+                for t in 1:4, c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                return m
+            end
+            m_absent = run_cold(Dict{Symbol,Any}())
+            m_false  = run_cold(Dict{Symbol,Any}(:ice_number_realization => false))
+            m_true   = run_cold(Dict{Symbol,Any}(:ice_number_realization => true))
+            @test m_absent.var_np1 == m_false.var_np1
+            @test m_absent.expdot_n == m_false.expdot_n
+            # ...and it is not a no-op switch: with it on the number legs carry a different
+            # factor, so the answer moves.
+            @test m_absent.var_np1 != m_true.var_np1
+            # The residual sublimation-number factor column is an exact 1.0 with the switch
+            # off — that is what keeps the ETD site bitwise — and live with it on.
+            S_off = m_absent.mc_scratch[Threads.threadid()]
+            @test all(S_off.f_isn1 .== 1.0)
+            @test all(S_off.f_isn2 .== 1.0)
+            @test all(S_off.f_isn3 .== 1.0)
+            S_on = m_true.mc_scratch[Threads.threadid()]
+            @test any(S_on.f_isn1 .!= 1.0)
+            @test all(S_on.f_isn1 .> 0.0)
+            # It is a RATIO, `f_n/f_i`, not a factor, and it is ABOVE ONE on this fixture
+            # (measured 1.0000004 to 1.00003): below the melting level the number's only
+            # legs are aggregation — whose conductance here is the SMALLER one, κ_n/κ_q =
+            # 0.46 — and sublimation, whose two conductances are equal, so κ_n < κ_q, the
+            # mass factor UNDER-realizes the number, and the residual has to make that up.
+            # The invariant is not on the ratio; it is on what the leg ends up carrying,
+            # which is the product, and that is `J₀(κ_{n,k}Δt) ≤ 1` by construction.
+            @test all(S_on.f_isn1 .* S_on.f_ice1 .<= 1.0)
+            @test all(S_on.f_isn2 .* S_on.f_ice2 .<= 1.0)
+            @test maximum(S_on.f_isn1) > 1.0
+
+            # ── (3) THE CENSUS READS THE NUMBER DRAW, IN BOTH MODES ──────────────────────
+            # On the Stage-1 stiff-cold fixture the number row is the LARGE one: measured
+            # 0.0694 reservoirs per step against 1.19e-4 for the melt+aggregation mass row
+            # and 0.0605 for the sublimation mass row. Nothing here breaches — the point is
+            # that the number is being drawn on at a rate the mass rows do not report, which
+            # is what "the ice number reservoirs are not censused at all" meant.
+            for m in (m_absent, m_true)
+                st = m.mc_water_stats
+                n1 = maximum(view(st, drow(Scythe.MC_DONOR_N1), :))
+                n2 = maximum(view(st, drow(Scythe.MC_DONOR_N2), :))
+                @test n1 > 0.0
+                @test n2 > 0.0
+                @test n1 <= 1.0 + 1.0e-9
+                # An order of magnitude above BOTH mass rows for the same species.
+                @test n1 > 10.0 * maximum(view(st, drow(Scythe.MC_DONOR_I1), :))
+                @test n1 > maximum(view(st, drow(Scythe.MC_DONOR_S1), :))
+                # Species 3 is empty on this fixture, so its row must be an exact zero.
+                @test maximum(view(st, drow(Scythe.MC_DONOR_N3), :)) == 0.0
+            end
+        end
+
+        # The SMALL-CRYSTAL variant: same mass, a thousand times the number. The number row
+        # goes to 0.9986 reservoirs per step — the whole population, every step — while the
+        # melt+aggregation mass row is 7.9e-4. Bounded in both modes here (the draw is
+        # dominated by sublimation, whose two conductances are equal by construction), and
+        # this is the state that says WHICH reservoir is the binding one.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 259.15,
+                                              rho_i = 1.0e-3, n_i = 1.0e9,
+                                              rho_i2 = 1.0e-3, n_i2 = 1.0e9, ts = 1.0)
+            ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+            m.mc_water_stats .= 0.0
+            for t in 1:4, c in 1:ncols
+                Scythe.advance_column(m, c, t)
+            end
+            st = m.mc_water_stats
+            @test maximum(view(st, drow(Scythe.MC_DONOR_N1), :)) > 0.9
+            @test maximum(view(st, drow(Scythe.MC_DONOR_N1), :)) <= 1.0 + 1.0e-9
+            @test maximum(view(st, drow(Scythe.MC_DONOR_I1), :)) < 0.01
+        end
+
+        # ── (4) THE BREACH, AND WHAT THE SWITCH DOES TO IT ──────────────────────────────
+        # Above the melting level with rain present, `nmlt = q̇_mlt·(n/q) − dNmltri` and the
+        # second term has no mass partner: the number conductance is then STRICTLY larger
+        # than the mass one, the mass factor under-realizes it, and the realized number draw
+        # runs past the reservoir. Measured on this fixture with the switch off: 1.0000091
+        # reservoirs per step over 672 gridpoint-steps, while the MASS row sits at the
+        # saturated `1 + 1 ULP`. With the switch on the row is `1 − exp(−κ_n Δt)`, which
+        # rounds to that same one-ULP saturation and nowhere above it.
+        mktempdir() do tmpdir
+            function run_melt(opts)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 278.15,
+                                                  rho_i = 1.0e-3, n_i = 1.0e9,
+                                                  rho_i2 = 1.0e-3, n_i2 = 1.0e9,
+                                                  rho_r = 1.0e-4, n_r = 1.0e3, ts = 1.0,
+                                                  extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                m.mc_water_stats .= 0.0
+                for t in 1:4, c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                return m.mc_water_stats
+            end
+            st_off = run_melt(Dict{Symbol,Any}())
+            st_on  = run_melt(Dict{Symbol,Any}(:ice_number_realization => true))
+            off_max = maximum(view(st_off, drow(Scythe.MC_DONOR_N1), :))
+            on_max  = maximum(view(st_on,  drow(Scythe.MC_DONOR_N1), :))
+            off_n = sum(view(st_off, drow(Scythe.MC_DONOR_N1) + 1, :))
+            on_n  = sum(view(st_on,  drow(Scythe.MC_DONOR_N1) + 1, :))
+            # IT BREACHES with the switch off — by more than the one-ULP saturation the mass
+            # row shows, which is what makes it a real over-draw rather than rounding.
+            @test off_max > 1.0 + 1.0e-6
+            @test off_n > 100.0
+            # ...and the switch bounds it. `1 + 1e-9` is the same tolerance the rain donor's
+            # test uses, for the same reason: `1 − exp(−κΔt)` rounds to 1.0 at large `κΔt`
+            # and the division in the census lands one ULP over.
+            @test on_max <= 1.0 + 1.0e-9
+            @test on_n < off_n
+            # The MASS rows are untouched by the number factors: they are formed on, and
+            # realized at, the species' mass conductance in both modes.
+            @test maximum(view(st_off, drow(Scythe.MC_DONOR_I1), :)) ==
+                  maximum(view(st_on,  drow(Scythe.MC_DONOR_I1), :))
+        end
+    end
+
     @testset "ice: anchor reconciliation — inert when admissible, proportional when not" begin
         # Stage C (TeX §Reconciliation of the condensate partition). Three driver-level
         # claims: (1) on an ADMISSIBLE mixed-phase column the device is bitwise absent —
@@ -6193,6 +6400,15 @@ using Springsteel
         # 1. `J₀` is the coefficient it claims to be: exactly 1 with no sink, strictly
         #    bounding at any conductance, and converging to 1 as the step is refined.
         @test Scythe.relaxation_realization(0.0, 1.0e-3, 0.3) === 1.0
+        # The ZERO-RESERVOIR guard, and it is DELIBERATE: a factor answers "how much of the
+        # reservoir may this sink take", and with nothing there the answer is vacuous, so an
+        # exact 1.0 is what keeps the conversion-free path bitwise. It is also the reason a
+        # number bound may never be built out of a factor: at `n_r = 0` this returns 1.0 for
+        # the number leg while the mass leg's factor clamps to 1e-19, which is the seventeen-
+        # order gap FINDINGS §5i measured inside Bigg. What protects that case is the
+        # MINIMUM-CRYSTAL BOUND at the slot assembly (`nbig ≤ mbig/ISHMAEL_M_MIN`), tested
+        # below in "every realized ice-number source is bounded by its mass partner" — not
+        # this function, which is behaving exactly as specified here.
         @test Scythe.relaxation_realization(1.0, 0.0, 0.3) === 1.0
         for (rate, res) in ((1.0e-9, 1.0e-3), (1.0e-4, 1.0e-4), (48.4, 1.88e-5),
                             (2.9e9, 2.84e-7), (1.2e7, 6.0e-11))
@@ -6501,19 +6717,35 @@ using Springsteel
         # and the ANCHOR-RECONCILIATION census (Stage C) after that.
         @test Scythe.MC_DONOR_FIRST == Scythe.MC_STIFF_WARNED + 1
         @test Scythe.MC_ANCHOR_GAP == Scythe.MC_DONOR_WARNED + 1
-        # ...and the per-channel ATTRIBUTION block (Stage 0a) after THAT, which is what the
-        # last row of `MC_WATER_STATS` now is.
+        # ...and the per-channel ATTRIBUTION block (Stage 0a) after THAT, with the
+        # POPULATION-RECONCILIATION census (Stage 3a) last, which is what the final row of
+        # `MC_WATER_STATS` now is.
         @test Scythe.MC_ATTR_FIRST == Scythe.MC_ANCHOR_WARNED + 1
-        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_ATTR_LAST
         @test Scythe.MC_ATTR_CHANNELS == length(Scythe.MC_ATTR_NAMES)
         @test Scythe.MC_ATTR_WARM_PTS ==
               Scythe.MC_ATTR_FIRST + Scythe.MC_ATTR_N * Scythe.MC_ATTR_CHANNELS
         @test Scythe.MC_ATTR_LAST == Scythe.MC_ATTR_WARM_PTS + 4
+        @test Scythe.MC_POP_MAX == Scythe.MC_ATTR_LAST + 1
+        @test Scythe.MC_POP_LAST == Scythe.MC_POP_MAX + 4
+        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_POP_LAST
         @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_GAP] == :a_gap
         @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_REMOVED] == :a_rem
         @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_FIRST] == :x_hom
         @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_WARM_HELD] == :x_wheld
+        @test Scythe.MC_WATER_STATS[Scythe.MC_POP_MAX] == :o_max
+        @test Scythe.MC_WATER_STATS[Scythe.MC_POP_SEED] == :o_seed
+        @test Scythe.MC_WATER_STATS[Scythe.MC_POP_WARNED] == :o_warned
         @test Scythe.MC_DONOR_CHANNELS == length(Scythe.MC_DONOR_NAMES)
+        # STAGE 1b: the three ICE NUMBER donors append after the three sublimation rows, so
+        # the donor block is twelve channels and everything downstream of it shifted again.
+        @test Scythe.MC_DONOR_CHANNELS == 12
+        @test (Scythe.MC_DONOR_N1, Scythe.MC_DONOR_N2, Scythe.MC_DONOR_N3) == (10, 11, 12)
+        @test Scythe.MC_DONOR_N3 == Scythe.MC_DONOR_CHANNELS
+        @test Scythe.MC_WATER_STATS[Scythe.MC_DONOR_FIRST +
+                                    Scythe.MC_DONOR_N * (Scythe.MC_DONOR_N1 - 1)] == :p_n1_max
+        @test Scythe.MC_WATER_STATS[Scythe.MC_DONOR_FIRST +
+                                    Scythe.MC_DONOR_N * (Scythe.MC_DONOR_N3 - 1) + 1] == :p_n3_n
+        @test Scythe.MC_WATER_STATS[Scythe.MC_DONOR_WARNED] == :p_warned
         mktempdir() do tmpdir
             m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, rho_i = 1.0e-5,
                                               n_i = 5.0e4)
@@ -6534,13 +6766,22 @@ using Springsteel
     # spline fits can produce and nothing physical can — so every RATE and every FALL SPEED
     # must be an exact zero there, while NUCLEATION (which creates number and mass together)
     # must still fire. See the gate comment in `mc_ice_sources!`.
+    #
+    # `:ice_population_source => false` in the two dead-species fixtures below is not a
+    # loosening of the claim, it is what keeps the claim about RATES. Stage 3a's fourth
+    # reconciliation tier is now the one and only thing that writes into a dead species'
+    # slots — deliberately, because the gate leaves that mass exempt from every device that
+    # could remove it — and it is not a rate: it seeds crystals so that the rates can own
+    # the species again from the next step on. It has its own testset below.
     @testset "ice: mass with no number is inert, but nucleation still fires" begin
+        no_pop = Dict{Symbol,Any}(:ice_population_source => false)
         mktempdir() do tmpdir
             # A column carrying ice MASS with the number slot at exactly zero. Warm enough
             # that no nucleation fires, so the only thing that could move the slots is a
             # rate read off the phantom population var_check would manufacture.
             m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
-                                              rho_i = 1.0e-5, n_i = 0.0)
+                                              rho_i = 1.0e-5, n_i = 0.0,
+                                              extra_options = no_pop)
             Scythe.advance_column(m, 1, 2)
             S = m.mc_scratch[Threads.threadid()]
             # Every species-1 SOURCE is an exact zero: no rate may read a population that
@@ -6591,7 +6832,9 @@ using Springsteel
         # this grew without bound; gated, it must not move at all.
         mktempdir() do tmpdir
             m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 243.15, q_l = 5.0e-3,
-                                              rho_i = 1.0e-4, n_i = 0.0)
+                                              rho_i = 1.0e-4, n_i = 0.0,
+                                              extra_options = Dict{Symbol,Any}(
+                                                  :ice_population_source => false))
             for step in 1:5
                 Scythe.advance_column(m, 1, step)
             end
@@ -6611,6 +6854,758 @@ using Springsteel
             # population-dependent channel is an exact zero.
             @test all(iszero, S.Qdot_i1)                  # deposition
             @test all(iszero, S.SRC_i1a .* iszero.(S.SRC_i1n))   # no volume without number
+        end
+    end
+
+    # ── STAGE 3e: THE MINIMUM-CRYSTAL BOUND, AND THE RAIN POPULATION GATE ────────
+    #
+    # reference/FINDINGS_ISHMAEL_S8S9.md §5i. At the anvil top the two rain moments
+    # decorrelate on their independent spline fits: `n_r` rings to EXACTLY zero while `q_r`
+    # keeps ~1e-8 kg/kg at 192–203 K. `ishmael_rain_lambda` floors the number at `QNSMALL`
+    # and clamps the slope to `LAMMINR`, handing every DSD consumer a PHANTOM population of
+    # 2800 μm drops; Bigg, 30–40 K outside its validity where `exp(0.66ΔT) ~ 1e21`, then
+    # freezes it — and its number leg is realized at `relaxation_realization(rate, 0, dt) =
+    # 1.0` while its mass leg's factor clamps to 1e-19. Two devices close it, and they are
+    # the two principles already ratified: the number source is bounded by its REALIZED mass
+    # partner at `ISHMAEL_M_MIN`, and no kernel may read a rain DSD the carried number does
+    # not support.
+    @testset "ice: every realized ice-number source is bounded by its mass partner" begin
+        M = Scythe.ISHMAEL_M_MIN
+        gate_off = Dict{Symbol,Any}(:rain_population_gate => false)
+        ivars = Dict(v => i for (i, v) in enumerate(
+            Scythe.mc_var_names(Dict{Symbol,Any}(:rain_moments => 2,
+                                                 :ice_microphysics => :ishmael); cyl = false)))
+
+        # THE §5i STATE, reconstructed: rain mass with the number slot at exactly zero, at
+        # 202 K, with no ice anywhere. Nothing else can fire — the cloud is empty so the
+        # homogeneous cloud leg is zero, DeMott needs `sup ≥ 0` and the column is
+        # sub-saturated, Hallett-Mossop is outside its window and there is no ice to rime or
+        # collect with — so species 1's two sources are exactly Bigg plus the homogeneous
+        # RAIN leg, and the slots read the assembly directly.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 203.0, q_l = 0.0,
+                                              rho_i = 0.0, n_i = 0.0,
+                                              rho_r = 1.2e-8, n_r = 0.0,
+                                              extra_options = gate_off)
+            Scythe.advance_column(m, 1, 1)
+            S = m.mc_scratch[Threads.threadid()]
+            i = 4
+            rhoair = S.rho_d[i]; temp = S.Tk[i]
+            qr = max(S.rho_r[i], 0.0) / rhoair
+            nr = max(S.n_r[i], 0.0) / rhoair
+            qc = max(S.rho_c[i], 0.0) / rhoair
+            @test 192.0 < temp < 203.0                    # the measured window
+            @test nr == 0.0                               # the carried number rang to zero
+            @test qr > Scythe.ISHMAEL_QSMALL              # ...and the mass did not
+
+            # What the unbounded assembly would have produced, rebuilt from the same pieces
+            # the loop uses.
+            bg = Scythe.ishmael_bigg_freezing(temp, qr, nr, mod.ts; reservoir_caps = false)
+            hf = Scythe._ice_homogeneous_rates(temp, qc, 1.0e6 / rhoair, qr, nr, 5.0)
+            pe = Scythe._ice_empty_pre()
+            (f_qc, f_qr, f_nr) = Scythe._ice_donor_factors(hf, bg, pe, pe, pe, qc, qr, nr,
+                                                           S.kappa_ev[i], mod.ts)
+            # The two factors, seventeen orders apart on the SAME collisions — `f_nr` is
+            # `relaxation_realization`'s zero-reservoir 1.0, `f_qr` is the clamp.
+            @test f_nr === 1.0
+            @test f_qr < 1.0e-15
+            mbig = f_qr * bg.mbiggr
+            nbig_raw = f_nr * bg.nbiggr
+            nbig_bound = mbig / M
+            @test nbig_raw > 1.0e4 * nbig_bound           # measured 7.4e4x on this fixture
+
+            # THE BOUND, on the slot the step actually applied. Species 1's whole number
+            # source is Bigg, and it is the realized Bigg MASS at the minimum crystal — not
+            # the unbounded rate.
+            @test S.SRC_i1n[i] ≈ rhoair * nbig_bound rtol = 1e-12
+            @test S.SRC_i1n[i] < 1.0e-4 * rhoair * nbig_raw
+            # ...and the invariant it enforces, stated on the slots: no more crystals than
+            # the mass that arrived with them supports.
+            @test S.SRC_i1n[i] <= S.SRC_i1q[i] / M * (1.0 + 1.0e-12)
+            @test S.SRC_i1q[i] > 0.0                      # the mass leg is untouched
+            # Every species obeys it, at every gridpoint of the column, in both directions
+            # of the habit selector.
+            for (nsrc, qsrc) in ((S.SRC_i1n, S.SRC_i1q), (S.SRC_i2n, S.SRC_i2q),
+                                 (S.SRC_i3n, S.SRC_i3q))
+                @test all(k -> nsrc[k] <= max(qsrc[k], 0.0) / M * (1.0 + 1.0e-12),
+                          eachindex(nsrc))
+            end
+        end
+
+        # WITH THE GATE ON (the default) the kernel never runs at all, so the bound has
+        # nothing left to bind: no crystals, and no Bigg mass either.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 203.0, q_l = 0.0,
+                                              rho_i = 0.0, n_i = 0.0,
+                                              rho_r = 1.0e-6, n_r = 0.0)
+            Scythe.advance_column(m, 1, 1)
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(iszero, S.SRC_i1n)
+            @test all(iszero, S.SRC_i2n)
+            # The homogeneous RAIN leg is NOT gated — it needs no size distribution — so the
+            # mass channel is still alive and this is a gate on the DSD, not on the rain.
+            @test any(>(0.0), S.SRC_i1q)
+        end
+
+        # THE SPIKE DOES NOT GROW. Under the unbounded term this state made ~1e15 m⁻³ s⁻¹ of
+        # immortal crystals; here the number the column can accumulate is capped by the rain
+        # mass it has to make them out of, and with the gate on nothing is made at all.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 203.0, q_l = 0.0,
+                                              rho_i = 0.0, n_i = 0.0,
+                                              rho_r = 1.2e-8, n_r = 0.0,
+                                              extra_options = gate_off)
+            for step in 1:20
+                Scythe.advance_column(m, 1, step)
+            end
+            # Everything the rain could possibly become, one crystal per `M_MIN`: the whole
+            # seeded rain mass. The unbounded term passed this in a SINGLE step.
+            ceiling = 1.2e-8 / M
+            n1 = maximum(view(patch.physical, :, ivars["n_i1"], 1))
+            @test n1 < 100.0 * ceiling
+            @test n1 < 1.0e8
+        end
+
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 203.0, q_l = 0.0,
+                                              rho_i = 0.0, n_i = 0.0,
+                                              rho_r = 1.2e-8, n_r = 0.0)
+            for step in 1:20
+                Scythe.advance_column(m, 1, step)
+            end
+            @test all(iszero, view(patch.physical, :, ivars["n_i1"], 1))
+        end
+    end
+
+    @testset "ice: the rain population gate, and which kernels needed it" begin
+        # WHICH KERNEL NEEDED THE GATE, at the kernel boundary. `ishmael_ice_rain_riming`
+        # SELF-GATES: every rate it returns carries a factor of the CARRIED `nr` it was
+        # handed, so at `nr = 0` the whole tuple is exact zeros and the gate would be
+        # redundant. `ishmael_bigg_freezing` does NOT: its only existence test is on `q_r`,
+        # and the number it freezes is `ishmael_rain_lambda`'s floored, clamped one.
+        itabr = mktempdir() do tmpdir
+            m, _, _, _ = make_ice_mtile(tmpdir; Tsurf = 258.15)
+            m.ishmael_tables.itabr
+        end
+        rr0 = Scythe.ishmael_ice_rain_riming(itabr, 3.0e-5, 1.0e-8, 0.0, 0.6, 500.0,
+                                             5.0e4, 1.0, 202.0, 1.0e-5)
+        @test rr0.rimesumr == 0.0
+        @test rr0.numrateri == 0.0 && rr0.rainrateri == 0.0 && rr0.icerateri == 0.0
+        @test rr0.dQRfzri == 0.0 && rr0.dQIfzri == 0.0 && rr0.dNfzri == 0.0
+        @test rr0.qi_qr_nrm == 0.0 && rr0.qi_qr_nrd == 0.0 && rr0.qi_qr_nrn == 0.0
+        # The phantom DSD the gate exists to forbid: at `nr = 0` the slope clamps to the
+        # 2800 μm drop, the largest the scheme admits, and Bigg returns a large rate for a
+        # rain population that is not there.
+        dsd = Scythe.ishmael_rain_lambda(1.0e-8, 0.0)
+        @test dsd.lamr == Scythe.ISHMAEL_LAMMINR
+        @test 0.5 / dsd.lamr ≈ 1400.0e-6 rtol = 1e-12     # 2800 μm diameter
+        bg0 = Scythe.ishmael_bigg_freezing(202.0, 1.0e-8, 0.0, 0.1; reservoir_caps = false)
+        @test bg0.nbiggr > 1.0e10
+        @test bg0.mbiggr > 0.0
+
+        # BITWISE INERT WHEREVER THE RAIN IS HEALTHY. A column with real rain — mass AND
+        # number — must give the identical field under both settings, so the gate is a
+        # statement about a defect state and not a change to the storm.
+        mktempdir() do tmpdir
+            fields = map((true, false)) do g
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                    rho_i = 1.0e-5, n_i = 5.0e4, rho_r = 1.0e-4, n_r = 1.0e3,
+                    extra_options = Dict{Symbol,Any}(:rain_population_gate => g))
+                for step in 1:3
+                    Scythe.advance_column(m, 1, step)
+                end
+                copy(m.tile.physical[:, :, 1])
+            end
+            @test fields[1] == fields[2]
+        end
+
+        # ...and it is NOT vacuous: the same column with the number rung out is where the
+        # two answers separate.
+        mktempdir() do tmpdir
+            src = map((true, false)) do g
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 203.0, q_l = 0.0,
+                    rho_i = 0.0, n_i = 0.0, rho_r = 1.2e-8, n_r = 0.0,
+                    extra_options = Dict{Symbol,Any}(:rain_population_gate => g))
+                Scythe.advance_column(m, 1, 1)
+                S = m.mc_scratch[Threads.threadid()]
+                (maximum(S.SRC_i1n), maximum(S.SRC_i1q))
+            end
+            @test src[1][1] == 0.0                        # gate on: no crystals
+            @test src[2][1] > 0.0                         # gate off: the phantom fires
+            @test src[2][2] > src[1][2]                   # and freezes rain mass with it
+        end
+
+        # ── STAGE 3f: THE WARM SIDE OF THE SAME AUDIT ────────────────────────────────
+        # `rain_selfcollection_2m` is the warm two-moment closure that reads the DIAGNOSED
+        # number rather than the carried one, and at the `LAMMINR` clamp its breakup rolloff
+        # (`dum = 2 - e^5.75 = -312`) flips sign and makes it a number SOURCE — the way a
+        # rung-out rain slot gets a positive number back, and with it a population for Bigg
+        # to freeze on the next step. It now tests the carried number first
+        # (`microphysics.jl`, and see the per-consumer classification in test_microphysics).
+        # HERE, at the host: a column with rain mass, no rain number and no cloud must write
+        # an EXACTLY zero rain-number source. Every leg is zero for its own reason —
+        # autoconversion has no cloud, the evaporation number sink self-gates at `n_r <= 0`,
+        # and self-collection is gated — so the assertion is an exact one.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 203.0, q_l = 0.0,
+                                              rho_i = 0.0, n_i = 0.0,
+                                              rho_r = 1.2e-8, n_r = 0.0)
+            Scythe.advance_column(m, 1, 1)
+            S = m.mc_scratch[Threads.threadid()]
+            # The state the audit is about: rain mass above the closures' threshold with no
+            # carried drops anywhere.
+            @test all(<=(0.0), S.n_r)
+            @test any(S.rho_r .> Scythe.RAIN_2M_Q_MIN .* S.rho_d)
+            @test all(iszero, S.NR_SRC)
+            # ...and it is not vacuous: the same column WITH drops has a live number source.
+            m2, _, _, _ = make_ice_mtile(tmpdir; Tsurf = 203.0, q_l = 0.0,
+                                         rho_i = 0.0, n_i = 0.0,
+                                         rho_r = 1.0e-6, n_r = 1.0e3)
+            Scythe.advance_column(m2, 1, 1)
+            @test any(!iszero, m2.mc_scratch[Threads.threadid()].NR_SRC)
+        end
+    end
+
+    # ── STAGE 3a: THE RECONCILIATION OF THE POPULATION ───────────────────────────
+    #
+    # TeX §"Reconciliation of the population". The gate above is right, and the same
+    # measurement that justified it records its consequence: mass with no number is exempt
+    # from every device that could REMOVE it too — below the melting level of the O01 ice
+    # column the ice is number-less at 97–99.9% by mass over the final half hour, sitting at
+    # the surface at 300 K, with an anchor share of exactly one. The fourth reconciliation
+    # tier returns it to a representation the equations can act on: rain with L_f absorbed
+    # above T_0, 2 um crystals below it, on tau_pop, one-sided and censused.
+    @testset "ice: the population reconciliation returns number-less mass" begin
+        tau = 10.0                                    # physical_params[:tau_ice_population]
+
+        # ── (1) BELOW T_0: number only. No mass moves, nothing thermodynamic happens, and
+        # the seeded population is the smallest crystal the scheme resolves.
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
+                                              rho_i = 1.0e-5, n_i = 0.0)
+            m.mc_water_stats .= 0.0
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(S.Tk .< Scythe.T_0)
+            hits = 0
+            for i in eachindex(S.SRC_i1n)
+                (S.i1q[i] > Scythe.ISHMAEL_QSMALL * S.rho_d[i] && S.i1n[i] <= 0.0) || continue
+                hits += 1
+                rate = S.i1q[i] / tau
+                @test S.SRC_i1n[i] ≈ rate / Scythe.ISHMAEL_M_MIN rtol = 1e-13
+                @test S.SRC_i1a[i] ≈ Scythe._ice_nucleation_volume(rate,
+                          rate / Scythe.ISHMAEL_M_MIN) rtol = 1e-13
+                @test S.SRC_i1c[i] == S.SRC_i1a[i]
+                # THE MASS IS NOT TOUCHED, and no latent heat accompanies the seeding.
+                @test S.SRC_i1q[i] == 0.0
+                @test S.FRZ_NET[i] == 0.0
+                @test S.ICE_R[i] == 0.0
+                @test S.ICE_NR[i] == 0.0
+            end
+            @test hits > 0                            # the fixture really is dead ice
+            # Nothing in lambda or N: this branch is not a vapor exchange.
+            @test all(iszero, S.invtau_i1)
+            @test all(iszero, S.Qdot_i1)
+            # ...and the census recorded the defect, its support and the number seeded.
+            st = m.mc_water_stats
+            @test maximum(view(st, Scythe.MC_POP_MAX, :)) > 0.0
+            @test sum(view(st, Scythe.MC_POP_PTS, :)) == Float64(hits)
+            @test sum(view(st, Scythe.MC_POP_SEED, :)) > 0.0
+            @test sum(view(st, Scythe.MC_POP_RAIN, :)) == 0.0
+        end
+
+        # ── (2) The point of the seeding: the species comes ALIVE, and the rates, the
+        # consistency source and the sedimentation own it from then on.
+        #
+        # Sampled over several steps rather than read off the last one. The source is gated
+        # on a STATE test (`n <= 0`), like every other rate in the block, so under the
+        # multistep it switches on and off as the number crosses zero — one step of seeding,
+        # then the AB3 history's negative coefficient pulling back, then more seeding. The
+        # claim is that the species HAS a population and rates again, not that it does at
+        # some particular step; the cumulative census is the monotone statement.
+        mktempdir() do tmpdir
+            # `advance_column` alone only forms tendencies; the state advances through
+            # `calcTendency` + `gridTransform!` (what `step_mc!` does), and this test is
+            # about the STATE, so the loop is written out to sample it every step.
+            function run_pop(opts)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
+                                                  rho_i = 1.0e-5, n_i = 0.0,
+                                                  extra_options = opts)
+                m.mc_water_stats .= 0.0
+                s = m.mc_slots
+                ncols = div(size(patch.physical, 1), mod.grid_params.kDim)
+                @test all(patch.physical[:, s.i1_n, 1] .== 0.0)      # dead at t = 0
+                numbered = false
+                alive = false
+                fell = false
+                for t in 1:12
+                    for c in 1:ncols
+                        Scythe.advance_column(m, c, t)
+                    end
+                    S = m.mc_scratch[Threads.threadid()]
+                    any(!iszero, S.invtau_i1) && (alive = true)   # it can exchange vapor
+                    any(!iszero, S.Vi1m) && (fell = true)         # ...and it falls
+                    Scythe.calcTendency(m)
+                    gridTransform!(patch)
+                    maximum(patch.physical[:, s.i1_n, 1]) > 0.0 && (numbered = true)
+                end
+                return (m, patch, numbered, alive, fell)
+            end
+
+            m, patch, numbered, alive, fell = run_pop(Dict{Symbol,Any}())
+            @test numbered                            # crystals, where there were none
+            @test alive                               # ...and rates, where there were none
+            @test fell
+            @test sum(view(m.mc_water_stats, Scythe.MC_POP_SEED, :)) > 0.0
+
+            # The same run with the source OFF stays dead forever: zero number, zero rates.
+            m_off, patch_off, numbered_off, alive_off, fell_off =
+                run_pop(Dict{Symbol,Any}(:ice_population_source => false))
+            @test !numbered_off
+            @test !alive_off
+            @test !fell_off
+            @test all(patch_off.physical[:, m_off.mc_slots.i1_n, 1] .== 0.0)
+        end
+
+        # ── (3) ABOVE T_0: the mass returns to the rain, total water closes to the last
+        # bit, and L_f goes with it (FRZ_NET < 0 — the transfer ABSORBS the latent heat of
+        # fusion, which is what melting ice does).
+        mktempdir() do tmpdir
+            m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 290.0, q_l = 0.0,
+                                              rho_i = 1.0e-5, n_i = 0.0)
+            m.mc_water_stats .= 0.0
+            Scythe.advance_column(m, 1, 2)
+            S = m.mc_scratch[Threads.threadid()]
+            @test all(S.Tk .> Scythe.T_0)
+            hits = 0
+            for i in eachindex(S.SRC_i1q)
+                (S.i1q[i] > Scythe.ISHMAEL_QSMALL * S.rho_d[i] && S.i1n[i] <= 0.0) || continue
+                hits += 1
+                rate = S.i1q[i] / tau
+                @test S.SRC_i1q[i] ≈ -rate rtol = 1e-13
+                @test S.ICE_R[i] ≈ rate rtol = 1e-13
+                # CONSERVATION, exactly: one number, two slots, opposite signs.
+                @test S.SRC_i1q[i] + S.ICE_R[i] === 0.0
+                # The identity FRZ_NET = -(ICE_C + ICE_R) survives the increment...
+                @test S.FRZ_NET[i] === -(S.ICE_C[i] + S.ICE_R[i])
+                @test S.FRZ_NET[i] < 0.0
+                # ...and the rain number is seeded at autoconversion's 25 um drop.
+                @test S.ICE_NR[i] ≈ rate / Scythe.RAIN_2M_M_AUTO rtol = 1e-13
+                # Both volume moments leave at the same fraction as the mass.
+                @test S.SRC_i1a[i] ≈ -max(S.i1a[i], 0.0) / tau rtol = 1e-13
+                @test S.SRC_i1c[i] ≈ -max(S.i1c[i], 0.0) / tau rtol = 1e-13
+                # Bounded by dt/tau: no realization factor is needed and none is applied.
+                @test -S.SRC_i1q[i] * mod.ts / S.i1q[i] <= mod.ts / tau + eps()
+            end
+            @test hits > 0
+            st = m.mc_water_stats
+            @test sum(view(st, Scythe.MC_POP_RAIN, :)) > 0.0
+            @test sum(view(st, Scythe.MC_POP_SEED, :)) == 0.0
+        end
+
+        # ── (4) THE OFF SWITCH reproduces the pre-Stage-3a tree bitwise, on both branches,
+        # while the census keeps measuring: a forensic tool, not a blindfold.
+        mktempdir() do tmpdir
+            off = Dict{Symbol,Any}(:ice_population_source => false)
+            for Tsurf in (258.15, 290.0)
+                m_on, _, mod, _ = make_ice_mtile(tmpdir; Tsurf = Tsurf, q_l = 0.0,
+                                                 rho_i = 1.0e-5, n_i = 0.0)
+                m_off, _, _, _ = make_ice_mtile(tmpdir; Tsurf = Tsurf, q_l = 0.0,
+                                                rho_i = 1.0e-5, n_i = 0.0,
+                                                extra_options = off)
+                m_on.mc_water_stats .= 0.0
+                m_off.mc_water_stats .= 0.0
+                Scythe.advance_column(m_on, 1, 2)
+                Scythe.advance_column(m_off, 1, 2)
+                # The device MOVES something with it on...
+                @test m_on.expdot_n != m_off.expdot_n
+                # ...and with it off, every ice source is the exact zero the gate left.
+                S_off = m_off.mc_scratch[Threads.threadid()]
+                for nm in (:SRC_i1q, :SRC_i1n, :SRC_i1a, :SRC_i1c,
+                           :ICE_C, :ICE_R, :ICE_NR, :FRZ_NET)
+                    # `iszero`, not `=== 0.0`: several of these are formed as `-ρ_a·0.0`
+                    # and land on the signed zero, which is the same number.
+                    @test all(iszero, getproperty(S_off, nm))
+                end
+                # ...but the census saw the same defect in BOTH runs.
+                @test maximum(view(m_on.mc_water_stats, Scythe.MC_POP_MAX, :)) ==
+                      maximum(view(m_off.mc_water_stats, Scythe.MC_POP_MAX, :)) > 0.0
+                @test sum(view(m_on.mc_water_stats, Scythe.MC_POP_PTS, :)) ==
+                      sum(view(m_off.mc_water_stats, Scythe.MC_POP_PTS, :))
+            end
+        end
+
+        # ── (5) ONE-SIDED AND BITWISE ABSENT from healthy air: a fully live ice column and
+        # a warm ice-free one are identical with the source on or off, and the census is
+        # silent. This is the property that keeps every existing reference bit-for-bit.
+        mktempdir() do tmpdir
+            off = Dict{Symbol,Any}(:ice_population_source => false)
+            m_on, _, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                             rho_i = 1.0e-5, n_i = 5.0e4)
+            m_off, _, _, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                            rho_i = 1.0e-5, n_i = 5.0e4,
+                                            extra_options = off)
+            m_on.mc_water_stats .= 0.0
+            for t in 2:4
+                Scythe.advance_column(m_on, 1, t)
+                Scythe.advance_column(m_off, 1, t)
+            end
+            @test m_on.expdot_n == m_off.expdot_n
+            @test m_on.var_np1 == m_off.var_np1
+            @test all(view(m_on.mc_water_stats,
+                           Scythe.MC_POP_MAX:Scythe.MC_POP_LAST, :) .== 0.0)
+        end
+        mktempdir() do tmpdir
+            # The DRY/warm path: ice registered, no ice present, both Stage 3 options on —
+            # still bitwise the ice-free run in every common slot.
+            args = (; q_l = 3.0e-3, kDim = 16, num_cells = 8, precipitation = true)
+            function run_warm(opts)
+                m, patch, mod, _ = make_mc_mtile(tmpdir; args..., extra_options = opts)
+                ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
+                for t in 1:5, c in 1:ncols
+                    Scythe.advance_column(m, c, t)
+                end
+                return m
+            end
+            m_off = run_warm(Dict{Symbol,Any}(:rain_moments => 2))
+            m_on = run_warm(Dict{Symbol,Any}(:rain_moments => 2,
+                                             :ice_microphysics => :ishmael,
+                                             :ice_population_source => true,
+                                             :ice_shed_above_t0 => true))
+            for slot in 1:(m_on.mc_slots.i1_q - 1)
+                @test m_on.var_np1[:, slot] == m_off.var_np1[:, slot]
+                @test m_on.expdot_n[:, slot] == m_off.expdot_n[:, slot]
+            end
+            @test all(view(m_on.mc_water_stats,
+                           Scythe.MC_POP_MAX:Scythe.MC_POP_LAST, :) .== 0.0)
+        end
+
+        # ── (6) STAGE 3c: WHICH CRYSTAL the below-T_0 branch seeds.
+        # `options[:ice_population_seed]`: `:min` (the 2 um sphere), `:large` (var_check's
+        # own re-diagnosis of the dead mass at the floor number -- the size-sorted particles
+        # the number-less mass actually is) or `:local` (the neighbour's crystals, (7)
+        # below). The DEFAULT is `:local`, chosen by measurement (author decision
+        # 2026-08-31; reference/FINDINGS_ISHMAEL_S8S9.md 5f-5j). `:min` and `:large` remain
+        # selectable and their arithmetic is untouched.
+        mktempdir() do tmpdir
+            fixture(opts) = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
+                                           rho_i = 1.0e-5, n_i = 0.0,
+                                           extra_options = opts)[1]
+
+            # THE DEFAULT IS `:local`, BITWISE.
+            m_abs = fixture(Dict{Symbol,Any}())
+            m_loc = fixture(Dict{Symbol,Any}(:ice_population_seed => :local))
+            for t in 2:4
+                Scythe.advance_column(m_abs, 1, t)
+                Scythe.advance_column(m_loc, 1, t)
+            end
+            @test m_abs.var_np1 == m_loc.var_np1
+            @test m_abs.expdot_n == m_loc.expdot_n
+
+            # AND `:min` IS STILL SELECTABLE. On THIS fixture species 1 is dead at every
+            # level, which is `:local`'s documented pure-dead fallback (asserted in (7)), so
+            # the two agree bitwise HERE and for that reason alone. The mixed column of (7)
+            # is where the default separates from `:min`, and that is asserted there.
+            m_min = fixture(Dict{Symbol,Any}(:ice_population_seed => :min))
+            for t in 2:4
+                Scythe.advance_column(m_min, 1, t)
+            end
+            @test m_min.var_np1 == m_abs.var_np1
+            @test m_min.expdot_n == m_abs.expdot_n
+
+            # THE `:large` ARM on the same dead-species-below-T_0 fixture: the species
+            # comes alive on a number ten orders of magnitude smaller. The `:min` column
+            # is re-run to the same step first, so the two are read off one state.
+            m_min = fixture(Dict{Symbol,Any}(:ice_population_seed => :min))
+            Scythe.advance_column(m_min, 1, 2)
+            S_min = m_min.mc_scratch[Threads.threadid()]
+            hits = 0
+            for i in eachindex(S_min.SRC_i1n)
+                (S_min.i1q[i] > Scythe.ISHMAEL_QSMALL * S_min.rho_d[i] &&
+                 S_min.i1n[i] <= 0.0) || continue
+                hits += 1
+                @test S_min.SRC_i1n[i] ≈ (S_min.i1q[i] / 10.0) / Scythe.ISHMAEL_M_MIN rtol = 1e-13
+                @test S_min.SRC_i1a[i] > 0.0
+            end
+            @test hits > 0
+
+            m_lrg2 = fixture(Dict{Symbol,Any}(:ice_population_seed => :large))
+            Scythe.advance_column(m_lrg2, 1, 2)
+            S_lrg = m_lrg2.mc_scratch[Threads.threadid()]
+            checked = 0
+            for i in eachindex(S_lrg.SRC_i1n)
+                (S_lrg.i1q[i] > Scythe.ISHMAEL_QSMALL * S_lrg.rho_d[i] &&
+                 S_lrg.i1n[i] <= 0.0) || continue
+                checked += 1
+                n, a, c = Scythe._ice_population_seed_large(S_lrg.i1q[i] / S_lrg.rho_d[i], 1)
+                @test S_lrg.SRC_i1n[i] ≈ n * S_lrg.rho_d[i] / 10.0 rtol = 1e-13
+                @test S_lrg.SRC_i1a[i] ≈ a * S_lrg.rho_d[i] / 10.0 rtol = 1e-13
+                @test S_lrg.SRC_i1c[i] === S_lrg.SRC_i1a[i]
+                # ORDERS OF MAGNITUDE fewer crystals for the identical mass...
+                @test S_lrg.SRC_i1n[i] < 1.0e-8 * S_min.SRC_i1n[i]
+                # ...and STILL no mass, no latent heat: the branch creates number only.
+                @test S_lrg.SRC_i1q[i] == 0.0
+                @test S_lrg.FRZ_NET[i] == 0.0
+                @test S_lrg.ICE_R[i] == 0.0
+            end
+            @test checked == hits
+            @test sum(view(m_lrg2.mc_water_stats, Scythe.MC_POP_SEED, :)) > 0.0
+            @test sum(view(m_lrg2.mc_water_stats, Scythe.MC_POP_SEED, :)) <
+                  1.0e-8 * sum(view(m_min.mc_water_stats, Scythe.MC_POP_SEED, :))
+            # The census sees the SAME defect: the seeding changes the answer, not the
+            # measurement of the defect that provoked it.
+            @test maximum(view(m_lrg2.mc_water_stats, Scythe.MC_POP_MAX, :)) ==
+                  maximum(view(m_min.mc_water_stats, Scythe.MC_POP_MAX, :))
+
+            # THE POPULATION IS REALIZABLE AND FALLS: stepped forward, the species
+            # acquires number, exchanges vapor, and has a FINITE fall speed -- 1 mm
+            # particles at 920 kg/m^3 are the fastest the scheme can represent, so
+            # "finite" is the claim that matters and is not automatic.
+            m_run = fixture(Dict{Symbol,Any}(:ice_population_seed => :large))
+            patch = m_run.tile
+            s_ = m_run.mc_slots
+            ncols = div(size(patch.physical, 1), m_run.model.grid_params.kDim)
+            numbered = false
+            alive = false
+            fell = false
+            for t in 1:12
+                for c in 1:ncols
+                    Scythe.advance_column(m_run, c, t)
+                end
+                Sr = m_run.mc_scratch[Threads.threadid()]
+                @test all(isfinite, Sr.Vi1m)
+                @test all(isfinite, Sr.Vi1n)
+                @test all(isfinite, Sr.SRC_i1n)
+                any(!iszero, Sr.invtau_i1) && (alive = true)
+                any(!iszero, Sr.Vi1m) && (fell = true)
+                Scythe.calcTendency(m_run)
+                gridTransform!(patch)
+                maximum(patch.physical[:, s_.i1_n, 1]) > 0.0 && (numbered = true)
+            end
+            @test numbered
+            @test alive
+            @test fell
+            @test all(isfinite, m_run.var_np1)
+
+            # An unrecognized seeding is refused rather than silently defaulted.
+            m_bad = fixture(Dict{Symbol,Any}(:ice_population_seed => :medium))
+            @test_throws ErrorException Scythe.advance_column(m_bad, 1, 2)
+        end
+
+        # ── (7) STAGE 3d: `:local`, THE THIRD SEEDING. Neither of the other two reads
+        # the DEFECT: number-less mass is the negative lobe of the number moment's
+        # spline ringing at cloud edges and gradients, so the crystals it lost are the
+        # crystals of the same species one gridpoint away, not a size to be derived
+        # from its own mass. The fixture is a column with a live population over part
+        # of its depth and number-less mass over the rest, which is that shape.
+        mktempdir() do tmpdir
+            mixed(opts) = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0,
+                                         rho_i = 1.0e-5, n_i = 5.0e4, r_i = 30.0e-6,
+                                         n_i_levels = 11:16, extra_options = opts)[1]
+            seeded(m) = sum(view(m.mc_water_stats, Scythe.MC_POP_SEED, :))
+
+            m_loc = mixed(Dict{Symbol,Any}(:ice_population_seed => :local))
+            m_min = mixed(Dict{Symbol,Any}(:ice_population_seed => :min))
+            m_lrg = mixed(Dict{Symbol,Any}(:ice_population_seed => :large))
+            # THE DEFAULT, ON A COLUMN WHERE THE THREE SEEDS DISAGREE: the optionless tree
+            # is the `:local` one bitwise, and it is NOT the `:min` one. This is the
+            # separation (6) cannot see, because there species 1 is dead everywhere and
+            # `:local` falls back to `:min` by construction.
+            m_def = mixed(Dict{Symbol,Any}())
+            for m in (m_loc, m_min, m_lrg, m_def)
+                m.mc_water_stats .= 0.0
+                Scythe.advance_column(m, 1, 2)
+            end
+            @test m_def.var_np1 == m_loc.var_np1
+            @test m_def.expdot_n == m_loc.expdot_n
+            @test m_def.var_np1 != m_min.var_np1
+            @test m_def.var_np1 != m_lrg.var_np1
+            S = m_loc.mc_scratch[Threads.threadid()]
+            @test all(S.Tk .< Scythe.T_0)
+
+            # PRECONDITION: the fixture really is mixed -- dead points AND live ones.
+            live(i) = S.i1q[i] > Scythe.ISHMAEL_QSMALL * S.rho_d[i] && S.i1n[i] > 0.0
+            dead(i) = S.i1q[i] > Scythe.ISHMAEL_QSMALL * S.rho_d[i] && S.i1n[i] <= 0.0
+            idx = eachindex(S.Tk)
+            @test count(live, idx) > 0
+            @test count(dead, idx) > 0
+
+            hits = 0
+            for i in idx
+                dead(i) || continue
+                hits += 1
+                # The nearest live point of this species IN THIS COLUMN, found here by an
+                # independent outward walk rather than by the code under test.
+                j = 0
+                for d in 1:length(idx)
+                    if i - d >= first(idx) && live(i - d)
+                        j = i - d
+                        break
+                    elseif i + d <= last(idx) && live(i + d)
+                        j = i + d
+                        break
+                    end
+                end
+                @test j != 0
+                nj = S.i1n[j]
+                nl, al, cl = Scythe._ice_population_seed_local(S.i1q[i] / S.rho_d[i],
+                                 S.i1q[j] / nj, S.i1a[j] / nj, S.i1c[j] / nj, 1)
+                @test S.SRC_i1n[i] ≈ nl * S.rho_d[i] / 10.0 rtol = 1e-13
+                @test S.SRC_i1a[i] ≈ al * S.rho_d[i] / 10.0 rtol = 1e-13
+                @test S.SRC_i1c[i] ≈ cl * S.rho_d[i] / 10.0 rtol = 1e-13
+                # ...which is `rho_empty/(m_loc tau_pop)` with `m_loc` the neighbour's
+                # per-crystal mass, and that mass is a 30 um crystal: orders of magnitude
+                # heavier than the 2 um sphere and lighter than the 1 mm one, so the
+                # seeded number sits STRICTLY BETWEEN the two ends.
+                Smn = m_min.mc_scratch[Threads.threadid()]
+                Slg = m_lrg.mc_scratch[Threads.threadid()]
+                @test Slg.SRC_i1n[i] < S.SRC_i1n[i] < Smn.SRC_i1n[i]
+                @test S.SRC_i1n[i] > 1.0e2 * Slg.SRC_i1n[i]
+                @test S.SRC_i1n[i] < 1.0e-2 * Smn.SRC_i1n[i]
+                # STILL NUMBER ONLY: no mass, no latent heat, nothing in the rain.
+                @test S.SRC_i1q[i] == 0.0
+                @test S.FRZ_NET[i] == 0.0
+                @test S.ICE_R[i] == 0.0
+                @test S.ICE_NR[i] == 0.0
+            end
+            @test hits > 0
+            # ONE-SIDEDNESS at the live points. Their `SRC_i1n` is NOT zero -- ISHMAEL's own
+            # aggregation is taking number out of a live population there, which is the
+            # physics working -- so the statement is that the SEEDING did not touch it: all
+            # three arms leave the live points bit for bit identical.
+            for i in idx
+                live(i) || continue
+                @test S.SRC_i1n[i] === m_min.mc_scratch[Threads.threadid()].SRC_i1n[i]
+                @test S.SRC_i1n[i] === m_lrg.mc_scratch[Threads.threadid()].SRC_i1n[i]
+                @test S.SRC_i1a[i] === m_min.mc_scratch[Threads.threadid()].SRC_i1a[i]
+            end
+            # The census sees the SAME defect in all three; only the seeded number moves.
+            @test maximum(view(m_loc.mc_water_stats, Scythe.MC_POP_MAX, :)) ==
+                  maximum(view(m_min.mc_water_stats, Scythe.MC_POP_MAX, :)) ==
+                  maximum(view(m_lrg.mc_water_stats, Scythe.MC_POP_MAX, :))
+            @test sum(view(m_loc.mc_water_stats, Scythe.MC_POP_PTS, :)) ==
+                  sum(view(m_min.mc_water_stats, Scythe.MC_POP_PTS, :)) == Float64(hits)
+            @test seeded(m_lrg) < seeded(m_loc) < seeded(m_min)
+
+            # THE FALLBACK. A column in which species 1 is live NOWHERE is the pure-dead
+            # case: there is no habit anywhere to inherit and `:local` is `:min` BITWISE.
+            allmin = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0, rho_i = 1.0e-5,
+                                    n_i = 0.0,
+                                    extra_options = Dict{Symbol,Any}(
+                                        :ice_population_seed => :min))[1]
+            allloc = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 0.0, rho_i = 1.0e-5,
+                                    n_i = 0.0,
+                                    extra_options = Dict{Symbol,Any}(
+                                        :ice_population_seed => :local))[1]
+            for t in 2:4
+                Scythe.advance_column(allmin, 1, t)
+                Scythe.advance_column(allloc, 1, t)
+            end
+            @test allmin.var_np1 == allloc.var_np1
+            @test allmin.expdot_n == allloc.expdot_n
+
+            # AND IT RUNS: stepped forward, the seeded species acquires number, exchanges
+            # vapor, falls, and every moment stays finite.
+            m_run = mixed(Dict{Symbol,Any}(:ice_population_seed => :local))
+            patch = m_run.tile
+            s_ = m_run.mc_slots
+            ncols = div(size(patch.physical, 1), m_run.model.grid_params.kDim)
+            numbered = false
+            alive = false
+            fell = false
+            for t in 1:12
+                for c in 1:ncols
+                    Scythe.advance_column(m_run, c, t)
+                end
+                Sr = m_run.mc_scratch[Threads.threadid()]
+                @test all(isfinite, Sr.SRC_i1n)
+                @test all(isfinite, Sr.Vi1m)
+                any(!iszero, Sr.invtau_i1) && (alive = true)
+                any(!iszero, Sr.Vi1m) && (fell = true)
+                Scythe.calcTendency(m_run)
+                gridTransform!(patch)
+                maximum(patch.physical[:, s_.i1_n, 1]) > 0.0 && (numbered = true)
+            end
+            @test numbered
+            @test alive
+            @test fell
+            @test all(isfinite, m_run.var_np1)
+        end
+    end
+
+    # ── STAGE 3b: NO LIQUID IS CONVERTED TO ICE ABOVE THE FREEZING LEVEL ─────────
+    #
+    # TeX §Departures (e). ISHMAEL's collection kernels carry no temperature gate and the
+    # wet-growth branch adds the collected liquid to the ice mass, on the understanding that
+    # the melting rate will return it — free in a host whose freezing latent heat is gated to
+    # T <= T_0, and not free here, where FRZ_NET is signed by the partition and the transfer
+    # releases L_f wherever it happens. Above T_0 a crystal that collects liquid SHEDS it.
+    @testset "ice: above T_0 the collected liquid is shed, not frozen" begin
+        # A riming state ABOVE the melting level: cloud, rain and a LIVE ice population, all
+        # at 290 K, which is where ISHMAEL's wet-growth branch runs.
+        warm_rimer(tmpdir, opts) = make_ice_mtile(tmpdir; Tsurf = 290.0, q_l = 1.0e-3,
+                                                 rho_i = 1.0e-5, n_i = 5.0e4,
+                                                 rho_r = 1.0e-4, n_r = 1.0e3, ts = 1.0,
+                                                 extra_options = opts)[1]
+        mktempdir() do tmpdir
+            m_on = warm_rimer(tmpdir, Dict{Symbol,Any}())                       # default: shed
+            m_off = warm_rimer(tmpdir, Dict{Symbol,Any}(:ice_shed_above_t0 => false))
+            Scythe.advance_column(m_on, 1, 2)
+            Scythe.advance_column(m_off, 1, 2)
+            S_on = m_on.mc_scratch[Threads.threadid()]
+            S_off = m_off.mc_scratch[Threads.threadid()]
+            @test all(S_on.Tk .> Scythe.T_0)
+
+            # PRECONDITION: the ungated kernel really does convert liquid to ice here, or
+            # the statements below are vacuous. Riming is the ONLY liquid->ice channel left
+            # above T_0 (homogeneous freezing is gated to T < T_0-35, Bigg to T < T_0-4,
+            # and ishmael_ice_rain_riming routes dQRfzri/dQIfzri/dNfzri to zero there), so
+            # a cloud debit above freezing IS the wet-growth transfer.
+            @test minimum(S_off.ICE_C) < 0.0
+            # ...and it releases L_f where it happens. `FRZ_NET` itself stays negative in
+            # this column because the melt credit dominates it; the statement is that the
+            # riming transfer PUSHES IT UP, which is exactly the loan the departure removes.
+            @test maximum(S_off.FRZ_NET .- S_on.FRZ_NET) > 0.0
+
+            # WITH THE DEPARTURE: no mass leaves the cloud or the rain to the ice.
+            @test all(S_on.ICE_C .== 0.0)             # nothing debits the cloud at all
+            @test all(S_on.ICE_R .>= 0.0)             # the rain only GAINS (melt credit)
+            # ...so FRZ_NET above T_0 contains melting alone, and melting is negative.
+            @test all(S_on.FRZ_NET .<= 0.0)
+            @test minimum(S_on.FRZ_NET) < 0.0         # the melt is live, not switched off
+            # The ice mass source carries no riming gain either: the only mass channel left
+            # for a species above T_0 is melting, which removes.
+            @test all(S_on.SRC_i1q .<= 0.0)
+            @test minimum(S_on.SRC_i1q) < 0.0
+            # And the axes grow on no rime.
+            @test all(S_on.SRC_i1a .<= S_off.SRC_i1a .+ 1.0e-30)
+
+            # THE LOOP IS THE DIFFERENCE: melting still carries the sensible heat of the
+            # liquid that struck the crystal, so the collection kernels DID run — the melt
+            # rate is not the shed-free one.
+            @test S_on.SRC_i1q != S_off.SRC_i1q
+        end
+
+        # BITWISE INERT BELOW T_0: the branch is a strict `temp > T_0` state test, exactly
+        # like the melt's, so a subfreezing riming column is unchanged to the last bit.
+        mktempdir() do tmpdir
+            function run_cold(opts)
+                m, patch, mod, _ = make_ice_mtile(tmpdir; Tsurf = 258.15, q_l = 1.0e-3,
+                                                  rho_i = 1.0e-5, n_i = 5.0e4,
+                                                  rho_r = 1.0e-4, n_r = 1.0e3, ts = 1.0,
+                                                  extra_options = opts)
+                for t in 2:4
+                    Scythe.advance_column(m, 1, t)
+                end
+                return m
+            end
+            m_on = run_cold(Dict{Symbol,Any}())
+            m_off = run_cold(Dict{Symbol,Any}(:ice_shed_above_t0 => false))
+            @test m_on.expdot_n == m_off.expdot_n
+            @test m_on.var_np1 == m_off.var_np1
+            S_on = m_on.mc_scratch[Threads.threadid()]
+            @test all(S_on.Tk .< Scythe.T_0)
+            @test minimum(S_on.ICE_C) < 0.0           # riming IS running down here
         end
     end
 

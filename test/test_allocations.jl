@@ -313,6 +313,30 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test Scythe.ice_slots(mtile_it.mc_slots, 1) == (13, 14, 15, 16)
         Scythe.moist_compressible_axisym(mtile_it, 1, kDim_it, 2)  # compile
         @test (@allocations Scythe.moist_compressible_axisym(mtile_it, 1, kDim_it, 2)) == 0
+
+        # ...and with the `:local` population seeding, which is the one reconciliation
+        # branch that walks the column instead of reading one gridpoint: three live-span
+        # sweeps per column plus a bounded outward index walk per dead point, all on the
+        # raw slots and with no workspace of their own.
+        mtile_ls, kDim_ls = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3),
+                                          precipitation = true,
+                                          extra_options = merge(ice_opts,
+                                              Dict{Symbol,Any}(
+                                                  :ice_population_seed => :local)))
+        moist_compressible_XZ(mtile_ls, 1, kDim_ls, 2)        # compile
+        @test (@allocations moist_compressible_XZ(mtile_ls, 1, kDim_ls, 2)) == 0
+
+        # ...and with the ICE NUMBER REALIZATION on (Stage 1b): three more donor factors per
+        # gridpoint, a second set of factors threaded into the aggregation kernel, and three
+        # more scratch columns written. All scalars and pre-allocated columns — the kernel
+        # gained keyword arguments, which must stay specialized rather than boxed.
+        mtile_nr, kDim_nr = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3),
+                                          precipitation = true,
+                                          extra_options = merge(ice_opts,
+                                              Dict{Symbol,Any}(
+                                                  :ice_number_realization => true)))
+        moist_compressible_XZ(mtile_nr, 1, kDim_nr, 2)        # compile
+        @test (@allocations moist_compressible_XZ(mtile_nr, 1, kDim_nr, 2)) == 0
     end
 
     @testset "per-column allocations stay zero on the axisymmetric cylinder" begin

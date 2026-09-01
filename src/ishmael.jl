@@ -643,6 +643,25 @@ changes the equation being solved — and the moist-compressible host
 forbids those (reference/Scythe_moist_compressible.tex §Departures (b)),
 so it calls this with `reservoir_caps=false`. The default keeps the
 Fortran-faithful form for the reference harness and its tests.
+
+# What this function does NOT bound, and who does
+
+`nbiggr` is not bounded by `mbiggr` in any form. The two are written from
+the same clamped DSD, so `mbiggr/nbiggr = 20π ρ_w/λ_r³` is whatever the
+DSD says and nothing here asks whether the crystals it implies are a size
+the scheme can represent. Nor is the existence gate a POPULATION test:
+`qr > QSMALL` alone, with [`ishmael_rain_lambda`](@ref) flooring `nr` at
+`QNSMALL` and clamping `lamr` to `LAMMINR`, so a rain slot carrying mass
+and no number is handed to Bigg as 2800 μm drops. Measured at the O01
+anvil top, 30–40 K below Bigg's validity where `exp(0.66ΔT) ~ 1e21`, that
+was ~1e15 m⁻³ s⁻¹ of ice crystals created with a millionth of the minimum
+resolved mass each (reference/FINDINGS_ISHMAEL_S8S9.md §5i). Both repairs
+live in the host, where the realized rates and the carried moments are:
+the RAIN POPULATION GATE (`options[:rain_population_gate]`) skips this
+call entirely where the carried `n_r` is not positive, and the
+minimum-crystal bound in `mc_ice_sources!`'s slot assembly holds
+`nbig ≤ mbig/ISHMAEL_M_MIN` on the realized pair. This function stays the
+verbatim port it is.
 """
 function ishmael_bigg_freezing(temp::Float64, qr::Float64, nr::Float64, dt::Float64;
                                 QSMALL::Float64=ISHMAEL_QSMALL, T0::Float64=ISHMAEL_T0,
@@ -835,9 +854,10 @@ end
 #   - the "do not over-deplete from aggregation" `ratioagg` reconciliation
 #     in `aggregation`, lines 4400-4426 -- the LIMITER is not ported, but
 #     its HOOK is: `ishmael_aggregation` takes one realization factor per
-#     donor species and applies it exactly there (see that docstring), so
-#     the host bounds the pair sums with its own exponential realization
-#     instead of with a `dt`-shaped ratio.
+#     donor species PER MOMENT (mass and number separately) and applies
+#     them exactly there (see that docstring), so the host bounds the
+#     pair sums with its own exponential realization instead of with a
+#     `dt`-shaped ratio.
 # Everything up to but NOT INCLUDING those blocks is ported below.
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1488,35 +1508,60 @@ ishmael_tables.jl, used by `mkcoltb`) -- these are two independent,
 intentionally-different uses of "cfmas(5)" in the Fortran, both
 transcribed faithfully to their own call sites.
 
-THE REALIZATION HOOK, `f_agg1`/`f_agg2`: the Fortran's "do not
+THE REALIZATION HOOK, `f_agg1`/`f_agg2` (mass) and
+`f_aggn1`/`f_aggn2`/`f_aggn3` (number): the Fortran's "do not
 over-deplete from aggregation" `ratioagg` reconciliation across the 3
 pairs feeding category 3/4's sink (lines 4400-4426) is NOT ported -- it
 is a rate limiter, and this port removes rate limiters (module-level
 exclusion note above). What IS ported is its HOOK. The caller supplies
-one factor per DONOR SPECIES and it is applied exactly where `ratioagg`
-was applied, right after the seven [`ishmael_col1`](@ref) calls, to each
-contributing pair's `(colamt, deltan)`: species 1's three pairs
-(planar+columnar, planar+aggregates, planar self) by `f_agg1`, species
-2's three by `f_agg2`, aggregate self-collection (`c_55`, which moves
-nothing between species) untouched. The host forms those factors from
-each species' TOTAL sink conductance (`mc_ice_sources!`), so the 3-pair
-SUM ends up bounded against `q1`/`q2` by the same exponential
+one factor per DONOR SPECIES per MOMENT and it is applied exactly where
+`ratioagg` was applied, right after the seven [`ishmael_col1`](@ref)
+calls, to each contributing pair's `colamt` and `deltan` separately:
+species 1's three pairs (planar+columnar, planar+aggregates, planar
+self) by `f_agg1`/`f_aggn1`, species 2's three by `f_agg2`/`f_aggn2`,
+and aggregate self-collection (`c_55`) -- which moves no mass between
+species but does remove species-3 NUMBER -- by `f_aggn3` alone. The host
+forms those factors from each species' TOTAL sink conductance in that
+moment (`mc_ice_sources!`), so the 3-pair SUM ends up bounded against
+`q1`/`q2` (and against `n1`/`n2`/`n3`) by the same exponential
 realization every other donor in the set uses, rather than by a
-`dt`-shaped ratio. Both default to `1.0` and `1.0*x` is `x` to the bit,
-so the default call is the Fortran unchanged.
+`dt`-shaped ratio. All default to `1.0` (the number factors default to
+their species' MASS factor, `f_aggn3` to `1.0`) and `1.0*x` is `x` to
+the bit, so the default call is the Fortran unchanged and the
+mass-factor defaults are bitwise the single-factor hook this shipped
+with.
 
 Two deliberate DEPARTURES from `ratioagg`. (1) It scales the mass
 transfer only, leaving the number transfer at its unlimited value; here
-the NUMBER RIDES THE MASS FACTOR. A pair's `(colamt, deltan)` is one
-collision count, so scaling both keeps the surviving per-particle mass
-invariant, where the mass-only form drifts number without mass. (2) Its
-own guard is a `min(1, q/sink)` truncation; the caller's factor is an
-exponential realization, and no truncation is ported with the hook.
+the number is scaled too, but at ITS OWN factor. This corrects the
+claim the single-factor hook was written on -- "a pair's `(colamt,
+deltan)` is one collision count, so scaling both keeps the surviving
+per-particle mass invariant". The first half is true and the conclusion
+does not follow from it: `colamt` is integrated from `coltab` and
+`deltan` from `coltabn`, two SEPARATE offline tables integrating
+DIFFERENT MOMENTS of the same collision kernel over the same size
+distributions (`mkcoltb`, ishmael_tables.jl), so the fraction of the
+mass a step collects and the fraction of the number it collects are
+independent state functions. Measured at unit factors on the
+stiff-cold two-habit fixture of `test_moist_compressible.jl`
+(`rho_i = rho_i2 = 1e-3 kg/m^3`, `n_i = n_i2 = 1e6 /m^3`, T = 259.15 K,
+`dt = 1 s`): `kappa_q = 1.77e-4 /s` against `kappa_n = 8.21e-5 /s`, a
+ratio `kappa_n/kappa_q = 0.464`; at `n_i = 1e9 /m^3`, 0.377; on an
+anvil-like state (`1e-4 kg/m^3`, `5e7 /m^3`, T = 240 K, rho_a = 0.55),
+0.201. The number conductance is therefore NOT the mass conductance --
+here it is SMALLER, so the mass factor over-realizes the number transfer
+by up to 5x, and nothing says it stays on that side of 1 in a state the
+tables have not been probed at. Two reservoirs, two conductances, two
+factors. (2) `ratioagg`'s own guard is a `min(1, q/sink)` truncation;
+the caller's factor is an exponential realization, and no truncation is
+ported with the hook.
 
 `reservoir_caps` is passed through to the six MASS pairs (see
 [`ishmael_col1`](@ref)). `c_55` always keeps its own caps: aggregate
-self-collection has no conductance in this construction, so the per-pair
-bound is the only thing standing behind it.
+self-collection has no MASS conductance in this construction, so for the
+mass the per-pair bound is the only thing standing behind it. Its number
+now has `f_aggn3`, and the caps stay anyway -- they are the Fortran's
+and they cost nothing where the factor already bounds the sum.
 """
 function ishmael_aggregation(dt::Float64, rhoair::Float64, temp::Float64,
                               q1::Float64, n1::Float64, d1::Float64,
@@ -1526,6 +1571,8 @@ function ishmael_aggregation(dt::Float64, rhoair::Float64, temp::Float64,
                               coltab::Array{Float64,3}, coltabn::Array{Float64,3};
                               T0::Float64=ISHMAEL_T0,
                               f_agg1::Float64=1.0, f_agg2::Float64=1.0,
+                              f_aggn1::Float64=f_agg1, f_aggn2::Float64=f_agg2,
+                              f_aggn3::Float64=1.0,
                               reservoir_caps::Bool=true)
     tempC = temp - T0
     en1 = n1 * rhoair
@@ -1563,16 +1610,22 @@ function ishmael_aggregation(dt::Float64, rhoair::Float64, temp::Float64,
                         coltab, coltabn, ip_55, true)
 
     # ── The caller's realization factors, at the `ratioagg` hook (see the docstring) ──
-    # One factor per DONOR SPECIES, on the pairs that draw from it, mass and number
-    # together. `1.0*x === x`, so unit factors leave every line below bitwise the Fortran.
-    c_34 = (colamt = f_agg1 * c_34.colamt, deltan = f_agg1 * c_34.deltan)
-    c_35 = (colamt = f_agg1 * c_35.colamt, deltan = f_agg1 * c_35.deltan)
-    c_33 = (colamt = f_agg1 * c_33.colamt, deltan = f_agg1 * c_33.deltan)
-    c_43 = (colamt = f_agg2 * c_43.colamt, deltan = f_agg2 * c_43.deltan)
-    c_45 = (colamt = f_agg2 * c_45.colamt, deltan = f_agg2 * c_45.deltan)
-    c_44 = (colamt = f_agg2 * c_44.colamt, deltan = f_agg2 * c_44.deltan)
-    # `c_55` is untouched: aggregate self-collection takes from species 3 and gives to
-    # species 3, so no donor reservoir realizes it.
+    # TWO factors per DONOR SPECIES, one per MOMENT: `f_agg<k>` on the mass its three pairs
+    # move, `f_aggn<k>` on the number. `1.0*x === x`, so unit factors leave every line below
+    # bitwise the Fortran, and the defaults `f_aggn<k> = f_agg<k>` reproduce the
+    # number-rides-the-mass-factor form this hook shipped with.
+    c_34 = (colamt = f_agg1 * c_34.colamt, deltan = f_aggn1 * c_34.deltan)
+    c_35 = (colamt = f_agg1 * c_35.colamt, deltan = f_aggn1 * c_35.deltan)
+    c_33 = (colamt = f_agg1 * c_33.colamt, deltan = f_aggn1 * c_33.deltan)
+    c_43 = (colamt = f_agg2 * c_43.colamt, deltan = f_aggn2 * c_43.deltan)
+    c_45 = (colamt = f_agg2 * c_45.colamt, deltan = f_aggn2 * c_45.deltan)
+    c_44 = (colamt = f_agg2 * c_44.colamt, deltan = f_aggn2 * c_44.deltan)
+    # `c_55`'s MASS is untouched, as it always was: aggregate self-collection takes from
+    # species 3 and gives to species 3, so no mass reservoir realizes it. Its NUMBER is not
+    # in that position — two aggregates leave and one arrives, so species 3's number IS a
+    # donor here — and `f_aggn3` is where its reservoir's factor goes. It defaults to `1.0`,
+    # which is what this pair carried before the number moments were separated.
+    c_55 = (colamt = c_55.colamt, deltan = f_aggn3 * c_55.deltan)
 
     sink3 = c_34.colamt + c_35.colamt + c_33.colamt
     sink4 = c_43.colamt + c_45.colamt + c_44.colamt

@@ -1705,10 +1705,35 @@ factors in `nr·qr` against it, leaving the product of the two densities. Breaku
 `dum` negative at large drop sizes, which flips the sign and makes the term a number
 SOURCE — that is the intended Verlinde-Cotton behaviour and is not clipped.
 
-Exactly `0.0` below `q_r = RAIN_2M_Q_MIN`.
+Exactly `0.0` below `q_r = RAIN_2M_Q_MIN`, and exactly `0.0` for `n_r <= 0`.
+
+# The rain POPULATION GATE, on the one warm-path kernel that needs it
+
+This is the only two-moment warm closure whose rate is a number SOURCE read off the
+DIAGNOSED distribution rather than off the carried number, and both halves of that matter
+where the two rain moments decorrelate. [`rain_dsd_2m`](@ref) floors the number at `QNSMALL`
+and clamps the slope, so a rain slot that has rung to mass-without-number is handed back as
+2800 μm drops (`lamr = LAMMINR`) with `n0rr` and `n_r` re-diagnosed from the MASS — and at
+that mean size the breakup rolloff is `dum = 2 − e^{5.75} = −312`, which flips the sign and
+makes this term create drops where the transport is carrying none. The result is not large
+(`~1e-10 # m⁻³ s⁻¹` at the O01 anvil top) but it is the wrong kind of small: it is number
+without activation, and once the slot is positive again the DSD consumers that gate on
+`n_r > 0` — Bigg freezing above all — see a population to act on
+(reference/FINDINGS_ISHMAEL_S8S9.md §5i, §5j).
+
+So the carried number is tested first: no drops, no collisions between drops, and no
+breakup of drops that are not there. Like the minimum-crystal bound on the ice number
+sources this carries NO off-switch — `options[:rain_population_gate]` is the switch on the
+Bigg call, which is a kernel-level gate on a verbatim port; this is an invariant of a
+closure written here, and it is stated the same way its sibling
+[`rain_number_evaporation_2m`](@ref) already states it. BITWISE INERT for `n_r > 0`, which
+is all healthy rain: the test is not taken and the arithmetic below is what it always was.
+The other two DSD consumers need nothing — `invtau_rain_2m` and `rain_fall_speeds_2m` are
+bounded by the same clamp rather than exposed by it; see their docstrings.
 """
 @inline function rain_selfcollection_2m(rho_r, n_r, rho_d)
 
+    n_r > 0.0 || return 0.0
     dsd = rain_dsd_2m(rho_r, n_r, rho_d)
     dsd.q_r < RAIN_2M_Q_MIN && return 0.0
     d_mean = 1.0 / dsd.lamr
@@ -1734,6 +1759,26 @@ content the second moment buys. Both are capped at 9.1 m/s, and the cap can make
 equal at very large drop sizes.
 
 Exactly `(0.0, 0.0)` below `q_r = RAIN_2M_Q_MIN`, so rain-free air has no flux.
+
+# At `n_r <= 0`: CLAMP-BOUNDED, and deliberately ungated
+
+A rain slot carrying mass with no carried number gets the floored, `LAMMINR`-clamped DSD out
+of [`rain_dsd_2m`](@ref) — 2800 μm drops — and both speeds then sit on the 9.1 m/s cap. That
+is the fastest the scheme can fall, and it is INDEPENDENT of the mass, which is the shape of
+the defect the ice population gate exists to forbid. What makes it a bounded exposure rather
+than a phantom one is the OTHER end of the same clamp: at `q_r = 1e-8` kg/kg and `ρ_d = 0.3`
+kg/m³, every number from 1e2 to 1e7 m⁻³ puts `lamr` on `LAMMAXR` and returns
+`(−2.665, −1.218)` m/s, so the whole exposure is a factor of 3.4 on `w_m` (9.1 / 2.665) and
+7.5 on `w_n`, with no dependence on anything that can run away. Nothing is created: the flux
+is `ρ_r·w`, linear in a mass that is really there.
+
+It is therefore left UNGATED, and that is a choice with a reason on both sides. Zeroing the
+speed would stop the mass falling at all, and rain — unlike ice — has no population
+reconciliation to hand orphaned mass back to a representation the equations can act on
+(`_ice_population_reconcile!` in `moist_compressible.jl` is the ice-only fourth tier), so the
+gate would strand it in the slot instead of bounding it. `rain_number_evaporation_2m` and
+`rain_selfcollection_2m` gate because they are number rates on a population that is not
+there; a fall speed here moves mass that is.
 """
 @inline function rain_fall_speeds_2m(rho_r, n_r, rho_d)
 
@@ -1772,6 +1817,20 @@ actually carrying.
 
 Returned non-negative and exactly `0.0` below `q_r = RAIN_2M_Q_MIN`. The condensation-side
 cloud gate lives in the caller [`qss_condensation_rates`](@ref), unchanged.
+
+# At `n_r <= 0`: CLAMP-BOUNDED, in the conservative direction
+
+The floored, `LAMMINR`-clamped DSD [`rain_dsd_2m`](@ref) returns for a mass-without-number
+rain slot re-diagnoses `n0rr = lamr⁴ q_r/(π ρ_w)` from the MASS, so `1/τ_r` stays exactly
+proportional to `q_r` — it cannot outlive the mass, and it is a SINK on the reservoir it is
+proportional to, never a source. It is also the SMALLEST value the clamp range admits, since
+`1/τ_r ∝ lamr² q_r F1R + lamr^{1.25} q_r F2R(·)` is increasing in `lamr`: measured at
+`q_r = 1e-8` kg/kg, 198 K, 120 hPa and `ρ_d = 0.3` kg/m³, `1.02e-9 s⁻¹` at `n_r = 0` against
+`1.69e-6 s⁻¹` for every number from 1e2 to 1e7 m⁻³ (which all sit on `LAMMAXR` at that mass).
+So the phantom DSD under-evaporates such a slot by ~1.7e3 rather than over-driving it, and
+gating the channel would make that worse: it would leave the ringing mass with no sink at
+all. Ungated deliberately; contrast [`rain_selfcollection_2m`](@ref), which is a number
+SOURCE at the same clamp and is gated there.
 """
 function invtau_rain_2m(Tk, p_hPa, rho_r, n_r, rho_d)
 
