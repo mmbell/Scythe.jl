@@ -612,6 +612,99 @@ using SpecialFunctions: gamma
                                                 rain_2m = true, n_r_density = 0.0)
             @test dry === (0.0, 0.0, 0.0, 0.0)
         end
+
+        @testset "Every DSD consumer at n_r <= 0 (the Stage 3f audit)" begin
+            # THE DEFECT STATE (reference/FINDINGS_ISHMAEL_S8S9.md 5i): at the anvil top the
+            # two rain moments decorrelate on their independent spline fits — n_r rings to
+            # EXACTLY zero while rho_r keeps ~1e-8 kg/kg at 190-200 K. `rain_dsd_2m` then
+            # floors the number at QNSMALL, the slope falls into the LAMMINR clamp, and every
+            # consumer is handed 2800 um drops with n0rr and n_r re-diagnosed from the MASS.
+            # This testset states, for EACH consumer, what that does — and each of the three
+            # verdicts (gated / clamp-bounded / self-gating) is asserted rather than argued.
+            rd_a = 0.3
+            rr_a = 1.0e-8 * rd_a
+            Tk_a = 198.0
+            p_a = 120.0
+
+            dead = Scythe.rain_dsd_2m(rr_a, 0.0, rd_a)
+            @test dead.lamr == Scythe.ISHMAEL_LAMMINR
+            @test 1.0 / dead.lamr ≈ 2800.0e-6 rtol=1e-12
+            @test dead.n_r > 0.0                  # a population re-diagnosed from the mass
+            # Every healthy number at this mass sits on the OTHER end of the same clamp, so
+            # the phantom is not a point on a continuum: it is the far end of the range.
+            for nn in (1.0e2, 1.0e3, 1.0e5, 1.0e7)
+                @test Scythe.rain_dsd_2m(rr_a, nn, rd_a).lamr >= 4.7e4
+            end
+
+            # ── PHANTOM-VULNERABLE, AND GATED: rain_selfcollection_2m ────────────────
+            # At the clamp the Verlinde-Cotton rolloff flips the sign and the term CREATES
+            # drops where the transport carries none.
+            dum_dead = 2.0 - exp(2300.0 * ((1.0 / dead.lamr) - 300.0e-6))
+            @test dum_dead < -300.0
+            @test -5.78 * dum_dead * dead.n_r * rr_a > 0.0     # what it used to return
+            @test Scythe.rain_selfcollection_2m(rr_a, 0.0, rd_a) === 0.0
+            @test Scythe.rain_selfcollection_2m(rr_a, -1.0e3, rd_a) === 0.0
+            @test Scythe.rain_selfcollection_2m(rho_r, 0.0, rho_d) === 0.0
+            @test Scythe.rain_selfcollection_2m(1.0e-4, -1.0, rho_d) === 0.0
+            # THE GATE IS EXACTLY THE CARRIED-NUMBER TEST, and nothing more: the smallest
+            # positive number there is still runs the full arithmetic.
+            @test Scythe.rain_selfcollection_2m(rr_a, nextfloat(0.0), rd_a) > 0.0
+            # HEALTHY RAIN IS BITWISE WHAT IT WAS, at both ends of the rolloff.
+            for (rr_h, nr_h) in ((rho_r, n_r), (1.0e-4, 1.0e5), (1.0e-3, 1.0e2))
+                d_h = Scythe.rain_dsd_2m(rr_h, nr_h, rho_d)
+                dm_h = 1.0 / d_h.lamr
+                dum_h = dm_h < 300.0e-6 ? 1.0 : 2.0 - exp(2300.0 * (dm_h - 300.0e-6))
+                @test Scythe.rain_selfcollection_2m(rr_h, nr_h, rho_d) ===
+                      -5.78 * dum_h * d_h.n_r * max(rr_h, 0.0)
+            end
+
+            # ── SELF-GATING: rain_number_evaporation_2m tests the raw slot itself ─────
+            @test Scythe.rain_number_evaporation_2m(-1.0e-9, rr_a, 0.0) === 0.0
+            @test Scythe.rain_number_evaporation_2m(-1.0e-9, rr_a, -1.0e3) === 0.0
+            @test Scythe.rain_number_evaporation_2m(-1.0e-9, rr_a, 1.0e3) < 0.0
+
+            # ── CLAMP-BOUNDED, conservative direction: invtau_rain_2m ────────────────
+            # n0rr is re-diagnosed from the MASS at the clamp, so the rate stays exactly
+            # linear in rho_r — it cannot outlive the mass it removes — and it is the
+            # SMALLEST value the clamp range admits, i.e. the phantom UNDER-evaporates.
+            it_dead = Scythe.invtau_rain_2m(Tk_a, p_a, rr_a, 0.0, rd_a)
+            @test it_dead > 0.0
+            for nn in (1.0e2, 1.0e3, 1.0e5, 1.0e7)
+                @test Scythe.invtau_rain_2m(Tk_a, p_a, rr_a, nn, rd_a) > it_dead
+            end
+            @test Scythe.invtau_rain_2m(Tk_a, p_a, 2 * rr_a, 0.0, rd_a) ≈ 2 * it_dead rtol=1e-12
+            @test Scythe.invtau_rain_2m(Tk_a, p_a, 0.0, 0.0, rd_a) === 0.0
+
+            # ── CLAMP-BOUNDED: rain_fall_speeds_2m ───────────────────────────────────
+            # The phantom falls at the 9.1 m/s cap and is INDEPENDENT of the mass, which is
+            # the shape of the ice-side defect; what bounds it is the other end of the same
+            # clamp — a factor of 3.4 on the mass-weighted speed, with nothing that can run
+            # away, and the flux it feeds is linear in a mass that is really there.
+            wd = Scythe.rain_fall_speeds_2m(rr_a, 0.0, rd_a)
+            wl = Scythe.rain_fall_speeds_2m(rr_a, 1.0e3, rd_a)
+            @test wd === (-Scythe.RAIN_2M_VT_MAX, -Scythe.RAIN_2M_VT_MAX)
+            @test Scythe.rain_fall_speeds_2m(1.0e3 * rr_a, 0.0, rd_a) === wd
+            @test abs(wd[1]) / abs(wl[1]) < 4.0
+            for nn in (1.0e2, 1.0e3, 1.0e5, 1.0e7)
+                w = Scythe.rain_fall_speeds_2m(rr_a, nn, rd_a)
+                @test abs(w[1]) <= abs(wd[1]) && abs(w[2]) <= abs(wd[2])
+            end
+
+            # ── NO NUMBER READ AT ALL: the two KK2000 mass closures ──────────────────
+            # Autoconversion's number leg is the ratio bound by construction (one 25 um drop
+            # per unit of converted mass), which is the warm twin of the ice sources'
+            # minimum-crystal bound; accretion takes no number argument and grows the drops
+            # that are there.
+            aq, an = Scythe.rain_autoconversion_2m(rho_c, rho_d, 100.0)
+            @test aq > 0.0
+            @test an === aq / Scythe.RAIN_2M_M_AUTO
+
+            # ALLOCATION-FREE, gate and all.
+            Scythe.rain_selfcollection_2m(rr_a, 0.0, rd_a)
+            Scythe.rain_selfcollection_2m(rho_r, n_r, rho_d)
+            @test @allocated(Scythe.rain_selfcollection_2m(rr_a, 0.0, rd_a)) == 0
+            @test @allocated(Scythe.rain_selfcollection_2m(rho_r, n_r, rho_d)) == 0
+        end
     end
 
 end
