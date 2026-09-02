@@ -17,6 +17,14 @@ include(joinpath(@__DIR__, "..", "benchmarks", "common", "harness.jl"))
     quick_opts = BenchmarkOptions(:quick, STAGE_MC, :rirk, 1, false, false, 1.0, 1, false, false)
     full_opts  = BenchmarkOptions(:full,  STAGE_MC, :rirk, 1, false, false, 1.0, 1, false, false)
 
+    @testset "worker_threads: positional 10-arg form defaults to the CPU split" begin
+        @test quick_opts.worker_threads == 0
+        @test parse_benchmark_args(String["--worker-threads", "3"]).worker_threads == 3
+        @test parse_benchmark_args(String[]).worker_threads ==
+              parse(Int, get(ENV, "SCYTHE_BENCH_THREADS", "0"))
+        @test_throws ErrorException parse_benchmark_args(String["--worker-threads", "-1"])
+    end
+
     @testset "reference_csv_path: unarmed is byte-identical to the pre-arm path" begin
         @test reference_csv_path("o01_rainfall", quick_opts) ==
               joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "quick_mc_rirk_final.csv")

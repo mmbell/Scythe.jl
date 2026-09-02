@@ -115,10 +115,11 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     # FULL-mode ice windows (load_targets prefers "<key>_full" in full mode). Seeded from
     # the accepted 2026-09-01 full run (the author's overnight run on the Stage D physics;
     # fields/movie review: physical anvil at the tropopause, transient downburst ice below
-    # the melting level, ~0.1 mg/m^3 lid trace excluded by the ice_top cap). ONE
-    # REALIZATION: the run-to-run spread question is OPEN (HANDOFF_REPRODUCIBILITY.md) --
-    # revisit the atols once reproducibility is settled. Tolerances copied from the quick
-    # set (both columns; stage mc reads the quick column).
+    # the melting level, ~0.1 mg/m^3 lid trace excluded by the ice_top cap). The arm
+    # reproduces bitwise on the same code (FINDINGS 5n; the 4d' spread was a code-state
+    # confound), so these are physics-drift guards, not realization spread; the rtol-1e-6
+    # diagnostics reference is the tight gate. Tolerances copied from the quick set (both
+    # columns; stage mc reads the quick column).
     "o01_rainfall_ice_full" => Dict(
         "peak_rain_rate_gm2s"   => (84.8,  25.0, 30.0, "seeded 2026-09-01 (accepted full run)"),
         "max_rho_r_gm3"         => (15.7,  3.5,  4.0,  "seeded 2026-09-01 (accepted full run)"),

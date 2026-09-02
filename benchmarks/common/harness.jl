@@ -8,6 +8,7 @@
 # reference data, and appends a JSON record with timing and provenance.
 
 using Distributed
+using LinearAlgebra: BLAS
 using Printf
 using Dates
 using CSV
@@ -30,7 +31,14 @@ struct BenchmarkOptions
     nests::Int          # --nests N: grid-nesting levels (1 = single grid, default)
     hsi::Bool           # --hsi: horizontal semi-implicit (mc stage, RiRk grid only)
     xsi::Bool           # --exact-si: unsplit 2-D acoustic SI (mc stage, RiRk grid only)
+    worker_threads::Int # --worker-threads N: Julia threads per worker (0 = CPU_THREADS ÷ workers)
 end
+
+# Positional 10-argument form, kept for callers that predate `worker_threads`
+# (test/test_benchmark_smoke.jl builds options this way).
+BenchmarkOptions(mode, stage, grid, workers, update_reference, plot, ts_factor, nests, hsi, xsi) =
+    BenchmarkOptions(mode, stage, grid, workers, update_reference, plot, ts_factor, nests, hsi,
+                     xsi, 0)
 
 # Primitive-equation stage carrying the linear dry-air density rho_d' (slot 2)
 # in place of the log-density xi. Spelled with a hyphen for external clarity;
@@ -100,8 +108,9 @@ end
 
 Parse benchmark command line arguments:
 --mode quick|full (default quick), --stage legacy|pe|pe-rho_d (default legacy),
---grid rz|rirk (default rz), --workers N (default 2), --ts-factor F (RiRk timestep
-scale, default 1.0), --update-reference, --plot.
+--grid rz|rirk (default rz), --workers N (default 2), --worker-threads N (Julia threads
+per worker; default 0 = `Sys.CPU_THREADS ÷ workers`; env fallback `SCYTHE_BENCH_THREADS`),
+--ts-factor F (RiRk timestep scale, default 1.0), --update-reference, --plot.
 """
 function parse_benchmark_args(args::Vector{String})
     mode = :quick
@@ -114,6 +123,7 @@ function parse_benchmark_args(args::Vector{String})
     nests = 1
     hsi = false
     xsi = false
+    worker_threads = parse(Int, get(ENV, "SCYTHE_BENCH_THREADS", "0"))
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -125,6 +135,8 @@ function parse_benchmark_args(args::Vector{String})
             grid = Symbol(args[i+1]); i += 2
         elseif arg == "--workers"
             nworkers = parse(Int, args[i+1]); i += 2
+        elseif arg == "--worker-threads"
+            worker_threads = parse(Int, args[i+1]); i += 2
         elseif arg == "--ts-factor"
             ts_factor = parse(Float64, args[i+1]); i += 2
         elseif arg == "--nests"
@@ -140,7 +152,8 @@ function parse_benchmark_args(args::Vector{String})
         elseif arg in ("--help", "-h")
             println("Usage: julia --project=. benchmarks/<case>.jl " *
                     "[--mode quick|full] [--stage legacy|pe|pe-rho_d] [--grid rz|rirk] " *
-                    "[--workers N] [--ts-factor F] [--nests N] [--hsi] [--exact-si] [--update-reference] [--plot]")
+                    "[--workers N] [--worker-threads N] [--ts-factor F] [--nests N] [--hsi] " *
+                    "[--exact-si] [--update-reference] [--plot]")
             exit(0)
         else
             error("Unknown argument: $arg")
@@ -151,6 +164,7 @@ function parse_benchmark_args(args::Vector{String})
         error("--stage must be legacy, pe, pe-rho_d, pe-rho_d-pd, pe-sigma, or mc")
     grid in (:rz, :rirk) || error("--grid must be rz or rirk")
     nworkers >= 1 || error("--workers must be >= 1")
+    worker_threads >= 0 || error("--worker-threads must be >= 0 (0 = CPU_THREADS ÷ workers)")
     ts_factor > 0.0 || error("--ts-factor must be > 0")
     nests >= 1 || error("--nests must be >= 1")
     hsi && (stage == STAGE_MC && grid == :rirk ||
@@ -158,29 +172,69 @@ function parse_benchmark_args(args::Vector{String})
     xsi && (stage == STAGE_MC && grid == :rirk ||
         error("--exact-si requires --stage mc --grid rirk"))
     (hsi && xsi) && error("--hsi and --exact-si are mutually exclusive")
-    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot, ts_factor, nests, hsi, xsi)
+    return BenchmarkOptions(mode, stage, grid, nworkers, update_reference, plot, ts_factor, nests,
+                            hsi, xsi, worker_threads)
 end
 
 """Geometry string for the configured vertical basis (RZ Chebyshev vs RiRk B-spline)."""
 benchmark_geometry(opts::BenchmarkOptions) = opts.grid == :rirk ? "RiRk" : "RZ"
 
 """
-    add_benchmark_workers(opts)
+    add_benchmark_workers(opts; count = opts.workers)
 
 Add the worker processes, dividing the machine's threads *among* them rather than giving
-each one the whole box.
+each one the whole box, and pin each worker's OpenBLAS to one thread.
 
 `--threads=auto` hands every worker `Sys.CPU_THREADS` threads, so the default 2 workers on a
 12-core machine spawn 24 compute threads for 12 cores. They then all allocate into a shared
 GC from inside the `Threads.@threads` column loop, which shows up as heavy GC time and
 millions of lock conflicts — and is a suspected contributor to the intermittent worker death
-in long moist_compressible runs.
+in long moist_compressible runs. `opts.worker_threads > 0` overrides the split (the
+reproducibility ladder needs 1 worker × 1 thread, which the split alone cannot express).
+
+OpenBLAS defaults to `Sys.CPU_THREADS` threads per process on top of the Julia threads:
+2 workers × 6 Julia threads × 12 BLAS threads = 144 runnable threads on 12 cores. The
+periodic-BC spline fit on the RiRk grid solves through LAPACK `potrs` (Springsteel
+`DenseSplineFactor`), so BLAS IS on the fit path, and a threaded BLAS partitioning is the one
+timing-dependent reduction order a fixed-thread-count run could still carry. The pin is
+applied HERE, never at the top level of this file (test/test_benchmark_smoke.jl includes it).
+`SCYTHE_BENCH_BLAS_THREADS=0` leaves OpenBLAS at its default for before/after checks.
 """
 function add_benchmark_workers(opts::BenchmarkOptions; count::Int = opts.workers)
-    nthreads = max(1, Sys.CPU_THREADS ÷ count)
+    nthreads = opts.worker_threads > 0 ? opts.worker_threads : max(1, Sys.CPU_THREADS ÷ count)
+    blas = parse(Int, get(ENV, "SCYTHE_BENCH_BLAS_THREADS", "1"))
     println("Adding $(count) worker(s) with $(nthreads) thread(s) each " *
-            "($(Sys.CPU_THREADS) CPU threads available)")
-    return addprocs(count, exeflags = "--threads=$(nthreads)")
+            "($(Sys.CPU_THREADS) CPU threads available); BLAS threads per worker: " *
+            (blas > 0 ? string(blas) : "OpenBLAS default"))
+    pids = addprocs(count, exeflags = "--threads=$(nthreads)")
+    if blas > 0
+        BLAS.set_num_threads(blas)
+        # Quoted expressions rather than `@everywhere ... using ...`: a `using` inside a
+        # macro call in a function body is rejected as a non-toplevel expression.
+        Distributed.remotecall_eval(Main, pids, :(using LinearAlgebra))
+        Distributed.remotecall_eval(Main, pids,
+                                    :(LinearAlgebra.BLAS.set_num_threads($blas)))
+    end
+    return pids
+end
+
+"""
+    worker_provenance() -> Dict
+
+Thread/BLAS/bounds-check settings as the FIRST WORKER sees them (the master's values are not
+what the model ran under), for the JSONL record. Every entry is a plain Int; -1 means the
+worker could not report it (no workers, or LinearAlgebra not loaded there).
+"""
+function worker_provenance()
+    isempty(workers()) && return Dict("worker_threads" => -1, "blas_threads" => -1,
+                                      "check_bounds" => -1)
+    w = workers()[1]
+    wt = remotecall_fetch(Threads.nthreads, w)
+    bt = remotecall_fetch(w) do
+        isdefined(Main, :LinearAlgebra) ? Main.LinearAlgebra.BLAS.get_num_threads() : -1
+    end
+    cb = remotecall_fetch(() -> Int(Base.JLOptions().check_bounds), w)
+    return Dict("worker_threads" => wt, "blas_threads" => bt, "check_bounds" => cb)
 end
 
 """
@@ -356,9 +410,10 @@ function load_targets(name::String, opts::BenchmarkOptions; arm::String="")
     # A mode-qualified window set wins where one exists (the nested-arm precedent): the
     # full-resolution ice storm is not the quick storm re-run finer (accum 0.90 vs 3.7 on
     # the accepted 2026-09-01 run -- more water held in the anvil, hour-1 rain delayed),
-    # so its windows carry their own centers. The rtol-1e-6 diagnostics reference stays
-    # deliberately unseeded for the ice arm: its run-to-run spread (FINDINGS 4d', open
-    # question in HANDOFF_REPRODUCIBILITY.md) makes that comparison meaningless.
+    # so its windows carry their own centers. The ice arm's rtol-1e-6 diagnostics
+    # reference is seeded like any other: the run-to-run spread once recorded against it
+    # (FINDINGS 4d') was two code states across a commit, and the arm reproduces bitwise
+    # on the same code (FINDINGS 5n).
     if opts.mode == :full && haskey(BENCHMARK_EXPECTED, "$(key)_full")
         key = "$(key)_full"
     end
@@ -467,10 +522,25 @@ end
 function git_info(dir::String)
     try
         sha = strip(read(`git -C $dir rev-parse --short HEAD`, String))
-        dirty = !isempty(strip(read(`git -C $dir status --porcelain`, String)))
+        # Tracked modifications only. Untracked scratch (notebooks, Finder files) cannot
+        # enter a run -- Scythe.jl includes its files explicitly -- and counting it made
+        # every record on file read dirty=true, which hid the one distinction that matters
+        # for provenance (FINDINGS_ISHMAEL_S8S9 §4d′ compared two dirty trees across a commit).
+        dirty = !isempty(strip(read(`git -C $dir status --porcelain --untracked-files=no`,
+                                    String)))
         return String(sha), dirty
     catch
         return "unknown", false
+    end
+end
+
+"""Number of untracked (non-ignored) paths in `dir`, recorded beside `scythe_dirty`."""
+function git_untracked_count(dir::String)
+    try
+        out = read(`git -C $dir status --porcelain --untracked-files=all`, String)
+        return count(l -> startswith(l, "??"), split(out, '\n'))
+    catch
+        return -1
     end
 end
 
@@ -645,9 +715,10 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
         println("(re-run with --update-reference after accepting this result)")
     end
 
-    scythe_sha, scythe_dirty = git_info(normpath(joinpath(@__DIR__, "..", "..")))
+    scythe_root = normpath(joinpath(@__DIR__, "..", ".."))
+    scythe_sha, scythe_dirty = git_info(scythe_root)
     springsteel_sha, _ = git_info(pkgdir(Springsteel))
-    worker_threads = fetch(@spawnat workers()[1] Threads.nthreads())
+    prov = worker_provenance()
 
     passed = targets_ok && (isnothing(regression_ok) || regression_ok)
     record = Dict(
@@ -659,11 +730,17 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
         "equation_set" => model.equation_set,
         "scythe_sha" => scythe_sha,
         "scythe_dirty" => scythe_dirty,
+        "scythe_untracked" => git_untracked_count(scythe_root),
         "springsteel_sha" => springsteel_sha,
         "julia_version" => string(VERSION),
         "hostname" => gethostname(),
         "nworkers" => nworkers(),
-        "worker_threads" => worker_threads,
+        "worker_threads" => prov["worker_threads"],
+        "master_threads" => Threads.nthreads(),
+        "blas_threads" => prov["blas_threads"],
+        "check_bounds" => prov["check_bounds"],
+        "bench_tag" => get(ENV, "SCYTHE_BENCH_TAG", ""),
+        "tstop_env" => get(ENV, "SCYTHE_O01_TSTOP", ""),
         "ts" => model.ts,
         "num_cells" => model.grid_params.num_cells,
         "kDim" => model.grid_params.kDim,
@@ -766,8 +843,10 @@ function run_nested_benchmark(name::String, opts::BenchmarkOptions;
         println("(re-run with --update-reference after accepting this result)")
     end
 
-    scythe_sha, scythe_dirty = git_info(normpath(joinpath(@__DIR__, "..", "..")))
+    scythe_root = normpath(joinpath(@__DIR__, "..", ".."))
+    scythe_sha, scythe_dirty = git_info(scythe_root)
     springsteel_sha, _ = git_info(pkgdir(Springsteel))
+    prov = worker_provenance()
 
     passed = targets_ok && (isnothing(regression_ok) || regression_ok)
     record = Dict(
@@ -780,10 +859,17 @@ function run_nested_benchmark(name::String, opts::BenchmarkOptions;
         "equation_set" => nest.base.equation_set,
         "scythe_sha" => scythe_sha,
         "scythe_dirty" => scythe_dirty,
+        "scythe_untracked" => git_untracked_count(scythe_root),
         "springsteel_sha" => springsteel_sha,
         "julia_version" => string(VERSION),
         "hostname" => gethostname(),
         "nworkers" => nworkers(),
+        "worker_threads" => prov["worker_threads"],
+        "master_threads" => Threads.nthreads(),
+        "blas_threads" => prov["blas_threads"],
+        "check_bounds" => prov["check_bounds"],
+        "bench_tag" => get(ENV, "SCYTHE_BENCH_TAG", ""),
+        "tstop_env" => get(ENV, "SCYTHE_O01_TSTOP", ""),
         "ts" => join(topo.ts_actual, "|"),
         "num_cells" => join([m.grid_params.num_cells for m in models], "|"),
         "kDim" => nest.base.grid_params.kDim,

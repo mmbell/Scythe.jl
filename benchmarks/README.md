@@ -19,13 +19,24 @@ julia --project=. benchmarks/bf02_moist.jl --mode quick --stage legacy
 |------|--------|---------|
 | `--mode` | `quick` (default) \| `full` | quick: coarse grid for routine regression; full: paper-grade resolution |
 | `--stage` | `legacy` (default) \| `pe` | legacy: original equation sets (`Euler_test`/`BF02_test`); pe: `primitive_equation_XZ` (Stage 2) |
-| `--workers` | integer (default 2) | distributed worker count (recorded; results are worker-count independent to ~1e-10) |
+| `--workers` | integer (default 2) | distributed worker count (recorded). A different decomposition is a different computation: same-config runs are bitwise reproducible, runs at different worker counts agree only to round-off growth |
+| `--worker-threads` | integer (default 0) | Julia threads per worker; 0 = `Sys.CPU_THREADS ÷ workers`. Env fallback `SCYTHE_BENCH_THREADS`. Workers' OpenBLAS is pinned to 1 thread (`SCYTHE_BENCH_BLAS_THREADS=0` restores the OpenBLAS default) |
 | `--update-reference` | | write the committed regression reference from this run |
 | `--plot` | | save final-time contour figures to the output directory |
 
 Exit code 0 = all targets and the regression comparison passed (CI-friendly).
-Run records append to `results/<case>.jsonl` (gitignored) with git SHAs,
-timing, worker/thread counts, and all diagnostics.
+Run records append to `results/<case>.jsonl` (gitignored) with git SHAs
+(`scythe_dirty` counts TRACKED modifications only; `scythe_untracked` is recorded
+beside it), timing, worker/master/BLAS thread counts, the bounds-check setting,
+`SCYTHE_BENCH_TAG`, and all diagnostics.
+
+### Run-to-run reproducibility
+
+Every run writes into `output/<case>_<mode>_<stage>_<grid><SCYTHE_BENCH_TAG>/` and
+deletes that directory's `*_physical.csv` first, so two runs to be compared need
+distinct `SCYTHE_BENCH_TAG`s. `repro_census.sh N TSTOP [o01 args]` runs N identical
+tagged runs back to back and `cmp`s every snapshot pairwise (exit 0 only if all are
+bitwise identical); `LOAD=8` adds CPU burners to reproduce a loaded machine.
 
 ## Cases
 
