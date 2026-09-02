@@ -138,7 +138,8 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     haloReceiveBuffer::Vector{Float64}
     patch_b_iDim::Int64
     # Parameterized rather than pinned to a single factorization type: the concrete type
-    # varies with both the grid and the run configuration. `h_matrix` is an `LU` over a
+    # varies with both the grid and the run configuration. `h_matrix` is a `SplineFactor`
+    # (a factorization plus its Dirichlet flags) on RiRk and an `LU` over a
     # `Matrix` when semi-implicit is on but an `LU` over a `Tridiagonal` (the 2x2 dummy)
     # when it is off; `diffusion_matrix` is a `BunchKaufman` on RiRk and an `LU` on RZ.
     h_matrix::H
@@ -1025,7 +1026,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     # Output initial time
     patch.spectral .= sharedSpectral
     gridTransform!(patch)
-    @async write_output(patch, model, 0.0)
+    write_output(patch, model, 0.0)
     flush(stdout)
     # Check for NaNs and quit if found
     checkCFL(patch)
@@ -1146,15 +1147,20 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
             cfl_diagnostics(patch, model, t, dz_min, dx_min, c_bar)
         end
 
-        # Output if on specified time interval
+        # Output if on specified time interval. Synchronous: the writer reads
+        # `patch.physical`/`patch.spectral` in place, and the next output/CFL/restart step's
+        # `gridTransform!(patch)` above rewrites them, so an `@async` writer that fell behind
+        # would leave a snapshot torn across two times -- exactly the file a bitwise
+        # reproducibility comparison reads. The write costs ~1-2 s per 80 MB CSV against
+        # ~50 s of stepping per output interval on the quick ice benchmark.
         if is_output_step
-            @async write_output(patch, model, (t*model.ts))
+            write_output(patch, model, (t*model.ts))
             checkCFL(patch; t=t, ts=model.ts, where="output")
         end
 
-        # Restart checkpoint on its own (typically coarser) cadence. Synchronous,
-        # unlike the analysis output: a checkpoint half-written by an @async task
-        # racing process exit is useless for restart.
+        # Restart checkpoint on its own (typically coarser) cadence. Synchronous for the
+        # same reason as the analysis output above (and was first: a checkpoint
+        # half-written by an @async task racing process exit is useless for restart).
         if is_restart_step
             write_restart(patch, model, (t*model.ts))
         end
@@ -2248,9 +2254,27 @@ end
 
 const _RIRK_SOLVE_CACHE = Dict{UInt, NamedTuple}()
 const _RIRK_SOLVE_LOCK = ReentrantLock()
-# Per-factorization Dirichlet flags (bottom, top), so the load vector can zero the
-# matching boundary rows. Keyed by objectid of the factorization object.
-const _RIRK_DIRICHLET = Dict{UInt, Tuple{Bool, Bool}}()
+
+"""
+    SplineFactor(F, db, dt)
+
+A factorized B-spline Galerkin vertical operator together with the Dirichlet flags
+(bottom, top) of the rows it was assembled with, so `_vertical_solve!` can zero the
+matching load-vector rows. The flags used to live in a global `Dict` keyed by
+`objectid(F)`: every `_vertical_solve!` read it WITHOUT the lock that the first-step
+per-column assemblies (`t == 1` inside the `@threads :static` column loop) inserted under,
+and `objectid` of a freed factorization can be reused. Carrying the flags on the object
+removes the registry, the lock, the address-keyed lookup, and the race in one move.
+`ldiv!` forwards to the wrapped factorization, so the solve itself is unchanged.
+"""
+struct SplineFactor{F<:Factorization} <: Factorization{Float64}
+    F::F
+    db::Bool
+    dt::Bool
+end
+Base.size(sf::SplineFactor) = size(sf.F)
+Base.size(sf::SplineFactor, i::Integer) = size(sf.F, i)
+LinearAlgebra.ldiv!(x::AbstractVector, sf::SplineFactor, b::AbstractVector) = ldiv!(x, sf.F, b)
 
 _is_dirichlet(bc::BoundaryConditions) = bc.u !== nothing
 
@@ -2288,11 +2312,7 @@ function _assemble_spline_matrix(d, α::Float64, β::Float64,
     db = _is_dirichlet(bc_bottom); dt = _is_dirichlet(bc_top)
     if db; A[1,   :] .= d.Nb[1, :]; end
     if dt; A[end, :] .= d.Nb[2, :]; end
-    F = factorize(A)
-    lock(_RIRK_SOLVE_LOCK) do
-        _RIRK_DIRICHLET[objectid(F)] = (db, dt)
-    end
-    return F
+    return SplineFactor(factorize(A), db, dt)
 end
 
 """
@@ -2302,9 +2322,8 @@ Per-column, per-step Helmholtz assembly for the STATE-DEPENDENT semi-implicit:
 the operator `∂z(α(z)∂z·) − 1` in the weak Galerkin form `−M1ᵀ(W·α)M1 − Mass`
 with `α = Δτ²·Pξⁿ(z)` evaluated from the CURRENT column state, Dirichlet rows
 per `db`/`dt`. Unlike `_assemble_spline_matrix` this reuses the precomputed
-`d.Mass` and does NOT register in the `_RIRK_DIRICHLET` dict (which would take
-a global lock and grow by one entry per column per step) — callers pass the
-Dirichlet flags to `_vertical_solve!` explicitly.
+`d.Mass` and returns the bare factorization — callers pass the Dirichlet flags
+to `_vertical_solve!` explicitly.
 """
 function _assemble_sd_helmholtz(d, α::AbstractVector{Float64}, db::Bool, dt::Bool)
     A = -(d.M1' * ((d.W .* α) .* d.M1)) .- d.Mass
@@ -2326,11 +2345,7 @@ function _assemble_spline_matrix(d, α::AbstractVector{Float64}, β::Float64,
     db = _is_dirichlet(bc_bottom); dt = _is_dirichlet(bc_top)
     if db; A[1,   :] .= d.Nb[1, :]; end
     if dt; A[end, :] .= d.Nb[2, :]; end
-    F = factorize(A)
-    lock(_RIRK_SOLVE_LOCK) do
-        _RIRK_DIRICHLET[objectid(F)] = (db, dt)
-    end
-    return F
+    return SplineFactor(factorize(A), db, dt)
 end
 
 """
@@ -2409,10 +2424,10 @@ function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, mtile::ModelTile;
         w .= d.W .* rhs_mish
         mul!(b, d.M0', w)
         # Dirichlet flags: explicit from the caller (per-step factorizations,
-        # `_assemble_sd_helmholtz`) or from the registry keyed by the
-        # precomputed factorization object.
-        db, dt = dirichlet === nothing ?
-            get(_RIRK_DIRICHLET, objectid(h_a), (false, false)) : dirichlet
+        # `_assemble_sd_helmholtz`) or carried by the `SplineFactor` the assembly
+        # returned. A bare factorization with no flags means no Dirichlet rows.
+        db, dt = dirichlet !== nothing ? dirichlet :
+                 h_a isa SplineFactor ? (h_a.db, h_a.dt) : (false, false)
         if db; b[1]   = 0.0; end
         if dt; b[end] = 0.0; end
     else

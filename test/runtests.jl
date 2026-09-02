@@ -32,6 +32,7 @@ using Scythe
     include("test_oneway_sw_slab.jl")
     include("test_pv_mixing_floor.jl")
     include("test_pv_mixing_stochastic.jl")
+    include("test_spline_factor.jl")
     include("test_allocations.jl")
     include("test_benchmark_smoke.jl")
 end
