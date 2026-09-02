@@ -673,6 +673,14 @@ function advanceTimestepA(mtile::ModelTile, sharedSpectral::SharedArray{Float64}
         exact_si_load_history!(mtile, hfields, t, rowstart)
     end
 
+    # Radiative heating pre-pass: recompute (on the radiation cadence) or simply hold the
+    # tile's `q_lw`/`q_sw` field, which every column then folds into `QDOT_TH`. HERE, and
+    # not inside the column loop, because a radiative transfer is a whole-tile operation
+    # that threads over columns itself — nesting it inside `Threads.@threads :static` would
+    # oversubscribe the machine and break the `threadid()` ownership rule the scratch
+    # columns depend on. A no-op when radiation is off. See `radiation_prepass!`.
+    radiation_prepass!(mtile, t)
+
     if num_columns(mtile.tile) > 0
         Threads.@threads :static for c in 1:num_columns(mtile.tile)
             advance_column(mtile, c, t)

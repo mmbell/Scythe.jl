@@ -242,6 +242,14 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # whenever ice is off, so the field stays CONCRETE and `mtile.ishmael_tables.itab`
     # infers to `Array{Float64,5}` inside the driver. See `mc_ishmael_tables`.
     ishmael_tables::IshmaelTables
+    # The tile's radiative heating field and everything needed to recompute it, or
+    # `EMPTY_RADIATION` when `options[:radiation]` is absent. CONCRETE, not
+    # `Union{RadiationState,Nothing}`, for the same reason `ishmael_tables` is: the driver
+    # reads `mtile.radiation.active` in its preamble and `mtile.radiation.q_lw` inside the
+    # per-column hot path, and a Union field makes both loads type-unstable. See
+    # `mc_radiation_state` (src/radiation.jl) and `EMPTY_RADIATION`
+    # (src/radiation_state.jl). Per-tile = per-worker, so nesting and distribution are free.
+    radiation::RadiationState
 end
 
 """
@@ -552,7 +560,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_micro_n,
         mc_micro_nm1,
         mc_micro_nm2,
-        mc_ishmael_tables(model))
+        mc_ishmael_tables(model),
+        # Defined in radiation.jl, which is included after this file — resolved at call
+        # time, like `_allocate_mc_scratch` above, so the forward reference is fine.
+        mc_radiation_state(model, tile, tilepoints))
     return mtile
 end
 
@@ -1224,6 +1235,14 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && mc_stiffness_trace(mtile, t)
+
+    # Radiative heating pre-pass: recompute (on the radiation cadence) or simply hold the
+    # tile's `q_lw`/`q_sw` field, which every column then folds into `QDOT_TH`. HERE, and
+    # not inside the column loop, because a radiative transfer is a whole-tile operation
+    # that threads over columns itself — nesting it inside `Threads.@threads :static` would
+    # oversubscribe the machine and break the `threadid()` ownership rule the scratch
+    # columns depend on. A no-op when radiation is off. See `radiation_prepass!`.
+    radiation_prepass!(mtile, t)
 
     # Advance each column.
     #

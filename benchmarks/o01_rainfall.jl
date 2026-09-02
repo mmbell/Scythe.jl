@@ -26,6 +26,17 @@
 # convective flow is never damped, only the radiated gravity waves.
 # Only --stage mc is supported.
 #
+# Radiation (S2b/S3b): SCYTHE_O01_RAD selects an RRTMGP arm -- `lw` (clear-sky longwave
+# only, the S2b production arm), `allsky` (same solver, all-sky kernels, with the S3a
+# microphysics -> cloud-optics mapping live: a real cloudy arm), `sw` (clear-sky with a
+# fixed sun) or `diurnal` (clear-sky, full diurnal cycle at 20 N, day 240, 12:00 local).
+# Unset or `0` sets NO radiation key at all and the run is bit-identical to the committed
+# reference. SCYTHE_O01_RAD_FORCING (`full` default | `anomaly`), SCYTHE_O01_RAD_INTERVAL
+# (cadence in seconds, default 300), SCYTHE_O01_RAD_ZMAX (taper height, unset = no taper)
+# and SCYTHE_O01_RAD_RAIN (1 = put rain mass in the liquid water path, default off) tune
+# the arm; the radiative surface temperature is deliberately left unset, so the driver
+# uses the column's own extrapolated surface air temperature (O01 has no ocean).
+#
 # Reference: Ooyama (2001), J. Atmos. Sci. 58, 2073-2102 (Fig. 6: peak ground
 # precipitation ~75-125 g m^-2 s^-1 at ~35-40 min for a similar bubble).
 # reference/ooyama_jas2001.pdf
@@ -487,6 +498,96 @@ function o01_model(opts::BenchmarkOptions)
         haskey(ENV, "SCYTHE_O01_RTRANS")  || (options[:rain_transform]         = :bhyp)
         haskey(ENV, "SCYTHE_O01_NRTRANS") || (options[:rain_number_transform]  = :bhyp)
         haskey(ENV, "SCYTHE_O01_ICETRANS")|| (options[:ice_transform]          = :bhyp)
+    end
+
+    # ── RADIATION (S2b). Unset (or "0") => NOT ONE radiation key is set, so the committed
+    #    configuration is bit-identical: `mc_radiation_state` sees no `:radiation` key,
+    #    returns `Scythe.EMPTY_RADIATION`, and `mc_driver!`'s fold is gated off entirely
+    #    (the gate is `if rad_on`, not `+ 0.0` — adding an exact zero is not the identity
+    #    for -0.0, and every committed reference here rests on that).
+    #
+    #    SCYTHE_O01_RAD selects the ARM:
+    #      lw      RRTMGP clear-sky longwave only (`:clearsky`, `:solar = :none`). The S2b
+    #              production arm: no shortwave is solved for, the cloud-optics fields are
+    #              the all-clear stub, and the answer is the Dunion column's own clear-sky
+    #              cooling profile.
+    #      allsky  the same solver with the all-sky method. From S3b this is a REAL cloudy
+    #              arm: `Scythe.radiation_assemble!` runs the S3a microphysics mapping
+    #              (`cloud_optics_column!`) on every column, so the liquid cloud of the
+    #              warm arm and the ISHMAEL anvil of the ice arm are both seen by the
+    #              radiation. (Until S3a landed it was the all-clear stub and differed
+    #              from `lw` only in which kernels ran.)
+    #      sw      clear-sky with a FIXED sun (`:solar = :fixed`, cos_z 0.2588 / beam
+    #              551.58 => 142.7 W/m^2 daily-mean insolation).
+    #      diurnal clear-sky with the full diurnal cycle (`:solar = :diurnal`) at
+    #              latitude 20 N, day 240, starting at 12:00 local — i.e. local noon, so
+    #              the one hour this benchmark integrates sits on the peak of the cycle
+    #              where the per-step zenith rescale is measurable.
+    #
+    #    SCYTHE_O01_RAD_FORCING = full (default) | anomaly. `:anomaly` holds
+    #    `q - q̄(z)`, the horizontal mean over the patch captured on the FIRST call, so on
+    #    the horizontally homogeneous sounding the forcing starts at machine zero and only
+    #    the bubble's own departure from the mean is felt.
+    #
+    #    SCYTHE_O01_RAD_INTERVAL is the cadence in SECONDS (default 300, i.e. 12 calls in
+    #    the 3600 s run); SCYTHE_O01_RAD_ZMAX tapers the heating to zero below that height
+    #    (unset => Inf => no taper; 17000 would confine it below the DK83 sponge).
+    #
+    #    SCYTHE_O01_RAD_RAIN = 1 puts the RAIN mass into the liquid water path
+    #    (`options[:radiation_rain_in_cloud]`, default false). Off is the physical default:
+    #    rain's per-mass extinction is far below cloud's and its size is far above the
+    #    21.5 um edge of the liquid table, so including it both over-states the optical
+    #    depth and saturates the effective-radius clamp. The knob exists so the difference
+    #    can be MEASURED on this benchmark rather than argued about.
+    #
+    #    The radiative SURFACE temperature is left UNSET on purpose: O01 has no ocean, so
+    #    `Scythe.radiation_surface_temperature` falls through `:T_sfc` and `:SST` to the
+    #    column's own hydrostatically extrapolated surface AIR temperature, which is
+    #    radiatively consistent with the sounding and introduces no air-sea
+    #    disequilibrium the run was never given. The line printed below says so.
+    rad_arm = get(ENV, "SCYTHE_O01_RAD", "0")
+    if rad_arm != "0" && rad_arm != ""
+        options[:radiation] = :rrtmgp
+        if rad_arm == "lw"
+            options[:radiation_method] = :clearsky
+            options[:solar] = :none
+        elseif rad_arm == "allsky"
+            options[:radiation_method] = :allsky
+            options[:solar] = :none
+        elseif rad_arm == "sw"
+            options[:radiation_method] = :clearsky
+            options[:solar] = :fixed
+        elseif rad_arm == "diurnal"
+            options[:radiation_method] = :clearsky
+            options[:solar] = :diurnal
+            physical_params[:latitude] = 20.0
+            physical_params[:start_doy] = 240.0
+            physical_params[:start_hour] = 12.0
+        else
+            error("SCYTHE_O01_RAD = \"$rad_arm\" is not an arm; use lw, allsky, sw, " *
+                  "diurnal, or 0/unset for no radiation at all")
+        end
+        options[:radiation_forcing] = Symbol(get(ENV, "SCYTHE_O01_RAD_FORCING", "full"))
+        options[:radiation_interval] =
+            parse(Float64, get(ENV, "SCYTHE_O01_RAD_INTERVAL", "300.0"))
+        haskey(ENV, "SCYTHE_O01_RAD_ZMAX") &&
+            (options[:radiation_z_max] = parse(Float64, ENV["SCYTHE_O01_RAD_ZMAX"]))
+        get(ENV, "SCYTHE_O01_RAD_RAIN", "0") == "1" &&
+            (options[:radiation_rain_in_cloud] = true)
+        # One line, on the MASTER's console (the driver's own setup runs on a worker and
+        # its output goes to <output_dir>/scythe_err.log): which of the three surface
+        # temperatures `radiation_surface_temperature` will actually use.
+        tsfc_src = haskey(physical_params, :T_sfc) ?
+            "physical_params[:T_sfc] = $(physical_params[:T_sfc]) K" :
+            haskey(physical_params, :SST) ?
+            "physical_params[:SST] = $(physical_params[:SST]) K" :
+            "the column's own extrapolated surface AIR temperature T_face[1] (no ocean)"
+        println("O01 radiation: arm=$rad_arm method=$(options[:radiation_method]) " *
+                "solar=$(options[:solar]) forcing=$(options[:radiation_forcing]) " *
+                "interval=$(options[:radiation_interval]) s " *
+                "z_max=$(get(options, :radiation_z_max, Inf)) m " *
+                "rain_in_cloud=$(get(options, :radiation_rain_in_cloud, false)); " *
+                "surface temperature source = $tsfc_src")
     end
 
     # Slot names, now that the transforms are known. Everything keyed by NAME below — the BC

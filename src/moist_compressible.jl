@@ -6915,6 +6915,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # the momentum diffusion). Both default OFF so existing configurations are
     # bit-identical.
     louis_bl = get(model.options, :louis_bl, false)::Bool
+    # Radiative heating. `RAD.q_lw`/`q_sw` are the HELD flux divergences [W/m^3] the
+    # pre-pass (`radiation_prepass!`, src/radiation.jl) recomputed on the radiation cadence
+    # before this column loop started; nothing is solved here. `rad_on` is a plain field
+    # load because `ModelTile` carries the state concretely (see `EMPTY_RADIATION`), and it
+    # gates the fold below so a radiation-free run is BYTE-identical to the code that had
+    # no radiation at all -- `x + 0.0` is not the identity for `x = -0.0`.
+    RAD = mtile.radiation
+    rad_on = RAD.active
     # Horizontal acoustic semi-implicit (the patch-level ADI sweep in
     # horizontal_si.jl). Default OFF so existing configurations are bit-identical.
     hsi = get(model.options, :horizontal_semiimplicit, false)::Bool
@@ -7781,6 +7789,26 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @. QDOT_TH = rho_d * Tk * (K_smag / Pr_t) * sd_xx
     else
         @. QDOT_TH = rho_d * Tk * Khdiff_heat * sd_xx
+    end
+
+    # RADIATION enters the thermal source and nothing else. `QDOT_TH` is the single point
+    # where a diabatic heating reaches the pressure equation (slot 1, through R_m/C_vt),
+    # the total energy (slot 6, directly) and the supersaturation forcing (slot 7, through
+    # the non-condensational dT_nc/dp_nc that feed SATF) -- which is exactly the set of
+    # places radiative cooling has to reach: it creates supersaturation, and a radiation
+    # term that skipped Q_ss would cool the air without making the cloud that cooling makes.
+    # The Louis boundary layer adds its heating at the same place for the same reason.
+    #
+    # The field is HELD between radiation calls (the pre-pass owns the cadence), so this is
+    # an indexed add and nothing more. `q_lw`/`q_sw` are gridpoint-indexed exactly like
+    # `expdot`, hence `colstart + i - 1` and no reshape. The shortwave carries `sw_scale`,
+    # the per-step zenith rescale that keeps a diurnal forcing continuous between calls
+    # (plan D6); it is exactly 1 with a fixed sun and 0 at night.
+    if rad_on
+        q_lw = RAD.q_lw; q_sw = RAD.q_sw; sw_s = RAD.sw_scale
+        @inbounds for i in eachindex(QDOT_TH)
+            QDOT_TH[i] += q_lw[colstart + i - 1] + sw_s * q_sw[colstart + i - 1]
+        end
     end
 
     # Horizontal frictional KE change [W/m^3]. Momentum diffusion is a resolved-KE SINK to
