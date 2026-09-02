@@ -22,6 +22,7 @@ spectral_out_*.csv
 *_ics.csv
 *.ics
 !benchmarks/reference_data/**
+benchmarks/reference_data/.DS_Store
 
 # Benchmark run artifacts (committed reference data lives in benchmarks/reference_data)
 benchmarks/output/
