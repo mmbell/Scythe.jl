@@ -12,6 +12,8 @@ using Scythe
     include("test_etd_relaxation.jl")
     include("test_ice_anchor_reconcile.jl")
     include("test_moist_compressible.jl")
+    include("test_radiation.jl")
+    include("test_radiation_rrtmgp.jl")
     include("test_louis_bl.jl")
     include("test_surface_fluxes.jl")
     include("test_idealized_init.jl")

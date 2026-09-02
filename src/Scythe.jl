@@ -86,6 +86,13 @@ include("reference_state.jl")
 # exist before the one that names it. ishmael_tables.jl is a leaf — SpecialFunctions, JLD2
 # and its own literals — so it can sit anywhere above its first user.
 include("ishmael_tables.jl")
+# The RADIATION STATE layer comes before semiimplicit.jl for the same reason: `ModelTile`
+# carries a `RadiationState` field CONCRETELY (see `EMPTY_RADIATION`), so the struct has to
+# be defined before the one that names it. radiation_state.jl is a leaf — the Springsteel
+# thermodynamic constants imported by thermodynamics.jl and nothing else — and in
+# particular it names no radiative-transfer library: every RRTMGP reference is confined to
+# src/radiation.jl, which is included after moist_compressible.jl.
+include("radiation_state.jl")
 include("semiimplicit.jl")
 include("testModels.jl")
 include("shallowWaterModels.jl")
@@ -102,6 +109,16 @@ include("microphysics.jl")
 include("mc_geometry.jl")
 include("mc_boundary_layer.jl")
 include("moist_compressible.jl")
+# The microphysics -> cloud-optics conversion (Stage S3a) needs `_ice_effective`
+# (moist_compressible.jl) and ISHMAEL_NU (ishmael.jl), and radiation.jl's driver calls
+# it directly, so it sits between the two.
+# The RADIATION DRIVER comes after moist_compressible.jl because it reuses the driver's own
+# thermodynamic helpers (`recover_rho_c`, `recover_total`, `retrieve_temperature`, the
+# transform-mode accessors) to reconstruct a column — a radiation column that disagreed with
+# `mc_driver!` about what the cloud IS would put that disagreement into the heating field.
+# radiation.jl names no radiative-transfer library at all; radiation_rrtmgp.jl is the ONE
+# file that does, and it is included after it so the driver's interface calls resolve.
+include("radiation_rrtmgp.jl")
 include("horizontal_si.jl")
 include("exact_si.jl")
 include("exact_si_rlr.jl")
