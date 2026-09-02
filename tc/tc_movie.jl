@@ -89,7 +89,7 @@ boundaries = sort([geom[n].redge for n in nests if geom[n].redge < rmax - 1e-6])
 readfield(ds, name) = coalesce.(Array(ds[name])[1, :, :], NaN)   # (n_r, n_z) → NaN fill
 
 # ── Fixed contour/colour scales (shared across nests and frames) ──────────────
-refl_levels = 5.0:5.0:60.0                 # dBZ
+refl_levels = -15.0:5.0:60.0                 # dBZ
 p_levels = -1500.0:50:250.0
 u_levels = -10.0:1.0:5.0
 v_levels    = vcat(-40.0:5.0:-5.0, 5.0:5.0:40.0)   # m/s (0 omitted)
@@ -115,12 +115,12 @@ function draw_frame(t, framepath)
             w    = readfield(ds, "w")
 
             # Reflectivity fill (NaN below the echo floor → transparent)
-            #cf = contourf!(ax, g.r, g.z, refl; levels = refl_levels,
-            #               colormap = :turbo, extendhigh = :auto)
+            cf = contourf!(ax, g.r, g.z, refl; levels = refl_levels,
+                           colormap = :turbo, extendhigh = :auto)
             #cf = contourf!(ax, g.r, g.z, p_prime; levels = p_levels,
             #               colormap = :turbo, extendhigh = :auto)
-            cf = contourf!(ax, g.r, g.z, u; levels = u_levels,
-                           colormap = :turbo, extendhigh = :auto)
+            #cf = contourf!(ax, g.r, g.z, u; levels = u_levels,
+            #               colormap = :turbo, extendhigh = :auto)
             # Tangential wind line contours (negative dashed, as in the papers)
             contour!(ax, g.r, g.z, v; levels = filter(l -> l > 0, v_levels),
                      color = :black, linewidth = 0.8)
@@ -138,7 +138,7 @@ function draw_frame(t, framepath)
                 push!(pu, u[i, k] * vec_scale); push!(pw, w[i, k] * vec_scale * w_scale)
             end
             isempty(px) || arrows2d!(ax, Point2f.(px, py), Vec2f.(pu, pw);
-                                     lengthscale = 1.0, shaftwidth = 1.0,
+                                     lengthscale = 0.5, shaftwidth = 1.0,
                                      tipwidth = 6.0, tiplength = 5.0,
                                      color = (:gray20, 0.7))
         end
