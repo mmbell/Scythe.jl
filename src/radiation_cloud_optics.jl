@@ -95,12 +95,22 @@ loop (same calling convention as `radiation_column_state!`/`radiation_levels!`).
   clear-sky default (`iwp = 0`, `re_ice` benign) and `n_clamp_ice` is always 0.
 - `dz`: layer thickness [m], length `nlay`.
 
-Returns the number of points where `re_liq`/`re_ice` had to be clamped into RRTMGP's
-valid table range. The driver accumulates these into `RadiationState`'s
+Returns the number of CLOUDY points where `re_liq`/`re_ice` had to be clamped into
+RRTMGP's valid table range. The driver accumulates these into `RadiationState`'s
 `n_clamp_re_liq`/`n_clamp_re_ice` counters (never silently reset) -- a plain
 `NTuple{2,Int}` was chosen over a dedicated counter struct because the driver already
 owns the long-lived counters and this function's whole contract is "how many did I
 just clamp", not "how many have there ever been".
+
+# Clamp accounting (S4)
+Only layers with `cf == 1` are counted. RRTMGP MASKS the cloud optics of every layer
+whose cloud fraction is zero, so an effective radius written there is never read and a
+clamp there is not a saturated table -- it is a clear layer. Counting them made the
+counter useless: on the S3b warm arm roughly a third of all gridpoints carried a trace
+positive `rho_c` below `q_min`, and every one of them clamped low. `cf` is therefore
+computed FIRST, before either radius, and the two counters are gated on it. The clamped
+VALUES are still written in both cases -- RRTMGP wants a finite in-table number in every
+cell whether or not it reads it.
 
 # Water paths
 `lwp = 1000 * max(rho_c [+ rho_r if rain_in_cloud], 0) * dz` [g/m² per layer]. Rain is
@@ -117,9 +127,22 @@ same choice for their own aggregate species).
 Monodisperse volume radius (`cloud_droplet_radius`, `src/microphysics.jl:502-527`,
 which already returns micron) rescaled to RRTMGP's effective radius by the Martin et
 al. (1994) maritime spectral-dispersion factor `k = 0.8`: `r_eff = r_vol / cbrt(k)`.
-Clamped to [2.5, 21.5] µm, counting. Set to a benign in-range value (10.0 µm, ignored
-by RRTMGP wherever `lwp == 0`) so a clear layer never carries a zero or NaN effective
-radius into the solver.
+Clamped to [2.5, 21.5] µm, counting IN CLOUDY LAYERS ONLY (see "Clamp accounting").
+Set to a benign in-range value (10.0 µm, ignored by RRTMGP wherever `lwp == 0`) so a
+clear layer never carries a zero or NaN effective radius into the solver.
+
+THE `q_min` WINDOW (documented, intended, S4). At the fixed `N_c = 100` cm⁻³ the
+monodisperse radius reaches the table floor `2.5 µm` at
+
+    r_vol = 2.5 · k^{1/3} = 2.321 µm  ⟹  ρ_c = (4/3)π r_vol³ ρ_w N_c = 5.2e-6 kg/m³,
+
+whereas the cloud-fraction threshold `q_min = 1e-6 kg/kg` calls a layer cloudy from
+`ρ_c ≈ 1.2e-6 kg/m³` upward. Layers in the window `1.2e-6 < ρ_c < 5.2e-6 kg/m³` are
+therefore CLOUD whose true effective radius is below the table, and they are clamped to
+2.5 µm and counted. That is intended and is kept: at O01's 250 m spacing such a layer
+carries under 1 g/m² of liquid water path (optical depth ~1e-3), so the clamped size is
+radiatively irrelevant, while RAISING `q_min` to close the window would start discarding
+real thin cloud. The counter is the honest record of it, not an error signal.
 
 # Ice effective radius -- the gamma-PSD moment factor
 [`_ice_effective`](@ref) (via [`ishmael_var_check`](@ref)) returns `rni`, the gamma
@@ -140,17 +163,50 @@ does `Γ(ν)`), giving
 
 -- exactly the closed form the plan specifies. SPHERICAL SANITY CHECK: at δ = 1
 (aspect ratio 1, `cni = ani`) and `ν = 4`, `Γ(7)/Γ(6) = 720/120 = 6`, so
-`r_eff = 6·rni`, the standard `(ν+2)/ν` gamma-distribution effective-radius result
-(`test_radiation_cloud_optics.jl` asserts exactly this as its round-trip check). This
-IS RRTMGP's own `(3/4)V/A` definition for a population of SPHERES; for the
-non-spherical ISHMAEL habits it OVERESTIMATES `r_eff` by the ratio of the spheroid's
-Cauchy mean projected area (`S/4`, a function of `ani/cni`) to the equal-volume
-sphere's projected area.
+`r_eff = 6·rni` at solid-ice density, the standard `(ν+2)/ν` gamma-distribution
+effective-radius result (`test_radiation_cloud_optics.jl` asserts exactly this as its
+round-trip check).
 
-TODO (documented refinement, not shipped in S3a): multiply `r_eff,k` by that Cauchy
-projected-area ratio, computable from `ani`, `cni` (already returned by
-`_ice_effective`) -- see plan D5, "the documented REFINEMENT, not the first
-implementation".
+# Ice effective radius -- the BULK-DENSITY correction (S4)
+
+The gamma moment above is `(3/4)V/A` for a population of spheres of the PARTICLE's own
+bulk density `rhobar`, because `rni` is defined by `ishmael_var_check` (`src/ishmael_tables.jl:454`,
+and again at :480 under the large-ice cap) as
+
+    rni = [ 3 q Γ(ν) / (4π n rhobar Γ(ν+2+δ)) ]^{1/3},
+
+i.e. the radius of a sphere of density `rhobar` carrying the particle's mass. That is
+NOT what an ice-optics table wants. Fu (1996)'s generalized effective size -- the
+quantity RRTMGP's `re_ice` parameterizes, and the one that makes the extinction per unit
+IWC come out right -- is built on the SOLID-ICE volume `m/ρ_ice` divided by the
+particle's PROJECTED AREA:
+
+    D_ge = (2√3 / 3) · IWC / (ρ_ice A),      r_eff = (3/4) V_solid / A.
+
+A low-density particle of a given `rni` has the same projected area as a solid-ice
+particle of that `rni` but only `rhobar/ρ_ice` of its solid volume, so
+
+    r_eff,k = rni_k · Γ(ν+2+δ_k)/Γ(ν+(4+2δ_k)/3) · rhobar_k / RHOI,   RHOI = 920 kg/m³.
+
+The factor is LINEAR in `rhobar`, not its cube root: the volume changes, the area does
+not. `rhobar` is `_ice_effective`'s own `rhobar`, already clamped by `ishmael_var_check`
+to `[50, RHOI]`, so the factor lies in `[0.0543, 1]`.
+
+This is the fix for the S3b finding that the ISHMAEL AGGREGATES (species 3, whose bulk
+density floors at 50 kg/m³) pinned at the 90 µm table ceiling with ~15k clamps per call
+and an IWP-weighted `re_ice` of 78 µm: at `rhobar = 50` their effective size is 5.4 % of
+the uncorrected value, which is where a low-density aggregate's radiative size actually
+is. It also moves the low end of the reachable range down by the same factor (2 µm ×
+4.342 × 0.0543 ≈ 0.47 µm), so the `RAD_RE_ICE_MIN = 5 µm` floor -- previously
+unreachable -- is now a live clamp for near-massless low-density crystals.
+
+TODO (documented refinement, still not shipped): the moment above uses the EQUAL-VOLUME
+SPHERE's projected area. For the non-spherical ISHMAEL habits the true area is the
+spheroid's Cauchy mean projected area (`S/4`, a function of `ani/cni`), which is LARGER
+than the equal-volume sphere's for both oblate and prolate shapes, so `r_eff` is still
+overestimated by that area ratio -- see plan D5. The bulk-density correction had to come
+first because it is the larger factor (up to 18×) and because the Cauchy ratio multiplies
+it rather than replacing it.
 
 # Combination across species
 Harmonic mass weighting, `re_ice = IWC_tot / Σ_k (IWC_k / r_eff,k)`, which preserves
@@ -188,6 +244,25 @@ function cloud_optics_column!(cld::CloudOpticsColumn, P::CloudOpticsParams,
     @inbounds for k in 1:nlay
         rd = rho_d[k]
 
+        # ── Condensate sums, and the cloud fraction they decide (FIRST, S4) ──
+        # The mass sums have to be taken before either effective radius, because the
+        # clamp counters are gated on `cf`: a clamp in a layer RRTMGP masks out is not a
+        # saturated table. `rho_i_sum` is the RAW (unfloored) species sum for `iwp`;
+        # `cf_ice_sum` is Σ max(rho_ik, 0), unconditional (cloud fraction asks "is there
+        # condensate", not "do I know its size"), and is used for `cf` alone.
+        rho_i_sum = 0.0
+        cf_ice_sum = 0.0
+        if ice !== nothing
+            for s in 1:3
+                rho_ik = ice[k, RAD_ICE_SPECIES_COL0[s]]
+                rho_i_sum += rho_ik
+                cf_ice_sum += max(rho_ik, 0.0)
+            end
+        end
+        # Strict threshold, 0/1 only (McICA determinism).
+        cloudy = (max(rho_c[k], 0.0) + cf_ice_sum) / rd > P.q_min
+        cld.cf[k] = cloudy ? 1.0 : 0.0
+
         # ── Liquid water path and effective radius ──
         liq_sum = rho_c[k] + (P.rain_in_cloud ? rho_r[k] : 0.0)
         lwp_k = 1000.0 * max(liq_sum, 0.0) * dz[k]
@@ -199,29 +274,24 @@ function cloud_optics_column!(cld::CloudOpticsColumn, P::CloudOpticsParams,
             r_eff = r_vol / cbrt(P.k_factor)
             if r_eff < RAD_RE_LIQ_MIN
                 r_eff = RAD_RE_LIQ_MIN
-                n_clamp_liq += 1
+                cloudy && (n_clamp_liq += 1)
             elseif r_eff > RAD_RE_LIQ_MAX
                 r_eff = RAD_RE_LIQ_MAX
-                n_clamp_liq += 1
+                cloudy && (n_clamp_liq += 1)
             end
             cld.re_liq[k] = r_eff
         else
             cld.re_liq[k] = RAD_RE_LIQ_BENIGN
         end
 
-        # ── Ice water path, per-species effective radius, harmonic combination ──
-        rho_i_sum = 0.0     # raw (unfloored) species sum, for iwp -- floor AFTER summing
-        cf_ice_sum = 0.0    # Σ max(rho_ik, 0), unconditional, for cf only
-        iwc_weight_sum = 0.0  # Σ_k IWC_k over species with a valid (n>0) gamma PSD
+        # ── Per-species ice effective radius, harmonic combination ──
+        iwc_weight_sum = 0.0   # Σ_k IWC_k over species with a valid (n>0) gamma PSD
         inv_re_sum = 0.0       # Σ_k IWC_k / r_eff,k, same species set as iwc_weight_sum
 
         if ice !== nothing
             for s in 1:3
                 c0 = RAD_ICE_SPECIES_COL0[s]
                 rho_ik = ice[k, c0]
-                rho_i_sum += rho_ik
-                cf_ice_sum += max(rho_ik, 0.0)
-
                 q = max(rho_ik, 0.0) / rd
                 n = max(ice[k, c0 + 1], 0.0) / rd
                 if q > 0.0 && n > 0.0
@@ -229,11 +299,19 @@ function cloud_optics_column!(cld::CloudOpticsColumn, P::CloudOpticsParams,
                     c = max(ice[k, c0 + 3], 0.0) / rd
                     eff = _ice_effective(q, n, a, c, s)
                     delta = eff.deltastr
-                    # r_eff,k = rni * Gamma(nu+2+delta) / Gamma(nu + (4+2*delta)/3)
-                    # -- derivation and spherical check (delta=1, nu=4 -> 6*rni) above.
+                    # r_eff,k = rni * Gamma(nu+2+delta)/Gamma(nu+(4+2*delta)/3)
+                    #                * rhobar / RHOI
+                    # The gamma factor is the population moment of the EQUAL-VOLUME
+                    # SPHERE radius (delta=1, nu=4 -> 6*rni); `rhobar/RHOI` converts the
+                    # particle's own bulk volume to the SOLID-ICE volume Fu (1996)'s
+                    # generalized effective size is built on, at unchanged projected
+                    # area. Both steps are derived in the docstring. `rhobar` comes
+                    # clamped to [50, RHOI] by `ishmael_var_check`, so the factor is in
+                    # [0.0543, 1] and can never invert the sign or blow up.
                     r_eff_k = eff.rni * 1.0e6 *
                               (gamma(ISHMAEL_NU + 2.0 + delta) /
-                               gamma(ISHMAEL_NU + (4.0 + 2.0 * delta) / 3.0))
+                               gamma(ISHMAEL_NU + (4.0 + 2.0 * delta) / 3.0)) *
+                              (eff.rhobar / ISHMAEL_RHOI)
                     iwc_k = max(rho_ik, 0.0)
                     iwc_weight_sum += iwc_k
                     inv_re_sum += iwc_k / r_eff_k
@@ -247,18 +325,15 @@ function cloud_optics_column!(cld::CloudOpticsColumn, P::CloudOpticsParams,
             r_eff = iwc_weight_sum / inv_re_sum
             if r_eff < RAD_RE_ICE_MIN
                 r_eff = RAD_RE_ICE_MIN
-                n_clamp_ice += 1
+                cloudy && (n_clamp_ice += 1)
             elseif r_eff > RAD_RE_ICE_MAX
                 r_eff = RAD_RE_ICE_MAX
-                n_clamp_ice += 1
+                cloudy && (n_clamp_ice += 1)
             end
             cld.re_ice[k] = r_eff
         else
             cld.re_ice[k] = RAD_RE_ICE_BENIGN
         end
-
-        # ── Cloud fraction: strict threshold, 0/1 only (McICA determinism) ──
-        cld.cf[k] = (max(rho_c[k], 0.0) + cf_ice_sum) / rd > P.q_min ? 1.0 : 0.0
     end
 
     return (n_clamp_liq, n_clamp_ice)

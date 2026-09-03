@@ -1062,8 +1062,15 @@ function radiation_offline_column(; kind::Symbol = :tropical,
     radiation_divergence!(q_lw, fluxes.lw_net, dz, nlay, 1, nlay, 1)
     radiation_divergence!(q_sw, fluxes.sw_net, dz, nlay, 1, nlay, 1)
 
-    rho = work.rho_d .+ work.rho_v
-    cp = (Cpd .* work.rho_d .+ Cpv .* work.rho_v) ./ rho
+    # The K/day conversion, in exactly the form `_rad_kday` (src/radiation.jl) uses, so
+    # this anchor and a live run's trace are the same number with no factor between them:
+    # `rho` is the TOTAL mass density and `rho * cp = rho_d C_pd + rho_v C_pv +
+    # rho_liq C_l + rho_ice C_i`. The condensate terms are identically zero on this
+    # clear-sky standard-atmosphere column; they are written out anyway so the definition
+    # here is literally the shared one rather than a special case of it.
+    rho = work.rho_d .+ work.rho_v .+ work.rho_liq .+ work.rho_ice
+    cp = (Cpd .* work.rho_d .+ Cpv .* work.rho_v .+
+          Cl .* work.rho_liq .+ Ci .* work.rho_ice) ./ rho
 
     return (z = z, dz = dz, z_face = z_face,
             q_lw = q_lw, q_sw = q_sw,

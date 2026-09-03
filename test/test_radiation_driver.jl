@@ -277,6 +277,52 @@ using SparseArrays
         end
     end
 
+    # S4: the ORDER of the two post-processing steps. `radiation_store!` subtracts the
+    # reference FIRST and tapers second, so the taper acts on the ANOMALY. The reverse
+    # order -- S2b's -- leaves `-q_ref(z)` above `z_max`: a spurious forcing exactly in
+    # the sponge the taper exists to clear. Nothing else in the suite would catch that,
+    # because every other taper test runs `:full`, where the two orders coincide.
+    @testset "taper acts on the anomaly, not on the full field" begin
+        mktempdir() do tmp
+            z_max = 1500.0
+            mtile, _, _, gp, z = make_rad_mtile(tmp;
+                radopts = Dict{Symbol,Any}(:radiation => :prescribed,
+                                           :radiation_forcing => :anomaly,
+                                           :radiation_z_max => z_max))
+            rs = mtile.radiation
+            kDim = gp.kDim
+            @test rs.forcing === :anomaly
+            @test any(rs.taper .== 0.0)
+
+            # Break the homogeneity so `q != q_ref` and the two orders actually differ:
+            # cloud liquid in column 1 changes that column's mixture heat capacity.
+            phys = mtile.tile.physical
+            for k in 1:kDim
+                phys[k, 9, 1] = 1.0e-3
+            end
+            Scythe.radiation_prepass!(mtile, 1)
+
+            # The reference is a real, non-zero cooling: without that, "zero above z_max"
+            # would be true for the wrong reason.
+            @test all(rs.q_lw_ref .< 0.0)
+            @test maximum(abs.(rs.q_lw_ref)) > 1.0e-5
+
+            for c in 1:rs.ncol, k in 1:kDim
+                j = (c - 1) * kDim + k
+                if z[k] >= z_max
+                    # EXACTLY zero. Taper-then-subtract would leave -q_lw_ref[k] here.
+                    @test rs.q_lw[j] == 0.0
+                elseif c > 1
+                    @test rs.q_lw[j] == 0.0        # unperturbed column: pure anomaly zero
+                end
+            end
+            # ... and the perturbed column below the ramp is NOT zero, so the test above
+            # is not passing because the whole field is zero.
+            k_low = findfirst(zz -> zz < z_max - 2000.0 || zz < 500.0, z)
+            @test rs.q_lw[k_low] != 0.0
+        end
+    end
+
     @testset ":anomaly forcing on a homogeneous state is identically zero" begin
         mktempdir() do tmp
             mtile, patch, _, _, _ = make_rad_mtile(tmp;
@@ -437,7 +483,8 @@ using SparseArrays
 
     `:radiation => :prescribed` keeps it artifact-free: no lookup tables, no network, no
     solver -- `radiation_column_state!` is the same function on every scheme."""
-    function make_o01_rad_mtile(tmpdir; num_cells_i = 4, num_cells_k = 100, ice = false)
+    function make_o01_rad_mtile(tmpdir; num_cells_i = 4, num_cells_k = 100, ice = false,
+                                extra_opts = Dict{Symbol,Any}())
         sounding = joinpath(@__DIR__, "..", "benchmarks", "reference_data",
                             "o01_rainfall", "dunion_MT_hum90.ref")
         isfile(sounding) || error("the O01 sounding is missing: $sounding")
@@ -475,7 +522,7 @@ using SparseArrays
                                              :vertical_mixing => false,
                                              :radiation => :prescribed,
                                              :radiation_trace => false),
-                            opts_names))
+                            opts_names, extra_opts))
         gp = model.grid_params
         patch = createGrid(gp)
         gridpoints = Scythe.getGridpoints(patch)
@@ -563,6 +610,85 @@ using SparseArrays
     end
 
     # ──────────────────────────────────────────────
+    # 7b. S4/B: the :anomaly reference is the RESTING REFERENCE COLUMN
+    # ──────────────────────────────────────────────
+    #
+    # S2a/S2b defined `q̄(z)` as the per-tile HORIZONTAL MEAN captured at the first call.
+    # Two defects: on the O01 initial state the mean already contains the warm bubble
+    # (47 of 225 columns), so the far field is left with a residual instead of zero; and
+    # two tiles with different cloud populations hold different references, so the same
+    # physical column is forced differently depending on which patch owns it.
+    #
+    # S4 replaces it with the radiation of the RESTING REFERENCE COLUMN -- the state the
+    # tile was constructed from -- recomputed on EVERY call. That column is bubble-free,
+    # identical on every tile and patch, and independent of the initial condition, and
+    # on a resting column it is BITWISE the column the model itself reconstructs, so the
+    # anomaly there is exactly zero by construction rather than by cancellation.
+    @testset ":anomaly reference is the resting reference column (S4)" begin
+        mktempdir() do tmp
+            mtile, patch, model, gp, z = make_o01_rad_mtile(tmp;
+                extra_opts = Dict{Symbol,Any}(:radiation_forcing => :anomaly))
+            rs = mtile.radiation
+            kDim = gp.kDim
+            ncol = rs.ncol
+            @test rs.forcing === :anomaly
+            @test ncol >= 4
+
+            # PERTURB one column only. This is the discriminator the old mean-based
+            # reference fails: with the mean, a perturbation anywhere moves the reference
+            # and therefore the forcing in EVERY column, including the untouched ones.
+            phys = mtile.tile.physical
+            k_liq = findall(zz -> 1.0e3 <= zz <= 3.0e3, z)
+            @test !isempty(k_liq)
+            for k in k_liq
+                phys[k, 9, 1] = 1.0e-3        # slot 9 = cloud liquid, column 1
+            end
+
+            Scythe.radiation_prepass!(mtile, 1)
+
+            # Untouched columns: the reconstruction reproduces the reference profiles
+            # bitwise, so the prescribed heating equals the reference column's heating
+            # and the anomaly is EXACTLY zero -- `== 0.0`, not `< eps`.
+            for c in 2:ncol, k in 1:kDim
+                @test rs.q_lw[(c - 1) * kDim + k] == 0.0
+            end
+            # The perturbed column is NOT zero, and only in the perturbed layers: the
+            # cloud changes the mixture heat capacity there and nowhere else.
+            @test any(k -> rs.q_lw[k] != 0.0, k_liq)
+            for k in 1:kDim
+                k in k_liq && continue
+                @test rs.q_lw[k] == 0.0
+            end
+
+            # The reference profile itself is the FULL resting heating (negative: the
+            # prescribed rate is a cooling), and it is recomputed every call rather than
+            # captured -- on an unchanged reference state that means the same numbers.
+            @test all(rs.q_lw_ref .< 0.0)
+            @test all(rs.q_sw_ref .== 0.0)
+            ref1 = copy(rs.q_lw_ref)
+            Scythe.radiation_prepass!(mtile, 1 + rs.interval_steps)
+            @test rs.q_lw_ref == ref1
+
+            # And it really is the reference column, not the tile mean: with one of four
+            # columns perturbed the two differ, and the reference matches the UNPERTURBED
+            # profile, which is what column 2 carries.
+            work = Scythe.RadiationWork(kDim)
+            Scythe.radiation_column_state!(work, mtile, kDim + 1, 2 * kDim)
+            # Same association as `radiation_prescribed!` (`f` precomputed, then one
+            # multiply): `(rho_d*C_vt*rate)/86400` differs from `rho_d*C_vt*(rate/86400)`
+            # in the last ulp, and this assertion is deliberately `==`.
+            f = get(model.physical_params, :radiation_prescribed_rate, -1.5) / 86400.0
+            for k in 1:kDim
+                q_v = work.rho_v[k] / work.rho_d[k]
+                q_l = work.rho_liq[k] / work.rho_d[k]
+                q_i = work.rho_ice[k] / work.rho_d[k]
+                C_vt = Scythe.Cvd + q_v * Scythe.Cvv + q_l * Scythe.Cl + q_i * Scythe.Ci
+                @test rs.q_lw_ref[k] == work.rho_d[k] * C_vt * f
+            end
+        end
+    end
+
+    # ──────────────────────────────────────────────
     # 8. S3b: the cloud optics reach the solver batch
     # ──────────────────────────────────────────────
     #
@@ -598,7 +724,8 @@ using SparseArrays
             n_i_inj = 1.0e5             # #/m^3
             # a = c, so the habit is spherical and delta = 1 exactly; with this (q, n, a)
             # `var_check` re-derives a bulk density of ~199 kg/m^3 and rni = 10 um, so
-            # the gamma moment gives re_ice = 6*rni = 60 um -- comfortably inside the
+            # the gamma moment gives 6*rni = 60 um, which the S4 bulk-density correction
+            # then scales by rhobar/RHOI = 199/920 to ~13 um -- comfortably inside the
             # [5, 90] um table, which is what makes the clamp assertion below meaningful.
             a_inj = 10.0e-6             # a- and c-axis scale [m]
             vol_inj = (a_inj^3) * n_i_inj   # a_i = ani^2 cni n, c_i likewise
@@ -644,7 +771,19 @@ using SparseArrays
                     # where the weighting is empty.
                     @test Scythe.RAD_RE_ICE_MIN <= B.re_ice[k, c] <= Scythe.RAD_RE_ICE_MAX
                     @test B.re_ice[k, c] != Scythe.RAD_RE_ICE_BENIGN
-                    @test B.re_ice[k, c] ≈ 60.0 rtol = 1.0e-6
+                    # The expected value is built from `_ice_effective`'s OWN moments on
+                    # the injected triple, so the assertion pins the whole formula --
+                    # gamma moment times bulk-density factor -- rather than a magic
+                    # number that would have to be re-derived by hand at every change.
+                    # `_ice_effective`'s outputs are invariant under a common rho_d
+                    # divisor (ani depends on a^2/(c n), rbdum and rni on q/n), so the
+                    # mixing-ratio conversion can be taken at rho_d = 1 here.
+                    eff_inj = Scythe._ice_effective(rho_i_inj, n_i_inj, vol_inj, vol_inj, 1)
+                    @test eff_inj.deltastr ≈ 1.0 atol = 1.0e-10
+                    @test 190.0 < eff_inj.rhobar < 210.0
+                    @test B.re_ice[k, c] ≈
+                          6.0 * eff_inj.rni * 1.0e6 * eff_inj.rhobar / Scythe.ISHMAEL_RHOI rtol = 1.0e-9
+                    @test 12.0 < B.re_ice[k, c] < 14.0
                 end
                 # Everywhere else in a cloudy column is still clear.
                 for k in 1:rs.nlay
@@ -709,6 +848,211 @@ using SparseArrays
             # RRTMGP's own tasks; that is why the two halves are measured apart.)
             Scythe.radiation_assemble!(rs, mtile, B, P)     # warm up
             @test @allocated(Scythe.radiation_assemble!(rs, mtile, B, P)) == 0
+        end
+    end
+
+    # ──────────────────────────────────────────────
+    # 9. S4/E: the solar path -- the per-step zenith rescale
+    # ──────────────────────────────────────────────
+    #
+    # `sw_scale` is the ONLY part of the radiation that moves between calls: the longwave
+    # is held piecewise constant, but the shortwave has a diurnal factor on the timestep,
+    # so the held SW profile is multiplied by `cos_z(now)/cos_z(call)` in `mc_driver!`'s
+    # `QDOT_TH` fold. These tests pin that ratio on the `:prescribed` scheme, which needs
+    # no lookup tables: the scheme decides what `q_sw` IS, and `sw_scale` is computed by
+    # the pre-pass before and independently of it.
+    @testset "sw_scale follows the sun (:diurnal, no artifacts)" begin
+        mktempdir() do tmp
+            # 20 N, day 240, starting at 06:00 UTC at longitude 0 -- i.e. local sunrise,
+            # so one hour of model time sweeps the steepest part of the diurnal curve and
+            # the ratio is unambiguous. ts = 0.1 s, cadence 300 s.
+            mtile, _, model, gp, _ = make_rad_mtile(tmp;
+                radopts = Dict{Symbol,Any}(:radiation => :prescribed,
+                                           :solar => :diurnal,
+                                           :radiation_interval => 300.0),
+                radparams = Dict{Symbol,Float64}(:latitude => 20.0, :longitude => 0.0,
+                                                 :start_doy => 240.0, :start_hour => 6.0))
+            rs = mtile.radiation
+            @test rs.solar === :diurnal
+            @test rs.sw_rescale            # default true for :diurnal (D6)
+
+            pp = model.physical_params
+            ts = model.ts
+            solar_at(t) = Scythe.solar_state(model.options, pp, (t - 1) * ts)
+
+            Scythe.radiation_prepass!(mtile, 1)
+            # The held profile is solved at the INTERVAL MIDPOINT, not the call time.
+            t_mid = ((1 - 1) + 0.5 * rs.interval_steps) * ts
+            cz_call, toa_call = Scythe.solar_state(model.options, pp, t_mid)
+            @test rs.cos_zenith == cz_call
+            @test rs.toa_flux == toa_call
+            @test cz_call > 0.0            # sunrise-plus-a-bit: the sun really is up
+            # At the call itself the rescale is reset to 1 (the profile was just built).
+            @test rs.sw_scale == 1.0
+
+            # Between calls it is exactly cos_z(now)/cos_z(call), and it GROWS through the
+            # morning, which is the whole reason the rescale exists. It starts BELOW 1
+            # because the held profile was solved at the interval midpoint (150 s), which
+            # is ahead of the first few steps.
+            prev = 0.0
+            for t in (2, 100, 500, 1000, 2000)
+                Scythe.radiation_prepass!(mtile, t)
+                cz_now, _ = solar_at(t)
+                @test rs.sw_scale == clamp(cz_now / cz_call, 0.0, 4.0)
+                @test rs.sw_scale > prev
+                prev = rs.sw_scale
+                # The held profile itself has NOT been recomputed (cadence is 3000 steps).
+                @test rs.cos_zenith == cz_call
+                @test rs.last_call_step == 1
+            end
+            @test prev > 1.0        # by t = 2000 the sun is past the midpoint geometry
+
+            # NIGHT. Step to 19:00 local: the pre-pass first RESCALES against the old
+            # call, then finds the cadence elapsed and re-solves, which resets `sw_scale`
+            # to 1 by definition. It is the step AFTER that -- the first held step of a
+            # nocturnal interval -- where `cos_zenith(call) == 0` switches the held
+            # shortwave off exactly rather than fading it.
+            t_night = round(Int, 13.0 * 3600.0 / ts) + 1     # 19:00 local
+            cz_night, _ = solar_at(t_night)
+            @test cz_night == 0.0
+            Scythe.radiation_prepass!(mtile, t_night)
+            @test rs.last_call_step == t_night
+            @test rs.cos_zenith == 0.0
+            @test rs.toa_flux > 0.0        # beam-normal flux is geometry-independent
+            Scythe.radiation_prepass!(mtile, t_night + 1)
+            @test rs.sw_scale == 0.0
+        end
+    end
+
+    @testset "sw_scale clamps at 4 and at 0" begin
+        mktempdir() do tmp
+            # ts = 0.1 s, cadence 2400 s => interval_steps = 24000 and the first call's
+            # geometry is taken at the midpoint, t_model = 1200 s = 05:50 local, twenty
+            # minutes after sunrise where cos_z is still 0.0148.
+            mtile, _, model, _, _ = make_rad_mtile(tmp;
+                radopts = Dict{Symbol,Any}(:radiation => :prescribed,
+                                           :solar => :diurnal,
+                                           :radiation_interval => 2400.0),
+                radparams = Dict{Symbol,Float64}(:latitude => 20.0, :longitude => 0.0,
+                                                 :start_doy => 240.0, :start_hour => 5.5))
+            rs = mtile.radiation
+            Scythe.radiation_prepass!(mtile, 1)
+            # Just after sunrise the call-time cos_z is tiny, so the UNCLAMPED ratio runs
+            # away well inside one interval; the clamp is what stops a held profile from
+            # being amplified without bound near the terminator.
+            @test 0.0 < rs.cos_zenith < 0.02
+            ts = model.ts
+            # t_model = 2000 s, still INSIDE the 24000-step interval so no re-solve.
+            t_late = round(Int, 2000.0 / ts) + 1
+            @test (t_late - rs.last_call_step) < rs.interval_steps
+            cz_late, _ = Scythe.solar_state(model.options, model.physical_params,
+                                            (t_late - 1) * ts)
+            @test cz_late / rs.cos_zenith > 4.0        # the ratio really does exceed 4
+            Scythe.radiation_prepass!(mtile, t_late)
+            @test rs.sw_scale == 4.0                   # ... and is clamped there
+            @test rs.last_call_step == 1               # the profile was NOT re-solved
+        end
+    end
+
+    @testset ":solar = :none leaves q_sw identically zero" begin
+        mktempdir() do tmp
+            mtile, _, _, gp, _ = make_rad_mtile(tmp;
+                radopts = Dict{Symbol,Any}(:radiation => :prescribed, :solar => :none))
+            rs = mtile.radiation
+            @test rs.solar === :none
+            @test rs.sw_rescale == false               # nothing to rescale
+            for t in (1, 5, 50)
+                Scythe.radiation_prepass!(mtile, t)
+                @test all(rs.q_sw .== 0.0)             # exactly, at every gridpoint
+                @test rs.cos_zenith == 0.0
+                @test rs.toa_flux == 0.0
+                @test rs.sw_scale == 1.0               # never touched, so never NaN
+            end
+            # And the longwave IS non-zero, so the assertion above is not vacuous.
+            @test any(rs.q_lw .< 0.0)
+        end
+    end
+
+    # ──────────────────────────────────────────────
+    # 10. S4/B: :anomaly through the REAL solver (artifact-gated)
+    # ──────────────────────────────────────────────
+    #
+    # The `:prescribed` test above proves the reference-column DEFINITION. This one proves
+    # it survives the actual radiative transfer: on a resting tile, every model column's
+    # solver inputs are bitwise the reference column's, so RRTMGP runs identical arithmetic
+    # on identical numbers and the difference is zero -- by CONSTRUCTION, not by physical
+    # cancellation between a cooling and a mean cooling that happen to be close.
+    lookups_ok = try
+        Scythe.rrtmgp_lookups(:clearsky)
+        true
+    catch err
+        @info("test_radiation_driver: the RRTMGP spectral lookup tables could not be " *
+              "built, so the :rrtmgp :anomaly testset is SKIPPED. Run " *
+              "tools/rrtmgp_prewarm.jl on a machine with network access.",
+              exception = (err, catch_backtrace()))
+        false
+    end
+
+    if lookups_ok
+        @testset ":anomaly through RRTMGP: a resting tile has zero forcing" begin
+            mktempdir() do tmp
+                mtile, _, model, gp, _ = make_o01_rad_mtile(tmp;
+                    extra_opts = Dict{Symbol,Any}(:radiation => :rrtmgp,
+                                                  :radiation_method => :clearsky,
+                                                  :solar => :none,
+                                                  :radiation_forcing => :anomaly))
+                rs = mtile.radiation
+                kDim = gp.kDim
+                @test rs.scheme === :rrtmgp && rs.forcing === :anomaly
+                # The batch carries one MORE column than the tile: the reference column.
+                B = (rs.solver::NamedTuple).batch::Scythe.RadiationBatch
+                @test size(B.T_lay, 2) == rs.ncol + 1
+
+                Scythe.radiation_prepass!(mtile, 1)
+
+                # Every model column of a RESTING tile is bitwise the reference column,
+                # so its batch row is too -- assert that first, because if it fails the
+                # zero below would be an accident of the solver rather than a property of
+                # the driver.
+                cref = rs.ncol + 1
+                for c in 1:rs.ncol
+                    @test B.T_lay[:, c] == B.T_lay[:, cref]
+                    @test B.p_lay[:, c] == B.p_lay[:, cref]
+                    @test B.T_lev[:, c] == B.T_lev[:, cref]
+                    @test B.p_lev[:, c] == B.p_lev[:, cref]
+                    @test B.vmr_h2o[:, c] == B.vmr_h2o[:, cref]
+                    @test B.t_sfc[c] == B.t_sfc[cref]
+                end
+
+                # The anomaly in K/day, the reported convention.
+                work = Scythe.RadiationWork(kDim)
+                worst = 0.0
+                for c in 1:rs.ncol
+                    cs = (c - 1) * kDim + 1
+                    Scythe.radiation_column_state!(work, mtile, cs, cs + kDim - 1)
+                    for k in 1:kDim
+                        f = 86400.0 / (work.rho_d[k] *
+                                       (Scythe.Cpd +
+                                        (work.rho_v[k] / work.rho_d[k]) * Scythe.Cpv +
+                                        (work.rho_liq[k] / work.rho_d[k]) * Scythe.Cl +
+                                        (work.rho_ice[k] / work.rho_d[k]) * Scythe.Ci))
+                        worst = max(worst, abs(rs.q_lw[cs + k - 1] * f))
+                    end
+                end
+                @test worst <= 1.0e-10
+                @test all(rs.q_sw .== 0.0)     # :solar = :none
+
+                # The reference profile is a real clear-sky cooling, so the zero above is
+                # a cancellation of something substantial, not of nothing: 1-3 K/day of
+                # tropospheric cooling on the humidified Dunion column.
+                @test any(rs.q_lw_ref .< 0.0)
+                k5 = argmin(abs.(rs.z .- 5.0e3))
+                Scythe.radiation_column_state!(work, mtile, 1, kDim)
+                f5 = 86400.0 / (work.rho_d[k5] *
+                                (Scythe.Cpd +
+                                 (work.rho_v[k5] / work.rho_d[k5]) * Scythe.Cpv))
+                @test -4.0 < rs.q_lw_ref[k5] * f5 < -1.0
+            end
         end
     end
 

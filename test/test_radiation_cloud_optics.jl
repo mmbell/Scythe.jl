@@ -104,10 +104,17 @@ using SpecialFunctions: gamma
     # ──────────────────────────────────────────────
     @testset "liquid r_eff clamps" begin
         P = Scythe.CloudOpticsParams(Dict{Symbol,Any}(), Dict{Symbol,Float64}())
+        # A high droplet number is what puts a CLOUDY layer below the 2.5 um table floor:
+        # from S4 the clamp counters are gated on `cf == 1`, so the low-end case has to
+        # carry real cloud (q_c > q_min) as well as tiny droplets. 5000 /cm^3 with
+        # 1e-5 kg/m^3 of liquid gives r_eff ~0.84 um at q_c = 1e-5 > q_min = 1e-6.
+        P_hi = Scythe.CloudOpticsParams(Dict{Symbol,Any}(),
+                                        Dict{Symbol,Float64}(:max_N_c => 5000.0))
 
-        # Tiny cloud water at huge droplet number -> tiny droplets -> clamp low.
         cld = Scythe.CloudOpticsColumn(1)
-        n_liq, _ = Scythe.cloud_optics_column!(cld, P, [1.0], [1.0e-9], [0.0], nothing, [10.0])
+        n_liq, _ = Scythe.cloud_optics_column!(cld, P_hi, [1.0], [1.0e-5], [0.0],
+                                                nothing, [10.0])
+        @test cld.cf[1] == 1.0
         @test n_liq == 1
         @test cld.re_liq[1] == 2.5
 
@@ -117,19 +124,23 @@ using SpecialFunctions: gamma
         @test n_liq2 == 1
         @test cld2.re_liq[1] == 21.5
 
-        # A column mixing both directions counts both.
-        P3 = P
+        # A column mixing both directions counts both, at the DEFAULT droplet number:
+        # 3e-6 kg/m^3 is inside the `q_min` window (cloudy, but below the 2.5 um floor --
+        # testset 14) and 5e-2 kg/m^3 is over the 21.5 um ceiling.
         cld3 = Scythe.CloudOpticsColumn(2)
-        n_liq3, _ = Scythe.cloud_optics_column!(cld3, P3, [1.0, 1.0], [1.0e-9, 5.0e-2],
+        n_liq3, _ = Scythe.cloud_optics_column!(cld3, P, [1.0, 1.0], [3.0e-6, 5.0e-2],
                                                  [0.0, 0.0], nothing, [10.0, 10.0])
+        @test cld3.cf == [1.0, 1.0]
         @test n_liq3 == 2
         @test cld3.re_liq == [2.5, 21.5]
     end
 
     # ──────────────────────────────────────────────
-    # 4. Ice: single species, spherical (delta=1) round-trip, re_ice == 6*rni
+    # 4. Ice: single species, spherical (delta=1) round-trip.
+    #    SOLID ice (rhobar = RHOI = 920) -> re_ice == 6*rni exactly; a low-density
+    #    aggregate (rhobar = 50) -> the same 6*rni scaled by rhobar/RHOI (S4, A1).
     # ──────────────────────────────────────────────
-    @testset "ice r_eff spherical round-trip (delta=1, nu=4 -> 6*rni)" begin
+    @testset "ice r_eff spherical round-trip (delta=1, nu=4 -> 6*rni at rhobar=RHOI)" begin
         rho_d = 1.2
         ani = 10.0e-6     # 10 micron a-axis scale -> r_eff = 6*10 = 60 micron, in-range
         n_mix = 1.0e6     # #/kg, arbitrary positive
@@ -140,6 +151,9 @@ using SpecialFunctions: gamma
         eff = Scythe._ice_effective(dens.rho_i / rho_d, dens.n_i / rho_d,
                                     dens.a_i / rho_d, dens.c_i / rho_d, 1)
         @test eff.deltastr ≈ 1.0 atol=1e-10   # construction must land exactly on delta=1
+        # Solid ice: the bulk-density factor rhobar/RHOI is EXACTLY 1, so this case still
+        # pins the pure gamma-moment factor Gamma(nu+2+delta)/Gamma(nu+(4+2delta)/3) = 6.
+        @test eff.rhobar == Scythe.ISHMAEL_RHOI
         expected_re_ice = 6.0 * eff.rni * 1.0e6   # micron
         @test 5.0 < expected_re_ice < 90.0        # sanity: must not clamp
 
@@ -152,6 +166,39 @@ using SpecialFunctions: gamma
         @test n_ice == 0
         @test cld.re_ice[1] ≈ expected_re_ice rtol=1e-9
         @test cld.iwp[1] ≈ 1000.0 * dens.rho_i * 10.0 rtol=1e-12
+    end
+
+    @testset "ice r_eff bulk-density correction (rhobar = 50 -> 6*rni*50/920)" begin
+        # Same spherical construction, but a LOW-density particle: the same axis scale
+        # holds 50/920 of the solid-ice mass, so Fu (1996)'s generalized effective size --
+        # built on the SOLID-ICE volume m/rho_ice over the (unchanged) projected area --
+        # is smaller by exactly that ratio. `rni` is the spheroid radius at the PARTICLE
+        # density rhobar, so the correction is the linear factor rhobar/RHOI, not its
+        # cube root: the volume ratio is what changes, the area is not.
+        rho_d = 1.2
+        ani = 1.5e-4      # 150 micron a-axis scale: 6*rni = 900 um uncorrected,
+        n_mix = 1.0e6     # 48.9 um once corrected -- i.e. inside [5, 90] ONLY when the
+                          # correction is applied, so this test cannot pass by accident.
+        dens = ice_species_densities(ani, n_mix, rho_d; rhobar = 50.0)
+        eff = Scythe._ice_effective(dens.rho_i / rho_d, dens.n_i / rho_d,
+                                    dens.a_i / rho_d, dens.c_i / rho_d, 1)
+        @test eff.deltastr ≈ 1.0 atol=1e-10
+        @test eff.rhobar ≈ 50.0 rtol=1e-8      # var_check re-derives it from (q, n, ani)
+
+        uncorrected = 6.0 * eff.rni * 1.0e6
+        expected = uncorrected * eff.rhobar / Scythe.ISHMAEL_RHOI
+        @test uncorrected > 90.0               # the OLD formula would have clamped here
+        @test 5.0 < expected < 90.0
+
+        M = ice_matrix(1; k = 1, s = 3, rho_i = dens.rho_i, n_i = dens.n_i,
+                       a_i = dens.a_i, c_i = dens.c_i)
+        cld = Scythe.CloudOpticsColumn(1)
+        P = Scythe.CloudOpticsParams(Dict{Symbol,Any}(), Dict{Symbol,Float64}())
+        _, n_ice = Scythe.cloud_optics_column!(cld, P, [rho_d], [0.0], [0.0], M, [10.0])
+        @test n_ice == 0
+        @test cld.re_ice[1] ≈ expected rtol=1e-9
+        # And the ratio to the solid-ice answer is the bulk-density ratio itself.
+        @test cld.re_ice[1] / uncorrected ≈ 50.0 / 920.0 rtol=1e-7
     end
 
     # ──────────────────────────────────────────────
@@ -203,38 +250,50 @@ using SpecialFunctions: gamma
         @test n_iceB == 1
         @test cldB.re_ice[1] == 90.0
 
-        # FINDING (reported to the orchestrator): the RAD_RE_ICE_MIN = 5 micron floor is
-        # UNREACHABLE through any legitimate `_ice_effective` output. `ishmael_var_check`
-        # floors `rni` at ISHMAEL_RMIN = 2 micron and clamps `deltastr` to [0.55, 1.3]; the
-        # gamma-moment factor Gamma(nu+2+delta)/Gamma(nu+(4+2*delta)/3) is minimized at
-        # delta=0.55 (factor ~4.342, nu=4), so the absolute floor of a single species'
-        # r_eff,k is ~2*4.342 = 8.68 micron, and the harmonic combination across species is
-        # bounded within [min_k r_eff,k, max_k r_eff,k] (see the docstring), so it can never
-        # go lower either. This test exercises the closest approach found by direct search
-        # (an extreme, physically degenerate population: tiny mass, huge number, strongly
-        # oblate axes) and confirms it still clamps to NEITHER bound, staying comfortably
-        # above 5 micron -- i.e. the low clamp's counter can be nonzero only if a future
-        # change to ISHMAEL's own floors (RMIN, the deltastr range) or a coding error moved
-        # rni or delta outside their current ranges; the clamp is retained as that defensive
-        # bound, not because it is expected to fire under ISHMAEL's current physics.
+        # FINDING, REVISED IN S4. Before the bulk-density correction the RAD_RE_ICE_MIN =
+        # 5 micron floor was UNREACHABLE: `ishmael_var_check` floors `rni` at
+        # ISHMAEL_RMIN = 2 micron and clamps `deltastr` to [0.55, 1.3], the gamma-moment
+        # factor Gamma(nu+2+delta)/Gamma(nu+(4+2*delta)/3) is minimized at delta = 0.55
+        # (~4.342 at nu = 4), so a single species' r_eff,k could not fall below
+        # 2*4.342 = 8.68 micron, and the harmonic combination is bounded within
+        # [min_k r_eff,k, max_k r_eff,k]. The rhobar/RHOI factor moves that floor DOWN by
+        # up to 50/920 = 0.0543, to ~0.47 micron, so the low clamp is now genuinely
+        # reachable -- by exactly the population it should be reachable by: a
+        # near-massless, hugely numerous, strongly oblate low-density crystal, whose
+        # solid-ice volume per unit projected area really is tiny. The same degenerate
+        # population used before now clamps LOW, and this test asserts that (it is the
+        # regression that would fail if the correction were dropped again).
         ani, cni, n_mix, qi_mix = 1.0e-5, 1.0e-7, 1.0e8, 1.0e-10
         a_mix = ani^2 * cni * n_mix
         c_mix = cni^2 * ani * n_mix
         MC = zeros(Float64, 1, 12)
         MC[1, 1:4] = [qi_mix * rho_d, n_mix * rho_d, a_mix * rho_d, c_mix * rho_d]
+        # The crystal's own mass (1e-10 kg/kg) is far below `q_min`, and from S4 clamps
+        # are counted only in CLOUDY layers -- so the layer is made cloudy by liquid
+        # water alongside it, which is exactly the situation an anvil edge is in.
         cldC = Scythe.CloudOpticsColumn(1)
-        _, n_iceC = Scythe.cloud_optics_column!(cldC, P, [rho_d], [0.0], [0.0], MC, [1.0])
-        @test n_iceC == 0
-        @test 5.0 < cldC.re_ice[1] < 15.0   # near the theoretical floor, but not clamped
+        _, n_iceC = Scythe.cloud_optics_column!(cldC, P, [rho_d], [1.0e-3], [0.0], MC, [1.0])
+        @test cldC.cf[1] == 1.0
+        @test n_iceC == 1
+        @test cldC.re_ice[1] == 5.0
+        # The uncorrected value is what the pre-S4 code returned, and it did NOT clamp:
+        # the low clamp exists because of the density factor, not in spite of it.
+        effC = Scythe._ice_effective(qi_mix, n_mix, a_mix, c_mix, 1)
+        uncorrC = effC.rni * 1.0e6 *
+                  gamma(NU + 2.0 + effC.deltastr) / gamma(NU + (4.0 + 2.0 * effC.deltastr) / 3.0)
+        @test 5.0 < uncorrC < 15.0
+        @test effC.rhobar == 50.0
 
-        # Both the reachable high clamp and the unreachable-low case in one column.
+        # Both clamps, one column: the high end from solid ice, the low end from the
+        # low-density degenerate population.
         Mboth = zeros(Float64, 2, 12)
         Mboth[1, 1:4] = [densB.rho_i, densB.n_i, densB.a_i, densB.c_i]
         Mboth[2, 1:4] = MC[1, 1:4]
         cldBoth = Scythe.CloudOpticsColumn(2)
-        _, n_iceBoth = Scythe.cloud_optics_column!(cldBoth, P, [rho_d, rho_d], [0.0, 0.0],
-                                                    [0.0, 0.0], Mboth, [1.0, 1.0])
-        @test n_iceBoth == 1
+        _, n_iceBoth = Scythe.cloud_optics_column!(cldBoth, P, [rho_d, rho_d],
+                                                    [0.0, 1.0e-3], [0.0, 0.0],
+                                                    Mboth, [1.0, 1.0])
+        @test n_iceBoth == 2
         @test cldBoth.re_ice[1] == 90.0
         @test cldBoth.re_ice[2] == cldC.re_ice[1]
     end
@@ -397,5 +456,97 @@ using SpecialFunctions: gamma
         @test cld.lwp[2] ≈ 1000.0 * rho_c[2] * dz[2] rtol=1e-12
         @test cld.cf[2] == 1.0
         @test cld.cf[1] == 0.0
+    end
+
+    # ──────────────────────────────────────────────
+    # 13. S4/A2: clamps are counted ONLY in cloudy layers (cf == 1)
+    # ──────────────────────────────────────────────
+    #
+    # RRTMGP masks the cloud optics of every layer with cf == 0, so an effective radius
+    # written there is never read: counting its clamp saturates the counter with layers
+    # that are radiatively inert. On the S3b warm arm that was about a third of all
+    # gridpoints. `cf` is therefore computed FIRST and the counters are gated on it; the
+    # radii themselves are still written (RRTMGP wants a finite in-table value in every
+    # cell), just not counted.
+    @testset "clamps counted only where cf == 1" begin
+        P = Scythe.CloudOpticsParams(Dict{Symbol,Any}(), Dict{Symbol,Float64}())
+        rho_d = 1.0
+
+        # Trace liquid, BELOW the cf threshold (q_min = 1e-6 kg/kg at rho_d = 1 means
+        # rho_c = 1e-6 kg/m^3): the droplet radius is far below 2.5 um and IS clamped in
+        # the array, but the layer is not cloud, so nothing is counted.
+        cld = Scythe.CloudOpticsColumn(1)
+        n_liq, n_ice = Scythe.cloud_optics_column!(cld, P, [rho_d], [5.0e-7], [0.0],
+                                                    nothing, [10.0])
+        @test cld.cf[1] == 0.0
+        @test cld.lwp[1] > 0.0          # the path is still built: mass is mass
+        @test cld.re_liq[1] == 2.5      # still written in range for the solver
+        @test n_liq == 0                # ... but NOT counted
+        @test n_ice == 0
+
+        # Same trace ice: a low-density degenerate crystal that would clamp low, at a
+        # mass below the cloud-fraction threshold.
+        M = zeros(Float64, 1, 12)
+        ani, cni, n_mix, qi_mix = 1.0e-5, 1.0e-7, 1.0e8, 1.0e-10
+        M[1, 1:4] = [qi_mix * rho_d, n_mix * rho_d,
+                     ani^2 * cni * n_mix * rho_d, cni^2 * ani * n_mix * rho_d]
+        @test qi_mix < 1.0e-6           # below q_min: this layer is not cloud
+        cld2 = Scythe.CloudOpticsColumn(1)
+        _, n_ice2 = Scythe.cloud_optics_column!(cld2, P, [rho_d], [0.0], [0.0], M, [1.0])
+        @test cld2.cf[1] == 0.0
+        @test cld2.re_ice[1] == 5.0     # clamped in the array
+        @test n_ice2 == 0               # not counted
+
+        # The SAME crystal in a layer made cloudy by liquid water alongside it IS counted:
+        # the gate is the layer's cloud fraction, not the species' own mass.
+        cld3 = Scythe.CloudOpticsColumn(1)
+        _, n_ice3 = Scythe.cloud_optics_column!(cld3, P, [rho_d], [1.0e-3], [0.0], M, [1.0])
+        @test cld3.cf[1] == 1.0
+        @test n_ice3 == 1
+    end
+
+    # ──────────────────────────────────────────────
+    # 14. S4/A3: q_min admits cloudy layers whose uncorrected r_eff < 2.5 um
+    # ──────────────────────────────────────────────
+    #
+    # At N_c = 100 /cm^3 the monodisperse volume radius reaches RAD_RE_LIQ_MIN / cbrt(k)
+    # = 2.5*cbrt(0.8) = 2.321 um at rho_c = 5.24e-6 kg/m^3, while the cloud-fraction
+    # threshold q_min = 1e-6 kg/kg admits cloud from rho_c = 1.2e-6 kg/m^3 (rho_d = 1.2).
+    # The window in between is CLOUDY BY DEFINITION and clamped: that is intended, and
+    # the count it produces is a real, reported number rather than a defect.
+    @testset "q_min admits clamped sub-2.5 um cloudy layers (intended)" begin
+        rho_d = 1.2
+        P = Scythe.CloudOpticsParams(Dict{Symbol,Any}(), Dict{Symbol,Float64}())
+
+        # The exact rho_c at which the UNCLAMPED effective radius equals 2.5 um, from
+        # cloud_droplet_radius's own formula inverted by hand.
+        r_vol_at_min = 2.5 * cbrt(0.8) * 1.0e-6              # m
+        kg_drop = (4.0 / 3.0) * pi * r_vol_at_min^3 * 1000.0  # kg, rho_water = 1000
+        rho_c_at_min = kg_drop * (100.0 * 1.0e6)              # N_c = 100 /cm^3 -> /m^3
+        @test rho_c_at_min ≈ 5.24e-6 rtol = 2.0e-2
+
+        rho_c_cf = P.q_min * rho_d                            # 1.2e-6 kg/m^3
+        @test rho_c_cf < rho_c_at_min                         # the window is non-empty
+
+        # A layer inside the window: cloudy, clamped, and COUNTED.
+        rho_c_mid = 0.5 * (rho_c_cf + rho_c_at_min)
+        cld = Scythe.CloudOpticsColumn(1)
+        n_liq, _ = Scythe.cloud_optics_column!(cld, P, [rho_d], [rho_c_mid], [0.0],
+                                                nothing, [10.0])
+        @test cld.cf[1] == 1.0
+        @test cld.re_liq[1] == Scythe.RAD_RE_LIQ_MIN
+        @test n_liq == 1
+        # Optically negligible, which is why it is kept rather than screened out: over
+        # the 10 m layer used here that is 0.03 g/m^2 of liquid water path, and even at
+        # O01's 250 m spacing it is under 1 g/m^2 -- an optical depth of order 1e-3.
+        @test cld.lwp[1] < 5.0e-2
+
+        # Just above the window: cloudy, in range, not counted.
+        cld2 = Scythe.CloudOpticsColumn(1)
+        n_liq2, _ = Scythe.cloud_optics_column!(cld2, P, [rho_d], [2.0 * rho_c_at_min],
+                                                 [0.0], nothing, [10.0])
+        @test cld2.cf[1] == 1.0
+        @test cld2.re_liq[1] > Scythe.RAD_RE_LIQ_MIN
+        @test n_liq2 == 0
     end
 end

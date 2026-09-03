@@ -205,19 +205,32 @@ function mc_radiation_state(model::ModelParameters, tile, tilepoints)
     sfc_emis = get(model.physical_params, :sfc_emissivity, 0.98)
     sfc_alb = get(model.physical_params, :sfc_albedo, 0.06)
 
+    # ── The :anomaly reference column (S4, plan D3 step 6 as revised) ──
+    # `:anomaly` subtracts the radiation of the RESTING REFERENCE COLUMN, and that column
+    # is solved IN THE SAME CALL as one extra batch column rather than precomputed or
+    # averaged. Solving it here, every call, is what makes the far-field anomaly exactly
+    # zero: a resting model column's batch entries are bitwise the reference column's (the
+    # reconstruction is `perturbation + reference` and the perturbation is zero), so
+    # identical inputs go through identical arithmetic and the difference is 0.0, not a
+    # cancellation to round-off. It also makes the reference independent of the initial
+    # condition and identical on every tile and patch -- the two defects of the S2a/S2b
+    # per-tile horizontal mean, which contained the O01 bubble and differed between tiles.
+    # The cost is one column in a batch of `ncol` (0.9 % on the O01 quick tile).
+    ncol_solve = cfg.forcing === :anomaly ? ncol + 1 : ncol
+
     solver = try
         # `z_face` and `latitude` are read only by the `:gray` method (level altitudes and
         # the latitude-dependent optical thickness); the spectral methods work in pressure
         # and ignore both. Passed unconditionally so a `:gray` run is configured, not
         # refused, and so nothing here has to know which method needs what.
-        rrtmgp_solver(nlay, ext, ncol, cfg.method, cfg.solar, cfg.check_values;
+        rrtmgp_solver(nlay, ext, ncol_solve, cfg.method, cfg.solar, cfg.check_values;
                       sfc_emissivity = sfc_emis, sfc_albedo = sfc_alb, gases = gases,
                       z_face = z_face,
                       latitude = Float64(get(model.physical_params, :latitude, 0.0)))
     catch err
         error("mc_radiation_state: building the RRTMGP solver failed " *
               "(method = :$(cfg.method), solar = :$(cfg.solar), nlay = $nlay, " *
-              "n_ext = $(ext.nlay), ncol = $ncol). The usual cause is a missing lookup " *
+              "n_ext = $(ext.nlay), ncol = $ncol_solve). The usual cause is a missing lookup " *
               "artifact on a node with no network — run tools/rrtmgp_prewarm.jl on a " *
               "login node first. Original error: $(sprint(showerror, err))")
     end
@@ -226,7 +239,7 @@ function mc_radiation_state(model::ModelParameters, tile, tilepoints)
     # `mc_ice_slot_indices` asks it in `createModelTile`; `mtile.mc_slots` does not exist
     # yet at this point in the tile construction.
     ice_on = all(>(0), mc_ice_slot_indices(model.grid_params.vars))
-    batch = RadiationBatch(nlay, ncol; ice_on = ice_on)
+    batch = RadiationBatch(nlay, ncol_solve; ice_on = ice_on)
     cloud_params = CloudOpticsParams(model.options, model.physical_params)
     nlev_tot = nlay + 1 + ext.nlay
 
@@ -285,6 +298,7 @@ function radiation_prepass!(mtile::ModelTile, t::Int64)
         cz_now, _ = solar_state(model.options, model.physical_params, t_model)
         rs.sw_scale = rs.cos_zenith > 0.0 ?
             clamp(cz_now / rs.cos_zenith, 0.0, 4.0) : 0.0
+        radiation_trace_sw!(mtile, t, t_model, cz_now)
     end
 
     if rs.last_call_step == typemin(Int) || (t - rs.last_call_step) >= rs.interval_steps
@@ -292,6 +306,39 @@ function radiation_prepass!(mtile::ModelTile, t::Int64)
     end
 
     radiation_write!(mtile, t)
+    return nothing
+end
+
+"""
+    radiation_trace_sw!(mtile, t, t_model, cz_now)
+
+One line per COARSE step (every 60 s of model time, and always the first step) showing
+the per-step shortwave rescale following the sun, gated by
+`options[:radiation_trace_sw]` (default `false`).
+
+The per-call trace ([`radiation_trace!`](@ref)) prints only at the radiation cadence, so
+it can show the zenith angle the held profile was BUILT at but never the rescale that
+runs between calls -- which is the whole mechanism `:diurnal` depends on. This is the
+window onto that: `cos_z(now)`, the `cos_z` the held profile was solved at, and their
+clamped ratio `sw_scale`, which is exactly the factor `mc_driver!` multiplies `q_sw` by
+in the `QDOT_TH` fold.
+
+Off by default and cheap when off (one `get` and one integer test per step): it is a
+per-STEP print, so on a 12,000-step run at every step it would swamp the log. The 60 s
+cadence is coarse enough to read and fine enough that a 300 s radiation interval shows
+four intermediate points.
+"""
+function radiation_trace_sw!(mtile::ModelTile, t::Int64, t_model::Float64, cz_now::Float64)
+    rs = mtile.radiation
+    model = mtile.model
+    get(model.options, :radiation_trace_sw, false)::Bool || return nothing
+    every = max(1, round(Int, 60.0 / model.ts))
+    (t == 1 || mod(t - 1, every) == 0) || return nothing
+    @info "radiation sw rescale, step $t (t = $(round(t_model; digits = 1)) s): " *
+          "cos_zenith(now) = $(round(cz_now; digits = 6)), " *
+          "cos_zenith(call) = $(round(rs.cos_zenith; digits = 6)), " *
+          "sw_scale = $(round(rs.sw_scale; digits = 6)), " *
+          "toa_flux(call) = $(round(rs.toa_flux; digits = 3)) W/m^2"
     return nothing
 end
 
@@ -306,9 +353,11 @@ the value whose time integral over the interval is right to second order. `sw_sc
 reset to 1 here because the held profile has just been recomputed at the new zenith
 angle — the rescale measures drift SINCE the call.
 
-`last_call_step` is updated LAST, after [`radiation_store!`](@ref), because the
-`:anomaly` reference profile is captured on the first call and "is this the first call"
-is exactly `last_call_step == typemin(Int)`.
+`last_call_step` is updated LAST, after [`radiation_store!`](@ref), so that anything the
+store or the trace needs to know about "is this the first call" can still ask
+`last_call_step == typemin(Int)`. (Through S2b the `:anomaly` reference profile was
+captured on exactly that test; from S4 the reference is recomputed every call and the
+ordering is kept only because the trace reports the call index.)
 """
 function radiation_update!(mtile::ModelTile, t::Int64)
 
@@ -359,6 +408,46 @@ is fighting the damping rather than doing physics and is therefore the thing to 
 const RADIATION_TRACE_HEIGHTS = (1.0e3, 5.0e3, 10.0e3, 13.0e3, 15.0e3, 20.0e3, 24.0e3)
 
 """
+The ONE definition of the K/day conversion used by every radiation diagnostic in Scythe,
+and the string that states it in the trace header.
+
+    dT/dt|_p = q / (rho c_p),
+    rho c_p  = rho_d C_pd + rho_v C_pv + rho_liq C_l + rho_ice C_i
+             = rho_d (C_pd + q_v C_pv + q_l C_l + q_i C_i),
+
+i.e. the CONSTANT-PRESSURE rate, with `rho` the TOTAL mass density (dry air + vapour +
+condensate) and `c_p` the mass-weighted mixture heat capacity. The two forms above are
+algebraically identical -- the second is the one evaluated, because `rho_d` and the
+mixing ratios are what the column reconstruction already carries -- and the second
+equals `radiation_offline_column`'s returned `rho .* cp` term for term, which is what
+makes the offline anchor and a live run directly comparable (S4, item C).
+
+Constant PRESSURE, not constant volume, is the radiation convention: every published
+cooling rate, every RRTMGP verification number and the S1 offline anchor are quoted that
+way. S2b's trace reported `q/(rho_d C_vt)` instead, which is `C_p/C_v ~ 1.40` times
+larger; the constant-volume number is the model's own internal-energy response to
+`QDOT_TH` and is a perfectly good number, but reporting both invites exactly the mixup
+this note exists to prevent, so only the constant-pressure rate is printed.
+
+Note `C_l` and `C_i` need no `p`/`v` distinction: a condensate is treated as
+incompressible, so its two heat capacities are the same constant.
+"""
+const RADIATION_KDAY_LABEL =
+    "K/day AT CONSTANT PRESSURE, q/(rho c_p) with rho = rho_d + rho_v + condensate and " *
+    "rho c_p = rho_d(C_pd + q_v C_pv + q_l C_l + q_i C_i) -- the radiation convention, " *
+    "the same one radiation_offline_column reports"
+
+@inline function _rad_kday(work::RadiationWork, k::Int)
+    @inbounds begin
+        rho_d = work.rho_d[k]
+        q_v = work.rho_v[k] / rho_d
+        q_l = work.rho_liq[k] / rho_d
+        q_i = work.rho_ice[k] / rho_d
+        return 86400.0 / (rho_d * (Cpd + (q_v * Cpv) + (q_l * Cl) + (q_i * Ci)))
+    end
+end
+
+"""
     radiation_trace!(mtile, t, wall_ms)
 
 Print ONE compact block per radiation call, in the style of
@@ -377,13 +466,12 @@ What it reports, and why each line is there:
   the MODEL-top face (row `nlay+1`, 25 km) it is the same flux before the extension's
   ~25 hPa of ozone and CO2 have acted on it. The two differ by the extension's own
   emission, so labelling them apart is the difference between a check and a coincidence.
-- **The heating profile in K/day**, converted with the column's OWN `rho_d C_vt` —
-  the same mixture heat capacity `mc_driver!` uses — because W/m^3 is the unit the
-  forcing is applied in and K/day is the unit it can be judged in. That is a CONSTANT
-  VOLUME rate: it is the model's own internal-energy response to `QDOT_TH`, and it is
-  `C_p/C_v ~ 1.4` times the constant-pressure rate that textbook and offline-column
-  numbers are quoted at (`radiation_offline_column` returns `cp`, not `C_vt`). Both
-  conventions are defensible; only silently mixing them is not, hence the label.
+- **The heating profile in K/day at CONSTANT PRESSURE** ([`_rad_kday`](@ref)), because
+  W/m^3 is the unit the forcing is applied in and K/day is the unit it can be judged in,
+  and `q/(rho c_p)` is the convention every published cooling rate and the S1 offline
+  anchor are quoted in. (S2b printed `q/(rho_d C_vt)`, larger by `C_p/C_v ~ 1.40`; S4
+  unified the two so a trace line and an offline number can be compared without a
+  conversion factor in the reader's head.)
 - **The extreme of `q_lw` over the whole tile with its height**, which is where a
   cloud-top cooling maximum (S3) or a bad extension seam would announce itself.
 - **The cloud census** (S3b), read out of the batch the assembly has just filled: how
@@ -438,6 +526,16 @@ function radiation_trace!(mtile::ModelTile, t::Int64, wall_ms::Float64)
     kmin = 0; kmax = 0
     qmin_c = Inf; qmax_c = -Inf
     kmin_c = 0; kmax_c = 0
+    # Shortwave and NET (lw + sw) extremes restricted to cloudy columns: cloud-top
+    # shortwave absorption is what partly offsets the cloud-top longwave cooling, and the
+    # only number that says whether it wins is their sum at the same point (S4 D5).
+    smin_c = Inf; smax_c = -Inf; ksmin_c = 0; ksmax_c = 0
+    nmin_c = Inf; nmax_c = -Inf; knmin_c = 0; knmax_c = 0
+    # Per-column peak |q| in K/day. On an `:anomaly` run the QUIETEST column is the
+    # far-field residual -- the number the reference-column definition exists to drive to
+    # zero -- and a domain mean cannot show it (it is diluted by the columns that do carry
+    # a perturbation). Reported as the min/median/max of this vector.
+    colmax = zeros(Float64, ncol)
 
     # ── The cloud census (S3b), over the batch the assembly has just filled ──
     # The batch is the ONLY place the cloud-optics answer survives a call (the per-column
@@ -482,21 +580,17 @@ function radiation_trace!(mtile::ModelTile, t::Int64, wall_ms::Float64)
         radiation_column_state!(work, mtile, colstart, colstart + kDim - 1)
         for h in 1:nh
             k = kidx[h]
-            rho_d = work.rho_d[k]
-            q_v = work.rho_v[k] / rho_d
-            q_l = work.rho_liq[k] / rho_d
-            q_i = work.rho_ice[k] / rho_d
-            f = 86400.0 / (rho_d * (Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)))
+            f = _rad_kday(work, k)
             sum_lw[h] += rs.q_lw[colstart + k - 1] * f
             sum_sw[h] += rs.q_sw[colstart + k - 1] * f
         end
+        cm = 0.0
         for k in 1:kDim
-            rho_d = work.rho_d[k]
-            q_v = work.rho_v[k] / rho_d
-            q_l = work.rho_liq[k] / rho_d
-            q_i = work.rho_ice[k] / rho_d
-            f = 86400.0 / (rho_d * (Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)))
+            f = _rad_kday(work, k)
             v = rs.q_lw[colstart + k - 1] * f
+            vs = rs.q_sw[colstart + k - 1] * f * rs.sw_scale
+            vn = v + vs
+            cm = max(cm, abs(vn))
             if v < qmin
                 qmin = v; kmin = k
             end
@@ -510,9 +604,23 @@ function radiation_trace!(mtile::ModelTile, t::Int64, wall_ms::Float64)
                 if v > qmax_c
                     qmax_c = v; kmax_c = k
                 end
+                if vs < smin_c
+                    smin_c = vs; ksmin_c = k
+                end
+                if vs > smax_c
+                    smax_c = vs; ksmax_c = k
+                end
+                if vn < nmin_c
+                    nmin_c = vn; knmin_c = k
+                end
+                if vn > nmax_c
+                    nmax_c = vn; knmax_c = k
+                end
             end
         end
+        colmax[c] = cm
     end
+    sort!(colmax)
     rs.n_clamp_tk = n_tk
 
     # No Printf: Scythe does not depend on it anywhere else, and `round` to a fixed
@@ -544,6 +652,110 @@ function radiation_trace!(mtile::ModelTile, t::Int64, wall_ms::Float64)
     zk(k) = (k >= 1 && k <= length(rs.z) * stride) ?
             rs.z[div(k - 1, stride) + 1] / 1000.0 : NaN
 
+    # ── The shortwave fluxes (S4) ──
+    # The longwave line above reports OLR; the shortwave needs its own, because the two
+    # numbers that verify a solar configuration are boundary fluxes, not heating rates:
+    # the TOA DOWNWARD flux must equal `toa_flux * cos_zenith` (that is the definition of
+    # the boundary condition, and a mismatch means the solver's convention is not the
+    # one `solar_state` returns), and the SURFACE downward flux is what a cloud shadow
+    # shows up in.
+    sw_line = if rs.solar === :none || size(rs.flux_sw_dn, 1) < rs.nlay + 1
+        "no shortwave (options[:solar] = :$(rs.solar))"
+    else
+        nlv = size(rs.flux_sw_dn, 1)
+        toa = view(rs.flux_sw_dn, nlv, :)
+        mtop = view(rs.flux_sw_dn, rs.nlay + 1, :)
+        sfc_dn = view(rs.flux_sw_dn, 1, :)
+        sfc_up = view(rs.flux_sw_up, 1, :)
+        expect = rs.toa_flux * rs.cos_zenith
+        "TOA down mean " * _fx(sum(toa) / ncol, 3, 9) *
+        " vs toa_flux*cos_zenith = " * _fx(expect, 3, 9) *
+        " (" * _fx(expect == 0.0 ? 0.0 : 100.0 * (sum(toa) / ncol - expect) / expect, 4, 8) *
+        " %)\n  " *
+        "model top (" * string(round(rs.z_face[end] / 1000.0; digits = 1)) * " km) down: " *
+        "mean " * _fx(sum(mtop) / ncol, 3, 9) * "\n  " *
+        "surface down: mean " * _fx(sum(sfc_dn) / ncol, 3, 9) *
+        " min " * _fx(minimum(sfc_dn), 3, 9) * " max " * _fx(maximum(sfc_dn), 3, 9) *
+        ", surface up: mean " * _fx(sum(sfc_up) / ncol, 3, 9)
+    end
+
+    # ── The column energy budget (S4) ──
+    # `sum_k q_k dz_k == F_net[1] - F_net[nlay+1]` per column, the telescoping identity
+    # `radiation_divergence!` is written in flux-difference form to guarantee. It is
+    # checked HERE, on the HELD field, because that is the field the model actually
+    # integrates: on `:full` with no taper the residual must be round-off, and any
+    # departure is the taper or the `:anomaly` subtraction (both of which are deliberate
+    # modifications of the flux divergence, so the number is reported, never asserted).
+    res_lw = 0.0; res_sw = 0.0; net_lw = 0.0; net_sw = 0.0
+    if size(rs.flux_lw_net, 1) >= rs.nlay + 1
+        @inbounds for c in 1:ncol
+            base = (c - 1) * kDim
+            s_lw = 0.0; s_sw = 0.0
+            for k in 1:kDim
+                w = rs.dz[div(k - 1, stride) + 1] / stride
+                s_lw += rs.q_lw[base + k] * w
+                s_sw += rs.q_sw[base + k] * w
+            end
+            f_lw = rs.flux_lw_net[1, c] - rs.flux_lw_net[rs.nlay + 1, c]
+            f_sw = rs.flux_sw_net[1, c] - rs.flux_sw_net[rs.nlay + 1, c]
+            net_lw += f_lw; net_sw += f_sw
+            res_lw = max(res_lw, abs(s_lw - f_lw))
+            res_sw = max(res_sw, abs(s_sw - f_sw))
+        end
+    end
+    budget_line = "column budget [W/m^2], sum_k q dz vs F_net(sfc) - F_net(model top): " *
+        "LW net mean " * _fx(net_lw / ncol, 3, 9) * ", max residual " *
+        string(res_lw) * "; SW net mean " * _fx(net_sw / ncol, 3, 9) *
+        ", max residual " * string(res_sw)
+
+    # ── Full-precision fingerprint of the held field (S4) ──
+    # Every other number in this block is rounded for reading, which is fine for judging
+    # a profile and useless for comparing two ARMS that should agree exactly. Two runs
+    # whose solver inputs are identical -- e.g. `:solar = :fixed` set to the
+    # `cos_zenith`/`toa_flux` a `:diurnal` run resolves at its first call -- must produce
+    # the same held field to the last bit, and these four sums are how that is checked
+    # from a log file without a side channel. Sum and absolute sum together: the first
+    # catches a sign or cancellation change, the second a magnitude change that the
+    # signed sum could hide.
+    sum_qlw = 0.0; abs_qlw = 0.0; sum_qsw = 0.0; abs_qsw = 0.0
+    @inbounds for j in 1:(ncol * kDim)
+        sum_qlw += rs.q_lw[j]; abs_qlw += abs(rs.q_lw[j])
+        sum_qsw += rs.q_sw[j]; abs_qsw += abs(rs.q_sw[j])
+    end
+    fingerprint_line = "held-field fingerprint [W/m^3, full precision, for exact " *
+        "cross-arm comparison]: sum q_lw = " * string(sum_qlw) * ", sum |q_lw| = " *
+        string(abs_qlw) * ", sum q_sw = " * string(sum_qsw) * ", sum |q_sw| = " *
+        string(abs_qsw)
+
+    # ── The :anomaly reference column's own profile (S4) ──
+    # `q_lw`/`q_sw` on an :anomaly run are DEPARTURES, so the profile lines above say
+    # nothing about the absolute cooling the reference is carrying. This line is that
+    # reference, in the same K/day convention, at the same heights -- converted with the
+    # RESTING column's own heat capacity, which is what the reference was computed on.
+    ref_line = if rs.forcing !== :anomaly
+        "reference profile: none (forcing :full -- the held q IS the full heating)"
+    else
+        radiation_reference_column!(work, mtile)
+        rs.n_clamp_tk = n_tk        # the diagnostic must not inflate the census
+        parts = String[]
+        for h in 1:nh
+            k = kidx[h]
+            f = _rad_kday(work, k)
+            lay = div(k - 1, stride) + 1
+            push!(parts, _fx(RADIATION_TRACE_HEIGHTS[h] / 1000.0, 1, 5) * " km: lw " *
+                         _fx(rs.q_lw_ref[lay] * f, 4, 10) * "  sw " *
+                         _fx(rs.q_sw_ref[lay] * f, 4, 10))
+        end
+        "reference column (resting, subtracted from every model column) [" *
+        RADIATION_KDAY_LABEL * "]\n  " * join(parts, "\n  ") * "\n  " *
+        "per-column peak |q_lw + sw_scale*q_sw| [K/day]: quietest column " *
+        string(colmax[1]) * ", median " * string(colmax[div(ncol + 1, 2)]) *
+        ", loudest " * string(colmax[end]) *
+        "  (the quietest column IS the far-field residual: it must be zero to " *
+        "round-off, because a resting column and the reference column are the same " *
+        "column)"
+    end
+
     cloud_line = if B_ === nothing
         "no cloud diagnostic (scheme = :$(rs.scheme))"
     else
@@ -561,16 +773,30 @@ function radiation_trace!(mtile::ModelTile, t::Int64, wall_ms::Float64)
          _fx(qmin_c, 4, 10) * " K/day at " *
          string(round(zk(kmin_c); digits = 2)) * " km, max " *
          _fx(qmax_c, 4, 10) * " K/day at " *
-         string(round(zk(kmax_c); digits = 2)) * " km")
+         string(round(zk(kmax_c); digits = 2)) * " km\n  " *
+         "q_sw extremes over CLOUDY columns: min " *
+         _fx(smin_c, 4, 10) * " K/day at " *
+         string(round(zk(ksmin_c); digits = 2)) * " km, max " *
+         _fx(smax_c, 4, 10) * " K/day at " *
+         string(round(zk(ksmax_c); digits = 2)) * " km\n  " *
+         "NET (lw + sw_scale*sw) over CLOUDY columns: min " *
+         _fx(nmin_c, 4, 10) * " K/day at " *
+         string(round(zk(knmin_c); digits = 2)) * " km, max " *
+         _fx(nmax_c, 4, 10) * " K/day at " *
+         string(round(zk(knmax_c); digits = 2)) * " km")
     end
 
     @info """radiation call, step $t (t = $(round((t - 1) * model.ts; digits = 1)) s), scheme :$(rs.scheme)/:$(rs.method), forcing :$(rs.forcing)
   wall $(round(wall_ms; digits = 1)) ms for $ncol columns x $(rs.nlay) layers (+$(rs.extension.nlay) extension), cos_zenith = $(round(rs.cos_zenith; digits = 5)), toa_flux = $(round(rs.toa_flux; digits = 2)) W/m^2, sw_scale = $(rs.sw_scale)
   OLR [W/m^2], LW up at
   $olr_line
-  domain-mean heating [K/day AT CONSTANT VOLUME, q/(rho_d C_vt) -- the model's own internal-energy response; divide by C_p/C_v ~ 1.4 for the conventional c_p rate the literature quotes] at the nearest layer to
+  domain-mean heating [$RADIATION_KDAY_LABEL] at the nearest layer to
   $prof
   q_lw extremes over the tile: min $(round(qmin; digits = 4)) K/day at $(round(zk(kmin); digits = 2)) km, max $(round(qmax; digits = 4)) K/day at $(round(zk(kmax); digits = 2)) km
+  SW [W/m^2]: $sw_line
+  $budget_line
+  $fingerprint_line
+  $ref_line
   $cloud_line
   counters (cumulative): Tk clamps $n_tk, re_liq clamps $n_rel, re_ice clamps $n_rei, negative rho_v floored $n_negv"""
     return nothing
@@ -620,6 +846,25 @@ function radiation_prescribed!(mtile::ModelTile)
             rs.q_lw[colstart + k - 1] = rho_d * C_vt * f
         end
     end
+
+    # The `:anomaly` reference, in the same shape the `:rrtmgp` path builds it (S4): the
+    # SAME product evaluated on the RESTING REFERENCE COLUMN, recomputed every call. On a
+    # resting column `radiation_column_state!` and `radiation_reference_column!` agree
+    # bitwise, so the two lines above and below produce the identical number there and the
+    # anomaly is exactly 0.0 -- which is what makes `:prescribed` the artifact-free
+    # regression target for the reference-column definition, not just for the plumbing.
+    if rs.forcing === :anomaly
+        radiation_reference_column!(work, mtile)
+        @inbounds for k in 1:rs.nlay
+            rho_d = work.rho_d[k]
+            q_v = work.rho_v[k] / rho_d
+            q_l = work.rho_liq[k] / rho_d
+            q_i = work.rho_ice[k] / rho_d
+            C_vt = Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)
+            rs.q_lw_ref[k] = rho_d * C_vt * f
+            rs.q_sw_ref[k] = 0.0
+        end
+    end
     return nothing
 end
 
@@ -656,13 +901,49 @@ function radiation_rrtmgp_update!(mtile::ModelTile)
                           B.t_sfc, rs.cos_zenith, rs.toa_flux)
     lw_up, lw_dn, lw_net, sw_up, sw_dn, sw_net = rrtmgp_fluxes(solver)
 
+    # The MODEL columns are 1:ncol. Under `:anomaly` the batch carries one more, the
+    # resting reference column (`radiation_assemble!` filled it); its own divergence
+    # becomes the reference profile that `radiation_store!` subtracts.
     radiation_divergence!(rs.q_lw, lw_net, rs.dz, rs.nlay, rs.ncol, rs.kDim, rs.stride)
     radiation_divergence!(rs.q_sw, sw_net, rs.dz, rs.nlay, rs.ncol, rs.kDim, rs.stride)
+    if rs.forcing === :anomaly
+        cref = rs.ncol + 1
+        _rad_column_divergence!(rs.q_lw_ref, lw_net, rs.dz, rs.nlay, cref)
+        _rad_column_divergence!(rs.q_sw_ref, sw_net, rs.dz, rs.nlay, cref)
+    end
 
-    copyto!(rs.flux_lw_up, lw_up); copyto!(rs.flux_lw_dn, lw_dn)
-    copyto!(rs.flux_lw_net, lw_net)
-    copyto!(rs.flux_sw_up, sw_up); copyto!(rs.flux_sw_dn, sw_dn)
-    copyto!(rs.flux_sw_net, sw_net)
+    # The flux diagnostics are sized at the MODEL column count, so the reference column's
+    # fluxes are dropped here: it is a forcing definition, not part of the domain, and a
+    # flux field with a phantom extra column would corrupt every domain mean the trace and
+    # the S5 sidecar take. Its heating profile survives in `q_lw_ref`/`q_sw_ref`.
+    nc = rs.ncol
+    copyto!(rs.flux_lw_up, view(lw_up, :, 1:nc)); copyto!(rs.flux_lw_dn, view(lw_dn, :, 1:nc))
+    copyto!(rs.flux_lw_net, view(lw_net, :, 1:nc))
+    copyto!(rs.flux_sw_up, view(sw_up, :, 1:nc)); copyto!(rs.flux_sw_dn, view(sw_dn, :, 1:nc))
+    copyto!(rs.flux_sw_net, view(sw_net, :, 1:nc))
+    return nothing
+end
+
+"""
+    _rad_column_divergence!(q, flux_net, dz, nlay, c)
+
+The [`radiation_divergence!`](@ref) flux difference for ONE column `c`, written per
+LAYER into `q` (length `nlay`) instead of per gridpoint.
+
+Used for the `:anomaly` reference column, whose profile is stored on the radiation
+layers -- `radiation_store!` maps layer to gridpoint when it subtracts. Same telescoping
+form as the gridpoint version, so `sum(q .* dz) == flux_net[1,c] - flux_net[nlay+1,c]`
+holds for the reference column too.
+"""
+function _rad_column_divergence!(q::AbstractVector, flux_net::AbstractMatrix,
+                                 dz::AbstractVector, nlay::Int, c::Int)
+    length(q) >= nlay || error("_rad_column_divergence!: q is short of nlay = $nlay")
+    size(flux_net, 2) >= c || error(
+        "_rad_column_divergence!: flux_net has $(size(flux_net, 2)) columns, need $c " *
+        "(the :anomaly reference column is the last of ncol+1)")
+    @inbounds for k in 1:nlay
+        q[k] = (flux_net[k, c] - flux_net[k + 1, c]) / dz[k]
+    end
     return nothing
 end
 
@@ -746,6 +1027,47 @@ function radiation_assemble!(rs::RadiationState, mtile::ModelTile, B::RadiationB
                                             ice, rs.dz)
         rs.n_clamp_re_liq += n_liq
         rs.n_clamp_re_ice += n_ice
+        _rad_write_batch_column!(rs, B, c, work, cloud, have_o3, mtile.model, true)
+    end
+
+    # ── The :anomaly reference column (S4) ──
+    # One more column, index `ncol+1`, carrying the RESTING reference state through the
+    # very same level build, cloud optics and batch write the model columns just took.
+    # "Same call, same code, same solver" is the whole point: it is what makes a resting
+    # model column's inputs BITWISE identical to this one, and therefore its anomaly
+    # exactly zero. Its counters are NOT accumulated -- the census is about the model
+    # state, and a reference column that clamped would announce itself in the trace's
+    # reference profile, not by inflating the model's clamp count.
+    if rs.forcing === :anomaly
+        radiation_reference_column!(work, mtile, B)
+        radiation_levels!(work, rs.z, rs.z_face)
+        cloud_optics_column!(cloud, P, work.rho_d, B.rho_c, B.rho_r, ice, rs.dz)
+        _rad_write_batch_column!(rs, B, rs.ncol + 1, work, cloud, have_o3, mtile.model,
+                                 false)
+    end
+    return nothing
+end
+
+"""
+    _rad_write_batch_column!(rs, B, c, work, cloud, have_o3, model, count)
+
+Copy one reconstructed column (`work` + `cloud`) into column `c` of the solver batch.
+
+Split out of [`radiation_assemble!`](@ref) so the `:anomaly` reference column goes
+through the IDENTICAL write as a model column -- same vapour conversion, same ozone,
+same five cloud fields, same surface-temperature rule. Any divergence between the two
+paths would show up as a residual far-field anomaly, which is precisely the quantity the
+reference column exists to make zero.
+
+`count` gates the negative-vapour counter: true for model columns (a negative `rho_v` is
+a real resolution diagnostic worth counting), false for the reference column (which has
+none, and whose bookkeeping is not the model's).
+"""
+@inline function _rad_write_batch_column!(rs::RadiationState, B::RadiationBatch, c::Int,
+                                          work::RadiationWork, cloud::CloudOpticsColumn,
+                                          have_o3::Bool, model::ModelParameters,
+                                          count::Bool)
+    @inbounds begin
         for k in 1:rs.nlay
             B.T_lay[k, c] = work.Tk[k]
             B.p_lay[k, c] = work.p[k]
@@ -753,7 +1075,7 @@ function radiation_assemble!(rs::RadiationState, mtile::ModelTile, B::RadiationB
             # see reference/HANDOFF_CONDENSATE_REPRESENTATION.md); only this INPUT is
             # floored, and the flooring is counted.
             rv = work.rho_v[k]
-            rv < 0.0 && (rs.n_neg_rho_v += 1)
+            (count && rv < 0.0) && (rs.n_neg_rho_v += 1)
             B.vmr_h2o[k, c] = (max(rv, 0.0) / work.rho_d[k]) * (Rv / Rd)
             B.o3[k, c] = have_o3 ? rs.o3[k] : 0.0
             B.lwp[k, c] = cloud.lwp[k]
@@ -766,7 +1088,124 @@ function radiation_assemble!(rs::RadiationState, mtile::ModelTile, B::RadiationB
             B.T_lev[k, c] = work.T_face[k]
             B.p_lev[k, c] = work.p_face[k]
         end
-        B.t_sfc[c] = radiation_surface_temperature(mtile.model, work.T_face[1])
+        B.t_sfc[c] = radiation_surface_temperature(model, work.T_face[1])
+    end
+    return nothing
+end
+
+"""
+    radiation_reference_column!(work, mtile, cond = nothing)
+
+Reconstruct the RESTING REFERENCE COLUMN into `work`: what
+[`radiation_column_state!`](@ref) returns for a column whose every prognostic slot is
+exactly zero.
+
+This is [`radiation_column_state!`](@ref) with the perturbations deleted, written out
+rather than called with a zeroed state buffer, and it is deliberately term-for-term
+identical to it so the two agree BITWISE at rest:
+
+- the totals ARE the reference profiles, because `0.0 + x === x`;
+- the vapour is `mc_ref_diag.rho_vbar` (the DERIVED `rho_tbar - rho_dbar - rho_cbar`),
+  never Springsteel's separately fitted `ref_rho_v`, exactly as the model column;
+- the condensates go through the SAME recoveries applied to a zero slot --
+  `recover_rho_c(0.0, rho_cbar, ...)`, `recover_rho_r(0.0, ...)`,
+  `recover_total(0.0, ...)` -- so a run carrying `:bhyp` control variables gets the
+  transform's own round-trip value, not `rho_cbar` raw, and still matches its resting
+  columns to the last bit;
+- `ke = 0.0` (u = v = w = 0) enters `M` in the same associativity,
+  `M = p + E_t - rho_t*(ke + g z)`;
+- the retrieval and its counted [170, 350] K clamp are the same call.
+
+`z` is column 1's height coordinate, which is every column's: the vertical mish is
+identical across a tile.
+
+The temperature clamp here IS counted (`rs.n_clamp_tk`): a reference column outside
+[170, 350] K means the reference state itself is broken, which is worth exactly one
+loud counter per call and cannot be confused with a model excursion because the
+reference column is solved once per call, not once per column.
+"""
+function radiation_reference_column!(work::RadiationWork, mtile::ModelTile,
+                                     cond::Union{Nothing,RadiationBatch} = nothing)
+
+    model = mtile.model
+    rs = mtile.radiation
+    refstate = mtile.ref_state
+    slots = mtile.mc_slots
+    n = rs.kDim
+
+    pbar = view(ref_pressure(refstate), :, 1)
+    rho_dbar = view(ref_rho_d(refstate), :, 1)
+    rho_tbar = view(ref_rho_t(refstate), :, 1)
+    E_tbar = view(ref_total_energy(refstate), :, 1)
+    rho_cbar = view(Springsteel.ref_rho_c(refstate), :, 1)
+    rho_vbar = mtile.mc_ref_diag.rho_vbar
+
+    ctrans = condensate_transform_mode(model.options)
+    cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
+    rtrans = rain_transform_mode(model.options)
+    rmu = get(model.physical_params, :rain_mu, 1.0e-7)
+    ice_on = ice_registered(slots)
+    itrans = ice_transform_mode(model.options)
+    imu = ice_mu(model.physical_params, 1)
+
+    want_cond = cond !== nothing
+    ice_cond = want_cond && ice_on
+    imu_n = ice_cond ? ice_mu(model.physical_params, 2) : 0.0
+    imu_a = ice_cond ? ice_mu(model.physical_params, 3) : 0.0
+    imu_c = ice_cond ? ice_mu(model.physical_params, 4) : 0.0
+
+    z = view(mtile.tilepoints, 1:n, size(mtile.tilepoints, 2))
+
+    @inbounds for k in 1:n
+        p = pbar[k]
+        rho_d = rho_dbar[k]
+        rho_t = rho_tbar[k]
+        E_t = E_tbar[k]
+        rho_v = rho_vbar[k]
+        rho_c = recover_rho_c(0.0, rho_cbar[k], ctrans, cmu)
+        rho_r = recover_rho_r(0.0, rtrans, rmu)
+        ri1 = ice_on ? recover_total(0.0, itrans, imu) : 0.0
+        ri2 = ri1
+        ri3 = ri1
+        rho_ice = ice_on ? ((ri1 + ri2) + ri3) : 0.0
+        ke = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0) + (0.0 * 0.0))
+        M = p + E_t - (rho_t * (ke + (gravity * z[k])))
+        rho_liq = rho_c + rho_r
+        Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
+        if Tk < 170.0
+            Tk = 170.0; rs.n_clamp_tk += 1
+        elseif Tk > 350.0
+            Tk = 350.0; rs.n_clamp_tk += 1
+        end
+
+        work.p[k] = p
+        work.Tk[k] = Tk
+        work.rho_d[k] = rho_d
+        work.rho_v[k] = rho_v
+        work.rho_liq[k] = rho_liq
+        work.rho_ice[k] = rho_ice
+        work.ke[k] = ke
+        work.M[k] = M
+
+        if cond !== nothing
+            cond.rho_c[k] = rho_c
+            cond.rho_r[k] = rho_r
+            if ice_cond
+                ic = cond.ice
+                ic[k, 1] = ri1
+                ic[k, 2] = recover_total(0.0, itrans, imu_n)
+                ic[k, 3] = recover_total(0.0, itrans, imu_a)
+                ic[k, 4] = recover_total(0.0, itrans, imu_c)
+                ic[k, 5] = ri2
+                ic[k, 6] = ic[k, 2]
+                ic[k, 7] = ic[k, 3]
+                ic[k, 8] = ic[k, 4]
+                ic[k, 9] = ri3
+                ic[k, 10] = ic[k, 2]
+                ic[k, 11] = ic[k, 3]
+                ic[k, 12] = ic[k, 4]
+            end
+        end
     end
     return nothing
 end
@@ -975,66 +1414,53 @@ end
 Post-process the freshly computed `q_lw`/`q_sw` in place: apply the `z_max` taper, and,
 under `options[:radiation_forcing] = :anomaly`, subtract the horizontal-mean profile.
 
-**Taper first** (the user's decision, plan D3/D5). The sponge layer relaxes the state
+**Anomaly reference first, taper second (S4).** `:anomaly` holds `q − q_ref(z)`, where
+`q_ref` is the radiation of the RESTING REFERENCE COLUMN, solved in the same call as one
+extra batch column (`radiation_assemble!`) or, on `:prescribed`, evaluated on the same
+reference profiles ([`radiation_prescribed!`](@ref)). It is recomputed EVERY call and is
+already sitting in `q_lw_ref`/`q_sw_ref` by the time this runs.
+
+Why the reference column rather than the S2a/S2b per-tile horizontal mean: the mean over
+the O01 initial state already contains the warm bubble (47 of 225 columns), so the far
+field kept a 0.08 K/day residual instead of zero; and two tiles with different cloud
+populations held different references, so the same physical column was forced differently
+depending on which patch owned it. The reference column has neither problem -- it is
+bubble-free by construction, identical on every tile and patch, and independent of the
+initial condition -- and on a RESTING model column its solver inputs are bitwise the
+model column's, so the anomaly there is exactly `0.0` rather than a cancellation.
+
+The ORDER matters and is the reverse of S2b's. The taper must act on the ANOMALY: taper
+the full `q` first and then subtract an untapered `q_ref` and the sponge layer is left
+with `−q_ref`, a spurious forcing exactly where the taper exists to remove one. With the
+subtraction first, `taper·(q − q_ref)` is zero above `z_max` whatever the reference is.
+On `:full` nothing changes -- there is no subtraction, so the two orders coincide.
+
+**The taper** (the user's decision, plan D3/D5). The sponge layer relaxes the state
 toward the reference, so a radiative tendency up there is fighting the damping rather
 than doing physics, and the extension blend at the model top is the least trustworthy
 part of the column. `taper` is precomputed per LAYER and `q` is per GRIDPOINT, hence the
 `div(k-1, stride)+1` map; at the default stride 1 it is the identity. `z_max = Inf` makes
 the taper all ones, so this costs one multiply per gridpoint and never branches.
-
-**Anomaly reference.** `:anomaly` holds `q − q̄(z)` where `q̄` is the horizontal mean over
-this tile at the FIRST radiation call, captured here and never recomputed. On a
-horizontally homogeneous initial state — the O01 sounding, exactly — that makes the
-forcing identically zero at t = 0, which is the sharp integration test: the run must stay
-bitwise identical to the radiation-off run until something breaks the homogeneity.
-
-The "first call" test is `last_call_step == typemin(Int)`, which is why
-[`radiation_update!`](@ref) updates `last_call_step` only after calling this.
-
-On a NESTED run each patch captures its own mean, so patches with different cloud
-populations hold different references. The plan flags that as an open item (the coarsest
-patch's mean broadcast to all is the intended fix); for a single patch, and for the
-homogeneous t = 0 state every patch shares, the two agree.
 """
 function radiation_store!(mtile::ModelTile)
 
     rs = mtile.radiation
-    kDim = rs.kDim; ncol = rs.ncol; stride = rs.stride; nlay = rs.nlay
+    kDim = rs.kDim; ncol = rs.ncol; stride = rs.stride
     q_lw = rs.q_lw; q_sw = rs.q_sw; taper = rs.taper
-
-    @inbounds for c in 1:ncol
-        base = (c - 1) * kDim
-        for k in 1:kDim
-            wgt = taper[div(k - 1, stride) + 1]
-            q_lw[base + k] *= wgt
-            q_sw[base + k] *= wgt
-        end
-    end
-
-    rs.forcing === :anomaly || return nothing
-
-    if rs.last_call_step == typemin(Int) && ncol > 0
-        @inbounds for lay in 1:nlay
-            s_lw = 0.0; s_sw = 0.0; cnt = 0
-            for c in 1:ncol
-                base = (c - 1) * kDim
-                for k in ((lay - 1) * stride + 1):(lay * stride)
-                    s_lw += q_lw[base + k]
-                    s_sw += q_sw[base + k]
-                    cnt += 1
-                end
-            end
-            rs.q_lw_ref[lay] = s_lw / cnt
-            rs.q_sw_ref[lay] = s_sw / cnt
-        end
-    end
+    anom = rs.forcing === :anomaly
+    q_lw_ref = rs.q_lw_ref; q_sw_ref = rs.q_sw_ref
 
     @inbounds for c in 1:ncol
         base = (c - 1) * kDim
         for k in 1:kDim
             lay = div(k - 1, stride) + 1
-            q_lw[base + k] -= rs.q_lw_ref[lay]
-            q_sw[base + k] -= rs.q_sw_ref[lay]
+            if anom
+                q_lw[base + k] -= q_lw_ref[lay]
+                q_sw[base + k] -= q_sw_ref[lay]
+            end
+            wgt = taper[lay]
+            q_lw[base + k] *= wgt
+            q_sw[base + k] *= wgt
         end
     end
     return nothing

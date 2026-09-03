@@ -26,16 +26,22 @@
 # convective flow is never damped, only the radiated gravity waves.
 # Only --stage mc is supported.
 #
-# Radiation (S2b/S3b): SCYTHE_O01_RAD selects an RRTMGP arm -- `lw` (clear-sky longwave
+# Radiation (S2b/S3b/S4): SCYTHE_O01_RAD selects an RRTMGP arm -- `lw` (clear-sky longwave
 # only, the S2b production arm), `allsky` (same solver, all-sky kernels, with the S3a
 # microphysics -> cloud-optics mapping live: a real cloudy arm), `sw` (clear-sky with a
-# fixed sun) or `diurnal` (clear-sky, full diurnal cycle at 20 N, day 240, 12:00 local).
+# fixed sun), `allsky_sw` (all-sky WITH the fixed sun: cloud-top shortwave warming
+# against cloud-top longwave cooling) or `diurnal` (clear-sky, full diurnal cycle at
+# 20 N, day 240, 12:00 local).
 # Unset or `0` sets NO radiation key at all and the run is bit-identical to the committed
 # reference. SCYTHE_O01_RAD_FORCING (`full` default | `anomaly`), SCYTHE_O01_RAD_INTERVAL
 # (cadence in seconds, default 300), SCYTHE_O01_RAD_ZMAX (taper height, unset = no taper)
 # and SCYTHE_O01_RAD_RAIN (1 = put rain mass in the liquid water path, default off) tune
-# the arm; the radiative surface temperature is deliberately left unset, so the driver
-# uses the column's own extrapolated surface air temperature (O01 has no ocean).
+# the arm; SCYTHE_O01_RAD_COSZ / SCYTHE_O01_RAD_TOA override the FIXED sun's geometry
+# (used to reproduce a `:diurnal` first call with `:fixed`), and
+# SCYTHE_O01_RAD_TRACE_SW=1 turns on the coarse per-step shortwave-rescale line (already
+# on for the `diurnal` arm). The radiative surface temperature is deliberately left
+# unset, so the driver uses the column's own extrapolated surface air temperature (O01
+# has no ocean).
 #
 # Reference: Ooyama (2001), J. Atmos. Sci. 58, 2073-2102 (Fig. 6: peak ground
 # precipitation ~75-125 g m^-2 s^-1 at ~35-40 min for a similar bubble).
@@ -557,15 +563,26 @@ function o01_model(opts::BenchmarkOptions)
         elseif rad_arm == "sw"
             options[:radiation_method] = :clearsky
             options[:solar] = :fixed
+        elseif rad_arm == "allsky_sw"
+            # S4 D5: the cloudy arm WITH a sun. Cloud-top shortwave absorption partly
+            # offsets the longwave cooling there, and the shadow under the cloud shows up
+            # in the surface downward flux -- neither is visible on `allsky` (no sun) or
+            # on `sw` (no cloud), which is why this is its own arm rather than a flag.
+            options[:radiation_method] = :allsky
+            options[:solar] = :fixed
         elseif rad_arm == "diurnal"
             options[:radiation_method] = :clearsky
             options[:solar] = :diurnal
             physical_params[:latitude] = 20.0
             physical_params[:start_doy] = 240.0
             physical_params[:start_hour] = 12.0
+            # The per-step zenith rescale is the mechanism this arm exists to exercise,
+            # and the per-call trace cannot see it (it prints only at the cadence), so
+            # the coarse per-step shortwave line is on by default HERE and nowhere else.
+            options[:radiation_trace_sw] = true
         else
             error("SCYTHE_O01_RAD = \"$rad_arm\" is not an arm; use lw, allsky, sw, " *
-                  "diurnal, or 0/unset for no radiation at all")
+                  "allsky_sw, diurnal, or 0/unset for no radiation at all")
         end
         options[:radiation_forcing] = Symbol(get(ENV, "SCYTHE_O01_RAD_FORCING", "full"))
         options[:radiation_interval] =
@@ -574,6 +591,20 @@ function o01_model(opts::BenchmarkOptions)
             (options[:radiation_z_max] = parse(Float64, ENV["SCYTHE_O01_RAD_ZMAX"]))
         get(ENV, "SCYTHE_O01_RAD_RAIN", "0") == "1" &&
             (options[:radiation_rain_in_cloud] = true)
+        # S4 D4: override the FIXED sun's geometry, so a `:fixed` arm can be run at
+        # exactly the `cos_zenith`/`toa_flux` a `:diurnal` arm resolves at its first call
+        # and the two shortwave answers compared directly. Both knobs are needed for that
+        # comparison: `solar_geometry` returns the beam-normal flux
+        # `solar_constant * (1 + 0.033 cos(2 pi doy/365.25))`, which is NOT the 551.58
+        # default. They do nothing on the `:none`/`:diurnal` arms (`solar_state` reads
+        # `:cos_zenith`/`:sw_toa_flux` only under `:fixed`), and setting one without the
+        # other is a half-matched comparison, so both are read here together.
+        haskey(ENV, "SCYTHE_O01_RAD_COSZ") &&
+            (physical_params[:cos_zenith] = parse(Float64, ENV["SCYTHE_O01_RAD_COSZ"]))
+        haskey(ENV, "SCYTHE_O01_RAD_TOA") &&
+            (physical_params[:sw_toa_flux] = parse(Float64, ENV["SCYTHE_O01_RAD_TOA"]))
+        get(ENV, "SCYTHE_O01_RAD_TRACE_SW", "0") == "1" &&
+            (options[:radiation_trace_sw] = true)
         # One line, on the MASTER's console (the driver's own setup runs on a worker and
         # its output goes to <output_dir>/scythe_err.log): which of the three surface
         # temperatures `radiation_surface_temperature` will actually use.

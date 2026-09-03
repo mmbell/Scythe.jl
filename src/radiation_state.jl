@@ -134,10 +134,16 @@ the dynamic dispatch is unmeasurable.
 # Held forcing
 `q_lw`, `q_sw` are GRIDPOINT-indexed [W/m^3], laid out exactly like `expdot`
 (row `j = (c-1)*kDim + k`), so the driver's fold is a straight indexed add with no
-reshape. `q_lw_ref`, `q_sw_ref` are the t=0 horizontal-mean profiles (length `nlay`)
-that `options[:radiation_forcing] = :anomaly` subtracts; they are filled on the first
-radiation call, which is detectable from `last_call_step` alone (it starts at
-`typemin(Int)`), so no extra "have I been initialized" flag is needed.
+reshape. `q_lw_ref`, `q_sw_ref` are the RESTING REFERENCE COLUMN's heating profiles (length
+`nlay`) that `options[:radiation_forcing] = :anomaly` subtracts. They are recomputed on
+EVERY radiation call, not captured once: on `:rrtmgp` the reference column is solved as
+one extra column of the same batch, on `:prescribed` it is the same local product
+evaluated on the reference profiles. That makes the reference bubble-free, identical on
+every tile and nest patch, and independent of the initial condition -- and bitwise equal
+to what a RESTING model column produces, which is what makes the far-field anomaly
+exactly zero. (S2a/S2b used the per-tile horizontal mean at t=0 and had none of those
+properties.) They stay populated between calls so the trace and the S5 sidecar can report
+the reference profile itself.
 
 # Counters
 `n_clamp_tk`, `n_clamp_re_liq`, `n_clamp_re_ice`, `n_neg_rho_v` accumulate how often an
@@ -248,7 +254,7 @@ function RadiationState(;
         solver = nothing,
         # `typemin(Int)` rather than 0 or -1: the very first step of a run is t = 1, and
         # "no call has happened yet" has to be distinguishable from "called at step 0"
-        # for the :anomaly reference profile to be captured exactly once.
+        # so the pre-pass can force the first solve whatever the cadence is.
         last_call_step::Int = typemin(Int),
         cos_zenith::Float64 = 0.0,
         toa_flux::Float64 = 0.0,
@@ -524,7 +530,7 @@ const RADIATION_OPTION_KEYS = Set{Symbol}((
     :radiation_sw_rescale, :radiation_level_interp, :radiation_extension,
     :radiation_extension_layers, :radiation_layer_stride, :radiation_z_max,
     :radiation_rain_in_cloud, :radiation_gases, :radiation_output,
-    :radiation_check_values, :radiation_trace))
+    :radiation_check_values, :radiation_trace, :radiation_trace_sw))
 
 const RADIATION_SCHEMES = (:none, :prescribed, :rrtmgp)
 const RADIATION_FORCINGS = (:full, :anomaly)
