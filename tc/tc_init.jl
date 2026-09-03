@@ -241,6 +241,71 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                    extra_physical=Dict{Symbol,Any}())
     axis_bc, wall_bc, bot_bc, top_bc = tc_boundary_conditions()
     mkpath(output_dir)
+
+    # ── Radiation (S6) ────────────────────────────────────────────────────────
+    # SCYTHE_TC_RAD selects the arm, in the style of the benchmark's SCYTHE_O01_RAD
+    # (benchmarks/o01_rainfall.jl) and the SCYTHE_TC_CTRANS env-switch pattern above:
+    #   unset | "0"   no radiation keys at all -- the run is BIT-IDENTICAL to a
+    #                 pre-radiation TC run (mc_radiation_state returns EMPTY_RADIATION
+    #                 whenever options[:radiation] is absent).
+    #   "lw"          RRTMGP clear-sky longwave only, no sun (:clearsky, :solar = :none).
+    #   "allsky"      the cloud-optics-coupled all-sky method (warm-rain liquid cloud
+    #                 only here -- ice is out of scope for S6/S7), still no sun.
+    #   "diurnal"     allsky + the full diurnal solar cycle at RAD_LATITUDE/
+    #                 RAD_START_DOY/RAD_START_HOUR (tc_params.jl) -- the S6 production
+    #                 arm. `physical_params[:SST]` (already set below, SST_K) becomes
+    #                 the radiative surface temperature automatically through
+    #                 `radiation_surface_temperature`'s `:T_sfc` > `:SST` > extrapolated
+    #                 -air-temperature precedence (src/radiation.jl) -- no `:T_sfc` is
+    #                 set here, so `:SST` wins.
+    # SCYTHE_TC_RAD_FORCING ("full" default | "anomaly"), SCYTHE_TC_RAD_ZMAX (override
+    # RAD_ZMAX) and SCYTHE_TC_RAD_INTERVAL (override RAD_INTERVAL, seconds) tune the arm
+    # without editing tc_params.jl -- same reasoning as SCYTHE_TC_TS_SCALE: a restart
+    # re-reads tc_params.jl/tc_init.jl, so an edit made mid-run silently changes what a
+    # later restart does.
+    #
+    # Every nest patch is built from this SAME `base.options`/`base.physical_params`
+    # (make_nest/build_nest only vary ts and grid_params per patch), so every patch gets
+    # the identical radiation keys -- including the SECONDS-valued
+    # `:radiation_interval`, which `validate_radiation_options` converts to
+    # `interval_steps` from EACH patch's own `model.ts` (`mc_radiation_state` is called
+    # once per tile, inside `createModelTile`, with that tile's own `model`), so patches
+    # at different timesteps still share one 300 s cadence in wall-clock/model-time terms
+    # even though the step count between calls would differ if their ts differed.
+    rad_arm = get(ENV, "SCYTHE_TC_RAD", "0")
+    rad_options = Dict{Symbol,Any}()
+    rad_physical = Dict{Symbol,Any}()
+    if rad_arm != "0" && rad_arm != ""
+        rad_options[:radiation] = :rrtmgp
+        if rad_arm == "lw"
+            rad_options[:radiation_method] = :clearsky
+            rad_options[:solar] = :none
+        elseif rad_arm == "allsky"
+            rad_options[:radiation_method] = :allsky
+            rad_options[:solar] = :none
+        elseif rad_arm == "diurnal"
+            rad_options[:radiation_method] = :allsky
+            rad_options[:solar] = :diurnal
+            rad_physical[:latitude] = RAD_LATITUDE
+            rad_physical[:start_doy] = RAD_START_DOY
+            rad_physical[:start_hour] = RAD_START_HOUR
+        else
+            error("SCYTHE_TC_RAD = \"$rad_arm\" is not an arm; use lw, allsky, " *
+                  "diurnal, or 0/unset for no radiation at all")
+        end
+        rad_forcing = Symbol(get(ENV, "SCYTHE_TC_RAD_FORCING", "full"))
+        rad_interval = parse(Float64, get(ENV, "SCYTHE_TC_RAD_INTERVAL", string(RAD_INTERVAL)))
+        rad_zmax = parse(Float64, get(ENV, "SCYTHE_TC_RAD_ZMAX", string(RAD_ZMAX)))
+        rad_options[:radiation_forcing] = rad_forcing
+        rad_options[:radiation_interval] = rad_interval
+        rad_options[:radiation_z_max] = rad_zmax
+        rad_physical[:sfc_albedo] = RAD_ALBEDO
+        rad_physical[:sfc_emissivity] = RAD_EMISSIVITY
+        println("TC radiation: arm=$rad_arm method=$(rad_options[:radiation_method]) " *
+                "solar=$(rad_options[:solar]) forcing=$rad_forcing " *
+                "interval=$rad_interval s z_max=$rad_zmax m; the radiative surface " *
+                "temperature is physical_params[:SST] = $(SST_K) K (no :T_sfc set)")
+    end
     return ModelParameters(
         ts = NEST_TS[end],                     # root (outer patch) timestep
         integration_time = integration_time,
@@ -273,7 +338,7 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                :Cd => CD, :l_inf => L_INF,
                                :Ls => LS_SMAG, :K_min => K_MIN,
                                :Ck => CK, :SST => SST_K, :U_min => U_MIN),
-                                extra_physical),
+                                rad_physical, extra_physical),
         # Acoustic solver: the vertical-only SI with the state-dependent acoustic
         # linearization. options[:exact_si] is NOT used here -- see
         # reference/EXACT_SI_VORTEX_FAILURE.md: on this balanced vortex it drives rho_d
@@ -338,7 +403,7 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                          :louis_bl => true,
                                          :surface_fluxes => true,
                                          :output_formats => output_formats),
-                        extra_options))
+                        rad_options, extra_options))
 end
 
 function make_nest(base)

@@ -34,5 +34,34 @@ if !isempty(miss)
         Check the branch of the Springsteel.jl checked out beside Scythe.jl.""")
 end
 println("  Springsteel : required symbols present")
+
+# RRTMGP lookup-table artifacts (S6, plan D8). CHECK-ONLY -- this never triggers a
+# download (that is tools/rrtmgp_prewarm.jl, meant for a LOGIN NODE with network
+# access); it only asserts the artifacts RRTMGP.jl downloads lazily on first use are
+# already local. RRTMGP.lookup_tables (radiation_rrtmgp.jl) would trigger the download
+# itself if the files are missing, which is exactly the failure mode this guards
+# against: a compute node with no network, twenty minutes into a queued job, hanging
+# or erroring on the first radiation call instead of failing here in seconds.
+# Gated on SCYTHE_TC_RAD so a non-radiation run (still the common case through S6)
+# pays nothing extra and is not blocked by an artifact it will never touch.
+rad_arm = get(ENV, "SCYTHE_TC_RAD", "0")
+if rad_arm != "0" && rad_arm != ""
+    using RRTMGP
+    missing_artifacts = String[]
+    for optics_type in (:gas, :cloud), lam in (:lw, :sw)
+        path = RRTMGP.ArtifactPaths.get_lookup_filename(optics_type, lam)
+        isfile(path) || push!(missing_artifacts, "$(optics_type)/$(lam) -> $path")
+    end
+    if !isempty(missing_artifacts)
+        error("""
+            RRTMGP lookup-table artifacts are missing (SCYTHE_TC_RAD=$rad_arm needs them):
+              $(join(missing_artifacts, "\n  "))
+            Run tools/rrtmgp_prewarm.jl on a LOGIN NODE (with network access) first:
+              julia --project=<Scythe.jl checkout> tools/rrtmgp_prewarm.jl
+            Compute nodes on this cluster have no network, so a lazy download at the
+            first radiation call would hang or fail deep into a queued job.""")
+    end
+    println("  RRTMGP artifacts : present (gas/lw, gas/sw, cloud/lw, cloud/sw)")
+end
 ' || { echo "PREFLIGHT FAILED - not starting the run." >&2; exit 3; }
 }

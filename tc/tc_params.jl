@@ -173,6 +173,37 @@ const RAIN_TRANSFORM       = Symbol(get(ENV, "SCYTHE_TC_RTRANS", "bhyp"))
 const SPONGE_ALPHA = 0.02    # [1/s]
 const Z_DAMP = 17.0e3        # [m] sponge onset (tropopause knot at 16.59 km)
 
+# ── Radiation (S6) ────────────────────────────────────────────────────────────
+# Constants for the TC's RRTMGP diurnal cycle (`SCYTHE_TC_RAD=diurnal`, wired in
+# tc_init.jl `make_base`). Latitude 20 N / day-of-year 240 (~28 August) is a
+# plausible peak-season genesis latitude/date for the RE87 vortex this TC runs.
+#
+# START_HOUR = 0.0 is LOCAL midnight at longitude 0 (`solar_geometry`'s hour angle
+# is `2*pi*(start_hour/24 + t/86400) - longitude`-referenced, and `:longitude`
+# defaults to 0, which the TC never overrides) -- so the run STARTS in darkness.
+# That is deliberate, not a default left alone: the first production integration
+# is 24 h, and starting at local noon (as O01's one-hour benchmark does, to put
+# its single hour on the cycle's peak) would show only a monotonic decline into
+# one night, never the full day/night alternation. Starting at midnight puts
+# sunrise at h12 and the daytime SW heating half of the cycle inside the SAME
+# 24 h window the run already covers, so both halves of the diurnal cycle are the
+# S6 acceptance target ("the diurnal heating cycle is visible") on one run rather
+# than needing a second one shifted 12 h.
+const RAD_LATITUDE = 20.0             # [deg N]
+const RAD_START_DOY = 240.0           # day of year
+const RAD_START_HOUR = 0.0            # [h, local, at longitude 0] local midnight
+const RAD_INTERVAL = 300.0            # [s] radiation cadence (same default as O01)
+# Taper the held heating to zero at the DK83 sponge onset (Z_DAMP), not the model
+# top: S4's O01 measurement found the unopposed extension-seam cooling above the
+# taper height drifted the sponge layer, so the taper and the sponge share an
+# onset by construction here (plan/user decision) rather than being independently
+# tuned knobs that could drift apart on a future edit to either constant.
+const RAD_ZMAX = Z_DAMP               # [m] taper onset = the sponge onset
+const RAD_ALBEDO = 0.06               # ocean surface albedo
+const RAD_EMISSIVITY = 0.98           # ocean surface emissivity
+# CO2/CH4/N2O/O2/N2/CFCs: left at validate_radiation_options's / radiation.jl's own
+# driver defaults (420 ppm CO2 etc, D7) -- no TC-specific override.
+
 # ── Grid resolution ─────────────────────────────────────────────────────────
 # Two configurations, selected by SCYTHE_TC_RES (default "coarse").
 #
