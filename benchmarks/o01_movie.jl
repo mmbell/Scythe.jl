@@ -6,10 +6,20 @@
 # are drawn on one shared axis, finest last so it wins in the collar overlaps.
 #
 #   julia --project=. benchmarks/o01_movie.jl [--mode full] [--grid rirk]
-#         [--nests 1|3] [--dir NAME_OR_PATH] [--field rho_c|rho_r|ice]
+#         [--nests 1|3] [--dir NAME_OR_PATH] [--field rho_c|rho_r|ice|rad]
 #         [--xlim lo,hi] [--zlim lo,hi] [--fps 8]
 #         [--ctrans none|bhyp|bhyp_smooth] [--rtrans ...] [--cmu X] [--rmu X]
 #         [--icetrans none|bhyp|bhyp_smooth] [--icemu X]
+#
+# --field rad (S5) needs a radiation sidecar (<tag>_radiation_i*.nc, Scythe.read_radiation
+# -- src/radiation_io.jl) in every patch directory, i.e. the run was made with
+# SCYTHE_O01_RAD set. Three panels: a thin top row of domain OLR vs x (line); bottom-left
+# is the SAME condensate view as --field rho_c/ice (rho_c fill, rho_r contours, and the
+# three ISHMAEL ice-mass contours WHEN the run carries ice -- same "mass vars only,
+# distinct colours per species" convention, drawn automatically rather than gated behind
+# a separate flag); bottom-right is the net radiative heating `dT_lw + sw_scale*dT_sw`
+# [K/day] on the radiation mish (no regridding), a diverging colormap with symmetric
+# limits fixed over the whole run. Sign convention: negative (blue) is cooling.
 #
 # Reads benchmarks/output/o01_rainfall_<mode>_mc<gridsuffix><nestsuffix>/ and
 # writes o01_rainfall_<mode>_<grid><nestsuffix>_<field>.mp4 there. Grid
@@ -114,7 +124,9 @@ let i = 1
         end
     end
 end
-field in ("rho_c", "rho_r", "ice") || error("--field must be rho_c, rho_r or ice")
+field in ("rho_c", "rho_r", "ice", "rad") ||
+    error("--field must be rho_c, rho_r, ice or rad")
+is_rad = field == "rad"
 
 # ── Locate the run, and its patches ─────────────────────────────────────────
 suffix = grid == "rz" ? "" : "_$(grid)"
@@ -199,25 +211,30 @@ transform_cfg = let det = detect_transforms(dir), det_ice = detect_ice_transform
      rtrans = rt, rmu = something(rmu_arg, det.rmu),
      itrans = it, imu = something(icemu_arg, det_ice.imu))
 end
-# --field ice needs the three ice-mass columns to exist at all; check by NAME (either the
-# density name or its nu_* alias) and name exactly what is missing rather than letting the
-# failure surface deep inside the render loop as an opaque KeyError.
-if field == "ice"
-    hdr = names(CSV.read(first_path, DataFrame; limit = 1))
+# Ice-mass column presence, by NAME (either the density name or its nu_* alias) --
+# --field ice REQUIRES the three columns (name exactly what is missing rather than
+# letting the failure surface deep inside the render loop as an opaque KeyError);
+# --field rad draws the ice contours only WHEN they are present, same convention as the
+# left panel of --field ice, but does not require ice (a warm-rain radiation run is a
+# perfectly good --field rad target).
+ice_present = let hdr = names(CSV.read(first_path, DataFrame; limit = 1))
     missing_ice = [ "$role/$alias" for (role, alias) in
                     (("rho_i1", "nu_i1"), ("rho_i2", "nu_i2"), ("rho_i3", "nu_i3"))
                     if !(role in hdr) && !(alias in hdr) ]
-    isempty(missing_ice) ||
+    if field == "ice" && !isempty(missing_ice)
         error("--field ice needs the three ISHMAEL ice-mass columns, but this run has none " *
               "of " * join(missing_ice, ", ") * " in $dir — it was very likely run with " *
               "options[:ice_microphysics] = :none (or an older layout). Columns present: " *
               "$hdr")
+    end
+    isempty(missing_ice)
 end
+draw_ice = field == "ice" || (is_rad && ice_present)
 water_desc(col, mode, mu) = mode === :none ? "$col (density)" :
     "$col (control variable, $(mode), mu = $(mu)" *
     (startswith(col, "nu_") ? ")" : "; pre-rename layout)")
 let hdr = names(CSV.read(first_path, DataFrame; limit = 1))
-    ice_desc = field == "ice" ? ", ice mass (i1/i2/i3) = " *
+    ice_desc = draw_ice ? ", ice mass (i1/i2/i3) = " *
         water_desc("nu_i1" in hdr ? "nu_i1" : "rho_i1", transform_cfg.itrans,
                    transform_cfg.imu) : ""
     println("Water columns: cloud = " *
@@ -229,8 +246,9 @@ let hdr = names(CSV.read(first_path, DataFrame; limit = 1))
 end
 
 """Read one patch snapshot; return (x[km] (ncol), z[km] (kDim), field2d, rho_c2d, rho_r2d,
-i1/i2/i3 2d). The three ice-mass fields are `nothing` unless `--field ice` is active — the
-liquid-only runs this script also serves carry no ice columns to recover them from."""
+i1/i2/i3 2d). The three ice-mass fields are `nothing` unless ice contours are being drawn
+(`--field ice`, or `--field rad` on a run that carries ice) — the liquid-only runs this
+script also serves carry no ice columns to recover them from."""
 function read_patch(path, rho_cbar)
     df = CSV.read(path, DataFrame)
     zc = df.z
@@ -243,7 +261,7 @@ function read_patch(path, rho_cbar)
                       ctrans = transform_cfg.ctrans, cmu = transform_cfg.cmu,
                       rtrans = transform_cfg.rtrans, rmu = transform_cfg.rmu)
     i1 = i2 = i3 = nothing
-    if field == "ice"
+    if draw_ice
         ri1, ri2, ri3 = mc_ice(df; itrans = transform_cfg.itrans, imu = transform_cfg.imu)
         i1 = reshape(1000.0 .* ri1, kDim, ncol)
         i2 = reshape(1000.0 .* ri2, kDim, ncol)
@@ -302,10 +320,35 @@ for t in snap_times, p in 1:npatch
     f = fld(pat)
     global vmax_pos = max(vmax_pos, maximum(f))
     global vmin_neg = min(vmin_neg, minimum(f))
-    if field == "ice"
+    if draw_ice
         global imax1 = max(imax1, maximum(pat.i1))
         global imax2 = max(imax2, maximum(pat.i2))
         global imax3 = max(imax3, maximum(pat.i3))
+    end
+end
+
+# ── Radiation colour/axis scaling (--field rad only) ─────────────────────────
+# A second pass, over the sidecar (Scythe.read_radiation, on the radiation mish -- no
+# regridding): the net-heating diverging colour range (symmetric, fixed over the whole
+# run, same rationale as rho_r's above) and the OLR line panel's y-range (so it does not
+# rescale frame to frame either).
+rad_cmax = 0.1
+olr_lo = Inf
+olr_hi = -Inf
+if is_rad
+    for p in 1:npatch
+        pdir = joinpath(dir, patch_dirs[p])
+        isempty(Scythe.radiation_snapshots(pdir)) &&
+            error("--field rad needs a radiation sidecar (<tag>_radiation_i*.nc, " *
+                  "Scythe.read_radiation) in $pdir — this run was very likely made with " *
+                  "radiation off. Re-run o01_rainfall.jl with SCYTHE_O01_RAD set.")
+    end
+    for t in snap_times, p in 1:npatch
+        rad = Scythe.read_radiation(joinpath(dir, patch_dirs[p]), string(t))
+        net = rad.dT_lw .+ rad.sw_scale .* rad.dT_sw
+        global rad_cmax = max(rad_cmax, maximum(abs.(net)))
+        global olr_lo = min(olr_lo, minimum(rad.olr))
+        global olr_hi = max(olr_hi, maximum(rad.olr))
     end
 end
 if field == "rho_r"
@@ -339,9 +382,12 @@ ice_levels3 = filter(l -> l <= imax3, ice_ladder)       # i3 = aggregate
 println(@sprintf("fill = %s, range %s  (peak +%.2f, min %.3f)", field,
                  field == "rho_r" ? "±$(round(cmax; digits=2))" :
                                     "0..$(round(cmax; digits=2))", vmax_pos, vmin_neg))
-field == "ice" && println(@sprintf(
+draw_ice && println(@sprintf(
     "ice species max (g/m³) over the run: i1(planar) %.4f, i2(columnar) %.4f, i3(aggregate) %.4f",
     imax1, imax2, imax3))
+is_rad && println(@sprintf(
+    "radiation: net heating range ±%.2f K/day, OLR range %.1f..%.1f W/m²",
+    rad_cmax, olr_lo, olr_hi))
 
 # ── Frames ──────────────────────────────────────────────────────────────────
 framedir = joinpath(dir, "movie_frames")
@@ -368,15 +414,27 @@ rain_pos_color = field == "rho_r" ? :white : :black
 conv_note = let bits = String[]
     transform_cfg.ctrans === :none || push!(bits, "ρ_c via $(transform_cfg.ctrans)⁻¹")
     transform_cfg.rtrans === :none || push!(bits, "ρ_r via $(transform_cfg.rtrans)⁻¹")
-    field == "ice" && transform_cfg.itrans !== :none &&
+    draw_ice && transform_cfg.itrans !== :none &&
         push!(bits, "ρ_i via $(transform_cfg.itrans)⁻¹")
     isempty(bits) ? "" : "   [" * join(bits, ", ") * "]"
 end
 
+# `--field rad`'s "late frame" PNG deliverable: 90% through the run, so it shows
+# established cloud/heating structure rather than the still-quiescent early state.
+late_frame_idx = max(1, round(Int, 0.9 * length(snap_times)))
+late_frame_path = joinpath(dir, "$(rundir === nothing ?
+    "o01_rainfall_$(mode)_$(grid)$(nested ? "_n$(npatch == 5 ? 3 : npatch)" : "")" :
+    basename(rstrip(dir, '/')))_$(field)_frame_late.png")
+
 for (i, t) in enumerate(snap_times)
-    fig = Figure(size = (1100, 460))
-    ax = Axis(fig[1, 1], xlabel = "x (km)", ylabel = "z (km)")
+    fig = Figure(size = is_rad ? (1500, 560) : (1100, 460))
+    ax = is_rad ? Axis(fig[2, 1], xlabel = "x (km)", ylabel = "z (km)") :
+                  Axis(fig[1, 1], xlabel = "x (km)", ylabel = "z (km)")
+    ax_olr = is_rad ? Axis(fig[1, 1:4], xlabel = "", ylabel = "OLR (W/m²)") : nothing
+    ax_rad = is_rad ? Axis(fig[2, 3], xlabel = "x (km)", ylabel = "z (km)") : nothing
+    is_rad && rowsize!(fig.layout, 1, Relative(0.18))   # thin top row, per the S5 spec
     local cf = nothing
+    local cf_rad = nothing
     minc = Inf; minr = Inf
     max1 = max2 = max3 = 0.0
     for p in draw_order
@@ -403,7 +461,7 @@ for (i, t) in enumerate(snap_times)
         # The three ISHMAEL ice-mass species, each its own colour family, drawn LAST so
         # they sit on top of everything else — the point of this view is "where is ice",
         # so it has to read at a glance over the liquid fill and the undershoot contours.
-        if field == "ice"
+        if draw_ice
             max1 = max(max1, maximum(pat.i1)); max2 = max(max2, maximum(pat.i2))
             max3 = max(max3, maximum(pat.i3))
             isempty(ice_levels1) ||
@@ -420,28 +478,60 @@ for (i, t) in enumerate(snap_times)
         nested && vlines!(ax, [pat.x[1], pat.x[end]]; color = (:gray, 0.3),
                           linewidth = 0.5)
     end
+
+    # ── Radiation panel (--field rad): net heating on the RIGHT, OLR-vs-x on top.
+    # Both read straight off the sidecar mish (Scythe.read_radiation) -- no regridding.
+    if is_rad
+        for p in draw_order
+            rad = Scythe.read_radiation(joinpath(dir, patch_dirs[p]), string(t))
+            xr = rad.x ./ 1000.0
+            zr = rad.z ./ 1000.0
+            net = rad.dT_lw .+ rad.sw_scale .* rad.dT_sw
+            cf_rad = contourf!(ax_rad, xr, zr, net,
+                               levels = range(-rad_cmax, rad_cmax; length = 41),
+                               extendlow = :auto, extendhigh = :auto,
+                               colormap = Reverse(:RdBu))   # blue = cooling, red = warming
+            lines!(ax_olr, xr, rad.olr, color = :black, linewidth = 1.5)
+            nested && vlines!(ax_rad, [xr[1], xr[end]]; color = (:gray, 0.3),
+                              linewidth = 0.5)
+        end
+        xlims!(ax_rad, xspan...); ylims!(ax_rad, zlim...)
+        ax_rad.title = "net heating  dT_lw + sw_scale·dT_sw  (blue = cooling)"
+        xlims!(ax_olr, xspan...)
+        ylims!(ax_olr, olr_lo - 0.05 * abs(olr_lo), olr_hi + 0.05 * abs(olr_hi) + 1.0)
+        Colorbar(fig[2, 4], cf_rad, label = "K/day")
+    end
+
     # State the CONVENTION alongside the minima. Under a transform these read 0.000 by
     # construction, and a reader has to be able to tell that from a run that simply had no
-    # undershoot. The ice view adds each species' current-frame max alongside them.
-    ice_bit = field == "ice" ? @sprintf("   max ρ_i1 = %.3f, ρ_i2 = %.3f, ρ_i3 = %.3f g/m³",
-                                        max1, max2, max3) : ""
-    ax.title = @sprintf("O01 warm rain — t = %d min    min ρ_c = %.3f, min ρ_r = %.3f g/m³%s%s",
-                        round(Int, t / 60), minc, minr, ice_bit, conv_note)
+    # undershoot. The ice view (and --field rad on an ice run) adds each species' current-
+    # frame max alongside them.
+    ice_bit = draw_ice ? @sprintf("   max ρ_i1 = %.3f, ρ_i2 = %.3f, ρ_i3 = %.3f g/m³",
+                                  max1, max2, max3) : ""
+    title_str = @sprintf("O01 warm rain — t = %d min    min ρ_c = %.3f, min ρ_r = %.3f g/m³%s%s",
+                         round(Int, t / 60), minc, minr, ice_bit, conv_note)
+    if is_rad
+        ax_olr.title = title_str
+    else
+        ax.title = title_str
+    end
     xlims!(ax, xspan...); ylims!(ax, zlim...)
     lbl = if field == "rho_r"
         "ρ_r (g/m³)   [blue<0; lines ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
-    elseif field == "ice"
+    elseif draw_ice
         "ρ_c (g/m³)   [lines: ρ_r>0 black; ice mass i1 planar dodgerblue, i2 columnar " *
         "purple, i3 aggregate darkorange; dashed magenta ρ_r<0, cyan ρ_c<0]"
     else
         "ρ_c (g/m³)   [lines: ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
     end
-    Colorbar(fig[1, 2], cf, label = lbl)
+    Colorbar(fig[is_rad ? 2 : 1, 2], cf, label = lbl)
     frame = joinpath(framedir, "frame_" * lpad(i - 1, 4, '0') * ".png")
     save(frame, fig)
+    is_rad && i == late_frame_idx && save(late_frame_path, fig)
     i % 10 == 0 && println("  frame $i / $(length(snap_times))")
 end
 println("Rendered $(length(snap_times)) frames")
+is_rad && println("Late frame: $late_frame_path")
 
 # ── Movie ───────────────────────────────────────────────────────────────────
 nsfx = nested ? "_n$(npatch == 5 ? 3 : npatch)" : ""

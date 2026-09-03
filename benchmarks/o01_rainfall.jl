@@ -1060,12 +1060,80 @@ function _o01_ice_diags(model, ref, kDim)
     return d
 end
 
+"""
+    o01_radiation_diagnostics(model, ref, kDim) -> Dict
+
+Radiation diagnostics read from the sidecar NetCDF (`Scythe.read_radiation`,
+src/radiation_io.jl), merged into `o01_diagnostics` ONLY when a sidecar exists
+(`SCYTHE_O01_RAD` on and `:radiation_output` not disabled) — an empty `Dict` on every
+non-radiation arm, exactly the pattern `o01_ice_diagnostics` uses for ice.
+
+INFORMATIONAL ONLY (S5): no `expected_values` targets exist for these keys, so nothing
+here can fail `check_targets` or gate `passed` — they land in `diagnostics.csv` and the
+JSONL record as plain rows, per the plan's stated policy (a reference is seeded only
+after the user has tested a radiation arm on real output).
+
+`ref`/`kDim` are accepted for signature symmetry with the other `o01_*_diagnostics`
+functions (`o01_diagnostics` calls all three the same way) but unused — the sidecar
+already carries its own vertical coordinate and reference-column subtraction.
+
+- `olr_mean_t0`/`olr_min_run`/`olr_mean_final`: domain-mean OLR [W/m^2] at the first
+  snapshot, the minimum over every snapshot (the cloud's OLR depression), and the
+  domain mean at the last snapshot.
+- `lw_cooling_5km_kday_t0`/`sw_heating_5km_kday_t0`: domain-mean `dT_lw`/`sw_scale*dT_sw`
+  [K/day] at the layer nearest 5 km, at the FIRST snapshot (before the bubble has done
+  much) — the number the S1 offline clear-sky anchor is directly comparable to. The SW
+  one is 0 when the arm carries no shortwave (`options[:solar] = :none`).
+- `cloud_top_cooling_min_kday`: the minimum `dT_lw` over every layer, column and
+  snapshot — the anvil/cloud-top cooling extreme the run ever produces.
+- `max_lwp_gm2`/`max_iwp_gm2`: the largest column liquid/ice water path [g/m^2] seen at
+  any snapshot.
+- `re_liq_clamps`/`re_ice_clamps`: the cloud-optics saturation counters from the FINAL
+  sidecar (cumulative over the run, exactly what `radiation_trace!`'s log line reports).
+"""
+function o01_radiation_diagnostics(model, ref, kDim)
+    tags = Scythe.radiation_snapshots(model.output_dir)
+    isempty(tags) && return Dict{String,Float64}()
+
+    rad0 = Scythe.read_radiation(model.output_dir, tags[1])
+    radN = Scythe.read_radiation(model.output_dir, tags[end])
+    k5 = argmin(abs.(rad0.z .- 5.0e3))
+    has_sw = !(rad0.solar in ("none", ""))
+
+    olr_min_run = Inf
+    cloud_top_cooling_min = Inf
+    max_lwp = 0.0
+    max_iwp = 0.0
+    for tag in tags
+        r = Scythe.read_radiation(model.output_dir, tag)
+        olr_min_run = min(olr_min_run, minimum(r.olr))
+        cloud_top_cooling_min = min(cloud_top_cooling_min, minimum(r.dT_lw))
+        max_lwp = max(max_lwp, maximum(r.lwp))
+        max_iwp = max(max_iwp, maximum(r.iwp))
+    end
+
+    return Dict(
+        "olr_mean_t0" => sum(rad0.olr) / length(rad0.olr),
+        "olr_min_run" => olr_min_run,
+        "olr_mean_final" => sum(radN.olr) / length(radN.olr),
+        "lw_cooling_5km_kday_t0" => sum(view(rad0.dT_lw, :, k5)) / size(rad0.dT_lw, 1),
+        "sw_heating_5km_kday_t0" => has_sw ?
+            rad0.sw_scale * sum(view(rad0.dT_sw, :, k5)) / size(rad0.dT_sw, 1) : 0.0,
+        "cloud_top_cooling_min_kday" => cloud_top_cooling_min,
+        "max_lwp_gm2" => max_lwp,
+        "max_iwp_gm2" => max_iwp,
+        "re_liq_clamps" => Float64(radN.n_clamp_re_liq),
+        "re_ice_clamps" => Float64(radN.n_clamp_re_ice),
+    )
+end
+
 function o01_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
 
     diags = merge(o01_rain_diagnostics(model, ref, kDim),
-                  o01_ice_diagnostics(model, ref, kDim))
+                  o01_ice_diagnostics(model, ref, kDim),
+                  o01_radiation_diagnostics(model, ref, kDim))
     diags["max_w"] = maximum(df.w)
     diags["min_w"] = minimum(df.w)
 

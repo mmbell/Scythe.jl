@@ -7,12 +7,15 @@
 # `mc_driver!` about what the cloud IS would put that disagreement straight into the
 # heating field.
 #
-# It names NO radiative-transfer library. Every RRTMGP/ClimaComms/NCDatasets reference
-# lives in src/radiation_rrtmgp.jl, which this file calls through a small fixed
-# interface (`rrtmgp_solver`, `rrtmgp_solve_columns!`, `rrtmgp_fluxes`,
-# `radiation_divergence!`, `standard_extension`, `model_ozone`, `default_gases`). The
-# split keeps the dependency at ONE file and makes the eventual conversion of RRTMGP to
-# a package extension mechanical.
+# It names NO radiative-transfer library. Every RRTMGP/ClimaComms reference lives in
+# src/radiation_rrtmgp.jl, which this file calls through a small fixed interface
+# (`rrtmgp_solver`, `rrtmgp_solve_columns!`, `rrtmgp_fluxes`, `radiation_divergence!`,
+# `standard_extension`, `model_ozone`, `default_gases`). The split keeps the RRTMGP/
+# ClimaComms dependency at ONE file and makes the eventual conversion of RRTMGP to a
+# package extension mechanical. (NCDatasets is named in TWO files, not one:
+# src/radiation_rrtmgp.jl imports it only to trigger RRTMGP's own NCDatasets extension,
+# and src/radiation_io.jl — S5, the sidecar writer/reader — is the one that actually
+# reads and writes with it. Neither of those is this file.)
 #
 # What S2a ships (this stage): the plumbing. `ModelTile` carries a `RadiationState`, the
 # pre-pass runs once per step before the threaded column loop, and the held heating folds
@@ -387,15 +390,11 @@ function radiation_update!(mtile::ModelTile, t::Int64)
     return nothing
 end
 
-"""
-    radiation_write!(mtile, t)
-
-Sidecar radiation output (plan D9). A STUB in S2a: the writer, `read_radiation` and the
-final-snapshot hook are S5. It is called from the pre-pass rather than from
-`write_output` because the fluxes live on faces and on the extension, neither of which is
-on the prognostic variable grid.
-"""
-radiation_write!(::ModelTile, ::Int64) = nothing
+# `radiation_write!` is called from the pre-pass rather than from `write_output` because
+# the fluxes live on faces and on the extension, neither of which is on the prognostic
+# variable grid — it is called here by name only, resolved at RUNTIME once every file is
+# loaded, so it can be (and, from S5, is) defined in src/radiation_io.jl, included later.
+# See `radiation_write!`/`radiation_write_final!`/`read_radiation` there.
 
 # ── The per-call trace ────────────────────────────────────────────────────────
 

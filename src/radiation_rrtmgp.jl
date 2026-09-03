@@ -1,6 +1,9 @@
 # ── The RRTMGP half of the radiation driver ───────────────────────────────────
 #
-# This is the ONLY file in Scythe that names RRTMGP, ClimaComms or NCDatasets.
+# This is the ONLY file in Scythe that names RRTMGP or ClimaComms (and, of the two files
+# that name NCDatasets, the one that names it only to trigger RRTMGP's own NCDatasets
+# extension — see the import-style note below — never to read or write a file itself;
+# src/radiation_io.jl, S5, is the file that actually does that).
 # Everything above it (src/radiation_state.jl, src/radiation.jl) works on plain
 # arrays and knows nothing about the radiative-transfer library, which is what
 # keeps `ModelTile` free of an RRTMGP type parameter and makes a later move of

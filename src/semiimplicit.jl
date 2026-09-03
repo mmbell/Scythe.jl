@@ -1179,6 +1179,17 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         # Done with this timestep
         flush(stdout)
     end
+
+    # Final radiation sidecar (S5). `radiation_write!`'s periodic cadence
+    # (`mod(t-1, out_int) == 0`, read against the PRE-ADVANCE state) never lands on the
+    # run's own final time — that would need a pre-pass at step `num_ts + 1`, which never
+    # runs (see its docstring) — so write it once here, exactly the way the final
+    # `write_output`/`write_restart` above are approximated by this loop's own last
+    # output/restart step rather than a separate call. `radiation_write_final!` is a
+    # no-op per worker when that worker's `mtile.radiation` is inactive, so this costs one
+    # remote no-op call per worker on a radiation-off run.
+    map(wait, [get_from(w, :(Scythe.radiation_write_final!(mtile, $(num_ts * model.ts))))
+               for w in workerids])
     return nothing
 end
 

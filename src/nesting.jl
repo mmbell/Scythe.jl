@@ -969,6 +969,14 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
         flush(stdout)
     end
 
+    # Final radiation sidecar (S5), the nested-run analogue of the hook at the end of
+    # src/semiimplicit.jl's `model_loop`: `radiation_write!`'s periodic cadence never
+    # lands on this patch's own final time (see its docstring), so it is written once
+    # here. `radiation_write_final!` is a no-op per worker when that worker's
+    # `mtile.radiation` is inactive.
+    map(wait, [get_from(w, :(Scythe.radiation_write_final!(mtile, $(num_ts * model.ts))))
+               for w in workerids])
+
     patch.spectral .= sharedSpectral
     gridTransform!(patch)
     println("Nest patch done with time integration")

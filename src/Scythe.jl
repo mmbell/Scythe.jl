@@ -118,9 +118,16 @@ include("radiation_cloud_optics.jl")
 # transform-mode accessors) to reconstruct a column — a radiation column that disagreed with
 # `mc_driver!` about what the cloud IS would put that disagreement into the heating field.
 # radiation.jl names no radiative-transfer library at all; radiation_rrtmgp.jl is the ONE
-# file that does, and it is included after it so the driver's interface calls resolve.
+# file that names RRTMGP/ClimaComms, and it is included after it so the driver's interface
+# calls resolve. radiation_io.jl (S5, the sidecar NetCDF writer/reader) follows immediately:
+# it is the SECOND of the two files that name NCDatasets (radiation_rrtmgp.jl names it only
+# to trigger RRTMGP's NCDatasets extension; radiation_io.jl is the one that actually reads
+# and writes with it) and defines `radiation_write!`/`radiation_write_final!`, which
+# `radiation_prepass!` above calls by name only at RUNTIME, so the include order relative to
+# radiation.jl does not matter for those two — it matters for RRTMGP/ClimaComms above.
 include("radiation.jl")
 include("radiation_rrtmgp.jl")
+include("radiation_io.jl")
 include("horizontal_si.jl")
 include("exact_si.jl")
 include("exact_si_rlr.jl")

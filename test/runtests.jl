@@ -16,6 +16,7 @@ using Scythe
     include("test_radiation_driver.jl")
     include("test_radiation_rrtmgp.jl")
     include("test_radiation_cloud_optics.jl")
+    include("test_radiation_io.jl")
     include("test_louis_bl.jl")
     include("test_surface_fluxes.jl")
     include("test_idealized_init.jl")
