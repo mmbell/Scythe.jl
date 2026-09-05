@@ -96,6 +96,46 @@ RadiationBatch(nlay::Int, ncol::Int; ice_on::Bool = false) =
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 """
+    radiation_setup_line(model, cfg, scheme, ncol, nlay)
+
+One line, `radiation: ...`, stating the resolved configuration of this tile's radiation:
+scheme, method, solar mode, forcing, the cadence in seconds and in this patch's steps
+(nests differ in `ts`), `z_max`, the extension, the column count, and which surface
+temperature source `radiation_surface_temperature` will use (`:T_sfc` > `:SST` >
+the extrapolated surface air temperature). Printed to stdout so it lands in the per-nest
+`scythe_out.log`.
+"""
+function radiation_setup_line(model::ModelParameters, cfg, scheme::Symbol, ncol::Int,
+                              nlay::Int)
+    pp = model.physical_params
+    sfc = if haskey(pp, :T_sfc)
+        "physical_params[:T_sfc] = $(pp[:T_sfc]) K"
+    elseif haskey(pp, :SST)
+        "physical_params[:SST] = $(pp[:SST]) K"
+    else
+        "the extrapolated surface air temperature (no :T_sfc or :SST set)"
+    end
+    solar_detail = if cfg.solar === :diurnal
+        " (lat $(get(pp, :latitude, NaN)) deg, lon $(get(pp, :longitude, 0.0)) deg, " *
+        "start doy $(get(pp, :start_doy, 172.0)), start hour $(get(pp, :start_hour, 0.0)))"
+    elseif cfg.solar === :fixed
+        " (cos_zenith $(get(pp, :cos_zenith, 0.2588)), " *
+        "toa $(get(pp, :sw_toa_flux, 551.58)) W/m^2)"
+    else
+        ""
+    end
+    ext = scheme === :prescribed ? "none" : "$(cfg.extension) x $(cfg.n_ext) layers"
+    interval_s = Float64(get(model.options, :radiation_interval, 300.0))
+    get(model.options, :radiation_trace, true)::Bool || return nothing
+    println("radiation: scheme=:$(scheme) method=:$(cfg.method) solar=:$(cfg.solar)" *
+            solar_detail * " forcing=:$(cfg.forcing) interval=$(interval_s) s " *
+            "(= $(cfg.interval_steps) steps at ts=$(model.ts) s) z_max=$(cfg.z_max) m " *
+            "extension=$(ext) columns=$(ncol) layers=$(nlay); " *
+            "radiative surface temperature = $(sfc)")
+    return nothing
+end
+
+"""
     mc_radiation_state(model, tile, tilepoints) -> RadiationState
 
 The tile's radiation state, or [`EMPTY_RADIATION`](@ref) when `options[:radiation]` is
@@ -169,6 +209,14 @@ function mc_radiation_state(model::ModelParameters, tile, tilepoints)
 
     work = RadiationWork(kDim)
     cloud = CloudOpticsColumn(kDim)
+
+    # The configuration summary is printed HERE, on the worker that builds the tile, and
+    # not (only) by the run script: each nest's group master has its stdout redirected to
+    # `<output_dir>/scythe_out.log` before `initialize_model` builds its tiles (nesting.jl),
+    # so this line lands in the per-nest log beside the `ModelParameters` dump the
+    # postprocess reads -- the run script's own summary goes to the driver's console,
+    # which the 6 h / 24 h TC runs did not capture.
+    radiation_setup_line(model, cfg, scheme, ncol, nlay)
 
     if scheme === :prescribed
         # No solver, no extension, no ozone: the prescribed heating is a local
