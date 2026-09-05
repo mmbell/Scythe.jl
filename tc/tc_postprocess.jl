@@ -27,6 +27,15 @@
 # products (T, rho_v, rho_c, reflectivity, rain_rate). Derivatives of the
 # control variables are passed through if present; derived products carry none.
 #
+# When the run carried radiation (S5 sidecars <t>_radiation_i*.nc alongside the
+# snapshot), the sidecar is merged into the same derived file: the heating rates
+# (q_lw, q_sw, q_sw_applied, dT_lw, dT_sw, dT_net) and the per-column boundary
+# diagnostics (olr, sw_sfc_dn, lwp, ...), resampled from the radiation mish onto
+# the regular grid, plus the solar/scheme/counter scalars as `radiation_*` global
+# attributes. See the "Radiation sidecar regridding" block below for what that
+# interpolation does and which fields deliberately stay in the sidecar. A run
+# without sidecars produces exactly the file it always did.
+#
 # The input directory is configurable; it defaults to the axisymmetric TC run.
 
 using Scythe
@@ -58,13 +67,25 @@ isdir(indir) || error("Input directory not found: $indir")
 reffile === nothing && (reffile = joinpath(indir, "tc_exact.ref"))
 isfile(reffile) || error("Reference-state file not found: $reffile")
 
+# A RAW snapshot is `<t>.nc` and nothing else. The whole name must be a number plus the
+# extension: a leading-digit test alone also matches this script's own `<t>_derived.nc`
+# and, since S5, the radiation sidecars `<t>_radiation_i<offset>.nc` — and the latter then
+# reach `parse(Float64, ...)` as "0.0_radiation_i0", which is not a time.
+const RAW_SNAPSHOT_RE = r"^[0-9]+(\.[0-9]+)?\.nc$"
+israw(f) = occursin(RAW_SNAPSHOT_RE, f)
+
+# The sidecar family for one snapshot tag, so a tag with radiation output can be detected
+# without opening anything (`Scythe.read_radiation` errors when nothing matches).
+has_radiation(ndir, tag) =
+    any(f -> occursin(Regex("^" * Base.escape_string(tag) * raw"_radiation_i[0-9]+\.nc$"), f),
+        readdir(ndir))
+
 # Auto-detect nests: subdirectories that contain at least one raw snapshot.
 if isempty(nests)
     for d in sort(readdir(indir))
         full = joinpath(indir, d)
         isdir(full) || continue
-        any(f -> occursin(r"^\d", f) && endswith(f, ".nc") && !endswith(f, "_derived.nc"),
-            readdir(full)) && push!(nests, d)
+        any(israw, readdir(full)) && push!(nests, d)
     end
     isempty(nests) && error("No nest subdirectories with raw .nc snapshots under $indir")
 end
@@ -196,10 +217,70 @@ function reference_background(x, z_reg)
     return (; pbar, rho_dbar, rho_tbar, rho_cbar, E_tbar, Q_ssbar, Tbar)
 end
 
+# ── Radiation sidecar regridding (mish → regular) ─────────────────────────────
+# The S5 sidecar (`<t>_radiation_i*.nc`, src/radiation_io.jl) is written MISH-NATIVE —
+# deliberately, because the fluxes live on faces and on the stratospheric extension above
+# the model top, neither of which is on the prognostic grid. The derived file here lives on
+# the regular (x, z) grid the raw snapshot was written on, so merging the two means
+# resampling: separable linear interpolation, x then z, from the radiation mish (Gauss
+# points in x, layer centres in z) onto that regular grid.
+#
+# Outside the mish hull the value is CLAMPED to the edge, not extrapolated. The first and
+# last Gauss points sit strictly inside the first and last cell, so the regular grid's end
+# points — r = 0 and the outer wall, z = 0 and the model top — lie outside it by up to half
+# a cell. Holding the edge value there is the conservative choice: linear extrapolation off
+# a two-point slope at the wall would manufacture a gradient the radiation never computed.
+#
+# The face-based flux profiles (`flux_lw_*`, `flux_sw_*`, on `zf`, which extends to 70 km)
+# are NOT merged: they have no counterpart on the derived file's 25 km regular z grid and
+# regridding them would be a lie about where they live. They remain in the sidecar, which
+# `Scythe.read_radiation` reads directly. The per-column boundary values derived FROM them
+# (olr, sw_sfc_dn, ...) do come across, since those are scalars per column.
+
+"""
+Linear-interpolation weights from ascending source nodes `xs` onto targets `xt`: the
+bracketing indices and the weight on the left one. Targets outside `xs` clamp to the edge.
+"""
+function interp_weights(xs::AbstractVector{<:Real}, xt::AbstractVector{<:Real})
+    n = length(xs)
+    i0 = Vector{Int}(undef, length(xt)); i1 = similar(i0)
+    w0 = Vector{Float64}(undef, length(xt))
+    for (j, x) in enumerate(xt)
+        if n == 1 || x <= xs[1]
+            i0[j] = 1; i1[j] = 1; w0[j] = 1.0
+        elseif x >= xs[n]
+            i0[j] = n; i1[j] = n; w0[j] = 1.0
+        else
+            k = clamp(searchsortedlast(xs, x), 1, n - 1)
+            i0[j] = k; i1[j] = k + 1
+            w0[j] = (xs[k + 1] - x) / (xs[k + 1] - xs[k])
+        end
+    end
+    return (i0, i1, w0)
+end
+
+"""Separable linear resample of the (x, z) matrix `A` using `interp_weights` in each axis."""
+function regrid2d(A::AbstractMatrix, wx, wz)
+    (ix0, ix1, wx0) = wx; (iz0, iz1, wz0) = wz
+    B = Matrix{Float64}(undef, length(ix0), length(iz0))
+    @inbounds for j in eachindex(iz0), i in eachindex(ix0)
+        a = wx0[i] * A[ix0[i], iz0[j]] + (1 - wx0[i]) * A[ix1[i], iz0[j]]
+        b = wx0[i] * A[ix0[i], iz1[j]] + (1 - wx0[i]) * A[ix1[i], iz1[j]]
+        B[i, j] = wz0[j] * a + (1 - wz0[j]) * b
+    end
+    return B
+end
+
+"""Linear resample of a per-column (x-only) vector."""
+function regrid1d(v::AbstractVector, wx)
+    (ix0, ix1, wx0) = wx
+    return [wx0[i] * v[ix0[i]] + (1 - wx0[i]) * v[ix1[i]] for i in eachindex(ix0)]
+end
+
 # ── Per-snapshot derivation and write ─────────────────────────────────────────
 rd2d(ds, name, n_i, n_k) = coalesce.(Array(ds[name])[1, :, :], NaN)   # (n_i, n_k)
 
-function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
+function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing)
     NCDataset(rawpath, "r") do ds
         x = ds["x"][:]; z = ds["z"][:]
         n_i = length(x); n_k = length(z)
@@ -274,6 +355,11 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
                 dv.attrib["units"] = units; dv.attrib["long_name"] = long
                 dv[1, :, :] = data
             end
+            wrx(name, data, units, long) = begin
+                dv = defVar(out, name, Float64, ("time", "x"); fillvalue = NaN)
+                dv.attrib["units"] = units; dv.attrib["long_name"] = long
+                dv[1, :] = data
+            end
 
             # Primes (perturbations off the hydrostatic reference)
             wr("p_prime",     pp,   "Pa",     "pressure perturbation")
@@ -312,6 +398,77 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
                 bv[:] = prof
             end
 
+            # ── Radiation, merged from the S5 sidecar (absent ⇒ nothing below is
+            # written and the file is byte-for-byte what a radiation-off run produces) ──
+            if rad !== nothing
+                wx = interp_weights(rad.x, x); wz = interp_weights(rad.z, z)
+                net = rad.dT_lw .+ rad.sw_scale .* rad.dT_sw
+
+                wr("q_lw", regrid2d(rad.q_lw, wx, wz), "W m-3",
+                   "longwave heating rate (flux divergence)")
+                wr("q_sw", regrid2d(rad.q_sw, wx, wz), "W m-3",
+                   "shortwave heating rate (flux divergence), held profile")
+                wr("q_sw_applied", regrid2d(rad.q_sw_applied, wx, wz), "W m-3",
+                   "sw_scale * q_sw, the rate actually folded into QDOT_TH")
+                wr("dT_lw", regrid2d(rad.dT_lw, wx, wz), "K day-1",
+                   "longwave heating rate at constant pressure")
+                wr("dT_sw", regrid2d(rad.dT_sw, wx, wz), "K day-1",
+                   "shortwave heating rate at constant pressure, UNSCALED " *
+                   "(multiply by radiation_sw_scale for the rate actually applied)")
+                wr("dT_net", regrid2d(net, wx, wz), "K day-1",
+                   "net radiative heating at constant pressure, dT_lw + sw_scale*dT_sw")
+
+                for (nm, v, units, long) in (
+                        ("olr", rad.olr, "W m-2",
+                         "outgoing longwave radiation at the top of the full column " *
+                         "(incl. stratospheric extension)"),
+                        ("olr_model_top", rad.olr_model_top, "W m-2",
+                         "longwave flux up at the model top face"),
+                        ("sw_sfc_dn", rad.sw_sfc_dn, "W m-2",
+                         "shortwave flux down at the surface"),
+                        ("sw_toa_dn", rad.sw_toa_dn, "W m-2",
+                         "shortwave flux down at the top of the full column"),
+                        ("lw_sfc_dn", rad.lw_sfc_dn, "W m-2",
+                         "longwave flux down at the surface"),
+                        ("lwp", rad.lwp, "g m-2", "column liquid water path"),
+                        ("iwp", rad.iwp, "g m-2", "column ice water path"),
+                        ("cloudy", rad.cloudy, "1",
+                         "cloudy-column indicator, linearly interpolated off the mish: " *
+                         "0 or 1 at a mish column, fractional between two — the sidecar " *
+                         "holds the exact 0/1 mask"))
+                    wrx(nm, regrid1d(v, wx), units, long)
+                end
+
+                out.attrib["radiation_source"] = "Scythe radiation sidecar " *
+                    "<t>_radiation_i*.nc, read with Scythe.read_radiation"
+                out.attrib["radiation_regridding"] =
+                    "Radiation fields were computed on the radiation MISH (Gauss points " *
+                    "in x, layer centres in z) and are resampled here onto this file's " *
+                    "regular (x, z) grid by separable LINEAR interpolation, x then z, " *
+                    "with edge clamping outside the mish hull (the outermost Gauss " *
+                    "points lie inside the first/last cell, so the wall and the model " *
+                    "top are outside it by up to half a cell and hold the edge value). " *
+                    "The face-based flux profiles (flux_lw_*, flux_sw_*, on zf, which " *
+                    "runs to the top of the stratospheric extension) are NOT merged: " *
+                    "they have no counterpart on this 25 km regular z grid. They remain " *
+                    "in the sidecar. The per-column boundary values derived from them " *
+                    "(olr, olr_model_top, sw_sfc_dn, sw_toa_dn, lw_sfc_dn) are here."
+                out.attrib["radiation_time"] = rad.t
+                out.attrib["radiation_cos_zenith"] = rad.cos_zenith
+                out.attrib["radiation_toa_flux"] = rad.toa_flux
+                out.attrib["radiation_sw_scale"] = rad.sw_scale
+                out.attrib["radiation_scheme"] = rad.scheme
+                out.attrib["radiation_method"] = rad.method
+                out.attrib["radiation_solar"] = rad.solar
+                out.attrib["radiation_forcing"] = rad.forcing
+                out.attrib["radiation_z_max"] = rad.z_max
+                out.attrib["radiation_interval_s"] = rad.radiation_interval_s
+                out.attrib["radiation_n_clamp_tk"] = rad.n_clamp_tk
+                out.attrib["radiation_n_clamp_re_liq"] = rad.n_clamp_re_liq
+                out.attrib["radiation_n_clamp_re_ice"] = rad.n_clamp_re_ice
+                out.attrib["radiation_n_neg_rho_v"] = rad.n_neg_rho_v
+            end
+
             # Pass through any control-variable derivative slots that were output
             # (derived products get none). These are extra data variables in the
             # source beyond the value slots handled above.
@@ -328,15 +485,15 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec)
         end
         return (; t = tsec, max_refl = maximum(x -> isnan(x) ? -Inf : x, refl),
                   max_rain = maximum(rain_rate), max_v = has_v ? maximum(v) : NaN,
-                  Tmin = minimum(T), Tmax = maximum(T))
+                  Tmin = minimum(T), Tmax = maximum(T),
+                  olr_mean = rad === nothing ? NaN : sum(rad.olr) / length(rad.olr))
     end
 end
 
 # ── Drive over nests and snapshots ────────────────────────────────────────────
 for nest in nests
     ndir = joinpath(indir, nest)
-    raws = sort(filter(f -> occursin(r"^[0-9]", f) && endswith(f, ".nc") &&
-                            !endswith(f, "_derived.nc"), readdir(ndir)),
+    raws = sort(filter(israw, readdir(ndir)),
                 by = f -> parse(Float64, replace(f, ".nc" => "")))
     isempty(raws) && (println("  $nest: no snapshots, skipping"); continue)
 
@@ -351,14 +508,19 @@ for nest in nests
     for f in raws
         raw = joinpath(ndir, f)
         out = joinpath(ndir, replace(f, ".nc" => "_derived.nc"))
-        tsec = parse(Float64, replace(f, ".nc" => ""))
-        s = process_snapshot(raw, out, bg, z_reg, tsec)
+        tag = replace(f, ".nc" => "")
+        tsec = parse(Float64, tag)
+        # Merge the radiation sidecar when this snapshot has one (S5 runs only).
+        rad = has_radiation(ndir, tag) ? Scythe.read_radiation(ndir, tag) : nothing
+        s = process_snapshot(raw, out, bg, z_reg, tsec, rad)
         refl_str = isfinite(s.max_refl) ? "$(round(s.max_refl;digits=1)) dBZ" : "no echo"
         println("    t=$(round(Int, tsec)) s: " *
                 "T∈[$(round(s.Tmin;digits=1)),$(round(s.Tmax;digits=1))] K  " *
                 "max_refl=$(refl_str)  " *
                 "max_rain=$(round(s.max_rain;digits=2)) mm/hr  " *
-                "max_v=$(round(s.max_v;digits=1)) m/s")
+                "max_v=$(round(s.max_v;digits=1)) m/s" *
+                (isnan(s.olr_mean) ? "" :
+                 "  OLR=$(round(s.olr_mean;digits=1)) W/m²"))
     end
 end
 println("Done. Derived files written as <t>_derived.nc alongside each snapshot.")

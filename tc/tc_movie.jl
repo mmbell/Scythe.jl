@@ -2,7 +2,7 @@
 # Radius-height movie of a nested TC run from the postprocessed derived NetCDF.
 #
 #   julia --project=. tc/tc_movie.jl [--indir DIR] [--nests n1,n2,...] [--fps 4]
-#          [--rmax KM] [--zmax KM] [--vec-scale S] [--w-scale S]
+#          [--rmax KM] [--zmax KM] [--vec-scale S] [--w-scale S] [--rad]
 #
 # Reads <t>_derived.nc from each nest (produced by tc/tc_postprocess.jl) and draws
 # one frame per output time, overlaying every nest on a single radius-height axis:
@@ -17,6 +17,16 @@
 # blockier, and the boundary lines mark where the resolution changes. Frames are
 # assembled into an mp4 with ffmpeg. The input directory is configurable and
 # defaults to the axisymmetric TC run.
+#
+# --rad adds the RADIATION view, which needs a run whose derived files carry the
+# merged radiation sidecar (tc/tc_postprocess.jl on a run made with SCYTHE_TC_RAD):
+# a thin OLR-vs-radius line panel across the top and, beside the reflectivity
+# cross-section, the net radiative heating dT_net = dT_lw + sw_scale*dT_sw as a
+# diverging filled contour. Both overlay every nest coarsest-first exactly as the
+# main panel does. The flag only ADDS: without it the figure, the frames and the
+# movie name are what they always were, so the old view stays reproducible. The two
+# views write to separate frame directories and separate mp4s (_rz.mp4 vs
+# _rz_rad.mp4), so rendering one never clobbers the other.
 
 using NCDatasets
 using CairoMakie
@@ -30,6 +40,7 @@ rmax = nothing         # [km] outer radius of the plot (default: outermost nest)
 zmax = 20.0            # [km] model top is 25 km; the storm layer is below ~18 km
 vec_scale = 2.0        # arrow length = vec_scale * speed[m/s], in km of the r-axis
 w_scale = 5.0          # vertical velocity exaggeration for the arrows only
+showrad = false        # --rad: add the OLR line panel and the dT_net cross-section
 let i = 1
     while i <= length(ARGS)
         a = ARGS[i]
@@ -40,6 +51,7 @@ let i = 1
         elseif a == "--zmax";    global zmax = parse(Float64, ARGS[i+1]); i += 2
         elseif a == "--vec-scale"; global vec_scale = parse(Float64, ARGS[i+1]); i += 2
         elseif a == "--w-scale"; global w_scale = parse(Float64, ARGS[i+1]); i += 2
+        elseif a == "--rad";     global showrad = true; i += 1
         else error("Unknown argument: $a")
         end
     end
@@ -94,17 +106,65 @@ p_levels = -1500.0:50:250.0
 u_levels = -10.0:1.0:5.0
 v_levels    = vcat(-40.0:5.0:-5.0, 5.0:5.0:40.0)   # m/s (0 omitted)
 
+# ── Radiation scales (--rad only): one pass over every frame and nest ─────────
+# Both scales are fixed for the WHOLE movie, so a frame's colours and the OLR line's
+# height mean the same thing throughout and the eye can read change rather than
+# rescaling. The heating limit is the 99th percentile of |dT_net| rather than its max:
+# the maximum is set by a handful of points at a sharp cloud top, and keying the colour
+# range to those flattens the entire rest of the field to white.
+rad_cmax = 0.1
+olr_lo = Inf; olr_hi = -Inf
+if showrad
+    absnet = Float64[]
+    for t in times, nest in nests
+        NCDataset(catalog[t][nest], "r") do ds
+            haskey(ds, "dT_net") || error(
+                "--rad needs the radiation sidecar merged into the derived files, and " *
+                "$(catalog[t][nest]) has no dT_net. Either the run was made with " *
+                "radiation off, or tc/tc_postprocess.jl was run on it before the merge " *
+                "existed — re-run tc/tc_postprocess.jl --indir $indir.")
+            net = readfield(ds, "dT_net")
+            append!(absnet, abs.(filter(isfinite, vec(net))))
+            fo = filter(isfinite, coalesce.(Array(ds["olr"])[1, :], NaN))
+            if !isempty(fo)
+                global olr_lo = min(olr_lo, minimum(fo))
+                global olr_hi = max(olr_hi, maximum(fo))
+            end
+        end
+    end
+    sort!(absnet)
+    isempty(absnet) ||
+        (rad_cmax = max(absnet[max(1, ceil(Int, 0.99 * length(absnet)))], 0.1))
+    if !isfinite(olr_lo)
+        olr_lo = 0.0; olr_hi = 300.0
+    end
+    println(@sprintf("  radiation: net heating ±%.2f K/day (99th pct), OLR %.1f..%.1f W/m²",
+                     rad_cmax, olr_lo, olr_hi))
+end
+rad_levels = range(-rad_cmax, rad_cmax; length = 41)
+
 # ── Frame rendering ───────────────────────────────────────────────────────────
-framedir = joinpath(indir, "movie_frames")
+framedir = joinpath(indir, showrad ? "movie_frames_rad" : "movie_frames")
 mkpath(framedir)
 rm.(joinpath.(framedir, readdir(framedir)); force = true)
 
 function draw_frame(t, framepath)
-    fig = Figure(size = (1100, 520))
-    ax = Axis(fig[1, 1];
-              title = @sprintf("Nested TC — reflectivity / v / (u,w),  t = %.1f h", t / 3600),
-              xlabel = "radius (km)", ylabel = "height (km)")
+    # --rad grows the figure to two rows: a thin OLR-vs-r strip across the top and, in
+    # row 2, the reflectivity cross-section (col 1, colorbar col 2) beside the net-heating
+    # cross-section (col 3, colorbar col 4). Without it the layout is the original
+    # single-axis figure, unchanged.
+    fig = Figure(size = showrad ? (1500, 620) : (1100, 520))
+    title_str = @sprintf("Nested TC — reflectivity / v / (u,w),  t = %.1f h", t / 3600)
+    ax = showrad ? Axis(fig[2, 1]; xlabel = "radius (km)", ylabel = "height (km)") :
+                   Axis(fig[1, 1]; title = title_str,
+                        xlabel = "radius (km)", ylabel = "height (km)")
+    ax_olr = showrad ? Axis(fig[1, 1:4]; title = title_str, ylabel = "OLR (W/m²)") : nothing
+    ax_rad = showrad ? Axis(fig[2, 3]; xlabel = "radius (km)", ylabel = "height (km)",
+                            title = "net radiative heating  dT_lw + sw_scale·dT_sw") :
+                       nothing
+    showrad && rowsize!(fig.layout, 1, Relative(0.20))
     local cf
+    local cf_rad = nothing
     for nest in draw_order
         g = geom[nest]
         NCDataset(catalog[t][nest], "r") do ds
@@ -141,24 +201,50 @@ function draw_frame(t, framepath)
                                      lengthscale = 0.5, shaftwidth = 1.0,
                                      tipwidth = 6.0, tiplength = 5.0,
                                      color = (:gray20, 0.7))
+
+            # Radiation, from the merged sidecar fields in the same derived file. Same
+            # coarsest-first overlay as everything else, so the fine nests draw on top.
+            if showrad
+                net = readfield(ds, "dT_net")
+                cf_rad = contourf!(ax_rad, g.r, g.z, net; levels = rad_levels,
+                                   extendlow = :auto, extendhigh = :auto,
+                                   colormap = Reverse(:RdBu))  # blue cools, red warms
+                lines!(ax_olr, g.r, coalesce.(Array(ds["olr"])[1, :], NaN);
+                       color = :black, linewidth = 1.4)
+            end
         end
     end
     for b in boundaries
         vlines!(ax, b; color = :black, linestyle = :dashdot, linewidth = 1.2)
+        if showrad
+            vlines!(ax_rad, b; color = :black, linestyle = :dash, linewidth = 1.2)
+            vlines!(ax_olr, b; color = :black, linestyle = :dash, linewidth = 1.0)
+        end
     end
     xlims!(ax, 0, rmax); ylims!(ax, 0, zmax)
-    Colorbar(fig[1, 2], cf; label = "reflectivity (dBZ)")
+    Colorbar(fig[showrad ? 2 : 1, 2], cf; label = "reflectivity (dBZ)")
+    if showrad
+        xlims!(ax_rad, 0, rmax); ylims!(ax_rad, 0, zmax)
+        xlims!(ax_olr, 0, rmax)
+        pad = 0.05 * max(olr_hi - olr_lo, 1.0)
+        ylims!(ax_olr, olr_lo - pad, olr_hi + pad)
+        Colorbar(fig[2, 4], cf_rad; label = "K/day")
+    end
     save(framepath, fig)
 end
 
+stem = basename(rstrip(indir, '/')) * "_rz" * (showrad ? "_rad" : "")
 for (i, t) in enumerate(times)
     frame = joinpath(framedir, "frame_" * lpad(i - 1, 4, '0') * ".png")
     draw_frame(t, frame)
     println("  frame $i/$(length(times))  (t = $(round(t/3600; digits=2)) h)")
+    # Keep the LAST frame as a still, outside the frame directory the next render
+    # clears: it is the one picture a report wants, and it survives re-runs.
+    i == length(times) && cp(frame, joinpath(indir, "$(stem)_late.png"); force = true)
 end
 
 # ── Assemble movie ────────────────────────────────────────────────────────────
-movie = joinpath(indir, "$(basename(indir))_rz.mp4")
+movie = joinpath(indir, "$(stem).mp4")
 run(`ffmpeg -y -loglevel error -framerate $fps -i $(joinpath(framedir, "frame_%04d.png"))
      -c:v libx264 -pix_fmt yuv420p -vf "crop=trunc(iw/2)*2:trunc(ih/2)*2" $movie`)
 println("Wrote $movie")

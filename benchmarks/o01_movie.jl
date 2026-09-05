@@ -508,7 +508,9 @@ for (i, t) in enumerate(snap_times)
     # frame max alongside them.
     ice_bit = draw_ice ? @sprintf("   max ρ_i1 = %.3f, ρ_i2 = %.3f, ρ_i3 = %.3f g/m³",
                                   max1, max2, max3) : ""
-    title_str = @sprintf("O01 warm rain — t = %d min    min ρ_c = %.3f, min ρ_r = %.3f g/m³%s%s",
+    # Name the ARM, not the warm-rain default: an ice run's frames said "warm rain".
+    title_str = @sprintf("%s — t = %d min    min ρ_c = %.3f, min ρ_r = %.3f g/m³%s%s",
+                         ice_present ? "O01 ice" : "O01 warm rain",
                          round(Int, t / 60), minc, minr, ice_bit, conv_note)
     if is_rad
         ax_olr.title = title_str
@@ -516,15 +518,26 @@ for (i, t) in enumerate(snap_times)
         ax.title = title_str
     end
     xlims!(ax, xspan...); ylims!(ax, zlim...)
-    lbl = if field == "rho_r"
-        "ρ_r (g/m³)   [blue<0; lines ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
+    # The colorbar label carries the quantity AND the contour legend. Keep the two
+    # separable: under --field rad the fill colorbar sits in row 2, which is only ~70% of
+    # the figure height, and the ice legend rotated vertically is taller than that — it
+    # ran up into row 1 and struck through the OLR panel's title. There, label the bar
+    # with the quantity alone and hang the legend off the cross-section's own title.
+    lbl_q = field == "rho_r" ? "ρ_r (g/m³)" : "ρ_c (g/m³)"
+    lbl_legend = if field == "rho_r"
+        "[blue<0; lines ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
     elseif draw_ice
-        "ρ_c (g/m³)   [lines: ρ_r>0 black; ice mass i1 planar dodgerblue, i2 columnar " *
+        "[lines: ρ_r>0 black; ice mass i1 planar dodgerblue, i2 columnar " *
         "purple, i3 aggregate darkorange; dashed magenta ρ_r<0, cyan ρ_c<0]"
     else
-        "ρ_c (g/m³)   [lines: ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
+        "[lines: ρ_r>0; dashed magenta ρ_r<0, cyan ρ_c<0]"
     end
-    Colorbar(fig[is_rad ? 2 : 1, 2], cf, label = lbl)
+    if is_rad
+        ax.title = lbl_legend
+        ax.titlesize = 11
+    end
+    Colorbar(fig[is_rad ? 2 : 1, 2], cf,
+             label = is_rad ? lbl_q : lbl_q * "   " * lbl_legend)
     frame = joinpath(framedir, "frame_" * lpad(i - 1, 4, '0') * ".png")
     save(frame, fig)
     is_rad && i == late_frame_idx && save(late_frame_path, fig)
