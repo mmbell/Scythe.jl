@@ -288,7 +288,11 @@ gp = Scythe.compute_derived_params(GridParameters(;
     vars = Dict(v => i for (i, v) in enumerate(vars))))
 refpatch = createGrid(gp)
 column = Scythe.reference_column(refpatch, gp)
-ref = Springsteel.exact_pressure_reference_state(joinpath(dir, "o01_exact.ref"),
+# The run's own exact reference column: o01_rainfall writes o01_exact.ref, ocean_warm_bubble
+# writes owb_exact.ref -- any single "*_exact.ref" in the run directory is the one.
+reffiles = filter(f -> endswith(f, "_exact.ref"), readdir(dir))
+length(reffiles) == 1 || error("expected exactly one *_exact.ref in $dir, found $(reffiles)")
+ref = Springsteel.exact_pressure_reference_state(joinpath(dir, reffiles[1]),
                                                  Scythe.getGridpoints(refpatch)[1:kDim0, 2],
                                                  column)
 rho_cbar = Springsteel.ref_rho_c(ref)[:, 1]
@@ -403,7 +407,13 @@ draw_order = let widths = map(1:npatch) do p
     sortperm(widths; rev = true)             # coarse first, fine last
 end
 
-xspan = xlim === nothing ? (0.0, 150.0) : xlim
+# Full-domain x span from the data (the last mish point sits inside the last cell, so round
+# the far edge up to the next 10 km): o01_rainfall is 150 km, ocean_warm_bubble 300 km.
+xspan = xlim === nothing ?
+    (0.0, 10.0 * ceil(maximum(read_patch(snap_path(p, snap_times[1]), rho_cbar).x[end]
+                              for p in 1:npatch) / 10.0)) : xlim
+# Case label for the title: the run directory's benchmark name, humanised.
+case_label = startswith(basename(dir), "ocean_warm_bubble") ? "Ocean warm bubble" : "O01"
 
 # Positive rain contours read best in a colour that contrasts the fill: white on
 # the dark viridis cloud (the original convention, shared by --field ice since it
@@ -510,7 +520,7 @@ for (i, t) in enumerate(snap_times)
                                   max1, max2, max3) : ""
     # Name the ARM, not the warm-rain default: an ice run's frames said "warm rain".
     title_str = @sprintf("%s — t = %d min    min ρ_c = %.3f, min ρ_r = %.3f g/m³%s%s",
-                         ice_present ? "O01 ice" : "O01 warm rain",
+                         ice_present ? "$case_label ice" : "$case_label warm rain",
                          round(Int, t / 60), minc, minr, ice_bit, conv_note)
     if is_rad
         ax_olr.title = title_str

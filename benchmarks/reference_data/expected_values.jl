@@ -67,6 +67,11 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     # sounding and single non-nested grid all differ from Ooyama (2001), so only
     # comparable magnitude and timing are enforced here; tight version-to-version
     # regression comes from the committed reference CSVs.
+    # Ocean warm bubble (benchmarks/ocean_warm_bubble.jl, MYNN-EDMF plan S1): mesoscale bubble
+    # over a fixed-SST ocean with surface fluxes and the boundary layer ON. No published target;
+    # an EMPTY window set (the harness then runs zero targets) until the accepted control run
+    # seeds "the solution moved" guards.
+    "ocean_warm_bubble" => Dict{String,Tuple{Float64,Float64,Float64,String}}(),
     "o01_rainfall" => Dict(
         "peak_rain_rate_gm2s" => (90.0, 35.0, 40.0, "re-seeded 2026-07-29; O01 Fig. 6 range 75-125"),
         "max_rho_r_gm3"       => (14.0, 4.0,  5.0,  "re-seeded 2026-07-29; O01 Figs. 4-6, 11 show ~4"),
