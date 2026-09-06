@@ -283,6 +283,36 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations Scythe.moist_compressible_axisym(mtile_2t, 1, kDim_2t, 2)) == 0
     end
 
+    @testset "per-column allocations stay zero with the MYNN TKE slot" begin
+        # `options[:mynn]` APPENDS the prognostic TKE density `rho_e`, whose index is
+        # resolved by NAME into `MCSlots` once at tile creation. Same tripwire as the rain
+        # number's: if the lookup, the slot's views or the transport broadcast ever start
+        # allocating per column, this is what catches it. At this stage (S4) the slot is
+        # transport-only, so what is measured is the continuity block alone.
+        mtile_bl, kDim_bl = build_mc_tile(extra_options = Dict{Symbol,Any}(:mynn => true,
+                                                                          :mynn_trace => false))
+        @test mtile_bl.mc_slots.rho_v == 10        # the unconditional vapor slot
+        @test mtile_bl.mc_slots.rho_e == 11        # appended after it
+        @test mtile_bl.mynn.active
+        # The MYNN state must not make any ModelTile field abstract.
+        for f in fieldnames(typeof(mtile_bl))
+            @test isconcretetype(fieldtype(typeof(mtile_bl), f))
+        end
+        moist_compressible_XZ(mtile_bl, 1, kDim_bl, 2)      # compile
+        diffusion_timestep_mc(mtile_bl, 1, kDim_bl, 2)
+
+        @test (@allocations moist_compressible_XZ(mtile_bl, 1, kDim_bl, 2)) == 0
+        @test (@allocations diffusion_timestep_mc(mtile_bl, 1, kDim_bl, 2)) == 0
+
+        # ...and on the cylinder, where the slot moves out by one.
+        mtile_bc, kDim_bc = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                          extra_options = Dict{Symbol,Any}(
+                                              :mynn => true, :mynn_trace => false))
+        @test mtile_bc.mc_slots.rho_e == 12
+        Scythe.moist_compressible_axisym(mtile_bc, 1, kDim_bc, 2)  # compile
+        @test (@allocations Scythe.moist_compressible_axisym(mtile_bc, 1, kDim_bc, 2)) == 0
+    end
+
     @testset "per-column allocations stay zero with ice microphysics" begin
         # Twelve more appended slots, each with its own views, its own control-variable
         # recovery, its own scratch columns and its own sedimentation flux transform — the

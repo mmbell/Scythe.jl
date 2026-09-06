@@ -92,6 +92,11 @@ include("ishmael_tables.jl")
 # after mc_boundary_layer.jl.
 include("mynn_constants.jl")
 include("mynn_closure.jl")
+# The MYNN STATE layer, for the same reason radiation_state.jl sits where it does:
+# `ModelTile` carries a `MYNNState` field CONCRETELY (see `EMPTY_MYNN`), so the struct has
+# to be defined before the one that names it. It is a leaf over mynn_closure.jl and names
+# no closure routine -- the coupling (mc_mynn_bl.jl, S5) comes after mc_boundary_layer.jl.
+include("mynn_state.jl")
 # The RADIATION STATE layer comes before semiimplicit.jl for the same reason: `ModelTile`
 # carries a `RadiationState` field CONCRETELY (see `EMPTY_RADIATION`), so the struct has to
 # be defined before the one that names it. radiation_state.jl is a leaf — the Springsteel

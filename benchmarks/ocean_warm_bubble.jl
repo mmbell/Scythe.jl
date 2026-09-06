@@ -13,8 +13,10 @@
 # on the mesoscale grid), DK83 stratospheric sponge, warm rain by default.
 #
 # Physics knobs (every one is a NO-OP when unset, so the committed control is reproducible):
-#   SCYTHE_OWB_BL=louis|none      boundary layer + surface fluxes (default louis; `mynn`
-#                                 arrives at S5 and is refused until then)
+#   SCYTHE_OWB_BL=louis|none|mynn boundary layer + surface fluxes (default louis; `mynn`
+#                                 is the MYNN-EDMF arm — at stage S4 it registers and
+#                                 TRANSPORTS the rho_e TKE slot with zero sources and
+#                                 applies no BL tendency, so it is `none` + one tracer)
 #   SCYTHE_OWB_SFC=komori|gfdl_v7|charnock   surface roughness closure (options[:sfc_z0],
 #                                 default komori = the historical Komori Cd + constant Ck);
 #                                 arm suffix = the value
@@ -115,8 +117,14 @@ function owb_model(opts::BenchmarkOptions)
     elseif bl == "none"
         # no boundary layer at all: the O01 physics on the mesoscale grid (SST unused)
     elseif bl == "mynn"
-        error("SCYTHE_OWB_BL=mynn: the MYNN-EDMF closure arrives at plan stage S5; " *
-              "until then the arms are louis (default) and none")
+        # Plan stage S4: the PLUMBING only. This registers the prognostic TKE-density slot
+        # `rho_e` and transports it with zero sources; no boundary-layer tendency and no
+        # surface flux is applied, so the arm is the `none` arm plus one passive tracer
+        # until `mc_mynn_bl!` lands at S5. Surface fluxes are deliberately NOT switched on
+        # here: with no closure to carry them they would be computed and dropped.
+        options[:mynn] = true
+        println("OWB MYNN arm: stage S4 — the rho_e slot is registered and TRANSPORTED " *
+                "with zero sources; no BL tendency and no surface fluxes until S5")
     else
         error("SCYTHE_OWB_BL must be louis | none | mynn, got \"$bl\"")
     end

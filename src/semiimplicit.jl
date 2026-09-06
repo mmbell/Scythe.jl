@@ -61,10 +61,15 @@ struct MCSlots
     i2_q::Int; i2_n::Int; i2_a::Int; i2_c::Int
     "Species 3 = aggregates."
     i3_q::Int; i3_n::Int; i3_a::Int; i3_c::Int
+    """
+    Prognostic TKE density ρ_e = ρ_t·e [J/m³] under `options[:mynn]`; 0 otherwise. Appended
+    AFTER the ice family so the twelve ice indices stay contiguous whatever else is on.
+    """
+    rho_e::Int
 end
 
 """All slots absent — the state of every NON-mc equation set."""
-MCSlots() = MCSlots(0, 0, ntuple(_ -> 0, 12)...)
+MCSlots() = MCSlots(0, 0, ntuple(_ -> 0, 12)..., 0)
 
 """
     ice_slots(s::MCSlots, k) -> NTuple{4,Int}
@@ -95,12 +100,15 @@ function mc_slots(model::ModelParameters)
     # Defined in moist_compressible.jl, included after this file; resolved at call time.
     rv = mc_slot(vars, "rho_v")
     nr = rain_moments(model.options) == 2 ? mc_slot(vars, "n_r") : 0
+    # The MYNN TKE density, resolved by name on the same rule: the option DECLARES the slot,
+    # so a `vars` built from a stale name list must fail here and not at the first column.
+    re = get(model.options, :mynn, false) === true ? mc_slot(vars, "rho_e") : 0
     if ice_microphysics(model.options) !== :ishmael
-        return MCSlots(rv, nr, ntuple(_ -> 0, 12)...)
+        return MCSlots(rv, nr, ntuple(_ -> 0, 12)..., re)
     end
     # `MC_ICE_VARS` is species-major and in registration order, so the twelve resolved
     # indices land on the twelve fields in declaration order with no reshuffling.
-    return MCSlots(rv, nr, ntuple(j -> mc_slot(vars, MC_ICE_VARS[j]), 12)...)
+    return MCSlots(rv, nr, ntuple(j -> mc_slot(vars, MC_ICE_VARS[j]), 12)..., re)
 end
 
 """
@@ -250,6 +258,14 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # `mc_radiation_state` (src/radiation.jl) and `EMPTY_RADIATION`
     # (src/radiation_state.jl). Per-tile = per-worker, so nesting and distribution are free.
     radiation::RadiationState
+    # The tile's MYNN-EDMF boundary-layer state (held column fields, the exchange
+    # coefficients, the per-thread closure work space), or `EMPTY_MYNN` when
+    # `options[:mynn]` is absent or false. CONCRETE, not `Union{MYNNState,Nothing}`, for
+    # exactly the reason `radiation` is: the driver reads `mtile.mynn.active` in its
+    # preamble and would read its arrays inside the per-column hot path, and a Union field
+    # makes both loads type-unstable. See `mc_mynn_state` and `EMPTY_MYNN`
+    # (src/mynn_state.jl).
+    mynn::MYNNState
 end
 
 """
@@ -563,7 +579,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_ishmael_tables(model),
         # Defined in radiation.jl, which is included after this file — resolved at call
         # time, like `_allocate_mc_scratch` above, so the forward reference is fine.
-        mc_radiation_state(model, tile, tilepoints))
+        mc_radiation_state(model, tile, tilepoints),
+        # Defined in mynn_state.jl, which is included BEFORE this file (the struct has to
+        # be); the call sits here beside the radiation state for the same reason.
+        mc_mynn_state(model, tile, tilepoints))
     return mtile
 end
 

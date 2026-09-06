@@ -1811,7 +1811,10 @@ what would stop the resting base being a discrete fixed point.
 function positivity_reference_profile(name::AbstractString, ref_state)
     # `n_r` (the two-moment rain number) joins the totals: there is no reference number
     # density in any configuration or in the reference-state format, exactly as for rho_r.
-    name in ("rho_r", "n_r", "u", "w", "v") && return nothing  # totals: no offset
+    # `rho_e` (the MYNN TKE density) joins them for the same reason: there is no resting
+    # turbulence field in any reference state, so ρ̄_e ≡ 0 is a property of the closure
+    # rather than of the sounding.
+    name in ("rho_r", "n_r", "rho_e", "u", "w", "v") && return nothing  # totals: no offset
     # ...and so do all twelve ice slots, for the same reason and one stronger: there is no
     # resting ice field in any configuration, so `f̄ ≡ 0` is a property of the equation set
     # rather than of the sounding (reference/Scythe_moist_compressible.tex, "The ice variables
@@ -2530,6 +2533,12 @@ function mc_var_names(options; cyl::Bool = false)
             push!(names, nm)
         end
     end
+    # The MYNN-EDMF TKE density ρ_e = ρ_t·e [J/m³], LAST of the appended block so the twelve
+    # ice indices stay contiguous whatever else a configuration turns on. A TOTAL with
+    # ρ̄_e ≡ 0 and no control-variable transform (the TKE is not a positive-definite
+    # microphysical density with a spike problem; it is floored by the closure itself), so
+    # unlike slots 8/9 and the ice family it carries no alias and its name is fixed.
+    get(options, :mynn, false) === true && push!(names, "rho_e")
     return names
 end
 
@@ -2633,8 +2642,9 @@ function check_mc_var_names(model::ModelParameters)
     # something first reads a drop size that is not carried.
     ice = ice_microphysics(model.options)
     itrans = ice_transform_mode(model.options)
+    mynn = get(model.options, :mynn, false) === true
     (ctrans === :none && rtrans === :none && nrtrans === :none && nmoments == 1 &&
-     ice === :none) && return nothing
+     ice === :none && !mynn) && return nothing
 
     gp = model.grid_params
     expected = Set(mc_var_names(model.options;
@@ -2672,6 +2682,14 @@ function check_mc_var_names(model::ModelParameters)
                       "n_r, so their indices are geometry-dependent and only " *
                       "`Scythe.mc_var_names(options)` knows them — build `vars` from that.")
         end
+    end
+    if mynn
+        haskey(gp.vars, "rho_e") ||
+            error("options[:mynn] declares the prognostic TKE-density slot \"rho_e\", but " *
+                  "grid_params.vars does not have it (it has " *
+                  "$(sort(collect(keys(gp.vars))))). It is APPENDED after the ice family, " *
+                  "so its index is geometry- and option-dependent and only " *
+                  "`Scythe.mc_var_names(options)` knows it — build `vars` from that.")
     end
 
     for (label, d) in (("vars", gp.vars), ("BCL", gp.BCL), ("BCR", gp.BCR),
@@ -6915,6 +6933,34 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # the momentum diffusion). Both default OFF so existing configurations are
     # bit-identical.
     louis_bl = get(model.options, :louis_bl, false)::Bool
+    # ── MYNN-EDMF boundary layer (options[:mynn]; src/mynn_state.jl, and mc_mynn_bl.jl
+    #    from S5). Read from the SLOT, on the rule the rain number and the ice family
+    #    follow: `MCSlots` resolved the appended `rho_e` index by name once when the tile
+    #    was built, and `> 0` is the same test the transport below uses, so "the slot
+    #    exists" and "the closure runs" cannot disagree. At THIS stage the closure itself
+    #    is not written: `rho_e` is transported with zero sources and nothing else changes,
+    #    so a run without the option is byte-identical to the code that had no MYNN.
+    re_i = IS.rho_e
+    mynn_on = re_i > 0
+    if mynn_on && louis_bl
+        # One boundary layer, or two schemes mix the same column twice — the fluxes are
+        # additive and neither knows about the other, so the surface layer would be
+        # over-mixed by an amount nothing reports.
+        error("options[:mynn] with options[:louis_bl] is not allowed: both are complete " *
+              "boundary-layer closures and their tendencies are additive, so enabling " *
+              "both mixes every column twice. Choose one.")
+    end
+    if mynn_on && ice_on
+        # The MYNN water legs mix q_v/q_c/q_i, and the ice here is three ISHMAEL species
+        # with four moments each — mixing an ice MASS without its number and volume moments
+        # rescales the crystals of every column the operator touches (the `Khdiff_water`
+        # argument, one category further out).
+        error("options[:mynn] with options[:ice_microphysics] = :ishmael is not " *
+              "implemented: the MYNN ice legs arrive at S8. The closure mixes a single " *
+              "ice mixing ratio, while ISHMAEL carries three species with four moments " *
+              "each, so mixing the mass alone would rescale every crystal. Set " *
+              "ice_microphysics = :none or wait for S8.")
+    end
     # Radiative heating. `RAD.q_lw`/`q_sw` are the HELD flux divergences [W/m^3] the
     # pre-pass (`radiation_prepass!`, src/radiation.jl) recomputed on the radiation cadence
     # before this column loop started; nothing is solved here. `rad_on` is a plain field
@@ -6955,9 +7001,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # switch requires louis_bl. SST is in KELVIN (Float64 params carry no units;
     # the guard catches the Celsius footgun).
     surface_fluxes = get(model.options, :surface_fluxes, false)::Bool
-    if surface_fluxes && !louis_bl
-        error("options[:surface_fluxes] requires options[:louis_bl] — the fluxes " *
-              "enter as the bottom nodes of the Louis boundary-layer flux columns")
+    if surface_fluxes && !(louis_bl || mynn_on)
+        error("options[:surface_fluxes] requires a boundary-layer closure " *
+              "(options[:louis_bl] or options[:mynn]) — the fluxes enter as the bottom " *
+              "nodes of that scheme's flux columns and have nowhere to go without one")
     end
     SST = get(model.physical_params, :SST, 301.15)
     if surface_fluxes && SST <= 200.0
@@ -7016,6 +7063,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     i3nv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_n : 8, geom)
     i3av = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_a : 8, geom)
     i3cv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_c : 8, geom)
+    # The APPENDED MYNN TKE-density slot, bound the same way and for the same reason:
+    # UNCONDITIONALLY, aliased to slot 8 when the closure is off, so this is the same
+    # straight-line `mc_slot_views` call every fixed slot makes and elides identically.
+    # Nothing reads it unless `mynn_on`.
+    rev = mc_slot_views(grid, colstart, colend, mynn_on ? re_i : 8, geom)
 
     pp = pv.f;      pp_x = pv.f_x;         pp_z = pv.f_z
     rho_dp = rdv.f; rho_dp_x = rdv.f_x;    rho_dp_z = rdv.f_z; rho_dp_zz = rdv.f_zz
@@ -8334,6 +8386,31 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @turbo expdot[colstart:colend, IS.i3_c] .= @. ADV + FORCING
     end
 
+    # ── The MYNN TKE density ρ_e = ρ_t·e [J/m³] (the appended slot, options[:mynn]) ──
+    #
+    # The same continuity form every other TOTAL in the set takes, with the closure's
+    # sources left out because the closure is not written yet (S5):
+    #
+    #     ∂ρ_e/∂t = −u·∇ρ_e − ρ_e ∇·u + [shear + buoyancy − dissipation + vertical
+    #                                    transport, all arriving at S5]
+    #
+    # ρ̄_e ≡ 0 and there is no control-variable transform, so the slot IS the field: the
+    # advection reads its own fitted gradients directly (no ν, no Jacobian) and the
+    # compressibility term is the bare `−ρ_e ∇·u`. The whole reason the TKE is carried as a
+    # DENSITY rather than as the closure's `qke = 2e` is exactly this — `ρ_t·e` obeys the
+    # same conservation law as ρ_r and the ice masses, so the resolved-flow transport is the
+    # set's own machinery and only the subgrid production/destruction is the closure's.
+    #
+    # EXPLICIT ONLY: no `impdot` row, no acoustic leg, no sedimentation. The vertical
+    # turbulent transport of TKE is part of the closure's own tridiagonal solve, not of the
+    # dycore's implicit pair.
+    if mynn_on
+        rho_e = rev.f
+        mc_advect!(ADV, geom, u, w, vv, r, rev.f_x, rev.f_z, rev.f_l)
+        @turbo FORCING .= @. -rho_e * div
+        @turbo expdot[colstart:colend, re_i] .= @. ADV + FORCING
+    end
+
     # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
     #
     # *** DIAGNOSTIC / TEMPORARY -- NOT ENERGY CONSISTENT. READ BEFORE USING. ***
@@ -8539,6 +8616,20 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         end
         mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
                      expdot, l_inf, sfc, ctrans_on)
+    end
+
+    # ── MYNN-EDMF boundary layer — THE S5 PLUG-IN POINT ────────────────────────
+    # Deliberately empty at S4. The closure (`mc_mynn_bl!`, src/mc_mynn_bl.jl) folds its
+    # momentum, heat, water and TKE tendencies in HERE, after every slot is written, for
+    # exactly the reason the Louis call sits where it does: all contributions are additive,
+    # so the lines above stay frozen. `rho_e` is transported and nothing else at this stage.
+    #
+    # The gate is `mynn_on` (the slot's existence), never `+ 0.0` on the off path: `x + 0.0`
+    # is not the identity for `x = -0.0`, which is what makes an absent-option run BITWISE
+    # the code that had no MYNN.
+    if mynn_on
+        # S5: mc_mynn_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
+        #                 rev, expdot, sfc, t)
     end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──
@@ -10042,6 +10133,12 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
     ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -10076,6 +10173,7 @@ function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                 vapor_slot(0.0, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1])
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
             i += 1
         end
     end
@@ -10108,6 +10206,12 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
     ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -10139,6 +10243,7 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
                 vapor_slot(0.0, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1])
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
             i += 1
         end
     end
@@ -10174,6 +10279,12 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
     ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -10220,6 +10331,7 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
                 vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1])
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
             i += 1
         end
     end
@@ -10254,6 +10366,12 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
     # threaded here — the same reason `rain_slot` needed none.
     n_r_i = mc_optional_slot(vars, "n_r")
     ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     rho_cbar = Springsteel.ref_rho_c(ref)
@@ -10316,6 +10434,7 @@ function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float
                 vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1])
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
             i += 1
         end
     end

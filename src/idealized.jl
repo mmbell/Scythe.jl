@@ -1036,6 +1036,12 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
     # APPENDED optional slots, seeded only where registered. Zero under every transform.
     n_r_i = mc_optional_slot(vars, "n_r")
     ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
     kDim = patch.params.kDim
     pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
     E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
@@ -1087,6 +1093,7 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, v_i, 1] = v
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
             i += 1
         end
     end
@@ -1407,6 +1414,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         rv_i = mc_slot(vars, "rho_v")
         nr_i = mc_optional_slot(vars, "n_r")
         ice_ii = mc_ice_slot_indices(vars)
+        re_i = mc_optional_slot(vars, "rho_e")
 
         gpts = getGridpoints(patch)
         kDim = gp.kDim
@@ -1577,6 +1585,9 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         for s in ice_ii
             s > 0 && (mish[:, s] .= 0.0)
         end
+        # The MYNN TKE density, likewise: a BALANCED vortex has no resolved turbulence, and
+        # the closure's own spin-up (options[:mynn_init]) is what seeds it.
+        re_i > 0 && (mish[:, re_i] .= 0.0)
         # No condensate: the vortex is built subsaturated everywhere (the moistening
         # caps rho_v at RH_max*rho_vs), and with rho_c prognostic that means EXACTLY
         # zero cloud rather than "whatever four fitted fields leave over". The
