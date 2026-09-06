@@ -7,6 +7,7 @@ using Scythe
     include("test_ishmael_tables.jl")
     include("test_ishmael.jl")
     include("test_mynn_closure.jl")
+    include("test_mynn_edmf.jl")
     include("test_bf02_restoration.jl")
     include("test_partial_density.jl")
     include("test_sigma_entropy.jl")

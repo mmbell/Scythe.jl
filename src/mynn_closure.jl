@@ -2868,11 +2868,15 @@ though `ts` is ALREADY `T_sfc/exner(1)` (README item 2), and the drag denominato
 Returns the two scale-awareness factors of this step.
 """
 function mynn_column_step!(work::MYNNWork, c::MYNNConstants, col::MYNNColumn,
-                           st::MYNNColumnState, opts::MYNNOptions; edmf::Bool)
-    edmf && throw(ArgumentError("mynn_column_step!: edmf = true, but the mass-flux " *
-                                "plumes (DMP_mf, module_bl_mynn.F90 :5700-6820) are " *
-                                "not ported yet. Call with edmf = false, which " *
-                                "leaves every plume sum zero."))
+                           st::MYNNColumnState, opts::MYNNOptions; edmf::Bool, ework = nothing)
+    # S6 hook: `ework` is an EDMFWork (src/mynn_edmf.jl, included after this file, hence
+    # unannotated). The bodies stay duplicated on purpose; the test "reproduces the
+    # edmf = false path bitwise where no plume fires" keeps them honest.
+    if edmf
+        ework === nothing && throw(ArgumentError("mynn_column_step!: edmf = true needs " *
+                                                 "an EDMFWork (src/mynn_edmf.jl)"))
+        return mynn_column_step_edmf!(work, ework, c, col, st, opts)[1:2]
+    end
     n = col.n
     (work.n == n && st.n == n) ||
         throw(ArgumentError("mynn_column_step!: work/state sized for " *

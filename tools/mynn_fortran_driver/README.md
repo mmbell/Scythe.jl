@@ -82,6 +82,29 @@ driver had to widen a `public` list).
       -fdefault-real-8 -fdefault-double-8 stub_machine.o bl_mynn_common.o \
       module_bl_mynn.o ../../moisture_ref_driver.f90 -o moisture_ref_driver && ./moisture_ref_driver
   ```
+- `edmf_ref_driver.f90` — a fourth tiny program (stage S3), for the parts of `DMP_mf`
+  that the five reference columns never reach. In `ref_driver_output_r8.txt` the
+  plumes NEVER condense (`edmf_qc` is identically zero at every level of every case at
+  both steps), so the Chaboureau-Bechtold shallow-cumulus block (:6631-6766, which
+  overwrites `vt`, `vq`, `cldfra_bl1d` and `qc_bl1d`) and the `maxqc >= 1e-8`
+  moist-plume branch of the `maxmf` sign (:6771-6775) have no coverage at all; nor
+  does any `landsea < 1.5` (LAND) branch, all five columns being water. This program
+  calls `DMP_mf` directly, twice, on a synthetic column built from
+  `columns/case4_convective.txt` (vapour x1.5, `pblh = 1500 m`, `flt = 0.3`,
+  `flq = 3e-4`, `ust = 0.4`) whose plumes reach 22 interfaces and saturate at 19 of
+  them — once with `landsea = 2` and once with `landsea = 1`. Output blocks use the
+  main driver's format, so `test/reference/mynn_fortran_refs.jl` parses them
+  unchanged (cases `spot_moist_water` / `spot_moist_land`, closure 2.50, mode B,
+  step 1); it is CHECKED IN as `edmf_ref_driver_output.txt` (8190 lines) rather than
+  transcribed, and `run.sh` does not build it. To regenerate, after `run.sh` has
+  built `build/r8`:
+  ```sh
+  cd build/r8 && /opt/homebrew/bin/gfortran -ffree-line-length-none -O0 -ffp-contract=off \
+      -fdefault-real-8 -fdefault-double-8 stub_machine.o bl_mynn_common.o \
+      module_bl_mynn.o ../../edmf_ref_driver.f90 -o edmf_ref_driver && \
+      ./edmf_ref_driver > ../../edmf_ref_driver_output.txt
+  ```
+- `edmf_ref_driver_output.txt` — its reference (checked in, ~250 kB).
 - `ref_driver_output_r8.txt` — the reference (checked in, 5.9 MB, ~184k lines).
 - `ref_driver_output_native.txt` — UFS-precision run (gitignored; regenerate with `run.sh`).
 
@@ -166,6 +189,57 @@ Output format: `## <case> closure=<c> mode=<A|B> step=<s> <name> n=<len>` follow
     the port's ONE known divergence; it is documented at the top of part 2 of
     `src/mynn_closure.jl` and pinned by its own testset in
     `test/test_mynn_closure.jl`. Any column with `ust > 0` is unaffected.
+
+
+### Behaviours found while porting `DMP_mf` (stage S3)
+
+11. **`edmf_qc` is identically zero in the whole reference.** Case 4's plumes reach
+    only 653 m and `condensation_edmf` forces `QC = 0` below 100 m (:6867), so no
+    plume ever saturates. Consequences: `DMP_mf` never modifies `vt`, `vq`,
+    `cldfra_bl` or `qc_bl` (the Chaboureau-Bechtold block :6631-6766 is gated on
+    `0.5*(edmf_qc(k)+edmf_qc(k-1)) > 0`), so the printed post-`DMP_mf` blocks for
+    EVERY case are still `mym_condensation`'s output; and `maxmf` is always
+    sign-flipped negative by the dry-plume rule (:6771-6775). `edmf_ref_driver.f90`
+    exists to cover what that leaves untested.
+
+12. **The activation gate is not the whole story.** `fltv2 > 0.002 .AND. maxwidth >
+    minwidth .AND. superadiabatic` (:6039) PASSES for case 2, case 4 and case 5 at
+    step 1, yet only case 4 produces flux. For cases 2 and 5 all eight plumes fail to
+    leave the surface interface, which trips `IF (k==kts+1 .AND. Wn == 0.) NUP2 = 0`
+    (:6288); `nup2` stays 0 for the rest of the column loop even though the later
+    plumes are still integrated and could still raise `ktop`, so `IF (nup2 > 0)`
+    (:6389) skips the entire flux calculation. `maxwidth` still comes back nonzero
+    (545 m and 590 m) because :6035 zeroes it only when the WIDTH criterion is what
+    failed — which is how cases 1 and 3 (gate failed on `fltv2`/`superadiabatic` and
+    on `maxwidth`, respectively) differ from cases 2 and 5 in the dump.
+
+13. **`k50` (:5948) is read before it is necessarily assigned.** It is written only
+    inside `if (ZW(k)<=50.)` in the taper loop, and read at :5977 as
+    `do k=1,max(1,k50-1)`. `zw(kts) = 0` and the loop's `exit` cannot fire at
+    `k = kts`, so it is always assigned at least once — but it is a genuine
+    uninitialised-variable read as written.
+
+14. **`dzp` (:6316-6318) can be read undefined.** It is assigned in the
+    `Wn <= 0 .and. overshoot == 0` branch only when `THVk - THVkm1 > 0`, and read
+    three lines later. It feeds only the `envm_*` arrays, which nothing reads unless
+    `env_subs` is true, so it is dead on the shipped configuration.
+
+15. **The subsidence block reads one past the end of `rhoz`.** With `env_subs`
+    true, `sub_thl(kts)` (:6586) — and likewise `sub_sqv(kts)`, `sub_u(kts)`,
+    `sub_v(kts)` — divides by `rhoz(k)` where `k` is the loop variable LEFT OVER
+    from the `DO k=kts,kte` transform loop above, i.e. `k = kte+1`, whereas `rhoz` is
+    `dimension(kts:kte)`. Unreachable in the shipped code (`env_subs = .false.`,
+    :337), which is presumably why it has survived.
+
+16. **Declared and never used, in `DMP_mf` alone:** `ENTf`/`ENTi` (:5793-5794, the
+    stochastic-entrainment leftovers), `s_aw2` (:5779), `UPQV` (zeroed at :5877 and
+    never written or read), `ERF` (:5824), `wlv` (:6122), `qsl` (:6636), `Ac_mf`/
+    `Ac_strat`/`qc_mf` (:5840), and the `sgm`, `qc_bl1D_old` and `cldfra_bl1D_old`
+    dummy arguments, plus the `F_QC`/`F_QI`/`F_QN*` `optional` flags — none of which
+    the body references. The five number-concentration plume matrices `UPQNC`,
+    `UPQNI`, `UPQNWFA`, `UPQNIFA`, `UPQNBCA` are computed unconditionally but their
+    only source is the zero columns the driver passes, so they and their `s_awqn*`
+    sums are zero everywhere.
 
 ### Running
 

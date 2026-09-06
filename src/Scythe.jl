@@ -92,6 +92,7 @@ include("ishmael_tables.jl")
 # after mc_boundary_layer.jl.
 include("mynn_constants.jl")
 include("mynn_closure.jl")
+include("mynn_edmf.jl")        # DMP_mf mass flux (S6); EDMFWork is defined here, after the closure
 # The MYNN STATE layer, for the same reason radiation_state.jl sits where it does:
 # `ModelTile` carries a `MYNNState` field CONCRETELY (see `EMPTY_MYNN`), so the struct has
 # to be defined before the one that names it. It is a leaf over mynn_closure.jl and names
