@@ -1,0 +1,18 @@
+case 2: Dunion sounding + u = 10 tanh(z/150 m), v = w = 0, over SST = 301.15 K.
+Surface layer = Scythe bulk (mc_boundary_layer.jl): U1 = max(|u1|, 2), Cd = komori_cd(U1),
+ust = sqrt(Cd) U1, hfx = rho_d1 Cpd Ck U1 (SST - T1), qfx = Ck U1 (rho_vs(SST,p1) - rho_v1),
+znt = z1 exp(-kappa/sqrt(Cd)) (neutral log law consistent with Cd), rmol = wrapper fallback.
+Cd = 0.001, U1 = 3.5894314884602578
+n = 150, z1 = 56.35083268962915 m, ztop = 24943.64916731037 m
+ps = 101491.90071751004
+ts = 300.421354215387
+qsfc = 0.023568697556202115
+ust = 0.11350779008662806
+hfx = 6.2355581552111738
+qfx = 2.0682855259715994e-05
+wspd = 3.5894314884602578
+znt = 0.00018090950516388103
+xland = 2
+dx = 2000
+rmol = -0.00040708609148965859
+delt = 20

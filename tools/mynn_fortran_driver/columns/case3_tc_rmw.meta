@@ -1,0 +1,17 @@
+case 3: tc/output/tc_rad_24h_full/nest1/86400.0_physical.csv column 25 of 45 (r = 81127.01665379258 m, max lowest-level v = 8.019541999251697 m/s),
+rebuilt with tc/output/tc_rad_24h_full/tc_exact.ref (E_tbar and T as tc_postprocess.jl; bhyp cloud/rain, mu = 1e-7;
+ke includes v). SST = 302.65 K (tc_params SST_K), Komori Cd, Ck = 1e-3, U_min = 2; dx = 10 km
+(nest-1 coarse cells). Cd = 0.0014013536300979763, U1 = 10.143553701388303, hfx = 36.579857427435392, qfx = 8.6334825329022563e-05
+n = 150, z1 = 56.35083268962915 m, ztop = 24943.64916731037 m
+ps = 100133.54421633412
+ts = 303.08844851032507
+qsfc = 0.025676113374507131
+ust = 0.37972046514152835
+hfx = 36.579857427435392
+qfx = 8.6334825329022563e-05
+wspd = 10.143553701388303
+znt = 0.0012892582576798516
+xland = 2
+dx = 10000
+rmol = -0.0023881023665762485
+delt = 20
