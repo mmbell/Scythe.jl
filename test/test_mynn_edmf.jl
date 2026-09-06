@@ -68,8 +68,9 @@ const _EDMF_EXPORTS = (:MYNNConstants, :MYNNWork, :MYNNColumn, :MYNNColumnState,
                        :dmp_mf!, :mynn_column_step_edmf!,
                        # closure helpers the tests call unqualified
                        :qsat_blend, :esat_blend, :xl_blend,
-                       # constants the tests reference unqualified
-                       :MYNN_CASES, :MYNN_DRIVER_DIR, :MYNN_P1000MB)
+                       # constants the tests reference unqualified (MYNN_CASES and
+                       # MYNN_DRIVER_DIR are test-local, from the refs parser)
+                       :MYNN_P1000MB)
 
 if isdefined(Main, :Scythe) && all(nm -> isdefined(Main.Scythe, nm), _EDMF_EXPORTS)
     for _nm in _EDMF_EXPORTS
