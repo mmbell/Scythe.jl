@@ -15,6 +15,11 @@
 # Physics knobs (every one is a NO-OP when unset, so the committed control is reproducible):
 #   SCYTHE_OWB_BL=louis|none      boundary layer + surface fluxes (default louis; `mynn`
 #                                 arrives at S5 and is refused until then)
+#   SCYTHE_OWB_SFC=komori|gfdl_v7|charnock   surface roughness closure (options[:sfc_z0],
+#                                 default komori = the historical Komori Cd + constant Ck);
+#                                 arm suffix = the value
+#   SCYTHE_OWB_SFC_STAB=1         Monin-Obukhov stability functions + Beljaars gustiness
+#                                 (options[:sfc_stability]); arm suffix `_stab`
 #   SCYTHE_OWB_SST=302.65         sea surface temperature [K] (default tc_params SST_K)
 #   SCYTHE_OWB_ICE=1              ISHMAEL ice (with two-moment rain and the bhyp transforms,
 #                                 as o01_rainfall's ice arm); arm suffix `_ice`
@@ -114,6 +119,16 @@ function owb_model(opts::BenchmarkOptions)
               "until then the arms are louis (default) and none")
     else
         error("SCYTHE_OWB_BL must be louis | none | mynn, got \"$bl\"")
+    end
+
+    # Surface-exchange closure (src/mc_surface_layer.jl). Both are no-ops when unset:
+    # :komori without stability is the historical bulk formula, bitwise.
+    sfc_arm = get(ENV, "SCYTHE_OWB_SFC", "komori")
+    sfc_arm in ("komori", "gfdl_v7", "charnock") ||
+        error("SCYTHE_OWB_SFC must be komori | gfdl_v7 | charnock, got \"$sfc_arm\"")
+    sfc_arm == "komori" || (options[:sfc_z0] = Symbol(sfc_arm))
+    if haskey(ENV, "SCYTHE_OWB_SFC_STAB") && envflag("SCYTHE_OWB_SFC_STAB")
+        options[:sfc_stability] = true
     end
 
     haskey(ENV, "SCYTHE_OWB_CTRANS") &&
@@ -217,7 +232,9 @@ function owb_model(opts::BenchmarkOptions)
 
     println("OWB: $(num_cells_i) x $(num_cells_k) cells ($(OWB_WIDTH / num_cells_i / 1000) km x " *
             "$(kMax / num_cells_k) m), ts = $ts s, $(integration_time / 3600) h, output every " *
-            "$output_interval s; BL = $bl, SST = $OWB_SST K, wall BC = $wall_mode; " *
+            "$output_interval s; BL = $bl, SST = $OWB_SST K, wall BC = $wall_mode, " *
+            "sfc_z0 = $(get(options, :sfc_z0, :komori)), " *
+            "sfc_stability = $(get(options, :sfc_stability, false)); " *
             "vars = $(join(vars, ' '))")
 
     return ModelParameters(
@@ -277,9 +294,12 @@ end
 
 # ── Surface-flux budget and boundary-layer rows ──────────────────────────────
 #
-# The model writes no surface-flux output, so the bulk formulas of mc_boundary_layer.jl are
-# re-evaluated on every snapshot's lowest mish level (the same inputs the scheme uses) and
-# integrated in time with the trapezoid rule, exactly as the precipitation energy flux is.
+# The model writes no surface-flux output, so `Scythe.surface_exchange` -- the SAME function
+# `mc_louis_bl!` calls, not a second copy of the bulk formulas -- is re-evaluated on every
+# snapshot's lowest mish level (the same inputs the scheme uses) and integrated in time with
+# the trapezoid rule, exactly as the precipitation energy flux is. Going through the model's
+# own function is what keeps these rows right for :gfdl_v7, :charnock and the stability arm
+# instead of silently reporting Komori numbers for a run that used something else.
 # Domain-mean quantities are per unit width [.../m^2] like the rain rows.
 
 function owb_surface_diagnostics(model, ref, kDim)
@@ -287,11 +307,11 @@ function owb_surface_diagnostics(model, ref, kDim)
     louis = get(model.options, :louis_bl, false)
     fluxes = get(model.options, :surface_fluxes, false)
     SST = get(pp, :SST, NaN)
-    Cd_param = get(pp, :Cd, 0.0)
-    Ck = get(pp, :Ck, 0.0)
-    U_min = get(pp, :U_min, 0.0)
     sfc_fac = get(pp, :sfc_wind_factor, 1.0)
     l_inf = get(pp, :l_inf, 80.0)
+    # The model's own resolved surface-layer configuration, built exactly as the driver
+    # preamble builds it (src/moist_compressible.jl).
+    sfc = Scythe.surface_layer_params(pp, model.options; surface_fluxes = fluxes)
     ctf = Scythe.condensate_transform_mode(model.options)
     cmu = get(pp, :condensate_mu, 1.0e-7)
     rtf = Scythe.rain_transform_mode(model.options)
@@ -314,17 +334,21 @@ function owb_surface_diagnostics(model, ref, kDim)
             Wh = gauss_cell_weights(ncols, gp.num_cells, gp.iMax - gp.iMin,
                                     ncols ÷ gp.num_cells, gp.quadrature)
         end
-        u1 = df.u[surf] .* sfc_fac
-        U1 = max.(abs.(u1), U_min)
-        Cd = Cd_param < 0.0 ? Scythe.komori_cd.(U1) : fill(Cd_param, length(U1))
-        ust = sqrt.(Cd) .* U1
-        F_sh = fluxes ? rho_d[surf] .* Scythe.Cpd .* Ck .* U1 .* (SST .- Tk[surf]) : zeros(ncols)
-        F_q = fluxes ? Ck .* U1 .* (Springsteel.Thermodynamics.rho_v_sat.(SST, p[surf] ./ 100.0) .-
-                                   rho_v[surf]) : zeros(ncols)
         z1 = df.z[surf]
+        # One call per column into the model's surface layer: v = 0 on the XZ slice, and
+        # `sfc_wind_factor` is applied inside (so `u1` below repeats it only to form the
+        # drag WORK tau_u*u1, which is what the resolved flow actually loses).
+        u_s = df.u[surf]
+        sx = [Scythe.surface_exchange(u_s[j], 0.0, Tk[surf][j], rho_d[surf][j],
+                                      rho_t[surf][j], rho_v[surf][j], p[surf][j], z1[j],
+                                      SST, sfc) for j in 1:ncols]
+        u1 = u_s .* sfc_fac
+        ust = [r.ust for r in sx]
+        F_sh = [r.F_sh for r in sx]
+        F_q = [r.F_q for r in sx]
         ke1 = 0.5 .* (df.u[surf] .^ 2 .+ df.w[surf] .^ 2)
         e_v = ((Scythe.Cpv - Scythe.Rv) .* Tk[surf]) .+ ke1 .+ (Scythe.gravity .* z1)   # c_w + c_v
-        drag = louis ? rho_t[surf] .* Cd .* U1 .* (u1 .^ 2) : zeros(ncols)             # tau_u * u1
+        drag = louis ? [r.tau_u for r in sx] .* u1 : zeros(ncols)                      # tau_u * u1
         push!(times, t)
         push!(sh_int, sum(Wh .* F_sh))
         push!(lat_int, sum(Wh .* (e_v .* F_q)))
@@ -397,8 +421,14 @@ end
 
 model = owb_model(opts)
 arm = Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""
+addarm(a, s) = isempty(s) ? a : (isempty(a) ? s : "$(a)_$(s)")
 bl_arm = get(ENV, "SCYTHE_OWB_BL", "louis")
-bl_arm == "louis" || (arm = isempty(arm) ? bl_arm : "$(arm)_$(bl_arm)")
+bl_arm == "louis" || (arm = addarm(arm, bl_arm))
+# A non-default SURFACE choice gets its own suffix, so the committed komori control and a
+# gfdl_v7/charnock or stability arm never look up the same expected values.
+arm = addarm(arm, get(model.options, :sfc_z0, :komori) === :komori ? "" :
+                  String(model.options[:sfc_z0]))
+get(model.options, :sfc_stability, false) && (arm = addarm(arm, "stab"))
 passed = run_benchmark("ocean_warm_bubble", opts;
                        model = model,
                        init! = owb_init!,

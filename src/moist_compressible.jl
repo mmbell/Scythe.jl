@@ -6946,8 +6946,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # are bit-identical; the TC configs enable it. Spline (RiRk) vertical only.
     sd_si = get(model.options, :state_dependent_si, false)::Bool
     l_inf = get(model.physical_params, :l_inf, 80.0)
-    Cd_param = get(model.physical_params, :Cd, -1.0)
-    sfc_wind_factor = get(model.physical_params, :sfc_wind_factor, 1.0)
     Ls = get(model.physical_params, :Ls, 0.0)
     K_min = get(model.physical_params, :K_min, 0.0)
     use_smag = Ls > 0.0
@@ -6961,12 +6959,17 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         error("options[:surface_fluxes] requires options[:louis_bl] — the fluxes " *
               "enter as the bottom nodes of the Louis boundary-layer flux columns")
     end
-    Ck = get(model.physical_params, :Ck, 1.0e-3)
     SST = get(model.physical_params, :SST, 301.15)
     if surface_fluxes && SST <= 200.0
         error("physical_params[:SST] must be in Kelvin (got $SST — 28 C is 301.15)")
     end
-    U_min = get(model.physical_params, :U_min, 0.0)
+    # The whole bulk air-sea configuration (:Cd, :Ck, :U_min, :sfc_wind_factor, :SST,
+    # options[:sfc_z0], options[:sfc_stability]) resolved into ONE isbits struct, here,
+    # once per driver call — never a Dict lookup inside the column loop, and an
+    # unrecognized :sfc_z0 dies here rather than silently defaulting. See
+    # src/mc_surface_layer.jl.
+    sfc = surface_layer_params(model.physical_params, model.options;
+                               surface_fluxes = surface_fluxes)
 
     # Gridpoints: z from the geometry's vertical column; r is the geometry metric
     # handle (radius view on the cylinders, colatitude/a/Omega on the sphere,
@@ -8535,8 +8538,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             @. S.bl_rho_cp_z = rho_c_z - rho_cbar_z
         end
         mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
-                     expdot, l_inf, Cd_param, sfc_wind_factor,
-                     surface_fluxes, Ck, SST, U_min, ctrans_on)
+                     expdot, l_inf, sfc, ctrans_on)
     end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──

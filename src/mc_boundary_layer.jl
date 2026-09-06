@@ -33,22 +33,9 @@
 "Blackadar-blended Louis mixing length l = 1/(1/(κz) + 1/l∞), κ = 0.4; 0 at z = 0."
 @inline louis_length(z, l_inf) = 1.0 / ((1.0 / (0.4 * z)) + (1.0 / l_inf))
 
-"""
-    komori_cd(U)
-
-Wind-speed-dependent surface drag coefficient, Komori et al. (2018): 1.0e-3 below
-5.2 m/s, 4.4e-4 U^0.5 to 33.6 m/s, capped at 2.55e-3 in the high-wind regime.
-Selected by a NEGATIVE configured `:Cd` (the tcbl sentinel convention); a positive
-`:Cd` is used as a constant, and `:Cd = 0` disables the drag.
-"""
-@inline function komori_cd(U)
-    if U < 5.2
-        return 1.0e-3
-    elseif U < 33.6
-        return 4.4e-4 * sqrt(U)
-    end
-    return 2.55e-3
-end
+# `komori_cd` and the whole bulk surface exchange moved to src/mc_surface_layer.jl at
+# stage S1b: MYNN-EDMF needs the same air-sea formulas, and a second copy of them is
+# a second thing to keep in step. `surface_exchange` there is the one entry point.
 
 # Vertical shear magnitude of the horizontal wind — the Louis closure is
 # shear-only (prescribed length, no Richardson correction).
@@ -95,21 +82,24 @@ end
 
 """
     mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
-                 expdot, l_inf, Cd_param, sfc_fac, surface_fluxes, Ck, SST, U_min,
-                 ctrans_on)
+                 expdot, l_inf, sfc::SurfaceLayerParams, ctrans_on)
 
 Louis boundary layer for one column of the total-energy set: eddy diffusivity
 `Kv = l(z)² |∂V/∂z|` with the Blackadar-blended length `l = 1/(1/(κz) + 1/l∞)`,
 applied to momentum (u, w, v), heat (the moist entropy s_t', in energy-flux form
 `F_h = ρ_d T Kv ∂z s_t'` so the column energy books telescope exactly) and water
 (total water ρ_w' and cloud ρ_c'; rain is left to sedimentation).
-Surface momentum drag `τ = ρ_t Cd |U₁| u₁` on the lowest mish-level wind
-([`komori_cd`](@ref) when `Cd_param < 0`). With `surface_fluxes` on, the scalar
-surface nodes carry the bulk enthalpy/moisture fluxes over a fixed-`SST` sea:
-`F_sh = ρ_d1 C_pd Ck U₁ (SST − T₁)` into the heat column and
-`F_q = Ck U₁ (ρ_vs(SST, p₁) − ρ_v1)` into the TOTAL-water column (the surface
-source adds vapor, so it reaches both ρ_w and the vapor slot), with the exchange
-wind floored by the gustiness minimum `U_min`.
+The SURFACE exchange itself is not computed here: `sfc` is the once-per-driver-call
+[`SurfaceLayerParams`](@ref) and [`surface_exchange`](@ref) (src/mc_surface_layer.jl)
+returns the stress `τ_u, τ_v` and the bulk fluxes `F_sh` [W/m²], `F_q` [kg/m²/s] from
+the lowest mish-level state. On the DEFAULT configuration (`options[:sfc_z0] = :komori`,
+`options[:sfc_stability] = false`) that returns exactly what this function used to compute
+inline, bitwise: `τ = ρ_t Cd |U₁| u₁` with [`komori_cd`](@ref) when `Cd_param < 0`,
+`F_sh = ρ_d1 C_pd Ck U₁ (SST − T₁)` and `F_q = Ck U₁ (ρ_vs(SST, p₁) − ρ_v1)`, the
+exchange wind floored by the gustiness minimum `U_min`. `F_sh` goes into the heat column
+and `F_q` into the TOTAL-water column (the surface source adds vapor, so it reaches both
+ρ_w and the vapor slot). What the surface layer computes is now selectable; how it is
+DELIVERED (the analytic g(z) profile below) is not, and did not change.
 
 The increments are mapped onto the prognostic slots with the model's canonical
 consistent mappings: momentum/E_t via the FRIC_KE invariant (E_t follows the
@@ -158,9 +148,7 @@ carrying no cloud.
 @noinline function mc_louis_bl!(mtile::ModelTile, S, geom::MCGeometry,
                                 colstart::Int64, colend::Int64, z,
                                 uv, wv, vv, rtv, rdv, rcv, expdot,
-                                l_inf::Float64, Cd_param::Float64,
-                                sfc_fac::Float64, surface_fluxes::Bool,
-                                Ck::Float64, SST::Float64, U_min::Float64,
+                                l_inf::Float64, sfc::SurfaceLayerParams,
                                 ctrans_on::Bool)
     u = uv.f; u_z = uv.f_z
     w = wv.f; w_z = wv.f_z
@@ -176,33 +164,29 @@ carrying no cloud.
         Kv[i] = l * l * Kv[i]
     end
 
-    # Surface exchange wind: the lowest mish-level speed, floored by the
-    # optional gustiness minimum U_min (applies to drag AND the fluxes; with a
-    # calm surface wind the stress is still zero since tau ∝ U1*u1)
-    u1 = u[1] * sfc_fac
-    v1 = _louis_v1(geom, vv) * sfc_fac
-    U1 = max(sqrt((u1 * u1) + (v1 * v1)), U_min)
-    Cd = Cd_param < 0.0 ? komori_cd(U1) : Cd_param
-    drag_coeff = Cd * U1
-
-    # Bulk surface enthalpy/moisture fluxes over the fixed-SST sea surface:
-    # sensible F_sh = rho_d1 Cpd Ck U1 (SST - T1) [W/m²] and moisture
-    # F_q = Ck U1 (rho_vs(SST, p1) - rho_v1) [kg/m²/s]. Latent heat is NOT a
-    # separate term — it enters through the fixed-T energy bookkeeping of the
-    # vapor mass source below (the (CpvT-Lv)+(Lv-RvT) = CvvT identity).
-    F_sh = 0.0
-    F_q = 0.0
-    if surface_fluxes
-        Tk1 = Tk[1]
-        # `S.rho_v` is the PROGNOSTIC vapor mc_driver! staged for this column. The surface
-        # moisture flux is a disequilibrium against rho_v_sat(SST), i.e. a thermodynamic
-        # consumer of the partition, and it must read the same vapor the mixture
-        # thermodynamics did.
-        rho_v1 = S.rho_v[1]
-        p1_hPa = S.p_hPa[1]
-        F_sh = rho_d[1] * Cpd * Ck * U1 * (SST - Tk1)
-        F_q = Ck * U1 * (rho_v_sat(SST, p1_hPa) - rho_v1)
-    end
+    # Surface exchange: ONE call into the shared bulk air-sea layer
+    # (src/mc_surface_layer.jl). It applies `sfc_wind_factor`, floors the exchange
+    # wind by the gustiness minimum U_min, and returns the stress and the bulk
+    # enthalpy/moisture fluxes. With a calm surface wind the stress is still zero
+    # since tau ∝ U1*u1. Latent heat is NOT a separate term — it enters through the
+    # fixed-T energy bookkeeping of the vapor mass source below (the
+    # (CpvT-Lv)+(Lv-RvT) = CvvT identity).
+    #
+    # `S.rho_v` is the PROGNOSTIC vapor mc_driver! staged for this column. The surface
+    # moisture flux is a disequilibrium against rho_v_sat(SST), i.e. a thermodynamic
+    # consumer of the partition, and it must read the same vapor the mixture
+    # thermodynamics did. `S.p[1] / 100.0` inside the callee is bitwise `S.p_hPa[1]`
+    # (mc_driver! stages `@. p_hPa = p / 100.0`).
+    #
+    # Scalars in, an isbits NamedTuple out, and `sfc` an immutable struct whose only
+    # non-bits field is an interned Symbol: nothing here boxes. That is not obvious across
+    # a @noinline boundary (the SubArray elision lesson — see the note at the call site in
+    # moist_compressible.jl), so test/test_allocations.jl gates all six sfc_z0 x stability
+    # arms at zero allocations per column.
+    sx = surface_exchange(u[1], _louis_v1(geom, vv), Tk[1], rho_d[1], rho_t[1],
+                          S.rho_v[1], S.p[1], z[1], sfc.SST, sfc)
+    F_sh = sx.F_sh   # an exact 0.0 when options[:surface_fluxes] is off
+    F_q = sx.F_q
 
     # Surface-layer delivery profile g(z) = (2/δ)(1 − z/δ)₊, ∫g = 1, over the
     # lowest cell (the first-cell Gauss midpoint z[2] sits at δ/2 exactly for
@@ -210,8 +194,8 @@ carrying no cloud.
     # tendencies as F·g(z) — see the header comment for why not a fitted node.
     delta = 2.0 * z[2]
     inv_delta = 1.0 / delta
-    tau_u = rho_t[1] * drag_coeff * u1
-    tau_v = rho_t[1] * drag_coeff * v1
+    tau_u = sx.tau_u
+    tau_v = sx.tau_v
 
     # Interior momentum flux divergences on the rho_r column basis: fit
     # ρ_t Kv ∂z(u); ∂z of the fit is ρ_t du/dt.

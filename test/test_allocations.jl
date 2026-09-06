@@ -399,6 +399,26 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                               :rain_transform => :bhyp))
         Scythe.moist_compressible_axisym(mtile_ct, 1, kDim_ct, 2)  # compile
         @test (@allocations Scythe.moist_compressible_axisym(mtile_ct, 1, kDim_ct, 2)) == 0
+
+        # AND EVERY SURFACE-LAYER ARM (stage S1b, src/mc_surface_layer.jl). The
+        # SurfaceLayerParams struct carries a Symbol, so it is not isbits; it crosses the
+        # @noinline boundary of mc_louis_bl! once per column and this is what proves the
+        # compiler keeps it out of the heap. The :gfdl_v7 / :charnock / stability paths also
+        # run log/exp/atan and a fixed-point loop inside that callee.
+        for z0 in (:komori, :gfdl_v7, :charnock), stab in (false, true)
+            mtile_sl, kDim_sl = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                              extra_params = Dict(:f => 5.0e-5, :Cd => -1.0,
+                                                                  :l_inf => 80.0,
+                                                                  :Ck => 1.0e-3,
+                                                                  :SST => 301.15,
+                                                                  :U_min => 1.0),
+                                              extra_options = Dict{Symbol,Any}(
+                                                  :louis_bl => true, :surface_fluxes => true,
+                                                  :sfc_z0 => z0, :sfc_stability => stab))
+            Scythe.moist_compressible_axisym(mtile_sl, 1, kDim_sl, 2)  # compile
+            @test (@allocations Scythe.moist_compressible_axisym(mtile_sl, 1,
+                                                                 kDim_sl, 2)) == 0
+        end
     end
 
     @testset "per-column allocations stay zero on the 3D RLR cylinder" begin

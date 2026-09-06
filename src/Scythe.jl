@@ -86,6 +86,12 @@ include("reference_state.jl")
 # exist before the one that names it. ishmael_tables.jl is a leaf — SpecialFunctions, JLD2
 # and its own literals — so it can sit anywhere above its first user.
 include("ishmael_tables.jl")
+# MYNN-EDMF closure (plan S2): pure column functions on plain vectors, no ModelTile, no
+# scratch, no options -- only MYNNConstants (built from Springsteel) -- so they stay testable
+# against the Fortran reference driver with no model. The coupling (mc_mynn_bl.jl, S5) comes
+# after mc_boundary_layer.jl.
+include("mynn_constants.jl")
+include("mynn_closure.jl")
 # The RADIATION STATE layer comes before semiimplicit.jl for the same reason: `ModelTile`
 # carries a `RadiationState` field CONCRETELY (see `EMPTY_RADIATION`), so the struct has to
 # be defined before the one that names it. radiation_state.jl is a leaf — the Springsteel
@@ -107,6 +113,11 @@ include("io.jl")
 include("ishmael.jl")
 include("microphysics.jl")
 include("mc_geometry.jl")
+# The SHARED SURFACE-EXCHANGE layer comes before mc_boundary_layer.jl because the Louis BL
+# calls `surface_exchange` and carries a `SurfaceLayerParams` through its argument list; the
+# MYNN-EDMF closure will call the same function. It is a leaf apart from `komori_cd`, which
+# now lives there too — the bulk air-sea formulas are in ONE file, not two.
+include("mc_surface_layer.jl")
 include("mc_boundary_layer.jl")
 include("moist_compressible.jl")
 # The microphysics -> cloud-optics conversion (Stage S3a) needs `_ice_effective`

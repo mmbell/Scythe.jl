@@ -1,4 +1,10 @@
-# MYNN-EDMF Fortran reference driver
+# MYNN-EDMF / surface-layer Fortran reference drivers
+
+Two standalone Fortran programs over **verbatim** ccpp-physics sources. `ref_driver.f90`
+(the original, below) runs the MYNN-EDMF boundary layer; `sfc_ref_driver.f90` (stage S1b,
+the last section of this file) prints the GFDL/HWRF v7 sea-surface roughness fits.
+
+## MYNN-EDMF driver (`ref_driver.f90`)
 
 Standalone Fortran program that runs the **verbatim** ccpp-physics MYNN-EDMF boundary-layer
 scheme (`module_bl_mynn.F90`, `bl_mynn_common.f90`) on single columns and prints, at full
@@ -14,7 +20,7 @@ are unmodified copies, Apache-2.0 header retained. `module_bl_mynn.F90` has no `
 statement, so every routine is callable from the driver — no patch was needed (ISHMAEL's
 driver had to widen a `public` list).
 
-## Files
+### Files
 
 - `module_bl_mynn.F90`, `bl_mynn_common.f90` — verbatim copies.
 - `stub_machine.f90` — stand-in for `physics/hooks/machine.F`: just `kind_phys = 8`.
@@ -46,10 +52,40 @@ driver had to widen a `public` list).
   line 2 `ps ts qsfc ust hfx qfx wspd znt xland dx rmol delt`; then `n` lines
   `z dz u v w T th exner p rho sqv sqc sqi`. `sqv` is specific humidity `rho_v/rho_t` and
   `rho` the moist density, the wrapper's conventions; `ts` is `T_sfc/exner(1)`.
+- `blend_ref_driver.f90` — a second, tiny program for the pure functions the main driver
+  never prints directly: `esat_blend`, `qsat_blend`, `xl_blend` (only reachable from
+  `mym_condensation`, whose *outputs* are what mode B dumps), the **stable** branch of
+  `phim`/`phih` (every case here has `rmol <= 0`, so only the unstable branch is
+  exercised), and `boulac_length0` on a synthetic 20-level column (CASE 2 of `mym_length`
+  never calls it). Same output format; its numbers are transcribed by hand into
+  `test/test_mynn_closure.jl`, so it is not run at test time and `run.sh` does not build
+  it. To regenerate, after `run.sh` has built `build/r8`:
+  ```sh
+  cd build/r8 && /opt/homebrew/bin/gfortran -ffree-line-length-none -O0 -ffp-contract=off \
+      -fdefault-real-8 -fdefault-double-8 stub_machine.o bl_mynn_common.o \
+      module_bl_mynn.o ../../blend_ref_driver.f90 -o blend_ref_driver && ./blend_ref_driver
+  ```
+- `moisture_ref_driver.f90` — a third tiny program, for `moisture_check` (:5133-5220).
+  The main driver prints none of its arguments, and every reference column is
+  non-negative everywhere, so in `ref_driver_output_r8.txt` that routine only ever runs
+  on its NO-OP path — its correction path (condense vapour into a negative condensate,
+  borrow from the layer below, then redistribute the borrow over the column) has no
+  coverage at all, and it is exactly the path a Scythe column with negative water takes.
+  This program calls it directly on two synthetic 6-level columns, one that fires the
+  condensation correction and a single-layer borrow and one that also fires the
+  column-wide redistribution (:5198-5216). Same output format; its numbers are
+  transcribed by hand into `test/test_mynn_closure.jl` (the `MC_*` constants), so it is
+  not run at test time and `run.sh` does not build it. To regenerate, after `run.sh`
+  has built `build/r8`:
+  ```sh
+  cd build/r8 && /opt/homebrew/bin/gfortran -ffree-line-length-none -O0 -ffp-contract=off \
+      -fdefault-real-8 -fdefault-double-8 stub_machine.o bl_mynn_common.o \
+      module_bl_mynn.o ../../moisture_ref_driver.f90 -o moisture_ref_driver && ./moisture_ref_driver
+  ```
 - `ref_driver_output_r8.txt` — the reference (checked in, 5.9 MB, ~184k lines).
 - `ref_driver_output_native.txt` — UFS-precision run (gitignored; regenerate with `run.sh`).
 
-## The two modes and the gate
+### The two modes and the gate
 
 For every case the driver runs, at `delt = 20 s`, 30 steps with the column state FROZEN
 (`mynn_bl_driver` never updates `u/th/q` itself):
@@ -70,7 +106,7 @@ Output format: `## <case> closure=<c> mode=<A|B> step=<s> <name> n=<len>` follow
 `<len>` lines `k value` (`ES25.17E3`, so 3-digit exponents keep their `E`). Scalars have
 `n=1`; integers are printed as reals.
 
-## Build flags
+### Build flags
 
 `run.sh` builds twice (gfortran 15.2, `/opt/homebrew/bin/gfortran`):
 
@@ -85,7 +121,7 @@ Output format: `## <case> closure=<c> mode=<A|B> step=<s> <name> n=<len>` follow
   differences from the r8 run at step 30 are ~1e-7 (qke, el, exch_h) to ~1e-5 (rthblten),
   i.e. the 24-bit truncation of the bare-real locals and literals. Not tested against.
 
-## Fortran behaviours the port must know about (found while building the gate)
+### Fortran behaviours the port must know about (found while building the gate)
 
 1. **`mynn_tendencies` and `moisture_check` write their input columns.** `thl, sqw, sqv,
    sqc, sqi` are `intent(inout)` (:4092) and `moisture_check` corrects `thl` in place.
@@ -112,8 +148,26 @@ Output format: `## <case> closure=<c> mode=<A|B> step=<s> <name> n=<len>` follow
    The driver does not apply these; the port makes them counters (plan D5).
 8. `closure = 2.6` exercises only the prognostic-`qsq` branch of `mym_predict` (:3392);
    `mym_turbulence` has `closure >= 3.0` branches only. Both closures are dumped in mode A.
+9. **`mym_initialize` is passed `sqv`, not `sqw`, as its total-water argument `qw`**
+   (:817, and the driver copies that). Cloud and ice are therefore excluded from `q_w`
+   for the cold start only — every later `mym_level2`/`mym_turbulence` call gets the real
+   `sqw`. Passing `sqw` at init still reproduces `init_el` and `init_qke` (the `qke` floor
+   masks the difference in `pdk`) but moves `init_sh`/`init_sm` by ~3-8 % and
+   `init_qsq`/`init_cov` by orders of magnitude, so it is easy to get wrong and hard to
+   see. Found while writing `test/test_mynn_closure.jl`.
 
-## Running
+10. **`MAX` with a NaN quenches it in gfortran, and Julia's `max` propagates it.**
+    Item 4's NaN in `tsq/qsq/cov(kts)` reaches exactly two `MAX` calls downstream —
+    `mym_condensation` :3849 `r3sq = max(qsq(k), 0.)` and `mym_predict` :3427
+    `qsq(k) = MAX(x(k), 1e-17)` — and the reference build returns the OTHER argument
+    (0. and 1e-17), so the Fortran column stays finite. The Julia port keeps Julia's
+    NaN-propagating `max`, so case 1 (the only `ust = 0` column) diverges at `k = 1`
+    of `mym_condensation`'s outputs and across the whole closure-2.6 `qsq`. This is
+    the port's ONE known divergence; it is documented at the top of part 2 of
+    `src/mynn_closure.jl` and pinned by its own testset in
+    `test/test_mynn_closure.jl`. Any column with `ust > 0` is unaffected.
+
+### Running
 
 ```sh
 julia --project=. tools/mynn_dump_columns.jl            # rewrites columns/ (needs the TC run for case 3)
@@ -122,3 +176,29 @@ tools/mynn_fortran_driver/run.sh                         # builds both, runs bot
 
 Re-running is only needed when a case changes; the checked-in `ref_driver_output_r8.txt`
 is static and the test suite needs neither gfortran nor the TC run.
+
+## Surface-roughness driver (`sfc_ref_driver.f90`, stage S1b)
+
+Prints `znot_m_v7(U10)` and `znot_t_v7(U10)` — the HWRF/HAFS sea-surface roughness fits
+(Bin Liu, NOAA/NCEP/EMC 2018) — at the 17 wind speeds `test/test_surface_layer.jl` checks
+the Julia port in `src/mc_surface_layer.jl` against.
+
+- `module_sf_exchcoef.f90` — **verbatim** copy of
+  `ccpp-physics/physics/SFC_Layer/GFDL/module_sf_exchcoef.f90` at the same `72570a3f`
+  (Apache-2.0 header retained; the file itself was last touched at `b7e3e94e`, 2025-06-05).
+  Unmodified: the module has no `private` statement and no `use`, so it compiles alone.
+- `sfc_ref_driver.f90` — the program. Output: a `## gfdl_v7 znot uref z0m z0t` header line,
+  then one `uref z0m z0t` line per wind speed in `ES25.17E3`.
+- `run_sfc.sh` — builds and runs it, leaving `sfc_ref_driver_output.txt`.
+- Build flags: `gfortran -fdefault-real-8 -ffp-contract=off -O0`. That module declares its
+  arguments and locals as **bare `real`**, so without `-fdefault-real-8` the printed values
+  are single precision and useless as a double-precision reference;
+  `-ffp-contract=off` for the same FMA reason as the MYNN build above.
+- The values are transcribed into `test/reference/gfdl_sfc_refs.jl` as Float64 literals, so
+  the test suite needs no Fortran. The Julia port currently reproduces all 34 of them
+  BITWISE (the test asserts rtol 1e-12, which is the honest bound: it depends on gfortran
+  and Julia agreeing on `exp` and on the expansion of `uref**n`).
+
+```sh
+tools/mynn_fortran_driver/run_sfc.sh
+```

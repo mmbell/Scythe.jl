@@ -59,4 +59,7 @@ Springsteel = "66b52f22-0fad-4358-9559-2105d4560aaf"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Springsteel", "NCDatasets", "Printf", "Dates", "Distributed"]
+# NCDatasets is a hard dependency since the radiation port (b91303a) and must NOT also be a
+# test-target entry: Julia 1.12's Pkg rejects a target entry that is neither in [extras] nor
+# [weakdeps] ("declared as a test dependency, but no such entry in extras or weakdeps").
+test = ["Test", "Springsteel", "Printf", "Dates", "Distributed"]
