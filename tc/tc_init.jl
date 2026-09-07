@@ -17,7 +17,22 @@
 # (called from createModelTile) refuses a stale key, which is the backstop, not the plan.
 const TC_WATER_OPTS = Dict{Symbol,Any}(:condensate_transform => CONDENSATE_TRANSFORM,
                                        :rain_transform => RAIN_TRANSFORM)
-const TC_VARS = Scythe.mc_var_names(TC_WATER_OPTS; cyl = true)
+
+# SCYTHE_TC_BL selects the boundary-layer scheme, "louis" (default) or "mynn"
+# (S10a, src/mynn_state.jl). Read HERE, at file-include time rather than inside
+# make_base, because the MYNN TKE density is an APPENDED `mc_var_names` slot
+# ("rho_e", moist_compressible.jl) and TC_VARS below -- and everything keyed off
+# it (grid_params.vars, all four BC dicts in tc_boundary_conditions) -- has to
+# be built knowing whether that slot exists before a single ModelParameters is
+# constructed. make_base reuses this SAME constant for options[:mynn] rather
+# than re-reading the env var, so the two can never disagree.
+const TC_BL_CHOICE = get(ENV, "SCYTHE_TC_BL", "louis")
+TC_BL_CHOICE in ("louis", "mynn") ||
+    error("SCYTHE_TC_BL = \"$(TC_BL_CHOICE)\" is not recognized; use louis or mynn")
+const TC_NAME_OPTS = merge(TC_WATER_OPTS,
+                           TC_BL_CHOICE == "mynn" ? Dict{Symbol,Any}(:mynn => true) :
+                                                    Dict{Symbol,Any}())
+const TC_VARS = Scythe.mc_var_names(TC_NAME_OPTS; cyl = true)
 const TC_RAIN_VAR = Scythe.rain_var_name(TC_WATER_OPTS)
 const TC_CLOUD_VAR = Scythe.condensate_var_name(TC_WATER_OPTS)
 
@@ -306,6 +321,48 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                 "interval=$rad_interval s z_max=$rad_zmax m; the radiative surface " *
                 "temperature is physical_params[:SST] = $(SST_K) K (no :T_sfc set)")
     end
+
+    # ── Boundary layer (S10a) ────────────────────────────────────────────────
+    # SCYTHE_TC_BL selects the boundary-layer scheme, in the style of SCYTHE_TC_RAD.
+    # The choice itself (TC_BL_CHOICE, already validated) is resolved above, at
+    # file-include time -- see the comment there for why: the MYNN TKE-density
+    # slot "rho_e" is an APPENDED mc_var_names slot, and TC_VARS (built at
+    # include time from TC_NAME_OPTS) has to already know about it.
+    #   "louis" (default, unset)   the shipped Louis bulk-formula scheme
+    #                              (:louis_bl => true) -- BIT-IDENTICAL to a
+    #                              pre-knob TC run, since this is today's
+    #                              configuration.
+    #   "mynn"                     the MYNN-EDMF port (src/mynn_state.jl):
+    #                              :louis_bl is dropped and :mynn => true is set
+    #                              instead. :surface_fluxes stays on either way --
+    #                              MYNN consumes the same surface enthalpy/
+    #                              moisture/momentum fluxes, it does not replace
+    #                              that scheme.
+    # SCYTHE_TC_MYNN_INTERVAL (s, default 20.0) -> options[:mynn_interval] and
+    # SCYTHE_TC_MYNN_EDMF (0/1, default 0) -> options[:mynn_edmf] tune the mynn arm
+    # without editing this file -- same reasoning as SCYTHE_TC_RAD_INTERVAL: a
+    # restart re-reads tc_params.jl/tc_init.jl, so an edit made mid-run silently
+    # changes what a later restart does.
+    #
+    # `Scythe.validate_mynn_options` (src/mynn_state.jl) is the actual gate: it
+    # checks the equation set is a pressure-reference moist_compressible set (true
+    # here), that the vertical basis is the cubic B-spline (true for both RiRk and
+    # RLR geometries this driver builds), :mynn_interval >= this patch's own ts,
+    # and :mynn_edmf in (0, 1) -- refusing 1 outright until S7 ports the mass-flux
+    # plumes. It runs once per tile at construction, so a bad knob dies at setup.
+    bl_options = Dict{Symbol,Any}()
+    if TC_BL_CHOICE == "louis"
+        bl_options[:louis_bl] = true
+        println("TC boundary layer: louis (default)")
+    else # "mynn" -- TC_BL_CHOICE is validated to be one of these two at include time
+        mynn_interval = parse(Float64, get(ENV, "SCYTHE_TC_MYNN_INTERVAL", "20.0"))
+        mynn_edmf = parse(Int, get(ENV, "SCYTHE_TC_MYNN_EDMF", "0"))
+        bl_options[:mynn] = true
+        bl_options[:mynn_interval] = mynn_interval
+        bl_options[:mynn_edmf] = mynn_edmf
+        println("TC boundary layer: mynn interval=$mynn_interval s edmf=$mynn_edmf")
+    end
+
     return ModelParameters(
         ts = NEST_TS[end],                     # root (outer patch) timestep
         integration_time = integration_time,
@@ -400,10 +457,9 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
                                          :state_deviation => STATE_DEVIATION,
                                          :precipitation => true,
                                          :vertical_mixing => false,
-                                         :louis_bl => true,
                                          :surface_fluxes => true,
                                          :output_formats => output_formats),
-                        rad_options, extra_options))
+                        bl_options, rad_options, extra_options))
 end
 
 function make_nest(base)
