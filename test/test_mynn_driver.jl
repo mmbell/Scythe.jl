@@ -439,7 +439,12 @@ using SparseArrays
         end
     end
 
-    @testset "driver refusal: :mynn with ISHMAEL ice" begin
+    @testset ":mynn with ISHMAEL ice: accepted at S8, except the :fixed_T carry" begin
+        # S4 refused this combination outright. S8 mixes all twelve ice moments
+        # species-wise and lifts it (test_mynn_ice.jl is where the legs themselves are
+        # checked); the ONE thing still refused is the local fixed-temperature water map,
+        # which has no ice coefficient. The Louis refusal is untouched and lives in
+        # test_louis_bl.jl's own driver checks.
         mktempdir() do tmp
             ice_opts = Dict{Symbol,Any}(:rain_moments => 2,
                                         :ice_microphysics => :ishmael)
@@ -447,7 +452,15 @@ using SparseArrays
                 extra_opts = ice_opts,
                 extra_params = Dict{Symbol,Float64}(:N_r => 1.0e-3))
             spectralTransform!(patch); gridTransform!(patch)
-            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            @test (Scythe.advance_column(m, 1, 1); true)
+            @test all(isfinite, m.expdot_n)
+
+            m2, p2, _, _, _ = make_mynn_mtile(tmp; mynn = true,
+                extra_opts = merge(ice_opts,
+                    Dict{Symbol,Any}(:mynn_water_carry => :fixed_T)),
+                extra_params = Dict{Symbol,Float64}(:N_r => 1.0e-3))
+            spectralTransform!(p2); gridTransform!(p2)
+            @test_throws ErrorException Scythe.advance_column(m2, 1, 1)
         end
     end
 end

@@ -30,7 +30,17 @@
 #                                 (options[:sfc_stability]); arm suffix `_stab`
 #   SCYTHE_OWB_SST=302.65         sea surface temperature [K] (default tc_params SST_K)
 #   SCYTHE_OWB_ICE=1              ISHMAEL ice (with two-moment rain and the bhyp transforms,
-#                                 as o01_rainfall's ice arm); arm suffix `_ice`
+#                                 as o01_rainfall's ice arm); arm suffix `_ice`.
+#                                 ICE + MYNN IS THE SUPPORTED BOUNDARY-LAYER PAIR (S8):
+#                                 `mc_mynn_bl!` mixes all twelve ice moments species-wise
+#                                 (all four moments of a species on the SAME K_h, so the
+#                                 mean crystal does not move), mixes the rain number
+#                                 beside the rain mass, and carries the ice's -L_f share
+#                                 of the water energy. Ice + LOUIS is still refused by the
+#                                 driver -- that scheme infers the vapour tendency as
+#                                 rho_dot_w - rho_dot_c, which with ice inside rho_t
+#                                 attributes the ice flux to vapour -- so an ice arm runs
+#                                 with SCYTHE_OWB_BL=mynn or =none.
 #   SCYTHE_OWB_RAIN_MOMENTS=2     two-moment rain without ice
 #   SCYTHE_OWB_RAD=lw|allsky|sw|allsky_sw|diurnal  RRTMGP arm (o01 semantics; the SST is
 #                                 the radiative surface temperature), + _RAD_FORCING,

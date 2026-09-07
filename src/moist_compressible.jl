@@ -6958,16 +6958,25 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
               "boundary-layer closures and their tendencies are additive, so enabling " *
               "both mixes every column twice. Choose one.")
     end
-    if mynn_on && ice_on
-        # The MYNN water legs mix q_v/q_c/q_i, and the ice here is three ISHMAEL species
-        # with four moments each — mixing an ice MASS without its number and volume moments
-        # rescales the crystals of every column the operator touches (the `Khdiff_water`
-        # argument, one category further out).
-        error("options[:mynn] with options[:ice_microphysics] = :ishmael is not " *
-              "implemented: the MYNN ice legs arrive at S8. The closure mixes a single " *
-              "ice mixing ratio, while ISHMAEL carries three species with four moments " *
-              "each, so mixing the mass alone would rescale every crystal. Set " *
-              "ice_microphysics = :none or wait for S8.")
+    # ICE + MYNN is the SUPPORTED pair (S8; the Louis refusal above stands, because its
+    # `rho_dot_v = rho_dot_w - rho_dot_c` decomposition attributes the ice flux to vapour).
+    # `mc_mynn_bl!` mixes all twelve ice moments species-wise, all four moments of a species
+    # on the SAME K_h, and carries the ice's `-L_f` share of the water energy in the
+    # flux-form `S_Ew` column. The one combination that is still refused is the LOCAL
+    # fixed-temperature water map, which has no ice term:
+    if mynn_on && ice_on && mtile.mynn.water_carry === :fixed_T
+        # `:fixed_T` is the D10 fidelity comparison: E_t receives `c_w rho_dot_w +
+        # c_v rho_dot_v` pointwise instead of the divergence of the energy column. It has no
+        # ice coefficient, and the routine it mirrors — `_diffusion_water_step!` — has no ice
+        # handling to copy (it refuses ice itself, above). Adding a third pointwise term here
+        # would be inventing a convention rather than mirroring one, so it is refused until
+        # the local map is derived with ice.
+        error("options[:mynn_water_carry] = :fixed_T with options[:ice_microphysics] = " *
+              ":ishmael is not implemented: the local fixed-temperature water map carries " *
+              "`c_w rho_dot_w + c_v rho_dot_v` and has no ice coefficient, and " *
+              "`_diffusion_water_step!`, the routine it mirrors, has no ice handling to " *
+              "copy. Use the default :flux carry (where the ice rides the S_Ew column as " *
+              "-L_f K_h dz(rho_i)) or set ice_microphysics = :none.")
     end
     # Radiative heating. `RAD.q_lw`/`q_sw` are the HELD flux divergences [W/m^3] the
     # pre-pass (`radiation_prepass!`, src/radiation.jl) recomputed on the radiation cadence

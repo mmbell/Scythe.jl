@@ -62,8 +62,9 @@ state, loaded out of `MYNNState` on an update step and written back (a per-threa
 column is shared between columns, so it cannot be assumed to still hold this column's
 values); `Km`..`Ke` the diffusivities; `Su`..`Sv` the FITTED momentum fluxes, which the
 discrete shear production multiplies (the value, not the raw product -- D3); `div_*` the
-fitted flux divergences of the species/energy/TKE legs; `e`/`e_z` the mass-specific TKE and
-its gradient; `wk` one general work column.
+fitted flux divergences of the species/energy/TKE legs (S8 appends the rain-number leg
+`div_nr` and the twelve ice-moment legs `div_i1q`..`div_i3c`); `e`/`e_z` the mass-specific
+TKE and its gradient; `wk` one general work column.
 
 Every field is a `Vector{Float64}` of length `kDim`, so the struct is concrete and a field
 load inside a `@noinline` helper is a plain pointer load.
@@ -101,6 +102,24 @@ struct MYNNColumnScratch
     div_e::Vector{Float64}
     div_Ew::Vector{Float64}
     div_Pm::Vector{Float64}
+    # -- the two-moment rain NUMBER leg (S8; options[:rain_moments] = 2) --------
+    div_nr::Vector{Float64}
+    # -- the twelve ISHMAEL ICE moment legs (S8) --------------------------------
+    # `<species><moment>` exactly as `MC_SCRATCH_SLOTS` names them: `i1q` the mass of
+    # species 1, `i1n` its number, `i1a`/`i1c` its two spheroid volume moments. All
+    # thirteen are unread and untouched with ice / two-moment rain off.
+    div_i1q::Vector{Float64}
+    div_i1n::Vector{Float64}
+    div_i1a::Vector{Float64}
+    div_i1c::Vector{Float64}
+    div_i2q::Vector{Float64}
+    div_i2n::Vector{Float64}
+    div_i2a::Vector{Float64}
+    div_i2c::Vector{Float64}
+    div_i3q::Vector{Float64}
+    div_i3n::Vector{Float64}
+    div_i3a::Vector{Float64}
+    div_i3c::Vector{Float64}
     # -- TKE and one general work column ---------------------------------------
     e::Vector{Float64}
     e_z::Vector{Float64}
@@ -201,6 +220,7 @@ mutable struct MYNNState
     const init_mode::Symbol         # :taper | :zero
     const fidelity::Symbol          # :fortran
     const water_carry::Symbol       # :flux | :fixed_T
+    const mix_numbers::Bool         # mix the two-moment rain NUMBER? (:mynn_mix_numbers)
     const interval_steps::Int       # BL cadence, in model steps
     const ncol::Int
     const kDim::Int
@@ -322,6 +342,7 @@ function MYNNState(;
         init_mode::Symbol = :taper,
         fidelity::Symbol = :fortran,
         water_carry::Symbol = :flux,
+        mix_numbers::Bool = true,
         interval_steps::Int = 1,
         ncol::Int = 0,
         kDim::Int = 0,
@@ -392,7 +413,7 @@ function MYNNState(;
         n_stall::Int = 0,
         n_plume::Int = 0)
     return MYNNState(active, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
-                     water_carry,
+                     water_carry, mix_numbers,
                      interval_steps, ncol, kDim, K_max, output, trace, check_values,
                      el, sm, sh, vt, vq, sgm, cldfra_bl, qc_bl, qi_bl, K_m, K_h,
                      gh, gm, qsq,
@@ -430,8 +451,8 @@ const EMPTY_MYNN = MYNNState()
 # Louis-BL and Khdiff_water blockers, and `RADIATION_OPTION_KEYS`).
 const MYNN_OPTION_KEYS = Set{Symbol}((
     :mynn, :mynn_interval, :mynn_edmf, :mynn_edmf_mom, :mynn_closure, :mynn_scale_aware,
-    :mynn_init, :mynn_fidelity, :mynn_water_carry, :mynn_output, :mynn_trace,
-    :mynn_check_values))
+    :mynn_init, :mynn_fidelity, :mynn_water_carry, :mynn_mix_numbers, :mynn_output,
+    :mynn_trace, :mynn_check_values))
 
 const MYNN_INIT_MODES = (:taper, :zero)
 const MYNN_FIDELITIES = (:fortran,)
@@ -446,7 +467,7 @@ _mynn_check(value, allowed, key) = value in allowed || error(
 
 Check the MYNN-EDMF configuration LOUDLY and return the resolved settings as a NamedTuple
 `(active, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity, water_carry,
-interval_steps, K_max, output, trace, check_values)`.
+mix_numbers, interval_steps, K_max, output, trace, check_values)`.
 
 Called once per tile from [`mc_mynn_state`](@ref), before any array is allocated, so a
 misconfigured run dies at setup rather than several minutes in -- or, worse, runs to
@@ -462,7 +483,8 @@ Errors:
   (`moist_compressible_*`) set -- nothing else carries the `rho_e` slot;
 - `:mynn_closure` other than 2.5 (2.6 is a later stage);
 - `:mynn_edmf` other than 0/1, or `= 1` on a column shorter than four layers;
-- an unrecognized `:mynn_init`, `:mynn_fidelity` or `:mynn_water_carry`;
+- an unrecognized `:mynn_init`, `:mynn_fidelity` or `:mynn_water_carry`, or a
+  non-`Bool` `:mynn_mix_numbers`;
 - a non-positive `:mynn_interval`, or one SHORTER than the model timestep (the cadence is
   in seconds so it is nest-invariant; a cadence below one step is not a cadence);
 - a non-positive `physical_params[:mynn_K_max]`.
@@ -481,6 +503,15 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     init_mode = get(options, :mynn_init, :taper)
     fidelity = get(options, :mynn_fidelity, :fortran)
     water_carry = get(options, :mynn_water_carry, :flux)
+    # Mix the two-moment rain NUMBER alongside the rain MASS (S8). Default ON, because
+    # mixing a mass without its number is a statement about the drop size: `K_h ∂z ρ_r`
+    # with `n_r` left behind rescales the mean diameter of every column the operator
+    # touches, and the fall speeds, the evaporation timescale and the self-collection all
+    # read that size. The knob exists as the FORENSIC comparison (WRF's own
+    # `bl_mynn_mixscalars = 0` is the same lever) and never as a production setting; the
+    # twelve ICE moments are NOT gated by it, because there the mass and its number/axis
+    # moments are what the habit prediction is made of.
+    mix_numbers = get(options, :mynn_mix_numbers, true)::Bool
     interval_sec = Float64(get(options, :mynn_interval, 20.0))
     output = get(options, :mynn_output, false)::Bool
     trace = get(options, :mynn_trace, true)::Bool
@@ -488,7 +519,8 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     K_max = Float64(get(physical_params, :mynn_K_max, Inf))
 
     resolved = (; active = on, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
-                water_carry, interval_steps = 1, K_max, output, trace, check_values)
+                water_carry, mix_numbers, interval_steps = 1, K_max, output, trace,
+                check_values)
     on || return resolved
 
     for key in keys(options)
@@ -537,7 +569,7 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
                       "the boundary layer is a column process")
 
     return (; active = on, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
-            water_carry, interval_steps, K_max, output, trace, check_values)
+            water_carry, mix_numbers, interval_steps, K_max, output, trace, check_values)
 end
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -558,7 +590,8 @@ function mynn_setup_line(model::ModelParameters, cfg, ncol::Int, kDim::Int)
     println("mynn: closure=$(cfg.closure) edmf=$(cfg.edmf) " *
             "edmf_mom=$(cfg.edmf_mom) " *
             "scale_aware=$(cfg.scale_aware) init=:$(cfg.init_mode) " *
-            "water_carry=:$(cfg.water_carry) fidelity=:$(cfg.fidelity) " *
+            "water_carry=:$(cfg.water_carry) mix_numbers=$(cfg.mix_numbers) " *
+            "fidelity=:$(cfg.fidelity) " *
             "interval=$(interval_s) s (= $(cfg.interval_steps) steps at ts=$(model.ts) s) " *
             "K_max=$(cfg.K_max) m^2/s columns=$(ncol) layers=$(kDim)")
     return nothing
@@ -646,6 +679,7 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         edmf_mom = cfg.edmf_mom,
         scale_aware = cfg.scale_aware, init_mode = cfg.init_mode,
         fidelity = cfg.fidelity, water_carry = cfg.water_carry,
+        mix_numbers = cfg.mix_numbers,
         interval_steps = cfg.interval_steps, ncol, kDim, K_max = cfg.K_max,
         output = cfg.output, trace = cfg.trace, check_values = cfg.check_values,
         el = zpt(), sm = zpt(), sh = zpt(), vt = zpt(), vq = zpt(), sgm = zpt(),

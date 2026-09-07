@@ -367,6 +367,56 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
             @test (@allocations driver(mtile_ed, 1, kDim_ed, 3)) == 0
         end
 
+        # ...and with ISHMAEL ICE live (S8): twelve more fitted flux columns, each on its
+        # OWN spline column through `_mynn_moment_leg!`, plus the rain-number leg and the
+        # ice share of the flux-form energy carry. That is the widest the MYNN apply path
+        # gets, and `scratch_column(mtile, slot)` is indexed by a field of `MCSlots` — a
+        # per-column `Dict{String,Int}` lookup creeping back in is exactly what this
+        # catches. `:rain_moments = 2` is ISHMAEL's own requirement.
+        for (eqs, driver) in (("moist_compressible_XZ", Scythe.moist_compressible_XZ),
+                              ("moist_compressible_axisym",
+                               Scythe.moist_compressible_axisym))
+            mtile_mi, kDim_mi = build_mc_tile(equation_set = eqs,
+                extra_params = Dict(:f => 5.0e-5, :Cd => -1.0, :Ck => 1.0e-3,
+                                    :SST => 301.15, :U_min => 1.0, :N_r => 1.0e-3),
+                precipitation = true,
+                extra_options = Dict{Symbol,Any}(:mynn => true, :mynn_trace => false,
+                                                 :surface_fluxes => true,
+                                                 :rain_moments => 2,
+                                                 :ice_microphysics => :ishmael))
+            @test Scythe.ice_registered(mtile_mi.mc_slots)
+            @test mtile_mi.mynn.mix_numbers
+            mtile_mi.tile.physical[:, mtile_mi.mc_slots.rho_e, 1] .= 0.5
+            i1q, i1n, i1a, i1c = Scythe.ice_slots(mtile_mi.mc_slots, 1)
+            mtile_mi.tile.physical[:, i1q, 1] .= 1.0e-5
+            mtile_mi.tile.physical[:, i1n, 1] .= 1.0e3
+            mtile_mi.tile.physical[:, i1a, 1] .= 2.6e-9
+            mtile_mi.tile.physical[:, i1c, 1] .= 2.6e-9
+            mtile_mi.tile.physical[:, mtile_mi.mc_slots.n_r, 1] .= 1.0e3
+            spectralTransform!(mtile_mi.tile)
+            gridTransform!(mtile_mi.tile)
+            driver(mtile_mi, 1, kDim_mi, 2)                        # compile
+            @test (@allocations driver(mtile_mi, 1, kDim_mi, 3)) == 0
+        end
+
+        # ...and the same with the ICE control-variable transform on, where every one of
+        # the twelve legs is built from `nu_z/J` and its increment carries `J` back.
+        mtile_mt, kDim_mt = build_mc_tile(
+            extra_params = Dict(:f => 5.0e-5, :Cd => -1.0, :Ck => 1.0e-3,
+                                :SST => 301.15, :U_min => 1.0, :N_r => 1.0e-3),
+            precipitation = true,
+            extra_options = Dict{Symbol,Any}(:mynn => true, :mynn_trace => false,
+                                             :surface_fluxes => true,
+                                             :rain_moments => 2,
+                                             :rain_number_transform => :bhyp,
+                                             :ice_microphysics => :ishmael,
+                                             :ice_transform => :bhyp))
+        mtile_mt.tile.physical[:, mtile_mt.mc_slots.rho_e, 1] .= 0.5
+        spectralTransform!(mtile_mt.tile)
+        gridTransform!(mtile_mt.tile)
+        moist_compressible_XZ(mtile_mt, 1, kDim_mt, 2)             # compile
+        @test (@allocations moist_compressible_XZ(mtile_mt, 1, kDim_mt, 3)) == 0
+
         # ...and with the water control-variable transforms on, where the cloud leg is
         # built from the staged perturbation DENSITY gradient and the rain leg from
         # nu_r,z/J: two more SubArray-shaped escapes that must not box.

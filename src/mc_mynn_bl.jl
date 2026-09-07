@@ -146,6 +146,41 @@ all; this is the second lock, for the column that has the plumes ON and no plume
     return nothing
 end
 
+"""
+    _mynn_moment_leg!(mtile, div, Kh, nu_z, J, slot, n)
+
+One fitted eddy-diffusion leg of a TOTAL-form moment slot (S8): the twelve ISHMAEL ice
+moments and the two-moment rain number.
+
+    S = K_h ∂z(moment density) = K_h · (∂z ν / J)          fitted, then differentiated
+
+`nu_z` is the slot's own fitted vertical gradient and `J = dν/dx` its Jacobian, both staged
+by `_load_total_slot!` in the driver — so the gradient here is the gradient of the QUANTITY
+and not of the control variable, exactly as the cloud and rain legs build theirs. With no
+transform declared `J` is an exact `1.0` and `ν_z / 1.0 === ν_z` for every double, so the
+untransformed path is bitwise the raw slot gradient. The caller multiplies the divergence by
+`J` again on the way into the slot.
+
+**Each moment is fitted on ITS OWN spline column**, `scratch_column(mtile, slot)`, not on the
+shared slot-8 basis the liquid legs use. That is `_ice_flux!`'s rule and it is the same
+argument: a mass slot with a Natural bottom must be free to let its crystals leave the domain
+while a number or a volume moment fitted with different boundary conditions is not forced to
+agree with it. It also means the twelve divergences do NOT sum to a refit of their sum; the
+one place that matters is the ice energy carry, and see `_mynn_flux_columns!` for what is
+done there.
+"""
+@noinline function _mynn_moment_leg!(mtile::ModelTile, div, Kh, nu_z, J,
+                                     slot::Int64, n::Int64)
+    c = scratch_column(mtile, slot)
+    @inbounds for i in 1:n
+        c.uMish[i] = Kh[i] * (nu_z[i] / J[i])
+    end
+    Btransform!(c)
+    Atransform!(c)
+    Ixtransform(c, div)
+    return nothing
+end
+
 @inline function _mynn_v_flux!(VD_v, Sv, col, ::MCCartesianXZ, rho_t, Km, vv,
                                MY::MYNNState, colstart::Int64, n::Int64, mf::Bool)
     return nothing
@@ -295,9 +330,30 @@ of cloud water is a MASS flux, not a flux of `nu`), and the slot increment is mu
 by the Jacobian. `Jc`/`Jr` are an exact 1.0 with no transform declared, so the default
 path is bit-identical.
 
-Ice is REFUSED upstream (the `mc_driver!` preamble): the closure mixes one ice mixing
-ratio while ISHMAEL carries three species with four moments each, so `q_i` is an exact
-0.0 column here and the ice legs arrive at S8.
+# Ice (S8, `options[:ice_microphysics] = :ishmael`)
+The closure carries ONE ice mixing ratio and ISHMAEL carries three species with four
+moments each, so the two halves are treated differently and on purpose. The CLOSURE is
+handed the species sum (`q_i` into `theta_l`, `q_w` and the cloud PDF; `q_s` is an exact
+zero, because the Fortran never mixes snow and there is no snow category here to mix). The
+TRANSPORT is species-wise and moment-wise: each of the twelve moments gets its own fitted
+`K_h dz(moment density)` leg on its own spline column, all four moments of a species
+sharing one `K_h` so the mean particle does not move.
+
+WHAT CLOSES AND WHAT DOES NOT. The total-water leg `S_w` is built from
+`rho_w' = rho_t' - rho_d'`, which INCLUDES the ice, so `rho_dot_w` already carries every
+species; the vapour and cloud stay their own legs and nothing is inferred as a difference
+(that inference is exactly why the Louis scheme is still refused with ice). The species
+sum `rho_dot_v + rho_dot_c + rho_dot_r + sum_k rho_dot_i,k` therefore equals `rho_dot_w`
+only to the FIT ERROR of six independent spline columns, not identically. That residual
+is the same one every other water source in this set leaves: `rho_t` stays the exactly
+conserved anchor, the partition it implies is `res_rho_t = rho_t - rho_d - rho_liq -
+rho_ice`, and `rho_v_reconcile` pulls the prognostic vapour onto it on `tau_rec`
+(`_vapor_gap_census!` reports `max|delta|` as the drift diagnostic). Nothing here is
+withheld or clipped to force a pointwise closure.
+
+`:mynn_water_carry = :fixed_T` is REFUSED with ice (the `mc_driver!` preamble): the local
+map has no ice term and `_diffusion_water_step!`, the routine it mirrors, has no ice
+handling to copy.
 """
 @noinline function mc_mynn_bl!(mtile::ModelTile, S, geom::MCGeometry,
                                colstart::Int64, colend::Int64, z,
@@ -305,6 +361,14 @@ ratio while ISHMAEL carries three species with four moments each, so `q_i` is an
                                sfc::SurfaceLayerParams, t::Int64,
                                ctrans_on::Bool, rtrans_on::Bool)
     MY = mtile.mynn
+    # The appended-slot gates, read from `MCSlots` exactly as `mc_driver!` reads them: the
+    # indices were resolved by NAME once when the tile was built, so "the slots exist" and
+    # "the legs run" cannot disagree, and this is a field load and not a Dict lookup in a
+    # per-column path. No transform flag is needed anywhere below: `_load_total_slot!`
+    # leaves `J` an exact `1.0` with no transform declared, and `nu_z / 1.0 === nu_z`.
+    IS = mtile.mc_slots
+    ice_on = ice_registered(IS)
+    nr_on = MY.mix_numbers && IS.n_r > 0
     n = colend - colstart + 1
     ci = div(colstart - 1, MY.kDim) + 1
     work = MY.work[Threads.threadid()]
@@ -339,11 +403,12 @@ ratio while ISHMAEL carries three species with four moments each, so `q_i` is an
     _mynn_diffusivities!(MY, MN, colstart, n, ci, n_clamp)
 
     ed = _mynn_flux_columns!(mtile, MY, S, MN, work, geom, colstart, n, z, uv, wv, vv,
-                             rtv, rdv, rcv, rrv, rvv, rho_e, ctrans_on, rtrans_on)
+                             rtv, rdv, rcv, rrv, rvv, rho_e, ctrans_on, rtrans_on,
+                             IS, ice_on, nr_on)
 
     _mynn_apply_column!(MY, S, MN, geom, colstart, n, ci, z, uv, wv, vv, expdot,
-                        mtile.mc_slots.rho_v, re_i, sx.tau_u, sx.tau_v, F_sh, F_q,
-                        2.0 * z[2], ed)
+                        IS.rho_v, re_i, sx.tau_u, sx.tau_v, F_sh, F_q,
+                        2.0 * z[2], ed, IS, ice_on, nr_on)
     return nothing
 end
 
@@ -383,7 +448,14 @@ resting column produce EXACTLY zero rather than the floor's residue:
         th = Tk[i] / ex
         sqv = S.rho_v[i] / rho_t[i]
         sqc = S.rho_c[i] / rho_t[i]
-        sqi = 0.0                                  # ice is refused until S8
+        # The closure's ONE ice mixing ratio is the SUM of the three ISHMAEL species
+        # (S8). `rho_ice_t` is the column the thermodynamics reads -- floored per species
+        # under `:condensate_floor` and capped at the anchor headroom -- so the closure's
+        # `q_i` and the retrieval's `q_i = rho_ice_t/rho_d` are the same water, and a
+        # spline undershoot in one ice mass cannot reach `theta_l` as negative latent
+        # heat. With ice OFF the driver fills it with exact zeros, so `sqi` is `0.0` and
+        # every line below is bitwise the pre-S8 code (`x - 0.0 === x`).
+        sqi = S.rho_ice_t[i] / rho_t[i]
         work.s_u[i] = uv.f[i]
         work.s_v[i] = _louis_v(geom, vv, i)
         work.s_w[i] = wv.f[i]
@@ -863,7 +935,9 @@ spline coefficients is what makes the D3 identity exact rather than approximate.
 Momentum (`rho_t K_m dz(u,w,v)`), heat in FLUX form (`rho_d T K_h dz(s_t')`, so the column
 books telescope), the four SPECIES water legs (D7: total water `rho_w' = rho_t' - rho_d'`,
 the prognostic vapour, cloud and rain -- Louis's total-minus-cloud inference is gone), the
-water ENERGY carry `c_w K_h rho_w,z + c_v K_h rho_v,z` and the TKE transport.
+two-moment rain NUMBER and the twelve ISHMAEL ICE moments (S8, each on its own spline
+column through `_mynn_moment_leg!`), the water ENERGY carry
+`c_w K_h rho_w,z + c_v K_h rho_v,z - L_f K_h rho_i,z` and the TKE transport.
 
 With `:mynn_edmf = 1` the EDMF mass flux is SUBTRACTED from the same columns before they
 are fitted (`_mynn_add_mf!` says why a minus): `u`, `v` (both only under
@@ -891,7 +965,8 @@ well; the choice is documented rather than silent because both were available.
                                        MN::MYNNColumnScratch, work::MYNNWork,
                                        geom::MCGeometry, colstart::Int64, n::Int64, z,
                                        uv, wv, vv, rtv, rdv, rcv, rrv, rvv, rho_e,
-                                       ctrans_on::Bool, rtrans_on::Bool)
+                                       ctrans_on::Bool, rtrans_on::Bool,
+                                       IS::MCSlots, ice_on::Bool, nr_on::Bool)
     rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
     Km = MN.Km; Kh = MN.Kh; Ke = MN.Ke
     col = scratch_column(mtile, 8)
@@ -1018,6 +1093,40 @@ well; the choice is documented rather than silent because both were available.
     Btransform!(col); Atransform!(col)
     Ixtransform(col, MN.div_r)
 
+    # ── The two-moment rain NUMBER (S8, `:mynn_mix_numbers`) ─────────────────
+    # Mixing the rain MASS and leaving `n_r` behind is a statement about the drop size:
+    # the mean diameter of every column the operator touches becomes a function of the
+    # diffusivity, and the fall speeds, the evaporation timescale and the self-collection
+    # all read that size. So the number rides the SAME `K_h` on its own column and its own
+    # boundary conditions, which is what `bl_mynn_mixscalars = 1` does for `qnc`/`qni` in
+    # the Fortran. The plumes carry no precipitation, so there is no mass-flux term here.
+    if nr_on
+        _mynn_moment_leg!(mtile, MN.div_nr, Kh, S.nu_nr_z, S.Jnr, IS.n_r, n)
+    end
+
+    # ── The twelve ISHMAEL ICE moments (S8) ──────────────────────────────────
+    # All twelve are per-volume moments advected with the product-rule continuity, so the
+    # eddy flux of each is the same `K_h ∂z(moment density)` the cloud and rain masses get
+    # — and all four moments of a species take the SAME `K_h`, which is what keeps the
+    # crystals intact: mixing `ρ_i`, `n_i`, `a_i` and `c_i` with one diffusivity moves the
+    # mean particle nowhere, while mixing the mass alone would rescale every crystal in the
+    # column (the reason S4 refused this combination). There is no plume term: `DMP_mf`
+    # carries no ice.
+    if ice_on
+        _mynn_moment_leg!(mtile, MN.div_i1q, Kh, S.nu_i1q_z, S.J_i1q, IS.i1_q, n)
+        _mynn_moment_leg!(mtile, MN.div_i1n, Kh, S.nu_i1n_z, S.J_i1n, IS.i1_n, n)
+        _mynn_moment_leg!(mtile, MN.div_i1a, Kh, S.nu_i1a_z, S.J_i1a, IS.i1_a, n)
+        _mynn_moment_leg!(mtile, MN.div_i1c, Kh, S.nu_i1c_z, S.J_i1c, IS.i1_c, n)
+        _mynn_moment_leg!(mtile, MN.div_i2q, Kh, S.nu_i2q_z, S.J_i2q, IS.i2_q, n)
+        _mynn_moment_leg!(mtile, MN.div_i2n, Kh, S.nu_i2n_z, S.J_i2n, IS.i2_n, n)
+        _mynn_moment_leg!(mtile, MN.div_i2a, Kh, S.nu_i2a_z, S.J_i2a, IS.i2_a, n)
+        _mynn_moment_leg!(mtile, MN.div_i2c, Kh, S.nu_i2c_z, S.J_i2c, IS.i2_c, n)
+        _mynn_moment_leg!(mtile, MN.div_i3q, Kh, S.nu_i3q_z, S.J_i3q, IS.i3_q, n)
+        _mynn_moment_leg!(mtile, MN.div_i3n, Kh, S.nu_i3n_z, S.J_i3n, IS.i3_n, n)
+        _mynn_moment_leg!(mtile, MN.div_i3a, Kh, S.nu_i3a_z, S.J_i3a, IS.i3_a, n)
+        _mynn_moment_leg!(mtile, MN.div_i3c, Kh, S.nu_i3c_z, S.J_i3c, IS.i3_c, n)
+    end
+
     SEw0 = 0.0; SEw1 = 0.0
     if MY.water_carry === :flux
         wk = MN.wk
@@ -1025,6 +1134,33 @@ well; the choice is documented rather than silent because both were available.
             cw = (Cpv*Tk[i]) - S.Lv[i] + S.ke[i] + (gravity*z[i])
             cv = S.Lv[i] - (Rv*Tk[i])
             wk[i] = Kh[i]*((cw*(rtv.f_z[i] - rdv.f_z[i])) + (cv*rvv.f_z[i]))
+        end
+        if ice_on
+            # THE ICE ENERGY CARRY. `rho_w' = rho_t' - rho_d'` already INCLUDES the ice, so
+            # the total-water leg has given every kilogram of ice the LIQUID coefficient
+            # `c_w`; what is owed is the difference between the ice and the liquid specific
+            # energies. The model's own ice convention is `E_sed_i` (the sedimentation
+            # energy flux, src/moist_compressible.jl):
+            #
+            #     c_i = C_pv T - L_s(T) + ke + g z          (liquid: c_w, with L_v)
+            #
+            # so `c_i - c_w = L_v - L_s = -L_f`, and the ice rides the same column as a
+            # SUBTRACTED `L_f K_h dz(rho_i)`. That is the exact structural mirror of the
+            # vapour's `+c_v`: one flux column, three coefficients, and `S_Ew` still
+            # telescopes to a boundary value, so the D3 identity is unchanged.
+            #
+            # The GRADIENT is summed over the three species before the multiply (one term
+            # in a column that is fitted once); the DIVERGENCE that `Qdot_w` subtracts in
+            # `_mynn_apply_column!` is summed from the three separately fitted legs, the
+            # same choice `Fi_z` makes for the sedimentation. They differ by the fit error
+            # of a sum against the sum of fits, which is a `Qdot_w` (thermal) effect only
+            # — `E_t` receives the divergence of THIS column and nothing else.
+            @inbounds for i in 1:n
+                cf = L_s(Tk[i]) - S.Lv[i]                             # L_f > 0
+                di = ((S.nu_i1q_z[i]/S.J_i1q[i]) + (S.nu_i2q_z[i]/S.J_i2q[i])) +
+                     (S.nu_i3q_z[i]/S.J_i3q[i])
+                wk[i] -= cf * (Kh[i] * di)
+            end
         end
         if mf
             # D7 with the plumes: `S_Ew = Fit[c_w(K_h rho_w,z + M_w) + c_v(K_h rho_v,z +
@@ -1068,6 +1204,24 @@ well; the choice is documented rather than silent because both were available.
 end
 
 """
+    _mynn_moment_apply!(expdot, div, J, slot, colstart, n)
+
+Fold one fitted moment divergence into its prognostic slot (S8): `expdot[j, slot] += J·div`.
+
+The Jacobian is the SLOT's, not the density's: the leg was built from `∂z ν / J` so that it
+is a flux of the quantity, and the increment goes back the other way through `dν/dx`. `J` is
+an exact `1.0` with no transform declared, and `1.0 * x === x`, so the untransformed slot
+receives the raw divergence.
+"""
+@inline function _mynn_moment_apply!(expdot, div, J, slot::Int64,
+                                     colstart::Int64, n::Int64)
+    @inbounds for i in 1:n
+        expdot[colstart + i - 1, slot] += J[i] * div[i]
+    end
+    return nothing
+end
+
+"""
     _mynn_apply_column!(...)
 
 Fold every leg onto the prognostic slots and accumulate the D3 boundary/surface energy
@@ -1108,7 +1262,8 @@ that value actually is and report it.
                                        colstart::Int64, n::Int64, ci::Int64, z,
                                        uv, wv, vv, expdot, rv_i::Int64, re_i::Int64,
                                        tau_u::Float64, tau_v::Float64,
-                                       F_sh::Float64, F_q::Float64, delta::Float64, ed)
+                                       F_sh::Float64, F_q::Float64, delta::Float64, ed,
+                                       IS::MCSlots, ice_on::Bool, nr_on::Bool)
     u = uv.f
     w = wv.f
     rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
@@ -1161,7 +1316,15 @@ that value actually is and report it.
 
         if flux_carry
             dE_w = VD_Ew[i] + ((cw + cv) * F_q * gz)
-            qdot_w = VD_Ew[i] - (cw*div_w[i]) - (cv*div_v[i])
+            # The ice share of the flux-form carry (S8), the mirror of the `S_Ew` column's
+            # own ice term: the total-water leg gave the ice `c_w`, and `c_i - c_w = -L_f`.
+            # Written INSIDE the `c_w` bracket rather than as a term of its own so that a
+            # zero ice divergence is `(cw*div_w) - 0.0`, which is `=== cw*div_w` for every
+            # double — `x + 0.0` would flip a `-0.0` and, one spline fit later, show up as
+            # a sign-of-zero difference in a warm increment.
+            qw_i = ice_on ? (L_s(Tk[i]) - Lv[i]) *
+                            (((MN.div_i1q[i] + MN.div_i2q[i]) + MN.div_i3q[i])) : 0.0
+            qdot_w = VD_Ew[i] - ((cw*div_w[i]) - qw_i) - (cv*div_v[i])
         else
             dE_w = (cw*rw) + (cv*rv)
             qdot_w = 0.0
@@ -1183,6 +1346,29 @@ that value actually is and report it.
         expdot[j, re_i] += ((div_e[i] + Ps) + (Pb - eps)) + Psfc
 
         bdry += wq[i] * (cw + cv) * F_q * gz
+    end
+    # ── The appended moment slots (S8) ───────────────────────────────────────
+    # Outside the loop above, deliberately: the warm slots' arithmetic is then untouched
+    # by the ice being on, so an ice-on column whose ice is exactly zero is bitwise the
+    # ice-off column in every warm increment (test_mynn_ice.jl pins that with `===`).
+    # Nothing here reaches E_t: a NUMBER and a VOLUME MOMENT carry no energy, and the ice
+    # MASS carried its own `-L_f K_h dz(rho_i)` inside the `S_Ew` column already.
+    if nr_on
+        _mynn_moment_apply!(expdot, MN.div_nr, S.Jnr, IS.n_r, colstart, n)
+    end
+    if ice_on
+        _mynn_moment_apply!(expdot, MN.div_i1q, S.J_i1q, IS.i1_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1n, S.J_i1n, IS.i1_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1a, S.J_i1a, IS.i1_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1c, S.J_i1c, IS.i1_c, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2q, S.J_i2q, IS.i2_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2n, S.J_i2n, IS.i2_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2a, S.J_i2a, IS.i2_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2c, S.J_i2c, IS.i2_c, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3q, S.J_i3q, IS.i3_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3n, S.J_i3n, IS.i3_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3a, S.J_i3a, IS.i3_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3c, S.J_i3c, IS.i3_c, colstart, n)
     end
     @inbounds begin
         MY.bdry_E[ci] = bdry
