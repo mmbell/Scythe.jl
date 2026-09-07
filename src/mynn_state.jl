@@ -144,12 +144,16 @@ coefficients of `mym_condensation!`), `sgm` (the cloud-PDF width), `cldfra_bl`/`
 onto the tile. `qke` is NOT among them: the TKE is the PROGNOSTIC slot `rho_e`, which is
 the whole point of the coupling -- a second copy carried here could disagree with it.
 
-# Plume sums (S7)
-`s_aw`, `s_aw_st`, `s_aw_qw`, `s_aw_qv`, `s_aw_u`, `s_aw_v`, `s_aw_e` are the mass-flux
-sums `DMP_mf` will fill (the Fortran's `s_aw`, `s_awthl`, `s_awqt`, `s_awqv`, `s_awu`,
-`s_awv`, `s_awqke`). Allocated and zeroed HERE, at the same gridpoint length as everything
-else, so the S5 tendency assembly can read them unconditionally and the S7 plume stage is
-a fill rather than a re-plumb. Nothing writes them before S7.
+# Plume sums (S7), GRIDPOINT-indexed and held on the cadence
+`s_aw` is `Sigma_aw = sum_i a_i w_i` [m/s] and `s_aw_st`, `s_aw_qw`, `s_aw_qv`, `s_aw_u`,
+`s_aw_v`, `s_aw_e` the plume-weighted sums `sum_i a_i w_i phi_i` of the plume's entropy
+[J/(kg K)], its total and vapour SPECIFIC water [kg/kg], its `u`, `v` [m/s] and its
+mass-specific TKE `e = qke/2` [J/kg]. They are Scythe's variables, not the Fortran's:
+`DMP_mf` returns `s_aw*` on the INTERFACES and multiplied by the interface density, and
+`_mynn_plume_sums!` (src/mc_mynn_bl.jl) maps them onto the mish and divides the density
+back out, so the every-step assembly forms `M_phi = rho_t Sigma_aw (phi_up - bar phi)`
+with the CURRENT environment. All seven are exact zeros with `:mynn_edmf = 0` and on any
+column whose plumes did not fire, which is what makes the off path bitwise.
 
 # Column geometry (built once; the mish is the same for every column of a tile)
 `z_lay` (mish heights), `dz` (MYNN layer thickness from midpoint faces), `zw` (wall
@@ -182,14 +186,17 @@ set, built once from Springsteel.
 # Counters
 `n_clamp_e`, `n_cap_K`, `n_diffnum` accumulate how often the TKE had to be floored, an
 exchange coefficient hit `physical_params[:mynn_K_max]`, and the vertical diffusion number
-exceeded its stability bound. They are NOT `const`: they are the reason a clamp is never
-silent.
+exceeded its stability bound. `n_gate`, `n_stall`, `n_plume` are the S7 plume counts
+(gate passed / passed but every plume stalled at the first interface / a mass flux was
+actually produced), in COLUMN-UPDATES. All six are NOT `const`: they are the reason a
+clamp, and a plume that never fires, is never silent.
 """
 mutable struct MYNNState
     # ── resolved configuration (see validate_mynn_options) ──
     const active::Bool
     const closure::Float64          # 2.5 (2.6 arrives later)
-    const edmf::Int                 # 0 | 1 (1 arrives at S7)
+    const edmf::Int                 # 0 (eddy diffusivity only) | 1 (mass-flux plumes)
+    const edmf_mom::Bool            # do the plumes carry momentum? (:mynn_edmf_mom)
     const scale_aware::Bool
     const init_mode::Symbol         # :taper | :zero
     const fidelity::Symbol          # :fortran
@@ -229,6 +236,21 @@ mutable struct MYNNState
     const s_aw_u::Vector{Float64}
     const s_aw_v::Vector{Float64}
     const s_aw_e::Vector{Float64}
+    # ── per-column plume census (S7); zero with :mynn_edmf = 0 ──
+    # `plume_ktop`/`plume_ztop`/`aw_max` are RUNNING MAXIMA over the run of that column's
+    # plume state (the highest interface a plume reached, its height and the largest
+    # `Sigma_aw`), advanced only on an update that actually produced a flux; the three
+    # counters accumulate COLUMN-UPDATES, which is what makes the
+    # gate/stall distinction of tools/mynn_fortran_driver/README.md item 12 readable:
+    # `n_gate` passed `fltv2 > 0.002 && maxwidth > minwidth && superadiabatic`, `n_stall`
+    # passed it and still made no flux because every plume failed to leave the first
+    # interface (`nup2 = 0` at :6288), `n_plume` actually produced a mass flux.
+    const plume_ktop::Vector{Int}
+    const plume_ztop::Vector{Float64}
+    const aw_max::Vector{Float64}
+    const n_gate_col::Vector{Int}
+    const n_stall_col::Vector{Int}
+    const n_plume_col::Vector{Int}
     # ── per-column ──
     const pblh::Vector{Float64}
     const kpbl::Vector{Int}
@@ -270,11 +292,18 @@ mutable struct MYNNState
     # `MC_SCRATCH_SLOTS` — see [`MYNNColumnScratch`](@ref) for the register-pressure
     # reason. Empty on the MYNN-off value, like `work`.
     const colscratch::Vector{MYNNColumnScratch}
+    # Thread `t`'s `DMP_mf` scratch. EMPTY unless `:mynn_edmf = 1`: one `EDMFWork` is nine
+    # (kDim+1, 8) plume matrices plus ~25 columns, and a run without the plumes must not
+    # pay for it. Indexed by `threadid()` under the same ownership rule as `work`.
+    const ework::Vector{EDMFWork}
     const constants::MYNNConstants
     # ── clamp/cap counters (never silent) ──
     n_clamp_e::Int
     n_cap_K::Int
     n_diffnum::Int
+    n_gate::Int
+    n_stall::Int
+    n_plume::Int
 end
 
 """
@@ -288,6 +317,7 @@ function MYNNState(;
         active::Bool = false,
         closure::Float64 = 2.5,
         edmf::Int = 0,
+        edmf_mom::Bool = true,
         scale_aware::Bool = true,
         init_mode::Symbol = :taper,
         fidelity::Symbol = :fortran,
@@ -320,6 +350,12 @@ function MYNNState(;
         s_aw_u::Vector{Float64} = Float64[],
         s_aw_v::Vector{Float64} = Float64[],
         s_aw_e::Vector{Float64} = Float64[],
+        plume_ktop::Vector{Int} = Int[],
+        plume_ztop::Vector{Float64} = Float64[],
+        aw_max::Vector{Float64} = Float64[],
+        n_gate_col::Vector{Int} = Int[],
+        n_stall_col::Vector{Int} = Int[],
+        n_plume_col::Vector{Int} = Int[],
         pblh::Vector{Float64} = Float64[],
         kpbl::Vector{Int} = Int[],
         ust::Vector{Float64} = Float64[],
@@ -347,20 +383,27 @@ function MYNNState(;
         n_diffnum_col::Vector{Int} = Int[],
         work::Vector{MYNNWork} = MYNNWork[],
         colscratch::Vector{MYNNColumnScratch} = MYNNColumnScratch[],
+        ework::Vector{EDMFWork} = EDMFWork[],
         constants::MYNNConstants = MYNNConstants(),
         n_clamp_e::Int = 0,
         n_cap_K::Int = 0,
-        n_diffnum::Int = 0)
-    return MYNNState(active, closure, edmf, scale_aware, init_mode, fidelity, water_carry,
+        n_diffnum::Int = 0,
+        n_gate::Int = 0,
+        n_stall::Int = 0,
+        n_plume::Int = 0)
+    return MYNNState(active, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
+                     water_carry,
                      interval_steps, ncol, kDim, K_max, output, trace, check_values,
                      el, sm, sh, vt, vq, sgm, cldfra_bl, qc_bl, qi_bl, K_m, K_h,
                      gh, gm, qsq,
                      s_aw, s_aw_st, s_aw_qw, s_aw_qv, s_aw_u, s_aw_v, s_aw_e,
+                     plume_ktop, plume_ztop, aw_max, n_gate_col, n_stall_col, n_plume_col,
                      pblh, kpbl, ust, rmol, last_update_step,
                      z_lay, dz, zw, w_mish, dx, z_top, dz_cell, dz_min, ts,
                      bdry_E, D_gal, D_mish, ts_tau, K_m_max, K_h_max, Ps_disc, Ps_mynn,
                      n_clamp_col, n_capK_col, n_diffnum_col,
-                     work, colscratch, constants, n_clamp_e, n_cap_K, n_diffnum)
+                     work, colscratch, ework, constants,
+                     n_clamp_e, n_cap_K, n_diffnum, n_gate, n_stall, n_plume)
 end
 
 """
@@ -386,8 +429,9 @@ const EMPTY_MYNN = MYNNState()
 # default cadence, which is exactly the kind of failure that costs a campaign (cf. the
 # Louis-BL and Khdiff_water blockers, and `RADIATION_OPTION_KEYS`).
 const MYNN_OPTION_KEYS = Set{Symbol}((
-    :mynn, :mynn_interval, :mynn_edmf, :mynn_closure, :mynn_scale_aware, :mynn_init,
-    :mynn_fidelity, :mynn_water_carry, :mynn_output, :mynn_trace, :mynn_check_values))
+    :mynn, :mynn_interval, :mynn_edmf, :mynn_edmf_mom, :mynn_closure, :mynn_scale_aware,
+    :mynn_init, :mynn_fidelity, :mynn_water_carry, :mynn_output, :mynn_trace,
+    :mynn_check_values))
 
 const MYNN_INIT_MODES = (:taper, :zero)
 const MYNN_FIDELITIES = (:fortran,)
@@ -401,8 +445,8 @@ _mynn_check(value, allowed, key) = value in allowed || error(
     validate_mynn_options(options, physical_params, equation_set, ts, kDim)
 
 Check the MYNN-EDMF configuration LOUDLY and return the resolved settings as a NamedTuple
-`(active, closure, edmf, scale_aware, init_mode, fidelity, water_carry, interval_steps,
-K_max, output, trace, check_values)`.
+`(active, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity, water_carry,
+interval_steps, K_max, output, trace, check_values)`.
 
 Called once per tile from [`mc_mynn_state`](@ref), before any array is allocated, so a
 misconfigured run dies at setup rather than several minutes in -- or, worse, runs to
@@ -417,7 +461,7 @@ Errors:
 - `options[:mynn]` on an equation set that is not a pressure-reference
   (`moist_compressible_*`) set -- nothing else carries the `rho_e` slot;
 - `:mynn_closure` other than 2.5 (2.6 is a later stage);
-- `:mynn_edmf = 1` (the mass-flux plumes arrive at S7), or any value but 0/1;
+- `:mynn_edmf` other than 0/1, or `= 1` on a column shorter than four layers;
 - an unrecognized `:mynn_init`, `:mynn_fidelity` or `:mynn_water_carry`;
 - a non-positive `:mynn_interval`, or one SHORTER than the model timestep (the cadence is
   in seconds so it is nest-invariant; a cadence below one step is not a cadence);
@@ -432,6 +476,7 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     # Resolve the whole table first so the off path returns the same NamedTuple shape.
     closure = Float64(get(options, :mynn_closure, 2.5))
     edmf = Int(get(options, :mynn_edmf, 0))
+    edmf_mom = get(options, :mynn_edmf_mom, true)::Bool
     scale_aware = get(options, :mynn_scale_aware, true)::Bool
     init_mode = get(options, :mynn_init, :taper)
     fidelity = get(options, :mynn_fidelity, :fortran)
@@ -442,7 +487,7 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     check_values = get(options, :mynn_check_values, false)::Bool
     K_max = Float64(get(physical_params, :mynn_K_max, Inf))
 
-    resolved = (; active = on, closure, edmf, scale_aware, init_mode, fidelity,
+    resolved = (; active = on, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
                 water_carry, interval_steps = 1, K_max, output, trace, check_values)
     on || return resolved
 
@@ -464,10 +509,11 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
         "carried fields and a second predictor")
     (edmf == 0 || edmf == 1) || error(
         "options[:mynn_edmf] must be 0 (no mass flux) or 1, got $edmf")
-    edmf == 0 || error(
-        "options[:mynn_edmf] = 1 arrives at S7: the mass-flux plumes (DMP_mf, " *
-        "module_bl_mynn.F90 :5700-6820) are not ported. Run with 0, which leaves every " *
-        "plume sum zero — the same column the Fortran produces for ktop_plume = 0")
+    # `DMP_mf` reaches k+1 and k-1 from the interior interfaces and `EDMFWork` refuses a
+    # column shorter than four layers; say so here rather than in the constructor.
+    (edmf == 0 || kDim >= 4) || error(
+        "options[:mynn_edmf] = 1 needs at least 4 vertical layers (grid_params.kDim = " *
+        "$kDim); DMP_mf integrates the plumes on kts+1 : kte-1")
 
     _mynn_check(init_mode, MYNN_INIT_MODES, "mynn_init")
     _mynn_check(fidelity, MYNN_FIDELITIES, "mynn_fidelity")
@@ -490,8 +536,8 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     kDim > 0 || error("options[:mynn] needs a vertical dimension (grid_params.kDim = 0); " *
                       "the boundary layer is a column process")
 
-    return (; active = on, closure, edmf, scale_aware, init_mode, fidelity, water_carry,
-            interval_steps, K_max, output, trace, check_values)
+    return (; active = on, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
+            water_carry, interval_steps, K_max, output, trace, check_values)
 end
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -510,6 +556,7 @@ function mynn_setup_line(model::ModelParameters, cfg, ncol::Int, kDim::Int)
     cfg.trace || return nothing
     interval_s = Float64(get(model.options, :mynn_interval, 20.0))
     println("mynn: closure=$(cfg.closure) edmf=$(cfg.edmf) " *
+            "edmf_mom=$(cfg.edmf_mom) " *
             "scale_aware=$(cfg.scale_aware) init=:$(cfg.init_mode) " *
             "water_carry=:$(cfg.water_carry) fidelity=:$(cfg.fidelity) " *
             "interval=$(interval_s) s (= $(cfg.interval_steps) steps at ts=$(model.ts) s) " *
@@ -596,6 +643,7 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
                       "SCALE_AWARE needs a positive dx")
 
     st = MYNNState(; active = true, closure = cfg.closure, edmf = cfg.edmf,
+        edmf_mom = cfg.edmf_mom,
         scale_aware = cfg.scale_aware, init_mode = cfg.init_mode,
         fidelity = cfg.fidelity, water_carry = cfg.water_carry,
         interval_steps = cfg.interval_steps, ncol, kDim, K_max = cfg.K_max,
@@ -605,6 +653,9 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         gh = zpt(), gm = zpt(), qsq = zpt(),
         s_aw = zpt(), s_aw_st = zpt(), s_aw_qw = zpt(), s_aw_qv = zpt(),
         s_aw_u = zpt(), s_aw_v = zpt(), s_aw_e = zpt(),
+        plume_ktop = zeros(Int, ncol), plume_ztop = zcol(), aw_max = zcol(),
+        n_gate_col = zeros(Int, ncol), n_stall_col = zeros(Int, ncol),
+        n_plume_col = zeros(Int, ncol),
         pblh = zcol(), kpbl = zeros(Int, ncol), ust = zcol(), rmol = zcol(),
         z_lay = z_lay, dz = dz, zw = zw, w_mish = w_mish, dx = dx, z_top = z_top,
         dz_cell = dz_cell, dz_min = dz_min, ts = Float64(model.ts),
@@ -620,6 +671,9 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         # rule `scratch_columns` uses. One `MYNNWork` is ~40 kDim-length columns.
         work = [MYNNWork(kDim) for _ in 1:Threads.maxthreadid()],
         colscratch = [MYNNColumnScratch(kDim) for _ in 1:Threads.maxthreadid()],
+        # Allocated ONLY with the plumes on: nine (kDim+1, 8) matrices per thread.
+        ework = cfg.edmf == 1 ? [EDMFWork(kDim) for _ in 1:Threads.maxthreadid()] :
+                                EDMFWork[],
         constants = MYNNConstants())
 
     mynn_setup_line(model, cfg, ncol, kDim)

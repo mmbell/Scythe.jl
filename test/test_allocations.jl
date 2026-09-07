@@ -341,6 +341,32 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
             @test maximum(mtile_my.mynn.K_h) >= 0.0
         end
 
+        # ...and with the EDMF MASS FLUX live (S7). `dmp_mf!` is called on the cadence
+        # with ~50 arguments and its eight (kDim+1, 8) plume matrices come out of a
+        # `Vector{EDMFWork}` indexed by `threadid()`, and `_mynn_plume_sums!` then walks
+        # the plumes calling `moist_entropy_total` per gridpoint. Every one of those is a
+        # place a boxed argument or a heap temporary could appear; step 3 below is a
+        # cadence step (`:mynn_interval` is the default 20 s, so the FIRST call on a
+        # column updates the closure whatever the cadence), so the plume path is what is
+        # being measured and not just the every-step assembly.
+        for (eqs, driver) in (("moist_compressible_XZ", Scythe.moist_compressible_XZ),
+                              ("moist_compressible_axisym",
+                               Scythe.moist_compressible_axisym))
+            mtile_ed, kDim_ed = build_mc_tile(equation_set = eqs,
+                extra_params = Dict(:f => 5.0e-5, :Cd => -1.0, :Ck => 1.0e-3,
+                                    :SST => 301.15, :U_min => 1.0),
+                extra_options = Dict{Symbol,Any}(:mynn => true, :mynn_trace => false,
+                                                 :mynn_edmf => 1,
+                                                 :surface_fluxes => true))
+            @test mtile_ed.mynn.edmf == 1
+            @test !isempty(mtile_ed.mynn.ework)
+            mtile_ed.tile.physical[:, mtile_ed.mc_slots.rho_e, 1] .= 0.5
+            spectralTransform!(mtile_ed.tile)
+            gridTransform!(mtile_ed.tile)
+            driver(mtile_ed, 1, kDim_ed, 2)                        # compile
+            @test (@allocations driver(mtile_ed, 1, kDim_ed, 3)) == 0
+        end
+
         # ...and with the water control-variable transforms on, where the cloud leg is
         # built from the staged perturbation DENSITY gradient and the rain leg from
         # nu_r,z/J: two more SubArray-shaped escapes that must not box.

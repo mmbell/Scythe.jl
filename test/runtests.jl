@@ -24,6 +24,7 @@ using Scythe
     include("test_surface_layer.jl")
     include("test_mynn_driver.jl")
     include("test_mynn_bl.jl")
+    include("test_mynn_edmf_live.jl")
     include("test_idealized_init.jl")
     include("test_spectralGrid.jl")
     include("test_output_formats.jl")

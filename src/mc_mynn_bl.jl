@@ -55,6 +55,20 @@
 #     heating and drives T, p and Q_ss. `:fixed_T` restores the local Louis map and is
 #     kept as the fidelity comparison (D10).
 #
+#  4. THE MASS FLUX RIDES IN THE SAME COLUMNS (D6, S7, `:mynn_edmf = 1`). `DMP_mf` runs
+#     on the closure cadence and its eight plumes are reduced to seven held sums per
+#     gridpoint -- `Sigma_aw` and the plume-weighted `u, v, e, s_t, q_t, q_v`
+#     (`_mynn_plume_sums!`). Every step the term `M_phi = rho_t Sigma_aw (phi_up - bar
+#     phi)` is re-formed with the CURRENT environment and folded into the SAME flux column
+#     as the eddy-diffusive part, before the fit. Because it is the same column, its
+#     divergence, its boundary values and the momentum-energy product `Psi` all carry it,
+#     so the plume's momentum work is inside `rho P_s` automatically and the D3 identity
+#     above is unchanged -- nothing was added to it. The Fortran applies the environmental
+#     half of the plume flux implicitly and floors the tridiagonal with `khdz` for
+#     diagonal dominance; there is no counterpart to that floor in an explicit fit and it
+#     is DROPPED (the plume Courant number `Sigma_aw ts/dz` is O(1e-3) -- `Sigma_aw` is
+#     tenths of m/s, and it is counted in the census).
+#
 # ── Explicit in time, like Louis, and why the census exists ──────────────────
 # The vertical mixing is applied EXPLICITLY. The offline harness
 # (model_tests/MYNN_REPLAY_README.md) measured `D_gal = K_e ts 10/dz_cell^2` on real
@@ -95,12 +109,54 @@ const MYNN_P0 = 100000.0
 @inline _mynn_vdiv(::MCCartesianXZ, VD_v, i) = 0.0
 @inline _mynn_vdiv(::MCWithV, VD_v, i) = @inbounds VD_v[i]
 
-@inline function _mynn_v_flux!(VD_v, Sv, col, ::MCCartesianXZ, rho_t, Km, vv)
+"""
+    _mynn_add_mf!(colv, fac, s_aw, s_aw_phi, phi, colstart, n)
+
+Fold the EDMF mass-flux transport of `phi` into a flux column that has already been filled
+with its eddy-diffusive part, BEFORE the fit (D6):
+
+    colv[i] -= fac[i] * (Sigma_aw_phi[j] - Sigma_aw[j] * phi[i])
+
+`fac` is `rho_t` for `u`, `v`, `e` and the water legs (`rho_t * specific content` IS the
+partial density, exactly as `rho_d * mixing ratio` is) and `rho_d*T` on the heat leg.
+
+WHY IT IS A MINUS. The plan and the TeX write the plume flux as
+`M_phi = rho_t Sigma_aw (phi_up - bar phi)`, a flux POSITIVE UPWARD. Every column fitted in
+`_mynn_flux_columns!` is `S = +rho K dz(phi)` and the slot receives `+dz(S)`, so `S` is
+MINUS the physical flux (`dphi/dt = -dz(F)`). The mass flux therefore enters the same
+column with the opposite sign, and then the divergence, the boundary values `_mynn_edges`
+returns and the momentum-energy product `Psi` all carry it automatically -- which is why
+D3 is unchanged and the plume's momentum work needs no term of its own.
+
+Subtraction, not addition, is also what keeps the off path bitwise. With the plumes absent
+every sum is an exact `0.0`, the bracket is `0.0 - (0.0*phi) = +0.0` for any finite `phi`
+(including a negative one, `0.0 - (-0.0) = +0.0`), `fac[i] > 0`, and `x - 0.0 === x` for
+EVERY double -- `-0.0` included, where `x + 0.0` would flip the sign of the zero and, one
+spline fit later, show up as a `-0.0`/`0.0` difference in an increment. The caller still
+guards the call with `if mf`, so a run with `:mynn_edmf = 0` does not execute the loop at
+all; this is the second lock, for the column that has the plumes ON and no plume firing.
+"""
+@inline function _mynn_add_mf!(colv, fac, s_aw::Vector{Float64},
+                               s_aw_phi::Vector{Float64}, phi,
+                               colstart::Int64, n::Int64)
+    @inbounds for i in 1:n
+        j = colstart + i - 1
+        colv[i] -= fac[i] * (s_aw_phi[j] - (s_aw[j] * phi[i]))
+    end
     return nothing
 end
-@inline function _mynn_v_flux!(VD_v, Sv, col, ::MCWithV, rho_t, Km, vv)
+
+@inline function _mynn_v_flux!(VD_v, Sv, col, ::MCCartesianXZ, rho_t, Km, vv,
+                               MY::MYNNState, colstart::Int64, n::Int64, mf::Bool)
+    return nothing
+end
+@inline function _mynn_v_flux!(VD_v, Sv, col, ::MCWithV, rho_t, Km, vv,
+                               MY::MYNNState, colstart::Int64, n::Int64, mf::Bool)
     v_z = vv.f_z
     col.uMish .= rho_t .* Km .* v_z
+    if mf
+        _mynn_add_mf!(col.uMish, rho_t, MY.s_aw, MY.s_aw_v, vv.f, colstart, n)
+    end
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VD_v)
@@ -195,8 +251,10 @@ a column): `GET_PBLH` -> `SCALE_AWARE` -> the surface block (`flt`, `fltv`, `rmo
 `zeta`-dependent `pmz`/`phh`) -> `mym_condensation!` -> `mym_turbulence!`, in exactly the
 order `mynn_column_step!` (src/mynn_closure.jl) replays the Fortran driver, and the
 results (`el, sm, sh, vt, vq, sgm, cldfra_bl, qc_bl, qi_bl, gh, qsq, pblh, kpbl`) are
-stored on the tile. `DMP_mf` is NOT called (`:mynn_edmf = 0`; the plumes arrive at S7),
-which is the column the Fortran produces for `ktop_plume = 0`.
+stored on the tile. With `:mynn_edmf = 1` (S7) `DMP_mf` also runs, between the two, and
+its plume ensemble is mapped onto the mish as the seven held sums `MYNNState.s_aw*`
+(`_mynn_plume_sums!`); with `:mynn_edmf = 0` every one of them stays an exact zero, which
+is the column the Fortran produces for `ktop_plume = 0`.
 
 `mym_predict!` is deliberately NOT called: the TKE equation is Scythe's own prognostic
 `rho_e` slot, integrated by the model's multistep with the closure's production and
@@ -280,7 +338,7 @@ ratio while ISHMAEL carries three species with four moments each, so `q_i` is an
 
     _mynn_diffusivities!(MY, MN, colstart, n, ci, n_clamp)
 
-    ed = _mynn_flux_columns!(mtile, MY, S, MN, geom, colstart, n, z, uv, wv, vv,
+    ed = _mynn_flux_columns!(mtile, MY, S, MN, work, geom, colstart, n, z, uv, wv, vv,
                              rtv, rdv, rcv, rrv, rvv, rho_e, ctrans_on, rtrans_on)
 
     _mynn_apply_column!(MY, S, MN, geom, colstart, n, ci, z, uv, wv, vv, expdot,
@@ -397,9 +455,9 @@ end
 One held-closure update: `GET_PBLH` -> `SCALE_AWARE` -> the surface block -> the Level-2
 water variance's consumer `mym_condensation!` -> `mym_turbulence!`, in exactly the order
 `mynn_column_step!` (src/mynn_closure.jl) replays the Fortran driver's per-column
-sequence. `DMP_mf` is NOT called (`:mynn_edmf = 0`; the plumes arrive at S7), which is
-the column the Fortran produces for `ktop_plume = 0`, and `mym_predict!` is NOT called
-because the TKE equation is Scythe's own prognostic slot.
+sequence -- with `dmp_mf!` between the condensation and the turbulence when
+`:mynn_edmf = 1` (S7). `mym_predict!` is NOT called because the TKE equation is Scythe's
+own prognostic slot.
 
 The carried state is loaded OUT of the tile first and written back after: `sm(kts)` and
 `sh(kts)` are never written by `mym_turbulence!` (its interface loops start at `kts+1`),
@@ -486,7 +544,22 @@ update, which is why it is stored rather than recomputed.
                       2, qcb, qib, cfb, zi, F_sh, vt, vq, work.s_th, sgm, rmol,
                       0, zn, c, work)
 
-    # DMP_mf would run here; with :mynn_edmf = 0 every plume sum stays zero.
+    # ── DMP_mf, between the condensation and the turbulence (:1150-1180) ─────
+    # With `:mynn_edmf = 0` this is not entered, the plume sums stay the exact zeros
+    # `mc_mynn_state` allocated, and `mym_turbulence!` is handed the same all-zero
+    # `edmf_w`/`edmf_a` stand-in it always was -- so the S5 path is bitwise.
+    # With the plumes ON, `edmf_a1`/`edmf_w1` are what put the mass-flux term into the
+    # mixing length (:2830-2840) and the `sm`/`sh` floors under an active plume or a
+    # cloudy layer (:3050-3056, `mym_turbulence!` :1404-1407); those floors are the
+    # Fortran's and they are kept.
+    ed_w = zn; ed_a = zn
+    if MY.edmf == 1
+        ew = MY.ework[Threads.threadid()]
+        _mynn_edmf_update!(MY, S, MN, work, ew, colstart, n, ci, zi, kzi, ust,
+                           flt, fltv, flq, flqv, th_sfc, Psig_shcu)
+        ed_w = ew.edmf_w
+        ed_a = ew.edmf_a
+    end
 
     mym_turbulence!(1, n, MYNN_XLAND_WATER, MY.closure, dz, MY.dx, zw,
                     work.s_u, work.s_v, work.s_thl, work.s_thetav, work.s_sqc,
@@ -496,7 +569,7 @@ update, which is why it is stored rather than recomputed.
                     work.out_tcd, work.out_qcd,
                     work.out_pdk, work.out_pdt, work.out_pdq, work.out_pdc,
                     work.out_qwt, work.out_qshear, work.out_qbuoy, work.out_qdiss,
-                    0, Psig_bl, Psig_shcu, cfb, 2, zn, zn, zn, 0, zn, c, work)
+                    0, Psig_bl, Psig_shcu, cfb, 2, ed_w, ed_a, zn, 0, zn, c, work)
 
     @inbounds begin
         work.out_pdq[1] = work.out_pdq[2]
@@ -525,6 +598,193 @@ update, which is why it is stored rather than recomputed.
         end
     end
     MY.last_update_step[ci] = t
+    return nothing
+end
+
+"""
+    _mynn_edmf_update!(MY, S, MN, work, ew, colstart, n, ci, zi, kzi, ust, flt, fltv,
+                       flq, flqv, th_sfc, Psig_shcu) -> EDMFGate
+
+One `DMP_mf` call and the mapping of its plumes into Scythe's variables (D6, S7). Runs on
+the closure cadence, between `mym_condensation!` and `mym_turbulence!` -- exactly where
+`mynn_column_step_edmf!` (src/mynn_edmf.jl) and `mynn_bl_driver` (:1150-1180) call it.
+
+The argument set is the ONE the parity harness validated (`momentum_opt = 1, tke_opt = 0,
+scalar_opt = 1`, no chemistry, no aerosol, `spp_pbl = 0`), whatever `:mynn_edmf_mom` says:
+that option decides whether the plume momentum reaches the FITTED COLUMNS, not what the
+Fortran is asked to compute, so `dmp_mf!` is never run on a combination test/test_mynn_edmf.jl
+does not cover. `dt` is dead inside `DMP_mf` (it appears only in the unreachable
+`env_subs` block) and is passed as the model timestep for the record.
+
+`vt`, `vq`, `cldfra_bl` and `qc_bl` go in as `mym_condensation!` left them and can come
+back CHANGED: the Chaboureau-Bechtold shallow-cumulus block (:6630-6768) overwrites them
+wherever a plume carries condensate. That is the Fortran's order and it is why the
+write-back to the tile happens after `mym_turbulence!`, not before `dmp_mf!`.
+"""
+@noinline function _mynn_edmf_update!(MY::MYNNState, S, MN::MYNNColumnScratch,
+                                      work::MYNNWork, ew::EDMFWork,
+                                      colstart::Int64, n::Int64, ci::Int64,
+                                      zi::Float64, kzi::Int, ust::Float64,
+                                      flt::Float64, fltv::Float64, flq::Float64,
+                                      flqv::Float64, th_sfc::Float64,
+                                      Psig_shcu::Float64)
+    zn = work.z_n
+    gate = dmp_mf!(1, n, MY.ts, MY.zw, MY.dz, S.p, S.rho_t, 1, 0, 1,
+                   work.s_u, work.s_v, work.s_w, work.s_th, work.s_thl, work.s_thetav,
+                   work.s_tk, work.s_sqw, work.s_sqv, work.s_sqc, MN.qke,
+                   MN.exner, MN.vt, MN.vq, MN.sgm,
+                   ust, flt, fltv, flq, flqv, zi, kzi, MY.dx, MYNN_XLAND_WATER, th_sfc,
+                   ew.edmf_a, ew.edmf_w, ew.edmf_qt, ew.edmf_thl, ew.edmf_ent, ew.edmf_qc,
+                   ew.s_aw, ew.s_awthl, ew.s_awqt, ew.s_awqv, ew.s_awqc,
+                   ew.s_awu, ew.s_awv, ew.s_awqke,
+                   ew.sub_thl, ew.sub_sqv, ew.sub_u, ew.sub_v,
+                   ew.det_thl, ew.det_sqv, ew.det_sqc, ew.det_u, ew.det_v,
+                   MN.qcb, MN.cfb, zn, zn, true, true, Psig_shcu, 0, zn,
+                   MY.constants, ew)
+    _mynn_plume_sums!(MY, S, MN, ew, gate, colstart, n, ci)
+    return gate
+end
+
+"""
+    _mynn_plume_sums!(MY, S, MN, ew, gate, colstart, n, ci)
+
+Map `DMP_mf`'s plume ensemble onto the mish and store the seven sums the every-step
+tendency assembly needs (D6): `Sigma_aw` and the plume-weighted `u, v, e, s_t, q_t, q_v`.
+
+# The interface -> mish mapping
+`DMP_mf` carries the plumes on the box WALLS. Plume property index `k` lives at the wall
+`zw[k+1]`, between mish points `k` and `k+1` (that is what `rhoz[k]`, `exneri[k]` and
+`Pk = (p[k]dz[k+1] + p[k+1]dz[k])/(dz[k+1]+dz[k])` interpolate to, and it is why the
+Fortran's own interface sums are written to `s_aw[k+1]`). Those walls are the MIDPOINTS
+between mish points -- `mc_mynn_state` builds `zw` with `radiation_faces`, which is
+bitwise `mynn_wall_heights(dz)` -- so the map back is the midpoint average: mish point `k`
+is bounded by wall `k` (plume index `k-1`, and the GROUND at `k = 1`, where no plume
+exists) and wall `k+1` (plume index `k`), and each contributes half.
+
+# Why it is done per PLUME and not on the summed interface arrays
+`Sigma_aw phi_up` is linear in the plume properties, so for `u, v, e, q_t, q_v` averaging
+the eight-plume interface sums and averaging per plume are the same number. The ENTROPY is
+not: `s_t` is a nonlinear function of the plume's own `T` and water, so it has to be
+evaluated per plume. It is evaluated AT THE MISH, on the mass-flux-weighted mean of the
+plume's `thl`, `q_t`, `q_c` over the two bounding walls, with the mish `exner` and the mish
+`rho_d` -- NOT wall by wall with a wall-interpolated density. That choice is the whole
+point: `s_t` carries `-R_d ln(rho_d)`, `rho_d` changes by ~1.5 % across a 150 m layer, and
+`R_d * 0.015 = 4.3 J/(kg K)` would swamp the O(1) plume excess `s_t,up - bar s_t` that the
+flux is made of. Evaluating the plume and its environment on the SAME `rho_d` makes the
+excess a statement about the plume's temperature and composition, which is what a mass
+flux transports, and nothing else.
+
+The plume's own saturation adjustment is already in `upthl`/`upqc`: `condensation_edmf`
+wrote them, so `T_up = exner*thl_up + xlvcp*qc_up` is the plume's temperature after its
+condensation and `q_v,up = q_t,up - q_c,up` its vapour. `upqt`/`upqc` are SPECIFIC contents
+(the `sqw` convention); `moist_entropy_total` wants MIXING RATIOS, and the conversion is
+the one `_mynn_column_inputs!` applies to the environment, `q/(1 - q_v)`, so plume and
+environment are converted identically.
+
+# Nothing is recomputed
+`upa`, `upw`, `upthl`, `upqt`, `upqc`, `upu`, `upv`, `upqke` are read straight out of
+`EDMFWork`, where `dmp_mf!` left them, including the heat-flux limiter's column rescale
+(:6483-6501 multiplies `UPA` itself, so `upa*upw` already carries `adjustment` exactly as
+the Fortran's own `s_aw*` do). `Psig_w` comes back in the gate. `rhoz` is NOT used: the
+Fortran's `s_aw*` are a MASS flux and the sums stored here are the kinematic
+`Sigma_aw = sum a_i w_i` [m/s], so the every-step assembly can multiply by the CURRENT
+`rho_t` at the mish rather than by the density the closure saw when the plumes were built.
+
+`nup2 == 0` is the "gate passed but every plume stalled at the first wall" case
+(:6288, harness README item 12) and it means NO flux, whatever `ktop` says -- so the sums
+are zeroed on it exactly as `dmp_mf!` leaves its own `s_aw*` zeroed.
+"""
+@noinline function _mynn_plume_sums!(MY::MYNNState, S, MN::MYNNColumnScratch,
+                                     ew::EDMFWork, gate::EDMFGate,
+                                     colstart::Int64, n::Int64, ci::Int64)
+    s_aw = MY.s_aw; s_st = MY.s_aw_st; s_qw = MY.s_aw_qw; s_qv = MY.s_aw_qv
+    s_u = MY.s_aw_u; s_v = MY.s_aw_v; s_e = MY.s_aw_e
+    fired = gate.nup2 > 0 && gate.ktop > 0
+    if !fired
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            s_aw[j] = 0.0; s_st[j] = 0.0; s_qw[j] = 0.0; s_qv[j] = 0.0
+            s_u[j] = 0.0; s_v[j] = 0.0; s_e[j] = 0.0
+        end
+    end
+    @inbounds begin
+        gate.active && (MY.n_gate_col[ci] += 1)
+        (gate.active && gate.nup2 == 0) && (MY.n_stall_col[ci] += 1)
+    end
+    # `plume_ktop`, `plume_ztop` and `aw_max` are RUNNING maxima over the run, and they
+    # are advanced only on an update that actually produced a flux. Two reasons, both
+    # learned from the first ocean-bubble arm, where 286 of 25605 gate-passing
+    # column-updates made plumes and the census still printed `max Sigma_aw = 0`: a
+    # last-update snapshot reports whatever the final call happened to see, which on a
+    # scheme that fires intermittently is almost always nothing; and `ktop > 0` with
+    # `nup2 == 0` is the STALL, not a plume, so recording it would make the active
+    # fraction count columns that transported nothing.
+    if !fired
+        return nothing
+    end
+    @inbounds begin
+        gate.ktop > MY.plume_ktop[ci] && (MY.plume_ktop[ci] = gate.ktop)
+        gate.ztop > MY.plume_ztop[ci] && (MY.plume_ztop[ci] = gate.ztop)
+    end
+
+    c = MY.constants
+    upa = ew.upa; upw = ew.upw; upthl = ew.upthl; upqt = ew.upqt; upqc = ew.upqc
+    upu = ew.upu; upv = ew.upv; upqke = ew.upqke
+    nup = ew.nup
+    psig = gate.psig_w
+    exner = MN.exner; rho_d = S.rho_d
+    awmax = 0.0
+    @inbounds for i in 1:n
+        j = colstart + i - 1
+        aw_t = 0.0; awu = 0.0; awv = 0.0; awe = 0.0
+        awqw = 0.0; awqv = 0.0; awst = 0.0
+        ex = exner[i]; rd = rho_d[i]
+        for m in 1:nup
+            # The two walls bounding mish point i: wall i (plume index i-1; the GROUND
+            # when i == 1, where no plume lives) and wall i+1 (plume index i).
+            a1 = upa[i,m]*upw[i,m]
+            if i == 1
+                den = a1
+                den > 0.0 || continue
+                inv = 1.0/den
+                thl_up = upthl[i,m]; qt_up = upqt[i,m]; qc_up = upqc[i,m]
+                u_up = upu[i,m]; v_up = upv[i,m]; qk_up = upqke[i,m]
+            else
+                a0 = upa[i-1,m]*upw[i-1,m]
+                den = a0 + a1
+                den > 0.0 || continue
+                inv = 1.0/den
+                thl_up = ((a0*upthl[i-1,m]) + (a1*upthl[i,m]))*inv
+                qt_up  = ((a0*upqt[i-1,m])  + (a1*upqt[i,m]))*inv
+                qc_up  = ((a0*upqc[i-1,m])  + (a1*upqc[i,m]))*inv
+                u_up   = ((a0*upu[i-1,m])   + (a1*upu[i,m]))*inv
+                v_up   = ((a0*upv[i-1,m])   + (a1*upv[i,m]))*inv
+                qk_up  = ((a0*upqke[i-1,m]) + (a1*upqke[i,m]))*inv
+            end
+            aw = 0.5*den*psig
+            # The plume's thermodynamics AT THIS MISH POINT (see the docstring): its
+            # temperature after `condensation_edmf`, and its water as mixing ratios by
+            # the same `q/(1 - q_v)` conversion the environment gets.
+            qv_up = qt_up - qc_up
+            dry = 1.0 - qv_up
+            T_up = (ex*thl_up) + (c.xlvcp*qc_up)
+            s_up = moist_entropy_total(T_up, rd, qv_up/dry, qc_up/dry, 0.0)
+            aw_t += aw
+            awu += aw*u_up
+            awv += aw*v_up
+            awe += aw*(0.5*qk_up)
+            awqw += aw*qt_up
+            awqv += aw*qv_up
+            awst += aw*s_up
+        end
+        s_aw[j] = aw_t; s_st[j] = awst; s_qw[j] = awqw; s_qv[j] = awqv
+        s_u[j] = awu; s_v[j] = awv; s_e[j] = awe
+        aw_t > awmax && (awmax = aw_t)
+    end
+    @inbounds begin
+        awmax > MY.aw_max[ci] && (MY.aw_max[ci] = awmax)
+        MY.n_plume_col[ci] += 1
+    end
     return nothing
 end
 
@@ -605,6 +865,16 @@ books telescope), the four SPECIES water legs (D7: total water `rho_w' = rho_t' 
 the prognostic vapour, cloud and rain -- Louis's total-minus-cloud inference is gone), the
 water ENERGY carry `c_w K_h rho_w,z + c_v K_h rho_v,z` and the TKE transport.
 
+With `:mynn_edmf = 1` the EDMF mass flux is SUBTRACTED from the same columns before they
+are fitted (`_mynn_add_mf!` says why a minus): `u`, `v` (both only under
+`:mynn_edmf_mom`), the heat leg with `rho_d T`, total water and vapour, the cloud leg as
+`M_w - M_v`, the water energy carry with `c_w M_w + c_v M_v`, and the TKE with the plume's
+`e = qke/2`. `w` and rain get none -- the Fortran carries neither a plume `w` flux nor
+precipitation in the plumes. Because the term is inside the column rather than beside it,
+`Ixtransform` and `_mynn_edges` deliver its divergence and its boundary value with no
+further code, and `Psi = u S_u + w S_w + v S_v` picks the plume momentum work up on its
+own.
+
 Under a control-variable transform the condensate legs are built from the perturbation
 DENSITY gradient, because an eddy flux of cloud or rain water is a MASS flux and not a
 flux of `nu`; the slot increment then carries the Jacobian (in `_mynn_apply_column!`).
@@ -618,15 +888,26 @@ lid. Fitting `rho_e` itself and applying the product rule would close the budget
 well; the choice is documented rather than silent because both were available.
 """
 @noinline function _mynn_flux_columns!(mtile::ModelTile, MY::MYNNState, S,
-                                       MN::MYNNColumnScratch,
+                                       MN::MYNNColumnScratch, work::MYNNWork,
                                        geom::MCGeometry, colstart::Int64, n::Int64, z,
                                        uv, wv, vv, rtv, rdv, rcv, rrv, rvv, rho_e,
                                        ctrans_on::Bool, rtrans_on::Bool)
     rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
     Km = MN.Km; Kh = MN.Kh; Ke = MN.Ke
     col = scratch_column(mtile, 8)
+    # The mass-flux legs (D6). `mf` is the whole scheme, `mf_mom` its momentum half
+    # (`:mynn_edmf_mom = false` leaves the plumes carrying heat, water and TKE but no
+    # momentum). There is NO plume flux of `w`: the Fortran carries no `s_aww` -- the
+    # plume's own vertical velocity is internal to the closure, not a transported
+    # property of the resolved flow.
+    mf = MY.edmf == 1
+    mf_mom = mf && MY.edmf_mom
+    s_aw = MY.s_aw
 
     col.uMish .= rho_t .* Km .* uv.f_z
+    if mf_mom
+        _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_u, uv.f, colstart, n)
+    end
     Btransform!(col); Atransform!(col)
     Ixtransform(col, S.VD_u)
     SItransform!(col); copyto!(MN.Su, col.uMish)
@@ -636,7 +917,7 @@ well; the choice is documented rather than silent because both were available.
     Ixtransform(col, S.VD_w)
     SItransform!(col); copyto!(MN.Sw, col.uMish)
 
-    _mynn_v_flux!(S.VD_v, MN.Sv, col, geom, rho_t, Km, vv)
+    _mynn_v_flux!(S.VD_v, MN.Sv, col, geom, rho_t, Km, vv, MY, colstart, n, mf_mom)
 
     # The momentum ENERGY flux `Psi = u S_u + w S_w + v S_v`, fitted as ONE column.
     # This is the one place the discrete shear production departs from the plan's literal
@@ -673,15 +954,35 @@ well; the choice is documented rather than silent because both were available.
     Ixtransform(s_col, s_z)
 
     col.uMish .= rho_d .* Tk .* Kh .* s_z
+    if mf
+        # `M_h = rho_d T Sigma_aw (s_t,up - bar s_t)`, on the FULL entropies: the mass
+        # flux transports a difference, so the reference `s_tbar` the diffusive leg is
+        # built from cancels out of it exactly.
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            col.uMish[i] -= (rho_d[i]*Tk[i]) *
+                            (MY.s_aw_st[j] - (s_aw[j]*s_t[i]))
+        end
+    end
     Btransform!(col); Atransform!(col)
     Ixtransform(col, S.QDOT_V)
     Sh0, Sh1 = _mynn_edges(col)
 
+    # The water legs. `work.s_sqw`/`work.s_sqv` are the SPECIFIC contents this step's
+    # `_mynn_column_inputs!` built (`rho_v/rho_t`, `(rho_v+rho_c)/rho_t`) and the plume
+    # sums are in the same units, so `rho_t * (q_up - bar q)` is the partial-density mass
+    # flux the diffusive `K_h dz(rho')` beside it already is.
     col.uMish .= Kh .* (rtv.f_z .- rdv.f_z)
+    if mf
+        _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_qw, work.s_sqw, colstart, n)
+    end
     Btransform!(col); Atransform!(col)
     Ixtransform(col, MN.div_w)
 
     col.uMish .= Kh .* rvv.f_z
+    if mf
+        _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_qv, work.s_sqv, colstart, n)
+    end
     Btransform!(col); Atransform!(col)
     Ixtransform(col, MN.div_v)
 
@@ -689,6 +990,17 @@ well; the choice is documented rather than silent because both were available.
         col.uMish .= Kh .* S.bl_rho_cp_z
     else
         col.uMish .= Kh .* rcv.f_z
+    end
+    if mf
+        # `M_c = M_w - M_v` exactly: with `q_i = 0` the plume's and the environment's
+        # total water are both vapour + cloud, so the difference IS the cloud leg. Rain
+        # gets none -- the plumes do not carry precipitation.
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            col.uMish[i] -= rho_t[i] *
+                ((MY.s_aw_qw[j] - (s_aw[j]*work.s_sqw[i])) -
+                 (MY.s_aw_qv[j] - (s_aw[j]*work.s_sqv[i])))
+        end
     end
     Btransform!(col); Atransform!(col)
     Ixtransform(col, MN.div_c)
@@ -714,6 +1026,20 @@ well; the choice is documented rather than silent because both were available.
             cv = S.Lv[i] - (Rv*Tk[i])
             wk[i] = Kh[i]*((cw*(rtv.f_z[i] - rdv.f_z[i])) + (cv*rvv.f_z[i]))
         end
+        if mf
+            # D7 with the plumes: `S_Ew = Fit[c_w(K_h rho_w,z + M_w) + c_v(K_h rho_v,z +
+            # M_v)]`. The same two mass-flux terms the water legs took, weighted by the
+            # same energy factors -- so `Qdot_w = dS_Ew - c_w dS_w - c_v dS_v` stays the
+            # product-rule remainder and the D3 column identity is untouched.
+            @inbounds for i in 1:n
+                j = colstart + i - 1
+                cw = (Cpv*Tk[i]) - S.Lv[i] + S.ke[i] + (gravity*z[i])
+                cv = S.Lv[i] - (Rv*Tk[i])
+                tw = rho_t[i]*(MY.s_aw_qw[j] - (s_aw[j]*work.s_sqw[i]))
+                tv = rho_t[i]*(MY.s_aw_qv[j] - (s_aw[j]*work.s_sqv[i]))
+                wk[i] -= (cw*tw) + (cv*tv)
+            end
+        end
         col.uMish .= wk
         Btransform!(col); Atransform!(col)
         Ixtransform(col, MN.div_Ew)
@@ -731,6 +1057,9 @@ well; the choice is documented rather than silent because both were available.
     Ixtransform(s_col, MN.e_z)
 
     col.uMish .= rho_t .* Ke .* MN.e_z
+    if mf
+        _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_e, e_col, colstart, n)
+    end
     Btransform!(col); Atransform!(col)
     Ixtransform(col, MN.div_e)
     Se0, Se1 = _mynn_edges(col)
@@ -885,7 +1214,44 @@ function mynn_census_line(MY::MYNNState)
            "max pblh=$(round(mx(MY.pblh); digits = 1)) m; " *
            "mynn_n_clamp_e=$(sum(MY.n_clamp_col)) " *
            "mynn_n_cap_K=$(sum(MY.n_capK_col)) " *
-           "mynn_n_diffnum=$(sum(MY.n_diffnum_col))"
+           "mynn_n_diffnum=$(sum(MY.n_diffnum_col))" *
+           mynn_plume_census(MY)
+end
+
+"""
+    mynn_plume_census(MY::MYNNState) -> String
+
+The EDMF half of the census (S7), appended to the same line so one parse gets both. Empty
+with `:mynn_edmf = 0`.
+
+`mynn_plume_active_frac` is the fraction of COLUMNS that produced a mass flux at least
+once in the run (`ktop > 0` AND `nup2 > 0` -- the stall is not a plume);
+`mynn_max_mass_flux` is the largest `Sigma_aw = sum a_i w_i` [m/s] and `mynn_max_ztop_m`
+the highest plume top [m] reached anywhere, at any time. All three are running maxima over
+the run rather than a snapshot of its last step, because a scheme that fires
+intermittently is almost never firing at the moment the run happens to end. The three counters are COLUMN-UPDATES and
+they keep the gate and the stall apart, which is the distinction
+tools/mynn_fortran_driver/README.md item 12 exists to make: `mynn_n_gate` passed
+`fltv2 > 0.002 && maxwidth > minwidth && superadiabatic`; `mynn_n_stall` passed it and
+still produced nothing because every one of the eight plumes failed to leave the first
+wall (`nup2 = 0`, :6288); `mynn_n_plume` produced a flux. A run where `n_gate` is large
+and `n_plume` is zero is not a broken scheme -- it is a grid whose first layer is too
+thick for the plumes to accelerate out of, and it is reported as such.
+"""
+function mynn_plume_census(MY::MYNNState)
+    MY.edmf == 1 || return ""
+    mx(v) = isempty(v) ? 0.0 : maximum(v)
+    nact = 0
+    @inbounds for ci in eachindex(MY.plume_ktop)
+        MY.plume_ktop[ci] > 0 && (nact += 1)
+    end
+    frac = isempty(MY.plume_ktop) ? 0.0 : nact/length(MY.plume_ktop)
+    return "; mynn_plume_active_frac=$(round(frac; sigdigits = 4)) " *
+           "mynn_max_mass_flux=$(round(mx(MY.aw_max); sigdigits = 4)) " *
+           "mynn_max_ztop_m=$(round(mx(MY.plume_ztop); digits = 1)) " *
+           "mynn_n_gate=$(sum(MY.n_gate_col)) " *
+           "mynn_n_stall=$(sum(MY.n_stall_col)) " *
+           "mynn_n_plume=$(sum(MY.n_plume_col))"
 end
 
 """
@@ -902,6 +1268,9 @@ function mynn_write_final!(mtile::ModelTile)
     MY.n_clamp_e = sum(MY.n_clamp_col)
     MY.n_cap_K = sum(MY.n_capK_col)
     MY.n_diffnum = sum(MY.n_diffnum_col)
+    MY.n_gate = sum(MY.n_gate_col)
+    MY.n_stall = sum(MY.n_stall_col)
+    MY.n_plume = sum(MY.n_plume_col)
     MY.trace && println(mynn_census_line(MY))
     return nothing
 end

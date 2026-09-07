@@ -212,8 +212,16 @@ using SparseArrays
 
         @test_throws ErrorException V(Dict{Symbol,Any}(:mynn => 1))         # not a Bool
         @test_throws ErrorException V(merge(on, Dict{Symbol,Any}(:mynn_closure => 2.6)))
-        @test_throws ErrorException V(merge(on, Dict{Symbol,Any}(:mynn_edmf => 1)))
+        # `:mynn_edmf = 1` is the S7 mass-flux arm and is now ACCEPTED; 2 is not a value,
+        # and 1 on a column too short for `DMP_mf`'s kts+1 : kte-1 integration is refused
+        # at setup rather than inside the first plume loop.
+        @test V(merge(on, Dict{Symbol,Any}(:mynn_edmf => 1))).edmf == 1
+        @test V(merge(on, Dict{Symbol,Any}(:mynn_edmf => 1))).edmf_mom
+        @test V(merge(on, Dict{Symbol,Any}(:mynn_edmf => 1,
+                                           :mynn_edmf_mom => false))).edmf_mom == false
         @test_throws ErrorException V(merge(on, Dict{Symbol,Any}(:mynn_edmf => 2)))
+        @test_throws ErrorException V(merge(on, Dict{Symbol,Any}(:mynn_edmf => 1));
+                                      kDim = 3)
         @test_throws ErrorException V(merge(on, Dict{Symbol,Any}(:mynn_init => :spinup)))
         @test_throws ErrorException V(merge(on, Dict{Symbol,Any}(:mynn_fidelity => :fast)))
         @test_throws ErrorException V(merge(on,

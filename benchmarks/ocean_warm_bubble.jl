@@ -17,6 +17,8 @@
 #                                 is the MYNN-EDMF arm: the prognostic rho_e TKE slot plus
 #                                 the ED closure applied in Scythe's variables, with the
 #                                 SAME surface layer the Louis control uses)
+#   SCYTHE_OWB_MYNN_EDMF=1        turn the EDMF mass-flux plumes on (options[:mynn_edmf]);
+#                                 arm suffix `_edmf`. Needs SCYTHE_OWB_BL=mynn.
 #   SCYTHE_OWB_MYNN_INTERVAL=20   MYNN closure cadence [s] (options[:mynn_interval]); the
 #                                 diffusivities still track the TKE every step
 #   SCYTHE_OWB_MYNN_KMAX=Inf      counted safety cap on K_m/K_h/K_e [m^2/s]
@@ -129,6 +131,10 @@ function owb_model(opts::BenchmarkOptions)
         options[:surface_fluxes] = true
         haskey(ENV, "SCYTHE_OWB_MYNN_INTERVAL") &&
             (options[:mynn_interval] = parse(Float64, ENV["SCYTHE_OWB_MYNN_INTERVAL"]))
+        # The EDMF mass-flux plumes (S7). No key when unset, so the S5 eddy-diffusivity
+        # arm stays bitwise; `_edmf` when set, so the two never look up the same targets.
+        (haskey(ENV, "SCYTHE_OWB_MYNN_EDMF") && envflag("SCYTHE_OWB_MYNN_EDMF")) &&
+            (options[:mynn_edmf] = 1)
         haskey(ENV, "SCYTHE_OWB_MYNN_KMAX") &&
             (physical_params[:mynn_K_max] = parse(Float64, ENV["SCYTHE_OWB_MYNN_KMAX"]))
     else
@@ -451,6 +457,19 @@ function owb_mynn_diagnostics(model, ref, kDim)
     counters = Dict{String,Float64}("mynn_n_diffnum" => NaN,
                                     "mynn_n_clamp_e" => NaN,
                                     "mynn_n_cap_K" => NaN)
+    # The EDMF plume census (S7), on the SAME `mynn census:` line and parsed the same way,
+    # but as floats: a fraction, a mass flux [m/s] and a height [m]. Present only with
+    # `options[:mynn_edmf] = 1`, so they stay NaN -- reported as missing, never as zero --
+    # on the eddy-diffusivity arm.
+    if get(model.options, :mynn_edmf, 0) == 1
+        counters["mynn_n_gate"] = NaN
+        counters["mynn_n_stall"] = NaN
+        counters["mynn_n_plume"] = NaN
+    end
+    floats = get(model.options, :mynn_edmf, 0) == 1 ?
+             Dict{String,Float64}("mynn_plume_active_frac" => NaN,
+                                  "mynn_max_mass_flux" => NaN,
+                                  "mynn_max_ztop_m" => NaN) : Dict{String,Float64}()
     logfile = joinpath(model.output_dir, "scythe_out.log")
     if isfile(logfile)
         for line in eachline(logfile)
@@ -459,8 +478,13 @@ function owb_mynn_diagnostics(model, ref, kDim)
                 m = match(Regex("$(key)=([0-9]+)"), line)
                 m === nothing || (counters[key] = parse(Float64, m.captures[1]))
             end
+            for key in keys(floats)
+                m = match(Regex("$(key)=([0-9.eE+-]+)"), line)
+                m === nothing || (floats[key] = parse(Float64, m.captures[1]))
+            end
         end
     end
+    counters = merge(counters, floats)
     # `Dict{String,Float64}`, not `Dict{String,Any}`: `owb_diagnostics` merges these
     # rows into the harness's target dictionary, and `check_targets` dispatches on the
     # concrete element type.
@@ -513,6 +537,7 @@ arm = Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""
 addarm(a, s) = isempty(s) ? a : (isempty(a) ? s : "$(a)_$(s)")
 bl_arm = get(ENV, "SCYTHE_OWB_BL", "louis")
 bl_arm == "louis" || (arm = addarm(arm, bl_arm))
+get(model.options, :mynn_edmf, 0) == 1 && (arm = addarm(arm, "edmf"))
 # A non-default SURFACE choice gets its own suffix, so the committed komori control and a
 # gfdl_v7/charnock or stability arm never look up the same expected values.
 arm = addarm(arm, get(model.options, :sfc_z0, :komori) === :komori ? "" :
