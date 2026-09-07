@@ -200,6 +200,17 @@ function warn_timestep_stability(grid_params, ts::Float64;
         u_max = get(options, :u_max, 90.0)
         w_max = get(options, :w_max, 25.0)
         state_deviation = get(options, :state_deviation, 0.25)
+        # Boundary-layer EXPLICIT VERTICAL DIFFUSION reference coefficient [m^2/s].
+        # Both the Louis and the MYNN-EDMF closures apply their vertical mixing
+        # explicitly, so `D = K ts / dz^2` is a real stability limit of the configuration
+        # and not a detail of one scheme -- and the offline MYNN survey
+        # (model_tests/MYNN_REPLAY_README.md) measured K_e up to ~1.1e4 m^2/s on a
+        # convective column at 250 m spacing, which is where it binds. 3000 m^2/s is a
+        # representative CONVECTIVE-BOUNDARY-LAYER value, stated so the margin below can
+        # be read as "how much K this grid and timestep can carry"; override it with
+        # options[:bl_K_ref] to ask about a different one. Reported at every mc startup,
+        # with or without a boundary layer, because it is a property of the grid (D12).
+        bl_K_ref = get(options, :bl_K_ref, 3000.0)
         # The exact (unsplit) 2-D solve shares the horizontal-SI advisory
         # envelope (its measured envelope is set by Stage 2's sweeps).
         hsi = get(options, :horizontal_semiimplicit, false) === true ||
@@ -234,6 +245,12 @@ function warn_timestep_stability(grid_params, ts::Float64;
              courant = u_max * ts / dx_min, target = 0.5),
             (name = "w advection (w_max=$(w_max) m/s)",
              courant = w_max * ts / dz_min, target = 0.5),
+            # Explicit vertical diffusion on the MISH spacing. The advisory target is the
+            # classical explicit bound 0.5; a margin below 1 means the configuration is
+            # unstable at the stated K, which is a resolution+timestep statement, not a
+            # scheme one.
+            (name = "BL vertical diffusion (K=$(bl_K_ref) m^2/s)",
+             courant = bl_K_ref * ts / (dz_min * dz_min), target = 0.5),
         ]
         margins = [l.target / l.courant for l in limits]
         binding = argmin(margins)

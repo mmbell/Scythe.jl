@@ -257,6 +257,14 @@ const MC_SCRATCH_SLOTS = (
     # `mc_driver!` only under a condensate transform (it is `rcv.f_z` otherwise). It reuses the
     # column that was the retired diagnosed-ρ_v gradient.
     :bl_s_z, :bl_rho_cp_z,
+    # The MYNN-EDMF boundary layer's per-column columns are NOT here. They were, and the
+    # twenty-nine extra names widened this NamedTuple's type far enough that LLVM tipped
+    # over a register-pressure cliff compiling `mc_driver!`'s callees — the `@turbo`
+    # broadcast in the vertical-diffusion block below stopped compiling in seconds and
+    # started spending unbounded time in the MachineScheduler, wedging the test suite.
+    # They live in `MYNNColumnScratch` (src/mynn_state.jl), one per thread beside
+    # `MYNNWork`, and reach `mc_mynn_bl!` as a single argument. Nothing outside that file
+    # reads them, so nothing here needs their names.
     # ── semiimplicit_adjustment_p (si_ prefix) ──
     # Deliberately NOT sharing the names above. The two functions' temporaries are not live at
     # the same time today, so sharing would work — but it would be an invisible coupling, and
@@ -8595,41 +8603,22 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # (an unconditional `+ 0.0` term could flip -0.0 tendencies).
     mc_sponge!(expdot, geom, colstart, alpha, z_damp, z, u, w, vv, rho_t, ke)
 
-    # ── Louis boundary layer (explicit vertical mixing + surface drag) ──
+    # ── Boundary layer (explicit vertical mixing + surface drag) ──
     # Added AFTER every slot is written: all contributions are additive (the Q_ss
-    # saturation chain rule is linear), so the lines above stay frozen and
-    # louis_bl = false is bit-identical. See mc_boundary_layer.jl.
-    if louis_bl
-        if ctrans_on
-            # The BL's cloud eddy flux is a MASS flux, so it has to be built from the
-            # perturbation DENSITY gradient, not from the slot's. `rho_c_z` (line ~2703) is the
-            # total ∂z ρ_c = ∂z ν / J, and this is its first consumer — it was written for one.
-            #
-            # Staged HERE and not inside `mc_louis_bl!` because `rho_cbar_z` is a SubArray, and
-            # handing it to a @noinline callee is an escape that boxes once per column; the
-            # zero-allocation gate in test/test_allocations.jl exists for exactly that.
-            #
-            # NOT used on the `:none` path: there `rho_c_z` is `rho_cp_z + rho_cbar_z` and
-            # subtracting `rho_cbar_z` back off is not bitwise `rho_cp_z`. The callee keeps
-            # reading `rcv.f_z` directly when the transform is off, which is.
-            @. S.bl_rho_cp_z = rho_c_z - rho_cbar_z
-        end
-        mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
-                     expdot, l_inf, sfc, ctrans_on)
-    end
-
-    # ── MYNN-EDMF boundary layer — THE S5 PLUG-IN POINT ────────────────────────
-    # Deliberately empty at S4. The closure (`mc_mynn_bl!`, src/mc_mynn_bl.jl) folds its
-    # momentum, heat, water and TKE tendencies in HERE, after every slot is written, for
-    # exactly the reason the Louis call sits where it does: all contributions are additive,
-    # so the lines above stay frozen. `rho_e` is transported and nothing else at this stage.
+    # saturation chain rule is linear), so the lines above stay frozen and a run with
+    # neither closure is bit-identical. See mc_boundary_layer.jl / mc_mynn_bl.jl.
     #
-    # The gate is `mynn_on` (the slot's existence), never `+ 0.0` on the off path: `x + 0.0`
-    # is not the identity for `x = -0.0`, which is what makes an absent-option run BITWISE
-    # the code that had no MYNN.
-    if mynn_on
-        # S5: mc_mynn_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
-        #                 rev, expdot, sfc, t)
+    # ONE call site for BOTH closures, and that is a codegen constraint, not a style
+    # choice. `mc_bl_apply!` (src/mc_mynn_bl.jl) holds the shared perturbation-density
+    # staging and dispatches; putting the MYNN call here as a SECOND @noinline call
+    # beside the Louis one is what wedged the test suite — two calls' worth of live
+    # ranges across the `@turbo` vertical-diffusion block below pushed LLVM's
+    # MachineScheduler over a register-pressure cliff and its compile time became
+    # unbounded. See `mc_bl_apply!` for the measurement.
+    if louis_bl || mynn_on
+        mc_bl_apply!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
+                     rrv, rvv, rev, expdot, l_inf, sfc, t, ctrans_on, rtrans_on,
+                     louis_bl, mynn_on)
     end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──

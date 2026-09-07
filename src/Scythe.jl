@@ -125,6 +125,12 @@ include("mc_geometry.jl")
 # now lives there too — the bulk air-sea formulas are in ONE file, not two.
 include("mc_surface_layer.jl")
 include("mc_boundary_layer.jl")
+# The MYNN-EDMF APPLY (S5). After mc_boundary_layer.jl because it reuses that
+# file's tangential-wind trait accessors and its surface-delivery convention, and
+# after mynn_closure.jl/mynn_state.jl because it calls the closure and reads the
+# held state. It names ModelTile, the scratch pool and the geometry traits, which is
+# exactly why it is NOT one of the three leaf mynn_* files (D11).
+include("mc_mynn_bl.jl")
 include("moist_compressible.jl")
 # The microphysics -> cloud-optics conversion (Stage S3a) needs `_ice_effective`
 # (moist_compressible.jl) and ISHMAEL_NU (ishmael.jl), and radiation.jl's driver calls

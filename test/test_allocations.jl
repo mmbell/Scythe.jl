@@ -313,6 +313,51 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations Scythe.moist_compressible_axisym(mtile_bc, 1, kDim_bc, 2)) == 0
     end
 
+    @testset "per-column allocations stay zero with the MYNN-EDMF closure LIVE" begin
+        # The S5 apply path: the closure calls (get_pblh/scale_aware/mym_condensation/
+        # mym_turbulence, each of which takes ~30 Vector arguments), the ~10 flux-column
+        # transforms with their boundary evaluations, and the surface layer crossing the
+        # @noinline boundary of `mc_mynn_bl!` once per column. `SurfaceLayerParams` carries
+        # an interned Symbol so it is not isbits, which is exactly the escape this gate
+        # exists to catch (the same argument the Louis-BL arm below makes).
+        #
+        # `rho_e` is seeded POSITIVE so the taper branch does not fire and the every-step
+        # path -- the one that runs for the whole of a real integration -- is what is
+        # measured.
+        for (eqs, driver) in (("moist_compressible_XZ", Scythe.moist_compressible_XZ),
+                              ("moist_compressible_axisym",
+                               Scythe.moist_compressible_axisym))
+            mtile_my, kDim_my = build_mc_tile(equation_set = eqs,
+                extra_params = Dict(:f => 5.0e-5, :Cd => -1.0, :Ck => 1.0e-3,
+                                    :SST => 301.15, :U_min => 1.0),
+                extra_options = Dict{Symbol,Any}(:mynn => true, :mynn_trace => false,
+                                                 :surface_fluxes => true))
+            re_i = mtile_my.mc_slots.rho_e
+            mtile_my.tile.physical[:, re_i, 1] .= 0.5
+            spectralTransform!(mtile_my.tile)
+            gridTransform!(mtile_my.tile)
+            driver(mtile_my, 1, kDim_my, 2)                        # compile
+            @test (@allocations driver(mtile_my, 1, kDim_my, 3)) == 0
+            @test maximum(mtile_my.mynn.K_h) >= 0.0
+        end
+
+        # ...and with the water control-variable transforms on, where the cloud leg is
+        # built from the staged perturbation DENSITY gradient and the rain leg from
+        # nu_r,z/J: two more SubArray-shaped escapes that must not box.
+        mtile_ct, kDim_ct = build_mc_tile(equation_set = "moist_compressible_axisym",
+            extra_params = Dict(:f => 5.0e-5, :Cd => -1.0, :Ck => 1.0e-3,
+                                :SST => 301.15, :U_min => 1.0),
+            extra_options = Dict{Symbol,Any}(:mynn => true, :mynn_trace => false,
+                                             :surface_fluxes => true,
+                                             :condensate_transform => :bhyp,
+                                             :rain_transform => :bhyp))
+        mtile_ct.tile.physical[:, mtile_ct.mc_slots.rho_e, 1] .= 0.5
+        spectralTransform!(mtile_ct.tile)
+        gridTransform!(mtile_ct.tile)
+        Scythe.moist_compressible_axisym(mtile_ct, 1, kDim_ct, 2)  # compile
+        @test (@allocations Scythe.moist_compressible_axisym(mtile_ct, 1, kDim_ct, 3)) == 0
+    end
+
     @testset "per-column allocations stay zero with ice microphysics" begin
         # Twelve more appended slots, each with its own views, its own control-variable
         # recovery, its own scratch columns and its own sedimentation flux transform — the

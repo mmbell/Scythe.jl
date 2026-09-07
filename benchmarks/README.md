@@ -46,7 +46,7 @@ bitwise identical); `LOAD=8` adds CPU burners to reproduce a loaded machine.
 | `bf02_dry` | `Euler_test` | 20 × 10 km, K=0 | 100 m / 200 m | Bryan & Fritsch (2002) Fig. 1, `reference/bryan_fritsch_mwr2002.pdf` |
 | `bf02_moist` | `BF02_test` | 20 × 10 km, K=0, θ_e=320 K, r_t=0.020 | 100 m / 200 m | Bryan & Fritsch (2002) Fig. 3 |
 | `o01_rainfall` | `moist_compressible_XZ` (mc only) | 150 × 20 km, warm rain, inviscid (spline filter only), humidified Dunion sounding | 500 m / 2 km (Δz 500 m both) | Ooyama (2001) Fig. 6 magnitudes, `reference/ooyama_jas2001.pdf` |
-| `ocean_warm_bubble` | `moist_compressible_XZ` (mc only) | 300 × 25 km, 2 h, warm bubble over a fixed-SST ocean (302.65 K), Louis BL + bulk surface fluxes + Komori drag ON; `SCYTHE_OWB_*` knobs for ice / radiation / BL arms | 3 km × 300 m / 6 km × 500 m (the TC nests' spacings) | none — control-run windows only (MYNN-EDMF plan S1; RCE precursor) |
+| `ocean_warm_bubble` | `moist_compressible_XZ` (mc only) | 300 × 25 km, 2 h, warm bubble over a fixed-SST ocean (302.65 K), Louis BL + bulk surface fluxes + Komori drag ON, or the MYNN-EDMF arm (`SCYTHE_OWB_BL=mynn`, prognostic `rho_e` TKE, `_MYNN_INTERVAL` / `_MYNN_KMAX`); `SCYTHE_OWB_*` knobs for ice / radiation / BL arms | 3 km × 300 m / 6 km × 500 m (the TC nests' spacings) | none — control-run windows only (MYNN-EDMF plan S1; RCE precursor) |
 
 Published target values and tolerances live in
 `reference_data/expected_values.jl` with their sources. Full-mode tolerances

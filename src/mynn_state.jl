@@ -34,6 +34,94 @@
 #     where `retrieve_exchange_coeffs!` leaves them.
 
 """
+    MYNNColumnScratch
+
+Thread `t`'s per-column working columns for the MYNN apply (src/mc_mynn_bl.jl): the
+closure inputs, the per-column staging of the held closure state, the diffusivities, the
+fitted fluxes and their divergences.
+
+WHY THESE ARE NOT IN `MC_SCRATCH_SLOTS`. Every other per-column temporary in the
+moist-compressible set lives in that `NamedTuple`, and these started there too. Appending
+twenty-nine names to it widens the NamedTuple TYPE that `mc_driver!` and everything it
+calls specialise on, and `mc_driver!` is large enough that the extra fields pushed LLVM
+over a register-pressure cliff: the `@turbo` broadcast in the vertical-diffusion block
+stopped compiling in seconds and started spending unbounded time in the MachineScheduler's
+register-pressure tracking, wedging the test suite. Nothing about these columns needs to be
+in the shared pool -- they are read and written only inside `mc_mynn_bl!` and its
+`@noinline` helpers -- so they are a concrete struct of their own, held per thread in
+[`MYNNState`](@ref) beside [`MYNNWork`](@ref) and passed down as ONE argument.
+
+The naming drops the `mn_` prefix the slots carried (`S.mn_exner` is `MN.exner`): the
+prefix existed to keep them apart from the other ~400 names in the shared pool, and there
+is nothing here to collide with.
+
+`exner` and `q`/`qke` are the closure INPUTS built from the retrieved state each step (the
+Exner function, `q = sqrt(2e)` from the `rho_e` slot and the `[qkemin, 150]`-clamped copy
+the closure integrates against); `el`..`qsq` are the per-column staging of the HELD closure
+state, loaded out of `MYNNState` on an update step and written back (a per-thread scratch
+column is shared between columns, so it cannot be assumed to still hold this column's
+values); `Km`..`Ke` the diffusivities; `Su`..`Sv` the FITTED momentum fluxes, which the
+discrete shear production multiplies (the value, not the raw product -- D3); `div_*` the
+fitted flux divergences of the species/energy/TKE legs; `e`/`e_z` the mass-specific TKE and
+its gradient; `wk` one general work column.
+
+Every field is a `Vector{Float64}` of length `kDim`, so the struct is concrete and a field
+load inside a `@noinline` helper is a plain pointer load.
+"""
+struct MYNNColumnScratch
+    n::Int
+    # -- closure inputs --------------------------------------------------------
+    exner::Vector{Float64}
+    q::Vector{Float64}
+    qke::Vector{Float64}
+    # -- per-column staging of the held closure state --------------------------
+    el::Vector{Float64}
+    sm::Vector{Float64}
+    sh::Vector{Float64}
+    vt::Vector{Float64}
+    vq::Vector{Float64}
+    sgm::Vector{Float64}
+    cfb::Vector{Float64}
+    qcb::Vector{Float64}
+    qib::Vector{Float64}
+    qsq::Vector{Float64}
+    # -- diffusivities ---------------------------------------------------------
+    Km::Vector{Float64}
+    Kh::Vector{Float64}
+    Ke::Vector{Float64}
+    # -- fitted momentum fluxes ------------------------------------------------
+    Su::Vector{Float64}
+    Sw::Vector{Float64}
+    Sv::Vector{Float64}
+    # -- fitted flux divergences -----------------------------------------------
+    div_w::Vector{Float64}
+    div_v::Vector{Float64}
+    div_c::Vector{Float64}
+    div_r::Vector{Float64}
+    div_e::Vector{Float64}
+    div_Ew::Vector{Float64}
+    div_Pm::Vector{Float64}
+    # -- TKE and one general work column ---------------------------------------
+    e::Vector{Float64}
+    e_z::Vector{Float64}
+    wk::Vector{Float64}
+end
+
+"""
+    MYNNColumnScratch(n)
+
+`n` zeroed columns of length `n`, one field at a time, the `MYNNWork(n)` pattern.
+"""
+function MYNNColumnScratch(n::Integer)
+    n = Int(n)
+    args = Any[n]
+    for _ in 2:fieldcount(MYNNColumnScratch)
+        push!(args, zeros(Float64, n))
+    end
+    return MYNNColumnScratch(args...)
+end
+
+"""
     MYNNState
 
 Everything one tile needs to run and hold the MYNN-EDMF boundary layer.
@@ -63,16 +151,31 @@ sums `DMP_mf` will fill (the Fortran's `s_aw`, `s_awthl`, `s_awqt`, `s_awqv`, `s
 else, so the S5 tendency assembly can read them unconditionally and the S7 plume stage is
 a fill rather than a re-plumb. Nothing writes them before S7.
 
-# Per-column diagnostics
-`pblh` [m], `kpbl` (the layer index of the PBL top), `ust` [m/s], `rmol` (1/L), and
-`last_update_step`, all of length `ncol`. `last_update_step` starts at `typemin(Int)` for
+# Column geometry (built once; the mish is the same for every column of a tile)
+`z_lay` (mish heights), `dz` (MYNN layer thickness from midpoint faces), `zw` (wall
+heights, `kDim+1` long), `w_mish` (the Gauss quadrature weight of each mish point, which
+is what the D3 column identity is summed with), `dx` (the patch's own horizontal cell
+width, for `SCALE_AWARE`), `z_top`, `dz_cell`, `dz_min` and this patch's `ts`. Nothing
+here is a hardcoded number: the census limits and the gray-zone taper are computed for
+the grid and timestep the run actually has (D12).
+
+# Per-column diagnostics and census
+`pblh` [m], `kpbl` (the layer index of the PBL top), `ust` [m/s], `rmol` (1/L),
+`last_update_step`, the D3 energy identity's right-hand side `bdry_E` [W/m^2], the two
+explicit-diffusion numbers `D_gal`/`D_mish`, the TKE stiffness `ts_tau`, the column
+maxima `K_m_max`/`K_h_max`, the two shear productions `Ps_disc`/`Ps_mynn` [W/m^2] and the
+three per-column counters `n_clamp_col`/`n_capK_col`/`n_diffnum_col`. All of length
+`ncol`. The counters are per COLUMN rather than per tile so the reduction is exact under
+`@threads :static`: each column is written by the one thread that owns it, so nothing
+races and no increment is lost; `mynn_write_final!` sums them into the tile scalars. `last_update_step` starts at `typemin(Int)` for
 the same reason `RadiationState.last_call_step` does: "no call has happened yet" has to be
 distinguishable from "called at step 0", so the first step forces an update whatever the
-cadence is.
+cadence is (and it is what the `:mynn_init = :taper` cold start keys off).
 
 # Work and constants
 `work[t]` is thread `t`'s [`MYNNWork`](@ref) -- the preallocated scratch that keeps the
-closure routines allocation-free -- indexed by `threadid()` under the same
+closure routines allocation-free -- and `colscratch[t]` its [`MYNNColumnScratch`](@ref),
+the apply half's own per-column columns; both are indexed by `threadid()` under the same
 `@threads :static` ownership rule `scratch_columns` uses. `constants` is the host constant
 set, built once from Springsteel.
 
@@ -110,6 +213,14 @@ mutable struct MYNNState
     const qi_bl::Vector{Float64}
     const K_m::Vector{Float64}
     const K_h::Vector{Float64}
+    # `gh` is `mym_level2!`'s buoyancy-gradient function G_H, held so the EVERY-STEP
+    # buoyancy exchange rho*P_b = rho_t K_h G_H can be formed between closure updates;
+    # `qsq` is the Level-2 water-variance diagnostic the NEXT `mym_condensation!` reads
+    # (it is the only one of tsq/qsq/cov that CASE 2 actually uses -- see that routine's
+    # docstring). Both are gridpoint-indexed like the fields above.
+    const gh::Vector{Float64}
+    const gm::Vector{Float64}
+    const qsq::Vector{Float64}
     # ── mass-flux plume sums (S7); zero at this stage ──
     const s_aw::Vector{Float64}
     const s_aw_st::Vector{Float64}
@@ -124,8 +235,41 @@ mutable struct MYNNState
     const ust::Vector{Float64}
     const rmol::Vector{Float64}
     const last_update_step::Vector{Int}
+    # ── column geometry, built ONCE from the tile's mish (identical for every column) ──
+    const z_lay::Vector{Float64}     # mish heights [m]
+    const dz::Vector{Float64}        # MYNN layer thickness from midpoint faces [m]
+    const zw::Vector{Float64}        # wall heights, length kDim+1 [m]
+    const w_mish::Vector{Float64}    # Gauss quadrature weight of each mish point [m]
+    const dx::Float64                # horizontal cell width for SCALE_AWARE [m]
+    const z_top::Float64             # domain lid [m]
+    const dz_cell::Float64           # vertical B-spline cell width [m]
+    const dz_min::Float64            # smallest actual mish spacing [m]
+    const ts::Float64                # this patch's model timestep [s]
+    # ── PER-COLUMN census (D12) and the column energy identity (D3) ──
+    # Written by the ONE thread that owns the column, so no atomics and no lost counts;
+    # the tile totals below are reductions over these, taken when they are printed.
+    const bdry_E::Vector{Float64}    # boundary + surface energy input [W/m^2]
+    const D_gal::Vector{Float64}     # K_e ts 10 / dz_cell^2
+    const D_mish::Vector{Float64}    # K_e ts / dz_min^2
+    const ts_tau::Vector{Float64}    # ts / tau_eps, tau_eps = B1 l /(2q)
+    const K_m_max::Vector{Float64}
+    const K_h_max::Vector{Float64}
+    # The two shear productions, column-integrated [W/m^2]: `Ps_disc` is what the TKE
+    # slot actually received (`u_z S_u + w_z S_w + v_z S_v` on the FITTED fluxes, the
+    # form the D3 identity needs) and `Ps_mynn` the closure's own `rho_t K_m gm`. Their
+    # ratio is the "design A leaves <pdk - rho P_s> unclosed" residual, measured rather
+    # than argued.
+    const Ps_disc::Vector{Float64}
+    const Ps_mynn::Vector{Float64}
+    const n_clamp_col::Vector{Int}
+    const n_capK_col::Vector{Int}
+    const n_diffnum_col::Vector{Int}
     # ── per-thread scratch and the host constants ──
     const work::Vector{MYNNWork}
+    # Thread `t`'s per-column apply scratch. Held HERE rather than appended to
+    # `MC_SCRATCH_SLOTS` — see [`MYNNColumnScratch`](@ref) for the register-pressure
+    # reason. Empty on the MYNN-off value, like `work`.
+    const colscratch::Vector{MYNNColumnScratch}
     const constants::MYNNConstants
     # ── clamp/cap counters (never silent) ──
     n_clamp_e::Int
@@ -166,6 +310,9 @@ function MYNNState(;
         qi_bl::Vector{Float64} = Float64[],
         K_m::Vector{Float64} = Float64[],
         K_h::Vector{Float64} = Float64[],
+        gh::Vector{Float64} = Float64[],
+        gm::Vector{Float64} = Float64[],
+        qsq::Vector{Float64} = Float64[],
         s_aw::Vector{Float64} = Float64[],
         s_aw_st::Vector{Float64} = Float64[],
         s_aw_qw::Vector{Float64} = Float64[],
@@ -178,7 +325,28 @@ function MYNNState(;
         ust::Vector{Float64} = Float64[],
         rmol::Vector{Float64} = Float64[],
         last_update_step::Vector{Int} = Int[],
+        z_lay::Vector{Float64} = Float64[],
+        dz::Vector{Float64} = Float64[],
+        zw::Vector{Float64} = Float64[],
+        w_mish::Vector{Float64} = Float64[],
+        dx::Float64 = 0.0,
+        z_top::Float64 = 0.0,
+        dz_cell::Float64 = 0.0,
+        dz_min::Float64 = 0.0,
+        ts::Float64 = 0.0,
+        bdry_E::Vector{Float64} = Float64[],
+        D_gal::Vector{Float64} = Float64[],
+        D_mish::Vector{Float64} = Float64[],
+        ts_tau::Vector{Float64} = Float64[],
+        K_m_max::Vector{Float64} = Float64[],
+        Ps_disc::Vector{Float64} = Float64[],
+        Ps_mynn::Vector{Float64} = Float64[],
+        K_h_max::Vector{Float64} = Float64[],
+        n_clamp_col::Vector{Int} = Int[],
+        n_capK_col::Vector{Int} = Int[],
+        n_diffnum_col::Vector{Int} = Int[],
         work::Vector{MYNNWork} = MYNNWork[],
+        colscratch::Vector{MYNNColumnScratch} = MYNNColumnScratch[],
         constants::MYNNConstants = MYNNConstants(),
         n_clamp_e::Int = 0,
         n_cap_K::Int = 0,
@@ -186,9 +354,13 @@ function MYNNState(;
     return MYNNState(active, closure, edmf, scale_aware, init_mode, fidelity, water_carry,
                      interval_steps, ncol, kDim, K_max, output, trace, check_values,
                      el, sm, sh, vt, vq, sgm, cldfra_bl, qc_bl, qi_bl, K_m, K_h,
+                     gh, gm, qsq,
                      s_aw, s_aw_st, s_aw_qw, s_aw_qv, s_aw_u, s_aw_v, s_aw_e,
                      pblh, kpbl, ust, rmol, last_update_step,
-                     work, constants, n_clamp_e, n_cap_K, n_diffnum)
+                     z_lay, dz, zw, w_mish, dx, z_top, dz_cell, dz_min, ts,
+                     bdry_E, D_gal, D_mish, ts_tau, K_m_max, K_h_max, Ps_disc, Ps_mynn,
+                     n_clamp_col, n_capK_col, n_diffnum_col,
+                     work, colscratch, constants, n_clamp_e, n_cap_K, n_diffnum)
 end
 
 """
@@ -341,8 +513,7 @@ function mynn_setup_line(model::ModelParameters, cfg, ncol::Int, kDim::Int)
             "scale_aware=$(cfg.scale_aware) init=:$(cfg.init_mode) " *
             "water_carry=:$(cfg.water_carry) fidelity=:$(cfg.fidelity) " *
             "interval=$(interval_s) s (= $(cfg.interval_steps) steps at ts=$(model.ts) s) " *
-            "K_max=$(cfg.K_max) m^2/s columns=$(ncol) layers=$(kDim); " *
-            "TRANSPORT ONLY at this stage — the closure tendencies arrive at S5")
+            "K_max=$(cfg.K_max) m^2/s columns=$(ncol) layers=$(kDim)")
     return nothing
 end
 
@@ -383,6 +554,47 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
     zpt() = zeros(Float64, npoints)
     zcol() = zeros(Float64, ncol)
 
+    # ── Column geometry, built ONCE ───────────────────────────────────────────────
+    # One column of the vertical mish (`tilepoints[:, end]` is z on every
+    # moist-compressible geometry -- the expression `mc_radiation_state` uses), and the
+    # MYNN layer thickness from faces at the MIDPOINTS between mish points, plus the
+    # ground and the lid. That is the radiation convention (`radiation_faces`) and the
+    # one `tools/mynn_dump_columns.jl` dumped the Fortran reference columns with, so the
+    # closure sees exactly the `dz`/`zw` the parity harness validated. `sum(dz) == z_top`
+    # by construction, and `zw` is bitwise `mynn_wall_heights(dz)`.
+    z_lay = collect(Float64, tilepoints[1:kDim, end])
+    z_bottom = Float64(model.grid_params.kMin)
+    z_top = Float64(model.grid_params.kMax)
+    # The closure's heights are ABOVE GROUND (`zw[1] == 0` is what `mynn_wall_heights`,
+    # the mixing-length wall term and the TKE taper all assume) while the mish carries
+    # absolute z. Every moist-compressible configuration puts the ground at z = 0, so
+    # rather than carry two height systems this refuses the one case where they differ.
+    z_bottom == 0.0 || error(
+        "options[:mynn] needs the ground at z = 0 (grid_params.kMin = $(z_bottom)); the " *
+        "closure's wall heights, mixing length and TKE taper are all above-ground-level")
+    zw, _ = radiation_faces(z_lay, z_bottom, z_top)
+    dz = diff(zw)
+    # The mish points are Gauss quadrature nodes of the vertical B-spline cells, so the
+    # column integral of any fitted field is the weighted sum with these weights -- what
+    # the D3 energy identity is checked against, and what `benchmarks/common/diagnostics.jl`
+    # `gauss_cell_weights` builds for the same purpose.
+    dz_cell = (z_top - z_bottom) / model.grid_params.num_cells_k
+    qw_cell = Springsteel.CubicBSpline._quadrature_rule(model.grid_params.mubar,
+                                                        model.grid_params.quadrature)[2]
+    w_mish = repeat(qw_cell .* dz_cell, outer = model.grid_params.num_cells_k)
+    length(w_mish) == kDim || error(
+        "mc_mynn_state: the vertical mish has $(kDim) points but " *
+        "$(model.grid_params.num_cells_k) cells x mubar = $(length(w_mish)); the MYNN " *
+        "column quadrature assumes one Gauss rule per B-spline cell")
+    dz_min = minimum(diff(z_lay))
+    # SCALE_AWARE's horizontal scale: this patch's own i-direction cell width (dr on the
+    # cylinders), so `Psig_bl` tapers the closure in the gray zone from the grid the run
+    # actually has -- never a hardcoded number (D12).
+    dx = (Float64(model.grid_params.iMax) - Float64(model.grid_params.iMin)) /
+         model.grid_params.num_cells_i
+    dx > 0.0 || error("mc_mynn_state: the horizontal cell width came out $(dx) m; " *
+                      "SCALE_AWARE needs a positive dx")
+
     st = MYNNState(; active = true, closure = cfg.closure, edmf = cfg.edmf,
         scale_aware = cfg.scale_aware, init_mode = cfg.init_mode,
         fidelity = cfg.fidelity, water_carry = cfg.water_carry,
@@ -390,9 +602,16 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         output = cfg.output, trace = cfg.trace, check_values = cfg.check_values,
         el = zpt(), sm = zpt(), sh = zpt(), vt = zpt(), vq = zpt(), sgm = zpt(),
         cldfra_bl = zpt(), qc_bl = zpt(), qi_bl = zpt(), K_m = zpt(), K_h = zpt(),
+        gh = zpt(), gm = zpt(), qsq = zpt(),
         s_aw = zpt(), s_aw_st = zpt(), s_aw_qw = zpt(), s_aw_qv = zpt(),
         s_aw_u = zpt(), s_aw_v = zpt(), s_aw_e = zpt(),
         pblh = zcol(), kpbl = zeros(Int, ncol), ust = zcol(), rmol = zcol(),
+        z_lay = z_lay, dz = dz, zw = zw, w_mish = w_mish, dx = dx, z_top = z_top,
+        dz_cell = dz_cell, dz_min = dz_min, ts = Float64(model.ts),
+        bdry_E = zcol(), D_gal = zcol(), D_mish = zcol(), ts_tau = zcol(),
+        K_m_max = zcol(), K_h_max = zcol(), Ps_disc = zcol(), Ps_mynn = zcol(),
+        n_clamp_col = zeros(Int, ncol), n_capK_col = zeros(Int, ncol),
+        n_diffnum_col = zeros(Int, ncol),
         # `typemin(Int)` rather than 0: "no call yet" must be distinguishable from
         # "called at step 0" so the first step forces an update whatever the cadence is
         # (the `RadiationState.last_call_step` argument).
@@ -400,6 +619,7 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         # Per-thread, indexed by `threadid()` under the same `@threads :static` ownership
         # rule `scratch_columns` uses. One `MYNNWork` is ~40 kDim-length columns.
         work = [MYNNWork(kDim) for _ in 1:Threads.maxthreadid()],
+        colscratch = [MYNNColumnScratch(kDim) for _ in 1:Threads.maxthreadid()],
         constants = MYNNConstants())
 
     mynn_setup_line(model, cfg, ncol, kDim)

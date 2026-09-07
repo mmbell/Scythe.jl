@@ -318,21 +318,38 @@ using SparseArrays
         return nothing
     end
 
-    @testset "rho_e advects exactly like a source-free control total" begin
+    # These two testsets were written at S4, when the plug-in point was empty and rho_e was
+    # a source-free total. S5 wired the closure in (src/mc_mynn_bl.jl via mc_bl_apply!), so
+    # they now assert what stays exactly true with the closure LIVE but silenced by
+    # configuration: no drag (Cd = 0), no surface fluxes, `:mynn_init = :zero` (no taper
+    # seeding) and, for the blob case, `:mynn_K_max = 0` (no eddy fluxes). What remains of
+    # the closure on a TKE blob is its dissipation, a pure SINK of rho_e that vanishes where
+    # e = 0 -- which is what the transport comparison now pins. The full fold/resting/budget
+    # statements live in test/test_mynn_bl.jl.
+    @testset "rho_e transports like a control total plus a pure dissipation sink" begin
         mktempdir() do tmp
-            mtile, patch, model, gp, gridpoints = make_mynn_mtile(tmp; mynn = true)
+            mtile, patch, model, gp, gridpoints = make_mynn_mtile(tmp; mynn = true,
+                extra_opts = Dict{Symbol,Any}(:mynn_init => :zero),
+                # The validator refuses a zero cap; nextfloat(0.0) underflows every K*gradient
+                # product to an exact 0.0, which is what "no eddy flux" has to mean here.
+                extra_params = Dict{Symbol,Float64}(:Cd => 0.0, :mynn_K_max => nextfloat(0.0)))
             vars = model.grid_params.vars
             re_i = vars["rho_e"]
             seed_blob!(patch, vars, gp.kDim, gridpoints)
             D = advance_all!(mtile, patch, gp)
+            kDim = gp.kDim
 
             # With `:condensation => false` and `:precipitation => false` the rain slot's
-            # sources (`Qdot_r`, `AUTO_COLL`, `Fr_z`) are exact zero columns and `Jr` is an
-            # exact 1.0, so slot 8 carries `-u·∇ρ_r - ρ_r∇·u`: precisely the equation
-            # `rho_e` is given at this stage, on the same blob under the same BCs.
-            @test D[:, re_i] == D[:, vars["rho_r"]]
-            # Not a vacuous comparison: the blob really is being transported.
-            @test maximum(abs, D[:, re_i]) > 1.0e-6
+            # sources are exact zero columns and `Jr` is an exact 1.0, so slot 8 carries
+            # `-u·∇ρ_r - ρ_r∇·u` on the same blob under the same BCs. The TKE slot carries the
+            # same transport MINUS the dissipation rho_t q^3/(B1 l), which is >= 0 wherever
+            # the blob puts TKE and exactly 0 where rho_e = 0.
+            diff = D[:, re_i] .- D[:, vars["rho_r"]]
+            @test all(diff .<= 0.0)
+            rho_e = patch.physical[:, re_i, 1]
+            @test all(diff[rho_e .== 0.0] .== 0.0)
+            @test minimum(diff) < 0.0                 # the sink is really there
+            @test maximum(abs, D[:, re_i]) > 1.0e-6    # and the blob really is transported
 
             # The slot really is prognostic -- it appears in the explicit channel and in
             # NEITHER implicit one (no acoustic leg, no vertical-diffusion history).
@@ -342,12 +359,18 @@ using SparseArrays
         end
     end
 
-    @testset "rho_e = 0 changes no other slot, BITWISE" begin
+    @testset "rho_e = 0 with the closure silenced changes no other slot, BITWISE" begin
         mktempdir() do tmp
             mktempdir() do tmp2
-                m_on, p_on, mod_on, gp_on, gpts = make_mynn_mtile(tmp; mynn = true)
-                m_off, p_off, mod_off, gp_off, gpts2 = make_mynn_mtile(tmp2; mynn = false)
-                # The SAME state on both, with the TKE slot left at zero.
+                silent = Dict{Symbol,Any}(:mynn_init => :zero)
+                nodrag = Dict{Symbol,Float64}(:Cd => 0.0)
+                m_on, p_on, mod_on, gp_on, gpts = make_mynn_mtile(tmp; mynn = true,
+                    extra_opts = silent, extra_params = nodrag)
+                m_off, p_off, mod_off, gp_off, gpts2 = make_mynn_mtile(tmp2; mynn = false,
+                    extra_params = nodrag)
+                # The SAME sheared state on both, with the TKE slot left at zero: e = 0 gives
+                # q = 0, hence K = 0, no production, no dissipation; Cd = 0 and no surface
+                # fluxes give no surface terms. Every MYNN increment is then exactly 0.0.
                 seed_blob!(p_on, mod_on.grid_params.vars, gp_on.kDim, gpts;
                            with_rho_e = false)
                 seed_blob!(p_off, mod_off.grid_params.vars, gp_off.kDim, gpts2;
@@ -355,20 +378,24 @@ using SparseArrays
                 D_on = advance_all!(m_on, p_on, gp_on)
                 D_off = advance_all!(m_off, p_off, gp_off)
 
-                # Every shared slot, bit for bit. `===` on the Float64 elements, not `≈`:
-                # `x + 0.0` is not the identity for `x = -0.0`, and the whole point of the
-                # `if mynn_on` gates is that the off path is untouched.
+                # Every shared slot, value for value (signed zeros aside, see below).
                 names_off = Scythe.mc_var_names(mod_off.options)
                 @test length(names_off) == 10
                 for nm in names_off
                     i_on = mod_on.grid_params.vars[nm]
                     i_off = mod_off.grid_params.vars[nm]
                     @test i_on == i_off
-                    @test all(D_on[j, i_on] === D_off[j, i_off]
-                              for j in axes(D_on, 1))
+                    # `==`, not `===`: on the ON path the silenced closure still adds its
+                    # exact-zero increments, which turns a `-0.0` tendency into `+0.0`. The
+                    # OFF path (option absent) is byte-identical by construction and is proven
+                    # so by the benchmark `cmp` checks, not here.
+                    same = all(D_on[j, i_on] == D_off[j, i_off] for j in axes(D_on, 1))
+                    same || println("  slot \"$nm\" differs: max |Δ| = ",
+                                    maximum(abs.(D_on[:, i_on] .- D_off[:, i_off])))
+                    @test (nm, same) == (nm, true)
                 end
                 # ...and the TKE slot's own tendency is identically zero at rho_e = 0
-                # (advection of nothing, and `-0 * div`).
+                # (advection of nothing, `-0 * div`, and no source).
                 @test all(iszero, D_on[:, mod_on.grid_params.vars["rho_e"]])
             end
         end

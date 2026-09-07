@@ -14,9 +14,13 @@
 #
 # Physics knobs (every one is a NO-OP when unset, so the committed control is reproducible):
 #   SCYTHE_OWB_BL=louis|none|mynn boundary layer + surface fluxes (default louis; `mynn`
-#                                 is the MYNN-EDMF arm — at stage S4 it registers and
-#                                 TRANSPORTS the rho_e TKE slot with zero sources and
-#                                 applies no BL tendency, so it is `none` + one tracer)
+#                                 is the MYNN-EDMF arm: the prognostic rho_e TKE slot plus
+#                                 the ED closure applied in Scythe's variables, with the
+#                                 SAME surface layer the Louis control uses)
+#   SCYTHE_OWB_MYNN_INTERVAL=20   MYNN closure cadence [s] (options[:mynn_interval]); the
+#                                 diffusivities still track the TKE every step
+#   SCYTHE_OWB_MYNN_KMAX=Inf      counted safety cap on K_m/K_h/K_e [m^2/s]
+#                                 (physical_params[:mynn_K_max]) -- never a tuning knob
 #   SCYTHE_OWB_SFC=komori|gfdl_v7|charnock   surface roughness closure (options[:sfc_z0],
 #                                 default komori = the historical Komori Cd + constant Ck);
 #                                 arm suffix = the value
@@ -117,14 +121,16 @@ function owb_model(opts::BenchmarkOptions)
     elseif bl == "none"
         # no boundary layer at all: the O01 physics on the mesoscale grid (SST unused)
     elseif bl == "mynn"
-        # Plan stage S4: the PLUMBING only. This registers the prognostic TKE-density slot
-        # `rho_e` and transports it with zero sources; no boundary-layer tendency and no
-        # surface flux is applied, so the arm is the `none` arm plus one passive tracer
-        # until `mc_mynn_bl!` lands at S5. Surface fluxes are deliberately NOT switched on
-        # here: with no closure to carry them they would be computed and dropped.
+        # The MYNN-EDMF treatment arm. Surface fluxes are ON, exactly as in the Louis
+        # control: `mc_mynn_bl!` carries them on the same analytic g(z) delivery through
+        # the same `surface_exchange` call, so the two arms differ in the CLOSURE and in
+        # nothing else -- which is the only way the comparison means anything (S1b).
         options[:mynn] = true
-        println("OWB MYNN arm: stage S4 — the rho_e slot is registered and TRANSPORTED " *
-                "with zero sources; no BL tendency and no surface fluxes until S5")
+        options[:surface_fluxes] = true
+        haskey(ENV, "SCYTHE_OWB_MYNN_INTERVAL") &&
+            (options[:mynn_interval] = parse(Float64, ENV["SCYTHE_OWB_MYNN_INTERVAL"]))
+        haskey(ENV, "SCYTHE_OWB_MYNN_KMAX") &&
+            (physical_params[:mynn_K_max] = parse(Float64, ENV["SCYTHE_OWB_MYNN_KMAX"]))
     else
         error("SCYTHE_OWB_BL must be louis | none | mynn, got \"$bl\"")
     end
@@ -313,6 +319,11 @@ end
 function owb_surface_diagnostics(model, ref, kDim)
     pp = model.physical_params
     louis = get(model.options, :louis_bl, false)
+    mynn = get(model.options, :mynn, false)
+    # Either closure applies the surface stress, on the same `g(z)` and from the same
+    # `surface_exchange` call, so the drag WORK row belongs to both arms; only the Louis
+    # eddy-diffusivity row below is Louis-specific.
+    bl = louis === true || mynn === true
     fluxes = get(model.options, :surface_fluxes, false)
     SST = get(pp, :SST, NaN)
     sfc_fac = get(pp, :sfc_wind_factor, 1.0)
@@ -356,7 +367,7 @@ function owb_surface_diagnostics(model, ref, kDim)
         F_q = [r.F_q for r in sx]
         ke1 = 0.5 .* (df.u[surf] .^ 2 .+ df.w[surf] .^ 2)
         e_v = ((Scythe.Cpv - Scythe.Rv) .* Tk[surf]) .+ ke1 .+ (Scythe.gravity .* z1)   # c_w + c_v
-        drag = louis ? [r.tau_u for r in sx] .* u1 : zeros(ncols)                      # tau_u * u1
+        drag = bl ? [r.tau_u for r in sx] .* u1 : zeros(ncols)                         # tau_u * u1
         push!(times, t)
         push!(sh_int, sum(Wh .* F_sh))
         push!(lat_int, sum(Wh .* (e_v .* F_q)))
@@ -389,6 +400,75 @@ function owb_surface_diagnostics(model, ref, kDim)
     )
 end
 
+# ── MYNN-EDMF boundary-layer rows ────────────────────────────────────────────
+#
+# What the TKE slot actually did, read back from the model output rather than from the
+# scheme: `rho_e` is a plain prognostic column of `<t>_physical.csv` (a TOTAL, so the
+# slot IS the field -- no reference to add and no transform to undo), and `e = rho_e/rho_t`
+# is the mass-specific TKE the closure's `q = sqrt(2e)` is built from. The lowest-km rows
+# are where a flux-driven boundary layer has to show up if it is working at all.
+#
+# The census COUNTERS live on the tile, in the worker process that ran the columns, so
+# they cannot be read here; `mynn_write_final!` prints them as one `mynn census:` line at
+# the end of the run. When the run's stdout was captured to `<output_dir>/scythe_out.log`
+# they are parsed back out of it, and are `NaN` otherwise -- reported as missing rather
+# than as zero, which would read as "no clamps fired".
+function owb_mynn_diagnostics(model, ref, kDim)
+    get(model.options, :mynn, false) === true || return Dict{String,Float64}()
+    gp = model.grid_params
+    rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
+    snaps = output_snapshots(model)
+    max_rho_e = 0.0
+    max_e_lowkm = 0.0
+    mean_e_lowkm = NaN
+    for (t, path) in snaps
+        df = CSV.read(path, DataFrame)
+        hasproperty(df, :rho_e) || continue
+        ncols = div(nrow(df), kDim)
+        rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
+        e = df.rho_e ./ rho_t
+        low = df.z .<= 1000.0
+        max_rho_e = max(max_rho_e, maximum(df.rho_e))
+        any(low) && (max_e_lowkm = max(max_e_lowkm, maximum(e[low])))
+        if t == snaps[end][1] && any(low)
+            # Domain mean over the lowest km, Gauss-weighted in BOTH directions so it is
+            # the same quadrature every other integral in this file uses.
+            Wh = gauss_cell_weights(ncols, gp.num_cells, gp.iMax - gp.iMin,
+                                    ncols ÷ gp.num_cells, gp.quadrature)
+            Wv = gauss_cell_weights(kDim, gp.num_cells_k, gp.kMax - gp.kMin,
+                                    gp.mubar, gp.quadrature)
+            num = 0.0; den = 0.0
+            for c in 1:ncols, k in 1:kDim
+                j = (c - 1) * kDim + k
+                df.z[j] <= 1000.0 || continue
+                wgt = Wh[c] * Wv[k]
+                num += wgt * e[j]
+                den += wgt
+            end
+            mean_e_lowkm = den > 0.0 ? num / den : NaN
+        end
+    end
+    counters = Dict{String,Float64}("mynn_n_diffnum" => NaN,
+                                    "mynn_n_clamp_e" => NaN,
+                                    "mynn_n_cap_K" => NaN)
+    logfile = joinpath(model.output_dir, "scythe_out.log")
+    if isfile(logfile)
+        for line in eachline(logfile)
+            occursin("mynn census:", line) || continue
+            for key in keys(counters)
+                m = match(Regex("$(key)=([0-9]+)"), line)
+                m === nothing || (counters[key] = parse(Float64, m.captures[1]))
+            end
+        end
+    end
+    # `Dict{String,Float64}`, not `Dict{String,Any}`: `owb_diagnostics` merges these
+    # rows into the harness's target dictionary, and `check_targets` dispatches on the
+    # concrete element type.
+    return merge(Dict{String,Float64}("max_rho_e" => max_rho_e,
+                                      "max_e_lowkm" => max_e_lowkm,
+                                      "mean_e_lowkm" => mean_e_lowkm), counters)
+end
+
 function owb_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
@@ -396,7 +476,8 @@ function owb_diagnostics(model)
     diags = merge(o01_rain_diagnostics(model, ref, kDim),
                   o01_ice_diagnostics(model, ref, kDim),
                   o01_radiation_diagnostics(model, ref, kDim),
-                  owb_surface_diagnostics(model, ref, kDim))
+                  owb_surface_diagnostics(model, ref, kDim),
+                  owb_mynn_diagnostics(model, ref, kDim))
     diags["max_w"] = maximum(df.w)
     diags["min_w"] = minimum(df.w)
 

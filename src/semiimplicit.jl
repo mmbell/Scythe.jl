@@ -1209,6 +1209,11 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
     # remote no-op call per worker on a radiation-off run.
     map(wait, [get_from(w, :(Scythe.radiation_write_final!(mtile, $(num_ts * model.ts))))
                for w in workerids])
+    # ...and the MYNN-EDMF boundary-layer census (S5), on the same hook and for the same
+    # reason: the clamp/cap/diffusion-number counters accumulate per column all run and
+    # are only meaningful once, at the end. `mynn_write_final!` is a no-op per worker
+    # when that worker's `mtile.mynn` is inactive.
+    map(wait, [get_from(w, :(Scythe.mynn_write_final!(mtile))) for w in workerids])
     return nothing
 end
 
