@@ -36,6 +36,13 @@
 # interpolation does and which fields deliberately stay in the sidecar. A run
 # without sidecars produces exactly the file it always did.
 #
+# When the run carried the MYNN-EDMF boundary layer (S9 sidecars <t>_mynn_i*.nc), that
+# sidecar is merged the SAME way: the held closure fields (K_m, K_h, mynn_e, mynn_el,
+# mynn_P_s, mynn_P_b, mynn_eps, mynn_tke_transport, mynn_cldfra_bl, ...) and the
+# per-column diagnostics (pblh, ust, inv_L, ...), resampled from the closure's own mish
+# onto the regular grid, plus the resolved-option/counter scalars as `mynn_*` global
+# attributes. A run without MYNN sidecars produces exactly the file it always did.
+#
 # The input directory is configurable; it defaults to the axisymmetric TC run.
 
 using Scythe
@@ -78,6 +85,11 @@ israw(f) = occursin(RAW_SNAPSHOT_RE, f)
 # without opening anything (`Scythe.read_radiation` errors when nothing matches).
 has_radiation(ndir, tag) =
     any(f -> occursin(Regex("^" * Base.escape_string(tag) * raw"_radiation_i[0-9]+\.nc$"), f),
+        readdir(ndir))
+
+# The MYNN sidecar family for one snapshot tag (S9), the `has_radiation` pattern exactly.
+has_mynn(ndir, tag) =
+    any(f -> occursin(Regex("^" * Base.escape_string(tag) * raw"_mynn_i[0-9]+\.nc$"), f),
         readdir(ndir))
 
 # Auto-detect nests: subdirectories that contain at least one raw snapshot.
@@ -280,7 +292,7 @@ end
 # ── Per-snapshot derivation and write ─────────────────────────────────────────
 rd2d(ds, name, n_i, n_k) = coalesce.(Array(ds[name])[1, :, :], NaN)   # (n_i, n_k)
 
-function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing)
+function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn = nothing)
     NCDataset(rawpath, "r") do ds
         x = ds["x"][:]; z = ds["z"][:]
         n_i = length(x); n_k = length(z)
@@ -469,6 +481,76 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing)
                 out.attrib["radiation_n_neg_rho_v"] = rad.n_neg_rho_v
             end
 
+            # ── MYNN-EDMF, merged from the S9 sidecar (absent ⇒ nothing below is written
+            # and the file is byte-for-byte what a MYNN-off run produces). Same regridding
+            # as the radiation block above: separable linear interpolation, x then z, edge-
+            # clamped outside the closure's own mish hull. Every (x, z) field is prefixed
+            # `mynn_` except `K_m`/`K_h`, which keep their bare names (an exchange
+            # coefficient is unambiguous and the prefix would only make every downstream
+            # reader spell it out again).
+            if mynn !== nothing
+                wxm = interp_weights(mynn.x, x); wzm = interp_weights(mynn.z, z)
+
+                wr("K_m", regrid2d(mynn.K_m, wxm, wzm), "m2 s-1",
+                   "MYNN momentum exchange coefficient")
+                wr("K_h", regrid2d(mynn.K_h, wxm, wzm), "m2 s-1",
+                   "MYNN heat/moisture exchange coefficient")
+                for (nm, A, units, long) in (
+                        ("mynn_e", mynn.e, "m2 s-2", "mass-specific TKE, rho_e/rho_t"),
+                        ("mynn_el", mynn.el, "m", "mixing length"),
+                        ("mynn_sm", mynn.sm, "1", "momentum stability function"),
+                        ("mynn_sh", mynn.sh, "1", "heat stability function"),
+                        ("mynn_cldfra_bl", mynn.cldfra_bl, "1", "subgrid cloud fraction"),
+                        ("mynn_qc_bl", mynn.qc_bl, "kg kg-1",
+                         "subgrid cloud liquid mixing ratio"),
+                        ("mynn_qi_bl", mynn.qi_bl, "kg kg-1",
+                         "subgrid cloud ice mixing ratio"),
+                        ("mynn_vt", mynn.vt, "1",
+                         "condensation buoyancy coefficient (temperature)"),
+                        ("mynn_vq", mynn.vq, "1",
+                         "condensation buoyancy coefficient (moisture)"),
+                        ("mynn_P_s", mynn.P_s, "W m-3", "discrete shear production"),
+                        ("mynn_P_s_mynn", mynn.P_s_mynn, "W m-3",
+                         "closure's own shear production, rho_t K_m G_M"),
+                        ("mynn_P_b", mynn.P_b, "W m-3",
+                         "buoyancy production/consumption, rho_t K_h G_H"),
+                        ("mynn_eps", mynn.eps, "W m-3", "dissipation, rho_t q^3/(B1 l)"),
+                        ("mynn_tke_transport", mynn.tke_transport, "W m-3",
+                         "fitted TKE turbulent-transport divergence, dz(S_e)"),
+                        ("mynn_s_aw", mynn.s_aw, "m s-1",
+                         "plume mass-flux sum, sum_i a_i w_i"))
+                    wr(nm, regrid2d(A, wxm, wzm), units, long)
+                end
+
+                for (nm, v, units, long) in (
+                        ("mynn_pblh", mynn.pblh, "m", "boundary layer height"),
+                        ("mynn_ust", mynn.ust, "m s-1", "friction velocity"),
+                        ("mynn_inv_L", mynn.inv_L, "m-1", "inverse Obukhov length, 1/L"),
+                        ("mynn_bdry_E", mynn.bdry_E, "W m-2",
+                         "D3 boundary/surface energy input"))
+                    wrx(nm, regrid1d(v, wxm), units, long)
+                end
+
+                out.attrib["mynn_source"] = "Scythe MYNN sidecar <t>_mynn_i*.nc, " *
+                    "read with Scythe.read_mynn"
+                out.attrib["mynn_regridding"] =
+                    "MYNN fields were computed on the closure's own mish and are " *
+                    "resampled here onto this file's regular (x, z) grid by separable " *
+                    "LINEAR interpolation, x then z, with edge clamping outside the " *
+                    "mish hull (the radiation_regridding convention, applied to the " *
+                    "MYNN mish)."
+                out.attrib["mynn_closure"] = mynn.closure
+                out.attrib["mynn_edmf"] = mynn.edmf
+                out.attrib["mynn_init_mode"] = mynn.init_mode
+                out.attrib["mynn_water_carry"] = mynn.water_carry
+                out.attrib["mynn_n_clamp_e"] = mynn.n_clamp_e
+                out.attrib["mynn_n_cap_K"] = mynn.n_cap_K
+                out.attrib["mynn_n_diffnum"] = mynn.n_diffnum
+                out.attrib["mynn_n_gate"] = mynn.n_gate
+                out.attrib["mynn_n_stall"] = mynn.n_stall
+                out.attrib["mynn_n_plume"] = mynn.n_plume
+            end
+
             # Pass through any control-variable derivative slots that were output
             # (derived products get none). These are extra data variables in the
             # source beyond the value slots handled above.
@@ -512,7 +594,9 @@ for nest in nests
         tsec = parse(Float64, tag)
         # Merge the radiation sidecar when this snapshot has one (S5 runs only).
         rad = has_radiation(ndir, tag) ? Scythe.read_radiation(ndir, tag) : nothing
-        s = process_snapshot(raw, out, bg, z_reg, tsec, rad)
+        # Merge the MYNN sidecar when this snapshot has one (S9 runs only).
+        mynn = has_mynn(ndir, tag) ? Scythe.read_mynn(ndir, tag) : nothing
+        s = process_snapshot(raw, out, bg, z_reg, tsec, rad, mynn)
         refl_str = isfinite(s.max_refl) ? "$(round(s.max_refl;digits=1)) dBZ" : "no echo"
         println("    t=$(round(Int, tsec)) s: " *
                 "T∈[$(round(s.Tmin;digits=1)),$(round(s.Tmax;digits=1))] K  " *

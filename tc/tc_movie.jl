@@ -27,6 +27,14 @@
 # movie name are what they always were, so the old view stays reproducible. The two
 # views write to separate frame directories and separate mp4s (_rz.mp4 vs
 # _rz_rad.mp4), so rendering one never clobbers the other.
+#
+# --bl mirrors --rad for the MYNN-EDMF boundary layer (S9), which needs a run whose
+# derived files carry the merged MYNN sidecar (tc/tc_postprocess.jl on a run made with
+# `:mynn => true`): a thin PBL-height-vs-radius line panel across the top (the OLR
+# panel's role) and, beside the reflectivity cross-section, K_h -- log-scaled, a
+# boundary-layer diffusivity spans orders of magnitude -- as a filled contour. Writes to
+# its own frame directory and its own mp4 (_rz_bl.mp4), so it never clobbers --rad or
+# the plain view, and --rad/--bl are mutually exclusive (one movie, one extra view).
 
 using NCDatasets
 using CairoMakie
@@ -41,6 +49,7 @@ zmax = 20.0            # [km] model top is 25 km; the storm layer is below ~18 k
 vec_scale = 2.0        # arrow length = vec_scale * speed[m/s], in km of the r-axis
 w_scale = 5.0          # vertical velocity exaggeration for the arrows only
 showrad = false        # --rad: add the OLR line panel and the dT_net cross-section
+showbl = false         # --bl: add the PBL-height line panel and the K_h cross-section
 let i = 1
     while i <= length(ARGS)
         a = ARGS[i]
@@ -52,10 +61,12 @@ let i = 1
         elseif a == "--vec-scale"; global vec_scale = parse(Float64, ARGS[i+1]); i += 2
         elseif a == "--w-scale"; global w_scale = parse(Float64, ARGS[i+1]); i += 2
         elseif a == "--rad";     global showrad = true; i += 1
+        elseif a == "--bl";      global showbl = true; i += 1
         else error("Unknown argument: $a")
         end
     end
 end
+showrad && showbl && error("--rad and --bl are mutually exclusive (one extra view per movie)")
 isdir(indir) || error("Input directory not found: $indir")
 
 # Auto-detect nests with derived snapshots.
@@ -143,28 +154,69 @@ if showrad
 end
 rad_levels = range(-rad_cmax, rad_cmax; length = 41)
 
+# ── MYNN scales (--bl only): one pass over every frame and nest ───────────────
+# K_h's log-scale range (a positive floor for the axis, and the domain max) and the
+# PBL-height line panel's y-range, both fixed for the whole movie -- the `showrad`
+# pre-pass above, mirrored.
+kh_floor = 1.0e-3       # m^2/s -- below this reads as "no mixing" on the log scale
+kh_max = kh_floor
+pblh_lo = Inf; pblh_hi = -Inf
+if showbl
+    for t in times, nest in nests
+        NCDataset(catalog[t][nest], "r") do ds
+            haskey(ds, "K_h") || error(
+                "--bl needs the MYNN sidecar merged into the derived files, and " *
+                "$(catalog[t][nest]) has no K_h. Either the run was made without " *
+                "options[:mynn], or tc/tc_postprocess.jl was run on it before the merge " *
+                "existed — re-run tc/tc_postprocess.jl --indir $indir.")
+            Kh = readfield(ds, "K_h")
+            global kh_max = max(kh_max, maximum(x -> isnan(x) ? -Inf : x, Kh))
+            fp = filter(isfinite, coalesce.(Array(ds["mynn_pblh"])[1, :], NaN))
+            if !isempty(fp)
+                global pblh_lo = min(pblh_lo, minimum(fp))
+                global pblh_hi = max(pblh_hi, maximum(fp))
+            end
+        end
+    end
+    kh_max = max(kh_max, 10.0 * kh_floor)   # widen a decade if K_h is identically ~0
+    if !isfinite(pblh_lo)
+        pblh_lo = 0.0; pblh_hi = 1000.0
+    end
+    println(@sprintf("  MYNN: K_h range %.1e..%.2f m²/s (log scale), PBLH %.0f..%.0f m",
+                     kh_floor, kh_max, pblh_lo, pblh_hi))
+end
+kh_levels = 10.0 .^ range(log10(kh_floor), log10(kh_max); length = 31)
+
 # ── Frame rendering ───────────────────────────────────────────────────────────
-framedir = joinpath(indir, showrad ? "movie_frames_rad" : "movie_frames")
+framedir = joinpath(indir, showrad ? "movie_frames_rad" : showbl ? "movie_frames_bl" :
+                          "movie_frames")
 mkpath(framedir)
 rm.(joinpath.(framedir, readdir(framedir)); force = true)
 
 function draw_frame(t, framepath)
-    # --rad grows the figure to two rows: a thin OLR-vs-r strip across the top and, in
-    # row 2, the reflectivity cross-section (col 1, colorbar col 2) beside the net-heating
-    # cross-section (col 3, colorbar col 4). Without it the layout is the original
-    # single-axis figure, unchanged.
-    fig = Figure(size = showrad ? (1500, 620) : (1100, 520))
+    # --rad/--bl grow the figure to two rows: a thin line-diagnostic strip across the top
+    # and, in row 2, the reflectivity cross-section (col 1, colorbar col 2) beside the
+    # extra cross-section (col 3, colorbar col 4). Without either the layout is the
+    # original single-axis figure, unchanged.
+    extra = showrad || showbl
+    fig = Figure(size = extra ? (1500, 620) : (1100, 520))
     title_str = @sprintf("Nested TC — reflectivity / v / (u,w),  t = %.1f h", t / 3600)
-    ax = showrad ? Axis(fig[2, 1]; xlabel = "radius (km)", ylabel = "height (km)") :
-                   Axis(fig[1, 1]; title = title_str,
-                        xlabel = "radius (km)", ylabel = "height (km)")
-    ax_olr = showrad ? Axis(fig[1, 1:4]; title = title_str, ylabel = "OLR (W/m²)") : nothing
+    ax = extra ? Axis(fig[2, 1]; xlabel = "radius (km)", ylabel = "height (km)") :
+                 Axis(fig[1, 1]; title = title_str,
+                      xlabel = "radius (km)", ylabel = "height (km)")
+    ax_line = showrad ? Axis(fig[1, 1:4]; title = title_str, ylabel = "OLR (W/m²)") :
+              showbl ? Axis(fig[1, 1:4]; title = title_str, ylabel = "PBL height (m)") :
+              nothing
     ax_rad = showrad ? Axis(fig[2, 3]; xlabel = "radius (km)", ylabel = "height (km)",
                             title = "net radiative heating  dT_lw + sw_scale·dT_sw") :
                        nothing
-    showrad && rowsize!(fig.layout, 1, Relative(0.20))
+    ax_bl = showbl ? Axis(fig[2, 3]; xlabel = "radius (km)", ylabel = "height (km)",
+                          title = "K_h (log scale)") :
+                     nothing
+    extra && rowsize!(fig.layout, 1, Relative(0.20))
     local cf
     local cf_rad = nothing
+    local cf_bl = nothing
     for nest in draw_order
         g = geom[nest]
         NCDataset(catalog[t][nest], "r") do ds
@@ -209,7 +261,18 @@ function draw_frame(t, framepath)
                 cf_rad = contourf!(ax_rad, g.r, g.z, net; levels = rad_levels,
                                    extendlow = :auto, extendhigh = :auto,
                                    colormap = Reverse(:RdBu))  # blue cools, red warms
-                lines!(ax_olr, g.r, coalesce.(Array(ds["olr"])[1, :], NaN);
+                lines!(ax_line, g.r, coalesce.(Array(ds["olr"])[1, :], NaN);
+                       color = :black, linewidth = 1.4)
+            end
+
+            # MYNN, from the merged sidecar fields in the same derived file. Same
+            # coarsest-first overlay as everything else, so the fine nests draw on top.
+            if showbl
+                Kh = max.(readfield(ds, "K_h"), kh_floor)   # floored for log10
+                cf_bl = contourf!(ax_bl, g.r, g.z, Kh; levels = kh_levels,
+                                  colorscale = log10, extendlow = :auto, extendhigh = :auto,
+                                  colormap = :viridis)
+                lines!(ax_line, g.r, coalesce.(Array(ds["mynn_pblh"])[1, :], NaN);
                        color = :black, linewidth = 1.4)
             end
         end
@@ -218,22 +281,33 @@ function draw_frame(t, framepath)
         vlines!(ax, b; color = :black, linestyle = :dashdot, linewidth = 1.2)
         if showrad
             vlines!(ax_rad, b; color = :black, linestyle = :dash, linewidth = 1.2)
-            vlines!(ax_olr, b; color = :black, linestyle = :dash, linewidth = 1.0)
+            vlines!(ax_line, b; color = :black, linestyle = :dash, linewidth = 1.0)
+        end
+        if showbl
+            vlines!(ax_bl, b; color = :black, linestyle = :dash, linewidth = 1.2)
+            vlines!(ax_line, b; color = :black, linestyle = :dash, linewidth = 1.0)
         end
     end
     xlims!(ax, 0, rmax); ylims!(ax, 0, zmax)
-    Colorbar(fig[showrad ? 2 : 1, 2], cf; label = "reflectivity (dBZ)")
+    Colorbar(fig[extra ? 2 : 1, 2], cf; label = "reflectivity (dBZ)")
     if showrad
         xlims!(ax_rad, 0, rmax); ylims!(ax_rad, 0, zmax)
-        xlims!(ax_olr, 0, rmax)
+        xlims!(ax_line, 0, rmax)
         pad = 0.05 * max(olr_hi - olr_lo, 1.0)
-        ylims!(ax_olr, olr_lo - pad, olr_hi + pad)
+        ylims!(ax_line, olr_lo - pad, olr_hi + pad)
         Colorbar(fig[2, 4], cf_rad; label = "K/day")
+    end
+    if showbl
+        xlims!(ax_bl, 0, rmax); ylims!(ax_bl, 0, zmax)
+        xlims!(ax_line, 0, rmax)
+        pad = 0.05 * max(pblh_hi - pblh_lo, 1.0)
+        ylims!(ax_line, pblh_lo - pad, pblh_hi + pad)
+        Colorbar(fig[2, 4], cf_bl; label = "K_h (m²/s)")
     end
     save(framepath, fig)
 end
 
-stem = basename(rstrip(indir, '/')) * "_rz" * (showrad ? "_rad" : "")
+stem = basename(rstrip(indir, '/')) * "_rz" * (showrad ? "_rad" : showbl ? "_bl" : "")
 for (i, t) in enumerate(times)
     frame = joinpath(framedir, "frame_" * lpad(i - 1, 4, '0') * ".png")
     draw_frame(t, frame)

@@ -416,91 +416,101 @@ function owb_surface_diagnostics(model, ref, kDim)
     )
 end
 
-# ── MYNN-EDMF boundary-layer rows ────────────────────────────────────────────
+# ── MYNN-EDMF boundary-layer rows (S9: read from the sidecar) ───────────────────
 #
-# What the TKE slot actually did, read back from the model output rather than from the
-# scheme: `rho_e` is a plain prognostic column of `<t>_physical.csv` (a TOTAL, so the
-# slot IS the field -- no reference to add and no transform to undo), and `e = rho_e/rho_t`
-# is the mass-specific TKE the closure's `q = sqrt(2e)` is built from. The lowest-km rows
-# are where a flux-driven boundary layer has to show up if it is working at all.
+# Stage S9 gives the closure its own sidecar NetCDF (`Scythe.read_mynn`/`mynn_snapshots`,
+# src/mynn_io.jl), written on the same output cadence as `<t>_physical.csv`. Everything
+# below used to come from two much weaker sources -- `rho_e/rho_t` reconstructed from the
+# physical CSV, and the tile's `mynn census:` stdout line regex-parsed back out of
+# `scythe_out.log` (which needed the run's stdout captured at all, and only ever carried
+# the counters' FINAL values, never a per-snapshot maximum) -- both retired here in favor
+# of reading the closure's own held state directly. `NaN` reported for a domain mean whose
+# denominator is empty (a run with nothing in the lowest km/2 km, or zero columns) rather
+# than a `0/0` that would misread as "exactly zero".
 #
-# The census COUNTERS live on the tile, in the worker process that ran the columns, so
-# they cannot be read here; `mynn_write_final!` prints them as one `mynn census:` line at
-# the end of the run. When the run's stdout was captured to `<output_dir>/scythe_out.log`
-# they are parsed back out of it, and are `NaN` otherwise -- reported as missing rather
-# than as zero, which would read as "no clamps fired".
+# ALL INFORMATIONAL: nothing here is gated in `check_targets` (unlike the rain/ice/surface
+# rows above it), the same status the retired census counters always had.
 function owb_mynn_diagnostics(model, ref, kDim)
     get(model.options, :mynn, false) === true || return Dict{String,Float64}()
+    tags = Scythe.mynn_snapshots(model.output_dir)
+    # No sidecar: `:mynn_output = false`, or a run predating S9. Empty, not NaN-filled --
+    # there is nothing to report, and an empty Dict merges into `owb_diagnostics`'s table
+    # without adding or displacing any row.
+    isempty(tags) && return Dict{String,Float64}()
+
     gp = model.grid_params
-    rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
-    snaps = output_snapshots(model)
-    max_rho_e = 0.0
-    max_e_lowkm = 0.0
-    mean_e_lowkm = NaN
-    for (t, path) in snaps
-        df = CSV.read(path, DataFrame)
-        hasproperty(df, :rho_e) || continue
-        ncols = div(nrow(df), kDim)
-        rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
-        e = df.rho_e ./ rho_t
-        low = df.z .<= 1000.0
-        max_rho_e = max(max_rho_e, maximum(df.rho_e))
-        any(low) && (max_e_lowkm = max(max_e_lowkm, maximum(e[low])))
-        if t == snaps[end][1] && any(low)
-            # Domain mean over the lowest km, Gauss-weighted in BOTH directions so it is
-            # the same quadrature every other integral in this file uses.
-            Wh = gauss_cell_weights(ncols, gp.num_cells, gp.iMax - gp.iMin,
-                                    ncols ÷ gp.num_cells, gp.quadrature)
-            Wv = gauss_cell_weights(kDim, gp.num_cells_k, gp.kMax - gp.kMin,
-                                    gp.mubar, gp.quadrature)
-            num = 0.0; den = 0.0
-            for c in 1:ncols, k in 1:kDim
-                j = (c - 1) * kDim + k
-                df.z[j] <= 1000.0 || continue
-                wgt = Wh[c] * Wv[k]
-                num += wgt * e[j]
-                den += wgt
+    max_K_m = 0.0; max_K_h = 0.0; max_e_lowkm = 0.0; max_pblh = 0.0
+    max_mass_flux = 0.0; max_ztop = 0.0
+    mean_e_lowkm = NaN; mean_pblh_final = NaN
+    mean_P_s = NaN; mean_P_b = NaN; mean_eps = NaN
+    n_clamp_e = NaN; n_cap_K = NaN; n_diffnum = NaN
+    plume_active_frac = 0.0
+    final_tag = tags[end]
+
+    for tag in tags
+        snap = Scythe.read_mynn(model.output_dir, tag)
+        ncols = length(snap.x)
+        max_K_m = max(max_K_m, maximum(snap.K_m))
+        max_K_h = max(max_K_h, maximum(snap.K_h))
+        max_pblh = max(max_pblh, maximum(snap.pblh))
+        max_mass_flux = max(max_mass_flux, maximum(snap.aw_max))
+        max_ztop = max(max_ztop, maximum(snap.plume_ztop))
+        low = snap.z .<= 1000.0
+        any(low) && (max_e_lowkm = max(max_e_lowkm, maximum(view(snap.e, :, low))))
+
+        tag == final_tag || continue
+
+        n_clamp_e = Float64(snap.n_clamp_e)
+        n_cap_K = Float64(snap.n_cap_K)
+        n_diffnum = Float64(snap.n_diffnum)
+        nact = count(>(0.0), snap.plume_ktop)
+        plume_active_frac = ncols > 0 ? nact / ncols : 0.0
+
+        # Gauss-weighted domain means, in BOTH directions -- the same quadrature every
+        # other integral in this file uses (`gauss_cell_weights`, `domain_integral`).
+        Wh = gauss_cell_weights(ncols, gp.num_cells, gp.iMax - gp.iMin,
+                                ncols ÷ gp.num_cells, gp.quadrature)
+        Wv = gauss_cell_weights(kDim, gp.num_cells_k, gp.kMax - gp.kMin,
+                                gp.mubar, gp.quadrature)
+        num_e = 0.0; den_e = 0.0
+        num_ps = 0.0; num_pb = 0.0; num_eps = 0.0; den_2km = 0.0
+        for c in 1:ncols, k in 1:kDim
+            z = snap.z[k]
+            wgt = Wh[c] * Wv[k]
+            if z <= 1000.0
+                num_e += wgt * snap.e[c, k]
+                den_e += wgt
             end
-            mean_e_lowkm = den > 0.0 ? num / den : NaN
-        end
-    end
-    counters = Dict{String,Float64}("mynn_n_diffnum" => NaN,
-                                    "mynn_n_clamp_e" => NaN,
-                                    "mynn_n_cap_K" => NaN)
-    # The EDMF plume census (S7), on the SAME `mynn census:` line and parsed the same way,
-    # but as floats: a fraction, a mass flux [m/s] and a height [m]. Present only with
-    # `options[:mynn_edmf] = 1`, so they stay NaN -- reported as missing, never as zero --
-    # on the eddy-diffusivity arm.
-    if get(model.options, :mynn_edmf, 0) == 1
-        counters["mynn_n_gate"] = NaN
-        counters["mynn_n_stall"] = NaN
-        counters["mynn_n_plume"] = NaN
-    end
-    floats = get(model.options, :mynn_edmf, 0) == 1 ?
-             Dict{String,Float64}("mynn_plume_active_frac" => NaN,
-                                  "mynn_max_mass_flux" => NaN,
-                                  "mynn_max_ztop_m" => NaN) : Dict{String,Float64}()
-    logfile = joinpath(model.output_dir, "scythe_out.log")
-    if isfile(logfile)
-        for line in eachline(logfile)
-            occursin("mynn census:", line) || continue
-            for key in keys(counters)
-                m = match(Regex("$(key)=([0-9]+)"), line)
-                m === nothing || (counters[key] = parse(Float64, m.captures[1]))
-            end
-            for key in keys(floats)
-                m = match(Regex("$(key)=([0-9.eE+-]+)"), line)
-                m === nothing || (floats[key] = parse(Float64, m.captures[1]))
+            if z <= 2000.0
+                num_ps += wgt * snap.P_s[c, k]
+                num_pb += wgt * snap.P_b[c, k]
+                num_eps += wgt * snap.eps[c, k]
+                den_2km += wgt
             end
         end
+        mean_e_lowkm = den_e > 0.0 ? num_e / den_e : NaN
+        mean_P_s = den_2km > 0.0 ? num_ps / den_2km : NaN
+        mean_P_b = den_2km > 0.0 ? num_pb / den_2km : NaN
+        mean_eps = den_2km > 0.0 ? num_eps / den_2km : NaN
+        sum_wh = sum(Wh)
+        mean_pblh_final = sum_wh > 0.0 ?
+            sum(Wh[c] * snap.pblh[c] for c in 1:ncols) / sum_wh : NaN
     end
-    counters = merge(counters, floats)
-    # `Dict{String,Float64}`, not `Dict{String,Any}`: `owb_diagnostics` merges these
-    # rows into the harness's target dictionary, and `check_targets` dispatches on the
-    # concrete element type.
-    return merge(Dict{String,Float64}("max_rho_e" => max_rho_e,
-                                      "max_e_lowkm" => max_e_lowkm,
-                                      "mean_e_lowkm" => mean_e_lowkm), counters)
+
+    # `Dict{String,Float64}`, not `Dict{String,Any}`: `owb_diagnostics` merges these rows
+    # into the harness's target dictionary, and `check_targets` dispatches on the concrete
+    # element type.
+    return Dict{String,Float64}(
+        "max_K_m_m2s" => max_K_m, "max_K_h_m2s" => max_K_h,
+        "max_e_lowkm" => max_e_lowkm, "mean_e_lowkm" => mean_e_lowkm,
+        "max_pblh_m" => max_pblh, "mean_pblh_final_m" => mean_pblh_final,
+        "mynn_n_clamp_e" => n_clamp_e, "mynn_n_cap_K" => n_cap_K,
+        "mynn_n_diffnum" => n_diffnum,
+        "mynn_plume_active_frac" => plume_active_frac,
+        "mynn_max_mass_flux" => max_mass_flux, "mynn_max_ztop_m" => max_ztop,
+        "mean_P_s_lowkm_Wm3" => mean_P_s, "mean_P_b_lowkm_Wm3" => mean_P_b,
+        "mean_eps_lowkm_Wm3" => mean_eps,
+    )
 end
 
 function owb_diagnostics(model)

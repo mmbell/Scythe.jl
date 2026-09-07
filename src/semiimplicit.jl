@@ -1279,6 +1279,12 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # columns depend on. A no-op when radiation is off. See `radiation_prepass!`.
     radiation_prepass!(mtile, t)
 
+    # MYNN-EDMF sidecar output (S9): a no-op unless the closure is on and its
+    # own output is enabled, and gated on the SAME output cadence as `radiation_write!`
+    # -- see `mynn_write!` (src/mynn_io.jl) for why it fires HERE, alongside the
+    # radiation pre-pass, rather than inside the column loop.
+    mynn_write!(mtile, t)
+
     # Advance each column.
     #
     # `:static` (not the default `:dynamic`) because the equation sets take their vertical work

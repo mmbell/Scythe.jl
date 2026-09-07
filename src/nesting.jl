@@ -608,6 +608,12 @@ function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{F
     # columns depend on. A no-op when radiation is off. See `radiation_prepass!`.
     radiation_prepass!(mtile, t)
 
+    # MYNN-EDMF sidecar output (S9): a no-op unless the closure is on and its
+    # own output is enabled, and gated on the SAME output cadence as `radiation_write!`
+    # -- see `mynn_write!` (src/mynn_io.jl) for why it fires HERE, alongside the
+    # radiation pre-pass, rather than inside the column loop.
+    mynn_write!(mtile, t)
+
     if num_columns(mtile.tile) > 0
         Threads.@threads :static for c in 1:num_columns(mtile.tile)
             advance_column(mtile, c, t)
@@ -669,6 +675,12 @@ function advance_nested_timestepA(mtile::ModelTile, sharedSpectral::SharedArray{
     # oversubscribe the machine and break the `threadid()` ownership rule the scratch
     # columns depend on. A no-op when radiation is off. See `radiation_prepass!`.
     radiation_prepass!(mtile, t)
+
+    # MYNN-EDMF sidecar output (S9): a no-op unless the closure is on and its
+    # own output is enabled, and gated on the SAME output cadence as `radiation_write!`
+    # -- see `mynn_write!` (src/mynn_io.jl) for why it fires HERE, alongside the
+    # radiation pre-pass, rather than inside the column loop.
+    mynn_write!(mtile, t)
 
     if num_columns(mtile.tile) > 0
         Threads.@threads :static for c in 1:num_columns(mtile.tile)

@@ -248,6 +248,21 @@ mutable struct MYNNState
     const gh::Vector{Float64}
     const gm::Vector{Float64}
     const qsq::Vector{Float64}
+    # ── PER-GRIDPOINT budget columns (S9), held so the sidecar (src/mynn_io.jl) can write
+    # them without recomputing the apply loop. Filled in `_mynn_apply_column!`
+    # (src/mc_mynn_bl.jl) from exactly the values that already feed the D3 identity:
+    # `g_Ps` the discrete shear production, `g_Ps_mynn` the closure's own
+    # `rho_t K_m G_M`, `g_Pb` the buoyancy exchange `rho_t K_h G_H`, `g_eps` the
+    # dissipation `rho_t q^3/(B_1 l)`, `g_tke_transport` the fitted TKE turbulent-transport
+    # divergence `dz(S_e)`. All [W/m^3] except `g_tke_transport` (also W/m^3, a divergence
+    # of an energy flux). Exact zeros with `:mynn` off (empty) and, on an active tile,
+    # exactly the per-point terms `_mynn_apply_column!` already computed -- nothing here
+    # changes what any tendency receives.
+    const g_Ps::Vector{Float64}
+    const g_Ps_mynn::Vector{Float64}
+    const g_Pb::Vector{Float64}
+    const g_eps::Vector{Float64}
+    const g_tke_transport::Vector{Float64}
     # ── mass-flux plume sums (S7); zero at this stage ──
     const s_aw::Vector{Float64}
     const s_aw_st::Vector{Float64}
@@ -364,6 +379,11 @@ function MYNNState(;
         gh::Vector{Float64} = Float64[],
         gm::Vector{Float64} = Float64[],
         qsq::Vector{Float64} = Float64[],
+        g_Ps::Vector{Float64} = Float64[],
+        g_Ps_mynn::Vector{Float64} = Float64[],
+        g_Pb::Vector{Float64} = Float64[],
+        g_eps::Vector{Float64} = Float64[],
+        g_tke_transport::Vector{Float64} = Float64[],
         s_aw::Vector{Float64} = Float64[],
         s_aw_st::Vector{Float64} = Float64[],
         s_aw_qw::Vector{Float64} = Float64[],
@@ -416,7 +436,7 @@ function MYNNState(;
                      water_carry, mix_numbers,
                      interval_steps, ncol, kDim, K_max, output, trace, check_values,
                      el, sm, sh, vt, vq, sgm, cldfra_bl, qc_bl, qi_bl, K_m, K_h,
-                     gh, gm, qsq,
+                     gh, gm, qsq, g_Ps, g_Ps_mynn, g_Pb, g_eps, g_tke_transport,
                      s_aw, s_aw_st, s_aw_qw, s_aw_qv, s_aw_u, s_aw_v, s_aw_e,
                      plume_ktop, plume_ztop, aw_max, n_gate_col, n_stall_col, n_plume_col,
                      pblh, kpbl, ust, rmol, last_update_step,
@@ -513,7 +533,9 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     # moments are what the habit prediction is made of.
     mix_numbers = get(options, :mynn_mix_numbers, true)::Bool
     interval_sec = Float64(get(options, :mynn_interval, 20.0))
-    output = get(options, :mynn_output, false)::Bool
+    # Default ON (S9): a run with `:mynn` on gets the sidecar for free, the same default
+    # `:radiation_output` takes (src/radiation_state.jl). Explicitly `false` opts out.
+    output = get(options, :mynn_output, true)::Bool
     trace = get(options, :mynn_trace, true)::Bool
     check_values = get(options, :mynn_check_values, false)::Bool
     K_max = Float64(get(physical_params, :mynn_K_max, Inf))
@@ -685,6 +707,8 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         el = zpt(), sm = zpt(), sh = zpt(), vt = zpt(), vq = zpt(), sgm = zpt(),
         cldfra_bl = zpt(), qc_bl = zpt(), qi_bl = zpt(), K_m = zpt(), K_h = zpt(),
         gh = zpt(), gm = zpt(), qsq = zpt(),
+        g_Ps = zpt(), g_Ps_mynn = zpt(), g_Pb = zpt(), g_eps = zpt(),
+        g_tke_transport = zpt(),
         s_aw = zpt(), s_aw_st = zpt(), s_aw_qw = zpt(), s_aw_qv = zpt(),
         s_aw_u = zpt(), s_aw_v = zpt(), s_aw_e = zpt(),
         plume_ktop = zeros(Int, ncol), plume_ztop = zcol(), aw_max = zcol(),

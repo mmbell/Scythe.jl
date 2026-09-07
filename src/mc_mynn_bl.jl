@@ -1308,6 +1308,14 @@ that value actually is and report it.
         Ps_d += wq[i] * Ps
         Ps_m += wq[i] * rho_t[i] * MN.Km[i] * MY.gm[j]
 
+        # Per-gridpoint budget columns (S9), held only for the sidecar
+        # (src/mynn_io.jl) -- exactly the terms above, nothing recomputed.
+        MY.g_Ps[j] = Ps
+        MY.g_Ps_mynn[j] = rho_t[i] * MN.Km[i] * MY.gm[j]
+        MY.g_Pb[j] = Pb
+        MY.g_eps[j] = eps
+        MY.g_tke_transport[j] = div_e[i]
+
         qdot_h = QDOT_V[i] + (F_sh * gz)
         rw = div_w[i] + (F_q * gz)
         rv = div_v[i] + (F_q * gz)
@@ -1440,23 +1448,6 @@ function mynn_plume_census(MY::MYNNState)
            "mynn_n_plume=$(sum(MY.n_plume_col))"
 end
 
-"""
-    mynn_write_final!(grid, model, mtile)
-
-Print the census once at the end of a run, the `radiation_write_final!` pattern, into
-the per-nest `scythe_out.log`. Also folds the per-column counters into the tile scalars
-`n_clamp_e`/`n_cap_K`/`n_diffnum` so a caller that reads the state (a test, the
-benchmark diagnostics) sees the same totals the line reports. The sidecar NetCDF is S9.
-"""
-function mynn_write_final!(mtile::ModelTile)
-    MY = mtile.mynn
-    MY.active || return nothing
-    MY.n_clamp_e = sum(MY.n_clamp_col)
-    MY.n_cap_K = sum(MY.n_capK_col)
-    MY.n_diffnum = sum(MY.n_diffnum_col)
-    MY.n_gate = sum(MY.n_gate_col)
-    MY.n_stall = sum(MY.n_stall_col)
-    MY.n_plume = sum(MY.n_plume_col)
-    MY.trace && println(mynn_census_line(MY))
-    return nothing
-end
+# `mynn_write_final!` (the run-end hook: folds the per-column counters, prints the
+# census line, and -- S9 -- writes the final sidecar snapshot) lives in src/mynn_io.jl,
+# included after this file, beside `mynn_write!` and the rest of the sidecar I/O.

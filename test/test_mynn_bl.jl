@@ -99,6 +99,12 @@ using SparseArrays
             options[:mynn_interval] = interval
             options[:mynn_water_carry] = water_carry
             options[:mynn_trace] = false
+            # `:mynn_output` now defaults to true (S9); this fixture has no `output_dir`
+            # of its own (it falls back to `ModelParameters`'s "./output/" default), so
+            # every caller that reaches `mynn_write_final!` would otherwise write a
+            # sidecar into the repo's working directory. Off here; test_mynn_io.jl is
+            # where the sidecar itself is tested, with its own `mktempdir` output_dir.
+            options[:mynn_output] = false
         end
         model = ModelParameters(
             ts = ts, integration_time = 10.0 * ts, output_interval = 10.0 * ts,

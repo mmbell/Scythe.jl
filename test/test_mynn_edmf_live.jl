@@ -128,7 +128,11 @@ using SparseArrays
                                    :mynn_interval => interval,
                                    :mynn_edmf => edmf,
                                    :mynn_edmf_mom => edmf_mom,
-                                   :mynn_trace => false)
+                                   :mynn_trace => false,
+                                   # See the identical note in test_mynn_bl.jl's fixture:
+                                   # `:mynn_output` defaults to true (S9) and this fixture
+                                   # has no `output_dir` of its own.
+                                   :mynn_output => false)
         model = ModelParameters(
             ts = ts, integration_time = 10.0 * ts, output_interval = 10.0 * ts,
             equation_set = "moist_compressible_XZ",

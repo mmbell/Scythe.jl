@@ -6,7 +6,7 @@
 # are drawn on one shared axis, finest last so it wins in the collar overlaps.
 #
 #   julia --project=. benchmarks/o01_movie.jl [--mode full] [--grid rirk]
-#         [--nests 1|3] [--dir NAME_OR_PATH] [--field rho_c|rho_r|ice|rad]
+#         [--nests 1|3] [--dir NAME_OR_PATH] [--field rho_c|rho_r|ice|rad|bl]
 #         [--xlim lo,hi] [--zlim lo,hi] [--fps 8]
 #         [--ctrans none|bhyp|bhyp_smooth] [--rtrans ...] [--cmu X] [--rmu X]
 #         [--icetrans none|bhyp|bhyp_smooth] [--icemu X]
@@ -20,6 +20,17 @@
 # a separate flag); bottom-right is the net radiative heating `dT_lw + sw_scale*dT_sw`
 # [K/day] on the radiation mish (no regridding), a diverging colormap with symmetric
 # limits fixed over the whole run. Sign convention: negative (blue) is cooling.
+#
+# --field bl (S9) needs a MYNN sidecar (<tag>_mynn_i*.nc, Scythe.read_mynn --
+# src/mynn_io.jl) in every patch directory, i.e. the run was made with `:mynn => true`
+# and `:mynn_output` left at its (live) default. Three panels, left to right: the SAME
+# condensate view as the default --field rho_c (rho_c fill, rho_r contours); K_h,
+# log-scaled (a boundary-layer diffusivity spans orders of magnitude, from a "no mixing"
+# free troposphere to tens of m^2/s in a convective layer) on the closure's own mish
+# (no regridding), with the diagnosed PBL height drawn as a line over the fill; and the
+# mass-specific TKE `e = rho_e/rho_t`, filled, same mish. Works on an `ocean_warm_bubble`
+# directory too (`--dir ocean_warm_bubble_quick_mc_rirk_s5mynn`-style) -- this script's
+# case label already detects that benchmark by its directory name.
 #
 # Reads benchmarks/output/o01_rainfall_<mode>_mc<gridsuffix><nestsuffix>/ and
 # writes o01_rainfall_<mode>_<grid><nestsuffix>_<field>.mp4 there. Grid
@@ -124,9 +135,10 @@ let i = 1
         end
     end
 end
-field in ("rho_c", "rho_r", "ice", "rad") ||
-    error("--field must be rho_c, rho_r, ice or rad")
+field in ("rho_c", "rho_r", "ice", "rad", "bl") ||
+    error("--field must be rho_c, rho_r, ice, rad or bl")
 is_rad = field == "rad"
+is_bl = field == "bl"
 
 # ── Locate the run, and its patches ─────────────────────────────────────────
 suffix = grid == "rz" ? "" : "_$(grid)"
@@ -355,6 +367,31 @@ if is_rad
         global olr_hi = max(olr_hi, maximum(rad.olr))
     end
 end
+# ── MYNN colour/axis scaling (--field bl only) ───────────────────────────────
+# A second pass, over the sidecar (Scythe.read_mynn, on the closure's own mish -- no
+# regridding): K_h's log-scale colour range (a positive floor for the log axis, and the
+# domain max) and e's sequential colour range (0..max), both fixed over the whole run,
+# same rationale as rad's ranges above.
+kh_floor = 1.0e-3     # m^2/s -- below this reads as "no mixing" on the log scale
+kh_max = kh_floor
+e_max = 0.0
+if is_bl
+    for p in 1:npatch
+        pdir = joinpath(dir, patch_dirs[p])
+        isempty(Scythe.mynn_snapshots(pdir)) &&
+            error("--field bl needs a MYNN sidecar (<tag>_mynn_i*.nc, Scythe.read_mynn) " *
+                  "in $pdir — this run was very likely made without options[:mynn], or " *
+                  "with :mynn_output = false.")
+    end
+    for t in snap_times, p in 1:npatch
+        snap = Scythe.read_mynn(joinpath(dir, patch_dirs[p]), string(t))
+        global kh_max = max(kh_max, maximum(snap.K_h))
+        global e_max = max(e_max, maximum(snap.e))
+    end
+    # A run with no mixing at all (K_h identically 0) would otherwise hand contourf a
+    # zero-span log range; widen it a decade so the (blank) fill still renders.
+    global kh_max = max(kh_max, 10.0 * kh_floor)
+end
 if field == "rho_r"
     # Diverging, symmetric, clipped a little tighter than the positive peak so
     # the smaller negative rain still reads at contrast.
@@ -392,6 +429,9 @@ draw_ice && println(@sprintf(
 is_rad && println(@sprintf(
     "radiation: net heating range ±%.2f K/day, OLR range %.1f..%.1f W/m²",
     rad_cmax, olr_lo, olr_hi))
+is_bl && println(@sprintf(
+    "MYNN: K_h range %.1e..%.2f m²/s (log scale), e range 0..%.3f m²/s²",
+    kh_floor, kh_max, e_max))
 
 # ── Frames ──────────────────────────────────────────────────────────────────
 framedir = joinpath(dir, "movie_frames")
@@ -437,14 +477,21 @@ late_frame_path = joinpath(dir, "$(rundir === nothing ?
     basename(rstrip(dir, '/')))_$(field)_frame_late.png")
 
 for (i, t) in enumerate(snap_times)
-    fig = Figure(size = is_rad ? (1500, 560) : (1100, 460))
+    fig = Figure(size = is_rad ? (1500, 560) : is_bl ? (1650, 460) : (1100, 460))
     ax = is_rad ? Axis(fig[2, 1], xlabel = "x (km)", ylabel = "z (km)") :
                   Axis(fig[1, 1], xlabel = "x (km)", ylabel = "z (km)")
     ax_olr = is_rad ? Axis(fig[1, 1:4], xlabel = "", ylabel = "OLR (W/m²)") : nothing
     ax_rad = is_rad ? Axis(fig[2, 3], xlabel = "x (km)", ylabel = "z (km)") : nothing
     is_rad && rowsize!(fig.layout, 1, Relative(0.18))   # thin top row, per the S5 spec
+    # `--field bl`: two more panels beside the condensate view, K_h then e, each with its
+    # own colorbar column -- the SAME three-axis-plus-colorbars layout `ax`/`Colorbar`
+    # already use for the default view, just repeated twice.
+    ax_kh = is_bl ? Axis(fig[1, 3], xlabel = "x (km)", ylabel = "z (km)") : nothing
+    ax_e = is_bl ? Axis(fig[1, 5], xlabel = "x (km)", ylabel = "z (km)") : nothing
     local cf = nothing
     local cf_rad = nothing
+    local cf_kh = nothing
+    local cf_e = nothing
     minc = Inf; minr = Inf
     max1 = max2 = max3 = 0.0
     for p in draw_order
@@ -510,6 +557,39 @@ for (i, t) in enumerate(snap_times)
         xlims!(ax_olr, xspan...)
         ylims!(ax_olr, olr_lo - 0.05 * abs(olr_lo), olr_hi + 0.05 * abs(olr_hi) + 1.0)
         Colorbar(fig[2, 4], cf_rad, label = "K/day")
+    end
+
+    # ── MYNN panels (--field bl): K_h (log scale) with the PBL height line, and e. Both
+    # read straight off the sidecar mish (Scythe.read_mynn) -- no regridding.
+    if is_bl
+        for p in draw_order
+            snap = Scythe.read_mynn(joinpath(dir, patch_dirs[p]), string(t))
+            xr = snap.x ./ 1000.0
+            zr = snap.z ./ 1000.0
+            # `snap.K_h`/`snap.e` come out of `read_mynn` already (x, z) -- the SAME
+            # shape convention `rad.dT_lw` uses in the radiation panel above (no
+            # transpose there either); only the condensate view above needs the `'`
+            # because `read_patch` hands back (z, x).
+            Kh = max.(snap.K_h, kh_floor)     # floored for log10
+            e_ = snap.e
+            cf_kh = contourf!(ax_kh, xr, zr, Kh,
+                              levels = 10.0 .^ range(log10(kh_floor), log10(kh_max);
+                                                     length = 31),
+                              colorscale = log10, extendlow = :auto, extendhigh = :auto,
+                              colormap = :viridis)
+            lines!(ax_kh, xr, snap.pblh ./ 1000.0, color = :white, linewidth = 1.5)
+            cf_e = contourf!(ax_e, xr, zr, e_,
+                             levels = range(0.0, max(e_max, 1.0e-6); length = 30),
+                             extendhigh = :auto, colormap = :viridis)
+            nested && vlines!(ax_kh, [xr[1], xr[end]]; color = (:gray, 0.3), linewidth = 0.5)
+            nested && vlines!(ax_e, [xr[1], xr[end]]; color = (:gray, 0.3), linewidth = 0.5)
+        end
+        xlims!(ax_kh, xspan...); ylims!(ax_kh, zlim...)
+        xlims!(ax_e, xspan...); ylims!(ax_e, zlim...)
+        ax_kh.title = "K_h (log scale), white line = PBL height"
+        ax_e.title = "e = ρ_e/ρ_t"
+        Colorbar(fig[1, 4], cf_kh, label = "K_h (m²/s)")
+        Colorbar(fig[1, 6], cf_e, label = "e (m²/s²)")
     end
 
     # State the CONVENTION alongside the minima. Under a transform these read 0.000 by
