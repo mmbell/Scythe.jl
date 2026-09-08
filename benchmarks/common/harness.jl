@@ -14,6 +14,21 @@ using Dates
 using CSV
 using DataFrames
 
+# WHY EVERY BENCHMARK PINS CSV.
+#
+# The model's default `options[:output_formats]` is `[:netcdf]` -- one comprehensive
+# `<t>.nc` per output time, written by the model itself. The benchmark harness does not read
+# that: `read_final_output`, `compare_reference`, `write_reference`, `conservation_drift` and
+# every per-case diagnostic parse `<t>_physical.csv` / `<t>_spectral.csv`, and the committed
+# regression references ARE CSVs. A benchmark that inherited the default would produce no
+# CSV at all and fail with a missing file, or -- far worse for a regression suite -- quietly
+# compare against a stale one left over from an earlier run.
+#
+# So the format is PINNED here and spliced into every benchmark's options Dict, rather than
+# left to the default. It is a list so a benchmark that also wants the comprehensive file
+# can write `[BENCHMARK_OUTPUT_FORMATS..., :netcdf]` without guessing what the harness needs.
+const BENCHMARK_OUTPUT_FORMATS = [:csv]
+
 const BENCHMARKS_DIR = normpath(joinpath(@__DIR__, ".."))
 const REFERENCE_DATA_DIR = joinpath(BENCHMARKS_DIR, "reference_data")
 const RESULTS_DIR = joinpath(BENCHMARKS_DIR, "results")

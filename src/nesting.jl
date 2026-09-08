@@ -799,7 +799,12 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
     map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
     patch.spectral .= sharedSpectral
     gridTransform!(patch)
-    write_output(patch, model, 0.0)
+    # This patch's comprehensive-NetCDF output context, built ONCE here for the same
+    # reason `run_model` builds one (it constructs the reference state) and threaded into
+    # both writes below. Every nest has its OWN vertical extent and therefore its own
+    # regular z and its own reference profiles, so this cannot be shared between patches.
+    nc_ctx = netcdf_output_context(patch, model)
+    write_output(patch, model, 0.0; ctx = nc_ctx, workerids = workerids)
     flush(stdout)
     checkCFL(patch)
 
@@ -972,7 +977,7 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
             cfl_diagnostics(patch, model, t, dz_min, dx_min, c_bar)
         end
         if is_output_step
-            write_output(patch, model, t * model.ts)
+            write_output(patch, model, t * model.ts; ctx = nc_ctx, workerids = workerids)
             checkCFL(patch; t=t, ts=model.ts, where="output")
         end
         if is_restart_step

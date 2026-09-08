@@ -42,8 +42,9 @@ function bf02_moist_model(opts::BenchmarkOptions)
             "primitive_equation_XZ_rhod_pd" : "primitive_equation_XZ_rhod"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
-        options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                       :precipitation => false, :vertical_mixing => false)
+        options = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                       :precipitation => false, :vertical_mixing => false,
+                       :output_formats => BENCHMARK_OUTPUT_FORMATS)
     else
         error("This re-eval helper is for the pe-rho_d / pe-rho_d-pd stages.")
     end

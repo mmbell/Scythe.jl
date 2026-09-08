@@ -166,7 +166,8 @@ function o01_model(opts::BenchmarkOptions)
                            :tau_qss => 10.0, :N_r => N_R, :N_0 => N_0_MP,
                            :alpha => 0.02, :z_damp => 17.0e3)
     options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
-                                     :precipitation => true, :vertical_mixing => false),
+                                     :precipitation => true, :vertical_mixing => false,
+                                     :output_formats => BENCHMARK_OUTPUT_FORMATS),
                     reference_state_options())
     # Attribution knobs: toggle the water source terms ("0"/"1"). Unset => defaults
     # (:precipitation on, :condensation on-by-absence), i.e. bit-identical.

@@ -95,8 +95,9 @@ function straka_model(opts::BenchmarkOptions)
     # Semi-implicit acoustics are validated for the linear rho_d set (Phase 2) and the
     # total-energy set, so enable them there; the xi stages stay explicit for this dry
     # benchmark. The mc set consumes an exact pressure-based reference state.
-    options = Dict(:semiimplicit => opts.stage in (STAGE_PE_RHOD, STAGE_MC),
-                   :exact_reference_state => opts.stage == STAGE_MC)
+    options = Dict{Symbol,Any}(:semiimplicit => opts.stage in (STAGE_PE_RHOD, STAGE_MC),
+                   :exact_reference_state => opts.stage == STAGE_MC,
+                   :output_formats => BENCHMARK_OUTPUT_FORMATS)
     if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_MC)
         # The paper prescribes uniform K = 75 only (carried by Khdiff/Kvdiff);
         # no precipitation or shear-based turbulence

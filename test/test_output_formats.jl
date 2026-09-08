@@ -50,13 +50,36 @@ using NCDatasets
             options = opts)
     end
 
-    @testset "default is CSV (backward compatible)" begin
+    @testset "default is NetCDF" begin
+        # Stage N1 flipped the default from [:csv] to [:netcdf]. CSV is now OPT-IN, and
+        # every consumer that parses `<t>_physical.csv` (the benchmark harnesses, the
+        # regression references, the ICs reader) pins it explicitly.
         dir = mktempdir()
         Scythe.write_output(make_grid(), model(dir), 0.0)
+        @test isfile(joinpath(dir, "0.0.nc"))
+        @test !isfile(joinpath(dir, "0.0_spectral.csv"))
+        @test !isfile(joinpath(dir, "0.0_physical.csv"))
+        @test !isfile(joinpath(dir, "0.0_gridded.csv"))
+        # ...and this equation set is not a pressure-reference one, so what it gets is the
+        # PROGNOSTIC layout under the same name, marked as such.
+        NCDataset(joinpath(dir, "0.0.nc"), "r") do ds
+            @test ds.attrib["scythe_file_kind"] == "prognostic"
+            @test ds.attrib["equation_set"] == "Twoway_PV_mixing"
+            @test haskey(ds, "u")
+            @test haskey(ds, "v")
+            # Springsteel defaults every coordinate's units to "1"; Scythe supplies the
+            # real ones (RL is cylindrical: radius in metres, azimuth in degrees).
+            @test ds["radius"].attrib["units"] == "m"
+            @test ds["azimuth"].attrib["units"] == "degrees"
+        end
+    end
+
+    @testset "explicit [:csv] still writes the CSV trio and no .nc" begin
+        dir = mktempdir()
+        Scythe.write_output(make_grid(), model(dir; formats = [:csv]), 0.0)
         @test isfile(joinpath(dir, "0.0_spectral.csv"))
         @test isfile(joinpath(dir, "0.0_physical.csv"))
         @test isfile(joinpath(dir, "0.0_gridded.csv"))
-        # No opt-in formats requested → no nc emitted.
         @test !isfile(joinpath(dir, "0.0.nc"))
     end
 
@@ -89,14 +112,30 @@ using NCDatasets
         end
     end
 
-    @testset "NetCDF derivatives knob" begin
+    @testset "NetCDF derivatives knob (:netcdf_raw only)" begin
+        # The derivative slots belong to the LEGACY prognostic writer: they are spline
+        # derivatives of the control variables, and the comprehensive file's variables are
+        # derived products that have none. So the knob follows `:netcdf_raw`, whose file is
+        # `<t>_raw.nc`.
         dir = mktempdir()
         Scythe.write_output(make_grid(),
-                            model(dir; formats = [:netcdf], derivs = true), 0.0)
-        NCDataset(joinpath(dir, "0.0.nc"), "r") do ds
+                            model(dir; formats = [:netcdf_raw], derivs = true), 0.0)
+        @test isfile(joinpath(dir, "0.0_raw.nc"))
+        @test !isfile(joinpath(dir, "0.0.nc"))
+        NCDataset(joinpath(dir, "0.0_raw.nc"), "r") do ds
             @test haskey(ds, "u")
             @test haskey(ds, "u_r")     # radial derivative slot now present
             @test haskey(ds, "u_az")    # azimuthal derivative slot
+        end
+    end
+
+    @testset ":netcdf_raw values-only by default" begin
+        dir = mktempdir()
+        Scythe.write_output(make_grid(), model(dir; formats = [:netcdf_raw]), 0.0)
+        NCDataset(joinpath(dir, "0.0_raw.nc"), "r") do ds
+            @test haskey(ds, "u")
+            @test !haskey(ds, "u_r")
+            @test ds["time"].var[1] == 0.0
         end
     end
 

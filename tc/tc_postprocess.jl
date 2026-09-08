@@ -103,57 +103,13 @@ if isempty(nests)
 end
 println("Postprocessing $(length(nests)) nest(s) in $indir: $(join(nests, ", "))")
 
-const RHO_L = Springsteel.Thermodynamics.rho_l   # 1000 kg/m^3
-
-# ── What slots 8 and 9 hold ───────────────────────────────────────────────────
-# Under options[:condensate_transform] / [:rain_transform] the slot carries Ooyama's biased
-# hyperbolic control variable rather than a density, and the netCDF variable is NAMED for it
-# (nu_c / nu_r). The names decide; this only supplies the variant and the bias, which a name
-# cannot carry, read from the `show(ModelParameters)` on line 2 of the run's scythe_out.log.
-# Falls back to the model's own defaults, which is the state of every TC run to date.
-function detect_water_transforms(dir)
-    ctrans, rtrans = :bhyp, :bhyp          # only consulted when a nu_* variable is present
-    cmu, rmu = 1.0e-7, 1.0e-7
-    for cand in (joinpath(dir, "scythe_out.log"),
-                 (joinpath(dir, d, "scythe_out.log") for d in readdir(dir)
-                  if isdir(joinpath(dir, d)))...)
-        isfile(cand) || continue
-        txt = try read(cand, String) catch; "" end
-        m = match(r":condensate_transform\s*=>\s*:(\w+)", txt)
-        m === nothing || (ctrans = Symbol(m.captures[1]))
-        m = match(r":rain_transform\s*=>\s*:(\w+)", txt)
-        m === nothing || (rtrans = Symbol(m.captures[1]))
-        m = match(r":condensate_mu\s*=>\s*([0-9.eE+-]+)", txt)
-        m === nothing || (cmu = parse(Float64, m.captures[1]))
-        m = match(r":rain_mu\s*=>\s*([0-9.eE+-]+)", txt)
-        m === nothing || (rmu = parse(Float64, m.captures[1]))
-        break
-    end
-    return (ctrans = ctrans, cmu = cmu, rtrans = rtrans, rmu = rmu)
-end
-const WTRANS = detect_water_transforms(indir)
-
 # ── S-band Rayleigh reflectivity ──────────────────────────────────────────────
-# Equivalent reflectivity factor Z = ∫ N(D) D^6 dD, converted to mm^6/m^3, then
-# dBZ = 10 log10(Z). Rain: exponential DSD n(D)=N0 exp(-λD) with the model's slope
-# λ = (π ρ_l N0 / ρ_r)^(1/4) (mp_slope), giving Z_r = 720 N0 / λ^7. Cloud: N_c
-# identical droplets of diameter D_c set by the mass, Z_c = N_c D_c^6. Cloud is
-# negligible in dBZ but included for completeness. Below REFL_FLOOR → NaN (no echo).
-const REFL_FLOOR_DBZ = -30.0
-function reflectivity_dBZ(rho_c, rho_r, N0, Nc_m3)
-    Z = 0.0                                                   # [m^6/m^3]
-    if rho_r > 1.0e-8
-        λ = (π * RHO_L * N0 / rho_r)^0.25                     # [1/m]
-        Z += 720.0 * N0 / λ^7
-    end
-    if rho_c > 1.0e-8
-        Dc = (6.0 * rho_c / (π * RHO_L * Nc_m3))^(1.0 / 3.0)  # [m]
-        Z += Nc_m3 * Dc^6
-    end
-    Z *= 1.0e18                                               # m^6/m^3 → mm^6/m^3
-    dBZ = 10.0 * log10(Z)
-    return dBZ < REFL_FLOOR_DBZ ? NaN : dBZ
-end
+# The implementation now lives in the MODEL (`Scythe.reflectivity_dBZ`, src/netcdf_output.jl),
+# which writes the same product straight into `<t>.nc`. This script keeps the name as an
+# alias rather than a copy, so the two can never drift: a change to the assumed DSD has to
+# happen in one place and both the live output and this postprocessor follow it.
+const REFL_FLOOR_DBZ = Scythe.REFL_FLOOR_DBZ
+const reflectivity_dBZ = Scythe.reflectivity_dBZ
 
 # ── Reference column (shared: all nests use the same vertical grid) ───────────
 # Read the run's own reference column values (z p rho_d rho_v rho_c, p in Pa) and
@@ -249,45 +205,14 @@ end
 # `Scythe.read_radiation` reads directly. The per-column boundary values derived FROM them
 # (olr, sw_sfc_dn, ...) do come across, since those are scalars per column.
 
-"""
-Linear-interpolation weights from ascending source nodes `xs` onto targets `xt`: the
-bracketing indices and the weight on the left one. Targets outside `xs` clamp to the edge.
-"""
-function interp_weights(xs::AbstractVector{<:Real}, xt::AbstractVector{<:Real})
-    n = length(xs)
-    i0 = Vector{Int}(undef, length(xt)); i1 = similar(i0)
-    w0 = Vector{Float64}(undef, length(xt))
-    for (j, x) in enumerate(xt)
-        if n == 1 || x <= xs[1]
-            i0[j] = 1; i1[j] = 1; w0[j] = 1.0
-        elseif x >= xs[n]
-            i0[j] = n; i1[j] = n; w0[j] = 1.0
-        else
-            k = clamp(searchsortedlast(xs, x), 1, n - 1)
-            i0[j] = k; i1[j] = k + 1
-            w0[j] = (xs[k + 1] - x) / (xs[k + 1] - xs[k])
-        end
-    end
-    return (i0, i1, w0)
-end
-
-"""Separable linear resample of the (x, z) matrix `A` using `interp_weights` in each axis."""
-function regrid2d(A::AbstractMatrix, wx, wz)
-    (ix0, ix1, wx0) = wx; (iz0, iz1, wz0) = wz
-    B = Matrix{Float64}(undef, length(ix0), length(iz0))
-    @inbounds for j in eachindex(iz0), i in eachindex(ix0)
-        a = wx0[i] * A[ix0[i], iz0[j]] + (1 - wx0[i]) * A[ix1[i], iz0[j]]
-        b = wx0[i] * A[ix0[i], iz1[j]] + (1 - wx0[i]) * A[ix1[i], iz1[j]]
-        B[i, j] = wz0[j] * a + (1 - wz0[j]) * b
-    end
-    return B
-end
-
-"""Linear resample of a per-column (x-only) vector."""
-function regrid1d(v::AbstractVector, wx)
-    (ix0, ix1, wx0) = wx
-    return [wx0[i] * v[ix0[i]] + (1 - wx0[i]) * v[ix1[i]] for i in eachindex(ix0)]
-end
+# The three regridding helpers below are the MODEL's (`Scythe.interp_weights`,
+# `Scythe.regrid2d`, `Scythe.regrid1d`, src/netcdf_output.jl), aliased rather than copied
+# for the reason given at `reflectivity_dBZ` above: stage N2 folds the physics sidecars into
+# `<t>.nc` with these same weights, and a second copy here would be free to drift from the
+# interpolation the model actually writes.
+const interp_weights = Scythe.interp_weights
+const regrid2d = Scythe.regrid2d
+const regrid1d = Scythe.regrid1d
 
 # ── Per-snapshot derivation and write ─────────────────────────────────────────
 rd2d(ds, name, n_i, n_k) = coalesce.(Array(ds[name])[1, :, :], NaN)   # (n_i, n_k)

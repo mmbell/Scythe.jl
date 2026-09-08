@@ -315,6 +315,75 @@ function _allocate_solve_workspace(kbasis, tile::AbstractGrid)
 end
 
 """
+    build_reference_state(model, z_values, ref_column) -> AbstractReferenceState
+
+The reference state a run integrates against, for the model levels `z_values` and the
+natural-BC vertical basis column `ref_column`.
+
+Factored out of [`createModelTile`](@ref) as a PURE MOVE — the same branches in the same
+order, calling the same Springsteel constructors with the same arguments — so the reference
+every tile builds is bitwise what it was. Nothing may be added here that the tile does not
+already get.
+
+It is a free function rather than tile-private because the comprehensive NetCDF writer
+needs the SAME object on the MASTER (`netcdf_output_context`, src/netcdf_output.jl), where
+there is no `ModelTile`: the totals it writes are `prime + reference`, and a reference
+rebuilt by any other route — re-read from the sounding, re-derived, interpolated — would
+put a reconstruction error into every total in the file. That is exactly the class of bug
+`tc/tc_postprocess.jl` carried (its `--legacy-qss` flag existed because it could not know
+which `Q̄_ss` convention the run had used).
+
+Which branch fires:
+- `uses_pressure_reference` (the `moist_compressible` family) → the pressure-based
+  `PressureReferenceState`, with the `:hydrostatic_reference` and
+  `:consistent_qss_reference` opt-ins;
+- `options[:exact_reference_state]` → the pre-balanced file, physical or legacy xi/mu;
+- otherwise → the Springsteel physical reference, viewed back as a legacy `ReferenceState`
+  for the older equation sets.
+"""
+function build_reference_state(model::ModelParameters, z_values::Vector{Float64},
+                               ref_column)
+
+    # The partial-density equation sets (primitive_equation_*_pd) read the physical
+    # vapor/condensate partial-density profiles (ref_rho_v / ref_rho_c) directly, so
+    # they keep the Springsteel physical reference state rather than the legacy
+    # xi/mu derived view used by the older equation sets.
+    physical_ref = uses_physical_reference(model.equation_set)
+
+    if uses_pressure_reference(model.equation_set)
+        # The total-energy set (moist_compressible) consumes the pressure-based
+        # reference (p, partial densities, E_t, Q_ss) directly.
+        # :hydrostatic_reference — build dp̄/dz to satisfy discrete hydrostatic
+        # balance EXACTLY rather than to spline-fit accuracy (17% off at the TC
+        # lid). Opt-in, off by default: it moves every pressure-reference baseline.
+        hydro = get(model.options, :hydrostatic_reference, false)::Bool
+        ref_state = model.options[:exact_reference_state] ?
+            Springsteel.exact_pressure_reference_state(model.ref_state_file, z_values,
+                                                       ref_column; hydrostatic=hydro) :
+            Springsteel.calculate_pressure_reference_state(model.ref_state_file, z_values,
+                                                           ref_column; hydrostatic=hydro)
+        # Rebuild Q_ssbar through the model's own retrieval so the resting column is
+        # a discrete fixed point (see consistent_qss_reference). Opt-in, off by
+        # default: it moves every pressure-reference baseline (BF02, O01, Straka).
+        if get(model.options, :consistent_qss_reference, false)::Bool
+            ref_state = consistent_qss_reference(ref_state, z_values, ref_column)
+        end
+    elseif (model.options[:exact_reference_state])
+        ref_state = physical_ref ?
+            Springsteel.exact_reference_state(model.ref_state_file, z_values, ref_column) :
+            exact_reference_state(model, z_values, ref_column)
+    else
+        # Build the shared physical-density reference state (Springsteel). The
+        # partial-density sets consume it directly; the legacy xi/mu sets view it
+        # back as a legacy ReferenceState so their bodies are unchanged.
+        phys = Springsteel.calculate_reference_state(model.ref_state_file, z_values,
+            ref_column; moisture=true)
+        ref_state = physical_ref ? phys : legacy_reference_view(phys, ref_column)
+    end
+    return ref_state
+end
+
+"""
     createModelTile(patch, tile, model, haloReceiveMap)
 
 Create and initialize a [`ModelTile`](@ref) with allocated state arrays, reference state,
@@ -373,43 +442,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         # grids have 3 — `ndims` was wrong there, it is always 2 for a Matrix)
         z_values = tilepoints[1:model.grid_params.kDim,end]
         ref_column = reference_column(tile, model.grid_params)
-
-        # The partial-density equation sets (primitive_equation_*_pd) read the physical
-        # vapor/condensate partial-density profiles (ref_rho_v / ref_rho_c) directly, so
-        # they keep the Springsteel physical reference state rather than the legacy
-        # xi/mu derived view used by the older equation sets.
-        physical_ref = uses_physical_reference(model.equation_set)
-
-        if uses_pressure_reference(model.equation_set)
-            # The total-energy set (moist_compressible) consumes the pressure-based
-            # reference (p, partial densities, E_t, Q_ss) directly.
-            # :hydrostatic_reference — build dp̄/dz to satisfy discrete hydrostatic
-            # balance EXACTLY rather than to spline-fit accuracy (17% off at the TC
-            # lid). Opt-in, off by default: it moves every pressure-reference baseline.
-            hydro = get(model.options, :hydrostatic_reference, false)::Bool
-            ref_state = model.options[:exact_reference_state] ?
-                Springsteel.exact_pressure_reference_state(model.ref_state_file, z_values,
-                                                           ref_column; hydrostatic=hydro) :
-                Springsteel.calculate_pressure_reference_state(model.ref_state_file, z_values,
-                                                               ref_column; hydrostatic=hydro)
-            # Rebuild Q_ssbar through the model's own retrieval so the resting column is
-            # a discrete fixed point (see consistent_qss_reference). Opt-in, off by
-            # default: it moves every pressure-reference baseline (BF02, O01, Straka).
-            if get(model.options, :consistent_qss_reference, false)::Bool
-                ref_state = consistent_qss_reference(ref_state, z_values, ref_column)
-            end
-        elseif (model.options[:exact_reference_state])
-            ref_state = physical_ref ?
-                Springsteel.exact_reference_state(model.ref_state_file, z_values, ref_column) :
-                exact_reference_state(model, z_values, ref_column)
-        else
-            # Build the shared physical-density reference state (Springsteel). The
-            # partial-density sets consume it directly; the legacy xi/mu sets view it
-            # back as a legacy ReferenceState so their bodies are unchanged.
-            phys = Springsteel.calculate_reference_state(model.ref_state_file, z_values,
-                ref_column; moisture=true)
-            ref_state = physical_ref ? phys : legacy_reference_view(phys, ref_column)
-        end
+        ref_state = build_reference_state(model, z_values, ref_column)
     end
 
     # Set up the map between the tile and the patch (returns SparseMatrixCSC directly)
@@ -876,6 +909,10 @@ Returns the initialized patch grid.
 function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     num_workers = length(workerids)
+    # Output configuration FIRST, before a worker or a grid exists: a typo in
+    # :output_formats or a :netcdf_* key must kill the run here, not at the first output
+    # interval several minutes in (src/netcdf_output.jl).
+    validate_output_options(model)
     println("Initializing with $(num_workers) workers and tiles")
     patch = createGrid(model.grid_params)
     println("$model")
@@ -934,7 +971,14 @@ end
 Main time integration loop. Establishes `RemoteChannel` connections between workers,
 creates the shared spectral array, and drives the model forward through all timesteps.
 """
-function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64})
+function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64};
+        ctx = nothing)   # ::NetCDFOutputContext; untyped, netcdf_output.jl is included later
+
+    # Comprehensive-NetCDF output context (src/netcdf_output.jl). Built ONCE per run --
+    # it constructs the reference state, which means reading and fitting the run's .ref
+    # file -- and threaded into every write below. `integrate_model` normally builds it
+    # and passes it in; a direct caller (a test, the REPL) gets it built here.
+    ctx === nothing && (ctx = netcdf_output_context(patch, model))
 
     num_workers = length(workerids)
     println("Model starting up with $(num_workers) workers and tiles...")
@@ -1056,7 +1100,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     # Output initial time
     patch.spectral .= sharedSpectral
     gridTransform!(patch)
-    write_output(patch, model, 0.0)
+    write_output(patch, model, 0.0; ctx = ctx, workerids = workerids)
     flush(stdout)
     # Check for NaNs and quit if found
     checkCFL(patch)
@@ -1064,7 +1108,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
         haloInitBuffer, haloReceiveBuffer, haloReceiveMap; hsd, hsi_u_incr,
-        esd, xsi_xstar, xsi_h)
+        esd, xsi_xstar, xsi_h, ctx)
 
     # Integration complete! Finalize the patch
     patch.spectral .= sharedSpectral
@@ -1083,7 +1127,8 @@ via `RemoteChannel`s, accumulates spectral contributions, and writes periodic ou
 function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
         sharedSpectral::SharedArray{Float64}, haloInit::RemoteChannel, haloReceive::RemoteChannel,
         haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveMap::SparseMatrixCSC{Float64, Int64};
-        hsd=nothing, hsi_u_incr=nothing, esd=nothing, xsi_xstar=nothing, xsi_h=nothing)
+        hsd=nothing, hsi_u_incr=nothing, esd=nothing, xsi_xstar=nothing, xsi_h=nothing,
+        ctx = nothing)   # ::NetCDFOutputContext; see run_model
 
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
@@ -1184,7 +1229,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         # reproducibility comparison reads. The write costs ~1-2 s per 80 MB CSV against
         # ~50 s of stepping per output interval on the quick ice benchmark.
         if is_output_step
-            write_output(patch, model, (t*model.ts))
+            write_output(patch, model, (t*model.ts); ctx = ctx, workerids = workerids)
             checkCFL(patch; t=t, ts=model.ts, where="output")
         end
 
@@ -1357,13 +1402,20 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
 end
 
 """
-    finalize_model(grid, model)
+    finalize_model(grid, model; ctx = nothing, workerids = Int64[])
 
 Write final model output at the end of the integration period.
-"""
-function finalize_model(grid::AbstractGrid, model::ModelParameters)
 
-    write_output(grid, model, model.integration_time)
+`ctx` is the comprehensive-NetCDF output context (src/netcdf_output.jl). `integrate_model`
+passes the one it built at setup; the NESTED driver does not (its context is a local of
+`run_nested_patch`, which has already returned by the time each patch is finalized), so a
+nested run rebuilds it here — one reference-state construction per patch, once, at run end.
+`workerids` is threaded for stage N2's physics-group collection and unused in N1.
+"""
+function finalize_model(grid::AbstractGrid, model::ModelParameters;
+                        ctx = nothing, workerids::Vector{Int64} = Int64[])
+
+    write_output(grid, model, model.integration_time; ctx = ctx, workerids = workerids)
     # Guaranteed final restart checkpoint (covers both single-grid and nested,
     # which route their finalize through here). Skipped when checkpoints are off.
     if model.restart_interval > 0

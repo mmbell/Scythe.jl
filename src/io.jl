@@ -1,54 +1,88 @@
 #Functions for I/O
 
 """
-    write_output(grid::AbstractGrid, model::ModelParameters, t::Float64)
+    write_output(grid::AbstractGrid, model::ModelParameters, t::Float64;
+                 ctx = nothing, workerids::Vector{Int64} = Int64[])
 
 Write the current grid state to the output directory specified in `model.output_dir`,
 using a time-stamped filename stem (`round(t; digits=2)`).
 
 The set of ANALYSIS formats is selected by `model.options[:output_formats]`, a
-list of symbols (default `[:csv]`). Each listed format writes its own file(s) via
-the matching Springsteel writer, all sharing the time stem:
+list of symbols (default `[:netcdf]`). Each listed format writes its own file(s),
+all sharing the time stem:
 
-| Symbol    | Writer               | Files                                              |
-|:--------- |:-------------------- |:-------------------------------------------------- |
-| `:csv`    | `write_grid`         | `<t>_spectral.csv`, `<t>_physical.csv`, `<t>_gridded.csv` |
-| `:netcdf` | `write_netcdf`       | `<t>.nc` — regular/gridded representation (CF, with a `time` coordinate) |
+| Symbol        | Writer                          | Files                                              |
+|:------------- |:------------------------------- |:-------------------------------------------------- |
+| `:netcdf`     | [`write_netcdf_comprehensive`](@ref) | `<t>.nc` — ONE comprehensive file: primes, totals, hydrometeors, derived thermodynamics, radar/precipitation products, column integrals and the reference profiles |
+| `:csv`        | `write_grid`                    | `<t>_spectral.csv`, `<t>_physical.csv`, `<t>_gridded.csv` |
+| `:netcdf_raw` | Springsteel `write_netcdf`      | `<t>_raw.nc` — the legacy prognostic-slot-only gridded file |
 
-For `:netcdf`, `model.options[:netcdf_derivatives]::Bool` (default `false`)
-controls whether derivative slots are written alongside the field values.
+`:netcdf` writes the comprehensive file only for the runs it is defined for: a
+pressure-reference (`moist_compressible`) equation set on a 2-D k-active grid, with a
+reference state to add back ([`comprehensive_netcdf_eligible`](@ref)). Every other run —
+the legacy equation sets, the 3-D moist-compressible grids — gets
+[`write_netcdf_prognostic`](@ref) under the same `<t>.nc` name, which is Springsteel's
+prognostic layout with real coordinate units and a `scythe_file_kind` marker. A reader can
+always tell which it has from that global attribute.
+
+For `:netcdf_raw`, `model.options[:netcdf_derivatives]::Bool` (default `false`) controls
+whether derivative slots are written alongside the field values. It does NOT apply to
+`:netcdf`: the comprehensive file's variables are derived products, which have no spline
+derivative slots.
 
 JLD2 is NOT an analysis format: it is the restart/checkpoint format, written by
 [`write_restart`](@ref) at `model.restart_interval`, not here. Passing
 `:jld2` in `:output_formats` errors and points at `restart_interval` — set
 `restart_interval = output_interval` to checkpoint every analysis step.
 
-!!! note "CSV is the default for a reason"
-    The ICs reader (`read_physical_grid`), the regression references, and the
-    benchmark harnesses all parse `<t>_physical.csv` / `<t>_spectral.csv`. A run
-    whose `:output_formats` omits `:csv` will not feed those consumers — keep
-    `:csv` in the list when a run must also produce CSV. See also
-    [`Twoway_PV_mixing`](@ref) for the `:noise_seed` option pattern this follows.
+!!! note "CSV is opt-in; benchmarks pin it"
+    The ICs reader (`read_physical_grid`), the regression references, and the benchmark
+    harnesses all parse `<t>_physical.csv` / `<t>_spectral.csv`, so every benchmark under
+    `benchmarks/` pins `:output_formats => [:csv]` explicitly rather than relying on the
+    default. A NEW run that must feed one of those consumers has to list `:csv` itself;
+    the default no longer does it for you.
 
 # Arguments
 - `grid::AbstractGrid`: the Springsteel grid containing the current model state.
 - `model::ModelParameters`: model configuration providing the output directory
   and (via `options`) the output format selection.
 - `t::Float64`: current simulation time [s], used to label the output file.
+
+# Keywords
+- `ctx`: the [`NetCDFOutputContext`](@ref) built once per patch by the driver. `nothing`
+  (the default) builds one HERE, which costs a reference-state construction per call — fine
+  for a test or a REPL call, wrong for a run, which is why `run_model`, `model_loop`,
+  `finalize_model` and `run_nested_patch` all thread one through.
+- `workerids`: accepted now, used in stage N2 to collect the physics-group fields (BL,
+  radiation, surface) from the workers that hold them.
 """
-function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64)
+function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64;
+                      ctx = nothing, workerids::Vector{Int64} = Int64[])
+
+    validate_output_options(model)
 
     tag = string(round(t; digits=2))
     isdir(model.output_dir) || mkpath(model.output_dir)
 
-    formats = get(model.options, :output_formats, [:csv])
+    formats = get(model.options, :output_formats, [:netcdf])
     include_derivs = get(model.options, :netcdf_derivatives, false)::Bool
 
     for fmt in formats
         if fmt === :csv
             write_grid(grid, model.output_dir, tag)
         elseif fmt === :netcdf
-            write_netcdf(joinpath(model.output_dir, "$(tag).nc"), grid;
+            # Lazy context so an in-process caller (test, REPL) needs no setup. The drivers
+            # pass one in; see the docstring.
+            ctx === nothing && (ctx = netcdf_output_context(grid, model))
+            path = joinpath(model.output_dir, "$(tag).nc")
+            if ctx.active
+                # Stage N2 fills the `physics` argument from `workerids`; N1 passes nothing.
+                write_netcdf_comprehensive(path, grid, model, t, ctx, nothing)
+            else
+                write_netcdf_prognostic(path, grid, model, t)
+            end
+        elseif fmt === :netcdf_raw
+            write_netcdf(joinpath(model.output_dir, "$(tag)_raw.nc"), grid;
                          include_derivatives = include_derivs, time = t)
         elseif fmt === :jld2
             error("`:jld2` is not an analysis output format — it is the restart " *
@@ -57,7 +91,7 @@ function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64)
                   ":jld2 in options[:output_formats].")
         else
             error("Unknown output format $(fmt) in options[:output_formats]; " *
-                  "supported: :csv, :netcdf")
+                  "supported: :csv, :netcdf, :netcdf_raw")
         end
     end
 
@@ -67,8 +101,8 @@ end
 """
     write_restart(grid::AbstractGrid, model::ModelParameters, t::Float64)
 
-Write a restart checkpoint of `grid` to `model.output_dir/<t>.jld2` via
-Springsteel's [`save_grid`](@ref) (params + spectral + physical, reloaded exactly
+Write a restart checkpoint of `grid` to `model.output_dir/<t>.jld2` via Springsteel's
+[`save_grid`](@ref) (params + spectral + physical, reloaded exactly
 by `load_grid`). Called at `model.restart_interval` and once more at the end of
 the run; a run with `restart_interval == 0` writes no checkpoints.
 

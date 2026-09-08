@@ -90,7 +90,8 @@ function bf02_moist_model(opts::BenchmarkOptions)
     if opts.stage == :legacy
         equation_set = "BF02_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
-        options = Dict(:semiimplicit => true, :exact_reference_state => true)
+        options = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                                   :output_formats => BENCHMARK_OUTPUT_FORMATS)
     elseif opts.stage in (STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA, STAGE_MC)
         # Linear dry-air-density prognostic variant (mass-conserving continuity)
         # with semi-implicit acoustics on the mass flux phi = rhobar_d * w
@@ -111,7 +112,8 @@ function bf02_moist_model(opts::BenchmarkOptions)
                                          :precipitation => false,
                                          :vertical_mixing => false,
                                          :horizontal_semiimplicit => opts.hsi,
-                                         :exact_si => opts.xsi),
+                                         :exact_si => opts.xsi,
+                                         :output_formats => BENCHMARK_OUTPUT_FORMATS),
                         opts.stage == STAGE_MC ? reference_state_options() :
                                                  Dict{Symbol,Any}())
         # Condensate control-variable transform (mc stage only; slot 9 is the cloud density
@@ -145,8 +147,9 @@ function bf02_moist_model(opts::BenchmarkOptions)
         # Reversible benchmark: no precipitation fallout (BF02 spec). The
         # saturated base state carries cloud water everywhere, so
         # autoconversion would otherwise generate rain domain-wide.
-        options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                       :precipitation => false, :vertical_mixing => false)
+        options = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                       :precipitation => false, :vertical_mixing => false,
+                       :output_formats => BENCHMARK_OUTPUT_FORMATS)
     end
 
     ts = vertical_ts(ts, opts)

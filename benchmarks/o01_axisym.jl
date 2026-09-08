@@ -69,8 +69,9 @@ function o01_axisym_model(opts::BenchmarkOptions)
                            :tau_qss => 10.0, :N_r => N_R,
                            :alpha => 0.02, :z_damp => 17.0e3,
                            :f => 0.0)
-    options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                   :precipitation => true, :vertical_mixing => false)
+    options = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                   :precipitation => true, :vertical_mixing => false,
+                   :output_formats => BENCHMARK_OUTPUT_FORMATS)
 
     output_dir = benchmark_output_dir("o01_axisym", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)   # includes v: free-slip walls

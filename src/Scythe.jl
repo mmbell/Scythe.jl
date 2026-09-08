@@ -25,8 +25,9 @@ Main configuration struct for Scythe model runs. Uses `Base.@kwdef` for keyword 
 - `grid_params::SpringsteelGridParameters`: Springsteel grid configuration (required, no default)
 - `physical_params::Dict{Symbol,Float64}`: physical parameters for the equation set (default: empty)
 - `options::Dict{Symbol,Any}`: solver and output options (default: `Dict(:semiimplicit => false, :exact_reference_state => false)`). `:semiimplicit` is an opt-in for the LEGACY equation sets only; the moist_compressible (pressure-reference) sets are ALWAYS semi-implicit — the key may be omitted or `true`, and an explicit `false` is an error (the explicit acoustic mode was removed). Output-format keys read by [`write_output`](@ref):
-    - `:output_formats::Vector{Symbol}` (default `[:csv]`) — which ANALYSIS formats to write each `output_interval`. `:csv` writes the `<t>_spectral.csv`/`<t>_physical.csv`/`<t>_gridded.csv` trio (Springsteel `write_grid`); `:netcdf` writes the gridded representation to `<t>.nc` (`write_netcdf`). List several to write several, e.g. `[:csv, :netcdf]`. JLD2 is not listed here — it is the restart format, written at `restart_interval` (see `write_restart`). NOTE: the ICs reader, regression references, and benchmark harnesses parse the CSVs, so drop `:csv` only for runs that don't feed them.
-    - `:netcdf_derivatives::Bool` (default `false`) — when `:netcdf` is selected, whether to write derivative slots alongside field values.
+    - `:output_formats::Vector{Symbol}` (default `[:netcdf]`) — which ANALYSIS formats to write each `output_interval`. `:netcdf` writes ONE comprehensive `<t>.nc` per output time (primes, totals, recovered hydrometeors, retrieved thermodynamics, radar/precipitation products, column integrals and the reference profiles) for the moist-compressible sets, and the prognostic-slot layout for everything else; `:csv` writes the `<t>_spectral.csv`/`<t>_physical.csv`/`<t>_gridded.csv` trio (Springsteel `write_grid`); `:netcdf_raw` writes the LEGACY prognostic-only gridded file to `<t>_raw.nc` (Springsteel `write_netcdf`). List several to write several, e.g. `[:csv, :netcdf]`. JLD2 is not listed here — it is the restart format, written at `restart_interval` (see `write_restart`). NOTE: the ICs reader, regression references, and benchmark harnesses parse the CSVs, so a run that must feed one of those has to list `:csv` explicitly — every benchmark under `benchmarks/` pins it.
+    - `:netcdf_grid::Symbol` (default `:regular`) — the grid the NetCDF output is written on. `:mish` is reserved and not implemented.
+    - `:netcdf_derivatives::Bool` (default `false`) — whether `:netcdf_raw` writes derivative slots alongside field values. Does not apply to `:netcdf`, whose derived products have no derivative slots.
 
 `grid_params` is passed through Springsteel's `compute_derived_params` on construction, so a
 cubic B-spline axis may be sized by *either* its cell count (`num_cells_i`/`num_cells_k`, the
@@ -152,6 +153,13 @@ include("radiation.jl")
 include("radiation_rrtmgp.jl")
 include("radiation_io.jl")
 include("mynn_io.jl")
+# The comprehensive NetCDF analysis writer (Stage N1). After mynn_io.jl because it is
+# the third and last file that names NCDatasets, and after moist_compressible.jl /
+# mc_geometry.jl / microphysics.jl because every derived product it forms goes through
+# the equation set's OWN helpers (retrieve_temperature, recover_rho_c, the transform-mode
+# accessors, the rain fall speeds) -- a writer that re-derived any of them would be free
+# to disagree with the run about what its own state means.
+include("netcdf_output.jl")
 include("horizontal_si.jl")
 include("exact_si.jl")
 include("exact_si_rlr.jl")
@@ -202,8 +210,16 @@ function integrate_model(model::ModelParameters)
     wait(get_from(workers()[1], :(redirect_stderr(err))))
     
     wait(save_at(workers()[1], :patch, :(initialize_model($(model),workers()))))
-    wait(get_from(workers()[1], :(@time run_model(patch, model, workers()))))
-    wait(get_from(workers()[1], :(finalize_model(patch,model))))
+    # The comprehensive-NetCDF output context (src/netcdf_output.jl): the reference state
+    # and the regular output coordinates the writer adds back. Built ONCE, here, on the
+    # master worker that owns `patch`, and threaded into every write of the run -- it
+    # constructs the reference state (reads and fits the run's .ref file), which must not
+    # happen once per output interval. Inert (`active = false`, nothing built) unless the
+    # run asks for :netcdf on a pressure-reference equation set.
+    wait(save_at(workers()[1], :nc_ctx, :(Scythe.netcdf_output_context(patch, model))))
+    wait(get_from(workers()[1], :(@time run_model(patch, model, workers(); ctx = nc_ctx))))
+    wait(get_from(workers()[1], :(finalize_model(patch, model; ctx = nc_ctx,
+                                                workerids = workers()))))
     
     wait(get_from(workers()[1], :(close(out))))
     wait(get_from(workers()[1], :(close(err))))

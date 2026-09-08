@@ -123,7 +123,8 @@ function owb_model(opts::BenchmarkOptions)
                            :Cd => OWB_CD, :Ck => OWB_CK, :U_min => OWB_U_MIN,
                            :l_inf => OWB_L_INF, :SST => OWB_SST)
     options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
-                                     :precipitation => true, :vertical_mixing => false),
+                                     :precipitation => true, :vertical_mixing => false,
+                                     :output_formats => BENCHMARK_OUTPUT_FORMATS),
                     reference_state_options())
 
     bl = get(ENV, "SCYTHE_OWB_BL", "louis")

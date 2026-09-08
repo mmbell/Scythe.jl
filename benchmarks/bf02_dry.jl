@@ -90,7 +90,10 @@ function bf02_dry_model(opts::BenchmarkOptions)
     # dry profile (rho_v = rho_c = 0), and the total-energy set a pressure-based one;
     # the legacy/pe/pe-rho_d sets build the xi/mu reference.
     exact_ref = physical_stage || opts.stage == STAGE_MC
-    options = Dict(:semiimplicit => true, :exact_reference_state => exact_ref)
+    # `Dict{Symbol,Any}` (not the inferred `Dict{Symbol,Bool}`): the pinned format list
+    # below is a Vector, and the stage branches add non-Bool keys.
+    options = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => exact_ref,
+                               :output_formats => BENCHMARK_OUTPUT_FORMATS)
     if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA, STAGE_MC)
         # Benchmark specification has no turbulence or precipitation
         options[:precipitation] = false
