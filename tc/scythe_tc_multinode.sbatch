@@ -26,6 +26,14 @@
 #                               directory and continues writing into it.
 #   TRACE=<n>                   min-rho_d trace every n steps (0 = off)
 #   SCYTHE_TC_OUTDIR=<path>     override the output tree entirely
+#   CSV=1                       append --csv to the julia invocation (CSV alongside the
+#                               comprehensive NetCDF, for the replay harness / mynn_dump)
+#
+# stdout/stderr are tee'd to $SCYTHE_TC_OUTDIR/job_stdout.log (in addition to the
+# %j.log this SBATCH -o writes in the submit cwd), preceded by a provenance header
+# (date, hostname, git HEAD/dirty count, every SCYTHE_TC_* env var, thread count, the
+# julia args) -- the run directory is then self-describing without cross-referencing
+# the submit-dir log.
 #
 #SBATCH -J scythe_tc
 #SBATCH -N 3
@@ -54,13 +62,32 @@ fi
 export SCYTHE_TC_OUTDIR=${SCYTHE_TC_OUTDIR:-$SCYTHE/tc/output/tc_${SCYTHE_TC_RES}_mn_${SLURM_JOB_ID:-manual}}
 mkdir -p "$SCYTHE_TC_OUTDIR"
 
+# Redirect ALL stdout/stderr into the run tree from here on. `-o scythe_tc_%j.log` above
+# lands in the SUBMIT cwd, not $SCYTHE_TC_OUTDIR -- so without this, the master's
+# "TC boundary layer:"/"TC radiation:"/wall-clock/--csv summary lines never reach the run
+# directory and are effectively lost (the submit-dir log is easy to lose track of once a
+# job is resubmitted from a different cwd or the log is cleaned up).
+exec > >(tee -a "$SCYTHE_TC_OUTDIR/job_stdout.log") 2>&1
+
 ARGS=""
 [ -n "${RESTART_T:-}" ] && ARGS="$ARGS --restart $RESTART_T"
 [ "${TRACE:-0}" != "0" ] && ARGS="$ARGS --trace ${TRACE}"
+[ "${CSV:-0}" != "0" ] && ARGS="$ARGS --csv"
 
 JULIA=${JULIA_BIN:-julia}
 . "$SCYTHE/tc/_preflight.sh"
 tc_preflight
+
+echo "=== provenance ====================================================="
+echo "  date        : $(date)"
+echo "  hostname    : $(hostname)"
+echo "  git HEAD    : $(cd "$SCYTHE" && git rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "  git dirty   : $(cd "$SCYTHE" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s)"
+echo "  env SCYTHE_TC_*:"
+env | grep '^SCYTHE_TC_' | sort | sed 's/^/    /'
+echo "  JULIA_NUM_THREADS : $JULIA_NUM_THREADS"
+echo "  julia args  : $INTEGRATION_TIME $ARGS"
+echo "====================================================================="
 
 echo "=== Scythe TC run (node-per-patch) =============================="
 echo "  job         : ${SLURM_JOB_ID:-manual}"

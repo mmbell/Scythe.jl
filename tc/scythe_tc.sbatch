@@ -19,6 +19,14 @@
 #                               die on "restart file not found".
 #   TRACE=<n>                   min-rho_d trace every n steps (0 = off)
 #   SCYTHE_TC_OUTDIR=<path>     override the output tree entirely
+#   CSV=1                       append --csv to the julia invocation (CSV alongside the
+#                               comprehensive NetCDF, for the replay harness / mynn_dump)
+#
+# stdout/stderr are tee'd to $SCYTHE_TC_OUTDIR/job_stdout.log (in addition to the
+# %j.log this SBATCH -o writes in the submit cwd), preceded by a provenance header
+# (date, hostname, git HEAD/dirty count, every SCYTHE_TC_* env var, thread count, the
+# julia args) -- the run directory is then self-describing without cross-referencing
+# the submit-dir log.
 #
 # Examples:
 #   sbatch tc/scythe_tc.sbatch 432000                                # 5-day, coarse
@@ -56,13 +64,29 @@ fi
 export SCYTHE_TC_OUTDIR=${SCYTHE_TC_OUTDIR:-$SCYTHE/tc/output/tc_${SCYTHE_TC_RES}_${SLURM_JOB_ID:-manual}}
 mkdir -p "$SCYTHE_TC_OUTDIR"
 
+# Redirect ALL stdout/stderr into the run tree from here on -- see
+# scythe_tc_multinode.sbatch for why (the same -o-lands-in-submit-cwd gap applies here).
+exec > >(tee -a "$SCYTHE_TC_OUTDIR/job_stdout.log") 2>&1
+
 ARGS=""
 [ -n "${RESTART_T:-}" ] && ARGS="$ARGS --restart $RESTART_T"
 [ "${TRACE:-0}" != "0" ] && ARGS="$ARGS --trace ${TRACE}"
+[ "${CSV:-0}" != "0" ] && ARGS="$ARGS --csv"
 
 JULIA=${JULIA_BIN:-julia}
 . "$SCYTHE/tc/_preflight.sh"
 tc_preflight
+
+echo "=== provenance ====================================================="
+echo "  date        : $(date)"
+echo "  hostname    : $(hostname)"
+echo "  git HEAD    : $(cd "$SCYTHE" && git rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "  git dirty   : $(cd "$SCYTHE" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s)"
+echo "  env SCYTHE_TC_*:"
+env | grep '^SCYTHE_TC_' | sort | sed 's/^/    /'
+echo "  JULIA_NUM_THREADS : $JULIA_NUM_THREADS"
+echo "  julia args  : $INTEGRATION_TIME $ARGS"
+echo "====================================================================="
 
 echo "=== Scythe TC run ==============================================="
 echo "  job         : ${SLURM_JOB_ID:-manual} on $(hostname)"

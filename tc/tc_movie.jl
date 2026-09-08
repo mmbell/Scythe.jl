@@ -1,11 +1,16 @@
 #!/usr/bin/env julia
-# Radius-height movie of a nested TC run from the postprocessed derived NetCDF.
+# Radius-height movie of a nested TC run from its NetCDF output.
 #
 #   julia --project=. tc/tc_movie.jl [--indir DIR] [--nests n1,n2,...] [--fps 4]
 #          [--rmax KM] [--zmax KM] [--vec-scale S] [--w-scale S] [--rad]
 #
-# Reads <t>_derived.nc from each nest (produced by tc/tc_postprocess.jl) and draws
-# one frame per output time, overlaying every nest on a single radius-height axis:
+# Reads the comprehensive `<t>.nc` the model itself now writes per nest
+# (options[:output_formats] default [:netcdf], src/netcdf_output.jl -- global attribute
+# `scythe_file_kind = "comprehensive"`) directly: no postprocessing step needed. A run
+# made BEFORE that stage (no such attribute on its `<t>.nc`, prognostic primes only)
+# falls back to the `<t>_derived.nc` tc/tc_postprocess.jl produces for it, if present;
+# with neither, this script errors and names tc/tc_postprocess.jl as the fix. Draws one
+# frame per output time, overlaying every nest on a single radius-height axis:
 #
 #   • reflectivity as a filled contour (shared colour scale, one colorbar)
 #   • tangential wind v as line contours (negative dashed)
@@ -18,23 +23,26 @@
 # assembled into an mp4 with ffmpeg. The input directory is configurable and
 # defaults to the axisymmetric TC run.
 #
-# --rad adds the RADIATION view, which needs a run whose derived files carry the
-# merged radiation sidecar (tc/tc_postprocess.jl on a run made with SCYTHE_TC_RAD):
-# a thin OLR-vs-radius line panel across the top and, beside the reflectivity
-# cross-section, the net radiative heating dT_net = dT_lw + sw_scale*dT_sw as a
-# diverging filled contour. Both overlay every nest coarsest-first exactly as the
-# main panel does. The flag only ADDS: without it the figure, the frames and the
-# movie name are what they always were, so the old view stays reproducible. The two
-# views write to separate frame directories and separate mp4s (_rz.mp4 vs
-# _rz_rad.mp4), so rendering one never clobbers the other.
+# --rad adds the RADIATION view: a thin OLR-vs-radius line panel across the top and,
+# beside the reflectivity cross-section, the net radiative heating
+# dT_net = dT_lw + sw_scale*dT_sw as a diverging filled contour. A comprehensive file
+# carries these fields directly when the run had radiation on (`physics_groups`
+# includes it; sidecars are opt-in via options[:radiation_output] and are NOT read
+# here); a legacy derived file carries them only if tc/tc_postprocess.jl merged the
+# S5 sidecar into it. Both overlay every nest coarsest-first exactly as the main panel
+# does. The flag only ADDS: without it the figure, the frames and the movie name are
+# what they always were, so the old view stays reproducible. The two views write to
+# separate frame directories and separate mp4s (_rz.mp4 vs _rz_rad.mp4), so rendering
+# one never clobbers the other.
 #
-# --bl mirrors --rad for the MYNN-EDMF boundary layer (S9), which needs a run whose
-# derived files carry the merged MYNN sidecar (tc/tc_postprocess.jl on a run made with
-# `:mynn => true`): a thin PBL-height-vs-radius line panel across the top (the OLR
-# panel's role) and, beside the reflectivity cross-section, K_h -- log-scaled, a
-# boundary-layer diffusivity spans orders of magnitude -- as a filled contour. Writes to
-# its own frame directory and its own mp4 (_rz_bl.mp4), so it never clobbers --rad or
-# the plain view, and --rad/--bl are mutually exclusive (one movie, one extra view).
+# --bl mirrors --rad for the MYNN-EDMF boundary layer (S9): a thin PBL-height-vs-radius
+# line panel across the top (the OLR panel's role) and, beside the reflectivity
+# cross-section, K_h -- log-scaled, a boundary-layer diffusivity spans orders of
+# magnitude -- as a filled contour. A comprehensive file carries these fields directly
+# when the run had `:mynn => true` on; a legacy derived file needs tc/tc_postprocess.jl
+# to have merged the S9 sidecar. Writes to its own frame directory and its own mp4
+# (_rz_bl.mp4), so it never clobbers --rad or the plain view, and --rad/--bl are
+# mutually exclusive (one movie, one extra view).
 
 using NCDatasets
 using CairoMakie
@@ -69,24 +77,64 @@ end
 showrad && showbl && error("--rad and --bl are mutually exclusive (one extra view per movie)")
 isdir(indir) || error("Input directory not found: $indir")
 
-# Auto-detect nests with derived snapshots.
+# A raw snapshot name: the whole name is a number plus the extension (tc/tc_postprocess.jl's
+# RAW_SNAPSHOT_RE, kept in sync by inspection -- both scripts need the same "is this a
+# snapshot, not a sidecar or a derived file" test).
+const RAW_SNAPSHOT_RE = r"^[0-9]+(\.[0-9]+)?\.nc$"
+snaptime_raw(f) = parse(Float64, replace(f, ".nc" => ""))
+snaptime_derived(f) = parse(Float64, replace(f, "_derived.nc" => ""))
+
+"""Does `path` carry the model's own `scythe_file_kind = "comprehensive"` global
+attribute? False for both a legacy prognostic-only raw snapshot (no such attribute) and
+a `<t>_derived.nc` (tc/tc_postprocess.jl's own `source` attribute, not this one)."""
+iscomprehensive(path) = NCDataset(path, "r") do ds
+    get(ds.attrib, "scythe_file_kind", nothing) == "comprehensive"
+end
+
+# Auto-detect nests with either a comprehensive snapshot or a legacy derived file.
 if isempty(nests)
     for d in sort(readdir(indir))
         full = joinpath(indir, d)
-        isdir(full) && any(f -> endswith(f, "_derived.nc"), readdir(full)) && push!(nests, d)
+        isdir(full) || continue
+        files = readdir(full)
+        has_snap = any(f -> occursin(RAW_SNAPSHOT_RE, f), files)
+        has_derived = any(f -> endswith(f, "_derived.nc"), files)
+        (has_snap || has_derived) && push!(nests, d)
     end
     isempty(nests) &&
-        error("No nests with *_derived.nc under $indir — run tc/tc_postprocess.jl first")
+        error("No nests with a comprehensive <t>.nc or a legacy <t>_derived.nc under $indir")
 end
 
 # ── Catalogue snapshots: {time => Dict(nest => path)} ─────────────────────────
-snaptime(f) = parse(Float64, replace(f, "_derived.nc" => ""))
+# A comprehensive `<t>.nc` is read directly and wins over a same-time derived file (the
+# derived file would just be a stale re-derivation of the same run). A legacy raw
+# snapshot (no scythe_file_kind attribute) needs its `<t>_derived.nc` companion --
+# without one this errors immediately rather than silently dropping that time from
+# every downstream nest-intersection.
 catalog = Dict{Float64,Dict{String,String}}()
 for nest in nests
     ndir = joinpath(indir, nest)
-    for f in filter(x -> endswith(x, "_derived.nc"), readdir(ndir))
-        t = snaptime(f)
-        get!(catalog, t, Dict{String,String}())[nest] = joinpath(ndir, f)
+    files = readdir(ndir)
+    for f in filter(x -> occursin(RAW_SNAPSHOT_RE, x), files)
+        path = joinpath(ndir, f)
+        t = snaptime_raw(f)
+        if iscomprehensive(path)
+            get!(catalog, t, Dict{String,String}())[nest] = path
+        else
+            dpath = joinpath(ndir, replace(f, ".nc" => "_derived.nc"))
+            isfile(dpath) ||
+                error("$path is a legacy prognostic-only snapshot (no " *
+                      "scythe_file_kind = \"comprehensive\" attribute) with no " *
+                      "$(basename(dpath)) alongside it. Run tc/tc_postprocess.jl " *
+                      "--indir $indir on this old run first.")
+            get!(catalog, t, Dict{String,String}())[nest] = dpath
+        end
+    end
+    # Any standalone *_derived.nc not already reached via its raw snapshot above.
+    for f in filter(x -> endswith(x, "_derived.nc"), files)
+        t = snaptime_derived(f)
+        d = get!(catalog, t, Dict{String,String}())
+        haskey(d, nest) || (d[nest] = joinpath(ndir, f))
     end
 end
 # Keep only times present in every requested nest, sorted.
@@ -111,6 +159,26 @@ boundaries = sort([geom[n].redge for n in nests if geom[n].redge < rmax - 1e-6])
 
 readfield(ds, name) = coalesce.(Array(ds[name])[1, :, :], NaN)   # (n_r, n_z) → NaN fill
 
+"""Error text for a `--rad`/`--bl` view that finds `path` missing `varname`. A
+comprehensive file (has scythe_file_kind attribute) simply had that physics group off --
+point at `physics_groups` rather than at tc/tc_postprocess.jl, which such a file never
+needs. A legacy derived file keeps the old wording: either the run had it off, or the
+postprocessor ran before the sidecar merge existed."""
+function missing_physics_error(path, varname, flag, groupname)
+    kind, pg = NCDataset(path, "r") do ds
+        (get(ds.attrib, "scythe_file_kind", nothing), get(ds.attrib, "physics_groups", "none"))
+    end
+    if kind == "comprehensive"
+        error("$flag needs `$varname`, and $path has none (physics_groups = " *
+              "\"$pg\"). This run had $groupname off.")
+    else
+        error("$flag needs the $groupname sidecar merged into the derived files, and " *
+              "$path has no $varname. Either the run was made with $groupname off, or " *
+              "tc/tc_postprocess.jl was run on it before the merge existed — re-run " *
+              "tc/tc_postprocess.jl --indir $indir.")
+    end
+end
+
 # ── Fixed contour/colour scales (shared across nests and frames) ──────────────
 refl_levels = -15.0:5.0:60.0                 # dBZ
 p_levels = -1500.0:50:250.0
@@ -129,11 +197,8 @@ if showrad
     absnet = Float64[]
     for t in times, nest in nests
         NCDataset(catalog[t][nest], "r") do ds
-            haskey(ds, "dT_net") || error(
-                "--rad needs the radiation sidecar merged into the derived files, and " *
-                "$(catalog[t][nest]) has no dT_net. Either the run was made with " *
-                "radiation off, or tc/tc_postprocess.jl was run on it before the merge " *
-                "existed — re-run tc/tc_postprocess.jl --indir $indir.")
+            haskey(ds, "dT_net") ||
+                missing_physics_error(catalog[t][nest], "dT_net", "--rad", "radiation")
             net = readfield(ds, "dT_net")
             append!(absnet, abs.(filter(isfinite, vec(net))))
             fo = filter(isfinite, coalesce.(Array(ds["olr"])[1, :], NaN))
@@ -164,11 +229,8 @@ pblh_lo = Inf; pblh_hi = -Inf
 if showbl
     for t in times, nest in nests
         NCDataset(catalog[t][nest], "r") do ds
-            haskey(ds, "K_h") || error(
-                "--bl needs the MYNN sidecar merged into the derived files, and " *
-                "$(catalog[t][nest]) has no K_h. Either the run was made without " *
-                "options[:mynn], or tc/tc_postprocess.jl was run on it before the merge " *
-                "existed — re-run tc/tc_postprocess.jl --indir $indir.")
+            haskey(ds, "K_h") ||
+                missing_physics_error(catalog[t][nest], "K_h", "--bl", "MYNN")
             Kh = readfield(ds, "K_h")
             global kh_max = max(kh_max, maximum(x -> isnan(x) ? -Inf : x, Kh))
             fp = filter(isfinite, coalesce.(Array(ds["mynn_pblh"])[1, :], NaN))

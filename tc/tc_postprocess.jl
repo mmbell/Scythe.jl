@@ -1,5 +1,13 @@
 #!/usr/bin/env julia
-# Postprocess moist-compressible NetCDF output into derived physical products.
+# LEGACY. Postprocess PRE-COMPREHENSIVE moist-compressible NetCDF output (raw <t>.nc
+# snapshots carrying only prognostic control variables, no scythe_file_kind attribute --
+# runs made before the stage that added src/netcdf_output.jl) into derived physical
+# products. A run made since then writes a comprehensive `<t>.nc` per nest directly
+# (options[:output_formats] default [:netcdf]) with everything this script derives
+# already in it (same names/units) plus the physics groups (BL, radiation, surface) --
+# nothing to run here, and tc/tc_movie.jl reads that file natively. This script now
+# REFUSES to touch a comprehensive file (see the scythe_file_kind check below); it stays
+# for the runs on disk from before the change.
 #
 #   julia --project=. tc/tc_postprocess.jl [--indir DIR] [--nests n1,n2,...]
 #                                          [--ref REFFILE] [--N0 8e6] [--Nc 100]
@@ -80,6 +88,23 @@ isfile(reffile) || error("Reference-state file not found: $reffile")
 # reach `parse(Float64, ...)` as "0.0_radiation_i0", which is not a time.
 const RAW_SNAPSHOT_RE = r"^[0-9]+(\.[0-9]+)?\.nc$"
 israw(f) = occursin(RAW_SNAPSHOT_RE, f)
+
+# LIVE FOOTGUN without this: RAW_SNAPSHOT_RE also matches the model's own comprehensive
+# <t>.nc (same "<number>.nc" name), and this script would then treat its `p` variable
+# (already a TOTAL, background included) as a PRIME and add the reference background to
+# it a second time -- silently corrupting every derived field. Check the marker the
+# model writes (`scythe_file_kind`, src/netcdf_output.jl) before touching anything.
+function check_not_comprehensive(path)
+    kind = NCDataset(path, "r") do ds
+        get(ds.attrib, "scythe_file_kind", nothing)
+    end
+    kind == "comprehensive" && error(
+        "$(path) is already a comprehensive Scythe NetCDF file " *
+        "(scythe_file_kind = \"comprehensive\") -- tc/tc_postprocess.jl is LEGACY, for " *
+        "pre-comprehensive raw snapshots only. Use $(path) directly, or point " *
+        "tc/tc_movie.jl at $(dirname(path)); it reads comprehensive files natively and " *
+        "needs no postprocessing step.")
+end
 
 # The sidecar family for one snapshot tag, so a tag with radiation output can be detected
 # without opening anything (`Scythe.read_radiation` errors when nothing matches).
@@ -503,6 +528,9 @@ for nest in nests
     raws = sort(filter(israw, readdir(ndir)),
                 by = f -> parse(Float64, replace(f, ".nc" => "")))
     isempty(raws) && (println("  $nest: no snapshots, skipping"); continue)
+    # All snapshots of one run share the same scythe_file_kind; checking the first is
+    # enough to refuse a comprehensive-output run before any real work starts.
+    check_not_comprehensive(joinpath(ndir, raws[1]))
 
     # Reference background from this nest's z grid (built once per nest)
     local bg, z_reg

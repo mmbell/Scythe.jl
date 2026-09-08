@@ -350,18 +350,44 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
     # RLR geometries this driver builds), :mynn_interval >= this patch's own ts,
     # and :mynn_edmf in (0, 1) -- refusing 1 outright until S7 ports the mass-flux
     # plumes. It runs once per tile at construction, so a bad knob dies at setup.
+    # ── Surface layer (S1b, shared by BOTH BL schemes) ───────────────────────
+    # SCYTHE_TC_SFC selects options[:sfc_z0] (Scythe.SFC_Z0_MODES,
+    # src/mc_surface_layer.jl): komori | gfdl_v7 | charnock. Resolved (and validated)
+    # HERE, before the louis/mynn branch, so both println lines below can report it --
+    # the surface layer is not part of either scheme's own options, it sits underneath
+    # both (surface_layer_params is called the same way from mc_louis_bl! and the MYNN
+    # closure). komori is the default and is left OUT of bl_options entirely when
+    # selected, so the louis branch's options dict stays byte-identical to a pre-S1b TC
+    # run; only a non-default value adds the key.
+    sfc_z0_str = get(ENV, "SCYTHE_TC_SFC", "komori")
+    sfc_z0_str in string.(Scythe.SFC_Z0_MODES) ||
+        error("SCYTHE_TC_SFC = \"$(sfc_z0_str)\" is not recognized; use " *
+              join(string.(Scythe.SFC_Z0_MODES), ", "))
+    # SCYTHE_TC_SFC_STAB (0 default | 1) selects options[:sfc_stability] (Monin-Obukhov
+    # stability functions over the neutral coefficients above); same reasoning -- only
+    # "1" adds the key, so the default run's options dict is unchanged.
+    sfc_stab_str = get(ENV, "SCYTHE_TC_SFC_STAB", "0")
+    sfc_stab_str in ("0", "1") ||
+        error("SCYTHE_TC_SFC_STAB = \"$(sfc_stab_str)\" is not recognized; use 0 or 1")
+    sfc_suffix = "  sfc_z0=$sfc_z0_str sfc_stability=$(sfc_stab_str == "1")"
+
     bl_options = Dict{Symbol,Any}()
     if TC_BL_CHOICE == "louis"
         bl_options[:louis_bl] = true
-        println("TC boundary layer: louis (default)")
+        println("TC boundary layer: louis (default)" * sfc_suffix)
     else # "mynn" -- TC_BL_CHOICE is validated to be one of these two at include time
         mynn_interval = parse(Float64, get(ENV, "SCYTHE_TC_MYNN_INTERVAL", "20.0"))
         mynn_edmf = parse(Int, get(ENV, "SCYTHE_TC_MYNN_EDMF", "0"))
         bl_options[:mynn] = true
         bl_options[:mynn_interval] = mynn_interval
         bl_options[:mynn_edmf] = mynn_edmf
-        println("TC boundary layer: mynn interval=$mynn_interval s edmf=$mynn_edmf")
+        println("TC boundary layer: mynn interval=$mynn_interval s edmf=$mynn_edmf" *
+                sfc_suffix)
     end
+    # Applied OUTSIDE the branch above: the surface layer is shared, not a per-scheme
+    # option, and this way a future scheme added to the if/else inherits it for free.
+    sfc_z0_str == "komori" || (bl_options[:sfc_z0] = Symbol(sfc_z0_str))
+    sfc_stab_str == "1" && (bl_options[:sfc_stability] = true)
 
     return ModelParameters(
         ts = NEST_TS[end],                     # root (outer patch) timestep

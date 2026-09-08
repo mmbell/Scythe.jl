@@ -30,6 +30,11 @@
 # src/radiation.jl), so sum(dz) = z_top and zw(k) = sum(dz(1:k-1)) in the driver.
 # `sqv` is SPECIFIC humidity rho_v/rho_t and `rho` the MOIST density rho_t, the
 # conventions of mynnedmf_wrapper.F90; `ts` is T_sfc/exner(1) (the wrapper's "theta").
+#
+# case3_tc_rmw reads `<tc-dir>/nest1/<tc-t>_physical.csv`, so --tc-dir must point at a
+# TC run made with `--csv` (options[:output_formats] including :csv; the default
+# [:netcdf] alone writes no CSV). Without one, case 3 is skipped -- see the "case 3
+# SKIPPED" message below -- and the other cases still write normally.
 
 using Printf
 using Springsteel

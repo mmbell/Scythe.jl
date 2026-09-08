@@ -8,7 +8,15 @@
 #   julia --project=. tc/tc_run_axisym.jl [integration_time_s] [--csv] [--restart T]
 #
 #   integration_time_s  default 1800 (laptop smoke); production 432000 (5 days)
-#   --csv               add CSV output alongside NetCDF (short runs/diagnostics)
+#   --csv               each nest's <t>.nc is now the COMPREHENSIVE NetCDF the model
+#                       writes directly (options[:output_formats] default [:netcdf],
+#                       src/netcdf_output.jl) -- primes, totals, derived thermodynamics,
+#                       radar/precipitation products and the reference profiles, no
+#                       postprocessing step. --csv ADDS <t>_spectral/physical/gridded.csv
+#                       alongside it, only for consumers that specifically need CSV: the
+#                       replay harness, tools/mynn_dump_columns.jl, and the post-run
+#                       finite/min-max print below. A run that does not feed one of
+#                       those can skip --csv.
 #   --rlr               run the 3D cylindrical (RLR) nest instead of axisym:
 #                       ring-native azimuthal truncation, output in tc_rlr/
 #   --restart T         continue from the T-second JLD2 restarts in each nest's

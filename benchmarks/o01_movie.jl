@@ -11,6 +11,15 @@
 #         [--ctrans none|bhyp|bhyp_smooth] [--rtrans ...] [--cmu X] [--rmu X]
 #         [--icetrans none|bhyp|bhyp_smooth] [--icemu X]
 #
+# --field rad and --field bl both need a run made with --csv (options[:output_formats]
+# including :csv; this script reads the same <tag>_physical.csv the condensate view
+# reads) AND their respective sidecar opted in: sidecars are now OFF by default
+# (options[:radiation_output] / options[:mynn_output], both default false as of the
+# comprehensive-NetCDF stage) since the comprehensive `<t>.nc` the TC driver writes
+# already carries these fields merged in and most runs no longer need the sidecar at
+# all. A benchmark run that wants --field rad/bl here must set the matching option
+# explicitly to get the sidecar files this script reads.
+#
 # --field rad (S5) needs a radiation sidecar (<tag>_radiation_i*.nc, Scythe.read_radiation
 # -- src/radiation_io.jl) in every patch directory, i.e. the run was made with
 # SCYTHE_O01_RAD set. Three panels: a thin top row of domain OLR vs x (line); bottom-left
