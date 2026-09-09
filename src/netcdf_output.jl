@@ -25,10 +25,13 @@
 #      lives only on the workers.
 #   3. `write_output` (src/io.jl) dispatching on `options[:output_formats]`.
 #
-# PHYSICS GROUPS (BL / radiation / surface) are stage N2. The `physics` argument of
-# `write_netcdf_comprehensive` and the `physics_weights` field of `NetCDFOutputContext`
-# exist now so the plumbing does not move again; N1 accepts them and writes the global
-# attribute `physics_groups = "none (stage N1)"`.
+# PHYSICS GROUPS (BL / radiation / surface) are LAYER 2b, added in stage N2: the master
+# gathers each worker's held MYNN / radiation / surface diagnostics at output steps only
+# (`physics_snapshot` -> `gather_physics` -> `assemble_physics`) and the writer resamples
+# them from their own mishes onto this file's regular grid. The global attribute
+# `physics_groups` names the groups a file actually carries. Nothing is added to the
+# per-step path; the only per-step cost anywhere is the gated store `surface_record!`
+# (src/mc_surface_layer.jl) at the two boundary-layer call sites.
 #
 # `import`, not `using`, for NCDatasets -- the same narrower-blast-radius choice
 # radiation_io.jl and mynn_io.jl make. Included in src/Scythe.jl right after mynn_io.jl.
@@ -545,8 +548,10 @@ not happen every output interval.
 that is not a pressure-reference (`moist_compressible`) one: there is no reference state to
 add back and no water partition to recover, so those runs get the prognostic file instead.
 
-`physics_weights` is the stage-N2 slot for the interpolation weights that map each physics
-group's own mish onto this grid (`interp_weights`, above). N1 leaves it `nothing`.
+`physics_weights` caches the interpolation weights that map each physics group's own mish
+onto this grid (`interp_weights`, above), keyed by group name. The mishes are fixed for the
+life of a run, so the weights are built on the first output time that carries a group and
+reused for every one after. `nothing` until then.
 """
 mutable struct NetCDFOutputContext
     active::Bool
@@ -660,10 +665,222 @@ function netcdf_output_context(grid::AbstractGrid, model::ModelParameters)
             (cfg.cond_floor ? "FLOORED at zero per species (options[:condensate_floor] " *
                               "= :diagnostic), state left raw" :
                               "RAW (options[:condensate_floor] = :none)"),
-        "condensate_floor" => cfg.cond_floor ? "diagnostic" : "none",
-        "physics_groups" => "none (stage N1)")
+        "condensate_floor" => cfg.cond_floor ? "diagnostic" : "none")
 
     return NetCDFOutputContext(active, x_reg, z_reg, ref_profiles, cfg, attrs, nothing)
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 2b — physics groups (stage N2)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The BL (MYNN), radiation and surface diagnostics live on the WORKERS, in
+# `mtile.mynn` / `mtile.radiation` / `mtile.surface`, on each tile's own mish. The
+# comprehensive file is written by the MASTER, which holds the patch and no `ModelTile` at
+# all. So at an output step -- and ONLY at an output step; nothing here touches the
+# per-step path -- the master asks every worker for a snapshot of its held physics
+# (`gather_physics`), stitches the tiles back into one patch-wide set (`assemble_physics`)
+# and hands it to the writer, which regrids it onto the regular output grid with the same
+# separable linear interpolation `tc/tc_postprocess.jl` used to merge the sidecars.
+#
+# TIMING. The held physics a worker returns at output step `t` is what that step's column
+# loop last wrote, which is the same alignment the sidecars have (see `radiation_write!`'s
+# docstring): the schemes hold their forcing between calls, so the snapshot tagged `t` is
+# the forcing the state at `t` was advanced with.
+#
+# OMITTED, NEVER ZERO-FILLED. A group is `nothing` when its scheme is off OR has not run
+# yet, and a `nothing` group writes no variables at all. A file with a `K_h` of all zeros
+# would be indistinguishable from a run whose boundary layer genuinely did nothing; a file
+# with no `K_h` cannot be misread.
+
+"""
+    surface_diagnostics(mtile::ModelTile) -> NamedTuple
+
+The tile's held per-column surface exchange ([`SurfaceDiag`](@ref)) as plain arrays: `x`
+(the tile's own horizontal mish coordinate, the radiation/MYNN convention), the ten
+per-column fields of [`SURFACE_FIELDS_1D`](@ref), and `attrs`/`sum_attrs`.
+
+The attributes record which layer produced them: `boundary_layer` (`"louis"`/`"mynn"`),
+`surface_fluxes`, and the two knobs that decide the formulas
+([`surface_layer_params`](@ref)) -- `sfc_z0` and `sfc_stability`. A flux is only
+interpretable against the closure that made it, and this run's is not recoverable from
+the numbers.
+"""
+function surface_diagnostics(mtile::ModelTile)
+    sd = mtile.surface
+    ncol = length(sd.F_sh)
+    kDim = ncol > 0 ? div(size(mtile.tile.physical, 1), ncol) : 0
+    x = Vector{Float64}(undef, ncol)
+    @inbounds for c in 1:ncol
+        x[c] = mtile.tilepoints[(c - 1) * kDim + 1, 1]
+    end
+    opts = mtile.model.options
+    attrs = Dict{String,Any}(
+        "boundary_layer" => get(opts, :mynn, false) === true ? "mynn" :
+                            get(opts, :louis_bl, false) === true ? "louis" : "none",
+        "surface_fluxes" => Int(get(opts, :surface_fluxes, false) === true),
+        "sfc_z0" => string(get(opts, :sfc_z0, :komori)),
+        "sfc_stability" => Int(get(opts, :sfc_stability, false) === true))
+    return (; x, F_sh = copy(sd.F_sh), F_q = copy(sd.F_q),
+              tau_u = copy(sd.tau_u), tau_v = copy(sd.tau_v),
+              ust = copy(sd.ust), inv_L = copy(sd.inv_L), U10 = copy(sd.U10),
+              Cd = copy(sd.Cd), Ch = copy(sd.Ch), z0m = copy(sd.z0m),
+              attrs = attrs, sum_attrs = String[])
+end
+
+"""
+    SURFACE_FIELDS_1D
+
+The `(name, units, long_name)` of every per-column surface-exchange diagnostic, written
+under these exact names. `ust` and `inv_L` are the SURFACE LAYER's own, straight out of
+[`surface_exchange`](@ref); MYNN's copies of the same two quantities are written
+alongside as `mynn_ust`/`mynn_inv_L`.
+"""
+const SURFACE_FIELDS_1D = (
+    ("F_sh", "W m-2", "surface sensible heat flux"),
+    ("F_q", "kg m-2 s-1", "surface moisture flux"),
+    ("tau_u", "Pa", "surface stress, u component"),
+    ("tau_v", "Pa", "surface stress, v component"),
+    ("ust", "m s-1", "friction velocity"),
+    ("inv_L", "m-1", "inverse Obukhov length, 1/L"),
+    ("U10", "m s-1", "10 m wind speed of the roughness fit (the exchange wind on :komori)"),
+    ("Cd", "1", "surface drag coefficient"),
+    ("Ch", "1", "surface enthalpy/moisture exchange coefficient"),
+    ("z0m", "m", "momentum roughness length (0 on :komori, which forms none)"))
+
+"""
+    physics_snapshot(mtile::ModelTile) -> NamedTuple
+
+One tile's physics groups, for the master to assemble. Evaluated ON THE WORKER (through
+[`gather_physics`](@ref)); the return value is plain arrays and `Dict`s, so it serializes.
+
+`(; offset, ncol, kDim, mynn, radiation, surface)`. `offset` is
+`mtile.tile.params.patchOffsetL`, the left-edge gridpoint offset of this tile within its
+patch — the same quantity the sidecar filenames carry and the key the tiles are sorted by.
+
+Each group is [`mynn_diagnostics`](@ref) / [`radiation_diagnostics`](@ref) /
+[`surface_diagnostics`](@ref), or `nothing` when that scheme is off OR HAS NOT RUN YET.
+The three "has run" witnesses are the states' own:
+
+- MYNN: some column has `last_update_step != typemin(Int)` (its cold-start sentinel);
+- radiation: `rs.last_call_step != typemin(Int)` (the same sentinel, per tile);
+- surface: `sd.n_calls[1] > 0`.
+
+The distinction matters at `t = 0`: `run_model` writes an output file BEFORE the first
+timestep, and at that point every held field is an allocation-time zero rather than a
+computed one. Writing them would put a physically meaningless `K_h = 0`, `pblh = 0`,
+`F_sh = 0` field in the file under the same names a spun-up snapshot uses.
+"""
+function physics_snapshot(mtile::ModelTile)
+    MY = mtile.mynn
+    rs = mtile.radiation
+    sd = mtile.surface
+    kDim = mtile.model.grid_params.kDim
+    ncol = kDim > 0 ? div(size(mtile.tile.physical, 1), kDim) : 0
+    mynn = (MY.active && any(!=(typemin(Int)), MY.last_update_step)) ?
+           mynn_diagnostics(mtile) : nothing
+    radiation = (rs.active && rs.last_call_step != typemin(Int)) ?
+                radiation_diagnostics(mtile) : nothing
+    surface = (sd.active && sd.n_calls[1] > 0) ? surface_diagnostics(mtile) : nothing
+    return (; offset = mtile.tile.params.patchOffsetL, ncol, kDim,
+              mynn, radiation, surface)
+end
+
+"""
+    gather_physics(workerids) -> Vector
+
+Ask every worker in `workerids` for its [`physics_snapshot`](@ref). Master-side; the
+`get_val_from` pattern `run_model` uses for the reference profiles.
+
+Called once per output time per patch, from [`write_output`](@ref)'s `:netcdf` branch.
+"""
+gather_physics(workerids::Vector{Int64}) =
+    [get_val_from(w, :(Scythe.physics_snapshot(mtile))) for w in workerids]
+
+"The physics group names, in the order [`write_netcdf_comprehensive`](@ref) writes them."
+const PHYSICS_GROUPS = (:mynn, :radiation, :surface)
+
+"""
+    assemble_physics(snaps) -> Union{Nothing,NamedTuple}
+
+Stitch per-tile [`physics_snapshot`](@ref)s into one patch-wide set, or `nothing` when no
+group is present on any tile.
+
+Tiles are sorted by `offset` and every array is concatenated along `x` (dimension 1 of the
+`(x, z)` matrices, the whole of the per-column vectors) — the domain decomposition is in
+`x` only, so this is the same reassembly `read_mynn`/`read_radiation` do from the sidecar
+files, done in memory instead of through the filesystem. `z` is taken from the first tile
+(every tile of a patch shares the vertical mish) and CHECKED against the rest.
+
+A group must be present on EVERY tile or on NONE: the schemes are configured per MODEL,
+not per tile, so a mixed answer means a tile failed to run one and the file would silently
+carry a partial domain. That is an error, loudly.
+
+Attributes come from the first tile — they are the resolved configuration, identical on
+every tile by construction — EXCEPT each group's `sum_attrs` (the clamp/plume counters),
+which are SUMMED across tiles to give the domain-wide census, exactly as `read_mynn` sums
+them.
+"""
+function assemble_physics(snaps::AbstractVector)
+    isempty(snaps) && return nothing
+    order = sortperm([s.offset for s in snaps])
+    ss = snaps[order]
+
+    out = Dict{Symbol,Any}()
+    for g in PHYSICS_GROUPS
+        parts = [getfield(s, g) for s in ss]
+        present = count(p -> p !== nothing, parts)
+        if present == 0
+            out[g] = nothing
+            continue
+        end
+        present == length(parts) || error(
+            "assemble_physics: the :$g group is present on $present of $(length(parts)) " *
+            "tiles. A physics scheme is configured per MODEL, so it must be held by every " *
+            "tile of a patch or by none; a partial answer would write a file covering " *
+            "only part of the domain under full-domain variable names. Offsets with the " *
+            "group: $([s.offset for (s, p) in zip(ss, parts) if p !== nothing]).")
+        out[g] = _concat_group(g, parts)
+    end
+    all(g -> out[g] === nothing, PHYSICS_GROUPS) && return nothing
+    return (; mynn = out[:mynn], radiation = out[:radiation], surface = out[:surface])
+end
+
+"Concatenate one group's per-tile diagnostics along `x`; see [`assemble_physics`](@ref)."
+function _concat_group(g::Symbol, parts::Vector)
+    a1 = parts[1]
+    length(parts) == 1 && return a1
+    for (n, p) in enumerate(parts[2:end])
+        keys(p) == keys(a1) || error(
+            "assemble_physics: tile $(n + 1)'s :$g group has fields $(keys(p)), the " *
+            "first tile's has $(keys(a1)) — the tiles disagree about the diagnostic set")
+    end
+    vals = map(keys(a1)) do k
+        v1 = getfield(a1, k)
+        if k === :attrs
+            merged = copy(v1)
+            for nm in a1.sum_attrs
+                merged[nm] = sum(getfield(p, :attrs)[nm] for p in parts)
+            end
+            merged
+        elseif k === :sum_attrs
+            v1
+        elseif k === :z || k === :zf || k === :q_lw_ref || k === :q_sw_ref
+            # Per-LAYER (or per-face) profiles shared by every column of the patch, not
+            # per-column fields: concatenating them would multiply the vertical.
+            for p in parts
+                getfield(p, k) == v1 || error(
+                    "assemble_physics: the :$g group's `$k` differs between tiles of the " *
+                    "same patch; every tile shares the patch's vertical mish")
+            end
+            v1
+        elseif v1 isa AbstractArray
+            vcat((getfield(p, k) for p in parts)...)
+        else
+            v1
+        end
+    end
+    return NamedTuple{keys(a1)}(vals)
 end
 
 # ── Writers ───────────────────────────────────────────────────────────────────
@@ -677,6 +894,51 @@ function _reshape_regular(reg_phys, var_idx::Int, n_i::Int, n_k::Int)
     return data
 end
 
+"The regridding note both physics groups carry, so a reader of either knows the fields
+were computed somewhere else and linearly resampled here."
+const PHYSICS_REGRID_NOTE =
+    "These fields were computed on the scheme's OWN mish and are resampled onto this " *
+    "file's regular (x, z) grid by separable LINEAR interpolation, x then z, with edge " *
+    "clamping outside the mish hull (the outermost Gauss points lie inside the " *
+    "first/last cell, so the wall and the model top are outside it by up to half a cell " *
+    "and hold the edge value)."
+
+"""
+    _physics_weights!(ctx, key, xs, zs) -> (wx, wz)
+
+The interpolation weights from a physics group's mish (`xs`, `zs`) onto the context's
+regular grid, built on first use and CACHED on `ctx.physics_weights` under `key`.
+
+The mish does not move for the life of a run, so the weights are computed once per group
+per patch however many output times the run writes. `zs === nothing` (the surface group,
+which is per-column only) gives `wz === nothing`.
+"""
+function _physics_weights!(ctx::NetCDFOutputContext, key::Symbol,
+                           xs::AbstractVector, zs::Union{Nothing,AbstractVector})
+    ctx.physics_weights === nothing && (ctx.physics_weights = Dict{Symbol,Any}())
+    W = ctx.physics_weights::Dict{Symbol,Any}
+    return get!(W, key) do
+        (interp_weights(xs, ctx.x_reg),
+         zs === nothing ? nothing : interp_weights(zs, ctx.z_reg))
+    end
+end
+
+"""
+    _write_group_attrs!(ds, prefix, attrs) -> Nothing
+
+Write one physics group's global attributes under `prefix`, leaving alone any name that
+already carries it (`mynn_interval_s`, `radiation_interval_s`) so the result is
+`mynn_interval_s` and not `mynn_mynn_interval_s`. Sorted, so the file's attribute order is
+reproducible rather than `Dict`-iteration order.
+"""
+function _write_group_attrs!(ds, prefix::String, attrs::AbstractDict)
+    for k in sort!(collect(keys(attrs)))
+        name = (isempty(prefix) || startswith(k, prefix)) ? k : prefix * k
+        ds.attrib[name] = attrs[k]
+    end
+    return nothing
+end
+
 """
     write_netcdf_comprehensive(path, grid, model, t, ctx, physics = nothing) -> Nothing
 
@@ -685,9 +947,11 @@ variables where a transform is on, the reconstructed totals, the recovered hydro
 the retrieved thermodynamics, the radar/precipitation products, the column integrals and
 the 1-D reference profiles, all on the regular (x, z) output grid.
 
-`ctx` is the [`NetCDFOutputContext`](@ref) built once per patch. `physics` is the stage-N2
-physics-group `NamedTuple`; N1 ACCEPTS AND IGNORES it, and records that in the file
-(`physics_groups = "none (stage N1)"`), so the call sites do not move when N2 fills it in.
+`ctx` is the [`NetCDFOutputContext`](@ref) built once per patch. `physics` is the
+patch-wide physics-group set [`assemble_physics`](@ref) built from the workers' snapshots:
+the BL (MYNN), radiation and surface groups, each on its own mish and each resampled here
+onto the regular output grid. `nothing` — a run with no physics, or one whose schemes have
+not run yet — writes no physics variables and records that in `physics_groups`.
 
 !!! note "2-D only in stage N1"
     Only the 2-D k-active moist-compressible grids (RiRk / RZ: the XZ slice and the
@@ -874,6 +1138,78 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         ice_on && wrx("column_ice_water", d.column_ice_water, "kg m-2",
                       "column integral of rho_ice")
 
+        # ── Physics groups (N2): BL, radiation, surface ──
+        # Each group lives on its OWN mish and is resampled onto this file's regular
+        # (x, z) grid by separable LINEAR interpolation, x then z, edge-clamped outside
+        # the mish hull (the outermost Gauss points lie inside the first/last cell, so
+        # the wall and the model top are outside it by up to half a cell and hold the
+        # edge value). That is the convention `tc/tc_postprocess.jl` established when it
+        # merged the sidecars, kept here verbatim so the two files agree.
+        groups = String[]
+        if physics !== nothing
+            mynn = physics.mynn
+            if mynn !== nothing
+                push!(groups, "mynn")
+                wxm, wzm = _physics_weights!(ctx, :mynn, mynn.x, mynn.z)
+                for (nm, units, long) in MYNN_FIELDS_2D
+                    # `K_m`/`K_h` keep their bare names -- an exchange coefficient is
+                    # unambiguous and the prefix would only make every downstream reader
+                    # spell it out again -- everything else is prefixed.
+                    out = nm in ("K_m", "K_h") ? nm : "mynn_" * nm
+                    lbl = nm in ("K_m", "K_h") ? "MYNN " * long : long
+                    wr(out, regrid2d(getfield(mynn, Symbol(nm)), wxm, wzm), units, lbl)
+                end
+                for (nm, units, long) in MYNN_FIELDS_1D
+                    wrx("mynn_" * nm, regrid1d(getfield(mynn, Symbol(nm)), wxm),
+                        units, long)
+                end
+                _write_group_attrs!(ds, "mynn_", mynn.attrs)
+                ds.attrib["mynn_regridding"] = PHYSICS_REGRID_NOTE
+            end
+
+            rad = physics.radiation
+            if rad !== nothing
+                push!(groups, "radiation")
+                wxr, wzr = _physics_weights!(ctx, :radiation, rad.x, rad.z)
+                for (nm, units, long) in RADIATION_FIELDS_2D
+                    wr(nm, regrid2d(getfield(rad, Symbol(nm)), wxr, wzr), units, long)
+                end
+                # The rate a column actually felt, formed on the mish and regridded once
+                # (not from the two regridded fields, which would interpolate twice).
+                wr("dT_net", regrid2d(rad.dT_lw .+ rad.sw_scale .* rad.dT_sw, wxr, wzr),
+                   "K day-1",
+                   "net radiative heating at constant pressure, dT_lw + sw_scale*dT_sw")
+                for (nm, units, long) in RADIATION_FIELDS_1D
+                    lbl = nm == "cloudy" ?
+                        "cloudy-column indicator, linearly interpolated off the mish: " *
+                        "0 or 1 at a mish column, fractional between two" : long
+                    wrx(nm, regrid1d(getfield(rad, Symbol(nm)), wxr), units, lbl)
+                end
+                _write_group_attrs!(ds, "radiation_", rad.attrs)
+                # The snapshot's own model time, the name `tc/tc_postprocess.jl` gave it.
+                ds.attrib["radiation_time"] = t
+                ds.attrib["radiation_regridding"] = PHYSICS_REGRID_NOTE * " " *
+                    "The face-based flux profiles (flux_lw_*, flux_sw_*, on zf, which " *
+                    "runs to the top of the stratospheric extension) are NOT written: " *
+                    "they have no counterpart on this regular z grid and remain in the " *
+                    "radiation sidecar (options[:radiation_output]). The per-column " *
+                    "boundary values derived from them (olr, olr_model_top, " *
+                    "sw_sfc_dn, sw_toa_dn, lw_sfc_dn, ...) are here."
+            end
+
+            sfc = physics.surface
+            if sfc !== nothing
+                push!(groups, "surface")
+                wxs, _ = _physics_weights!(ctx, :surface, sfc.x, nothing)
+                for (nm, units, long) in SURFACE_FIELDS_1D
+                    wrx(nm, regrid1d(getfield(sfc, Symbol(nm)), wxs), units, long)
+                end
+                _write_group_attrs!(ds, "", sfc.attrs)
+            end
+        end
+        ds.attrib["physics_groups"] =
+            isempty(groups) ? "none (schemes not yet run)" : join(groups, ",")
+
         # ── 1-D reference profiles the totals were built from ──
         for (nm, prof, units) in (("pbar", ref.pbar, "Pa"),
                                   ("rho_dbar", ref.rho_dbar, "kg m-3"),
@@ -919,7 +1255,7 @@ function write_netcdf_prognostic(path::String, grid::AbstractGrid,
         "ts" => model.ts,
         "output_interval" => model.output_interval,
         "integration_time" => model.integration_time,
-        "physics_groups" => "none (stage N1)")
+        "physics_groups" => "none (prognostic layout)")
     Springsteel.write_netcdf(path, grid; include_derivatives = include_derivs, time = t,
                              coordinate_attributes = coord_attrs,
                              global_attributes = global_attrs)

@@ -227,7 +227,9 @@ using Springsteel
                                               "LinearAdvection1D", 0.3, 300)
         @test r.scheme == :none
         @test r.forcing == :full
-        @test r.output == true
+        # N2: the sidecar is OPT-IN now (the radiation fields ride in the model's own
+        # comprehensive <t>.nc). :radiation_output => true is what turns it back on.
+        @test r.output == false
 
         # Resolved defaults with radiation on.
         r = Scythe.validate_radiation_options(base(), nopp(), eqs, 0.3, 300)

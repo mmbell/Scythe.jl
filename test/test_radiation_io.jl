@@ -47,7 +47,12 @@ function make_rad_io_mtile(tmpdir; num_cells_i = 2, num_cells_k = 100,
                                          :precipitation => true,
                                          :vertical_mixing => false,
                                          :radiation => :prescribed,
-                                         :radiation_trace => false),
+                                         :radiation_trace => false,
+                                         # N2: the sidecar is opt-in (the fields ride in
+                                         # the comprehensive <t>.nc now), and this file
+                                         # is the sidecar's own test, so it asks. The
+                                         # "noout" arm below overrides it back to false.
+                                         :radiation_output => true),
                         extra_opts),
     )
     gp = model.grid_params
@@ -137,6 +142,31 @@ end
             @test ds.attrib["sw_scale"] == rs.sw_scale
             @test ds.attrib["cos_zenith"] == rs.cos_zenith
             @test !haskey(ds, "q_lw_ref")     # :full forcing carries no reference profile
+        end
+
+        # ── N2: the sidecar is written FROM `radiation_diagnostics`, and the
+        # comprehensive <t>.nc writes the same NamedTuple regridded. Every variable in
+        # the file must equal the corresponding diagnostics array EXACTLY -- if they
+        # ever diverge, the two output files disagree about what a radiation field is.
+        d = Scythe.radiation_diagnostics(mtile)
+        NCDataset(path, "r") do ds
+            @test collect(ds["x"]) == d.x
+            @test collect(ds["z"]) == d.z
+            @test collect(ds["zf"]) == d.zf
+            for (nm, _, _) in Scythe.RADIATION_FIELDS_2D
+                @test Array(ds[nm])[1, :, :] == getfield(d, Symbol(nm))
+            end
+            for (nm, _, _) in Scythe.RADIATION_FIELDS_FACE
+                @test Array(ds[nm])[1, :, :] == getfield(d, Symbol(nm))
+            end
+            for (nm, _, _) in Scythe.RADIATION_FIELDS_1D
+                @test Array(ds[nm])[1, :] == getfield(d, Symbol(nm))
+            end
+            for (k, v) in Scythe.radiation_global_attrs(rs, model.ts)
+                @test ds.attrib[k] == v || (v isa Number && isnan(v) &&
+                                            ds.attrib[k] isa Number && isnan(ds.attrib[k]))
+            end
+            @test issubset(Scythe.RADIATION_COUNTER_ATTRS, keys(d.attrs))
         end
     end
 end

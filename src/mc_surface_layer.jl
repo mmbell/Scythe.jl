@@ -485,3 +485,140 @@ enters the exchange wind as `U_eff = sqrt(U1^2 + (1.2 w*)^2)`. `U_min` still flo
             F_sh = F_sh, F_q = F_q, inv_L = inv_L, z0m = z0m, z0t = z0t,
             Cd = Cd, Ch = Ch, U1 = U1, U10 = U10, w_star = w_star)
 end
+
+# ── Held surface diagnostics (Stage N2) ────────────────────────────────────────
+#
+# `surface_exchange` above returns ten numbers per column per step and, until N2, every
+# one of them was consumed on the spot and thrown away: the tendencies got `tau_u`,
+# `F_sh`, `F_q` and nothing kept `Cd`, `Ch`, `u*`, `1/L`, `U10` or `z0m`. A run could not
+# answer "what were the air-sea fluxes?" without re-deriving them from the output state
+# through a separate implementation -- exactly the reconstruction risk the comprehensive
+# NetCDF writer exists to remove.
+#
+# `SurfaceDiag` is the held per-column store, filled by a pure STORE (`surface_record!`)
+# at the two call sites that already compute `sx` (`mc_louis_bl!`,
+# src/mc_boundary_layer.jl, and `mc_mynn_bl!`, src/mc_mynn_bl.jl). No arithmetic is added
+# to the per-step path: a `Bool` field load, a branch, and ten `Float64` stores into
+# preallocated vectors. The MYNN state (src/mynn_state.jl) and the radiation state
+# (src/radiation_state.jl) hold their own diagnostics the same way and for the same
+# reason.
+#
+# `ModelTile` carries this CONCRETELY (never `Union{SurfaceDiag,Nothing}`), which is why
+# this file is included before semiimplicit.jl -- the same ordering constraint
+# `MYNNState` and `RadiationState` impose.
+
+"""
+    SurfaceDiag
+
+Per-column surface-exchange diagnostics held on a tile: the last value
+[`surface_exchange`](@ref) returned for each column.
+
+`active` is false on the shared [`EMPTY_SURFACE_DIAG`](@ref) and on every tile whose
+configuration has no surface layer; the vectors are then empty and
+[`surface_record!`](@ref) is never called (the call sites branch on `active`).
+
+# Fields
+- `F_sh` [W m⁻²] sensible-heat flux, `F_q` [kg m⁻² s⁻¹] moisture flux;
+- `tau_u`, `tau_v` [Pa] surface stress components;
+- `ust` [m s⁻¹] friction velocity, `inv_L` [m⁻¹] inverse Obukhov length;
+- `U10` [m s⁻¹] the 10-m wind of the roughness fit (the exchange wind `U1` on the
+  `:komori` path, which forms no 10-m wind of its own);
+- `Cd`, `Ch` [1] the drag and enthalpy exchange coefficients actually used;
+- `z0m` [m] the momentum roughness length (`0.0` on `:komori`, which forms none);
+- `n_calls` a length-1 witness vector, incremented on every store. `n_calls[1] > 0` is
+  the "this scheme has actually run" test [`physics_snapshot`](@ref) uses to decide
+  whether the group is written at all. It is a WITNESS, not a census: the column loop is
+  `@threads :static`, so concurrent increments can lose counts. Nothing reads its
+  magnitude.
+
+`mutable struct` with every field `const` — the [`MYNNState`](@ref)/`RadiationState`
+shape — not because anything is reassigned (nothing is; the vectors are written in place)
+but so the `ModelTile` field is ONE reference rather than twelve inline slots, matching
+its two sibling physics states. See [`IshmaelTables`](@ref) for the measurement that made
+`ModelTile`'s pointer count something worth caring about.
+"""
+mutable struct SurfaceDiag
+    const active::Bool
+    const F_sh::Vector{Float64}
+    const F_q::Vector{Float64}
+    const tau_u::Vector{Float64}
+    const tau_v::Vector{Float64}
+    const ust::Vector{Float64}
+    const inv_L::Vector{Float64}
+    const U10::Vector{Float64}
+    const Cd::Vector{Float64}
+    const Ch::Vector{Float64}
+    const z0m::Vector{Float64}
+    const n_calls::Vector{Int}
+end
+
+"""
+    EMPTY_SURFACE_DIAG
+
+The inactive [`SurfaceDiag`](@ref): no columns, `active = false`, and a zero witness.
+Shared by every tile with no surface layer, exactly as [`EMPTY_MYNN`](@ref) and
+[`EMPTY_RADIATION`](@ref) are shared — safe because nothing ever writes to it (the call
+sites are gated on `active`).
+"""
+const EMPTY_SURFACE_DIAG = SurfaceDiag(false, Float64[], Float64[], Float64[], Float64[],
+                                       Float64[], Float64[], Float64[], Float64[],
+                                       Float64[], Float64[], Int[0])
+
+"""
+    mc_surface_diag(model, tile) -> SurfaceDiag
+
+The tile's surface-diagnostic store, or [`EMPTY_SURFACE_DIAG`](@ref).
+
+Active exactly when a surface exchange actually runs AND has fluxes to report: a
+pressure-reference (moist_compressible) equation set with a boundary layer
+(`options[:louis_bl]` or `options[:mynn]`) and `options[:surface_fluxes]`. Those are the
+two call sites of [`surface_exchange`](@ref); a run without them stores nothing and pays
+nothing.
+"""
+function mc_surface_diag(model::ModelParameters, tile)
+    uses_pressure_reference(model.equation_set) || return EMPTY_SURFACE_DIAG
+    bl = (get(model.options, :louis_bl, false) === true) ||
+         (get(model.options, :mynn, false) === true)
+    bl || return EMPTY_SURFACE_DIAG
+    get(model.options, :surface_fluxes, false) === true || return EMPTY_SURFACE_DIAG
+    ncol = num_columns(tile)
+    ncol > 0 || return EMPTY_SURFACE_DIAG
+    z() = zeros(Float64, ncol)
+    return SurfaceDiag(true, z(), z(), z(), z(), z(), z(), z(), z(), z(), z(), Int[0])
+end
+
+"""
+    surface_record!(sd, ci, sx) -> Nothing
+
+Store column `ci`'s surface-exchange result `sx` (the isbits `NamedTuple`
+[`surface_exchange`](@ref) returned) into `sd`.
+
+STORES ONLY: no arithmetic, no allocation, nothing derived. Called at the two BL call
+sites behind `sd.active &&`, so a run with the store off pays one `Bool` load and one
+branch per column.
+
+`@noinline` DELIBERATELY, and it is not a performance choice — it is a COMPILE-TIME one.
+`surface_exchange` is `@inline`, so its thirteen-field isbits `NamedTuple` result is SSA
+inside the boundary-layer callee. Inlining this store there keeps all ten stored fields
+live to the end of a function that is already among the largest in the model, and LLVM's
+optimizer time on `moist_compressible_axisym` goes from ~60 s to many MINUTES (measured:
+the compile wedges). Behind `@noinline` the NamedTuple is passed by reference to a stack
+slot — isbits, so still ZERO heap allocation, which test/test_allocations.jl gates — and
+the caller's live ranges are untouched. Ten stores are not worth an inline.
+"""
+@noinline function surface_record!(sd::SurfaceDiag, ci::Int, sx)
+    @inbounds begin
+        sd.F_sh[ci] = sx.F_sh
+        sd.F_q[ci] = sx.F_q
+        sd.tau_u[ci] = sx.tau_u
+        sd.tau_v[ci] = sx.tau_v
+        sd.ust[ci] = sx.ust
+        sd.inv_L[ci] = sx.inv_L
+        sd.U10[ci] = sx.U10
+        sd.Cd[ci] = sx.Cd
+        sd.Ch[ci] = sx.Ch
+        sd.z0m[ci] = sx.z0m
+        sd.n_calls[1] += 1
+    end
+    return nothing
+end

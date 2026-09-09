@@ -96,6 +96,17 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         # The critical one: erasing this is what caused the crash.
         @test fieldtype(MT, :tile) === RiRk_Grid
         @test isconcretetype(fieldtype(MT, :tile))
+
+        # N2's `surface::SurfaceDiag` is the third CONCRETE physics field (after
+        # `radiation` and `mynn`), for the same reason: `mtile.surface.active` is read
+        # once per column in the boundary layer, and a Union field would make that load
+        # type-unstable. This tile has no boundary layer, so it holds the shared
+        # inactive value and the store's branch is never taken.
+        @test fieldtype(MT, :surface) === Scythe.SurfaceDiag
+        @test isconcretetype(fieldtype(MT, :surface))
+        @test !mtile.surface.active
+        @test isempty(mtile.surface.F_sh)
+        @test mtile.surface.n_calls[1] == 0
     end
 
     @testset "splineBuffer is gone" begin
@@ -519,6 +530,29 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                                                            :surface_fluxes => true))
         Scythe.moist_compressible_axisym(mtile_bl, 1, kDim_bl, 2)  # compile
         @test (@allocations Scythe.moist_compressible_axisym(mtile_bl, 1, kDim_bl, 2)) == 0
+
+        # ── THE N2 SURFACE-DIAGNOSTIC STORE, LIVE ────────────────────────────────────
+        # `surface_record!` (src/mc_surface_layer.jl) runs once per column inside the
+        # @noinline `mc_louis_bl!`, storing the ten fields of the isbits NamedTuple
+        # `surface_exchange` returned. It is a STORE and nothing else, and this is what
+        # proves it: ten Float64 writes into preallocated vectors and one Int increment
+        # must not box the NamedTuple, widen a field load, or allocate a temporary. The
+        # arm above already ran a column, so the store has fired.
+        #
+        # `surface_record!` is itself `@noinline` — the ONE thing that stops LLVM wedging
+        # on `moist_compressible_axisym` (see its docstring) — so this arm is also the
+        # gate on the by-reference isbits argument NOT becoming a heap box.
+        @test mtile_bl.surface.active
+        @test mtile_bl.surface.n_calls[1] > 0
+        @test length(mtile_bl.surface.F_sh) == div(size(mtile_bl.tile.physical, 1), kDim_bl)
+        # The values really are this column's exchange, not zeros left by the allocator.
+        @test isfinite(mtile_bl.surface.Cd[1]) && mtile_bl.surface.Cd[1] > 0.0
+        @test mtile_bl.surface.U10[1] > 0.0
+        # ...and the field is CONCRETE, so the `mtile.surface.active` load in the hot
+        # path is a plain field read (the whole-struct sweep above covers this too; this
+        # names the field so a regression says which one broke).
+        @test isconcretetype(fieldtype(typeof(mtile_bl), :surface))
+        @test fieldtype(typeof(mtile_bl), :surface) === Scythe.SurfaceDiag
 
         # And the RLR trait path (the production 3D geometry)
         mtile_blr, kDim_blr = build_mc_tile(geometry = "RLR",

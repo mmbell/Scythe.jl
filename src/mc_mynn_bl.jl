@@ -385,6 +385,11 @@ handling to copy.
     F_sh = sx.F_sh              # an exact 0.0 when options[:surface_fluxes] is off
     F_q = sx.F_q
 
+    # Hold this column's exchange for the output writer (N2); see the identical store at
+    # the Louis call site (src/mc_boundary_layer.jl). Stores only, zero allocation.
+    sd = mtile.surface
+    sd.active && surface_record!(sd, ci, sx)
+
     n_clamp = _mynn_column_inputs!(MY, S, MN, work, geom, uv, wv, vv, rho_e, n)
 
     # ── Cold start (`:mynn_init = :taper`) ───────────────────────────────────

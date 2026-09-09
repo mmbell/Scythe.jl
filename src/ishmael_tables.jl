@@ -132,12 +132,31 @@ file -- they are rebuilt at load time by [`mkcoltb`](@ref) (a few tenths of
 a second), since they are cheap to (re)compute and storing them would just
 duplicate `mkcoltb`'s own output.
 """
-struct IshmaelTables
-    itab::Array{Float64,5}
-    itabr::Array{Float64,5}
-    coltab::Array{Float64,3}
-    coltabn::Array{Float64,3}
-    igrdata::Vector{Float64}
+# MUTABLE, with every field `const`: not because anything is ever reassigned (nothing is —
+# these five tables are loaded once at tile construction and read forever after) but
+# because of `ModelTile`'s LAYOUT. An immutable struct field is stored INLINE, so an
+# immutable `IshmaelTables` puts all five of its array references directly into
+# `ModelTile`; a mutable one is a single reference, like `radiation::RadiationState` and
+# `mynn::MYNNState` already are.
+#
+# That is not cosmetic. `ModelTile` sits on an LLVM optimization cliff: adding ONE more
+# reference-typed field to it takes the compile of `moist_compressible_SLR` — the widest
+# equation-set body in the model, which does not read the new field at all — from 63 s to
+# over ELEVEN MINUTES (measured on a stage-N2 branch, and reproduced on a clean tree with a
+# dummy `MYNNState` field, so it is a property of the struct's reference count and not of
+# any particular field). A `Bool` field, which adds no reference, costs nothing. Making
+# this bundle mutable frees four of those slots, which is what pays for stage N2's
+# `surface::SurfaceDiag` and leaves headroom: with both changes the same compile is 143 s.
+#
+# The cost is one pointer hop on `mtile.ishmael_tables.itab` in the ice microphysics, which
+# is hoisted out of every loop that reads it; test/test_allocations.jl's two ISHMAEL arms
+# gate that this stays allocation-free.
+mutable struct IshmaelTables
+    const itab::Array{Float64,5}
+    const itabr::Array{Float64,5}
+    const coltab::Array{Float64,3}
+    const coltabn::Array{Float64,3}
+    const igrdata::Vector{Float64}
 end
 
 """

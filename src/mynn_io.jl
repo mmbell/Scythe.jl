@@ -93,18 +93,128 @@ function _mynn_write_snapshot!(mtile::ModelTile, t_model::Float64)
 end
 
 """
-    _mynn_write_file!(path, mtile, t_model)
+    MYNN_FIELDS_2D
 
-Write one tile's sidecar to `path`. Internal (not part of the S9 API); `mynn_write!` and
-`mynn_write_final!` are the entry points, and tests reach this directly (with a
-hand-chosen `path`) to write two "tiles" at different offsets -- see test/test_mynn_io.jl.
+The `(name, units, long_name)` of every held `(x, z)` MYNN field, in the order the
+sidecar writes them. [`mynn_diagnostics`](@ref) returns each under `Symbol(name)`.
 
-ALLOCATION: this allocates (a fresh `NCDataset`, the reshapes below, the `e` column) on
-every call, the same deliberate S5 choice `_radiation_write_file!` documents: the sidecar
-fires at the OUTPUT cadence, orders of magnitude coarser than the column driver's
-allocation-disciplined hot path.
+ONE table, read by BOTH writers: the sidecar writes these names bare, the comprehensive
+file writes `K_m`/`K_h` bare (an exchange coefficient is unambiguous and a prefix would
+only make every downstream reader spell it out again) and the rest under a `mynn_`
+prefix -- exactly the convention `tc/tc_postprocess.jl` established when it merged the
+sidecar into `<t>_derived.nc`.
 """
-function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
+const MYNN_FIELDS_2D = (
+    ("K_m", "m2 s-1", "momentum exchange coefficient"),
+    ("K_h", "m2 s-1", "heat/moisture exchange coefficient"),
+    ("e", "m2 s-2", "mass-specific TKE, rho_e/rho_t"),
+    ("el", "m", "mixing length"),
+    ("sm", "1", "momentum stability function"),
+    ("sh", "1", "heat stability function"),
+    ("cldfra_bl", "1", "subgrid cloud fraction"),
+    ("qc_bl", "kg kg-1", "subgrid cloud liquid mixing ratio"),
+    ("qi_bl", "kg kg-1", "subgrid cloud ice mixing ratio"),
+    ("vt", "1", "condensation buoyancy coefficient (temperature)"),
+    ("vq", "1", "condensation buoyancy coefficient (moisture)"),
+    ("P_s", "W m-3", "discrete shear production"),
+    ("P_s_mynn", "W m-3", "closure's own shear production, rho_t K_m G_M"),
+    ("P_b", "W m-3", "buoyancy production/consumption, rho_t K_h G_H"),
+    ("eps", "W m-3", "dissipation, rho_t q^3/(B1 l)"),
+    ("tke_transport", "W m-3", "fitted TKE turbulent-transport divergence, dz(S_e)"),
+    ("s_aw", "m s-1", "plume mass-flux sum, sum_i a_i w_i"))
+
+"""
+    MYNN_FIELDS_1D
+
+The `(name, units, long_name)` of every per-column MYNN field, in sidecar order. Written
+bare by the sidecar and under a `mynn_` prefix by the comprehensive writer (see
+[`MYNN_FIELDS_2D`](@ref)); `mynn_ust` and `mynn_inv_L` are the CLOSURE's copies and sit
+alongside the surface group's own `ust`/`inv_L`, which come straight from
+[`surface_exchange`](@ref).
+"""
+const MYNN_FIELDS_1D = (
+    ("pblh", "m", "boundary layer height"),
+    ("kpbl", "1", "PBL top layer index"),
+    ("ust", "m s-1", "friction velocity"),
+    ("inv_L", "m-1", "inverse Obukhov length, 1/L"),
+    ("plume_ktop", "1", "running-max plume top layer index"),
+    ("plume_ztop", "m", "running-max plume top height"),
+    ("aw_max", "m s-1", "running-max plume mass flux Sigma_aw"),
+    ("bdry_E", "W m-2", "D3 boundary/surface energy input"))
+
+"The MYNN counter attributes [`assemble_physics`](@ref) must SUM across tiles rather than
+take from the first one -- the same six `read_mynn` sums when it reassembles a snapshot."
+const MYNN_COUNTER_ATTRS = ("n_clamp_e", "n_cap_K", "n_diffnum", "n_gate", "n_stall",
+                            "n_plume")
+
+"""
+    mynn_global_attrs(MY::MYNNState) -> Vector{Pair{String,Any}}
+
+The MYNN-EDMF run configuration and clamp/plume census as NetCDF global attributes, in
+ONE place.
+
+Consumed by BOTH writers: the sidecar ([`_mynn_write_file!`](@ref)) writes these names
+verbatim, and the comprehensive file ([`write_netcdf_comprehensive`](@ref)) writes each
+under a `mynn_` prefix (names that already carry the prefix, i.e. `mynn_interval_s`, are
+left alone), which is exactly how `tc/tc_postprocess.jl` named them when it merged the
+sidecar. A knob added to the closure gets its attribute here and appears in both files
+without either writer being touched.
+
+Bools are stored as `0`/`1` `Int`s: NetCDF has no attribute type for `Bool`.
+
+The six counters are the TILE scalars, which `mynn_write_final!` folds from the
+per-column vectors at run end; before that they read zero. That is the sidecar's
+pre-existing behaviour and is preserved deliberately — the per-column vectors are the
+live census, and summing them here would change every sidecar ever written.
+"""
+function mynn_global_attrs(MY::MYNNState)
+    return Pair{String,Any}[
+        "closure" => MY.closure,
+        "edmf" => MY.edmf,
+        "edmf_mom" => Int(MY.edmf_mom),
+        "scale_aware" => Int(MY.scale_aware),
+        "init_mode" => string(MY.init_mode),
+        "fidelity" => string(MY.fidelity),
+        "water_carry" => string(MY.water_carry),
+        "mix_numbers" => Int(MY.mix_numbers),
+        "mynn_interval_s" => MY.interval_steps * MY.ts,
+        "K_max" => isinf(MY.K_max) ? 1.0e30 : MY.K_max,
+        "n_clamp_e" => MY.n_clamp_e,
+        "n_cap_K" => MY.n_cap_K,
+        "n_diffnum" => MY.n_diffnum,
+        "n_gate" => MY.n_gate,
+        "n_stall" => MY.n_stall,
+        "n_plume" => MY.n_plume]
+end
+
+"""
+    mynn_diagnostics(mtile::ModelTile) -> NamedTuple
+
+Everything the MYNN closure holds, on the TILE'S OWN MISH, as plain arrays: the
+coordinates (`x`, `z`), every `(x, z)` field as an `(ncol, kDim)` `Matrix{Float64}`, every
+per-column field as a length-`ncol` `Vector{Float64}`, plus `attrs`
+([`mynn_global_attrs`](@ref)) and `sum_attrs` ([`MYNN_COUNTER_ATTRS`](@ref)).
+
+This is the ONE reader of `mtile.mynn`'s held state for output. The sidecar
+([`_mynn_write_file!`](@ref)) writes it to `<t>_mynn_i<offset>.nc` unchanged; the
+comprehensive writer regrids it onto the regular output grid. Two consumers, one
+extraction, so the two files can never disagree about what a field is.
+
+Field names are the SIDECAR's variable names (`cldfra_bl`, `inv_L` for the `rmol` state
+field, ...), which is also what `read_mynn` returns, so a reader written against either
+one already knows them.
+
+`e = rho_e/rho_t` is the only derived quantity: `rho_e` is the appended TKE-density slot
+and `rho_t` is the same reconstruction `mc_driver!` uses every column (slot 3's
+perturbation plus the 1-D reference profile, indexed by the within-column layer).
+
+`edmf_a`/`edmf_w` are ZERO: the plume area-fraction and vertical-velocity sums are not
+separately held by `MYNNState` (only their mass-flux product `s_aw` is). They are here so
+the sidecar layout is fixed rather than configuration-dependent.
+
+ALLOCATES: called at the OUTPUT cadence only, never per step.
+"""
+function mynn_diagnostics(mtile::ModelTile)
     MY = mtile.mynn
     ncol = MY.ncol
     kDim = MY.kDim
@@ -138,29 +248,58 @@ function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
 
     reshape2(v) = permutedims(reshape(v, kDim, ncol))    # gridpoint vector -> (x, z)
     zerorc() = zeros(Float64, ncol, kDim)
+
+    return (; x, z = copy(MY.z_lay),
+              K_m = reshape2(MY.K_m), K_h = reshape2(MY.K_h), e = reshape2(e),
+              el = reshape2(MY.el), sm = reshape2(MY.sm), sh = reshape2(MY.sh),
+              cldfra_bl = reshape2(MY.cldfra_bl), qc_bl = reshape2(MY.qc_bl),
+              qi_bl = reshape2(MY.qi_bl), vt = reshape2(MY.vt), vq = reshape2(MY.vq),
+              P_s = reshape2(MY.g_Ps), P_s_mynn = reshape2(MY.g_Ps_mynn),
+              P_b = reshape2(MY.g_Pb), eps = reshape2(MY.g_eps),
+              tke_transport = reshape2(MY.g_tke_transport), s_aw = reshape2(MY.s_aw),
+              edmf_a = zerorc(), edmf_w = zerorc(),
+              pblh = copy(MY.pblh), kpbl = Float64.(MY.kpbl), ust = copy(MY.ust),
+              inv_L = copy(MY.rmol), plume_ktop = Float64.(MY.plume_ktop),
+              plume_ztop = copy(MY.plume_ztop), aw_max = copy(MY.aw_max),
+              bdry_E = copy(MY.bdry_E),
+              attrs = Dict{String,Any}(mynn_global_attrs(MY)),
+              sum_attrs = collect(MYNN_COUNTER_ATTRS))
+end
+
+"""
+    _mynn_write_file!(path, mtile, t_model)
+
+Write one tile's sidecar to `path` from [`mynn_diagnostics`](@ref). Internal (not part of
+the S9 API); `mynn_write!` and `mynn_write_final!` are the entry points, and tests reach
+this directly (with a hand-chosen `path`) to write two "tiles" at different offsets --
+see test/test_mynn_io.jl.
+
+Every array written here comes from `mynn_diagnostics`, the SAME extraction the
+comprehensive `<t>.nc` reads (src/netcdf_output.jl), so the two files can never disagree
+about what a MYNN field is. The tile-local census extremes (`census_max_*`) and
+`patch_offset_l` are written here ONLY: they describe a TILE, and the comprehensive file
+covers a patch.
+
+ALLOCATION: this allocates (a fresh `NCDataset`, the reshapes, the `e` column) on every
+call, the same deliberate S5 choice `_radiation_write_file!` documents: the sidecar fires
+at the OUTPUT cadence, orders of magnitude coarser than the column driver's
+allocation-disciplined hot path.
+"""
+function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
+    MY = mtile.mynn
+    d = mynn_diagnostics(mtile)
     mx(v) = isempty(v) ? 0.0 : maximum(v)
 
     NCDatasets.NCDataset(path, "c") do ds
         ds.attrib["Conventions"] = "CF-1.12"
         ds.attrib["source"] = "Scythe MYNN-EDMF sidecar"
-        ds.attrib["closure"] = MY.closure
-        ds.attrib["edmf"] = MY.edmf
-        # NCDatasets has no NetCDF attribute type for `Bool` -- store as 0/1 `Int`, the
-        # same convention `cloudy` (radiation_io.jl) uses for a per-column flag.
-        ds.attrib["edmf_mom"] = Int(MY.edmf_mom)
-        ds.attrib["scale_aware"] = Int(MY.scale_aware)
-        ds.attrib["init_mode"] = string(MY.init_mode)
-        ds.attrib["fidelity"] = string(MY.fidelity)
-        ds.attrib["water_carry"] = string(MY.water_carry)
-        ds.attrib["mix_numbers"] = Int(MY.mix_numbers)
-        ds.attrib["mynn_interval_s"] = MY.interval_steps * MY.ts
-        ds.attrib["K_max"] = isinf(MY.K_max) ? 1.0e30 : MY.K_max
-        ds.attrib["n_clamp_e"] = MY.n_clamp_e
-        ds.attrib["n_cap_K"] = MY.n_cap_K
-        ds.attrib["n_diffnum"] = MY.n_diffnum
-        ds.attrib["n_gate"] = MY.n_gate
-        ds.attrib["n_stall"] = MY.n_stall
-        ds.attrib["n_plume"] = MY.n_plume
+        # The resolved configuration and the clamp/plume census, from the SAME function
+        # the comprehensive writer reads (N2): one list, two files.
+        for (k, v) in mynn_global_attrs(MY)
+            ds.attrib[k] = v
+        end
+        # Tile-local extremes, which have no place in a domain-wide file and so are not
+        # part of `mynn_global_attrs`.
         ds.attrib["census_max_K_m"] = mx(MY.K_m_max)
         ds.attrib["census_max_K_h"] = mx(MY.K_h_max)
         ds.attrib["census_max_D_gal"] = mx(MY.D_gal)
@@ -170,8 +309,8 @@ function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
         ds.attrib["patch_offset_l"] = mtile.tile.params.patchOffsetL
 
         NCDatasets.defDim(ds, "time", 1)
-        NCDatasets.defDim(ds, "x", ncol)
-        NCDatasets.defDim(ds, "z", kDim)
+        NCDatasets.defDim(ds, "x", MY.ncol)
+        NCDatasets.defDim(ds, "z", MY.kDim)
 
         tv = NCDatasets.defVar(ds, "time", Float64, ("time",))
         tv.attrib["units"] = "seconds"; tv.attrib["long_name"] = "simulation time"
@@ -180,12 +319,12 @@ function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
         xv = NCDatasets.defVar(ds, "x", Float64, ("x",))
         xv.attrib["units"] = "m"
         xv.attrib["long_name"] = "tile horizontal mish coordinate"
-        xv[:] = x
+        xv[:] = d.x
 
         zv = NCDatasets.defVar(ds, "z", Float64, ("z",))
         zv.attrib["units"] = "m"
         zv.attrib["long_name"] = "MYNN column height above ground"
-        zv[:] = MY.z_lay
+        zv[:] = d.z
 
         wrz(name, data, units, long) = begin
             dv = NCDatasets.defVar(ds, name, Float64, ("time", "x", "z");
@@ -200,43 +339,21 @@ function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
             dv[1, :] = data
         end
 
-        wrz("K_m", reshape2(MY.K_m), "m2 s-1", "momentum exchange coefficient")
-        wrz("K_h", reshape2(MY.K_h), "m2 s-1", "heat/moisture exchange coefficient")
-        wrz("e", reshape2(e), "m2 s-2", "mass-specific TKE, rho_e/rho_t")
-        wrz("el", reshape2(MY.el), "m", "mixing length")
-        wrz("sm", reshape2(MY.sm), "1", "momentum stability function")
-        wrz("sh", reshape2(MY.sh), "1", "heat stability function")
-        wrz("cldfra_bl", reshape2(MY.cldfra_bl), "1", "subgrid cloud fraction")
-        wrz("qc_bl", reshape2(MY.qc_bl), "kg kg-1", "subgrid cloud liquid mixing ratio")
-        wrz("qi_bl", reshape2(MY.qi_bl), "kg kg-1", "subgrid cloud ice mixing ratio")
-        wrz("vt", reshape2(MY.vt), "1", "condensation buoyancy coefficient (temperature)")
-        wrz("vq", reshape2(MY.vq), "1", "condensation buoyancy coefficient (moisture)")
-        wrz("P_s", reshape2(MY.g_Ps), "W m-3", "discrete shear production")
-        wrz("P_s_mynn", reshape2(MY.g_Ps_mynn), "W m-3",
-            "closure's own shear production, rho_t K_m G_M")
-        wrz("P_b", reshape2(MY.g_Pb), "W m-3",
-            "buoyancy production/consumption, rho_t K_h G_H")
-        wrz("eps", reshape2(MY.g_eps), "W m-3", "dissipation, rho_t q^3/(B1 l)")
-        wrz("tke_transport", reshape2(MY.g_tke_transport), "W m-3",
-            "fitted TKE turbulent-transport divergence, dz(S_e)")
-        wrz("s_aw", reshape2(MY.s_aw), "m s-1", "plume mass-flux sum, sum_i a_i w_i")
-        wrz("edmf_a", zerorc(), "1",
+        for (nm, units, long) in MYNN_FIELDS_2D
+            wrz(nm, getfield(d, Symbol(nm)), units, long)
+        end
+        wrz("edmf_a", d.edmf_a, "1",
             "plume area-fraction sum (not separately held by MYNNState; zero)")
-        wrz("edmf_w", zerorc(), "m s-1",
+        wrz("edmf_w", d.edmf_w, "m s-1",
             "plume vertical-velocity sum (not separately held by MYNNState; zero)")
 
-        wrx("pblh", MY.pblh, "m", "boundary layer height")
-        wrx("kpbl", Float64.(MY.kpbl), "1", "PBL top layer index")
-        wrx("ust", MY.ust, "m s-1", "friction velocity")
-        wrx("inv_L", MY.rmol, "m-1", "inverse Obukhov length, 1/L")
-        wrx("plume_ktop", Float64.(MY.plume_ktop), "1",
-            "running-max plume top layer index")
-        wrx("plume_ztop", MY.plume_ztop, "m", "running-max plume top height")
-        wrx("aw_max", MY.aw_max, "m s-1", "running-max plume mass flux Sigma_aw")
-        wrx("bdry_E", MY.bdry_E, "W m-2", "D3 boundary/surface energy input")
+        for (nm, units, long) in MYNN_FIELDS_1D
+            wrx(nm, getfield(d, Symbol(nm)), units, long)
+        end
     end
     return nothing
 end
+
 
 # ── Reader ───────────────────────────────────────────────────────────────────────
 

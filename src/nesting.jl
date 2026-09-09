@@ -1105,7 +1105,10 @@ function integrate_nested_model(nest::NestedModelParameters)
     # Finalize each patch and close the log files
     for i in 1:n
         gm = groups[i][1]
-        wait(get_from(gm, :(finalize_model(patch, model))))
+        # `workerids` so the FINAL comprehensive file carries the physics groups too:
+        # `finalize_model` -> `write_output` gathers them from this patch's own worker
+        # group, the same group `run_nested_patch` wrote the periodic files from.
+        wait(get_from(gm, :(finalize_model(patch, model; workerids = $(groups[i])))))
         wait(get_from(gm, :(close(out))))
         wait(get_from(gm, :(close(err))))
     end

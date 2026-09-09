@@ -106,6 +106,16 @@ include("mynn_state.jl")
 # particular it names no radiative-transfer library: every RRTMGP reference is confined to
 # src/radiation.jl, which is included after moist_compressible.jl.
 include("radiation_state.jl")
+# The SHARED SURFACE-EXCHANGE layer. It comes before mc_boundary_layer.jl because the
+# Louis BL calls `surface_exchange` and carries a `SurfaceLayerParams` through its
+# argument list, and the MYNN-EDMF closure calls the same function; it is a leaf apart
+# from `komori_cd`, which lives there too — the bulk air-sea formulas are in ONE file,
+# not two. It comes before semiimplicit.jl for the reason mynn_state.jl and
+# radiation_state.jl do: stage N2 gave it `SurfaceDiag`, and `ModelTile` carries one
+# CONCRETELY (see `EMPTY_SURFACE_DIAG`), so the struct has to be defined before the one
+# that names it. Nothing in it references `ModelTile`, the geometry traits or the
+# equation sets, so the move is inert.
+include("mc_surface_layer.jl")
 include("semiimplicit.jl")
 include("testModels.jl")
 include("shallowWaterModels.jl")
@@ -120,11 +130,6 @@ include("io.jl")
 include("ishmael.jl")
 include("microphysics.jl")
 include("mc_geometry.jl")
-# The SHARED SURFACE-EXCHANGE layer comes before mc_boundary_layer.jl because the Louis BL
-# calls `surface_exchange` and carries a `SurfaceLayerParams` through its argument list; the
-# MYNN-EDMF closure will call the same function. It is a leaf apart from `komori_cd`, which
-# now lives there too — the bulk air-sea formulas are in ONE file, not two.
-include("mc_surface_layer.jl")
 include("mc_boundary_layer.jl")
 # The MYNN-EDMF APPLY (S5). After mc_boundary_layer.jl because it reuses that
 # file's tangential-wind trait accessors and its surface-delivery convention, and

@@ -27,6 +27,9 @@ const TC_WATER_OPTS = Dict{Symbol,Any}(:condensate_transform => CONDENSATE_TRANS
 # constructed. make_base reuses this SAME constant for options[:mynn] rather
 # than re-reading the env var, so the two can never disagree.
 const TC_BL_CHOICE = get(ENV, "SCYTHE_TC_BL", "louis")
+# SCYTHE_TC_SIDECARS=1 also writes the per-tile MYNN/radiation sidecar NetCDFs (opt-in
+# since the comprehensive <t>.nc carries those fields; default 0 = one file per output time).
+const TC_SIDECARS = get(ENV, "SCYTHE_TC_SIDECARS", "0") == "1"
 TC_BL_CHOICE in ("louis", "mynn") ||
     error("SCYTHE_TC_BL = \"$(TC_BL_CHOICE)\" is not recognized; use louis or mynn")
 const TC_NAME_OPTS = merge(TC_WATER_OPTS,
@@ -311,6 +314,10 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         rad_forcing = Symbol(get(ENV, "SCYTHE_TC_RAD_FORCING", "full"))
         rad_interval = parse(Float64, get(ENV, "SCYTHE_TC_RAD_INTERVAL", string(RAD_INTERVAL)))
         rad_zmax = parse(Float64, get(ENV, "SCYTHE_TC_RAD_ZMAX", string(RAD_ZMAX)))
+        # The per-tile radiation sidecar (<t>_radiation_i*.nc) is opt-in since the
+        # comprehensive <t>.nc carries the radiation fields; SCYTHE_TC_SIDECARS=1 asks for
+        # it (it is the only place the face-based flux profiles on zf exist).
+        TC_SIDECARS && (rad_options[:radiation_output] = true)
         rad_options[:radiation_forcing] = rad_forcing
         rad_options[:radiation_interval] = rad_interval
         rad_options[:radiation_z_max] = rad_zmax
@@ -381,6 +388,11 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         bl_options[:mynn] = true
         bl_options[:mynn_interval] = mynn_interval
         bl_options[:mynn_edmf] = mynn_edmf
+        # The mish-native MYNN sidecar (<t>_mynn_i*.nc) is opt-in: the MYNN fields ride
+        # in the comprehensive <t>.nc (regridded onto the regular output grid), which
+        # tc/tc_movie.jl reads directly. SCYTHE_TC_SIDECARS=1 writes the sidecar too (the
+        # legacy tc/tc_postprocess.jl path and the mish-native replay tools want it).
+        TC_SIDECARS && (bl_options[:mynn_output] = true)
         println("TC boundary layer: mynn interval=$mynn_interval s edmf=$mynn_edmf" *
                 sfc_suffix)
     end

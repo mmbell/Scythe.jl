@@ -101,22 +101,124 @@ function _radiation_write_snapshot!(mtile::ModelTile, t_model::Float64)
     return nothing
 end
 
+"The radiation counter attributes [`assemble_physics`](@ref) must SUM across tiles rather
+than take from the first one."
+const RADIATION_COUNTER_ATTRS = ("n_clamp_tk", "n_clamp_re_liq", "n_clamp_re_ice",
+                                 "n_neg_rho_v")
+
 """
-    _radiation_write_file!(path, mtile, t_model)
+    RADIATION_FIELDS_2D
 
-Write one tile's sidecar to `path`. Internal (not part of the S5 API); `radiation_write!`
-and `radiation_write_final!` are the entry points, and tests reach this directly (with a
-hand-chosen `path`) to write two "tiles" at different offsets without a real multi-worker
-run -- see test/test_radiation_io.jl.
+The `(name, units, long_name)` of every layer-resolved radiation field, in the order the
+sidecar writes them. [`radiation_diagnostics`](@ref) returns each under `Symbol(name)`.
 
-ALLOCATION: this allocates (reshapes, transposes, a fresh `NCDataset`) on every call. That
-is a deliberate S5 choice, not an oversight: the sidecar fires at the OUTPUT cadence
-(60-300 s of model time), three to four orders of magnitude coarser than the acoustic
-timestep the rest of the driver is allocation-disciplined for, so a few dozen small
-allocations here are unmeasurable against the write itself. Preallocating a scratch
-struct in the solver bundle (the plan's other option) would save little and would have to
-be sized for the FULL (nlev_tot, ncol) shape whether or not `:radiation_output` is even
-on.
+ONE table, read by BOTH the sidecar and [`write_netcdf_comprehensive`](@ref); the latter
+also writes the derived `dT_net = dT_lw + sw_scale * dT_sw`, the rate a column actually
+felt, which the sidecar leaves to the reader because it holds `sw_scale` as an attribute.
+"""
+const RADIATION_FIELDS_2D = (
+    ("q_lw", "W m-3", "longwave heating rate (flux divergence)"),
+    ("q_sw", "W m-3", "shortwave heating rate (flux divergence), held profile"),
+    ("q_sw_applied", "W m-3",
+     "sw_scale * q_sw, the rate actually folded into QDOT_TH this step"),
+    ("dT_lw", "K day-1", RADIATION_KDAY_LABEL * " -- longwave"),
+    ("dT_sw", "K day-1",
+     RADIATION_KDAY_LABEL * " -- shortwave, UNSCALED (multiply by sw_scale " *
+     "for the rate actually applied)"))
+
+"""
+    RADIATION_FIELDS_FACE
+
+The `(name, units, long_name)` of the six FACE-based flux profiles, on `zf` (which runs
+to the top of the stratospheric extension).
+
+Sidecar ONLY. They are deliberately NOT merged into the comprehensive file: `zf` has no
+counterpart on the regular output z grid, which stops at the model top. The per-column
+boundary values derived from them ([`RADIATION_FIELDS_1D`](@ref): `olr`, `sw_sfc_dn`,
+...) ARE in both files, so nothing a column-integrated budget needs is lost — only the
+profiles themselves, which stay here.
+"""
+const RADIATION_FIELDS_FACE = (
+    ("flux_lw_up", "W m-2", "longwave flux, upward"),
+    ("flux_lw_dn", "W m-2", "longwave flux, downward"),
+    ("flux_lw_net", "W m-2", "longwave net flux (up - down)"),
+    ("flux_sw_up", "W m-2", "shortwave flux, upward"),
+    ("flux_sw_dn", "W m-2", "shortwave flux, downward"),
+    ("flux_sw_net", "W m-2", "shortwave net flux (up - down)"))
+
+"""
+    RADIATION_FIELDS_1D
+
+The `(name, units, long_name)` of every per-column radiation diagnostic, in sidecar
+order. Written under these exact names in BOTH files.
+"""
+const RADIATION_FIELDS_1D = (
+    ("olr", "W m-2",
+     "outgoing longwave radiation at the top of the full column (incl. extension)"),
+    ("olr_model_top", "W m-2",
+     "longwave flux up at the model top face, before the stratospheric extension"),
+    ("lw_sfc_dn", "W m-2", "longwave flux down at the surface"),
+    ("lw_sfc_up", "W m-2", "longwave flux up at the surface"),
+    ("sw_sfc_dn", "W m-2", "shortwave flux down at the surface"),
+    ("sw_sfc_up", "W m-2", "shortwave flux up at the surface"),
+    ("sw_toa_dn", "W m-2", "shortwave flux down at the top of the full column"),
+    ("sw_toa_up", "W m-2", "shortwave flux up at the top of the full column"),
+    ("lwp", "g m-2", "column liquid water path"),
+    ("iwp", "g m-2", "column ice water path"),
+    ("cloudy", "1", "1 if any layer of this column has cf == 1, else 0"))
+
+"""
+    radiation_global_attrs(rs::RadiationState, ts::Float64) -> Vector{Pair{String,Any}}
+
+The radiation run configuration, sun state and clamp census as NetCDF global attributes,
+in ONE place. `ts` is the model timestep, which the last-call time and the call interval
+are expressed in.
+
+Consumed by BOTH writers: the sidecar writes these names verbatim, the comprehensive file
+writes each under a `radiation_` prefix (names that already carry it — `radiation_interval_s`
+— are left alone), which is how `tc/tc_postprocess.jl` named them when it merged the
+sidecar. See [`mynn_global_attrs`](@ref), which does the same for MYNN.
+"""
+function radiation_global_attrs(rs::RadiationState, ts::Float64)
+    return Pair{String,Any}[
+        "t_last_call" => rs.last_call_step == typemin(Int) ? NaN :
+                         (rs.last_call_step - 1) * ts,
+        "cos_zenith" => rs.cos_zenith,
+        "toa_flux" => rs.toa_flux,
+        "sw_scale" => rs.sw_scale,
+        "scheme" => string(rs.scheme),
+        "method" => string(rs.method),
+        "solar" => string(rs.solar),
+        "forcing" => string(rs.forcing),
+        "z_max" => isinf(rs.z_max) ? 1.0e30 : rs.z_max,
+        "radiation_interval_s" => rs.interval_steps * ts,
+        "n_clamp_tk" => rs.n_clamp_tk,
+        "n_clamp_re_liq" => rs.n_clamp_re_liq,
+        "n_clamp_re_ice" => rs.n_clamp_re_ice,
+        "n_neg_rho_v" => rs.n_neg_rho_v]
+end
+
+"""
+    radiation_diagnostics(mtile::ModelTile) -> NamedTuple
+
+The tile's radiative forcing, fluxes and cloud diagnostics on the RADIATION MISH (Gauss
+points in `x`, layer centres in `z`, faces in `zf`), as plain arrays: `x`, `z`, `zf`,
+every layer field of [`RADIATION_FIELDS_2D`](@ref) as an `(ncol, nlay)` matrix, every
+face field of [`RADIATION_FIELDS_FACE`](@ref) as an `(ncol, nlev_tot)` matrix, every
+per-column field of [`RADIATION_FIELDS_1D`](@ref) as a length-`ncol` vector, the
+`sw_scale` the applied rate is built with, `forcing` and (on `:anomaly`) the two
+reference heating profiles, plus `attrs` ([`radiation_global_attrs`](@ref)) and
+`sum_attrs` ([`RADIATION_COUNTER_ATTRS`](@ref)).
+
+The ONE reader of `mtile.radiation`'s held state for output: the sidecar
+([`_radiation_write_file!`](@ref)) writes it unchanged, the comprehensive writer regrids
+the layer and per-column parts onto the regular output grid and drops the faces (see
+[`RADIATION_FIELDS_FACE`](@ref)).
+
+`dT_lw`/`dT_sw` are the K/day-at-constant-pressure rates, from the SAME `_rad_kday` the
+trace uses. The column reconstruction is re-run (as the trace's is) and the
+temperature-clamp counter is snapshotted and restored around it for the same reason: a
+diagnostic must not inflate the census it reports.
 
 Requires `options[:radiation_layer_stride] == 1` (`rs.kDim == rs.nlay`): the held
 `q_lw`/`q_sw` are GRIDPOINT-indexed while the layer geometry (`rs.z`, the taper, the
@@ -125,14 +227,19 @@ stride `:rrtmgp` runs anyway (`mc_radiation_state` refuses anything else). A `:p
 run at stride > 1 is the one configuration this could in principle serve and does not;
 that combination is untested elsewhere in the radiation stack and errors here rather than
 silently mis-shaping the `z` dimension.
+
+ALLOCATES (reshapes, transposes, the K/day matrices) on every call. That is a deliberate
+S5 choice, not an oversight: this fires at the OUTPUT cadence (60-300 s of model time),
+three to four orders of magnitude coarser than the acoustic timestep the rest of the
+driver is allocation-disciplined for.
 """
-function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64)
+function radiation_diagnostics(mtile::ModelTile)
     rs = mtile.radiation
     kDim = rs.kDim
     nlay = rs.nlay
     ncol = rs.ncol
     kDim == nlay || error(
-        "radiation sidecar output needs options[:radiation_layer_stride] = 1 " *
+        "radiation output needs options[:radiation_layer_stride] = 1 " *
         "(kDim = $kDim, nlay = $nlay); the held q_lw/q_sw are gridpoint-indexed and " *
         "only coincide with the layer-indexed geometry at stride 1")
 
@@ -145,18 +252,15 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
                                  copy(rs.z_face)
     nlev_tot = length(zf)
     size(rs.flux_lw_up, 1) == nlev_tot || error(
-        "radiation sidecar: flux matrix has $(size(rs.flux_lw_up, 1)) rows, expected " *
+        "radiation output: flux matrix has $(size(rs.flux_lw_up, 1)) rows, expected " *
         "nlev_tot = $nlev_tot from z_face/extension -- geometry mismatch")
 
     # ── Held forcing, reshaped (x, z) ──
-    q_lw2 = permutedims(reshape(rs.q_lw, kDim, ncol))
-    q_sw2 = permutedims(reshape(rs.q_sw, kDim, ncol))
-    q_sw_applied2 = rs.sw_scale .* q_sw2
+    q_lw = permutedims(reshape(rs.q_lw, kDim, ncol))
+    q_sw = permutedims(reshape(rs.q_sw, kDim, ncol))
+    q_sw_applied = rs.sw_scale .* q_sw
 
-    # ── K/day at constant pressure, the SAME `_rad_kday` the trace uses. The column
-    # reconstruction is re-run (as the trace's is), and the temperature-clamp counter is
-    # snapshotted/restored around it for the same reason: a diagnostic must not inflate
-    # the census it reports. ──
+    # ── K/day at constant pressure (see the docstring) ──
     dT_lw = zeros(Float64, ncol, nlay)
     dT_sw = zeros(Float64, ncol, nlay)
     n_tk_save = rs.n_clamp_tk
@@ -173,10 +277,10 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
     rs.n_clamp_tk = n_tk_save
 
     # ── Fluxes, reshaped (x, zf) ──
-    flw_up = permutedims(rs.flux_lw_up); flw_dn = permutedims(rs.flux_lw_dn)
-    flw_net = permutedims(rs.flux_lw_net)
-    fsw_up = permutedims(rs.flux_sw_up); fsw_dn = permutedims(rs.flux_sw_dn)
-    fsw_net = permutedims(rs.flux_sw_net)
+    flux_lw_up = permutedims(rs.flux_lw_up); flux_lw_dn = permutedims(rs.flux_lw_dn)
+    flux_lw_net = permutedims(rs.flux_lw_net)
+    flux_sw_up = permutedims(rs.flux_sw_up); flux_sw_dn = permutedims(rs.flux_sw_dn)
+    flux_sw_net = permutedims(rs.flux_sw_net)
 
     # ── Per-column boundary diagnostics. Row 1 of every flux matrix is the surface, row
     # nlay+1 the model-top face, row end the top of the full column (incl. extension) --
@@ -204,31 +308,49 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
         end
     end
 
+    return (; x, z = copy(rs.z), zf,
+              q_lw, q_sw, q_sw_applied, dT_lw, dT_sw,
+              flux_lw_up, flux_lw_dn, flux_lw_net,
+              flux_sw_up, flux_sw_dn, flux_sw_net,
+              olr, olr_model_top, lw_sfc_dn, lw_sfc_up,
+              sw_sfc_dn, sw_sfc_up, sw_toa_dn, sw_toa_up, lwp, iwp, cloudy,
+              sw_scale = rs.sw_scale, forcing = rs.forcing,
+              q_lw_ref = copy(rs.q_lw_ref), q_sw_ref = copy(rs.q_sw_ref),
+              attrs = Dict{String,Any}(radiation_global_attrs(rs, mtile.model.ts)),
+              sum_attrs = collect(RADIATION_COUNTER_ATTRS))
+end
+
+"""
+    _radiation_write_file!(path, mtile, t_model)
+
+Write one tile's sidecar to `path` from [`radiation_diagnostics`](@ref). Internal (not
+part of the S5 API); `radiation_write!` and `radiation_write_final!` are the entry
+points, and tests reach this directly (with a hand-chosen `path`) to write two "tiles" at
+different offsets without a real multi-worker run -- see test/test_radiation_io.jl.
+
+Every array written here comes from `radiation_diagnostics`, the SAME extraction the
+comprehensive `<t>.nc` reads (src/netcdf_output.jl), so this file and that one can never
+disagree about what a radiation field is. The face-based flux profiles and the `:anomaly`
+reference columns are written here ONLY (see [`RADIATION_FIELDS_FACE`](@ref)).
+"""
+function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64)
+    rs = mtile.radiation
+    d = radiation_diagnostics(mtile)
+
     NCDatasets.NCDataset(path, "c") do ds
         ds.attrib["Conventions"] = "CF-1.12"
         ds.attrib["source"] = "Scythe radiation sidecar"
-        ds.attrib["t_last_call"] =
-            rs.last_call_step == typemin(Int) ? NaN :
-            (rs.last_call_step - 1) * mtile.model.ts
-        ds.attrib["cos_zenith"] = rs.cos_zenith
-        ds.attrib["toa_flux"] = rs.toa_flux
-        ds.attrib["sw_scale"] = rs.sw_scale
-        ds.attrib["scheme"] = string(rs.scheme)
-        ds.attrib["method"] = string(rs.method)
-        ds.attrib["solar"] = string(rs.solar)
-        ds.attrib["forcing"] = string(rs.forcing)
-        ds.attrib["z_max"] = isinf(rs.z_max) ? 1.0e30 : rs.z_max
-        ds.attrib["radiation_interval_s"] = rs.interval_steps * mtile.model.ts
-        ds.attrib["n_clamp_tk"] = rs.n_clamp_tk
-        ds.attrib["n_clamp_re_liq"] = rs.n_clamp_re_liq
-        ds.attrib["n_clamp_re_ice"] = rs.n_clamp_re_ice
-        ds.attrib["n_neg_rho_v"] = rs.n_neg_rho_v
+        # The resolved configuration, sun state and clamp census, from the SAME function
+        # the comprehensive writer reads (N2): one list, two files.
+        for (k, v) in radiation_global_attrs(rs, mtile.model.ts)
+            ds.attrib[k] = v
+        end
         ds.attrib["patch_offset_l"] = mtile.tile.params.patchOffsetL
 
         NCDatasets.defDim(ds, "time", 1)
-        NCDatasets.defDim(ds, "x", ncol)
-        NCDatasets.defDim(ds, "z", nlay)
-        NCDatasets.defDim(ds, "zf", nlev_tot)
+        NCDatasets.defDim(ds, "x", rs.ncol)
+        NCDatasets.defDim(ds, "z", rs.nlay)
+        NCDatasets.defDim(ds, "zf", length(d.zf))
 
         tv = NCDatasets.defVar(ds, "time", Float64, ("time",))
         tv.attrib["units"] = "seconds"; tv.attrib["long_name"] = "simulation time"
@@ -237,17 +359,17 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
         xv = NCDatasets.defVar(ds, "x", Float64, ("x",))
         xv.attrib["units"] = "m"
         xv.attrib["long_name"] = "tile horizontal mish coordinate"
-        xv[:] = x
+        xv[:] = d.x
 
         zv = NCDatasets.defVar(ds, "z", Float64, ("z",))
         zv.attrib["units"] = "m"; zv.attrib["long_name"] = "radiation layer height"
-        zv[:] = rs.z
+        zv[:] = d.z
 
         zfv = NCDatasets.defVar(ds, "zf", Float64, ("zf",))
         zfv.attrib["units"] = "m"
         zfv.attrib["long_name"] =
             "radiation layer face height (incl. stratospheric extension)"
-        zfv[:] = zf
+        zfv[:] = d.zf
 
         wrz(name, data, units, long) = begin
             dv = NCDatasets.defVar(ds, name, Float64, ("time", "x", "z");
@@ -268,37 +390,15 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
             dv[1, :] = data
         end
 
-        wrz("q_lw", q_lw2, "W m-3", "longwave heating rate (flux divergence)")
-        wrz("q_sw", q_sw2, "W m-3", "shortwave heating rate (flux divergence), held profile")
-        wrz("q_sw_applied", q_sw_applied2, "W m-3",
-            "sw_scale * q_sw, the rate actually folded into QDOT_TH this step")
-        wrz("dT_lw", dT_lw, "K day-1", RADIATION_KDAY_LABEL * " -- longwave")
-        wrz("dT_sw", dT_sw, "K day-1",
-            RADIATION_KDAY_LABEL * " -- shortwave, UNSCALED (multiply by sw_scale " *
-            "for the rate actually applied)")
-
-        wrzf("flux_lw_up", flw_up, "W m-2", "longwave flux, upward")
-        wrzf("flux_lw_dn", flw_dn, "W m-2", "longwave flux, downward")
-        wrzf("flux_lw_net", flw_net, "W m-2", "longwave net flux (up - down)")
-        wrzf("flux_sw_up", fsw_up, "W m-2", "shortwave flux, upward")
-        wrzf("flux_sw_dn", fsw_dn, "W m-2", "shortwave flux, downward")
-        wrzf("flux_sw_net", fsw_net, "W m-2", "shortwave net flux (up - down)")
-
-        wrx("olr", olr, "W m-2",
-            "outgoing longwave radiation at the top of the full column (incl. extension)")
-        wrx("olr_model_top", olr_model_top, "W m-2",
-            "longwave flux up at the model top face, before the stratospheric extension")
-        wrx("lw_sfc_dn", lw_sfc_dn, "W m-2", "longwave flux down at the surface")
-        wrx("lw_sfc_up", lw_sfc_up, "W m-2", "longwave flux up at the surface")
-        wrx("sw_sfc_dn", sw_sfc_dn, "W m-2", "shortwave flux down at the surface")
-        wrx("sw_sfc_up", sw_sfc_up, "W m-2", "shortwave flux up at the surface")
-        wrx("sw_toa_dn", sw_toa_dn, "W m-2",
-            "shortwave flux down at the top of the full column")
-        wrx("sw_toa_up", sw_toa_up, "W m-2",
-            "shortwave flux up at the top of the full column")
-        wrx("lwp", lwp, "g m-2", "column liquid water path")
-        wrx("iwp", iwp, "g m-2", "column ice water path")
-        wrx("cloudy", cloudy, "1", "1 if any layer of this column has cf == 1, else 0")
+        for (nm, units, long) in RADIATION_FIELDS_2D
+            wrz(nm, getfield(d, Symbol(nm)), units, long)
+        end
+        for (nm, units, long) in RADIATION_FIELDS_FACE
+            wrzf(nm, getfield(d, Symbol(nm)), units, long)
+        end
+        for (nm, units, long) in RADIATION_FIELDS_1D
+            wrx(nm, getfield(d, Symbol(nm)), units, long)
+        end
 
         if rs.forcing === :anomaly
             qlr = NCDatasets.defVar(ds, "q_lw_ref", Float64, ("time", "z");
@@ -306,17 +406,18 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
             qlr.attrib["units"] = "W m-3"
             qlr.attrib["long_name"] =
                 "resting reference column longwave heating (subtracted for :anomaly forcing)"
-            qlr[1, :] = rs.q_lw_ref
+            qlr[1, :] = d.q_lw_ref
             qsr = NCDatasets.defVar(ds, "q_sw_ref", Float64, ("time", "z");
                                     deflatelevel = 4)
             qsr.attrib["units"] = "W m-3"
             qsr.attrib["long_name"] =
                 "resting reference column shortwave heating (subtracted for :anomaly forcing)"
-            qsr[1, :] = rs.q_sw_ref
+            qsr[1, :] = d.q_sw_ref
         end
     end
     return nothing
 end
+
 
 # ── Reader ───────────────────────────────────────────────────────────────────────
 

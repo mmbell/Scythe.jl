@@ -188,6 +188,14 @@ carrying no cloud.
     F_sh = sx.F_sh   # an exact 0.0 when options[:surface_fluxes] is off
     F_q = sx.F_q
 
+    # Hold this column's exchange for the output writer (N2). A STORE and nothing else --
+    # no arithmetic here changes, and on a run with the store off (`active == false`) this
+    # is one Bool load and one branch. `colstart` indexes the flat gridpoint vector and one
+    # column is `colend - colstart + 1 == kDim` points long, so the column index is that
+    # division -- the same `div(colstart - 1, kDim) + 1` `mc_mynn_bl!` forms from `MY.kDim`.
+    sd = mtile.surface
+    sd.active && surface_record!(sd, div(colstart - 1, colend - colstart + 1) + 1, sx)
+
     # Surface-layer delivery profile g(z) = (2/δ)(1 − z/δ)₊, ∫g = 1, over the
     # lowest cell (the first-cell Gauss midpoint z[2] sits at δ/2 exactly for
     # odd-order Gauss quadrature). The bulk surface stresses/fluxes enter the

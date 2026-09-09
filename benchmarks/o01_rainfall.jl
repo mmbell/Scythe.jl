@@ -585,6 +585,12 @@ function o01_model(opts::BenchmarkOptions)
             error("SCYTHE_O01_RAD = \"$rad_arm\" is not an arm; use lw, allsky, sw, " *
                   "allsky_sw, diurnal, or 0/unset for no radiation at all")
         end
+        # The mish-native radiation sidecar. Its default flipped to OFF in stage N2 (the
+        # radiation fields now ride in the model's comprehensive <t>.nc, regridded onto
+        # the regular grid), but this benchmark's radiation diagnostics and
+        # `benchmarks/o01_movie.jl --field rad` read the SIDECAR, so the arm asks for it
+        # explicitly. Switching them to the regular-grid file would change their numbers.
+        options[:radiation_output] = true
         options[:radiation_forcing] = Symbol(get(ENV, "SCYTHE_O01_RAD_FORCING", "full"))
         options[:radiation_interval] =
             parse(Float64, get(ENV, "SCYTHE_O01_RAD_INTERVAL", "300.0"))

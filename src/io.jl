@@ -53,8 +53,10 @@ JLD2 is NOT an analysis format: it is the restart/checkpoint format, written by
   (the default) builds one HERE, which costs a reference-state construction per call — fine
   for a test or a REPL call, wrong for a run, which is why `run_model`, `model_loop`,
   `finalize_model` and `run_nested_patch` all thread one through.
-- `workerids`: accepted now, used in stage N2 to collect the physics-group fields (BL,
-  radiation, surface) from the workers that hold them.
+- `workerids`: the workers holding this patch's tiles. `:netcdf` asks each of them for its
+  held physics diagnostics ([`gather_physics`](@ref)) and writes the assembled BL /
+  radiation / surface groups into the comprehensive file. Empty (the default) writes the
+  file with no physics groups, which is what an in-process caller gets.
 """
 function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64;
                       ctx = nothing, workerids::Vector{Int64} = Int64[])
@@ -76,8 +78,14 @@ function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64;
             ctx === nothing && (ctx = netcdf_output_context(grid, model))
             path = joinpath(model.output_dir, "$(tag).nc")
             if ctx.active
-                # Stage N2 fills the `physics` argument from `workerids`; N1 passes nothing.
-                write_netcdf_comprehensive(path, grid, model, t, ctx, nothing)
+                # The physics groups (BL, radiation, surface) live on the WORKERS, on
+                # each tile's own mish. Ask for them HERE, at the output cadence and
+                # nowhere else, and stitch the tiles back together
+                # (src/netcdf_output.jl). An in-process caller with no workers (a test,
+                # the REPL) passes none and gets a file with no physics groups.
+                physics = isempty(workerids) ? nothing :
+                          assemble_physics(gather_physics(workerids))
+                write_netcdf_comprehensive(path, grid, model, t, ctx, physics)
             else
                 write_netcdf_prognostic(path, grid, model, t)
             end

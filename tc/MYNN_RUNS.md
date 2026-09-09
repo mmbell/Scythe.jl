@@ -27,6 +27,7 @@ Surface layer (shared by BOTH `louis` and `mynn` — resolved OUTSIDE the BL bra
 | `SCYTHE_TC_SFC=gfdl_v7`  | `options[:sfc_z0] = :gfdl_v7` — the HWRF/HAFS z0m(U10)/z0t(U10) polynomial fits |
 | `SCYTHE_TC_SFC=charnock` | `options[:sfc_z0] = :charnock` — Charnock + Zeng et al. (1998) thermal roughness |
 | `SCYTHE_TC_SFC_STAB=0` (default) / `1` | `options[:sfc_stability]` — Monin–Obukhov stability functions + Beljaars gustiness over the neutral coefficients above |
+| `SCYTHE_TC_SIDECARS` | `0` (default) \| `1` | `1` also writes the per-tile `<t>_mynn_i*.nc` / `<t>_radiation_i*.nc` sidecars (mish-native; the legacy `tc_postprocess.jl` path, the replay tools, and the face-based radiation flux profiles on `zf` need them). Default: the comprehensive `<t>.nc` only. |
 
 `SCYTHE_TC_SFC` and `SCYTHE_TC_SFC_STAB` are validated at setup (`Scythe.SFC_Z0_MODES`,
 `src/mc_surface_layer.jl`) and printed on the `TC boundary layer:` line.

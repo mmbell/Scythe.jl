@@ -266,6 +266,17 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # makes both loads type-unstable. See `mc_mynn_state` and `EMPTY_MYNN`
     # (src/mynn_state.jl).
     mynn::MYNNState
+    # The tile's per-column surface-exchange diagnostics (stage N2), or
+    # [`EMPTY_SURFACE_DIAG`](@ref) when this run has no surface layer. CONCRETE for the
+    # third time and for the third identical reason: `mc_louis_bl!` and `mc_mynn_bl!`
+    # read `mtile.surface.active` once per column, immediately after the
+    # `surface_exchange` call, and a Union field would make that load type-unstable in
+    # the hot path. See `mc_surface_diag` and `surface_record!`
+    # (src/mc_surface_layer.jl).
+    #
+    # LAST field deliberately: every positional `ModelTile(...)` construction in the tree
+    # is the one in `createModelTile` below, so appending here is a one-line change there.
+    surface::SurfaceDiag
 end
 
 """
@@ -615,7 +626,10 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_radiation_state(model, tile, tilepoints),
         # Defined in mynn_state.jl, which is included BEFORE this file (the struct has to
         # be); the call sits here beside the radiation state for the same reason.
-        mc_mynn_state(model, tile, tilepoints))
+        mc_mynn_state(model, tile, tilepoints),
+        # ...and the surface-exchange diagnostic store (N2), from mc_surface_layer.jl,
+        # which moved above this file for exactly the same struct-ordering reason.
+        mc_surface_diag(model, tile))
     return mtile
 end
 

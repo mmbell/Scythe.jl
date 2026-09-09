@@ -533,9 +533,15 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     # moments are what the habit prediction is made of.
     mix_numbers = get(options, :mynn_mix_numbers, true)::Bool
     interval_sec = Float64(get(options, :mynn_interval, 20.0))
-    # Default ON (S9): a run with `:mynn` on gets the sidecar for free, the same default
-    # `:radiation_output` takes (src/radiation_state.jl). Explicitly `false` opts out.
-    output = get(options, :mynn_output, true)::Bool
+    # Default OFF (N2): the MYNN fields now ride in the model's own comprehensive
+    # `<t>.nc` (src/netcdf_output.jl writes them from `mynn_diagnostics`, regridded onto
+    # the regular output grid), so the mish-native sidecar is no longer what a reader
+    # reaches for -- it is the FORENSIC file, on the closure's own mish with no
+    # interpolation, and it is opted into explicitly. The benchmarks whose diagnostics
+    # parse it (`benchmarks/ocean_warm_bubble.jl`, `benchmarks/o01_rainfall.jl`) set
+    # `:mynn_output => true` themselves. `:radiation_output` moved the same way and for
+    # the same reason (src/radiation_state.jl).
+    output = get(options, :mynn_output, false)::Bool
     trace = get(options, :mynn_trace, true)::Bool
     check_values = get(options, :mynn_check_values, false)::Bool
     K_max = Float64(get(physical_params, :mynn_K_max, Inf))

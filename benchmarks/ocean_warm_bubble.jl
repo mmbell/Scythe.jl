@@ -140,6 +140,12 @@ function owb_model(opts::BenchmarkOptions)
         # nothing else -- which is the only way the comparison means anything (S1b).
         options[:mynn] = true
         options[:surface_fluxes] = true
+        # The mish-native MYNN sidecar. Its default flipped to OFF in stage N2 (the MYNN
+        # fields now ride in the model's comprehensive <t>.nc, regridded), but this
+        # benchmark's BL diagnostics read the SIDECAR (`benchmarks/common/
+        # warm_bubble_diagnostics.jl`), so the arm asks for it explicitly. Reading the
+        # regular-grid file instead would change the numbers the reference tables pin.
+        options[:mynn_output] = true
         haskey(ENV, "SCYTHE_OWB_MYNN_INTERVAL") &&
             (options[:mynn_interval] = parse(Float64, ENV["SCYTHE_OWB_MYNN_INTERVAL"]))
         # The EDMF mass-flux plumes (S7). No key when unset, so the S5 eddy-diffusivity
@@ -201,6 +207,9 @@ function owb_model(opts::BenchmarkOptions)
             error("SCYTHE_OWB_RAD = \"$rad_arm\" is not an arm; use lw, allsky, sw, " *
                   "allsky_sw, diurnal, or 0/unset")
         end
+        # As for :mynn_output above: the OWB radiation diagnostics parse the mish-native
+        # sidecar, whose default flipped to OFF in N2, so the arm asks for it explicitly.
+        options[:radiation_output] = true
         options[:radiation_forcing] = Symbol(get(ENV, "SCYTHE_OWB_RAD_FORCING", "full"))
         options[:radiation_interval] = parse(Float64, get(ENV, "SCYTHE_OWB_RAD_INTERVAL", "300.0"))
         options[:radiation_z_max] = parse(Float64, get(ENV, "SCYTHE_OWB_RAD_ZMAX", "17.0e3"))

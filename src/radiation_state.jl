@@ -586,7 +586,13 @@ function validate_radiation_options(options, physical_params, equation_set, ts, 
     z_max = Float64(get(options, :radiation_z_max, Inf))
     interval_sec = Float64(get(options, :radiation_interval, 300.0))
     rain_in_cloud = get(options, :radiation_rain_in_cloud, false)::Bool
-    output = get(options, :radiation_output, true)::Bool
+    # Default OFF (N2): the radiation fields now ride in the model's own comprehensive
+    # `<t>.nc` (src/netcdf_output.jl writes them from `radiation_diagnostics`, regridded
+    # onto the regular output grid). The sidecar remains the FORENSIC file -- it is the
+    # only place the face-based flux profiles on `zf` exist, since they have no
+    # counterpart on the regular z grid -- and is opted into explicitly. The benchmarks
+    # whose diagnostics parse it set `:radiation_output => true` themselves.
+    output = get(options, :radiation_output, false)::Bool
     check_values = get(options, :radiation_check_values, false)::Bool
     # The per-step zenith rescale exists to make a DIURNAL shortwave forcing continuous
     # between calls; with a fixed sun it is identically 1, so it defaults on only there.

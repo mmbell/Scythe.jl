@@ -171,6 +171,31 @@ using NCDatasets
                 @test ds.attrib["water_carry"] == "flux"
                 @test ds.attrib["n_clamp_e"] == 0
             end
+
+            # ── N2: the sidecar is written FROM `mynn_diagnostics`, and the
+            # comprehensive <t>.nc writes the same NamedTuple regridded. Every variable
+            # in the file must therefore equal the corresponding diagnostics array
+            # EXACTLY -- if the two ever diverge, the two output files disagree about
+            # what a MYNN field is, which is precisely the failure the shared extraction
+            # exists to make impossible.
+            d = Scythe.mynn_diagnostics(mtile)
+            NCDataset(path, "r") do ds
+                @test collect(ds["x"]) == d.x
+                @test collect(ds["z"]) == d.z
+                for (nm, _, _) in Scythe.MYNN_FIELDS_2D
+                    @test Array(ds[nm])[1, :, :] == getfield(d, Symbol(nm))
+                end
+                for (nm, _, _) in Scythe.MYNN_FIELDS_1D
+                    @test Array(ds[nm])[1, :] == getfield(d, Symbol(nm))
+                end
+                @test Array(ds["edmf_a"])[1, :, :] == d.edmf_a
+                @test Array(ds["edmf_w"])[1, :, :] == d.edmf_w
+                # ...and the shared attribute list is what the file carries.
+                for (k, v) in Scythe.mynn_global_attrs(MY)
+                    @test ds.attrib[k] == v
+                end
+                @test issubset(Scythe.MYNN_COUNTER_ATTRS, keys(d.attrs))
+            end
         end
     end
 

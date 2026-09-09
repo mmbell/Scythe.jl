@@ -300,7 +300,8 @@ using NCDatasets
                 @test ds.attrib["scythe_file_kind"] == "comprehensive"
                 @test ds.attrib["netcdf_grid"] == "regular"
                 @test ds.attrib["equation_set"] == "moist_compressible_XZ"
-                @test ds.attrib["physics_groups"] == "none (stage N1)"
+                # No BL, no radiation, no surface layer on this fixture.
+                @test ds.attrib["physics_groups"] == "none (schemes not yet run)"
                 @test ds.dim["time"] == 1
                 @test ds.dim["x"] == gp.i_regular_out
                 @test ds.dim["z"] == gp.k_regular_out
@@ -394,6 +395,315 @@ using NCDatasets
                 NCDataset(joinpath(model.output_dir, "0.0.nc"), "r") do ds
                     @test ds.attrib["scythe_file_kind"] == "comprehensive"
                 end
+            end
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Stage N2: the physics groups (BL / radiation / surface).
+    #
+    # `physics_snapshot` runs on a WORKER and `assemble_physics` on the master; both are
+    # pure functions of a `ModelTile` / a vector of snapshots, so a one-tile "gather"
+    # built in process exercises exactly the code a distributed run does, minus the
+    # serialization (which the distributed smoke covers separately).
+    @testset "physics groups in the comprehensive file" begin
+
+        """A `moist_compressible_XZ` RiRk tile with a live boundary layer and surface
+        fluxes. `bl` is `:mynn`, `:louis` or `:none`; `rad` adds the artifact-free
+        `:prescribed` radiation scheme. The MYNN half is test_mynn_io.jl's `make_io_tile`
+        (warm SST under a cool column, `:mynn_init = :taper`, so ONE step gives nonzero
+        K_m/K_h/pblh)."""
+        function make_physics_tile(tmpdir; bl = :mynn, rad = false, outname = "phys")
+            opts_names = Dict{Symbol,Any}()
+            bl === :mynn && (opts_names[:mynn] = true)
+            varlist = Scythe.mc_var_names(opts_names; cyl = false)
+            rain_name = Scythe.rain_var_name(opts_names)
+            vars = Dict(v => i for (i, v) in enumerate(varlist))
+            scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+            bot_bc = merge(scalar_bc,
+                           Dict("w" => DirichletBC(), rain_name => NaturalBC()))
+            top_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+            gp = GridParameters(geometry = "RiRk",
+                iMin = 0.0, iMax = 8.0e3, num_cells_i = 2,
+                kMin = 0.0, kMax = 5.0e3, num_cells_k = 30,
+                BCL = scalar_bc, BCR = scalar_bc, BCB = bot_bc, BCT = top_bc, vars = vars)
+            ref_file = joinpath(tmpdir, "phys_$(outname).ref")
+            options = Dict{Symbol,Any}(:semiimplicit => true,
+                                       :exact_reference_state => true,
+                                       :precipitation => false,
+                                       :surface_fluxes => bl !== :none)
+            if bl === :mynn
+                options[:mynn] = true
+                options[:mynn_init] = :taper
+                options[:mynn_trace] = false
+            elseif bl === :louis
+                options[:louis_bl] = true
+            end
+            if rad
+                options[:radiation] = :prescribed
+                options[:radiation_trace] = false
+            end
+            model = ModelParameters(
+                ts = 2.0, integration_time = 8.0, output_interval = 4.0,
+                equation_set = "moist_compressible_XZ",
+                output_dir = joinpath(tmpdir, outname),
+                ref_state_file = ref_file, grid_params = gp,
+                physical_params = Dict{Symbol,Any}(
+                    :Khdiff => 0.0, :Kvdiff => 0.0, :Kvdiff_heat => 0.0,
+                    :Kvdiff_water => 0.0, :tau_qss => 10.0, :alpha => 0.0,
+                    :z_damp => 4.0e3, :f => 0.0, :Cd => -1.0, :Ls => 0.0,
+                    :Ck => 1.0e-3, :U_min => 1.0, :l_inf => 80.0, :SST => 302.0,
+                    :radiation_prescribed_rate => -1.5),
+                options = options)
+            gp = model.grid_params
+            patch = createGrid(gp)
+            gridpoints = Scythe.getGridpoints(patch)
+            kDim = gp.kDim
+            zz = gridpoints[1:kDim, end]
+            col = stable_column(zz)
+            Scythe.write_exact_ref_mc(ref_file, zz, col.p_Pa, col.rho_d,
+                                      col.rho_v, col.rho_c)
+            patch.physical .= 0.0
+            spectralTransform!(patch)
+            gridTransform!(patch)
+            hrm = sparse(Int64[], Int64[], Float64[],
+                         size(patch.spectral, 1), size(patch.spectral, 2))
+            mtile = createModelTile(patch, patch, model, hrm)
+            return mtile, patch, model, gp
+        end
+
+        "Advance every column of `mtile` for `nsteps` real steps."
+        function spin_up!(mtile, kDim, nsteps)
+            ncols = div(size(mtile.tile.physical, 1), kDim)
+            for t in 1:nsteps, c in 1:ncols
+                Scythe.advance_column(mtile, c, t)
+            end
+            return ncols
+        end
+
+        "Write the comprehensive file for `mtile` with the physics of its own tile."
+        function write_with_physics(mtile, patch, model, t)
+            ctx = Scythe.netcdf_output_context(patch, model)
+            physics = Scythe.assemble_physics([Scythe.physics_snapshot(mtile)])
+            path = joinpath(model.output_dir, "$(string(round(t; digits = 2))).nc")
+            isdir(model.output_dir) || mkpath(model.output_dir)
+            Scythe.write_netcdf_comprehensive(path, patch, model, t, ctx, physics)
+            return path, ctx, physics
+        end
+
+        @testset "MYNN + surface: fields, names and provenance" begin
+            mktempdir() do tmpdir
+                mtile, patch, model, gp = make_physics_tile(tmpdir; outname = "my")
+                @test mtile.mynn.active
+                @test mtile.surface.active
+                # ...and the store is inert until a column actually runs.
+                @test mtile.surface.n_calls[1] == 0
+                @test Scythe.physics_snapshot(mtile).surface === nothing
+
+                spin_up!(mtile, gp.kDim, 1)
+                @test mtile.surface.n_calls[1] > 0
+                @test any(!=(0.0), mtile.mynn.K_h)
+
+                path, ctx, physics = write_with_physics(mtile, patch, model, 4.0)
+                @test physics !== nothing
+                @test physics.mynn !== nothing
+                @test physics.surface !== nothing
+                @test physics.radiation === nothing
+
+                NCDataset(path, "r") do ds
+                    @test ds.attrib["physics_groups"] == "mynn,surface"
+                    @test ds.attrib["boundary_layer"] == "mynn"
+                    @test ds.attrib["surface_fluxes"] == 1
+                    @test ds.attrib["sfc_z0"] == "komori"
+
+                    # Every documented MYNN variable, on the REGULAR grid.
+                    for nm in ("K_m", "K_h", "mynn_e", "mynn_el", "mynn_sm", "mynn_sh",
+                               "mynn_cldfra_bl", "mynn_qc_bl", "mynn_qi_bl", "mynn_vt",
+                               "mynn_vq", "mynn_P_s", "mynn_P_s_mynn", "mynn_P_b",
+                               "mynn_eps", "mynn_tke_transport", "mynn_s_aw")
+                        @test haskey(ds, nm)
+                        @test size(Array(ds[nm])) == (1, gp.i_regular_out,
+                                                      gp.k_regular_out)
+                        @test all(isfinite, Array(ds[nm])[1, :, :])
+                    end
+                    for nm in ("mynn_pblh", "mynn_kpbl", "mynn_ust", "mynn_inv_L",
+                               "mynn_plume_ktop", "mynn_plume_ztop", "mynn_aw_max",
+                               "mynn_bdry_E")
+                        @test haskey(ds, nm)
+                        @test size(Array(ds[nm])) == (1, gp.i_regular_out)
+                        @test all(isfinite, Array(ds[nm])[1, :])
+                    end
+                    for nm in ("F_sh", "F_q", "tau_u", "tau_v", "ust", "inv_L", "U10",
+                               "Cd", "Ch", "z0m")
+                        @test haskey(ds, nm)
+                        @test size(Array(ds[nm])) == (1, gp.i_regular_out)
+                        @test all(isfinite, Array(ds[nm])[1, :])
+                        @test haskey(ds[nm].attrib, "units")
+                        @test haskey(ds[nm].attrib, "long_name")
+                    end
+                    # The surface fluxes are REAL: a 302 K SST under a ~300 K column
+                    # drives an upward sensible-heat flux and a moisture flux.
+                    @test all(>(0.0), Array(ds["F_sh"])[1, :])
+                    @test all(>(0.0), Array(ds["F_q"])[1, :])
+                    @test all(>(0.0), Array(ds["Cd"])[1, :])
+
+                    # `mynn_pblh` IS `regrid1d` of the held column vector -- the claim the
+                    # whole regrid path makes, checked against the pure helper.
+                    wx = Scythe.interp_weights(physics.mynn.x, ctx.x_reg)
+                    @test Array(ds["mynn_pblh"])[1, :] ==
+                          Scythe.regrid1d(mtile.mynn.pblh, wx)
+                    @test Array(ds["F_sh"])[1, :] ==
+                          Scythe.regrid1d(mtile.surface.F_sh, wx)
+
+                    # The MYNN configuration attributes, under the tc_postprocess names.
+                    for nm in ("mynn_closure", "mynn_edmf", "mynn_init_mode",
+                               "mynn_water_carry", "mynn_n_clamp_e", "mynn_n_cap_K",
+                               "mynn_n_diffnum", "mynn_n_gate", "mynn_n_stall",
+                               "mynn_n_plume", "mynn_interval_s")
+                        @test haskey(ds.attrib, nm)
+                    end
+                    @test ds.attrib["mynn_init_mode"] == "taper"
+                    # ...and no double prefix on the one name that already carries it.
+                    @test !haskey(ds.attrib, "mynn_mynn_interval_s")
+                    @test haskey(ds.attrib, "mynn_regridding")
+
+                    # No radiation group.
+                    @test !haskey(ds, "dT_net")
+                    @test !haskey(ds, "olr")
+                end
+
+                # The weights are CACHED on the context after the first write.
+                @test ctx.physics_weights isa Dict
+                @test haskey(ctx.physics_weights, :mynn)
+                @test haskey(ctx.physics_weights, :surface)
+            end
+        end
+
+        @testset "radiation group" begin
+            mktempdir() do tmpdir
+                mtile, patch, model, gp = make_physics_tile(tmpdir; bl = :none,
+                                                            rad = true, outname = "rad")
+                @test mtile.radiation.active
+                @test !mtile.surface.active          # no BL, no surface store
+                Scythe.radiation_update!(mtile, 1)
+                @test any(!=(0.0), mtile.radiation.q_lw)
+
+                path, _, physics = write_with_physics(mtile, patch, model, 4.0)
+                @test physics.radiation !== nothing
+                @test physics.mynn === nothing
+                @test physics.surface === nothing
+
+                NCDataset(path, "r") do ds
+                    @test ds.attrib["physics_groups"] == "radiation"
+                    for nm in ("q_lw", "q_sw", "q_sw_applied", "dT_lw", "dT_sw", "dT_net")
+                        @test haskey(ds, nm)
+                        @test size(Array(ds[nm])) == (1, gp.i_regular_out,
+                                                      gp.k_regular_out)
+                    end
+                    for nm in ("olr", "olr_model_top", "lw_sfc_dn", "lw_sfc_up",
+                               "sw_sfc_dn", "sw_sfc_up", "sw_toa_dn", "sw_toa_up",
+                               "lwp", "iwp", "cloudy")
+                        @test haskey(ds, nm)
+                        @test size(Array(ds[nm])) == (1, gp.i_regular_out)
+                    end
+                    # dT_net = dT_lw + sw_scale*dT_sw, and :prescribed has no shortwave.
+                    @test Array(ds["dT_net"])[1, :, :] == Array(ds["dT_lw"])[1, :, :]
+                    @test all(<(0.0), Array(ds["dT_lw"])[1, :, :])   # -1.5 K/day cooling
+                    # The face fluxes stay in the sidecar, deliberately.
+                    for nm in ("flux_lw_up", "flux_sw_dn", "zf")
+                        @test !haskey(ds, nm)
+                    end
+                    for nm in ("radiation_scheme", "radiation_method", "radiation_solar",
+                               "radiation_forcing", "radiation_z_max",
+                               "radiation_interval_s", "radiation_n_clamp_tk",
+                               "radiation_n_clamp_re_liq", "radiation_n_clamp_re_ice",
+                               "radiation_n_neg_rho_v", "radiation_time",
+                               "radiation_cos_zenith", "radiation_toa_flux",
+                               "radiation_sw_scale")
+                        @test haskey(ds.attrib, nm)
+                    end
+                    @test ds.attrib["radiation_scheme"] == "prescribed"
+                    @test ds.attrib["radiation_time"] == 4.0
+                    @test !haskey(ds.attrib, "radiation_radiation_interval_s")
+                end
+            end
+        end
+
+        @testset "a scheme that has not run yet writes NO group" begin
+            mktempdir() do tmpdir
+                mtile, patch, model, gp = make_physics_tile(tmpdir; rad = true,
+                                                            outname = "fresh")
+                # Fresh tile: MYNN, radiation and the surface store are all configured
+                # and all EMPTY. Zero-filling them would be indistinguishable from a run
+                # whose boundary layer genuinely did nothing.
+                snap = Scythe.physics_snapshot(mtile)
+                @test snap.mynn === nothing
+                @test snap.radiation === nothing
+                @test snap.surface === nothing
+                @test Scythe.assemble_physics([snap]) === nothing
+
+                path, _, physics = write_with_physics(mtile, patch, model, 0.0)
+                @test physics === nothing
+                NCDataset(path, "r") do ds
+                    @test ds.attrib["physics_groups"] == "none (schemes not yet run)"
+                    for nm in ("K_h", "mynn_pblh", "F_sh", "dT_net", "olr")
+                        @test !haskey(ds, nm)
+                    end
+                    @test haskey(ds, "T")        # the prognostic/derived set is unaffected
+                end
+            end
+        end
+
+        @testset "Louis BL: the surface group alone" begin
+            mktempdir() do tmpdir
+                mtile, patch, model, gp = make_physics_tile(tmpdir; bl = :louis,
+                                                            outname = "louis")
+                @test !mtile.mynn.active
+                @test mtile.surface.active
+                spin_up!(mtile, gp.kDim, 1)
+                @test mtile.surface.n_calls[1] > 0
+
+                path, _, physics = write_with_physics(mtile, patch, model, 4.0)
+                @test physics.surface !== nothing
+                @test physics.mynn === nothing
+
+                NCDataset(path, "r") do ds
+                    @test ds.attrib["physics_groups"] == "surface"
+                    @test ds.attrib["boundary_layer"] == "louis"
+                    @test haskey(ds, "F_sh")
+                    @test haskey(ds, "tau_u")
+                    @test all(isfinite, Array(ds["U10"])[1, :])
+                    @test !haskey(ds, "K_h")
+                    @test !haskey(ds, "mynn_pblh")
+                end
+            end
+        end
+
+        @testset "assemble_physics stitches tiles and refuses a partial group" begin
+            mktempdir() do tmpdir
+                mtile, patch, model, gp = make_physics_tile(tmpdir; outname = "asm")
+                spin_up!(mtile, gp.kDim, 1)
+                snap = Scythe.physics_snapshot(mtile)
+
+                # Two "tiles" (the same one twice, at different offsets) concatenate
+                # along x, in ASCENDING offset order whatever order they arrive in.
+                lo = merge(snap, (; offset = 0))
+                hi = merge(snap, (; offset = 100))
+                a = Scythe.assemble_physics([hi, lo])
+                @test length(a.surface.F_sh) == 2 * length(snap.surface.F_sh)
+                @test a.surface.F_sh == vcat(snap.surface.F_sh, snap.surface.F_sh)
+                @test size(a.mynn.K_h, 1) == 2 * size(snap.mynn.K_h, 1)
+                @test size(a.mynn.K_h, 2) == size(snap.mynn.K_h, 2)
+                @test a.mynn.z == snap.mynn.z            # the vertical is shared
+                # The counters are the DOMAIN-wide census: summed, not taken from tile 1.
+                @test a.mynn.attrs["n_clamp_e"] == 2 * snap.mynn.attrs["n_clamp_e"]
+
+                # A group present on one tile and not the other is an error, loudly:
+                # the schemes are configured per MODEL, so a partial answer means a tile
+                # failed to run one and the file would cover part of the domain.
+                bare = merge(snap, (; offset = 200, surface = nothing))
+                @test_throws ErrorException Scythe.assemble_physics([lo, bare])
+                @test Scythe.assemble_physics(Any[]) === nothing
             end
         end
     end
