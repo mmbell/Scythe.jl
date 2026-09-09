@@ -417,6 +417,11 @@ flqv, pblh, kpbl, dx, landsea, ts`) and the subgrid cloud `qc_bl1d`/`cldfra_bl1d
 SPECIFIC contents — the `mynnedmf_wrapper` convention. `ts` is the driver's `th_sfc`
 (`= ts/exner(1)`, harness README item 2), not a temperature.
 
+The keyword `gtr_k` is the `:gtr_local` fidelity deviation (`MYNN_DEVIATIONS`):
+`nothing` (the default) is the Fortran's single `c.gtr = g/300 K`; a per-level
+`g/theta_v` column makes the surface plume scaling `wstar` use the SURFACE value and the
+overshoot Brunt-Vaisala frequency `bvf` the value at its own level.
+
 `qc_bl1d_old` and `cldfra_bl1d_old` are `intent(inout)` arguments of the Fortran
 (:5781) that its body NEVER reads or writes; they are accepted here so the call site
 matches, and ignored. `sgm` is the same (see the header). `F_QC`/`F_QI` are
@@ -458,7 +463,8 @@ function dmp_mf!(kts::Int, kte::Int, dt::Float64,
                  qc_bl1d_old::Vector{Float64}, cldfra_bl1d_old::Vector{Float64},
                  F_QC::Bool, F_QI::Bool, Psig_shcu::Float64,
                  spp_pbl::Int, rstoch_col::Vector{Float64},
-                 c::MYNNConstants, work::EDMFWork)
+                 c::MYNNConstants, work::EDMFWork;
+                 gtr_k::Union{Nothing,Vector{Float64}} = nothing)
     (F_QC && F_QI) ||
         throw(ArgumentError("dmp_mf!: F_QC = $F_QC, F_QI = $F_QI. Both are " *
                             "`logical, optional` arguments of DMP_mf " *
@@ -616,7 +622,7 @@ function dmp_mf!(kts::Int, kte::Int, dt::Float64,
         pwmin = 0.1
         pwmax = 0.4
 
-        wstar  = max(1.0e-2, (c.gtr*fltv2*pblh)^MYNN_ONETHIRD)
+        wstar  = max(1.0e-2, (_gtr_lev(gtr_k, c, kts)*fltv2*pblh)^MYNN_ONETHIRD)
         qstar  = max(flq, 1.0e-5)/wstar
         thstar = flt/wstar
 
@@ -757,7 +763,7 @@ function dmp_mf!(kts::Int, kte::Int, dt::Float64,
                 if Wn <= 0.0 && overshoot == 0
                     overshoot = 1
                     if THVk - THVkm1 > 0.0
-                        bvf = sqrt(c.gtr*(THVk - THVkm1)/dz[k])
+                        bvf = sqrt(_gtr_lev(gtr_k, c, k)*(THVk - THVkm1)/dz[k])
                         Frz = upw[k-1,i]/(bvf*dz[k])   # vertical Froude number
                         dzp = dz[k]*max(min(Frz, 1.0), 0.0)
                     end
@@ -1154,14 +1160,18 @@ function mynn_column_step_edmf!(work::MYNNWork, ework::EDMFWork, c::MYNNConstant
     Psig_bl, Psig_shcu = scale_aware(col.dx, zi)
 
     # -- surface fluxes and stability functions (mynn_bl_driver :1060-1097) --------
+    # The offline fidelity deviations, exactly as in `mynn_column_step!` (see there).
+    hfx    = opts.flux_clip ? clamp(col.hfx, MYNN_HFX_MIN, MYNN_HFX_MAX) : col.hfx
+    qfx    = opts.flux_clip ? clamp(col.qfx, MYNN_QFX_MIN, MYNN_QFX_MAX) : col.qfx
+    gtr_k  = opts.gtr_local ? work.gtr_k : nothing
     cpm    = c.cp*(1.0 + 0.84*work.s_qv[kts])
-    flqv   = col.qfx/col.rho[kts]
+    flqv   = qfx/col.rho[kts]
     flqc   = 0.0
-    th_sfc = col.ts/col.exner[kts]
+    th_sfc = opts.exner_single ? col.ts : col.ts/col.exner[kts]
     flq    = flqv + flqc
-    flt    = col.hfx/(col.rho[kts]*cpm) - c.xlvcp*flqc/col.exner[kts]
+    flt    = hfx/(col.rho[kts]*cpm) - c.xlvcp*flqc/col.exner[kts]
     fltv   = flt + flqv*c.p608*th_sfc
-    rmol   = -c.karman*c.gtr*fltv/max(col.ust^3, 1.0e-6)
+    rmol   = -c.karman*_gtr_lev(gtr_k, c, kts)*fltv/max(col.ust^3, 1.0e-6)
     zet    = 0.5*col.dz[kts]*rmol
     zet    = max(zet, -20.0)
     zet    = min(zet,  20.0)
@@ -1174,7 +1184,7 @@ function mynn_column_step_edmf!(work::MYNNWork, ework::EDMFWork, c::MYNNConstant
                       work.s_thl, work.s_sqw, work.s_sqv, work.s_sqc, work.s_sqi, zn,
                       col.p, col.exner, st.tsq, st.qsq, st.cov, st.sh, st.el,
                       opts.bl_mynn_cloudpdf, st.qc_bl, st.qi_bl, st.cldfra_bl,
-                      st.pblh, col.hfx, st.vt, st.vq, work.s_th, st.sgm, st.rmol,
+                      st.pblh, hfx, st.vt, st.vq, work.s_th, st.sgm, st.rmol,
                       opts.spp_pbl, zn, c, work)
 
     # -- THE MASS FLUX (module_bl_mynn.F90 :5680-6826) ----------------------------
@@ -1196,7 +1206,8 @@ function mynn_column_step_edmf!(work::MYNNWork, ework::EDMFWork, c::MYNNConstant
                    ework.det_thl, ework.det_sqv, ework.det_sqc, ework.det_u,
                    ework.det_v,
                    st.qc_bl, st.cldfra_bl, zn, zn,
-                   opts.flag_qc, opts.flag_qi, Psig_shcu, opts.spp_pbl, zn, c, ework)
+                   opts.flag_qc, opts.flag_qi, Psig_shcu, opts.spp_pbl, zn, c, ework;
+                   gtr_k = gtr_k)
 
     mym_turbulence!(kts, kte, col.xland, opts.closure, col.dz, col.dx, col.zw,
                     work.s_u, work.s_v, work.s_thl, work.s_thetav, work.s_sqc,
@@ -1209,14 +1220,15 @@ function mynn_column_step_edmf!(work::MYNNWork, ework::EDMFWork, c::MYNNConstant
                     work.out_qwt, work.out_qshear, work.out_qbuoy, work.out_qdiss,
                     opts.tke_budget, Psig_bl, Psig_shcu, st.cldfra_bl,
                     opts.bl_mynn_mixlength, ework.edmf_w, ework.edmf_a, zn,
-                    opts.spp_pbl, zn, c, work)
+                    opts.spp_pbl, zn, c, work; gtr_k = gtr_k)
 
     mym_predict!(kts, kte, opts.closure, opts.delt, col.dz, col.ust, flt, flq,
                  pmz, phh, st.el, work.out_dfq, col.rho,
                  work.out_pdk, work.out_pdt, work.out_pdq, work.out_pdc,
                  st.qke, st.tsq, st.qsq, st.cov, ework.s_aw, ework.s_awqke,
                  opts.bl_mynn_edmf_tke,
-                 work.out_qwt, work.out_qdiss, opts.tke_budget, c, work)
+                 work.out_qwt, work.out_qdiss, opts.tke_budget, c, work;
+                 sqfac = opts.sqfac)
 
     # -- dissipative heating (mynn_bl_driver :1224-1234) --------------------------
     dh = work.out_diss_heat

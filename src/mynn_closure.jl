@@ -216,6 +216,12 @@ struct MYNNWork
     out_dozone::Vector{Float64}
     out_km::Vector{Float64}
     out_kh::Vector{Float64}
+    # -- the `:gtr_local` fidelity deviation (MYNN_DEVIATIONS) -----------------
+    # `g/theta_v` per LEVEL, filled from the staged `theta_v` by whichever caller asked
+    # for the deviation and passed as the `gtr_k` keyword to `mym_level2!`,
+    # `mym_length!`, `mym_turbulence!` and `dmp_mf!`. Preallocated here so the switch
+    # costs no allocation; left all-zero, and never passed, under `:fortran`.
+    gtr_k::Vector{Float64}
 end
 
 """
@@ -480,6 +486,40 @@ end
 # ── Level-2 gradients and stability functions (:1719-1830) ───────────────────
 
 """
+    _gtr_face(gtr_k, c::MYNNConstants, dz, k) -> Float64
+
+The buoyancy parameter `g/theta_v` at the wall between levels `k-1` and `k`.
+
+`gtr_k === nothing` is the Fortran (`:mynn_fidelity = :fortran`): a single
+`c.gtr = g/MYNN_TREF` with `MYNN_TREF = 300 K`, returned with no arithmetic at all, so
+the default path is the same instruction it always was. With the `:gtr_local` deviation
+`gtr_k` is the per-LEVEL `g/theta_v` and this is the interface interpolation the
+neighbouring `vt`/`vq` lines of `mym_level2!` already use (`x[k]*abk + x[k-1]*afk`).
+
+Julia specializes on the argument type, so the `Nothing` method is a compile-time
+constant fold and neither branch is ever tested at run time.
+"""
+@inline _gtr_face(::Nothing, c::MYNNConstants, dz::Vector{Float64}, k::Int) = c.gtr
+@inline function _gtr_face(gtr_k::Vector{Float64}, ::MYNNConstants,
+                           dz::Vector{Float64}, k::Int)
+    @inbounds begin
+        afk = dz[k]/(dz[k] + dz[k-1])
+        return gtr_k[k]*(1.0 - afk) + gtr_k[k-1]*afk
+    end
+end
+
+"""
+    _gtr_lev(gtr_k, c::MYNNConstants, k) -> Float64
+
+`g/theta_v` at LEVEL `k`, the companion of [`_gtr_face`](@ref) for the terms the Fortran
+builds at a level rather than across an interface: the surface ones (`vsc`, `wstar`, the
+plume scaling, `rmol`, all at `kts`) and `dmp_mf!`'s overshoot Brunt-Vaisala frequency.
+"""
+@inline _gtr_lev(::Nothing, c::MYNNConstants, k::Int) = c.gtr
+@inline _gtr_lev(gtr_k::Vector{Float64}, ::MYNNConstants, k::Int) = @inbounds gtr_k[k]
+
+
+"""
     mym_level2!(kts, kte, dz, u, v, thl, thetav, qw, ql, vt, vq,
                 dtl, dqw, dtv, gm, gh, sm, sh, c::MYNNConstants)
 
@@ -491,6 +531,11 @@ All seven outputs are INTERFACE fields written for `kts+1:kte` only; element `kt
 left untouched (see the staggering note at the top of this file). `thetav` is accepted
 and ignored — the Fortran offers `dtq` from `thetav` as a commented-out alternative
 (:1780) and keeps the argument.
+
+The keyword `gtr_k` is the `:gtr_local` fidelity deviation (see `MYNN_DEVIATIONS`):
+`nothing` (the default, and `:fortran`) uses the Fortran's single `c.gtr = g/300 K` for
+`G_H`; a per-level `g/theta_v` column uses the same interface interpolation the `vt`/`vq`
+lines above it use. See [`_gtr_face`](@ref).
 
 The Canuto/Kitamura modification (`CKmod = 1`) recomputes `f1, smc, shc, ri1..ri4`
 INSIDE the k-loop with `a2*a2fac` in place of `a2`, which makes the pre-loop block
@@ -505,7 +550,8 @@ function mym_level2!(kts::Int, kte::Int,
                      dtl::Vector{Float64}, dqw::Vector{Float64}, dtv::Vector{Float64},
                      gm::Vector{Float64}, gh::Vector{Float64},
                      sm::Vector{Float64}, sh::Vector{Float64},
-                     c::MYNNConstants)
+                     c::MYNNConstants;
+                     gtr_k::Union{Nothing,Vector{Float64}} = nothing)
     # -- :1753-1765: recomputed inside the loop under CKmod, hence dead. Kept verbatim.
     rfc = MYNN_G1/(MYNN_G1 + MYNN_G2)
     f1  = MYNN_B1*(MYNN_G1 - MYNN_C1) + 3.0*MYNN_A2*(1.0 - MYNN_C2)*(1.0 - MYNN_C5) +
@@ -540,7 +586,7 @@ function mym_level2!(kts::Int, kte::Int,
         dtv[k] = dtq
 
         gm[k] =  duz
-        gh[k] = -dtq*c.gtr
+        gh[k] = -dtq*_gtr_face(gtr_k, c, dz, k)
 
         #   **  Gradient Richardson number  **
         ri = -gh[k]/max(duz, 1.0e-10)
@@ -726,6 +772,10 @@ straight from `fltv` (:2151, the `(vt+1)*flt + (vq+tv0)*flq` form is commented o
 (only CASE 1 builds `thetaw` from it). They stay in the signature so the call site
 matches the Fortran.
 
+The keyword `gtr_k` is the `:gtr_local` fidelity deviation: `nothing` (the default) is
+the Fortran's `c.gtr`; a per-level `g/theta_v` column makes `vsc` and `wstar` use the
+SURFACE value and `bv` the interface one ([`_gtr_lev`](@ref), [`_gtr_face`](@ref)).
+
 Dead-but-transcribed, marked in place: `Uonset`/`Ugrid` (:2103-2104 — the `cns` taper
 that would use them is commented out on :2105) and `cldavg` (:2161, computed per level
 and never read in this branch).
@@ -740,7 +790,8 @@ function mym_length!(kts::Int, kte::Int, xland::Float64,
                      Psig_bl::Float64, cldfra_bl1D::Vector{Float64},
                      bl_mynn_mixlength::Int,
                      edmf_w1::Vector{Float64}, edmf_a1::Vector{Float64},
-                     c::MYNNConstants, work::MYNNWork)
+                     c::MYNNConstants, work::MYNNWork;
+                     gtr_k::Union{Nothing,Vector{Float64}} = nothing)
     bl_mynn_mixlength == 2 ||
         throw(ArgumentError("mym_length!: only CASE 2 (bl_mynn_mixlength = 2) is " *
                             "ported; got $(bl_mynn_mixlength). CASE 0 and CASE 1 of " *
@@ -797,7 +848,7 @@ function mym_length!(kts::Int, kte::Int, xland::Float64,
         elt = min(max(alp1*elt/vsc, 10.0), 400.0)
         # avoid the buoyancy-flux functions, ill-defined at the surface (:2149-2151)
         vflx = fltv
-        vsc  = (c.gtr*elt*max(vflx, 0.0))^MYNN_ONETHIRD
+        vsc  = (_gtr_lev(gtr_k, c, kts)*elt*max(vflx, 0.0))^MYNN_ONETHIRD
 
         #   **  Strictly, el(i,j,1) is not zero.  **
         el[kts] = 0.0                                                     # :2155
@@ -812,13 +863,13 @@ function mym_length!(kts::Int, kte::Int, xland::Float64,
             local elb::Float64, elf::Float64, elb_mf::Float64
             if dtv[k] > 0.0
                 # impose a min value on bv
-                bv = max(sqrt(c.gtr*dtv[k]), 0.001)
+                bv = max(sqrt(_gtr_face(gtr_k, c, dz, k)*dtv[k]), 0.001)
                 elb_mf = max(alp2*qkw[k],
                              alp6*edmf_a1[k-1]*edmf_w1[k-1]) / bv *
                          (1.0 + alp3*sqrt(vsc/(bv*elt)))
                 elb = min(max(alp5*qkw[k], alp6*edmf_a1[k]*edmf_w1[k])/bv, zwk)
 
-                wstar = 1.25*(c.gtr*zi*max(vflx, 1.0e-4))^MYNN_ONETHIRD
+                wstar = 1.25*(_gtr_lev(gtr_k, c, kts)*zi*max(vflx, 1.0e-4))^MYNN_ONETHIRD
                 tau_cloud = min(max(MYNN_CTAU * wstar/c.grav, 30.0), 150.0)
                 # minimize the influence of the surface heat flux far from the PBLH
                 wt = 0.5*tanh((zwk - (zi2 + h1))/h2) + 0.5
@@ -828,7 +879,7 @@ function mym_length!(kts::Int, kte::Int, xland::Float64,
             else
                 # tau_cloud is an eddy turnover timescale; Teixeira and Cheinet (2004)
                 # Eq. 1, Cheinet and Teixeira (2003) Eq. 7.
-                wstar = 1.25*(c.gtr*zi*max(vflx, 1.0e-4))^MYNN_ONETHIRD
+                wstar = 1.25*(_gtr_lev(gtr_k, c, kts)*zi*max(vflx, 1.0e-4))^MYNN_ONETHIRD
                 tau_cloud = min(max(MYNN_CTAU * wstar/c.grav, 50.0), 200.0)
                 wt = 0.5*tanh((zwk - (zi2 + h1))/h2) + 0.5
                 tau_cloud = tau_cloud*(1.0 - wt) + max(100.0, dzk*0.25)*wt
@@ -1251,6 +1302,9 @@ either, so 2.5 and 2.6 give bitwise identical turbulence.
 Note also that at closure ≤ 2.6 `tsq`, `qsq` and `cov` are read ONLY inside the
 Level-3 block, i.e. never: they are accepted so the call site matches the Fortran.
 
+The keyword `gtr_k` (the `:gtr_local` fidelity deviation) is forwarded unchanged to both
+`mym_level2!` and `mym_length!` and is used nowhere else in this routine.
+
 Fortran shapes preserved that a cleanup would break:
 
   * `q2sq` (:2731) is formed from `sh(k)`/`sm(k)` BEFORE the `max(·, 1e-5)` floor on
@@ -1287,7 +1341,8 @@ function mym_turbulence!(kts::Int, kte::Int, xland::Float64, closure::Float64,
                          edmf_w1::Vector{Float64}, edmf_a1::Vector{Float64},
                          TKEprodTD::Vector{Float64},
                          spp_pbl::Int, rstoch_col::Vector{Float64},
-                         c::MYNNConstants, work::MYNNWork)
+                         c::MYNNConstants, work::MYNNWork;
+                         gtr_k::Union{Nothing,Vector{Float64}} = nothing)
     closure < 3.0 ||
         throw(ArgumentError("mym_turbulence!: closure = $(closure); the Level-3 " *
                             "branches (module_bl_mynn.F90 :2898-3037) are out of " *
@@ -1299,11 +1354,12 @@ function mym_turbulence!(kts::Int, kte::Int, xland::Float64, closure::Float64,
     gm  = work.gm;  gh  = work.gh;  qkw = work.qkw
 
     mym_level2!(kts, kte, dz, u, v, thl, thetav, qw, ql, vt, vq,
-                dtl, dqw, dtv, gm, gh, sm, sh, c)                        # :2705
+                dtl, dqw, dtv, gm, gh, sm, sh, c; gtr_k = gtr_k)         # :2705
 
     mym_length!(kts, kte, xland, dz, dx, zw, rmo, flt, fltv, flq, vt, vq,
                 u, v, qke, dtv, el, zi, theta, qkw, Psig_bl, cldfra_bl1D,
-                bl_mynn_mixlength, edmf_w1, edmf_a1, c, work)            # :2711
+                bl_mynn_mixlength, edmf_w1, edmf_a1, c, work;
+                gtr_k = gtr_k)                                           # :2711
 
     @inbounds for k in (kts+1):kte
         dzk  = 0.5  *(dz[k] + dz[k-1])
@@ -1494,6 +1550,10 @@ production `pdk1`, and the other three simply copy level `kts+1`.
 `qWT1D`/`qDISS1D` are written only when `tke_budget == 1`; with the reference's
 `tke_budget = 0` they are accepted and left untouched (the Fortran declares them
 `intent(out)`, so they are undefined there — do not rely on their contents).
+
+The keyword `sqfac` is the `:sqfac1` fidelity deviation (see `MYNN_DEVIATIONS`): the
+TKE's own diffusivity is `sqfac*dfq`, and the default [`MYNN_SQFAC`](@ref) `= 3.0` is
+the Fortran's `Sqfac`.
 """
 function mym_predict!(kts::Int, kte::Int, closure::Float64, delt::Float64,
                       dz::Vector{Float64}, ust::Float64,
@@ -1507,7 +1567,8 @@ function mym_predict!(kts::Int, kte::Int, closure::Float64, delt::Float64,
                       bl_mynn_edmf_tke::Int,
                       qWT1D::Vector{Float64}, qDISS1D::Vector{Float64},
                       tke_budget::Int,
-                      c::MYNNConstants, work::MYNNWork)
+                      c::MYNNConstants, work::MYNNWork;
+                      sqfac::Float64 = MYNN_SQFAC)
     closure < 3.0 ||
         throw(ArgumentError("mym_predict!: closure = $(closure); the Level-3 " *
                             "prognostic tsq/cov branch (module_bl_mynn.F90 " *
@@ -1529,7 +1590,7 @@ function mym_predict!(kts::Int, kte::Int, closure::Float64, delt::Float64,
         #   **  dfq for the TKE is 3.0*dfm.  **
         for k in kts:kte
             qkw[k]  = sqrt(max(qke[k], 0.0))
-            df3q[k] = MYNN_SQFAC*dfq[k]
+            df3q[k] = sqfac*dfq[k]
             dtz[k]  = delt/dz[k]
         end
 
@@ -2738,6 +2799,17 @@ Base.@kwdef struct MYNNOptions
     dheat_opt::Int              = MYNN_DHEAT_OPT
     flag_qc::Bool               = true
     flag_qi::Bool               = true
+    # ── the fidelity deviations the OFFLINE path can carry (MYNN_DEVIATIONS) ──
+    # The wired model reads them off `MYNNState.fidelity`; the replay harness has no
+    # `MYNNState`, so the four deviations that live inside `mynn_column_step!` and the
+    # kernels it calls are namelist switches here. Every default is the Fortran, so a
+    # parity call that names none of them is bitwise what it always was.
+    # (`:K_interface`, `:pdk1` and `:rmol_sfc` are COUPLING deviations -- they live in
+    # src/mc_mynn_bl.jl, which the offline path does not run -- so they are absent here.)
+    gtr_local::Bool             = false
+    sqfac::Float64              = MYNN_SQFAC
+    exner_single::Bool          = false
+    flux_clip::Bool             = false
 end
 
 # Re-gather the frozen column into the working copies (mynn_bl_driver :1004-1013 and
@@ -2762,6 +2834,11 @@ end
         work.s_qv[k]     = work.s_sqv[k]/(1.0 - work.s_sqv[k])
         work.s_qc[k]     = work.s_sqc[k]/(1.0 - work.s_sqv[k])
         work.s_qi[k]     = work.s_sqi[k]/(1.0 - work.s_sqv[k])
+        # `g/theta_v` per level, for the `:gtr_local` deviation. Filled unconditionally
+        # on the OFFLINE path (a replay is not a hot loop) and read only when the caller
+        # passes `work.gtr_k` on as the `gtr_k` keyword; under `:fortran` nothing reads
+        # it, so it changes no result.
+        work.gtr_k[k]    = c.grav/work.s_thetav[k]
     end
     return nothing
 end
@@ -2893,14 +2970,22 @@ function mynn_column_step!(work::MYNNWork, c::MYNNConstants, col::MYNNColumn,
     Psig_bl, Psig_shcu = scale_aware(col.dx, zi)
 
     # -- surface fluxes and stability functions (mynn_bl_driver :1060-1097) --------
+    # The four OFFLINE fidelity deviations (MYNN_DEVIATIONS) enter here and in the
+    # keywords below. `hfx`/`qfx` are the wrapper-clipped fluxes under `:flux_clip` and
+    # the column's own otherwise; `th_sfc` divides by the surface Exner function ONCE
+    # under `:exner_single` -- and `col.ts` IS already `T_sfc/exner(1)` (harness README
+    # item 2), so the single-division form is `col.ts` itself.
+    hfx    = opts.flux_clip ? clamp(col.hfx, MYNN_HFX_MIN, MYNN_HFX_MAX) : col.hfx
+    qfx    = opts.flux_clip ? clamp(col.qfx, MYNN_QFX_MIN, MYNN_QFX_MAX) : col.qfx
+    gtr_k  = opts.gtr_local ? work.gtr_k : nothing
     cpm    = c.cp*(1.0 + 0.84*work.s_qv[kts])
-    flqv   = col.qfx/col.rho[kts]
+    flqv   = qfx/col.rho[kts]
     flqc   = 0.0
-    th_sfc = col.ts/col.exner[kts]
+    th_sfc = opts.exner_single ? col.ts : col.ts/col.exner[kts]
     flq    = flqv + flqc
-    flt    = col.hfx/(col.rho[kts]*cpm) - c.xlvcp*flqc/col.exner[kts]
+    flt    = hfx/(col.rho[kts]*cpm) - c.xlvcp*flqc/col.exner[kts]
     fltv   = flt + flqv*c.p608*th_sfc
-    rmol   = -c.karman*c.gtr*fltv/max(col.ust^3, 1.0e-6)
+    rmol   = -c.karman*_gtr_lev(gtr_k, c, kts)*fltv/max(col.ust^3, 1.0e-6)
     zet    = 0.5*col.dz[kts]*rmol
     zet    = max(zet, -20.0)
     zet    = min(zet,  20.0)
@@ -2913,7 +2998,7 @@ function mynn_column_step!(work::MYNNWork, c::MYNNConstants, col::MYNNColumn,
                       work.s_thl, work.s_sqw, work.s_sqv, work.s_sqc, work.s_sqi, zn,
                       col.p, col.exner, st.tsq, st.qsq, st.cov, st.sh, st.el,
                       opts.bl_mynn_cloudpdf, st.qc_bl, st.qi_bl, st.cldfra_bl,
-                      st.pblh, col.hfx, st.vt, st.vq, work.s_th, st.sgm, st.rmol,
+                      st.pblh, hfx, st.vt, st.vq, work.s_th, st.sgm, st.rmol,
                       opts.spp_pbl, zn, c, work)
 
     # DMP_mf would run here; with edmf = false every plume sum stays zero.
@@ -2928,13 +3013,15 @@ function mynn_column_step!(work::MYNNWork, c::MYNNConstants, col::MYNNColumn,
                     work.out_pdk, work.out_pdt, work.out_pdq, work.out_pdc,
                     work.out_qwt, work.out_qshear, work.out_qbuoy, work.out_qdiss,
                     opts.tke_budget, Psig_bl, Psig_shcu, st.cldfra_bl,
-                    opts.bl_mynn_mixlength, zn, zn, zn, opts.spp_pbl, zn, c, work)
+                    opts.bl_mynn_mixlength, zn, zn, zn, opts.spp_pbl, zn, c, work;
+                    gtr_k = gtr_k)
 
     mym_predict!(kts, kte, opts.closure, opts.delt, col.dz, col.ust, flt, flq,
                  pmz, phh, st.el, work.out_dfq, col.rho,
                  work.out_pdk, work.out_pdt, work.out_pdq, work.out_pdc,
                  st.qke, st.tsq, st.qsq, st.cov, zn1, zn1, opts.bl_mynn_edmf_tke,
-                 work.out_qwt, work.out_qdiss, opts.tke_budget, c, work)
+                 work.out_qwt, work.out_qdiss, opts.tke_budget, c, work;
+                 sqfac = opts.sqfac)
 
     # -- dissipative heating (mynn_bl_driver :1224-1234) --------------------------
     dh = work.out_diss_heat

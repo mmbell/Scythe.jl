@@ -352,6 +352,33 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
             @test maximum(mtile_my.mynn.K_h) >= 0.0
         end
 
+        # ...and with every FIDELITY deviation that the wired path carries live (F1).
+        # Each one is a branch inside the per-column apply or the closure update, and
+        # three of them (`:gtr_local`'s `work.gtr_k`, `:pdk1`'s `MY.pmz`,
+        # `:flux_clip`'s counters) reach for state that has to be PREALLOCATED to stay
+        # here: a `gtr_k` built per column, or a `Union{Nothing,Vector}` that fails to
+        # union-split at the `mym_turbulence!` keyword, would show up as an allocation
+        # and nowhere else. `:rmol_sfc` brings `options[:sfc_stability]` with it, which
+        # is the Monin-Obukhov iteration in `surface_exchange` -- also on this path.
+        for (eqs, driver) in (("moist_compressible_XZ", Scythe.moist_compressible_XZ),
+                              ("moist_compressible_axisym",
+                               Scythe.moist_compressible_axisym))
+            mtile_fd, kDim_fd = build_mc_tile(equation_set = eqs,
+                extra_params = Dict(:f => 5.0e-5, :Cd => -1.0, :Ck => 1.0e-3,
+                                    :SST => 301.15, :U_min => 1.0),
+                extra_options = Dict{Symbol,Any}(:mynn => true, :mynn_trace => false,
+                                                 :surface_fluxes => true,
+                                                 :sfc_stability => true,
+                                                 :mynn_fidelity =>
+                                                     collect(Scythe.MYNN_DEVIATIONS)))
+            @test mtile_fd.mynn.fidelity.names == collect(Scythe.MYNN_DEVIATIONS)
+            mtile_fd.tile.physical[:, mtile_fd.mc_slots.rho_e, 1] .= 0.5
+            spectralTransform!(mtile_fd.tile)
+            gridTransform!(mtile_fd.tile)
+            driver(mtile_fd, 1, kDim_fd, 2)                        # compile
+            @test (@allocations driver(mtile_fd, 1, kDim_fd, 3)) == 0
+        end
+
         # ...and with the EDMF MASS FLUX live (S7). `dmp_mf!` is called on the cadence
         # with ~50 arguments and its eight (kDim+1, 8) plume matrices come out of a
         # `Vector{EDMFWork}` indexed by `threadid()`, and `_mynn_plume_sums!` then walks

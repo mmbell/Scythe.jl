@@ -77,6 +77,8 @@ function mynn_write_final!(mtile::ModelTile)
     MY.n_gate = sum(MY.n_gate_col)
     MY.n_stall = sum(MY.n_stall_col)
     MY.n_plume = sum(MY.n_plume_col)
+    MY.n_hfx_clip = sum(MY.n_hfx_clip_col)
+    MY.n_qfx_clip = sum(MY.n_qfx_clip_col)
     MY.trace && println(mynn_census_line(MY))
     MY.output && _mynn_write_snapshot!(mtile, mtile.model.integration_time)
     return nothing
@@ -143,9 +145,9 @@ const MYNN_FIELDS_1D = (
     ("bdry_E", "W m-2", "D3 boundary/surface energy input"))
 
 "The MYNN counter attributes [`assemble_physics`](@ref) must SUM across tiles rather than
-take from the first one -- the same six `read_mynn` sums when it reassembles a snapshot."
+take from the first one -- the same ones `read_mynn` sums when it reassembles a snapshot."
 const MYNN_COUNTER_ATTRS = ("n_clamp_e", "n_cap_K", "n_diffnum", "n_gate", "n_stall",
-                            "n_plume")
+                            "n_plume", "n_hfx_clip", "n_qfx_clip")
 
 """
     mynn_global_attrs(MY::MYNNState) -> Vector{Pair{String,Any}}
@@ -162,7 +164,7 @@ without either writer being touched.
 
 Bools are stored as `0`/`1` `Int`s: NetCDF has no attribute type for `Bool`.
 
-The six counters are the TILE scalars, which `mynn_write_final!` folds from the
+The counters are the TILE scalars, which `mynn_write_final!` folds from the
 per-column vectors at run end; before that they read zero. That is the sidecar's
 pre-existing behaviour and is preserved deliberately — the per-column vectors are the
 live census, and summing them here would change every sidecar ever written.
@@ -174,7 +176,7 @@ function mynn_global_attrs(MY::MYNNState)
         "edmf_mom" => Int(MY.edmf_mom),
         "scale_aware" => Int(MY.scale_aware),
         "init_mode" => string(MY.init_mode),
-        "fidelity" => string(MY.fidelity),
+        "fidelity" => mynn_fidelity_string(MY.fidelity),
         "water_carry" => string(MY.water_carry),
         "mix_numbers" => Int(MY.mix_numbers),
         "mynn_interval_s" => MY.interval_steps * MY.ts,
@@ -184,7 +186,9 @@ function mynn_global_attrs(MY::MYNNState)
         "n_diffnum" => MY.n_diffnum,
         "n_gate" => MY.n_gate,
         "n_stall" => MY.n_stall,
-        "n_plume" => MY.n_plume]
+        "n_plume" => MY.n_plume,
+        "n_hfx_clip" => MY.n_hfx_clip,
+        "n_qfx_clip" => MY.n_qfx_clip]
 end
 
 """
@@ -457,6 +461,8 @@ function read_mynn(dir::AbstractString, tag::AbstractString)
         n_gate = sum(Int(get(s.attrs, "n_gate", 0)) for s in snaps),
         n_stall = sum(Int(get(s.attrs, "n_stall", 0)) for s in snaps),
         n_plume = sum(Int(get(s.attrs, "n_plume", 0)) for s in snaps),
+        n_hfx_clip = sum(Int(get(s.attrs, "n_hfx_clip", 0)) for s in snaps),
+        n_qfx_clip = sum(Int(get(s.attrs, "n_qfx_clip", 0)) for s in snaps),
         census_max_K_m = maximum(Float64(get(s.attrs, "census_max_K_m", 0.0)) for s in snaps),
         census_max_K_h = maximum(Float64(get(s.attrs, "census_max_K_h", 0.0)) for s in snaps),
         census_max_pblh = maximum(Float64(get(s.attrs, "census_max_pblh", 0.0)) for s in snaps),

@@ -196,7 +196,10 @@ using SparseArrays
         @test cfg.edmf == 0
         @test cfg.scale_aware
         @test cfg.init_mode === :taper
-        @test cfg.fidelity === :fortran
+        # `:mynn_fidelity` resolves to a `MYNNFidelity` (F1): `:fortran` is the
+        # no-deviation value, which its own `==` reads off `names`.
+        @test cfg.fidelity == Scythe.MYNN_FORTRAN_FIDELITY
+        @test isempty(cfg.fidelity.names)
         @test cfg.water_carry === :flux
         @test cfg.K_max == Inf
         # 20 s default cadence at ts = 0.5 s

@@ -302,11 +302,13 @@ cloud-PDF width; `tsq` and `cov` are not, at CASE 2, read by anything.
     (mynn_bl_driver :1063; harness README item 2). It divides by the surface Exner
     function twice, which inflates the surface potential temperature by ~3 % and so
     inflates `fltv`, `rmol` and through them the mixing length. Reproduced because the
-    parity anchor is the Fortran; `:mynn_fidelity = :scythe` is where it gets fixed,
-    after the deviation has been measured (D10), not before.
+    parity anchor is the Fortran; the `:exner_single` deviation of
+    `options[:mynn_fidelity]` (`MYNN_DEVIATIONS`) is where it gets fixed, after it has
+    been measured (D10), not before.
   * `rmol` is RECOMPUTED here from `fltv` and `ust` (:1079) rather than taken from
     `surface_exchange`'s Monin-Obukhov `inv_L`, so the closure's `zeta`, `pmz` and `phh`
-    are self-consistent with the fluxes it was handed.
+    are self-consistent with the fluxes it was handed. The `:rmol_sfc` deviation takes
+    `sx.inv_L` instead.
 
 # The energy budget (D3), term by term
 Momentum `du = (dS_u - tau_u g)/rho_t` with `dE_t^mom = rho_t(u du + w dw + v dv)` -- the
@@ -402,7 +404,7 @@ handling to copy.
     # ── The held closure, on the cadence (D9) ────────────────────────────────
     if first_call || (t - MY.last_update_step[ci]) >= MY.interval_steps
         _mynn_closure_update!(MY, S, MN, work, colstart, n, ci, sfc.SST, sx.ust,
-                              F_sh, F_q, t)
+                              F_sh, F_q, sx.inv_L, t)
     end
 
     _mynn_diffusivities!(MY, MN, colstart, n, ci, n_clamp)
@@ -542,17 +544,24 @@ The carried state is loaded OUT of the tile first and written back after: `sm(kt
 the cloud-PDF width -- and a per-thread scratch column is shared between columns, so
 nothing in it can be assumed to still belong to this one.
 
-Two Fortran shapes are reproduced on purpose (`:mynn_fidelity = :fortran`, D10):
+Four fidelity deviations (`MYNN_DEVIATIONS`) live in this routine, every one of them off
+under the default `options[:mynn_fidelity] = :fortran`:
 
   * `th_sfc = ts/exner(1)` where the driver's `ts` is ALREADY `T_sfc/exner(1)`
     (mynn_bl_driver :1063; harness README item 2). It divides by the surface Exner
     function TWICE, which inflates the surface potential temperature by ~3 % and through
     `fltv` inflates `rmol` and the mixing length. Reproduced because the parity anchor is
-    the Fortran; `:mynn_fidelity = :scythe` is where it gets fixed, AFTER the deviation
-    has been measured (D10), not before.
+    the Fortran; `:exner_single` divides once.
   * `rmol` is RECOMPUTED here from `fltv` and `ust` (:1079) rather than taken from
     `surface_exchange`'s Monin-Obukhov `inv_L`, so the closure's `zeta`, `pmz` and `phh`
-    are self-consistent with the fluxes it was handed.
+    are self-consistent with the fluxes it was handed. `:rmol_sfc` takes the `inv_L`
+    this routine is handed instead (and the validator refuses it without
+    `options[:sfc_stability]`, where that `inv_L` is an identical zero).
+  * `:gtr_local` fills `work.gtr_k` with the per-level `g/theta_v` and passes it to
+    `mym_turbulence!` (hence `mym_level2!` and `mym_length!`) and to `dmp_mf!`, in place
+    of the Fortran's single `g/300 K`.
+  * `:flux_clip` applies the wrapper's `hfx`/`qfx` limits to what the CLOSURE sees. The
+    two clip COUNTERS are accumulated on every configuration.
 
 The six lines that set `qsq` are `mym_predict!`'s `closure <= 2.5` branch verbatim
 (:3298-3300 for the surface copy, :3664-3673 for the diagnostic). `qsq` is the only one
@@ -563,8 +572,10 @@ update, which is why it is stored rather than recomputed.
                                          work::MYNNWork,
                                          colstart::Int64, n::Int64, ci::Int64,
                                          SST::Float64, ust::Float64,
-                                         F_sh::Float64, F_q::Float64, t::Int64)
+                                         F_sh::Float64, F_q::Float64,
+                                         inv_L::Float64, t::Int64)
     c = MY.constants
+    fid = MY.fidelity
     zn = work.z_n                      # the shared all-zero stand-in; NEVER written
     dz = MY.dz; zw = MY.zw
     exner = MN.exner; qke = MN.qke
@@ -580,6 +591,19 @@ update, which is why it is stored rather than recomputed.
         qsq[i] = MY.qsq[j]
     end
 
+    # `:gtr_local` (MYNN_DEVIATIONS): the buoyancy parameter per LEVEL, `g/theta_v`,
+    # from the theta_v `_mynn_column_inputs!` staged for this column. Filled only when
+    # the deviation is on -- under `:fortran` the vector is never written, never read,
+    # and the kernels take their `c.gtr` load exactly as before.
+    gtr_k = nothing
+    if fid.gtr_local
+        gk = work.gtr_k
+        @inbounds for i in 1:n
+            gk[i] = c.grav/work.s_thetav[i]
+        end
+        gtr_k = gk
+    end
+
     zi, kzi = get_pblh!(1, n, work.s_thetav, qke, zw, dz, MYNN_XLAND_WATER)
     MY.pblh[ci] = zi
     MY.kpbl[ci] = kzi
@@ -588,13 +612,32 @@ update, which is why it is stored rather than recomputed.
     # Surface fluxes, 1/L and the surface-layer stability functions
     # (mynn_bl_driver :1060-1097). `flqc = 0`: Scythe's surface layer has no liquid-water
     # flux off the sea surface (droplets do not evaporate off it).
+    # `:flux_clip` (MYNN_DEVIATIONS): the COUNTERS run on every configuration -- they are
+    # comparisons, they touch no arithmetic, and a run should always be able to say how
+    # often the Fortran wrapper's clips (harness README item 7) would have bitten. The
+    # clip itself is the deviation, and it applies to what the CLOSURE sees only: the
+    # model's own surface delivery `F_sh*g(z)`/`F_q*g(z)` in `_mynn_apply_column!` stays
+    # UNCLIPPED, so the column energy budget against the surface fluxes keeps its meaning.
+    @inbounds begin
+        (F_sh > MYNN_HFX_MAX || F_sh < MYNN_HFX_MIN) && (MY.n_hfx_clip_col[ci] += 1)
+        (F_q > MYNN_QFX_MAX || F_q < MYNN_QFX_MIN) && (MY.n_qfx_clip_col[ci] += 1)
+    end
+    F_sh_c = fid.flux_clip ? clamp(F_sh, MYNN_HFX_MIN, MYNN_HFX_MAX) : F_sh
+    F_q_c = fid.flux_clip ? clamp(F_q, MYNN_QFX_MIN, MYNN_QFX_MAX) : F_q
     cpm = c.cp*(1.0 + 0.84*work.s_qv[1])
-    flqv = F_q/S.rho_t[1]
-    th_sfc = (SST/exner[1])/exner[1]         # the double division; see the docstring
+    flqv = F_q_c/S.rho_t[1]
+    # `:exner_single` divides by the surface Exner function ONCE; the Fortran divides
+    # TWICE (see the docstring).
+    th_sfc = fid.exner_single ? SST/exner[1] : (SST/exner[1])/exner[1]
     flq = flqv
-    flt = F_sh/(S.rho_t[1]*cpm)
+    flt = F_sh_c/(S.rho_t[1]*cpm)
     fltv = flt + flqv*c.p608*th_sfc
-    rmol = -c.karman*c.gtr*fltv/max(ust^3, 1.0e-6)
+    # `:rmol_sfc` takes 1/L from `surface_exchange`'s own Monin-Obukhov solve instead of
+    # recomputing it here (the validator refuses it without `options[:sfc_stability]`,
+    # where that `inv_L` is identically zero). `gtr_1` under `:gtr_local` is this column's
+    # own `g/theta_v(1)`; loading it into a local leaves the expression bitwise.
+    gtr_1 = fid.gtr_local ? (@inbounds work.gtr_k[1]) : c.gtr
+    rmol = fid.rmol_sfc ? inv_L : -c.karman*gtr_1*fltv/max(ust^3, 1.0e-6)
     zet = 0.5*dz[1]*rmol
     zet = max(zet, -20.0)
     zet = min(zet, 20.0)
@@ -602,15 +645,18 @@ update, which is why it is stored rather than recomputed.
     # functions `mym_predict!` uses to build the log-layer TKE production `pdk1`. The
     # prognostic TKE slot takes that production as `P_sfc` (the drag sink itself,
     # delivered on the surface g(z)) instead, so they are formed here only when the
-    # trace/diagnostic path asks for them -- the D10 `P_sfc from the drag sink vs pdk1`
-    # fidelity switch is where they come back.
-    if MY.check_values
+    # trace/diagnostic path or the `:pdk1` deviation asks for them -- that deviation IS
+    # the D10 "P_sfc from the drag sink vs pdk1" comparison, and `pmz` is what it needs.
+    if MY.check_values || fid.pdk1
         pmz = phim(zet) - zet
         phh = phih(zet)
         (isfinite(pmz) && isfinite(phh)) || error(
             "mc_mynn_bl!: the surface-layer stability functions are not finite " *
             "(zeta = $zet, rmol = $rmol, ust = $ust); the surface fluxes handed to the " *
             "closure are inconsistent")
+        # Held for `:pdk1`, which builds the Fortran's log-layer surface TKE production
+        # from it every step, not just on the cadence this update runs at.
+        @inbounds MY.pmz[ci] = pmz
     end
     MY.rmol[ci] = rmol
     MY.ust[ci] = ust
@@ -618,7 +664,7 @@ update, which is why it is stored rather than recomputed.
     mym_condensation!(1, n, MY.dx, dz, zw, MYNN_XLAND_WATER,
                       work.s_thl, work.s_sqw, work.s_sqv, work.s_sqc, work.s_sqi, zn,
                       S.p, exner, zn, qsq, zn, sh, el,
-                      2, qcb, qib, cfb, zi, F_sh, vt, vq, work.s_th, sgm, rmol,
+                      2, qcb, qib, cfb, zi, F_sh_c, vt, vq, work.s_th, sgm, rmol,
                       0, zn, c, work)
 
     # ── DMP_mf, between the condensation and the turbulence (:1150-1180) ─────
@@ -633,7 +679,7 @@ update, which is why it is stored rather than recomputed.
     if MY.edmf == 1
         ew = MY.ework[Threads.threadid()]
         _mynn_edmf_update!(MY, S, MN, work, ew, colstart, n, ci, zi, kzi, ust,
-                           flt, fltv, flq, flqv, th_sfc, Psig_shcu)
+                           flt, fltv, flq, flqv, th_sfc, Psig_shcu, gtr_k)
         ed_w = ew.edmf_w
         ed_a = ew.edmf_a
     end
@@ -646,7 +692,8 @@ update, which is why it is stored rather than recomputed.
                     work.out_tcd, work.out_qcd,
                     work.out_pdk, work.out_pdt, work.out_pdq, work.out_pdc,
                     work.out_qwt, work.out_qshear, work.out_qbuoy, work.out_qdiss,
-                    0, Psig_bl, Psig_shcu, cfb, 2, ed_w, ed_a, zn, 0, zn, c, work)
+                    0, Psig_bl, Psig_shcu, cfb, 2, ed_w, ed_a, zn, 0, zn, c, work;
+                    gtr_k = gtr_k)
 
     @inbounds begin
         work.out_pdq[1] = work.out_pdq[2]
@@ -693,6 +740,9 @@ Fortran is asked to compute, so `dmp_mf!` is never run on a combination test/tes
 does not cover. `dt` is dead inside `DMP_mf` (it appears only in the unreachable
 `env_subs` block) and is passed as the model timestep for the record.
 
+`gtr_k` is the `:gtr_local` fidelity deviation, forwarded to `dmp_mf!` unchanged:
+`nothing` on every other configuration.
+
 `vt`, `vq`, `cldfra_bl` and `qc_bl` go in as `mym_condensation!` left them and can come
 back CHANGED: the Chaboureau-Bechtold shallow-cumulus block (:6630-6768) overwrites them
 wherever a plume carries condensate. That is the Fortran's order and it is why the
@@ -704,7 +754,8 @@ write-back to the tile happens after `mym_turbulence!`, not before `dmp_mf!`.
                                       zi::Float64, kzi::Int, ust::Float64,
                                       flt::Float64, fltv::Float64, flq::Float64,
                                       flqv::Float64, th_sfc::Float64,
-                                      Psig_shcu::Float64)
+                                      Psig_shcu::Float64,
+                                      gtr_k::Union{Nothing,Vector{Float64}})
     zn = work.z_n
     gate = dmp_mf!(1, n, MY.ts, MY.zw, MY.dz, S.p, S.rho_t, 1, 0, 1,
                    work.s_u, work.s_v, work.s_w, work.s_th, work.s_thl, work.s_thetav,
@@ -717,7 +768,7 @@ write-back to the tile happens after `mym_turbulence!`, not before `dmp_mf!`.
                    ew.sub_thl, ew.sub_sqv, ew.sub_u, ew.sub_v,
                    ew.det_thl, ew.det_sqv, ew.det_sqc, ew.det_u, ew.det_v,
                    MN.qcb, MN.cfb, zn, zn, true, true, Psig_shcu, 0, zn,
-                   MY.constants, ew)
+                   MY.constants, ew; gtr_k = gtr_k)
     _mynn_plume_sums!(MY, S, MN, ew, gate, colstart, n, ci)
     return gate
 end
@@ -871,6 +922,14 @@ end
 `K_m = l q S_M`, `K_h = l q S_H`, `K_e = Sqfac K_m` from the HELD closure and the CURRENT
 TKE, plus the D12 census.
 
+Two fidelity deviations live here (`MYNN_DEVIATIONS`). `:sqfac1` sets `Sqfac` to 1
+instead of [`MYNN_SQFAC`](@ref) `= 3`, which is a factor of three on the TKE's own
+explicit diffusion number `D_gal`. `:K_interface` restores MYNN's wall averaging (see the
+branch), and note what it then does downstream: `_mynn_apply_column!`'s buoyancy exchange
+is `rho P_b = rho_t K_h G_H` with a WALL-averaged `K_h` multiplying the closure's
+colocated `G_H`, which is deliberate -- the deviation is the diffusivity's staggering,
+not a restaggering of the whole budget, and the flux fit stays at the mish.
+
 Colocated at the mish (D1): MYNN's interface averaging of `el`/`rho`/`dzk` is dropped and
 `K = l q S` is formed pointwise, because every consumer downstream is a spline fit on the
 mish rather than a staggered finite difference. `el[1] == 0` (the wall), so `K[1] == 0`
@@ -890,28 +949,77 @@ that column, so the tile totals are exact under threading rather than racy.
                                         ci::Int64, n_clamp::Int64)
     Km = MN.Km; Kh = MN.Kh; Ke = MN.Ke; q_col = MN.q
     K_max = MY.K_max
+    sqfac = MY.fidelity.sqfac
     n_cap = 0
     Kmax_m = 0.0; Kmax_h = 0.0; Kmax_e = 0.0; tstau = 0.0
-    @inbounds for i in 1:n
-        j = colstart + i - 1
-        elj = MY.el[j]
-        lq = elj * q_col[i]
-        km = lq * MY.sm[j]
-        kh = lq * MY.sh[j]
-        km < 0.0 && (km = 0.0)
-        kh < 0.0 && (kh = 0.0)
-        if km > K_max; km = K_max; n_cap += 1; end
-        if kh > K_max; kh = K_max; n_cap += 1; end
-        ke = MYNN_SQFAC * km
-        if ke > K_max; ke = K_max; n_cap += 1; end
-        Km[i] = km; Kh[i] = kh; Ke[i] = ke
-        MY.K_m[j] = km; MY.K_h[j] = kh
-        km > Kmax_m && (Kmax_m = km)
-        kh > Kmax_h && (Kmax_h = kh)
-        ke > Kmax_e && (Kmax_e = ke)
-        if elj > 0.0
-            r = MY.ts * 2.0 * q_col[i] / (MYNN_B1 * elj)
-            r > tstau && (tstau = r)
+    if MY.fidelity.K_interface
+        # `:K_interface` (MYNN_DEVIATIONS): the closure's `el`, `S_M`, `S_H` live on the
+        # WALLS -- `mym_length!` writes `el[kts] = 0` and then `el[k]` at `zw[k]`, the
+        # wall BELOW mish point k, which is also why `mym_predict!` reads
+        # `0.5*(el(k+1)+el(k))` for a level quantity and `mym_turbulence!` divides `elq*sm`
+        # by `dzk = 0.5*(dz(k)+dz(k-1))`, the mish-point spacing across that wall. So the
+        # level-k value of `el*S` is the average of the walls below and above it, and the
+        # top level has only the wall below.
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            elj = MY.el[j]
+            lsm = elj * MY.sm[j]
+            lsh = elj * MY.sh[j]
+            if i < n
+                jp = j + 1
+                lsm = 0.5*(lsm + MY.el[jp]*MY.sm[jp])
+                lsh = 0.5*(lsh + MY.el[jp]*MY.sh[jp])
+            end
+            # `K[1] == 0` is kept: the wall carries no interface (`el[kts] = 0`) and the
+            # surface stress and fluxes ride in on `g(z)` instead. Averaging the FIRST
+            # interior wall into the ground node would deliver an eddy flux through the
+            # bottom node on top of that delivery, which is a different change from the
+            # one this deviation is measuring.
+            if i == 1
+                lsm = 0.0
+                lsh = 0.0
+            end
+            km = lsm * q_col[i]
+            kh = lsh * q_col[i]
+            km < 0.0 && (km = 0.0)
+            kh < 0.0 && (kh = 0.0)
+            if km > K_max; km = K_max; n_cap += 1; end
+            if kh > K_max; kh = K_max; n_cap += 1; end
+            ke = sqfac * km
+            if ke > K_max; ke = K_max; n_cap += 1; end
+            Km[i] = km; Kh[i] = kh; Ke[i] = ke
+            MY.K_m[j] = km; MY.K_h[j] = kh
+            km > Kmax_m && (Kmax_m = km)
+            kh > Kmax_h && (Kmax_h = kh)
+            ke > Kmax_e && (Kmax_e = ke)
+            if elj > 0.0
+                r = MY.ts * 2.0 * q_col[i] / (MYNN_B1 * elj)
+                r > tstau && (tstau = r)
+            end
+        end
+    else
+        # ── today's colocated form (D1), untouched ──
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            elj = MY.el[j]
+            lq = elj * q_col[i]
+            km = lq * MY.sm[j]
+            kh = lq * MY.sh[j]
+            km < 0.0 && (km = 0.0)
+            kh < 0.0 && (kh = 0.0)
+            if km > K_max; km = K_max; n_cap += 1; end
+            if kh > K_max; kh = K_max; n_cap += 1; end
+            ke = sqfac * km
+            if ke > K_max; ke = K_max; n_cap += 1; end
+            Km[i] = km; Kh[i] = kh; Ke[i] = ke
+            MY.K_m[j] = km; MY.K_h[j] = kh
+            km > Kmax_m && (Kmax_m = km)
+            kh > Kmax_h && (Kmax_h = kh)
+            ke > Kmax_e && (Kmax_e = ke)
+            if elj > 0.0
+                r = MY.ts * 2.0 * q_col[i] / (MYNN_B1 * elj)
+                r > tstau && (tstau = r)
+            end
         end
     end
     D_gal = Kmax_e * MY.ts * 10.0 / (MY.dz_cell * MY.dz_cell)
@@ -1255,6 +1363,12 @@ column identity is open by exactly `<S_w dc_w/dz + S_v dc_v/dz>` and `bdry_E` is
 right-hand side only under `:flux`. test/test_mynn_bl.jl reports that residual rather than
 asserting a closure the local map cannot have.
 
+The `:pdk1` fidelity deviation (`MYNN_DEVIATIONS`) replaces `P_sfc` with the Fortran's
+log-layer production `rho_t(1) u*^3 pmz/karman` on the same `g(z)`, and routes the
+difference from the drag work into the HEATING rather than dropping it -- see the branch
+below. `<dE_t + drho_e>` and `bdry_E` are unchanged by the switch; what changes is how
+much of the surface drag ends up as TKE and how much as heat.
+
 The boundary term `bdry_E` is the D3 identity's right-hand side, and every piece of it is
 an EXACT spline boundary value of a fitted column -- the momentum products included, which
 is the whole reason `Psi` is fitted (see `_mynn_flux_columns!`). Nothing in it is assumed
@@ -1281,6 +1395,18 @@ that value actually is and report it.
     div_e = MN.div_e; VD_Ew = MN.div_Ew; QDOT_V = S.QDOT_V
     flux_carry = MY.water_carry === :flux
     inv_delta = 1.0 / delta
+    # `:pdk1` (MYNN_DEVIATIONS): the Fortran's log-layer surface TKE production in place
+    # of the drag work. `pdk1 = 2 u*^3 pmz / vkz` with `vkz = karman 0.5 dz(1)` is a
+    # production of `qke = 2e`, so per unit mass in `e` it is `u*^3 pmz/(karman 0.5 dz(1))`
+    # and the LAYER-INTEGRATED surface production is `rho_t(1) u*^3 pmz/karman` [W/m^2].
+    # Delivered on the same surface profile `g(z)` the stress and the surface fluxes use,
+    # which turns it into the [W/m^3] the slot takes.
+    pdk1 = MY.fidelity.pdk1
+    Psfc_e = 0.0
+    if pdk1
+        @inbounds Psfc_e = rho_t[1]*MY.ust[ci]*MY.ust[ci]*MY.ust[ci]*MY.pmz[ci] /
+                           MY.constants.karman
+    end
 
     bdry = (ed.Pm1 - ed.Pm0) +
            (ed.Sh1 - ed.Sh0) + (ed.SEw1 - ed.SEw0) + (ed.Se1 - ed.Se0) + F_sh
@@ -1305,7 +1431,14 @@ that value actually is and report it.
         # only this form makes the column identity exact.
         Ps = div_Pm[i] - (((u[i]*VD_u[i]) + (w[i]*VD_w[i])) +
                           (vi*_mynn_vdiv(geom, VD_v, i)))
-        Psfc = ((tau_u*u[i]) + (tau_v*vi)) * gz
+        # Under `:pdk1` the TKE slot receives the log-layer production and the DIFFERENCE
+        # between the drag work and that production becomes heat (`Pres`, folded into
+        # `qdot_h` below, the same route `+rho eps` takes into E_t and the QDOT channel),
+        # so `<dE_t + drho_e>` is exactly what it was and the D3 identity still closes.
+        # Physically that is most of the log-layer drag sink arriving as heat instead of
+        # as TKE -- which is the thing being measured.
+        Pdrag = ((tau_u*u[i]) + (tau_v*vi)) * gz
+        Psfc = pdk1 ? Psfc_e * gz : Pdrag
         Pb = rho_t[i] * Kh[i] * MY.gh[j]
         elj = MY.el[j]
         qi = q_col[i]
@@ -1321,7 +1454,8 @@ that value actually is and report it.
         MY.g_eps[j] = eps
         MY.g_tke_transport[j] = div_e[i]
 
-        qdot_h = QDOT_V[i] + (F_sh * gz)
+        qdot_h = pdk1 ? (QDOT_V[i] + (F_sh * gz)) + (Pdrag - Psfc) :
+                        QDOT_V[i] + (F_sh * gz)
         rw = div_w[i] + (F_q * gz)
         rv = div_v[i] + (F_q * gz)
         cw = (Cpv*Tk[i]) - Lv[i] + ke[i] + (gravity*z[i])
@@ -1395,9 +1529,11 @@ end
     mynn_census_line(MY::MYNNState) -> String
 
 One line summarising the tile's boundary-layer census: the domain maxima of `K_m`,
-`K_h`, the two explicit-diffusion numbers and `ts/tau_eps`, and the three counters --
+`K_h`, the two explicit-diffusion numbers and `ts/tau_eps`, and the counters --
 TKE clamps and `K` caps in GRIDPOINT-steps, `n_diffnum` in COLUMN-steps (a column is
-counted once per step in which its own `D_gal` exceeded 0.5). The counters are
+counted once per step in which its own `D_gal` exceeded 0.5), and the two surface-flux
+clip counts in COLUMN-UPDATES (how often the Fortran wrapper's `hfx`/`qfx` limits would
+have bitten, whether or not `:flux_clip` is on -- see `MYNN_DEVIATIONS`). The counters are
 reductions over the PER-COLUMN arrays, which is why they are exact under threading:
 each column is written by the one thread that owns it, so nothing races and nothing is
 lost.
@@ -1413,7 +1549,9 @@ function mynn_census_line(MY::MYNNState)
            "max pblh=$(round(mx(MY.pblh); digits = 1)) m; " *
            "mynn_n_clamp_e=$(sum(MY.n_clamp_col)) " *
            "mynn_n_cap_K=$(sum(MY.n_capK_col)) " *
-           "mynn_n_diffnum=$(sum(MY.n_diffnum_col))" *
+           "mynn_n_diffnum=$(sum(MY.n_diffnum_col)) " *
+           "mynn_n_hfx_clip=$(sum(MY.n_hfx_clip_col)) " *
+           "mynn_n_qfx_clip=$(sum(MY.n_qfx_clip_col))" *
            mynn_plume_census(MY)
 end
 

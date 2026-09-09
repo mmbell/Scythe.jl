@@ -140,6 +140,132 @@ function MYNNColumnScratch(n::Integer)
     return MYNNColumnScratch(args...)
 end
 
+# ── Fidelity: the named deviations from the verbatim Fortran ──────────────────
+
+"""
+    MYNN_DEVIATIONS
+
+The seven NAMED deviations from the verbatim-Fortran MYNN closure and coupling. Each is
+one branch in one place, each is off under `:mynn_fidelity = :fortran` (the default), and
+each exists to be MEASURED against that default rather than argued about:
+
+  * `:gtr_local` -- the buoyancy parameter `g/theta_v` per LEVEL instead of the Fortran's
+    single `g/MYNN_TREF` with `MYNN_TREF = 300 K`. Used by `G_H` (`mym_level2!`), the
+    mixing length's `vsc`/`bv`/`wstar` (`mym_length!`), the plume surface scaling and
+    Brunt-Vaisala frequency (`dmp_mf!`) and the surface `rmol`. In a tropical boundary
+    layer `theta_v` runs ~305 K, so the Fortran's `gtr` is ~2 % high everywhere and more
+    than that in the warm core of a TC.
+  * `:K_interface` -- `K_m`/`K_h` formed by AVERAGING the closure's wall values of
+    `el*S` onto the mish point, the way `mym_predict!`'s `0.5*(el(k+1)+el(k))` and the
+    Fortran's `dfm(k) = elq*sm(k)/dzk` treat them, instead of the colocated
+    `K = el(k) q(k) S(k)` of D1.
+  * `:sqfac1` -- `K_e = 1 * K_m` instead of `MYNN_SQFAC * K_m = 3 K_m`. The Fortran's
+    `Sqfac = 3` is a TKE-transport enhancement inside its implicit tridiagonal solve;
+    Scythe integrates `rho_e` explicitly, where the same factor triples the diffusion
+    number the timestep has to survive (`D_gal`).
+  * `:pdk1` -- the surface TKE source is the Fortran's log-layer production
+    `pdk1 = 2 u*^3 pmz / (karman 0.5 dz(1))` instead of the drag work
+    `(tau_u u + tau_v v) g(z)` the coupling delivers today. See `_mynn_apply_column!`.
+  * `:exner_single` -- `th_sfc = SST/exner(1)`, dividing by the surface Exner function
+    ONCE. The Fortran divides TWICE (`mynn_bl_driver` :1063 with a `ts` that is already
+    `T_sfc/exner(1)`; harness README item 2), which inflates the surface potential
+    temperature by ~3 % and through `fltv` inflates `rmol` and the mixing length.
+  * `:rmol_sfc` -- `1/L` taken from `surface_exchange`'s Monin-Obukhov solve
+    (`sx.inv_L`) instead of recomputed inside the closure from `fltv` and `u*`. Needs
+    `options[:sfc_stability] = true`; without it `inv_L` is identically zero and the
+    switch would silently neutralize the surface-layer stability functions.
+  * `:flux_clip` -- the `mynnedmf_wrapper` clips of harness README item 7,
+    `hfx in [-500, 1200] W/m^2` and `qfx in [-2e-4, 5e-4] kg/(m^2 s)`, applied to what
+    the CLOSURE sees. The model's own surface delivery stays UNCLIPPED, so the energy
+    budget against the surface fluxes keeps its meaning. The COUNTERS
+    (`n_hfx_clip`/`n_qfx_clip`) are accumulated whether or not the switch is on, so a run
+    always reports how often the Fortran would have clipped.
+
+There is deliberately no `:scythe` BUNDLE at this stage: a bundle is a claim that a set
+of deviations is the better model, and no deviation has been measured yet. One gets
+added, with its members named, when the evidence is in.
+"""
+const MYNN_DEVIATIONS = (:gtr_local, :K_interface, :sqfac1, :pdk1, :exner_single,
+                         :rmol_sfc, :flux_clip)
+
+"""
+    MYNNFidelity
+
+The RESOLVED form of `options[:mynn_fidelity]`: one field per deviation of
+[`MYNN_DEVIATIONS`](@ref), so every use site is a `fid.<name>` load and never a `Symbol`
+comparison or a `in` on a vector in a per-column loop. `names` keeps the requested list
+for the setup line, the NetCDF attribute and the tests.
+
+`sqfac` is a Float64 rather than a Bool because it is a FACTOR: `:sqfac1` sets it to 1.0
+and its absence leaves it at [`MYNN_SQFAC`](@ref) `= 3.0`, so `K_e = fid.sqfac*K_m` is
+the same IEEE product as today's `MYNN_SQFAC*K_m` on the default path.
+"""
+struct MYNNFidelity
+    gtr_local::Bool
+    K_interface::Bool
+    sqfac::Float64
+    pdk1::Bool
+    exner_single::Bool
+    rmol_sfc::Bool
+    flux_clip::Bool
+    names::Vector{Symbol}
+end
+
+"The no-deviation fidelity: verbatim Fortran, and the default of every configuration."
+const MYNN_FORTRAN_FIDELITY = MYNNFidelity(false, false, MYNN_SQFAC, false, false, false,
+                                           false, Symbol[])
+
+"""
+    MYNNFidelity(names::AbstractVector{Symbol}) -> MYNNFidelity
+
+Resolve a list of deviation names. An empty list IS `:fortran`. An unrecognized name or a
+repeat raises with the valid list, in the `_mynn_check` style: a misspelled deviation that
+silently did nothing would be a measurement of the control reported as a measurement of
+the treatment.
+"""
+function MYNNFidelity(names::AbstractVector{Symbol})
+    seen = Symbol[]
+    for nm in names
+        nm in MYNN_DEVIATIONS || error(
+            "options[:mynn_fidelity] does not have a deviation :$(nm); the deviations " *
+            "are " * join(string.(":", MYNN_DEVIATIONS), ", ", " and ") *
+            ", and :fortran (or an empty vector) is no deviation at all")
+        nm in seen && error(
+            "options[:mynn_fidelity] names :$(nm) twice; each deviation is one switch")
+        push!(seen, nm)
+    end
+    return MYNNFidelity(:gtr_local in seen, :K_interface in seen,
+                        (:sqfac1 in seen) ? 1.0 : MYNN_SQFAC,
+                        :pdk1 in seen, :exner_single in seen, :rmol_sfc in seen,
+                        :flux_clip in seen, seen)
+end
+
+Base.:(==)(a::MYNNFidelity, b::MYNNFidelity) = a.names == b.names
+
+"""
+    mynn_fidelity_string(f::MYNNFidelity) -> String
+
+`"fortran"` for the no-deviation default, otherwise the comma-joined deviation names --
+the form the setup line prints, the NetCDF `fidelity` attribute carries and
+[`parse_mynn_fidelity`](@ref) reads back.
+"""
+mynn_fidelity_string(f::MYNNFidelity) =
+    isempty(f.names) ? "fortran" : join(string.(f.names), ",")
+
+"""
+    parse_mynn_fidelity(s::AbstractString) -> Union{Symbol,Vector{Symbol}}
+
+`options[:mynn_fidelity]` from a STRING, for the environment knobs
+(`SCYTHE_OWB_MYNN_FIDELITY`, `SCYTHE_TC_MYNN_FIDELITY`) and for reading a run's own
+`fidelity` attribute back. `"fortran"` (and the empty string) give `:fortran`; anything
+else is split on commas into a `Vector{Symbol}`, which
+[`validate_mynn_options`](@ref) then checks -- a typo dies at setup, not silently.
+"""
+function parse_mynn_fidelity(s::AbstractString)
+    t = strip(s)
+    (isempty(t) || t == "fortran") && return :fortran
+    return Symbol[Symbol(strip(p)) for p in split(t, ',') if !isempty(strip(p))]
+end
 """
     MYNNState
 
@@ -208,7 +334,9 @@ exchange coefficient hit `physical_params[:mynn_K_max]`, and the vertical diffus
 exceeded its stability bound. `n_gate`, `n_stall`, `n_plume` are the S7 plume counts
 (gate passed / passed but every plume stalled at the first interface / a mass flux was
 actually produced), in COLUMN-UPDATES. All six are NOT `const`: they are the reason a
-clamp, and a plume that never fires, is never silent.
+clamp, and a plume that never fires, is never silent. `n_hfx_clip`, `n_qfx_clip` count
+how often the Fortran wrapper's surface-flux clips (`:flux_clip`) would have bitten,
+whether or not that deviation is on.
 """
 mutable struct MYNNState
     # ── resolved configuration (see validate_mynn_options) ──
@@ -218,7 +346,7 @@ mutable struct MYNNState
     const edmf_mom::Bool            # do the plumes carry momentum? (:mynn_edmf_mom)
     const scale_aware::Bool
     const init_mode::Symbol         # :taper | :zero
-    const fidelity::Symbol          # :fortran
+    const fidelity::MYNNFidelity    # the resolved deviation switches (MYNN_DEVIATIONS)
     const water_carry::Symbol       # :flux | :fixed_T
     const mix_numbers::Bool         # mix the two-moment rain NUMBER? (:mynn_mix_numbers)
     const interval_steps::Int       # BL cadence, in model steps
@@ -291,6 +419,11 @@ mutable struct MYNNState
     const kpbl::Vector{Int}
     const ust::Vector{Float64}
     const rmol::Vector{Float64}
+    # `pmz = phim(zeta) - zeta`, the surface-layer momentum stability function, per
+    # column. Written whenever `check_values` or the `:pdk1` deviation asks for it and
+    # read ONLY by `:pdk1` (`_mynn_apply_column!` builds its log-layer surface
+    # production from it); under `:fortran` it is written by nothing and read by nothing.
+    const pmz::Vector{Float64}
     const last_update_step::Vector{Int}
     # ── column geometry, built ONCE from the tile's mish (identical for every column) ──
     const z_lay::Vector{Float64}     # mish heights [m]
@@ -321,6 +454,12 @@ mutable struct MYNNState
     const n_clamp_col::Vector{Int}
     const n_capK_col::Vector{Int}
     const n_diffnum_col::Vector{Int}
+    # How often the Fortran wrapper's flux clips (harness README item 7) would have
+    # bitten, in COLUMN-UPDATES. Counted on EVERY run, `:flux_clip` or not, so a run
+    # always reports whether the deviation would have changed anything; the clip itself
+    # happens only under the switch.
+    const n_hfx_clip_col::Vector{Int}
+    const n_qfx_clip_col::Vector{Int}
     # ── per-thread scratch and the host constants ──
     const work::Vector{MYNNWork}
     # Thread `t`'s per-column apply scratch. Held HERE rather than appended to
@@ -339,6 +478,8 @@ mutable struct MYNNState
     n_gate::Int
     n_stall::Int
     n_plume::Int
+    n_hfx_clip::Int
+    n_qfx_clip::Int
 end
 
 """
@@ -355,7 +496,7 @@ function MYNNState(;
         edmf_mom::Bool = true,
         scale_aware::Bool = true,
         init_mode::Symbol = :taper,
-        fidelity::Symbol = :fortran,
+        fidelity::MYNNFidelity = MYNN_FORTRAN_FIDELITY,
         water_carry::Symbol = :flux,
         mix_numbers::Bool = true,
         interval_steps::Int = 1,
@@ -401,6 +542,7 @@ function MYNNState(;
         kpbl::Vector{Int} = Int[],
         ust::Vector{Float64} = Float64[],
         rmol::Vector{Float64} = Float64[],
+        pmz::Vector{Float64} = Float64[],
         last_update_step::Vector{Int} = Int[],
         z_lay::Vector{Float64} = Float64[],
         dz::Vector{Float64} = Float64[],
@@ -422,6 +564,8 @@ function MYNNState(;
         n_clamp_col::Vector{Int} = Int[],
         n_capK_col::Vector{Int} = Int[],
         n_diffnum_col::Vector{Int} = Int[],
+        n_hfx_clip_col::Vector{Int} = Int[],
+        n_qfx_clip_col::Vector{Int} = Int[],
         work::Vector{MYNNWork} = MYNNWork[],
         colscratch::Vector{MYNNColumnScratch} = MYNNColumnScratch[],
         ework::Vector{EDMFWork} = EDMFWork[],
@@ -431,7 +575,9 @@ function MYNNState(;
         n_diffnum::Int = 0,
         n_gate::Int = 0,
         n_stall::Int = 0,
-        n_plume::Int = 0)
+        n_plume::Int = 0,
+        n_hfx_clip::Int = 0,
+        n_qfx_clip::Int = 0)
     return MYNNState(active, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
                      water_carry, mix_numbers,
                      interval_steps, ncol, kDim, K_max, output, trace, check_values,
@@ -439,12 +585,14 @@ function MYNNState(;
                      gh, gm, qsq, g_Ps, g_Ps_mynn, g_Pb, g_eps, g_tke_transport,
                      s_aw, s_aw_st, s_aw_qw, s_aw_qv, s_aw_u, s_aw_v, s_aw_e,
                      plume_ktop, plume_ztop, aw_max, n_gate_col, n_stall_col, n_plume_col,
-                     pblh, kpbl, ust, rmol, last_update_step,
+                     pblh, kpbl, ust, rmol, pmz, last_update_step,
                      z_lay, dz, zw, w_mish, dx, z_top, dz_cell, dz_min, ts,
                      bdry_E, D_gal, D_mish, ts_tau, K_m_max, K_h_max, Ps_disc, Ps_mynn,
                      n_clamp_col, n_capK_col, n_diffnum_col,
+                     n_hfx_clip_col, n_qfx_clip_col,
                      work, colscratch, ework, constants,
-                     n_clamp_e, n_cap_K, n_diffnum, n_gate, n_stall, n_plume)
+                     n_clamp_e, n_cap_K, n_diffnum, n_gate, n_stall, n_plume,
+                     n_hfx_clip, n_qfx_clip)
 end
 
 """
@@ -475,12 +623,56 @@ const MYNN_OPTION_KEYS = Set{Symbol}((
     :mynn_trace, :mynn_check_values))
 
 const MYNN_INIT_MODES = (:taper, :zero)
+# The Symbol values `:mynn_fidelity` accepts. `:fortran` is the verbatim closure and the
+# only single-Symbol setting there is; every DEVIATION is named individually, as a
+# `Vector{Symbol}` drawn from `MYNN_DEVIATIONS` (an empty vector is `:fortran`). A bundle
+# Symbol -- `:scythe`, say -- would be a claim that a particular set of deviations is the
+# better model, and it gets added here only when the evidence says so.
 const MYNN_FIDELITIES = (:fortran,)
 const MYNN_WATER_CARRIES = (:flux, :fixed_T)
 
 _mynn_check(value, allowed, key) = value in allowed || error(
     "options[:$key] = :$(value) is not recognized; use " *
     join(string.(":", allowed), ", ", " or "))
+
+"""
+    _mynn_resolve_fidelity(value, options) -> MYNNFidelity
+
+`options[:mynn_fidelity]` -> the resolved switch set. Accepts `:fortran` (the default) and
+a `Vector{Symbol}` of [`MYNN_DEVIATIONS`](@ref) names; an empty vector is `:fortran`.
+Anything else -- another Symbol, a vector with a non-Symbol element, a string -- raises
+with the valid names, as does an unknown or repeated deviation
+([`MYNNFidelity`](@ref)).
+
+`:rmol_sfc` additionally REQUIRES `options[:sfc_stability] = true`: without the
+Monin-Obukhov solve `surface_exchange` returns `inv_L = 0.0` identically
+(src/mc_surface_layer.jl), so the deviation would not replace the closure's `1/L` with a
+better one -- it would replace it with a neutral surface layer, and report that as a
+measurement of the deviation.
+"""
+function _mynn_resolve_fidelity(value, options)
+    fid = if value isa Symbol
+        _mynn_check(value, MYNN_FIDELITIES, "mynn_fidelity")
+        MYNN_FORTRAN_FIDELITY
+    elseif value isa AbstractVector
+        all(x -> x isa Symbol, value) || error(
+            "options[:mynn_fidelity] as a list must hold Symbols (got " *
+            "$(repr(value))); the deviations are " *
+            join(string.(":", MYNN_DEVIATIONS), ", ", " and "))
+        MYNNFidelity(collect(Symbol, value))
+    else
+        error("options[:mynn_fidelity] must be :fortran or a Vector{Symbol} of " *
+              join(string.(":", MYNN_DEVIATIONS), ", ", " and ") *
+              " (got $(repr(value)))")
+    end
+    (!fid.rmol_sfc || get(options, :sfc_stability, false) === true) || error(
+        "options[:mynn_fidelity] names :rmol_sfc, which takes 1/L from " *
+        "surface_exchange's Monin-Obukhov solve -- but options[:sfc_stability] is not " *
+        "true, so that inv_L is identically 0.0 and the deviation would measure a " *
+        "neutral surface layer instead of a better one. Set " *
+        "options[:sfc_stability] = true, or drop :rmol_sfc")
+    return fid
+end
 
 """
     validate_mynn_options(options, physical_params, equation_set, ts, kDim)
@@ -503,8 +695,12 @@ Errors:
   (`moist_compressible_*`) set -- nothing else carries the `rho_e` slot;
 - `:mynn_closure` other than 2.5 (2.6 is a later stage);
 - `:mynn_edmf` other than 0/1, or `= 1` on a column shorter than four layers;
-- an unrecognized `:mynn_init`, `:mynn_fidelity` or `:mynn_water_carry`, or a
-  non-`Bool` `:mynn_mix_numbers`;
+- an unrecognized `:mynn_init` or `:mynn_water_carry`, or a non-`Bool`
+  `:mynn_mix_numbers`;
+- a `:mynn_fidelity` that is neither `:fortran` nor a `Vector{Symbol}` of
+  [`MYNN_DEVIATIONS`](@ref) names, one that repeats a deviation, or one that names
+  `:rmol_sfc` without `options[:sfc_stability] = true`
+  ([`_mynn_resolve_fidelity`](@ref));
 - a non-positive `:mynn_interval`, or one SHORTER than the model timestep (the cadence is
   in seconds so it is nest-invariant; a cadence below one step is not a cadence);
 - a non-positive `physical_params[:mynn_K_max]`.
@@ -521,7 +717,6 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     edmf_mom = get(options, :mynn_edmf_mom, true)::Bool
     scale_aware = get(options, :mynn_scale_aware, true)::Bool
     init_mode = get(options, :mynn_init, :taper)
-    fidelity = get(options, :mynn_fidelity, :fortran)
     water_carry = get(options, :mynn_water_carry, :flux)
     # Mix the two-moment rain NUMBER alongside the rain MASS (S8). Default ON, because
     # mixing a mass without its number is a statement about the drop size: `K_h ∂z ρ_r`
@@ -546,7 +741,11 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
     check_values = get(options, :mynn_check_values, false)::Bool
     K_max = Float64(get(physical_params, :mynn_K_max, Inf))
 
-    resolved = (; active = on, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
+    # The OFF path is resolved BEFORE anything can raise, and takes the no-deviation
+    # fidelity unexamined: a run with the closure off must never be able to fail on a
+    # MYNN rule, and nothing reads the field on that path.
+    resolved = (; active = on, closure, edmf, edmf_mom, scale_aware, init_mode,
+                fidelity = MYNN_FORTRAN_FIDELITY,
                 water_carry, mix_numbers, interval_steps = 1, K_max, output, trace,
                 check_values)
     on || return resolved
@@ -576,7 +775,7 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
         "$kDim); DMP_mf integrates the plumes on kts+1 : kte-1")
 
     _mynn_check(init_mode, MYNN_INIT_MODES, "mynn_init")
-    _mynn_check(fidelity, MYNN_FIDELITIES, "mynn_fidelity")
+    fidelity = _mynn_resolve_fidelity(get(options, :mynn_fidelity, :fortran), options)
     _mynn_check(water_carry, MYNN_WATER_CARRIES, "mynn_water_carry")
 
     ts > 0.0 || error("validate_mynn_options: the model timestep must be positive, " *
@@ -619,7 +818,7 @@ function mynn_setup_line(model::ModelParameters, cfg, ncol::Int, kDim::Int)
             "edmf_mom=$(cfg.edmf_mom) " *
             "scale_aware=$(cfg.scale_aware) init=:$(cfg.init_mode) " *
             "water_carry=:$(cfg.water_carry) mix_numbers=$(cfg.mix_numbers) " *
-            "fidelity=:$(cfg.fidelity) " *
+            "fidelity=$(mynn_fidelity_string(cfg.fidelity)) " *
             "interval=$(interval_s) s (= $(cfg.interval_steps) steps at ts=$(model.ts) s) " *
             "K_max=$(cfg.K_max) m^2/s columns=$(ncol) layers=$(kDim)")
     return nothing
@@ -721,12 +920,14 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         n_gate_col = zeros(Int, ncol), n_stall_col = zeros(Int, ncol),
         n_plume_col = zeros(Int, ncol),
         pblh = zcol(), kpbl = zeros(Int, ncol), ust = zcol(), rmol = zcol(),
+        pmz = zcol(),
         z_lay = z_lay, dz = dz, zw = zw, w_mish = w_mish, dx = dx, z_top = z_top,
         dz_cell = dz_cell, dz_min = dz_min, ts = Float64(model.ts),
         bdry_E = zcol(), D_gal = zcol(), D_mish = zcol(), ts_tau = zcol(),
         K_m_max = zcol(), K_h_max = zcol(), Ps_disc = zcol(), Ps_mynn = zcol(),
         n_clamp_col = zeros(Int, ncol), n_capK_col = zeros(Int, ncol),
         n_diffnum_col = zeros(Int, ncol),
+        n_hfx_clip_col = zeros(Int, ncol), n_qfx_clip_col = zeros(Int, ncol),
         # `typemin(Int)` rather than 0: "no call yet" must be distinguishable from
         # "called at step 0" so the first step forces an update whatever the cadence is
         # (the `RadiationState.last_call_step` argument).

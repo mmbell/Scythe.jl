@@ -258,3 +258,14 @@ const MYNN_MINDZ = 300.0     # :1904  min (half) transition-layer depth
 const MYNN_ZSLH = 100.0      # :1907  max height correlated to surface conditions (m)
 const MYNN_CSL  = 2.0        # :1908  constant of proportionality to L, O(1)
 const MYNN_CTAU = 1000.0     # :1915  constant for tau_cloud
+
+# ── 4. The mynnedmf_wrapper surface-flux clips ────────────────────────────────
+#
+# NOT constants of the closure: these are the limits `mynnedmf_wrapper` puts on the
+# surface fluxes it hands `mynn_bl_driver` (tools/mynn_fortran_driver/README.md item 7),
+# and they are the `:flux_clip` fidelity deviation (`MYNN_DEVIATIONS`). Named here so the
+# wired coupling, the offline column step and the counters all clip at the SAME numbers.
+const MYNN_HFX_MIN = -500.0    # W m-2
+const MYNN_HFX_MAX = 1200.0    # W m-2
+const MYNN_QFX_MIN = -2.0e-4   # kg m-2 s-1
+const MYNN_QFX_MAX = 5.0e-4    # kg m-2 s-1

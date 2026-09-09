@@ -35,8 +35,21 @@ Surface layer (shared by BOTH `louis` and `mynn` — resolved OUTSIDE the BL bra
 Louis path's options dict stays byte-identical to a pre-S1b run; only a non-default value
 adds a key.
 
-`SCYTHE_TC_MYNN_FIDELITY` — *placeholder: arrives with the fidelity stage, not yet wired
-to a TC env knob.*
+`SCYTHE_TC_MYNN_FIDELITY` — the named deviations from the verbatim-Fortran closure
+(`Scythe.MYNN_DEVIATIONS`), comma separated, e.g.
+`SCYTHE_TC_MYNN_FIDELITY=gtr_local,pdk1`. Unset or `fortran` (the default) adds no
+`:mynn_fidelity` key at all, so the standard run is byte-identical to a pre-F1 one. The
+seven names are `gtr_local` (`g/theta_v` per level instead of `g/300 K`), `K_interface`
+(`K` from the wall average of `el*S` instead of the colocated product), `sqfac1`
+(`K_e = K_m` instead of `3 K_m`), `pdk1` (the Fortran log-layer surface TKE production
+instead of the drag work, with the difference routed to heating), `exner_single`
+(`th_sfc = SST/exner(1)`, not divided twice), `rmol_sfc` (`1/L` from
+`surface_exchange`'s Monin–Obukhov solve — REQUIRES `SCYTHE_TC_SFC_STAB=1`, and setup
+refuses it otherwise) and `flux_clip` (the wrapper's `hfx`/`qfx` limits on what the
+closure sees; the model's own surface delivery stays unclipped). The value is validated
+at setup and printed on the `TC boundary layer:` line, and it is carried into every
+output file's `mynn_fidelity` attribute. The clip counters `mynn_n_hfx_clip` /
+`mynn_n_qfx_clip` are reported on the census line on EVERY run, `flux_clip` or not.
 
 Ice: the MYNN closure runs with ISHMAEL (ice legs, S8 e007c81); the Louis scheme is still
 refused with ice. The TC has never run ice with either.
