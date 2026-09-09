@@ -157,3 +157,11 @@ file exactly as it would from a comprehensive one. For a NEW run, skip straight 
 sidecar itself (rather than the merged fields) is wanted. Assess as `S10_BL_ASSESSMENT.md`
 did (hourly nest-1 table, census lines, cost), n = 1 in a ±10 m/s oscillating regime is not
 quotable without a repeat.
+
+Assessment is now automated: `julia --project=. tc/tc_bl_assess.jl --indir <run> [--indir
+<run> ...] [--nest N] [--out <md path>] [--clamp-hist]` reads the comprehensive `<t>.nc`
+files directly and prints (or writes) the hourly nest table, provenance block, and — with
+two or more `--indir`s — the options/physical_params diff and a final-time comparison, the
+same structure `S10_BL_ASSESSMENT.md` was built by hand from. `tc/output/S10_BL_ASSESSMENT_FINE.md`
+is the template for the fine 24 h pair's write-up; see `reference/HANDOFF_S11_RCE.md` for
+the full S10c close-out and the RCE (S11) starting points.
