@@ -179,6 +179,17 @@ function missing_physics_error(path, varname, flag, groupname)
     end
 end
 
+"""`true` when `ds` carries `varname`; `false` when this is a comprehensive frame written
+before the scheme's first call (the t = 0 file: `physics_groups` says the schemes have not
+run yet), which is drawn without the overlay; otherwise the run had the scheme off and
+`missing_physics_error` fires."""
+function physics_available(ds, path, varname, flag, groupname)
+    haskey(ds, varname) && return true
+    pg = get(ds.attrib, "physics_groups", "none")
+    startswith(pg, "none (schemes not yet run)") && return false
+    missing_physics_error(path, varname, flag, groupname)
+end
+
 # ── Fixed contour/colour scales (shared across nests and frames) ──────────────
 refl_levels = -15.0:5.0:60.0                 # dBZ
 p_levels = -1500.0:50:250.0
@@ -197,8 +208,8 @@ if showrad
     absnet = Float64[]
     for t in times, nest in nests
         NCDataset(catalog[t][nest], "r") do ds
-            haskey(ds, "dT_net") ||
-                missing_physics_error(catalog[t][nest], "dT_net", "--rad", "radiation")
+            physics_available(ds, catalog[t][nest], "dT_net", "--rad", "radiation") ||
+                return
             net = readfield(ds, "dT_net")
             append!(absnet, abs.(filter(isfinite, vec(net))))
             fo = filter(isfinite, coalesce.(Array(ds["olr"])[1, :], NaN))
@@ -229,8 +240,8 @@ pblh_lo = Inf; pblh_hi = -Inf
 if showbl
     for t in times, nest in nests
         NCDataset(catalog[t][nest], "r") do ds
-            haskey(ds, "K_h") ||
-                missing_physics_error(catalog[t][nest], "K_h", "--bl", "MYNN")
+            physics_available(ds, catalog[t][nest], "K_h", "--bl", "MYNN") ||
+                return
             Kh = readfield(ds, "K_h")
             global kh_max = max(kh_max, maximum(x -> isnan(x) ? -Inf : x, Kh))
             fp = filter(isfinite, coalesce.(Array(ds["mynn_pblh"])[1, :], NaN))
@@ -318,7 +329,7 @@ function draw_frame(t, framepath)
 
             # Radiation, from the merged sidecar fields in the same derived file. Same
             # coarsest-first overlay as everything else, so the fine nests draw on top.
-            if showrad
+            if showrad && haskey(ds, "dT_net")   # absent only on the t = 0 frame
                 net = readfield(ds, "dT_net")
                 cf_rad = contourf!(ax_rad, g.r, g.z, net; levels = rad_levels,
                                    extendlow = :auto, extendhigh = :auto,
@@ -329,7 +340,7 @@ function draw_frame(t, framepath)
 
             # MYNN, from the merged sidecar fields in the same derived file. Same
             # coarsest-first overlay as everything else, so the fine nests draw on top.
-            if showbl
+            if showbl && haskey(ds, "K_h")       # absent only on the t = 0 frame
                 Kh = max.(readfield(ds, "K_h"), kh_floor)   # floored for log10
                 cf_bl = contourf!(ax_bl, g.r, g.z, Kh; levels = kh_levels,
                                   colorscale = log10, extendlow = :auto, extendhigh = :auto,
@@ -357,14 +368,14 @@ function draw_frame(t, framepath)
         xlims!(ax_line, 0, rmax)
         pad = 0.05 * max(olr_hi - olr_lo, 1.0)
         ylims!(ax_line, olr_lo - pad, olr_hi + pad)
-        Colorbar(fig[2, 4], cf_rad; label = "K/day")
+        cf_rad === nothing || Colorbar(fig[2, 4], cf_rad; label = "K/day")   # t = 0 frame has none
     end
     if showbl
         xlims!(ax_bl, 0, rmax); ylims!(ax_bl, 0, zmax)
         xlims!(ax_line, 0, rmax)
         pad = 0.05 * max(pblh_hi - pblh_lo, 1.0)
         ylims!(ax_line, pblh_lo - pad, pblh_hi + pad)
-        Colorbar(fig[2, 4], cf_bl; label = "K_h (m²/s)")
+        cf_bl === nothing || Colorbar(fig[2, 4], cf_bl; label = "K_h (m²/s)")   # t = 0 frame has none
     end
     save(framepath, fig)
 end
