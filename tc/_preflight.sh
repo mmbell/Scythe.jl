@@ -42,9 +42,9 @@ println("  Springsteel : required symbols present")
 # itself if the files are missing, which is exactly the failure mode this guards
 # against: a compute node with no network, twenty minutes into a queued job, hanging
 # or erroring on the first radiation call instead of failing here in seconds.
-# Gated on SCYTHE_TC_RAD so a non-radiation run (still the common case through S6)
+# Gated on SCYTHE_TC_RAD (or SCYTHE_RCE_RAD for rce/scythe_rce.sbatch) so a non-radiation run (still the common case through S6)
 # pays nothing extra and is not blocked by an artifact it will never touch.
-rad_arm = get(ENV, "SCYTHE_TC_RAD", "0")
+rad_arm = get(ENV, "SCYTHE_TC_RAD", get(ENV, "SCYTHE_RCE_RAD", "0"))   # TC or RCE wrapper
 if rad_arm != "0" && rad_arm != ""
     using RRTMGP
     missing_artifacts = String[]
