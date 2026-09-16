@@ -181,12 +181,51 @@ each exists to be MEASURED against that default rather than argued about:
     (`n_hfx_clip`/`n_qfx_clip`) are accumulated whether or not the switch is on, so a run
     always reports how often the Fortran would have clipped.
 
-There is deliberately no `:scythe` BUNDLE at this stage: a bundle is a claim that a set
-of deviations is the better model, and no deviation has been measured yet. One gets
-added, with its members named, when the evidence is in.
+A bundle is a claim that a particular SET of deviations is the better model, so it is
+named only on evidence: see [`MYNN_SCYTHE_BUNDLE`](@ref), which the F2 sweep
+(`benchmarks/output/MYNN_FIDELITY_SWEEP.md`) and the write-up's "Departures from the
+Fortran" section (`reference/Scythe_moist_compressible.tex`, sec:fidelity) put together.
 """
 const MYNN_DEVIATIONS = (:gtr_local, :K_interface, :sqfac1, :pdk1, :exner_single,
                          :rmol_sfc, :flux_clip)
+
+"""
+    MYNN_SCYTHE_BUNDLE
+
+The deviations of the `:scythe` fidelity: `:gtr_local`, `:exner_single`, `:pdk1` -- and
+`:rmol_sfc` as well whenever `options[:sfc_stability] === true`, which the resolver adds
+for you ([`_mynn_resolve_fidelity`](@ref)). It is the model's OWN closure, as against the
+verbatim `:fortran` reference; `:fortran` remains the default of every configuration.
+
+The evidence is the F2 sweep (`benchmarks/output/MYNN_FIDELITY_SWEEP.md`, the replay
+tables of §1 and the wired bubble arms of §2) as read in the write-up's "Departures from
+the Fortran" section (`reference/Scythe_moist_compressible.tex`, sec:fidelity):
+
+  * `:gtr_local` -- ADOPT. The local `g/theta_v` is the coefficient the model's own energy
+    budget is written with; the Fortran's `g/300 K` is a Boussinesq convenience of the
+    original setting and the sweep shows it matters exactly where that setting does not
+    apply (peak `K` down ~50 % in the bubble's convective cloud layers, ~1 % in the
+    boundary layer itself).
+  * `:exner_single` -- ADOPT. The Fortran's double Exner division is a defect of the
+    reference code; correcting it moves nothing by more than 0.03 %.
+  * `:pdk1` -- ADOPT (the one that changes the answer). The log-layer surface production
+    is the physically right closure of the unresolved surface layer; the drag work was a
+    bookkeeping convenience. It cuts the near-surface TKE by ~81 % and the peak
+    diffusivities by ~37 % in the wired bubble, which is why the write-up asks for one
+    hurricane arm before it becomes the DEFAULT -- the bundle exists to be that arm.
+  * `:rmol_sfc` -- ADOPT TOGETHER WITH `options[:sfc_stability]`, as a matter of
+    consistency: the closure and the surface layer should use one `1/L`. It is
+    meaningless without that option (`inv_L` is identically zero there), so without it
+    the bundle is simply the other three -- that is not an error, just a run of the
+    bundle on a model whose surface layer has no Monin-Obukhov solve.
+
+Left OUT, and why: `:K_interface` and `:sqfac1` are a discretisation and a tuning choice
+with no physical argument behind them (the colocated `K` is what the spline discretisation
+imposes; the stability limit `:sqfac1` would relax does not bind anywhere, and the sweep
+shows the smaller `K_e` degrades the TKE field). `:flux_clip` is a host-model safety guard
+whose counters are zero on every column of every run in the campaign.
+"""
+const MYNN_SCYTHE_BUNDLE = (:gtr_local, :exner_single, :pdk1)
 
 """
     MYNNFidelity
@@ -199,6 +238,11 @@ for the setup line, the NetCDF attribute and the tests.
 `sqfac` is a Float64 rather than a Bool because it is a FACTOR: `:sqfac1` sets it to 1.0
 and its absence leaves it at [`MYNN_SQFAC`](@ref) `= 3.0`, so `K_e = fid.sqfac*K_m` is
 the same IEEE product as today's `MYNN_SQFAC*K_m` on the default path.
+
+`bundle` is `:none`, or the name of the BUNDLE the list came from
+([`MYNN_SCYTHE_BUNDLE`](@ref)) when the request was that bundle and nothing else. It is
+labelling only -- it never reaches a kernel, and equality ignores it -- so that the setup
+line and the NetCDF attribute can say `scythe(...)` rather than an anonymous list.
 """
 struct MYNNFidelity
     gtr_local::Bool
@@ -209,26 +253,34 @@ struct MYNNFidelity
     rmol_sfc::Bool
     flux_clip::Bool
     names::Vector{Symbol}
+    bundle::Symbol
 end
 
 "The no-deviation fidelity: verbatim Fortran, and the default of every configuration."
 const MYNN_FORTRAN_FIDELITY = MYNNFidelity(false, false, MYNN_SQFAC, false, false, false,
-                                           false, Symbol[])
+                                           false, Symbol[], :none)
 
 """
-    MYNNFidelity(names::AbstractVector{Symbol}) -> MYNNFidelity
+    MYNNFidelity(names::AbstractVector{Symbol}; bundle = :none) -> MYNNFidelity
 
 Resolve a list of deviation names. An empty list IS `:fortran`. An unrecognized name or a
 repeat raises with the valid list, in the `_mynn_check` style: a misspelled deviation that
 silently did nothing would be a measurement of the control reported as a measurement of
 the treatment.
+
+`names` is always the EXPANDED deviation list, so a bundle is one of these too; the
+bundle NAME (`:scythe`) is expanded by [`_mynn_resolve_fidelity`](@ref) and passed here as
+the `bundle` keyword, for the label only.
 """
-function MYNNFidelity(names::AbstractVector{Symbol})
+function MYNNFidelity(names::AbstractVector{Symbol}; bundle::Symbol = :none)
     seen = Symbol[]
     for nm in names
         nm in MYNN_DEVIATIONS || error(
             "options[:mynn_fidelity] does not have a deviation :$(nm); the deviations " *
             "are " * join(string.(":", MYNN_DEVIATIONS), ", ", " and ") *
+            ", :scythe is the bundle of " *
+            join(string.(":", MYNN_SCYTHE_BUNDLE), ", ", " and ") *
+            " (resolved by validate_mynn_options, not here)" *
             ", and :fortran (or an empty vector) is no deviation at all")
         nm in seen && error(
             "options[:mynn_fidelity] names :$(nm) twice; each deviation is one switch")
@@ -237,7 +289,7 @@ function MYNNFidelity(names::AbstractVector{Symbol})
     return MYNNFidelity(:gtr_local in seen, :K_interface in seen,
                         (:sqfac1 in seen) ? 1.0 : MYNN_SQFAC,
                         :pdk1 in seen, :exner_single in seen, :rmol_sfc in seen,
-                        :flux_clip in seen, seen)
+                        :flux_clip in seen, seen, bundle)
 end
 
 Base.:(==)(a::MYNNFidelity, b::MYNNFidelity) = a.names == b.names
@@ -245,26 +297,41 @@ Base.:(==)(a::MYNNFidelity, b::MYNNFidelity) = a.names == b.names
 """
     mynn_fidelity_string(f::MYNNFidelity) -> String
 
-`"fortran"` for the no-deviation default, otherwise the comma-joined deviation names --
-the form the setup line prints, the NetCDF `fidelity` attribute carries and
-[`parse_mynn_fidelity`](@ref) reads back.
+`"fortran"` for the no-deviation default, `"scythe(gtr_local,exner_single,pdk1)"` -- the
+bundle name with the members it actually expanded to, in parentheses -- for a bundle, and
+otherwise the comma-joined deviation names. This is the form the setup line prints, the
+NetCDF `fidelity` attribute carries and [`parse_mynn_fidelity`](@ref) reads back; the
+parenthesised list is informational (it records what `:scythe` meant on THAT run, with or
+without `:rmol_sfc`), and reading it back gives the bundle NAME again.
 """
-mynn_fidelity_string(f::MYNNFidelity) =
-    isempty(f.names) ? "fortran" : join(string.(f.names), ",")
+function mynn_fidelity_string(f::MYNNFidelity)
+    isempty(f.names) && return "fortran"
+    f.bundle === :none && return join(string.(f.names), ",")
+    return string(f.bundle) * "(" * join(string.(f.names), ",") * ")"
+end
 
 """
     parse_mynn_fidelity(s::AbstractString) -> Union{Symbol,Vector{Symbol}}
 
 `options[:mynn_fidelity]` from a STRING, for the environment knobs
 (`SCYTHE_OWB_MYNN_FIDELITY`, `SCYTHE_TC_MYNN_FIDELITY`) and for reading a run's own
-`fidelity` attribute back. `"fortran"` (and the empty string) give `:fortran`; anything
-else is split on commas into a `Vector{Symbol}`, which
-[`validate_mynn_options`](@ref) then checks -- a typo dies at setup, not silently.
+`fidelity` attribute back. A single name that is one of [`MYNN_FIDELITIES`](@ref)
+(`"fortran"`, `"scythe"`) -- and the empty string -- gives that Symbol; anything else is
+split on commas into a `Vector{Symbol}`, which [`validate_mynn_options`](@ref) then checks
+-- a typo dies at setup, not silently.
+
+A parenthesised member list is stripped before anything else, so the attribute
+`"scythe(gtr_local,exner_single,pdk1,rmol_sfc)"` that a run wrote round-trips back to
+`:scythe` (the members are re-derived from that run's own `options[:sfc_stability]`, which
+is where they came from in the first place), and `"scythe,K_interface"` gives
+`[:scythe, :K_interface]`.
 """
 function parse_mynn_fidelity(s::AbstractString)
-    t = strip(s)
-    (isempty(t) || t == "fortran") && return :fortran
-    return Symbol[Symbol(strip(p)) for p in split(t, ',') if !isempty(strip(p))]
+    t = strip(replace(strip(s), r"\([^)]*\)" => ""))
+    isempty(t) && return :fortran
+    parts = Symbol[Symbol(strip(p)) for p in split(t, ',') if !isempty(strip(p))]
+    (length(parts) == 1 && parts[1] in MYNN_FIDELITIES) && return parts[1]
+    return parts
 end
 """
     MYNNState
@@ -624,11 +691,13 @@ const MYNN_OPTION_KEYS = Set{Symbol}((
 
 const MYNN_INIT_MODES = (:taper, :zero)
 # The Symbol values `:mynn_fidelity` accepts. `:fortran` is the verbatim closure and the
-# only single-Symbol setting there is; every DEVIATION is named individually, as a
-# `Vector{Symbol}` drawn from `MYNN_DEVIATIONS` (an empty vector is `:fortran`). A bundle
-# Symbol -- `:scythe`, say -- would be a claim that a particular set of deviations is the
-# better model, and it gets added here only when the evidence says so.
-const MYNN_FIDELITIES = (:fortran,)
+# DEFAULT; `:scythe` is the one BUNDLE, `MYNN_SCYTHE_BUNDLE` = :gtr_local, :exner_single,
+# :pdk1 (plus :rmol_sfc under `options[:sfc_stability]`), named on the evidence of the F2
+# sweep (benchmarks/output/MYNN_FIDELITY_SWEEP.md) as read in the write-up's "Departures
+# from the Fortran" section. Every DEVIATION is also available individually, as a
+# `Vector{Symbol}` drawn from `MYNN_DEVIATIONS` (an empty vector is `:fortran`), and
+# `:scythe` may appear in such a vector, where it expands in place.
+const MYNN_FIDELITIES = (:fortran, :scythe)
 const MYNN_WATER_CARRIES = (:flux, :fixed_T)
 
 _mynn_check(value, allowed, key) = value in allowed || error(
@@ -638,11 +707,20 @@ _mynn_check(value, allowed, key) = value in allowed || error(
 """
     _mynn_resolve_fidelity(value, options) -> MYNNFidelity
 
-`options[:mynn_fidelity]` -> the resolved switch set. Accepts `:fortran` (the default) and
-a `Vector{Symbol}` of [`MYNN_DEVIATIONS`](@ref) names; an empty vector is `:fortran`.
-Anything else -- another Symbol, a vector with a non-Symbol element, a string -- raises
-with the valid names, as does an unknown or repeated deviation
+`options[:mynn_fidelity]` -> the resolved switch set. Accepts `:fortran` (the default),
+the bundle `:scythe` ([`MYNN_SCYTHE_BUNDLE`](@ref)) and a `Vector{Symbol}` of
+[`MYNN_DEVIATIONS`](@ref) names, which may itself contain `:scythe`; an empty vector is
+`:fortran`. Anything else -- another Symbol, a vector with a non-Symbol element, a
+string -- raises with the valid names, as does an unknown or repeated deviation
 ([`MYNNFidelity`](@ref)).
+
+The bundle EXPANDS here, into `MYNN_SCYTHE_BUNDLE` plus `:rmol_sfc` when
+`options[:sfc_stability] === true` (the write-up recommends that deviation "together with
+that option"; without the option it is meaningless, and its absence is not an error --
+the bundle is then the other three). What comes out is an ordinary deviation list, so
+`:scythe` under `:sfc_stability` IS `[:gtr_local, :exner_single, :pdk1, :rmol_sfc]`, `==`
+and all. A repeat AFTER expansion is the usual error: `[:scythe, :pdk1]` names `:pdk1`
+twice.
 
 `:rmol_sfc` additionally REQUIRES `options[:sfc_stability] = true`: without the
 Monin-Obukhov solve `surface_exchange` returns `inv_L = 0.0` identically
@@ -651,18 +729,37 @@ better one -- it would replace it with a neutral surface layer, and report that 
 measurement of the deviation.
 """
 function _mynn_resolve_fidelity(value, options)
+    # `MYNN_SCYTHE_BUNDLE` as this configuration spells it: the write-up adopts
+    # `:rmol_sfc` "together with" the Monin-Obukhov surface layer, so it joins only when
+    # that option is on. Without it the bundle is the other three -- not an error.
+    scythe_members() = (get(options, :sfc_stability, false) === true) ?
+        Symbol[MYNN_SCYTHE_BUNDLE..., :rmol_sfc] : Symbol[MYNN_SCYTHE_BUNDLE...]
     fid = if value isa Symbol
         _mynn_check(value, MYNN_FIDELITIES, "mynn_fidelity")
-        MYNN_FORTRAN_FIDELITY
+        value === :scythe ? MYNNFidelity(scythe_members(); bundle = :scythe) :
+                            MYNN_FORTRAN_FIDELITY
     elseif value isa AbstractVector
         all(x -> x isa Symbol, value) || error(
             "options[:mynn_fidelity] as a list must hold Symbols (got " *
             "$(repr(value))); the deviations are " *
-            join(string.(":", MYNN_DEVIATIONS), ", ", " and "))
-        MYNNFidelity(collect(Symbol, value))
+            join(string.(":", MYNN_DEVIATIONS), ", ", " and ") *
+            ", plus the bundle :scythe")
+        v = collect(Symbol, value)
+        if :scythe in v
+            # Expanded IN PLACE, extras kept, and the bundle label survives only when the
+            # request was the bundle and nothing else -- so a mixed list writes (and
+            # reads back) as the plain deviation list it is.
+            expanded = Symbol[]
+            for nm in v
+                nm === :scythe ? append!(expanded, scythe_members()) : push!(expanded, nm)
+            end
+            MYNNFidelity(expanded; bundle = (length(v) == 1 ? :scythe : :none))
+        else
+            MYNNFidelity(v)
+        end
     else
-        error("options[:mynn_fidelity] must be :fortran or a Vector{Symbol} of " *
-              join(string.(":", MYNN_DEVIATIONS), ", ", " and ") *
+        error("options[:mynn_fidelity] must be :fortran, :scythe, or a Vector{Symbol} " *
+              "of " * join(string.(":", MYNN_DEVIATIONS), ", ", " and ") *
               " (got $(repr(value)))")
     end
     (!fid.rmol_sfc || get(options, :sfc_stability, false) === true) || error(
@@ -697,8 +794,10 @@ Errors:
 - `:mynn_edmf` other than 0/1, or `= 1` on a column shorter than four layers;
 - an unrecognized `:mynn_init` or `:mynn_water_carry`, or a non-`Bool`
   `:mynn_mix_numbers`;
-- a `:mynn_fidelity` that is neither `:fortran` nor a `Vector{Symbol}` of
-  [`MYNN_DEVIATIONS`](@ref) names, one that repeats a deviation, or one that names
+- a `:mynn_fidelity` that is none of `:fortran`, the bundle `:scythe`
+  ([`MYNN_SCYTHE_BUNDLE`](@ref)) and a `Vector{Symbol}` of
+  [`MYNN_DEVIATIONS`](@ref) names, one that repeats a deviation (after the bundle
+  expands), or one that names
   `:rmol_sfc` without `options[:sfc_stability] = true`
   ([`_mynn_resolve_fidelity`](@ref));
 - a non-positive `:mynn_interval`, or one SHORTER than the model timestep (the cadence is

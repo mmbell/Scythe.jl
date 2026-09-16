@@ -51,7 +51,8 @@ after every fixed slot and after the vapour, so slots 1-9 and `rho_v` keep the s
 indices on both tiles.
 
 `fidelity` (F1) is `nothing` for "no `:mynn_fidelity` key at all", `:fortran` for the
-key set to its default, or a `Vector{Symbol}` of `Scythe.MYNN_DEVIATIONS` names.
+key set to its default, the bundle `:scythe` (F3, `Scythe.MYNN_SCYTHE_BUNDLE`), or a
+`Vector{Symbol}` of `Scythe.MYNN_DEVIATIONS` names.
 `sfc_stability` turns the Monin-Obukhov surface layer on -- which `:rmol_sfc` requires,
 and which is set OUTSIDE the `mynn` branch because the surface layer is shared. `Ck` is
 the enthalpy exchange coefficient, exposed so a test can drive the surface heat flux past

@@ -9,6 +9,19 @@
 #   tc/submit_s10_pair.sh --calibrate    # submit ONLY the 1 h fine calibration job
 #   tc/submit_s10_pair.sh --pair         # submit ONLY the three 24 h arms
 #   tc/submit_s10_pair.sh --calibrate --pair   # submit all four jobs
+#   tc/submit_s10_pair.sh --scythe       # ADD the `scythe`-fidelity 24 h arm: printed on
+#                                         # a dry run, and submitted with --pair. It is a
+#                                         # MODIFIER, not a mode -- on its own it still
+#                                         # submits nothing, exactly like the bare script.
+#
+# The `scythe` arm (--scythe) is the fourth 24 h arm: `SCYTHE_TC_MYNN_FIDELITY=scythe`
+# plus `SCYTHE_TC_SFC_STAB=1`, i.e. Scythe's own closure (`Scythe.MYNN_SCYTHE_BUNDLE`:
+# gtr_local, exner_single, pdk1 and, under that surface-layer option, rmol_sfc) against
+# the same `mynn` arm's verbatim Fortran. It exists because the write-up
+# (reference/Scythe_moist_compressible.tex, "Departures from the Fortran") adopts `pdk1`
+# only "after one hurricane arm": it cuts the near-surface TKE by a factor of five and the
+# mixing by a third, and the hurricane's spin-up is set by the boundary-layer inflow. Its
+# comparison run is MYNN_CMD (tc_s10_24h_mynn), not LOUIS_CMD.
 #
 # WALL-TIME NOTE (tc/MYNN_RUNS.md "Runs made"): the COARSE 6 h pair took 40 min (louis)
 # / 52 min (mynn) at JULIA_NUM_THREADS=4 on a laptop. FINE is ~11x the per-simulated-
@@ -43,11 +56,14 @@ SBATCH="tc/scythe_tc_multinode.sbatch"
 
 do_calibrate=0
 do_pair=0
+do_scythe=0
 for a in "$@"; do
   case "$a" in
     --calibrate) do_calibrate=1 ;;
     --pair)      do_pair=1 ;;
-    *) echo "Unknown argument: $a (use --calibrate and/or --pair)" >&2; exit 2 ;;
+    --scythe)    do_scythe=1 ;;
+    *) echo "Unknown argument: $a (use --calibrate and/or --pair, plus --scythe)" >&2
+       exit 2 ;;
   esac
 done
 dry_run=1
@@ -58,6 +74,7 @@ CAL_CMD=(sbatch --export=ALL,SCYTHE_TC_RES=fine,SCYTHE_TC_BL=mynn,CSV=1,SCYTHE_T
 LOUIS_CMD=(sbatch --export=ALL,SCYTHE_TC_RES=fine,SCYTHE_TC_BL=louis,CSV=1,SCYTHE_TC_OUTDIR="$SCYTHE/tc/output/tc_s10_24h_louis" "$SBATCH" 86400)
 MYNN_CMD=(sbatch --export=ALL,SCYTHE_TC_RES=fine,SCYTHE_TC_BL=mynn,SCYTHE_TC_MYNN_EDMF=0,CSV=1,SCYTHE_TC_OUTDIR="$SCYTHE/tc/output/tc_s10_24h_mynn" "$SBATCH" 86400)
 EDMF_CMD=(sbatch --export=ALL,SCYTHE_TC_RES=fine,SCYTHE_TC_BL=mynn,SCYTHE_TC_MYNN_EDMF=1,CSV=1,SCYTHE_TC_OUTDIR="$SCYTHE/tc/output/tc_s10_24h_mynn_edmf" "$SBATCH" 86400)
+SCYTHE_CMD=(sbatch --export=ALL,SCYTHE_TC_RES=fine,SCYTHE_TC_BL=mynn,SCYTHE_TC_MYNN_EDMF=0,SCYTHE_TC_MYNN_FIDELITY=scythe,SCYTHE_TC_SFC_STAB=1,CSV=1,SCYTHE_TC_OUTDIR="$SCYTHE/tc/output/tc_s10_24h_mynn_scythe" "$SBATCH" 86400)
 
 print_cmd() { echo "$*"; }
 
@@ -69,10 +86,17 @@ echo "# the definitive pair (+ EDMF arm), 24 h, fine, --csv for the replay-harne
 print_cmd "${LOUIS_CMD[@]}"
 print_cmd "${MYNN_CMD[@]}"
 print_cmd "${EDMF_CMD[@]}"
+if [ "$do_scythe" = "1" ]; then
+  echo
+  echo "# the scythe-fidelity arm (MYNN_SCYTHE_BUNDLE + the Monin-Obukhov surface layer),"
+  echo "# to be read against tc_s10_24h_mynn"
+  print_cmd "${SCYTHE_CMD[@]}"
+fi
 
 if [ "$dry_run" = "1" ]; then
   echo
-  echo "# (dry run -- nothing submitted; pass --calibrate and/or --pair to submit)"
+  echo "# (dry run -- nothing submitted; pass --calibrate and/or --pair to submit;"
+  echo "#  --scythe on its own only ADDS the scythe arm to what is printed)"
   exit 0
 fi
 
@@ -88,4 +112,8 @@ if [ "$do_pair" = "1" ]; then
   "${LOUIS_CMD[@]}"
   "${MYNN_CMD[@]}"
   "${EDMF_CMD[@]}"
+  if [ "$do_scythe" = "1" ]; then
+    echo "Submitting the scythe-fidelity 24 h arm..."
+    "${SCYTHE_CMD[@]}"
+  fi
 fi

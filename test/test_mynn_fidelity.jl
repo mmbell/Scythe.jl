@@ -80,7 +80,6 @@ using .MYNNTestFixtures
         # A misspelling is a typo, not a no-op -- the whole reason the option is
         # validated at setup (the Louis-BL and Khdiff_water blockers).
         @test_throws ErrorException V(with([:gtr_locl]))
-        @test_throws ErrorException V(with([:scythe]))
         @test_throws ErrorException V(with([:pdk1, :pdk1]))         # a repeat
         @test_throws ErrorException V(with(Any[:pdk1, "sqfac1"]))   # not all Symbols
         @test_throws ErrorException V(with("gtr_local"))            # not a list
@@ -94,6 +93,47 @@ using .MYNNTestFixtures
         # ...but the OFF path refuses nothing, a broken fidelity included.
         @test V(Dict{Symbol,Any}(:mynn => false,
                                  :mynn_fidelity => :nonsense)).active == false
+
+        # ── the `:scythe` BUNDLE (stage F3) ──────────────────────────────────
+        # `MYNN_SCYTHE_BUNDLE` is a NAME for a measured set (the F2 sweep,
+        # benchmarks/output/MYNN_FIDELITY_SWEEP.md, as read in the write-up's
+        # "Departures from the Fortran"); it must resolve to exactly those deviations
+        # and to nothing else, or a bundle arm would measure something other than what
+        # its name claims.
+        @test Scythe.MYNN_SCYTHE_BUNDLE == (:gtr_local, :exner_single, :pdk1)
+        @test :scythe in Scythe.MYNN_FIDELITIES
+        # Without the Monin-Obukhov surface layer the bundle is the three: `:rmol_sfc`
+        # is meaningless there (inv_L is identically 0.0), and that is not an error.
+        fb = V(with(:scythe)).fidelity
+        @test fb.names == [:gtr_local, :exner_single, :pdk1]
+        @test fb.bundle === :scythe
+        @test fb.gtr_local && fb.exner_single && fb.pdk1
+        @test !fb.rmol_sfc && !fb.K_interface && !fb.flux_clip
+        @test fb.sqfac == Scythe.MYNN_SQFAC
+        # ...with it, `:rmol_sfc` joins -- the write-up adopts it "together with that
+        # option".
+        fbs = V(with(:scythe; sfc_stability = true)).fidelity
+        @test fbs.names == [:gtr_local, :exner_single, :pdk1, :rmol_sfc]
+        @test fbs.bundle === :scythe
+        @test fbs.gtr_local && fbs.exner_single && fbs.pdk1 && fbs.rmol_sfc
+        @test !fbs.K_interface && !fbs.flux_clip && fbs.sqfac == Scythe.MYNN_SQFAC
+        # The bundle IS its members: equality is the switch set, not the label.
+        @test fbs == V(with([:gtr_local, :exner_single, :pdk1, :rmol_sfc];
+                            sfc_stability = true)).fidelity
+        @test fb == V(with([:gtr_local, :exner_single, :pdk1])).fidelity
+        @test fb != fbs
+        # A bundle expands IN PLACE inside a list, keeping the extras...
+        fmix = V(with([:scythe, :K_interface])).fidelity
+        @test fmix.names == [:gtr_local, :exner_single, :pdk1, :K_interface]
+        @test fmix.K_interface && fmix.bundle === :none
+        @test V(with([:K_interface, :scythe])).fidelity.names ==
+              [:K_interface, :gtr_local, :exner_single, :pdk1]
+        # ...and a member named twice is the usual repeat error, AFTER the expansion.
+        @test_throws ErrorException V(with([:scythe, :pdk1]))
+        @test_throws ErrorException V(with([:scythe, :scythe]))
+        # `MYNNFidelity` itself still takes DEVIATIONS only: the bundle is resolved by
+        # the validator, so a raw list holding it is a name it does not have.
+        @test_throws ErrorException Scythe.MYNNFidelity([:scythe])
 
         # String round trip: the setup line, the NetCDF attribute and the env knobs all
         # go through these two.
@@ -109,6 +149,25 @@ using .MYNNTestFixtures
         # A parsed typo still dies at the validator, not silently in the run.
         @test_throws ErrorException Scythe.MYNNFidelity(
             Scythe.parse_mynn_fidelity("gtr_locl"))
+
+        # The bundle writes its NAME and the members it expanded to on that run, and
+        # reads back as the name -- so the NetCDF `fidelity` attribute of a bundle run
+        # round-trips through `read_mynn` into the option that produced it.
+        @test Scythe.mynn_fidelity_string(fb) == "scythe(gtr_local,exner_single,pdk1)"
+        @test Scythe.mynn_fidelity_string(fbs) ==
+              "scythe(gtr_local,exner_single,pdk1,rmol_sfc)"
+        @test Scythe.parse_mynn_fidelity("scythe") === :scythe
+        @test Scythe.parse_mynn_fidelity(Scythe.mynn_fidelity_string(fb)) === :scythe
+        @test Scythe.parse_mynn_fidelity(Scythe.mynn_fidelity_string(fbs)) === :scythe
+        @test V(with(Scythe.parse_mynn_fidelity(Scythe.mynn_fidelity_string(fbs));
+                     sfc_stability = true)).fidelity == fbs
+        # A bundle inside a comma list stays a list, and a MIXED fidelity writes the
+        # plain deviation list it resolved to (nothing is lost on the way back).
+        @test Scythe.parse_mynn_fidelity("scythe,K_interface") == [:scythe, :K_interface]
+        @test Scythe.mynn_fidelity_string(fmix) ==
+              "gtr_local,exner_single,pdk1,K_interface"
+        @test V(with(Scythe.parse_mynn_fidelity(
+                    Scythe.mynn_fidelity_string(fmix)))).fidelity == fmix
     end
 
     @testset "the setup line states the fidelity" begin
@@ -132,6 +191,11 @@ using .MYNNTestFixtures
             @test occursin("fidelity=fortran", say(cfg))
             devs = Scythe.MYNNFidelity([:gtr_local, :pdk1])
             @test occursin("fidelity=gtr_local,pdk1", say(merge(cfg, (; fidelity = devs))))
+            bun = Scythe.MYNNFidelity([:gtr_local, :exner_single, :pdk1];
+                                      bundle = :scythe)
+            line = say(merge(cfg, (; fidelity = bun)))
+            @test occursin("fidelity=scythe(", line)
+            @test occursin("fidelity=scythe(gtr_local,exner_single,pdk1) ", line)
         end
     end
 
@@ -457,6 +521,21 @@ using .MYNNTestFixtures
                 @test abs(r) <= 1.0e-12 * scale
                 if !(abs(r) <= 1.0e-12 * scale)
                     @info "fidelity budget residual" nm Cd fluxes r scale rel = abs(r)/scale
+                end
+            end
+            # ...and under the BUNDLE, which runs three (four with the Monin-Obukhov
+            # surface layer) of them at once: the deviations are not additive, and the
+            # bundle is what a run will actually carry.
+            for (stab, (Cd, fluxes)) in ((false, (-1.0, true)), (false, (0.0, true)),
+                                         (true, (-1.0, true)))
+                r, scale, = budget_residual(tmp; num_cells_k = 50, ts = 0.5, Cd = Cd,
+                                            fluxes = fluxes, fidelity = :scythe,
+                                            sfc_stability = stab)
+                @test isfinite(r)
+                @test abs(r) <= 1.0e-12 * scale
+                if !(abs(r) <= 1.0e-12 * scale)
+                    @info "scythe-bundle budget residual" stab Cd fluxes r scale rel =
+                        abs(r)/scale
                 end
             end
         end

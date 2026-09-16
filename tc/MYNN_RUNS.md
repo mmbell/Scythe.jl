@@ -37,8 +37,9 @@ adds a key.
 
 `SCYTHE_TC_MYNN_FIDELITY` — the named deviations from the verbatim-Fortran closure
 (`Scythe.MYNN_DEVIATIONS`), comma separated, e.g.
-`SCYTHE_TC_MYNN_FIDELITY=gtr_local,pdk1`. Unset or `fortran` (the default) adds no
-`:mynn_fidelity` key at all, so the standard run is byte-identical to a pre-F1 one. The
+`SCYTHE_TC_MYNN_FIDELITY=gtr_local,pdk1`, or the bundle name `scythe` (below). Unset or
+`fortran` (the default) adds no `:mynn_fidelity` key at all, so the standard run is
+byte-identical to a pre-F1 one. The
 seven names are `gtr_local` (`g/theta_v` per level instead of `g/300 K`), `K_interface`
 (`K` from the wall average of `el*S` instead of the colocated product), `sqfac1`
 (`K_e = K_m` instead of `3 K_m`), `pdk1` (the Fortran log-layer surface TKE production
@@ -50,6 +51,29 @@ closure sees; the model's own surface delivery stays unclipped). The value is va
 at setup and printed on the `TC boundary layer:` line, and it is carried into every
 output file's `mynn_fidelity` attribute. The clip counters `mynn_n_hfx_clip` /
 `mynn_n_qfx_clip` are reported on the census line on EVERY run, `flux_clip` or not.
+
+`SCYTHE_TC_MYNN_FIDELITY=scythe` — the BUNDLE (`Scythe.MYNN_SCYTHE_BUNDLE`), Scythe's own
+closure as against the verbatim-Fortran reference: `gtr_local`, `exner_single`, `pdk1`,
+plus `rmol_sfc` whenever `SCYTHE_TC_SFC_STAB=1` is also set (the write-up adopts that one
+"together with that option"; without it the bundle is simply the other three, and that is
+not an error). The members were chosen on the F2 sweep
+(`benchmarks/output/MYNN_FIDELITY_SWEEP.md`) as read in the write-up's "Departures from
+the Fortran" section (`reference/Scythe_moist_compressible.tex`, `sec:fidelity`): the
+first three are the deviations recommended for adoption, `K_interface` and `sqfac1` are a
+discretisation and a tuning choice the sweep gives no reason to make, and `flux_clip`
+never fires. The bundle is NOT the model default — `:fortran` still is — because `pdk1`
+cuts the near-surface TKE by a factor of five and the mixing by a third, which the
+write-up asks to see on a hurricane arm first; `tc/submit_s10_pair.sh --scythe` is that
+arm. A bundle run writes `fidelity = "scythe(gtr_local,exner_single,pdk1,rmol_sfc)"` into
+its output — the name plus what it expanded to on THAT run — and
+`Scythe.parse_mynn_fidelity` reads that string back as `:scythe`.
+
+```
+SCYTHE_TC_BL=mynn SCYTHE_TC_MYNN_EDMF=0 \
+SCYTHE_TC_MYNN_FIDELITY=scythe SCYTHE_TC_SFC_STAB=1 \
+SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s10_24h_mynn_scythe \
+julia --project=. tc/tc_run_axisym.jl 86400 --csv
+```
 
 Ice: the MYNN closure runs with ISHMAEL (ice legs, S8 e007c81); the Louis scheme is still
 refused with ice. The TC has never run ice with either.

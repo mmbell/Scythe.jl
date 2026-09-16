@@ -21,9 +21,13 @@
 #                                 arm suffix `_edmf`. Needs SCYTHE_OWB_BL=mynn.
 #   SCYTHE_OWB_MYNN_FIDELITY=a,b  named deviations from the verbatim Fortran closure
 #                                 (Scythe.MYNN_DEVIATIONS: gtr_local, K_interface,
-#                                 sqfac1, pdk1, exner_single, rmol_sfc, flux_clip);
-#                                 "fortran" or unset is the control. Arm suffix
-#                                 `_fid_<names joined by _>`. Needs SCYTHE_OWB_BL=mynn.
+#                                 sqfac1, pdk1, exner_single, rmol_sfc, flux_clip), or
+#                                 the bundle `scythe` (Scythe.MYNN_SCYTHE_BUNDLE:
+#                                 gtr_local, exner_single, pdk1, + rmol_sfc under
+#                                 SCYTHE_OWB_SFC_STAB=1); "fortran" or unset is the
+#                                 control. Arm suffix `_fid_<names joined by _>`
+#                                 (`_fid_scythe` for the bundle). Needs
+#                                 SCYTHE_OWB_BL=mynn.
 #   SCYTHE_OWB_MYNN_INTERVAL=20   MYNN closure cadence [s] (options[:mynn_interval]); the
 #                                 diffusivities still track the TKE every step
 #   SCYTHE_OWB_MYNN_KMAX=Inf      counted safety cap on K_m/K_h/K_e [m^2/s]
@@ -158,7 +162,8 @@ function owb_model(opts::BenchmarkOptions)
         (haskey(ENV, "SCYTHE_OWB_MYNN_EDMF") && envflag("SCYTHE_OWB_MYNN_EDMF")) &&
             (options[:mynn_edmf] = 1)
         # The fidelity deviations (`Scythe.MYNN_DEVIATIONS`), as a comma-separated list:
-        # `SCYTHE_OWB_MYNN_FIDELITY=gtr_local,sqfac1`. Unset or "fortran" adds no key, so
+        # `SCYTHE_OWB_MYNN_FIDELITY=gtr_local,sqfac1`, or the bundle name `scythe`
+        # (`Scythe.MYNN_SCYTHE_BUNDLE`). Unset or "fortran" adds no key, so
         # the verbatim-Fortran control stays bitwise; anything else gets its own arm
         # suffix below, so a deviation never looks up the control's expected values.
         haskey(ENV, "SCYTHE_OWB_MYNN_FIDELITY") &&
@@ -583,9 +588,14 @@ get(model.options, :mynn_edmf, 0) == 1 && (arm = addarm(arm, "edmf"))
 # A named-deviation fidelity gets its own suffix (`_fid_<names>`), so a deviation arm and
 # the verbatim-Fortran control never look up the same expected values. No `let` here: a
 # `let` is a HARD scope, so an `arm` assigned inside one would never leave it.
+# A BUNDLE arrives as a bare Symbol (`:scythe`) and gets `_fid_scythe`; a deviation list
+# gets `_fid_<names joined by _>`, with `:scythe` inside a list joining as `scythe`.
 mynn_fid = get(model.options, :mynn_fidelity, :fortran)
-(mynn_fid isa AbstractVector && !isempty(mynn_fid)) &&
-    (arm = addarm(arm, "fid_" * join(string.(mynn_fid), "_")))
+if mynn_fid isa Symbol
+    mynn_fid === :fortran || (arm = addarm(arm, "fid_" * String(mynn_fid)))
+elseif mynn_fid isa AbstractVector && !isempty(mynn_fid)
+    arm = addarm(arm, "fid_" * join(string.(mynn_fid), "_"))
+end
 # A non-default SURFACE choice gets its own suffix, so the committed komori control and a
 # gfdl_v7/charnock or stability arm never look up the same expected values.
 arm = addarm(arm, get(model.options, :sfc_z0, :komori) === :komori ? "" :
