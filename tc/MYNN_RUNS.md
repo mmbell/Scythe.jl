@@ -189,3 +189,37 @@ two or more `--indir`s — the options/physical_params diff and a final-time com
 same structure `S10_BL_ASSESSMENT.md` was built by hand from. `tc/output/S10_BL_ASSESSMENT_FINE.md`
 is the template for the fine 24 h pair's write-up; see `reference/HANDOFF_S11_RCE.md` for
 the full S10c close-out and the RCE (S11) starting points.
+
+## RCE-derived sounding (env override, opt-in)
+
+`tc/tc_params.jl`'s `SOUNDING` constant is now env-overridable:
+`SCYTHE_TC_SOUNDING=/path/to/sounding.ref`. Default (unset) is unchanged — the Dunion MT
+sounding, bitwise identical to every existing run. `tc_init.jl`'s "Reference: ..." setup
+print now includes the sounding's basename, so a run's log records which one it used.
+
+`benchmarks/rce_sounding.jl --dir <ocean_rce.jl output root> [--avg-days 5] [--out <path>]
+[--splice <dunion-format file>] [--sst <K>]` turns the time- and domain-mean state of a 2D
+`ocean_rce.jl` run into a sounding file in this same format (surface line `p_sfc theta q_v`,
+then `z theta q_v u v` per level), splicing on the Dunion file's rows above the RCE's own
+top so the TC's `Z_TOP` stays bracketed (`_interp_to_levels` throws otherwise). It reports a
+saturation cap count, a round-trip check (rebuilds the RCE grid and re-reads the file it
+just wrote through `Springsteel.calculate_pressure_reference_state`), and SST − T_air at the
+surface (must be positive — see the surface-flux-reversal note in the project history; a
+non-positive value is a loud warning, not a hard refusal).
+
+**Convention note**: the written `theta` is rebuilt from the comprehensive file's `T` (the
+closed-form retrieval) and `p` (total pressure) as `T*(p0/p)^(Rd/Cpd)`, matching what
+`calculate_pressure_reference_state` itself assumes — NOT copied from the comprehensive
+file's own `theta` diagnostic, which is `Springsteel.potential_temperature(p, rho_d)`, a
+dry-density approximation that never separates out the vapor partial pressure. Writing that
+field directly left the round-tripped dry-air density low by roughly `q_v/(Eps+q_v)` (a
+~4 % pressure round-trip error at typical near-surface `q_v`); rebuilding from `(T, p)`
+brought it under 0.2 %.
+
+A run this short is only a wiring smoke test, not a usable environment: the 29-minute
+`ocean_rce_quick_mc_rirk` run used to verify the script still carries the initial
+humidified-Dunion sounding's steep near-lid structure (theta rising ~44 K per 500 m
+approaching the 25 km top), which is what the round-trip's residual `max|dtheta| ~ 0.2 K`
+traces to (spline-fit smoothing of that local gradient) — expect this to shrink once a real
+multi-day equilibrated RCE average replaces it. The TC 6 h smoke test on a production
+(multi-day) RCE sounding is the next step, not done here.

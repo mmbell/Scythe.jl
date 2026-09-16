@@ -572,7 +572,7 @@ function init_tc!(nest)
     if get(nest.base.options, :consistent_qss_reference, false)::Bool
         ref = Scythe.consistent_qss_reference(ref, z, column)
     end
-    println("Reference: sfc p = " *
+    println("Reference: sounding = $(basename(SOUNDING)), sfc p = " *
             "$(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits=2)) hPa")
 
     # ── NATIVE-GRID BALANCE (default) ──────────────────────────────────────────

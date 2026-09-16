@@ -55,8 +55,12 @@ const F_COR = 2.0 * 7.292e-5 * sind(15.0)   # [1/s] Coriolis at 15 N (3.775e-5)
 # (RE87 could run 26.3 C because their model-neutral Jordan sounding had
 # correspondingly cooler surface air; ours is a different sounding.)
 const SST_K = 302.65                        # [K] fixed sea surface temp (29.5 C)
-const SOUNDING = joinpath(@__DIR__, "..", "benchmarks", "reference_data",
-                          "o01_rainfall", "dunion_MT_hum90.ref")
+# Env-overridable so an RCE-derived sounding (benchmarks/rce_sounding.jl) can be swapped
+# in without editing this file: SCYTHE_TC_SOUNDING=/path/to/rce_XXXK_quick.ref. Default
+# is unchanged (the Dunion MT sounding), so every existing run stays bitwise identical.
+const SOUNDING = get(ENV, "SCYTHE_TC_SOUNDING",
+                     joinpath(@__DIR__, "..", "benchmarks", "reference_data",
+                              "o01_rainfall", "dunion_MT_hum90.ref"))
 
 # Inner-core moisture. The Dunion MT sounding is the OUTER-core / near-RCE
 # environment; the initial perturbation makes the inner core much moister and
