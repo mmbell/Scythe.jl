@@ -101,6 +101,10 @@
 # adjustment, initializers, and the reference-state writer.
 
 using Springsteel.Thermodynamics: rho_v_sat, internal_energy_bf02
+# The RCE noise initializer's reproducible stream (moist_temperature_noise_mc!): a
+# SEEDED generator, never the global one, so the initial condition is a function of
+# the seed alone and not of whatever else on this process has drawn a random number.
+using Random: MersenneTwister
 
 # ── Per-thread scratch for the equation-set RHS ────────────────────────────────
 
@@ -10249,23 +10253,29 @@ function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64}
 end
 
 """
-    moist_temperature_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dT_max)
+    _moist_temperature_perturbation_mc!(patch, gridpoints, ref, dT_at; zcol, ...)
 
-Ooyama (2001)-style warm-rain trigger for the total-energy set on a moist (vapor-bearing)
-`PressureReferenceState`: a constant-pressure temperature perturbation
-`ΔT = dT_max cos²(πL/2)` for `L ≤ 1` with the vapor adjusted to PRESERVE the local
-relative humidity at the perturbed temperature (`ρ_v = H·ρ_v*(T)` with
-`H = ρ̄_v/ρ_v*(T̄)`), so the bubble carries extra moisture rather than drying out as it
-warms. The dry density follows from the moist EOS at constant pressure; E_t and Q_ss
-are computed pointwise before subtracting the reference; rho_r = 0.
+The slot-writing arithmetic shared by every constant-pressure, RH-PRESERVING temperature
+perturbation of the total-energy set. `dT_at(i, k, x, z)` returns the perturbation [K] at
+the running flat gridpoint index `i`, level `k`, and the coordinates the column loop already
+holds; everything downstream of it — the moist EOS at constant pressure, the humidity-
+preserving vapor, E_t and Q_ss, and the write of EVERY prognostic slot — is identical for
+the warm bubble ([`moist_temperature_bubble_mc!`](@ref)) and the RCE noise
+([`moist_temperature_noise_mc!`](@ref)).
+
+Unlike the bubble this one admits a NEGATIVE `dT`: the RH-preserving branch is taken
+whenever `dT != 0.0`, which is bitwise-inert for the bubble (whose `dT >= 0` by
+construction) and is what lets cooled points stay on the same isopleth of relative humidity
+as the warmed ones.
 """
-function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
-                                      ref::Springsteel.PressureReferenceState;
-                                      xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
-                                      dT_max=3.0, zcol=2,
-                                      condensate_transform::Symbol=:none,
-                                      condensate_mu=1.0e-7,
-                                      rain_transform::Symbol=:none, rain_mu=1.0e-7)
+function _moist_temperature_perturbation_mc!(patch::AbstractGrid,
+                                             gridpoints::Matrix{Float64},
+                                             ref::Springsteel.PressureReferenceState,
+                                             dT_at;
+                                             zcol=2,
+                                             condensate_transform::Symbol=:none,
+                                             condensate_mu=1.0e-7,
+                                             rain_transform::Symbol=:none, rain_mu=1.0e-7)
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
     et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
@@ -10296,8 +10306,7 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
             # column 1 is the radius and λ (column 2) does not enter.
             x = gridpoints[i, 1]
             z = gridpoints[i, zcol]
-            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
-            dT = L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+            dT = dT_at(i, k, x, z)
             p_ref = pbar[k, 1]                              # Pa
             rho_dref = rho_dbar[k, 1]
             rho_vref = rho_vbar[k, 1]
@@ -10305,7 +10314,7 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
             T_ref = p_ref / ((rho_dref * Rd) + (rho_vref * Rv))
             Tk = T_ref + dT
             rho_v = rho_vref
-            if dT > 0.0
+            if dT != 0.0
                 H = rho_vref / rho_v_sat(T_ref, p_ref / 100.0)
                 rho_v = H * rho_v_sat(Tk, p_ref / 100.0)
             end
@@ -10334,6 +10343,105 @@ function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Fl
         end
     end
     return patch
+end
+
+"""
+    moist_temperature_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dT_max)
+
+Ooyama (2001)-style warm-rain trigger for the total-energy set on a moist (vapor-bearing)
+`PressureReferenceState`: a constant-pressure temperature perturbation
+`ΔT = dT_max cos²(πL/2)` for `L ≤ 1` with the vapor adjusted to PRESERVE the local
+relative humidity at the perturbed temperature (`ρ_v = H·ρ_v*(T)` with
+`H = ρ̄_v/ρ_v*(T̄)`), so the bubble carries extra moisture rather than drying out as it
+warms. The dry density follows from the moist EOS at constant pressure; E_t and Q_ss
+are computed pointwise before subtracting the reference; rho_r = 0.
+"""
+function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                      ref::Springsteel.PressureReferenceState;
+                                      xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
+                                      dT_max=3.0, zcol=2,
+                                      condensate_transform::Symbol=:none,
+                                      condensate_mu=1.0e-7,
+                                      rain_transform::Symbol=:none, rain_mu=1.0e-7)
+    # The bubble IS its dT field; the expression is the one this function has always
+    # evaluated, in the same order, so the committed benchmark references are bitwise.
+    return _moist_temperature_perturbation_mc!(patch, gridpoints, ref,
+        function (i, k, x, z)
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            return L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+        end;
+        zcol=zcol, condensate_transform=condensate_transform,
+        condensate_mu=condensate_mu, rain_transform=rain_transform, rain_mu=rain_mu)
+end
+
+"""
+    moist_temperature_noise_mc!(patch, gridpoints, ref; z_max=1000.0, dT_max=0.1, seed,
+                                zcol=2, condensate_transform, condensate_mu,
+                                rain_transform, rain_mu)
+
+Seeded random low-level temperature noise — the standard RCE trigger. A radiative-convective
+equilibrium case has no bubble and no wave to release its instability; the convection has to
+be started from small-amplitude noise near the surface and then forgotten. This writes the
+same constant-pressure, RH-PRESERVING perturbation the warm bubble does (shared body,
+[`_moist_temperature_perturbation_mc!`](@ref)), with
+
+    ΔT(col, k) = dT_max (2u − 1) cos²(π z / 2 z_max)   for z ≤ z_max,   0 above,
+
+`u ~ U[0,1)` drawn once per (column, level), MINUS the per-level mean over columns. The mean
+removal is what makes this a TRIGGER rather than a heating: at every level the domain-mean
+state is exactly the one the run would have had without the noise, so the RCE equilibrium is
+set by the radiation and the surface fluxes and not by the initial draw. The cos² taper is 1
+at the ground and 0 at `z_max`, so nothing is seeded into the free troposphere.
+
+DETERMINISM. The draw is `rand(MersenneTwister(seed), num_columns, kDim)` — one array, in one
+call, on the patch. It is therefore a function of `seed` and the grid shape ALONE: not of the
+thread count, not of the worker tiling, and not of anything else on the process that has
+drawn a random number. This initializer runs on the MASTER, on the whole patch, before
+`write_ics_csv`, which is what keeps that property true of a distributed run: the workers
+read the written IC file, they never re-draw.
+
+GEOMETRY-GENERIC. The only geometry the body needs is that the gridpoint loop is column-major
+with z FASTEST, which every Springsteel `getGridpoints` provides: RZ/RiRk gives `(x, z)` with
+`zcol = 2`, and the 3-D Cartesian RRR grid gives `(x, y, z)` ordered `k` fastest, then `j`,
+then `i` (`transforms_cartesian.jl`, `getGridpoints(::_3DCartesianRRR)`), so `zcol = 3` and
+`num_columns = iDim*jDim` index the same way with no other change. On a cylindrical grid each
+(r, λ) pair is its own column, so the noise is fully three-dimensional there too.
+"""
+function moist_temperature_noise_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                     ref::Springsteel.PressureReferenceState;
+                                     z_max=1000.0, dT_max=0.1, seed::Integer, zcol=2,
+                                     condensate_transform::Symbol=:none,
+                                     condensate_mu=1.0e-7,
+                                     rain_transform::Symbol=:none, rain_mu=1.0e-7)
+    kDim = patch.params.kDim
+    ncols = num_columns(patch)
+    # ONE draw, whole-patch, from the seeded stream. Shape (column, level).
+    noise = rand(MersenneTwister(seed), ncols, kDim)
+    for c in 1:ncols
+        for k in 1:kDim
+            # z is read per (column, level) rather than from a single column, so a grid
+            # whose vertical mish varies with the horizontal index tapers correctly.
+            z = gridpoints[((c - 1) * kDim) + k, zcol]
+            taper = z <= z_max ? (cos((pi / 2.0) * (z / z_max)))^2 : 0.0
+            noise[c, k] = dT_max * ((2.0 * noise[c, k]) - 1.0) * taper
+        end
+    end
+    # Remove the per-level mean over columns: the domain-mean state is unperturbed at
+    # EVERY level. Above z_max every entry is already zero, so this is exactly zero there.
+    for k in 1:kDim
+        m = 0.0
+        for c in 1:ncols
+            m += noise[c, k]
+        end
+        m /= ncols
+        for c in 1:ncols
+            noise[c, k] -= m
+        end
+    end
+    return _moist_temperature_perturbation_mc!(patch, gridpoints, ref,
+        (i, k, x, z) -> noise[div(i - 1, kDim) + 1, k];
+        zcol=zcol, condensate_transform=condensate_transform,
+        condensate_mu=condensate_mu, rain_transform=rain_transform, rain_mu=rain_mu)
 end
 
 """
