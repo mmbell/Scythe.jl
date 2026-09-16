@@ -99,11 +99,15 @@ using NCDatasets
             @test all(ds.rho_v .≈ sat)
         end
 
-        @testset "theta is the Pa-form potential temperature" begin
-            # The EOS temperature of a dry column, p/(Rd rho_d), raised by (1e5/p)^kappa.
-            # This is the check that catches a hPa/Pa mix-up in the call.
-            T_eos = d.p ./ (Rd .* d.rho_d)
-            @test all(d.theta .≈ T_eos .* (100.0 * p_0 ./ d.p) .^ (Rd / Cpd))
+        @testset "theta is the Pa-form potential temperature of the TRUE temperature" begin
+            # theta = T (1e5/p)^kappa with the closed-form EOS temperature the file itself
+            # carries as `T` -- NOT the dry-air p/(Rd rho_d), which over-reads T by
+            # (1 + Rv/Rd q_v) (~3 %, ~9 K at 18 g/kg) and is what the writer used until
+            # 2026-09-16. The Pa/hPa check is kept: a hPa slip changes theta by 100^kappa.
+            @test all(d.theta .≈ d.T .* (100.0 * p_0 ./ d.p) .^ (Rd / Cpd))
+            T_dry = d.p ./ (Rd .* d.rho_d)
+            moist = d.rho_v .> 1.0e-6
+            any(moist) && @test all((T_dry ./ d.T)[moist] .> 1.0 + 1.0e-6)   # the old form was warmer
         end
 
         @testset "rain rate is the sedimentation flux of the run's own fall speed" begin

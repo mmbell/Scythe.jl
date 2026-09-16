@@ -397,7 +397,14 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     # ice curve below freezing would not be the model's own supersaturation.
     RH = rho_v ./ Springsteel.Thermodynamics.rho_v_sat.(T, p_hPa)
     RH_ice = cfg.ice ? rho_v ./ Springsteel.Thermodynamics.rho_i_sat.(T, p_hPa) : nothing
-    theta = Springsteel.Thermodynamics.potential_temperature.(p, rho_d)   # p in Pa
+    # theta from the TRUE temperature (the closed-form EOS retrieval above), not from
+    # `potential_temperature(p, rho_d)`: that two-argument form sets T := p/(R_d rho_d), the
+    # dry-air equation of state, which over-reads T by the factor (1 + R_v/R_d q_v) -- about
+    # 3 % (~9 K) at 18 g/kg -- and was what this file carried through 2026-09-16. Found by
+    # the RCE sounding round trip (benchmarks/rce_sounding.jl): a sounding written from that
+    # theta rebuilt rho_d 3 % low and p 4 % off.
+    theta = T .* (100.0 * Springsteel.Thermodynamics.p_0 ./ p) .^
+            (Springsteel.Thermodynamics.Rd / Springsteel.Thermodynamics.Cpd)   # p in Pa
     q_v = rho_v ./ rho_d
     q_c = rho_c ./ rho_d
     q_r = rho_r ./ rho_d
