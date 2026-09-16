@@ -52,6 +52,7 @@ const TEST_FILES = [
     ("test_distributed_nesting.jl",         :nesting),
     ("test_distributed_linear_advection.jl", :nesting),
     ("test_distributed_rz.jl",              :nesting),
+    ("test_distributed_periodic_rirk.jl",   :nesting),
     ("test_oneway_sw_slab.jl",              :nesting),
     ("test_pv_mixing_floor.jl",             :core),
     ("test_pv_mixing_stochastic.jl",        :core),
