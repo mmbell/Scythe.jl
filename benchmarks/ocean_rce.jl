@@ -58,7 +58,7 @@
 #   SCYTHE_RCE_RAD=diurnal|lw|allsky|sw|allsky_sw|0   RRTMGP arm (default diurnal; 0 = off)
 #   SCYTHE_RCE_ICE=0                  warm rain instead of ISHMAEL ice (default ON here)
 #   SCYTHE_RCE_SST=302.65             sea surface temperature [K]
-#   SCYTHE_RCE_WIDTH=600.0e3          domain width [m] (periodic)
+#   SCYTHE_RCE_WIDTH=300.0e3          domain width [m] (periodic; 600e3 was the shakedown width)
 #   SCYTHE_RCE_TS, _NI, _NK           grid/timestep overrides
 #   SCYTHE_RCE_OUTPUT=3600.0          analysis output cadence [s]
 #   SCYTHE_RCE_NOISE_DT=0.1           noise amplitude [K]
@@ -275,7 +275,7 @@ end
 
 # ── Grid / timestep sizing ───────────────────────────────────────────────────
 
-WIDTH = parse(Float64, get(ENV, "SCYTHE_RCE_WIDTH", "600.0e3"))
+WIDTH = parse(Float64, get(ENV, "SCYTHE_RCE_WIDTH", "300.0e3"))   # user decision 2026-09-22: 300 km for wall clock
 if opts.mode == :full
     cellsize_i = 3000.0
     num_cells_k = 84
