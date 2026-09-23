@@ -298,6 +298,9 @@ dissipation as sources. Its Level-2 `qsq` diagnostic IS reproduced here (six lin
 cloud-PDF width; `tsq` and `cov` are not, at CASE 2, read by anything.
 
 # Two Fortran shapes reproduced on purpose (`:mynn_fidelity = :fortran`, D10)
+`:fortran` is the verbatim REFERENCE and is no longer the model default -- that is the
+`:scythe` bundle (`MYNN_SCYTHE_BUNDLE`), which turns the first of these two off.
+
   * `th_sfc = ts/exner(1)` where the driver's `ts` is ALREADY `T_sfc/exner(1)`
     (mynn_bl_driver :1063; harness README item 2). It divides by the surface Exner
     function twice, which inflates the surface potential temperature by ~3 % and so
@@ -545,7 +548,9 @@ the cloud-PDF width -- and a per-thread scratch column is shared between columns
 nothing in it can be assumed to still belong to this one.
 
 Four fidelity deviations (`MYNN_DEVIATIONS`) live in this routine, every one of them off
-under the default `options[:mynn_fidelity] = :fortran`:
+under `options[:mynn_fidelity] = :fortran` -- the verbatim reference, which since
+2026-09-23 has to be asked for by name (the default is the `:scythe` bundle, whose
+`:exner_single`, `:gtr_local` and `:pdk1` are three of the four below):
 
   * `th_sfc = ts/exner(1)` where the driver's `ts` is ALREADY `T_sfc/exner(1)`
     (mynn_bl_driver :1063; harness README item 2). It divides by the surface Exner

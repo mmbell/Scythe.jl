@@ -196,10 +196,16 @@ using SparseArrays
         @test cfg.edmf == 0
         @test cfg.scale_aware
         @test cfg.init_mode === :taper
-        # `:mynn_fidelity` resolves to a `MYNNFidelity` (F1): `:fortran` is the
-        # no-deviation value, which its own `==` reads off `names`.
-        @test cfg.fidelity == Scythe.MYNN_FORTRAN_FIDELITY
-        @test isempty(cfg.fidelity.names)
+        # `:mynn_fidelity` resolves to a `MYNNFidelity` (F1). With no key at all that is
+        # the `:scythe` BUNDLE (the default since 2026-09-23); `:fortran` is the
+        # no-deviation value, which its own `==` reads off `names`, and is now asked for
+        # by name.
+        @test cfg.fidelity.bundle === :scythe
+        @test cfg.fidelity.names == collect(Scythe.MYNN_SCYTHE_BUNDLE)
+        @test V(merge(on, Dict{Symbol,Any}(:mynn_fidelity => :fortran))).fidelity ==
+              Scythe.MYNN_FORTRAN_FIDELITY
+        @test isempty(V(merge(on,
+            Dict{Symbol,Any}(:mynn_fidelity => :fortran))).fidelity.names)
         @test cfg.water_carry === :flux
         @test cfg.K_max == Inf
         # 20 s default cadence at ts = 0.5 s

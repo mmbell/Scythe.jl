@@ -386,25 +386,26 @@ function make_base(integration_time; output_formats=OUTPUT_FORMATS,
         mynn_interval = parse(Float64, get(ENV, "SCYTHE_TC_MYNN_INTERVAL", "20.0"))
         mynn_edmf = parse(Int, get(ENV, "SCYTHE_TC_MYNN_EDMF", "0"))
         # The named fidelity deviations (`Scythe.MYNN_DEVIATIONS`), comma-separated:
-        # SCYTHE_TC_MYNN_FIDELITY=gtr_local,pdk1, or the bundle SCYTHE_TC_MYNN_FIDELITY=
-        # scythe (`Scythe.MYNN_SCYTHE_BUNDLE`). Unset (or "fortran") leaves the key out
-        # entirely, so the verbatim-Fortran default run is bitwise unchanged.
-        mynn_fid_str = get(ENV, "SCYTHE_TC_MYNN_FIDELITY", "fortran")
-        mynn_fid = Scythe.parse_mynn_fidelity(mynn_fid_str)
+        # SCYTHE_TC_MYNN_FIDELITY=gtr_local,pdk1, or a fidelity NAME -- `scythe`
+        # (`Scythe.MYNN_SCYTHE_BUNDLE`, the model default since 2026-09-23) or `fortran`
+        # (the verbatim reference). UNSET leaves the key out entirely, so the run takes
+        # the model default; SET always adds the key, `=fortran` included, because a
+        # Fortran control now has to SAY so -- dropping the key would run the bundle
+        # under the control's name, the exact confound stage F1 exists to prevent.
+        mynn_fid_str = get(ENV, "SCYTHE_TC_MYNN_FIDELITY", "")
         bl_options[:mynn] = true
         bl_options[:mynn_interval] = mynn_interval
         bl_options[:mynn_edmf] = mynn_edmf
-        # Only `:fortran` leaves the key out: a BUNDLE parses to a bare Symbol
-        # (`:scythe`), and dropping that would silently run the Fortran control under the
-        # bundle's name -- the exact confound stage F1 exists to prevent.
-        mynn_fid === :fortran || (bl_options[:mynn_fidelity] = mynn_fid)
+        isempty(strip(mynn_fid_str)) ||
+            (bl_options[:mynn_fidelity] = Scythe.parse_mynn_fidelity(mynn_fid_str))
         # The mish-native MYNN sidecar (<t>_mynn_i*.nc) is opt-in: the MYNN fields ride
         # in the comprehensive <t>.nc (regridded onto the regular output grid), which
         # tc/tc_movie.jl reads directly. SCYTHE_TC_SIDECARS=1 writes the sidecar too (the
         # legacy tc/tc_postprocess.jl path and the mish-native replay tools want it).
         TC_SIDECARS && (bl_options[:mynn_output] = true)
         println("TC boundary layer: mynn interval=$mynn_interval s edmf=$mynn_edmf " *
-                "fidelity=$mynn_fid_str" * sfc_suffix)
+                "fidelity=$(isempty(strip(mynn_fid_str)) ? "scythe (model default)" :
+                            mynn_fid_str)" * sfc_suffix)
     end
     # Applied OUTSIDE the branch above: the surface layer is shared, not a per-scheme
     # option, and this way a future scheme added to the if/else inherits it for free.

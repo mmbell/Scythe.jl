@@ -37,11 +37,12 @@ adds a key.
 
 `SCYTHE_TC_MYNN_FIDELITY` — the named deviations from the verbatim-Fortran closure
 (`Scythe.MYNN_DEVIATIONS`), comma separated, e.g.
-`SCYTHE_TC_MYNN_FIDELITY=gtr_local,pdk1`, or the bundle name `scythe` (below). Unset or
-`fortran` (the default) adds no `:mynn_fidelity` key at all, so the standard run is
-byte-identical to a pre-F1 one. The
-seven names are `gtr_local` (`g/theta_v` per level instead of `g/300 K`), `K_interface`
-(`K` from the wall average of `el*S` instead of the colocated product), `sqfac1`
+`SCYTHE_TC_MYNN_FIDELITY=gtr_local,pdk1`, or a fidelity name: `scythe` (the bundle,
+below) or `fortran` (the verbatim reference). UNSET adds no `:mynn_fidelity` key at all,
+so the run takes the MODEL DEFAULT, which since 2026-09-23 is the `scythe` bundle; SET
+always adds the key, `fortran` included, because a Fortran control now has to say so by
+name. The seven names are `gtr_local` (`g/theta_v` per level instead of `g/300 K`),
+`K_interface` (`K` from the wall average of `el*S` instead of the colocated product), `sqfac1`
 (`K_e = K_m` instead of `3 K_m`), `pdk1` (the Fortran log-layer surface TKE production
 instead of the drag work, with the difference routed to heating), `exner_single`
 (`th_sfc = SST/exner(1)`, not divided twice), `rmol_sfc` (`1/L` from
@@ -61,10 +62,15 @@ not an error). The members were chosen on the F2 sweep
 the Fortran" section (`reference/Scythe_moist_compressible.tex`, `sec:fidelity`): the
 first three are the deviations recommended for adoption, `K_interface` and `sqfac1` are a
 discretisation and a tuning choice the sweep gives no reason to make, and `flux_clip`
-never fires. The bundle is NOT the model default — `:fortran` still is — because `pdk1`
-cuts the near-surface TKE by a factor of five and the mixing by a third, which the
-write-up asks to see on a hurricane arm first; `tc/submit_s10_pair.sh --scythe` is that
-arm. A bundle run writes `fidelity = "scythe(gtr_local,exner_single,pdk1,rmol_sfc)"` into
+never fires. The bundle IS the model default as of 2026-09-23: `pdk1` cuts the
+near-surface TKE by a factor of five and the mixing by a third, which the write-up asked
+to see on a hurricane arm first, and that arm has now been run — the coarse 12 h pair of
+`tc/output/S10_BL_ASSESSMENT_COARSE12H_SCYTHE.md` (near-surface TKE −80 %, peak `K`
+−70 %, no `K`-cap or diffusion-number hits, spin-up unchanged). Setting
+`SCYTHE_TC_MYNN_FIDELITY=scythe` explicitly is therefore the same run as leaving it
+unset; `tc/submit_s10_pair.sh --scythe` still spells it out, and
+`SCYTHE_TC_MYNN_FIDELITY=fortran` is how a verbatim-Fortran control is now requested. A
+bundle run writes `fidelity = "scythe(gtr_local,exner_single,pdk1,rmol_sfc)"` into
 its output — the name plus what it expanded to on THAT run — and
 `Scythe.parse_mynn_fidelity` reads that string back as `:scythe`.
 

@@ -13,9 +13,13 @@ using .MYNNTestFixtures
 #
 # Three things are being asserted, in this order of importance:
 #
-#   1. the DEFAULT is unchanged. `:fortran` -- and no key at all -- must produce bitwise
-#      the same tendencies, the same `K`, the same mixing length. Every deviation is one
-#      branch, and this is the test that says the branch is never taken by accident.
+#   1. the DEFAULT is what it claims to be, and the verbatim reference is still reachable
+#      bitwise. Since 2026-09-23 no key at all IS the `:scythe` bundle, so "no key" and
+#      an explicit `:scythe` must produce bitwise the same tendencies, the same `K`, the
+#      same mixing length -- and an explicit `:fortran` (equivalently an empty deviation
+#      list) must be bitwise the verbatim closure the parity anchors are written against,
+#      and must DIFFER from the default. Every deviation is one branch, and this is the
+#      test that says no branch is taken, or skipped, by accident.
 #   2. each switch does the ONE thing it names, checked against a value recomputed here
 #      from the Fortran arm's own output rather than against a stored number. Where the
 #      deviation is a pure factor (`gtr_local` on `rmol`, `sqfac1` on `D_gal`,
@@ -45,16 +49,24 @@ using .MYNNTestFixtures
         with(fid; extra...) = merge(on(), Dict{Symbol,Any}(:mynn_fidelity => fid),
                                     Dict{Symbol,Any}(extra...))
 
-        # The default, an explicit `:fortran` and an empty list are the SAME switch set.
-        @test isempty(V(on()).fidelity.names)
-        @test V(on()).fidelity == Scythe.MYNN_FORTRAN_FIDELITY
+        # The DEFAULT (no key at all) is the `:scythe` bundle (2026-09-23), label and
+        # all -- so an output file, a setup line and a benchmark arm name say `scythe`
+        # on a run that never mentioned a fidelity.
+        @test V(on()).fidelity == V(with(:scythe)).fidelity
+        @test V(on()).fidelity.bundle === :scythe
+        @test V(on()).fidelity.names == [:gtr_local, :exner_single, :pdk1]
+        # An explicit `:fortran` and an empty list are the SAME switch set -- the
+        # verbatim reference, which is now asked for by name.
+        @test isempty(V(with(:fortran)).fidelity.names)
         @test V(with(:fortran)).fidelity == Scythe.MYNN_FORTRAN_FIDELITY
         @test V(with(Symbol[])).fidelity == Scythe.MYNN_FORTRAN_FIDELITY
         # ...and no deviation is on in it.
-        f0 = V(on()).fidelity
+        f0 = V(with(:fortran)).fidelity
         @test !f0.gtr_local && !f0.K_interface && !f0.pdk1 && !f0.exner_single &&
               !f0.rmol_sfc && !f0.flux_clip
         @test f0.sqfac == Scythe.MYNN_SQFAC
+        # ...and it is NOT the default any more.
+        @test V(on()).fidelity != Scythe.MYNN_FORTRAN_FIDELITY
 
         # Each name sets EXACTLY its own field.
         @test length(DEV) == 7
@@ -200,34 +212,54 @@ using .MYNNTestFixtures
     end
 
     # ──────────────────────────────────────────────
-    # 2. `:fortran` is BITWISE today's code
+    # 2. The DEFAULT is the bundle; an explicit `:fortran` is BITWISE the reference
     # ──────────────────────────────────────────────
-    @testset ":fortran is bitwise the no-key default" begin
+    @testset "no key is :scythe; explicit :fortran is the verbatim reference" begin
         mktempdir() do tmp
             # `fidelity = nothing` leaves `:mynn_fidelity` out of the options dict
-            # entirely; `fidelity = :fortran` sets it explicitly. Those two runs must not
-            # differ in a single bit -- `==`, never `isapprox`.
-            m_a, p_a, mo, gpo, z, col = make_mynn_tile(tmp; mynn = true,
-                                                       fidelity = nothing)
-            m_b, p_b, mob, _, _, _ = make_mynn_tile(tmp; mynn = true,
-                                                    fidelity = :fortran)
-            kDim = gpo.kDim
-            set_state!(p_a, mo, kDim, z, col)
-            set_state!(p_b, mob, kDim, z, col)
-            step_all!(m_a, p_a, kDim)
-            step_all!(m_b, p_b, kDim)
+            # entirely, which since 2026-09-23 IS the `:scythe` bundle; `:scythe` asks
+            # for it by name. Those two runs must not differ in a single bit -- `==`,
+            # never `isapprox` -- or the default is not the thing it is named after.
+            #
+            # The second pair is the PARITY ANCHOR: an explicit `:fortran` and an empty
+            # deviation list are the verbatim-Fortran switch set that the no-key path
+            # used to give, and `test_mynn_closure.jl` / `test_mynn_edmf.jl` compare
+            # against. It has to stay reachable, and reachable BITWISE, now that it has
+            # to be asked for by name.
+            arm(fid) = begin
+                m, p, mo, gp, z, col = make_mynn_tile(tmp; mynn = true, fidelity = fid)
+                set_state!(p, mo, gp.kDim, z, col)
+                step_all!(m, p, gp.kDim)
+                m
+            end
+            same(x, y) = (size(x.expdot_n) == size(y.expdot_n) &&
+                          x.expdot_n == y.expdot_n &&      # every slot, every gridpoint
+                          x.mynn.K_m == y.mynn.K_m && x.mynn.K_h == y.mynn.K_h &&
+                          x.mynn.el == y.mynn.el && x.mynn.gh == y.mynn.gh &&
+                          x.mynn.rmol == y.mynn.rmol)
 
-            @test m_a.mynn.fidelity == Scythe.MYNN_FORTRAN_FIDELITY
-            @test m_b.mynn.fidelity == Scythe.MYNN_FORTRAN_FIDELITY
-            @test size(m_a.expdot_n) == size(m_b.expdot_n)
-            @test m_a.expdot_n == m_b.expdot_n           # every slot, every gridpoint
-            @test m_a.mynn.K_m == m_b.mynn.K_m
-            @test m_a.mynn.K_h == m_b.mynn.K_h
-            @test m_a.mynn.el == m_b.mynn.el
-            @test m_a.mynn.gh == m_b.mynn.gh
-            @test m_a.mynn.rmol == m_b.mynn.rmol
-            # ...and the run is not trivially zero, or the equality above says nothing.
-            @test maximum(m_a.mynn.K_m) > 0.0
+            m_none = arm(nothing)
+            m_bundle = arm(:scythe)
+            m_fortran = arm(:fortran)
+            m_empty = arm(Symbol[])
+
+            @test m_none.mynn.fidelity == m_bundle.mynn.fidelity
+            @test m_none.mynn.fidelity.bundle === :scythe
+            @test m_none.mynn.fidelity.names == [:gtr_local, :exner_single, :pdk1]
+            @test same(m_none, m_bundle)
+
+            @test m_fortran.mynn.fidelity == Scythe.MYNN_FORTRAN_FIDELITY
+            @test m_empty.mynn.fidelity == Scythe.MYNN_FORTRAN_FIDELITY
+            @test same(m_fortran, m_empty)
+
+            # ...and the default really MOVED: `:pdk1` alone changes the surface TKE
+            # source by a factor of several, so if these agreed the switch would not be
+            # reaching the wired path at all.
+            @test m_none.mynn.K_m != m_fortran.mynn.K_m
+            @test m_none.expdot_n != m_fortran.expdot_n
+            # ...and neither run is trivially zero, or the equalities above say nothing.
+            @test maximum(m_none.mynn.K_m) > 0.0
+            @test maximum(m_fortran.mynn.K_m) > 0.0
         end
     end
 
@@ -236,7 +268,10 @@ using .MYNNTestFixtures
     # ──────────────────────────────────────────────
     """Fortran and deviation tiles on the SAME state, each advanced one step.
 
-    Returns `(m_fortran, m_dev, model, grid_params, z, col)`. `state = false` leaves every
+    Returns `(m_fortran, m_dev, model, grid_params, z, col)`. The control arm is the
+    VERBATIM FORTRAN -- `make_mynn_tile`'s own `fidelity` default, which is `:fortran`
+    and not the model's `:scythe` -- so each deviation below is measured against the
+    reference it deviates from, one switch at a time. `state = false` leaves every
     perturbation at exactly zero -- a resting column whose `theta_v`, `p` and `q_v` at the
     surface are the reference's own, so a surface-block identity can be recomputed here
     from the sounding with nothing assumed about the retrieval."""

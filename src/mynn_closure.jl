@@ -492,9 +492,10 @@ The buoyancy parameter `g/theta_v` at the wall between levels `k-1` and `k`.
 
 `gtr_k === nothing` is the Fortran (`:mynn_fidelity = :fortran`): a single
 `c.gtr = g/MYNN_TREF` with `MYNN_TREF = 300 K`, returned with no arithmetic at all, so
-the default path is the same instruction it always was. With the `:gtr_local` deviation
-`gtr_k` is the per-LEVEL `g/theta_v` and this is the interface interpolation the
-neighbouring `vt`/`vq` lines of `mym_level2!` already use (`x[k]*abk + x[k-1]*afk`).
+the parity path is the same instruction it always was. With the `:gtr_local` deviation
+(which the default `:scythe` bundle turns on) `gtr_k` is the per-LEVEL `g/theta_v` and
+this is the interface interpolation the neighbouring `vt`/`vq` lines of `mym_level2!`
+already use (`x[k]*abk + x[k-1]*afk`).
 
 Julia specializes on the argument type, so the `Nothing` method is a compile-time
 constant fold and neither branch is ever tested at run time.

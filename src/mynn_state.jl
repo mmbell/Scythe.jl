@@ -146,8 +146,10 @@ end
     MYNN_DEVIATIONS
 
 The seven NAMED deviations from the verbatim-Fortran MYNN closure and coupling. Each is
-one branch in one place, each is off under `:mynn_fidelity = :fortran` (the default), and
-each exists to be MEASURED against that default rather than argued about:
+one branch in one place, each is off under `:mynn_fidelity = :fortran` (the verbatim
+reference, which since 2026-09-23 has to be asked for: the model's DEFAULT is the
+`:scythe` bundle, [`MYNN_SCYTHE_BUNDLE`](@ref)), and each exists to be MEASURED against
+that reference rather than argued about:
 
   * `:gtr_local` -- the buoyancy parameter `g/theta_v` per LEVEL instead of the Fortran's
     single `g/MYNN_TREF` with `MYNN_TREF = 300 K`. Used by `G_H` (`mym_level2!`), the
@@ -195,7 +197,9 @@ const MYNN_DEVIATIONS = (:gtr_local, :K_interface, :sqfac1, :pdk1, :exner_single
 The deviations of the `:scythe` fidelity: `:gtr_local`, `:exner_single`, `:pdk1` -- and
 `:rmol_sfc` as well whenever `options[:sfc_stability] === true`, which the resolver adds
 for you ([`_mynn_resolve_fidelity`](@ref)). It is the model's OWN closure, as against the
-verbatim `:fortran` reference; `:fortran` remains the default of every configuration.
+verbatim `:fortran` reference, and since 2026-09-23 it is the DEFAULT of every
+configuration: `options[:mynn_fidelity]` unset IS `:scythe`, and `:fortran` is what a
+parity run now asks for by name.
 
 The evidence is the F2 sweep (`benchmarks/output/MYNN_FIDELITY_SWEEP.md`, the replay
 tables of §1 and the wired bubble arms of §2) as read in the write-up's "Departures from
@@ -211,8 +215,12 @@ the Fortran" section (`reference/Scythe_moist_compressible.tex`, sec:fidelity):
   * `:pdk1` -- ADOPT (the one that changes the answer). The log-layer surface production
     is the physically right closure of the unresolved surface layer; the drag work was a
     bookkeeping convenience. It cuts the near-surface TKE by ~81 % and the peak
-    diffusivities by ~37 % in the wired bubble, which is why the write-up asks for one
-    hurricane arm before it becomes the DEFAULT -- the bundle exists to be that arm.
+    diffusivities by ~37 % in the wired bubble, which is why the write-up asked for one
+    hurricane arm before it became the DEFAULT. That arm has now been run: the coarse
+    12 h TC pair (`tc/output/S10_BL_ASSESSMENT_COARSE12H_SCYTHE.md`) puts the
+    near-surface TKE down ~80 % and the peak `K` down ~70 % with the spin-up unchanged
+    and no `K` cap or diffusion-number hit anywhere, which is the evidence the default
+    moved on (user decision, 2026-09-23).
   * `:rmol_sfc` -- ADOPT TOGETHER WITH `options[:sfc_stability]`, as a matter of
     consistency: the closure and the surface layer should use one `1/L`. It is
     meaningless without that option (`inv_L` is identically zero there), so without it
@@ -297,9 +305,9 @@ Base.:(==)(a::MYNNFidelity, b::MYNNFidelity) = a.names == b.names
 """
     mynn_fidelity_string(f::MYNNFidelity) -> String
 
-`"fortran"` for the no-deviation default, `"scythe(gtr_local,exner_single,pdk1)"` -- the
-bundle name with the members it actually expanded to, in parentheses -- for a bundle, and
-otherwise the comma-joined deviation names. This is the form the setup line prints, the
+`"fortran"` for the no-deviation switch set, `"scythe(gtr_local,exner_single,pdk1)"` --
+the bundle name with the members it actually expanded to, in parentheses -- for a bundle,
+and otherwise the comma-joined deviation names. This is the form the setup line prints, the
 NetCDF `fidelity` attribute carries and [`parse_mynn_fidelity`](@ref) reads back; the
 parenthesised list is informational (it records what `:scythe` meant on THAT run, with or
 without `:rmol_sfc`), and reading it back gives the bundle NAME again.
@@ -690,13 +698,15 @@ const MYNN_OPTION_KEYS = Set{Symbol}((
     :mynn_trace, :mynn_check_values))
 
 const MYNN_INIT_MODES = (:taper, :zero)
-# The Symbol values `:mynn_fidelity` accepts. `:fortran` is the verbatim closure and the
-# DEFAULT; `:scythe` is the one BUNDLE, `MYNN_SCYTHE_BUNDLE` = :gtr_local, :exner_single,
-# :pdk1 (plus :rmol_sfc under `options[:sfc_stability]`), named on the evidence of the F2
-# sweep (benchmarks/output/MYNN_FIDELITY_SWEEP.md) as read in the write-up's "Departures
-# from the Fortran" section. Every DEVIATION is also available individually, as a
-# `Vector{Symbol}` drawn from `MYNN_DEVIATIONS` (an empty vector is `:fortran`), and
-# `:scythe` may appear in such a vector, where it expands in place.
+# The Symbol values `:mynn_fidelity` accepts. `:scythe` is the one BUNDLE and, since
+# 2026-09-23, the DEFAULT: `MYNN_SCYTHE_BUNDLE` = :gtr_local, :exner_single, :pdk1 (plus
+# :rmol_sfc under `options[:sfc_stability]`), named on the evidence of the F2 sweep
+# (benchmarks/output/MYNN_FIDELITY_SWEEP.md) as read in the write-up's "Departures from
+# the Fortran" section and adopted as the default on the coarse 12 h TC pair
+# (tc/output/S10_BL_ASSESSMENT_COARSE12H_SCYTHE.md). `:fortran` is the verbatim closure,
+# the parity anchor, and is now asked for BY NAME. Every DEVIATION is also available
+# individually, as a `Vector{Symbol}` drawn from `MYNN_DEVIATIONS` (an empty vector is
+# `:fortran`), and `:scythe` may appear in such a vector, where it expands in place.
 const MYNN_FIDELITIES = (:fortran, :scythe)
 const MYNN_WATER_CARRIES = (:flux, :fixed_T)
 
@@ -707,9 +717,10 @@ _mynn_check(value, allowed, key) = value in allowed || error(
 """
     _mynn_resolve_fidelity(value, options) -> MYNNFidelity
 
-`options[:mynn_fidelity]` -> the resolved switch set. Accepts `:fortran` (the default),
-the bundle `:scythe` ([`MYNN_SCYTHE_BUNDLE`](@ref)) and a `Vector{Symbol}` of
-[`MYNN_DEVIATIONS`](@ref) names, which may itself contain `:scythe`; an empty vector is
+`options[:mynn_fidelity]` -> the resolved switch set. Accepts `:fortran` (the verbatim
+reference), the bundle `:scythe` (the DEFAULT, [`MYNN_SCYTHE_BUNDLE`](@ref)) and a
+`Vector{Symbol}` of [`MYNN_DEVIATIONS`](@ref) names, which may itself contain `:scythe`;
+an empty vector is
 `:fortran`. Anything else -- another Symbol, a vector with a non-Symbol element, a
 string -- raises with the valid names, as does an unknown or repeated deviation
 ([`MYNNFidelity`](@ref)).
@@ -874,7 +885,10 @@ function validate_mynn_options(options, physical_params, equation_set, ts, kDim)
         "$kDim); DMP_mf integrates the plumes on kts+1 : kte-1")
 
     _mynn_check(init_mode, MYNN_INIT_MODES, "mynn_init")
-    fidelity = _mynn_resolve_fidelity(get(options, :mynn_fidelity, :fortran), options)
+    # The DEFAULT is the `:scythe` bundle (2026-09-23): unset means the model's own
+    # closure, and `:fortran` -- the verbatim reference the parity tests anchor on -- is
+    # asked for by name. See `MYNN_SCYTHE_BUNDLE` for the evidence.
+    fidelity = _mynn_resolve_fidelity(get(options, :mynn_fidelity, :scythe), options)
     _mynn_check(water_carry, MYNN_WATER_CARRIES, "mynn_water_carry")
 
     ts > 0.0 || error("validate_mynn_options: the model timestep must be positive, " *

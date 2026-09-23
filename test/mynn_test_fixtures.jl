@@ -50,9 +50,14 @@ is the control the tendency difference is taken against: the `rho_e` slot is app
 after every fixed slot and after the vapour, so slots 1-9 and `rho_v` keep the same
 indices on both tiles.
 
-`fidelity` (F1) is `nothing` for "no `:mynn_fidelity` key at all", `:fortran` for the
-key set to its default, the bundle `:scythe` (F3, `Scythe.MYNN_SCYTHE_BUNDLE`), or a
+`fidelity` (F1) is `nothing` for "no `:mynn_fidelity` key at all" -- which since
+2026-09-23 is the MODEL DEFAULT, the `:scythe` bundle -- the bundle `:scythe` itself
+(F3, `Scythe.MYNN_SCYTHE_BUNDLE`), `:fortran` for the verbatim reference, or a
 `Vector{Symbol}` of `Scythe.MYNN_DEVIATIONS` names.
+It DEFAULTS to `:fortran`, not to `nothing`, on purpose: every wired test built on this
+fixture is anchored on the verbatim-Fortran closure and its numbers were measured there,
+so moving the model default must not move them. A test that wants the model's default
+closure asks for `fidelity = nothing` (or `:scythe`) by name.
 `sfc_stability` turns the Monin-Obukhov surface layer on -- which `:rmol_sfc` requires,
 and which is set OUTSIDE the `mynn` branch because the surface layer is shared. `Ck` is
 the enthalpy exchange coefficient, exposed so a test can drive the surface heat flux past
@@ -62,7 +67,7 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
                         init = :zero, interval = 20.0, K_max = Inf,
                         water_carry = :flux, ctrans = :none, rtrans = :none,
                         l_inf = 80.0, lapse = 0.004, Ck = 1.0e-3,
-                        fidelity = nothing, sfc_stability = false, trace = false)
+                        fidelity = :fortran, sfc_stability = false, trace = false)
     opts_names = Dict{Symbol,Any}(:condensate_transform => ctrans,
                                   :rain_transform => rtrans)
     mynn && (opts_names[:mynn] = true)
@@ -112,9 +117,10 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
     if mynn
         options[:mynn] = true
         options[:mynn_init] = init
-        # `nothing` (the default) adds NO key at all, and `:fortran` adds the key with
-        # the default value: the bitwise arm has to be able to show that those two are
-        # the same run, so they cannot be spelled the same way here.
+        # `nothing` adds NO key at all (so the run takes the MODEL default, the
+        # `:scythe` bundle), while `:fortran` (this fixture's default) adds the key
+        # explicitly: the bitwise arms have to be able to show which of those two a run
+        # was, so they cannot be spelled the same way here.
         fidelity === nothing || (options[:mynn_fidelity] = fidelity)
         options[:mynn_interval] = interval
         options[:mynn_water_carry] = water_carry

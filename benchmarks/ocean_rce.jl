@@ -47,8 +47,11 @@
 #   SCYTHE_RCE_BL=mynn|louis|none     boundary layer (default mynn, NOT louis -- ice is the
 #                                     RCE default and Louis + ice is refused by the driver)
 #   SCYTHE_RCE_MYNN_EDMF=1            EDMF mass-flux plumes (needs BL=mynn)
-#   SCYTHE_RCE_MYNN_FIDELITY=scythe   named deviation(s) or the bundle name (default scythe;
-#                                     "fortran" is the verbatim-Fortran control)
+#   SCYTHE_RCE_MYNN_FIDELITY=scythe   named deviation(s) or a fidelity name (default scythe,
+#                                     which is also the MODEL default since 2026-09-23;
+#                                     "fortran" is the verbatim-Fortran control). Set here
+#                                     explicitly either way, so every RCE output file
+#                                     records the fidelity it ran with.
 #   SCYTHE_RCE_MYNN_INTERVAL=20       MYNN closure cadence [s]
 #   SCYTHE_RCE_SFC=komori|gfdl_v7|charnock   surface roughness closure (default komori)
 #   SCYTHE_RCE_SFC_STAB=0             stability functions are ON by default HERE (unlike OWB);
