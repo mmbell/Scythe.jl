@@ -266,8 +266,32 @@ function mynn_diagnostics(mtile::ModelTile)
               inv_L = copy(MY.rmol), plume_ktop = Float64.(MY.plume_ktop),
               plume_ztop = copy(MY.plume_ztop), aw_max = copy(MY.aw_max),
               bdry_E = copy(MY.bdry_E),
-              attrs = Dict{String,Any}(mynn_global_attrs(MY)),
+              attrs = _mynn_live_census_attrs(MY),
               sum_attrs = collect(MYNN_COUNTER_ATTRS))
+end
+
+"""
+    _mynn_live_census_attrs(MY) -> Dict{String,Any}
+
+[`mynn_global_attrs`](@ref) with the eight census counters replaced by the LIVE sums of
+the per-column vectors. The tile scalars those attrs read are folded only by
+`mynn_write_final!` at run end, so every periodic comprehensive file -- and every file of a
+run killed by a wall-clock limit (the 2026-09 fine TC pair, 17 h of 24) -- carried zeros
+for all of them while `mynn_plume_ktop` showed plumes firing. The comprehensive file now
+carries the census as of its own write; the sidecar keeps the run-end fold semantics its
+docstring records. The sums are cheap (one pass over the columns per output time).
+"""
+function _mynn_live_census_attrs(MY::MYNNState)
+    attrs = Dict{String,Any}(mynn_global_attrs(MY))
+    attrs["n_clamp_e"] = sum(MY.n_clamp_col)
+    attrs["n_cap_K"] = sum(MY.n_capK_col)
+    attrs["n_diffnum"] = sum(MY.n_diffnum_col)
+    attrs["n_gate"] = sum(MY.n_gate_col)
+    attrs["n_stall"] = sum(MY.n_stall_col)
+    attrs["n_plume"] = sum(MY.n_plume_col)
+    attrs["n_hfx_clip"] = sum(MY.n_hfx_clip_col)
+    attrs["n_qfx_clip"] = sum(MY.n_qfx_clip_col)
+    return attrs
 end
 
 """
