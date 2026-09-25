@@ -1,36 +1,40 @@
 #!/usr/bin/env julia
-# Turn the time- and domain-mean state of a 2D ocean_rce.jl run into a SOUNDING FILE in
+# Turn the time- and domain-mean state of a 2D ocean_2D_rce run into a SOUNDING FILE in
 # the format Springsteel's reference-state builder reads (`_read_sounding` /
 # `calculate_pressure_reference_state`, src/reference_state.jl:231-320 in Springsteel.jl),
-# so the TC driver (tc/tc_init.jl, via tc/tc_params.jl's SOUNDING constant) can start from
-# a model-consistent, SST-tuned, near-moist-neutral environment instead of the Dunion MT
-# sounding.
+# so a TC config's `reference_state.sounding` can start from a model-consistent, SST-tuned,
+# near-moist-neutral environment instead of the Dunion MT sounding.
 #
 # Format (see benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref for the exemplar):
 #   line 1        p_sfc[hPa] theta[K] q_v[g/kg]              (z = 0)
 #   line 2..N     z[m] theta[K] q_v[g/kg] u[m/s] v[m/s]       (one per level, u=v=0 here)
 # `_interp_to_levels` is piecewise linear and THROWS if a model level is not bracketed, so
-# the file must extend above the TC's Z_TOP (tc/tc_params.jl); this script splices on the
-# high-altitude rows of a Dunion-format file (default: dunion_MT_hum90.ref) to guarantee that.
+# the file must extend above the TC's lid; this script splices on the high-altitude rows of
+# a Dunion-format file (default: dunion_MT_hum90.ref) to guarantee that.
 #
-#   julia --project=. benchmarks/rce_sounding.jl --dir <root> [--avg-days 5] [--out <path>]
+#   julia --project=simulations simulations/ocean_2D_rce/rce_sounding.jl --dir <root> \
+#       [--avg-days 5] [--out <path>]
 #       [--splice benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref] [--sst <K>]
 #
-# `<root>` is an ocean_rce.jl output root (benchmarks/output/ocean_rce_<mode>_mc_rirk<tag>/),
-# holding `segments.csv` and `seg_NN/<t>.nc` comprehensive NetCDF files. `--sst` is the last
-# resort in the SST-resolution chain (netCDF attr -> "RCE:" setup line in
-# seg_01/segment_stdout.log -> --sst) and is REQUIRED if neither of the first two is found.
+# `<root>` is a run_simulation (src/run_driver.jl) output root -- this case's
+# `<output.dir>` -- holding `config.toml`, `segments.csv` and `seg_NN/<t>.nc` comprehensive
+# NetCDF files. SST and the model grid are read from `<root>/config.toml`
+# (`load_config` + `build_model`); `--sst` overrides it. `--project=simulations` is
+# required whenever the run's `physics.radiation.scheme` is `"rrtmgp"` (the case default):
+# RRTMGP/ClimaComms are WEAK dependencies of Scythe, loadable only from an environment that
+# lists them.
 
 using Printf
-
-include(joinpath(@__DIR__, "common", "harness.jl"))
 
 using NCDatasets
 using Springsteel
 using Scythe
 
-const RCE_REF_DIR = joinpath(REFERENCE_DATA_DIR, "rce")
-const DEFAULT_SPLICE = joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "dunion_MT_hum90.ref")
+include(joinpath(@__DIR__, "..", "..", "benchmarks", "common", "rce_io.jl"))
+
+const RCE_REF_DIR = joinpath(pkgdir(Scythe), "benchmarks", "reference_data", "rce")
+const DEFAULT_SPLICE = joinpath(pkgdir(Scythe), "benchmarks", "reference_data", "o01_rainfall",
+                                "dunion_MT_hum90.ref")
 
 # ── CLI ──────────────────────────────────────────────────────────────────────────────
 
@@ -66,47 +70,29 @@ opts = parse_sounding_args(ARGS)
 root = abspath(opts.dir)
 isdir(root) || error("rce_sounding.jl: no such directory: $root")
 
+# ── The run's own resolved configuration: SST, and (below) the grid to rebuild ───────
+
+config_path = joinpath(root, "config.toml")
+isfile(config_path) || error("rce_sounding.jl: no config.toml in $root -- is this a " *
+                             "run_simulation (src/run_driver.jl) output root?")
+cfg = load_config(config_path)
+if cfg.physics.radiation.scheme == :rrtmgp
+    Base.identify_package("RRTMGP") !== nothing || error(
+        "rce_sounding.jl: this run's physics.radiation.scheme = \"rrtmgp\" but RRTMGP " *
+        "cannot be loaded from the active project $(Base.active_project()). Launch with " *
+        "`julia --project=simulations`.")
+    @eval Main import RRTMGP, ClimaComms
+end
+
 # ── Locate every <t>.nc under segments.csv, in absolute (t_offset_s + t) time ────────
 
-segments_csv = joinpath(root, "segments.csv")
-isfile(segments_csv) || error("rce_sounding.jl: no segments.csv in $root")
-segs = CSV.read(segments_csv, DataFrame)
-
-struct RceSample
-    abs_t::Float64
-    path::String
-    seg::Int
-end
-
-const SNAPSHOT_RE = r"^([0-9]+(\.[0-9]+)?)\.nc$"
-
-samples = RceSample[]
-for row in eachrow(segs)
-    k = Int(row.segment)
-    seg_dir = String(row.dir)
-    if !isdir(seg_dir)
-        println("WARNING: segment $k directory missing, skipping: $seg_dir")
-        continue
-    end
-    t_off = Float64(row.t_offset_s)
-    for f in readdir(seg_dir)
-        m = match(SNAPSHOT_RE, f)
-        m === nothing && continue
-        t = parse(Float64, m.captures[1])
-        # Each segment's 0.0.nc duplicates the PREVIOUS segment's final file (same absolute
-        # time, identical data) -- drop it for every segment after the first so it is not
-        # double-counted in the time mean. Segment 1's 0.0.nc is the true t=0 initial state.
-        k > 1 && t == 0.0 && continue
-        push!(samples, RceSample(t_off + t, joinpath(seg_dir, f), k))
-    end
-end
+samples = catalog_snapshots(root)
 isempty(samples) && error("rce_sounding.jl: no <t>.nc snapshots found under $root")
-sort!(samples, by = s -> s.abs_t)
 
 # ── Averaging window: last `avg_days`, clamped to what exists ────────────────────────
 
-t_end = maximum(s.abs_t for s in samples)
-t_start_all = minimum(s.abs_t for s in samples)
+t_end = maximum(s.t_abs for s in samples)
+t_start_all = minimum(s.t_abs for s in samples)
 available_days = (t_end - t_start_all) / 86400.0
 window_s = opts.avg_days * 86400.0
 t_start = t_end - window_s
@@ -116,7 +102,7 @@ if t_start < t_start_all - 1.0e-6
             "clamping the averaging window to all available output.")
     t_start = t_start_all
 end
-window_samples = filter(s -> s.abs_t >= t_start - 1.0e-6, samples)
+window_samples = filter(s -> s.t_abs >= t_start - 1.0e-6, samples)
 isempty(window_samples) && error("rce_sounding.jl: no samples fall in the averaging window")
 println("rce_sounding: averaging $(length(window_samples)) file(s) over absolute t in " *
         "[$(round(t_start; digits=2)), $(round(t_end; digits=2))] s " *
@@ -145,8 +131,7 @@ function read_rce_profile(path::String)
         p = get1("p"); T = get1("T"); q_v = get1("q_v")
         u = get1("u")
         v = haskey(ds, "v") ? get1("v") : zeros(nx, length(z))
-        attrs = Dict{String,Any}(k => ds.attrib[k] for k in keys(ds.attrib))
-        return (; x, z, p, T, q_v, u, v, attrs)
+        return (; x, z, p, T, q_v, u, v)
     end
 end
 
@@ -162,7 +147,6 @@ function accumulate_window(window_samples, first_prof, nz)
     acc_p = zeros(nz); acc_T = zeros(nz); acc_qv = zeros(nz)
     acc_u = zeros(nz); acc_v = zeros(nz)
     n = 0
-    last_attrs = first_prof.attrs
     for s in window_samples
         prof = s === window_samples[1] ? first_prof : read_rce_profile(s.path)
         length(prof.z) == nz || error("rce_sounding.jl: z grid mismatch at $(s.path)")
@@ -174,10 +158,8 @@ function accumulate_window(window_samples, first_prof, nz)
         acc_u .+= xmean(prof.u)
         acc_v .+= xmean(prof.v)
         n += 1
-        last_attrs = prof.attrs
     end
-    return (; p = acc_p ./ n, T = acc_T ./ n, qv = acc_qv ./ n,
-            u = acc_u ./ n, v = acc_v ./ n, last_attrs)
+    return (; p = acc_p ./ n, T = acc_T ./ n, qv = acc_qv ./ n, u = acc_u ./ n, v = acc_v ./ n)
 end
 
 wmean = accumulate_window(window_samples, first_prof, nz)
@@ -192,7 +174,6 @@ u_mean = wmean.u              # m/s
 theta_mean = T_mean .* (Springsteel.p_0 ./ (p_mean ./ 100.0)) .^
              (Springsteel.Rd / Springsteel.Cpd)   # K
 v_mean = wmean.v              # m/s
-last_attrs = wmean.last_attrs
 
 # ── Saturation cap ─────────────────────────────────────────────────────────────────────
 # q_sat_liquid(Tk, phPa) is what calculate_pressure_reference_state itself uses (via
@@ -212,48 +193,19 @@ else
     println("Saturation cap: 0 levels exceeded q_sat_liquid(T,p)")
 end
 
-# ── SST resolution: netCDF attr -> "RCE:" setup line -> --sst ─────────────────────────
+# ── SST: the run's own config, or --sst to override ───────────────────────────────────
 
-function resolve_sst(root::String, last_nc::String, sst_cli)
-    sst = nothing
-    src = ""
-    for key in ("sfc_sst", "SST", "sst")
-        if haskey(last_attrs, key)
-            sst = Float64(last_attrs[key]); src = "netCDF global attr \"$key\""
-            break
-        end
-    end
-    if sst === nothing
-        logf = joinpath(root, "seg_01", "segment_stdout.log")
-        if isfile(logf)
-            for line in eachline(logf)
-                if occursin("RCE:", line)
-                    m = match(r"SST\s*=\s*([0-9.eE+-]+)\s*K", line)
-                    if m !== nothing
-                        sst = parse(Float64, m.captures[1])
-                        src = "seg_01/segment_stdout.log \"RCE:\" setup line"
-                        break
-                    end
-                end
-            end
-        end
-    end
-    if sst === nothing
-        sst_cli === nothing && error("rce_sounding.jl: SST not found in the netCDF attrs " *
-            "or seg_01/segment_stdout.log; pass --sst <K>")
-        sst = sst_cli; src = "--sst"
-    end
-    return sst, src
+function resolve_sst(cfg::RunConfig, sst_cli)
+    sst_cli === nothing || return sst_cli, "--sst"
+    return cfg.environment.sst, "config.toml (environment.sst)"
 end
 
-sst, sst_src = resolve_sst(root, window_samples[end].path, opts.sst_cli)
+sst, sst_src = resolve_sst(cfg, opts.sst_cli)
 println("SST resolved from $sst_src: $sst K")
 
 # ── Output path ────────────────────────────────────────────────────────────────────────
 
-mode_m = match(r"ocean_rce_([^_]+)_mc_rirk", basename(root))
-mode_str = mode_m === nothing ? "unknown" : mode_m.captures[1]
-default_out = joinpath(RCE_REF_DIR, "rce_$(round(Int, sst))K_$(mode_str).ref")
+default_out = joinpath(RCE_REF_DIR, "rce_$(round(Int, sst))K_$(cfg.run.name).ref")
 out_path = opts.out === nothing ? default_out : opts.out
 mkpath(dirname(out_path))
 
@@ -283,7 +235,7 @@ dunion_rows = read_dunion_rows(opts.splice)
 kMax = z[end]
 splice_rows = filter(r -> r[1] > kMax, dunion_rows)
 isempty(splice_rows) && error("rce_sounding.jl: no splice rows with alt > kMax = $kMax m " *
-    "in $(opts.splice) -- the TC's Z_TOP would not be bracketed by this sounding")
+    "in $(opts.splice) -- the target model's lid would not be bracketed by this sounding")
 
 open(out_path, "w") do io
     @printf(io, "%.4f %.4f %.4f\n", p_sfc_hpa, theta0, qv0_gkg)
@@ -304,65 +256,8 @@ issorted(z_full) || error("rce_sounding.jl: sounding z is not monotone increasin
 theta_full = vcat(theta_mean, [r[2] for r in splice_rows])
 qv_full = vcat(qv_mean, [r[3] / 1000.0 for r in splice_rows])   # kg/kg
 
-# ── Round-trip check: rebuild the RCE grid, re-read the file we just wrote ────────────
-
-function options_from_attrs(attrs)
-    o = Dict{Symbol,Any}()
-    haskey(attrs, "rain_moments") && (o[:rain_moments] = Int(attrs["rain_moments"]))
-    icemp = get(attrs, "ice_microphysics", "none")
-    icemp != "none" && (o[:ice_microphysics] = Symbol(icemp))
-    for k in ("condensate_transform", "rain_transform", "rain_number_transform", "ice_transform")
-        haskey(attrs, k) && (o[Symbol(k)] = Symbol(attrs[k]))
-    end
-    o[:mynn] = get(attrs, "boundary_layer", "") == "mynn"
-    return o
-end
-
-function rebuild_rce_grid(x, z, attrs)
-    num_cells_i = length(x) - 1
-    iMax = x[end]
-    num_cells_k = length(z) - 1
-    kMaxg = z[end]
-    o = options_from_attrs(attrs)
-    vars = Scythe.mc_var_names(o)
-    rain_name = Scythe.rain_var_name(o)
-    rain_number_name = Scythe.rain_number_var_name(o)
-    two_moment = Scythe.rain_moments(o) == 2
-    ice_on = Scythe.ice_microphysics(o) === :ishmael
-    ice_names = ice_on ? Scythe.ice_var_names(o) : String[]
-
-    vert_scalar = Dict{String,Any}(v => SecondDerivativeBC() for v in vars)
-    topbot_bc = merge(vert_scalar,
-                      Dict{String,Any}("w" => DirichletBC(), rain_name => NaturalBC()))
-    two_moment && (topbot_bc[rain_number_name] = NaturalBC())
-    if ice_on
-        for nm in ice_names
-            topbot_bc[nm] = NaturalBC()
-        end
-    end
-    positivity = Dict{String,Any}()
-    rain_name == "rho_r" && (positivity["rho_r"] = Dict(:k => 0.0))
-    side_bc = Dict{String,Any}(v => PeriodicBC() for v in vars)
-
-    # GridParameters (SpringsteelGridParameters) is immutable and leaves kDim/b_kDim etc.
-    # at their auto (0) default until compute_derived_params resolves them -- normally done
-    # for you by ModelParameters's inner constructor (Scythe.jl `Scythe.jl:73`), which is not
-    # in play here since we only need a grid to build a reference_column.
-    grid_params = Springsteel.compute_derived_params(GridParameters(;
-        geometry = "RiRk",
-        iMin = 0.0, iMax = iMax, num_cells_i = num_cells_i,
-        kMin = 0.0, kMax = kMaxg, num_cells_k = num_cells_k,
-        l_q = Dict("default" => 2.0),
-        positivity = positivity,
-        BCL = side_bc, BCR = side_bc, BCB = topbot_bc, BCT = topbot_bc,
-        vars = Dict(v => i for (i, v) in enumerate(vars))))
-
-    patch = createGrid(grid_params)
-    kDim = grid_params.kDim
-    z_mish = Scythe.getGridpoints(patch)[1:kDim, 2]
-    column = Scythe.reference_column(patch, grid_params)
-    return z_mish, column
-end
+# ── Round-trip check: rebuild the run's own grid (build_model), re-read the file we
+# just wrote ────────────────────────────────────────────────────────────────────────────
 
 function lininterp(x0::Vector{Float64}, y0::Vector{Float64}, xq::Vector{Float64})
     n0 = length(x0)
@@ -382,8 +277,13 @@ function lininterp(x0::Vector{Float64}, y0::Vector{Float64}, xq::Vector{Float64}
     return out
 end
 
-z_mish, column = rebuild_rce_grid(first_prof.x, z, last_attrs)
-hydro = reference_state_hydrostatic()
+model = build_model(cfg)   # the run's own grid, physics options and BCs -- no I/O
+patch = createGrid(model.grid_params)
+kDim = model.grid_params.kDim
+z_mish = Scythe.getGridpoints(patch)[1:kDim, 2]
+column = Scythe.reference_column(patch, model.grid_params)
+
+hydro = cfg.reference_state.hydrostatic
 ref = Springsteel.calculate_pressure_reference_state(out_path, z_mish, column;
                                                      hydrostatic = hydro)
 pbar_mish = Springsteel.ref_pressure(ref)[:, 1]
@@ -422,8 +322,9 @@ end
 
 # ── Metadata sidecar ─────────────────────────────────────────────────────────────────
 
-window_segs = unique(s.seg for s in window_samples)
-shas = unique(String.(segs.scythe_sha[[findfirst(==(k), segs.segment) for k in window_segs]]))
+segment_rows = Scythe.read_segments_csv(root)
+window_segs = unique(s.segment for s in window_samples)
+shas = unique(String[segment_rows[k]["scythe_sha"] for k in window_segs if haskey(segment_rows, k)])
 meta_path = out_path * ".meta.txt"
 open(meta_path, "w") do io
     println(io, "source root: $root")

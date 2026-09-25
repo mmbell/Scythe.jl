@@ -1,13 +1,15 @@
 #!/usr/bin/env julia
-# RCE diagnostics: time series, mean profiles, energy budget and equilibrium check for
-# an benchmarks/ocean_rce.jl output tree. Reads ONLY the comprehensive `<t>.nc` files the
-# model itself writes (src/netcdf_output.jl, src/radiation_io.jl) -- it never runs the
-# model, and it never writes into the run's own output tree except the three files named
-# below (or into `--out` if given, which defaults to `--dir` itself).
+# RCE diagnostics: time series, mean profiles, energy budget and equilibrium check for an
+# ocean_2D_rce (simulations/ocean_2D_rce/run.jl) output tree. Reads ONLY the comprehensive
+# `<t>.nc` files the model itself writes (src/netcdf_output.jl, src/radiation_io.jl) -- it
+# never runs the model, and it never writes into the run's own output tree except the
+# three files named below (or into `--out` if given, which defaults to `--dir` itself).
 #
-#   julia --project=. benchmarks/rce_diagnostics.jl --dir <root> [--avg-days M] [--out <root>]
+#   julia --project=. simulations/ocean_2D_rce/rce_diagnostics.jl --dir <root> \
+#       [--avg-days M] [--out <root>]
 #
-#   --dir <root>       an ocean_rce.jl output root (holds segments.csv, seg_01/, ...)
+#   --dir <root>       a run_simulation (src/run_driver.jl) output root (holds
+#                      config.toml, segments.csv, seg_01/, ...)
 #   --avg-days M       length [days] of the trailing averaging/equilibrium window
 #                       (default 5.0). Clamped to whatever the run actually has, with a
 #                       warning, when the run is shorter.
@@ -43,7 +45,7 @@ using DataFrames
 using Springsteel.Thermodynamics: Rd, Rv, Eps, Cpd, Cpv, gravity, L_v0, p_0, L_v,
     q_sat_liquid
 
-include(joinpath(@__DIR__, "common", "rce_io.jl"))
+include(joinpath(@__DIR__, "..", "..", "benchmarks", "common", "rce_io.jl"))
 
 const t0 = time()
 

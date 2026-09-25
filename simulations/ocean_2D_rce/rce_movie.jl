@@ -1,10 +1,11 @@
 #!/usr/bin/env julia
-# x-z movie of an benchmarks/ocean_rce.jl output tree: one frame per stitched output
-# time (or every `n`-th, with `--every n`), reading ONLY the comprehensive `<t>.nc` files
-# the model itself writes (src/netcdf_output.jl). Never runs the model.
+# x-z movie of an ocean_2D_rce (simulations/ocean_2D_rce/run.jl) output tree: one frame
+# per stitched output time (or every `n`-th, with `--every n`), reading ONLY the
+# comprehensive `<t>.nc` files the model itself writes (src/netcdf_output.jl). Never runs
+# the model.
 #
-#   julia --project=. benchmarks/rce_movie.jl --dir <root> [--out <root>/rce.mp4]
-#         [--every n] [--fps 4]
+#   julia --project=. simulations/ocean_2D_rce/rce_movie.jl --dir <root> \
+#       [--out <root>/rce.mp4] [--every n] [--fps 4]
 #
 # Four x-z panels per frame:
 #   - potential-temperature anomaly: theta(x,z) - mean_x(theta(z)) FOR THIS FRAME (a
@@ -27,7 +28,7 @@ using CairoMakie
 using Printf
 using Statistics
 
-include(joinpath(@__DIR__, "common", "rce_io.jl"))
+include(joinpath(@__DIR__, "..", "..", "benchmarks", "common", "rce_io.jl"))
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 root = nothing

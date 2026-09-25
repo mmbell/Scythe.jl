@@ -28,6 +28,10 @@ benchmarks/reference_data/.DS_Store
 benchmarks/output/
 benchmarks/results/
 
+# Simulation run output (simulations/<case>/output/, and any --set output.dir=output/<tag>
+# tree under it) — model output never goes in the repo, see the TC note below.
+simulations/*/output/
+
 # TC run output (NetCDF, JLD2 restarts, ICs, ref states):
 # model output never goes in the repo — validation references, when accepted,
 # are committed as small JSON like the benchmarks

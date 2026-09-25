@@ -15,14 +15,17 @@ julia --project=. benchmarks/bf02_dry.jl   --mode full  --stage legacy --plot
 julia --project=. benchmarks/bf02_moist.jl --mode quick --stage legacy
 ```
 
-Radiation arms (`ocean_rce`, which runs diurnal RRTMGP by default; `ocean_warm_bubble` via
-`--set physics.radiation.scheme=rrtmgp` on `simulations/ocean_warm_bubble/run.jl`; and the
-`SCYTHE_O01_RAD` radiation arm of `o01_rainfall`) must run from `--project=simulations`
-instead, e.g.
-`julia --project=simulations benchmarks/ocean_rce.jl --mode quick --stage mc --grid rirk`.
+Radiation arms (`ocean_warm_bubble` via `--set physics.radiation.scheme=rrtmgp` on
+`simulations/ocean_warm_bubble/run.jl`, the `SCYTHE_O01_RAD` radiation arm of `o01_rainfall`,
+and `simulations/ocean_2D_rce`, which runs diurnal RRTMGP by default) must run from
+`--project=simulations` instead, e.g.
+`julia --project=simulations benchmarks/ocean_warm_bubble.jl --mode quick --stage mc --grid rirk`.
 RRTMGP and ClimaComms are WEAK dependencies of Scythe (`ext/ScytheRRTMGPExt.jl`) and load
 only from an environment that lists them; `simulations/Project.toml` is a workspace member
 sharing the root `Manifest.toml`. The non-radiation commands above need no extension.
+`ocean_rce` (below) is no longer one of these scripts -- it is `simulations/ocean_2D_rce/`,
+run with `julia --project=simulations simulations/ocean_2D_rce/run.jl` (see that
+directory's README.md).
 
 | Flag | Values | Meaning |
 |------|--------|---------|
@@ -56,7 +59,7 @@ bitwise identical); `LOAD=8` adds CPU burners to reproduce a loaded machine.
 | `bf02_moist` | `BF02_test` | 20 × 10 km, K=0, θ_e=320 K, r_t=0.020 | 100 m / 200 m | Bryan & Fritsch (2002) Fig. 3 |
 | `o01_rainfall` | `moist_compressible_XZ` (mc only) | 150 × 20 km, warm rain, inviscid (spline filter only), humidified Dunion sounding | 500 m / 2 km (Δz 500 m both) | Ooyama (2001) Fig. 6 magnitudes, `reference/ooyama_jas2001.pdf` |
 | `ocean_warm_bubble` | `moist_compressible_XZ` (mc only) | 300 × 25 km, 2 h, warm bubble over a fixed-SST ocean (302.65 K); a thin `run_benchmark` wrapper around `simulations/ocean_warm_bubble/config.toml` (config consolidation, stage 4a) — MYNN + ISHMAEL ice + surface fluxes/drag/stability ON, radiation off by default (ice + MYNN is the supported pair, S8; ice + Louis is refused by `validate`). No more `SCYTHE_OWB_*` env knobs: vary the physics with `--set` / overlays on `simulations/ocean_warm_bubble/run.jl` (see its README); this script only takes `--mode`/`--stage`/`--grid`/`--workers`/`--ts-factor` and derives its output "arm" tag from the resolved config | 3 km × 300 m / 6 km × 500 m (the TC nests' spacings) | none — control-run windows only (MYNN-EDMF plan S1; RCE precursor) |
-| `ocean_rce` | `moist_compressible_XZ` (mc only) | 600 × 25 km **periodic**, multi-day (default 20 d, run in 2-day SEGMENTS — see `rce/README.md`), open ocean (SST 302.65 K default), seeded low-level temperature-noise trigger (no bubble); MYNN-EDMF `:scythe` fidelity + stability-aware surface layer, ISHMAEL ice, diurnal all-sky RRTMGP ON by default (all `SCYTHE_RCE_*`, mirroring `ocean_warm_bubble`'s knobs); not a `run_benchmark` case (no CLI regression target — an RCE equilibrium is a many-day statistical statement) | 3 km × 300 m / 6 km × 500 m (the TC nests' spacings) | none — standalone multi-day driver, see `rce/README.md` |
+| `ocean_rce` | moved to `simulations/ocean_2D_rce/` (config-driven, `moist_compressible_XZ`) | 300 × 25 km **periodic**, multi-day (default 20 d, run in 2-day SEGMENTS — see `simulations/ocean_2D_rce/README.md`), open ocean (SST 302.65 K default), seeded low-level temperature-noise trigger (no bubble); MYNN `:scythe` fidelity + stability-aware surface layer, ISHMAEL ice, diurnal all-sky RRTMGP ON by default (all struct defaults; override with `--set key.path=value` or an overlay TOML — no more `SCYTHE_RCE_*` env vars); not a `run_benchmark` case (no CLI regression target — an RCE equilibrium is a many-day statistical statement) | 3 km × 300 m / 6 km × 500 m (the TC nests' spacings) | none — standalone multi-day driver, see `simulations/ocean_2D_rce/README.md` |
 
 Published target values and tolerances live in
 `reference_data/expected_values.jl` with their sources. Full-mode tolerances

@@ -1,14 +1,17 @@
 # Shared NetCDF reading / segment-stitching helpers for the RCE diagnostics
-# (benchmarks/rce_diagnostics.jl) and movie (benchmarks/rce_movie.jl) scripts. Both read
-# the comprehensive per-time `<t>.nc` files benchmarks/ocean_rce.jl writes under
-# benchmarks/output/ocean_rce_<mode>_mc_rirk<tag>/seg_NN/ (see that file's header comment
-# and src/netcdf_output.jl). This file only READS existing output -- it never runs the
-# model, and neither of its callers should either.
+# (simulations/ocean_2D_rce/rce_diagnostics.jl) and movie (rce_movie.jl) scripts. Both read
+# the comprehensive per-time `<t>.nc` files simulations/ocean_2D_rce/run.jl writes under
+# <output.dir>/seg_NN/[nest{i}/] (src/run_driver.jl's segmented layout; see
+# src/netcdf_output.jl for the file contents). This file only READS existing output -- it
+# never runs the model, and neither of its callers should either.
+#
+# Segment discovery goes through Scythe.read_segments_csv (src/run_driver.jl), the single
+# writer of <root>/segments.csv, so a reader here can never drift from the columns the
+# driver actually writes.
 
 using NCDatasets
-using CSV
-using DataFrames
 using Statistics
+using Scythe
 
 # NCDatasets returns Union{Missing,Float64} for a `_FillValue`'d variable; turn missing
 # into NaN so the rest of the code can use plain isnan/isfinite logic (the convention
@@ -27,15 +30,14 @@ struct RceSegment
     status::String
 end
 
-"""Read `<root>/segments.csv` (ocean_rce.jl's bookkeeping file), sorted by segment
-number."""
+"""Read `<root>/segments.csv` (`src/run_driver.jl`'s bookkeeping file, one row per
+segment), sorted by segment number, via `Scythe.read_segments_csv`."""
 function read_segments(root::String)
-    path = joinpath(root, "segments.csv")
-    isfile(path) ||
-        error("no segments.csv under $root -- is this an ocean_rce.jl output root?")
-    df = CSV.read(path, DataFrame)
-    segs = [RceSegment(Int(r.segment), String(r.dir), Float64(r.t_offset_s), String(r.status))
-            for r in eachrow(df)]
+    rows = Scythe.read_segments_csv(root)
+    isempty(rows) && error("no segments.csv under $root -- is this a run_simulation " *
+                           "(src/run_driver.jl) output root?")
+    segs = [RceSegment(k, r["dir"], parse(Float64, r["t_offset_s"]), r["status"])
+            for (k, r) in rows]
     sort!(segs, by = s -> s.segment)
     return segs
 end
@@ -48,37 +50,40 @@ struct RceSnapshot
 end
 
 """
-    catalog_snapshots(root) -> Vector{RceSnapshot}
+    catalog_snapshots(root; patch = 0) -> Vector{RceSnapshot}
 
 Every `<t>.nc` across every segment directory under `root`, stitched onto one absolute
-time axis (`t_abs = t_offset_s + t_local`), sorted by `t_abs`.
+time axis (`t_abs = t_offset_s + t_local`), sorted by `t_abs`. `segments.csv`'s `dir`
+column is `<root>/seg_NN` (a single patch); `patch > 0` appends `nest\$patch` for a nested
+run's patch `patch` (`src/run_driver.jl segment_patch_dirs`).
 
 Segment 1's `0.0.nc` is the true initial condition (the noise-seeded state before the
 first timestep) and is kept. Every LATER segment's `0.0.nc` duplicates the PREVIOUS
-segment's final file (ocean_rce.jl warm-restarts each child from the prior segment's
-JLD2 checkpoint and writes its own t=0 snapshot on the way in) and is dropped here, per
-the output-root contract. A segment directory that does not exist yet (a run still in
-progress, or one that failed before writing anything) is skipped with a warning rather
-than an error, so this can be pointed at a live run.
+segment's final file (each segment warm-restarts from the prior segment's JLD2 checkpoint
+and writes its own t=0 snapshot on the way in) and is dropped here, per the output-root
+contract. A segment directory that does not exist yet (a run still in progress, or one
+that failed before writing anything) is skipped with a warning rather than an error, so
+this can be pointed at a live run.
 """
-function catalog_snapshots(root::String)
+function catalog_snapshots(root::String; patch::Int = 0)
     segs = read_segments(root)
     isempty(segs) && error("segments.csv under $root has no rows")
     snaps = RceSnapshot[]
     for s in segs
-        if !isdir(s.dir)
-            @warn "segment $(s.segment) directory missing, skipping" dir = s.dir
+        dir = patch > 0 ? joinpath(s.dir, "nest$patch") : s.dir
+        if !isdir(dir)
+            @warn "segment $(s.segment) directory missing, skipping" dir = dir
             continue
         end
         s.status == "done" ||
             @warn "segment $(s.segment) status = \"$(s.status)\" (not \"done\") -- " *
                   "including whatever <t>.nc files exist there"
-        for f in readdir(s.dir)
+        for f in readdir(dir)
             m = match(RCE_NC_RE, f)
             m === nothing && continue
             t_local = parse(Float64, m.captures[1])
             (s.segment > 1 && t_local == 0.0) && continue   # dup of prior segment's final file
-            push!(snaps, RceSnapshot(s.t_offset_s + t_local, joinpath(s.dir, f), s.segment))
+            push!(snaps, RceSnapshot(s.t_offset_s + t_local, joinpath(dir, f), s.segment))
         end
     end
     sort!(snaps, by = x -> x.t_abs)

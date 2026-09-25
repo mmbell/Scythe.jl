@@ -1,17 +1,66 @@
 # Open-ocean radiative-convective equilibrium on a 2-D (x-z) periodic slice: MYNN + ISHMAEL
 # ice + diurnal all-sky RRTMGP, triggered only by seeded low-level temperature noise (no
-# bubble, no wall). 300 km x 25 km at 6 km x 500 m cells (the quick grid; full.toml is
-# 3 km / 300 m). Horizontally inviscid apart from the B-spline filter (Smagorinsky is
-# cylindrical-only). Only keys that differ from the RunConfig struct defaults are listed:
-# the defaults are this case's domain, grid and physics.
+# bubble, no wall). Every key of [run]/[output]/[grid]/[timestep]/[reference_state]/
+# [initial_conditions]/[environment] below is spelled out, even where it equals the
+# RunConfig struct default (src/config.jl), so this file alone describes the domain (300 km
+# periodic x 25 km lid, 6 km x 500 m cells -- the quick grid; full.toml overlays 3 km / 300 m),
+# the sounding, the noise seed and the SST, with no need to cross-reference the struct.
+#
+# physics / numerics / diagnostics are left delta-only below: for this case there are NONE.
+# The struct defaults already give:
+#   - physics.boundary_layer: MYNN, :scythe fidelity bundle, EDMF off
+#   - physics.surface: fluxes on, stability-aware surface layer
+#   - physics.microphysics: ISHMAEL ice, two-moment rain, bhyp control-variable transforms
+#   - physics.radiation: diurnal all-sky RRTMGP
+#   - physics.horizontal_mixing: none -- Smagorinsky exists only for the cylindrical sets,
+#     so this case is horizontally inviscid apart from the B-spline spectral filter (l_q = 2.0)
+#   - physics.sponge: the Durran & Klemp (1983) sponge, alpha 0.02 /s, z_damp 17 km
+#   - numerics.state_dependent_si = true: implicit acoustic coefficients from the current
+#     column state; this case (and full.toml) are the FIRST to exercise it on XZ -- it had
+#     previously run only on the cylindrical TC equation sets
 
 [run]
 name             = "ocean_2D_rce"
+equation_set     = "moist_compressible_XZ"   # 2-D Cartesian x-z, RiRk (B-spline) vertical
 integration_time = 1728000.0         # 20 days
-segment_length   = 172800.0          # 2-day segments, one process each
+segment_length   = 172800.0          # 2-day segments, one process each (restart granularity)
 
 [output]
-dir = "output"                       # relative to this file
+dir                = "output"        # relative to this file
+interval           = 3600.0          # analysis-output cadence [s]
+restart_interval   = 21600.0         # JLD2 checkpoint cadence [s]
+formats            = ["netcdf"]
+sidecars           = false           # per-tile MYNN / radiation NetCDF sidecars
+netcdf_grid        = "regular"
+netcdf_derivatives = false
+
+[grid]
+geometry    = "RiRk"                 # B-spline vertical
+lateral     = "periodic"             # open ocean: no lateral wall at all
+boundaries  = [0.0, 300.0e3]         # 300 km domain (quick grid; full.toml: 3 km cells)
+num_cells   = [50]                   # 50 horizontal cells -> 6 km spacing
+z_top       = 25.0e3                 # 25 km lid
+num_cells_k = 50                     # 50 vertical cells -> 500 m spacing
+
+[timestep]
+ts           = 0.5                   # [s], root (and only) patch
+ts_per_patch = []                    # single patch: every patch runs at ts
+scale        = 1.0
+
+[reference_state]
+sounding       = "@scythe/benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref"
+exact          = true
+consistent_qss = true
+hydrostatic    = true
 
 [initial_conditions]
-method = "temperature_noise"         # z_max 1 km, dT_max 0.1 K, seed 2026 (defaults)
+method = "temperature_noise"         # seeded low-level noise; no bubble, no wall to trigger from
+
+[initial_conditions.temperature_noise]
+z_max  = 1000.0                      # top of the perturbed layer [m]
+dT_max = 0.1                         # noise amplitude [K]
+seed   = 2026                        # RNG seed (segment 1's initial conditions only)
+
+[environment]
+f_latitude = 15.0                    # unused here: moist_compressible_XZ carries no rotation
+sst        = 302.65                  # sea-surface temperature [K]
