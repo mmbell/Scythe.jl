@@ -1,0 +1,206 @@
+equation_set = "moist_compressible_XZ"
+initial_conditions_basename = "rce_ics.csv"
+integration_time = 172800.0
+output_dir_basename = "seg_01"
+output_interval = 3600.0
+ref_state_file_basename = "rce_exact.ref"
+restart_interval = 21600.0
+ts = 0.5
+
+[grid_params]
+geometry = "RiRk"
+iDim = 150
+iMax = 300000.0
+iMin = 0.0
+kDim = 150
+kMax = 25000.0
+kMin = 0.0
+mubar = 3
+num_cells_i = 50
+num_cells_k = 50
+quadrature = "gauss"
+
+    [grid_params.BCB]
+    E_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    Q_ss = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    nu_ai1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ai2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ai3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    nu_ci1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ci2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ci3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_i1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_i2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_i3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ni1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ni2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ni3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_nr = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    p = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_d = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_e = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+    [grid_params.BCL]
+    E_t = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    Q_ss = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ai1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ai2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ai3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_c = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ci1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ci2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ci3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_i1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_i2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_i3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ni1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ni2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ni3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_nr = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    p = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_d = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_e = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_t = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_v = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    u = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    w = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+
+    [grid_params.BCR]
+    E_t = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    Q_ss = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ai1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ai2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ai3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_c = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ci1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ci2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ci3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_i1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_i2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_i3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ni1 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ni2 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_ni3 = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_nr = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    p = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_d = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_e = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_t = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    rho_v = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    u = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+    w = "BoundaryConditions(nothing, nothing, nothing, nothing, true)"
+
+    [grid_params.BCT]
+    E_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    Q_ss = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    nu_ai1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ai2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ai3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    nu_ci1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ci2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ci3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_i1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_i2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_i3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ni1 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ni2 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_ni3 = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_nr = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    p = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_d = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_e = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+    [grid_params.l_q]
+    default = 2.0
+
+    [grid_params.max_wavenumber]
+    default = -1
+
+    [grid_params.positivity]
+
+    [grid_params.vars]
+    E_t = 6
+    Q_ss = 7
+    nu_ai1 = 14
+    nu_ai2 = 18
+    nu_ai3 = 22
+    nu_c = 9
+    nu_ci1 = 15
+    nu_ci2 = 19
+    nu_ci3 = 23
+    nu_i1 = 12
+    nu_i2 = 16
+    nu_i3 = 20
+    nu_ni1 = 13
+    nu_ni2 = 17
+    nu_ni3 = 21
+    nu_nr = 11
+    nu_r = 8
+    p = 1
+    rho_d = 2
+    rho_e = 24
+    rho_t = 3
+    rho_v = 10
+    u = 4
+    w = 5
+
+[options]
+condensate_transform = ":bhyp"
+exact_reference_state = "true"
+ice_microphysics = ":ishmael"
+ice_transform = ":bhyp"
+mynn = "true"
+mynn_fidelity = ":scythe"
+mynn_output = "false"
+output_formats = "[:netcdf]"
+precipitation = "true"
+radiation = ":rrtmgp"
+radiation_forcing = ":full"
+radiation_interval = "300.0"
+radiation_method = ":allsky"
+radiation_output = "false"
+radiation_z_max = "17000.0"
+rain_moments = "2"
+rain_number_transform = ":bhyp"
+rain_transform = ":bhyp"
+semiimplicit = "true"
+sfc_stability = "true"
+solar = ":diurnal"
+surface_fluxes = "true"
+vertical_mixing = "false"
+
+[physical_params]
+Cd = -1.0
+Ck = 0.001
+Khdiff = 0.0
+Khdiff_heat = 0.0
+Kvdiff = 0.0
+Kvdiff_heat = 0.0
+Kvdiff_water = 0.0
+N_0 = 8.0e6
+N_r = 0.001
+SST = 302.65
+U_min = 2.0
+alpha = 0.02
+l_inf = 80.0
+latitude = 20.0
+sfc_albedo = 0.06
+sfc_emissivity = 0.98
+start_doy = 240.0
+start_hour = 0.0
+tau_qss = 10.0
+z_damp = 17000.0

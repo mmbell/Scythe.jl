@@ -126,18 +126,12 @@ seg_length(j::Int, N::Float64, D::Float64) = min(D, N - (j - 1) * D)
 """Cumulative model-time offset [days] before segment `k` starts."""
 seg_offset(k::Int, N::Float64, D::Float64) = sum(seg_length(j, N, D) for j in 1:(k - 1); init = 0.0)
 
-rce = parse_rce_args(ARGS)
-opts = parse_benchmark_args(rce.rest)
-opts.stage == STAGE_MC || error("ocean_rce supports only --stage mc (the total-energy set)")
-opts.nests == 1 || error("ocean_rce supports only --nests 1 (nesting is out of scope here)")
-opts.grid == :rirk || error("ocean_rce targets the RiRk (B-spline vertical) grid")
-
-nseg_total = ceil(Int, rce.days / rce.segment_days)
-
-tag_suffix = get(ENV, "SCYTHE_BENCH_TAG", "") * (isempty(rce.tag) ? "" : "_$(rce.tag)")
-const RCE_ROOT = joinpath(BENCHMARKS_DIR, "output",
-                          "ocean_rce_$(opts.mode)_$(opts.stage)$(grid_suffix(opts))" *
-                          "$(nest_suffix(opts))$(tag_suffix)")
+# The segment must be a whole number of steps: integrate_model rounds
+# integration_time/ts to the step count, so a fractional segment integrates PAST the nominal
+# length (the final output lands at n_steps*ts) while the checkpoint file and the next
+# segment's t_offset carry the nominal value -- a silent clock skew. Checked after ts and
+# output_interval are known (below), where the output interval is held to the same rule.
+whole_steps(len, dt) = abs(len / dt - round(len / dt)) < 1.0e-9
 
 # ── segments.csv bookkeeping (shared by orchestrator and child) ────────────────
 
@@ -178,315 +172,258 @@ function upsert_segment_row!(row::Dict{String,Any})
     return path
 end
 
-# ── Orchestrator ─────────────────────────────────────────────────────────────
+"""
+    rce_model(rce, opts, k; root = RCE_ROOT) -> ModelParameters
 
-if rce.segment == 0
-    mkpath(RCE_ROOT)
-    if !rce.resume && isdir(joinpath(RCE_ROOT, "seg_01"))
-        error("refusing a fresh start: $(RCE_ROOT)/seg_01 already exists. Move the whole " *
-              "tree aside (mv, never rm) if you want a clean run, or pass --resume to " *
-              "continue it from segments.csv.")
-    end
+Build segment `k`'s ModelParameters: grid/timestep sizing, physics options, boundary
+conditions and the restart-checkpoint chain, given the parsed RCE (`parse_rce_args`) and
+benchmark (`parse_benchmark_args`) CLI results. `root` is the output root (defaults to
+the file-scope `RCE_ROOT`, so a normal run needs no extra argument); a caller building a
+model for inspection only can point it at a scratch directory instead. Creates `root` and
+the segment's own output directory as a side effect (mirrors tc/tc_init.jl's `make_base`,
+which does the same for its `output_dir`).
+"""
+function rce_model(rce, opts, k; root = RCE_ROOT)
+    mkpath(root)
+    seg_dir = joinpath(root, "seg_$(lpad(k, 2, '0'))")
+    mkpath(seg_dir)
 
-    println("RCE orchestrator: $(rce.days) day(s) in $(nseg_total) segment(s) of " *
-            "$(rce.segment_days) day(s); root = $RCE_ROOT")
+    Dk = seg_length(k, rce.days, rce.segment_days)
+    t_offset_days = seg_offset(k, rce.days, rce.segment_days)
+    integration_time = Dk * 86400.0
+    # The segment must be a whole number of steps: integrate_model rounds
+    # integration_time/ts to the step count, so a fractional segment integrates PAST the nominal
+    # length (the final output lands at n_steps*ts) while the checkpoint file and the next
+    # segment's t_offset carry the nominal value -- a silent clock skew. Checked after ts and
+    # output_interval are known (below), where the output interval is held to the same rule.
 
-    project_dir = dirname(Base.active_project())
-    thisfile = abspath(@__FILE__)
-    for k in 1:nseg_total
-        if rce.resume && segment_status(k) == "done"
-            println("RCE: segment $k/$nseg_total already done -- skipping (--resume)")
-            continue
-        end
-        child_args = vcat(ARGS, ["--segment", string(k)])
-        # NOTE: interpolate the Vector{String} WITHOUT a `...` splat -- backtick command
-        # literals treat `$(v...)` as concatenating every element into ONE argument with
-        # no separator (verified: `` `julia foo.jl $(["a","b"]...)` `` prints as a single
-        # "ab" argument), while a bare `$v` expands each element as its own argument.
-        cmd = `$(Base.julia_cmd()) --project=$(project_dir) $(thisfile) $child_args`
-        println("RCE: launching segment $k/$nseg_total")
-        println("  $cmd")
-        # The child's stdout (setup line, POSITIVITY line, the workers' "mynn:" / "mynn
-        # census:" lines) is tee'd into the segment's own directory -- the model's
-        # scythe_out.log only captures the worker's redirected stdout after integrate_model
-        # takes over, so without this the master-side prints of a segment are lost once the
-        # sbatch log scrolls. stderr goes to the same file.
-        seg_dir_k = joinpath(RCE_ROOT, "seg_$(lpad(k, 2, '0'))")
-        mkpath(seg_dir_k)
-        seg_log = joinpath(seg_dir_k, "segment_stdout.log")
-        ok = open(seg_log, "a") do errio
-            println(errio, "=== RCE segment $k/$nseg_total launched $(Dates.now()) ===")
-            flush(errio)
-            success(pipeline(pipeline(cmd; stderr = errio), `tee -a $seg_log`))
-        end
-        if !ok
-            error("RCE: segment $k/$nseg_total FAILED (see $seg_log). " *
-                  "Fix the issue and re-run this same command with --resume to continue " *
-                  "from segment $k.")
-        end
-        println("RCE: segment $k/$nseg_total complete.")
-    end
-    println("RCE: all $nseg_total segment(s) complete. Root: $RCE_ROOT")
-    exit(0)
-end
-
-# ── Child: build and integrate exactly one segment ──────────────────────────
-
-k = rce.segment
-(1 <= k <= nseg_total) || error("--segment $k is out of range for --days $(rce.days) " *
-                                "--segment-days $(rce.segment_days) ($(nseg_total) segment(s))")
-
-add_benchmark_workers(opts; count = opts.workers)
-@everywhere using Springsteel
-@everywhere using Scythe
-
-mkpath(RCE_ROOT)
-seg_dir = joinpath(RCE_ROOT, "seg_$(lpad(k, 2, '0'))")
-mkpath(seg_dir)
-
-Dk = seg_length(k, rce.days, rce.segment_days)
-t_offset_days = seg_offset(k, rce.days, rce.segment_days)
-integration_time = Dk * 86400.0
-# The segment must be a whole number of steps: integrate_model rounds
-# integration_time/ts to the step count, so a fractional segment integrates PAST the nominal
-# length (the final output lands at n_steps*ts) while the checkpoint file and the next
-# segment's t_offset carry the nominal value -- a silent clock skew. Checked after ts and
-# output_interval are known (below), where the output interval is held to the same rule.
-whole_steps(len, dt) = abs(len / dt - round(len / dt)) < 1.0e-9
-
-ref_state_file = joinpath(RCE_ROOT, "rce_exact.ref")
-if k == 1
-    initial_conditions = joinpath(RCE_ROOT, "rce_ics.csv")
-else
-    Dprev = seg_length(k - 1, rce.days, rce.segment_days)
-    prev_seg_dir = joinpath(RCE_ROOT, "seg_$(lpad(k - 1, 2, '0'))")
-    expected = joinpath(prev_seg_dir, "$(string(round(Dprev * 86400.0; digits = 2))).jld2")
-    if isfile(expected)
-        initial_conditions = expected
+    ref_state_file = joinpath(root, "rce_exact.ref")
+    if k == 1
+        initial_conditions = joinpath(root, "rce_ics.csv")
     else
-        candidates = filter(f -> endswith(f, ".jld2"), readdir(prev_seg_dir))
-        isempty(candidates) &&
-            error("no .jld2 checkpoint found in $prev_seg_dir to restart segment $k from")
-        newest = candidates[argmax([mtime(joinpath(prev_seg_dir, c)) for c in candidates])]
-        initial_conditions = joinpath(prev_seg_dir, newest)
-        println("RCE: WARNING expected checkpoint $expected not found; the restart-file " *
-                "naming assumption (round(integration_time; digits=2)) did not hold for " *
-                "segment $(k - 1). Using the newest checkpoint in $prev_seg_dir instead: " *
-                "$initial_conditions")
+        Dprev = seg_length(k - 1, rce.days, rce.segment_days)
+        prev_seg_dir = joinpath(root, "seg_$(lpad(k - 1, 2, '0'))")
+        expected = joinpath(prev_seg_dir, "$(string(round(Dprev * 86400.0; digits = 2))).jld2")
+        if isfile(expected)
+            initial_conditions = expected
+        else
+            candidates = filter(f -> endswith(f, ".jld2"), readdir(prev_seg_dir))
+            isempty(candidates) &&
+                error("no .jld2 checkpoint found in $prev_seg_dir to restart segment $k from")
+            newest = candidates[argmax([mtime(joinpath(prev_seg_dir, c)) for c in candidates])]
+            initial_conditions = joinpath(prev_seg_dir, newest)
+            println("RCE: WARNING expected checkpoint $expected not found; the restart-file " *
+                    "naming assumption (round(integration_time; digits=2)) did not hold for " *
+                    "segment $(k - 1). Using the newest checkpoint in $prev_seg_dir instead: " *
+                    "$initial_conditions")
+        end
     end
-end
 
-# ── Grid / timestep sizing ───────────────────────────────────────────────────
+    # ── Grid / timestep sizing ───────────────────────────────────────────────────
 
-WIDTH = parse(Float64, get(ENV, "SCYTHE_RCE_WIDTH", "300.0e3"))   # user decision 2026-09-22: 300 km for wall clock
-if opts.mode == :full
-    cellsize_i = 3000.0
-    num_cells_k = 84
-    kMax = 25.2e3
-    ts = 0.25
-else
-    cellsize_i = 6000.0
-    num_cells_k = 50
-    kMax = 25.0e3
-    ts = 0.5
-end
-num_cells_i = round(Int, WIDTH / cellsize_i)
-haskey(ENV, "SCYTHE_RCE_NI") && (num_cells_i = parse(Int, ENV["SCYTHE_RCE_NI"]))
-haskey(ENV, "SCYTHE_RCE_NK") && (num_cells_k = parse(Int, ENV["SCYTHE_RCE_NK"]))
-haskey(ENV, "SCYTHE_RCE_TS") && (ts = parse(Float64, ENV["SCYTHE_RCE_TS"]))
-kDim = 3 * num_cells_k
-ts = vertical_ts(ts, opts)
-output_interval = parse(Float64, get(ENV, "SCYTHE_RCE_OUTPUT", "3600.0"))
-
-SST = parse(Float64, get(ENV, "SCYTHE_RCE_SST", "302.65"))
-physical_params = Dict{Symbol,Any}(:Khdiff => 0.0, :Kvdiff => 0.0,
-                                   :Khdiff_heat => 0.0, :Kvdiff_heat => 0.0,
-                                   :Kvdiff_water => 0.0,
-                                   :tau_qss => 10.0, :N_r => 1.0e-3, :N_0 => 8.0e6,
-                                   :alpha => 0.02, :z_damp => 17.0e3,
-                                   :Cd => -1.0, :Ck => 1.0e-3, :U_min => 2.0,
-                                   :l_inf => 80.0, :SST => SST)
-
-options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
-                                 :precipitation => true, :vertical_mixing => false,
-                                 :output_formats => rce.csv ? [:netcdf, :csv] : [:netcdf]),
-                reference_state_options())
-
-# ── Boundary layer ───────────────────────────────────────────────────────────
-
-bl = get(ENV, "SCYTHE_RCE_BL", "mynn")
-if bl == "louis"
-    options[:louis_bl] = true
-    options[:surface_fluxes] = true
-elseif bl == "none"
-    # no boundary layer at all
-elseif bl == "mynn"
-    options[:mynn] = true
-    options[:surface_fluxes] = true
-    haskey(ENV, "SCYTHE_RCE_MYNN_INTERVAL") &&
-        (options[:mynn_interval] = parse(Float64, ENV["SCYTHE_RCE_MYNN_INTERVAL"]))
-    envflag("SCYTHE_RCE_MYNN_EDMF") && (options[:mynn_edmf] = 1)
-    options[:mynn_fidelity] =
-        Scythe.parse_mynn_fidelity(get(ENV, "SCYTHE_RCE_MYNN_FIDELITY", "scythe"))
-else
-    error("SCYTHE_RCE_BL must be louis | none | mynn, got \"$bl\"")
-end
-
-sfc_arm = get(ENV, "SCYTHE_RCE_SFC", "komori")
-sfc_arm in ("komori", "gfdl_v7", "charnock") ||
-    error("SCYTHE_RCE_SFC must be komori | gfdl_v7 | charnock, got \"$sfc_arm\"")
-sfc_arm == "komori" || (options[:sfc_z0] = Symbol(sfc_arm))
-# Stability-aware surface layer is ON BY DEFAULT here (unlike ocean_warm_bubble, where it is
-# opt-in): SCYTHE_RCE_SFC_STAB=0 turns it off. :scythe fidelity with it off is not an error --
-# _mynn_resolve_fidelity (src/mynn_state.jl) only folds :rmol_sfc into the bundle when
-# options[:sfc_stability] === true, so the bundle just has its other three members.
-env_on_unless_zero("SCYTHE_RCE_SFC_STAB", "1") && (options[:sfc_stability] = true)
-
-# ── Ice / rain microphysics (default ON here, unlike ocean_warm_bubble) ─────
-
-if env_on_unless_zero("SCYTHE_RCE_ICE", "1")
-    options[:ice_microphysics] = :ishmael
-    options[:rain_moments] = 2
-    options[:condensate_transform] = :bhyp
-    options[:rain_transform] = :bhyp
-    options[:rain_number_transform] = :bhyp
-    options[:ice_transform] = :bhyp
-end
-
-# ── Radiation (default diurnal here, unlike ocean_warm_bubble's default off) ─
-
-rad_arm = get(ENV, "SCYTHE_RCE_RAD", "diurnal")
-if rad_arm != "0" && rad_arm != ""
-    options[:radiation] = :rrtmgp
-    options[:radiation_forcing] = :full
-    options[:radiation_interval] = 300.0
-    options[:radiation_z_max] = 17.0e3
-    physical_params[:sfc_albedo] = 0.06
-    physical_params[:sfc_emissivity] = 0.98
-    if rad_arm == "lw"
-        options[:radiation_method] = :clearsky; options[:solar] = :none
-    elseif rad_arm == "allsky"
-        options[:radiation_method] = :allsky; options[:solar] = :none
-    elseif rad_arm == "sw"
-        options[:radiation_method] = :clearsky; options[:solar] = :fixed
-    elseif rad_arm == "allsky_sw"
-        options[:radiation_method] = :allsky; options[:solar] = :fixed
-    elseif rad_arm == "diurnal"
-        options[:radiation_method] = :allsky; options[:solar] = :diurnal
-        physical_params[:latitude] = 20.0
-        physical_params[:start_doy] = 240.0
-        # Only start_hour*3600 + t_model enters the solar clock (src/radiation_state.jl
-        # solar_state), and t_model is zero-based WITHIN this segment's own integration --
-        # so the offset in hours from segment 1's start is what keeps the diurnal cycle
-        # continuous across the segment boundary.
-        physical_params[:start_hour] = t_offset_days * 24.0
+    WIDTH = parse(Float64, get(ENV, "SCYTHE_RCE_WIDTH", "300.0e3"))   # user decision 2026-09-22: 300 km for wall clock
+    if opts.mode == :full
+        cellsize_i = 3000.0
+        num_cells_k = 84
+        kMax = 25.2e3
+        ts = 0.25
     else
-        error("SCYTHE_RCE_RAD = \"$rad_arm\" is not an arm; use diurnal, lw, allsky, sw, " *
-              "allsky_sw, or 0/unset")
+        cellsize_i = 6000.0
+        num_cells_k = 50
+        kMax = 25.0e3
+        ts = 0.5
     end
-end
+    num_cells_i = round(Int, WIDTH / cellsize_i)
+    haskey(ENV, "SCYTHE_RCE_NI") && (num_cells_i = parse(Int, ENV["SCYTHE_RCE_NI"]))
+    haskey(ENV, "SCYTHE_RCE_NK") && (num_cells_k = parse(Int, ENV["SCYTHE_RCE_NK"]))
+    haskey(ENV, "SCYTHE_RCE_TS") && (ts = parse(Float64, ENV["SCYTHE_RCE_TS"]))
+    kDim = 3 * num_cells_k
+    ts = vertical_ts(ts, opts)
+    output_interval = parse(Float64, get(ENV, "SCYTHE_RCE_OUTPUT", "3600.0"))
 
-sidecars = envflag("SCYTHE_RCE_SIDECARS")
-options[:mynn_output] = sidecars
-options[:radiation_output] = sidecars
+    SST = parse(Float64, get(ENV, "SCYTHE_RCE_SST", "302.65"))
+    physical_params = Dict{Symbol,Any}(:Khdiff => 0.0, :Kvdiff => 0.0,
+                                       :Khdiff_heat => 0.0, :Kvdiff_heat => 0.0,
+                                       :Kvdiff_water => 0.0,
+                                       :tau_qss => 10.0, :N_r => 1.0e-3, :N_0 => 8.0e6,
+                                       :alpha => 0.02, :z_damp => 17.0e3,
+                                       :Cd => -1.0, :Ck => 1.0e-3, :U_min => 2.0,
+                                       :l_inf => 80.0, :SST => SST)
 
-vars = Scythe.mc_var_names(options)
-rain_name = Scythe.rain_var_name(options)
-rain_number_name = Scythe.rain_number_var_name(options)
-two_moment = Scythe.rain_moments(options) == 2
-ice_on = Scythe.ice_microphysics(options) === :ishmael
-ice_names = Scythe.ice_var_names(options)
+    options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                                     :precipitation => true, :vertical_mixing => false,
+                                     :output_formats => rce.csv ? [:netcdf, :csv] : [:netcdf]),
+                    reference_state_options())
 
-wall_mode = get(ENV, "SCYTHE_RCE_WALL_BC", "d2")
-vert_scalar = wall_mode == "d2" ? Dict{String,Any}(v => SecondDerivativeBC() for v in vars) :
-              wall_mode == "neumann" ? Dict{String,Any}(v => NeumannBC() for v in vars) :
-              error("SCYTHE_RCE_WALL_BC must be d2 | neumann, got \"$wall_mode\"")
-topbot_bc = merge(vert_scalar, Dict{String,Any}("w" => DirichletBC(), rain_name => NaturalBC()))
-two_moment && (topbot_bc[rain_number_name] = NaturalBC())
-if ice_on
-    for nm in ice_names
-        topbot_bc[nm] = NaturalBC()
+    # ── Boundary layer ───────────────────────────────────────────────────────────
+
+    bl = get(ENV, "SCYTHE_RCE_BL", "mynn")
+    if bl == "louis"
+        options[:louis_bl] = true
+        options[:surface_fluxes] = true
+    elseif bl == "none"
+        # no boundary layer at all
+    elseif bl == "mynn"
+        options[:mynn] = true
+        options[:surface_fluxes] = true
+        haskey(ENV, "SCYTHE_RCE_MYNN_INTERVAL") &&
+            (options[:mynn_interval] = parse(Float64, ENV["SCYTHE_RCE_MYNN_INTERVAL"]))
+        envflag("SCYTHE_RCE_MYNN_EDMF") && (options[:mynn_edmf] = 1)
+        options[:mynn_fidelity] =
+            Scythe.parse_mynn_fidelity(get(ENV, "SCYTHE_RCE_MYNN_FIDELITY", "scythe"))
+    else
+        error("SCYTHE_RCE_BL must be louis | none | mynn, got \"$bl\"")
     end
+
+    sfc_arm = get(ENV, "SCYTHE_RCE_SFC", "komori")
+    sfc_arm in ("komori", "gfdl_v7", "charnock") ||
+        error("SCYTHE_RCE_SFC must be komori | gfdl_v7 | charnock, got \"$sfc_arm\"")
+    sfc_arm == "komori" || (options[:sfc_z0] = Symbol(sfc_arm))
+    # Stability-aware surface layer is ON BY DEFAULT here (unlike ocean_warm_bubble, where it is
+    # opt-in): SCYTHE_RCE_SFC_STAB=0 turns it off. :scythe fidelity with it off is not an error --
+    # _mynn_resolve_fidelity (src/mynn_state.jl) only folds :rmol_sfc into the bundle when
+    # options[:sfc_stability] === true, so the bundle just has its other three members.
+    env_on_unless_zero("SCYTHE_RCE_SFC_STAB", "1") && (options[:sfc_stability] = true)
+
+    # ── Ice / rain microphysics (default ON here, unlike ocean_warm_bubble) ─────
+
+    if env_on_unless_zero("SCYTHE_RCE_ICE", "1")
+        options[:ice_microphysics] = :ishmael
+        options[:rain_moments] = 2
+        options[:condensate_transform] = :bhyp
+        options[:rain_transform] = :bhyp
+        options[:rain_number_transform] = :bhyp
+        options[:ice_transform] = :bhyp
+    end
+
+    # ── Radiation (default diurnal here, unlike ocean_warm_bubble's default off) ─
+
+    rad_arm = get(ENV, "SCYTHE_RCE_RAD", "diurnal")
+    if rad_arm != "0" && rad_arm != ""
+        options[:radiation] = :rrtmgp
+        options[:radiation_forcing] = :full
+        options[:radiation_interval] = 300.0
+        options[:radiation_z_max] = 17.0e3
+        physical_params[:sfc_albedo] = 0.06
+        physical_params[:sfc_emissivity] = 0.98
+        if rad_arm == "lw"
+            options[:radiation_method] = :clearsky; options[:solar] = :none
+        elseif rad_arm == "allsky"
+            options[:radiation_method] = :allsky; options[:solar] = :none
+        elseif rad_arm == "sw"
+            options[:radiation_method] = :clearsky; options[:solar] = :fixed
+        elseif rad_arm == "allsky_sw"
+            options[:radiation_method] = :allsky; options[:solar] = :fixed
+        elseif rad_arm == "diurnal"
+            options[:radiation_method] = :allsky; options[:solar] = :diurnal
+            physical_params[:latitude] = 20.0
+            physical_params[:start_doy] = 240.0
+            # Only start_hour*3600 + t_model enters the solar clock (src/radiation_state.jl
+            # solar_state), and t_model is zero-based WITHIN this segment's own integration --
+            # so the offset in hours from segment 1's start is what keeps the diurnal cycle
+            # continuous across the segment boundary.
+            physical_params[:start_hour] = t_offset_days * 24.0
+        else
+            error("SCYTHE_RCE_RAD = \"$rad_arm\" is not an arm; use diurnal, lw, allsky, sw, " *
+                  "allsky_sw, or 0/unset")
+        end
+    end
+
+    sidecars = envflag("SCYTHE_RCE_SIDECARS")
+    options[:mynn_output] = sidecars
+    options[:radiation_output] = sidecars
+
+    vars = Scythe.mc_var_names(options)
+    rain_name = Scythe.rain_var_name(options)
+    rain_number_name = Scythe.rain_number_var_name(options)
+    two_moment = Scythe.rain_moments(options) == 2
+    ice_on = Scythe.ice_microphysics(options) === :ishmael
+    ice_names = Scythe.ice_var_names(options)
+
+    wall_mode = get(ENV, "SCYTHE_RCE_WALL_BC", "d2")
+    vert_scalar = wall_mode == "d2" ? Dict{String,Any}(v => SecondDerivativeBC() for v in vars) :
+                  wall_mode == "neumann" ? Dict{String,Any}(v => NeumannBC() for v in vars) :
+                  error("SCYTHE_RCE_WALL_BC must be d2 | neumann, got \"$wall_mode\"")
+    topbot_bc = merge(vert_scalar, Dict{String,Any}("w" => DirichletBC(), rain_name => NaturalBC()))
+    two_moment && (topbot_bc[rain_number_name] = NaturalBC())
+    if ice_on
+        for nm in ice_names
+            topbot_bc[nm] = NaturalBC()
+        end
+    end
+
+    # Periodic on BOTH lateral sides, for EVERY variable including u and w -- an open-ocean RCE
+    # domain has no lateral wall at all.
+    side_bc = Dict{String,Any}(v => PeriodicBC() for v in vars)
+
+    # Springsteel refuses an :i positivity bound under a periodic BC, so the OWB two-sided
+    # ("rho_r" => Dict(:i=>0.0, :k=>0.0)) becomes :k-only here. With ice on (the RCE default)
+    # the rain slot is a bhyp control variable, not "rho_r", and positivity is dropped entirely
+    # -- exactly as ocean_warm_bubble's ice arm already does.
+    positivity = Dict{String,Any}()
+    if rain_name == "rho_r"
+        positivity["rho_r"] = Dict(:k => 0.0)
+    else
+        println("POSITIVITY: dropped \"rho_r\" -- it is carried as a control variable")
+    end
+
+    grid_params = GridParameters(;
+        geometry = benchmark_geometry(opts),
+        iMin = 0.0,
+        iMax = WIDTH,
+        num_cells_i = num_cells_i,
+        kMin = 0.0,
+        kMax = kMax,
+        vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
+        l_q = Dict("default" => 2.0),
+        positivity = positivity,
+        BCL = side_bc,
+        BCR = side_bc,
+        BCB = topbot_bc,
+        BCT = topbot_bc,
+        vars = Dict(v => i for (i, v) in enumerate(vars)),
+    )
+
+    whole_steps(integration_time, ts) || error("RCE: segment length $(integration_time) s is not a " *
+        "whole number of steps at ts = $(ts) s; choose --segment-days (and --days) so that " *
+        "D*86400/ts is an integer")
+    whole_steps(output_interval, ts) || error("RCE: output interval $(output_interval) s is not a " *
+        "whole number of steps at ts = $(ts) s (SCYTHE_RCE_OUTPUT)")
+    whole_steps(integration_time, output_interval) || error("RCE: segment length " *
+        "$(integration_time) s is not a whole number of output intervals ($(output_interval) s); " *
+        "the stitched time axis needs each segment to end on an output time")
+
+    model = ModelParameters(
+        ts = ts,
+        integration_time = integration_time,
+        output_interval = output_interval,
+        restart_interval = 21600.0,
+        equation_set = "moist_compressible_XZ",
+        initial_conditions = initial_conditions,
+        output_dir = seg_dir,
+        ref_state_file = ref_state_file,
+        grid_params = grid_params,
+        physical_params = physical_params,
+        options = options,
+    )
+
+    # Computed locally (not read from the top-level `nseg_total` global) so `rce_model`
+    # stays a self-contained function of exactly its own arguments -- callable from a
+    # fresh process that never runs the ARGS-parsing guard below (e.g. the Stage-0
+    # golden-capture tool, tools/capture_legacy_models.jl, and its equivalence test).
+    nseg_total = ceil(Int, rce.days / rce.segment_days)
+    println("RCE: segment $k/$(nseg_total)  $(num_cells_i) x $(num_cells_k) cells " *
+            "($(WIDTH / num_cells_i / 1000) km x $(kMax / num_cells_k) m), ts = $ts s, " *
+            "t_offset = $(t_offset_days) d, length = $Dk d ($integration_time s), " *
+            "output every $output_interval s; BL = $bl, ICE = $(ice_on), " *
+            "RAD = $rad_arm, SST = $SST K, wall BC = $wall_mode, " *
+            "sfc_z0 = $(get(options, :sfc_z0, :komori)), " *
+            "sfc_stability = $(get(options, :sfc_stability, false)), " *
+            "mynn_fidelity = $(get(options, :mynn_fidelity, :none)); " *
+            "vars = $(join(vars, ' '))")
+
+    return model
 end
-
-# Periodic on BOTH lateral sides, for EVERY variable including u and w -- an open-ocean RCE
-# domain has no lateral wall at all.
-side_bc = Dict{String,Any}(v => PeriodicBC() for v in vars)
-
-# Springsteel refuses an :i positivity bound under a periodic BC, so the OWB two-sided
-# ("rho_r" => Dict(:i=>0.0, :k=>0.0)) becomes :k-only here. With ice on (the RCE default)
-# the rain slot is a bhyp control variable, not "rho_r", and positivity is dropped entirely
-# -- exactly as ocean_warm_bubble's ice arm already does.
-positivity = Dict{String,Any}()
-if rain_name == "rho_r"
-    positivity["rho_r"] = Dict(:k => 0.0)
-else
-    println("POSITIVITY: dropped \"rho_r\" -- it is carried as a control variable")
-end
-
-grid_params = GridParameters(;
-    geometry = benchmark_geometry(opts),
-    iMin = 0.0,
-    iMax = WIDTH,
-    num_cells_i = num_cells_i,
-    kMin = 0.0,
-    kMax = kMax,
-    vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
-    l_q = Dict("default" => 2.0),
-    positivity = positivity,
-    BCL = side_bc,
-    BCR = side_bc,
-    BCB = topbot_bc,
-    BCT = topbot_bc,
-    vars = Dict(v => i for (i, v) in enumerate(vars)),
-)
-
-whole_steps(integration_time, ts) || error("RCE: segment length $(integration_time) s is not a " *
-    "whole number of steps at ts = $(ts) s; choose --segment-days (and --days) so that " *
-    "D*86400/ts is an integer")
-whole_steps(output_interval, ts) || error("RCE: output interval $(output_interval) s is not a " *
-    "whole number of steps at ts = $(ts) s (SCYTHE_RCE_OUTPUT)")
-whole_steps(integration_time, output_interval) || error("RCE: segment length " *
-    "$(integration_time) s is not a whole number of output intervals ($(output_interval) s); " *
-    "the stitched time axis needs each segment to end on an output time")
-
-model = ModelParameters(
-    ts = ts,
-    integration_time = integration_time,
-    output_interval = output_interval,
-    restart_interval = 21600.0,
-    equation_set = "moist_compressible_XZ",
-    initial_conditions = initial_conditions,
-    output_dir = seg_dir,
-    ref_state_file = ref_state_file,
-    grid_params = grid_params,
-    physical_params = physical_params,
-    options = options,
-)
-
-scythe_root = normpath(joinpath(@__DIR__, ".."))
-scythe_sha, scythe_dirty = git_info(scythe_root)
-
-println("RCE: segment $k/$(nseg_total)  $(num_cells_i) x $(num_cells_k) cells " *
-        "($(WIDTH / num_cells_i / 1000) km x $(kMax / num_cells_k) m), ts = $ts s, " *
-        "t_offset = $(t_offset_days) d, length = $Dk d ($integration_time s), " *
-        "output every $output_interval s; BL = $bl, ICE = $(ice_on), " *
-        "RAD = $rad_arm, SST = $SST K, wall BC = $wall_mode, " *
-        "sfc_z0 = $(get(options, :sfc_z0, :komori)), " *
-        "sfc_stability = $(get(options, :sfc_stability, false)), " *
-        "mynn_fidelity = $(get(options, :mynn_fidelity, :none)); " *
-        "vars = $(join(vars, ' '))")
-println("RCE: git SHA $scythe_sha$(scythe_dirty ? " (dirty)" : ""); root = $RCE_ROOT")
-
-row = Dict{String,Any}(
-    "segment" => k, "dir" => seg_dir, "t_offset_s" => t_offset_days * 86400.0,
-    "integration_time_s" => integration_time, "ts" => ts,
-    "output_interval_s" => output_interval,
-    "restart_file" => joinpath(seg_dir, "$(string(round(integration_time; digits = 2))).jld2"),
-    "status" => "running", "scythe_sha" => scythe_sha,
-    "started" => string(now()), "finished" => "",
-)
-upsert_segment_row!(row)
 
 # ── Init (segment 1 only): reference sounding + noise-seeded initial conditions ────
 
@@ -527,24 +464,120 @@ function rce_init!(model::ModelParameters)
     Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
 end
 
-if k == 1
-    println("Generating reference state and initial conditions (segment 1)...")
-    rce_init!(model)
-end
+if abspath(PROGRAM_FILE) == @__FILE__
+    rce = parse_rce_args(ARGS)
+    opts = parse_benchmark_args(rce.rest)
+    opts.stage == STAGE_MC || error("ocean_rce supports only --stage mc (the total-energy set)")
+    opts.nests == 1 || error("ocean_rce supports only --nests 1 (nesting is out of scope here)")
+    opts.grid == :rirk || error("ocean_rce targets the RiRk (B-spline vertical) grid")
 
-# ── Integrate ────────────────────────────────────────────────────────────────
+    nseg_total = ceil(Int, rce.days / rce.segment_days)
 
-try
-    println("Integrating segment $k/$(nseg_total)...")
-    wallclock = @elapsed integrate_model(model)
-    @printf("Wall clock: %.1f s\n", wallclock)
-    row["status"] = "done"
-    row["finished"] = string(now())
+    tag_suffix = get(ENV, "SCYTHE_BENCH_TAG", "") * (isempty(rce.tag) ? "" : "_$(rce.tag)")
+    const RCE_ROOT = joinpath(BENCHMARKS_DIR, "output",
+                              "ocean_rce_$(opts.mode)_$(opts.stage)$(grid_suffix(opts))" *
+                              "$(nest_suffix(opts))$(tag_suffix)")
+
+    # ── Orchestrator ─────────────────────────────────────────────────────────────
+
+    if rce.segment == 0
+        mkpath(RCE_ROOT)
+        if !rce.resume && isdir(joinpath(RCE_ROOT, "seg_01"))
+            error("refusing a fresh start: $(RCE_ROOT)/seg_01 already exists. Move the whole " *
+                  "tree aside (mv, never rm) if you want a clean run, or pass --resume to " *
+                  "continue it from segments.csv.")
+        end
+
+        println("RCE orchestrator: $(rce.days) day(s) in $(nseg_total) segment(s) of " *
+                "$(rce.segment_days) day(s); root = $RCE_ROOT")
+
+        project_dir = dirname(Base.active_project())
+        thisfile = abspath(@__FILE__)
+        for k in 1:nseg_total
+            if rce.resume && segment_status(k) == "done"
+                println("RCE: segment $k/$nseg_total already done -- skipping (--resume)")
+                continue
+            end
+            child_args = vcat(ARGS, ["--segment", string(k)])
+            # NOTE: interpolate the Vector{String} WITHOUT a `...` splat -- backtick command
+            # literals treat `$(v...)` as concatenating every element into ONE argument with
+            # no separator (verified: `` `julia foo.jl $(["a","b"]...)` `` prints as a single
+            # "ab" argument), while a bare `$v` expands each element as its own argument.
+            cmd = `$(Base.julia_cmd()) --project=$(project_dir) $(thisfile) $child_args`
+            println("RCE: launching segment $k/$nseg_total")
+            println("  $cmd")
+            # The child's stdout (setup line, POSITIVITY line, the workers' "mynn:" / "mynn
+            # census:" lines) is tee'd into the segment's own directory -- the model's
+            # scythe_out.log only captures the worker's redirected stdout after integrate_model
+            # takes over, so without this the master-side prints of a segment are lost once the
+            # sbatch log scrolls. stderr goes to the same file.
+            seg_dir_k = joinpath(RCE_ROOT, "seg_$(lpad(k, 2, '0'))")
+            mkpath(seg_dir_k)
+            seg_log = joinpath(seg_dir_k, "segment_stdout.log")
+            ok = open(seg_log, "a") do errio
+                println(errio, "=== RCE segment $k/$nseg_total launched $(Dates.now()) ===")
+                flush(errio)
+                success(pipeline(pipeline(cmd; stderr = errio), `tee -a $seg_log`))
+            end
+            if !ok
+                error("RCE: segment $k/$nseg_total FAILED (see $seg_log). " *
+                      "Fix the issue and re-run this same command with --resume to continue " *
+                      "from segment $k.")
+            end
+            println("RCE: segment $k/$nseg_total complete.")
+        end
+        println("RCE: all $nseg_total segment(s) complete. Root: $RCE_ROOT")
+        exit(0)
+    end
+
+    # ── Child: build and integrate exactly one segment ──────────────────────────
+
+    k = rce.segment
+    (1 <= k <= nseg_total) || error("--segment $k is out of range for --days $(rce.days) " *
+                                    "--segment-days $(rce.segment_days) ($(nseg_total) segment(s))")
+
+    add_benchmark_workers(opts; count = opts.workers)
+    @everywhere using Springsteel
+    @everywhere using Scythe
+
+    model = rce_model(rce, opts, k)
+
+    scythe_root = normpath(joinpath(@__DIR__, ".."))
+    scythe_sha, scythe_dirty = git_info(scythe_root)
+
+    println("RCE: git SHA $scythe_sha$(scythe_dirty ? " (dirty)" : ""); root = $RCE_ROOT")
+
+    row = Dict{String,Any}(
+        "segment" => k, "dir" => model.output_dir,
+        "t_offset_s" => seg_offset(k, rce.days, rce.segment_days) * 86400.0,
+        "integration_time_s" => model.integration_time, "ts" => model.ts,
+        "output_interval_s" => model.output_interval,
+        "restart_file" => joinpath(model.output_dir,
+                                   "$(string(round(model.integration_time; digits = 2))).jld2"),
+        "status" => "running", "scythe_sha" => scythe_sha,
+        "started" => string(now()), "finished" => "",
+    )
     upsert_segment_row!(row)
-    println("RCE: segment $k/$(nseg_total) done.")
-catch e
-    row["status"] = "failed"
-    row["finished"] = string(now())
-    upsert_segment_row!(row)
-    rethrow(e)
+
+    if k == 1
+        println("Generating reference state and initial conditions (segment 1)...")
+        rce_init!(model)
+    end
+
+    # ── Integrate ────────────────────────────────────────────────────────────────
+
+    try
+        println("Integrating segment $k/$(nseg_total)...")
+        wallclock = @elapsed integrate_model(model)
+        @printf("Wall clock: %.1f s\n", wallclock)
+        row["status"] = "done"
+        row["finished"] = string(now())
+        upsert_segment_row!(row)
+        println("RCE: segment $k/$(nseg_total) done.")
+    catch e
+        row["status"] = "failed"
+        row["finished"] = string(now())
+        upsert_segment_row!(row)
+        rethrow(e)
+    end
 end

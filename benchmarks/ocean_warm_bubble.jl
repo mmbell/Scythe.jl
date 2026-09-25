@@ -70,15 +70,23 @@
 using Distributed
 
 include(joinpath(@__DIR__, "common", "harness.jl"))
-opts = parse_benchmark_args(ARGS)
-opts.stage == STAGE_MC ||
-    error("ocean_warm_bubble supports only --stage mc (the total-energy set)")
-opts.nests == 1 || error("ocean_warm_bubble supports only --nests 1 (nesting arrives later)")
-opts.grid == :rirk || error("ocean_warm_bubble targets the RiRk (B-spline vertical) grid")
 
-add_benchmark_workers(opts; count = opts.workers)
-@everywhere using Springsteel
-@everywhere using Scythe
+# ARGS parsing and worker/process setup are script-only (an `include` of this file --
+# the golden-capture tool, a future config-equivalence test -- wants `owb_model`,
+# `owb_init!` and the diagnostics functions defined without spawning workers or reading
+# real command-line ARGS; `owb_model` already takes `opts` as an ordinary argument, so
+# nothing downstream needs this block to have run).
+if abspath(PROGRAM_FILE) == @__FILE__
+    opts = parse_benchmark_args(ARGS)
+    opts.stage == STAGE_MC ||
+        error("ocean_warm_bubble supports only --stage mc (the total-energy set)")
+    opts.nests == 1 || error("ocean_warm_bubble supports only --nests 1 (nesting arrives later)")
+    opts.grid == :rirk || error("ocean_warm_bubble targets the RiRk (B-spline vertical) grid")
+
+    add_benchmark_workers(opts; count = opts.workers)
+    @everywhere using Springsteel
+    @everywhere using Scythe
+end
 
 include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 include(joinpath(@__DIR__, "common", "warm_bubble_diagnostics.jl"))
@@ -581,37 +589,39 @@ end
 
 # ── Run ────────────────────────────────────────────────────────────────────
 
-model = owb_model(opts)
-arm = Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""
-addarm(a, s) = isempty(s) ? a : (isempty(a) ? s : "$(a)_$(s)")
-bl_arm = get(ENV, "SCYTHE_OWB_BL", "louis")
-bl_arm == "louis" || (arm = addarm(arm, bl_arm))
-get(model.options, :mynn_edmf, 0) == 1 && (arm = addarm(arm, "edmf"))
-# Anything that is not the MODEL DEFAULT fidelity gets its own suffix (`_fid_<names>`),
-# so it never looks up the default arm's expected values. No `let` here: a `let` is a
-# HARD scope, so an `arm` assigned inside one would never leave it.
-# The default is the `:scythe` bundle (2026-09-23), so an absent key -- and an explicit
-# `:scythe`, which is the same run -- carries NO suffix, while the verbatim-Fortran
-# control is now a named arm and gets `_fid_fortran`. A deviation list gets
-# `_fid_<names joined by _>`, with `:scythe` inside a list joining as `scythe`; an EMPTY
-# list resolves to `:fortran` and is labelled as such.
-mynn_fid = get(model.options, :mynn_fidelity, :scythe)
-(mynn_fid isa AbstractVector && isempty(mynn_fid)) && (mynn_fid = :fortran)
-if mynn_fid isa Symbol
-    mynn_fid === :scythe || (arm = addarm(arm, "fid_" * String(mynn_fid)))
-elseif mynn_fid isa AbstractVector
-    arm = addarm(arm, "fid_" * join(string.(mynn_fid), "_"))
+if abspath(PROGRAM_FILE) == @__FILE__
+    model = owb_model(opts)
+    arm = Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""
+    addarm(a, s) = isempty(s) ? a : (isempty(a) ? s : "$(a)_$(s)")
+    bl_arm = get(ENV, "SCYTHE_OWB_BL", "louis")
+    bl_arm == "louis" || (arm = addarm(arm, bl_arm))
+    get(model.options, :mynn_edmf, 0) == 1 && (arm = addarm(arm, "edmf"))
+    # Anything that is not the MODEL DEFAULT fidelity gets its own suffix (`_fid_<names>`),
+    # so it never looks up the default arm's expected values. No `let` here: a `let` is a
+    # HARD scope, so an `arm` assigned inside one would never leave it.
+    # The default is the `:scythe` bundle (2026-09-23), so an absent key -- and an explicit
+    # `:scythe`, which is the same run -- carries NO suffix, while the verbatim-Fortran
+    # control is now a named arm and gets `_fid_fortran`. A deviation list gets
+    # `_fid_<names joined by _>`, with `:scythe` inside a list joining as `scythe`; an EMPTY
+    # list resolves to `:fortran` and is labelled as such.
+    mynn_fid = get(model.options, :mynn_fidelity, :scythe)
+    (mynn_fid isa AbstractVector && isempty(mynn_fid)) && (mynn_fid = :fortran)
+    if mynn_fid isa Symbol
+        mynn_fid === :scythe || (arm = addarm(arm, "fid_" * String(mynn_fid)))
+    elseif mynn_fid isa AbstractVector
+        arm = addarm(arm, "fid_" * join(string.(mynn_fid), "_"))
+    end
+    # A non-default SURFACE choice gets its own suffix, so the committed komori control and a
+    # gfdl_v7/charnock or stability arm never look up the same expected values.
+    arm = addarm(arm, get(model.options, :sfc_z0, :komori) === :komori ? "" :
+                      String(model.options[:sfc_z0]))
+    get(model.options, :sfc_stability, false) && (arm = addarm(arm, "stab"))
+    passed = run_benchmark("ocean_warm_bubble", opts;
+                           model = model,
+                           init! = owb_init!,
+                           diagnostics = owb_diagnostics,
+                           varnames = Scythe.mc_var_names(model.options),
+                           plotter = nothing,
+                           arm = arm)
+    exit(passed ? 0 : 1)
 end
-# A non-default SURFACE choice gets its own suffix, so the committed komori control and a
-# gfdl_v7/charnock or stability arm never look up the same expected values.
-arm = addarm(arm, get(model.options, :sfc_z0, :komori) === :komori ? "" :
-                  String(model.options[:sfc_z0]))
-get(model.options, :sfc_stability, false) && (arm = addarm(arm, "stab"))
-passed = run_benchmark("ocean_warm_bubble", opts;
-                       model = model,
-                       init! = owb_init!,
-                       diagnostics = owb_diagnostics,
-                       varnames = Scythe.mc_var_names(model.options),
-                       plotter = nothing,
-                       arm = arm)
-exit(passed ? 0 : 1)

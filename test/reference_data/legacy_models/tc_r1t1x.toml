@@ -1,0 +1,407 @@
+boundaries = [0.0, 150000.0, 450000.0, 1.05e6]
+n_sub = [1, 1, 1]
+num_cells = [15, 15, 15]
+ts_actual = [0.5, 0.5, 0.5]
+workers_per_patch = [1, 1, 1]
+
+[patches.patch_1]
+equation_set = "moist_compressible_axisym"
+initial_conditions_basename = "nest1_tc_ics.csv"
+integration_time = 1800.0
+output_dir_basename = "nest1"
+output_interval = 3600.0
+ref_state_file_basename = "tc_exact.ref"
+restart_interval = 21600.0
+ts = 0.5
+
+    [patches.patch_1.grid_params]
+    geometry = "RiRk"
+    iDim = 45
+    iMax = 150000.0
+    iMin = 0.0
+    kDim = 150
+    kMax = 25000.0
+    kMin = 0.0
+    mubar = 3
+    num_cells_i = 15
+    num_cells_k = 50
+    quadrature = "gauss"
+
+        [patches.patch_1.grid_params.BCB]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        p = "Dict{String, Real}(\"β1\" => 1.0, \"X1\" => 1, \"α1\" => 0.0)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+        [patches.patch_1.grid_params.BCL]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        p = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        u = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+        v = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+        w = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+
+        [patches.patch_1.grid_params.BCR]
+        E_t = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        Q_ss = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        nu_c = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        nu_r = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        p = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        rho_d = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        rho_t = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        rho_v = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        u = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        v = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        w = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+
+        [patches.patch_1.grid_params.BCT]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        p = "Dict{String, Real}(\"β1\" => 1.0, \"X1\" => 1, \"α1\" => 0.0)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+        [patches.patch_1.grid_params.l_q]
+        default = 2.0
+
+        [patches.patch_1.grid_params.max_wavenumber]
+
+        [patches.patch_1.grid_params.positivity]
+
+        [patches.patch_1.grid_params.vars]
+        E_t = 6
+        Q_ss = 7
+        nu_c = 9
+        nu_r = 8
+        p = 1
+        rho_d = 2
+        rho_t = 3
+        rho_v = 11
+        u = 4
+        v = 10
+        w = 5
+
+    [patches.patch_1.options]
+    condensate_transform = ":bhyp"
+    consistent_qss_reference = "true"
+    exact_reference_state = "true"
+    hydrostatic_reference = "true"
+    louis_bl = "true"
+    output_formats = "[:netcdf]"
+    precipitation = "true"
+    rain_transform = ":bhyp"
+    semiimplicit = "true"
+    state_dependent_si = "true"
+    state_deviation = "0.15"
+    surface_fluxes = "true"
+    vertical_mixing = "false"
+    wall_bc_tau = "Inf"
+
+    [patches.patch_1.physical_params]
+    Cd = -1.0
+    Ck = 0.001
+    K_min = 25.0
+    Khdiff = 0.0
+    Khdiff_heat = -1.0
+    Khdiff_water = 0.0
+    Kvdiff = 0.0
+    Kvdiff_heat = 0.0
+    Kvdiff_water = 0.0
+    Ls = 500.0
+    N_0 = 8.0e6
+    N_r = 0.001
+    Pr_t = 1.0
+    SST = 302.65
+    Sc_t = 1.0
+    U_min = 2.0
+    alpha = 0.02
+    f = 3.774616953775162e-5
+    l_inf = 80.0
+    tau_qss = 10.0
+    z_damp = 17000.0
+
+[patches.patch_2]
+equation_set = "moist_compressible_axisym"
+initial_conditions_basename = "nest2_tc_ics.csv"
+integration_time = 1800.0
+output_dir_basename = "nest2"
+output_interval = 3600.0
+ref_state_file_basename = "tc_exact.ref"
+restart_interval = 21600.0
+ts = 0.5
+
+    [patches.patch_2.grid_params]
+    geometry = "RiRk"
+    iDim = 48
+    iMax = 450000.0
+    iMin = 130000.0
+    kDim = 150
+    kMax = 25000.0
+    kMin = 0.0
+    mubar = 3
+    num_cells_i = 16
+    num_cells_k = 50
+    quadrature = "gauss"
+
+        [patches.patch_2.grid_params.BCB]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        p = "Dict{String, Real}(\"β1\" => 1.0, \"X1\" => 1, \"α1\" => 0.0)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+        [patches.patch_2.grid_params.BCL]
+        E_t = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        p = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        rho_d = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        w = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+
+        [patches.patch_2.grid_params.BCR]
+        E_t = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        Q_ss = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        nu_c = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        nu_r = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        p = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        rho_d = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        rho_t = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        rho_v = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        u = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        v = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+        w = "BoundaryConditions(NaN, NaN, NaN, nothing, false)"
+
+        [patches.patch_2.grid_params.BCT]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        p = "Dict{String, Real}(\"β1\" => 1.0, \"X1\" => 1, \"α1\" => 0.0)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+        [patches.patch_2.grid_params.l_q]
+        default = 2.0
+
+        [patches.patch_2.grid_params.max_wavenumber]
+
+        [patches.patch_2.grid_params.positivity]
+
+        [patches.patch_2.grid_params.vars]
+        E_t = 6
+        Q_ss = 7
+        nu_c = 9
+        nu_r = 8
+        p = 1
+        rho_d = 2
+        rho_t = 3
+        rho_v = 11
+        u = 4
+        v = 10
+        w = 5
+
+    [patches.patch_2.options]
+    condensate_transform = ":bhyp"
+    consistent_qss_reference = "true"
+    exact_reference_state = "true"
+    hydrostatic_reference = "true"
+    louis_bl = "true"
+    output_formats = "[:netcdf]"
+    precipitation = "true"
+    rain_transform = ":bhyp"
+    semiimplicit = "true"
+    state_dependent_si = "true"
+    state_deviation = "0.15"
+    surface_fluxes = "true"
+    vertical_mixing = "false"
+    wall_bc_tau = "Inf"
+
+    [patches.patch_2.physical_params]
+    Cd = -1.0
+    Ck = 0.001
+    K_min = 25.0
+    Khdiff = 0.0
+    Khdiff_heat = -1.0
+    Khdiff_water = 0.0
+    Kvdiff = 0.0
+    Kvdiff_heat = 0.0
+    Kvdiff_water = 0.0
+    Ls = 500.0
+    N_0 = 8.0e6
+    N_r = 0.001
+    Pr_t = 1.0
+    SST = 302.65
+    Sc_t = 1.0
+    U_min = 2.0
+    alpha = 0.02
+    f = 3.774616953775162e-5
+    l_inf = 80.0
+    tau_qss = 10.0
+    z_damp = 17000.0
+
+[patches.patch_3]
+equation_set = "moist_compressible_axisym"
+initial_conditions_basename = "nest3_tc_ics.csv"
+integration_time = 1800.0
+output_dir_basename = "nest3"
+output_interval = 3600.0
+ref_state_file_basename = "tc_exact.ref"
+restart_interval = 21600.0
+ts = 0.5
+
+    [patches.patch_3.grid_params]
+    geometry = "RiRk"
+    iDim = 48
+    iMax = 1.05e6
+    iMin = 410000.0
+    kDim = 150
+    kMax = 25000.0
+    kMin = 0.0
+    mubar = 3
+    num_cells_i = 16
+    num_cells_k = 50
+    quadrature = "gauss"
+
+        [patches.patch_3.grid_params.BCB]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        p = "Dict{String, Real}(\"β1\" => 1.0, \"X1\" => 1, \"α1\" => 0.0)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+        [patches.patch_3.grid_params.BCL]
+        E_t = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        p = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        rho_d = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+        w = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+
+        [patches.patch_3.grid_params.BCR]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        p = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        u = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+        v = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        w = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+
+        [patches.patch_3.grid_params.BCT]
+        E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        nu_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        nu_r = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        p = "Dict{String, Real}(\"β1\" => 1.0, \"X1\" => 1, \"α1\" => 0.0)"
+        rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+        rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+        w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+        [patches.patch_3.grid_params.l_q]
+        default = 2.0
+
+        [patches.patch_3.grid_params.max_wavenumber]
+
+        [patches.patch_3.grid_params.positivity]
+
+        [patches.patch_3.grid_params.vars]
+        E_t = 6
+        Q_ss = 7
+        nu_c = 9
+        nu_r = 8
+        p = 1
+        rho_d = 2
+        rho_t = 3
+        rho_v = 11
+        u = 4
+        v = 10
+        w = 5
+
+    [patches.patch_3.options]
+    condensate_transform = ":bhyp"
+    consistent_qss_reference = "true"
+    exact_reference_state = "true"
+    hydrostatic_reference = "true"
+    louis_bl = "true"
+    output_formats = "[:netcdf]"
+    precipitation = "true"
+    rain_transform = ":bhyp"
+    semiimplicit = "true"
+    state_dependent_si = "true"
+    state_deviation = "0.15"
+    surface_fluxes = "true"
+    vertical_mixing = "false"
+    wall_bc_tau = "Inf"
+
+    [patches.patch_3.physical_params]
+    Cd = -1.0
+    Ck = 0.001
+    K_min = 25.0
+    Khdiff = 0.0
+    Khdiff_heat = -1.0
+    Khdiff_water = 0.0
+    Kvdiff = 0.0
+    Kvdiff_heat = 0.0
+    Kvdiff_water = 0.0
+    Ls = 500.0
+    N_0 = 8.0e6
+    N_r = 0.001
+    Pr_t = 1.0
+    SST = 302.65
+    Sc_t = 1.0
+    U_min = 2.0
+    alpha = 0.02
+    f = 3.774616953775162e-5
+    l_inf = 80.0
+    tau_qss = 10.0
+    z_damp = 17000.0
