@@ -39,8 +39,7 @@ if cfg.physics.radiation.scheme == :rrtmgp
               "be loaded here: launch with julia --project=simulations")
     @eval Main import RRTMGP, ClimaComms
 end
-# On --resume the run's own <root>/config.toml is authoritative; `--set output.dir=...` only
-# locates that root, so it is not passed on (run_simulation refuses any other --set there
-# except run.integration_time).
-resume && filter!(s -> !startswith(strip(s), "output.dir="), set)
+# On --resume the run's own <root>/config.toml is authoritative: run_simulation accepts
+# `--set output.dir=...` (it locates the root) and `run.integration_time` (extends the run)
+# and refuses everything else.
 run_simulation(cfg, exec; resume, config_sources = paths, set)

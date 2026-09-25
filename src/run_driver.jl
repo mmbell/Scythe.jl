@@ -574,12 +574,17 @@ function run_simulation(cfg::RunConfig, exec::ExecutionEnv; resume::Bool = false
     notes = Dict{Int,String}()
 
     if resume
+        # `output.dir` is how the launcher LOCATES the tree to resume (the root's own
+        # config.toml is then authoritative for everything else), so it is accepted here
+        # and dropped; `run.integration_time` may change to extend the run; nothing else may.
         for s in set
             key = strip(first(split(s, '='; limit = 2)))
-            key == "run.integration_time" || error("--resume: --set $(repr(s)) refused: a " *
-                "resumed run keeps its recorded configuration; only run.integration_time " *
-                "may change (to extend the run)")
+            key in ("run.integration_time", "output.dir") || error("--resume: --set " *
+                "$(repr(s)) refused: a resumed run keeps its recorded configuration; only " *
+                "run.integration_time (to extend the run) and output.dir (to locate it) " *
+                "may be given")
         end
+        set = filter(s -> strip(first(split(s, '='; limit = 2))) != "output.dir", set)
         isfile(cfgpath) || error("--resume: $cfgpath does not exist (nothing to resume)")
         here = "output.dir=" * root
         old = load_config(cfgpath; set = [here])
