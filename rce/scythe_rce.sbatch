@@ -109,7 +109,9 @@ echo "  extra args  : $ARGS"
 echo "  started     : $(date)"
 echo "==================================================================="
 
-$JULIA --project=$SCYTHE $SCYTHE/benchmarks/ocean_rce.jl $ARGS
+# --project=$SCYTHE/simulations: the launch environment that can load RRTMGP/ClimaComms,
+# Scythe's WEAK deps (ext/ScytheRRTMGPExt.jl); the RCE runs diurnal RRTMGP by default.
+$JULIA --project=$SCYTHE/simulations $SCYTHE/benchmarks/ocean_rce.jl $ARGS
 status=$?
 
 echo "=== finished: $(date) (exit $status) ==="

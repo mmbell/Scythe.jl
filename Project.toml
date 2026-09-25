@@ -36,7 +36,7 @@ RRTMGP = "a01a1ee8-cea4-48fc-987c-fc7878d79da1"
 ScytheRRTMGPExt = ["RRTMGP", "ClimaComms"]
 
 [workspace]
-projects = ["test"]
+projects = ["test", "simulations"]
 
 [sources]
 Springsteel = {path = "../Springsteel.jl"}

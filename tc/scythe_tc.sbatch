@@ -98,7 +98,10 @@ echo "  extra args  : ${ARGS:-none}"
 echo "  started     : $(date)"
 echo "================================================================="
 
-$JULIA --project=$SCYTHE $SCYTHE/tc/tc_run_axisym.jl $INTEGRATION_TIME $ARGS
+# --project=$SCYTHE/simulations: the launch environment (a workspace member sharing
+# the root Manifest.toml) that can load RRTMGP/ClimaComms, Scythe's WEAK deps
+# (ext/ScytheRRTMGPExt.jl). Also fine for a no-radiation run.
+$JULIA --project=$SCYTHE/simulations $SCYTHE/tc/tc_run_axisym.jl $INTEGRATION_TIME $ARGS
 status=$?
 
 echo "=== finished: $(date) (exit $status) ==="

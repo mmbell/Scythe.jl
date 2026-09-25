@@ -24,6 +24,12 @@ requests any arm (`tools/rrtmgp_prewarm.jl`); `tc/_preflight.sh`'s `tc_preflight
 CHECK-ONLY-asserts they are present whenever `SCYTHE_TC_RAD` is set, and fails loudly with
 that instruction if not.
 
+**Launch environment.** Run from `--project=simulations`, not the root project. RRTMGP and
+ClimaComms are WEAK dependencies of Scythe (`ext/ScytheRRTMGPExt.jl`) and load only from an
+environment that lists them; `simulations/Project.toml` is a workspace member sharing the
+root `Manifest.toml`. Under the root project a radiation arm is refused at tile build with a
+message naming the missing `using`.
+
 ## S6 smoke run (this stage, laptop, 2026-09-02)
 
 30-min 3-nest axisym coarse smoke, `SCYTHE_TC_RAD=diurnal`:
@@ -31,7 +37,7 @@ that instruction if not.
 ```
 JULIA_NUM_THREADS=4 SCYTHE_TC_RAD=diurnal \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s6_rad_smoke_diurnal \
-julia --project=. tc/tc_run_axisym.jl 1800 --csv
+julia --project=simulations tc/tc_run_axisym.jl 1800 --csv
 ```
 
 Radiation-off control (unset `SCYTHE_TC_RAD`), 5-min, confirms no radiation setup line, no
@@ -40,7 +46,7 @@ sidecar files, no per-call trace (`rs.active == false`, `EMPTY_RADIATION`):
 ```
 JULIA_NUM_THREADS=2 \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s6_rad_smoke_control \
-julia --project=. tc/tc_run_axisym.jl 300 --csv
+julia --project=simulations tc/tc_run_axisym.jl 300 --csv
 ```
 
 Both completed cleanly (`finite=true` on every nest); see the S6 report for the trace
@@ -53,7 +59,7 @@ excerpts, OLR/cooling numbers and the `read_radiation` reassembly check.
 ```
 JULIA_NUM_THREADS=4 SCYTHE_TC_RAD=diurnal \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_rad_6h_full \
-julia --project=. tc/tc_run_axisym.jl 21600 --csv
+julia --project=simulations tc/tc_run_axisym.jl 21600 --csv
 ```
 
 ### 6 h, laptop, `:anomaly` forcing (for comparison against `:full`)
@@ -61,7 +67,7 @@ julia --project=. tc/tc_run_axisym.jl 21600 --csv
 ```
 JULIA_NUM_THREADS=4 SCYTHE_TC_RAD=diurnal SCYTHE_TC_RAD_FORCING=anomaly \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_rad_6h_anomaly \
-julia --project=. tc/tc_run_axisym.jl 21600 --csv
+julia --project=simulations tc/tc_run_axisym.jl 21600 --csv
 ```
 
 ### 24 h, laptop, `:full` forcing (the plan's first production diurnal target)
@@ -69,7 +75,7 @@ julia --project=. tc/tc_run_axisym.jl 21600 --csv
 ```
 JULIA_NUM_THREADS=4 SCYTHE_TC_RAD=diurnal \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_rad_24h_full \
-julia --project=. tc/tc_run_axisym.jl 86400 --csv
+julia --project=simulations tc/tc_run_axisym.jl 86400 --csv
 ```
 
 ### 24 h, single-node sbatch shape (`scythe_tc.sbatch`)
@@ -91,7 +97,7 @@ sbatch --export=ALL,SCYTHE_TC_RAD=diurnal,SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_rad
 
 Both sbatch wrappers already `tc_preflight` before launching, which now includes the
 RRTMGP artifact check whenever `SCYTHE_TC_RAD` is exported — run
-`julia --project=<Scythe.jl checkout> tools/rrtmgp_prewarm.jl` on the login node first if
+`julia --project=<Scythe.jl checkout>/simulations tools/rrtmgp_prewarm.jl` on the login node first if
 that check has never been run on the cluster.
 
 ## What to look at (S6 acceptance, per the plan)

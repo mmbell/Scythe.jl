@@ -78,11 +78,18 @@ its output — the name plus what it expanded to on THAT run — and
 SCYTHE_TC_BL=mynn SCYTHE_TC_MYNN_EDMF=0 \
 SCYTHE_TC_MYNN_FIDELITY=scythe SCYTHE_TC_SFC_STAB=1 \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s10_24h_mynn_scythe \
-julia --project=. tc/tc_run_axisym.jl 86400 --csv
+julia --project=simulations tc/tc_run_axisym.jl 86400 --csv
 ```
 
 Ice: the MYNN closure runs with ISHMAEL (ice legs, S8 e007c81); the Louis scheme is still
 refused with ice. The TC has never run ice with either.
+
+
+**Launch environment.** The commands below run from `--project=simulations`, not the root project. RRTMGP and
+ClimaComms are WEAK dependencies of Scythe (`ext/ScytheRRTMGPExt.jl`) and load only from an
+environment that lists them; `simulations/Project.toml` is a workspace member sharing the
+root `Manifest.toml`. Under the root project a radiation arm (`SCYTHE_TC_RAD`) is refused at tile build with a
+message naming the missing `using`.
 
 ## Runs made (2026-09-07, commits f2055ae / d4a27d2 + S8 edits in progress, laptop)
 
@@ -92,11 +99,11 @@ refused with ice. The TC has never run ice with either.
 ```
 JULIA_NUM_THREADS=4 SCYTHE_TC_BL=louis \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s10_6h_louis \
-julia --project=. tc/tc_run_axisym.jl 21600 --csv
+julia --project=simulations tc/tc_run_axisym.jl 21600 --csv
 
 JULIA_NUM_THREADS=4 SCYTHE_TC_BL=mynn SCYTHE_TC_MYNN_INTERVAL=20 SCYTHE_TC_MYNN_EDMF=0 \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s10_6h_mynn \
-julia --project=. tc/tc_run_axisym.jl 21600 --csv
+julia --project=simulations tc/tc_run_axisym.jl 21600 --csv
 ```
 
 Assessment: `tc/output/S10_BL_ASSESSMENT.md` — at 6 h the two vortices are statistically
@@ -153,16 +160,16 @@ walltime-killed or dead arm can be chained with `RESTART_T=<seconds>` and the sa
 ```
 JULIA_NUM_THREADS=4 SCYTHE_TC_RES=fine SCYTHE_TC_BL=louis \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s10_24h_louis \
-julia --project=. tc/tc_run_axisym.jl 86400 --csv
+julia --project=simulations tc/tc_run_axisym.jl 86400 --csv
 
 JULIA_NUM_THREADS=4 SCYTHE_TC_RES=fine SCYTHE_TC_BL=mynn SCYTHE_TC_MYNN_EDMF=0 \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s10_24h_mynn \
-julia --project=. tc/tc_run_axisym.jl 86400 --csv
+julia --project=simulations tc/tc_run_axisym.jl 86400 --csv
 
 # EDMF arm (plumes fire where the BL is unstable; the first fine-grid layer is ~100 m)
 JULIA_NUM_THREADS=4 SCYTHE_TC_RES=fine SCYTHE_TC_BL=mynn SCYTHE_TC_MYNN_EDMF=1 \
 SCYTHE_TC_OUTDIR=$PWD/tc/output/tc_s10_24h_mynn_edmf \
-julia --project=. tc/tc_run_axisym.jl 86400 --csv
+julia --project=simulations tc/tc_run_axisym.jl 86400 --csv
 ```
 
 ## Output

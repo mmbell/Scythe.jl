@@ -25,9 +25,15 @@ re-running one segment by hand after a crash.
 
 ## Launching
 
+`--project=simulations`, not the root project: the RCE runs diurnal RRTMGP by default, and
+RRTMGP/ClimaComms are WEAK dependencies of Scythe (`ext/ScytheRRTMGPExt.jl`) that load only
+from an environment listing them. `simulations/Project.toml` is a workspace member sharing
+the root `Manifest.toml`; the orchestrator launches its segment children in the same
+environment (`Base.active_project()`).
+
 ```sh
 # Local, foreground, the default 20 days in 2-day segments (10 children):
-julia --project=. benchmarks/ocean_rce.jl --mode quick --stage mc --grid rirk
+julia --project=simulations benchmarks/ocean_rce.jl --mode quick --stage mc --grid rirk
 
 # On the cluster (single node, 20 cores; see rce/scythe_rce.sbatch's header for knobs):
 sbatch rce/scythe_rce.sbatch                 # 20-day, quick, default physics
@@ -87,7 +93,7 @@ from the file alone, without re-deriving it from `--days`/`--segment-days`.
 ## Resuming
 
 ```sh
-julia --project=. benchmarks/ocean_rce.jl --mode quick --stage mc --grid rirk --resume
+julia --project=simulations benchmarks/ocean_rce.jl --mode quick --stage mc --grid rirk --resume
 # or: sbatch --export=ALL,RESUME=1,SCYTHE_RCE_TAG=ctrl1 rce/scythe_rce.sbatch
 ```
 

@@ -71,6 +71,13 @@ else
 end
 @everywhere using Springsteel
 @everywhere using Scythe
+# RRTMGP and ClimaComms are WEAK dependencies of Scythe: loading them (master AND every
+# worker, since each worker builds its own tiles) is what loads ext/ScytheRRTMGPExt.jl.
+# They load only from an environment that lists them -- launch radiation arms with
+# `--project=simulations`. Guarded so a no-radiation run still works under `--project=.`.
+if get(ENV, "SCYTHE_TC_RAD", "0") ∉ ("0", "")
+    @everywhere import RRTMGP, ClimaComms
+end
 using CSV, DataFrames
 
 include(joinpath(@__DIR__, "tc_init.jl"))

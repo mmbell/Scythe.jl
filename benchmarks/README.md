@@ -15,6 +15,14 @@ julia --project=. benchmarks/bf02_dry.jl   --mode full  --stage legacy --plot
 julia --project=. benchmarks/bf02_moist.jl --mode quick --stage legacy
 ```
 
+Radiation arms (`ocean_rce`, which runs diurnal RRTMGP by default, and the
+`SCYTHE_OWB_*` / `SCYTHE_O01_RAD` radiation arms of `ocean_warm_bubble` and `o01_rainfall`)
+must run from `--project=simulations` instead, e.g.
+`julia --project=simulations benchmarks/ocean_rce.jl --mode quick --stage mc --grid rirk`.
+RRTMGP and ClimaComms are WEAK dependencies of Scythe (`ext/ScytheRRTMGPExt.jl`) and load
+only from an environment that lists them; `simulations/Project.toml` is a workspace member
+sharing the root `Manifest.toml`. The non-radiation commands above need no extension.
+
 | Flag | Values | Meaning |
 |------|--------|---------|
 | `--mode` | `quick` (default) \| `full` | quick: coarse grid for routine regression; full: paper-grade resolution |

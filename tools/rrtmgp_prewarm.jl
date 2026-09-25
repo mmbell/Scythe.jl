@@ -7,7 +7,10 @@
 #
 # Run once per machine/user before a compute-node job that uses radiation:
 #
-#   julia --project=/Users/mmbell/Development/Scythe.jl tools/rrtmgp_prewarm.jl
+#   julia --project=/Users/mmbell/Development/Scythe.jl/simulations tools/rrtmgp_prewarm.jl
+#
+# (`simulations`, not the root project: RRTMGP/ClimaComms are WEAK dependencies of Scythe
+# and load only from an environment that lists them.)
 
 using RRTMGP, NCDatasets, ClimaComms
 ClimaComms.@import_required_backends

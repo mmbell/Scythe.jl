@@ -1,0 +1,27 @@
+# Workspace member for RUNNING simulations (Julia >= 1.12 workspaces share the root
+# Manifest.toml). It exists because RRTMGP and ClimaComms are WEAK dependencies of Scythe
+# (Project.toml [weakdeps]; ext/ScytheRRTMGPExt.jl) and a weak dependency can only be
+# loaded from an environment that lists it. Launch with `julia --project=simulations`.
+name = "ScytheSimulations"
+uuid = "b3f1c8a2-4d0e-4c1b-9a7e-2f6e5c9d1a10"
+version = "0.1.0"
+
+[deps]
+ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+ClimaComms = "3a4d1b5c-c61d-41fd-a00a-5873ba7a1b0d"
+ClusterManagers = "34f1f09b-3a8b-5176-ab39-66d58a4d544e"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
+RRTMGP = "a01a1ee8-cea4-48fc-987c-fc7878d79da1"
+Scythe = "d55642f6-1d05-468f-911d-cecaa5a3b3bf"
+Springsteel = "66b52f22-0fad-4358-9559-2105d4560aaf"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+
+[sources]
+Scythe = {path = ".."}
+Springsteel = {path = "../../Springsteel.jl"}
+
+[compat]
+ClimaComms = "0.6"
+RRTMGP = "1"

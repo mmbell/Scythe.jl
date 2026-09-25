@@ -13,7 +13,9 @@
 # Project.toml's [sources] entry points at a sibling checkout to make the right thing happen;
 # this check is what catches the case where that sibling checkout is on the wrong branch.
 tc_preflight() {
-  "$JULIA" --project="$SCYTHE" -e '
+  # --project=$SCYTHE/simulations: the same launch environment the sbatch wrappers run
+  # in, and the one that can load RRTMGP (a WEAK dependency of Scythe).
+  "$JULIA" --project="$SCYTHE/simulations" -e '
 using Pkg
 Pkg.instantiate()
 Pkg.precompile()
@@ -57,7 +59,7 @@ if rad_arm != "0" && rad_arm != ""
             RRTMGP lookup-table artifacts are missing (SCYTHE_TC_RAD=$rad_arm needs them):
               $(join(missing_artifacts, "\n  "))
             Run tools/rrtmgp_prewarm.jl on a LOGIN NODE (with network access) first:
-              julia --project=<Scythe.jl checkout> tools/rrtmgp_prewarm.jl
+              julia --project=<Scythe.jl checkout>/simulations tools/rrtmgp_prewarm.jl
             Compute nodes on this cluster have no network, so a lazy download at the
             first radiation call would hang or fail deep into a queued job.""")
     end
