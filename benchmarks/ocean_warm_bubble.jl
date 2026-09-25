@@ -8,12 +8,12 @@
 #   julia --project=. benchmarks/ocean_warm_bubble.jl --mode quick --stage mc --grid rirk
 #
 # THIS IS NOW A THIN WRAPPER (config consolidation, stage 4a). The model that runs is
-# EXACTLY simulations/ocean_warm_bubble/config.toml -- struct-default production physics
+# EXACTLY simulations/ocean_warm_bubble/scythe_config.toml -- struct-default production physics
 # (MYNN + ISHMAEL ice, no radiation, state_dependent_si) on the quick grid (300 km x 25 km,
 # 6 km x 500 m cells, 2 h). `--mode full` scales the grid to the paper-grade spacing (3 km
 # x 300 m, ts 0.25 s) through `--set`, the same numbers the legacy `full` arm used; every
-# other physics/grid variation goes through `simulations/ocean_warm_bubble/run.jl`
-# (`--set key.path=value` / overlay files), not this script. All the `SCYTHE_OWB_*` env-var
+# other physics/grid variation goes through `simulations/ocean_warm_bubble/run.jl` (edit a
+# copy of scythe_config.toml), not this script. All the `SCYTHE_OWB_*` env-var
 # knobs the legacy driver read are GONE -- there is no arm selection here anymore. The
 # "arm" tag below (output/reference-CSV naming) is derived from the RESOLVED config (ice
 # on/off, BL scheme, EDMF, fidelity, surface roughness/stability), so it always describes
@@ -26,7 +26,7 @@
 # Physics/grid knobs are no longer read here. The legacy driver had ~25 `SCYTHE_OWB_*` env
 # vars (BL scheme, MYNN EDMF/fidelity/interval/K_max, surface roughness/stability, SST,
 # ice, rain moments, RRTMGP arm, water transforms, wall BC, grid/run overrides) -- all
-# retired. Vary the case with `--set key.path=value` / overlay files on
+# retired. Vary the case by editing a copy of scythe_config.toml and running
 # simulations/ocean_warm_bubble/run.jl instead (see that script and
 # simulations/ocean_warm_bubble/README.md); this wrapper always runs the one production
 # config, `--mode`/`--stage`/`--grid`/`--workers` aside.
@@ -63,7 +63,7 @@ include(joinpath(@__DIR__, "common", "warm_bubble_diagnostics.jl"))
 
 # ── Configuration ────────────────────────────────────────────────────────────
 #
-# The model is built from simulations/ocean_warm_bubble/config.toml -- the production
+# The model is built from simulations/ocean_warm_bubble/scythe_config.toml -- the production
 # case config (struct defaults: MYNN + ISHMAEL ice, radiation off, state_dependent_si) --
 # via `build_model(load_config(...))`, not a hand-assembled `ModelParameters` (that
 # translation now lives once, in src/config_build.jl). `--mode full` overrides the grid to
@@ -72,7 +72,7 @@ include(joinpath(@__DIR__, "common", "warm_bubble_diagnostics.jl"))
 # here (this wrapper takes no `--set` of its own; it exists for the harness's diagnostics
 # table and regression CSVs, not as a general launcher).
 
-const OWB_CONFIG = joinpath(@__DIR__, "..", "simulations", "ocean_warm_bubble", "config.toml")
+const OWB_CONFIG = joinpath(@__DIR__, "..", "simulations", "ocean_warm_bubble", "scythe_config.toml")
 
 """
     owb_config_set(opts::BenchmarkOptions) -> Vector{String}

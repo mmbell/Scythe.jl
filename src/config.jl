@@ -21,7 +21,7 @@
 #      (ice + full microphysics, MYNN :scythe without EDMF, surface fluxes with stability,
 #      both reference-state fixes, the DK83 sponge, diurnal RRTMGP) on a generic
 #      single-patch periodic XZ domain; a case file states only what differs.
-#   2. The TOML front end: `load_config` (parse, deep-merge overlays, `--set`, typed
+#   2. The TOML front end: `load_config` (parse, deep-merge files, `--set`, typed
 #      conversion with path resolution) and `write_config` (the full resolved TOML,
 #      defaults included, so an output directory records exactly what ran).
 #   3. The key registries `KNOWN_OPTION_KEYS` / `KNOWN_PHYSICAL_KEYS`: every key `src/`
@@ -39,7 +39,7 @@
 # PATHS ARE ABSOLUTE IN THE STRUCT. A relative path means "relative to the file that set
 # it" in TOML, "relative to the working directory" for `--set` and for Julia construction,
 # and `@scythe/` means the package root. Resolving once, at the boundary, is what makes
-# `load_config(write_config(cfg)) == cfg` hold and what lets `<root>/config.toml` be
+# `load_config(write_config(cfg)) == cfg` hold and what lets `<root>/scythe_config.toml` be
 # re-read from any directory by `--resume`.
 
 using TOML
@@ -280,7 +280,7 @@ end
     InitialConditions
 
 `[initial_conditions]` — which initial condition, and the parameters of all four.
-All four sub-tables are always held so an overlay can switch `method`; only the active
+All four sub-tables are always held so a later file or `--set` can switch `method`; only the active
 one is written back by `write_config`.
 
 - `method::Symbol` — `balanced_vortex`, `temperature_noise`, `temperature_bubble` or `file`.
@@ -1240,6 +1240,10 @@ see [`parse_set`](@ref)) in order, and convert to a validated [`RunConfig`](@ref
 absent everywhere take the struct defaults. Path fields resolve against the directory of
 the file that set them; `set` paths against the working directory; `@scythe/` against the
 package root.
+
+The launcher (`simulations/<case>/run.jl`, [`parse_launcher_args`](@ref)) takes ONE file:
+a run is one config file, written out resolved into its root as `scythe_config.toml`.
+Several `paths` are for programmatic use (the equivalence tests stack legacy-pin files).
 """
 function load_config(paths::AbstractString...; set::AbstractVector{<:AbstractString} = String[])
     merged = Dict{String,Any}()

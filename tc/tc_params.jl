@@ -1,4 +1,4 @@
-# ── DEPRECATED shim: TC parameters, now derived from simulations/tc_axisym/config.toml ──
+# ── DEPRECATED shim: TC parameters, now derived from simulations/tc_axisym/scythe_config.toml ──
 #
 # tc/tc_params.jl + tc/tc_init.jl are a THIN, READ-ONLY shim over the consolidated run
 # configuration (src/config.jl, src/config_build.jl, src/config_init.jl), kept ONLY for the
@@ -7,28 +7,23 @@
 # tc_single_patch_holdtest, tc_balance_floor). For a real run use
 # simulations/tc_axisym/run.jl -- see simulations/tc_axisym/README.md, in particular its
 # "From the old environment variables" table: every SCYTHE_TC_* knob this file used to read
-# is GONE (`--set key.path=value` on the launcher, or an overlay TOML such as fine.toml /
-# rlr.toml, replaces each one) except SCYTHE_TC_RES=fine, kept below as the one legacy knob
-# worth keeping for a scratch script that wants the fine grid without a `--set`.
+# is GONE (a key in the case's scythe_config.toml replaces each one; the alternate grids are
+# simulations/tc_axisym/examples/fine.toml and rlr.toml) except SCYTHE_TC_RES=fine, kept
+# below as the one legacy knob worth keeping for a scratch script that wants the fine grid.
 #
 # THE PHYSICS IS NOW THE PRODUCTION SET: ISHMAEL ice + two-moment rain, MYNN (fidelity
 # "scythe", EDMF off), Monin-Obukhov surface stability, diurnal RRTMGP radiation, the DK83
 # sponge, and the state-dependent vertical semi-implicit solver -- see
-# simulations/tc_axisym/config.toml's header for the physical reasoning behind each default
+# simulations/tc_axisym/scythe_config.toml's header for the physical reasoning behind each default
 # and simulations/README.md for the full key reference. This is NOT the old "Louis + no ice
 # + no radiation" TC default: a caller that wants that has to ask for it explicitly (and
 # physics.boundary_layer.scheme = "louis" refuses ice, so drop ice too).
 #
-# RADIATION IS ON BY DEFAULT (physics.radiation.scheme = "rrtmgp"), and RRTMGP/ClimaComms
-# are WEAK dependencies of Scythe (a package extension, ext/ScytheRRTMGPExt.jl, that loads
-# only from an environment listing them). `make_base`/`init_tc!` in tc_init.jl therefore
-# WILL ERROR under `--project=.` with build_model's own "radiation = rrtmgp requested but
-# the RRTMGP extension is not loaded" message -- this shim does not silently import RRTMGP
-# for you. Launch under `--project=simulations`, or `import RRTMGP, ClimaComms` (on every
-# worker, under Distributed) before calling `make_base`/`init_tc!`.
+# RADIATION IS ON BY DEFAULT (physics.radiation.scheme = "rrtmgp"); RRTMGP is an ordinary
+# dependency of Scythe, so any environment with Scythe installed (e.g. `--project=.`) runs it.
 #
 # RE87 vortex, F_COR, SST, moisture and wall-BC reasoning: see the header of
-# simulations/tc_axisym/config.toml (the case) and src/idealized.jl (`re87_v`) -- not
+# simulations/tc_axisym/scythe_config.toml (the case) and src/idealized.jl (`re87_v`) -- not
 # reproduced here.
 #
 # This file needs `RunConfig`/`load_config` (Scythe), so it loads Scythe ITSELF rather than
@@ -43,13 +38,13 @@ _TC_RES in ("coarse", "fine") ||
     error("SCYTHE_TC_RES = \"$(_TC_RES)\" is not recognized; use coarse or fine -- every " *
           "other SCYTHE_TC_* knob is gone, see simulations/tc_axisym/README.md")
 const _TC_CONFIG_PATHS = _TC_RES == "fine" ?
-    (joinpath(_TC_SIM_DIR, "config.toml"), joinpath(_TC_SIM_DIR, "fine.toml")) :
-    (joinpath(_TC_SIM_DIR, "config.toml"),)
+    (joinpath(_TC_SIM_DIR, "scythe_config.toml"), joinpath(_TC_SIM_DIR, "examples", "fine.toml")) :
+    (joinpath(_TC_SIM_DIR, "scythe_config.toml"),)
 
 "The resolved production TC configuration (coarse or fine grid per SCYTHE_TC_RES)."
 const TC_CFG::RunConfig = load_config(_TC_CONFIG_PATHS...)
-"`TC_CFG` with the rlr.toml overlay: the 3-D cylindrical RLR geometry and its own nest layout."
-const TC_CFG_RLR::RunConfig = load_config(_TC_CONFIG_PATHS..., joinpath(_TC_SIM_DIR, "rlr.toml"))
+"`TC_CFG` with examples/rlr.toml stacked on: the 3-D cylindrical RLR geometry and its own nest layout."
+const TC_CFG_RLR::RunConfig = load_config(_TC_CONFIG_PATHS..., joinpath(_TC_SIM_DIR, "examples", "rlr.toml"))
 
 const _TC_WARNED = Set{Symbol}()
 "Print ONE deprecation line per shim function/file, on first use."
@@ -63,7 +58,7 @@ end
 _tc_deprecated(:tc_params)
 
 # ── Vortex (RE87), environment, moisture, transforms, sponge: thin derivations from
-# TC_CFG. See simulations/tc_axisym/config.toml for the physical reasoning.
+# TC_CFG. See simulations/tc_axisym/scythe_config.toml for the physical reasoning.
 const VORTEX_PROFILE = TC_CFG.initial_conditions.balanced_vortex.profile
 const V_M             = TC_CFG.initial_conditions.balanced_vortex.v_m
 const R_M             = TC_CFG.initial_conditions.balanced_vortex.r_m

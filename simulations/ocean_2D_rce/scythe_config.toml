@@ -3,7 +3,7 @@
 # bubble, no wall). Every key of [run]/[output]/[grid]/[timestep]/[reference_state]/
 # [initial_conditions]/[environment] below is spelled out, even where it equals the
 # RunConfig struct default (src/config.jl), so this file alone describes the domain (300 km
-# periodic x 25 km lid, 6 km x 500 m cells -- the quick grid; full.toml overlays 3 km / 300 m),
+# periodic x 25 km lid, 6 km x 500 m cells -- the quick grid; examples/full.toml has 3 km / 300 m),
 # the sounding, the noise seed and the SST, with no need to cross-reference the struct.
 #
 # physics / numerics / diagnostics are left delta-only below: for this case there are NONE.
@@ -16,7 +16,7 @@
 #     so this case is horizontally inviscid apart from the B-spline spectral filter (l_q = 2.0)
 #   - physics.sponge: the Durran & Klemp (1983) sponge, alpha 0.02 /s, z_damp 17 km
 #   - numerics.state_dependent_si = true: implicit acoustic coefficients from the current
-#     column state; this case (and full.toml) are the FIRST to exercise it on XZ -- it had
+#     column state; this case (and examples/full.toml) are the FIRST to exercise it on XZ -- it had
 #     previously run only on the cylindrical TC equation sets
 
 [run]
@@ -37,7 +37,7 @@ netcdf_derivatives = false
 [grid]
 geometry    = "RiRk"                 # B-spline vertical
 lateral     = "periodic"             # open ocean: no lateral wall at all
-boundaries  = [0.0, 300.0e3]         # 300 km domain (quick grid; full.toml: 3 km cells)
+boundaries  = [0.0, 300.0e3]         # 300 km domain (quick grid; examples/full.toml: 3 km cells)
 num_cells   = [50]                   # 50 horizontal cells -> 6 km spacing
 z_top       = 25.0e3                 # 25 km lid
 num_cells_k = 50                     # 50 vertical cells -> 500 m spacing

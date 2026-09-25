@@ -18,7 +18,7 @@
 # (`--indir` is accepted as an alias of `--root`.)
 # With one --root: single-run hourly table + provenance.
 # With two+ --roots: each run's table, a diff of the first two runs' resolved configurations
-#   (`<root>/config.toml`, read with Scythe.load_config; legacy trees fall back to the
+#   (`<root>/scythe_config.toml`, read with Scythe.load_config; legacy trees fall back to the
 #   options/physical_params of the `ModelParameters` log line), and a final-time
 #   side-by-side comparison table.
 # --out writes the report as Markdown to the given path; omitted, the report goes to stdout.
@@ -400,9 +400,9 @@ function job_stdout_provenance(indir)
     return keep
 end
 
-"The provenance header of `<root>/config.toml` (git SHA, sources, --set, execution)."
+"The provenance header of `<root>/scythe_config.toml` (git SHA, sources, --set, execution)."
 function config_header(indir)
-    p = joinpath(indir, "config.toml")
+    p = Scythe.run_config_file(indir)
     isfile(p) || return nothing
     lines = String[]
     for l in eachline(p)
@@ -473,7 +473,7 @@ function provenance_block(indir, nest, files)
     push!(lines, "**Run root:** `$indir`, nest $nest")
     ch = config_header(indir)
     if ch !== nothing
-        push!(lines, "**`config.toml` provenance header:**")
+        push!(lines, "**`scythe_config.toml` provenance header:**")
         push!(lines, "```\n" * join(ch, "\n") * "\n```")
     end
     ss = segments_summary(indir)
@@ -621,9 +621,9 @@ function final_comparison_table(labels, laststats::Vector{FileStats})
 end
 
 """The resolved configuration of a run root as a flat `dotted.key => value-text` table
-(`Scythe.load_config` of `<root>/config.toml`, every field), or nothing for a legacy tree."""
+(`Scythe.load_config` of `<root>/scythe_config.toml`, every field), or nothing for a legacy tree."""
 function run_config_flat(root)
-    p = joinpath(root, "config.toml")
+    p = Scythe.run_config_file(root)
     isfile(p) || return nothing
     cfg = Scythe.load_config(p; set = ["output.dir=" * root])
     flat = Dict{String,String}()
@@ -691,7 +691,7 @@ function main(argv)
         labelA, labelB = basename(indirs[1]), basename(indirs[2])
         cfgA, cfgB = run_config_flat(indirs[1]), run_config_flat(indirs[2])
         if cfgA !== nothing && cfgB !== nothing
-            println(report, "## Configuration diff (first two runs, `<root>/config.toml`)")
+            println(report, "## Configuration diff (first two runs, `<root>/scythe_config.toml`)")
             println(report)
             # output.dir differs by construction; it is not a physics difference.
             delete!(cfgA, "output.dir"); delete!(cfgB, "output.dir")

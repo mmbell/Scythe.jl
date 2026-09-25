@@ -7,14 +7,21 @@
 # Modeled on rce/scythe_rce.sbatch.
 #
 #   sbatch simulations/ocean_warm_bubble/scythe_owb.sbatch
-#   sbatch simulations/ocean_warm_bubble/scythe_owb.sbatch --set physics.boundary_layer.scheme=louis
-#   sbatch simulations/ocean_warm_bubble/scythe_owb.sbatch --set physics.radiation.scheme=rrtmgp
 #   sbatch simulations/ocean_warm_bubble/scythe_owb.sbatch --resume
 #
-# NO ENV-VAR KNOBS: every option is a `--set key.path=value` (repeatable) or an overlay
-# TOML file, passed straight through via "$@" to run.jl -- see
-# simulations/ocean_warm_bubble/README.md. This replaces the legacy driver's ~25
-# `SCYTHE_OWB_*` variables.
+# NO ENV-VAR KNOBS for physics: a run is ONE config file, scythe_config.toml -- a different
+# arm (Louis BL, radiation on, ...) is an edited copy of it (see
+# simulations/ocean_warm_bubble/README.md). This replaces the legacy driver's ~25
+# `SCYTHE_OWB_*` variables. Extra arguments ("$@": --set for run control, --resume) are
+# passed straight through to run.jl.
+#
+# Environment: SCYTHE (from SCYTHE_DIR, default $HOME/Development/Scythe.jl) is the Scythe
+# checkout -- or any run directory laid out as simulations/<case>/ -- holding run.jl and
+# scythe_config.toml; SCYTHE_PROJECT is any Julia environment where Scythe is installed
+# (default: $SCYTHE itself, i.e. the checkout's own project). Radiation (RRTMGP) is part of
+# Scythe and needs no special environment. Scythe's preflight checks (Springsteel version,
+# RRTMGP lookup tables when radiation is on) run inside run_simulation before anything is
+# written; run tools/rrtmgp_prewarm.jl on a login node once before a radiating job.
 #
 #SBATCH -J scythe_owb
 #SBATCH -N 1
@@ -29,14 +36,14 @@ set -uo pipefail
 export JULIA_NUM_THREADS=${JULIA_NUM_THREADS:-18}
 
 SCYTHE=${SCYTHE_DIR:-$HOME/Development/Scythe.jl}
-CONFIG=$SCYTHE/simulations/ocean_warm_bubble/config.toml
+PROJECT=${SCYTHE_PROJECT:-$SCYTHE}
+CONFIG=$SCYTHE/simulations/ocean_warm_bubble/scythe_config.toml
 JULIA=${JULIA_BIN:-julia}
 
 # job_stdout.log lives beside the run's own output: the case config's default
-# output.dir = "output", relative to config.toml. NO env-var override here (every option
-# is --set/overlay, passed through "$@") -- a `--set output.dir=...` moves where the RUN
-# writes without moving this wrapper's own provenance log; pass `--set output.dir=...`
-# consistently and look for job_stdout.log there by hand if so.
+# output.dir = "output", relative to scythe_config.toml. NO env-var override here -- a
+# `--set output.dir=...` moves where the RUN writes without moving this wrapper's own
+# provenance log; look for job_stdout.log here by hand if so.
 OUTDIR=$SCYTHE/simulations/ocean_warm_bubble/output
 mkdir -p "$OUTDIR"
 
@@ -53,11 +60,6 @@ echo "  config      : $CONFIG"
 echo "  extra args  : $*"
 echo "====================================================================="
 
-# Preflight (simulations/_preflight.jl): Springsteel-version + RRTMGP-artifact checks,
-# reading the RESOLVED config (config + "$@") so it checks exactly what this run needs --
-# radiation off by default, so no RRTMGP artifact check unless "$@" turns it on.
-"$JULIA" --project="$SCYTHE/simulations" "$SCYTHE/simulations/_preflight.jl" "$CONFIG" "$@"
-
 echo "=== Scythe ocean_warm_bubble run =================================="
 echo "  job         : ${SLURM_JOB_ID:-manual} on $(hostname)"
 echo "  threads     : $JULIA_NUM_THREADS"
@@ -66,11 +68,8 @@ echo "  extra args  : $*"
 echo "  started     : $(date)"
 echo "==================================================================="
 
-# --project=$SCYTHE/simulations: the workspace member that can load RRTMGP/ClimaComms
-# (Scythe's WEAK deps, ext/ScytheRRTMGPExt.jl) -- only exercised if "$@" turns radiation
-# on, but it is the standard launch environment for every case regardless.
-"$JULIA" --project="$SCYTHE/simulations" "$SCYTHE/simulations/ocean_warm_bubble/run.jl" \
-    --workers 1 --worker-threads "$JULIA_NUM_THREADS" "$@"
+"$JULIA" --project="$PROJECT" "$SCYTHE/simulations/ocean_warm_bubble/run.jl" \
+    --config "$CONFIG" --workers 1 --worker-threads "$JULIA_NUM_THREADS" "$@"
 status=$?
 
 echo "=== finished: $(date) (exit $status) ==="

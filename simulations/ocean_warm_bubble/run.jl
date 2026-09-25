@@ -1,69 +1,63 @@
 #!/usr/bin/env julia
-# ocean_warm_bubble/run.jl -- local launcher for the ocean warm bubble case (2 h, walls,
-# MYNN + ice, radiation off; simulations/ocean_warm_bubble/config.toml).
+# Launcher for the ocean warm bubble case (2 h, walls, MYNN + ice, radiation off;
+# scythe_config.toml beside this script).
 #
-#   julia --project=simulations simulations/ocean_warm_bubble/run.jl [overlay.toml ...] \
-#       [--set k.path=v ...] [--resume] [--workers N | --workers-per-patch a,b,c] \
-#       [--worker-threads N] [--blas-threads N] [--slurm] [--segment k]
+#   julia --project=<env> run.jl [--config scythe_config.toml] [--set k.path=v ...] [--resume]
+#       [--workers N] [--worker-threads N] [--blas-threads N] [--slurm]
+#
+# <env> is any Julia environment where Scythe is installed (a Scythe checkout itself works:
+# `--project=/path/to/Scythe.jl`). This file needs nothing else from the repository: copy it
+# and scythe_config.toml to any directory and run it there.
 #
 # Flags (Scythe.parse_launcher_args, src/run_driver.jl):
-#   --config PATH             case config file (default: config.toml beside this script)
-#   overlays                   positional overlay TOML files, applied in order after --config
-#   --set k.path=v             override one key (repeatable), e.g.
-#                               --set physics.boundary_layer.scheme=louis
+#   --config PATH              the run's one config file (default: scythe_config.toml beside
+#                              this script); there are no overlay files
+#   --set k.path=v             run control, e.g. --set output.dir=output/test (repeatable;
+#                              recorded in the resolved <output.dir>/scythe_config.toml)
 #   --resume                   continue an existing run from its segments.csv
 #   --workers N                worker processes (OWB is single-patch)
-#   --workers-per-patch a,b,c  per-patch worker counts (nests only; unused here)
 #   --worker-threads N         Julia threads per worker (0 = split the machine)
 #   --blas-threads N           OpenBLAS threads per process
 #   --slurm                    add workers through SLURM (addprocs_slurm)
-#   --segment k                internal: run only segment k (child process)
 #
-# Radiation is off by default (physics.radiation.scheme = "none"); turning it on with
-# --set physics.radiation.scheme=rrtmgp needs `--project=simulations` (RRTMGP/ClimaComms
-# are weak dependencies of Scythe loaded only from that workspace member -- the standard
-# launch environment for every case).
+# Radiation is off (physics.radiation.scheme = "none"); to turn it on, edit
+# scythe_config.toml -- radiation is part of Scythe and needs no special environment.
 
 using Scythe
 
-paths, set, resume, exec, segment = Scythe.parse_launcher_args(ARGS)
-cfg = load_config(paths...; set)
-
-if cfg.physics.radiation.scheme == :rrtmgp
-    Base.identify_package("RRTMGP") === nothing &&
-        error("physics.radiation.scheme = rrtmgp but RRTMGP cannot be loaded from the " *
-              "active project $(Base.active_project()); launch with " *
-              "`julia --project=simulations`")
-    @eval Main import RRTMGP, ClimaComms
-end
-
+path, set, resume, exec, segment = Scythe.parse_launcher_args(ARGS)
+cfg = load_config(path; set)
 if segment > 0
     Scythe.segment_main(ARGS)
 else
-    run_simulation(cfg, exec; resume, config_sources = paths, set)
+    run_simulation(cfg, exec; resume, config_sources = [path], set)
 
-    # Case-specific post-step: the OWB diagnostic table (owb_diagnostics,
-    # benchmarks/ocean_warm_bubble.jl), reused rather than duplicated -- that file's own
-    # top level is guarded (`abspath(PROGRAM_FILE) == @__FILE__`), so including it here
-    # only defines the functions. They read `<t>_physical.csv`, which the production
-    # config does not write (`output.formats = ["netcdf"]`); this step is a no-op unless
-    # the run (or a --set) also asked for CSV, e.g. --set output.formats='["netcdf","csv"]'.
+    # Case-specific post-step, ONLY inside a Scythe checkout: the OWB diagnostic table
+    # (owb_diagnostics, benchmarks/ocean_warm_bubble.jl), reused rather than duplicated --
+    # that file's own top level is guarded, so including it only defines the functions. A
+    # copied run.jl (no benchmarks/ beside it) skips it with a one-line note. The table
+    # reads `<t>_physical.csv`, which the production config does not write
+    # (`output.formats = ["netcdf"]`), so it is also a no-op unless the config asks for CSV.
     # Only single-segment runs are covered: build_model(cfg) with no segment override
     # targets seg_01, which is the run's only (and therefore final) segment here.
-    if cfg.run.segment_length == 0.0
+    owb = joinpath(@__DIR__, "..", "..", "benchmarks", "ocean_warm_bubble.jl")
+    if !isfile(owb)
+        println("\nScythe: benchmarks/ocean_warm_bubble.jl not found relative to this " *
+                "script -- skipping the OWB diagnostics table")
+    elseif cfg.run.segment_length == 0.0
         model = build_model(cfg)
         if isdir(model.output_dir) &&
            any(f -> endswith(f, "_physical.csv"), readdir(model.output_dir))
-            include(joinpath(@__DIR__, "..", "..", "benchmarks", "ocean_warm_bubble.jl"))
-            diags = owb_diagnostics(model)
+            include(owb)
+            diags = Base.@invokelatest owb_diagnostics(model)   # defined by the include above
             println("\n=== ocean_warm_bubble diagnostics ($(model.output_dir)) ===")
             for k in sort(collect(keys(diags)))
                 println("  ", k, " = ", diags[k])
             end
         else
             println("\nScythe: no *_physical.csv in $(model.output_dir) -- skipping the " *
-                     "OWB diagnostics table (add --set output.formats='[\"netcdf\",\"csv\"]' " *
-                     "to get one)")
+                    "OWB diagnostics table (set output.formats = [\"netcdf\", \"csv\"] in " *
+                    "scythe_config.toml to get one)")
         end
     end
 end

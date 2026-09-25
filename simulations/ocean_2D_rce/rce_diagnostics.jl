@@ -9,7 +9,7 @@
 #       [--avg-days M] [--out <root>]
 #
 #   --dir <root>       a run_simulation (src/run_driver.jl) output root (holds
-#                      config.toml, segments.csv, seg_01/, ...)
+#                      scythe_config.toml, segments.csv, seg_01/, ...)
 #   --avg-days M       length [days] of the trailing averaging/equilibrium window
 #                       (default 5.0). Clamped to whatever the run actually has, with a
 #                       warning, when the run is shorter.

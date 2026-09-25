@@ -42,17 +42,24 @@ The above command includes `time` to get an overall wall clock time, and pipes t
 The three moist-compressible production cases — a 3-nest axisymmetric tropical cyclone, a
 periodic 2-D radiative-convective-equilibrium ocean column, and an idealized ocean warm
 bubble — are configured and launched from [`simulations/`](simulations/README.md), not
-from environment variables or a bare Julia script: each case is a `config.toml` (what is
-run), overlay files for variants, a local `run.jl` launcher, and SLURM `*.sbatch`
-launchers, all documented in the per-case `README.md`:
+from environment variables: each case is a `scythe_config.toml` (what is run -- a run is
+ONE config file, written out resolved into its output tree), a `run.jl` launcher, SLURM
+`*.sbatch` launchers, and example alternate grids under `examples/`, all documented in the
+per-case `README.md`:
 
 - [`simulations/tc_axisym/`](simulations/tc_axisym/README.md) — axisymmetric tropical cyclone
 - [`simulations/ocean_2D_rce/`](simulations/ocean_2D_rce/README.md) — 2-D ocean RCE
 - [`simulations/ocean_warm_bubble/`](simulations/ocean_warm_bubble/README.md) — ocean warm bubble
 
 ```
-julia --project=simulations simulations/<case>/run.jl [overlays...] [--set key.path=value ...]
+julia --project=<env> simulations/<case>/run.jl [--set key.path=value ...] [--resume] [--workers N]
 ```
+
+`<env>` is any Julia environment where Scythe is installed (the checkout itself:
+`--project=.`); radiation (RRTMGP) is part of Scythe and needs nothing extra. `run.jl` is
+just `using Scythe` plus the launcher call, so a case runs anywhere: copy its
+`scythe_config.toml` and `run.jl` to a directory and run `julia --project=<env> run.jl`
+there. `--set` is for run control (`output.dir`, extending `run.integration_time`).
 
 See [`simulations/README.md`](simulations/README.md) for the full configuration reference
 (every key, its default, and what it means) and the launcher flags shared by every case.

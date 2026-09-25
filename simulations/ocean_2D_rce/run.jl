@@ -1,38 +1,27 @@
 #!/usr/bin/env julia
-# Local launcher for the ocean_2D_rce case: parses the shared launcher command line
-# (src/run_driver.jl `parse_launcher_args`), loads the config, then either runs one segment
-# (the orchestrator's own child process, `--segment k`) or the whole segment chain.
+# Launcher for the open-ocean 2-D RCE case (scythe_config.toml beside this script).
 #
-#   julia --project=simulations simulations/ocean_2D_rce/run.jl [overlay.toml ...] \
-#       [--set key.path=value ...] [--resume] [--workers N | --workers-per-patch a,b,c] \
-#       [--worker-threads N] [--blas-threads N] [--slurm]
+#   julia --project=<env> run.jl [--config scythe_config.toml] [--set key.path=value ...]
+#       [--resume] [--workers N] [--worker-threads N] [--blas-threads N] [--slurm]
 #
-# radiation.scheme = "rrtmgp" (this case's default) needs RRTMGP/ClimaComms, WEAK
-# dependencies of Scythe (ext/ScytheRRTMGPExt.jl) loadable only from an environment that
-# lists them -- simulations/Project.toml, a workspace member sharing the root
-# Manifest.toml. Launch with `--project=simulations`, not the root project.
+# <env> is any Julia environment where Scythe is installed (a Scythe checkout itself works:
+# `--project=/path/to/Scythe.jl`). This file needs nothing else from the repository: copy it
+# and scythe_config.toml to any directory and run it there. This case runs diurnal all-sky
+# RRTMGP by default; radiation is part of Scythe and needs no special environment.
 #
-# Examples:
-#   julia --project=simulations simulations/ocean_2D_rce/run.jl --workers 1
-#   julia --project=simulations simulations/ocean_2D_rce/run.jl --resume
-#   julia --project=simulations simulations/ocean_2D_rce/run.jl full.toml --workers 1 \
-#       --worker-threads 18
+# A run is ONE config file: edit scythe_config.toml (examples/full.toml is the
+# full-resolution grid to copy into it). `--set` is for run control -- output.dir, extending
+# run.integration_time on --resume -- and is recorded in the header of the resolved
+# <output.dir>/scythe_config.toml.
+#
+# Examples (from this directory):
+#   julia --project=<env> run.jl --workers 1
+#   julia --project=<env> run.jl --workers 1 --resume
+#   julia --project=<env> run.jl --workers 1 --worker-threads 18 --set output.dir=output/ctrl1
 
 using Scythe
 
-paths, set, resume, exec, segment = Scythe.parse_launcher_args(ARGS)
-cfg = load_config(paths...; set = set)
-
-if cfg.physics.radiation.scheme == :rrtmgp
-    Base.identify_package("RRTMGP") !== nothing || error(
-        "physics.radiation.scheme = \"rrtmgp\" but RRTMGP cannot be loaded from the " *
-        "active project $(Base.active_project()). Launch with " *
-        "`julia --project=simulations`.")
-    @eval Main import RRTMGP, ClimaComms
-end
-
-if segment > 0
-    Scythe.segment_main(ARGS)
-else
-    run_simulation(cfg, exec; resume = resume, config_sources = paths, set = set)
-end
+path, set, resume, exec, segment = Scythe.parse_launcher_args(ARGS)
+cfg = load_config(path; set)
+segment > 0 ? Scythe.segment_main(ARGS) :
+              run_simulation(cfg, exec; resume, config_sources = [path], set)

@@ -1,31 +1,24 @@
 # ── The library-free half of the RRTMGP radiation path ───────────────────────
 #
-# This file names NO radiative-transfer library. RRTMGP and ClimaComms are WEAK
-# dependencies of Scythe: everything that names them lives in the package extension
-# ext/ScytheRRTMGPExt.jl, which Julia loads automatically once the user has done
-# `using RRTMGP, ClimaComms` in the same session (and, under Distributed, on every
-# worker). Without them, Scythe loads and runs every other configuration; a model that
-# asks for `options[:radiation] = :rrtmgp` is refused at tile construction with a
-# message naming the missing `using` (see `require_rrtmgp_extension`, src/radiation.jl).
-# The split is what keeps RRTMGP's own compat bounds (notably its weak-dep
-# `CUDA = "5.9, 6"`) out of any project that `Pkg.develop`s Scythe without using
-# radiation.
+# This file names NO radiative-transfer library. It is the library-free half of the
+# RRTMGP path; the half that names RRTMGP and ClimaComms is src/radiation_rrtmgp.jl,
+# included right after this file. Keeping the pure profile/column code apart from the
+# library calls keeps the one file that knows RRTMGP's API small.
 #
 # What lives here (all plain Julia on plain arrays):
-#   * the fixed choices and the per-process cache containers (the extension fills them),
+#   * the fixed choices and the per-process cache containers (radiation_rrtmgp.jl fills them),
 #   * the standard-atmosphere interpolation that builds the stratospheric extension
 #     and the ozone profile Scythe does not carry (`standard_extension`,
 #     `model_ozone`; the sampled profile itself, `_standard_profile`, calls
-#     `RRTMGP.standard_atmosphere` and so is defined in the extension),
+#     `RRTMGP.standard_atmosphere` and so is defined in src/radiation_rrtmgp.jl),
 #   * the well-mixed gas table (`default_gases`),
 #   * the boundary-row seed and the typed column-write loops that
 #     `rrtmgp_solve_columns!` hands the solver's getter views to,
 #   * `radiation_divergence!`, the flux-difference-to-W/m^3 store.
 #
-# What lives in ext/ScytheRRTMGPExt.jl: `rrtmgp_context`, `rrtmgp_method`,
+# What lives in src/radiation_rrtmgp.jl: `rrtmgp_context`, `rrtmgp_method`,
 # `rrtmgp_lookups`, `_standard_profile`, `rrtmgp_solver`, `rrtmgp_solve_columns!`,
-# `rrtmgp_fluxes` and `radiation_offline_column`, each a METHOD of a stub declared in
-# src/radiation.jl.
+# `rrtmgp_fluxes` and `radiation_offline_column`.
 #
 # Conventions inherited from src/radiation_state.jl and repeated because they
 # are easy to get backwards:
@@ -88,14 +81,14 @@ const _RRTMGP_CONTEXT = Ref{Any}(nothing)
 const _RRTMGP_LOOKUPS = Dict{Symbol,Any}()
 const _RRTMGP_PROFILES = Dict{Symbol,Any}()
 #
-# The containers live here, in Scythe, so that the extension module owns no
-# global state of its own; ext/ScytheRRTMGPExt.jl fills them.
+# The containers live here, beside the pure profile code; src/radiation_rrtmgp.jl
+# fills them.
 
 # ── Standard-atmosphere sampling ──────────────────────────────────────────────
 
 # `_standard_profile(kind)`, the cached 50 m sampling of RRTMGP's analytic standard
-# atmosphere, is defined in ext/ScytheRRTMGPExt.jl (it calls
-# `RRTMGP.standard_atmosphere`); the stub is declared in src/radiation.jl.
+# atmosphere, is defined in src/radiation_rrtmgp.jl (it calls
+# `RRTMGP.standard_atmosphere`).
 
 """
     _interp_linear(xs, ys, x)
@@ -268,7 +261,7 @@ end
 
 # ── Solver construction ───────────────────────────────────────────────────────
 
-# `rrtmgp_solver` itself is in ext/ScytheRRTMGPExt.jl; the boundary-row seed it
+# `rrtmgp_solver` itself is in src/radiation_rrtmgp.jl; the boundary-row seed it
 # applies names no RRTMGP type and stays here.
 #
 # The isothermal boundary layer is RRTMGP's internal pad above the domain: one
@@ -296,7 +289,7 @@ function _seed_boundary_row!(layerdata, p_lev, t_lev, vmr_h2o, vmr_o3, nlay)
     return nothing
 end
 
-# ── Column writes (called by `rrtmgp_solve_columns!` in the extension) ─────────
+# ── Column writes (called by `rrtmgp_solve_columns!`, src/radiation_rrtmgp.jl) ─
 
 # Typed inner loops. `solver` is `Any` at the call site (RadiationState holds it
 # untyped so that ModelTile carries no RRTMGP type), so the getter results come
@@ -430,8 +423,8 @@ to round-off, for every column. That identity is the reason the store is written
 as a flux DIFFERENCE divided by `dz` rather than as a fitted derivative: it makes
 the discrete heating conserve energy by construction, not by accuracy.
 
-This function names no RRTMGP type and touches no solver, which is why it stays in
-Scythe proper rather than moving into the RRTMGP extension with the solve it consumes.
+This function names no RRTMGP type and touches no solver, which is why it lives here
+rather than in src/radiation_rrtmgp.jl with the solve it consumes.
 """
 function radiation_divergence!(q::AbstractVector, flux_net::AbstractMatrix,
                                dz::AbstractVector, nlay_model::Int, ncol::Int,

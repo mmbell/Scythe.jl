@@ -3,7 +3,8 @@
 #
 # A run ROOT written by the segment driver (src/run_driver.jl) looks like
 #
-#   <root>/config.toml            resolved config + provenance header
+#   <root>/scythe_config.toml     resolved config + provenance header (config.toml in
+#                                 trees written before the rename; Scythe.run_config_file)
 #   <root>/reference.ref          the reference column (z p rho_d rho_v rho_c)
 #   <root>/nest{i}_ics.csv        initial conditions
 #   <root>/segments.csv           one row per segment (columns incl. segment, dir,
@@ -57,14 +58,14 @@ end
 """
     tc_npatches(root) -> Int
 
-Number of nest patches: `length(grid.num_cells)` of `<root>/config.toml` (read with
+Number of nest patches: `length(grid.num_cells)` of `<root>/scythe_config.toml` (read with
 `Scythe.load_config`) for a segmented tree; the count of `nest{i}` directories for a
 legacy one.
 """
 function tc_npatches(root::AbstractString)
     if is_segmented_root(root)
         # output.dir overridden to the tree's own location, so a moved tree still loads.
-        cfg = Scythe.load_config(joinpath(root, "config.toml"); set = ["output.dir=" * root])
+        cfg = Scythe.load_config(Scythe.run_config_file(root); set = ["output.dir=" * root])
         return length(cfg.grid.num_cells)
     end
     n = 0

@@ -15,7 +15,7 @@
 #
 # [physics], [numerics] and [diagnostics] stay DELTA-ONLY (only keys that differ from the
 # struct default are listed): here that is just radiation off. The full resolved
-# configuration -- physics included -- is written to <output.dir>/config.toml at run start.
+# configuration -- physics included -- is written to <output.dir>/scythe_config.toml at run start.
 
 [run]
 name             = "ocean_warm_bubble"

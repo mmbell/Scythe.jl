@@ -17,14 +17,6 @@ using Dates
 using CSV
 using DataFrames
 
-# RRTMGP and ClimaComms are WEAK dependencies of Scythe (ext/ScytheRRTMGPExt.jl): the
-# extension -- and with it `options[:radiation] = :rrtmgp` -- exists only in a process that
-# has loaded both, and they can be loaded only from an environment that lists them
-# (`--project=simulations`; the root project cannot). So: load them on the master whenever
-# the launch environment can, and stay silent when it cannot (a non-radiation benchmark
-# under `--project=.`). Workers load them in the shared worker-setup helper.
-Base.identify_package("RRTMGP") === nothing || @eval(import RRTMGP, ClimaComms)
-
 # WHY EVERY BENCHMARK PINS CSV.
 #
 # The model's default `options[:output_formats]` is `[:netcdf]` -- one comprehensive

@@ -7,13 +7,13 @@
 # array here is written exactly on the columns and layers `mtile.radiation` computed on.
 #
 # This is the SECOND (and last) file in Scythe that names NCDatasets -- alongside
-# ext/ScytheRRTMGPExt.jl, which needs it only to trigger RRTMGP's NCDatasets extension
+# src/radiation_rrtmgp.jl, which needs it only to trigger RRTMGP's NCDatasets extension
 # (see the note at the top of that file) and never calls it directly. This file is the one
 # that actually reads and writes files with it, so it is named fully-qualified throughout
 # (`NCDatasets.NCDataset`, `NCDatasets.defVar`, ...) rather than splatted with `using`, for
-# the same "narrower blast radius" reason ext/ScytheRRTMGPExt.jl gives.
+# the same "narrower blast radius" reason radiation_rrtmgp.jl gives.
 #
-# Included in src/Scythe.jl immediately after radiation_profiles.jl. `import`, not `using`,
+# Included in src/Scythe.jl immediately after radiation_rrtmgp.jl. `import`, not `using`,
 # for the reason above.
 import NCDatasets
 

@@ -1,12 +1,13 @@
 # Open-ocean RCE (radiative-convective equilibrium)
 
-`config.toml` is a 2-D (x-z), periodic, open-ocean radiative-convective-equilibrium case:
+`scythe_config.toml` is a 2-D (x-z), periodic, open-ocean radiative-convective-equilibrium case:
 MYNN-EDMF boundary layer (`:scythe` fidelity bundle + stability-aware surface layer,
 struct defaults), ISHMAEL ice, diurnal all-sky RRTMGP radiation, seeded low-level
-temperature noise instead of a bubble. See `config.toml`'s header for the full physics/grid
+temperature noise instead of a bubble. See `scythe_config.toml`'s header for the full physics/grid
 reference -- every key is spelled out there, even where it equals the `RunConfig` struct
-default (`src/config.jl`), so the file alone describes what runs. `full.toml` overlays the
-full-resolution grid (3 km x 300 m cells); every other case config key is unchanged.
+default (`src/config.jl`), so the file alone describes what runs. `examples/full.toml`
+holds the full-resolution grid (3 km x 300 m cells) -- an example to copy into (a copy of)
+`scythe_config.toml`, not a command-line overlay.
 
 This is not a `run_benchmark` case: there is no published target and no committed
 regression reference (an RCE equilibrium is a many-day statistical statement, not a
@@ -19,28 +20,28 @@ A 20-day run at ocean-RCE resolution is many hours of wall clock. Rather than on
 `julia` process (which loses everything to a walltime kill or a crash), a run is split into
 SEGMENTS: one fresh `julia` process per segment, each warm-restarting from the previous
 segment's JLD2 checkpoint (`write_restart`'s guaranteed final checkpoint,
-`finalize_model`). `run.jl` with no `--segment` flag is the ORCHESTRATOR
-(`Scythe.run_simulation`, `src/run_driver.jl`) -- it spawns one child
-`julia ... run.jl --segment k` per segment, in order, waiting for each to finish (and
+`finalize_model`). `run.jl` is the ORCHESTRATOR (`Scythe.run_simulation`,
+`src/run_driver.jl`) -- it spawns one child julia process (`Scythe.segment_main`, given
+`--config <root>/scythe_config.toml --segment k`) per segment, in order, waiting for each to finish (and
 stopping with a clear message naming the segment and its log if one fails) before starting
 the next. A `--segment k` invocation (`Scythe.segment_main`) is a normal, standalone,
 reproducible run of exactly that segment -- useful for re-running one segment by hand.
 
 ## Launching
 
-`--project=simulations`, not the root project: this case runs diurnal RRTMGP by default,
-and RRTMGP/ClimaComms are WEAK dependencies of Scythe (`ext/ScytheRRTMGPExt.jl`) that load
-only from an environment listing them. `simulations/Project.toml` is a workspace member
-sharing the root `Manifest.toml`; the orchestrator launches its segment children in the
-same environment (`Base.active_project()`).
+`run.jl` is `using Scythe` plus the launcher call, so it runs from any directory under any
+Julia environment where Scythe is installed (`<env>`; the Scythe checkout itself works).
+Radiation (RRTMGP) is part of Scythe and needs no special environment; the orchestrator
+launches its segment children in the same environment (`Base.active_project()`).
 
 ```sh
 # Local, foreground, the default 20 days in 2-day segments (10 children):
-julia --project=simulations simulations/ocean_2D_rce/run.jl --workers 1
+julia --project=. simulations/ocean_2D_rce/run.jl --workers 1
 
-# An overlay (the full-resolution grid) plus an override:
-julia --project=simulations simulations/ocean_2D_rce/run.jl full.toml --workers 1 \
-    --set run.integration_time=864000
+# The full-resolution grid: a copy of the case with examples/full.toml pasted in
+mkdir -p ~/runs/rce_full && cp simulations/ocean_2D_rce/{scythe_config.toml,run.jl} ~/runs/rce_full
+#   ... paste examples/full.toml's [grid] and [timestep] into ~/runs/rce_full/scythe_config.toml
+cd ~/runs/rce_full && julia --project=<env> run.jl --workers 1 --set run.integration_time=864000
 
 # On the cluster (single node, 20 cores; see scythe_rce.sbatch's header for more examples):
 sbatch simulations/ocean_2D_rce/scythe_rce.sbatch                    # 20-day, default physics
@@ -51,16 +52,17 @@ sbatch simulations/ocean_2D_rce/scythe_rce.sbatch --set output.dir=output/ctrl1
 ```
 
 Every physics/grid knob that used to be a `SCYTHE_RCE_*` environment variable is now a
-config key: change it with a repeatable `--set key.path=value` or an overlay TOML file
-(`config_paths = [config.toml, overlay1.toml, ...]`, later files winning). There are no
+config key, and a run is ONE config file: a different arm is an edited copy of
+`scythe_config.toml`. `--set key.path=value` is for run control (output tree, run length,
+segment length) and is recorded in the resolved config's header. There are no
 `SCYTHE_RCE_*` or `SCYTHE_BENCH_TAG` environment knobs left -- an un-tagged run with no
-extra arguments is always exactly `config.toml` as committed.
+extra arguments is always exactly `scythe_config.toml` as committed.
 
 ## Output layout
 
 ```
 <output.dir>/                        default: simulations/ocean_2D_rce/output/
-├── config.toml       the resolved configuration (every field, defaults included) +
+├── scythe_config.toml  the resolved configuration (every field, defaults included) +
 │                      a provenance header (git SHA/dirty, date, host, sources, --set)
 ├── reference.ref      reference-state sounding (written once, by segment 1's init)
 ├── ics.csv             segment 1's noise-seeded initial conditions
@@ -70,7 +72,7 @@ extra arguments is always exactly `config.toml` as committed.
 │                        scythe_sha, started, finished, n_patches, ts_actual, start_hour,
 │                        workers, threads, host, note
 ├── seg_01/
-│   ├── config.toml      this segment's resolved config (t_offset, start_hour, IC paths
+│   ├── scythe_config.toml  this segment's resolved config (t_offset, start_hour, IC paths
 │   │                    in the header)
 │   ├── segment_stdout.log
 │   └── <t>.nc, <T>.jld2   comprehensive NetCDF output + the final checkpoint seg_02
@@ -92,7 +94,7 @@ the segments before or after. Two things carry continuity across a segment bound
   coefficients only; the AB3 tendency history is not checkpointed, so the first step after
   every segment boundary is Euler, not AB3).
 - **The diurnal solar clock**: each segment's `start_hour` (recorded in its own row of
-  `segments.csv`, and in the header of its `seg_NN/config.toml`) is
+  `segments.csv`, and in the header of its `seg_NN/scythe_config.toml`) is
   `physics.radiation.start_hour + t_offset_s / 3600`, the CUMULATIVE elapsed time in hours
   before that segment starts -- `solar_state` (`src/radiation_state.jl`) computes
   `doy = start_doy + (start_hour*3600 + t_model)/86400` with `t_model` zero-based within the
@@ -107,28 +109,23 @@ from the file alone.
 
 ```sh
 # The default tree:
-julia --project=simulations simulations/ocean_2D_rce/run.jl --workers 1 --resume
+julia --project=. simulations/ocean_2D_rce/run.jl --workers 1 --resume
 
-# A tagged tree: point --config at THAT tree's OWN resolved config.toml (already an
-# absolute output.dir) -- NOT the case file with --set output.dir=... again, which
-# --resume refuses (see below):
-julia --project=simulations simulations/ocean_2D_rce/run.jl \
-    --config output/ctrl1/config.toml --workers 1 --resume
-# or: sbatch simulations/ocean_2D_rce/scythe_rce.sbatch --config output/ctrl1/config.toml --resume
+# A tagged tree: --set output.dir names it (it only LOCATES the tree):
+julia --project=. simulations/ocean_2D_rce/run.jl --workers 1 --resume \
+    --set output.dir=simulations/ocean_2D_rce/output/ctrl1
+# or: sbatch simulations/ocean_2D_rce/scythe_rce.sbatch --resume --set output.dir=output/ctrl1
 ```
 
-`--resume` re-reads `<output.dir>/config.toml` (not the case file on disk -- the recorded
-configuration) and skips every segment whose `segments.csv` row already reads
-`status = done`; a segment marked `failed` (or missing entirely) is re-run. The `cfg`
-built from `--config`/overlays/`--set` supplies ONLY the root (`output.dir`) to resume;
-the only `--set` a resumed run accepts is `run.integration_time=...`, to extend the run
-with more segments -- any OTHER `--set` (including `output.dir=...`, even to the tree's
-own current value) is refused, because a resumed run keeps its recorded configuration.
-That is why a tagged tree resumes through `--config <root>/config.toml`, not through
-repeating the `--set output.dir=...` that created it. A FRESH start (no `--resume`)
-refuses to run at all if
-the root already holds `seg_01/` or any model output -- move the tree aside (`mv`, never
-`rm`) instead.
+`--resume` re-reads `<output.dir>/scythe_config.toml` (not the case file on disk -- the
+recorded configuration) and skips every segment whose `segments.csv` row already reads
+`status = done`; a segment marked `failed` (or missing entirely) is re-run. The case file
+and `--set output.dir` supply ONLY the root to resume; the only other `--set` a resumed
+run accepts is `run.integration_time=...`, to extend the run with more segments -- any
+other `--set` is refused, because a resumed run keeps its recorded configuration. A tree
+written before the rename holds `config.toml`; `--resume` says so and names the `mv` that
+fixes it. A FRESH start (no `--resume`) refuses to run at all if the root already holds
+`seg_01/` or any model output -- move the tree aside (`mv`, never `rm`) instead.
 
 ## Post-processing
 
@@ -144,6 +141,5 @@ julia --project=. simulations/ocean_2D_rce/rce_sounding.jl --dir <root> [--avg-d
 `rce_sounding.jl` turns the time- and domain-mean state of a run into a sounding file in
 the format Springsteel's reference-state builder reads, for seeding a TC run from a
 model-consistent, SST-tuned environment; it reads the SST and rebuilds the model's own grid
-from `<root>/config.toml` (`load_config` + `build_model`), so it needs
-`--project=simulations` whenever the run's `physics.radiation.scheme` is `"rrtmgp"` (the
-case default).
+from `<root>/scythe_config.toml` (`config.toml` in trees written before the rename;
+`load_config` + `build_model`).

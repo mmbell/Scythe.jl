@@ -1,14 +1,14 @@
 # ── Tests for the RRTMGP half of the radiation driver ─────────────────────────
 #
-# ext/ScytheRRTMGPExt.jl (the package extension) and src/radiation_profiles.jl (its
-# library-free half).
+# src/radiation_rrtmgp.jl (the file that names RRTMGP/ClimaComms) and
+# src/radiation_profiles.jl (the library-free half).
 #
 # Three tiers, by what they need:
 #
 #   1. PURE. `standard_extension`, `model_ozone`, `default_gases` and
 #      `radiation_divergence!` need no solver at all (the standard atmosphere is
 #      analytic and ships in the package -- though sampling it goes through
-#      `RRTMGP.standard_atmosphere`, so the extension must be loaded). Always run.
+#      `RRTMGP.standard_atmosphere`). Always run.
 #   2. GRAY. `GrayRadiation` uses no lookup tables and downloads no artifacts,
 #      so the whole construct-write-solve-store path can be exercised on a
 #      machine with no network. Always run.
@@ -19,22 +19,13 @@
 #
 # Run standalone with:
 #   julia -t 4 --project=. -e 'using Test, Scythe, Springsteel; include("test/test_radiation_rrtmgp.jl")'
-# (the file pushes test/ onto LOAD_PATH itself, so the root project suffices).
 
 using Test
 using Scythe
 using Springsteel
 
-# RRTMGP and ClimaComms are WEAK dependencies of Scythe: the root project cannot
-# `using` them, but test/Project.toml (a workspace member that shares the root
-# Manifest.toml, so the versions are the ones Scythe's extension was resolved against)
-# can. Loading both is what loads ext/ScytheRRTMGPExt.jl.
-@__DIR__() in LOAD_PATH || push!(LOAD_PATH, @__DIR__)
-import RRTMGP, ClimaComms   # `import`: loads both (and so the extension) without
-                             # splatting their exports into the shared test Main
-Scythe.rrtmgp_extension_loaded() ||
-    error("test_radiation_rrtmgp: RRTMGP and ClimaComms are loaded but the " *
-          "ScytheRRTMGPExt extension is not")
+# RRTMGP and ClimaComms are hard dependencies of Scythe; the tests below name their types.
+import RRTMGP, ClimaComms   # `import`: no splatting of their exports into the shared test Main
 
 const SR = Scythe
 

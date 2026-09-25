@@ -12,11 +12,6 @@ const GROUP = get(ENV, "GROUP", "all")
 const FILES = test_files_for(GROUP)
 println("Scythe tests: GROUP=$(GROUP) ($(length(FILES)) of $(length(TEST_FILES)) files)")
 
-# RRTMGP and ClimaComms are WEAK dependencies of Scythe (the ScytheRRTMGPExt extension):
-# the root project cannot load them, test/Project.toml -- a workspace member sharing the
-# root Manifest.toml -- can. The radiation test files that need the extension import them.
-@__DIR__() in LOAD_PATH || push!(LOAD_PATH, @__DIR__)
-
 using Test
 using Scythe
 

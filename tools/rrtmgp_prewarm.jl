@@ -7,10 +7,14 @@
 #
 # Run once per machine/user before a compute-node job that uses radiation:
 #
-#   julia --project=/Users/mmbell/Development/Scythe.jl/simulations tools/rrtmgp_prewarm.jl
+#   julia --project=<env> tools/rrtmgp_prewarm.jl
 #
-# (`simulations`, not the root project: RRTMGP/ClimaComms are WEAK dependencies of Scythe
-# and load only from an environment that lists them.)
+# where <env> is the environment the runs will use (any environment where Scythe is
+# installed, e.g. the checkout itself, --project=.). RRTMGP, NCDatasets and ClimaComms are
+# dependencies of Scythe; if <env> is not Scythe's own project and does not list them
+# directly, run it with --project=<Scythe checkout> instead -- the artifacts land in the
+# shared depot either way. Scythe's `preflight_checks` (run by run_simulation) checks that
+# they are present before a radiating run writes anything.
 
 using RRTMGP, NCDatasets, ClimaComms
 ClimaComms.@import_required_backends

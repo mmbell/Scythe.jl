@@ -4,39 +4,41 @@
      Do not edit by hand: change the code (docstrings, defaults, registries) and run
      `julia --project=. tools/config_reference.jl`. -->
 
-Each directory here is one case: a `config.toml` (what is run), optional overlay files, a
-local launcher `run.jl`, SLURM launchers `*.sbatch`, and a `README.md` for the case.
-The configuration describes WHAT is run, never how: workers, threads and the scheduler are
-launcher flags, recorded for provenance in `segments.csv` but never in `config.toml`, so
-two runs that differ only in launcher produce identical output.
+Each directory here is one case: a `scythe_config.toml` (what is run), a launcher
+`run.jl`, SLURM launchers `*.sbatch`, a `README.md` for the case, and optionally an
+`examples/` directory of alternate grids. A run is ONE config file: the example files are
+copied into `scythe_config.toml` by hand, never layered on the command line, so the
+resolved `scythe_config.toml` written into the run root is the whole record. The
+configuration describes WHAT is run, never how: workers, threads and the scheduler are
+launcher flags, recorded for provenance in `segments.csv` but never in the config, so two
+runs that differ only in launcher produce identical output.
 
 ## Cases
 
-- [`ocean_2D_rce/`](ocean_2D_rce/README.md) — `ocean_2D_rce/config.toml`
-- [`ocean_warm_bubble/`](ocean_warm_bubble/README.md) — `ocean_warm_bubble/config.toml`
-- [`tc_axisym/`](tc_axisym/README.md) — `tc_axisym/config.toml`
+- [`ocean_2D_rce/`](ocean_2D_rce/README.md) — `ocean_2D_rce/scythe_config.toml`
+- [`ocean_warm_bubble/`](ocean_warm_bubble/README.md) — `ocean_warm_bubble/scythe_config.toml`
+- [`tc_axisym/`](tc_axisym/README.md) — `tc_axisym/scythe_config.toml`
 
 ## Launching
 
-Every run goes through `julia --project=simulations`, NOT the root project: RRTMGP and
-ClimaComms are *weak* dependencies of Scythe (`ext/ScytheRRTMGPExt.jl`) and load only from
-an environment that lists them. `simulations/Project.toml` is a workspace member that
-shares the root `Manifest.toml`. (`julia --project=.` is for the test suite and for the
-output readers.)
+A `run.jl` is `using Scythe` plus the launcher call and nothing else, so it runs from any
+directory under any Julia environment where Scythe is installed (`<env>` below; a Scythe
+checkout itself works, `--project=/path/to/Scythe.jl`). Radiation (RRTMGP) is part of
+Scythe and needs no special environment. To run a case outside the repository, copy its
+`scythe_config.toml` and `run.jl` to a directory and run it there.
 
 ### Local: `run.jl`
 
 ```
-julia --project=simulations simulations/<case>/run.jl [overlays...] [--set key.path=value ...]
+julia --project=<env> run.jl [--config scythe_config.toml] [--set key.path=value ...]
       [--resume] [--workers N | --workers-per-patch a,b,c] [--worker-threads N]
       [--blas-threads N] [--slurm]
 ```
 
 | flag | meaning |
 |---|---|
-| `--config PATH` | the case file (default: `config.toml` beside `run.jl`) |
-| positional `overlays...` | overlay TOML files applied after `--config`, in order |
-| `--set key.path=value` | override one key (repeatable; applied after the overlays, in order) |
+| `--config PATH` | the run's one config file (default: `scythe_config.toml` beside `run.jl`); a positional argument is refused |
+| `--set key.path=value` | run control: `output.dir`, `run.integration_time`, ... (repeatable, applied in order; recorded in the resolved config's header) |
 | `--resume` | continue the run in `output.dir` from its `segments.csv` |
 | `--workers N` | N workers on a single-patch run |
 | `--workers-per-patch a,b,c` | worker group size per nest patch (one entry per patch) |
@@ -45,30 +47,36 @@ julia --project=simulations simulations/<case>/run.jl [overlays...] [--set key.p
 | `--slurm` | add the workers with `ClusterManagers.addprocs_slurm` (inside an allocation) |
 | `--segment k` | internal: the orchestrator's per-segment child |
 
-A fresh start refuses an `output.dir` that already holds a run (model output is
-experimental data: `mv` the tree aside, never `rm` it). `--resume` re-reads
-`<output.dir>/config.toml` and runs the segments not recorded `done`; the only `--set` it
+Before anything is written (fresh start or `--resume`), `run_simulation` runs
+`preflight_checks`: Springsteel new enough, the config validates, and, when
+`physics.radiation.scheme = "rrtmgp"`, the RRTMGP lookup tables already local (run
+`tools/rrtmgp_prewarm.jl` once on a login node; compute nodes have no network). A fresh
+start refuses an `output.dir` that already holds a run (model output is experimental
+data: `mv` the tree aside, never `rm` it). `--resume` re-reads
+`<output.dir>/scythe_config.toml` and runs the segments not recorded `done`; the only `--set` it
 accepts is `run.integration_time` (to extend a run); give the tree to resume with
 `--set output.dir=...`, which the launchers use only to locate it.
 
 ### Cluster: `*.sbatch`
 
 ```
-sbatch simulations/<case>/<launcher>.sbatch [overlays...] [--set key.path=value ...]
+sbatch simulations/<case>/<launcher>.sbatch [--set key.path=value ...] [--resume]
 ```
 
-The sbatch scripts set the node shape and `JULIA_NUM_THREADS`, run
-`simulations/_preflight.jl` with the same arguments (Springsteel version, the config
-loads and validates, RRTMGP artifacts present when radiation is on — run
-`tools/rrtmgp_prewarm.jl` once on a login node), give a fresh job its own
-`output.dir` unless one is `--set`, tee everything to `<output.dir>/job_stdout.log`, and
-pass every argument through to `run.jl`. Environment variables no longer configure a run.
+The sbatch scripts run `julia --project=${SCYTHE_PROJECT:-$SCYTHE}
+$SCYTHE/simulations/<case>/run.jl ...`, where `SCYTHE` (from `SCYTHE_DIR`) is the checkout
+or run directory holding `simulations/<case>/scythe_config.toml` and `SCYTHE_PROJECT` is
+any environment where Scythe is installed. They set the node shape and
+`JULIA_NUM_THREADS`, give a fresh job its own `output.dir` unless one is `--set` (TC),
+tee everything to `<output.dir>/job_stdout.log`, and pass every argument through to
+`run.jl`. Environment variables no longer configure a run.
 
-## Overlays and `--set`
+## The config file and `--set`
 
-- Files load in order (`--config`, then each overlay); tables merge recursively, scalars
-  and arrays replace. Then each `--set` applies in order. Keys absent everywhere take the
-  struct defaults below, so a case file lists only what it needs.
+- The case file is read, then each `--set` applies in order. Keys absent from the file
+  take the struct defaults below, so a case file lists only what it needs. `--set` is
+  for run control (where the output goes, how long to run); a physics or grid change
+  belongs in the config file, so that the file IS the record.
 - `--set` values are parsed as TOML (`TOML.parse("v = " * rhs)`) and fall back to a bare
   string: `--set physics.boundary_layer.scheme=louis`, `--set timestep.ts=0.25`,
   `--set grid.num_cells=[15,15,15]`, `--set physics.boundary_layer.K_max=inf`,
@@ -92,12 +100,12 @@ pass every argument through to `run.jl`. Environment variables no longer configu
 Always the segmented layout, even for one segment, so readers handle one shape:
 
 ```
-<output.dir>/config.toml              resolved config (every field) + provenance header
+<output.dir>/scythe_config.toml       resolved config (every field) + provenance header
 <output.dir>/reference.ref            reference column: z p rho_d rho_v rho_c
 <output.dir>/ics.csv | nest{i}_ics.csv  initial conditions
 <output.dir>/segments.csv             one row per segment (columns below)
 <output.dir>/job_stdout.log           (sbatch launchers only)
-<output.dir>/seg_NN/config.toml       the same config; the segment's values in the header
+<output.dir>/seg_NN/scythe_config.toml  the same config; the segment's values in the header
 <output.dir>/seg_NN/segment_stdout.log
 <output.dir>/seg_NN/[nest{i}/]<t>.nc | <t>.jld2 | scythe_{out,err}.log
 ```
@@ -131,8 +139,8 @@ each segment runs with `start_hour = physics.radiation.start_hour + t_offset_s /
 ## Configuration reference
 
 Tables in the order `write_config` writes them. Only the ACTIVE
-`[initial_conditions.<method>]` table is written back to an output `config.toml`; all
-four are held so an overlay can switch `method`.
+`[initial_conditions.<method>]` table is written back to an output `scythe_config.toml`;
+all four are held so a `--set` can switch `method`.
 
 ### `[run]`
 

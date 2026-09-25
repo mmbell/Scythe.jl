@@ -55,12 +55,9 @@ using Springsteel
         @test e2.slurm
         @test_throws ArgumentError setup_workers!(ExecutionEnv(workers_per_patch = Int[]))
         @test_throws ArgumentError setup_workers!(ExecutionEnv(workers_per_patch = [1, 0]))
-        # worker helpers compile (no spawn): argument guards fire before addprocs, and the
-        # extension probe used by the worker loader is well-formed on this build
+        # worker helpers compile (no spawn): argument guards fire before addprocs
         @test_throws ArgumentError Scythe.add_workers(0)
         @test_throws ArgumentError Scythe.add_slurm_workers(1; worker_threads = -1)
-        @test Base.get_extension(Scythe, :ScytheRRTMGPExt) === nothing ||
-              Base.get_extension(Scythe, :ScytheRRTMGPExt) isa Module
         @test hasmethod(Scythe._pin_blas_and_load, Tuple{Vector{Int}, Int})
     end
 
@@ -140,8 +137,8 @@ using Springsteel
 
     # ── Stage 3b: the segment driver's pure pieces ────────────────────────────────────
 
-    owb = joinpath(@__DIR__, "..", "simulations", "ocean_warm_bubble", "config.toml")
-    tc = joinpath(@__DIR__, "..", "simulations", "tc_axisym", "config.toml")
+    owb = joinpath(@__DIR__, "..", "simulations", "ocean_warm_bubble", "scythe_config.toml")
+    tc = joinpath(@__DIR__, "..", "simulations", "tc_axisym", "scythe_config.toml")
 
     @testset "segment_plan" begin
         plan(N, D) = Scythe.segment_plan(load_config(owb; set = [
@@ -245,7 +242,7 @@ using Springsteel
         mktempdir() do root
             @test Scythe.check_fresh_root(root) === nothing
             @test Scythe.check_fresh_root(joinpath(root, "not_yet")) === nothing
-            touch(joinpath(root, "config.toml")); touch(joinpath(root, "ics.csv"))
+            touch(joinpath(root, "scythe_config.toml")); touch(joinpath(root, "ics.csv"))
             @test Scythe.check_fresh_root(root) === nothing      # inputs are not output
             mkpath(joinpath(root, "seg_01"))
             @test_throws ErrorException Scythe.check_fresh_root(root)
@@ -261,7 +258,7 @@ using Springsteel
             mkpath(joinpath(root, "seg_01"))
             cfg = load_config(owb; set = ["output.dir=$root", "physics.radiation.scheme=none"])
             @test_throws ErrorException run_simulation(cfg, ExecutionEnv())
-            @test !isfile(joinpath(root, "config.toml"))
+            @test !isfile(joinpath(root, "scythe_config.toml"))
             # resume with a disallowed --set is refused
             err = try
                 run_simulation(cfg, ExecutionEnv(); resume = true, set = ["grid.num_cells=[8]"])
@@ -272,6 +269,17 @@ using Springsteel
             @test occursin("only run.integration_time", err)
             # resume with nothing to resume
             @test_throws ErrorException run_simulation(cfg, ExecutionEnv(); resume = true)
+            # a tree written before the rename (config.toml) is named, with the fix
+            touch(joinpath(root, "config.toml"))
+            err = try
+                run_simulation(cfg, ExecutionEnv(); resume = true); ""
+            catch e
+                sprint(showerror, e)
+            end
+            @test occursin("before the resolved config was renamed", err) && occursin("mv", err)
+            @test Scythe.run_config_file(root) == joinpath(root, "config.toml")
+            touch(joinpath(root, "scythe_config.toml"))
+            @test Scythe.run_config_file(root) == joinpath(root, "scythe_config.toml")
         end
     end
 
@@ -299,19 +307,37 @@ using Springsteel
         end
     end
 
+    @testset "preflight_checks" begin
+        # The struct-default config (diurnal all-sky RRTMGP: Springsteel symbols + lookup
+        # tables) and the OWB case (radiation off: no artifact check) both pass.
+        @test Scythe.preflight_checks(RunConfig()) === nothing
+        @test Scythe.preflight_checks(load_config(owb)) === nothing
+        @test Scythe.preflight_checks(load_config(tc)) === nothing
+    end
+
     @testset "parse_launcher_args" begin
-        a = parse_launcher_args(["--config", "/c/config.toml", "fine.toml", "rlr.toml",
+        a = parse_launcher_args(["--config", "/c/scythe_config.toml",
                                  "--set", "run.integration_time=20", "--set", "grid.num_cells=[8]",
                                  "--resume", "--workers-per-patch", "2,1,1",
                                  "--worker-threads", "4", "--blas-threads", "0", "--slurm"])
-        @test a.config_paths == ["/c/config.toml", "fine.toml", "rlr.toml"]
+        @test a.config_path == "/c/scythe_config.toml"
         @test a.set == ["run.integration_time=20", "grid.num_cells=[8]"]
         @test a.resume
         @test a.exec.workers_per_patch == [2, 1, 1]
         @test a.exec.worker_threads == 4 && a.exec.blas_threads == 0 && a.exec.slurm
         @test a.segment == 0
         d = parse_launcher_args(String[])
-        @test d.config_paths == [joinpath(dirname(abspath(PROGRAM_FILE)), "config.toml")]
+        @test d.config_path == joinpath(dirname(abspath(PROGRAM_FILE)), "scythe_config.toml")
+        # a run is ONE config file: a positional argument (an old-style overlay) is refused,
+        # and the refusal names --config
+        err = try
+            parse_launcher_args(["--config", "/c/scythe_config.toml", "fine.toml",
+                                 "--workers", "1"]); ""
+        catch e
+            sprint(showerror, e)
+        end
+        @test occursin("--config", err) && occursin("fine.toml", err)
+        @test_throws ArgumentError parse_launcher_args(["fine.toml"])
         @test d.set == String[] && !d.resume && d.segment == 0
         @test d.exec.workers_per_patch == [1] && d.exec.worker_threads == 0 &&
               d.exec.blas_threads == 1 && !d.exec.slurm

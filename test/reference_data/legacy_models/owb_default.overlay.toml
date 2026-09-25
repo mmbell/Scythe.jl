@@ -1,4 +1,4 @@
-# Legacy-pin overlay: simulations/ocean_warm_bubble/config.toml + this = what
+# Legacy-pin overlay: simulations/ocean_warm_bubble/scythe_config.toml + this = what
 # benchmarks/ocean_warm_bubble.jl built with no SCYTHE_OWB_* / SCYTHE_REFSTATE set (the
 # golden owb_default.toml, --mode quick).
 [output]

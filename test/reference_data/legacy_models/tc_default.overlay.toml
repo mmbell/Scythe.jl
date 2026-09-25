@@ -1,4 +1,4 @@
-# Legacy-pin overlay: simulations/tc_axisym/config.toml + this = what tc/tc_params.jl +
+# Legacy-pin overlay: simulations/tc_axisym/scythe_config.toml + this = what tc/tc_params.jl +
 # tc/tc_init.jl built with no SCYTHE_TC_* set (the golden tc_default.toml), captured with
 # make_base(1800.0). Used by test/test_config_equivalence.jl.
 [run]

@@ -115,10 +115,8 @@ merged into the built `options`/`physical_params` Dicts LAST and are NOT validat
 the config registries -- the same unchecked escape hatch the pre-config `extra_options` was,
 for a diagnostic run that wants an option `RunConfig` has no field for.
 
-Radiation is on by default (`TC_CFG.physics.radiation.scheme == :rrtmgp`): if the RRTMGP
-extension is not loaded, this errors with `build_model`'s own message naming the fix
-(launch under `--project=simulations`, or `import RRTMGP, ClimaComms` first) -- it does not
-import it for you.
+Radiation is on by default (`TC_CFG.physics.radiation.scheme == :rrtmgp`); RRTMGP is an
+ordinary dependency of Scythe, so nothing needs importing first.
 """
 function make_base(integration_time; output_formats = OUTPUT_FORMATS,
                    output_dir::AbstractString = OUTPUT_DIR,

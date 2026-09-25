@@ -2,7 +2,7 @@
 # src/config_init.jl) against the Stage-0 golden capture of the three legacy drivers
 # (test/reference_data/legacy_models/, tools/capture_legacy_models.jl).
 #
-#   1. EQUIVALENCE. For every captured arm, the case config (simulations/<case>/config.toml)
+#   1. EQUIVALENCE. For every captured arm, the case config (simulations/<case>/scythe_config.toml)
 #      plus a legacy-pin overlay (test/reference_data/legacy_models/<arm>.overlay.toml, which
 #      states the legacy physics) must fingerprint key by key like the golden. The only
 #      tolerated differences are
@@ -18,7 +18,7 @@
 #   4. `validate` refusals, the segment override, the advisory keyword.
 #
 # Standalone:
-#   julia --project=simulations -e 'using Test, Scythe; import RRTMGP, ClimaComms; include("test/test_config_equivalence.jl")'
+#   julia --project=. -e 'using Test, Scythe; include("test/test_config_equivalence.jl")'
 
 using Test
 using TOML
@@ -26,20 +26,14 @@ using SHA
 using Scythe
 using Springsteel
 
-# RRTMGP/ClimaComms are weak deps (see test_radiation_rrtmgp.jl): test/ on LOAD_PATH makes
-# them importable under the root project. Several legacy arms (and the RCE/TC production
-# configs) run RRTMGP, so the extension must be loaded to build them.
-@__DIR__() in LOAD_PATH || push!(LOAD_PATH, @__DIR__)
-import RRTMGP, ClimaComms
-
 include(joinpath(@__DIR__, "config_fingerprint.jl"))
 
 const CEQ_ROOT = normpath(joinpath(@__DIR__, ".."))
 const CEQ_LM = joinpath(@__DIR__, "reference_data", "legacy_models")
 const CEQ_SIM = joinpath(CEQ_ROOT, "simulations")
-const CEQ_TC = joinpath(CEQ_SIM, "tc_axisym", "config.toml")
-const CEQ_RCE = joinpath(CEQ_SIM, "ocean_2D_rce", "config.toml")
-const CEQ_OWB = joinpath(CEQ_SIM, "ocean_warm_bubble", "config.toml")
+const CEQ_TC = joinpath(CEQ_SIM, "tc_axisym", "scythe_config.toml")
+const CEQ_RCE = joinpath(CEQ_SIM, "ocean_2D_rce", "scythe_config.toml")
+const CEQ_OWB = joinpath(CEQ_SIM, "ocean_warm_bubble", "scythe_config.toml")
 ceq_ov(name) = joinpath(CEQ_LM, "$(name).overlay.toml")
 
 # arm => (config files in load order, segment, needs RRTMGP)
@@ -47,7 +41,7 @@ const CEQ_ARMS = [
     ("tc_default",       [CEQ_TC, ceq_ov("tc_default")], nothing, false),
     ("tc_mynn_rad_stab", [CEQ_TC, ceq_ov("tc_default"), ceq_ov("tc_mynn_rad_stab")], nothing, true),
     ("tc_r1t1x",         [CEQ_TC, ceq_ov("tc_default"), ceq_ov("tc_r1t1x")], nothing, false),
-    ("tc_rlr",           [CEQ_TC, joinpath(CEQ_SIM, "tc_axisym", "rlr.toml"), ceq_ov("tc_default")],
+    ("tc_rlr",           [CEQ_TC, joinpath(CEQ_SIM, "tc_axisym", "examples", "rlr.toml"), ceq_ov("tc_default")],
                          nothing, false),
     ("rce_default_seg1", [CEQ_RCE, ceq_ov("rce_default")], nothing, true),
     # Segment 3 of 20 d in 2 d segments: t_offset 4 d, restarting from seg_02's checkpoint.
@@ -260,10 +254,8 @@ end
 
 @testset "config build + init" begin
 
-@test Scythe.rrtmgp_extension_loaded()
-
 @testset "equivalence: $arm" for (arm, files, seg, rad) in CEQ_ARMS
-    (rad && !Scythe.rrtmgp_extension_loaded()) || mktempdir() do dir
+    mktempdir() do dir
         cfg = ceq_load(files; dir = dir)
         m = build_model(cfg; segment = seg)
         old = ceq_legacy(arm)

@@ -253,7 +253,7 @@ end
         root = realpath(root)
         sub = mkpath(joinpath(root, "case"))
         ovl = mkpath(joinpath(root, "overlays"))
-        a = writetoml(joinpath(sub, "config.toml"), """
+        a = writetoml(joinpath(sub, "scythe_config.toml"), """
             [output]
             dir = "out"
             [reference_state]

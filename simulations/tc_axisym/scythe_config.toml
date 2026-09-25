@@ -22,8 +22,9 @@
 #                    state-dependent vertical SI (implicit acoustic coefficients from the
 #                    current column: no convective SI ceiling), spline filter l_q = 2
 #
-# The full resolved configuration is written to <output.dir>/config.toml at run start.
-# Overlays: fine.toml (3 km / 300 m grid), rlr.toml (3-D cylindrical RLR geometry).
+# The full resolved configuration is written to <output.dir>/scythe_config.toml at run start.
+# Alternate grids: examples/fine.toml (3 km / 300 m grid), examples/rlr.toml (3-D cylindrical
+# RLR geometry) -- copy their sections into this file; they are not command-line overlays.
 # Launch: simulations/tc_axisym/run.jl (local) or scythe_tc*.sbatch; see README.md.
 
 [run]
@@ -43,7 +44,7 @@ netcdf_derivatives = false
 
 [grid]
 # "coarse" = 10|20|40 km radial cells x 500 m vertical cells, 25 km lid. Axisymmetric
-# spin-up from a cold start takes DAYS, and the fine grid (fine.toml) runs at ~1x real
+# spin-up from a cold start takes DAYS, and the fine grid (examples/fine.toml) runs at ~1x real
 # time. The vertical spacing is a compromise: a 1 km-cell version spun up but blew up on
 # the axis column at 8 h, and the surface flux is delivered as a flux divergence over the
 # LOWEST cell, so cell depth scales how it is spread; 500 m stays within a factor two of

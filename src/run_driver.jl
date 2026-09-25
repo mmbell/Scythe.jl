@@ -13,12 +13,29 @@ using Dates
 export ExecutionEnv, setup_workers!, checkpoint_path
 export run_simulation, segment_main, parse_launcher_args
 
+"The name of a run's resolved config file (the run root and each `seg_NN/`), and of the case file a launcher reads by default."
+const RUN_CONFIG_NAME = "scythe_config.toml"
+
+"""
+    run_config_file(dir) -> String
+
+The resolved config file of a run root (or a `seg_NN/` directory): `dir/scythe_config.toml`,
+or the `dir/config.toml` of a tree written before the file was renamed. For READERS
+(post-processing); the driver itself writes and resumes only `scythe_config.toml`. Returns
+the `scythe_config.toml` path when neither file exists.
+"""
+function run_config_file(dir::AbstractString)
+    p = joinpath(dir, RUN_CONFIG_NAME)
+    legacy = joinpath(dir, "config.toml")
+    return (!isfile(p) && isfile(legacy)) ? legacy : p
+end
+
 """
     ExecutionEnv(; workers_per_patch = [1], worker_threads = 0, blas_threads = 1, slurm = false)
 
 How a run is executed, as opposed to what it computes: it comes from the launcher's command
-line, is recorded in `segments.csv` for provenance, and is never written to `config.toml`
-(a run's physics must not depend on it).
+line, is recorded in `segments.csv` for provenance, and is never written to
+`scythe_config.toml` (a run's physics must not depend on it).
 
 # Fields
 - `workers_per_patch::Vector{Int}` — distributed worker group size per patch (one entry for
@@ -40,8 +57,7 @@ end
     _pin_blas_and_load(pids, blas_threads)
 
 Pin OpenBLAS to `blas_threads` on the master and on `pids` (skipped when `blas_threads <= 0`),
-then load Springsteel and Scythe on the new workers (plus `RRTMGP, ClimaComms` when the
-master has the `ScytheRRTMGPExt` extension loaded). Quoted expressions through
+then load Springsteel and Scythe on the new workers. Quoted expressions through
 `remotecall_eval` rather than `@everywhere using ...`: a `using` inside a macro call in a
 function body is rejected as a non-toplevel expression.
 """
@@ -53,15 +69,6 @@ function _pin_blas_and_load(pids, blas_threads::Int)
                                     :(LinearAlgebra.BLAS.set_num_threads($blas_threads)))
     end
     Distributed.remotecall_eval(Main, pids, :(using Springsteel, Scythe))
-    # RRTMGP/ClimaComms are WEAK dependencies: the RRTMGP radiation path lives in the
-    # package extension `ScytheRRTMGPExt`, which Julia loads per process only once that
-    # process has imported the trigger packages. The master having it loaded does not load
-    # it on the workers, and every worker that builds a radiating tile needs its own copy,
-    # so mirror the master. `get_extension` returns `nothing` when the extension is not
-    # loaded (or does not exist in this build), in which case the workers skip it.
-    if Base.get_extension(Scythe, :ScytheRRTMGPExt) !== nothing
-        Distributed.remotecall_eval(Main, pids, :(import RRTMGP, ClimaComms))
-    end
     return pids
 end
 
@@ -239,10 +246,10 @@ whole_steps(len, dt) = abs(len / dt - round(len / dt)) < 1.0e-9
 
 # ── Segment plan and on-disk layout ─────────────────────────────────────────────────────
 #
-#   <root>/config.toml              resolved config (fresh start) + provenance header
+#   <root>/scythe_config.toml       resolved config (fresh start) + provenance header
 #   <root>/reference.ref, ics.csv | nest{i}_ics.csv
 #   <root>/segments.csv             one row per segment (SEGMENTS_CSV_COLS)
-#   <root>/seg_NN/config.toml       the same config, with this segment's values in the header
+#   <root>/seg_NN/scythe_config.toml  the same config, with this segment's values in the header
 #   <root>/seg_NN/segment_stdout.log
 #   <root>/seg_NN/[nest{i}/]<t>.nc | <t>.jld2 | scythe_{out,err}.log
 #
@@ -467,21 +474,66 @@ function exec_flags(exec::ExecutionEnv)
     return f
 end
 
-"""
-    _load_rrtmgp!()
+# ── Preflight ───────────────────────────────────────────────────────────────────────────
 
-Import `RRTMGP, ClimaComms` into `Main` at run time (loading the `ScytheRRTMGPExt`
-extension in this process) when the active environment can load them; a clear error when it
-cannot. Callers continue through `Base.invokelatest` so the extension's methods are visible.
 """
-function _load_rrtmgp!()
-    Base.get_extension(@__MODULE__, :ScytheRRTMGPExt) === nothing || return nothing
-    (Base.identify_package("RRTMGP") === nothing ||
-     Base.identify_package("ClimaComms") === nothing) && error(
-        "physics.radiation.scheme = \"rrtmgp\" but RRTMGP/ClimaComms cannot be loaded from " *
-        "the active project $(Base.active_project()). Launch with " *
-        "`julia --project=<Scythe>/simulations` (the workspace member that lists them).")
-    Core.eval(Main, :(import RRTMGP, ClimaComms))
+    preflight_checks(cfg::RunConfig) -> nothing
+
+The checks that make a misconfigured environment fail in seconds, on the login node or at
+the top of a job, rather than deep into a queued run. Called by [`run_simulation`](@ref) on
+a fresh start and on `--resume`, before anything is written.
+
+1. Springsteel is new enough. Springsteel is a REGISTERED package, so an environment can
+   resolve an old release that lacks `_hydrostatic_pressure_profile`, `CubicBSpline.R1T1X`
+   and the `hydrostatic` keyword of `calculate_pressure_reference_state` -- and the run then
+   dies on an unknown-keyword MethodError deep into the job, with nothing saying "wrong
+   Springsteel".
+2. The configuration passes [`validate`](@ref).
+3. When `physics.radiation.scheme == :rrtmgp`: the RRTMGP lookup-table artifacts are
+   ALREADY local. Check only: compute nodes have no network and RRTMGP reads the tables at
+   the first radiation call, so run `tools/rrtmgp_prewarm.jl` on a login node first.
+
+Throws an error naming the failure; prints one line per check otherwise.
+"""
+function preflight_checks(cfg::RunConfig)
+    println("Scythe preflight:")
+    println("  Springsteel      : ", pkgdir(Springsteel))
+    miss = String[]
+    isdefined(Springsteel, :_hydrostatic_pressure_profile) ||
+        push!(miss, "_hydrostatic_pressure_profile")
+    isdefined(Springsteel.CubicBSpline, :R1T1X) || push!(miss, "CubicBSpline.R1T1X")
+    any(m -> :hydrostatic in Base.kwarg_decl(m),
+        methods(Springsteel.calculate_pressure_reference_state)) ||
+        push!(miss, "calculate_pressure_reference_state(; hydrostatic)")
+    isempty(miss) || error("""
+        preflight: this Springsteel ($(pkgdir(Springsteel))) is too old for Scythe's
+        moist-compressible configurations. Missing: $(join(miss, ", ")).
+        Update Springsteel in the launch environment ($(Base.active_project())); a
+        registered release resolved from the General registry is not evidence of anything.""")
+    println("  Springsteel      : required symbols present")
+    validate(cfg)
+    println("  config           : validates")
+    if cfg.physics.radiation.scheme === :rrtmgp
+        missing_artifacts = String[]
+        for optics_type in (:gas, :cloud), lam in (:lw, :sw)
+            path = try
+                RRTMGP.ArtifactPaths.get_lookup_filename(optics_type, lam)
+            catch e
+                "(artifact not available: $(sprint(showerror, e)))"
+            end
+            isfile(path) || push!(missing_artifacts, "$(optics_type)/$(lam) -> $path")
+        end
+        isempty(missing_artifacts) || error("""
+            preflight: RRTMGP lookup-table artifacts are missing (physics.radiation.scheme =
+            "rrtmgp" in this config):
+              $(join(missing_artifacts, "\n  "))
+            Run tools/rrtmgp_prewarm.jl from the Scythe checkout on a LOGIN NODE (with
+            network access) first, in the same environment the run uses:
+              julia --project=<env> <Scythe checkout>/tools/rrtmgp_prewarm.jl
+            Compute nodes have no network, so a lazy download at the first radiation call
+            would hang or fail deep into a queued job.""")
+        println("  RRTMGP artifacts : present (gas/lw, gas/sw, cloud/lw, cloud/sw)")
+    end
     return nothing
 end
 
@@ -551,15 +603,18 @@ npatches(cfg::RunConfig) = length(cfg.grid.num_cells)
 Run `cfg` as a chain of segments under `root = cfg.output.dir`, one child Julia process per
 segment ([`segment_main`](@ref)), in the layout `root/seg_NN/[nest{i}/]`.
 
+Both paths first run [`preflight_checks`](@ref) (Springsteel version; RRTMGP lookup tables
+present when radiation is on), before anything is written.
+
 Fresh start: refuses a root that already holds a run ([`check_fresh_root`](@ref)); writes
-`root/config.toml` (the resolved config, with a provenance header: git SHA and dirty state,
+`root/scythe_config.toml` (the resolved config, with a provenance header: git SHA and dirty state,
 date, host, `config_sources`, `set`, and `exec`, which is provenance only); builds segment
 1, writes the reference state and initial conditions (`initialize_case!`); then runs every
 segment.
 
-`resume = true`: re-reads `root/config.toml` and uses THAT configuration (the `cfg`
+`resume = true`: re-reads `root/scythe_config.toml` and uses THAT configuration (the `cfg`
 argument supplies only the root). `set` may only hold `run.integration_time=...` (to extend
-a run; config.toml is rewritten and the new segments carry a note in segments.csv).
+a run; scythe_config.toml is rewritten and the new segments carry a note in segments.csv).
 Segments recorded `done` are skipped, `failed`/`running`/missing ones re-run. The reference
 state and initial conditions must already exist. Execution flags may differ freely.
 
@@ -570,12 +625,12 @@ function run_simulation(cfg::RunConfig, exec::ExecutionEnv; resume::Bool = false
                         config_sources::Vector{String} = String[],
                         set::Vector{String} = String[])
     root = abspath(cfg.output.dir)
-    cfgpath = joinpath(root, "config.toml")
+    cfgpath = joinpath(root, RUN_CONFIG_NAME)
     notes = Dict{Int,String}()
 
     if resume
         # `output.dir` is how the launcher LOCATES the tree to resume (the root's own
-        # config.toml is then authoritative for everything else), so it is accepted here
+        # scythe_config.toml is then authoritative for everything else), so it is accepted here
         # and dropped; `run.integration_time` may change to extend the run; nothing else may.
         for s in set
             key = strip(first(split(s, '='; limit = 2)))
@@ -585,11 +640,17 @@ function run_simulation(cfg::RunConfig, exec::ExecutionEnv; resume::Bool = false
                 "may be given")
         end
         set = filter(s -> strip(first(split(s, '='; limit = 2))) != "output.dir", set)
-        isfile(cfgpath) || error("--resume: $cfgpath does not exist (nothing to resume)")
+        if !isfile(cfgpath)
+            legacy = joinpath(root, "config.toml")
+            isfile(legacy) && error("--resume: $cfgpath does not exist, but $legacy does: " *
+                "this tree was written before the resolved config was renamed. " *
+                "`mv $legacy $cfgpath` (and the same in each seg_NN/) and resume again.")
+            error("--resume: $cfgpath does not exist (nothing to resume)")
+        end
         here = "output.dir=" * root
         old = load_config(cfgpath; set = [here])
         cfg = load_config(cfgpath; set = [here; set])
-        _load_if_rrtmgp(cfg)
+        preflight_checks(cfg)
         oldplan, plan = segment_plan(old), segment_plan(cfg)
         rows = read_segments_csv(root)
         for (k, row) in rows
@@ -616,18 +677,15 @@ function run_simulation(cfg::RunConfig, exec::ExecutionEnv; resume::Bool = false
                                "conditions are written by a fresh start only")
         end
     else
+        preflight_checks(cfg)
         check_fresh_root(root)
-        _load_if_rrtmgp(cfg)
     end
-    return Base.invokelatest(_orchestrate, cfg, exec, root, resume, notes, config_sources, set)
+    return _orchestrate(cfg, exec, root, resume, notes, config_sources, set)
 end
-
-_load_if_rrtmgp(cfg::RunConfig) =
-    cfg.physics.radiation.scheme === :rrtmgp ? _load_rrtmgp!() : nothing
 
 function _orchestrate(cfg::RunConfig, exec::ExecutionEnv, root::String, resume::Bool,
                       notes::Dict{Int,String}, sources::Vector{String}, set::Vector{String})
-    cfgpath = joinpath(root, "config.toml")
+    cfgpath = joinpath(root, RUN_CONFIG_NAME)
     plan = segment_plan(cfg)
     nseg = length(plan)
     n = npatches(cfg)
@@ -701,27 +759,24 @@ end
     segment_main(args::Vector{String})
 
 Entry point of a segment's child process (launched by [`run_simulation`](@ref)):
-`--config <root>/config.toml --segment k` plus the execution flags
+`--config <root>/scythe_config.toml --segment k` plus the execution flags
 (`--workers-per-patch`, `--worker-threads`, `--blas-threads`, `--slurm`). Loads the
 config (its `output.dir` taken as the config file's directory, so a moved tree still
-resumes in place), imports RRTMGP/ClimaComms first when radiation is on, and chains the
+resumes in place) and chains the
 initial conditions: segment 1 reads `root/ics.csv` (nests: `root/nest{i}_ics.csv`),
 segment k > 1 each patch's [`find_segment_checkpoints`](@ref) in `seg_{k-1}`. Builds the
 model with the whole-step guards ([`segment_model`](@ref)) before any worker is spawned,
-writes `seg_NN/config.toml` with the segment's values in the header, adds the workers, and
+writes `seg_NN/scythe_config.toml` with the segment's values in the header, adds the workers, and
 integrates; the segment's row in segments.csv ends `done` or `failed` (the error is
 rethrown).
 """
 function segment_main(args::Vector{String})
     a = parse_launcher_args(args)
     a.segment >= 1 || error("segment_main: --segment k (k >= 1) is required")
-    length(a.config_paths) == 1 || error("segment_main: exactly one config (the run's " *
-        "config.toml) is expected, got $(a.config_paths)")
     isempty(a.set) || error("segment_main: --set is not accepted by a segment child")
-    config = abspath(a.config_paths[1])
+    config = abspath(a.config_path)
     cfg = load_config(config; set = ["output.dir=" * dirname(config)])
-    _load_if_rrtmgp(cfg)
-    return Base.invokelatest(_run_segment, cfg, a.segment, a.exec)
+    return _run_segment(cfg, a.segment, a.exec)
 end
 
 function _run_segment(cfg::RunConfig, k::Int, exec::ExecutionEnv)
@@ -770,7 +825,7 @@ function _run_segment(cfg::RunConfig, k::Int, exec::ExecutionEnv)
                        "restart_file = $restart",
                        "execution: $(_exec_string(exec))"], "\n")
         mkpath(segdir)
-        write_config(cfg, joinpath(segdir, "config.toml"); header = header)
+        write_config(cfg, joinpath(segdir, RUN_CONFIG_NAME); header = header)
 
         println("Scythe: segment $k/$nseg, t_offset = $(s.t_offset) s, length = " *
                 "$(s.integration_time) s, start_hour = $start_hour, ICs = $(join(ics, ", "))")
@@ -795,14 +850,19 @@ end
 # ── Launcher command line ───────────────────────────────────────────────────────────────
 
 """
-    parse_launcher_args(args) -> (config_paths, set, resume, exec::ExecutionEnv, segment)
+    parse_launcher_args(args) -> (config_path::String, set::Vector{String}, resume::Bool,
+                                  exec::ExecutionEnv, segment::Int)
 
 The shared command line of the `simulations/<case>/run.jl` launchers (and of the segment
 child):
 
-- `--config PATH` — the case file (default `config.toml` beside `PROGRAM_FILE`), then any
-  positional overlay files, later ones winning: `config_paths = [config; overlays...]`;
-- `--set key.path=value` (repeatable), `--resume`;
+- `--config PATH` — the run's ONE config file (default `scythe_config.toml` beside
+  `PROGRAM_FILE`, i.e. beside the launcher script). There are no overlay files: a run is one
+  config file, written out resolved into the run root. A positional argument is refused
+  with an error naming `--config`;
+- `--set key.path=value` (repeatable) — for run control (`output.dir`, extending
+  `run.integration_time` on `--resume`, ...); every `--set` is recorded in the header of the
+  resolved `scythe_config.toml`; `--resume`;
 - `--workers N` (N workers on a single patch) or `--workers-per-patch a,b,c` (a nest), not
   both; `--worker-threads N` (0 = split the machine), `--blas-threads N` (0 = OpenBLAS
   default), `--slurm`;
@@ -815,11 +875,11 @@ function parse_launcher_args(args::AbstractVector{<:AbstractString})
                                   description = "Run a Scythe simulation from a config file.")
     ArgParse.@add_arg_table! s begin
         "--config"
-            help = "case config file (default: config.toml beside the launcher script)"
+            help = "the run's config file (default: $(RUN_CONFIG_NAME) beside the launcher script)"
             arg_type = String
             default = ""
-        "overlays"
-            help = "overlay config files applied after --config, in order"
+        "positional"
+            help = "refused: a run is one config file, given with --config"
             nargs = '*'
             arg_type = String
         "--set"
@@ -854,8 +914,14 @@ function parse_launcher_args(args::AbstractVector{<:AbstractString})
             default = 0
     end
     p = ArgParse.parse_args(collect(String, args), s)
+    extra = String.(p["positional"])
+    isempty(extra) || throw(ArgumentError(
+        "run.jl takes ONE config file, given with --config PATH (default: " *
+        "$(RUN_CONFIG_NAME) beside the launcher script); positional argument(s) " *
+        "$(join(repr.(extra), ", ")) refused. There are no overlay files: copy the sections " *
+        "you want into the run's $(RUN_CONFIG_NAME), so the run's record is one file."))
     config = p["config"]
-    isempty(config) && (config = joinpath(dirname(abspath(PROGRAM_FILE)), "config.toml"))
+    isempty(config) && (config = joinpath(dirname(abspath(PROGRAM_FILE)), RUN_CONFIG_NAME))
     nw, wpp = p["workers"], p["workers-per-patch"]
     (nw > 0 && !isempty(wpp)) && throw(ArgumentError(
         "give --workers N (single patch) or --workers-per-patch a,b,c (nest), not both"))
@@ -868,7 +934,7 @@ function parse_launcher_args(args::AbstractVector{<:AbstractString})
                         worker_threads = p["worker-threads"],
                         blas_threads = p["blas-threads"], slurm = p["slurm"])
     p["segment"] >= 0 || throw(ArgumentError("--segment must be >= 1"))
-    return (config_paths = String[config; String.(p["overlays"])],
+    return (config_path = String(config),
             set = String.(p["set"]), resume = p["resume"], exec = exec,
             segment = p["segment"])
 end

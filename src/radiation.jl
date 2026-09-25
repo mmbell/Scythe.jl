@@ -7,22 +7,16 @@
 # `mc_driver!` about what the cloud IS would put that disagreement straight into the
 # heating field.
 #
-# It names NO radiative-transfer library. RRTMGP and ClimaComms are WEAK dependencies:
-# every reference to them lives in the package extension ext/ScytheRRTMGPExt.jl, loaded
-# automatically once the session has done `using RRTMGP, ClimaComms`. This file calls
-# the RRTMGP half through a small fixed interface (`rrtmgp_solver`,
-# `rrtmgp_solve_columns!`, `rrtmgp_fluxes`, plus the library-free `radiation_divergence!`,
-# `standard_extension`, `model_ozone`, `default_gases` of src/radiation_profiles.jl).
-# The library-bound members of that interface are declared below as STUBS (`function
-# rrtmgp_solver end`, ...) whose only methods are the extension's; `mc_radiation_state`
-# checks `require_rrtmgp_extension()` before the first of them is reached, so a
-# `:rrtmgp` configuration without the extension dies at setup with a message naming the
-# missing `using`, not with a MethodError. Keeping RRTMGP out of `[deps]` keeps its
-# compat bounds (its weak-dep `CUDA = "5.9, 6"` among them) out of every project that
-# `Pkg.develop`s Scythe without radiation. (NCDatasets is a hard dependency and is named
-# in TWO places, not one: the extension imports it only to trigger RRTMGP's own
-# NCDatasets extension, and src/radiation_io.jl — S5, the sidecar writer/reader — is the
-# one that actually reads and writes with it. Neither of those is this file.)
+# It names NO radiative-transfer library. Every RRTMGP/ClimaComms reference lives in
+# src/radiation_rrtmgp.jl, which this file calls through a small fixed interface
+# (`rrtmgp_solver`, `rrtmgp_solve_columns!`, `rrtmgp_fluxes`), alongside the
+# library-free half of the RRTMGP path in src/radiation_profiles.jl
+# (`radiation_divergence!`, `standard_extension`, `model_ozone`, `default_gases`, the
+# column-write loops). The split keeps the RRTMGP/ClimaComms dependency at ONE file.
+# (NCDatasets is named in TWO files, not one: src/radiation_rrtmgp.jl imports it only to
+# trigger RRTMGP's own NCDatasets extension, and src/radiation_io.jl — S5, the sidecar
+# writer/reader — is the one that actually reads and writes with it. Neither of those is
+# this file.)
 #
 # What S2a ships (this stage): the plumbing. `ModelTile` carries a `RadiationState`, the
 # pre-pass runs once per step before the threaded column loop, and the held heating folds
@@ -34,63 +28,6 @@
 # Sign and unit conventions are those of radiation_state.jl: `q_lw`/`q_sw` are flux
 # divergences in W/m^3, cooling is negative, layer 1 is the surface, and gridpoint row
 # `j = (c-1)*kDim + k` matches `expdot` exactly so the driver's fold needs no reshape.
-
-# ── The RRTMGP extension interface (stubs) ────────────────────────────────────
-#
-# Declared here, given their methods (and their docstrings) by ext/ScytheRRTMGPExt.jl.
-# Until `using RRTMGP, ClimaComms` has run in the session these have NO methods; the
-# model path is guarded by `require_rrtmgp_extension`, and a direct call gets the error
-# hint registered in `__init__` (src/Scythe.jl) naming the missing `using`.
-function rrtmgp_context end
-function rrtmgp_method end
-function rrtmgp_lookups end
-function _standard_profile end
-function rrtmgp_solver end
-function rrtmgp_solve_columns! end
-function rrtmgp_fluxes end
-function radiation_offline_column end
-
-"The stubs above, for the missing-extension error hint."
-const RRTMGP_EXTENSION_STUBS = (rrtmgp_context, rrtmgp_method, rrtmgp_lookups,
-                                _standard_profile, rrtmgp_solver, rrtmgp_solve_columns!,
-                                rrtmgp_fluxes, radiation_offline_column)
-
-const RRTMGP_EXTENSION_MISSING_MSG =
-    "radiation = rrtmgp requested but the RRTMGP extension is not loaded: add " *
-    "`using RRTMGP, ClimaComms` before building the model (under Distributed, on every " *
-    "worker: `@everywhere using RRTMGP, ClimaComms`)"
-
-"""
-    rrtmgp_extension_loaded() -> Bool
-
-Whether the RRTMGP package extension (`ScytheRRTMGPExt`) is loaded in THIS process, i.e.
-whether `using RRTMGP, ClimaComms` has run here. Per process: under Distributed each
-worker that builds a radiating tile needs its own `using`.
-"""
-rrtmgp_extension_loaded() = Base.get_extension(@__MODULE__, :ScytheRRTMGPExt) !== nothing
-
-"""
-    require_rrtmgp_extension()
-
-Throw the named setup error when the RRTMGP extension is not loaded; `nothing` otherwise.
-Called by `mc_radiation_state` for `options[:radiation] = :rrtmgp` before any stub is
-reached.
-"""
-function require_rrtmgp_extension()
-    rrtmgp_extension_loaded() || error(RRTMGP_EXTENSION_MISSING_MSG)
-    return nothing
-end
-
-# MethodError hint for a DIRECT call of a stub (e.g. `standard_extension(:tropical, ...)`
-# at the REPL, which reaches `_standard_profile`) with the extension absent.
-function _register_rrtmgp_error_hint()
-    Base.Experimental.register_error_hint(MethodError) do io, exc, argtypes, kwargs
-        if any(f -> exc.f === f, RRTMGP_EXTENSION_STUBS) && !rrtmgp_extension_loaded()
-            print(io, "\n", RRTMGP_EXTENSION_MISSING_MSG)
-        end
-    end
-    return nothing
-end
 
 # ── Per-tile batch of solver inputs ───────────────────────────────────────────
 
@@ -232,11 +169,6 @@ function mc_radiation_state(model::ModelParameters, tile, tilepoints)
     kDim = model.grid_params.kDim
     cfg = validate_radiation_options(model.options, model.physical_params,
                                      model.equation_set, model.ts, kDim)
-    # Before anything else that could reach an extension stub (`standard_extension`
-    # below samples RRTMGP's standard atmosphere): name the missing `using`, rather than
-    # surface a MethodError -- or, inside the solver's try/catch, misreport it as a
-    # missing lookup artifact.
-    scheme === :rrtmgp && require_rrtmgp_extension()
 
     ncol = num_columns(tile)
     ncol > 0 || error(

@@ -1,24 +1,14 @@
-module ScytheRRTMGPExt
-
-# ── ScytheRRTMGPExt: the RRTMGP half of the radiation driver ─────────────────
+# ── The RRTMGP half of the radiation driver ───────────────────────────────────
 #
-# A package extension of Scythe, loaded automatically when RRTMGP and ClimaComms are
-# both loaded alongside Scythe (`using RRTMGP, ClimaComms`). This is the ONLY code in
-# Scythe that names RRTMGP or ClimaComms (and, of the files that name NCDatasets, the
-# one that names it only to trigger RRTMGP's own NCDatasets extension — see the
-# import-style note below — never to read or write a file itself; src/radiation_io.jl,
-# S5, is the file that actually does that).
+# This is the ONLY file in Scythe that names RRTMGP or ClimaComms (and, of the files
+# that name NCDatasets, the one that names it only to trigger RRTMGP's own NCDatasets
+# extension — see the import-style note below — never to read or write a file itself;
+# src/radiation_io.jl, S5, is the file that actually does that). RRTMGP and ClimaComms
+# are ordinary (hard) dependencies of Scythe.
 # Everything above it (src/radiation_state.jl, src/radiation.jl,
 # src/radiation_profiles.jl) works on plain arrays and knows nothing about the
 # radiative-transfer library, which is what keeps `ModelTile` free of an RRTMGP type
-# parameter and is what made the move of these dependencies into this extension a
-# mechanical edit of one file.
-#
-# Every function here is a METHOD of a stub declared in src/radiation.jl
-# (`function rrtmgp_solver end`, ...), so the driver calls them by their Scythe names
-# and never has to know whether the extension is loaded — `mc_radiation_state` asks
-# (`require_rrtmgp_extension`) before the first call and refuses with a message naming
-# the missing `using`.
+# parameter.
 #
 # What lives here:
 #   * the per-process context and lookup-table caches (artifacts are read once
@@ -47,25 +37,9 @@ module ScytheRRTMGPExt
 # is that RRTMGP's spectral `lookup_tables` methods live in an RRTMGP package
 # EXTENSION that is triggered by NCDatasets being LOADED -- `import` triggers it
 # exactly as `using` does, and does not splat NCDatasets' exports (`Dataset`,
-# `defVar`, `dimnames`, ...) into this module (formerly into `Scythe` itself), where
-# they would collide with Springsteel's and Scythe's own I/O names. Functionally identical, strictly
+# `defVar`, `dimnames`, ...) into `Scythe`, where they would collide with
+# Springsteel's and Scythe's own I/O names. Functionally identical, strictly
 # narrower blast radius.
-
-using Scythe
-# The Scythe names the bodies below use unqualified. Importing them keeps every body
-# byte-identical to its pre-extension form in src/radiation_rrtmgp.jl; the stubs
-# among them are extended by the qualified `function Scythe.<name>` definitions.
-import Scythe: rrtmgp_context, rrtmgp_method, rrtmgp_lookups, _standard_profile,
-               rrtmgp_solver, rrtmgp_solve_columns!, rrtmgp_fluxes,
-               radiation_offline_column,
-               StratosphericExtension, default_gases, standard_extension, model_ozone,
-               radiation_divergence!, radiation_faces, radiation_levels!, RadiationWork,
-               _interp_linear, _seed_boundary_row!, _check_o3_shape,
-               _write_thermo!, _write_gases!, _write_clouds!,
-               _RRTMGP_CACHE_LOCK, _RRTMGP_CONTEXT, _RRTMGP_LOOKUPS, _RRTMGP_PROFILES,
-               RRTMGP_EXTENSION_TOP, RRTMGP_PROFILE_SAMPLES,
-               RRTMGP_BOUNDARY_P, RRTMGP_BOUNDARY_T,
-               Rd, Rv, Cpd, Cpv, Cl, Ci
 
 import ClimaComms
 ClimaComms.@import_required_backends
@@ -90,7 +64,7 @@ solver that quietly moved to a GPU would fail on the first host `view` write.
 That is safe precisely because the radiation update runs OUTSIDE Scythe's
 `Threads.@threads :static` column loop (D3), never nested inside it.
 """
-function Scythe.rrtmgp_context()
+function rrtmgp_context()
     ctx = _RRTMGP_CONTEXT[]
     ctx === nothing || return ctx
     return lock(_RRTMGP_CACHE_LOCK) do
@@ -121,7 +95,7 @@ Map a Scythe `options[:radiation_method]` symbol onto the RRTMGP method object.
   which runs BOTH a clear-sky and an all-sky solve (roughly twice the cost) and
   retains the clear-sky fluxes for the cloud-radiative-effect diagnostic.
 """
-function Scythe.rrtmgp_method(method::Symbol)
+function rrtmgp_method(method::Symbol)
     method === :gray && return RRTMGP.GrayRadiation()
     method === :clearsky && return RRTMGP.ClearSkyRadiation(false)
     method === :allsky && return RRTMGP.AllSkyRadiation(false, false)
@@ -150,7 +124,7 @@ The first call for a spectral method downloads the RRTMGP artifacts if they are
 not already in the depot. On a compute node with no network that throws; callers
 that must degrade gracefully (the test file, the preflight check) catch it.
 """
-function Scythe.rrtmgp_lookups(method::Symbol)
+function rrtmgp_lookups(method::Symbol)
     rm = rrtmgp_method(method)
     return lock(_RRTMGP_CACHE_LOCK) do
         get!(_RRTMGP_LOOKUPS, method) do
@@ -182,7 +156,7 @@ Fields: `z_lev`, `p_lev`, `lnp_lev`, `t_lev` on the 1401 sample faces;
 reversed (ascending-in-`ln p`) pair for inverting `p -> z`; and the profile's
 own `t_sfc`, `lat` and `well_mixed` dictionary.
 """
-function Scythe._standard_profile(kind::Symbol)
+function _standard_profile(kind::Symbol)
     return lock(_RRTMGP_CACHE_LOCK) do
         get!(_RRTMGP_PROFILES, kind) do
             prof = RRTMGP.standard_atmosphere(Float64; kind = kind,
@@ -274,7 +248,7 @@ is explicitly latitude-dependent, so it gets the `latitude` keyword.
   `:gray`, which needs level altitudes; ignored by the spectral methods, which
   work in pressure.
 """
-function Scythe.rrtmgp_solver(nlay_model::Int, ext::StratosphericExtension, ncol::Int,
+function rrtmgp_solver(nlay_model::Int, ext::StratosphericExtension, ncol::Int,
                        method::Symbol, solar::Symbol, check_values::Bool;
                        sfc_emissivity::Float64 = 0.98,
                        sfc_albedo::Float64 = 0.06,
@@ -474,7 +448,7 @@ so there is nothing to blend. Extension cloud fields are zeroed -- there is no
 cloud above 25 km worth representing, and a stale value from a previous call
 would be a phantom.
 """
-function Scythe.rrtmgp_solve_columns!(solver, T_lay::AbstractMatrix, p_lay::AbstractMatrix,
+function rrtmgp_solve_columns!(solver, T_lay::AbstractMatrix, p_lay::AbstractMatrix,
                                T_lev::AbstractMatrix, p_lev::AbstractMatrix,
                                vmr_h2o::AbstractMatrix, o3::AbstractVecOrMat,
                                cld::NTuple{5,<:AbstractMatrix},
@@ -557,7 +531,7 @@ the physics.
 The isothermal boundary layer is already masked off by RRTMGP's getters, so
 `nlev_total` is the physical count, with no pad row to skip.
 """
-function Scythe.rrtmgp_fluxes(solver)
+function rrtmgp_fluxes(solver)
     return (lw_up = RRTMGP.lw_flux_up(solver),
             lw_dn = RRTMGP.lw_flux_dn(solver),
             lw_net = RRTMGP.lw_flux_net(solver),
@@ -618,7 +592,7 @@ K/day without rebuilding it -- `p`, `Tk`, `rho`, `cp`, `vmr_h2o`, `o3`,
 `z_face`, `T_lev`, `p_lev`, `t_sfc`, `cos_zenith`, `toa_flux` -- plus `ext` and
 `solver` for inspection.
 """
-function Scythe.radiation_offline_column(; kind::Symbol = :tropical,
+function radiation_offline_column(; kind::Symbol = :tropical,
                                   nlay::Int = 60,
                                   n_ext::Int = 15,
                                   z_top::Float64 = 25.0e3,
@@ -705,6 +679,3 @@ function Scythe.radiation_offline_column(; kind::Symbol = :tropical,
             t_sfc = ts, cos_zenith = cosz, toa_flux = toa,
             ext = ext, solver = solver)
 end
-
-
-end # module ScytheRRTMGPExt

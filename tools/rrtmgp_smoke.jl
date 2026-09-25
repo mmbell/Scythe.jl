@@ -5,9 +5,9 @@
 # we-have-now-completed-hidden-pie.md) assumes. Read-only: touches nothing
 # under src/, test/, benchmarks/, tc/. Run with:
 #
-#   julia -t 6 --project=/Users/mmbell/Development/Scythe.jl/simulations tools/rrtmgp_smoke.jl
+#   julia -t 6 --project=. tools/rrtmgp_smoke.jl
 #
-# (`simulations`, not the root project: RRTMGP is a WEAK dependency of Scythe.)
+# (the Scythe checkout's own project, which lists RRTMGP.)
 #
 # Every section is clearly labelled so the transcript can be quoted directly
 # in the S0 report.

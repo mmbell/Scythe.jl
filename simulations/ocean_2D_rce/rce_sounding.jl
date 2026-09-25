@@ -12,17 +12,15 @@
 # the file must extend above the TC's lid; this script splices on the high-altitude rows of
 # a Dunion-format file (default: dunion_MT_hum90.ref) to guarantee that.
 #
-#   julia --project=simulations simulations/ocean_2D_rce/rce_sounding.jl --dir <root> \
+#   julia --project=<env> simulations/ocean_2D_rce/rce_sounding.jl --dir <root> \
 #       [--avg-days 5] [--out <path>]
 #       [--splice benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref] [--sst <K>]
 #
 # `<root>` is a run_simulation (src/run_driver.jl) output root -- this case's
-# `<output.dir>` -- holding `config.toml`, `segments.csv` and `seg_NN/<t>.nc` comprehensive
-# NetCDF files. SST and the model grid are read from `<root>/config.toml`
-# (`load_config` + `build_model`); `--sst` overrides it. `--project=simulations` is
-# required whenever the run's `physics.radiation.scheme` is `"rrtmgp"` (the case default):
-# RRTMGP/ClimaComms are WEAK dependencies of Scythe, loadable only from an environment that
-# lists them.
+# `<output.dir>` -- holding `scythe_config.toml`, `segments.csv` and `seg_NN/<t>.nc`
+# comprehensive NetCDF files. SST and the model grid are read from
+# `<root>/scythe_config.toml` (`load_config` + `build_model`); `--sst` overrides it. `<env>`
+# is any environment where Scythe is installed (e.g. the checkout itself).
 
 using Printf
 
@@ -72,17 +70,10 @@ isdir(root) || error("rce_sounding.jl: no such directory: $root")
 
 # ── The run's own resolved configuration: SST, and (below) the grid to rebuild ───────
 
-config_path = joinpath(root, "config.toml")
-isfile(config_path) || error("rce_sounding.jl: no config.toml in $root -- is this a " *
+config_path = Scythe.run_config_file(root)   # scythe_config.toml (config.toml: older trees)
+isfile(config_path) || error("rce_sounding.jl: no scythe_config.toml in $root -- is this a " *
                              "run_simulation (src/run_driver.jl) output root?")
 cfg = load_config(config_path)
-if cfg.physics.radiation.scheme == :rrtmgp
-    Base.identify_package("RRTMGP") !== nothing || error(
-        "rce_sounding.jl: this run's physics.radiation.scheme = \"rrtmgp\" but RRTMGP " *
-        "cannot be loaded from the active project $(Base.active_project()). Launch with " *
-        "`julia --project=simulations`.")
-    @eval Main import RRTMGP, ClimaComms
-end
 
 # ── Locate every <t>.nc under segments.csv, in absolute (t_offset_s + t) time ────────
 
@@ -197,7 +188,7 @@ end
 
 function resolve_sst(cfg::RunConfig, sst_cli)
     sst_cli === nothing || return sst_cli, "--sst"
-    return cfg.environment.sst, "config.toml (environment.sst)"
+    return cfg.environment.sst, "scythe_config.toml (environment.sst)"
 end
 
 sst, sst_src = resolve_sst(cfg, opts.sst_cli)

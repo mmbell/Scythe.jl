@@ -1,0 +1,13 @@
+# Example alternate grid. NOT a command-line overlay: copy these sections into
+# scythe_config.toml so the run's record is one file.
+#
+# The original fine TC grid, 3|6|12 km radial x 300 m vertical cells (structure runs;
+# ~1x real time). These sections replace the matching keys of
+# simulations/tc_axisym/scythe_config.toml.
+[grid]
+num_cells   = [50, 50, 50]
+z_top       = 25.2e3
+num_cells_k = 84
+
+[timestep]
+ts = 0.25

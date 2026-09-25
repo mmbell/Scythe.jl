@@ -114,7 +114,6 @@ function validate(cfg::RunConfig)
             "config: physics.boundary_layer.mynn_interval = $(bl.mynn_interval) s is shorter " *
             "than the time step ($(tmax) s after timestep.scale); it must be >= ts")
     end
-    rad.scheme === :rrtmgp && require_rrtmgp_extension()
     return nothing
 end
 

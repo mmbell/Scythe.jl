@@ -1,45 +1,42 @@
 #!/usr/bin/env julia
-# Local launcher for the axisymmetric TC (simulations/tc_axisym/config.toml).
+# Launcher for the axisymmetric TC (scythe_config.toml beside this script).
 #
-#   julia --project=simulations simulations/tc_axisym/run.jl [overlays...] \
-#       [--set key.path=value ...] [--resume] \
-#       --workers-per-patch 1,1,1 [--worker-threads N] [--blas-threads N] [--slurm]
+#   julia --project=<env> run.jl [--config scythe_config.toml] [--set key.path=value ...]
+#       [--resume] --workers-per-patch 1,1,1 [--worker-threads N] [--blas-threads N] [--slurm]
 #
-# --project=simulations, not the root project: radiation is on (RRTMGP), and RRTMGP and
-# ClimaComms are WEAK dependencies of Scythe that load only from an environment listing them.
+# <env> is any Julia environment where Scythe is installed (a Scythe checkout itself works:
+# `--project=/path/to/Scythe.jl`). This file needs nothing else from the repository: copy it
+# and scythe_config.toml to any directory and run it there. Radiation (RRTMGP) is part of
+# Scythe; no special environment is needed.
 #
-# Workers: this case is a 3-patch nest (the rlr.toml overlay too), so pass
-# `--workers-per-patch 1,1,1` -- one worker per nest (the default, a single entry, is refused
-# for a nest). `--worker-threads N` threads per worker (0 = split the machine).
+# A run is ONE config file: edit scythe_config.toml (examples/fine.toml and examples/rlr.toml
+# are alternate grids to copy into it). `--set` is for run control -- output.dir, extending
+# run.integration_time on --resume -- and is recorded in the header of the resolved
+# <output.dir>/scythe_config.toml. A relative output.dir resolves against the config file's
+# directory; a relative --set path against the working directory.
 #
-# Examples (from the repository root; a `--set` path resolves against the working directory):
-#   R=simulations/tc_axisym
-#   julia --project=simulations $R/run.jl --workers-per-patch 1,1,1 --worker-threads 4
-#   julia --project=simulations $R/run.jl $R/fine.toml --workers-per-patch 1,1,1 \
-#         --set run.integration_time=86400 --set output.dir=$R/output/tc_fine_24h
-#   julia --project=simulations $R/run.jl --workers-per-patch 1,1,1 --resume \
-#         --set output.dir=$R/output/tc_fine_24h                      # continue a run
-#   julia --project=simulations $R/run.jl --workers-per-patch 1,1,1 --resume \
-#         --set output.dir=$R/output/tc_fine_24h --set run.integration_time=172800   # extend it
+# Workers: this case is a 3-patch nest, so pass `--workers-per-patch 1,1,1` -- one worker per
+# nest (the default, a single entry, is refused for a nest). `--worker-threads N` threads per
+# worker (0 = split the machine).
+#
+# Examples (from this directory):
+#   julia --project=<env> run.jl --workers-per-patch 1,1,1 --worker-threads 4
+#   julia --project=<env> run.jl --workers-per-patch 1,1,1 --set output.dir=output/tc_24h \
+#         --set run.integration_time=86400
+#   julia --project=<env> run.jl --workers-per-patch 1,1,1 --resume \
+#         --set output.dir=output/tc_24h                                      # continue a run
+#   julia --project=<env> run.jl --workers-per-patch 1,1,1 --resume \
+#         --set output.dir=output/tc_24h --set run.integration_time=172800    # extend it
 #
 # Output goes to <output.dir>/seg_NN/nest{i}/ (see README.md). A fresh start refuses a tree
 # that already holds output: mv it aside (never rm model output), or continue with --resume.
+# On --resume the run's own <root>/scythe_config.toml is authoritative: run_simulation
+# accepts `--set output.dir=...` (it locates the root) and `run.integration_time` (extends
+# the run) and refuses everything else.
 
 using Scythe
 
-paths, set, resume, exec, segment = Scythe.parse_launcher_args(ARGS)
-if segment > 0                     # internal: a segment child launched by run_simulation
-    Scythe.segment_main(ARGS)
-    exit(0)
-end
-cfg = load_config(paths...; set)
-if cfg.physics.radiation.scheme == :rrtmgp
-    Base.identify_package("RRTMGP") === nothing &&
-        error("radiation is on (physics.radiation.scheme = \"rrtmgp\") but RRTMGP cannot " *
-              "be loaded here: launch with julia --project=simulations")
-    @eval Main import RRTMGP, ClimaComms
-end
-# On --resume the run's own <root>/config.toml is authoritative: run_simulation accepts
-# `--set output.dir=...` (it locates the root) and `run.integration_time` (extends the run)
-# and refuses everything else.
-run_simulation(cfg, exec; resume, config_sources = paths, set)
+path, set, resume, exec, segment = Scythe.parse_launcher_args(ARGS)
+cfg = load_config(path; set)
+segment > 0 ? Scythe.segment_main(ARGS) :
+              run_simulation(cfg, exec; resume, config_sources = [path], set)
