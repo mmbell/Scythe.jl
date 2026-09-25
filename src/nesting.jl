@@ -44,6 +44,12 @@ BCs of `base`; each junction must have an exact 2:1 cell-width ratio (parent
 - `base::ModelParameters` — template: equation set, physics, options,
   integration/output times, vertical axis, vars, outer BCs, output dir.
   `base.grid_params.iMin/iMax/num_cells` are ignored.
+- `initial_conditions::Vector{String}` — optional explicit per-patch
+  initial-condition (or restart) paths, default empty. When empty, patch `i`
+  reads `nest\$(i)_<basename>` beside `base.initial_conditions` (or nothing
+  when that is empty); when non-empty it must have one entry per patch and
+  patch `i` reads `initial_conditions[i]` verbatim (the segment driver uses
+  this to chain each patch from its own `nest{i}/<t>.jld2` checkpoint).
 """
 Base.@kwdef struct NestedModelParameters
     boundaries::Vector{Float64}
@@ -51,6 +57,7 @@ Base.@kwdef struct NestedModelParameters
     ts::Vector{Float64}
     workers_per_patch::Vector{Int}
     base::ModelParameters
+    initial_conditions::Vector{String} = String[]
 end
 
 """
@@ -160,20 +167,31 @@ function _physical_nslices(geometry::String)
 end
 
 """
-    build_nest(nest::NestedModelParameters) -> (models, topo)
+    build_nest(nest::NestedModelParameters; strict_intervals::Bool = false) -> (models, topo)
 
 Validate the nest configuration and construct the per-patch
 `ModelParameters` (with collar-extended grids, interface BCs, derived
 timesteps, and per-patch output directories `nest1/ … nestN/`) plus the
 `NestTopology` used by the integration drivers.
+
+`output_interval` and `restart_interval` (when > 0) should be whole multiples
+of every patch's derived timestep `ts_actual` (relative tolerance 1e-9).
+By default a mismatch is a warning (snapshot/checkpoint times will not align
+across patches); with `strict_intervals = true` it is an `ArgumentError`,
+which the segment driver uses so every patch writes its chaining checkpoint
+at the same model time.
 """
-function build_nest(nest::NestedModelParameters)
+function build_nest(nest::NestedModelParameters; strict_intervals::Bool = false)
     n = length(nest.num_cells)
     length(nest.boundaries) == n + 1 || throw(ArgumentError(
         "boundaries must have length $(n + 1) (one more than num_cells), got $(length(nest.boundaries))"))
     length(nest.ts) == n || throw(ArgumentError("ts must have length $n"))
     length(nest.workers_per_patch) == n || throw(ArgumentError(
         "workers_per_patch must have length $n"))
+    isempty(nest.initial_conditions) || length(nest.initial_conditions) == n ||
+        throw(ArgumentError(
+            "initial_conditions must be empty or have one path per patch ($n), " *
+            "got $(length(nest.initial_conditions))"))
     all(diff(nest.boundaries) .> 0) || throw(ArgumentError(
         "boundaries must be strictly increasing"))
     all(nest.num_cells .> 0) || throw(ArgumentError("num_cells must be positive"))
@@ -266,11 +284,20 @@ function build_nest(nest::NestedModelParameters)
     any(isnan, ts_actual) && throw(ArgumentError(
         "Could not resolve per-patch timesteps — is the refinement graph a valid chain?"))
 
+    # Whole-step guard: every patch must land exactly on each output /
+    # restart time. Warning by default (legacy behaviour); an error under
+    # `strict_intervals` (segment driver).
     for i in 1:n
-        ratio = base.output_interval / ts_actual[i]
-        if !isapprox(ratio, round(ratio); atol=1e-8)
-            @warn "output_interval $(base.output_interval) is not an integer multiple of " *
-                  "patch $i's actual ts $(ts_actual[i]) — snapshot times will not align"
+        for (name, interval) in (("output_interval", base.output_interval),
+                                 ("restart_interval", base.restart_interval))
+            (name == "restart_interval" && interval <= 0) && continue
+            ratio = interval / ts_actual[i]
+            isapprox(ratio, round(ratio); rtol=1e-9) && continue
+            msg = "$name $(interval) is not an integer multiple of patch $i's " *
+                  "actual ts $(ts_actual[i]) — " *
+                  (name == "output_interval" ? "snapshot" : "checkpoint") *
+                  " times will not align"
+            strict_intervals ? throw(ArgumentError(msg)) : @warn msg
         end
     end
 
@@ -366,7 +393,8 @@ function build_nest(nest::NestedModelParameters)
             patchOffsetL = ring_offset,
         )
 
-        ics = isempty(base.initial_conditions) ? "" :
+        ics = !isempty(nest.initial_conditions) ? nest.initial_conditions[i] :
+              isempty(base.initial_conditions) ? "" :
               joinpath(dirname(base.initial_conditions),
                        "nest$(i)_" * basename(base.initial_conditions))
         models[i] = ModelParameters(

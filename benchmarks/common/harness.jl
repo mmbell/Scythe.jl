@@ -9,6 +9,9 @@
 
 using Distributed
 using LinearAlgebra: BLAS
+# Worker setup, provenance and git state live in Scythe (src/run_driver.jl); the names
+# below forward to them. `import` so none of Scythe's exports shadow harness definitions.
+import Scythe
 using Printf
 using Dates
 using CSV
@@ -205,40 +208,16 @@ benchmark_geometry(opts::BenchmarkOptions) = opts.grid == :rirk ? "RiRk" : "RZ"
 """
     add_benchmark_workers(opts; count = opts.workers)
 
-Add the worker processes, dividing the machine's threads *among* them rather than giving
-each one the whole box, and pin each worker's OpenBLAS to one thread.
-
-`--threads=auto` hands every worker `Sys.CPU_THREADS` threads, so the default 2 workers on a
-12-core machine spawn 24 compute threads for 12 cores. They then all allocate into a shared
-GC from inside the `Threads.@threads` column loop, which shows up as heavy GC time and
-millions of lock conflicts — and is a suspected contributor to the intermittent worker death
-in long moist_compressible runs. `opts.worker_threads > 0` overrides the split (the
-reproducibility ladder needs 1 worker × 1 thread, which the split alone cannot express).
-
-OpenBLAS defaults to `Sys.CPU_THREADS` threads per process on top of the Julia threads:
-2 workers × 6 Julia threads × 12 BLAS threads = 144 runnable threads on 12 cores. The
-periodic-BC spline fit on the RiRk grid solves through LAPACK `potrs` (Springsteel
-`DenseSplineFactor`), so BLAS IS on the fit path, and a threaded BLAS partitioning is the one
-timing-dependent reduction order a fixed-thread-count run could still carry. The pin is
-applied HERE, never at the top level of this file (test/test_benchmark_smoke.jl includes it).
-`SCYTHE_BENCH_BLAS_THREADS=0` leaves OpenBLAS at its default for before/after checks.
+Add `count` worker processes through `Scythe.add_workers` (src/run_driver.jl, which carries
+the rationale): the machine's threads are split among the workers unless
+`opts.worker_threads > 0`, OpenBLAS is pinned to `SCYTHE_BENCH_BLAS_THREADS` threads (default
+1; `0` leaves the OpenBLAS default), and Springsteel and Scythe are loaded on the workers.
+The pin is applied HERE, never at the top level of this file (test/test_benchmark_smoke.jl
+includes it).
 """
 function add_benchmark_workers(opts::BenchmarkOptions; count::Int = opts.workers)
-    nthreads = opts.worker_threads > 0 ? opts.worker_threads : max(1, Sys.CPU_THREADS ÷ count)
-    blas = parse(Int, get(ENV, "SCYTHE_BENCH_BLAS_THREADS", "1"))
-    println("Adding $(count) worker(s) with $(nthreads) thread(s) each " *
-            "($(Sys.CPU_THREADS) CPU threads available); BLAS threads per worker: " *
-            (blas > 0 ? string(blas) : "OpenBLAS default"))
-    pids = addprocs(count, exeflags = "--threads=$(nthreads)")
-    if blas > 0
-        BLAS.set_num_threads(blas)
-        # Quoted expressions rather than `@everywhere ... using ...`: a `using` inside a
-        # macro call in a function body is rejected as a non-toplevel expression.
-        Distributed.remotecall_eval(Main, pids, :(using LinearAlgebra))
-        Distributed.remotecall_eval(Main, pids,
-                                    :(LinearAlgebra.BLAS.set_num_threads($blas)))
-    end
-    return pids
+    return Scythe.add_workers(count; worker_threads = opts.worker_threads,
+                              blas_threads = parse(Int, get(ENV, "SCYTHE_BENCH_BLAS_THREADS", "1")))
 end
 
 """
@@ -248,17 +227,7 @@ Thread/BLAS/bounds-check settings as the FIRST WORKER sees them (the master's va
 what the model ran under), for the JSONL record. Every entry is a plain Int; -1 means the
 worker could not report it (no workers, or LinearAlgebra not loaded there).
 """
-function worker_provenance()
-    isempty(workers()) && return Dict("worker_threads" => -1, "blas_threads" => -1,
-                                      "check_bounds" => -1)
-    w = workers()[1]
-    wt = remotecall_fetch(Threads.nthreads, w)
-    bt = remotecall_fetch(w) do
-        isdefined(Main, :LinearAlgebra) ? Main.LinearAlgebra.BLAS.get_num_threads() : -1
-    end
-    cb = remotecall_fetch(() -> Int(Base.JLOptions().check_bounds), w)
-    return Dict("worker_threads" => wt, "blas_threads" => bt, "check_bounds" => cb)
-end
+worker_provenance() = Scythe.worker_provenance()
 
 """
     vertical_ts(ts, opts) -> Float64
@@ -541,31 +510,13 @@ function write_reference(output_csv::String, reference_csv::String,
     return reference_csv
 end
 
-"""Git SHA and dirty flag for a repository directory, or ("unknown", false)."""
-function git_info(dir::String)
-    try
-        sha = strip(read(`git -C $dir rev-parse --short HEAD`, String))
-        # Tracked modifications only. Untracked scratch (notebooks, Finder files) cannot
-        # enter a run -- Scythe.jl includes its files explicitly -- and counting it made
-        # every record on file read dirty=true, which hid the one distinction that matters
-        # for provenance (FINDINGS_ISHMAEL_S8S9 §4d′ compared two dirty trees across a commit).
-        dirty = !isempty(strip(read(`git -C $dir status --porcelain --untracked-files=no`,
-                                    String)))
-        return String(sha), dirty
-    catch
-        return "unknown", false
-    end
-end
+"""Git SHA and dirty flag for a repository directory, or ("unknown", false). Forwards to
+`Scythe.git_info` (tracked modifications only; see its docstring)."""
+git_info(dir::String) = Scythe.git_info(dir)
 
-"""Number of untracked (non-ignored) paths in `dir`, recorded beside `scythe_dirty`."""
-function git_untracked_count(dir::String)
-    try
-        out = read(`git -C $dir status --porcelain --untracked-files=all`, String)
-        return count(l -> startswith(l, "??"), split(out, '\n'))
-    catch
-        return -1
-    end
-end
+"""Number of untracked (non-ignored) paths in `dir`, recorded beside `scythe_dirty`.
+Forwards to `Scythe.git_untracked_count`."""
+git_untracked_count(dir::String) = Scythe.git_untracked_count(dir)
 
 """Minimal JSON encoding for flat values, dicts, and arrays."""
 function to_json(x)

@@ -180,6 +180,8 @@ include("nesting.jl")
 # every file that defines a value tuple it reuses (SFC_Z0_MODES, RADIATION_*, MYNN_*,
 # OUTPUT_FORMAT_SYMBOLS) and after parse_mynn_fidelity.
 include("config.jl")
+# Execution environment (workers, threads, provenance) + segment arithmetic for the run driver.
+include("run_driver.jl")
 
 # Export the primary driver function and the ModelParameters
 export integrate_model

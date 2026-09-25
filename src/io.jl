@@ -107,9 +107,21 @@ function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64;
 end
 
 """
+    checkpoint_path(dir::AbstractString, t::Real) -> String
+
+Path of the restart checkpoint for model time `t` [s] in `dir`:
+`joinpath(dir, string(round(t; digits = 2)) * ".jld2")`, e.g. `3600.0.jld2`.
+This is the single naming rule shared by [`write_restart`](@ref) and every
+reader (segment chaining, restart discovery), so the two cannot drift.
+"""
+checkpoint_path(dir::AbstractString, t::Real) =
+    joinpath(dir, string(round(t; digits = 2)) * ".jld2")
+
+"""
     write_restart(grid::AbstractGrid, model::ModelParameters, t::Float64)
 
-Write a restart checkpoint of `grid` to `model.output_dir/<t>.jld2` via Springsteel's
+Write a restart checkpoint of `grid` to `model.output_dir/<t>.jld2` (named by
+[`checkpoint_path`](@ref)) via Springsteel's
 [`save_grid`](@ref) (params + spectral + physical, reloaded exactly
 by `load_grid`). Called at `model.restart_interval` and once more at the end of
 the run; a run with `restart_interval == 0` writes no checkpoints.
@@ -127,6 +139,6 @@ per-tile RNG re-seeds at init.)
 """
 function write_restart(grid::AbstractGrid, model::ModelParameters, t::Float64)
     isdir(model.output_dir) || mkpath(model.output_dir)
-    save_grid(joinpath(model.output_dir, "$(string(round(t; digits=2))).jld2"), grid)
+    save_grid(checkpoint_path(model.output_dir, t), grid)
     return nothing
 end
