@@ -1,294 +1,129 @@
-# ── Tropical cyclone simulation parameters ──────────────────────────────────
-# Every knob for the TC runs lives here; tc_init.jl and the run scripts
-# include this file. Edit and rerun tc_init to regenerate the initial
-# conditions.
-
-# ── Vortex ──────────────────────────────────────────────────────────────────
-# Rotunno & Emanuel (1987, JAS 44, 542-561) eq. (37), gradient-wind +
-# hydrostatically balanced. See src/idealized.jl `re87_v`.
+# ── DEPRECATED shim: TC parameters, now derived from simulations/tc_axisym/config.toml ──
 #
-# WHY :re87 AND NOT MODIFIED RANKINE (2026-07-19). The modified-Rankine profile
-# with alpha = 0.3 is not compact: v was still 12 m/s at r = 1050 km, the DOMAIN
-# EDGE. With no true far field the thermal-wind warm anomaly integrates across the
-# whole domain and reaches +6.91 K at the surface on the axis. The Dunion
-# sounding/SST pairing offers only +0.52 K of air-sea disequilibrium, so that
-# anomaly put the surface air ~4.8 K ABOVE the SST and REVERSED the surface
-# enthalpy and moisture fluxes -- the ocean cooling and drying the boundary layer,
-# the inverse of WISHE. The vortex could only decay.
+# tc/tc_params.jl + tc/tc_init.jl are a THIN, READ-ONLY shim over the consolidated run
+# configuration (src/config.jl, src/config_build.jl, src/config_init.jl), kept ONLY for the
+# gitignored model_tests/ scratch scripts that still `include` them (tc_balance_holdtest,
+# tc_discrete_balance, tc_init_diagnostics, tc_drain_onset, tc_lid_drift_probe,
+# tc_single_patch_holdtest, tc_balance_floor). For a real run use
+# simulations/tc_axisym/run.jl -- see simulations/tc_axisym/README.md, in particular its
+# "From the old environment variables" table: every SCYTHE_TC_* knob this file used to read
+# is GONE (`--set key.path=value` on the launcher, or an overlay TOML such as fine.toml /
+# rlr.toml, replaces each one) except SCYTHE_TC_RES=fine, kept below as the one legacy knob
+# worth keeping for a scratch script that wants the fine grid without a `--set`.
 #
-# The previous fix for that was Z_BAROTROPIC = 2 km (v height-independent below,
-# so no thermal-wind anomaly in the BL). It restored the flux sign but compressed
-# the vortex decay into 13 km instead of 15, and the resulting |dv/dz| drove dry
-# Ertel PV NEGATIVE over ~1350 work-grid points -- symmetrically unstable. The
-# model then overturned it with an exponentially growing circulation that looked
-# like a blow-up but was the physically correct response. A C2-smooth version was
-# WORSE (higher peak shear), which is what proved shear magnitude was the driver
-# rather than the piecewise-linear kink.
+# THE PHYSICS IS NOW THE PRODUCTION SET: ISHMAEL ice + two-moment rain, MYNN (fidelity
+# "scythe", EDMF off), Monin-Obukhov surface stability, diurnal RRTMGP radiation, the DK83
+# sponge, and the state-dependent vertical semi-implicit solver -- see
+# simulations/tc_axisym/config.toml's header for the physical reasoning behind each default
+# and simulations/README.md for the full key reference. This is NOT the old "Louis + no ice
+# + no radiation" TC default: a caller that wants that has to ask for it explicitly (and
+# physics.boundary_layer.scheme = "louis" refuses ice, so drop ice too).
 #
-# Eq. (37)'s cubic falloff and EXACT zero at r_0 makes the vortex compact, so the
-# warm anomaly is +1.56-1.91 K instead of +6.91 K, and the linear-in-z decay is
-# PV-stable without any barotropic layer. Z_BAROTROPIC is retained only as a knob
-# and MUST stay 0: it was the sole source of the symmetric instability.
-const VORTEX_PROFILE = :re87
-const V_M = 15.0             # [m/s] -> v_max ~ 12.9 m/s, matching RE87's ~12
-const R_M = 82.5e3           # [m] radius of maximum wind (RE87 control value)
-# Outer radius, WIDENED from RE87's 412.5 km. A compact vortex has strongly
-# anticyclonic outer vorticity (zeta ~ -v_m/(r_0 - r_m)) and f + zeta goes negative
-# when f is small. RE87 ran f = 5e-5 (20 N); F_COR here is 3.775e-5 (15 N), where
-# r_0 = 412.5 km gives 4546 negative-PV points. Measured: r_0 = 800 km gives ZERO.
-const R_0 = 800.0e3          # [m] v = 0 exactly at and beyond this radius
-const V_TOP = 15.0e3         # [m] winds decay linearly to zero here
-const Z_BAROTROPIC = 0.0     # [m] MUST be 0 -- see above; nonzero => unstable PV
-# Legacy modified-Rankine knobs, used only when VORTEX_PROFILE = :rankine.
-const VMAX = 30.0            # [m/s] maximum tangential wind
-const RMW = 50.0e3           # [m] radius of maximum wind
-const RANKINE_ALPHA = 0.3    # outer decay exponent, v = VMAX (RMW/r)^alpha
-
-# Environment
-const F_COR = 2.0 * 7.292e-5 * sind(15.0)   # [1/s] Coriolis at 15 N (3.775e-5)
-# SST was lowered 28 -> 27 C to moderate the surface fluxes, then raised to 29.5 C
-# (2026-07-19) once the flux SIGN turned out to be the real problem. The Dunion
-# hum90 sounding's surface air is 299.63 K, so SST = 300.15 left only +0.52 K of
-# environmental air-sea disequilibrium -- less than the vortex's own surface warm
-# anomaly (+1.91 K with the RE87 profile), which flipped the flux sign at the axis.
-# 302.65 K keeps SST - T_air POSITIVE at every radius with ~0.7 K of margin.
-# (RE87 could run 26.3 C because their model-neutral Jordan sounding had
-# correspondingly cooler surface air; ours is a different sounding.)
-const SST_K = 302.65                        # [K] fixed sea surface temp (29.5 C)
-# Env-overridable so an RCE-derived sounding (benchmarks/rce_sounding.jl) can be swapped
-# in without editing this file: SCYTHE_TC_SOUNDING=/path/to/rce_XXXK_quick.ref. Default
-# is unchanged (the Dunion MT sounding), so every existing run stays bitwise identical.
-const SOUNDING = get(ENV, "SCYTHE_TC_SOUNDING",
-                     joinpath(@__DIR__, "..", "benchmarks", "reference_data",
-                              "o01_rainfall", "dunion_MT_hum90.ref"))
-
-# Inner-core moisture. The Dunion MT sounding is the OUTER-core / near-RCE
-# environment; the initial perturbation makes the inner core much moister and
-# closer to convectively neutral, as a real pre-depression with 15 m/s winds and
-# ongoing convection would be. Without this the warm core is the DRIEST column in
-# RH terms (holding q_v at its ambient profile while T rises), which loads the
-# core with the most CIN and forces convection to wait for an explosive release.
-# The repartition holds rho_t and p fixed, so it is exactly balance preserving.
-# Measured at t=0 with model_tests/tc_init_diagnostics.jl: the CORE is the driest
-# column, RH 0.745 at the surface and only 0.699 at 5 km. The knobs separate
-# cleanly: RH_BL alone sets the surface parcel (hence CAPE and CIN), RH_CORE alone
-# sets mid-level humidity at ZERO CAPE cost.
+# RADIATION IS ON BY DEFAULT (physics.radiation.scheme = "rrtmgp"), and RRTMGP/ClimaComms
+# are WEAK dependencies of Scythe (a package extension, ext/ScytheRRTMGPExt.jl, that loads
+# only from an environment listing them). `make_base`/`init_tc!` in tc_init.jl therefore
+# WILL ERROR under `--project=.` with build_model's own "radiation = rrtmgp requested but
+# the RRTMGP extension is not loaded" message -- this shim does not silently import RRTMGP
+# for you. Launch under `--project=simulations`, or `import RRTMGP, ClimaComms` (on every
+# worker, under Distributed) before calling `make_base`/`init_tc!`.
 #
-# RH_BL was first left OFF, on the reasoning that CIN was modest (52 J/kg at the
-# axis) and that moistening the boundary layer nearly doubles CAPE (1536 -> 3115).
-# The 8-h run at that setting was STABLE BUT COMPLETELY QUIESCENT -- max w reached
-# only 0.05 m/s and no cloud or rain ever formed. The reasoning had missed the
-# TRIGGER problem: an axisymmetric domain has no asymmetries to initiate
-# convection, so parcels must be lifted mechanically to the LFC, and at RH_BL off
-# the LFC sits at 1.95 km while the frictional secondary circulation supplies only
-# ~2 cm/s. Surface fluxes were moistening the boundary layer correctly (RH 0.739 ->
-# 0.776 over 7 h) but far too slowly to close that gap.
+# RE87 vortex, F_COR, SST, moisture and wall-BC reasoning: see the header of
+# simulations/tc_axisym/config.toml (the case) and src/idealized.jl (`re87_v`) -- not
+# reproduced here.
 #
-# RH_BL = 0.88 drops CIN to 12 J/kg and the LFC to 0.45 km, which the existing
-# secondary circulation clears almost at once -- convection fires early and can
-# adjust continuously instead of waiting for a large release. The higher initial
-# CAPE is accepted deliberately: it is consumed from the start rather than
-# accumulated. (The pre-fix runs' explosive release at 5-6 h was very likely
-# triggered by the BROKEN initialization -- 40881 supersaturated points and
-# spurious condensate are a large artificial trigger, which the hydrostatic fix
-# removed along with the noise.)
-const RH_CORE = 0.95         # free-troposphere target RH in the core
-const RH_BL = 0.90           # boundary-layer target RH (sets CAPE/CIN and the LFC)
-const Z_BL = 1.5e3           # [m] top of the boundary-layer target
-const R_MOIST = 150.0e3      # [m] Gaussian radial e-folding of the moist core
-const Z_MOIST = 10.0e3       # [m] cosine taper to the environment above this
-const RH_INIT_MAX = 0.98     # hard cap: never initialize at/above saturation
-# Radial shape of the initial moistening. :gaussian peaks ON THE AXIS, which puts
-# maximum CAPE exactly where the 1/r geometry most easily triggers convection --
-# measured 5861 J/kg at r=0 vs 3327 at 100 km. :vortex weights by the surface
-# tangential wind instead (zero at the axis, peak at the RMW), co-locating the
-# moisture with the strongest surface fluxes and leaving the eye dry so mass
-# continuity can establish axis subsidence. Switch to :vortex if the axis column
-# goes unstable. See src/idealized.jl for the full reasoning.
-const MOIST_PROFILE = :vortex
+# This file needs `RunConfig`/`load_config` (Scythe), so it loads Scythe ITSELF rather than
+# relying on the including script's own `using Scythe` -- several model_tests scripts
+# `include` tc_params.jl BEFORE `@everywhere using Scythe` (they read NEST_WORKERS to size
+# `addprocs` first). `using Scythe` here is idempotent with that later `@everywhere using`.
+using Scythe
 
-# Surface exchange and boundary layer
-const CK = 1.0e-3            # bulk enthalpy/moisture exchange coefficient
-const CD = -1.0              # negative => wind-speed-dependent Komori et al. (2018)
-const U_MIN = 2.0            # [m/s] gustiness floor on the exchange wind
-const L_INF = 80.0           # [m] asymptotic Louis mixing length
+const _TC_SIM_DIR = normpath(joinpath(@__DIR__, "..", "simulations", "tc_axisym"))
+const _TC_RES = get(ENV, "SCYTHE_TC_RES", "coarse")
+_TC_RES in ("coarse", "fine") ||
+    error("SCYTHE_TC_RES = \"$(_TC_RES)\" is not recognized; use coarse or fine -- every " *
+          "other SCYTHE_TC_* knob is gone, see simulations/tc_axisym/README.md")
+const _TC_CONFIG_PATHS = _TC_RES == "fine" ?
+    (joinpath(_TC_SIM_DIR, "config.toml"), joinpath(_TC_SIM_DIR, "fine.toml")) :
+    (joinpath(_TC_SIM_DIR, "config.toml"),)
 
-# Horizontal turbulence (Smagorinsky) and microphysics.
-# An axisymmetric TC has NO asymmetries to provide radial mixing, so the resolved
-# radial gradients are damped only by this closure -- prior axisymmetric work
-# (model_tests/Twoway_PV_mixing) used Ls_free = 500 m / Ls_bl = 2000 m with a
-# K_min of 1000 m²/s in the boundary layer, far more than the 200 m / 5 m²/s this
-# case had been running. KH_HEAT = -1.0 is the sentinel for "diffuse heat with the
-# Smagorinsky K/Pr_t": before this, Smagorinsky mixed MOMENTUM ONLY and the
-# thermodynamic fields had no horizontal mixing at all, leaving grid-scale
-# buoyancy structure undamped on 3 km radial cells.
-const LS_SMAG = 500.0        # [m] Smagorinsky length scale
-const K_MIN = 25.0           # [m²/s] horizontal eddy viscosity floor
-const KH_HEAT = -1.0         # < 0 => Smagorinsky K/Pr_t (not a constant K)
-const PR_T = 1.0             # turbulent Prandtl number
-# Horizontal water mixing. OFF (2026-07-31, user decision). It is a bare K*grad^2 --
-# TEMPORARY / NOT ENERGY CONSISTENT (see the long note in moist_compressible.jl by
-# slot 8): it diffuses water mass without transporting the energy that mass carries,
-# so it WILL drift energy, and it is a very idealized turbulence closure that has to
-# be replaced regardless. It was switched on as pure noise control, on the reasoning
-# that the water species otherwise have no horizontal mixing at all; the spline filter
-# (l_q = 2.0 by default on every variable here) already serves part of that role, and
-# the negative-condensate reservoir that produced much of the grid-scale water
-# structure is gone under the transforms below. Turn it back on ONLY if a gate run
-# demonstrates that minimal diffusion is needed for computational stability, and say
-# so when you do.
-#
-# It is no longer refused under a transform: the mixing is applied to the slot, and
-# for rho >> mu, bhyp is exactly affine, so K*grad^2(nu) IS K*grad^2(rho)/2 to
-# relative O((mu/rho)^2) -- measured 3.7e-9 at rho_c = 2.3e-3 kg/m^3. The exact chain
-# rule was rejected: f''(0) = 1/mu over a 1.7 cm knee is not representable on a 500 m
-# cell. See the Khdiff_water block in src/moist_compressible.jl.
-const KH_WATER = 0.0         # < 0 => Smagorinsky K/Sc_t; 0.0 disables
-const SC_T = 1.0             # turbulent Schmidt number
-const N_0_MP = 8.0e6         # [m^-4] Marshall-Palmer intercept (exponential DSD)
-const TAU_QSS = 10.0         # [s] supersaturation relaxation
+"The resolved production TC configuration (coarse or fine grid per SCYTHE_TC_RES)."
+const TC_CFG::RunConfig = load_config(_TC_CONFIG_PATHS...)
+"`TC_CFG` with the rlr.toml overlay: the 3-D cylindrical RLR geometry and its own nest layout."
+const TC_CFG_RLR::RunConfig = load_config(_TC_CONFIG_PATHS..., joinpath(_TC_SIM_DIR, "rlr.toml"))
 
-# ── Water control variables (Ooyama 2001 Eq. 4.19-4.23) ─────────────────────
-# Slots 8 and 9 carry nu = bhyp(rho) instead of the density, so the RECOVERED
-# density is non-negative BY CONSTRUCTION -- no limiter, no clamp, nothing repaired.
-# Both species, because that is the only configuration available on a NEST: a child
-# patch's i-boundary is R3X, which the spline coefficient bound rejects, so a bounded
-# child runs on a k-only bound with a measured mass-creation leak
-# (bound_shortfall_total 573 on quick nested O01) while the transform has no such
-# restriction and delivers min rho = 0 exactly across the interface.
-#
-# Why this matters here specifically: the negative condensate was a PHYSICS-FREE
-# RESERVOIR (every microphysical rate is max(rho,0)-guarded, so a negative point has
-# no sink while the compensating positive overshoot is consumed every step), and it
-# fed the temperature retrieval directly through rho_liq. On quick O01 it reached
-# 2.75x the real cloud mass. reference/FINDINGS_CONDENSATE_STAGE1.md has the ladder.
-#
-# EXPECT the water partition to look WORSE, not better: min rho_v tracks min rho_w
-# once the negative condensate can no longer cancel part of the rho_t - rho_d
-# deficit. That deficit is a difference of two independently fitted fields and no
-# condensate scheme reaches it (benchmarks/FUTURE_WORK.md). It is an unmasking.
-#
-# mu stays at Ooyama's own 1e-7 kg/m^3: the sweep moved max_w by 0.34% between 1e-8
-# and 1e-7, and the retrieval cost is at most 7.2e-3 K, at the model top.
-const CONDENSATE_TRANSFORM = Symbol(get(ENV, "SCYTHE_TC_CTRANS", "bhyp"))
-const RAIN_TRANSFORM       = Symbol(get(ENV, "SCYTHE_TC_RTRANS", "bhyp"))
+const _TC_WARNED = Set{Symbol}()
+"Print ONE deprecation line per shim function/file, on first use."
+function _tc_deprecated(fn::Symbol)
+    fn in _TC_WARNED && return nothing
+    push!(_TC_WARNED, fn)
+    @warn "tc/tc_params.jl + tc/tc_init.jl are a DEPRECATED shim kept for model_tests/ " *
+          "scripts; for a real run use simulations/tc_axisym/run.jl" caller = fn
+    return nothing
+end
+_tc_deprecated(:tc_params)
 
-# Sponge (Durran-Klemp 1983, stratosphere-confined)
-const SPONGE_ALPHA = 0.02    # [1/s]
-const Z_DAMP = 17.0e3        # [m] sponge onset (tropopause knot at 16.59 km)
+# ── Vortex (RE87), environment, moisture, transforms, sponge: thin derivations from
+# TC_CFG. See simulations/tc_axisym/config.toml for the physical reasoning.
+const VORTEX_PROFILE = TC_CFG.initial_conditions.balanced_vortex.profile
+const V_M             = TC_CFG.initial_conditions.balanced_vortex.v_m
+const R_M             = TC_CFG.initial_conditions.balanced_vortex.r_m
+const R_0             = TC_CFG.initial_conditions.balanced_vortex.r_0
+const V_TOP           = TC_CFG.initial_conditions.balanced_vortex.v_top
+const Z_BAROTROPIC    = TC_CFG.initial_conditions.balanced_vortex.z_barotropic
+const RH_CORE         = TC_CFG.initial_conditions.balanced_vortex.rh_core
+const RH_BL           = TC_CFG.initial_conditions.balanced_vortex.rh_bl
+const Z_BL            = TC_CFG.initial_conditions.balanced_vortex.z_bl
+const R_MOIST         = TC_CFG.initial_conditions.balanced_vortex.r_moist
+const Z_MOIST         = TC_CFG.initial_conditions.balanced_vortex.z_moist
+const RH_INIT_MAX     = TC_CFG.initial_conditions.balanced_vortex.rh_max
+const MOIST_PROFILE   = TC_CFG.initial_conditions.balanced_vortex.moist_profile
+# Legacy modified-Rankine knobs (profile = :rankine). Not part of the config schema --
+# src/config_init.jl hardcodes these same literals for that branch ("the legacy
+# tc_params.jl values, not config fields") -- kept here verbatim for model_tests that
+# exercise the rankine fallback directly.
+const VMAX          = 30.0
+const RMW           = 50.0e3
+const RANKINE_ALPHA = 0.3
 
-# ── Radiation (S6) ────────────────────────────────────────────────────────────
-# Constants for the TC's RRTMGP diurnal cycle (`SCYTHE_TC_RAD=diurnal`, wired in
-# tc_init.jl `make_base`). Latitude 20 N / day-of-year 240 (~28 August) is a
-# plausible peak-season genesis latitude/date for the RE87 vortex this TC runs.
-#
-# START_HOUR = 0.0 is LOCAL midnight at longitude 0 (`solar_geometry`'s hour angle
-# is `2*pi*(start_hour/24 + t/86400) - longitude`-referenced, and `:longitude`
-# defaults to 0, which the TC never overrides) -- so the run STARTS in darkness.
-# That is deliberate, not a default left alone: the first production integration
-# is 24 h, and starting at local noon (as O01's one-hour benchmark does, to put
-# its single hour on the cycle's peak) would show only a monotonic decline into
-# one night, never the full day/night alternation. Starting at midnight puts
-# sunrise at h12 and the daytime SW heating half of the cycle inside the SAME
-# 24 h window the run already covers, so both halves of the diurnal cycle are the
-# S6 acceptance target ("the diurnal heating cycle is visible") on one run rather
-# than needing a second one shifted 12 h.
-const RAD_LATITUDE = 20.0             # [deg N]
-const RAD_START_DOY = 240.0           # day of year
-const RAD_START_HOUR = 0.0            # [h, local, at longitude 0] local midnight
-const RAD_INTERVAL = 300.0            # [s] radiation cadence (same default as O01)
-# Taper the held heating to zero at the DK83 sponge onset (Z_DAMP), not the model
-# top: S4's O01 measurement found the unopposed extension-seam cooling above the
-# taper height drifted the sponge layer, so the taper and the sponge share an
-# onset by construction here (plan/user decision) rather than being independently
-# tuned knobs that could drift apart on a future edit to either constant.
-const RAD_ZMAX = Z_DAMP               # [m] taper onset = the sponge onset
-const RAD_ALBEDO = 0.06               # ocean surface albedo
-const RAD_EMISSIVITY = 0.98           # ocean surface emissivity
-# CO2/CH4/N2O/O2/N2/CFCs: left at validate_radiation_options's / radiation.jl's own
-# driver defaults (420 ppm CO2 etc, D7) -- no TC-specific override.
+const F_COR    = 2.0 * 7.292e-5 * sind(TC_CFG.environment.f_latitude)
+const SST_K    = TC_CFG.environment.sst
+const SOUNDING = TC_CFG.reference_state.sounding
 
-# ── Grid resolution ─────────────────────────────────────────────────────────
-# Two configurations, selected by SCYTHE_TC_RES (default "coarse").
-#
-# "coarse" = 10 km radial cells (3.33 km nodal in the inner nest) x 500 m
-# vertical cells (167 m nodal), 25 km top. It exists because axisymmetric
-# spin-up from a cold start takes DAYS, and the fine grid runs at ~1x real time,
-# which makes a multi-day integration impossible. Relative to "fine" it has 5.6x
-# fewer gridpoints per nest and raises dz_min 67.6 -> 112.7 m, relaxing the
-# vertical convective SI ceiling 0.57 -> 0.96 s.
-#
-# The vertical spacing is a deliberate COMPROMISE, arrived at empirically. A
-# 1 km-cell version (25 cells) was tried first, following RE87 (15 km radial /
-# 1.25 km vertical): it ran ~40x real time and DID spin up -- convection at
-# 5-6 h, rain at 7 h, vortex 21 -> 55 m/s -- but blew up at 8.1 h on the AXIS
-# column (r = 1127 m, the first gridpoint), where w reached +20.9/-14.5 m/s
-# while the legitimate eyewall updraft sat at r = 50 km. Output preserved in
-# tc/output/tc_coarse_v30_spinup_axiscrash/. 500 m restores most of the vertical
-# fidelity -- and note surface exchange is delivered as an analytic flux
-# divergence over the LOWEST CELL, so cell depth directly scales how the surface
-# fluxes are spread; the Louis BL and surface-flux schemes were built at
-# 250-300 m, and 500 m stays within a factor of two of that.
-#
-# "fine" is the original 3 km / 300 m grid, kept for structure runs.
-const TC_RES = get(ENV, "SCYTHE_TC_RES", "coarse")
-const _tc_coarse = TC_RES == "coarse"
+const CONDENSATE_TRANSFORM = TC_CFG.physics.microphysics.condensate_transform
+const RAIN_TRANSFORM       = TC_CFG.physics.microphysics.rain_transform
+const TAU_QSS               = TC_CFG.physics.microphysics.tau_qss
+const N_0_MP                = TC_CFG.physics.microphysics.N_0
 
-const NEST_BOUNDARIES = [0.0, 150.0e3, 450.0e3, 1050.0e3]
-const NEST_CELLS = _tc_coarse ? [15, 15, 15] : [50, 50, 50]   # 10|20|40 vs 3|6|12 km
-const Z_TOP = _tc_coarse ? 25.0e3 : 25.2e3
-const NUM_CELLS_K = _tc_coarse ? 50 : 84                      # 500 m vs 300 m cells
+const CD    = TC_CFG.physics.surface.Cd
+const CK    = TC_CFG.physics.surface.Ck
+const U_MIN = TC_CFG.physics.surface.U_min
+const L_INF = TC_CFG.physics.boundary_layer.l_inf
+const PR_T  = TC_CFG.physics.horizontal_mixing.Pr_t
+const SC_T  = TC_CFG.physics.horizontal_mixing.Sc_t
 
-# Timesteps. delta = 0.25 is the ONLY limit holding ts below 2.25 s here:
-#   vertical convective SI, delta=0.25 : 0.96 s   <-- suspect, see below
-#   vertical convective SI, delta=0.10 : 2.39 s
-#   w advective (w_max 25)             : 2.25 s
-#   horizontal acoustic (explicit AB3) : 3.31 s
-#   u advective (u_max 90)             : 12.5 s
-# ts = 1.0 s (Co_z 3.02) deliberately sits ~5% ABOVE the delta = 0.25 ceiling
-# and comfortably inside every other limit and any delta <~ 0.16. NOTE delta =
-# 0.25 was
-# calibrated on the pre-fix TC run whose init carried 40881 supersaturated
-# points (reference/SI_CONVECTIVE_CEILING.md derives it from that run, whose own note
-# records rho_d deficits of 25-40% as "far beyond any physical warm anomaly").
-# With the initialization fixed the observed deficit is 4.4%, so delta is likely
-# nearer 0.05 and the ceiling correspondingly looser, so STATE_DEVIATION below
-# is set to 0.15 -- conservative against the observed 0.044, far below the
-# discredited 0.25 -- to keep the advisory honest rather than crying wolf.
-# Beyond that the next ceiling is the EXPLICIT horizontal acoustic limit (3.31 s
-# coarse), which is why RE87 (20 s) and BR09 (7.5 s) can step so much longer:
-# they sub-step the acoustics. Split-explicit acoustics + BR09's weak divergence
-# damper are the route past it.
-#
-# SCYTHE_TC_TS_SCALE multiplies every entry, so a diagnostic run can sweep the
-# timestep WITHOUT editing this file -- which matters because a restart re-reads
-# tc_params.jl, so an edit made while a run is in flight silently changes what a
-# later restart does. See reference/SI_WALL_BC_CEILING.md: the measured ceiling is
-# ts ~ 0.75 s with SecondDerivativeBC walls and ~2.0 s with Neumann, so ts = 1.0
-# below is ABOVE its ceiling until the inhomogeneous-Neumann wall fix lands.
-const TS_SCALE = parse(Float64, get(ENV, "SCYTHE_TC_TS_SCALE", "1.0"))
-# 1.0 -> 0.5 (2026-07-21): ts = 1.0 is ABOVE the measured wall-condition ceiling
-# of ~0.75 s for SecondDerivativeBC walls. 0.5 is validated over 12 h.
-const NEST_TS = TS_SCALE .* (_tc_coarse ? [0.5, 0.5, 0.5] : [0.25, 0.25, 0.25])
-const STATE_DEVIATION = 0.15  # convective state deviation for the ts advisory
-const NEST_WORKERS = [1, 1, 1]
+const SPONGE_ALPHA = TC_CFG.physics.sponge.alpha
+const Z_DAMP        = TC_CFG.physics.sponge.z_damp
 
-# RLR requires each junction to sit a whole number of PARENT cells from the
-# origin (global ring numbering), so the RLR layout differs from the axisym one.
-const NEST_BOUNDARIES_RLR = _tc_coarse ? [0.0, 160.0e3, 480.0e3, 1120.0e3] :
-                                         [0.0, 150.0e3, 456.0e3, 1056.0e3]
-const NEST_CELLS_RLR = _tc_coarse ? [16, 16, 16] : [50, 51, 50]
+# ── Grid, nest, timestep: thin derivations. TC_CFG_RLR carries its OWN (different) nest
+# layout -- RLR needs each junction a whole number of PARENT cells from the origin.
+const Z_TOP           = TC_CFG.grid.z_top
+const NUM_CELLS_K     = TC_CFG.grid.num_cells_k
+const NEST_BOUNDARIES = TC_CFG.grid.boundaries
+const NEST_CELLS      = TC_CFG.grid.num_cells
+const NEST_BOUNDARIES_RLR = TC_CFG_RLR.grid.boundaries
+const NEST_CELLS_RLR      = TC_CFG_RLR.grid.num_cells
+const TS_SCALE = TC_CFG.timestep.scale
+const NEST_TS  = TS_SCALE .* (isempty(TC_CFG.timestep.ts_per_patch) ?
+    fill(TC_CFG.timestep.ts, length(NEST_CELLS)) : TC_CFG.timestep.ts_per_patch)
+const NEST_WORKERS = ones(Int, length(NEST_CELLS))
+const STATE_DEVIATION = TC_CFG.diagnostics.timestep_advisory.state_deviation
 
-# Balance work grid (radial; the vertical axis is the model mish itself)
-const DR_WORK = 500.0        # [m]
+# Balance work-grid spacing: not part of the config schema (build_model/initialize_case!
+# only take the native-grid balance, balanced_vortex_native!, never the foreign work-grid
+# path); kept literal for model_tests that still call balanced_vortex_fields directly.
+const DR_WORK = 500.0
 
-# Run control (override integration_time on the command line where supported)
-const OUTPUT_INTERVAL = 3600.0      # [s] hourly gridded output
-const RESTART_INTERVAL = 21600.0    # [s] 6-hourly JLD2 restart
-const OUTPUT_FORMATS = [:netcdf]    # add :csv for short diagnostic runs
-# Output directory. Overridable via SCYTHE_TC_OUTDIR so concurrent or successive
-# runs (SLURM job arrays, resolution sweeps) each write to their own tree instead
-# of clobbering the previous one. Model output is experimental data: give every
-# run its own directory and MOVE old trees aside rather than deleting them.
-const OUTPUT_DIR = get(ENV, "SCYTHE_TC_OUTDIR",
-                       joinpath(@__DIR__, "output", "tc_axisym"))
+const OUTPUT_INTERVAL  = TC_CFG.output.interval
+const RESTART_INTERVAL = TC_CFG.output.restart_interval
+const OUTPUT_FORMATS   = TC_CFG.output.formats
+const OUTPUT_DIR       = TC_CFG.output.dir

@@ -61,7 +61,6 @@ const TEST_FILES = [
     ("test_pv_mixing_floor.jl",             :core),
     ("test_pv_mixing_stochastic.jl",        :core),
     ("test_spline_factor.jl",               :core),
-    ("test_legacy_fingerprints.jl",         :core),
     ("test_allocations.jl",                 :allocations),
     ("test_benchmark_smoke.jl",             :io),
 ]

@@ -37,6 +37,26 @@ nohup time  julia --threads 2 run_Scythe.jl -w 8 /path/to/model_file.jl &> scyth
 
 The above command includes `time` to get an overall wall clock time, and pipes the overarching output and errors to scythe_run.log. Note that the model diagnostics themselves are put in the directory containing model output. This log is for Julia errors and some limited status information.
 
+### Running simulations
+
+The three moist-compressible production cases — a 3-nest axisymmetric tropical cyclone, a
+periodic 2-D radiative-convective-equilibrium ocean column, and an idealized ocean warm
+bubble — are configured and launched from [`simulations/`](simulations/README.md), not
+from environment variables or a bare Julia script: each case is a `config.toml` (what is
+run), overlay files for variants, a local `run.jl` launcher, and SLURM `*.sbatch`
+launchers, all documented in the per-case `README.md`:
+
+- [`simulations/tc_axisym/`](simulations/tc_axisym/README.md) — axisymmetric tropical cyclone
+- [`simulations/ocean_2D_rce/`](simulations/ocean_2D_rce/README.md) — 2-D ocean RCE
+- [`simulations/ocean_warm_bubble/`](simulations/ocean_warm_bubble/README.md) — ocean warm bubble
+
+```
+julia --project=simulations simulations/<case>/run.jl [overlays...] [--set key.path=value ...]
+```
+
+See [`simulations/README.md`](simulations/README.md) for the full configuration reference
+(every key, its default, and what it means) and the launcher flags shared by every case.
+
 ### Future plans
 Support for CF-compliant NetCDF input and output will be added in the near future. Future releases will include fully distributed parallelization for use on multi-node clusters. Future versions will also support different geometries that can be constructed from the underlying basis functions (e.g. Cartesian and spherical). Support for grid nesting using the cubic B-splines will be added in future versions. Future releases will also improve the cluster options for HPC use. Interested users are welcome to contribute to improve the model. Stay tuned for more functionality!
 

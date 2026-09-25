@@ -99,6 +99,29 @@ written every 6 h (`output.restart_interval`). A walltime-killed job is continue
 | `SCYTHE_TC_SOUNDING=p` | `--set reference_state.sounding=p` |
 | `SCYTHE_TC_CTRANS` / `SCYTHE_TC_RTRANS` | `--set physics.microphysics.condensate_transform=...` / `rain_transform=...` |
 
+### Debug restart from a checkpoint
+
+`tc/tc_debug_restart.jl` (warm-restarting each nest from a crashed run's mid-run CSV state,
+with a short trace cadence) is gone; its use case is `initial_conditions.method = "file"`
+on a fresh, short-`integration_time` config pointed at the per-nest checkpoint or CSV
+snapshot, one path per patch, in nest order:
+
+```
+R=simulations/tc_axisym/output/tc_ice_24h    # the tree that crashed/stopped
+O=simulations/tc_axisym/output/tc_debug
+julia --project=simulations $(dirname $R)/../run.jl \
+      --workers-per-patch 1,1,1 --worker-threads 4 \
+      --set run.integration_time=3600 --set output.dir=$O \
+      --set diagnostics.state_minima_trace=40 \
+      --set initial_conditions.method=file \
+      --set 'initial_conditions.file.paths=["'$R'/seg_01/nest1/18000.0.jld2","'$R'/seg_01/nest2/18000.0.jld2","'$R'/seg_01/nest3/18000.0.jld2"]'
+```
+
+A `.jld2` checkpoint gives a warm restart (the AB3 tendency history is rebuilt, a small
+transient); a `<t>_physical.csv` snapshot works too (cold restart from that state). The
+reference state (`<R>/reference.ref`) is still required and is written automatically for
+`method = "file"`, so nothing needs to be copied by hand.
+
 ### Boundary layer (was `tc/MYNN_RUNS.md`)
 
 | old | now |
