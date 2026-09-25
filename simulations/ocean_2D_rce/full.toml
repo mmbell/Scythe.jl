@@ -1,0 +1,8 @@
+# Overlay: the full-resolution RCE grid, 3 km x 300 m cells (84 cells to a 25.2 km lid).
+[grid]
+num_cells   = [100]
+num_cells_k = 84
+z_top       = 25.2e3
+
+[timestep]
+ts = 0.25

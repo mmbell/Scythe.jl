@@ -1,0 +1,42 @@
+# Axisymmetric tropical cyclone: 3-nest RiRk r-z domain, coarse grid, ice on (production).
+# Only keys that differ from the RunConfig struct defaults (src/config.jl) are listed; the
+# full resolved configuration is written to <output.dir>/config.toml at run start.
+# Overlays: fine.toml (3 km / 300 m grid), rlr.toml (3-D cylindrical RLR geometry).
+
+[run]
+name             = "tc_axisym"
+equation_set     = "moist_compressible_axisym"
+integration_time = 432000.0          # 5 days
+segment_length   = 86400.0           # 1-day segments; restart granularity (replaces --restart T)
+
+[output]
+dir = "output"                       # relative to this file
+
+[grid]
+# "coarse" = 10|20|40 km radial cells x 500 m vertical cells, 25 km lid. Axisymmetric
+# spin-up from a cold start takes DAYS, and the fine grid runs at ~1x real time. 500 m
+# stays within a factor two of the 250-300 m the BL/surface schemes were built at (the
+# surface flux is delivered over the lowest cell, so cell depth scales its spreading).
+lateral    = "walls"                 # axis + outer wall (the only choice for cylindrical sets)
+boundaries = [0.0, 150.0e3, 450.0e3, 1050.0e3]
+num_cells  = [15, 15, 15]
+
+[initial_conditions]
+# RE87 (Rotunno & Emanuel 1987) eq. (37) vortex, gradient-wind + hydrostatically balanced
+# on the model's own mish (balanced_vortex_native!). The [initial_conditions.balanced_vortex]
+# struct defaults ARE the TC values: r_0 widened to 800 km (zero negative-PV points at
+# f = 15 N), z_barotropic MUST stay 0 (nonzero => symmetrically unstable PV), and a moist
+# inner core (rh_bl 0.90 drops CIN so an axisymmetric domain with no asymmetries can trigger).
+method = "balanced_vortex"
+
+[physics.horizontal_mixing]
+# An axisymmetric TC has no asymmetries to provide radial mixing, so the resolved radial
+# gradients are damped only by this closure; heat is mixed with K/Pr_t (without it the
+# thermodynamic fields had no horizontal mixing at all). Water mixing stays off (not
+# energy consistent; refused with ice).
+scheme = "smagorinsky"               # Ls = 500 m, K_min = 25 m^2/s, heat = true (defaults)
+
+[diagnostics.timestep_advisory]
+# Observed convective state deviation after the initialization fix is ~0.044; 0.15 keeps
+# the (warn-only) advisory honest. Omitted from the report under state_dependent_si.
+state_deviation = 0.15

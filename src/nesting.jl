@@ -1065,7 +1065,9 @@ function integrate_nested_model(nest::NestedModelParameters)
     for i in 1:n
         warn_timestep_stability(models[i].grid_params, models[i].ts;
                                 equation_set=models[i].equation_set,
-                                options=models[i].options)
+                                options=models[i].options,
+                                convective_ceiling=!(get(models[i].options,
+                                                         :state_dependent_si, false) === true))
         mkpath(models[i].output_dir)
     end
 

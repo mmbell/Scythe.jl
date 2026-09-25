@@ -1,0 +1,9 @@
+# Overlay: the original fine TC grid, 3|6|12 km radial x 300 m vertical cells (structure
+# runs; ~1x real time). load_config("config.toml", "fine.toml").
+[grid]
+num_cells   = [50, 50, 50]
+z_top       = 25.2e3
+num_cells_k = 84
+
+[timestep]
+ts = 0.25

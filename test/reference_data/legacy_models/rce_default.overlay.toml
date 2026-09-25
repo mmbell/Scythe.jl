@@ -1,0 +1,9 @@
+# Legacy-pin overlay: simulations/ocean_2D_rce/config.toml + this = what
+# benchmarks/ocean_rce.jl built with no SCYTHE_RCE_* / SCYTHE_REFSTATE set (goldens
+# rce_default_seg1.toml, rce_default_seg3.toml; --days 20 --segment-days 2).
+[reference_state]
+consistent_qss = false
+hydrostatic    = false
+
+[numerics]
+state_dependent_si = false

@@ -1,0 +1,19 @@
+# Legacy-pin overlay, stacked on owb_default.overlay.toml: SCYTHE_OWB_BL=mynn
+# SCYTHE_OWB_ICE=1 SCYTHE_OWB_RAD=diurnal SCYTHE_OWB_SFC_STAB=1 (the OWB MYNN and
+# radiation arms always asked for the sidecars).
+[output]
+sidecars = true
+
+[physics.microphysics]
+ice = "ishmael"
+condensate_transform = "bhyp"
+rain_transform = "bhyp"
+
+[physics.boundary_layer]
+scheme = "mynn"
+
+[physics.surface]
+stability = true
+
+[physics.radiation]
+scheme = "rrtmgp"

@@ -1,0 +1,17 @@
+# Open-ocean radiative-convective equilibrium on a 2-D (x-z) periodic slice: MYNN + ISHMAEL
+# ice + diurnal all-sky RRTMGP, triggered only by seeded low-level temperature noise (no
+# bubble, no wall). 300 km x 25 km at 6 km x 500 m cells (the quick grid; full.toml is
+# 3 km / 300 m). Horizontally inviscid apart from the B-spline filter (Smagorinsky is
+# cylindrical-only). Only keys that differ from the RunConfig struct defaults are listed:
+# the defaults are this case's domain, grid and physics.
+
+[run]
+name             = "ocean_2D_rce"
+integration_time = 1728000.0         # 20 days
+segment_length   = 172800.0          # 2-day segments, one process each
+
+[output]
+dir = "output"                       # relative to this file
+
+[initial_conditions]
+method = "temperature_noise"         # z_max 1 km, dT_max 0.1 K, seed 2026 (defaults)

@@ -1,0 +1,23 @@
+# Mesoscale warm bubble over a fixed-SST ocean: the boundary-layer / full-physics-suite
+# benchmark at production-like spacing (the TC coarse grid: 6 km x 500 m cells, 300 km x
+# 25 km), with surface fluxes and drag on. Lateral walls as O01; an RH-preserving 3 K
+# bubble of 30 km half-width (wider than O01's so the mesoscale grid resolves it).
+# MYNN + ice; no radiation (a 2-hour bubble does not feel it). Only keys that differ from
+# the RunConfig struct defaults are listed.
+
+[run]
+name             = "ocean_warm_bubble"
+integration_time = 7200.0            # 2 hours
+
+[output]
+dir      = "output"                  # relative to this file
+interval = 300.0
+
+[grid]
+lateral = "walls"
+
+[initial_conditions]
+method = "temperature_bubble"        # xc 150 km, xr 30 km, zc 500 m, zr 3 km, 3 K (defaults)
+
+[physics.radiation]
+scheme = "none"

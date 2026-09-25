@@ -161,6 +161,9 @@ default 0.25), and the u/w advective Courants for the expected peak winds
 (`options[:u_max]`/`options[:w_max]`, defaults 90/25 m/s) — prints all margins,
 names the binding one, and warns only if it is exceeded. Resolution-agnostic by
 design: no assumption about which limit binds. Returns the limits NamedTuple.
+`convective_ceiling = false` omits the convective-ceiling line; `integrate_model` and
+`integrate_nested_model` pass it when `options[:state_dependent_si]` is on, since the
+state-dependent linearization removes that ceiling.
 (The azimuthal spacing of the 3D cylinder at its inner radius is not probed —
 configure it comparably.)
 
@@ -174,7 +177,8 @@ subtract-AB3 semi-implicit form, not a derived bound.
 function warn_timestep_stability(grid_params, ts::Float64;
                                  c_nominal::Float64=340.0, target_courant::Float64=0.5,
                                  equation_set::String="",
-                                 options::AbstractDict=Dict{Symbol,Any}())
+                                 options::AbstractDict=Dict{Symbol,Any}(),
+                                 convective_ceiling::Bool=true)
 
     if uses_pressure_reference(equation_set)
         # Generic multi-limit advisor for the mc sets: compute EVERY known limit
@@ -238,9 +242,6 @@ function warn_timestep_stability(grid_params, ts::Float64;
             (name = "horizontal acoustic" * (hsi ? " (semi-implicit)" : " (explicit AB3)"),
              courant = c_nominal * ts / dx_min,
              target = hsi ? 3.0 : target_courant),
-            (name = "vertical acoustic (convective SI ceiling, δ=$(state_deviation))",
-             courant = c_nominal * ts / dz_min,
-             target = 0.72 / state_deviation),
             (name = "u advection (u_max=$(u_max) m/s)",
              courant = u_max * ts / dx_min, target = 0.5),
             (name = "w advection (w_max=$(w_max) m/s)",
@@ -252,6 +253,14 @@ function warn_timestep_stability(grid_params, ts::Float64;
             (name = "BL vertical diffusion (K=$(bl_K_ref) m^2/s)",
              courant = bl_K_ref * ts / (dz_min * dz_min), target = 0.5),
         ]
+        # The convective vertical SI ceiling exists only because the implicit coefficients
+        # are linearized about the resting reference. Under options[:state_dependent_si]
+        # they come from the current column state and the ceiling is moot, so the callers
+        # pass `convective_ceiling = false` and the line is omitted.
+        convective_ceiling && insert!(limits, 2,
+            (name = "vertical acoustic (convective SI ceiling, δ=$(state_deviation))",
+             courant = c_nominal * ts / dz_min,
+             target = 0.72 / state_deviation))
         margins = [l.target / l.courant for l in limits]
         binding = argmin(margins)
         println("Timestep limits at ts=$(ts) s (dx_min=$(round(dx_min; digits=1)) m, " *

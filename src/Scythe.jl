@@ -180,11 +180,16 @@ include("nesting.jl")
 # every file that defines a value tuple it reuses (SFC_Z0_MODES, RADIATION_*, MYNN_*,
 # OUTPUT_FORMAT_SYMBOLS) and after parse_mynn_fidelity.
 include("config.jl")
+# RunConfig -> ModelParameters/NestedModelParameters (the physics expansion, BCs, validation)
+# and the case initialization (reference state + initial conditions).
+include("config_build.jl")
+include("config_init.jl")
 # Execution environment (workers, threads, provenance) + segment arithmetic for the run driver.
 include("run_driver.jl")
 
 # Export the primary driver function and the ModelParameters
 export integrate_model
+export build_model, initialize_case!
 export ModelParameters
 
 """
@@ -214,7 +219,8 @@ function integrate_model(model::ModelParameters)
     # catch a timestep that is too large for the vertical resolution (e.g. raising
     # kDim without lowering ts). Warn-only; never aborts.
     warn_timestep_stability(model.grid_params, model.ts; equation_set=model.equation_set,
-                            options=model.options)
+                            options=model.options,
+                            convective_ceiling=!(get(model.options, :state_dependent_si, false) === true))
 
     if !isdir(model.output_dir)
         mkdir(model.output_dir)

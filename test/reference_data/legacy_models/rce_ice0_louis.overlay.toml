@@ -1,0 +1,12 @@
+# Legacy-pin overlay, stacked on rce_default.overlay.toml: SCYTHE_RCE_BL=louis
+# SCYTHE_RCE_ICE=0 SCYTHE_RCE_RAD=0.
+[physics.microphysics]
+ice = "none"
+condensate_transform = "none"
+rain_transform = "none"
+
+[physics.boundary_layer]
+scheme = "louis"
+
+[physics.radiation]
+scheme = "none"

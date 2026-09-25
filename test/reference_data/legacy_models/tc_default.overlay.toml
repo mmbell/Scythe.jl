@@ -1,0 +1,21 @@
+# Legacy-pin overlay: simulations/tc_axisym/config.toml + this = what tc/tc_params.jl +
+# tc/tc_init.jl built with no SCYTHE_TC_* set (the golden tc_default.toml), captured with
+# make_base(1800.0). Used by test/test_config_equivalence.jl.
+[run]
+integration_time = 1800.0
+
+[physics.microphysics]
+ice = "none"                         # warm rain, single-moment (rain_moments auto -> 1)
+
+[physics.boundary_layer]
+scheme = "louis"
+
+[physics.surface]
+stability = false
+
+[physics.radiation]
+scheme = "none"
+
+[numerics]
+sedimentation_top_bc = "wall"        # legacy TC left rain on the d2 wall condition at the lid
+wall_bc_tau = "inf"                  # inert under d2; the legacy value

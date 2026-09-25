@@ -1,0 +1,24 @@
+# Legacy-pin overlay: simulations/ocean_warm_bubble/config.toml + this = what
+# benchmarks/ocean_warm_bubble.jl built with no SCYTHE_OWB_* / SCYTHE_REFSTATE set (the
+# golden owb_default.toml, --mode quick).
+[output]
+formats = ["csv"]                    # BENCHMARK_OUTPUT_FORMATS
+restart_interval = 0.0
+
+[reference_state]
+consistent_qss = false
+hydrostatic    = false
+
+[physics.microphysics]
+ice = "none"
+condensate_transform = "none"
+rain_transform = "none"
+
+[physics.boundary_layer]
+scheme = "louis"
+
+[physics.surface]
+stability = false
+
+[numerics]
+state_dependent_si = false
