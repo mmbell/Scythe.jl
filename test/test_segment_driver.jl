@@ -91,6 +91,12 @@ tiny = ["run.integration_time=20", "run.segment_length=10", "output.interval=10"
         check_resume_and_refusal(root, cfg, exec)
     end
 
+    # The nest case costs ~6 min (two child processes each compiling the nested driver on
+    # fresh workers for a 10 s segment). Gated behind SCYTHE_SLOW_TESTS=1 like the slow
+    # benchmark smoke tests: the single-patch case above covers the driver's segment
+    # bookkeeping every run, and the per-patch checkpoint chaining it adds is exercised
+    # by the tc_axisym smoke run (simulations/tc_axisym/README.md).
+    if get(ENV, "SCYTHE_SLOW_TESTS", "") == "1"
     @testset "2-patch axisymmetric nest, 2 segments" begin
         root = mktempdir()
         set = [tiny; "grid.boundaries=[0.0,40.0e3,80.0e3]"; "grid.num_cells=[6,6]";
@@ -108,4 +114,5 @@ tiny = ["run.integration_time=20", "run.segment_length=10", "output.interval=10"
         @test isdir(joinpath(root, "seg_02", "nest1")) && isdir(joinpath(root, "seg_02", "nest2"))
         check_resume_and_refusal(root, cfg, exec)
     end
+    end # SCYTHE_SLOW_TESTS
 end
