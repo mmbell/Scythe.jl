@@ -1,13 +1,20 @@
 # test/test_legacy_fingerprints.jl -- Stage 0 golden-capture regression (config-
-# consolidation plan §7 "Equivalence"). For the three CHEAP arms (owb_default,
-# rce_default_seg1, and tc_default's nest fingerprint only -- no `init!`, no ICs, just the
+# consolidation plan §7 "Equivalence"). For the two remaining CHEAP arms (rce_default_seg1
+# and tc_default's nest fingerprint only -- no `init!`, no ICs, just the
 # ModelParameters/NestedModelParameters the legacy driver builds), rebuild the legacy model
-# in-process (OWB, RCE) or via a scratch subprocess (TC -- see below) and assert the
+# in-process (RCE) or via a scratch subprocess (TC -- see below) and assert the
 # fingerprint equals the committed `test/reference_data/legacy_models/<arm>.toml`. A
 # mismatch here means either a driver file changed behavior since the golden capture
 # (tools/capture_legacy_models.jl) was taken, or `test/config_fingerprint.jl` itself
 # changed -- both are meant to be caught immediately, well before the config-consolidation
 # work (stage 2) tries to reproduce these same values from `build_model(cfg)`.
+#
+# owb_default / owb_mynn_ice_rad dropped (stage 4a): `benchmarks/ocean_warm_bubble.jl`
+# became a thin `run_benchmark` wrapper around `build_model(load_config(...))` and no
+# longer builds a legacy `ModelParameters` with `owb_model`/`SCYTHE_OWB_*` env vars to
+# fingerprint here. The goldens stay committed (test/reference_data/legacy_models/
+# owb_default.toml, owb_mynn_ice_rad.toml) and are still checked, against the NEW build,
+# by test/test_config_equivalence.jl's "equivalence" testset.
 #
 # TC is done via a subprocess (not in-process) for two reasons: tc/tc_params.jl's
 # `OUTPUT_DIR` const defaults to `tc/output/tc_axisym` -- a REAL output tree -- unless
@@ -31,13 +38,6 @@ include(joinpath(@__DIR__, "config_fingerprint.jl"))
 load_golden(arm::AbstractString) = TOML.parsefile(joinpath(LEGACY_DIR, "$(arm).toml"))
 
 @testset "Legacy driver golden fingerprints (Stage 0)" begin
-
-    @testset "owb_default" begin
-        include(joinpath(SCYTHE_ROOT, "benchmarks", "ocean_warm_bubble.jl"))
-        opts = parse_benchmark_args(["--mode", "quick", "--stage", "mc", "--grid", "rirk"])
-        model = owb_model(opts)
-        @test model_fingerprint(model) == load_golden("owb_default")
-    end
 
     @testset "rce_default_seg1" begin
         include(joinpath(SCYTHE_ROOT, "benchmarks", "ocean_rce.jl"))

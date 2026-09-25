@@ -32,6 +32,7 @@ benchmarks/results/
 # model output never goes in the repo — validation references, when accepted,
 # are committed as small JSON like the benchmarks
 tc/output/
+simulations/*/output/
 *.nc
 *.jld2
 

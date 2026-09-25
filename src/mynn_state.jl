@@ -321,9 +321,9 @@ end
 """
     parse_mynn_fidelity(s::AbstractString) -> Union{Symbol,Vector{Symbol}}
 
-`options[:mynn_fidelity]` from a STRING, for the environment knobs
-(`SCYTHE_OWB_MYNN_FIDELITY`, `SCYTHE_TC_MYNN_FIDELITY`) and for reading a run's own
-`fidelity` attribute back. A single name that is one of [`MYNN_FIDELITIES`](@ref)
+`options[:mynn_fidelity]` from a STRING, for `physics.boundary_layer.mynn_fidelity`
+(`src/config_build.jl`), the legacy `SCYTHE_TC_MYNN_FIDELITY` environment knob, and for
+reading a run's own `fidelity` attribute back. A single name that is one of [`MYNN_FIDELITIES`](@ref)
 (`"fortran"`, `"scythe"`) -- and the empty string -- gives that Symbol; anything else is
 split on commas into a `Vector{Symbol}`, which [`validate_mynn_options`](@ref) then checks
 -- a typo dies at setup, not silently.

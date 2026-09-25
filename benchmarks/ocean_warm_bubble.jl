@@ -7,58 +7,29 @@
 #
 #   julia --project=. benchmarks/ocean_warm_bubble.jl --mode quick --stage mc --grid rirk
 #
-# Modes: quick = 6 km x 500 m cells, ts 0.5 s; full = 3 km x 300 m cells, ts 0.25 s
-# (the TC coarse / fine pairs), 300 km x 25 km, 2 h. Humidified Dunion sounding, RH-
-# preserving 3 K bubble of 30 km half-width (wider than O01's 16 km so it is resolved
-# on the mesoscale grid), DK83 stratospheric sponge, warm rain by default.
+# THIS IS NOW A THIN WRAPPER (config consolidation, stage 4a). The model that runs is
+# EXACTLY simulations/ocean_warm_bubble/config.toml -- struct-default production physics
+# (MYNN + ISHMAEL ice, no radiation, state_dependent_si) on the quick grid (300 km x 25 km,
+# 6 km x 500 m cells, 2 h). `--mode full` scales the grid to the paper-grade spacing (3 km
+# x 300 m, ts 0.25 s) through `--set`, the same numbers the legacy `full` arm used; every
+# other physics/grid variation goes through `simulations/ocean_warm_bubble/run.jl`
+# (`--set key.path=value` / overlay files), not this script. All the `SCYTHE_OWB_*` env-var
+# knobs the legacy driver read are GONE -- there is no arm selection here anymore. The
+# "arm" tag below (output/reference-CSV naming) is derived from the RESOLVED config (ice
+# on/off, BL scheme, EDMF, fidelity, surface roughness/stability), so it always describes
+# what actually ran rather than an env var that might disagree with it.
 #
-# Physics knobs (every one is a NO-OP when unset, so the committed control is reproducible):
-#   SCYTHE_OWB_BL=louis|none|mynn boundary layer + surface fluxes (default louis; `mynn`
-#                                 is the MYNN-EDMF arm: the prognostic rho_e TKE slot plus
-#                                 the ED closure applied in Scythe's variables, with the
-#                                 SAME surface layer the Louis control uses)
-#   SCYTHE_OWB_MYNN_EDMF=1        turn the EDMF mass-flux plumes on (options[:mynn_edmf]);
-#                                 arm suffix `_edmf`. Needs SCYTHE_OWB_BL=mynn.
-#   SCYTHE_OWB_MYNN_FIDELITY=a,b  named deviations from the verbatim Fortran closure
-#                                 (Scythe.MYNN_DEVIATIONS: gtr_local, K_interface,
-#                                 sqfac1, pdk1, exner_single, rmol_sfc, flux_clip), or a
-#                                 fidelity name. Unset is the MODEL DEFAULT, the bundle
-#                                 `scythe` (Scythe.MYNN_SCYTHE_BUNDLE: gtr_local,
-#                                 exner_single, pdk1, + rmol_sfc under
-#                                 SCYTHE_OWB_SFC_STAB=1), and carries no arm suffix;
-#                                 "fortran" is the verbatim-Fortran control and gets
-#                                 `_fid_fortran`. Arm suffix otherwise
-#                                 `_fid_<names joined by _>`. Needs SCYTHE_OWB_BL=mynn.
-#   SCYTHE_OWB_MYNN_INTERVAL=20   MYNN closure cadence [s] (options[:mynn_interval]); the
-#                                 diffusivities still track the TKE every step
-#   SCYTHE_OWB_MYNN_KMAX=Inf      counted safety cap on K_m/K_h/K_e [m^2/s]
-#                                 (physical_params[:mynn_K_max]) -- never a tuning knob
-#   SCYTHE_OWB_SFC=komori|gfdl_v7|charnock   surface roughness closure (options[:sfc_z0],
-#                                 default komori = the historical Komori Cd + constant Ck);
-#                                 arm suffix = the value
-#   SCYTHE_OWB_SFC_STAB=1         Monin-Obukhov stability functions + Beljaars gustiness
-#                                 (options[:sfc_stability]); arm suffix `_stab`
-#   SCYTHE_OWB_SST=302.65         sea surface temperature [K] (default tc_params SST_K)
-#   SCYTHE_OWB_ICE=1              ISHMAEL ice (with two-moment rain and the bhyp transforms,
-#                                 as o01_rainfall's ice arm); arm suffix `_ice`.
-#                                 ICE + MYNN IS THE SUPPORTED BOUNDARY-LAYER PAIR (S8):
-#                                 `mc_mynn_bl!` mixes all twelve ice moments species-wise
-#                                 (all four moments of a species on the SAME K_h, so the
-#                                 mean crystal does not move), mixes the rain number
-#                                 beside the rain mass, and carries the ice's -L_f share
-#                                 of the water energy. Ice + LOUIS is still refused by the
-#                                 driver -- that scheme infers the vapour tendency as
-#                                 rho_dot_w - rho_dot_c, which with ice inside rho_t
-#                                 attributes the ice flux to vapour -- so an ice arm runs
-#                                 with SCYTHE_OWB_BL=mynn or =none.
-#   SCYTHE_OWB_RAIN_MOMENTS=2     two-moment rain without ice
-#   SCYTHE_OWB_RAD=lw|allsky|sw|allsky_sw|diurnal  RRTMGP arm (o01 semantics; the SST is
-#                                 the radiative surface temperature), + _RAD_FORCING,
-#                                 _RAD_INTERVAL, _RAD_ZMAX
-#   SCYTHE_OWB_CTRANS/RTRANS=bhyp water control-variable transforms (+ _CMU, _RMU)
-#   SCYTHE_OWB_WALL_BC=d2|neumann ground/lid scalar condition (default d2, the TC's;
-#                                 O01 keeps Neumann)
-#   SCYTHE_OWB_TS, _HOURS, _TSTOP, _OUTPUT, _NI, _NK, _XR, _ZR, _ZC, _DT   grid/run overrides
+# This script exists only so the harness's diagnostics table, target checks and committed
+# regression CSVs (benchmarks/reference_data/ocean_warm_bubble/) keep working; see
+# simulations/ocean_warm_bubble/README.md for the case itself.
+#
+# Physics/grid knobs are no longer read here. The legacy driver had ~25 `SCYTHE_OWB_*` env
+# vars (BL scheme, MYNN EDMF/fidelity/interval/K_max, surface roughness/stability, SST,
+# ice, rain moments, RRTMGP arm, water transforms, wall BC, grid/run overrides) -- all
+# retired. Vary the case with `--set key.path=value` / overlay files on
+# simulations/ocean_warm_bubble/run.jl instead (see that script and
+# simulations/ocean_warm_bubble/README.md); this wrapper always runs the one production
+# config, `--mode`/`--stage`/`--grid`/`--workers` aside.
 #
 # Diagnostics: O01's rain / ice / radiation sets (benchmarks/common/warm_bubble_diagnostics.jl)
 # plus the surface-flux budget rows below. With fluxes on the column energy books are OPEN:
@@ -72,10 +43,9 @@ using Distributed
 include(joinpath(@__DIR__, "common", "harness.jl"))
 
 # ARGS parsing and worker/process setup are script-only (an `include` of this file --
-# the golden-capture tool, a future config-equivalence test -- wants `owb_model`,
-# `owb_init!` and the diagnostics functions defined without spawning workers or reading
-# real command-line ARGS; `owb_model` already takes `opts` as an ordinary argument, so
-# nothing downstream needs this block to have run).
+# simulations/ocean_warm_bubble/run.jl's diagnostics post-step -- wants `owb_diagnostics`
+# and the other diagnostic functions defined without spawning workers or reading real
+# command-line ARGS; nothing downstream needs this block to have run).
 if abspath(PROGRAM_FILE) == @__FILE__
     opts = parse_benchmark_args(ARGS)
     opts.stage == STAGE_MC ||
@@ -92,271 +62,36 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 include(joinpath(@__DIR__, "common", "warm_bubble_diagnostics.jl"))
 
 # ── Configuration ────────────────────────────────────────────────────────────
+#
+# The model is built from simulations/ocean_warm_bubble/config.toml -- the production
+# case config (struct defaults: MYNN + ISHMAEL ice, radiation off, state_dependent_si) --
+# via `build_model(load_config(...))`, not a hand-assembled `ModelParameters` (that
+# translation now lives once, in src/config_build.jl). `--mode full` overrides the grid to
+# the paper-grade spacing the legacy `full` arm used (3 km x 300 m cells, ts 0.25 s); every
+# other physics/grid variation belongs on simulations/ocean_warm_bubble/run.jl instead of
+# here (this wrapper takes no `--set` of its own; it exists for the harness's diagnostics
+# table and regression CSVs, not as a general launcher).
 
-const DUNION_SOUNDING = joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "dunion_MT_hum90.ref")
-const OWB_WIDTH = 300.0e3           # [m] domain width
-const OWB_XC = 150.0e3              # [m] bubble centre
-const OWB_XR = parse(Float64, get(ENV, "SCYTHE_OWB_XR", "30.0e3"))   # [m] bubble half-width
-const OWB_DT = parse(Float64, get(ENV, "SCYTHE_OWB_DT", "3.0"))      # [K] bubble amplitude
-const OWB_ZC = parse(Float64, get(ENV, "SCYTHE_OWB_ZC", "500.0"))    # [m] bubble centre height
-const OWB_ZR = parse(Float64, get(ENV, "SCYTHE_OWB_ZR", "3000.0"))   # [m] bubble half-depth
-const OWB_SST = parse(Float64, get(ENV, "SCYTHE_OWB_SST", "302.65")) # [K] tc_params SST_K
-const OWB_CD = -1.0                 # negative => Komori et al. (2018) wind-speed-dependent drag
-const OWB_CK = 1.0e-3               # bulk enthalpy/moisture exchange coefficient
-const OWB_U_MIN = 2.0               # [m/s] gustiness floor on the exchange wind
-const OWB_L_INF = 80.0              # [m] asymptotic Louis mixing length
-const N_R = 1.0e-3
-const N_0_MP = 8.0e6                # [m^-4] Marshall-Palmer intercept
+const OWB_CONFIG = joinpath(@__DIR__, "..", "simulations", "ocean_warm_bubble", "config.toml")
 
-envflag(k) = ENV[k] in ("1", "true", "yes")
+"""
+    owb_config_set(opts::BenchmarkOptions) -> Vector{String}
 
-function owb_model(opts::BenchmarkOptions)
+`--set` overrides applied on top of the case config: the harness's own output
+directory/format (CSV so the diagnostics can read `<t>_physical.csv`, the MYNN sidecar for
+`owb_mynn_diagnostics`), `--mode full`'s grid (the legacy full-mode numbers), and
+`--ts-factor` (`timestep.scale`, RiRk-only per `vertical_ts`'s historical convention but
+harmless to pass unconditionally since `opts.grid == :rirk` is required above).
+"""
+function owb_config_set(opts::BenchmarkOptions)
+    set = String["output.dir=" * benchmark_output_dir("ocean_warm_bubble", opts),
+                 "output.formats=[\"csv\"]", "output.sidecars=true",
+                 "timestep.scale=$(opts.ts_factor)"]
     if opts.mode == :full
-        num_cells_i = 100       # 3 km cells over 300 km
-        num_cells_k = 84        # 300 m cells
-        kMax = 25.2e3
-        ts = 0.25
-        output_interval = 600.0
-    else
-        num_cells_i = 50        # 6 km cells
-        num_cells_k = 50        # 500 m cells
-        kMax = 25.0e3
-        ts = 0.5
-        output_interval = 300.0
+        append!(set, ["grid.num_cells=[100]", "grid.num_cells_k=84", "grid.z_top=25200.0",
+                      "timestep.ts=0.25", "output.interval=600.0"])
     end
-    haskey(ENV, "SCYTHE_OWB_NI") && (num_cells_i = parse(Int, ENV["SCYTHE_OWB_NI"]))
-    haskey(ENV, "SCYTHE_OWB_NK") && (num_cells_k = parse(Int, ENV["SCYTHE_OWB_NK"]))
-    haskey(ENV, "SCYTHE_OWB_TS") && (ts = parse(Float64, ENV["SCYTHE_OWB_TS"]))
-    haskey(ENV, "SCYTHE_OWB_OUTPUT") && (output_interval = parse(Float64, ENV["SCYTHE_OWB_OUTPUT"]))
-    kDim = 3 * num_cells_k
-    ts = vertical_ts(ts, opts)
-    integration_time = haskey(ENV, "SCYTHE_OWB_TSTOP") ? parse(Float64, ENV["SCYTHE_OWB_TSTOP"]) :
-                       3600.0 * parse(Float64, get(ENV, "SCYTHE_OWB_HOURS", "2.0"))
-
-    physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
-                           :Khdiff_heat => 0.0, :Kvdiff_heat => 0.0,
-                           :Kvdiff_water => 0.0,
-                           :tau_qss => 10.0, :N_r => N_R, :N_0 => N_0_MP,
-                           :alpha => 0.02, :z_damp => 17.0e3,
-                           :Cd => OWB_CD, :Ck => OWB_CK, :U_min => OWB_U_MIN,
-                           :l_inf => OWB_L_INF, :SST => OWB_SST)
-    options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
-                                     :precipitation => true, :vertical_mixing => false,
-                                     :output_formats => BENCHMARK_OUTPUT_FORMATS),
-                    reference_state_options())
-
-    bl = get(ENV, "SCYTHE_OWB_BL", "louis")
-    if bl == "louis"
-        options[:louis_bl] = true
-        options[:surface_fluxes] = true
-    elseif bl == "none"
-        # no boundary layer at all: the O01 physics on the mesoscale grid (SST unused)
-    elseif bl == "mynn"
-        # The MYNN-EDMF treatment arm. Surface fluxes are ON, exactly as in the Louis
-        # control: `mc_mynn_bl!` carries them on the same analytic g(z) delivery through
-        # the same `surface_exchange` call, so the two arms differ in the CLOSURE and in
-        # nothing else -- which is the only way the comparison means anything (S1b).
-        options[:mynn] = true
-        options[:surface_fluxes] = true
-        # The mish-native MYNN sidecar. Its default flipped to OFF in stage N2 (the MYNN
-        # fields now ride in the model's comprehensive <t>.nc, regridded), but this
-        # benchmark's BL diagnostics read the SIDECAR (`benchmarks/common/
-        # warm_bubble_diagnostics.jl`), so the arm asks for it explicitly. Reading the
-        # regular-grid file instead would change the numbers the reference tables pin.
-        options[:mynn_output] = true
-        haskey(ENV, "SCYTHE_OWB_MYNN_INTERVAL") &&
-            (options[:mynn_interval] = parse(Float64, ENV["SCYTHE_OWB_MYNN_INTERVAL"]))
-        # The EDMF mass-flux plumes (S7). No key when unset, so the S5 eddy-diffusivity
-        # arm stays bitwise; `_edmf` when set, so the two never look up the same targets.
-        (haskey(ENV, "SCYTHE_OWB_MYNN_EDMF") && envflag("SCYTHE_OWB_MYNN_EDMF")) &&
-            (options[:mynn_edmf] = 1)
-        # The fidelity deviations (`Scythe.MYNN_DEVIATIONS`), as a comma-separated list:
-        # `SCYTHE_OWB_MYNN_FIDELITY=gtr_local,sqfac1`, or a fidelity name. Unset adds no
-        # key, so the run takes the MODEL DEFAULT (the `:scythe` bundle since
-        # 2026-09-23); anything that is not that default -- `fortran` included -- gets
-        # its own arm suffix below, so it never looks up the default arm's expected
-        # values.
-        haskey(ENV, "SCYTHE_OWB_MYNN_FIDELITY") &&
-            (options[:mynn_fidelity] =
-                Scythe.parse_mynn_fidelity(ENV["SCYTHE_OWB_MYNN_FIDELITY"]))
-        haskey(ENV, "SCYTHE_OWB_MYNN_KMAX") &&
-            (physical_params[:mynn_K_max] = parse(Float64, ENV["SCYTHE_OWB_MYNN_KMAX"]))
-    else
-        error("SCYTHE_OWB_BL must be louis | none | mynn, got \"$bl\"")
-    end
-
-    # Surface-exchange closure (src/mc_surface_layer.jl). Both are no-ops when unset:
-    # :komori without stability is the historical bulk formula, bitwise.
-    sfc_arm = get(ENV, "SCYTHE_OWB_SFC", "komori")
-    sfc_arm in ("komori", "gfdl_v7", "charnock") ||
-        error("SCYTHE_OWB_SFC must be komori | gfdl_v7 | charnock, got \"$sfc_arm\"")
-    sfc_arm == "komori" || (options[:sfc_z0] = Symbol(sfc_arm))
-    if haskey(ENV, "SCYTHE_OWB_SFC_STAB") && envflag("SCYTHE_OWB_SFC_STAB")
-        options[:sfc_stability] = true
-    end
-
-    haskey(ENV, "SCYTHE_OWB_CTRANS") &&
-        (options[:condensate_transform] = Symbol(ENV["SCYTHE_OWB_CTRANS"]))
-    haskey(ENV, "SCYTHE_OWB_CMU") &&
-        (physical_params[:condensate_mu] = parse(Float64, ENV["SCYTHE_OWB_CMU"]))
-    haskey(ENV, "SCYTHE_OWB_RTRANS") &&
-        (options[:rain_transform] = Symbol(ENV["SCYTHE_OWB_RTRANS"]))
-    haskey(ENV, "SCYTHE_OWB_RMU") &&
-        (physical_params[:rain_mu] = parse(Float64, ENV["SCYTHE_OWB_RMU"]))
-    haskey(ENV, "SCYTHE_OWB_RAIN_MOMENTS") &&
-        (options[:rain_moments] = parse(Int, ENV["SCYTHE_OWB_RAIN_MOMENTS"]))
-    if haskey(ENV, "SCYTHE_OWB_ICE") && envflag("SCYTHE_OWB_ICE")
-        options[:ice_microphysics] = :ishmael
-        haskey(ENV, "SCYTHE_OWB_RAIN_MOMENTS") || (options[:rain_moments] = 2)
-        haskey(ENV, "SCYTHE_OWB_CTRANS") || (options[:condensate_transform] = :bhyp)
-        haskey(ENV, "SCYTHE_OWB_RTRANS") || (options[:rain_transform] = :bhyp)
-        options[:rain_number_transform] = :bhyp
-        options[:ice_transform] = :bhyp
-    end
-
-    rad_arm = get(ENV, "SCYTHE_OWB_RAD", "0")
-    if rad_arm != "0" && rad_arm != ""
-        options[:radiation] = :rrtmgp
-        if rad_arm == "lw"
-            options[:radiation_method] = :clearsky; options[:solar] = :none
-        elseif rad_arm == "allsky"
-            options[:radiation_method] = :allsky; options[:solar] = :none
-        elseif rad_arm == "sw"
-            options[:radiation_method] = :clearsky; options[:solar] = :fixed
-        elseif rad_arm == "allsky_sw"
-            options[:radiation_method] = :allsky; options[:solar] = :fixed
-        elseif rad_arm == "diurnal"
-            options[:radiation_method] = :allsky; options[:solar] = :diurnal
-            physical_params[:latitude] = 20.0
-            physical_params[:start_doy] = 240.0
-            physical_params[:start_hour] = 0.0
-        else
-            error("SCYTHE_OWB_RAD = \"$rad_arm\" is not an arm; use lw, allsky, sw, " *
-                  "allsky_sw, diurnal, or 0/unset")
-        end
-        # As for :mynn_output above: the OWB radiation diagnostics parse the mish-native
-        # sidecar, whose default flipped to OFF in N2, so the arm asks for it explicitly.
-        options[:radiation_output] = true
-        options[:radiation_forcing] = Symbol(get(ENV, "SCYTHE_OWB_RAD_FORCING", "full"))
-        options[:radiation_interval] = parse(Float64, get(ENV, "SCYTHE_OWB_RAD_INTERVAL", "300.0"))
-        options[:radiation_z_max] = parse(Float64, get(ENV, "SCYTHE_OWB_RAD_ZMAX", "17.0e3"))
-        physical_params[:sfc_albedo] = 0.06
-        physical_params[:sfc_emissivity] = 0.98
-        println("OWB radiation: arm=$rad_arm method=$(options[:radiation_method]) " *
-                "solar=$(options[:solar]) forcing=$(options[:radiation_forcing]) " *
-                "interval=$(options[:radiation_interval]) s z_max=$(options[:radiation_z_max]) m; " *
-                "radiative surface temperature = physical_params[:SST] = $OWB_SST K")
-    end
-
-    vars = Scythe.mc_var_names(options)
-    rain_name = Scythe.rain_var_name(options)
-    rain_number_name = Scythe.rain_number_var_name(options)
-    two_moment = Scythe.rain_moments(options) == 2
-    cloud_name = Scythe.condensate_var_name(options)
-    ice_on = Scythe.ice_microphysics(options) === :ishmael
-    ice_names = Scythe.ice_var_names(options)
-
-    output_dir = benchmark_output_dir("ocean_warm_bubble", opts)
-    # Lateral walls as O01 (no normal flow, free-slip scalars). Ground and lid: the TC's
-    # d2 condition by default -- a Neumann ground forces dp'/dz = 0 and drains a
-    # surface-flux-driven boundary layer (the TC root cause of 2026-07-21).
-    wall_mode = get(ENV, "SCYTHE_OWB_WALL_BC", "d2")
-    vert_scalar = wall_mode == "d2" ? Dict{String,Any}(v => SecondDerivativeBC() for v in vars) :
-                  wall_mode == "neumann" ? Dict{String,Any}(v => NeumannBC() for v in vars) :
-                  error("SCYTHE_OWB_WALL_BC must be d2 | neumann, got \"$wall_mode\"")
-    side_scalar = Dict{String,Any}(v => NeumannBC() for v in vars)
-    side_bc = merge(side_scalar, Dict{String,Any}("u" => DirichletBC(), "w" => DirichletBC()))
-    topbot_bc = merge(vert_scalar, Dict{String,Any}("w" => DirichletBC(), rain_name => NaturalBC()))
-    two_moment && (topbot_bc[rain_number_name] = NaturalBC())
-    if ice_on
-        for nm in ice_names
-            topbot_bc[nm] = NaturalBC()
-        end
-    end
-
-    positivity = Dict("rho_r" => Dict(:i => 0.0, :k => 0.0))
-    if rain_name != "rho_r"
-        delete!(positivity, "rho_r")
-        println("POSITIVITY: dropped \"rho_r\" — it is carried as a control variable")
-    end
-
-    grid_params = GridParameters(;
-        geometry = benchmark_geometry(opts),
-        iMin = 0.0,
-        iMax = OWB_WIDTH,
-        num_cells_i = num_cells_i,
-        kMin = 0.0,
-        kMax = kMax,
-        vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
-        l_q = Dict("default" => 2.0),
-        positivity = positivity,
-        BCL = side_bc,
-        BCR = side_bc,
-        BCB = topbot_bc,
-        BCT = topbot_bc,
-        vars = Dict(v => i for (i, v) in enumerate(vars)),
-    )
-
-    println("OWB: $(num_cells_i) x $(num_cells_k) cells ($(OWB_WIDTH / num_cells_i / 1000) km x " *
-            "$(kMax / num_cells_k) m), ts = $ts s, $(integration_time / 3600) h, output every " *
-            "$output_interval s; BL = $bl, SST = $OWB_SST K, wall BC = $wall_mode, " *
-            "sfc_z0 = $(get(options, :sfc_z0, :komori)), " *
-            "sfc_stability = $(get(options, :sfc_stability, false)); " *
-            "vars = $(join(vars, ' '))")
-
-    return ModelParameters(
-        ts = ts,
-        integration_time = integration_time,
-        output_interval = output_interval,
-        equation_set = "moist_compressible_XZ",
-        initial_conditions = joinpath(output_dir, "owb_ics.csv"),
-        output_dir = output_dir,
-        ref_state_file = joinpath(output_dir, "owb_exact.ref"),
-        grid_params = grid_params,
-        physical_params = physical_params,
-        options = options,
-    )
-end
-
-# ── Initial conditions (Dunion reference + wide RH-preserving bubble) ───────
-
-function owb_init!(model)
-    for f in readdir(model.output_dir)
-        endswith(f, "_physical.csv") && rm(joinpath(model.output_dir, f))
-    end
-
-    patch = createGrid(model.grid_params)
-    gridpoints = Scythe.getGridpoints(patch)
-    kDim = model.grid_params.kDim
-    z = gridpoints[1:kDim, 2]
-    column = Scythe.reference_column(patch, model.grid_params)
-
-    hydro = reference_state_hydrostatic()
-    ref_phys = Springsteel.calculate_pressure_reference_state(DUNION_SOUNDING, z, column;
-                                                             hydrostatic = hydro)
-    pbar = Springsteel.ref_pressure(ref_phys)[:, 1]
-    rho_dbar = Springsteel.ref_rho_d(ref_phys)[:, 1]
-    rho_vbar = Springsteel.ref_rho_v(ref_phys)[:, 1]
-    Scythe.write_exact_ref_mc(model.ref_state_file, z, pbar, rho_dbar, rho_vbar, zeros(kDim))
-    ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column;
-                                                     hydrostatic = hydro)
-    if get(reference_state_options(), :consistent_qss_reference, false)
-        ref = Scythe.consistent_qss_reference(ref, z, column)
-    end
-
-    rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
-    pbar_z = Springsteel.ref_pressure(ref)[:, 2]
-    residual = pbar_z .+ (Scythe.gravity .* rho_tbar)
-    T1 = pbar[1] / (rho_dbar[1] * Scythe.Rd + rho_vbar[1] * Scythe.Rv)
-    println("Reference: sfc p = $(round(pbar[1] / 100.0, digits=2)) hPa, ",
-            "max hydrostatic residual = $(maximum(abs.(residual))) Pa/m, ",
-            "T(z1) = $(round(T1, digits=2)) K vs SST $(get(model.physical_params, :SST, NaN)) K")
-
-    patch.physical .= 0.0
-    Scythe.moist_temperature_bubble_mc!(patch, gridpoints, ref;
-                                        xc = OWB_XC, xr = OWB_XR,
-                                        zc = OWB_ZC, zr = OWB_ZR, dT_max = OWB_DT)
-    Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
+    return set
 end
 
 # ── Surface-flux budget and boundary-layer rows ──────────────────────────────
@@ -588,22 +323,31 @@ function owb_diagnostics(model)
 end
 
 # ── Run ────────────────────────────────────────────────────────────────────
+#
+# `cfg` is built once here (not inside `owb_config_set`, which only computes overrides) so
+# both `build_model` and `initialize_case!`/the arm derivation below share the SAME
+# resolved config -- `build_model`'s own `validate(cfg)` call is what actually front-loads
+# the config errors, same as every other launcher.
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    model = owb_model(opts)
-    arm = Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""
+    cfg = load_config(OWB_CONFIG; set = owb_config_set(opts))
+    model = build_model(cfg)
+
+    # The arm tag (output/reference-CSV naming) is read off the RESOLVED config/options,
+    # not an env var -- it always describes what actually ran. `addarm` composes suffixes
+    # the same way the legacy env-var arms did, so existing arm-qualified reference CSVs
+    # (owb_default has none committed; this is for future --update-reference runs) keep
+    # their naming convention.
     addarm(a, s) = isempty(s) ? a : (isempty(a) ? s : "$(a)_$(s)")
-    bl_arm = get(ENV, "SCYTHE_OWB_BL", "louis")
-    bl_arm == "louis" || (arm = addarm(arm, bl_arm))
+    arm = Scythe.ice_microphysics(model.options) === :ishmael ? "ice" : ""
+    bl = cfg.physics.boundary_layer.scheme
+    bl === :mynn || (arm = addarm(arm, String(bl)))
     get(model.options, :mynn_edmf, 0) == 1 && (arm = addarm(arm, "edmf"))
     # Anything that is not the MODEL DEFAULT fidelity gets its own suffix (`_fid_<names>`),
-    # so it never looks up the default arm's expected values. No `let` here: a `let` is a
-    # HARD scope, so an `arm` assigned inside one would never leave it.
-    # The default is the `:scythe` bundle (2026-09-23), so an absent key -- and an explicit
-    # `:scythe`, which is the same run -- carries NO suffix, while the verbatim-Fortran
-    # control is now a named arm and gets `_fid_fortran`. A deviation list gets
-    # `_fid_<names joined by _>`, with `:scythe` inside a list joining as `scythe`; an EMPTY
-    # list resolves to `:fortran` and is labelled as such.
+    # so it never looks up the default arm's expected values. The default is the `:scythe`
+    # bundle, so an absent key -- and an explicit `:scythe`, which is the same run --
+    # carries NO suffix, while the verbatim-Fortran control gets `_fid_fortran`. A
+    # deviation list gets `_fid_<names joined by _>`; an EMPTY list resolves to `:fortran`.
     mynn_fid = get(model.options, :mynn_fidelity, :scythe)
     (mynn_fid isa AbstractVector && isempty(mynn_fid)) && (mynn_fid = :fortran)
     if mynn_fid isa Symbol
@@ -611,14 +355,25 @@ if abspath(PROGRAM_FILE) == @__FILE__
     elseif mynn_fid isa AbstractVector
         arm = addarm(arm, "fid_" * join(string.(mynn_fid), "_"))
     end
-    # A non-default SURFACE choice gets its own suffix, so the committed komori control and a
+    # A non-default SURFACE choice gets its own suffix, so a komori/non-stability run and a
     # gfdl_v7/charnock or stability arm never look up the same expected values.
     arm = addarm(arm, get(model.options, :sfc_z0, :komori) === :komori ? "" :
                       String(model.options[:sfc_z0]))
     get(model.options, :sfc_stability, false) && (arm = addarm(arm, "stab"))
+
     passed = run_benchmark("ocean_warm_bubble", opts;
                            model = model,
-                           init! = owb_init!,
+                           init! = function (m)
+                               # The output directory is REUSED across runs (a fixed name
+                               # from `benchmark_output_dir`); clear stale snapshot output
+                               # before writing fresh initial conditions, as the legacy
+                               # `owb_init!` did, so a re-run never mixes old and new
+                               # `_physical.csv` files.
+                               isdir(m.output_dir) && for f in readdir(m.output_dir)
+                                   endswith(f, "_physical.csv") && rm(joinpath(m.output_dir, f))
+                               end
+                               initialize_case!(cfg, m)
+                           end,
                            diagnostics = owb_diagnostics,
                            varnames = Scythe.mc_var_names(model.options),
                            plotter = nothing,
