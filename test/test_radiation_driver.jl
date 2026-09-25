@@ -2,6 +2,12 @@ using Test
 using Scythe
 using Springsteel
 using SparseArrays
+# RRTMGP and ClimaComms are WEAK dependencies of Scythe (ext/ScytheRRTMGPExt.jl): the root
+# project cannot `using` them, test/Project.toml (a workspace member sharing the root
+# Manifest.toml) can. Section 10 builds an `:rrtmgp` tile, which needs the extension.
+@__DIR__() in LOAD_PATH || push!(LOAD_PATH, @__DIR__)
+import RRTMGP, ClimaComms   # `import`: loads both (and so the extension) without
+                             # splatting their exports into the shared test Main
 
 # Driver-level tests for the radiation plumbing (S2a): the `ModelTile.radiation` field
 # and its setup (`mc_radiation_state`), the once-per-step pre-pass and its cadence
@@ -1054,6 +1060,57 @@ using SparseArrays
                 @test -4.0 < rs.q_lw_ref[k5] * f5 < -1.0
             end
         end
+    end
+
+    # ──────────────────────────────────────────────
+    # 11. The RRTMGP extension is required, and named when absent
+    # ──────────────────────────────────────────────
+    #
+    # This process has loaded RRTMGP (above), so the refusal can only be observed in a
+    # FRESH process that never does: a subprocess on the root project, which cannot load
+    # RRTMGP at all (it is a weak dependency). `mc_radiation_state` runs the guard straight
+    # after option validation, before it touches the tile, so `tile = tilepoints =
+    # nothing` is enough to reach it -- and proves no stub is reached first.
+    @testset "RRTMGP extension: loaded here, refused by name when absent" begin
+        @test Scythe.rrtmgp_extension_loaded()
+        @test Base.get_extension(Scythe, :ScytheRRTMGPExt) !== nothing
+
+        script = raw"""
+            using Scythe, Springsteel
+            print("LOADED=", Scythe.rrtmgp_extension_loaded(), ";")
+            gp = GridParameters(geometry = "RiRk", iMin = 0.0, iMax = 150.0e3,
+                num_cells_i = 4, kMin = 0.0, kMax = 25.0e3, num_cells_k = 20,
+                vars = Dict("u" => 1))
+            model = ModelParameters(ts = 0.3, equation_set = "moist_compressible_XZ",
+                grid_params = gp,
+                options = Dict{Symbol,Any}(:radiation => :rrtmgp,
+                                           :radiation_method => :clearsky))
+            try
+                Scythe.mc_radiation_state(model, nothing, nothing)
+                print("MODEL=no error;")
+            catch err
+                print("MODEL=", sprint(showerror, err), ";")
+            end
+            try
+                Scythe.standard_extension(:tropical, 5, 25.0e3)
+                print("DIRECT=no error")
+            catch err
+                print("DIRECT=", sprint(showerror, err))
+            end
+            """
+        root = dirname(@__DIR__)
+        cmd = `$(Base.julia_cmd()) --startup-file=no --project=$root -e $script`
+        out = read(pipeline(cmd; stderr = devnull), String)
+        @test occursin("LOADED=false;", out)
+        msg = "radiation = rrtmgp requested but the RRTMGP extension is not loaded: " *
+              "add `using RRTMGP, ClimaComms` before building the model"
+        model_part = match(r"MODEL=(.*?);DIRECT=", out)
+        @test model_part !== nothing && occursin(msg, model_part.captures[1])
+        # A direct call of a stub (here `_standard_profile`, via `standard_extension`)
+        # is a MethodError, carrying the same message as its hint.
+        direct = match(r"DIRECT=(.*)"s, out)
+        @test direct !== nothing && occursin("MethodError", direct.captures[1]) &&
+              occursin(msg, direct.captures[1])
     end
 
 end

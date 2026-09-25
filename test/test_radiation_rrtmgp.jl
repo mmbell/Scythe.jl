@@ -1,10 +1,14 @@
-# ── Tests for src/radiation_rrtmgp.jl (the RRTMGP half of the radiation driver) ─
+# ── Tests for the RRTMGP half of the radiation driver ─────────────────────────
+#
+# ext/ScytheRRTMGPExt.jl (the package extension) and src/radiation_profiles.jl (its
+# library-free half).
 #
 # Three tiers, by what they need:
 #
 #   1. PURE. `standard_extension`, `model_ozone`, `default_gases` and
 #      `radiation_divergence!` need no solver at all (the standard atmosphere is
-#      analytic and ships in the package). Always run.
+#      analytic and ships in the package -- though sampling it goes through
+#      `RRTMGP.standard_atmosphere`, so the extension must be loaded). Always run.
 #   2. GRAY. `GrayRadiation` uses no lookup tables and downloads no artifacts,
 #      so the whole construct-write-solve-store path can be exercised on a
 #      machine with no network. Always run.
@@ -15,17 +19,22 @@
 #
 # Run standalone with:
 #   julia -t 4 --project=. -e 'using Test, Scythe, Springsteel; include("test/test_radiation_rrtmgp.jl")'
+# (the file pushes test/ onto LOAD_PATH itself, so the root project suffices).
 
 using Test
 using Scythe
 using Springsteel
 
-# `src/radiation_rrtmgp.jl` is included by `src/Scythe.jl` in a normal build.
-# Loading it here as well would redefine its `const`s; the guard makes the file
-# runnable both before and after that include line lands.
-if !isdefined(Scythe, :rrtmgp_solver)
-    Scythe.include(joinpath(dirname(pathof(Scythe)), "radiation_rrtmgp.jl"))
-end
+# RRTMGP and ClimaComms are WEAK dependencies of Scythe: the root project cannot
+# `using` them, but test/Project.toml (a workspace member that shares the root
+# Manifest.toml, so the versions are the ones Scythe's extension was resolved against)
+# can. Loading both is what loads ext/ScytheRRTMGPExt.jl.
+@__DIR__() in LOAD_PATH || push!(LOAD_PATH, @__DIR__)
+import RRTMGP, ClimaComms   # `import`: loads both (and so the extension) without
+                             # splatting their exports into the shared test Main
+Scythe.rrtmgp_extension_loaded() ||
+    error("test_radiation_rrtmgp: RRTMGP and ClimaComms are loaded but the " *
+          "ScytheRRTMGPExt extension is not")
 
 const SR = Scythe
 
@@ -51,15 +60,15 @@ end
     @testset "rrtmgp_context is cached and CPU-multithreaded" begin
         ctx = SR.rrtmgp_context()
         @test ctx === SR.rrtmgp_context()
-        @test Scythe.ClimaComms.device(ctx) isa Scythe.ClimaComms.CPUMultiThreaded
+        @test ClimaComms.device(ctx) isa ClimaComms.CPUMultiThreaded
     end
 
     @testset "rrtmgp_method mapping" begin
-        @test SR.rrtmgp_method(:gray) isa Scythe.RRTMGP.GrayRadiation
-        @test SR.rrtmgp_method(:clearsky) isa Scythe.RRTMGP.ClearSkyRadiation
-        @test SR.rrtmgp_method(:allsky) isa Scythe.RRTMGP.AllSkyRadiation
+        @test SR.rrtmgp_method(:gray) isa RRTMGP.GrayRadiation
+        @test SR.rrtmgp_method(:clearsky) isa RRTMGP.ClearSkyRadiation
+        @test SR.rrtmgp_method(:allsky) isa RRTMGP.AllSkyRadiation
         @test SR.rrtmgp_method(:allsky_clear) isa
-              Scythe.RRTMGP.AllSkyRadiationWithClearSkyDiagnostics
+              RRTMGP.AllSkyRadiationWithClearSkyDiagnostics
         @test_throws ErrorException SR.rrtmgp_method(:nonsense)
     end
 
@@ -276,13 +285,13 @@ end
         # input gets an immediate, named error instead of a plausible answer.
         ext = SR.standard_extension(:tropical, 5, 25.0e3)
         z_face = collect(range(0.0, 25.0e3; length = 21))
-        was = Scythe.RRTMGP.check_values[]
+        was = RRTMGP.check_values[]
         try
             sol = SR.rrtmgp_solver(20, ext, 1, :gray, :none, true;
                                    z_face = z_face)
-            @test_throws ErrorException Scythe.RRTMGP.update_fluxes!(sol)
+            @test_throws ErrorException RRTMGP.update_fluxes!(sol)
         finally
-            Scythe.RRTMGP.check_values[] = was
+            RRTMGP.check_values[] = was
         end
     end
 

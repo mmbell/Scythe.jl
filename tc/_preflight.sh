@@ -38,7 +38,7 @@ println("  Springsteel : required symbols present")
 # RRTMGP lookup-table artifacts (S6, plan D8). CHECK-ONLY -- this never triggers a
 # download (that is tools/rrtmgp_prewarm.jl, meant for a LOGIN NODE with network
 # access); it only asserts the artifacts RRTMGP.jl downloads lazily on first use are
-# already local. RRTMGP.lookup_tables (radiation_rrtmgp.jl) would trigger the download
+# already local. RRTMGP.lookup_tables (ext/ScytheRRTMGPExt.jl) would trigger the download
 # itself if the files are missing, which is exactly the failure mode this guards
 # against: a compute node with no network, twenty minutes into a queued job, hanging
 # or erroring on the first radiation call instead of failing here in seconds.

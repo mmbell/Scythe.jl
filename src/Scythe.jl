@@ -146,16 +146,22 @@ include("radiation_cloud_optics.jl")
 # thermodynamic helpers (`recover_rho_c`, `recover_total`, `retrieve_temperature`, the
 # transform-mode accessors) to reconstruct a column — a radiation column that disagreed with
 # `mc_driver!` about what the cloud IS would put that disagreement into the heating field.
-# radiation.jl names no radiative-transfer library at all; radiation_rrtmgp.jl is the ONE
-# file that names RRTMGP/ClimaComms, and it is included after it so the driver's interface
-# calls resolve. radiation_io.jl (S5, the sidecar NetCDF writer/reader) follows immediately:
-# it is the SECOND of the two files that name NCDatasets (radiation_rrtmgp.jl names it only
-# to trigger RRTMGP's NCDatasets extension; radiation_io.jl is the one that actually reads
-# and writes with it) and defines `radiation_write!`/`radiation_write_final!`, which
-# `radiation_prepass!` above calls by name only at RUNTIME, so the include order relative to
-# radiation.jl does not matter for those two — it matters for RRTMGP/ClimaComms above.
+# No file under src/ names RRTMGP or ClimaComms: they are WEAK dependencies, and the code
+# that names them is the package extension ext/ScytheRRTMGPExt.jl, which Julia loads after
+# Scythe once `using RRTMGP, ClimaComms` has run. radiation.jl declares the extension's
+# functions as method-less stubs (`function rrtmgp_solver end`, ...) and the guard that
+# refuses a `:rrtmgp` model without it; radiation_profiles.jl follows with the library-free
+# half of the RRTMGP path (profile constants and caches, the stratospheric extension, ozone,
+# gases, the column-write loops, `radiation_divergence!`). Every cross-reference among the
+# three (and into the extension) is a call resolved at RUNTIME, so their relative order is
+# not load-bearing; radiation.jl first keeps the stubs beside the interface description.
+# radiation_io.jl (S5, the sidecar NetCDF writer/reader) follows: it is the one radiation
+# file that reads and writes with NCDatasets (the extension imports NCDatasets only to
+# trigger RRTMGP's own NCDatasets extension) and defines
+# `radiation_write!`/`radiation_write_final!`, which `radiation_prepass!` above also calls
+# by name only at runtime.
 include("radiation.jl")
-include("radiation_rrtmgp.jl")
+include("radiation_profiles.jl")
 include("radiation_io.jl")
 include("mynn_io.jl")
 # The comprehensive NetCDF analysis writer (Stage N1). After mynn_io.jl because it is
@@ -229,6 +235,14 @@ function integrate_model(model::ModelParameters)
     wait(get_from(workers()[1], :(close(out))))
     wait(get_from(workers()[1], :(close(err))))
     println("All done!")
+end
+
+# Runtime-only registrations (not precompilable): the MethodError hint that names the
+# missing `using RRTMGP, ClimaComms` when an RRTMGP-extension stub is called without it
+# (src/radiation.jl).
+function __init__()
+    _register_rrtmgp_error_hint()
+    return nothing
 end
 
 # Module end
