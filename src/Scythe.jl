@@ -52,7 +52,7 @@ function integrate_model(model::ModelParameters)
     wait(get_from(workers()[1], :(redirect_stdout(out))))
     wait(get_from(workers()[1], :(redirect_stderr(err))))
     
-    wait(save_at(workers()[1], :patch, :(initialize_model($(model),workers()))))
+    wait(save_at(workers()[1], :patch, :(@time initialize_model($(model),workers()))))
     wait(get_from(workers()[1], :(@time run_model(patch, model, workers()))))
     wait(get_from(workers()[1], :(finalize_model(patch,model))))
     

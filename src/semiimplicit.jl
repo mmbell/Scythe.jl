@@ -188,6 +188,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
     map(wait, [remove_from(w, :patch) for w in workerids[2:length(workerids)]])
 
     println("Ready for time integration!")
+    println("Time to complete initialize_model()")
     flush(stdout)
     return patch
 end
@@ -251,6 +252,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     patch.spectral .= get_val_from(workerids[1],:(mtile.patchSpectral))
     tileTransform!(patch.splines, patch.spectral, model.grid_params, patch, allocateSplineBuffer(patch,patch))
     println("Done with time integration")
+    println("Time to complete run_model()")
     return true
 
 end
