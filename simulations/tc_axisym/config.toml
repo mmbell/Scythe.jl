@@ -1,33 +1,108 @@
-# Axisymmetric tropical cyclone: 3-nest RiRk r-z domain, coarse grid, ice on (production).
-# Only keys that differ from the RunConfig struct defaults (src/config.jl) are listed; the
-# full resolved configuration is written to <output.dir>/config.toml at run start.
+# Axisymmetric tropical cyclone: a 3-nest RiRk radius-height domain on the coarse grid,
+# production physics with ice.
+#
+# The case definition (run, output, grid, timestep, reference state, initial conditions and
+# environment) is written out IN FULL below, even where a value equals the RunConfig struct
+# default, so the nests, resolution, timestep, sounding, vortex and SST/f can be read here
+# without opening src/config.jl. Physics, numerics and diagnostics are DELTA-ONLY: the
+# struct defaults ARE the production moist-compressible physics, and a key is listed only
+# where the TC differs. What those defaults give:
+#
+#   microphysics     ISHMAEL ice + two-moment rain (rain_moments = 0 -> 2 under ice), bhyp
+#                    control variables on every water slot (non-negative by construction)
+#   boundary layer   MYNN level 2.5, fidelity "scythe" (gtr_local, exner_single, pdk1, plus
+#                    rmol_sfc under the stability option), EDMF off (a no-op on the TC)
+#   surface          Komori wind-dependent drag (Cd < 0), Ck = 1e-3, U_min = 2 m/s,
+#                    Monin-Obukhov stability on
+#   radiation        RRTMGP all-sky, diurnal sun at 20 N / day 240, t = 0 at local midnight
+#                    (sunrise near h12, so the first day holds both halves of the cycle);
+#                    heating tapered to zero at the sponge onset (z_max = 0 -> z_damp)
+#   sponge           Durran & Klemp (1983), alpha = 0.02 s^-1 above 17 km (stratosphere only)
+#   numerics         d2 lateral walls, natural lid BC for the sedimenting species,
+#                    state-dependent vertical SI (implicit acoustic coefficients from the
+#                    current column: no convective SI ceiling), spline filter l_q = 2
+#
+# The full resolved configuration is written to <output.dir>/config.toml at run start.
 # Overlays: fine.toml (3 km / 300 m grid), rlr.toml (3-D cylindrical RLR geometry).
+# Launch: simulations/tc_axisym/run.jl (local) or scythe_tc*.sbatch; see README.md.
 
 [run]
 name             = "tc_axisym"
 equation_set     = "moist_compressible_axisym"
-integration_time = 432000.0          # 5 days
-segment_length   = 86400.0           # 1-day segments; restart granularity (replaces --restart T)
+integration_time = 432000.0          # [s] 5 days: axisymmetric spin-up from a cold start takes days
+segment_length   = 86400.0           # [s] 1-day segments = restart granularity (--resume)
 
 [output]
-dir = "output"                       # relative to this file
+dir                = "output"        # relative to this file; the sbatch jobs set a per-job tree
+interval           = 3600.0          # [s] hourly analysis output
+restart_interval   = 21600.0         # [s] 6-hourly JLD2 checkpoints (must be > 0 with segments)
+formats            = ["netcdf"]      # add "csv" for the replay harness / mynn_dump_columns.jl
+sidecars           = false           # per-tile MYNN / radiation NetCDF sidecars
+netcdf_grid        = "regular"
+netcdf_derivatives = false
 
 [grid]
 # "coarse" = 10|20|40 km radial cells x 500 m vertical cells, 25 km lid. Axisymmetric
-# spin-up from a cold start takes DAYS, and the fine grid runs at ~1x real time. 500 m
-# stays within a factor two of the 250-300 m the BL/surface schemes were built at (the
-# surface flux is delivered over the lowest cell, so cell depth scales its spreading).
-lateral    = "walls"                 # axis + outer wall (the only choice for cylindrical sets)
-boundaries = [0.0, 150.0e3, 450.0e3, 1050.0e3]
-num_cells  = [15, 15, 15]
+# spin-up from a cold start takes DAYS, and the fine grid (fine.toml) runs at ~1x real
+# time. The vertical spacing is a compromise: a 1 km-cell version spun up but blew up on
+# the axis column at 8 h, and the surface flux is delivered as a flux divergence over the
+# LOWEST cell, so cell depth scales how it is spread; 500 m stays within a factor two of
+# the 250-300 m the BL/surface schemes were built at.
+geometry    = "RiRk"
+lateral     = "walls"                # axis + outer wall (the only choice for cylindrical sets)
+boundaries  = [0.0, 150.0e3, 450.0e3, 1050.0e3]   # [m] three nests, innermost first
+num_cells   = [15, 15, 15]           # 10 | 20 | 40 km radial cells
+z_top       = 25.0e3                 # [m]
+num_cells_k = 50                     # 500 m vertical cells
+
+[timestep]
+# 0.5 s on every patch. The d2 lateral-wall BC sets a measured SI ceiling of ~0.75 s
+# (reference/SI_WALL_BC_CEILING.md); ts = 1.0 sat above it and produced spurious cooling.
+# 0.5 is validated over 12 h. The explicit horizontal acoustic limit (3.31 s coarse) is
+# the next ceiling after that.
+ts           = 0.5                   # [s] root (coarsest) patch
+ts_per_patch = []                    # empty = every patch at ts
+scale        = 1.0                   # multiplies every step (timestep sweeps)
+
+[reference_state]
+sounding       = "@scythe/benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref"
+exact          = true                # pre-balance the reference state on the model grid
+consistent_qss = true                # reference Q_ss consistent with the discrete retrieval
+hydrostatic    = true                # discretely hydrostatic reference
 
 [initial_conditions]
-# RE87 (Rotunno & Emanuel 1987) eq. (37) vortex, gradient-wind + hydrostatically balanced
-# on the model's own mish (balanced_vortex_native!). The [initial_conditions.balanced_vortex]
-# struct defaults ARE the TC values: r_0 widened to 800 km (zero negative-PV points at
-# f = 15 N), z_barotropic MUST stay 0 (nonzero => symmetrically unstable PV), and a moist
-# inner core (rh_bl 0.90 drops CIN so an axisymmetric domain with no asymmetries can trigger).
+# RE87 (Rotunno & Emanuel 1987, JAS 44) eq. (37) vortex, gradient-wind + hydrostatically
+# balanced on the model's own mish (balanced_vortex_native!).
 method = "balanced_vortex"
+
+[initial_conditions.balanced_vortex]
+# re87, not modified Rankine: Rankine (alpha 0.3) is not compact -- v was still 12 m/s at
+# the domain edge, its thermal-wind warm anomaly reached +6.9 K at the surface and put the
+# surface air ABOVE the SST, reversing the air-sea fluxes. RE87's cubic falloff with an
+# exact zero at r_0 keeps the anomaly to +1.6-1.9 K and is PV-stable with no barotropic layer.
+profile       = "re87"
+v_m           = 15.0                 # [m/s] -> v_max ~ 12.9 m/s, matching RE87's ~12
+r_m           = 82.5e3               # [m] radius of maximum wind (RE87 control value)
+r_0           = 800.0e3              # [m] widened from RE87's 412.5 km: at f(15 N) the compact
+                                     # vortex's anticyclonic outer vorticity made f + zeta < 0
+                                     # (4546 negative-PV points); 800 km gives zero
+v_top         = 15.0e3               # [m] winds decay linearly to zero here
+z_barotropic  = 0.0                  # [m] MUST stay 0: a barotropic layer compressed the decay,
+                                     # drove dry Ertel PV negative (symmetrically unstable)
+rh_core       = 0.95                 # free-troposphere RH in the moist core (no CAPE cost)
+rh_bl         = 0.90                 # boundary-layer RH: drops CIN to ~12 J/kg and the LFC to
+                                     # ~0.45 km -- an axisymmetric domain has no asymmetries to
+                                     # trigger convection; with it off an 8 h run stayed quiescent
+z_bl          = 1.5e3                # [m] top of the boundary-layer RH target
+r_moist       = 150.0e3              # [m] Gaussian radial e-folding of the moist core
+z_moist       = 10.0e3               # [m] cosine taper to the environment above this
+rh_max        = 0.98                 # never initialize at or above saturation
+moist_profile = "vortex"             # weight by the surface wind: moisture at the RMW, dry eye
+
+[environment]
+f_latitude = 15.0                    # [deg] f = 2 Omega sin(15 N) = 3.775e-5 s^-1
+sst        = 302.65                  # [K] 29.5 C: keeps SST - T_air > 0 at every radius
+                                     # (~0.7 K margin over the vortex's own warm anomaly)
 
 [physics.horizontal_mixing]
 # An axisymmetric TC has no asymmetries to provide radial mixing, so the resolved radial

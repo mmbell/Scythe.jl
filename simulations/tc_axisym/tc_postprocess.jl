@@ -5,13 +5,21 @@
 # products. A run made since then writes a comprehensive `<t>.nc` per nest directly
 # (options[:output_formats] default [:netcdf]) with everything this script derives
 # already in it (same names/units) plus the physics groups (BL, radiation, surface) --
-# nothing to run here, and tc/tc_movie.jl reads that file natively. This script now
+# nothing to run here, and tc_movie.jl reads that file natively. This script now
 # REFUSES to touch a comprehensive file (see the scythe_file_kind check below); it stays
 # for the runs on disk from before the change.
 #
-#   julia --project=. tc/tc_postprocess.jl [--indir DIR] [--nests n1,n2,...]
-#                                          [--ref REFFILE] [--N0 8e6] [--Nc 100]
-#                                          [--legacy-qss]
+#   julia --project=. simulations/tc_axisym/tc_postprocess.jl --root <run root>
+#         [--nests 1,2,...] [--ref REFFILE] [--N0 8e6] [--Nc 100] [--legacy-qss]
+#
+# `--root` is a run root: a simulations/tc_axisym/run.jl tree (`<root>/segments.csv`,
+# `<root>/seg_NN/nest{i}/`, `<root>/reference.ref`; raw snapshots there are `<t>_raw.nc`,
+# written when `output.formats` includes "netcdf_raw") or a legacy tc/tc_run_axisym.jl tree
+# (`<root>/nest{i}/<t>.nc`, `<root>/tc_exact.ref`). `--indir` is an alias of `--root`.
+# Segments are processed in order; each derived file's `time` is the run's ABSOLUTE time
+# (t_offset_s + the segment-local t), and each later segment's duplicate t = 0 snapshot is
+# skipped (tc_run_io.jl). The legacy reconstruction below predates the prognostic-rho_c
+# and ice control variables; on a current-physics raw file expect it to need updating.
 #
 # The raw <t>.nc snapshots written by a run carry only the PROGNOSTIC control
 # variables, and the moist-compressible set stores most of them as PERTURBATIONS
@@ -19,7 +27,7 @@
 # u, w, v, rho_r are full). This script, for every snapshot in each nest:
 #
 #   1. reconstructs the z-only reference profiles on the netCDF's regular z grid
-#      by fitting the run's own reference column (from <indir>/tc_exact.ref) and
+#      by fitting the run's own reference column (from <root>/reference.ref) and
 #      evaluating the B-spline with SItransform — so background(z_reg) is exactly
 #      the model's reference spline, not an ad-hoc interpolation;
 #   2. adds the background back to recover the TOTAL control fields;
@@ -30,7 +38,7 @@
 #      (monodisperse cloud) and rho_r (exponential Marshall-Palmer rain), and a
 #      rain rate from rho_r and the Ooyama (2001) terminal fall speed.
 #
-# Each <t>.nc becomes <t>_derived.nc in the same nest directory, holding the
+# Each raw <t>.nc (<t>_raw.nc) becomes <t>_derived.nc in the same nest directory, holding the
 # primes, the reconstructed totals, the carried full fields, and the derived
 # products (T, rho_v, rho_c, reflectivity, rain_rate). Derivatives of the
 # control variables are passed through if present; derived products carry none.
@@ -51,16 +59,16 @@
 # onto the regular grid, plus the resolved-option/counter scalars as `mynn_*` global
 # attributes. A run without MYNN sidecars produces exactly the file it always did.
 #
-# The input directory is configurable; it defaults to the axisymmetric TC run.
 
 using Scythe
 using Springsteel
 using NCDatasets
+include(joinpath(@__DIR__, "tc_run_io.jl"))
 
 # ── Arguments ────────────────────────────────────────────────────────────────
-indir  = joinpath(@__DIR__, "output", "tc_axisym")
-nests  = String[]                       # empty => auto-detect nest subdirectories
-reffile = nothing                       # default: <indir>/tc_exact.ref
+indir  = ""                             # the run root (--root / --indir)
+nests  = Int[]                          # empty => every patch of the run
+reffile = nothing                       # default: <root>/reference.ref (legacy: tc_exact.ref)
 N0 = 8.0e6                               # [m^-4] Marshall-Palmer rain intercept
 Nc_cm3 = 100.0                           # [cm^-3] monodisperse cloud droplet count
 legacy_qss = false                       # --legacy-qss: for runs made BEFORE
@@ -68,8 +76,8 @@ legacy_qss = false                       # --legacy-qss: for runs made BEFORE
 let i = 1
     while i <= length(ARGS)
         a = ARGS[i]
-        if a == "--indir";      global indir = ARGS[i+1];  i += 2
-        elseif a == "--nests";  global nests = split(ARGS[i+1], ","); i += 2
+        if a in ("--root", "--indir"); global indir = ARGS[i+1];  i += 2
+        elseif a == "--nests";  global nests = parse.(Int, replace.(split(ARGS[i+1], ","), "nest" => "")); i += 2
         elseif a == "--ref";    global reffile = ARGS[i+1]; i += 2
         elseif a == "--N0";     global N0 = parse(Float64, ARGS[i+1]); i += 2
         elseif a == "--Nc";     global Nc_cm3 = parse(Float64, ARGS[i+1]); i += 2
@@ -78,16 +86,23 @@ let i = 1
         end
     end
 end
-isdir(indir) || error("Input directory not found: $indir")
-reffile === nothing && (reffile = joinpath(indir, "tc_exact.ref"))
+isempty(indir) && error("--root <run root> is required")
+indir = abspath(indir)
+isdir(indir) || error("Run root not found: $indir")
+reffile === nothing && (reffile = tc_reference_file(indir))
 isfile(reffile) || error("Reference-state file not found: $reffile")
+isempty(nests) && (nests = collect(1:tc_npatches(indir)))
 
-# A RAW snapshot is `<t>.nc` and nothing else. The whole name must be a number plus the
-# extension: a leading-digit test alone also matches this script's own `<t>_derived.nc`
-# and, since S5, the radiation sidecars `<t>_radiation_i<offset>.nc` — and the latter then
-# reach `parse(Float64, ...)` as "0.0_radiation_i0", which is not a time.
-const RAW_SNAPSHOT_RE = r"^[0-9]+(\.[0-9]+)?\.nc$"
+# A RAW snapshot: `<t>_raw.nc` (the driver's "netcdf_raw" format) or, in a legacy tree,
+# `<t>.nc` -- the whole name a number plus the extension: a leading-digit test alone also
+# matches this script's own `<t>_derived.nc` and the radiation/MYNN sidecars
+# `<t>_radiation_i<offset>.nc`, which then reach `parse(Float64, ...)` as not-a-time.
+# In a segment-driver tree the comprehensive file owns `<t>.nc`, so only `<t>_raw.nc` is raw
+# there; a legacy tree's raw snapshots are `<t>.nc` (and a comprehensive one is refused below).
+const RAW_SNAPSHOT_RE = is_segmented_root(indir) ? r"^([0-9]+(?:\.[0-9]+)?)_raw\.nc$" :
+                                                   r"^([0-9]+(?:\.[0-9]+)?)\.nc$"
 israw(f) = occursin(RAW_SNAPSHOT_RE, f)
+snaptag(f) = match(RAW_SNAPSHOT_RE, f).captures[1]
 
 # LIVE FOOTGUN without this: RAW_SNAPSHOT_RE also matches the model's own comprehensive
 # <t>.nc (same "<number>.nc" name), and this script would then treat its `p` variable
@@ -100,9 +115,9 @@ function check_not_comprehensive(path)
     end
     kind == "comprehensive" && error(
         "$(path) is already a comprehensive Scythe NetCDF file " *
-        "(scythe_file_kind = \"comprehensive\") -- tc/tc_postprocess.jl is LEGACY, for " *
+        "(scythe_file_kind = \"comprehensive\") -- tc_postprocess.jl is LEGACY, for " *
         "pre-comprehensive raw snapshots only. Use $(path) directly, or point " *
-        "tc/tc_movie.jl at $(dirname(path)); it reads comprehensive files natively and " *
+        "tc_movie.jl at the run root; it reads comprehensive files natively and " *
         "needs no postprocessing step.")
 end
 
@@ -117,16 +132,8 @@ has_mynn(ndir, tag) =
     any(f -> occursin(Regex("^" * Base.escape_string(tag) * raw"_mynn_i[0-9]+\.nc$"), f),
         readdir(ndir))
 
-# Auto-detect nests: subdirectories that contain at least one raw snapshot.
-if isempty(nests)
-    for d in sort(readdir(indir))
-        full = joinpath(indir, d)
-        isdir(full) || continue
-        any(israw, readdir(full)) && push!(nests, d)
-    end
-    isempty(nests) && error("No nest subdirectories with raw .nc snapshots under $indir")
-end
-println("Postprocessing $(length(nests)) nest(s) in $indir: $(join(nests, ", "))")
+println("Postprocessing nest(s) $(join(nests, ", ")) of $indir " *
+        "($(length(tc_segments(indir))) segment(s)), reference $reffile")
 
 # ── S-band Rayleigh reflectivity ──────────────────────────────────────────────
 # The implementation now lives in the MODEL (`Scythe.reflectivity_dBZ`, src/netcdf_output.jl),
@@ -298,7 +305,7 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
         NCDataset(outpath, "c") do out
             out.attrib["Conventions"] = "CF-1.12"
             out.attrib["title"] = "Scythe.jl moist-compressible derived products"
-            out.attrib["source"] = "tc/tc_postprocess.jl"
+            out.attrib["source"] = "simulations/tc_axisym/tc_postprocess.jl"
             haskey(ds.attrib, "history") && (out.attrib["source_history"] = ds.attrib["history"])
             out.attrib["reflectivity_N0_m4"] = N0
             out.attrib["reflectivity_Nc_cm3"] = Nc_cm3
@@ -522,42 +529,49 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
     end
 end
 
-# ── Drive over nests and snapshots ────────────────────────────────────────────
+# ── Drive over nests, segments and snapshots ──────────────────────────────────
 for nest in nests
-    ndir = joinpath(indir, nest)
-    raws = sort(filter(israw, readdir(ndir)),
-                by = f -> parse(Float64, replace(f, ".nc" => "")))
-    isempty(raws) && (println("  $nest: no snapshots, skipping"); continue)
-    # All snapshots of one run share the same scythe_file_kind; checking the first is
-    # enough to refuse a comprehensive-output run before any real work starts.
-    check_not_comprehensive(joinpath(ndir, raws[1]))
-
-    # Reference background from this nest's z grid (built once per nest)
     local bg, z_reg
-    NCDataset(joinpath(ndir, raws[1]), "r") do ds
-        z_reg = ds["z"][:]
-        bg = reference_background(ds["x"][:], z_reg)
-    end
+    have_bg = false
+    for (seg, ndir) in tc_nest_dirs(indir, nest)
+        raws = sort(filter(israw, readdir(ndir)), by = f -> parse(Float64, snaptag(f)))
+        # A later segment's t = 0 duplicates the previous segment's last snapshot.
+        seg.segment > 1 && filter!(f -> parse(Float64, snaptag(f)) != 0.0, raws)
+        isempty(raws) && (println("  nest$nest seg $(seg.segment): no raw snapshots, skipping"); continue)
+        # All snapshots of one run share the same scythe_file_kind; checking the first is
+        # enough to refuse a comprehensive-output run before any real work starts.
+        check_not_comprehensive(joinpath(ndir, raws[1]))
 
-    println("  $nest: $(length(raws)) snapshot(s)")
-    for f in raws
-        raw = joinpath(ndir, f)
-        out = joinpath(ndir, replace(f, ".nc" => "_derived.nc"))
-        tag = replace(f, ".nc" => "")
-        tsec = parse(Float64, tag)
-        # Merge the radiation sidecar when this snapshot has one (S5 runs only).
-        rad = has_radiation(ndir, tag) ? Scythe.read_radiation(ndir, tag) : nothing
-        # Merge the MYNN sidecar when this snapshot has one (S9 runs only).
-        mynn = has_mynn(ndir, tag) ? Scythe.read_mynn(ndir, tag) : nothing
-        s = process_snapshot(raw, out, bg, z_reg, tsec, rad, mynn)
-        refl_str = isfinite(s.max_refl) ? "$(round(s.max_refl;digits=1)) dBZ" : "no echo"
-        println("    t=$(round(Int, tsec)) s: " *
-                "T∈[$(round(s.Tmin;digits=1)),$(round(s.Tmax;digits=1))] K  " *
-                "max_refl=$(refl_str)  " *
-                "max_rain=$(round(s.max_rain;digits=2)) mm/hr  " *
-                "max_v=$(round(s.max_v;digits=1)) m/s" *
-                (isnan(s.olr_mean) ? "" :
-                 "  OLR=$(round(s.olr_mean;digits=1)) W/m²"))
+        # Reference background from this nest's z grid (built once per nest)
+        if !have_bg
+            NCDataset(joinpath(ndir, raws[1]), "r") do ds
+                z_reg = ds["z"][:]
+                bg = reference_background(ds["x"][:], z_reg)
+            end
+            have_bg = true
+        end
+
+        println("  nest$nest seg $(seg.segment) (t_offset $(seg.t_offset) s): " *
+                "$(length(raws)) snapshot(s)")
+        for f in raws
+            raw = joinpath(ndir, f)
+            tag = snaptag(f)
+            out = joinpath(ndir, tag * "_derived.nc")
+            tsec = seg.t_offset + parse(Float64, tag)     # absolute run time
+            # Merge the radiation sidecar when this snapshot has one (S5 runs only).
+            rad = has_radiation(ndir, tag) ? Scythe.read_radiation(ndir, tag) : nothing
+            # Merge the MYNN sidecar when this snapshot has one (S9 runs only).
+            mynn = has_mynn(ndir, tag) ? Scythe.read_mynn(ndir, tag) : nothing
+            s = process_snapshot(raw, out, bg, z_reg, tsec, rad, mynn)
+            refl_str = isfinite(s.max_refl) ? "$(round(s.max_refl;digits=1)) dBZ" : "no echo"
+            println("    t=$(round(Int, tsec)) s: " *
+                    "T∈[$(round(s.Tmin;digits=1)),$(round(s.Tmax;digits=1))] K  " *
+                    "max_refl=$(refl_str)  " *
+                    "max_rain=$(round(s.max_rain;digits=2)) mm/hr  " *
+                    "max_v=$(round(s.max_v;digits=1)) m/s" *
+                    (isnan(s.olr_mean) ? "" :
+                     "  OLR=$(round(s.olr_mean;digits=1)) W/m²"))
+        end
     end
 end
 println("Done. Derived files written as <t>_derived.nc alongside each snapshot.")

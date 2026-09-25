@@ -1,21 +1,26 @@
 #!/usr/bin/env julia
 # tc_bl_assess.jl — automated boundary-layer assessment from the comprehensive TC NetCDF.
 #
-# Reads every `<t>.nc` written directly by the model in `<indir>/nest<N>/` (one file per
-# output time, `scythe_file_kind = "comprehensive"`; see `src/netcdf_output.jl` and
-# `tc/MYNN_RUNS.md`) and prints (or writes as Markdown) the same tables that
-# `tc/output/S10_BL_ASSESSMENT.md` was built by hand: an hourly nest table, a provenance
-# block, and — with two or more `--indir`s — an options diff and a final-time comparison.
+# Reads every `<t>.nc` the model wrote for nest N of a run ROOT (simulations/tc_axisym/run.jl:
+# `<root>/seg_NN/nest<N>/<t>.nc`, stitched onto one time axis across segments by
+# tc_run_io.jl, each later segment's duplicate t = 0 dropped; a legacy tc/tc_run_axisym.jl
+# tree `<root>/nest<N>/` reads as one segment) and prints (or writes as Markdown) the tables
+# `tc/output/S10_BL_ASSESSMENT.md` was built by hand from: an hourly nest table, a
+# provenance block, and — with two or more `--root`s — a configuration diff and a
+# final-time comparison.
 #
-# This script reads NetCDF and log files only. It never runs the model.
+# This script reads NetCDF, CSV, TOML and log files only. It never runs the model.
 #
-# Usage:
-#   julia --project=. tc/tc_bl_assess.jl --indir <run> [--indir <run> ...] \
+# Usage (--project=., the root Scythe project, which carries NCDatasets):
+#   julia --project=. simulations/tc_axisym/tc_bl_assess.jl --root <run> [--root <run> ...] \
 #       [--nest 1] [--out <md path>] [--clamp-hist]
 #
-# With one --indir: single-run hourly table + provenance.
-# With two+ --indirs: each run's table, an options/physical_params diff between the first
-#   two runs' ModelParameters lines, and a final-time side-by-side comparison table.
+# (`--indir` is accepted as an alias of `--root`.)
+# With one --root: single-run hourly table + provenance.
+# With two+ --roots: each run's table, a diff of the first two runs' resolved configurations
+#   (`<root>/config.toml`, read with Scythe.load_config; legacy trees fall back to the
+#   options/physical_params of the `ModelParameters` log line), and a final-time
+#   side-by-side comparison table.
 # --out writes the report as Markdown to the given path; omitted, the report goes to stdout.
 # --clamp-hist adds a per-height histogram of the fraction of points sitting at the file's
 #   own min(e) * 1.05 — a cheap, approximate proxy for where the MYNN TKE floor clamp
@@ -23,9 +28,11 @@
 #   accumulated on the scheme's OWN mish over every internal sub-step, not on this
 #   regridded, single-snapshot field (see the `mynn_regridding` attribute).
 
+using Scythe
 using NCDatasets
 using Printf
 using Statistics
+include(joinpath(@__DIR__, "tc_run_io.jl"))
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -80,7 +87,7 @@ function parse_args(argv)
     i = 1
     while i <= length(argv)
         a = argv[i]
-        if a == "--indir"
+        if a == "--root" || a == "--indir"
             i += 1
             push!(indirs, argv[i])
         elseif a == "--nest"
@@ -93,11 +100,12 @@ function parse_args(argv)
             clamp_hist = true
         else
             error("tc_bl_assess.jl: unrecognized argument '$a'. " *
-                  "Usage: --indir <run> [--indir <run> ...] [--nest N] [--out path] [--clamp-hist]")
+                  "Usage: --root <run> [--root <run> ...] [--nest N] [--out path] [--clamp-hist]")
         end
         i += 1
     end
-    isempty(indirs) && error("tc_bl_assess.jl: at least one --indir is required")
+    isempty(indirs) && error("tc_bl_assess.jl: at least one --root is required")
+    indirs = abspath.(indirs)
     return indirs, nest, out, clamp_hist
 end
 
@@ -109,19 +117,23 @@ end
 # Opt-in sidecars are named "<t>_mynn_i<k>.nc" / "<t>_radiation_i<k>.nc" and must NOT match.
 const NC_RE = r"^([0-9]+(?:\.[0-9]+)?)\.nc$"
 
-function list_nc_files(nestdir)
+"""(absolute time, path) of every comprehensive `<t>.nc` of nest `nest` of the run at
+`root`, stitched across segments (tc_run_io.jl `tc_catalog`), sorted by time."""
+function list_nc_files(root, nest)
     out = Tuple{Float64,String}[]
-    isdir(nestdir) || return out
-    for f in readdir(nestdir)
-        m = match(NC_RE, f)
-        m === nothing && continue
-        push!(out, (parse(Float64, m.captures[1]), joinpath(nestdir, f)))
+    isdir(root) || return out
+    for (t, d) in tc_catalog(root; nests = [nest], re = NC_RE)
+        haskey(d, nest) && push!(out, (t, d[nest]))
     end
     sort!(out, by = x -> x[1])
     return out
 end
 
-nestdir(indir, nest) = joinpath(indir, "nest$(nest)")
+"The nest's directory in every segment, in order (a legacy tree has one)."
+nestdirs(indir, nest) = [d for (_, d) in tc_nest_dirs(indir, nest)]
+"The nest's log directory of the FIRST segment (setup lines) and the LAST (end-of-run census)."
+first_nestdir(indir, nest) = (ds = nestdirs(indir, nest); isempty(ds) ? joinpath(indir, "nest$nest") : ds[1])
+last_nestdir(indir, nest) = (ds = nestdirs(indir, nest); isempty(ds) ? joinpath(indir, "nest$nest") : ds[end])
 
 # ---------------------------------------------------------------------------
 # Per-file statistics
@@ -169,14 +181,15 @@ end
 # Attribute lookup that never throws; returns NaN (numeric) for a missing/non-numeric attr.
 attrnum(ds, k) = haskey(ds.attrib, k) ? Float64(ds.attrib[k]) : NaN
 
-function file_stats(path)
+# `t_abs` is the run's absolute time (the file's own `time` is local to its segment).
+function file_stats(path, t_abs = nothing)
     ds = NCDataset(path)
     try
         physics_groups = get(ds.attrib, "physics_groups", "")
         has_mynn = occursin("mynn", physics_groups)
         has_surface = occursin("surface", physics_groups)
 
-        t = Float64(ds["time"][1])
+        t = t_abs === nothing ? Float64(ds["time"][1]) : Float64(t_abs)
         x_km = denan(ds["x"][:]) ./ 1000.0
         z_km = denan(ds["z"][:]) ./ 1000.0
         z_m = denan(ds["z"][:])
@@ -348,7 +361,7 @@ function parse_model_parameters_line(line)
 end
 
 function read_model_parameters_line(indir, nest)
-    p = joinpath(nestdir(indir, nest), "scythe_out.log")
+    p = joinpath(first_nestdir(indir, nest), "scythe_out.log")
     isfile(p) || return nothing
     lines = readlines(p)
     length(lines) < 2 && return nothing
@@ -383,12 +396,52 @@ function job_stdout_provenance(indir)
     p = joinpath(indir, "job_stdout.log")
     isfile(p) || return nothing
     lines = readlines(p)
-    keep = filter(l -> occursin(r"HEAD|dirty|SCYTHE_TC|threads|wall clock|TC boundary layer:|TC radiation:"i, l), lines)
+    keep = filter(l -> occursin(r"HEAD|dirty|run\.jl args|run root|threads|nodes|wall clock"i, l), lines)
     return keep
 end
 
+"The provenance header of `<root>/config.toml` (git SHA, sources, --set, execution)."
+function config_header(indir)
+    p = joinpath(indir, "config.toml")
+    isfile(p) || return nothing
+    lines = String[]
+    for l in eachline(p)
+        startswith(l, "#") || break
+        push!(lines, l)
+    end
+    return lines
+end
+
+"The segments.csv rows as `k: dir t_offset length status host threads`, or nothing."
+function segments_summary(indir)
+    is_segmented_root(indir) || return nothing
+    df = CSV.read(joinpath(indir, "segments.csv"), DataFrame; types = String, pool = false)
+    return ["seg $(r.segment): t_offset $(r.t_offset_s) s, length $(r.integration_time_s) s, " *
+            "status $(coalesce(r.status, "")), start_hour $(coalesce(r.start_hour, "")), " *
+            "workers $(coalesce(r.workers, "")) x $(coalesce(r.threads, "")) threads on " *
+            "$(coalesce(r.host, ""))" for r in eachrow(df)]
+end
+
+"""The driver's own per-segment `segment k/n done in X s wall clock` lines (one per
+segment, from `seg_NN/segment_stdout.log`) and their sum [s], or nothing."""
+function segment_wallclock(indir)
+    lines = String[]
+    total = 0.0
+    for s in tc_segments(indir)
+        p = joinpath(s.dir, "segment_stdout.log")
+        isfile(p) || continue
+        for l in readlines(p)
+            m = match(r"segment \d+/\d+ done in ([0-9.]+) s wall clock", l)
+            m === nothing && continue
+            push!(lines, strip(l))
+            total += parse(Float64, m.captures[1])
+        end
+    end
+    return isempty(lines) ? nothing : (lines, total)
+end
+
 function nest_log_wallclock_line(indir, nest)
-    p = joinpath(nestdir(indir, nest), "scythe_out.log")
+    p = joinpath(last_nestdir(indir, nest), "scythe_out.log")
     isfile(p) || return nothing
     for l in readlines(p)
         occursin("wall clock", l) && return l
@@ -398,14 +451,15 @@ end
 
 function mtime_wallclock(indir, nest, files)
     isempty(files) && return NaN
-    icscsv = joinpath(indir, "nest$(nest)_tc_ics.csv")
+    icscsv = joinpath(indir, "nest$(nest)_ics.csv")
+    isfile(icscsv) || (icscsv = joinpath(indir, "nest$(nest)_tc_ics.csv"))   # legacy tree
     t0 = isfile(icscsv) ? mtime(icscsv) : mtime(files[1][2])
     t1 = mtime(files[end][2])
     return t1 - t0
 end
 
 function census_line(indir, nest)
-    p = joinpath(nestdir(indir, nest), "scythe_out.log")
+    p = joinpath(last_nestdir(indir, nest), "scythe_out.log")
     isfile(p) || return nothing
     line = nothing
     for l in readlines(p)
@@ -416,30 +470,37 @@ end
 
 function provenance_block(indir, nest, files)
     lines = String[]
-    push!(lines, "**Run dir:** `$indir`, nest $nest")
+    push!(lines, "**Run root:** `$indir`, nest $nest")
+    ch = config_header(indir)
+    if ch !== nothing
+        push!(lines, "**`config.toml` provenance header:**")
+        push!(lines, "```\n" * join(ch, "\n") * "\n```")
+    end
+    ss = segments_summary(indir)
+    if ss !== nothing
+        push!(lines, "**Segments (`segments.csv`):**")
+        push!(lines, "```\n" * join(ss, "\n") * "\n```")
+    end
     jp = job_stdout_provenance(indir)
     if jp === nothing
         push!(lines, "**`job_stdout.log`:** not present (laptop run without the sbatch wrapper).")
     else
-        push!(lines, "**`job_stdout.log`` provenance lines:**")
-        push!(lines, "```")
-        append!(lines, jp)
-        push!(lines, "```")
+        push!(lines, "**`job_stdout.log` provenance lines:**")
+        push!(lines, "```\n" * join(jp, "\n") * "\n```")
     end
+    sw = segment_wallclock(indir)
     wl = nest_log_wallclock_line(indir, nest)
-    if jp !== nothing && any(l -> occursin("wall clock", l), jp)
-        push!(lines, "**Wall clock:** from `job_stdout.log` (above).")
+    if sw !== nothing
+        push!(lines, "**Wall clock:** $(fmt(sw[2]; digits=1)) s ($(fmt(sw[2]/3600; digits=2)) h) " *
+                      "summed over the driver's per-segment lines (`seg_NN/segment_stdout.log`):")
+        push!(lines, "```\n" * join(sw[1], "\n") * "\n```")
     elseif wl !== nothing
         push!(lines, "**Wall clock:** from `nest$(nest)/scythe_out.log`: `$wl`")
     else
         wc = mtime_wallclock(indir, nest, files)
-        push!(lines, "**Wall clock:** no driver-reported wall-clock line found in " *
-                      "`job_stdout.log` or `nest$(nest)/scythe_out.log`; estimated from " *
-                      "file mtimes (`nest$(nest)_tc_ics.csv` -> last `<t>.nc`) as a fallback " *
-                      "proxy: **$(fmt(wc; digits=1)) s** ($(fmt(wc/60; digits=1)) min). " *
-                      "This is a filesystem-timestamp proxy, not the driver's own `@elapsed` " *
-                      "figure (which prints to the top-level driver stdout, not captured " *
-                      "in this run's logs).")
+        push!(lines, "**Wall clock:** no driver-reported wall-clock line found; estimated " *
+                      "from file mtimes (`nest$(nest)_ics.csv` -> last `<t>.nc`) as a " *
+                      "fallback proxy: **$(fmt(wc; digits=1)) s** ($(fmt(wc/60; digits=1)) min).")
     end
     cl = census_line(indir, nest)
     if cl !== nothing
@@ -447,8 +508,8 @@ function provenance_block(indir, nest, files)
     end
     mp = read_model_parameters_line(indir, nest)
     if mp === nothing
-        push!(lines, "**`ModelParameters` line:** not found (need `nest$(nest)/scythe_out.log` " *
-                      "line 2).")
+        push!(lines, "**`ModelParameters` line:** not found (need line 2 of the first " *
+                      "segment's `nest$(nest)/scythe_out.log`).")
     else
         physd, optd = parse_model_parameters_line(mp)
         if optd === nothing
@@ -559,6 +620,23 @@ function final_comparison_table(labels, laststats::Vector{FileStats})
     return join(lines, "\n") * "\n"
 end
 
+"""The resolved configuration of a run root as a flat `dotted.key => value-text` table
+(`Scythe.load_config` of `<root>/config.toml`, every field), or nothing for a legacy tree."""
+function run_config_flat(root)
+    p = joinpath(root, "config.toml")
+    isfile(p) || return nothing
+    cfg = Scythe.load_config(p; set = ["output.dir=" * root])
+    flat = Dict{String,String}()
+    function walk(d, prefix)
+        for (k, v) in d
+            key = isempty(prefix) ? string(k) : prefix * "." * string(k)
+            v isa AbstractDict ? walk(v, key) : (flat[key] = repr(v))
+        end
+    end
+    walk(Scythe.to_dict(cfg), "")
+    return flat
+end
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -567,22 +645,21 @@ function main(argv)
     indirs, nest, out, clamp_hist = parse_args(argv)
 
     report = IOBuffer()
-    println(report, "# TC boundary-layer assessment (auto-generated by tc/tc_bl_assess.jl)")
+    println(report, "# TC boundary-layer assessment (auto-generated by simulations/tc_axisym/tc_bl_assess.jl)")
     println(report)
     println(report, "Runs: " * join(["`$d`" for d in indirs], ", ") * "; nest $nest.")
     println(report)
 
     all_stats = Vector{Vector{FileStats}}()
     for indir in indirs
-        nd = nestdir(indir, nest)
-        files = list_nc_files(nd)
+        files = list_nc_files(indir, nest)
         if isempty(files)
             println(report, "## `$indir`\n")
-            println(report, "**No `<t>.nc` files found in `$nd`.**\n")
+            println(report, "**No `<t>.nc` files found for nest $nest under `$indir`.**\n")
             push!(all_stats, FileStats[])
             continue
         end
-        stats = [file_stats(p) for (_, p) in files]
+        stats = [file_stats(p, t) for (t, p) in files]
         push!(all_stats, stats)
 
         println(report, "## `$indir` (nest $nest)")
@@ -611,27 +688,37 @@ function main(argv)
     end
 
     if length(indirs) >= 2
-        println(report, "## Options / physical_params diff (first two runs)")
-        println(report)
-        mpA = read_model_parameters_line(indirs[1], nest)
-        mpB = read_model_parameters_line(indirs[2], nest)
-        if mpA === nothing || mpB === nothing
-            println(report, "(could not read `ModelParameters` line for one or both runs)")
+        labelA, labelB = basename(indirs[1]), basename(indirs[2])
+        cfgA, cfgB = run_config_flat(indirs[1]), run_config_flat(indirs[2])
+        if cfgA !== nothing && cfgB !== nothing
+            println(report, "## Configuration diff (first two runs, `<root>/config.toml`)")
+            println(report)
+            # output.dir differs by construction; it is not a physics difference.
+            delete!(cfgA, "output.dir"); delete!(cfgB, "output.dir")
+            println(report, dict_diff_table(labelA, cfgA, labelB, cfgB))
+            println(report)
         else
-            physA, optA = parse_model_parameters_line(mpA)
-            physB, optB = parse_model_parameters_line(mpB)
-            labelA, labelB = basename(indirs[1]), basename(indirs[2])
-            if optA !== nothing && optB !== nothing
-                println(report, "**options:**")
-                println(report)
-                println(report, dict_diff_table(labelA, optA, labelB, optB))
-                println(report)
-            end
-            if physA !== nothing && physB !== nothing
-                println(report, "**physical_params:**")
-                println(report)
-                println(report, dict_diff_table(labelA, physA, labelB, physB))
-                println(report)
+            println(report, "## Options / physical_params diff (first two runs)")
+            println(report)
+            mpA = read_model_parameters_line(indirs[1], nest)
+            mpB = read_model_parameters_line(indirs[2], nest)
+            if mpA === nothing || mpB === nothing
+                println(report, "(could not read `ModelParameters` line for one or both runs)")
+            else
+                physA, optA = parse_model_parameters_line(mpA)
+                physB, optB = parse_model_parameters_line(mpB)
+                if optA !== nothing && optB !== nothing
+                    println(report, "**options:**")
+                    println(report)
+                    println(report, dict_diff_table(labelA, optA, labelB, optB))
+                    println(report)
+                end
+                if physA !== nothing && physB !== nothing
+                    println(report, "**physical_params:**")
+                    println(report)
+                    println(report, dict_diff_table(labelA, physA, labelB, physB))
+                    println(report)
+                end
             end
         end
 
