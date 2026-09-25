@@ -103,6 +103,11 @@ function validate(cfg::RunConfig)
     (rad.solar === :diurnal && !(-90.0 <= rad.latitude <= 90.0)) && error(
         "config: physics.radiation.solar = \"diurnal\" needs physics.radiation.latitude in " *
         "[-90, 90], got $(rad.latitude)")
+    (cfg.physics.surface.fluxes && bl.scheme === :none) && error(
+        "config: physics.surface.fluxes = true needs a boundary-layer closure " *
+        "(physics.boundary_layer.scheme = \"mynn\" or \"louis\"): the fluxes enter as the " *
+        "bottom nodes of that scheme's flux columns. Set physics.surface.fluxes = false " *
+        "for a run with no boundary layer")
     if bl.scheme === :mynn
         tmax = maximum(_patch_ts_requested(cfg))
         bl.mynn_interval < tmax && error(
