@@ -176,6 +176,10 @@ include("exact_si.jl")
 include("exact_si_rlr.jl")
 include("idealized.jl")
 include("nesting.jl")
+# Typed run configuration + TOML front end + options/physical_params key registries. After
+# every file that defines a value tuple it reuses (SFC_Z0_MODES, RADIATION_*, MYNN_*,
+# OUTPUT_FORMAT_SYMBOLS) and after parse_mynn_fidelity.
+include("config.jl")
 
 # Export the primary driver function and the ModelParameters
 export integrate_model

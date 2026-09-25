@@ -43,6 +43,7 @@ const TEST_FILES = [
     ("test_reference_state.jl",             :core),
     ("test_reference_migration.jl",         :core),
     ("test_api_migration.jl",               :core),
+    ("test_config.jl",                      :core),
     ("test_generic_transforms.jl",          :core),
     ("test_linear_advection_integration.jl", :nesting),
     ("test_nesting_config.jl",              :nesting),
