@@ -285,7 +285,9 @@ The four BC dicts for the base patch, from ONE rule set covering the three legac
   Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w` Dirichlet at both ends.
 - sedimentation: rain (+ rain number, + the twelve ice slots) NaturalBC at the ground so
   they can fall out; at the lid too when `numerics.sedimentation_top_bc = natural`, left on
-  the wall condition when `wall`.
+  the wall condition when `wall`. That is the lid BC of the SLOT VALUES only: every
+  sedimentation FLUX is fitted on `flux_column`, the slot's basis with a zero-flux
+  (Dirichlet) lid, so no hydrometeor enters through the top whichever is chosen.
 """
 function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String})
     es = EQUATION_SETS[cfg.run.equation_set]

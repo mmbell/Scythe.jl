@@ -364,7 +364,7 @@ solver and boundary-condition choices; leave alone unless you know why.
 | key | type | default | description |
 |---|---|---|---|
 | `wall_bc` | string (enum) | `"d2"` | lateral-wall BC: `d2`, `natural`, `r1t1x` or `neumann`. |
-| `sedimentation_top_bc` | string (enum) | `"natural"` | lid BC on rain/number/ice: `natural` or `wall`. |
+| `sedimentation_top_bc` | string (enum) | `"natural"` | lid BC of the rain/number/ice slot values: `natural` or `wall`; the sedimentation flux fit always has a zero-flux (Dirichlet) lid, so this no longer decides whether mass enters through the lid. |
 | `positivity` | string (enum) | `"auto"` | `auto` (untransformed rain on k, plus i with walls) or `off`. |
 | `state_dependent_si` | bool | `true` | vertical SI coefficients from the current column state. |
 | `exact_si` | bool | `false` | exact coupled SI solve; incompatible with `state_dependent_si`. |
@@ -460,6 +460,7 @@ co2_ppm = 280.0
 | `bl_K_ref` | float | `diagnostics.timestep_advisory.bl_K_ref` (refused in `[extra.options]`) | timestep advisory: reference BL eddy diffusivity [m^2/s] (reference_state.jl) |
 | `cfl_interval` | float | `numerics.cfl_interval` (refused in `[extra.options]`) | CFL report cadence [s]; default output_interval (semiimplicit.jl, nesting.jl) |
 | `clamp_water` | bool |  | floor negative untransformed water at zero after each step (moist_compressible.jl) |
+| `column_state_guard` | bool |  | located error when p, rho_d, rho_t or T is not positive/finite after the retrieval; default true, false is forensics only (moist_compressible.jl) |
 | `condensate_floor` | string (enum) |  | cloud flooring at the thermodynamic interface: :none or :diagnostic (moist_compressible.jl) |
 | `condensate_transform` | string (enum) | `physics.microphysics.condensate_transform` (refused in `[extra.options]`) | cloud-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl) |
 | `condensation` | bool | `physics.microphysics.condensation` (refused in `[extra.options]`) | phase change on/off: QSS condensation and the ice transfers (moist_compressible.jl) |
@@ -527,6 +528,7 @@ co2_ppm = 280.0
 | `rain_number_transform` | string (enum) | `physics.microphysics.rain_number_transform` (refused in `[extra.options]`) | rain-number-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl) |
 | `rain_population_gate` | bool |  | skip two-moment rain sinks where the carried rain number is not a population (moist_compressible.jl) |
 | `rain_transform` | string (enum) | `physics.microphysics.rain_transform` (refused in `[extra.options]`) | rain-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl) |
+| `sedimentation_flux_lid` | string (enum) |  | lid of every sedimentation-flux fit: :dirichlet (default, F = 0 at the lid) or :natural (forensics: the slot's own lid BC, lets hydrometeors fall in from above) (moist_compressible.jl) |
 | `semiimplicit` | bool | `(always on for moist_compressible)` (refused in `[extra.options]`) | legacy equation sets: semi-implicit time stepping on/off; always on for moist_compressible (primitive_equations.jl, semiimplicit.jl) |
 | `sfc_stability` | bool | `physics.surface.stability` (refused in `[extra.options]`) | Monin-Obukhov stability correction (mc_surface_layer.jl, mynn_state.jl) |
 | `sfc_stability_iterations` | int |  | fixed-point iterations of the stability solve, >= 1 (mc_surface_layer.jl) |

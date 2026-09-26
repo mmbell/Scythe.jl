@@ -76,7 +76,7 @@ const BL_SCHEMES = (:mynn, :louis, :none)
 const HMIX_SCHEMES = (:smagorinsky, :constant, :none)
 "Allowed `numerics.wall_bc` values: the lateral-wall BC on the pressure-coupled variables."
 const WALL_BCS = (:d2, :natural, :r1t1x, :neumann)
-"Allowed `numerics.sedimentation_top_bc` values: the lid BC on rain/number/ice."
+"Allowed `numerics.sedimentation_top_bc` values: the lid BC of the rain/number/ice SLOTS (the sedimentation FLUX fit always has a zero-flux lid)."
 const SEDIMENTATION_TOP_BCS = (:natural, :wall)
 "Allowed `numerics.positivity` values: `auto` applies the positivity rule at build, `off` never does."
 const POSITIVITY_MODES = (:auto, :off)
@@ -485,7 +485,7 @@ end
 `[numerics]` — solver and boundary-condition choices; leave alone unless you know why.
 
 - `wall_bc::Symbol` — lateral-wall BC: `d2`, `natural`, `r1t1x` or `neumann`.
-- `sedimentation_top_bc::Symbol` — lid BC on rain/number/ice: `natural` or `wall`.
+- `sedimentation_top_bc::Symbol` — lid BC of the rain/number/ice slot values: `natural` or `wall`; the sedimentation flux fit always has a zero-flux (Dirichlet) lid, so this no longer decides whether mass enters through the lid.
 - `positivity::Symbol` — `auto` (untransformed rain on k, plus i with walls) or `off`.
 - `state_dependent_si::Bool` — vertical SI coefficients from the current column state.
 - `exact_si::Bool` — exact coupled SI solve; incompatible with `state_dependent_si`.
@@ -775,6 +775,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :water_warn_dT            => (Float64, "temperature-mismatch warning threshold [K] of the water reconciliation (moist_compressible.jl)"),
     :rain_evap_realization    => (Bool, "per-donor realization bound on rain evaporation (moist_compressible.jl)"),
     :rain_population_gate     => (Bool, "skip two-moment rain sinks where the carried rain number is not a population (moist_compressible.jl)"),
+    :sedimentation_flux_lid   => (Symbol, "lid of every sedimentation-flux fit: :dirichlet (default, F = 0 at the lid) or :natural (forensics: the slot's own lid BC, lets hydrometeors fall in from above) (moist_compressible.jl)"),
     :ice_microphysics         => (Symbol, "ice scheme: :ishmael or :none (moist_compressible.jl, radiation_state.jl, mc_mynn_bl.jl)"),
     :ice_agg_caps             => (Bool, "ISHMAEL aggregation caps on the unit pass (moist_compressible.jl)"),
     :ice_anchor_floor         => (Bool, "ice anchor reconciliation: floor leg (moist_compressible.jl)"),
@@ -830,6 +831,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :netcdf_derivatives       => (Bool, ":netcdf_raw also writes derivative slots (io.jl, netcdf_output.jl)"),
     # ── diagnostics and the timestep advisory
     :state_minima_trace       => (Int, "state-minima print interval [steps]; 0 = off (semiimplicit.jl)"),
+    :column_state_guard       => (Bool, "located error when p, rho_d, rho_t or T is not positive/finite after the retrieval; default true, false is forensics only (moist_compressible.jl)"),
     :water_budget_trace       => (Int, "water-budget print interval [steps]; 0 = off (moist_compressible.jl)"),
     :stiffness_trace          => (Int, "stiffness-census print interval [steps]; 0 = off (moist_compressible.jl)"),
     :u_max                    => (Float64, "timestep advisory: expected peak horizontal wind [m/s] (reference_state.jl)"),

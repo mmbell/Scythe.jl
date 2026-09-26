@@ -194,6 +194,18 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     #
     # Empty (`Matrix{Nothing}`) for grids with no vertical basis — `NoBasisArray` has no `data`.
     scratch_columns::Matrix{KC}
+    # The SEDIMENTATION-FLUX fit columns, indexed [thread, variable] exactly like
+    # `scratch_columns`: each is variable `v`'s own vertical basis (its bottom BC, its l_q,
+    # its cells) with the TOP boundary replaced by a homogeneous Dirichlet (R1T0), so a
+    # fitted sedimentation flux is exactly zero at the lid whatever the slot's own lid BC is.
+    # No hydrometeor can enter through the lid; a flux fitted on a Natural (R0) lid instead
+    # carries whatever the interior extrapolates to, i.e. inflow from above, and where the
+    # fall speed increases upward that inflow is a linear instability (e-folding ~35 s, the
+    # 2026-09 production ice TC death). Built ONCE here from the shared Springsteel spline
+    # template (only the work vectors are per-thread), read through [`flux_column`](@ref).
+    # ALIASES `scratch_columns` (no lid closure) on a Chebyshev k-basis, whose Dirichlet is a
+    # non-conservative point clamp — see `_allocate_flux_columns`.
+    flux_columns::Matrix{KC}
     # Galerkin solve data (M0, M1, W, Nb) for a cubic B-spline k-basis; `nothing` otherwise.
     # `_vertical_solve!` used to fetch this from a global Dict behind a global lock on EVERY
     # call — 4 solves x every column x every timestep, from every thread. It is per-grid and
@@ -292,6 +304,34 @@ transforming, or has `_vertical_solve!` set `a` outright.
     return @inbounds mtile.scratch_columns[Threads.threadid(), var_index]
 end
 
+"""
+    flux_column(mtile, var_index)
+
+The calling thread's SEDIMENTATION-FLUX fit column for variable slot `var_index`: that
+slot's vertical basis with a zero-value (Dirichlet, R1T0) lid, so `F = 0` at the top of the
+domain and nothing falls in from above. The ground keeps the slot's own condition (Natural
+for every sedimenting slot, so the flux is free to carry the fall-out). Same ownership rule
+and same "contents carry no meaning between uses" contract as [`scratch_column`](@ref).
+
+B-spline verticals only: on a Chebyshev vertical this IS `scratch_column` (the slot's own
+lid), because Springsteel's Chebyshev Dirichlet is a non-conservative point clamp — see
+`_allocate_flux_columns`.
+"""
+@inline function flux_column(mtile::ModelTile, var_index::Int64)
+    return @inbounds mtile.flux_columns[Threads.threadid(), var_index]
+end
+
+"""
+    sedimentation_flux_column(mtile, var_index, dirichlet_lid) -> column
+
+The column a sedimentation flux of slot `var_index` is fitted on: [`flux_column`](@ref)
+(zero-flux lid) when `dirichlet_lid`, else the slot's own [`scratch_column`](@ref) — the
+pre-fix behaviour, kept only as the `options[:sedimentation_flux_lid] = :natural`
+forensics switch.
+"""
+@inline sedimentation_flux_column(mtile::ModelTile, var_index::Int64, dirichlet_lid::Bool) =
+    dirichlet_lid ? flux_column(mtile, var_index) : scratch_column(mtile, var_index)
+
 """Reusable per-thread vertical work columns, or an empty matrix if the grid has no k-basis."""
 _allocate_scratch_columns(::NoBasisArray, tile::AbstractGrid) = Matrix{Nothing}(undef, 0, 0)
 
@@ -299,6 +339,48 @@ function _allocate_scratch_columns(kbasis, tile::AbstractGrid)
     nthreads = Threads.maxthreadid()
     nvars = size(tile.physical, 2)
     return [deepcopy(kbasis.data[v]) for _ in 1:nthreads, v in 1:nvars]
+end
+
+"""
+    _allocate_flux_columns(kbasis, tile, scratch_columns) -> Matrix
+
+The per-thread sedimentation-flux fit columns ([`flux_column`](@ref)): variable `v`'s
+B-spline k-basis parameters with the TOP boundary (the lid, `BCR`) replaced by
+`CubicBSpline.R1T0` (F = 0) and the bottom, cells and l_q unchanged. Built once, here.
+
+B-spline: the spline matrices and factorization come from Springsteel's template cache
+(keyed by the parameters, read-only in every transform), so all threads and every variable
+with the same bottom BC and l_q share ONE of them; only the work vectors are per column. The
+positivity lower bound is NOT carried: a flux is signed, and `Atransform!` is the unbounded
+solve anyway.
+
+Chebyshev (the RZ grids; no production run uses one): NOT closed — the flux columns ARE
+the scratch columns, i.e. the slot's own lid BC, as before. Springsteel's Chebyshev
+Dirichlet (`Chebyshev.R1T0`) is a point clamp: it adds a multiple of the top node's cardinal
+polynomial, which zeroes the top VALUE but leaves a derivative that is not the derivative of
+those values — on a 16-level column the exact quadrature integral of the fitted `∂F/∂z`
+missed `F(H) − F(0)` by 13 % on a smooth linear flux and by 96 % on a seeded top-level ice
+population, so a clamped flux DESTROYS water rather than stopping
+the inflow (measured 2026-09-26). The B-spline R1T0 is a genuine basis restriction and its
+divergence telescopes exactly.
+
+A grid with no k-basis gets the (empty) scratch matrix itself.
+"""
+_allocate_flux_columns(::NoBasisArray, tile::AbstractGrid, scratch) = scratch
+
+function _allocate_flux_columns(kbasis, tile::AbstractGrid, scratch)
+    nthreads, nvars = size(scratch)
+    if eltype(scratch) <: CubicBSpline.Spline1D
+        # A periodic vertical (no mc set has one) has no lid to close: keep that basis.
+        lid = [let p = kbasis.data[v].params
+                   p.BCL == CubicBSpline.PERIODIC ? p :
+                   CubicBSpline.SplineParameters(xmin = p.xmin, xmax = p.xmax,
+                       num_cells = p.num_cells, mubar = p.mubar, quadrature = p.quadrature,
+                       l_q = p.l_q, BCL = p.BCL, BCR = CubicBSpline.R1T0)
+               end for v in 1:nvars]
+        return [CubicBSpline.Spline1D(lid[v]) for _ in 1:nthreads, v in 1:nvars]
+    end
+    return scratch
 end
 
 """
@@ -465,6 +547,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
     scratch_columns = _allocate_scratch_columns(tile.kbasis, tile)
+    flux_columns = _allocate_flux_columns(tile.kbasis, tile, scratch_columns)
     solve_data, solve_rhs, solve_load = _allocate_solve_workspace(tile.kbasis, tile)
     # Reference-aware positivity bounds, once the reference state exists. The k-leg lives on
     # the tile and the i-leg on the worker's patch (`splineTransform!` builds the state's
@@ -607,6 +690,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         hacdot_nm1,
         mc_diffusion_matrices,
         scratch_columns,
+        flux_columns,
         solve_data,
         solve_rhs,
         solve_load,
@@ -2235,6 +2319,15 @@ DIFFERENCE of two prognostics, each fitted independently, so it can go negative
 from fit error alone while both parents stay healthy — and no per-field spline
 bound can prevent that, since `ρ_t - ρ_d ≥ 0` is not a constraint on either
 field's coefficients. Hence it is measured here rather than clamped anywhere.
+
+A fourth line tracks the collapse class that kills a run with `p < 0` (the §2c death:
+retrieval heating → w / sound-speed runaway → vertical SI past its limit): the minimum
+`p/p̄` (`p = p' + p̄(z)`, flagged below half its reference or at a non-positive value),
+the maximum `|w|`, and the maximum retrieved `T` (flagged when non-positive or non-finite),
+each with its location. `T` is the driver's closed-form retrieval from the RAW prognostic
+state — `M = p + E_t − ρ_t(½(u²+v²+w²) + gz)`, condensate through `recover_rho_c` /
+`recover_total` — the same reconstruction `radiation_column_state!` uses (no condensate
+floor, no anchor cap), so it is what the driver would retrieve with those devices idle.
 """
 function state_minima_trace(mtile::ModelTile, t::Int64)
     interval = Int(get(mtile.model.options, :state_minima_trace, 0))
@@ -2252,6 +2345,40 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
     min_ti = 1
     min_w = Inf
     min_wi = 1
+    # The pressure / updraft / temperature collapse precursors (see the docstring).
+    model = mtile.model
+    slots = mtile.mc_slots
+    phys = mtile.tile.physical
+    pbar = view(ref_pressure(mtile.ref_state), :, 1)
+    E_tbar = view(ref_total_energy(mtile.ref_state), :, 1)
+    rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
+    pp = view(phys, :, vars["p"], 1)
+    uu = view(phys, :, vars["u"], 1)
+    ww = view(phys, :, vars["w"], 1)
+    etp = view(phys, :, vars["E_t"], 1)
+    # Slots 8/9 are named for what they HOLD: nu_r/nu_c under the bhyp transforms.
+    nu_r = view(phys, :, vars[rain_var_name(model.options)], 1)
+    nu_c = view(phys, :, vars[condensate_var_name(model.options)], 1)
+    has_v = haskey(vars, "v")
+    vvv = view(phys, :, has_v ? vars["v"] : vars["u"], 1)
+    ice_on = ice_registered(slots)
+    i1q = view(phys, :, ice_on ? slots.i1_q : 1, 1)
+    i2q = view(phys, :, ice_on ? slots.i2_q : 1, 1)
+    i3q = view(phys, :, ice_on ? slots.i3_q : 1, 1)
+    ctrans = condensate_transform_mode(model.options)
+    cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
+    rtrans = rain_transform_mode(model.options)
+    rmu = get(model.physical_params, :rain_mu, 1.0e-7)
+    itrans = ice_transform_mode(model.options)
+    imu = ice_mu(model.physical_params, 1)
+    zc = size(mtile.tilepoints, 2)
+    min_pfrac = Inf
+    min_pi = 1
+    max_absw = -Inf
+    max_wi = 1
+    max_T = -Inf
+    max_Ti = 1
+    bad_T = false
     @inbounds for i in eachindex(rd)
         k = mod1(i, kDim)
         frac = rd[i] / rho_dbar[k] + 1.0
@@ -2269,8 +2396,42 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
             min_w = w
             min_wi = i
         end
+        pfrac = pp[i] / pbar[k] + 1.0
+        if pfrac < min_pfrac
+            min_pfrac = pfrac
+            min_pi = i
+        end
+        aw = abs(ww[i])
+        if aw > max_absw
+            max_absw = aw
+            max_wi = i
+        end
+        rho_dk = rd[i] + rho_dbar[k]
+        rho_tk = rt[i] + rho_tbar[k]
+        vk = has_v ? vvv[i] : 0.0
+        ke = 0.5 * ((uu[i] * uu[i]) + (vk * vk) + (ww[i] * ww[i]))
+        M = (pp[i] + pbar[k]) + (etp[i] + E_tbar[k]) -
+            (rho_tk * (ke + (gravity * mtile.tilepoints[i, zc])))
+        rho_liq = recover_rho_c(nu_c[i], rho_cbar[k], ctrans, cmu) +
+                  recover_rho_r(nu_r[i], rtrans, rmu)
+        rho_ice = ice_on ? ((recover_total(i1q[i], itrans, imu) +
+                             recover_total(i2q[i], itrans, imu)) +
+                            recover_total(i3q[i], itrans, imu)) : 0.0
+        Tk = retrieve_temperature(M, rho_dk, rho_tk, rho_liq, rho_ice)
+        if !(Tk > 0.0) || !isfinite(Tk)
+            # A bad T wins the slot outright: it is the one to locate.
+            if !bad_T
+                bad_T = true
+                max_T = Tk
+                max_Ti = i
+            end
+        elseif !bad_T && Tk > max_T
+            max_T = Tk
+            max_Ti = i
+        end
     end
-    low = min_frac < 0.5 || min_tfrac < 0.5 || min_w < 0.0
+    low_p = !(min_pfrac >= 0.5)
+    low = min_frac < 0.5 || min_tfrac < 0.5 || min_w < 0.0 || low_p || bad_T
     if low || t % interval == 0
         k = mod1(min_i, kDim)
         loc = (i) -> "r=$(round(mtile.tilepoints[i, 1]; digits=1)) " *
@@ -2291,6 +2452,15 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
                 "min rho_w=$(round(1.0e3 * min_w; sigdigits=4)) g/m^3 " *
                 "at $(loc(min_wi))" *
                 (min_w < 0.0 ? "  << NEGATIVE WATER" : ""))
+        kp = mod1(min_pi, kDim)
+        println("  p/w/T trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min p/ref=$(round(min_pfrac; digits=4)) " *
+                "(p=$(round(pp[min_pi] + pbar[kp]; sigdigits=5)), " *
+                "ref=$(round(pbar[kp]; sigdigits=5))) at $(loc(min_pi))" *
+                (low_p ? "  << LOW P" : "") *
+                "; max|w|=$(round(max_absw; sigdigits=4)) m/s at $(loc(max_wi))" *
+                "; max T=$(round(max_T; sigdigits=5)) K at $(loc(max_Ti))" *
+                (bad_T ? "  << BAD T" : ""))
     end
     return nothing
 end

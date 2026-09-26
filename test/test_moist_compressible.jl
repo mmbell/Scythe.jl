@@ -944,6 +944,122 @@ using Springsteel
         end
     end
 
+    # The LOCATED column-state guard (`check_column_state`): the §2c death class (retrieval
+    # heating -> w/sound-speed runaway -> vertical SI past its limit -> p < 0) used to surface
+    # as a bare DomainError in the ice kernel. The guard must name the level and its z, show
+    # the state, and be a no-op on a healthy column.
+    @testset "check_column_state: located error on p <= 0, inert when healthy" begin
+        n = 6
+        z = collect(range(0.0, 2500.0; length = n))
+        p = collect(range(1.0e5, 8.0e4; length = n))
+        rho_d = fill(1.1, n); rho_t = fill(1.12, n); Tk = fill(290.0, n)
+        w = fill(0.5, n); rho_liq_t = fill(0.0, n)
+        fields = (; p, rho_d, rho_t, Tk, w, rho_liq_t)
+        loc = (; step = 7, time_s = 0.7, tile = "nest2", column = 3, coord1 = 1500.0)
+        @test Scythe.check_column_state(p, rho_d, rho_t, Tk, z, fields, loc) === nothing
+        @test Scythe.mc_column_bad_level(p, rho_d, rho_t, Tk) == 0
+        # Healthy path allocates nothing (after compilation).
+        Scythe.check_column_state(p, rho_d, rho_t, Tk, z, fields, loc)
+        @test (@allocated Scythe.check_column_state(p, rho_d, rho_t, Tk, z, fields, loc)) == 0
+        # ...and writes nothing.
+        @test p == collect(range(1.0e5, 8.0e4; length = n))
+
+        k0 = 4
+        pbad = copy(p); pbad[k0] = -12.5
+        fbad = (; p = pbad, rho_d, rho_t, Tk, w, rho_liq_t)
+        err = try
+            Scythe.check_column_state(pbad, rho_d, rho_t, Tk, z, fbad, loc)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        msg = err.msg
+        @test occursin("k=$(k0), z=$(z[k0]) m", msg)
+        @test occursin("p = -12.5", msg)
+        @test occursin("step = 7", msg) && occursin("tile = nest2", msg)
+        # The neighbours are shown so the vertical structure of the collapse is visible.
+        @test occursin("k=$(k0 - 1), z=$(z[k0 - 1]) m  (below)", msg)
+        @test occursin("k=$(k0 + 1), z=$(z[k0 + 1]) m  (above)", msg)
+        @test occursin("anchor_headroom", msg)
+        # Each of the other admissibility conditions trips it too.
+        for (pp_, rd_, rt_, T_) in ((p, [0.0; rho_d[2:end]], rho_t, Tk),
+                                    (p, rho_d, [rho_t[1:2]; -1.0; rho_t[4:end]], Tk),
+                                    (p, rho_d, rho_t, [Tk[1:4]; -3.0; Tk[6]]),
+                                    (p, rho_d, rho_t, [Tk[1:4]; NaN; Tk[6]]),
+                                    ([p[1]; Inf; p[3:end]], rho_d, rho_t, Tk))
+            @test_throws ErrorException Scythe.check_column_state(pp_, rd_, rt_, T_, z,
+                                                                  fields, loc)
+        end
+    end
+
+    @testset "mc_driver! raises the located guard when p goes negative in a column" begin
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            z = Scythe.getGridpoints(patch)[1:kDim, 2]
+            pbar = Springsteel.ref_pressure(mtile.ref_state)[:, 1]
+            # A healthy column advances without tripping the guard.
+            Scythe.advance_column(mtile, 1, 1)
+            @test all(isfinite.(mtile.var_np1[1:kDim, :]))
+            # Force p = p' + pbar < 0 at one level of column 2 (the value slot only: the guard
+            # sits before every consumer, so the derivative slots are irrelevant to it).
+            k0 = 5
+            patch.physical[kDim + k0, vars["p"], 1] = -2.0 * pbar[k0]
+            err = try
+                Scythe.advance_column(mtile, 2, 3)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            msg = err.msg
+            @test occursin("level k=$(k0), z=$(z[k0]) m", msg)
+            @test occursin("p = $(-pbar[k0])", msg)
+            @test occursin("step = 3", msg)
+            @test occursin("column = 2", msg)
+            for f in ("p_prime", "pbar", "rho_d", "rho_t", "Tk", "w", "u", "rho_v",
+                      "rho_liq", "rho_ice", "rho_ice_t", "Q_ss")
+                @test occursin("    $(f) = ", msg)
+            end
+        end
+    end
+
+    # Both slot namings: plain densities and the bhyp control variables (nu_r / nu_c) -- the
+    # trace reads slots 8/9 by the names they HOLD, and a lookup by the literal "rho_r" once
+    # killed every production (bhyp) run that switched the trace on.
+    @testset "state_minima_trace reports min p/pbar, max|w|, max T ($(label))" for (label, topts) in
+            (("plain", Dict{Symbol,Any}()),
+             ("bhyp", Dict{Symbol,Any}(:condensate_transform => :bhyp, :rain_transform => :bhyp)))
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir;
+                extra_options = merge(Dict{Symbol,Any}(:state_minima_trace => 5), topts))
+            kDim = model.grid_params.kDim
+            vars = model.grid_params.vars
+            z = Scythe.getGridpoints(patch)[1:kDim, 2]
+            pbar = Springsteel.ref_pressure(mtile.ref_state)[:, 1]
+            patch.physical[2kDim + 3, vars["p"], 1] = -0.7 * pbar[3]     # p/pbar = 0.3
+            patch.physical[kDim + 6, vars["w"], 1] = -4.25
+            snapshot = copy(patch.physical)
+            out = mktemp() do path, io
+                redirect_stdout(io) do
+                    Scythe.state_minima_trace(mtile, 1)   # off-cadence, but LOW P breach
+                end
+                flush(io)
+                read(path, String)
+            end
+            @test patch.physical == snapshot          # a diagnostic: changes nothing
+            @test occursin("p/w/T trace", out)
+            @test occursin("min p/ref=0.3", out)
+            @test occursin("<< LOW P", out)
+            @test occursin("z=$(round(z[3]; digits=1))", out)
+            @test occursin("max|w|=4.25 m/s", out)
+            @test occursin(r"max T=[0-9.]+ K", out)
+            @test !occursin("BAD T", out)
+        end
+    end
+
     @testset "semi-implicit acoustic stability" begin
         mktempdir() do tmpdir
             # ts = 0.1 s is ~7x the explicit VERTICAL acoustic limit for the
@@ -1484,10 +1600,15 @@ using Springsteel
             @test maximum(abs.(pstab.physical[:, :, 1] .-
                                pstabx.physical[:, :, 1])) <= 1.0e-10
 
-            mref, pref, modref, gpref, _ = axi_build(tmpdir)
+            # The diverged 20-step state goes through p < 0 (step 19), which the located
+            # column-state guard in `mc_driver!` would (correctly) stop; it is switched off
+            # here because this comparison is deliberately of two diverged paths.
+            mref, pref, modref, gpref, _ = axi_build(tmpdir;
+                opts_extra=Dict{Symbol,Any}(:column_state_guard => false))
             axi_run!(mref, pref, modref, gpref, nothing; nsteps=20)
             mzx, pzx, modzx, gpzx, ezx = axi_build(tmpdir;
-                opts_extra=Dict{Symbol,Any}(:exact_si => true, :exact_si_zero_x => true))
+                opts_extra=Dict{Symbol,Any}(:exact_si => true, :exact_si_zero_x => true,
+                                            :column_state_guard => false))
             axi_run!(mzx, pzx, modzx, gpzx, ezx; nsteps=20)
             @test all(isequal.(pref.physical[:, :, 1], pzx.physical[:, :, 1]))
 
@@ -5117,6 +5238,200 @@ using Springsteel
         mtile = createModelTile(patch, patch, model, sparse(Int64[], Int64[], Float64[],
             size(patch.spectral, 1), size(patch.spectral, 2)))
         return mtile, patch, model, col
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # The ZERO-FLUX LID of every sedimentation-flux fit (`flux_column`). The first production
+    # ice TC run died at the lid: the flux F = f·max(x,0)·W was fitted on the slot's own
+    # column, whose Natural (R0) lid leaves F there to whatever the interior extrapolates —
+    # inflow from above the domain — and where |W| increases upward the top cells gained
+    # mass with no drain (a linear inflow instability, e-folding ~35 s). The flux fit now
+    # carries F = 0 at the lid whatever the slot's own lid BC; `:sedimentation_flux_lid =>
+    # :natural` restores the old fit and must show the growth (the discrimination check).
+    # ══════════════════════════════════════════════════════════════════════════
+
+    """
+    An ice-capable column in the PRODUCTION configuration the failure happened in: bhyp on
+    every water slot, the sedimenting slots (rain, rain number, the twelve ice moments)
+    Natural at BOTH ends (the `sedimentation_top_bc = natural` default), vapor at ICE
+    saturation so no phase change masks the transport, and a live population (mass AND
+    number) whose crystals grow toward the lid so the mass-weighted fall speed increases
+    upward (~0.56 m/s at the ground to ~1.95 m/s at the lid). `geometry` "RZ" is the
+    Chebyshev vertical, "RiRk" the cubic B-spline one the production TC runs on.
+    `make_mc_mtile`'s machinery, with those production BCs (which it does not expose).
+    """
+    function make_ice_lid_mtile(tmpdir, lid; geometry = "RZ", ts = 0.1, rho_i = 1.0e-4,
+                                n_low = 1.0e4, n_top = 1.0e2,
+                                Tsurf = 258.15)
+        opts = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
+            :condensate_transform => :bhyp, :rain_transform => :bhyp,
+            :rain_number_transform => :bhyp, :ice_transform => :bhyp,
+            :sedimentation_flux_lid => lid)
+        varlist = Scythe.mc_var_names(opts; cyl = false)
+        vars = Dict(v => i for (i, v) in enumerate(varlist))
+        scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+        wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
+        sed = [Scythe.rain_var_name(opts), Scythe.rain_number_var_name(opts),
+               Scythe.ice_var_names(opts)...]
+        vert = merge(wall_bc, Dict(v => NaturalBC() for v in sed))
+        gp = geometry == "RZ" ?
+            GridParameters(geometry = "RZ", num_cells = 8, iMin = 0.0, iMax = 2000.0,
+                kMin = 0.0, kMax = 2000.0, kDim = 16,
+                BCL = wall_bc, BCR = wall_bc, BCB = vert, BCT = vert, vars = vars) :
+            GridParameters(geometry = "RiRk", iMin = 0.0, iMax = 2000.0, num_cells_i = 4,
+                kMin = 0.0, kMax = 2000.0, num_cells_k = 8,
+                BCL = wall_bc, BCR = wall_bc, BCB = vert, BCT = vert, vars = vars)
+        ref = joinpath(tmpdir, "ice_lid_$(geometry)_$(lid).ref")
+        model = ModelParameters(ts = ts, integration_time = 1.0, output_interval = 1.0,
+            equation_set = "moist_compressible_XZ", ref_state_file = ref, grid_params = gp,
+            physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kvdiff_heat => 0.0,
+                :Kvdiff_water => 0.0, :Kv_mudiff => 0.0, :tau_qss => 10.0, :N_r => 1.0e-3,
+                :alpha => 0.0, :z_damp => 20.0e3, :f => 0.0),
+            options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                :exact_reference_state => true, :precipitation => true,
+                :vertical_mixing => false), opts))
+        # RiRk resolves kDim from num_cells_k inside ModelParameters, so the grid (and the
+        # reference, which needs its heights) come after the model.
+        gp = model.grid_params
+        patch = createGrid(gp)
+        kDim = gp.kDim
+        z = Scythe.getGridpoints(patch)[1:kDim, end]
+        Tk = @. Tsurf - 0.005 * z
+        p_Pa = @. 70000.0 * exp(-z / 8000.0)
+        H = gp.kMax
+        # A UNIFORM ice mass through the column (a sharp or layered seed rings, and the
+        # per-step spectral filter then moves the top values by more than the lid flux does
+        # in 40 steps), its NUMBER falling off with height so the crystals grow toward the
+        # lid and the mass-weighted fall speed increases upward: the failure's geometry.
+        xz = fill(rho_i, kDim)
+        nz = @. n_low * (n_top / n_low)^(z / H)
+        # The reference vapor is ICE-SATURATED PLUS the ice: the seed below turns that
+        # excess into ice at FIXED T (vapor slot −x, E_t by x(u_i − u_v) = x(R_v T − L_s)),
+        # so the vapor sits exactly at ice saturation and no sublimation or deposition
+        # masks the transport.
+        rho_v = Springsteel.Thermodynamics.rho_i_sat.(Tk, p_Pa ./ 100.0) .+ xz
+        rho_d = (p_Pa .- (Rv .* Tk .* rho_v)) ./ (Rd .* Tk)
+        Scythe.write_exact_ref_mc(ref, z, p_Pa, rho_d, rho_v, zeros(kDim))
+        patch.physical .= 0.0
+        mu = [Scythe.ice_mu(model.physical_params, j) for j in 1:4]
+        iq, inn, ia, ic = (vars[v] for v in Scythe.ice_var_names(opts)[1:4])
+        iqs = (iq, vars[Scythe.ice_var_names(opts)[5]], vars[Scythe.ice_var_names(opts)[9]])
+        # The top two levels by HEIGHT (the mish ordering is not assumed), for the checks.
+        top = sortperm(z)[(end - 1):end]
+        for i in 1:size(patch.physical, 1)
+            k = mod1(i, kDim)
+            x = xz[k]
+            nn = nz[k]
+            r = cbrt(3.0 * x / (4.0 * π * 917.0 * nn))     # equal-mass spheres
+            patch.physical[i, iq, 1] = Scythe.total_slot(x, :bhyp, mu[1])
+            patch.physical[i, inn, 1] = Scythe.total_slot(nn, :bhyp, mu[2])
+            patch.physical[i, ia, 1] = Scythe.total_slot(nn * r^3, :bhyp, mu[3])
+            patch.physical[i, ic, 1] = Scythe.total_slot(nn * r^3, :bhyp, mu[4])
+            patch.physical[i, vars["rho_v"], 1] = -x
+            patch.physical[i, vars["E_t"], 1] = x * ((Rv * Tk[k]) - Scythe.L_s(Tk[k]))
+        end
+        spectralTransform!(patch)
+        gridTransform!(patch)
+        mtile = createModelTile(patch, patch, model, sparse(Int64[], Int64[], Float64[],
+            size(patch.spectral, 1), size(patch.spectral, 2)))
+        return mtile, patch, model, (; vars, mu, iq, iqs, z, top)
+    end
+
+    """
+    Run `nsteps` of the lid fixture and return the top-level ice mass and ρ_t − ρ_d before
+    and after, plus the per-step sedimentation budget of column 1: the quadrature integral
+    of the column ice-mass sedimentation tendency ∫(−∂F/∂z)dz, and the fitted total ice mass
+    flux at the ground and at the lid, each summed × ts over the run.
+    """
+    function run_ice_lid(tmpdir, lid; nsteps = 40)
+        m, patch, mod, info = make_ice_lid_mtile(tmpdir, lid; geometry = "RiRk")
+        kDim = mod.grid_params.kDim
+        ncols = div(size(patch.physical, 1), kDim)
+        vars, mu, iq, iqs, z, top = info.vars, info.mu, info.iq, info.iqs, info.z, info.top
+        H = mod.grid_params.kMax
+        # Per-cell 3-point Gauss: EXACT for the fitted divergence (piecewise quadratic).
+        kc = Scythe.flux_column(m, iq)
+        wq = repeat(kc.quadweights, kc.params.num_cells) .* kc.params.DX
+        @test sum(wq) ≈ H rtol = 1e-12
+        ends = [0.0, H]
+        # TOTAL ice mass (all three species: aggregation moves mass into species 3).
+        ice_q(pp) = sum(Scythe.recover_total.(pp.physical[1:kDim, s, 1], :bhyp, mu[1])
+                        for s in iqs)
+        rtd(pp) = pp.physical[1:kDim, vars["rho_t"], 1] .- pp.physical[1:kDim, vars["rho_d"], 1]
+        q0 = ice_q(patch); rtd0 = rtd(patch)
+        sed = 0.0; F_gnd = 0.0; F_lid = 0.0
+        for t in 1:nsteps
+            Scythe.advance_column(m, 1, t)
+            S = m.mc_scratch[Threads.threadid()]
+            sed += mod.ts * sum(wq .* (.-S.Fi_z))
+            col = Scythe.sedimentation_flux_column(m, iq, lid === :dirichlet)
+            col.uMish .= (S.F_i1q .+ S.F_i2q) .+ S.F_i3q
+            Btransform!(col); Atransform!(col)
+            Fe = Springsteel.CubicBSpline.SItransform_matrix(col, ends, 0) * col.a
+            F_gnd += mod.ts * Fe[1]
+            F_lid += mod.ts * Fe[2]
+            for c in 2:ncols
+                Scythe.advance_column(m, c, t)
+            end
+            Scythe.calcTendency(m)
+            gridTransform!(patch)
+        end
+        @test all(isfinite.(patch.physical))
+        q1 = ice_q(patch); rtd1 = rtd(patch)
+        return (; q0 = sum(q0[top]), q1 = sum(q1[top]), rtd0 = sum(rtd0[top]),
+                rtd1 = sum(rtd1[top]), sed, F_gnd, F_lid, qscale = maximum(q0))
+    end
+
+    @testset "sedimentation flux: zero-flux lid, nothing falls in from above" begin
+        mktempdir() do tmpdir
+            @test Scythe.sedimentation_flux_lid_dirichlet(Dict{Symbol,Any}())
+            @test !Scythe.sedimentation_flux_lid_dirichlet(
+                Dict{Symbol,Any}(:sedimentation_flux_lid => :natural))
+            @test_throws ErrorException Scythe.sedimentation_flux_lid_dirichlet(
+                Dict{Symbol,Any}(:sedimentation_flux_lid => :wall))
+
+            # The flux columns: built once per tile, the slot's basis with an R1T0 lid and
+            # its own ground condition, on the B-spline vertical...
+            m, _, mod, info = make_ice_lid_mtile(tmpdir, :dirichlet; geometry = "RiRk")
+            fc = Scythe.flux_column(m, info.iq)
+            sc = Scythe.scratch_column(m, info.iq)
+            @test fc !== sc
+            @test fc.params.BCR == Springsteel.CubicBSpline.R1T0
+            @test fc.params.BCL == sc.params.BCL == Springsteel.CubicBSpline.R0
+            @test sc.params.BCR == Springsteel.CubicBSpline.R0   # the slot keeps its lid
+            @test fc.params.l_q == sc.params.l_q && fc.params.num_cells == sc.params.num_cells
+            @test Scythe.sedimentation_flux_column(m, info.iq, false) === sc
+            @test size(m.flux_columns) == size(m.scratch_columns)
+            # ...while a Chebyshev vertical keeps the slot's own column: its Dirichlet is a
+            # point clamp whose derivative does not telescope (see _allocate_flux_columns).
+            mz, _, _, infoz = make_ice_lid_mtile(tmpdir, :dirichlet; geometry = "RZ")
+            @test Scythe.flux_column(mz, infoz.iq) === Scythe.scratch_column(mz, infoz.iq)
+
+            d = run_ice_lid(tmpdir, :dirichlet)
+            n = run_ice_lid(tmpdir, :natural)
+
+            # (a) The FIX: the live top-level population does not grow — it drains
+            # downward — and neither does the total water there.
+            @test d.q1 <= d.q0 * (1.0 + 1.0e-12)
+            @test d.rtd1 <= d.rtd0 + 1.0e-12 * d.qscale
+
+            # (b) DISCRIMINATION: the pre-fix fit (the slot's own Natural lid) grows the
+            # top-level ice AND the total water there over the same 40 steps.
+            @test n.q1 > d.q1
+            @test n.q1 > n.q0
+            @test n.rtd1 > n.rtd0 + 1.0e-3 * n.qscale
+
+            # (c) CONSERVATION: with the zero-flux lid the fitted flux vanishes at the lid,
+            # so the column's sedimentation change of ice mass is exactly the ground
+            # fall-out (∫−∂F/∂z dz = F(0) − F(H), F(H) = 0; F < 0 is downward). With the
+            # Natural lid the same budget carries an INFLOW −F(H) > 0 through the lid.
+            @test abs(d.F_lid) <= 1.0e-12 * abs(d.sed) + 1.0e-20
+            @test d.sed ≈ d.F_gnd rtol = 1.0e-8 atol = 1.0e-14
+            @test d.F_gnd <= 0.0                      # fall-out only ever leaves
+            @test n.sed ≈ n.F_gnd - n.F_lid rtol = 1.0e-8 atol = 1.0e-14
+            @test -n.F_lid > 1.0e-3 * n.qscale * 40 * 0.1    # mass entered from above
+            @test n.sed > 0.0 > d.sed                 # net gain vs net loss by sedimentation
+        end
     end
 
     @testset "ice: 𝒟 and the deposition drive clip" begin

@@ -2061,12 +2061,19 @@ continuity form.
 end
 
 """
-    _ice_flux!(mtile, F, F_z, x, w_fall, f_anchor, slot) -> Nothing
+    _ice_flux!(mtile, F, F_z, x, w_fall, f_anchor, slot, dirichlet_lid = true) -> Nothing
 
 Form one ice moment's sedimentation flux `F = f_anchor·max(x, 0)·W` and its fitted divergence
-`∂F/∂z`, on THAT SLOT'S OWN spline column — its own basis and its own boundary conditions, so
-a mass slot with a Natural bottom lets the crystals leave the domain while a moment with a
-different fit is not forced to agree with it.
+`∂F/∂z`, on THAT SLOT'S OWN spline basis — its own cells, l_q and GROUND condition, so a mass
+slot with a Natural bottom lets the crystals leave the domain while a moment with a different
+fit is not forced to agree with it — but with a ZERO-FLUX LID ([`flux_column`](@ref): the
+slot's basis with a Dirichlet top). No crystal can enter through the top of the domain. A
+flux fitted on the slot's own Natural lid carried whatever the interior extrapolated to
+there, i.e. inflow from above; where the fall speed increases upward the top cells then gain
+mass with no drain, a linear instability (e-folding ~35 s) that killed the first production
+ice TC run at the lid. `dirichlet_lid = false` restores that fit (forensics:
+`options[:sedimentation_flux_lid] = :natural`). On a Chebyshev vertical (RZ) the flux column
+IS the slot's own column — see `_allocate_flux_columns` for why.
 
 `f_anchor` is the sedimentation anchor share (the `anchor_f` scratch column): `min(1,
 headroom/ρ_i)` per gridpoint, exactly `1.0` — and this function bitwise its pre-Stage-C
@@ -2096,7 +2103,8 @@ if no level has both a nonzero fall speed and a nonzero (positive) amount, `F` a
 its derivative is zero — it is the same numbers reached without the arithmetic, which is what
 keeps the zero-ice inertness gate BITWISE rather than merely small.
 """
-@inline function _ice_flux!(mtile::ModelTile, F, F_z, x, w_fall, f_anchor, slot::Int)
+@inline function _ice_flux!(mtile::ModelTile, F, F_z, x, w_fall, f_anchor, slot::Int,
+                            dirichlet_lid::Bool = true)
     # `f_anchor` is the sedimentation anchor share (see the `anchor_f` scratch doc): the
     # transported amount is the anchor-supported part of the moment, with `f_anchor == 1.0`
     # exactly — hence this line bitwise the unfactored product — wherever the partition is
@@ -2115,12 +2123,32 @@ keeps the zero-ice inertness gate BITWISE rather than merely small.
         fill!(F_z, 0.0)
         return nothing
     end
-    col = scratch_column(mtile, slot)
+    # The flux is fitted with a ZERO-FLUX LID (see `flux_column`): nothing falls in from
+    # above the domain, whatever the slot's own lid BC. `dirichlet_lid = false` is the
+    # pre-fix fit on the slot's own column (`options[:sedimentation_flux_lid] = :natural`).
+    col = sedimentation_flux_column(mtile, slot, dirichlet_lid)
     col.uMish .= F
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, F_z)
     return nothing
+end
+
+"""
+    sedimentation_flux_lid_dirichlet(options) -> Bool
+
+`options[:sedimentation_flux_lid]`: `:dirichlet` (the default — every sedimentation flux is
+fitted with F = 0 at the lid, see [`flux_column`](@ref)) returns `true`; `:natural` (forensics
+only — the flux takes the slot's own lid BC, which lets hydrometeors fall in from above the
+domain) returns `false`. Anything else is an error.
+"""
+function sedimentation_flux_lid_dirichlet(options)
+    mode = get(options, :sedimentation_flux_lid, :dirichlet)
+    mode === :dirichlet && return true
+    mode === :natural && return false
+    error("options[:sedimentation_flux_lid] = $(repr(mode)) is not recognized; use " *
+          ":dirichlet (the default: zero sedimentation flux through the lid) or :natural " *
+          "(forensics: the flux fit takes the slot's own lid BC)")
 end
 
 """
@@ -6632,6 +6660,78 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
     return nothing
 end
 
+# ── Located column-state guard ────────────────────────────────────────────────
+
+"""
+    mc_column_bad_level(p, rho_d, rho_t, Tk) -> Int
+
+The first level of a retrieved column at which the thermodynamic state is inadmissible —
+`p ≤ 0`, `ρ_d ≤ 0`, `ρ_t ≤ 0`, `T ≤ 0`, or a non-finite `p`/`T` — or `0` when every level is
+admissible. One pass of plain comparisons: no allocation, no write, nothing read but the four
+columns. The healthy-path half of [`check_column_state`](@ref), which `mc_driver!` calls on
+every column.
+"""
+@inline function mc_column_bad_level(p, rho_d, rho_t, Tk)
+    @inbounds for k in eachindex(p)
+        pk = p[k]; Tkk = Tk[k]
+        if !(pk > 0.0) || !(rho_d[k] > 0.0) || !(rho_t[k] > 0.0) || !(Tkk > 0.0) ||
+           !isfinite(pk) || !isfinite(Tkk)
+            return k
+        end
+    end
+    return 0
+end
+
+"""
+    check_column_state(p, rho_d, rho_t, Tk, z, fields::NamedTuple, loc::NamedTuple)
+
+Throw a LOCATED error when the retrieved column is thermodynamically inadmissible (see
+[`mc_column_bad_level`](@ref)); return `nothing` otherwise, having changed nothing.
+
+`loc` is printed first as `key = value` pairs (step, model time, tile, column, horizontal
+coordinates — whatever the caller has); then, for the bad level and the levels immediately
+below and above it, the level index, `z`, and one line per entry of `fields` (a NamedTuple of
+column vectors, printed in order). When `fields` carries `rho_t`, `rho_d` and `rho_liq_t`, the
+ice anchor headroom `max((ρ_t − ρ_d) − max(ρ_liq_t, 0), 0)` is printed as well. The message is
+built only on the failing path.
+
+Why this exists (the §2c death class): a retrieval-heating burst drives a w / sound-speed
+runaway, the vertical semi-implicit solve is carried past its limit, and the total pressure
+goes NEGATIVE in a convective column. Nothing downstream is defined there — the SI
+coefficient `γ_m p/ρ_t` loses its sign and the Helmholtz operator its definiteness — but the
+liquid path computes straight through it; the first thing to throw used to be the ice
+kernel's `nsch^(1/3)` (`ishmael_ventilation`), as a bare `DomainError` with no location and
+no state. This names the column and shows the collapse's vertical structure instead.
+"""
+function check_column_state(p, rho_d, rho_t, Tk, z, fields::NamedTuple, loc::NamedTuple)
+    kbad = mc_column_bad_level(p, rho_d, rho_t, Tk)
+    kbad == 0 && return nothing
+    _mc_column_state_error(kbad, z, fields, loc)
+end
+
+@noinline function _mc_column_state_error(kbad::Int, z, fields::NamedTuple, loc::NamedTuple)
+    io = IOBuffer()
+    println(io, "Inadmissible column state (p, rho_d, rho_t or T not positive/finite) at ",
+            "level k=$(kbad), z=$(z[kbad]) m")
+    for (key, val) in pairs(loc)
+        println(io, "  $(key) = $(val)")
+    end
+    n = length(z)
+    has_head = haskey(fields, :rho_t) && haskey(fields, :rho_d) && haskey(fields, :rho_liq_t)
+    for k in max(kbad - 1, 1):min(kbad + 1, n)
+        tag = k == kbad ? "  << BAD LEVEL" : (k < kbad ? "  (below)" : "  (above)")
+        println(io, "  level k=$(k), z=$(z[k]) m$(tag)")
+        for (key, col) in pairs(fields)
+            println(io, "    $(key) = $(col[k])")
+        end
+        if has_head
+            head = max((fields.rho_t[k] - fields.rho_d[k]) - max(fields.rho_liq_t[k], 0.0), 0.0)
+            println(io, "    anchor_headroom = $(head)")
+        end
+    end
+    error(String(take!(io)))
+end
+
 # ── Equation set ───────────────────────────────────────────────────────────────
 
 """
@@ -6696,6 +6796,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     ice_anchor_flr = get(model.options, :ice_anchor_floor, true)::Bool
     # The sedimentation leg (see the `anchor_f` scratch doc): applied only with ice on.
     ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool
+    # The LID of every sedimentation-flux fit (rain mass, its energy, rain number, the twelve
+    # ice moments, the ice energy): `:dirichlet` (the default and the physics) fits the flux
+    # on `flux_column` — the slot's basis with F = 0 at the lid, since no hydrometeor enters
+    # through the top of the domain. `:natural` fits it on the slot's own column (its own lid
+    # BC), the pre-2026-09-26 behaviour, whose extrapolated lid flux is inflow and a linear
+    # instability wherever the fall speed increases upward. Forensics only.
+    sed_lid_dir = sedimentation_flux_lid_dirichlet(model.options)
     # The rate-side leg (see the read block in `mc_ice_sources!`): ditto.
     ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool
     # The POPULATION reconciliation — the FOURTH tier of the chain (TeX §"Reconciliation of
@@ -7312,6 +7419,25 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         end
     end
     Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq_t, rho_ice_t)
+    # LOCATED STATE GUARD (see `check_column_state`): p, ρ_d, ρ_t and T must be positive and
+    # finite before anything consumes them — the saturation lookups just below, the sd_si
+    # coefficient γ_m p/ρ_t, the microphysics. The §2c death class (retrieval heating → w /
+    # sound-speed runaway → vertical SI past its limit → p < 0) used to surface first as a bare
+    # `DomainError` in the ice kernel, and the liquid path let it straight through. One
+    # comparison pass per column; reads only, and the message is built only on failure.
+    # `options[:column_state_guard] = false` disables it — forensics only (a test that
+    # deliberately carries a diverged state bitwise through two paths).
+    get(model.options, :column_state_guard, true)::Bool &&
+    check_column_state(p, rho_d, rho_t, Tk, z,
+        vv === nothing ?
+            (; p, p_prime = pp, pbar, rho_d, rho_t, Tk, w, u, rho_v, rho_liq, rho_ice,
+               rho_ice_t, rho_liq_t, Q_ss, E_t, M) :
+            (; p, p_prime = pp, pbar, rho_d, rho_t, Tk, w, u, v = vv.f, rho_v, rho_liq,
+               rho_ice, rho_ice_t, rho_liq_t, Q_ss, E_t, M),
+        (; step = t, time_s = t * model.ts, tile = model.output_dir, tile_ts = model.ts,
+           colstart, colend, column = Base.div(colstart - 1, colend - colstart + 1) + 1,
+           coord1 = gridpoints[colstart, 1],
+           coord2 = zcoord(geom) == 3 ? gridpoints[colstart, 2] : NaN))
     p_hPa = S.p_hPa;   @. p_hPa = p / 100.0
     rho_vs = S.rho_vs; @. rho_vs = rho_v_sat(Tk, p_hPa)
     # The DENSITY-BUDGET residual — no longer A vapor, but the vapor the ρ_t budget IMPLIES.
@@ -7542,7 +7668,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         Fr = S.Fr;       @. Fr = max(rho_r, 0.0) * Vt
         E_sed = S.E_sed; @. E_sed = Fr * ((Cpv * Tk) - Lv + ke + (gravity * z))
         Fnr = S.Fnr;     @. Fnr = max(n_r, 0.0) * Vtn
-        r_col = scratch_column(mtile, 8)
+        r_col = sedimentation_flux_column(mtile, 8, sed_lid_dir)
         r_col.uMish .= Fr
         Btransform!(r_col)
         Atransform!(r_col)
@@ -7554,7 +7680,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # The number flux on the n_r column: its OWN spline fit and its OWN boundary
         # conditions, so a Natural bottom lets the drops leave the domain with the rain they
         # carry rather than piling up at the ground.
-        nr_col = scratch_column(mtile, nr_i)
+        nr_col = sedimentation_flux_column(mtile, nr_i, sed_lid_dir)
         nr_col.uMish .= Fnr
         Btransform!(nr_col)
         Atransform!(nr_col)
@@ -7581,7 +7707,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         E_sed = S.E_sed; @. E_sed = Fr * ((Cpv * Tk) - Lv + ke + (gravity * z))
         # Fitted flux divergences on rho_r's column basis (its BCs decide whether the
         # surface flux is free to be nonzero), same discrete d/dz as the advection.
-        r_col = scratch_column(mtile, 8)
+        r_col = sedimentation_flux_column(mtile, 8, sed_lid_dir)
         r_col.uMish .= Fr
         Btransform!(r_col)
         Atransform!(r_col)
@@ -7703,18 +7829,18 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # falls, and a number that sedimented at the mass-weighted speed would carry the small
         # crystals down as fast as the large ones. `ishmael_fall_speeds` has already applied
         # the 25 m/s cap and the melting size-sorting override.
-        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, S.Vi1m, afx, IS.i1_q)
-        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, S.Vi1n, afx, IS.i1_n)
-        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, S.Vi1m, afx, IS.i1_a)
-        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, S.Vi1m, afx, IS.i1_c)
-        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, S.Vi2m, afx, IS.i2_q)
-        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, S.Vi2n, afx, IS.i2_n)
-        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, S.Vi2m, afx, IS.i2_a)
-        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, S.Vi2m, afx, IS.i2_c)
-        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, S.Vi3m, afx, IS.i3_q)
-        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, S.Vi3n, afx, IS.i3_n)
-        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, S.Vi3m, afx, IS.i3_a)
-        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, S.Vi3m, afx, IS.i3_c)
+        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, S.Vi1m, afx, IS.i1_q, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, S.Vi1n, afx, IS.i1_n, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, S.Vi1m, afx, IS.i1_a, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, S.Vi1m, afx, IS.i1_c, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, S.Vi2m, afx, IS.i2_q, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, S.Vi2n, afx, IS.i2_n, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, S.Vi2m, afx, IS.i2_a, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, S.Vi2m, afx, IS.i2_c, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, S.Vi3m, afx, IS.i3_q, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, S.Vi3n, afx, IS.i3_n, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, S.Vi3m, afx, IS.i3_a, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, S.Vi3m, afx, IS.i3_c, sed_lid_dir)
 
         # The two AGGREGATES that reach the conserved variables. `Fi_z` is summed from the
         # three fitted mass-flux divergences rather than refitting their sum, so slot 3 and
@@ -7726,7 +7852,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                      ((Cpv * Tk) - L_s(Tk) + ke + (gravity * z))
         # Fitted on species 1's mass column: it is a MASS flux and takes a mass slot's basis
         # and BCs (Natural at the bottom, so the energy can leave with the ice).
-        ei_col = scratch_column(mtile, IS.i1_q)
+        ei_col = sedimentation_flux_column(mtile, IS.i1_q, sed_lid_dir)
         ei_col.uMish .= E_sed_i
         Btransform!(ei_col)
         Atransform!(ei_col)
