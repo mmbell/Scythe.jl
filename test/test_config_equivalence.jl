@@ -132,7 +132,7 @@ function ceq_delta(old::Dict, new::Dict)
     return d
 end
 
-ceq_load(files; dir) = load_config(files...; set = ["output.dir=$(dir)"])
+ceq_load(files; dir, extra = String[]) = load_config(files...; set = ["output.dir=$(dir)"; extra])
 
 # ── EXPECTED_DELTAS: production config − legacy default arm ─────────────────────────
 #
@@ -397,6 +397,38 @@ end
         @test any(n -> occursin("convective SI ceiling", n), names(on))
         @test !any(n -> occursin("convective SI ceiling", n), names(off))
         @test length(names(off)) == length(names(on)) - 1
+    end
+end
+
+@testset "initial_conditions.method = file reads checkpoints in place" begin
+    # A .jld2 checkpoint must keep its extension: load_initial_conditions! dispatches on it,
+    # and copying it under an ics.csv name once made the CSV reader parse binary (the TC
+    # debug-restart recipe). build_model and the driver's segment-1 paths point at the
+    # user's files; initialize_case! writes only the reference.
+    mktempdir() do dir
+        ck = [joinpath(dir, "nest$(i)_21600.0.jld2") for i in 1:3]
+        foreach(p -> write(p, "x"), ck)
+        cfg = ceq_load([CEQ_TC]; dir = dir,
+                       extra = ["initial_conditions.method=file",
+                                "initial_conditions.file.paths=[" *
+                                join(("\"$p\"" for p in ck), ",") * "]"])
+        nest = build_model(cfg)
+        @test nest isa NestedModelParameters
+        @test nest.initial_conditions == ck
+        models, _ = Scythe.build_nest(nest)
+        @test [m.initial_conditions for m in models] == ck
+        @test Scythe.initial_ics_paths(cfg, dir, 3) == ck
+        # A CSV-named single-patch file is used verbatim too.
+        single = joinpath(dir, "state.csv"); write(single, "x")
+        cfg1 = ceq_load([CEQ_OWB]; dir = dir,
+                        extra = ["initial_conditions.method=file",
+                                 "initial_conditions.file.paths=[\"$single\"]"])
+        @test build_model(cfg1).initial_conditions == single
+        # Wrong count is refused.
+        bad = ceq_load([CEQ_TC]; dir = dir,
+                       extra = ["initial_conditions.method=file",
+                                "initial_conditions.file.paths=[\"$(ck[1])\"]"])
+        @test_throws ErrorException build_model(bad)
     end
 end
 

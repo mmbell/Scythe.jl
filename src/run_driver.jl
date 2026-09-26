@@ -287,6 +287,18 @@ initial_ics_paths(root::AbstractString, npatches::Int) =
     npatches == 1 ? [joinpath(root, "ics.csv")] :
                     [joinpath(root, "nest$(i)_ics.csv") for i in 1:npatches]
 
+"""
+    initial_ics_paths(cfg::RunConfig, root, npatches) -> Vector{String}
+
+The config-aware form. Under `initial_conditions.method = "file"` the run's segment 1 reads
+the user's files IN PLACE (a `.jld2` checkpoint must keep its extension: `load_initial_conditions!`
+dispatches on it, so copying a checkpoint under an `ics.csv` name makes the CSV reader parse
+binary); every other method writes `ics.csv` / `nest{i}_ics.csv` into the root.
+"""
+initial_ics_paths(cfg::RunConfig, root::AbstractString, npatches::Int) =
+    cfg.initial_conditions.method === :file ? abspath.(cfg.initial_conditions.file.paths) :
+                                              initial_ics_paths(root, npatches)
+
 "Model time [s] a checkpoint file name encodes (`<t>.jld2`), or `nothing`."
 _checkpoint_time(path::AbstractString) =
     tryparse(Float64, replace(basename(path), r"\.jld2$" => ""))
@@ -672,7 +684,7 @@ function run_simulation(cfg::RunConfig, exec::ExecutionEnv; resume::Bool = false
             println("Scythe: $msg")
         end
         n = npatches(cfg)
-        for p in [joinpath(root, "reference.ref"); initial_ics_paths(root, n)]
+        for p in [joinpath(root, "reference.ref"); initial_ics_paths(cfg, root, n)]
             isfile(p) || error("--resume: $p is missing; the reference state and initial " *
                                "conditions are written by a fresh start only")
         end
@@ -693,13 +705,13 @@ function _orchestrate(cfg::RunConfig, exec::ExecutionEnv, root::String, resume::
     # Every segment's guards before anything is written or launched (IC paths are
     # placeholders: build_model only records them).
     for s in plan
-        segment_model(cfg, merge(s, (initial_conditions = initial_ics_paths(root, n),)), exec)
+        segment_model(cfg, merge(s, (initial_conditions = initial_ics_paths(cfg, root, n),)), exec)
     end
 
     if !resume
         mkpath(root)
         write_config(cfg, cfgpath; header = _provenance_header(exec, sources, set))
-        seg1 = merge(plan[1], (initial_conditions = initial_ics_paths(root, n),))
+        seg1 = merge(plan[1], (initial_conditions = initial_ics_paths(cfg, root, n),))
         println("Scythe: writing the reference state and initial conditions into $root")
         initialize_case!(cfg, build_model(cfg; segment = seg1))
     end
@@ -786,7 +798,7 @@ function _run_segment(cfg::RunConfig, k::Int, exec::ExecutionEnv)
     1 <= k <= nseg || error("segment_main: --segment $k is out of range ($nseg segment(s))")
     n = npatches(cfg)
     s = plan[k]
-    ics = k == 1 ? initial_ics_paths(root, n) :
+    ics = k == 1 ? initial_ics_paths(cfg, root, n) :
         find_segment_checkpoints(segment_patch_dirs(root, k - 1, n),
                                  plan[k - 1].integration_time)
     for p in ics

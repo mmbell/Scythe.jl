@@ -418,7 +418,14 @@ function build_model(cfg::RunConfig; segment::Union{Nothing,NamedTuple} = nothin
                                        cfg.run.integration_time
     ics = joinpath(root, "ics.csv")
     seg_ics = segment === nothing ? String[] : String.(collect(segment.initial_conditions))
-    if segment !== nothing
+    if segment === nothing && cfg.initial_conditions.method === :file
+        # A `file` run reads the user's files in place (a .jld2 keeps its extension, which
+        # load_initial_conditions! dispatches on); the driver passes the same paths per segment.
+        seg_ics = abspath.(cfg.initial_conditions.file.paths)
+        length(seg_ics) == n || error("build_model: initial_conditions.file.paths has " *
+            "$(length(seg_ics)) path(s) for $n patch(es)")
+    end
+    if !isempty(seg_ics)
         length(seg_ics) == n || error("build_model: segment.initial_conditions has " *
             "$(length(seg_ics)) path(s) for $n patch(es)")
         n == 1 && (ics = seg_ics[1])
@@ -448,7 +455,7 @@ function build_model(cfg::RunConfig; segment::Union{Nothing,NamedTuple} = nothin
         ts = ts_patch,
         workers_per_patch = ones(Int, n),
         base = base,
-        initial_conditions = n > 1 && segment !== nothing ? seg_ics : String[])
+        initial_conditions = n > 1 ? seg_ics : String[])
     models, _ = build_nest(nest)
     foreach(_validate_patch, models)
     return nest

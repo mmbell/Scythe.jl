@@ -64,7 +64,7 @@ returned by [`build_model`](@ref). Dispatches on `initial_conditions.method`:
   from `[initial_conditions.balanced_vortex]`, `fcor = physical_params[:f]`);
 - `temperature_noise` — `moist_temperature_noise_mc!` (seeded, RH-preserving);
 - `temperature_bubble` — `moist_temperature_bubble_mc!`;
-- `file` — copy `initial_conditions.file.paths` (one per patch) to the IC paths.
+- `file` — read `initial_conditions.file.paths` (one per patch) in place; only the reference is written.
 
 Returns the model and, for a nest, the `NestTopology` (`nothing` for one patch).
 """
@@ -82,9 +82,13 @@ function initialize_case!(cfg::RunConfig, model::Union{ModelParameters,NestedMod
         # The reference is still written: the model reads it at tile construction.
         build_reference_state(cfg, createGrid(models[1].grid_params), models[1].grid_params;
                               path = base.ref_state_file)
+        # The files are read IN PLACE (build_model / initial_ics_paths point every patch at
+        # them): a .jld2 checkpoint has to keep its extension for load_initial_conditions!.
         for (src, m) in zip(paths, models)
             isfile(src) || error("config: initial_conditions.file.paths entry $(repr(src)) does not exist")
-            abspath(src) == abspath(m.initial_conditions) || cp(src, m.initial_conditions; force = true)
+            abspath(src) == abspath(m.initial_conditions) || error("config: initial_conditions.file " *
+                "path $(repr(src)) is not what the model was built to read ($(m.initial_conditions)); " *
+                "build the model from the same config (build_model points a `file` run at its paths)")
         end
         return model, topo
     end
