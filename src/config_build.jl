@@ -63,11 +63,19 @@ function validate(cfg::RunConfig)
         "config: timestep.ts_per_patch has $(length(ts.ts_per_patch)) entries for $n " *
         "patch(es) (grid.num_cells); give one per patch or leave it empty")
     all(>(0.0), ts.ts_per_patch) || error("config: timestep.ts_per_patch must all be positive")
-    g.lateral === :periodic && es.cyl && error(
-        "config: grid.lateral = \"periodic\" is refused for the cylindrical equation set " *
-        "run.equation_set = \"$(cfg.run.equation_set)\" (axis + outer wall)")
-    g.lateral === :periodic && n > 1 && error(
-        "config: grid.lateral = \"periodic\" with $n patches: nesting is not periodic")
+    bc = cfg.boundary_conditions
+    bc.lateral === :periodic && es.cyl && error(
+        "config: boundary_conditions.lateral = \"periodic\" is refused for the cylindrical " *
+        "equation set run.equation_set = \"$(cfg.run.equation_set)\" (axis + outer wall)")
+    bc.lateral === :periodic && n > 1 && error(
+        "config: boundary_conditions.lateral = \"periodic\" with $n patches: nesting is not periodic")
+    if bc.lateral === :periodic
+        for (var, sides) in bc.override, side in ("inner", "outer")
+            haskey(sides, side) && error("config: boundary_conditions.override.$var.$side is " *
+                "refused under boundary_conditions.lateral = \"periodic\" (a periodic pair " *
+                "cannot be overridden on one side)")
+        end
+    end
 
     # ── run / output
     cfg.run.integration_time > 0.0 || error("config: run.integration_time must be positive")
@@ -274,28 +282,36 @@ end
 """
     build_boundary_conditions(cfg, options, vars) -> (BCL, BCR, BCB, BCT)
 
-The four BC dicts for the base patch, from ONE rule set covering the three legacy drivers:
+The four BC dicts for the base patch (`BCL`/`BCR` = the `inner`/`outer` sides, `BCB`/`BCT`
+= `bottom`/`top`), from the three `[boundary_conditions]` family rules, then the
+per-variable `override`:
 
-- lateral, cylindrical (axisym, RLR): axis = scalars Neumann + u, v Dirichlet; outer wall =
-  scalars Neumann + u Dirichlet (nest junctions are set by `build_nest`).
-- lateral, XZ walls: scalars Neumann + u, w Dirichlet on both sides.
-- lateral, XZ periodic: `PeriodicBC` on every variable.
-- vertical (`numerics.wall_bc`): `d2` SecondDerivativeBC on every scalar, `natural`
+- `lateral`, cylindrical (axisym, RLR): axis = Neumann on every variable except `u`, `v`
+  Dirichlet; outer wall = Neumann except `u` Dirichlet (nest junctions are set by
+  `build_nest`, which replaces the inner side of every patch but the first and the outer
+  side of every patch but the last).
+- `lateral = walls`, XZ: Neumann on every variable except `u`, `w` Dirichlet, both sides.
+- `lateral = periodic`, XZ: `PeriodicBC` on every variable.
+- `vertical_scalars`: ground and lid of every variable: `d2` SecondDerivativeBC, `natural`
   NaturalBC, `neumann` NeumannBC, `r1t1x` d2 with the acoustic set (`rho_d, rho_t, E_t,
   Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w` Dirichlet at both ends.
 - sedimentation: rain (+ rain number, + the twelve ice slots) NaturalBC at the ground so
-  they can fall out; at the lid too when `numerics.sedimentation_top_bc = natural`, left on
-  the wall condition when `wall`. That is the lid BC of the SLOT VALUES only: every
-  sedimentation FLUX is fitted on `flux_column`, the slot's basis with a zero-flux
-  (Dirichlet) lid, so no hydrometeor enters through the top whichever is chosen.
+  they can fall out; at the lid too when `sedimentation_lid = natural`, left on the
+  `vertical_scalars` condition when `wall`. That is the lid BC of the SLOT VALUES only: on a
+  B-spline vertical every sedimentation FLUX is fitted on `flux_column`, the slot's basis
+  with a zero-flux (Dirichlet) lid, so no hydrometeor enters through the top whichever is
+  chosen.
+- `override`: each `{variable = {side = bc}}` entry replaces that one entry. A variable not
+  in `vars` is an error listing `vars`.
 """
 function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String})
     es = EQUATION_SETS[cfg.run.equation_set]
+    bc = cfg.boundary_conditions
     if es.cyl
         scalar = Dict{String,Any}(v => NeumannBC() for v in vars)
         bcl = merge(scalar, Dict{String,Any}("u" => DirichletBC(), "v" => DirichletBC()))
         bcr = merge(scalar, Dict{String,Any}("u" => DirichletBC()))
-    elseif cfg.grid.lateral === :periodic
+    elseif bc.lateral === :periodic
         bcl = Dict{String,Any}(v => PeriodicBC() for v in vars)
         bcr = bcl
     else
@@ -304,7 +320,7 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
         bcr = bcl
     end
 
-    mode = cfg.numerics.wall_bc
+    mode = bc.vertical_scalars
     vert = if mode === :d2
         Dict{String,Any}(v => SecondDerivativeBC() for v in vars)
     elseif mode === :natural
@@ -320,17 +336,225 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
         d
     end
 
+    bcb = merge(vert, Dict{String,Any}("w" => DirichletBC()))
+    bct = merge(vert, Dict{String,Any}("w" => DirichletBC()))
+    for v in sedimenting_var_names(options)
+        bcb[v] = NaturalBC()
+        bc.sedimentation_lid === :natural && (bct[v] = NaturalBC())
+    end
+
+    if !isempty(bc.override)
+        # Copy before writing: under XZ the two lateral dicts are one object.
+        bcl, bcr = copy(bcl), copy(bcr)
+        dicts = Dict("inner" => bcl, "outer" => bcr, "bottom" => bcb, "top" => bct)
+        for var in sort(collect(keys(bc.override)))
+            var in vars || error("config: boundary_conditions.override.$var: this run has no " *
+                "variable $(repr(var)); its variables are " * join(vars, ", "))
+            for (side, name) in bc.override[var]
+                dicts[side][var] = bc_from_name(name)
+            end
+        end
+    end
+    return bcl, bcr, bcb, bct
+end
+
+"""
+    sedimenting_var_names(options) -> Vector{String}
+
+The slots that sediment under `options`: the rain slot, the rain number under two-moment
+rain, and the twelve ice slots under ISHMAEL. These get the NaturalBC ground (and the
+`sedimentation_lid` lid) in [`build_boundary_conditions`](@ref).
+"""
+function sedimenting_var_names(options)
     sediment = [rain_var_name(options)]
     rain_moments(options) == 2 && push!(sediment, rain_number_var_name(options))
     ice_microphysics(options) === :ishmael && append!(sediment, ice_var_names(options))
+    return sediment
+end
 
-    bcb = merge(vert, Dict{String,Any}("w" => DirichletBC()))
-    bct = merge(vert, Dict{String,Any}("w" => DirichletBC()))
-    for v in sediment
-        bcb[v] = NaturalBC()
-        cfg.numerics.sedimentation_top_bc === :natural && (bct[v] = NaturalBC())
+# ── BC names: the vocabulary of `override`, of boundary_conditions.toml and of the log ──
+
+"The BC an `override` value names (`BC_OVERRIDE_VALUES`)."
+function bc_from_name(name::AbstractString)
+    name == "natural" && return NaturalBC()
+    name == "dirichlet" && return DirichletBC()
+    name == "neumann" && return NeumannBC()
+    name == "second_derivative" && return SecondDerivativeBC()
+    name == "periodic" && return PeriodicBC()
+    name == "r1t1x" && return Springsteel.CubicBSpline.R1T1X
+    error("config: boundary condition $(repr(name)) is not recognized; use " *
+          join(repr.(BC_OVERRIDE_VALUES), ", ", " or "))
+end
+
+"""
+    bc_name(bc) -> String
+
+The name of a boundary condition in the `override` vocabulary: `natural`, `dirichlet`,
+`neumann`, `second_derivative`, `periodic`, `r1t1x`, plus `r3x` for a nest interface
+(`FixedBC()`, its border trio pinned to the parent at run time). A non-zero value is
+appended (`dirichlet(1.0)`); anything else is `repr`'d.
+"""
+function bc_name(bc::BoundaryConditions)
+    bc.periodic && return "periodic"
+    bc.robin === nothing || return "robin$(bc.robin)"
+    set = [(k, x) for (k, x) in (("dirichlet", bc.u), ("neumann", bc.du),
+                                 ("second_derivative", bc.d2u)) if x !== nothing]
+    isempty(set) && return "natural"
+    all(isnan(x) for (_, x) in set) && length(set) == 3 && return "r3x"
+    length(set) == 1 && return set[1][2] == 0.0 ? set[1][1] : "$(set[1][1])($(set[1][2]))"
+    return join(("$k($x)" for (k, x) in set), "+")
+end
+function bc_name(bc::AbstractDict)
+    bc == Springsteel.CubicBSpline.R1T1X && return "r1t1x"
+    for s in (:R0, :R1T0, :R1T1, :R1T2, :R2T10, :R2T20, :R3, :R3X, :PERIODIC)
+        bc == getfield(Springsteel.CubicBSpline, s) && return lowercase(string(s))
     end
-    return bcl, bcr, bcb, bct
+    return repr(bc)
+end
+bc_name(bc) = repr(bc)
+
+"""
+    boundary_condition_table(model_or_nest, cfg) -> Vector{NamedTuple}
+
+The boundary condition every prognostic variable ACTUALLY has, read back from the built
+grid parameters (for a nest: from `build_nest`'s per-patch grids, collars and interfaces
+included). One row per variable per patch, patches in order, variables in slot order:
+`(patch, variable, inner, outer, bottom, top, note)`, the BCs as [`bc_name`](@ref)s.
+`inner`/`outer` are the axis/outer wall on the cylinders, left/right on XZ.
+
+`note` says what the name alone does not: `sedimenting: flux fit F=0 at lid` (the
+sedimentation flux is fitted with a zero-flux lid whatever the slot's own lid BC;
+`sedimenting: flux fit on the slot's own lid BC` when it is not, i.e. under
+`options[:sedimentation_flux_lid] = :natural` or on a Chebyshev vertical), `inner|outer =
+nest interface: R3X (child)` where `build_nest` pins this patch's border to its parent,
+`inner|outer = collar: natural (parent)` where this patch is the parent and extends one
+cell into the child with a free termination, `p lid/ground: dp'/dz = -g rho_t' each fit`
+under `r1t1x`, and `override: <sides>` for the `[boundary_conditions.override]` entries.
+"""
+function boundary_condition_table(m, cfg::RunConfig)
+    models = m isa NestedModelParameters ? first(build_nest(m)) : [m]
+    n = length(models)
+    opts = models[1].options
+    sed = Set(sedimenting_var_names(opts))
+    bspline_k = models[1].grid_params.geometry != "RZ"
+    flux_lid_f0 = bspline_k && sedimentation_flux_lid_dirichlet(opts)
+    ov = cfg.boundary_conditions.override
+    rows = NamedTuple{(:patch, :variable, :inner, :outer, :bottom, :top, :note),
+                      Tuple{Int,String,String,String,String,String,String}}[]
+    for (i, mm) in enumerate(models)
+        gp = mm.grid_params
+        vars = sort(collect(keys(gp.vars)); by = v -> gp.vars[v])
+        for v in vars
+            inner, outer = bc_name(gp.BCL[v]), bc_name(gp.BCR[v])
+            bottom, top = bc_name(gp.BCB[v]), bc_name(gp.BCT[v])
+            notes = String[]
+            for (side, name, interior) in (("inner", inner, i > 1), ("outer", outer, i < n))
+                interior || continue
+                push!(notes, name == "r3x" ? "$side = nest interface: R3X (child)" :
+                                             "$side = collar: $name (parent)")
+            end
+            v in sed && push!(notes, flux_lid_f0 ? "sedimenting: flux fit F=0 at lid" :
+                                                   "sedimenting: flux fit on the slot's own lid BC")
+            (v == "p" && "r1t1x" in (bottom, top)) &&
+                push!(notes, "r1t1x: dp'/dz = -g rho_t' installed before every fit")
+            if haskey(ov, v)
+                sides = [s for s in BC_OVERRIDE_SIDES if haskey(ov[v], s) &&
+                         !(s == "inner" && i > 1) && !(s == "outer" && i < n)]
+                isempty(sides) || push!(notes, "override: " * join(sides, ", "))
+            end
+            push!(rows, (patch = i, variable = v, inner = inner, outer = outer,
+                         bottom = bottom, top = top, note = join(notes, "; ")))
+        end
+    end
+    return rows
+end
+
+"Name of the resolved boundary-condition table in a run root."
+const BC_TABLE_NAME = "boundary_conditions.toml"
+
+"""
+    write_boundary_conditions(path, table; header = "") -> path
+
+Write a [`boundary_condition_table`](@ref) as TOML: one `[[patch]]` per patch (`index`),
+each holding one `[[patch.variable]]` per variable (`name, inner, outer, bottom, top`, and
+`note` when non-empty), in the table's order. `header` lines are written first as `#`
+comments. Deterministic, so identical tables give identical files.
+"""
+function write_boundary_conditions(path::AbstractString, table; header::AbstractString = "")
+    mkpath(dirname(abspath(path)))
+    open(path, "w") do io
+        for line in split(chomp(header), '\n')
+            isempty(header) && break
+            println(io, isempty(line) ? "#" : "# " * line)
+        end
+        isempty(header) || println(io)
+        for p in sort(unique(r.patch for r in table))
+            println(io, "[[patch]]")
+            println(io, "index = ", p)
+            for r in table
+                r.patch == p || continue
+                println(io, "\n    [[patch.variable]]")
+                for k in (:variable, :inner, :outer, :bottom, :top, :note)
+                    x = getfield(r, k)
+                    (k === :note && isempty(x)) && continue
+                    key = k === :variable ? "name" : string(k)
+                    println(io, "    ", rpad(key, 6), " = \"", escape_string(x), "\"")
+                end
+            end
+            println(io)
+        end
+    end
+    return path
+end
+
+"""
+    print_boundary_conditions(io, table)
+
+The compact form of a [`boundary_condition_table`](@ref): one line per variable. The
+lateral sides are shown `inner|outer` per patch, side by side; when every patch has the
+same entries for a variable they are shown once. `bottom`/`top` are shared by every patch
+in a build and shown once (as `a/b/c` per patch if they ever differ). Nest-interface and
+collar notes are given once per patch in the legend line, not repeated per variable.
+"""
+function print_boundary_conditions(io::IO, table)
+    patches = sort(unique(r.patch for r in table))
+    np = length(patches)
+    vars = String[r.variable for r in table if r.patch == patches[1]]
+    row(p, v) = table[findfirst(r -> r.patch == p && r.variable == v, table)]
+    lat(r) = r.inner == r.outer ? r.inner : "$(r.inner)|$(r.outer)"
+    iface(note) = join([x for x in split(note, "; ") if occursin(" = ", x)], ", ")
+    lines = Vector{Vector{String}}()
+    for v in vars
+        rs = [row(p, v) for p in patches]
+        cols = String[v]
+        if all(lat(r) == lat(rs[1]) for r in rs)
+            push!(cols, np == 1 ? lat(rs[1]) : "all: " * lat(rs[1]))
+        else
+            wl = maximum(length(lat(row(p, u))) for p in patches for u in vars)
+            push!(cols, join(("p$(r.patch) " * rpad(lat(r), wl) for r in rs), "  "))
+        end
+        b = unique(r.bottom for r in rs); t = unique(r.top for r in rs)
+        push!(cols, join(b, "/"), join(t, "/"))
+        other = unique(filter(!isempty, [join([x for x in split(r.note, "; ")
+                                               if !occursin(" = ", x)], "; ") for r in rs]))
+        push!(cols, join(other, " | "))
+        push!(lines, cols)
+    end
+    hdr = ["variable", np == 1 ? "lateral (inner|outer)" : "lateral per patch (inner|outer)",
+           "bottom", "top", "note"]
+    w = [maximum(length, [hdr[j]; [l[j] for l in lines]]) for j in 1:4]
+    fmt(c) = rstrip(join((rpad(c[j], w[j]) for j in 1:4), "  ") * "  " * c[5])
+    println(io, "Scythe: boundary conditions ($np patch$(np == 1 ? "" : "es"); " *
+                "a single name = both lateral sides):")
+    for p in patches
+        f = iface(row(p, vars[1]).note)
+        isempty(f) || println(io, "  patch $p: $f")
+    end
+    println(io, "  ", fmt(hdr))
+    for l in lines
+        println(io, "  ", fmt(l))
+    end
+    return nothing
 end
 
 """
@@ -346,7 +570,7 @@ function build_positivity(cfg::RunConfig, options)
     cfg.numerics.positivity === :off && return pos
     name = rain_var_name(options)
     name == "rho_r" || return pos
-    walls = EQUATION_SETS[cfg.run.equation_set].cyl || cfg.grid.lateral === :walls
+    walls = EQUATION_SETS[cfg.run.equation_set].cyl || cfg.boundary_conditions.lateral === :walls
     pos[name] = walls ? Dict(:i => 0.0, :k => 0.0) : Dict(:k => 0.0)
     return pos
 end

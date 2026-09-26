@@ -189,6 +189,7 @@ include("run_driver.jl")
 # Export the primary driver function and the ModelParameters
 export integrate_model
 export build_model, initialize_case!
+export boundary_condition_table, write_boundary_conditions, print_boundary_conditions
 export ModelParameters
 
 """

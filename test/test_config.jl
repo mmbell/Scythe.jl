@@ -5,12 +5,12 @@
 using Test
 using TOML
 using Scythe
-using Scythe: RunSection, OutputSection, GridSection, TimestepSection, ReferenceStateSection,
+using Scythe: RunSection, OutputSection, GridSection, BoundaryConditionsSection, TimestepSection, ReferenceStateSection,
     InitialConditions, VortexIC, NoiseIC, BubbleIC, FileIC, Environment, Microphysics,
     BoundaryLayer, Surface, Radiation, HorizontalMixing, Sponge, Physics, Numerics,
     Diagnostics, TimestepAdvisory, Extra, KNOWN_OPTION_KEYS, KNOWN_PHYSICAL_KEYS,
     OWNED_OPTION_KEYS, OWNED_PHYSICAL_KEYS, RETIRED_OPTION_KEYS, EQUATION_SETS,
-    config_hash, to_dict, parse_set
+    config_hash, to_dict, parse_set, MOVED_KEYS
 
 # The message a call dies with ("" if it does not), so a refusal is checked for SAYING
 # where the problem is, not just for throwing.
@@ -30,7 +30,10 @@ writetoml(path, s) = (write(path, s); path)
     @test c == RunConfig()
     @test hash(c) == hash(RunConfig())
     @test c.run.equation_set == "moist_compressible_XZ"
-    @test c.grid.geometry == "RiRk" && c.grid.lateral === :periodic
+    @test c.grid.geometry == "RiRk" && c.boundary_conditions.lateral === :periodic
+    @test c.boundary_conditions.vertical_scalars === :d2
+    @test c.boundary_conditions.sedimentation_lid === :natural
+    @test isempty(c.boundary_conditions.override)
     @test c.grid.boundaries == [0.0, 300.0e3] && c.grid.num_cells == [50]
     @test c.physics.microphysics.ice === :ishmael
     @test c.physics.boundary_layer.scheme === :mynn && !c.physics.boundary_layer.mynn_edmf
@@ -82,12 +85,15 @@ end
                                  segment_length = 86400.0),
                 output = OutputSection(dir = joinpath(dir, "out"), formats = [:netcdf, :csv],
                                        sidecars = true),
-                grid = GridSection(lateral = :walls, boundaries = [0.0, 150.0e3, 450.0e3],
-                                   num_cells = [15, 15]),
+                grid = GridSection(boundaries = [0.0, 150.0e3, 450.0e3], num_cells = [15, 15]),
+                boundary_conditions = BoundaryConditionsSection(lateral = :walls,
+                    vertical_scalars = :r1t1x, sedimentation_lid = :wall,
+                    override = Dict("nu_r" => Dict("top" => "dirichlet", "bottom" => "neumann"),
+                                    "p" => Dict("outer" => "second_derivative"))),
                 timestep = TimestepSection(ts = 0.25, ts_per_patch = [0.25, 0.5]),
                 initial_conditions = ic,
                 physics = base_phys,
-                numerics = Numerics(wall_bc = :r1t1x, wall_bc_tau = Inf, positivity = :off,
+                numerics = Numerics(wall_bc_tau = Inf, positivity = :off,
                                     state_dependent_si = false, exact_si = true),
                 diagnostics = Diagnostics(stiffness_trace = 10,
                                           timestep_advisory = TimestepAdvisory(state_deviation = 0.15)),
@@ -107,6 +113,11 @@ end
             @test back.extra.options[:radiation_level_interp] === :bestfit
             @test back.extra.options[:radiation_gases] == Dict("co2" => 8.0e-4)
             @test back.output.formats == [:netcdf, :csv]
+            @test back.boundary_conditions.override ==
+                  Dict("nu_r" => Dict("top" => "dirichlet", "bottom" => "neumann"),
+                       "p" => Dict("outer" => "second_derivative"))
+            @test back.boundary_conditions.vertical_scalars === :r1t1x
+            @test occursin("[boundary_conditions.override.nu_r]", text)
         end
         # An inactive sub-table that differs from its default is NOT written back.
         cfg = RunConfig(initial_conditions = InitialConditions(method = :file,
@@ -243,6 +254,41 @@ end
         @test occursin("run.equation_set", errmsg(() -> load_config(set = ["run.equation_set=moist_compressible_3D"])))
         @test load_config(set = ["run.equation_set=moist_compressible_RLR", "grid.geometry=RLR"]).grid.geometry == "RLR"
         @test load_config(set = ["run.equation_set=moist_compressible_axisym", "grid.geometry=RZ"]).grid.geometry == "RZ"
+        # [boundary_conditions]: the three moved keys are refused with the new location.
+        @test MOVED_KEYS["grid.lateral"] == "boundary_conditions.lateral"
+        for (old, new) in MOVED_KEYS
+            sec, key = split(old, '.')
+            m = errmsg(() -> load_config(f("[$sec]\n$key = \"natural\"\n")))
+            @test occursin(old, m) && occursin(new, m) && occursin("moved", m)
+            m = errmsg(() -> load_config(set = ["$old=walls"]))
+            @test occursin(new, m)
+        end
+        # Family enums.
+        m = errmsg(() -> load_config(set = ["boundary_conditions.vertical_scalars=d3"]))
+        @test occursin("boundary_conditions.vertical_scalars", m) && occursin(":r1t1x", m)
+        @test occursin("boundary_conditions.sedimentation_lid",
+                       errmsg(() -> load_config(set = ["boundary_conditions.sedimentation_lid=open"])))
+        @test occursin("boundary_conditions.lateral",
+                       errmsg(() -> load_config(set = ["boundary_conditions.lateral=open"])))
+        # Overrides: a bad side or value dies at load, naming the entry and the vocabulary.
+        m = errmsg(() -> load_config(set = ["boundary_conditions.override.nu_r.lid=natural"]))
+        @test occursin("boundary_conditions.override.nu_r.lid", m) && occursin("\"top\"", m)
+        m = errmsg(() -> load_config(f("[boundary_conditions.override.nu_r]\ntop = \"zero_flux\"\n")))
+        @test occursin("override.nu_r.top", m) && occursin("\"second_derivative\"", m)
+        @test occursin("override.nu_r", errmsg(() -> load_config(set = ["boundary_conditions.override.nu_r=3"])))
+        # A good override loads (from TOML and from --set) ...
+        good = load_config(f("[boundary_conditions.override.nu_r]\ntop = \"dirichlet\"\n");
+                           set = ["boundary_conditions.override.p.bottom=r1t1x"])
+        @test good.boundary_conditions.override == Dict("nu_r" => Dict("top" => "dirichlet"),
+                                                        "p" => Dict("bottom" => "r1t1x"))
+        # ... but a variable the run does not have dies at build, listing the run's variables.
+        m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)",
+                         "boundary_conditions.override.rho_r.top=dirichlet"])))
+        @test occursin("override.rho_r", m) && occursin("nu_r", m) && occursin("rho_e", m)
+        # inner/outer overrides are refused under periodic lateral BCs.
+        m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)",
+                         "boundary_conditions.override.p.inner=neumann"])))
+        @test occursin("periodic", m) && occursin("override.p.inner", m)
         # Missing file.
         @test occursin("not found", errmsg(() -> load_config(joinpath(dir, "nope.toml"))))
     end

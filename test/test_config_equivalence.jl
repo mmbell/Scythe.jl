@@ -375,10 +375,92 @@ end
                        cfg_errmsg(() -> build_model(s("physics.radiation.scheme=rrtmgp",
                                                       "physics.radiation.latitude=95.0"))))
         tcfg(xs...) = load_config(CEQ_TC; set = ["output.dir=$(dir)", xs...])
-        @test occursin("grid.lateral", cfg_errmsg(() -> build_model(tcfg("grid.lateral=periodic"))))
+        @test occursin("boundary_conditions.lateral",
+                       cfg_errmsg(() -> build_model(tcfg("boundary_conditions.lateral=periodic"))))
         # the production configs themselves validate and build
         @test build_model(tcfg()) isa NestedModelParameters
         @test build_model(s()) isa ModelParameters
+    end
+end
+
+@testset "boundary_conditions.override changes exactly one entry" begin
+    mktempdir() do dir
+        base = build_model(ceq_load([CEQ_OWB]; dir = dir))
+        ovr = build_model(ceq_load([CEQ_OWB]; dir = dir,
+                                   extra = ["boundary_conditions.override.nu_r.top=dirichlet"]))
+        old = ceq_fingerprint(base); new = ceq_fingerprint(ovr)
+        d = ceq_delta(old, new)
+        @test collect(keys(d)) == ["grid_params.BCT.nu_r"]
+        @test d["grid_params.BCT.nu_r"] == (BC_NATURAL, repr(DirichletBC()))
+        @test ovr.grid_params.BCT["nu_r"] == DirichletBC()
+        @test all(ovr.grid_params.BCT[v] == base.grid_params.BCT[v]
+                  for v in keys(base.grid_params.vars) if v != "nu_r")
+        # On XZ the two lateral dicts are one object: an `inner` override must not leak to `outer`.
+        lr = build_model(ceq_load([CEQ_OWB]; dir = dir,
+                                  extra = ["boundary_conditions.override.rho_v.inner=natural"]))
+        @test lr.grid_params.BCL["rho_v"] == NaturalBC() && lr.grid_params.BCR["rho_v"] == NeumannBC()
+        @test sort(collect(keys(ceq_delta(old, ceq_fingerprint(lr))))) == ["grid_params.BCL.rho_v"]
+        # The table reports the override.
+        cfgr = ceq_load([CEQ_OWB]; dir = dir, extra = ["boundary_conditions.override.nu_r.top=dirichlet"])
+        r = only(filter(x -> x.variable == "nu_r", boundary_condition_table(ovr, cfgr)))
+        @test r.top == "dirichlet" && occursin("override: top", r.note)
+    end
+end
+
+@testset "boundary_condition_table" begin
+    mktempdir() do dir
+        cfg = ceq_load([CEQ_TC]; dir = dir)
+        nest = build_model(cfg)
+        t = boundary_condition_table(nest, cfg)
+        vars = Scythe.mc_var_names(nest.base.options; cyl = true)
+        @test length(vars) == 25
+        @test length(t) == 3 * length(vars)
+        @test [r.patch for r in t] == repeat(1:3; inner = length(vars))
+        @test [r.variable for r in t if r.patch == 2] == vars
+        models, _ = Scythe.build_nest(nest)
+        # Every entry is the BC the built grid actually carries.
+        for r in t
+            gp = models[r.patch].grid_params
+            @test r.inner == Scythe.bc_name(gp.BCL[r.variable])
+            @test r.outer == Scythe.bc_name(gp.BCR[r.variable])
+            @test r.bottom == Scythe.bc_name(gp.BCB[r.variable])
+            @test r.top == Scythe.bc_name(gp.BCT[r.variable])
+        end
+        # build_nest: the TC's cells coarsen outward (10|20|40 km), so the OUTER patch of each
+        # junction is the parent. The finer patch's outer side is R3X (child); the coarser
+        # patch's inner side is its free collar termination (natural).
+        for r in t
+            p = r.patch
+            @test (r.outer == "r3x") == (p < 3)
+            @test occursin("outer = nest interface: R3X (child)", r.note) == (p < 3)
+            @test occursin("inner = collar: natural (parent)", r.note) == (p > 1)
+            p > 1 && @test r.inner == "natural"
+        end
+        # The domain's own walls: axis u, v Dirichlet, else Neumann; outer wall u Dirichlet only.
+        byv(p) = Dict(r.variable => r for r in t if r.patch == p)
+        ax, wall = byv(1), byv(3)
+        @test all(ax[v].inner == (v in ("u", "v") ? "dirichlet" : "neumann") for v in vars)
+        @test all(wall[v].outer == (v == "u" ? "dirichlet" : "neumann") for v in vars)
+        # Sedimenting: rain, rain number and the twelve ice slots; natural at both ends.
+        sed = ["nu_r"; "nu_nr"; ICE_SLOTS]
+        for r in t
+            s = r.variable in sed
+            @test occursin("sedimenting: flux fit F=0 at lid", r.note) == s
+            @test r.bottom == (s ? "natural" : r.variable == "w" ? "dirichlet" : "second_derivative")
+            @test r.top == r.bottom
+        end
+        # The file: deterministic, one [[patch]] per patch, the table's rows in order.
+        f1 = write_boundary_conditions(joinpath(dir, "a.toml"), t; header = "h")
+        f2 = write_boundary_conditions(joinpath(dir, "b.toml"), boundary_condition_table(nest, cfg); header = "h")
+        @test read(f1, String) == read(f2, String)
+        x = TOML.parsefile(f1)
+        @test [p["index"] for p in x["patch"]] == [1, 2, 3]
+        @test [v["name"] for v in x["patch"][3]["variable"]] == vars
+        @test x["patch"][1]["variable"][1]["outer"] == "r3x"
+        # The compact print: one line per variable plus the header and interface legend.
+        out = sprint(print_boundary_conditions, t)
+        @test count(==('\n'), out) == length(vars) + 1 + 1 + 3
+        @test occursin("patch 2: inner = collar: natural (parent), outer = nest interface: R3X (child)", out)
     end
 end
 

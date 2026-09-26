@@ -56,8 +56,16 @@ abstract type AbstractConfigSection end
 # `ENUM_FIELDS` below) so a scheme added to, say, `RADIATION_METHODS` is accepted by the
 # config with no edit here. Only the sets that are born with the config live here.
 
-"Allowed `grid.lateral` values: walls (cylindrical sets always take axis + outer wall) or periodic (XZ only; refused for the cylindrical sets at build)."
+"Allowed `boundary_conditions.lateral` values: walls (cylindrical sets always take axis + outer wall) or periodic (XZ only; refused for the cylindrical sets at build)."
 const LATERAL_BCS = (:walls, :periodic)
+"Allowed `boundary_conditions.vertical_scalars` values: the ground AND lid BC of every variable except `w` (and the sedimenting slots at the ground)."
+const VERTICAL_SCALAR_BCS = (:d2, :natural, :r1t1x, :neumann)
+"Allowed `boundary_conditions.sedimentation_lid` values: the lid BC of the rain/number/ice SLOTS (the sedimentation FLUX fit always has a zero-flux lid on a B-spline vertical)."
+const SEDIMENTATION_LID_BCS = (:natural, :wall)
+"Sides a `boundary_conditions.override` entry may name: `inner`/`outer` (cylindrical: axis/outer wall; XZ: left/right) and `bottom`/`top`."
+const BC_OVERRIDE_SIDES = ("inner", "outer", "bottom", "top")
+"Values a `boundary_conditions.override` entry may take: Springsteel's BC vocabulary (`r1t1x` = `CubicBSpline.R1T1X`, the inhomogeneous-Neumann pressure wall)."
+const BC_OVERRIDE_VALUES = ("natural", "dirichlet", "neumann", "second_derivative", "periodic", "r1t1x")
 "Allowed `initial_conditions.method` values."
 const IC_METHODS = (:balanced_vortex, :temperature_noise, :temperature_bubble, :file)
 "Allowed `initial_conditions.balanced_vortex.profile` values (the `vortex_profile` keyword of `balanced_vortex_native!`)."
@@ -74,10 +82,6 @@ const WATER_TRANSFORMS = (:none, :bhyp, :bhyp_smooth)
 const BL_SCHEMES = (:mynn, :louis, :none)
 "Allowed `physics.horizontal_mixing.scheme` values (smagorinsky exists only for the cylindrical geometries)."
 const HMIX_SCHEMES = (:smagorinsky, :constant, :none)
-"Allowed `numerics.wall_bc` values: the lateral-wall BC on the pressure-coupled variables."
-const WALL_BCS = (:d2, :natural, :r1t1x, :neumann)
-"Allowed `numerics.sedimentation_top_bc` values: the lid BC of the rain/number/ice SLOTS (the sedimentation FLUX fit always has a zero-flux lid)."
-const SEDIMENTATION_TOP_BCS = (:natural, :wall)
 "Allowed `numerics.positivity` values: `auto` applies the positivity rule at build, `off` never does."
 const POSITIVITY_MODES = (:auto, :off)
 "Allowed `output.netcdf_grid` values (`:mish` is reserved in `validate_output_options` and refused)."
@@ -149,7 +153,6 @@ end
 `[grid]` — the patches and the vertical axis.
 
 - `geometry::String` — Springsteel geometry name (`RiRk`, `RZ`, `RLR`, `RRR`); must suit `run.equation_set`.
-- `lateral::Symbol` — lateral boundaries: `walls` or `periodic` (periodic is XZ only).
 - `boundaries::Vector{Float64}` — patch edges [m], outermost last; length 2 = single patch.
 - `num_cells::Vector{Int}` — horizontal B-spline cells per patch; length `length(boundaries) - 1`.
 - `z_top::Float64` — model lid [m].
@@ -157,11 +160,27 @@ end
 """
 Base.@kwdef struct GridSection <: AbstractConfigSection
     geometry::String = "RiRk"
-    lateral::Symbol = :periodic
     boundaries::Vector{Float64} = [0.0, 300.0e3]
     num_cells::Vector{Int} = [50]
     z_top::Float64 = 25.0e3
     num_cells_k::Int = 50
+end
+
+"""
+    BoundaryConditionsSection
+
+`[boundary_conditions]` — the boundary condition of every prognostic variable, set by three family rules plus per-variable overrides. The resolved per-variable table is written to `<output.dir>/boundary_conditions.toml` and printed at startup.
+
+- `lateral::Symbol` — `walls` or `periodic` (XZ only). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here.
+- `vertical_scalars::Symbol` — ground AND lid BC of every variable except `w` (always Dirichlet zero at both) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `rho_t`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'` installed before every fit).
+- `sedimentation_lid::Symbol` — lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top.
+- `override::Dict{String,Dict{String,String}}` — expert per-variable overrides applied after the family rules: `{<variable> = {<side> = <bc>}}` with side `inner`/`outer`/`bottom`/`top` and bc `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic` or `r1t1x`; `inner`/`outer` act on the domain's own edges (a nest interface is always the nesting's), refused under periodic.
+"""
+Base.@kwdef struct BoundaryConditionsSection <: AbstractConfigSection
+    lateral::Symbol = :periodic
+    vertical_scalars::Symbol = :d2
+    sedimentation_lid::Symbol = :natural
+    override::Dict{String,Dict{String,String}} = Dict{String,Dict{String,String}}()
 end
 
 """
@@ -482,21 +501,17 @@ end
 """
     Numerics
 
-`[numerics]` — solver and boundary-condition choices; leave alone unless you know why.
+`[numerics]` — solver choices; leave alone unless you know why (boundary conditions live in `[boundary_conditions]`).
 
-- `wall_bc::Symbol` — lateral-wall BC: `d2`, `natural`, `r1t1x` or `neumann`.
-- `sedimentation_top_bc::Symbol` — lid BC of the rain/number/ice slot values: `natural` or `wall`; the sedimentation flux fit always has a zero-flux (Dirichlet) lid, so this no longer decides whether mass enters through the lid.
 - `positivity::Symbol` — `auto` (untransformed rain on k, plus i with walls) or `off`.
 - `state_dependent_si::Bool` — vertical SI coefficients from the current column state.
 - `exact_si::Bool` — exact coupled SI solve; incompatible with `state_dependent_si`.
 - `horizontal_semiimplicit::Bool` — horizontal semi-implicit acoustic terms (XZ RiRk only).
-- `wall_bc_tau::Float64` — relaxation timescale [s] of `wall_bc = r1t1x`; `inf` = none.
+- `wall_bc_tau::Float64` — relaxation timescale [s] of the `p` lid/ground condition under `boundary_conditions.vertical_scalars = r1t1x`; `inf` = none.
 - `l_q::Float64` — B-spline spectral filter length, every variable, both directions.
 - `cfl_interval::Float64` — CFL report cadence [s]; 0 = `output.interval`, resolved at build.
 """
 Base.@kwdef struct Numerics <: AbstractConfigSection
-    wall_bc::Symbol = :d2
-    sedimentation_top_bc::Symbol = :natural
     positivity::Symbol = :auto
     state_dependent_si::Bool = true
     exact_si::Bool = false
@@ -573,12 +588,13 @@ the package root).
 - `run::RunSection` — `[run]`: name, equation set, length, segmenting.
 - `output::OutputSection` — `[output]`: directory, cadences, formats.
 - `grid::GridSection` — `[grid]`: geometry, patches, vertical axis.
+- `boundary_conditions::BoundaryConditionsSection` — `[boundary_conditions]`: lateral, vertical and sedimentation BC families, per-variable overrides.
 - `timestep::TimestepSection` — `[timestep]`: root and per-patch steps.
 - `reference_state::ReferenceStateSection` — `[reference_state]`: sounding and reference fixes.
 - `initial_conditions::InitialConditions` — `[initial_conditions]`: method and its parameters.
 - `environment::Environment` — `[environment]`: f-plane latitude, SST.
 - `physics::Physics` — `[physics.*]`: microphysics, boundary layer, surface, radiation, horizontal mixing, sponge.
-- `numerics::Numerics` — `[numerics]`: solver and BC choices.
+- `numerics::Numerics` — `[numerics]`: solver choices.
 - `diagnostics::Diagnostics` — `[diagnostics]`: log traces and the timestep advisory.
 - `extra::Extra` — `[extra]`: validated escape hatch into `options`/`physical_params`.
 """
@@ -586,6 +602,7 @@ Base.@kwdef struct RunConfig <: AbstractConfigSection
     run::RunSection = RunSection()
     output::OutputSection = OutputSection()
     grid::GridSection = GridSection()
+    boundary_conditions::BoundaryConditionsSection = BoundaryConditionsSection()
     timestep::TimestepSection = TimestepSection()
     reference_state::ReferenceStateSection = ReferenceStateSection()
     initial_conditions::InitialConditions = InitialConditions()
@@ -595,7 +612,7 @@ Base.@kwdef struct RunConfig <: AbstractConfigSection
     diagnostics::Diagnostics = Diagnostics()
     extra::Extra = Extra()
 
-    function RunConfig(run, output, grid, timestep, reference_state, initial_conditions,
+    function RunConfig(run, output, grid, boundary_conditions, timestep, reference_state, initial_conditions,
                        environment, physics, numerics, diagnostics, extra)
         # Paths first (the checks below never look at them), then the checks, then the
         # coerced extra. A config that got this far is well formed; whether it is
@@ -607,10 +624,11 @@ Base.@kwdef struct RunConfig <: AbstractConfigSection
         ic_file = initial_conditions.file
         initial_conditions = _with(initial_conditions; file = _with(ic_file;
             paths = String[_resolve_config_path(p, base) for p in ic_file.paths]))
-        cfg = new(run, output, grid, timestep, reference_state, initial_conditions,
+        cfg = new(run, output, grid, boundary_conditions, timestep, reference_state, initial_conditions,
                   environment, physics, numerics, diagnostics, _checked_extra(extra))
         _check_enums(cfg, "")
         _check_equation_set(cfg)
+        _check_bc_override(cfg.boundary_conditions.override)
         return cfg
     end
 end
@@ -650,7 +668,9 @@ _with(x::T; kw...) where {T<:AbstractConfigSection} =
 const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (OutputSection, :formats)                  => OUTPUT_FORMAT_SYMBOLS,
     (OutputSection, :netcdf_grid)              => NETCDF_GRIDS,
-    (GridSection, :lateral)                    => LATERAL_BCS,
+    (BoundaryConditionsSection, :lateral)          => LATERAL_BCS,
+    (BoundaryConditionsSection, :vertical_scalars) => VERTICAL_SCALAR_BCS,
+    (BoundaryConditionsSection, :sedimentation_lid) => SEDIMENTATION_LID_BCS,
     (InitialConditions, :method)               => IC_METHODS,
     (VortexIC, :profile)                       => VORTEX_PROFILES,
     (VortexIC, :moist_profile)                 => VORTEX_MOIST_PROFILES,
@@ -668,8 +688,6 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (Radiation, :solar)                        => RADIATION_SOLAR_MODES,
     (Radiation, :forcing)                      => RADIATION_FORCINGS,
     (HorizontalMixing, :scheme)                => HMIX_SCHEMES,
-    (Numerics, :wall_bc)                       => WALL_BCS,
-    (Numerics, :sedimentation_top_bc)          => SEDIMENTATION_TOP_BCS,
     (Numerics, :positivity)                    => POSITIVITY_MODES)
 
 _join_path(path::AbstractString, f) = isempty(path) ? string(f) : string(path, ".", f)
@@ -703,6 +721,20 @@ function _check_mynn_fidelity(s::AbstractString, path::AbstractString)
         e in allowed || error("config: $(_join_path(path, :mynn_fidelity)) = $(repr(s)): " *
                               "$(repr(e)) is not recognized; use " *
                               join(repr.(allowed), ", ", " or ") * " (comma-separated)")
+    end
+    return nothing
+end
+
+# The side and value of every override entry are checked here (the file is malformed
+# otherwise); whether the VARIABLE exists depends on the physics, so that is
+# `build_boundary_conditions`'s check, made against the run's own variable list.
+function _check_bc_override(ov::AbstractDict)
+    for (var, sides) in ov, (side, val) in sides
+        where = "boundary_conditions.override.$var.$side"
+        side in BC_OVERRIDE_SIDES || error("config: $where: side $(repr(side)) is not " *
+            "recognized; use " * join(repr.(BC_OVERRIDE_SIDES), ", ", " or "))
+        val in BC_OVERRIDE_VALUES || error("config: $where = $(repr(val)) is not " *
+            "recognized; use " * join(repr.(BC_OVERRIDE_VALUES), ", ", " or "))
     end
     return nothing
 end
@@ -1069,6 +1101,16 @@ function _coerce(::Type{Vector{T}}, v, where) where {T}
     v isa AbstractVector || _type_error(where, v, "an array")
     return T[_coerce(T, e, "$where[$i]") for (i, e) in enumerate(v)]
 end
+function _coerce(::Type{Dict{String,Dict{String,String}}}, v, where)
+    v isa AbstractDict || _type_error(where, v, "a table of {side = \"bc\"} tables")
+    out = Dict{String,Dict{String,String}}()
+    for (var, sides) in v
+        sides isa AbstractDict || _type_error("$where.$var", sides, "a table {side = \"bc\"}")
+        out[string(var)] = Dict{String,String}(string(k) => _coerce(String, x, "$where.$var.$k")
+                                               for (k, x) in sides)
+    end
+    return out
+end
 function _coerce(::Type{Dict{String,Float64}}, v, where)
     v isa AbstractDict || _type_error(where, v, "a table of numbers")
     return Dict{String,Float64}(string(k) => _coerce(Float64, x, "$where.$k") for (k, x) in v)
@@ -1105,6 +1147,17 @@ end
 # ── Dict → struct ─────────────────────────────────────────────────────────────────
 
 """
+    MOVED_KEYS
+
+Config keys that moved to another section: old full key → new full key. `load_config`
+refuses the old spelling with a pointer to the new one instead of a bare unknown-key error.
+"""
+const MOVED_KEYS = Dict{String,String}(
+    "grid.lateral"                  => "boundary_conditions.lateral",
+    "numerics.wall_bc"              => "boundary_conditions.vertical_scalars",
+    "numerics.sedimentation_top_bc" => "boundary_conditions.sedimentation_lid")
+
+"""
     from_dict(T, d, path = "") -> T
 
 Convert a parsed TOML table into config section `T` (or `RunConfig`). Unknown keys are
@@ -1118,6 +1171,9 @@ function from_dict(::Type{T}, d::AbstractDict, path::AbstractString = "") where 
     kw = Dict{Symbol,Any}()
     for (k, v) in d
         s = Symbol(k)
+        full = _join_path(path, k)
+        haskey(MOVED_KEYS, full) && error("config: `$full` has moved to " *
+            "`$(MOVED_KEYS[full])` (same values); set it there")
         s in names || error("config: unknown key `$k` in [$(isempty(path) ? "top level" : path)]; " *
                             "valid keys: " * join(string.(names), ", "))
         kw[s] = _coerce(fieldtype(T, s), v, _join_path(path, k))

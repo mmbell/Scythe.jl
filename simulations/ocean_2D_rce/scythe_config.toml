@@ -1,6 +1,6 @@
 # Open-ocean radiative-convective equilibrium on a 2-D (x-z) periodic slice: MYNN + ISHMAEL
 # ice + diurnal all-sky RRTMGP, triggered only by seeded low-level temperature noise (no
-# bubble, no wall). Every key of [run]/[output]/[grid]/[timestep]/[reference_state]/
+# bubble, no wall). Every key of [run]/[output]/[grid]/[boundary_conditions]/[timestep]/[reference_state]/
 # [initial_conditions]/[environment] below is spelled out, even where it equals the
 # RunConfig struct default (src/config.jl), so this file alone describes the domain (300 km
 # periodic x 25 km lid, 6 km x 500 m cells -- the quick grid; examples/full.toml has 3 km / 300 m),
@@ -36,11 +36,26 @@ netcdf_derivatives = false
 
 [grid]
 geometry    = "RiRk"                 # B-spline vertical
-lateral     = "periodic"             # open ocean: no lateral wall at all
 boundaries  = [0.0, 300.0e3]         # 300 km domain (quick grid; examples/full.toml: 3 km cells)
 num_cells   = [50]                   # 50 horizontal cells -> 6 km spacing
 z_top       = 25.0e3                 # 25 km lid
 num_cells_k = 50                     # 50 vertical cells -> 500 m spacing
+
+[boundary_conditions]
+# The boundary condition of every variable follows from these three family rules (plus any
+# per-variable [boundary_conditions.override] entries). The resolved per-variable table is
+# written to <output.dir>/boundary_conditions.toml and printed at startup; the tables for
+# every case are in simulations/README.md ("Boundary conditions").
+lateral           = "periodic"       # open ocean, no lateral wall at all: every variable
+                                     # periodic in x (x = 300 km is x = 0)
+vertical_scalars  = "d2"             # GROUND and LID of every variable except w (always
+                                     # Dirichlet zero at both) and the sedimenting slots at the
+                                     # ground (always natural): second derivative zero -- p,
+                                     # rho_d, rho_t, u, E_t, Q_ss, nu_c, rho_v, rho_e
+sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
+                                     # ice slots: unconstrained (their ground is always natural,
+                                     # so they fall out). The sedimentation FLUX is fitted with a
+                                     # zero-flux lid either way: nothing falls in from above
 
 [timestep]
 ts           = 0.5                   # [s], root (and only) patch

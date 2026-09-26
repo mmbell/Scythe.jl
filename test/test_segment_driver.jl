@@ -49,6 +49,13 @@ function check_two_segment_run(root, npatches)
           join(Scythe.initial_ics_paths(root, npatches), ";")
     # the root config re-reads to the configuration that ran
     @test isfile(joinpath(root, "scythe_config.toml")) && isfile(joinpath(root, "reference.ref"))
+    # the resolved boundary conditions: one [[patch]] per patch, every variable listed
+    bcf = joinpath(root, "boundary_conditions.toml")
+    @test isfile(bcf)
+    bct = Scythe.TOML.parsefile(bcf)
+    @test length(bct["patch"]) == npatches
+    @test all(any(v -> v["name"] == "w" && v["bottom"] == "dirichlet", p["variable"])
+              for p in bct["patch"])
     return rows
 end
 

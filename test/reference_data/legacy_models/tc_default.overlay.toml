@@ -16,6 +16,8 @@ stability = false
 [physics.radiation]
 scheme = "none"
 
+[boundary_conditions]
+sedimentation_lid = "wall"           # legacy TC left rain on the d2 wall condition at the lid
+
 [numerics]
-sedimentation_top_bc = "wall"        # legacy TC left rain on the d2 wall condition at the lid
 wall_bc_tau = "inf"                  # inert under d2; the legacy value

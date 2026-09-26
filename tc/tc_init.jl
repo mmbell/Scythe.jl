@@ -42,12 +42,12 @@ const TC_CLOUD_VAR = Scythe.condensate_var_name(_TC_OPTIONS)
     tc_boundary_conditions() -> (axis_bc, wall_bc, bot_bc, top_bc)
 
 DEPRECATED shim over `Scythe.build_boundary_conditions(TC_CFG, ...)`: the axis + wall
-lateral conditions and the `numerics.wall_bc` (currently `"d2"`, `SecondDerivativeBC` on
-every scalar) vertical conditions of the production TC configuration, keyed by `TC_VARS`.
+lateral conditions and the `boundary_conditions.vertical_scalars` (currently `"d2"`,
+`SecondDerivativeBC` on every variable but `w`) vertical conditions of the production TC configuration, keyed by `TC_VARS`.
 The old `SCYTHE_TC_WALL_BC` switch (d2 | natural | r1t1x) is gone: a diagnostic that needs
 a non-default wall condition should build its own BC dicts directly (as
 model_tests/tc_lid_drift_probe.jl does) or load a `TC_CFG`-like config with
-`numerics.wall_bc` overridden.
+`boundary_conditions.vertical_scalars` overridden.
 """
 function tc_boundary_conditions()
     _tc_deprecated(:tc_boundary_conditions)

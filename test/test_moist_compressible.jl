@@ -5253,7 +5253,7 @@ using Springsteel
     """
     An ice-capable column in the PRODUCTION configuration the failure happened in: bhyp on
     every water slot, the sedimenting slots (rain, rain number, the twelve ice moments)
-    Natural at BOTH ends (the `sedimentation_top_bc = natural` default), vapor at ICE
+    Natural at BOTH ends (the `boundary_conditions.sedimentation_lid = natural` default), vapor at ICE
     saturation so no phase change masks the transport, and a live population (mass AND
     number) whose crystals grow toward the lid so the mass-weighted fall speed increases
     upward (~0.56 m/s at the ground to ~1.95 m/s at the lid). `geometry` "RZ" is the

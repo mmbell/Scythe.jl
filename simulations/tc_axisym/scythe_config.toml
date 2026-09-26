@@ -1,8 +1,8 @@
 # Axisymmetric tropical cyclone: a 3-nest RiRk radius-height domain on the coarse grid,
 # production physics with ice.
 #
-# The case definition (run, output, grid, timestep, reference state, initial conditions and
-# environment) is written out IN FULL below, even where a value equals the RunConfig struct
+# The case definition (run, output, grid, boundary conditions, timestep, reference state,
+# initial conditions and environment) is written out IN FULL below, even where a value equals the RunConfig struct
 # default, so the nests, resolution, timestep, sounding, vortex and SST/f can be read here
 # without opening src/config.jl. Physics, numerics and diagnostics are DELTA-ONLY: the
 # struct defaults ARE the production moist-compressible physics, and a key is listed only
@@ -18,8 +18,7 @@
 #                    (sunrise near h12, so the first day holds both halves of the cycle);
 #                    heating tapered to zero at the sponge onset (z_max = 0 -> z_damp)
 #   sponge           Durran & Klemp (1983), alpha = 0.02 s^-1 above 17 km (stratosphere only)
-#   numerics         d2 lateral walls, natural lid BC for the sedimenting species,
-#                    state-dependent vertical SI (implicit acoustic coefficients from the
+#   numerics         state-dependent vertical SI (implicit acoustic coefficients from the
 #                    current column: no convective SI ceiling), spline filter l_q = 2
 #
 # The full resolved configuration is written to <output.dir>/scythe_config.toml at run start.
@@ -50,14 +49,35 @@ netcdf_derivatives = false
 # LOWEST cell, so cell depth scales how it is spread; 500 m stays within a factor two of
 # the 250-300 m the BL/surface schemes were built at.
 geometry    = "RiRk"
-lateral     = "walls"                # axis + outer wall (the only choice for cylindrical sets)
 boundaries  = [0.0, 150.0e3, 450.0e3, 1050.0e3]   # [m] three nests, innermost first
 num_cells   = [15, 15, 15]           # 10 | 20 | 40 km radial cells
 z_top       = 25.0e3                 # [m]
 num_cells_k = 50                     # 500 m vertical cells
 
+[boundary_conditions]
+# The boundary condition of every variable follows from these three family rules (plus any
+# per-variable [boundary_conditions.override] entries). The resolved per-variable, per-patch
+# table is written to <output.dir>/boundary_conditions.toml and printed at startup; the
+# tables for every case are in simulations/README.md ("Boundary conditions").
+lateral           = "walls"          # the only choice for the cylindrical sets. AXIS (r = 0):
+                                     # u, v Dirichlet (zero); every other variable, w included,
+                                     # Neumann (zero radial gradient). OUTER WALL (1050 km): u
+                                     # Dirichlet; every other variable, v and w included,
+                                     # Neumann. The two nest junctions are NOT set here: the
+                                     # finer (inner) patch's outer side is R3X (border trio
+                                     # pinned to the coarser parent), the parent's inner side is
+                                     # a natural collar termination one parent cell inside the child
+vertical_scalars  = "d2"             # GROUND and LID of every variable except w (always
+                                     # Dirichlet zero at both) and the sedimenting slots at the
+                                     # ground (always natural): second derivative zero -- p,
+                                     # rho_d, rho_t, u, v, E_t, Q_ss, nu_c, rho_v, rho_e
+sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
+                                     # ice slots: unconstrained (their ground is always natural,
+                                     # so they fall out). The sedimentation FLUX is fitted with a
+                                     # zero-flux lid either way: nothing falls in from above
+
 [timestep]
-# 0.5 s on every patch. The d2 lateral-wall BC sets a measured SI ceiling of ~0.75 s
+# 0.5 s on every patch. The d2 ground/lid BC (vertical_scalars) sets a measured SI ceiling of ~0.75 s
 # (reference/SI_WALL_BC_CEILING.md); ts = 1.0 sat above it and produced spurious cooling.
 # 0.5 is validated over 12 h. The explicit horizontal acoustic limit (3.31 s coarse) is
 # the next ceiling after that.

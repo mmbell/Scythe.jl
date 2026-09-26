@@ -249,6 +249,7 @@ whole_steps(len, dt) = abs(len / dt - round(len / dt)) < 1.0e-9
 #   <root>/scythe_config.toml       resolved config (fresh start) + provenance header
 #   <root>/reference.ref, ics.csv | nest{i}_ics.csv
 #   <root>/segments.csv             one row per segment (SEGMENTS_CSV_COLS)
+#   <root>/boundary_conditions.toml the resolved BC of every variable per patch (rewritten on resume)
 #   <root>/seg_NN/scythe_config.toml  the same config, with this segment's values in the header
 #   <root>/seg_NN/segment_stdout.log
 #   <root>/seg_NN/[nest{i}/]<t>.nc | <t>.jld2 | scythe_{out,err}.log
@@ -624,6 +625,10 @@ date, host, `config_sources`, `set`, and `exec`, which is provenance only); buil
 1, writes the reference state and initial conditions (`initialize_case!`); then runs every
 segment.
 
+Both paths write `root/boundary_conditions.toml` ([`boundary_condition_table`](@ref): the
+BC every variable actually has on every patch) and print its compact form once, after the
+run summary line.
+
 `resume = true`: re-reads `root/scythe_config.toml` and uses THAT configuration (the `cfg`
 argument supplies only the root). `set` may only hold `run.integration_time=...` (to extend
 a run; scythe_config.toml is rewritten and the new segments carry a note in segments.csv).
@@ -718,6 +723,19 @@ function _orchestrate(cfg::RunConfig, exec::ExecutionEnv, root::String, resume::
 
     println("Scythe: $(cfg.run.name): $(cfg.run.integration_time) s in $nseg segment(s); " *
             "root = $root")
+    # The boundary condition every variable ACTUALLY has, as built (fresh start and resume):
+    # the three [boundary_conditions] family rules, the overrides and the nest interfaces.
+    bc_table = boundary_condition_table(build_model(cfg; segment = merge(plan[1],
+        (initial_conditions = initial_ics_paths(cfg, root, n),))), cfg)
+    bc = cfg.boundary_conditions
+    write_boundary_conditions(joinpath(root, BC_TABLE_NAME), bc_table; header =
+        "Resolved boundary conditions of every prognostic variable, as built by Scythe from\n" *
+        "[boundary_conditions] lateral = $(bc.lateral), vertical_scalars = " *
+        "$(bc.vertical_scalars), sedimentation_lid = $(bc.sedimentation_lid)" *
+        (isempty(bc.override) ? "" : " + $(length(bc.override)) override(s)") * ".\n" *
+        "inner/outer = axis/outer wall (cylindrical) or left/right (XZ).")
+    print_boundary_conditions(stdout, bc_table)
+    println("Scythe: full table in $(joinpath(root, BC_TABLE_NAME))")
     proj = dirname(Base.active_project())
     code = "using Scythe; Scythe.segment_main(ARGS)"
     for s in plan

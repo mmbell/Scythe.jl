@@ -5,13 +5,13 @@
 # MYNN + ice; no radiation (a 2-hour bubble does not feel it).
 #
 # The domain, grid, sounding, initial condition and environment are what this case IS, so
-# [run], [output], [grid], [timestep], [reference_state], [initial_conditions] (and its
+# [run], [output], [grid], [boundary_conditions], [timestep], [reference_state], [initial_conditions] (and its
 # active [initial_conditions.temperature_bubble] sub-table) and [environment] are spelled
 # out here IN FULL -- every key, even where it equals the `RunConfig` struct default in
 # src/config.jl -- so a reader sees the whole case without opening that file. Most of
 # these values in fact ARE the struct defaults: this case differs from the generic
 # single-patch XZ default only in `run.name`/`integration_time`, `output.interval`,
-# `grid.lateral` (walls, not periodic) and `initial_conditions.method`.
+# `boundary_conditions.lateral` (walls, not periodic) and `initial_conditions.method`.
 #
 # [physics], [numerics] and [diagnostics] stay DELTA-ONLY (only keys that differ from the
 # struct default are listed): here that is just radiation off. The full resolved
@@ -36,11 +36,26 @@ netcdf_derivatives = false
 # 300 km x 25 km, 6 km x 500 m cells (the TC coarse-grid spacing): production-like without
 # the TC's multi-day spin-up. Single patch, lateral WALLS (O01's domain, not periodic).
 geometry    = "RiRk"                 # B-spline vertical
-lateral     = "walls"
 boundaries  = [0.0, 300.0e3]
 num_cells   = [50]
 z_top       = 25.0e3
 num_cells_k = 50
+
+[boundary_conditions]
+# The boundary condition of every variable follows from these three family rules (plus any
+# per-variable [boundary_conditions.override] entries). The resolved per-variable table is
+# written to <output.dir>/boundary_conditions.toml and printed at startup; the tables for
+# every case are in simulations/README.md ("Boundary conditions").
+lateral           = "walls"          # LEFT and RIGHT (x = 0, 300 km): u and w Dirichlet (zero);
+                                     # every other variable Neumann (zero x-gradient)
+vertical_scalars  = "d2"             # GROUND and LID of every variable except w (always
+                                     # Dirichlet zero at both) and the sedimenting slots at the
+                                     # ground (always natural): second derivative zero -- p,
+                                     # rho_d, rho_t, u, E_t, Q_ss, nu_c, rho_v, rho_e
+sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
+                                     # ice slots: unconstrained (their ground is always natural,
+                                     # so they fall out). The sedimentation FLUX is fitted with a
+                                     # zero-flux lid either way: nothing falls in from above
 
 [timestep]
 ts           = 0.5                   # [s]

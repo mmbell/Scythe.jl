@@ -2,7 +2,9 @@
 # Generate simulations/README.md: the launcher reference and the complete run-configuration
 # reference, from the code itself -- the `RunConfig` section structs (their docstrings carry
 # one `- `field::Type` — description` line per field), their defaults, the enum value sets
-# (`Scythe.ENUM_FIELDS`), `EQUATION_SETS`, and the `[extra.*]` key registries.
+# (`Scythe.ENUM_FIELDS`), `EQUATION_SETS`, the `[extra.*]` key registries, and the resolved
+# boundary condition of every variable of every case (`build_model` + `boundary_condition_table`
+# on each simulations/<case>/scythe_config.toml, so the tables cannot drift from the code).
 #
 #   julia --project=. tools/config_reference.jl [--check]
 #
@@ -151,6 +153,71 @@ function registry_table(io, known, owned, what)
     println(io)
 end
 
+# ── Boundary conditions ───────────────────────────────────────────────────────────────
+
+"The resolved BC table of every case, from the code (build_model + boundary_condition_table)."
+function bc_section(io)
+    print(io, """
+    ## Boundary conditions
+
+    Every prognostic variable has a boundary condition on each of its four sides: `inner` and
+    `outer` (the axis and the outer wall on the cylindrical sets; left and right on XZ), and
+    `bottom` (the ground) and `top` (the lid). They are NOT listed one by one in the config:
+    `[boundary_conditions]` holds three family rules that `build_boundary_conditions`
+    (src/config_build.jl) applies to the run's variable list, then the per-variable
+    `override` entries, then `build_nest` sets the nest interfaces. What each family value
+    does, exactly:
+
+    | key = value | rule applied |
+    |---|---|
+    | `lateral = "walls"`, XZ | inner and outer: `u`, `w` dirichlet (zero); every other variable neumann (zero gradient) |
+    | `lateral = "walls"`, cylindrical (the only choice) | inner (axis): `u`, `v` dirichlet; every other variable, `w` included, neumann. outer (wall): `u` dirichlet; every other variable, `v` and `w` included, neumann |
+    | `lateral = "periodic"` (XZ, single patch only) | inner and outer: periodic on every variable |
+    | `vertical_scalars = "d2"` | bottom and top of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
+    | `vertical_scalars = "natural"` | bottom and top of every variable: natural (unconstrained); then the rules below |
+    | `vertical_scalars = "neumann"` | bottom and top of every variable: neumann; then the rules below |
+    | `vertical_scalars = "r1t1x"` | as `d2`, except `rho_d`, `rho_t`, `E_t`, `Q_ss` neumann and `p` r1t1x (the rigid-wall pressure condition `dp'/dz = -g rho_t'`, installed before every fit; relaxed on `numerics.wall_bc_tau`) |
+    | (always) | `w` dirichlet (zero) at bottom and top, whatever `vertical_scalars` |
+    | (always) | the sedimenting slots (rain; the rain number under two-moment rain; the twelve ice slots under ISHMAEL) natural at the bottom, so they fall out |
+    | `sedimentation_lid = "natural"` | the sedimenting slots natural at the top too |
+    | `sedimentation_lid = "wall"` | the sedimenting slots keep the `vertical_scalars` condition at the top |
+    | (always, B-spline vertical) | the sedimentation FLUX of every sedimenting slot is fitted with a zero-flux (dirichlet) lid, whatever its slot's own top BC: nothing falls in from above (`[extra.options] sedimentation_flux_lid = "natural"` undoes this, forensics only) |
+    | nests (not configurable) | at each junction the finer patch's side is r3x (its border value, slope and curvature pinned to the coarser parent at run time) and the coarser patch's side is natural (its free collar termination, one parent cell inside the child) |
+
+    `[boundary_conditions.override]` sets single entries after these rules, for experiments:
+
+    ```toml
+    [boundary_conditions.override]
+    nu_r = { top = "dirichlet" }            # or a [boundary_conditions.override.nu_r] table
+    ```
+
+    Sides: $(join(("`$(x)`" for x in S.BC_OVERRIDE_SIDES), ", ")). Values: $(join(("`$(x)`" for x in S.BC_OVERRIDE_VALUES), ", ")).
+    The variable must be one the run has (an error lists them); `inner`/`outer` act on the
+    domain's own edges (the first patch's inner side, the last patch's outer side), never on a
+    nest interface, and are refused under `lateral = "periodic"`.
+
+    Every run writes the resolved table to `<output.dir>/boundary_conditions.toml` (one
+    `[[patch]]` per patch, one `[[patch.variable]]` per variable) and prints its compact
+    form at startup. The tables of the cases here, generated from their `scythe_config.toml`
+    (a single lateral name = both sides; `p<i>` = patch `i`):
+
+    """)
+    for c in cases()
+        cfg = load_config(joinpath(dirname(OUT), c, "scythe_config.toml"))
+        bcs = cfg.boundary_conditions
+        println(io, "### `$c`\n")
+        println(io, "`lateral = \"$(bcs.lateral)\"`, `vertical_scalars = \"$(bcs.vertical_scalars)\"`, ",
+                "`sedimentation_lid = \"$(bcs.sedimentation_lid)\"`",
+                isempty(bcs.override) ? "" : ", plus $(length(bcs.override)) override(s)", ".\n")
+        table = redirect_stderr(devnull) do
+            boundary_condition_table(build_model(cfg), cfg)
+        end
+        println(io, "```")
+        print_boundary_conditions(io, table)
+        println(io, "```\n")
+    end
+end
+
 # ── The page ──────────────────────────────────────────────────────────────────────────
 
 function cases()
@@ -270,6 +337,7 @@ function page()
     <output.dir>/reference.ref            reference column: z p rho_d rho_v rho_c
     <output.dir>/ics.csv | nest{i}_ics.csv  initial conditions
     <output.dir>/segments.csv             one row per segment (columns below)
+    <output.dir>/boundary_conditions.toml the BC every variable actually has, per patch (see below)
     <output.dir>/job_stdout.log           (sbatch launchers only)
     <output.dir>/seg_NN/scythe_config.toml  the same config; the segment's values in the header
     <output.dir>/seg_NN/segment_stdout.log
@@ -299,6 +367,7 @@ function page()
     for (path, T, inst) in sections()
         section_table(io, path, T, inst)
     end
+    bc_section(io)
     println(io, "### Equation sets and geometries\n")
     equation_set_table(io)
     println(io, "### Enum values\n")
