@@ -941,10 +941,11 @@ reproducible rather than `Dict`-iteration order.
 function _write_group_attrs!(ds, prefix::String, attrs::AbstractDict)
     for k in sort!(collect(keys(attrs)))
         name = (isempty(prefix) || startswith(k, prefix)) ? k : prefix * k
-        ds.attrib[name] = attrs[k]
+        ds.attrib[name] = netcdf_attr_value(attrs[k])
     end
     return nothing
 end
+
 
 """
     write_netcdf_comprehensive(path, grid, model, t, ctx, physics = nothing) -> Nothing

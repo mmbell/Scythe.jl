@@ -148,6 +148,10 @@ const MYNN_FIELDS_1D = (
 take from the first one -- the same ones `read_mynn` sums when it reassembles a snapshot."
 const MYNN_COUNTER_ATTRS = ("n_clamp_e", "n_cap_K", "n_diffnum", "n_gate", "n_stall",
                             "n_plume", "n_hfx_clip", "n_qfx_clip")
+# The counters are written as Float64 (exact to 2^53): NCDatasets stores every Int64
+# attribute as NC_INT (Int32) for NetCDF portability, and the per-column-per-step census
+# sums of a multi-day run pass 2^31 (an RCE segment died at 16 h on n_gate = 2.27e9 with
+# an InexactError). Readers take Int(...) of the value, which is exact for integral floats.
 
 """
     mynn_global_attrs(MY::MYNNState) -> Vector{Pair{String,Any}}
@@ -181,14 +185,14 @@ function mynn_global_attrs(MY::MYNNState)
         "mix_numbers" => Int(MY.mix_numbers),
         "mynn_interval_s" => MY.interval_steps * MY.ts,
         "K_max" => isinf(MY.K_max) ? 1.0e30 : MY.K_max,
-        "n_clamp_e" => MY.n_clamp_e,
-        "n_cap_K" => MY.n_cap_K,
-        "n_diffnum" => MY.n_diffnum,
-        "n_gate" => MY.n_gate,
-        "n_stall" => MY.n_stall,
-        "n_plume" => MY.n_plume,
-        "n_hfx_clip" => MY.n_hfx_clip,
-        "n_qfx_clip" => MY.n_qfx_clip]
+        "n_clamp_e" => Float64(MY.n_clamp_e),
+        "n_cap_K" => Float64(MY.n_cap_K),
+        "n_diffnum" => Float64(MY.n_diffnum),
+        "n_gate" => Float64(MY.n_gate),
+        "n_stall" => Float64(MY.n_stall),
+        "n_plume" => Float64(MY.n_plume),
+        "n_hfx_clip" => Float64(MY.n_hfx_clip),
+        "n_qfx_clip" => Float64(MY.n_qfx_clip)]
 end
 
 """
@@ -283,14 +287,14 @@ docstring records. The sums are cheap (one pass over the columns per output time
 """
 function _mynn_live_census_attrs(MY::MYNNState)
     attrs = Dict{String,Any}(mynn_global_attrs(MY))
-    attrs["n_clamp_e"] = sum(MY.n_clamp_col)
-    attrs["n_cap_K"] = sum(MY.n_capK_col)
-    attrs["n_diffnum"] = sum(MY.n_diffnum_col)
-    attrs["n_gate"] = sum(MY.n_gate_col)
-    attrs["n_stall"] = sum(MY.n_stall_col)
-    attrs["n_plume"] = sum(MY.n_plume_col)
-    attrs["n_hfx_clip"] = sum(MY.n_hfx_clip_col)
-    attrs["n_qfx_clip"] = sum(MY.n_qfx_clip_col)
+    attrs["n_clamp_e"] = Float64(sum(MY.n_clamp_col))
+    attrs["n_cap_K"] = Float64(sum(MY.n_capK_col))
+    attrs["n_diffnum"] = Float64(sum(MY.n_diffnum_col))
+    attrs["n_gate"] = Float64(sum(MY.n_gate_col))
+    attrs["n_stall"] = Float64(sum(MY.n_stall_col))
+    attrs["n_plume"] = Float64(sum(MY.n_plume_col))
+    attrs["n_hfx_clip"] = Float64(sum(MY.n_hfx_clip_col))
+    attrs["n_qfx_clip"] = Float64(sum(MY.n_qfx_clip_col))
     return attrs
 end
 
@@ -324,7 +328,7 @@ function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
         # The resolved configuration and the clamp/plume census, from the SAME function
         # the comprehensive writer reads (N2): one list, two files.
         for (k, v) in mynn_global_attrs(MY)
-            ds.attrib[k] = v
+            ds.attrib[k] = netcdf_attr_value(v)
         end
         # Tile-local extremes, which have no place in a domain-wide file and so are not
         # part of `mynn_global_attrs`.

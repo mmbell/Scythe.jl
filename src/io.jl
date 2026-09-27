@@ -142,3 +142,18 @@ function write_restart(grid::AbstractGrid, model::ModelParameters, t::Float64)
     save_grid(checkpoint_path(model.output_dir, t), grid)
     return nothing
 end
+
+"""
+    netcdf_attr_value(v) -> v′
+
+The value to hand NCDatasets for a global attribute. NCDatasets writes every Int64 attribute
+as NC_INT (Int32) for NetCDF portability and throws `InexactError` past 2^31 — which is how a
+16-hour RCE segment died on a MYNN census counter of 2.27e9. The cumulative counters are
+Float64 at their source (`MYNN_COUNTER_ATTRS`, `RADIATION_COUNTER_ATTRS`); this is the safety
+net for any other integer attribute: an Int64 outside the Int32 range becomes a Float64
+(exact to 2^53) instead of an error. Everything else passes through unchanged.
+"""
+netcdf_attr_value(v) = v
+netcdf_attr_value(v::Bool) = v
+netcdf_attr_value(v::Integer) =
+    (typemin(Int32) <= v <= typemax(Int32)) ? v : Float64(v)

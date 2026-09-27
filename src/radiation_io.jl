@@ -192,10 +192,10 @@ function radiation_global_attrs(rs::RadiationState, ts::Float64)
         "forcing" => string(rs.forcing),
         "z_max" => isinf(rs.z_max) ? 1.0e30 : rs.z_max,
         "radiation_interval_s" => rs.interval_steps * ts,
-        "n_clamp_tk" => rs.n_clamp_tk,
-        "n_clamp_re_liq" => rs.n_clamp_re_liq,
-        "n_clamp_re_ice" => rs.n_clamp_re_ice,
-        "n_neg_rho_v" => rs.n_neg_rho_v]
+        "n_clamp_tk" => Float64(rs.n_clamp_tk),
+        "n_clamp_re_liq" => Float64(rs.n_clamp_re_liq),
+        "n_clamp_re_ice" => Float64(rs.n_clamp_re_ice),
+        "n_neg_rho_v" => Float64(rs.n_neg_rho_v)]   # Float64: see MYNN_COUNTER_ATTRS
 end
 
 """
@@ -343,7 +343,7 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
         # The resolved configuration, sun state and clamp census, from the SAME function
         # the comprehensive writer reads (N2): one list, two files.
         for (k, v) in radiation_global_attrs(rs, mtile.model.ts)
-            ds.attrib[k] = v
+            ds.attrib[k] = netcdf_attr_value(v)
         end
         ds.attrib["patch_offset_l"] = mtile.tile.params.patchOffsetL
 

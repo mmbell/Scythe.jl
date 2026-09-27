@@ -500,12 +500,12 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
                 out.attrib["mynn_edmf"] = mynn.edmf
                 out.attrib["mynn_init_mode"] = mynn.init_mode
                 out.attrib["mynn_water_carry"] = mynn.water_carry
-                out.attrib["mynn_n_clamp_e"] = mynn.n_clamp_e
-                out.attrib["mynn_n_cap_K"] = mynn.n_cap_K
-                out.attrib["mynn_n_diffnum"] = mynn.n_diffnum
-                out.attrib["mynn_n_gate"] = mynn.n_gate
-                out.attrib["mynn_n_stall"] = mynn.n_stall
-                out.attrib["mynn_n_plume"] = mynn.n_plume
+                out.attrib["mynn_n_clamp_e"] = Float64(mynn.n_clamp_e)
+                out.attrib["mynn_n_cap_K"] = Float64(mynn.n_cap_K)
+                out.attrib["mynn_n_diffnum"] = Float64(mynn.n_diffnum)
+                out.attrib["mynn_n_gate"] = Float64(mynn.n_gate)
+                out.attrib["mynn_n_stall"] = Float64(mynn.n_stall)
+                out.attrib["mynn_n_plume"] = Float64(mynn.n_plume)
             end
 
             # Pass through any control-variable derivative slots that were output

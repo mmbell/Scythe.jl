@@ -758,4 +758,27 @@ using NCDatasets
                   nothing
         end
     end
+    @testset "global attributes: Int64 counters past 2^31 are written, not truncated" begin
+        # NCDatasets stores every Int64 attribute as NC_INT (Int32); a 16-hour RCE segment
+        # died with InexactError when the MYNN n_gate census reached 2.27e9. Counters are
+        # Float64 at their source and netcdf_attr_value is the safety net for the rest.
+        @test Scythe.netcdf_attr_value(7) === 7
+        @test Scythe.netcdf_attr_value(true) === true
+        @test Scythe.netcdf_attr_value(2273316065) === 2.273316065e9
+        @test Scythe.netcdf_attr_value(-2^31 - 1) === -2.147483649e9
+        mktempdir() do dir
+            path = joinpath(dir, "attrs.nc")
+            NCDatasets.NCDataset(path, "c") do ds
+                Scythe._write_group_attrs!(ds, "mynn_", Dict{String,Any}(
+                    "n_gate" => 2273316065, "n_stall" => 12, "fidelity" => "scythe"))
+            end
+            NCDatasets.NCDataset(path) do ds
+                @test ds.attrib["mynn_n_gate"] == 2273316065
+                @test Int(ds.attrib["mynn_n_gate"]) === 2273316065
+                @test ds.attrib["mynn_n_stall"] == 12
+                @test ds.attrib["mynn_fidelity"] == "scythe"
+            end
+        end
+    end
+
 end
