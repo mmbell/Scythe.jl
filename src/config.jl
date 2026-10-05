@@ -58,7 +58,7 @@ abstract type AbstractConfigSection end
 
 "Allowed `boundary_conditions.lateral` values: walls (cylindrical sets always take axis + outer wall) or periodic (XZ only; refused for the cylindrical sets at build)."
 const LATERAL_BCS = (:walls, :periodic)
-"Allowed `boundary_conditions.vertical_scalars` values: the ground AND lid BC of every variable except `w` (and the sedimenting slots at the ground)."
+"Allowed `boundary_conditions.vertical_scalars` (ground) and `boundary_conditions.vertical_scalars_lid` (lid) values: the BC of every variable except `w` (and the sedimenting slots at the ground)."
 const VERTICAL_SCALAR_BCS = (:d2, :natural, :r1t1x, :neumann)
 "Allowed `boundary_conditions.sedimentation_lid` values: the lid BC of the rain/number/ice SLOTS (the sedimentation FLUX fit always has a zero-flux lid on a B-spline vertical)."
 const SEDIMENTATION_LID_BCS = (:natural, :wall)
@@ -169,16 +169,18 @@ end
 """
     BoundaryConditionsSection
 
-`[boundary_conditions]` — the boundary condition of every prognostic variable, set by three family rules plus per-variable overrides. The resolved per-variable table is written to `<output.dir>/boundary_conditions.toml` and printed at startup.
+`[boundary_conditions]` — the boundary condition of every prognostic variable, set by four family rules plus per-variable overrides. The resolved per-variable table is written to `<output.dir>/boundary_conditions.toml` and printed at startup.
 
 - `lateral::Symbol` — `walls` or `periodic` (XZ only). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here.
-- `vertical_scalars::Symbol` — ground AND lid BC of every variable except `w` (always Dirichlet zero at both) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `rho_t`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'` installed before every fit).
-- `sedimentation_lid::Symbol` — lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top.
+- `vertical_scalars::Symbol` — GROUND BC of every variable except `w` (always Dirichlet zero) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `rho_t`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'` installed before every fit). Keep `d2`: `neumann` on `p` at the ground drains the pressure field.
+- `vertical_scalars_lid::Symbol` — LID BC of the same family (every variable except `w`, always Dirichlet zero), same values as `vertical_scalars`. Natural by default: `d2` at a rigid lid over-constrains the perturbation fields and drifts warm over days (multi-day 2D RCE: lid T anomaly 0.5 K at 48 h, crash at 277 h; restarted with a natural lid the anomaly decays). Clean at ts = 0.75 s on the RCE case; ts = 1.0 s showed a transient adjustment that `d2` did not.
+- `sedimentation_lid::Symbol` — lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars_lid`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top.
 - `override::Dict{String,Dict{String,String}}` — expert per-variable overrides applied after the family rules: `{<variable> = {<side> = <bc>}}` with side `inner`/`outer`/`bottom`/`top` and bc `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic` or `r1t1x`; `inner`/`outer` act on the domain's own edges (a nest interface is always the nesting's), refused under periodic.
 """
 Base.@kwdef struct BoundaryConditionsSection <: AbstractConfigSection
     lateral::Symbol = :periodic
     vertical_scalars::Symbol = :d2
+    vertical_scalars_lid::Symbol = :natural
     sedimentation_lid::Symbol = :natural
     override::Dict{String,Dict{String,String}} = Dict{String,Dict{String,String}}()
 end
@@ -507,7 +509,7 @@ end
 - `state_dependent_si::Bool` — vertical SI coefficients from the current column state.
 - `exact_si::Bool` — exact coupled SI solve; incompatible with `state_dependent_si`.
 - `horizontal_semiimplicit::Bool` — horizontal semi-implicit acoustic terms (XZ RiRk only).
-- `wall_bc_tau::Float64` — relaxation timescale [s] of the `p` lid/ground condition under `boundary_conditions.vertical_scalars = r1t1x`; `inf` = none.
+- `wall_bc_tau::Float64` — relaxation timescale [s] of the `p` lid/ground condition under `boundary_conditions.vertical_scalars` or `vertical_scalars_lid` = `r1t1x`; `inf` = none.
 - `l_q::Float64` — B-spline spectral filter length, every variable, both directions.
 - `cfl_interval::Float64` — CFL report cadence [s]; 0 = `output.interval`, resolved at build.
 """
@@ -670,6 +672,7 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (OutputSection, :netcdf_grid)              => NETCDF_GRIDS,
     (BoundaryConditionsSection, :lateral)          => LATERAL_BCS,
     (BoundaryConditionsSection, :vertical_scalars) => VERTICAL_SCALAR_BCS,
+    (BoundaryConditionsSection, :vertical_scalars_lid) => VERTICAL_SCALAR_BCS,
     (BoundaryConditionsSection, :sedimentation_lid) => SEDIMENTATION_LID_BCS,
     (InitialConditions, :method)               => IC_METHODS,
     (VortexIC, :profile)                       => VORTEX_PROFILES,
@@ -1150,12 +1153,19 @@ end
     MOVED_KEYS
 
 Config keys that moved to another section: old full key → new full key. `load_config`
-refuses the old spelling with a pointer to the new one instead of a bare unknown-key error.
+refuses the old spelling with a pointer to the new one instead of a bare unknown-key error
+(plus the `MOVED_KEY_NOTES` entry, if any).
 """
 const MOVED_KEYS = Dict{String,String}(
     "grid.lateral"                  => "boundary_conditions.lateral",
     "numerics.wall_bc"              => "boundary_conditions.vertical_scalars",
     "numerics.sedimentation_top_bc" => "boundary_conditions.sedimentation_lid")
+
+"What a `MOVED_KEYS` refusal adds when the new key does not carry the old meaning alone."
+const MOVED_KEY_NOTES = Dict{String,String}(
+    "numerics.wall_bc" => "; it set the ground AND the lid, `vertical_scalars` is the ground " *
+        "only: set `boundary_conditions.vertical_scalars_lid` to the same value for the old " *
+        "behaviour (the lid default is natural)")
 
 """
     from_dict(T, d, path = "") -> T
@@ -1173,7 +1183,7 @@ function from_dict(::Type{T}, d::AbstractDict, path::AbstractString = "") where 
         s = Symbol(k)
         full = _join_path(path, k)
         haskey(MOVED_KEYS, full) && error("config: `$full` has moved to " *
-            "`$(MOVED_KEYS[full])` (same values); set it there")
+            "`$(MOVED_KEYS[full])` (same values); set it there" * get(MOVED_KEY_NOTES, full, ""))
         s in names || error("config: unknown key `$k` in [$(isempty(path) ? "top level" : path)]; " *
                             "valid keys: " * join(string.(names), ", "))
         kw[s] = _coerce(fieldtype(T, s), v, _join_path(path, k))

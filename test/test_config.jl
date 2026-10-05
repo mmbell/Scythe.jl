@@ -32,6 +32,7 @@ writetoml(path, s) = (write(path, s); path)
     @test c.run.equation_set == "moist_compressible_XZ"
     @test c.grid.geometry == "RiRk" && c.boundary_conditions.lateral === :periodic
     @test c.boundary_conditions.vertical_scalars === :d2
+    @test c.boundary_conditions.vertical_scalars_lid === :natural
     @test c.boundary_conditions.sedimentation_lid === :natural
     @test isempty(c.boundary_conditions.override)
     @test c.grid.boundaries == [0.0, 300.0e3] && c.grid.num_cells == [50]
@@ -87,7 +88,8 @@ end
                                        sidecars = true),
                 grid = GridSection(boundaries = [0.0, 150.0e3, 450.0e3], num_cells = [15, 15]),
                 boundary_conditions = BoundaryConditionsSection(lateral = :walls,
-                    vertical_scalars = :r1t1x, sedimentation_lid = :wall,
+                    vertical_scalars = :r1t1x, vertical_scalars_lid = :neumann,
+                    sedimentation_lid = :wall,
                     override = Dict("nu_r" => Dict("top" => "dirichlet", "bottom" => "neumann"),
                                     "p" => Dict("outer" => "second_derivative"))),
                 timestep = TimestepSection(ts = 0.25, ts_per_patch = [0.25, 0.5]),
@@ -117,6 +119,7 @@ end
                   Dict("nu_r" => Dict("top" => "dirichlet", "bottom" => "neumann"),
                        "p" => Dict("outer" => "second_derivative"))
             @test back.boundary_conditions.vertical_scalars === :r1t1x
+            @test back.boundary_conditions.vertical_scalars_lid === :neumann
             @test occursin("[boundary_conditions.override.nu_r]", text)
         end
         # An inactive sub-table that differs from its default is NOT written back.
@@ -263,9 +266,14 @@ end
             m = errmsg(() -> load_config(set = ["$old=walls"]))
             @test occursin(new, m)
         end
+        # numerics.wall_bc set both ends; its refusal says the lid is now a separate key.
+        @test occursin("boundary_conditions.vertical_scalars_lid",
+                       errmsg(() -> load_config(set = ["numerics.wall_bc=d2"])))
         # Family enums.
         m = errmsg(() -> load_config(set = ["boundary_conditions.vertical_scalars=d3"]))
         @test occursin("boundary_conditions.vertical_scalars", m) && occursin(":r1t1x", m)
+        m = errmsg(() -> load_config(set = ["boundary_conditions.vertical_scalars_lid=d3"]))
+        @test occursin("boundary_conditions.vertical_scalars_lid", m) && occursin(":r1t1x", m)
         @test occursin("boundary_conditions.sedimentation_lid",
                        errmsg(() -> load_config(set = ["boundary_conditions.sedimentation_lid=open"])))
         @test occursin("boundary_conditions.lateral",
@@ -291,6 +299,43 @@ end
         @test occursin("periodic", m) && occursin("override.p.inner", m)
         # Missing file.
         @test occursin("not found", errmsg(() -> load_config(joinpath(dir, "nope.toml"))))
+    end
+end
+
+@testset "vertical scalar family: d2 ground, natural lid" begin
+    # build_boundary_conditions on the default XZ config and on the axisym set: the scalar
+    # family is d2 at the ground and `vertical_scalars_lid` (natural) at the lid, `w`
+    # Dirichlet at both, the sedimenting slots natural at both.
+    for es in ("moist_compressible_XZ", "moist_compressible_axisym")
+        geo = es == "moist_compressible_XZ" ? "RiRk" : "RZ"
+        cf(xs...) = load_config(set = ["run.equation_set=$es", "grid.geometry=$geo", xs...])
+        cfg = cf()
+        options, _ = Scythe.build_physics(cfg)
+        vars = Scythe.mc_var_names(options; cyl = EQUATION_SETS[es].cyl)
+        sed = Scythe.sedimenting_var_names(options)
+        _, _, bcb, bct = Scythe.build_boundary_conditions(cfg, options, vars)
+        @test bcb["w"] == DirichletBC() && bct["w"] == DirichletBC()
+        for v in vars
+            v == "w" && continue
+            @test bcb[v] == (v in sed ? NaturalBC() : SecondDerivativeBC())
+            @test bct[v] == NaturalBC()
+        end
+        for v in ("p", "rho_d", "rho_t", "E_t")
+            @test bcb[v] == SecondDerivativeBC() && bct[v] == NaturalBC()
+        end
+        # vertical_scalars_lid = d2 restores the old both-sides table exactly: the lid dict is
+        # the ground dict with the sedimenting slots back on natural.
+        cfg2 = cf("boundary_conditions.vertical_scalars_lid=d2")
+        _, _, bcb2, bct2 = Scythe.build_boundary_conditions(cfg2, options, vars)
+        @test bcb2 == bcb
+        @test bct2 == bcb2
+        # A lid mode applies to the lid only; the ground keeps vertical_scalars.
+        cfg3 = cf("boundary_conditions.vertical_scalars=natural",
+                  "boundary_conditions.vertical_scalars_lid=r1t1x")
+        _, _, bcb3, bct3 = Scythe.build_boundary_conditions(cfg3, options, vars)
+        @test all(bcb3[v] == (v == "w" ? DirichletBC() : NaturalBC()) for v in vars)
+        @test bct3["p"] === Scythe.Springsteel.CubicBSpline.R1T1X && bct3["rho_t"] == NeumannBC()
+        @test bct3["w"] == DirichletBC()
     end
 end
 

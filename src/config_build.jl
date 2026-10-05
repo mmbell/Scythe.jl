@@ -283,7 +283,7 @@ end
     build_boundary_conditions(cfg, options, vars) -> (BCL, BCR, BCB, BCT)
 
 The four BC dicts for the base patch (`BCL`/`BCR` = the `inner`/`outer` sides, `BCB`/`BCT`
-= `bottom`/`top`), from the three `[boundary_conditions]` family rules, then the
+= `bottom`/`top`), from the four `[boundary_conditions]` family rules, then the
 per-variable `override`:
 
 - `lateral`, cylindrical (axisym, RLR): axis = Neumann on every variable except `u`, `v`
@@ -292,15 +292,16 @@ per-variable `override`:
   side of every patch but the last).
 - `lateral = walls`, XZ: Neumann on every variable except `u`, `w` Dirichlet, both sides.
 - `lateral = periodic`, XZ: `PeriodicBC` on every variable.
-- `vertical_scalars`: ground and lid of every variable: `d2` SecondDerivativeBC, `natural`
-  NaturalBC, `neumann` NeumannBC, `r1t1x` d2 with the acoustic set (`rho_d, rho_t, E_t,
-  Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w` Dirichlet at both ends.
+- `vertical_scalars` (ground) and `vertical_scalars_lid` (lid) of every variable: `d2`
+  SecondDerivativeBC, `natural` NaturalBC, `neumann` NeumannBC, `r1t1x` d2 with the acoustic
+  set (`rho_d, rho_t, E_t, Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w`
+  Dirichlet at both ends.
 - sedimentation: rain (+ rain number, + the twelve ice slots) NaturalBC at the ground so
   they can fall out; at the lid too when `sedimentation_lid = natural`, left on the
-  `vertical_scalars` condition when `wall`. That is the lid BC of the SLOT VALUES only: on a
-  B-spline vertical every sedimentation FLUX is fitted on `flux_column`, the slot's basis
-  with a zero-flux (Dirichlet) lid, so no hydrometeor enters through the top whichever is
-  chosen.
+  `vertical_scalars_lid` condition when `wall`. That is the lid BC of the SLOT VALUES only:
+  on a B-spline vertical every sedimentation FLUX is fitted on `flux_column`, the slot's
+  basis with a zero-flux (Dirichlet) lid, so no hydrometeor enters through the top
+  whichever is chosen.
 - `override`: each `{variable = {side = bc}}` entry replaces that one entry. A variable not
   in `vars` is an error listing `vars`.
 """
@@ -320,24 +321,26 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
         bcr = bcl
     end
 
-    mode = bc.vertical_scalars
-    vert = if mode === :d2
-        Dict{String,Any}(v => SecondDerivativeBC() for v in vars)
-    elseif mode === :natural
-        Dict{String,Any}(v => NaturalBC() for v in vars)
-    elseif mode === :neumann
-        Dict{String,Any}(v => NeumannBC() for v in vars)
-    else # :r1t1x
-        d = Dict{String,Any}(v => SecondDerivativeBC() for v in vars)
-        for v in ("rho_d", "rho_t", "E_t", "Q_ss")
-            d[v] = NeumannBC()
+    # One vertical scalar-family dict per mode; the ground and the lid each take their own.
+    function family(mode)
+        if mode === :d2
+            Dict{String,Any}(v => SecondDerivativeBC() for v in vars)
+        elseif mode === :natural
+            Dict{String,Any}(v => NaturalBC() for v in vars)
+        elseif mode === :neumann
+            Dict{String,Any}(v => NeumannBC() for v in vars)
+        else # :r1t1x
+            d = Dict{String,Any}(v => SecondDerivativeBC() for v in vars)
+            for v in ("rho_d", "rho_t", "E_t", "Q_ss")
+                d[v] = NeumannBC()
+            end
+            d["p"] = Springsteel.CubicBSpline.R1T1X
+            d
         end
-        d["p"] = Springsteel.CubicBSpline.R1T1X
-        d
     end
 
-    bcb = merge(vert, Dict{String,Any}("w" => DirichletBC()))
-    bct = merge(vert, Dict{String,Any}("w" => DirichletBC()))
+    bcb = merge(family(bc.vertical_scalars), Dict{String,Any}("w" => DirichletBC()))
+    bct = merge(family(bc.vertical_scalars_lid), Dict{String,Any}("w" => DirichletBC()))
     for v in sedimenting_var_names(options)
         bcb[v] = NaturalBC()
         bc.sedimentation_lid === :natural && (bct[v] = NaturalBC())

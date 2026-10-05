@@ -55,7 +55,7 @@ z_top       = 25.0e3                 # [m]
 num_cells_k = 50                     # 500 m vertical cells
 
 [boundary_conditions]
-# The boundary condition of every variable follows from these three family rules (plus any
+# The boundary condition of every variable follows from these four family rules (plus any
 # per-variable [boundary_conditions.override] entries). The resolved per-variable, per-patch
 # table is written to <output.dir>/boundary_conditions.toml and printed at startup; the
 # tables for every case are in simulations/README.md ("Boundary conditions").
@@ -67,20 +67,23 @@ lateral           = "walls"          # the only choice for the cylindrical sets.
                                      # finer (inner) patch's outer side is R3X (border trio
                                      # pinned to the coarser parent), the parent's inner side is
                                      # a natural collar termination one parent cell inside the child
-vertical_scalars  = "d2"             # GROUND and LID of every variable except w (always
-                                     # Dirichlet zero at both) and the sedimenting slots at the
-                                     # ground (always natural): second derivative zero -- p,
-                                     # rho_d, rho_t, u, v, E_t, Q_ss, nu_c, rho_v, rho_e
+vertical_scalars  = "d2"             # GROUND of every variable except w (always Dirichlet
+                                     # zero) and the sedimenting slots (always natural): second
+                                     # derivative zero -- p, rho_d, rho_t, u, v, E_t, Q_ss, nu_c, rho_v, rho_e
+vertical_scalars_lid = "natural"     # LID of the same family (w still Dirichlet zero):
+                                     # unconstrained. d2 at the lid drifts warm over days (2D
+                                     # RCE: lid T +0.5 K at 48 h, crash at 277 h); natural decays
 sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
                                      # ice slots: unconstrained (their ground is always natural,
                                      # so they fall out). The sedimentation FLUX is fitted with a
                                      # zero-flux lid either way: nothing falls in from above
 
 [timestep]
-# 0.5 s on every patch. The d2 ground/lid BC (vertical_scalars) sets a measured SI ceiling of ~0.75 s
+# 0.5 s on every patch. With d2 at ground AND lid the measured SI ceiling was ~0.75 s
 # (reference/SI_WALL_BC_CEILING.md); ts = 1.0 sat above it and produced spurious cooling.
-# 0.5 is validated over 12 h. The explicit horizontal acoustic limit (3.31 s coarse) is
-# the next ceiling after that.
+# The lid is now natural (vertical_scalars_lid): measured clean at 0.75 s and not at 1.0 s
+# (a transient adjustment), on the RCE case only. 0.5 was validated over 12 h (d2 lid). The explicit
+# horizontal acoustic limit (3.31 s coarse) is the next ceiling after that.
 ts           = 0.5                   # [s] root (coarsest) patch
 ts_per_patch = []                    # empty = every patch at ts
 scale        = 1.0                   # multiplies every step (timestep sweeps)

@@ -42,16 +42,18 @@ z_top       = 25.0e3                 # 25 km lid
 num_cells_k = 50                     # 50 vertical cells -> 500 m spacing
 
 [boundary_conditions]
-# The boundary condition of every variable follows from these three family rules (plus any
+# The boundary condition of every variable follows from these four family rules (plus any
 # per-variable [boundary_conditions.override] entries). The resolved per-variable table is
 # written to <output.dir>/boundary_conditions.toml and printed at startup; the tables for
 # every case are in simulations/README.md ("Boundary conditions").
 lateral           = "periodic"       # open ocean, no lateral wall at all: every variable
                                      # periodic in x (x = 300 km is x = 0)
-vertical_scalars  = "d2"             # GROUND and LID of every variable except w (always
-                                     # Dirichlet zero at both) and the sedimenting slots at the
-                                     # ground (always natural): second derivative zero -- p,
-                                     # rho_d, rho_t, u, E_t, Q_ss, nu_c, rho_v, rho_e
+vertical_scalars  = "d2"             # GROUND of every variable except w (always Dirichlet
+                                     # zero) and the sedimenting slots (always natural): second
+                                     # derivative zero -- p, rho_d, rho_t, u, E_t, Q_ss, nu_c, rho_v, rho_e
+vertical_scalars_lid = "natural"     # LID of the same family (w still Dirichlet zero):
+                                     # unconstrained. d2 at the lid drifts warm over days (2D
+                                     # RCE: lid T +0.5 K at 48 h, crash at 277 h); natural decays
 sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
                                      # ice slots: unconstrained (their ground is always natural,
                                      # so they fall out). The sedimentation FLUX is fitted with a

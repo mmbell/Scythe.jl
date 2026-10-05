@@ -154,6 +154,11 @@ ceq_added(first_slot) = merge(Dict("nu_nr" => first_slot),
 ceq_templates(rain) = merge(Dict(v => (lateral = "rho_v", vertical = rain) for v in ["nu_nr"; ICE_SLOTS]),
                             Dict("rho_e" => (lateral = "rho_v", vertical = "rho_v")))
 
+# The lid of the scalar family: d2 in every legacy build, natural now
+# (`boundary_conditions.vertical_scalars_lid`).
+ceq_lid(vars) = Dict{String,Any}("BCT.$v" => (BC_D2, BC_NATURAL) for v in vars)
+const LID_SCALARS = ["p", "rho_d", "rho_t", "E_t", "Q_ss", "rho_v", "u"]
+
 const RAD_OPTIONS_ADDED = Dict(
     "options.radiation" => (missing, ":rrtmgp"), "options.radiation_method" => (missing, ":allsky"),
     "options.solar" => (missing, ":diurnal"), "options.radiation_forcing" => (missing, ":full"),
@@ -178,7 +183,7 @@ const EXPECTED_DELTAS = Dict(
             "options.mynn" => (missing, "true"),
             "options.sfc_stability" => (missing, "true"),
             "options.wall_bc_tau" => ("Inf", "300.0"))),
-        bc_changed = Dict("BCT.nu_r" => (BC_D2, BC_NATURAL)),
+        bc_changed = merge(ceq_lid([LID_SCALARS; "v"; "nu_c"]), Dict("BCT.nu_r" => (BC_D2, BC_NATURAL))),
         renamed = Dict{String,String}(),
         added = ceq_added(12), templates = ceq_templates("nu_r")),
     # RCE: both reference-state fixes and the state-dependent SI (physics otherwise the
@@ -188,7 +193,7 @@ const EXPECTED_DELTAS = Dict(
             "options.consistent_qss_reference" => (missing, "true"),
             "options.hydrostatic_reference" => (missing, "true"),
             "options.state_dependent_si" => (missing, "true")),
-        bc_changed = Dict{String,Any}(), renamed = Dict{String,String}(),
+        bc_changed = ceq_lid([LID_SCALARS; "nu_c"; "rho_e"]), renamed = Dict{String,String}(),
         added = Dict{String,Int}(), templates = Dict{String,Any}()),
     # OWB: Louis -> MYNN (+ rho_e), ice (two-moment rain, bhyp on every water slot: rho_r/rho_c
     # become nu_r/nu_c and the rain positivity bound goes), NetCDF instead of CSV, a restart
@@ -211,7 +216,8 @@ const EXPECTED_DELTAS = Dict(
             "options.sfc_stability" => (missing, "true"),
             "grid_params.positivity.rho_r.i" => (0.0, missing),
             "grid_params.positivity.rho_r.k" => (0.0, missing)),
-        bc_changed = Dict{String,Any}(),
+        # nu_c is the renamed rho_c: its lid goes natural with the rest of the family.
+        bc_changed = merge(ceq_lid(LID_SCALARS), Dict{String,Any}("BCT.nu_c" => (missing, BC_NATURAL))),
         renamed = Dict("rho_r" => "nu_r", "rho_c" => "nu_c"),
         added = ceq_added(11), templates = ceq_templates("nu_r")))
 
@@ -222,9 +228,6 @@ function ceq_expected(spec, old::Dict, new::Dict, prefix::String)
         exp[prefix * k] = v
     end
     g = prefix * "grid_params."
-    for (k, v) in spec.bc_changed
-        exp[g * k] = v
-    end
     bcs = ("BCL", "BCR", "BCB", "BCT")
     for (o, n) in spec.renamed
         exp[g * "vars.$o"] = (old[g * "vars.$o"], missing)
@@ -241,6 +244,10 @@ function ceq_expected(spec, old::Dict, new::Dict, prefix::String)
             src = b in ("BCL", "BCR") ? t.lateral : t.vertical
             exp[g * "$b.$v"] = (missing, new[g * "$b.$src"])
         end
+    end
+    # Last: an explicit BC change also overrides what a rename would have carried.
+    for (k, v) in spec.bc_changed
+        exp[g * k] = v
     end
     return exp
 end
@@ -447,7 +454,8 @@ end
             s = r.variable in sed
             @test occursin("sedimenting: flux fit F=0 at lid", r.note) == s
             @test r.bottom == (s ? "natural" : r.variable == "w" ? "dirichlet" : "second_derivative")
-            @test r.top == r.bottom
+            # The lid of the scalar family is natural (vertical_scalars_lid); w stays Dirichlet.
+            @test r.top == (r.variable == "w" ? "dirichlet" : "natural")
         end
         # The file: deterministic, one [[patch]] per patch, the table's rows in order.
         f1 = write_boundary_conditions(joinpath(dir, "a.toml"), t; header = "h")

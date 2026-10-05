@@ -724,14 +724,15 @@ function _orchestrate(cfg::RunConfig, exec::ExecutionEnv, root::String, resume::
     println("Scythe: $(cfg.run.name): $(cfg.run.integration_time) s in $nseg segment(s); " *
             "root = $root")
     # The boundary condition every variable ACTUALLY has, as built (fresh start and resume):
-    # the three [boundary_conditions] family rules, the overrides and the nest interfaces.
+    # the four [boundary_conditions] family rules, the overrides and the nest interfaces.
     bc_table = boundary_condition_table(build_model(cfg; segment = merge(plan[1],
         (initial_conditions = initial_ics_paths(cfg, root, n),))), cfg)
     bc = cfg.boundary_conditions
     write_boundary_conditions(joinpath(root, BC_TABLE_NAME), bc_table; header =
         "Resolved boundary conditions of every prognostic variable, as built by Scythe from\n" *
         "[boundary_conditions] lateral = $(bc.lateral), vertical_scalars = " *
-        "$(bc.vertical_scalars), sedimentation_lid = $(bc.sedimentation_lid)" *
+        "$(bc.vertical_scalars), vertical_scalars_lid = $(bc.vertical_scalars_lid), " *
+        "sedimentation_lid = $(bc.sedimentation_lid)" *
         (isempty(bc.override) ? "" : " + $(length(bc.override)) override(s)") * ".\n" *
         "inner/outer = axis/outer wall (cylindrical) or left/right (XZ).")
     print_boundary_conditions(stdout, bc_table)

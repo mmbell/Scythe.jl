@@ -163,7 +163,7 @@ function bc_section(io)
     Every prognostic variable has a boundary condition on each of its four sides: `inner` and
     `outer` (the axis and the outer wall on the cylindrical sets; left and right on XZ), and
     `bottom` (the ground) and `top` (the lid). They are NOT listed one by one in the config:
-    `[boundary_conditions]` holds three family rules that `build_boundary_conditions`
+    `[boundary_conditions]` holds four family rules that `build_boundary_conditions`
     (src/config_build.jl) applies to the run's variable list, then the per-variable
     `override` entries, then `build_nest` sets the nest interfaces. What each family value
     does, exactly:
@@ -173,14 +173,15 @@ function bc_section(io)
     | `lateral = "walls"`, XZ | inner and outer: `u`, `w` dirichlet (zero); every other variable neumann (zero gradient) |
     | `lateral = "walls"`, cylindrical (the only choice) | inner (axis): `u`, `v` dirichlet; every other variable, `w` included, neumann. outer (wall): `u` dirichlet; every other variable, `v` and `w` included, neumann |
     | `lateral = "periodic"` (XZ, single patch only) | inner and outer: periodic on every variable |
-    | `vertical_scalars = "d2"` | bottom and top of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
-    | `vertical_scalars = "natural"` | bottom and top of every variable: natural (unconstrained); then the rules below |
-    | `vertical_scalars = "neumann"` | bottom and top of every variable: neumann; then the rules below |
-    | `vertical_scalars = "r1t1x"` | as `d2`, except `rho_d`, `rho_t`, `E_t`, `Q_ss` neumann and `p` r1t1x (the rigid-wall pressure condition `dp'/dz = -g rho_t'`, installed before every fit; relaxed on `numerics.wall_bc_tau`) |
-    | (always) | `w` dirichlet (zero) at bottom and top, whatever `vertical_scalars` |
+    | `vertical_scalars = "d2"` | bottom of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
+    | `vertical_scalars = "natural"` | bottom of every variable: natural (unconstrained); then the rules below |
+    | `vertical_scalars = "neumann"` | bottom of every variable: neumann; then the rules below |
+    | `vertical_scalars = "r1t1x"` | bottom as `d2`, except `rho_d`, `rho_t`, `E_t`, `Q_ss` neumann and `p` r1t1x (the rigid-wall pressure condition `dp'/dz = -g rho_t'`, installed before every fit; relaxed on `numerics.wall_bc_tau`) |
+    | `vertical_scalars_lid = <same values>` | the same rule at the top of every variable (default `natural`; `d2` at the lid drifts warm over days); then the rules below |
+    | (always) | `w` dirichlet (zero) at bottom and top, whatever `vertical_scalars` and `vertical_scalars_lid` |
     | (always) | the sedimenting slots (rain; the rain number under two-moment rain; the twelve ice slots under ISHMAEL) natural at the bottom, so they fall out |
     | `sedimentation_lid = "natural"` | the sedimenting slots natural at the top too |
-    | `sedimentation_lid = "wall"` | the sedimenting slots keep the `vertical_scalars` condition at the top |
+    | `sedimentation_lid = "wall"` | the sedimenting slots keep the `vertical_scalars_lid` condition at the top |
     | (always, B-spline vertical) | the sedimentation FLUX of every sedimenting slot is fitted with a zero-flux (dirichlet) lid, whatever its slot's own top BC: nothing falls in from above (`[extra.options] sedimentation_flux_lid = "natural"` undoes this, forensics only) |
     | nests (not configurable) | at each junction the finer patch's side is r3x (its border value, slope and curvature pinned to the coarser parent at run time) and the coarser patch's side is natural (its free collar termination, one parent cell inside the child) |
 
@@ -207,6 +208,7 @@ function bc_section(io)
         bcs = cfg.boundary_conditions
         println(io, "### `$c`\n")
         println(io, "`lateral = \"$(bcs.lateral)\"`, `vertical_scalars = \"$(bcs.vertical_scalars)\"`, ",
+                "`vertical_scalars_lid = \"$(bcs.vertical_scalars_lid)\"`, ",
                 "`sedimentation_lid = \"$(bcs.sedimentation_lid)\"`",
                 isempty(bcs.override) ? "" : ", plus $(length(bcs.override)) override(s)", ".\n")
         table = redirect_stderr(devnull) do

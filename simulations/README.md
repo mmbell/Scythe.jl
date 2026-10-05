@@ -182,13 +182,14 @@ the patches and the vertical axis.
 
 ### `[boundary_conditions]`
 
-the boundary condition of every prognostic variable, set by three family rules plus per-variable overrides. The resolved per-variable table is written to `<output.dir>/boundary_conditions.toml` and printed at startup.
+the boundary condition of every prognostic variable, set by four family rules plus per-variable overrides. The resolved per-variable table is written to `<output.dir>/boundary_conditions.toml` and printed at startup.
 
 | key | type | default | description |
 |---|---|---|---|
 | `lateral` | string (enum) | `"periodic"` | `walls` or `periodic` (XZ only). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here. |
-| `vertical_scalars` | string (enum) | `"d2"` | ground AND lid BC of every variable except `w` (always Dirichlet zero at both) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `rho_t`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'` installed before every fit). |
-| `sedimentation_lid` | string (enum) | `"natural"` | lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top. |
+| `vertical_scalars` | string (enum) | `"d2"` | GROUND BC of every variable except `w` (always Dirichlet zero) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `rho_t`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'` installed before every fit). Keep `d2`: `neumann` on `p` at the ground drains the pressure field. |
+| `vertical_scalars_lid` | string (enum) | `"natural"` | LID BC of the same family (every variable except `w`, always Dirichlet zero), same values as `vertical_scalars`. Natural by default: `d2` at a rigid lid over-constrains the perturbation fields and drifts warm over days (multi-day 2D RCE: lid T anomaly 0.5 K at 48 h, crash at 277 h; restarted with a natural lid the anomaly decays). Clean at ts = 0.75 s on the RCE case; ts = 1.0 s showed a transient adjustment that `d2` did not. |
+| `sedimentation_lid` | string (enum) | `"natural"` | lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars_lid`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top. |
 | `override` | table | `{}` | expert per-variable overrides applied after the family rules: `{<variable> = {<side> = <bc>}}` with side `inner`/`outer`/`bottom`/`top` and bc `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic` or `r1t1x`; `inner`/`outer` act on the domain's own edges (a nest interface is always the nesting's), refused under periodic. |
 
 ### `[timestep]`
@@ -378,7 +379,7 @@ solver choices; leave alone unless you know why (boundary conditions live in `[b
 | `state_dependent_si` | bool | `true` | vertical SI coefficients from the current column state. |
 | `exact_si` | bool | `false` | exact coupled SI solve; incompatible with `state_dependent_si`. |
 | `horizontal_semiimplicit` | bool | `false` | horizontal semi-implicit acoustic terms (XZ RiRk only). |
-| `wall_bc_tau` | float | `300.0` | relaxation timescale [s] of the `p` lid/ground condition under `boundary_conditions.vertical_scalars = r1t1x`; `inf` = none. |
+| `wall_bc_tau` | float | `300.0` | relaxation timescale [s] of the `p` lid/ground condition under `boundary_conditions.vertical_scalars` or `vertical_scalars_lid` = `r1t1x`; `inf` = none. |
 | `l_q` | float | `2.0` | B-spline spectral filter length, every variable, both directions. |
 | `cfl_interval` | float | `0.0` | CFL report cadence [s]; 0 = `output.interval`, resolved at build. |
 
@@ -411,7 +412,7 @@ inputs to the WARN-ONLY startup timestep report; they change nothing in the run.
 Every prognostic variable has a boundary condition on each of its four sides: `inner` and
 `outer` (the axis and the outer wall on the cylindrical sets; left and right on XZ), and
 `bottom` (the ground) and `top` (the lid). They are NOT listed one by one in the config:
-`[boundary_conditions]` holds three family rules that `build_boundary_conditions`
+`[boundary_conditions]` holds four family rules that `build_boundary_conditions`
 (src/config_build.jl) applies to the run's variable list, then the per-variable
 `override` entries, then `build_nest` sets the nest interfaces. What each family value
 does, exactly:
@@ -421,14 +422,15 @@ does, exactly:
 | `lateral = "walls"`, XZ | inner and outer: `u`, `w` dirichlet (zero); every other variable neumann (zero gradient) |
 | `lateral = "walls"`, cylindrical (the only choice) | inner (axis): `u`, `v` dirichlet; every other variable, `w` included, neumann. outer (wall): `u` dirichlet; every other variable, `v` and `w` included, neumann |
 | `lateral = "periodic"` (XZ, single patch only) | inner and outer: periodic on every variable |
-| `vertical_scalars = "d2"` | bottom and top of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
-| `vertical_scalars = "natural"` | bottom and top of every variable: natural (unconstrained); then the rules below |
-| `vertical_scalars = "neumann"` | bottom and top of every variable: neumann; then the rules below |
-| `vertical_scalars = "r1t1x"` | as `d2`, except `rho_d`, `rho_t`, `E_t`, `Q_ss` neumann and `p` r1t1x (the rigid-wall pressure condition `dp'/dz = -g rho_t'`, installed before every fit; relaxed on `numerics.wall_bc_tau`) |
-| (always) | `w` dirichlet (zero) at bottom and top, whatever `vertical_scalars` |
+| `vertical_scalars = "d2"` | bottom of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
+| `vertical_scalars = "natural"` | bottom of every variable: natural (unconstrained); then the rules below |
+| `vertical_scalars = "neumann"` | bottom of every variable: neumann; then the rules below |
+| `vertical_scalars = "r1t1x"` | bottom as `d2`, except `rho_d`, `rho_t`, `E_t`, `Q_ss` neumann and `p` r1t1x (the rigid-wall pressure condition `dp'/dz = -g rho_t'`, installed before every fit; relaxed on `numerics.wall_bc_tau`) |
+| `vertical_scalars_lid = <same values>` | the same rule at the top of every variable (default `natural`; `d2` at the lid drifts warm over days); then the rules below |
+| (always) | `w` dirichlet (zero) at bottom and top, whatever `vertical_scalars` and `vertical_scalars_lid` |
 | (always) | the sedimenting slots (rain; the rain number under two-moment rain; the twelve ice slots under ISHMAEL) natural at the bottom, so they fall out |
 | `sedimentation_lid = "natural"` | the sedimenting slots natural at the top too |
-| `sedimentation_lid = "wall"` | the sedimenting slots keep the `vertical_scalars` condition at the top |
+| `sedimentation_lid = "wall"` | the sedimenting slots keep the `vertical_scalars_lid` condition at the top |
 | (always, B-spline vertical) | the sedimentation FLUX of every sedimenting slot is fitted with a zero-flux (dirichlet) lid, whatever its slot's own top BC: nothing falls in from above (`[extra.options] sedimentation_flux_lid = "natural"` undoes this, forensics only) |
 | nests (not configurable) | at each junction the finer patch's side is r3x (its border value, slope and curvature pinned to the coarser parent at run time) and the coarser patch's side is natural (its free collar termination, one parent cell inside the child) |
 
@@ -451,105 +453,105 @@ form at startup. The tables of the cases here, generated from their `scythe_conf
 
 ### `ocean_2D_rce`
 
-`lateral = "periodic"`, `vertical_scalars = "d2"`, `sedimentation_lid = "natural"`.
+`lateral = "periodic"`, `vertical_scalars = "d2"`, `vertical_scalars_lid = "natural"`, `sedimentation_lid = "natural"`.
 
 ```
 Scythe: boundary conditions (1 patch; a single name = both lateral sides):
-  variable  lateral (inner|outer)  bottom             top                note
-  p         periodic               second_derivative  second_derivative
-  rho_d     periodic               second_derivative  second_derivative
-  rho_t     periodic               second_derivative  second_derivative
-  u         periodic               second_derivative  second_derivative
+  variable  lateral (inner|outer)  bottom             top        note
+  p         periodic               second_derivative  natural
+  rho_d     periodic               second_derivative  natural
+  rho_t     periodic               second_derivative  natural
+  u         periodic               second_derivative  natural
   w         periodic               dirichlet          dirichlet
-  E_t       periodic               second_derivative  second_derivative
-  Q_ss      periodic               second_derivative  second_derivative
-  nu_r      periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_c      periodic               second_derivative  second_derivative
-  rho_v     periodic               second_derivative  second_derivative
-  nu_nr     periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i1     periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni1    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai1    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci1    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i2     periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni2    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai2    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci2    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i3     periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni3    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai3    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci3    periodic               natural            natural            sedimenting: flux fit F=0 at lid
-  rho_e     periodic               second_derivative  second_derivative
+  E_t       periodic               second_derivative  natural
+  Q_ss      periodic               second_derivative  natural
+  nu_r      periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_c      periodic               second_derivative  natural
+  rho_v     periodic               second_derivative  natural
+  nu_nr     periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i1     periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni1    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai1    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci1    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i2     periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni2    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai2    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci2    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i3     periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni3    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai3    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci3    periodic               natural            natural    sedimenting: flux fit F=0 at lid
+  rho_e     periodic               second_derivative  natural
 ```
 
 ### `ocean_warm_bubble`
 
-`lateral = "walls"`, `vertical_scalars = "d2"`, `sedimentation_lid = "natural"`.
+`lateral = "walls"`, `vertical_scalars = "d2"`, `vertical_scalars_lid = "natural"`, `sedimentation_lid = "natural"`.
 
 ```
 Scythe: boundary conditions (1 patch; a single name = both lateral sides):
-  variable  lateral (inner|outer)  bottom             top                note
-  p         neumann                second_derivative  second_derivative
-  rho_d     neumann                second_derivative  second_derivative
-  rho_t     neumann                second_derivative  second_derivative
-  u         dirichlet              second_derivative  second_derivative
+  variable  lateral (inner|outer)  bottom             top        note
+  p         neumann                second_derivative  natural
+  rho_d     neumann                second_derivative  natural
+  rho_t     neumann                second_derivative  natural
+  u         dirichlet              second_derivative  natural
   w         dirichlet              dirichlet          dirichlet
-  E_t       neumann                second_derivative  second_derivative
-  Q_ss      neumann                second_derivative  second_derivative
-  nu_r      neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_c      neumann                second_derivative  second_derivative
-  rho_v     neumann                second_derivative  second_derivative
-  nu_nr     neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i1     neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni1    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai1    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci1    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i2     neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni2    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai2    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci2    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i3     neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni3    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai3    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci3    neumann                natural            natural            sedimenting: flux fit F=0 at lid
-  rho_e     neumann                second_derivative  second_derivative
+  E_t       neumann                second_derivative  natural
+  Q_ss      neumann                second_derivative  natural
+  nu_r      neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_c      neumann                second_derivative  natural
+  rho_v     neumann                second_derivative  natural
+  nu_nr     neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i1     neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni1    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai1    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci1    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i2     neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni2    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai2    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci2    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i3     neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni3    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai3    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci3    neumann                natural            natural    sedimenting: flux fit F=0 at lid
+  rho_e     neumann                second_derivative  natural
 ```
 
 ### `tc_axisym`
 
-`lateral = "walls"`, `vertical_scalars = "d2"`, `sedimentation_lid = "natural"`.
+`lateral = "walls"`, `vertical_scalars = "d2"`, `vertical_scalars_lid = "natural"`, `sedimentation_lid = "natural"`.
 
 ```
 Scythe: boundary conditions (3 patches; a single name = both lateral sides):
   patch 1: outer = nest interface: R3X (child)
   patch 2: inner = collar: natural (parent), outer = nest interface: R3X (child)
   patch 3: inner = collar: natural (parent)
-  variable  lateral per patch (inner|outer)                                   bottom             top                note
-  p         p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  rho_d     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  rho_t     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  u         p1 dirichlet|r3x      p2 natural|r3x        p3 natural|dirichlet  second_derivative  second_derivative
+  variable  lateral per patch (inner|outer)                                   bottom             top        note
+  p         p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  rho_d     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  rho_t     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  u         p1 dirichlet|r3x      p2 natural|r3x        p3 natural|dirichlet  second_derivative  natural
   w         p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    dirichlet          dirichlet
-  E_t       p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  Q_ss      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  nu_r      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_c      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  v         p1 dirichlet|r3x      p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  rho_v     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
-  nu_nr     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i1     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni1    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai1    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci1    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i2     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni2    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai2    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci2    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_i3     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ni3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ai3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  nu_ci3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural            sedimenting: flux fit F=0 at lid
-  rho_e     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  second_derivative
+  E_t       p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  Q_ss      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  nu_r      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_c      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  v         p1 dirichlet|r3x      p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  rho_v     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
+  nu_nr     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i1     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni1    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai1    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci1    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i2     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni2    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai2    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci2    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_i3     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ni3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ai3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  nu_ci3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural            natural    sedimenting: flux fit F=0 at lid
+  rho_e     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    second_derivative  natural
 ```
 
 ### Equation sets and geometries
@@ -568,6 +570,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
 | `boundary_conditions.lateral` | `walls`, `periodic` |
 | `boundary_conditions.sedimentation_lid` | `natural`, `wall` |
 | `boundary_conditions.vertical_scalars` | `d2`, `natural`, `r1t1x`, `neumann` |
+| `boundary_conditions.vertical_scalars_lid` | `d2`, `natural`, `r1t1x`, `neumann` |
 | `initial_conditions.balanced_vortex.moist_profile` | `vortex`, `gaussian` |
 | `initial_conditions.balanced_vortex.profile` | `re87`, `rankine` |
 | `initial_conditions.method` | `balanced_vortex`, `temperature_noise`, `temperature_bubble`, `file` |
