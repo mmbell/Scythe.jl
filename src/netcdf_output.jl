@@ -339,7 +339,11 @@ tolerance or clamp is applied to the state itself. The `max(·, 0)` calls in the
 θ_e arguments guard `log` of a negative mixing ratio at an under-resolved point (negative
 water is a resolution diagnostic in this model, never a state to repair -- see
 reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md); `q_v`, `q_c`, `q_r` and the densities
-themselves are reported RAW so that diagnostic stays visible.
+themselves are reported RAW so that diagnostic stays visible. `RH`/`RH_ice` read
+`max(ρ_v, 0)` — the floor radiation applies at its own interface — and the negativity they no
+longer show is carried by two fields of its own: `rho_w_deficit = min(ρ_t − ρ_d, 0)` and
+`condensate_lobe`, the transformed condensate slots' clipped negative lobe under
+[`ahyp_signed`](@ref).
 """
 function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
                            ref::RegularReferenceProfiles, cfg::DerivedConfig)
@@ -395,8 +399,15 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     # Liquid saturation at ALL temperatures: that is what Q_ss saturates against in this
     # equation set (`rho_vs = rho_v_sat(Tk, p_hPa)` in mc_driver!), so an RH built on the
     # ice curve below freezing would not be the model's own supersaturation.
-    RH = rho_v ./ Springsteel.Thermodynamics.rho_v_sat.(T, p_hPa)
-    RH_ice = cfg.ice ? rho_v ./ Springsteel.Thermodynamics.rho_i_sat.(T, p_hPa) : nothing
+    # The humidities read max(ρ_v, 0): a floor at a DIAGNOSTIC interface, the same one the
+    # radiation applies to the vapor it hands RRTMGP (radiation_state.jl). A negative vapor is
+    # a resolution diagnostic and is never repaired in the state, but a negative humidity is
+    # not a humidity, and every plot or profile mean built on one inherited it. The state's
+    # own sign stays visible where it belongs: `rho_v`, `q_v` and `PW` are written RAW, and
+    # `rho_w_deficit` / `condensate_lobe` below say where and why the water went negative.
+    rho_v_pos = max.(rho_v, 0.0)
+    RH = rho_v_pos ./ Springsteel.Thermodynamics.rho_v_sat.(T, p_hPa)
+    RH_ice = cfg.ice ? rho_v_pos ./ Springsteel.Thermodynamics.rho_i_sat.(T, p_hPa) : nothing
     # theta from the TRUE temperature (the closed-form EOS retrieval above), not from
     # `potential_temperature(p, rho_d)`: that two-argument form sets T := p/(R_d rho_d), the
     # dry-air equation of state, which over-reads T by the factor (1 + R_v/R_d q_v) -- about
@@ -427,6 +438,30 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     rain_rate = .-rho_r .* Vt .* 3600.0          # [mm/hr] (ρ_l = 1000 kg/m³)
     precip_rate = rain_rate[:, 1]                # surface value, one per column
 
+    # ── (5b) Negative-water diagnostics ─────────────────────────────────────
+    # The TOTAL-WATER deficit min(ρ_t − ρ_d, 0): where the conserved anchor itself holds less
+    # than no water — a transported lobe of the linear ρ_t, which no partition can make
+    # admissible.
+    rho_w_deficit = min.(rho_t .- rho_d, 0.0)
+    # The CLIPPED LOBE: Σ over the TRANSFORMED cloud, rain and ice-MASS slots of the slot's
+    # negative part under the attribution continuation [`ahyp_signed`](@ref) — the water the
+    # linear ρ_t carries as a transported condensate's negative lobe while the recovered
+    # densities above read 0 there. Under `:bhyp` it is exactly the `lobe_w` column mc_driver!
+    # hands back to the condensate in the vapor residual and the anchor headroom
+    # (`options[:water_lobe_attribution]`); under `:none` nothing is clipped and it is an exact
+    # zero field. Number and habit moments carry no water and never enter.
+    neg_part(nu, mu) = nu < 0.0 ? ahyp_signed(nu, mu) : 0.0
+    condensate_lobe = zeros(Float64, n_i, n_k)
+    cfg.ctrans === :none ||
+        (condensate_lobe .+= neg_part.(slots.cloud .+ bhyp.(col(ref.rho_cbar), cfg.cmu),
+                                       cfg.cmu))
+    cfg.rtrans === :none || (condensate_lobe .+= neg_part.(slots.rain, cfg.rmu))
+    if ice !== nothing && cfg.itrans !== :none
+        condensate_lobe .+= (neg_part.(slots.ice[1], cfg.imu[1]) .+
+                             neg_part.(slots.ice[5], cfg.imu[1])) .+
+                            neg_part.(slots.ice[9], cfg.imu[1])
+    end
+
     # ── (6) Column integrals ────────────────────────────────────────────────
     PW = _column_integral(rho_v, z)
     column_cloud_water = _column_integral(rho_c, z)
@@ -435,7 +470,7 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
 
     out = (; p, rho_d, rho_t, E_t, Q_ss, rho_v, rho_c, rho_r, rho_liq, rho_ice,
              u, w, ke, M, T, theta, theta_e, s, RH, q_v, q_c, q_r,
-             reflectivity, Vt, rain_rate, precip_rate,
+             reflectivity, Vt, rain_rate, precip_rate, rho_w_deficit, condensate_lobe,
              PW, column_cloud_water, column_rain_water)
     v === nothing || (out = merge(out, (; v)))
     n_r === nothing || (out = merge(out, (; n_r)))
@@ -1120,8 +1155,14 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         wr("T", d.T, "K", "temperature (closed-form nonlinear retrieval)")
         wr("theta", d.theta, "K", "potential temperature")
         wr("theta_e", d.theta_e, "K", "reversible equivalent potential temperature")
-        wr("RH", d.RH, "1", "relative humidity over liquid water, rho_v / rho_v_sat(T, p)")
-        ice_on && wr("RH_ice", d.RH_ice, "1", "relative humidity over ice")
+        # Floored at this diagnostic interface (max(rho_v, 0), as radiation reads it); the
+        # vapor's own sign is in rho_v / q_v and the two deficit fields below.
+        wr("RH", d.RH, "1",
+           "relative humidity over liquid water, max(rho_v, 0) / rho_v_sat(T, p); negative " *
+           "vapor reads 0 here and stays visible in rho_v, q_v, rho_w_deficit and " *
+           "condensate_lobe")
+        ice_on && wr("RH_ice", d.RH_ice, "1",
+                     "relative humidity over ice, max(rho_v, 0) / rho_i_sat(T, p)")
         wr("q_v", d.q_v, "kg kg-1", "vapor mixing ratio, rho_v / rho_d")
         wr("q_c", d.q_c, "kg kg-1", "cloud mixing ratio, rho_c / rho_d")
         wr("q_r", d.q_r, "kg kg-1", "rain mixing ratio, rho_r / rho_d")
@@ -1132,6 +1173,14 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
             wr("rho_e", d.rho_e, "J m-3", "turbulence kinetic energy density")
             wr("e", d.e, "m2 s-2", "mass-specific turbulence kinetic energy, rho_e / rho_t")
         end
+
+        # ── Negative-water diagnostics: the negativity the humidity floor no longer shows ──
+        wr("rho_w_deficit", d.rho_w_deficit, "kg m-3",
+           "total-water deficit, min(rho_t - rho_d, 0)")
+        wr("condensate_lobe", d.condensate_lobe, "kg m-3",
+           "clipped negative lobe of the transformed cloud, rain and ice-mass control " *
+           "variables, sum of ahyp_signed(nu) over slots with nu < 0 (the recovered " *
+           "densities read 0 there); 0 where no transform is declared")
 
         # ── Radar and precipitation ──
         wr("reflectivity", d.reflectivity, "dBZ", "S-band equivalent radar reflectivity")

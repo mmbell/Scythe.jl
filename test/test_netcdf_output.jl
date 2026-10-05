@@ -99,6 +99,74 @@ using NCDatasets
             @test all(ds.rho_v .≈ sat)
         end
 
+        @testset "RH is floored at the diagnostic interface; the deficit stays visible" begin
+            # RH and RH_ice read max(rho_v, 0) -- the floor radiation already applies at its
+            # own interface -- so a negative vapor (a resolution diagnostic in this model,
+            # never a state to repair) does not print as a negative humidity. The vapor, its
+            # mixing ratio and the precipitable water stay RAW, and the two deficit fields
+            # carry the negativity instead.
+            sat = rho_v_sat.(d.T, d.p ./ 100.0)
+            rv = copy(sat) .* 0.5
+            rv[2, 2] = -3.0e-4; rv[3, 4] = -1.0e-6
+            neg = rv .< 0.0
+            dr = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv)), ref, cfg)
+            @test all(dr.RH .>= 0.0)
+            @test all(dr.RH[neg] .=== 0.0)
+            @test all(dr.RH[.!neg] .== (rv ./ sat)[.!neg])
+            @test dr.rho_v == rv                           # the state, raw
+            @test any(dr.q_v .< 0.0)                       # ... and its mixing ratio
+            imu = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)
+            raw0 = ntuple(_ -> zeros(3, length(z)), 12)
+            di = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv, ice = raw0)), ref,
+                                          plain_cfg(ice = true, itrans = :bhyp, imu = imu))
+            @test all(di.RH_ice .>= 0.0)
+            @test all(di.RH_ice[neg] .=== 0.0)
+        end
+
+        @testset "rho_w_deficit and condensate_lobe" begin
+            # The TOTAL-WATER deficit min(rho_t - rho_d, 0): zero wherever the anchor holds
+            # water, the anchor's own value where it does not.
+            rt = copy(slots.rho_t)
+            rt[1, 3] -= 2.0e-4; rt[2, 5] -= 1.0e-9
+            dd = Scythe.mc_derived_fields(z, merge(slots, (; rho_t = rt)), ref, cfg)
+            @test dd.rho_w_deficit == min.(dd.rho_t .- dd.rho_d, 0.0)
+            @test dd.rho_w_deficit[1, 3] < 0.0 && dd.rho_w_deficit[2, 5] < 0.0
+            @test count(<(0.0), dd.rho_w_deficit) == 2
+            # No transform: nothing is clipped, so nothing is hidden -- an exact zero field
+            # even where the (untransformed) cloud slot is negative.
+            ncl = zeros(3, length(z)); ncl[2, 2] = -1.0e-4
+            dn = Scythe.mc_derived_fields(z, merge(slots, (; cloud = ncl)), ref, cfg)
+            @test all(x -> x === 0.0, dn.condensate_lobe)
+            # Transformed: the sum over the cloud, rain and ICE-MASS slots of the slot's
+            # negative part under the attribution continuation `ahyp_signed` -- the same
+            # `lobe_w` mc_driver! subtracts from the vapor residual. Number and habit
+            # moments carry no water and must not enter.
+            mu = 1.0e-7
+            imu = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)
+            cl = zeros(3, length(z)); cl[1, 2] = -2.0e-4; cl[3, 3] = 4.0e-4
+            rn = zeros(3, length(z)); rn[1, 2] = -1.0e-5; rn[2, 4] = -3.0e-6
+            ice = ntuple(_ -> zeros(3, length(z)), 12)
+            ice[5][2, 4] = -7.0e-6                  # species-2 MASS
+            ice[2][1, 1] = -5.0                     # species-1 NUMBER: no water
+            ice[3][1, 1] = -1.0e-12                 # species-1 volume moment: no water
+            dl = Scythe.mc_derived_fields(z, merge(slots, (; cloud = cl, rain = rn, ice)),
+                                          ref, plain_cfg(ctrans = :bhyp, rtrans = :bhyp,
+                                                         ice = true, itrans = :bhyp,
+                                                         imu = imu))
+            expect = zeros(3, length(z))
+            expect[1, 2] = Scythe.ahyp_signed(-2.0e-4, mu) + Scythe.ahyp_signed(-1.0e-5, mu)
+            expect[2, 4] = Scythe.ahyp_signed(-3.0e-6, mu) + Scythe.ahyp_signed(-7.0e-6, imu[1])
+            @test dl.condensate_lobe ≈ expect rtol = 1.0e-14
+            @test all(x -> x === 0.0, dl.condensate_lobe[expect .== 0.0])
+            @test all(dl.condensate_lobe .<= 0.0)
+            # Under :bhyp it IS the driver's clipped lobe (the recovery is 0 there).
+            @test dl.condensate_lobe[1, 2] ≈
+                  Scythe.clipped_lobe(-2.0e-4, Scythe.ahyp(-2.0e-4, mu), mu) +
+                  Scythe.clipped_lobe(-1.0e-5, Scythe.ahyp(-1.0e-5, mu), mu) rtol = 1.0e-15
+            # ... while the recovered densities written beside it stay clipped.
+            @test dl.rho_c[1, 2] === 0.0 && dl.rho_r[1, 2] === 0.0
+        end
+
         @testset "theta is the Pa-form potential temperature of the TRUE temperature" begin
             # theta = T (1e5/p)^kappa with the closed-form EOS temperature the file itself
             # carries as `T` -- NOT the dry-air p/(Rd rho_d), which over-reads T by
@@ -320,11 +388,17 @@ using NCDatasets
                              "T", "theta", "theta_e", "RH", "q_v", "q_c", "q_r",
                              "reflectivity", "rain_rate", "precip_rate",
                              "PW", "column_cloud_water", "column_rain_water",
+                             "rho_w_deficit", "condensate_lobe",
                              "pbar", "rho_dbar", "rho_vbar", "rho_cbar", "rho_tbar",
                              "E_tbar", "Q_ssbar", "Tbar"]
                 for nm in inventory
                     @test haskey(ds, nm)
                 end
+                # The humidity is floored at this interface, and says so.
+                @test occursin("max(rho_v, 0)", ds["RH"].attrib["long_name"])
+                @test all(Array(ds["RH"])[1, :, :] .>= 0.0)
+                @test all(Array(ds["rho_w_deficit"])[1, :, :] .<= 0.0)
+                @test all(Array(ds["condensate_lobe"])[1, :, :] .== 0.0)   # no transform
                 # This fixture has no v, no rain number, no ice and no TKE.
                 for nm in ("v", "n_r", "rho_i1", "rho_e", "nu_c", "nu_r", "RH_ice")
                     @test !haskey(ds, nm)
