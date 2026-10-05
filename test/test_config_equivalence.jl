@@ -154,9 +154,9 @@ ceq_added(first_slot) = merge(Dict("nu_nr" => first_slot),
 ceq_templates(rain) = merge(Dict(v => (lateral = "rho_v", vertical = rain) for v in ["nu_nr"; ICE_SLOTS]),
                             Dict("rho_e" => (lateral = "rho_v", vertical = "rho_v")))
 
-# The lid of the scalar family: d2 in every legacy build, natural now
-# (`boundary_conditions.vertical_scalars_lid`).
-ceq_lid(vars) = Dict{String,Any}("BCT.$v" => (BC_D2, BC_NATURAL) for v in vars)
+# The ground and the lid of the scalar family: d2 in every legacy build, natural now
+# (`boundary_conditions.vertical_scalars` / `vertical_scalars_lid`).
+ceq_lid(vars) = Dict{String,Any}("$b.$v" => (BC_D2, BC_NATURAL) for v in vars for b in ("BCB", "BCT"))
 const LID_SCALARS = ["p", "rho_d", "rho_t", "E_t", "Q_ss", "rho_v", "u"]
 
 const RAD_OPTIONS_ADDED = Dict(
@@ -217,7 +217,7 @@ const EXPECTED_DELTAS = Dict(
             "grid_params.positivity.rho_r.i" => (0.0, missing),
             "grid_params.positivity.rho_r.k" => (0.0, missing)),
         # nu_c is the renamed rho_c: its lid goes natural with the rest of the family.
-        bc_changed = merge(ceq_lid(LID_SCALARS), Dict{String,Any}("BCT.nu_c" => (missing, BC_NATURAL))),
+        bc_changed = merge(ceq_lid(LID_SCALARS), Dict{String,Any}("BCB.nu_c" => (missing, BC_NATURAL), "BCT.nu_c" => (missing, BC_NATURAL))),
         renamed = Dict("rho_r" => "nu_r", "rho_c" => "nu_c"),
         added = ceq_added(11), templates = ceq_templates("nu_r")))
 
@@ -453,9 +453,9 @@ end
         for r in t
             s = r.variable in sed
             @test occursin("sedimenting: flux fit F=0 at lid", r.note) == s
-            @test r.bottom == (s ? "natural" : r.variable == "w" ? "dirichlet" : "second_derivative")
-            # The lid of the scalar family is natural (vertical_scalars_lid); w stays Dirichlet.
-            @test r.top == (r.variable == "w" ? "dirichlet" : "natural")
+            # The scalar family is natural at ground and lid; w stays Dirichlet.
+            @test r.bottom == (r.variable == "w" ? "dirichlet" : "natural")
+            @test r.top == r.bottom
         end
         # The file: deterministic, one [[patch]] per patch, the table's rows in order.
         f1 = write_boundary_conditions(joinpath(dir, "a.toml"), t; header = "h")

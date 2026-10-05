@@ -48,9 +48,10 @@ num_cells_k = 50
 # every case are in simulations/README.md ("Boundary conditions").
 lateral           = "walls"          # LEFT and RIGHT (x = 0, 300 km): u and w Dirichlet (zero);
                                      # every other variable Neumann (zero x-gradient)
-vertical_scalars  = "d2"             # GROUND of every variable except w (always Dirichlet
-                                     # zero) and the sedimenting slots (always natural): second
-                                     # derivative zero -- p, rho_d, rho_t, u, E_t, Q_ss, nu_c, rho_v, rho_e
+vertical_scalars  = "natural"        # GROUND of every variable except w (always Dirichlet
+                                     # zero): unconstrained, so the logarithmic surface layer
+                                     # is not forced to a constant gradient (d2 did that) --
+                                     # p, rho_d, rho_t, u, E_t, Q_ss, nu_c, rho_v, rho_e
 vertical_scalars_lid = "natural"     # LID of the same family (w still Dirichlet zero):
                                      # unconstrained. d2 at the lid drifts warm over days (2D
                                      # RCE: lid T +0.5 K at 48 h, crash at 277 h); natural decays

@@ -17,7 +17,8 @@ stability = false
 scheme = "none"
 
 [boundary_conditions]
-vertical_scalars_lid = "d2"         # legacy: one wall condition, ground AND lid
+vertical_scalars = "d2"             # legacy: one wall condition, ground AND lid
+vertical_scalars_lid = "d2"
 sedimentation_lid = "wall"           # legacy TC left rain on the d2 wall condition at the lid
 
 [numerics]
