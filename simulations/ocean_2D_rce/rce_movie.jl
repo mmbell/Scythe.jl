@@ -137,7 +137,7 @@ function draw_frame(k, fidx, framepath)
             mx = maximum(A)
             mx > MASS_THRESH || continue
             contourf!(ax_cond, x_km, z_km, A; levels = [MASS_THRESH, max(mx, 2 * MASS_THRESH)],
-                     colormap = cgrad([color, color]), extendhigh = :auto, alpha = 0.6)
+                     colormap = cgrad(fill(Makie.to_color((color, 0.6)), 2)), extendhigh = :auto)
         end
         Legend(fig[2, 4], [PolyElement(color = c) for (_, _, c) in SPECIES],
               [lbl for (_, lbl, _) in SPECIES]; framevisible = false, labelsize = 11)
