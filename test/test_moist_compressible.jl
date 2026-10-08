@@ -3254,6 +3254,89 @@ using Springsteel
         @test Scythe.condensate_slot(1.0e-3, 0.0, :bhyp, mu) === Scythe.bhyp(1.0e-3, mu)
     end
 
+    # ── The attribution continuation of the clipped lobe ────────────────────────────
+    #
+    # `ahyp` recovers 0 for n <= 0, but the LINEAR rho_t carries the transported feature's
+    # negative lobe in full; the residual vapor used to inherit the whole of it. The
+    # continuation `ahyp_signed` is what the vapor residual and the ice anchor headroom read
+    # instead below n = 0 (`options[:water_lobe_attribution]`, default off): the odd
+    # reflection of the recovered density, C1 with ahyp at the origin and of slope -> 2 in
+    # the affine regime, so a lobe deep compared with mu is handed back to the condensate
+    # that made it. `clipped_lobe` is the part of it the recovery discarded.
+    @testset "ahyp_signed: the attribution continuation of the clipped lobe" begin
+        have = isdefined(Scythe, :ahyp_signed) && isdefined(Scythe, :clipped_lobe)
+        @test have                   # ← the gate
+        for mu in (1.0e-7, 1.0e-12)          # condensate_mu = rain_mu, and the ice mass mu
+            # EXACTLY ahyp on n >= 0 -- the identity every healthy point's bitwise
+            # inertness rests on. Signed zero included: -0.0 is not below zero.
+            for n in (0.0, -0.0, 1.0e-14, mu, 1.0e-6, 1.0e-3, 1.0)
+                @test Scythe.ahyp_signed(n, mu) === Scythe.ahyp(n, mu)
+                @test Scythe.clipped_lobe(n, Scythe.ahyp(n, mu), mu) === 0.0
+            end
+            # ODD, bit for bit, and strictly negative below zero (the sign of the lobe).
+            for a in (1.0e-14, mu, 10.0 * mu, 1.0e-6, 1.0e-3, 1.0)
+                @test Scythe.ahyp_signed(-a, mu) === -Scythe.ahyp_signed(a, mu)
+                @test Scythe.ahyp_signed(-a, mu) < 0.0
+            end
+            # Monotone through the origin: a change of variables on the whole line.
+            ns = [-1.0e-3, -1.0e-5, -mu, -1.0e-3 * mu, 0.0, 1.0e-3 * mu, mu, 1.0e-5, 1.0e-3]
+            @test issorted([Scythe.ahyp_signed(n, mu) for n in ns])
+            # CONTINUOUS and C1 at the matching point: ahyp's one-sided slope at 0+ is
+            # ahyp_smooth'(0) = 1/dbhyp(0) = 1, and the reflection's at 0- is the same.
+            h = 1.0e-6 * mu
+            @test isapprox(Scythe.ahyp_signed(h, mu) / h, 1.0; rtol = 1.0e-5)
+            @test isapprox(Scythe.ahyp_signed(-h, mu) / -h, 1.0; rtol = 1.0e-5)
+            @test 1.0 / Scythe.dbhyp(0.0, mu) == 1.0
+            # The effective SLOPE g(nu)/nu: 1 at the origin, sqrt(2) at |nu| = mu, -> 2 in the
+            # affine regime (g(-a) = -(2a - mu) + O(mu^2/a)). That limit is Ooyama's factor
+            # 1/2 undone: what makes the attribution match the linear rho_t's lobe.
+            @test isapprox(Scythe.ahyp_signed(-mu, mu) / -mu, sqrt(2.0); rtol = 1.0e-12)
+            for a in (100.0 * mu, 1.0e4 * mu)
+                @test abs(Scythe.ahyp_signed(-a, mu) + (2.0 * a - mu)) <= 2.0 * mu^2 / a +
+                                                                          8.0 * eps(a)
+            end
+            @test 1.9 < Scythe.ahyp_signed(-10.0 * mu, mu) / (-10.0 * mu) < 2.0
+        end
+        # The configured widths. Cloud/rain (mu = 1e-7): slope 1.905 at a 1e-6 lobe in nu and
+        # 1.990 at 1e-5; ice mass (mu = 1e-12): 2 to 1e-6 already at 1e-6. The offline fit
+        # on the RCE output was best at c = 2.
+        @test 1.90 < Scythe.ahyp_signed(-1.0e-6, 1.0e-7) / -1.0e-6 < 1.91
+        @test 1.989 < Scythe.ahyp_signed(-1.0e-5, 1.0e-7) / -1.0e-5 < 1.991
+        @test isapprox(Scythe.ahyp_signed(-1.0e-6, 1.0e-12) / -1.0e-6, 2.0; rtol = 1.0e-5)
+
+        # LINEAR-LOBE CONSISTENCY, the definition. Ring a sharp feature through one linear,
+        # constant-preserving operator applied to BOTH representations -- the linear rho_t
+        # and the transformed slot -- and compare the lobes. Where rho_t rings below zero by
+        # many mu, the continuation of the slot's lobe reproduces rho_t's to O(mu); the
+        # tangent-line continuation (slope 1) recovers only about half of it.
+        mu = 1.0e-7
+        xs = range(-1.0, 1.0; length = 201)
+        rho = [1.0e-3 * exp(-(x / 0.02)^2) for x in xs]        # sub-grid-sharp, >= 0
+        nu = Scythe.bhyp.(rho, mu)
+        ring(f) = [i == 1 || i == length(f) ? f[i] :
+                   (1.5 * f[i]) - 0.25 * (f[i - 1] + f[i + 1]) for i in eachindex(f)]
+        Lrho = ring(rho); Lnu = ring(nu)
+        lobe = findall(<(-10.0 * mu), Lrho)
+        @test !isempty(lobe)                                    # the premise
+        @test all(Lnu[lobe] .< 0.0)                             # the slot clips there
+        @test all(Scythe.ahyp.(Lnu[lobe], mu) .== 0.0)          # ... to exactly zero
+        g = Scythe.ahyp_signed.(Lnu[lobe], mu)
+        @test maximum(abs, g .- Lrho[lobe]) <= 2.0 * mu
+        @test minimum(abs.(Lnu[lobe] .- Lrho[lobe]) ./ abs.(Lrho[lobe])) > 0.4
+
+        # clipped_lobe is the continuation LESS what the recovery returned, so the residual
+        # that subtracts both reads the continuation: under :bhyp the recovery is 0 and the
+        # lobe is the whole continuation; under :bhyp_smooth it is the part below -mu.
+        for a in (mu, 1.0e-5, 1.0e-3)
+            @test Scythe.clipped_lobe(-a, Scythe.ahyp(-a, mu), mu) ===
+                  Scythe.ahyp_signed(-a, mu)
+            xs_ = Scythe.ahyp_smooth(-a, mu)
+            @test isapprox(xs_ + Scythe.clipped_lobe(-a, xs_, mu), Scythe.ahyp_signed(-a, mu);
+                           rtol = 1.0e-14)
+            @test Scythe.clipped_lobe(-a, xs_, mu) < 0.0
+        end
+    end
+
     @testset "condensate transform: option gating" begin
         @test Scythe.condensate_transform_mode(Dict{Symbol,Any}()) === :none
         @test Scythe.condensate_transform_mode(
@@ -3275,10 +3358,11 @@ using Springsteel
     """
     function ctrans_rirk(tmpdir, tag; transform = nothing, rain_transform = nothing,
                          positivity = nothing, amp = 3.0e-3, precipitation = false,
-                         rain_amp = 0.0, xmod = false, Khdiff_water = 0.0, Sc_t = 1.0)
+                         rain_amp = 0.0, xmod = false, Khdiff_water = 0.0, Sc_t = 1.0,
+                         extra_options = Dict{Symbol,Any}())
         ref_file = joinpath(tmpdir, "ctrans_$(tag).ref")
-        opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
-                                :precipitation => precipitation)
+        opts = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                                      :precipitation => precipitation), extra_options)
         transform === nothing || (opts[:condensate_transform] = transform)
         rain_transform === nothing || (opts[:rain_transform] = rain_transform)
         # The slot NAMES follow the declared transforms, and every name-keyed dict has to
@@ -5262,11 +5346,11 @@ using Springsteel
     """
     function make_ice_lid_mtile(tmpdir, lid; geometry = "RZ", ts = 0.1, rho_i = 1.0e-4,
                                 n_low = 1.0e4, n_top = 1.0e2,
-                                Tsurf = 258.15)
-        opts = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
+                                Tsurf = 258.15, extra_options = Dict{Symbol,Any}())
+        opts = merge(Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
             :condensate_transform => :bhyp, :rain_transform => :bhyp,
             :rain_number_transform => :bhyp, :ice_transform => :bhyp,
-            :sedimentation_flux_lid => lid)
+            :sedimentation_flux_lid => lid), extra_options)
         varlist = Scythe.mc_var_names(opts; cyl = false)
         vars = Dict(v => i for (i, v) in enumerate(varlist))
         scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
@@ -5431,6 +5515,159 @@ using Springsteel
             @test n.sed ≈ n.F_gnd - n.F_lid rtol = 1.0e-8 atol = 1.0e-14
             @test -n.F_lid > 1.0e-3 * n.qscale * 40 * 0.1    # mass entered from above
             @test n.sed > 0.0 > d.sed                 # net gain vs net loss by sedimentation
+        end
+    end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LOBE ATTRIBUTION (`options[:water_lobe_attribution]`, default off). The linear ρ_t
+    # carries a transported condensate feature's negative lobe in full while `ahyp` recovers
+    # the slot at 0 there, so the vapor residual `res_rho_t` (and through the nudge, the
+    # prognostic vapor) inherited the whole lobe, and the ice anchor headroom read the same
+    # deficit as missing water. Both now read the clipped lobe through `ahyp_signed`; the
+    # thermodynamic readers keep the recovered (non-negative) densities. `false` restores the
+    # clipped accounting bitwise, for forensics.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "lobe attribution: the vapor residual and the anchor headroom" begin
+        mktempdir() do tmpdir
+            # A column of the production configuration (bhyp on every water slot) with a
+            # KNOWN negative lobe at three levels, one per transformed mass family: the slot
+            # holds nu = -a, which ahyp recovers as exactly 0, and rho_t carries the lobe's
+            # continuation -ahyp_smooth(a) -- what the linear anchor holds when it transports
+            # the same feature. The vapor slot is untouched, so the vapor the column really
+            # carries is the resting one and the RIGHT residual is that vapor.
+            function seeded(attr)
+                eo = attr === nothing ? Dict{Symbol,Any}() :
+                     Dict{Symbol,Any}(:water_lobe_attribution => attr)
+                m, patch, mod, info = make_ice_lid_mtile(tmpdir, :dirichlet;
+                                                         geometry = "RiRk",
+                                                         extra_options = eo)
+                vars = info.vars
+                kDim = mod.grid_params.kDim
+                ord = sortperm(info.z)
+                kc, kr, ki = ord[4], ord[div(kDim, 2)], ord[kDim - 4]
+                cmu = get(mod.physical_params, :condensate_mu, 1.0e-7)
+                rmu = get(mod.physical_params, :rain_mu, 1.0e-7)
+                imu = info.mu[1]
+                a = 2.0e-3      # the old residual goes ~ -2.6e-3 at the lobes: the premise
+                rt = vars["rho_t"]
+                for (k, s, mu) in ((kc, Scythe.mc_slot(vars, "rho_c"), cmu),
+                                   (kr, Scythe.mc_slot(vars, "rho_r"), rmu),
+                                   (ki, info.iq, imu))
+                    # What was there (the ice level holds the fixture's 1e-4 of ice) is
+                    # REPLACED by the lobe, in the slot and in the anchor alike.
+                    x0 = Scythe.ahyp(patch.physical[k, s, 1], mu)
+                    patch.physical[k, s, 1] = -a
+                    patch.physical[k, rt, 1] -= x0 + Scythe.ahyp_smooth(a, mu)
+                end
+                Scythe.advance_column(m, 1, 1)
+                S = deepcopy(m.mc_scratch[Threads.threadid()])
+                return S, (; kc, kr, ki, a, cmu, rmu, imu, kDim)
+            end
+            Son, P = seeded(true)
+            Soff, _ = seeded(false)
+            Sdef, _ = seeded(nothing)
+            lobes = (P.kc, P.kr, P.ki)
+            others = setdiff(1:P.kDim, lobes)
+
+            # The DEFAULT is OFF until the slots' below-zero transport is consistent with
+            # rho_t (see `ahyp_signed`): the default arm is the clipped accounting.
+            @test Sdef.res_rho_t == Soff.res_rho_t
+            @test Sdef.Tk == Soff.Tk
+
+            # OFF is the pre-attribution residual, bit for bit, and the premise holds: the
+            # clipped lobe drives it negative at all three levels.
+            @test Soff.res_rho_t == ((Soff.rho_t .- Soff.rho_d) .- Soff.rho_liq) .- Soff.rho_ice
+            for k in lobes
+                @test Soff.res_rho_t[k] < -1.0e-3
+                @test Soff.VREC[k] < -1.0e-4          # ... and drags the vapor down with it
+            end
+
+            # ON: the lobe is handed back to the condensate that made it. The residual is the
+            # vapor the column carries (to the rounding of the rho_t seed) and the nudge has
+            # nothing to do -- at every one of the three families.
+            for k in lobes
+                @test Son.res_rho_t[k] >= 0.0
+                @test isapprox(Son.res_rho_t[k], Son.rho_v[k]; atol = 1.0e-12)
+                @test abs(Son.VREC[k]) <= 1.0e-13
+            end
+            @test Son.lobe_w[P.kc] === -Scythe.ahyp_smooth(P.a, P.cmu)
+            @test Son.lobe_w[P.kr] === -Scythe.ahyp_smooth(P.a, P.rmu)
+            @test Son.lobe_w[P.ki] === -Scythe.ahyp_smooth(P.a, P.imu)
+
+            # Everywhere every slot is non-negative: exactly zero lobe, identical residual.
+            @test all(x -> x === 0.0, Son.lobe_w[others])
+            @test Son.res_rho_t[others] == Soff.res_rho_t[others]
+
+            # The thermodynamic and microphysical readers keep their floors: the recovered
+            # liquid and ice are untouched, the lobe levels read exactly 0.
+            @test Son.rho_liq == Soff.rho_liq
+            @test Son.rho_ice == Soff.rho_ice
+            @test Son.rho_c[P.kc] === 0.0 && Son.rho_r[P.kr] === 0.0 && Son.i1q[P.ki] === 0.0
+
+            # The ANCHOR HEADROOM. At the cloud- and rain-lobe levels the column holds
+            # 1e-4 kg/m^3 of real ice against rho_t - rho_d < 0: under the clipped accounting
+            # the whole of it is "phantom" -- the reader cap zeroes it and the sedimentation
+            # share is 0 -- because the liquid's lobe was read as missing water. Attributed,
+            # the partition is admissible and every leg is absent there.
+            for k in (P.kc, P.kr)
+                @test Soff.rho_t[k] - Soff.rho_d[k] < 0.0
+                @test Soff.rho_ice[k] > 0.0
+                @test Soff.anchor_f[k] == 0.0
+                @test Soff.rho_ice_t[k] == 0.0
+                @test Son.anchor_f[k] === 1.0
+                @test Son.rho_ice_t[k] === Son.rho_ice[k]
+            end
+            @test Son.anchor_f[others] == Soff.anchor_f[others]
+            @test Son.rho_ice_t[others] == Soff.rho_ice_t[others]
+            @test Son.Tk[others] == Soff.Tk[others]
+        end
+    end
+
+    @testset "lobe attribution: bitwise inert where every slot is non-negative" begin
+        mktempdir() do tmpdir
+            # The healthy production column, one full step from a state whose transformed
+            # mass slots are all at or above zero (asserted -- it is the premise): the
+            # attribution must not move a single bit of the tendencies or the state. (One
+            # step, not several: the column's own fit rings a slot to -3e-12 by step 6, and
+            # from there the two arms are SUPPOSED to differ.)
+            function run_clean(attr; nsteps = 1)
+                m, patch, mod, info = make_ice_lid_mtile(tmpdir, :dirichlet;
+                    geometry = "RiRk",
+                    extra_options = Dict{Symbol,Any}(:water_lobe_attribution => attr))
+                vars = info.vars
+                kDim = mod.grid_params.kDim
+                ncols = div(size(patch.physical, 1), kDim)
+                mass = [Scythe.mc_slot(vars, "rho_c"), Scythe.mc_slot(vars, "rho_r"),
+                        info.iqs...]
+                minnu = Inf
+                for t in 1:nsteps
+                    minnu = min(minnu, minimum(patch.physical[:, mass, 1]))
+                    for c in 1:ncols
+                        Scythe.advance_column(m, c, t)
+                    end
+                    Scythe.calcTendency(m)
+                    gridTransform!(patch)
+                end
+                @test all(isfinite.(patch.physical))
+                return copy(patch.physical), copy(m.expdot_n), minnu
+            end
+            Pon, Eon, minnu = run_clean(true)
+            Poff, Eoff, _ = run_clean(false)
+            @test minnu >= 0.0
+            @test Eon == Eoff
+            @test Pon == Poff
+        end
+        # ... and under `:none` there is no clip and nothing to attribute: a cloud that rings
+        # clearly negative (the transform-gate fixture's premise) is bitwise the same run.
+        mktempdir() do tmpdir
+            mA, pA, _, gpA = ctrans_rirk(tmpdir, "la_none_on"; transform = :none)
+            mB, pB, _, gpB = ctrans_rirk(tmpdir, "la_none_off"; transform = :none,
+                extra_options = Dict{Symbol,Any}(:water_lobe_attribution => false))
+            cloudy_run!(mA, pA, gpA, 20)
+            cloudy_run!(mB, pB, gpB, 20)
+            @test minimum(ctrans_rho_c(pA, gpA, :none)) < -1.0e-6       # the premise
+            @test pA.physical == pB.physical
         end
     end
 

@@ -180,7 +180,12 @@ const MC_SCRATCH_SLOTS = (
     # partition, third leg): min(1, headroom/ρ_i) per gridpoint, exactly 1.0 where the
     # partition is admissible, applied to all twelve flux assemblies so the phantom part of
     # a detached ice mass does not fall — and does not move ρ_t or E_t.
-    :rho_ice, :rho_ice_t, :q_i, :Fi_z, :E_sed_i, :E_sed_i_z, :anchor_f,
+    # `lobe_w` is the summed CLIPPED LOBE of the transformed cloud, rain and ice-mass slots
+    # (`clipped_lobe` through `ahyp_signed`, ≤ 0, exact zeros wherever every slot is
+    # non-negative): the share of a transported condensate's negative lobe the linear ρ_t
+    # carries and the recovered densities do not. The vapor residual and the anchor headroom
+    # read it (`options[:water_lobe_attribution]`); no thermodynamic reader does.
+    :rho_ice, :rho_ice_t, :q_i, :Fi_z, :E_sed_i, :E_sed_i_z, :anchor_f, :lobe_w,
     # ── Ice PHYSICS (S8): the process rates the twelve slots and the shared thermodynamics
     # read. `Qdot_i<k>` is species k's deposition/sublimation rate [kg/m³/s] (TeX Eq.
     # dep_rate) and `invtau_i<k>` its relaxation rate for the stiffness census; `Q_s_i` is
@@ -1915,6 +1920,86 @@ shrinks the retrieval denominator; near the ground it is ~2.5e-4 K.
 @inline ahyp_smooth(n, mu) = n + ((n * n) / (sqrt((n * n) + (mu * mu)) + mu))
 @inline ahyp(n, mu) = n <= 0.0 ? 0.0 : ahyp_smooth(n, mu)
 @inline dbhyp(rho, mu) = 0.5 * (1.0 + (mu * mu) / ((rho + mu) * (rho + mu)))
+
+"""
+    ahyp_signed(n, mu) -> rho
+    clipped_lobe(n, rho, mu) -> lobe
+
+The ATTRIBUTION continuation of a transformed water-mass slot below `n = 0`, and the part of it
+the recovery discarded. `ahyp_signed` is `ahyp` on `n ≥ 0` — the identical function, bit for
+bit — and its odd reflection below:
+
+    ahyp_signed(n) =  ahyp(n)              n ≥ 0
+                   = −ahyp_smooth(−n)      n < 0      ( = n − n²/(√(n²+μ²) + μ) )
+
+`clipped_lobe(n, rho, mu)` is `ahyp_signed(n) − rho` where `n < 0` (with `rho` the density the
+slot's recovery returned there: 0 under `:bhyp`, `ahyp_smooth(n) ∈ (−μ, 0)` under
+`:bhyp_smooth`) and an exact `0.0` everywhere else, so `rho + lobe` reads the continuation and a
+point whose slot is non-negative contributes nothing.
+
+**Which readers.** Only the ones that BALANCE the slot against the linear `ρ_t` anchor: the
+vapor residual `res_rho_t` and the ice anchor headroom (`options[:water_lobe_attribution]`,
+default `false` — see the caveat below). Every THERMODYNAMIC and MICROPHYSICAL reader — the temperature retrieval, the
+rates, the fall speeds, radiation — keeps the recovered, non-negative density. Nothing is
+written back; this is accounting, not a state repair.
+
+**Why it is OFF by default (2026-10-07).** The closure assumes every negative slot lobe is also
+in the linear `ρ_t`. Measured on the ocean_2D_rce output that is false for most of the lobe
+mass: after the first convective burst the transformed slots hold a negative pool of 4-6.5
+kg/m² (10 % of the column water) that `ρ_t` does not, because the slots are not transported
+consistently with `ρ_t` below `ν = 0` (the clipped-point Jacobian is `dbhyp(0) = 1` where the
+in-cloud value is 1/2, so a flux divergence ringing at a condensate edge moves twice the
+equivalent mass in the slot, and only the negative side survives the physics). With the
+attribution on, that pool is handed to the vapor: a 1 h restart from the 30 h checkpoint
+put the species sum 5.7 kg/m² ABOVE the conserved `ρ_t - ρ_d` over 70 % of the domain. The
+switch stays off until the below-zero transport is consistent and the pool is gone; then
+this closure is exact to ~2μ per slot.
+
+**Why a continuation at all.** `ρ_t` is linear and transports a sharp condensate feature with
+its whole Gibbs lobe; the slot transports `ν = bhyp(ρ)` with the SAME linear operator, rings
+too, and `ahyp` recovers 0 where it rings below zero. The lobe `ρ_t` carries then has no owner
+in the partition, and the residual `ρ_t − ρ_d − ρ_liq − ρ_ice` hands all of it to the vapor —
+which the reconciliation nudge faithfully drags negative (the file header's "clamp channel").
+Measured on the 2-D RCE production output: every point with `ρ_t − ρ_d < 0` had
+`Σ min(ν, 0) < −1e-7` on the cloud/rain/ice-mass slots, and 15–32 % of the domain carried
+negative vapor.
+
+**Derivation (what the slot's negative value MEANS).** Let `L` be the linear,
+constant-preserving operator the step applies (spline fit, transport) and `F ≥ 0` a feature of
+amplitude `A ≫ μ` against condensate-free air. `bhyp` is EXACTLY affine above the knee —
+`bhyp(ρ) = (ρ + μ)/2 − μ²/(2(ρ + μ))`, algebra, not an expansion — so on the feature
+`ν = F/2 + (μ/2)χ + O(μ²/A)` with `χ` its indicator, and
+
+    L ν = (L F)/2 + (μ/2) L χ + O(μ²/A).
+
+Where the anchor rings below zero by `δ` (`L F = −δ`), the slot therefore holds `−δ/2 + O(μ)`:
+the density the slot stands for there is `2ν + O(μ)`, the affine branch of the inverse
+continued through zero with Ooyama's factor ½ undone. Of the continuations that are C¹ with
+`ahyp` at the matching point `n = 0` (where `ahyp` leaves with slope `1/dbhyp(0) = 1`), the odd
+reflection is the one that reaches that branch: `ahyp_signed(−a) = −(2a − μ) + O(μ²/a)`, its
+effective slope `g(ν)/ν` running 1 at the origin, √2 at `|ν| = μ`, 1.9 at `10μ`, → 2. The
+tangent line (slope 1) is also C¹ and recovers half of every deep lobe; the affine line
+`2ν − μ` is the deep limit itself but jumps by `μ` at the origin. With every water species then
+transported linearly in the representation it carries, the residual reads
+`L(ρ_v) + O(μ)` — the vapor the prognostic slot transported — and the redundancy the nudge
+reconciles is the splitting error it was meant to be, not the condensate's lobe.
+
+**What it is not.** An ATTRIBUTION CLOSURE, exact only in the limit identified: a lobe made by
+linear transport of a feature whose interior is in the affine regime (`A ≫ μ`) and whose lobe
+is deep compared with `μ`. The error there is bounded by `2μ` per slot per point (`(μ/2)Lχ`
+plus the `μ` offset), the order of Ooyama's own clip bound. A lobe of depth `~μ`, a feature
+that is itself in the knee, or a negative slot produced by a SOURCE rather than by transport is
+attributed by the same rule without the derivation behind it. At the configured widths
+(`condensate_mu = rain_mu = 1e-7`, ice mass `1e-12`) the effective cloud/rain slope is 1.905 at
+a `1e-6` lobe in `ν` and 1.990 at `1e-5`, the ice slope 2 to 1e-6 at either, against an
+offline fit on the RCE output that was best at `c = 2`
+(15–32 % negative-vapor area → 0.4–0.8 %; `c = 1` left 7–10 %). Mass slots only: a NUMBER or
+habit moment carries no water and never enters the partition.
+"""
+@inline ahyp_signed(n, mu) = n < 0.0 ? -ahyp_smooth(-n, mu) : ahyp(n, mu)
+
+@doc (@doc ahyp_signed)
+@inline clipped_lobe(n, rho, mu) = n < 0.0 ? ahyp_signed(n, mu) - rho : 0.0
 
 """
     condensate_slot(rho_c, rho_cbar, transform, mu) -> slot value
@@ -3955,21 +4040,50 @@ Properties (each is a test in test_ice_anchor_reconcile.jl):
 at the measured transport-phase feed (≤ 1.7e-6 kg/m³/s, FINDINGS §Stage C) the detachment
 equilibrates at `F·τ ≈ 1.7e-5` kg/m³ — a 0.16 K retrieval excursion against the ~1e4
 K/(kg/m³) sensitivity the ts=0.3 death window calibrates.
+
+`lobe` (keyword, default `0.0`) is the summed CLIPPED LOBE of the transformed water-mass slots
+at the point (≤ 0; see [`anchor_headroom`](@ref) and [`ahyp_signed`](@ref)). At `0.0` — every
+point whose slots are all non-negative, and every point when `options[:water_lobe_attribution]`
+is off — this is the law above, bit for bit.
 """
 @inline function ice_anchor_rate(rho_t::Float64, rho_d::Float64, rho_liq::Float64,
-                                 rho_ice::Float64, tau_anchor::Float64)
-    head = max((rho_t - rho_d) - max(rho_liq, 0.0), 0.0)
+                                 rho_ice::Float64, tau_anchor::Float64; lobe::Float64 = 0.0)
+    head = anchor_headroom(rho_t - rho_d, rho_liq, lobe)
     delta = max(rho_ice - head, 0.0)
     phi = (delta > 0.0 && rho_ice > 0.0) ? delta / (rho_ice * tau_anchor) : 0.0
     return phi, delta
 end
 
 """
-    _ice_anchor_reconcile!(S, st, tid, rho_t, rho_d, rho_liq, rho_ice, tau_anchor, apply, ts)
+    anchor_headroom(rho_w, rho_liq, lobe) -> headroom
+
+The water the conserved anchor leaves for the ice, `max((ρ_t − ρ_d) − max(ρ_liq, 0) − lobe, 0)`
+with `rho_w = ρ_t − ρ_d` — ONE expression for all four places that read it: the reconciliation
+rate ([`ice_anchor_rate`](@ref)), the reader-side cap on `rho_ice_t`, the sedimentation/rate
+share `anchor_f`, and the located column-state error.
+
+`lobe ≤ 0` is the summed [`clipped_lobe`](@ref) of the transformed cloud, rain and ice-mass slots
+(`options[:water_lobe_attribution]`, default off, see [`ahyp_signed`](@ref)). It is water the linear `ρ_t` carries as a
+transported condensate's negative lobe and the recovered densities clip to zero; it belongs to
+the condensate that made it, so it is not missing from the ice's headroom. Subtracting it
+ENLARGES the headroom by exactly `|lobe|`: a liquid lobe beside real ice no longer makes that ice
+"phantom" and drain it, cap it out of the retrieval and withhold its fall. With the ice's OWN
+lobe included the test `ρ_i > headroom` is exactly `res_rho_t < 0` (for `ρ_liq ≥ 0`), so the
+anchor and the vapor residual agree about which water is missing.
+
+`lobe = 0.0` is bitwise the pre-attribution headroom (`x − 0.0 === x`).
+"""
+@inline anchor_headroom(rho_w, rho_liq, lobe) = max((rho_w - max(rho_liq, 0.0)) - lobe, 0.0)
+
+"""
+    _ice_anchor_reconcile!(S, st, tid, rho_t, rho_d, rho_liq, rho_ice, lobe, tau_anchor,
+                           apply, ts)
 
 One column's pass of the anchor reconciliation: measure the partition defect at every
 gridpoint into the `MC_ANCHOR_*` census, and — when `apply` — subtract
-`phi · max(moment, 0)` from all twelve ice `SRC_*` accumulators.
+`phi · max(moment, 0)` from all twelve ice `SRC_*` accumulators. `lobe` is the column's
+summed clipped lobe (the `lobe_w` scratch column; all exact zeros when
+`options[:water_lobe_attribution]` is off — see [`anchor_headroom`](@ref)).
 
 Runs AFTER [`mc_ice_sources!`](@ref) and before the sedimentation fluxes, so it composes
 with the process sources on the multistep exactly as the `var_check` consistency source
@@ -3992,14 +4106,14 @@ deferred `clamp_water!` ice floor owed and could not provide.
 `apply = false` (`options[:ice_anchor_source] = false`) keeps the census and drops the
 removal: the defect reproduction stays bitwise available for forensics, measured.
 """
-function _ice_anchor_reconcile!(S, st, tid::Int64, rho_t, rho_d, rho_liq, rho_ice,
+function _ice_anchor_reconcile!(S, st, tid::Int64, rho_t, rho_d, rho_liq, rho_ice, lobe,
                                 tau_anchor::Float64, apply::Bool, ts::Float64)
     gap = 0.0
     pts = 0.0
     rem = 0.0
     @inbounds for i in eachindex(rho_ice)
         phi, delta = ice_anchor_rate(rho_t[i], rho_d[i], rho_liq[i], rho_ice[i],
-                                     tau_anchor)
+                                     tau_anchor; lobe = lobe[i])
         delta > 0.0 || continue
         delta > gap && (gap = delta)
         pts += 1.0
@@ -6692,8 +6806,9 @@ Throw a LOCATED error when the retrieved column is thermodynamically inadmissibl
 coordinates — whatever the caller has); then, for the bad level and the levels immediately
 below and above it, the level index, `z`, and one line per entry of `fields` (a NamedTuple of
 column vectors, printed in order). When `fields` carries `rho_t`, `rho_d` and `rho_liq_t`, the
-ice anchor headroom `max((ρ_t − ρ_d) − max(ρ_liq_t, 0), 0)` is printed as well. The message is
-built only on the failing path.
+ice anchor headroom [`anchor_headroom`](@ref) `max((ρ_t − ρ_d) − max(ρ_liq_t, 0) − lobe_w, 0)` is
+printed as well (`lobe_w` read from `fields` when present, 0 otherwise). The message is built
+only on the failing path.
 
 Why this exists (the §2c death class): a retrieval-heating burst drives a w / sound-speed
 runaway, the vertical semi-implicit solve is carried past its limit, and the total pressure
@@ -6725,7 +6840,8 @@ end
             println(io, "    $(key) = $(col[k])")
         end
         if has_head
-            head = max((fields.rho_t[k] - fields.rho_d[k]) - max(fields.rho_liq_t[k], 0.0), 0.0)
+            lobe = haskey(fields, :lobe_w) ? fields.lobe_w[k] : 0.0
+            head = anchor_headroom(fields.rho_t[k] - fields.rho_d[k], fields.rho_liq_t[k], lobe)
             println(io, "    anchor_headroom = $(head)")
         end
     end
@@ -6796,6 +6912,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     ice_anchor_flr = get(model.options, :ice_anchor_floor, true)::Bool
     # The sedimentation leg (see the `anchor_f` scratch doc): applied only with ice on.
     ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool
+    # LOBE ATTRIBUTION (see `ahyp_signed` and the `lobe_w` block below): the vapor residual
+    # and the anchor headroom read each transformed water-mass slot's clipped negative lobe
+    # through the odd continuation of `ahyp`, so the lobe the linear ρ_t carries is the
+    # condensate's and not the vapor's. Default ON; bitwise inert wherever every slot is
+    # non-negative and whenever no water transform is declared. `false` restores the clipped
+    # accounting — the residual that drove 15–32 % of the 2-D RCE domain to negative vapor —
+    # bitwise, for forensics.
+    lobe_attr = get(model.options, :water_lobe_attribution, false)::Bool
     # The LID of every sedimentation-flux fit (rain mass, its energy, rain number, the twelve
     # ice moments, the ice energy): `:dirichlet` (the default and the physics) fits the flux
     # on `flux_column` — the slot's basis with F = 0 at the lid, since no hydrometeor enters
@@ -7376,6 +7500,28 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     else
         fill!(rho_ice, 0.0)
     end
+    # The CLIPPED LOBE of the transformed water-mass slots — cloud, rain and the three ice
+    # masses; never a number or habit moment, which carry no water. Where a slot rings below
+    # ν = 0 the recovery returns 0 (`:bhyp`) or a value above −μ (`:bhyp_smooth`) while the
+    # linear ρ_t holds the transported feature's whole lobe; `clipped_lobe` is the difference
+    # under the odd continuation `ahyp_signed` (≈ 2ν for a lobe deep compared with μ — Ooyama's
+    # factor ½ undone; see its docstring for the derivation and the limit in which it is
+    # exact). It is an exact 0.0 at every point whose slots are all non-negative, so its two
+    # readers — `res_rho_t` and `anchor_headroom` — are bitwise their clipped selves there,
+    # and an all-zero column when no transform is declared or `lobe_attr` is off. Nothing
+    # here touches a recovered density: the retrieval, the rates, the fall speeds and the
+    # radiation read the clipped values exactly as before.
+    lobe_w = S.lobe_w
+    fill!(lobe_w, 0.0)
+    if lobe_attr
+        ctrans_on && (@. lobe_w += clipped_lobe(nu_c, rho_c, cmu))
+        rtrans_on && (@. lobe_w += clipped_lobe(nu_r, rho_r, rmu))
+        if ice_on && itrans_on
+            @. lobe_w += (clipped_lobe(S.nu_i1q, i1q, imu_q) +
+                          clipped_lobe(S.nu_i2q, i2q, imu_q)) +
+                         clipped_lobe(S.nu_i3q, i3q, imu_q)
+        end
+    end
     # What the THERMODYNAMICS reads. Under the default `:none` this is a copy of identical
     # doubles, so the whole option is bitwise inert. Under `:diagnostic` it is the floored
     # liquid, and ONLY the consumers below see it: the retrieval, q_l -> C_vt/R_m/gamma_m,
@@ -7414,7 +7560,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     end
     if ice_anchor_flr && ice_on
         @inbounds for i in eachindex(rho_ice_t)
-            head = max((rho_t[i] - rho_d[i]) - max(rho_liq_t[i], 0.0), 0.0)
+            head = anchor_headroom(rho_t[i] - rho_d[i], rho_liq_t[i], lobe_w[i])
             rho_ice_t[i] > head && (rho_ice_t[i] = head)
         end
     end
@@ -7431,9 +7577,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     check_column_state(p, rho_d, rho_t, Tk, z,
         vv === nothing ?
             (; p, p_prime = pp, pbar, rho_d, rho_t, Tk, w, u, rho_v, rho_liq, rho_ice,
-               rho_ice_t, rho_liq_t, Q_ss, E_t, M) :
+               rho_ice_t, rho_liq_t, lobe_w, Q_ss, E_t, M) :
             (; p, p_prime = pp, pbar, rho_d, rho_t, Tk, w, u, v = vv.f, rho_v, rho_liq,
-               rho_ice, rho_ice_t, rho_liq_t, Q_ss, E_t, M),
+               rho_ice, rho_ice_t, rho_liq_t, lobe_w, Q_ss, E_t, M),
         (; step = t, time_s = t * model.ts, tile = model.output_dir, tile_ts = model.ts,
            colstart, colend, column = Base.div(colstart - 1, colend - colstart + 1) + 1,
            coord1 = gridpoints[colstart, 1],
@@ -7448,7 +7594,17 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # ICE IS IN THE RESIDUAL: ρ_v = ρ_t − ρ_d − ρ_liq − ρ_ice (Eq. ice_mass of the TeX). With
     # ice off `rho_ice` is an exact zero column and `x - 0.0 === x`, so this is bitwise the
     # three-term residual it was.
-    res_rho_t = S.res_rho_t; @. res_rho_t = rho_t - rho_d - rho_liq - rho_ice
+    # AND THE CLIPPED LOBE (`lobe_w`, ≤ 0): the condensates enter at their attribution
+    # continuation, not at the clipped recovery, so a transported lobe the linear ρ_t carries
+    # stays with the condensate that made it instead of being nudged into the vapor. The
+    # residual then reads the vapor the prognostic slot transported, to O(μ). `lobe_w` is an
+    # exact 0.0 wherever every slot is non-negative, so the term is `x - 0.0 === x` there.
+    res_rho_t = S.res_rho_t
+    if lobe_attr
+        @. res_rho_t = rho_t - rho_d - rho_liq - rho_ice - lobe_w
+    else
+        @. res_rho_t = rho_t - rho_d - rho_liq - rho_ice
+    end
     q_v = S.q_v;     @. q_v = rho_v / rho_d
     q_l = S.q_l;     @. q_l = rho_liq_t / rho_d      # thermodynamic reader: see rho_liq_t
     q_i = S.q_i;     @. q_i = rho_ice_t / rho_d      # ditto; exactly 0.0 with ice off
@@ -7758,7 +7914,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # every leg bitwise absent from healthy air.
         af = S.anchor_f
         @inbounds for i in eachindex(af)
-            head = max((rho_t[i] - rho_d[i]) - max(rho_liq[i], 0.0), 0.0)
+            head = anchor_headroom(rho_t[i] - rho_d[i], rho_liq[i], lobe_w[i])
             ri = rho_ice[i]
             af[i] = (ri > head && ri > 0.0) ? head / ri : 1.0
         end
@@ -7788,7 +7944,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # invariant, no latent heat, nothing in λ/N. See `ice_anchor_rate` for the law and
         # TeX §"Reconciliation of the condensate partition" for the derivation.
         _ice_anchor_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
-                               rho_t, rho_d, rho_liq, rho_ice,
+                               rho_t, rho_d, rho_liq, rho_ice, lobe_w,
                                tau_anchor, ice_anchor_src, model.ts)
 
         # The POPULATION RECONCILIATION — the fourth and last tier, in the same slot and for

@@ -51,6 +51,39 @@
         @test delta_c == delta_a + 4.0e-3
     end
 
+    @testset "the headroom sees the clipped lobe (water_lobe_attribution)" begin
+        # `lobe` is the summed CLIPPED LOBE of the transformed water-mass slots at the
+        # point (`clipped_lobe` through `ahyp_signed`, <= 0): water the linear rho_t carries
+        # as a transported condensate's negative lobe, which the recovered densities clip
+        # to zero. It is the condensate's, so it is not missing from the ice's headroom.
+        tau = 10.0
+        # Exactly the old law at lobe = 0.0 (the keyword's default, and its value at every
+        # point whose slots are all non-negative) -- bitwise, over the admissible states and
+        # the detached ones.
+        for (rt, rd, rl, ri) in ((1.0, 0.98, 0.0, 0.0), (1.0, 0.98, -1.0e-4, 0.019),
+                                 (1.0, 0.99, 0.0, 0.02), (1.0, 0.99, 4.0e-3, 0.02),
+                                 (0.4080435348613092, 0.408042550918894, 0.0,
+                                  8.8166805353408e-6))
+            @test Scythe.ice_anchor_rate(rt, rd, rl, ri, tau; lobe = 0.0) ===
+                  Scythe.ice_anchor_rate(rt, rd, rl, ri, tau)
+            @test Scythe.anchor_headroom(rt - rd, rl, 0.0) === max((rt - rd) - max(rl, 0.0), 0.0)
+        end
+        # A real 1e-3 of ice where a 3e-3 liquid lobe has put rho_t - rho_d at -1e-3:
+        # unattributed, all of the ice is "phantom"; attributed, none of it is.
+        phi0, d0 = Scythe.ice_anchor_rate(1.0, 1.001, 0.0, 1.0e-3, tau)
+        @test d0 == 1.0e-3
+        @test phi0 ≈ 1.0 / tau
+        phi1, d1 = Scythe.ice_anchor_rate(1.0, 1.001, 0.0, 1.0e-3, tau; lobe = -3.0e-3)
+        @test phi1 === 0.0 && d1 === 0.0
+        # A lobe that does not cover the whole deficit leaves the rest as the defect: the
+        # attribution enlarges the headroom by exactly |lobe| and does nothing else.
+        _, d2 = Scythe.ice_anchor_rate(1.0, 1.001, 0.0, 1.0e-3, tau; lobe = -1.5e-3)
+        @test d2 ≈ 1.0e-3 - (1.5e-3 - 1.0e-3) rtol = 1e-12
+        @test Scythe.anchor_headroom(-2.0e-3, 0.0, -3.0e-3) ≈ 1.0e-3 rtol = 1e-12
+        # It is never a sink of headroom: lobe <= 0 by construction, and headroom >= 0.
+        @test Scythe.anchor_headroom(-1.0, 0.0, -0.5) === 0.0
+    end
+
     @testset "the removed fraction is bounded by dt/tau — never the reservoir" begin
         # phi <= 1/tau identically (delta <= rho_ice by construction), so the
         # per-step removed fraction phi*dt <= dt/tau << 1 at every state the

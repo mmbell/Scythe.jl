@@ -702,6 +702,7 @@ co2_ppm = 280.0
 | `w_max` | float | `diagnostics.timestep_advisory.w_max` (refused in `[extra.options]`) | timestep advisory: expected peak vertical wind [m/s] (reference_state.jl) |
 | `wall_bc_tau` | float | `numerics.wall_bc_tau` (refused in `[extra.options]`) | relaxation timescale [s] of the R1T1X wall BC; Inf = none (semiimplicit.jl) |
 | `water_budget_trace` | int | `diagnostics.water_budget_trace` (refused in `[extra.options]`) | water-budget print interval [steps]; 0 = off (moist_compressible.jl) |
+| `water_lobe_attribution` | bool |  | the vapor residual and the ice anchor headroom read each transformed water-mass slot's clipped negative lobe through the odd continuation of ahyp; default FALSE until the slots' below-zero transport is consistent with rho_t (measured 2026-10-07: the slots hold a 4-6.5 kg/m2 negative pool rho_t does not, so attributing it inflates the vapor by ~10% of the column); true enables it (moist_compressible.jl) |
 | `water_warn_dT` | float |  | temperature-mismatch warning threshold [K] of the water reconciliation (moist_compressible.jl) |
 | `xsi_lid_rows` | string |  | exact_si lid boundary rows: "strong" or weak (exact_si.jl, exact_si_rlr.jl) |
 | `xsi_rlr_axis_dirichlet` | bool |  | exact_si RLR: Dirichlet axis rows in the per-wavenumber solve (exact_si_rlr.jl) |

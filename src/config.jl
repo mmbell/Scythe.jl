@@ -810,6 +810,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :water_warn_dT            => (Float64, "temperature-mismatch warning threshold [K] of the water reconciliation (moist_compressible.jl)"),
     :rain_evap_realization    => (Bool, "per-donor realization bound on rain evaporation (moist_compressible.jl)"),
     :rain_population_gate     => (Bool, "skip two-moment rain sinks where the carried rain number is not a population (moist_compressible.jl)"),
+    :water_lobe_attribution   => (Bool, "the vapor residual and the ice anchor headroom read each transformed water-mass slot's clipped negative lobe through the odd continuation of ahyp; default FALSE until the slots' below-zero transport is consistent with rho_t (measured 2026-10-07: the slots hold a 4-6.5 kg/m2 negative pool rho_t does not, so attributing it inflates the vapor by ~10% of the column); true enables it (moist_compressible.jl)"),
     :sedimentation_flux_lid   => (Symbol, "lid of every sedimentation-flux fit: :dirichlet (default, F = 0 at the lid) or :natural (forensics: the slot's own lid BC, lets hydrometeors fall in from above) (moist_compressible.jl)"),
     :ice_microphysics         => (Symbol, "ice scheme: :ishmael or :none (moist_compressible.jl, radiation_state.jl, mc_mynn_bl.jl)"),
     :ice_agg_caps             => (Bool, "ISHMAEL aggregation caps on the unit pass (moist_compressible.jl)"),
