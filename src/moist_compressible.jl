@@ -1960,6 +1960,23 @@ put the species sum 5.7 kg/m² ABOVE the conserved `ρ_t - ρ_d` over 70 % of th
 switch stays off until the below-zero transport is consistent and the pool is gone; then
 this closure is exact to ~2μ per slot.
 
+**Measured 2026-10-08: the transport inconsistency is real but is NOT what makes the pool.**
+[`lobe_transport_jacobian`](@ref) now makes the below-zero continuity terms consistent, but an
+exact per-operator budget of `Σ min(ν, 0)` over the 24→33 h restart of the same run (the pool
+reproduced: −6.6 kg/m², ×2) attributes it to the PATCH REFIT of the slot between steps
+(−9.0), with the doubled sedimentation −0.55, the advection +0.28, the multistep sources
++1.43, MYNN +0.77 and the phase-change increments +0.49. The clipped-point Jacobian's whole
+share (actual − consistent, summed over divergence, sedimentation, sources and phase change)
+is +1.2: it FILLED holes faster than the consistent form does. The refit's lobe is born from
+the kink a phase change writes into the slot — ρ_t, untouched by condensation, has none — and
+its counterpart is the opposite ringing of the vapor slot, which the clipped residual nudges
+away. That pool is not in ρ_t, so this closure is still not to be switched on over it.
+Switched on from 24 h instead (before the pool exists), it keeps the vapor's counterpart:
+`2Σν` then tracks `ρ_t − ρ_d` to 0.01 % and negative vapor falls to 0.2 % of the domain, but
+the pool grows exactly as before and the recovered species sum stands above `ρ_t − ρ_d` by the
+whole of it (+3.3 kg/m² at 29 h). Either accounting books the refit's lobe somewhere it is not;
+the remedy has to act on the lobe itself.
+
 **Why a continuation at all.** `ρ_t` is linear and transports a sharp condensate feature with
 its whole Gibbs lobe; the slot transports `ν = bhyp(ρ)` with the SAME linear operator, rings
 too, and `ahyp` recovers 0 where it rings below zero. The lobe `ρ_t` carries then has no owner
@@ -2105,6 +2122,58 @@ silent conservation bug; Stage 3's paired-form test `Σ_k Δν_k = 0` is the gua
 @inline lobe_relaxation_cap(dnu, nu_star) = min(dnu, max(-nu_star, 0.0))
 
 """
+    lobe_transport_density(n, rho, mu) -> rho_s
+    lobe_transport_jacobian(n, rho, mu) -> J_s
+
+The density and the Jacobian a transformed water-mass slot's CONTINUITY terms read: the
+recovered `rho` and Ooyama's `dbhyp(max(rho, 0))` wherever `n ≥ 0` — the identical
+expressions, bit for bit — and, below `n = 0`, the odd continuation [`ahyp_signed`](@ref) and
+its own Jacobian, `dbhyp(|ahyp_signed(n)|)` (even in `n`, in `(1/2, 1]` like Ooyama's, `1` at
+the origin and `→ 1/2` in the affine regime).
+
+**Why.** Every term of the slot equation other than the transform-invariant advection is
+`J·[ρ-space tendency]`. At a clipped point the recovery returns `ρ = 0` and `J = dbhyp(0) = 1`,
+so the divergence term `−Jρ∇·u` vanished there while the linear `ρ_t` carries `−ρ_lobe∇·u`, and
+a flux divergence `−∂F/∂z` that `ρ_t` receives at face value moved the slot by `1·∂F/∂z` —
+TWICE the mass it moves in `ρ_t`, since a lobe `−δ` in `ρ_t` sits at `−δ/2` in the slot (see
+`ahyp_signed`'s derivation). Read through the continuation, `J_s ρ_s = ν + O(μ)` on either side
+of zero and `J_s → 1/2`, so the slot moves by half the `ρ`-space amount on the negative side
+exactly as it does on the positive one: the below-zero transport is the ν-image of `ρ_t`'s.
+
+**What it is not.** Not a reader of the physics: every rate, fall speed and flux is still
+formed from the recovered, non-negative density, and only multiplies `J_s`. Mass slots only —
+the cloud, the rain and the three ice masses, the slots whose sum is checked against `ρ_t − ρ_d`.
+`options[:water_lobe_transport] = false` restores the clipped-point forms bitwise (forensics).
+"""
+@inline lobe_transport_density(n, rho, mu) = n < 0.0 ? ahyp_signed(n, mu) : rho
+
+@doc (@doc lobe_transport_density)
+@inline lobe_transport_jacobian(n, rho, mu) =
+    n < 0.0 ? dbhyp(ahyp_smooth(-n, mu), mu) : dbhyp(max(rho, 0.0), mu)
+
+"""
+    _lobe_divergence!(expdot, slot, colstart, J, nu, rho, div, mu) -> Nothing
+
+Add the LOBE's divergence term to a transformed water-mass slot's assembled tendency:
+`−J·(ρ_s − ρ)·∇·u` with `ρ_s` the [`lobe_transport_density`](@ref), i.e. what turns the
+assembled `−J ρ ∇·u` into `−J ρ_s ∇·u` (`J` is already the continuation's Jacobian). Only
+where `ν < 0` — every other point is not touched, so the `@turbo` assembly beside it stays
+byte-identical and a non-negative column is bitwise the clipped one. An explicit loop and
+a separate function rather than a fifth broadcast column: the scratch `NamedTuple` is at
+the size where one more field takes the `moist_compressible_SLR` compile off the LLVM cliff.
+"""
+@noinline function _lobe_divergence!(expdot, slot::Int64, colstart::Int64, J, nu, rho, div,
+                                     mu::Float64)
+    @inbounds for i in eachindex(nu)
+        n = nu[i]
+        n < 0.0 || continue
+        expdot[colstart + i - 1, slot] -= J[i] * ((lobe_transport_density(n, rho[i], mu) -
+                                                   rho[i]) * div[i])
+    end
+    return nothing
+end
+
+"""
     condensate_slot(rho_c, rho_cbar, transform, mu) -> slot value
 
 What an initial condition must write into slot 9 for a physical cloud density `rho_c` against
@@ -2223,6 +2292,10 @@ Stage one TOTAL-form prognostic for the column: copy the control variable and it
 vertical gradient out of the grid views, recover the quantity itself, and form the Jacobian
 `J = dν/dx` the source terms are multiplied by.
 
+`lobe_tr` (keyword, MASS slots only) selects the below-zero continuation of
+[`lobe_transport_jacobian`](@ref): `J` reads the odd continuation where `ν < 0` and is the
+clipped form elsewhere, bit for bit. Number and habit moments do not pass it.
+
 This is the block slots 8/9 and `n_r` write out inline, factored so the twelve ice slots do
 not become twelve more copies of it. Under `:none` it is `copyto!` plus `fill!(J, 1.0)`, and
 `1.0 * x === x` for every double, so a transform-free ice slot takes exactly the untransformed
@@ -2231,7 +2304,8 @@ continuity form.
 `@inline` and allocation-free: `x`, `nu`, `nu_z`, `J` are the caller's scratch columns and
 `v` is an `mc_slot_views` `NamedTuple` of `SubArray`s.
 """
-@inline function _load_total_slot!(x, nu, nu_z, J, v, trans_on::Bool, trans::Symbol, mu)
+@inline function _load_total_slot!(x, nu, nu_z, J, v, trans_on::Bool, trans::Symbol, mu;
+                                   lobe_tr::Bool = false)
     copyto!(nu, v.f)
     copyto!(nu_z, v.f_z)
     if trans_on
@@ -2240,7 +2314,11 @@ continuity form.
         else
             @. x = ahyp_smooth(nu, mu)
         end
-        @. J = dbhyp(max(x, 0.0), mu)
+        if lobe_tr
+            @. J = lobe_transport_jacobian(nu, x, mu)
+        else
+            @. J = dbhyp(max(x, 0.0), mu)
+        end
     else
         copyto!(x, nu)
         fill!(J, 1.0)
@@ -7182,6 +7260,16 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         tau_lobe > 0.0 || error("physical_params[:tau_lobe] = $(tau_lobe) must be > 0 " *
                                 "(the lobe relaxation timescale, s)")
     end
+    # LOBE TRANSPORT (see `lobe_transport_jacobian`): below ν = 0 the continuity terms of the
+    # five transformed water-mass slots read the odd continuation of the recovery and its
+    # Jacobian, so their transport is the ν-image of the linear ρ_t's there. Default ON;
+    # bitwise inert wherever every slot is non-negative and whenever no transform is
+    # declared. `false` restores the clipped-point forms (`J = dbhyp(0) = 1`, `ρ = 0`) bitwise,
+    # for forensics. (Measured 2026-10-08: those forms are inconsistent but are NOT what grows
+    # the 2-D RCE's negative control-variable pool — that is the per-step refit of the
+    # condensation closure's kinked cloud, see `lobe_relaxation_increment`; the consistent
+    # forms change the pool by a few per cent.)
+    lobe_tr = get(model.options, :water_lobe_transport, true)::Bool
     # The LID of every sedimentation-flux fit (rain mass, its energy, rain number, the twelve
     # ice moments, the ice energy): `:dirichlet` (the default and the physics) fits the flux
     # on `flux_column` — the slot's basis with F = 0 at the lid, since no hydrometeor enters
@@ -7644,7 +7732,17 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # what bounds J in [0.5, 1] and removes the source stiffness. Clamping the argument
         # changes no state, no mass and no energy — it perturbs the tendency by at most a
         # factor of two at points whose density is within μ of zero.
-        @. Jc = dbhyp(max(rho_c, 0.0), cmu)
+        #
+        # BELOW ZERO the slot's continuity terms read the odd continuation instead
+        # (`lobe_transport_jacobian`/`_density`, `options[:water_lobe_transport]`): there the
+        # recovered density is 0 and `dbhyp(0) = 1`, which dropped the lobe's `−ρ∇·u` and moved
+        # it by twice the mass any flux divergence moves in ρ_t. Identical doubles at every
+        # point whose slot is non-negative.
+        if lobe_tr
+            @. Jc = lobe_transport_jacobian(nu_c, rho_c, cmu)
+        else
+            @. Jc = dbhyp(max(rho_c, 0.0), cmu)
+        end
     else
         @. nu_c = rho_cp + rho_cbar
         @. nu_c_z = rho_cp_z + rho_cbar_z
@@ -7665,7 +7763,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         else
             @. rho_r = ahyp_smooth(nu_r, rmu)
         end
-        @. Jr = dbhyp(max(rho_r, 0.0), rmu)
+        if lobe_tr
+            @. Jr = lobe_transport_jacobian(nu_r, rho_r, rmu)
+        else
+            @. Jr = dbhyp(max(rho_r, 0.0), rmu)
+        end
     else
         copyto!(rho_r, nu_r)
         fill!(Jr, 1.0)
@@ -7699,15 +7801,18 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     i2q = S.i2q; i2n = S.i2n; i2a = S.i2a; i2c = S.i2c
     i3q = S.i3q; i3n = S.i3n; i3a = S.i3a; i3c = S.i3c
     if ice_on
-        _load_total_slot!(i1q, S.nu_i1q, S.nu_i1q_z, S.J_i1q, i1qv, itrans_on, itrans, imu_q)
+        _load_total_slot!(i1q, S.nu_i1q, S.nu_i1q_z, S.J_i1q, i1qv, itrans_on, itrans, imu_q;
+                          lobe_tr)
         _load_total_slot!(i1n, S.nu_i1n, S.nu_i1n_z, S.J_i1n, i1nv, itrans_on, itrans, imu_n)
         _load_total_slot!(i1a, S.nu_i1a, S.nu_i1a_z, S.J_i1a, i1av, itrans_on, itrans, imu_a)
         _load_total_slot!(i1c, S.nu_i1c, S.nu_i1c_z, S.J_i1c, i1cv, itrans_on, itrans, imu_c)
-        _load_total_slot!(i2q, S.nu_i2q, S.nu_i2q_z, S.J_i2q, i2qv, itrans_on, itrans, imu_q)
+        _load_total_slot!(i2q, S.nu_i2q, S.nu_i2q_z, S.J_i2q, i2qv, itrans_on, itrans, imu_q;
+                          lobe_tr)
         _load_total_slot!(i2n, S.nu_i2n, S.nu_i2n_z, S.J_i2n, i2nv, itrans_on, itrans, imu_n)
         _load_total_slot!(i2a, S.nu_i2a, S.nu_i2a_z, S.J_i2a, i2av, itrans_on, itrans, imu_a)
         _load_total_slot!(i2c, S.nu_i2c, S.nu_i2c_z, S.J_i2c, i2cv, itrans_on, itrans, imu_c)
-        _load_total_slot!(i3q, S.nu_i3q, S.nu_i3q_z, S.J_i3q, i3qv, itrans_on, itrans, imu_q)
+        _load_total_slot!(i3q, S.nu_i3q, S.nu_i3q_z, S.J_i3q, i3qv, itrans_on, itrans, imu_q;
+                          lobe_tr)
         _load_total_slot!(i3n, S.nu_i3n, S.nu_i3n_z, S.J_i3n, i3nv, itrans_on, itrans, imu_n)
         _load_total_slot!(i3a, S.nu_i3a, S.nu_i3a_z, S.J_i3a, i3av, itrans_on, itrans, imu_a)
         _load_total_slot!(i3c, S.nu_i3c, S.nu_i3c_z, S.J_i3c, i3cv, itrans_on, itrans, imu_c)
@@ -8769,6 +8874,12 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_rp_x, nu_r_z, rrv.f_l)
     @turbo FORCING .= @. Jr * ((-rho_r * div) + AUTO_COLL - Fr_z)
     @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
+    # The LOBE's divergence term (`lobe_transport_density`): below ν = 0 the recovered density
+    # is 0 and the term above vanished there, while ρ_t carries `−ρ_lobe ∇·u`. Added as the
+    # continuation's difference from the recovered value, only where the slot is negative —
+    # an explicit loop beside the `@turbo` expression rather than a change to it (the slot-3
+    # rule), so a point whose slot is non-negative is not touched at all.
+    lobe_tr && rtrans_on && _lobe_divergence!(expdot, 8, colstart, Jr, nu_r, rho_r, div, rmu)
     # The ICE back-reaction on the rain: riming and Bigg/homogeneous freezing remove rain,
     # melting ice returns it. Through `Jr`, like every other source on this slot; separate
     # accumulation and explicit loop for the reasons slot 3 states.
@@ -8808,6 +8919,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     mc_advect!(ADV, geom, u, w, vv, r, rho_cp_x, nu_c_z, rcv.f_l)
     @turbo FORCING .= @. Jc * ((-rho_c * div) - AUTO_COLL)
     @turbo expdot[colstart:colend,9] .= @. ADV + FORCING
+    lobe_tr && ctrans_on && _lobe_divergence!(expdot, 9, colstart, Jc, nu_c, rho_c, div, cmu)
     # The ICE back-reaction on the cloud: riming collection and homogeneous freezing, both
     # sinks. There is no ice-to-cloud return channel — melting ice becomes rain, not cloud.
     if ice_on
@@ -8895,6 +9007,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_advect!(ADV, geom, u, w, vv, r, i1qv.f_x, S.nu_i1q_z, i1qv.f_l)
         @turbo FORCING .= @. S.J_i1q * ((-i1q * div) + S.SRC_i1q - S.F_i1q_z)
         @turbo expdot[colstart:colend, IS.i1_q] .= @. ADV + FORCING
+        lobe_tr && itrans_on &&
+            _lobe_divergence!(expdot, IS.i1_q, colstart, S.J_i1q, S.nu_i1q, i1q, div, imu_q)
 
         mc_advect!(ADV, geom, u, w, vv, r, i1nv.f_x, S.nu_i1n_z, i1nv.f_l)
         @turbo FORCING .= @. S.J_i1n * ((-i1n * div) + S.SRC_i1n - S.F_i1n_z)
@@ -8911,6 +9025,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_advect!(ADV, geom, u, w, vv, r, i2qv.f_x, S.nu_i2q_z, i2qv.f_l)
         @turbo FORCING .= @. S.J_i2q * ((-i2q * div) + S.SRC_i2q - S.F_i2q_z)
         @turbo expdot[colstart:colend, IS.i2_q] .= @. ADV + FORCING
+        lobe_tr && itrans_on &&
+            _lobe_divergence!(expdot, IS.i2_q, colstart, S.J_i2q, S.nu_i2q, i2q, div, imu_q)
 
         mc_advect!(ADV, geom, u, w, vv, r, i2nv.f_x, S.nu_i2n_z, i2nv.f_l)
         @turbo FORCING .= @. S.J_i2n * ((-i2n * div) + S.SRC_i2n - S.F_i2n_z)
@@ -8927,6 +9043,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_advect!(ADV, geom, u, w, vv, r, i3qv.f_x, S.nu_i3q_z, i3qv.f_l)
         @turbo FORCING .= @. S.J_i3q * ((-i3q * div) + S.SRC_i3q - S.F_i3q_z)
         @turbo expdot[colstart:colend, IS.i3_q] .= @. ADV + FORCING
+        lobe_tr && itrans_on &&
+            _lobe_divergence!(expdot, IS.i3_q, colstart, S.J_i3q, S.nu_i3q, i3q, div, imu_q)
 
         mc_advect!(ADV, geom, u, w, vv, r, i3nv.f_x, S.nu_i3n_z, i3nv.f_l)
         @turbo FORCING .= @. S.J_i3n * ((-i3n * div) + S.SRC_i3n - S.F_i3n_z)

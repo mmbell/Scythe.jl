@@ -5673,6 +5673,203 @@ using Springsteel
         end
     end
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # LOBE TRANSPORT (`options[:water_lobe_transport]`, default on). Every term of a
+    # transformed slot's continuity equation except the transform-invariant advection is
+    # `J·[rho-space tendency]`, and at a clipped point the recovery hands it `rho = 0` and
+    # `J = dbhyp(0) = 1`: the lobe's `-rho div u` vanished and a flux divergence that the
+    # linear rho_t takes at face value moved the slot by TWICE the equivalent mass (a lobe
+    # -delta in rho_t sits at -delta/2 in the slot). Below nu = 0 the continuity terms now
+    # read the odd continuation `ahyp_signed` and its own Jacobian; the physics keeps the
+    # recovered, non-negative density.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @testset "lobe transport: the continuity density and Jacobian below nu = 0" begin
+        have = isdefined(Scythe, :lobe_transport_density) &&
+               isdefined(Scythe, :lobe_transport_jacobian)
+        @test have                   # ← the gate
+        for mu in (1.0e-7, 1.0e-12)
+            # EXACTLY the clipped forms on n >= 0, under both recoveries -- the identity every
+            # healthy point's bitwise inertness rests on. Signed zero included.
+            for n in (0.0, -0.0, 1.0e-14, mu, 1.0e-6, 1.0e-3, 1.0)
+                for rec in (Scythe.ahyp(n, mu), Scythe.ahyp_smooth(n, mu))
+                    @test Scythe.lobe_transport_density(n, rec, mu) === rec
+                    @test Scythe.lobe_transport_jacobian(n, rec, mu) ===
+                          Scythe.dbhyp(max(rec, 0.0), mu)
+                end
+            end
+            for a in (1.0e-14, mu, 10.0 * mu, 1.0e-6, 1.0e-3)
+                # Below zero: the continuation, whatever the recovery returned there.
+                for rec in (0.0, Scythe.ahyp_smooth(-a, mu))
+                    @test Scythe.lobe_transport_density(-a, rec, mu) ===
+                          Scythe.ahyp_signed(-a, mu)
+                    Js = Scythe.lobe_transport_jacobian(-a, rec, mu)
+                    # The odd reflection's Jacobian: EVEN in nu, Ooyama's bound [1/2, 1].
+                    @test Js === Scythe.dbhyp(Scythe.ahyp(a, mu), mu)
+                    @test 0.5 <= Js <= 1.0
+                end
+                # The nu-IMAGE of the rho-space divergence term: J rho = nu + O(mu) on BOTH
+                # sides of zero (the affine branch bhyp = (rho + mu)/2 - O(mu^2/rho) and its
+                # reflection), so the slot compresses its lobe exactly as rho_t does.
+                rs = Scythe.ahyp_signed(-a, mu)
+                @test abs(Scythe.lobe_transport_jacobian(-a, 0.0, mu) * rs + a) <= mu
+                rp = Scythe.ahyp(a, mu)
+                @test abs(Scythe.lobe_transport_jacobian(a, rp, mu) * rp - a) <= mu
+            end
+            # -> 1/2 in the affine regime, 1 at the origin (C0 with the clipped form there).
+            @test Scythe.lobe_transport_jacobian(-1.0e4 * mu, 0.0, mu) - 0.5 < 1.0e-7
+            @test Scythe.lobe_transport_jacobian(-1.0e-6 * mu, 0.0, mu) ≈ 1.0 rtol = 1.0e-5
+        end
+
+        # TRANSPORT CONSISTENCY, the definition. Ring a sharp feature through one linear
+        # operator applied to both representations, then apply a divergence `D` and a flux
+        # divergence `G` to each in its own form: rho_t takes `-rho D - G`, the slot
+        # `J (-rho D - G)`. Where rho_t rings below zero by many mu, twice the slot's tendency
+        # must be rho_t's -- through the continuation it is, to O(mu); through the clipped
+        # forms (rho = 0, J = 1) the divergence term is lost and the flux counted twice.
+        mu = 1.0e-7
+        xs = range(-1.0, 1.0; length = 201)
+        rho = [1.0e-3 * exp(-(x / 0.02)^2) for x in xs]
+        nu = Scythe.bhyp.(rho, mu)
+        ring(f) = [i == 1 || i == length(f) ? f[i] :
+                   (1.5 * f[i]) - 0.25 * (f[i - 1] + f[i + 1]) for i in eachindex(f)]
+        Lrho = ring(rho); Lnu = ring(nu)
+        lobe = findall(<(-10.0 * mu), Lrho)                        # -1.7e-6 here
+        @test !isempty(lobe)                                       # the premise
+        D = 1.0e-3; G = 2.0e-6
+        rec = Scythe.ahyp.(Lnu, mu)
+        rhot_tend = (-Lrho .* D) .- G
+        new_tend = [Scythe.lobe_transport_jacobian(Lnu[i], rec[i], mu) *
+                    ((-Scythe.lobe_transport_density(Lnu[i], rec[i], mu) * D) - G)
+                    for i in eachindex(Lnu)]
+        old_tend = [Scythe.dbhyp(max(rec[i], 0.0), mu) * ((-rec[i] * D) - G)
+                    for i in eachindex(Lnu)]
+        # (0.4 % at this 17-mu lobe: the residual slope 1/2 + O(mu^2/rho^2) of the Jacobian.)
+        @test maximum(abs.(2.0 .* new_tend[lobe] .- rhot_tend[lobe]) ./
+                      abs.(rhot_tend[lobe])) < 1.0e-2
+        @test minimum(abs.(2.0 .* old_tend[lobe] .- rhot_tend[lobe]) ./
+                      abs.(rhot_tend[lobe])) > 0.5
+    end
+
+    @testset "lobe transport: the lobe's divergence term" begin
+        # `_lobe_divergence!` turns the assembled `-J rho div` into `-J rho_s div` where the
+        # slot is negative, and touches nothing else -- not even with `+ 0.0`.
+        mu = 1.0e-7
+        nu = [1.0e-4, 0.0, -0.0, -1.0e-9, -1.0e-5, 3.0e-7]
+        for rec in (Scythe.ahyp, Scythe.ahyp_smooth)
+            rho = rec.(nu, mu)
+            J = Scythe.lobe_transport_jacobian.(nu, rho, mu)
+            dv = [2.0e-3, -1.0e-3, 5.0e-4, 1.0e-3, -2.0e-3, 1.0e-3]
+            E = fill(-0.0, 8, 2); E[3:8, 2] .= 0.0
+            E0 = copy(E)
+            Scythe._lobe_divergence!(E, 2, 3, J, nu, rho, dv, mu)
+            for i in eachindex(nu)
+                if nu[i] < 0.0
+                    # assembled -J rho dv plus this = -J rho_s dv
+                    @test (-J[i] * rho[i] * dv[i]) + (E[2 + i, 2] - E0[2 + i, 2]) ≈
+                          -J[i] * Scythe.ahyp_signed(nu[i], mu) * dv[i] rtol = 1.0e-12
+                else
+                    @test E[2 + i, 2] === E0[2 + i, 2]
+                end
+            end
+            @test E[:, 1] == E0[:, 1] && all(x -> x === -0.0, E[1:2, 2])
+        end
+    end
+
+    @testset "lobe transport: the driver's continuity columns, and bitwise inertness" begin
+        mktempdir() do tmpdir
+            # The seeded three-family lobe column of the attribution test: nu = -a in the
+            # cloud, rain and species-1 ice-mass slots at three levels.
+            function seeded_tr(tr)
+                eo = tr === nothing ? Dict{Symbol,Any}() :
+                     Dict{Symbol,Any}(:water_lobe_transport => tr)
+                m, patch, mod, info = make_ice_lid_mtile(tmpdir, :dirichlet;
+                                                         geometry = "RiRk",
+                                                         extra_options = eo)
+                vars = info.vars
+                kDim = mod.grid_params.kDim
+                ord = sortperm(info.z)
+                kc, kr, ki = ord[4], ord[div(kDim, 2)], ord[kDim - 4]
+                cmu = get(mod.physical_params, :condensate_mu, 1.0e-7)
+                rmu = get(mod.physical_params, :rain_mu, 1.0e-7)
+                imu = info.mu[1]
+                a = 2.0e-3
+                rt = vars["rho_t"]
+                for (k, s, mu) in ((kc, Scythe.mc_slot(vars, "rho_c"), cmu),
+                                   (kr, Scythe.mc_slot(vars, "rho_r"), rmu),
+                                   (ki, info.iq, imu))
+                    x0 = Scythe.ahyp(patch.physical[k, s, 1], mu)
+                    patch.physical[k, s, 1] = -a
+                    patch.physical[k, rt, 1] -= x0 + Scythe.ahyp_smooth(a, mu)
+                end
+                Scythe.advance_column(m, 1, 1)
+                S = deepcopy(m.mc_scratch[Threads.threadid()])
+                return S, (; kc, kr, ki, a, cmu, rmu, imu, kDim)
+            end
+            Son, P = seeded_tr(true)
+            Soff, _ = seeded_tr(false)
+            Sdef, _ = seeded_tr(nothing)
+            lobes = (P.kc, P.kr, P.ki)
+            others = setdiff(1:P.kDim, lobes)
+            # Default ON.
+            @test Sdef.Jc == Son.Jc && Sdef.Jr == Son.Jr && Sdef.J_i1q == Son.J_i1q
+            # ON: the continuation's Jacobian at the three lobes, for all three families.
+            for (k, J, mu) in ((P.kc, Son.Jc, P.cmu), (P.kr, Son.Jr, P.rmu),
+                               (P.ki, Son.J_i1q, P.imu))
+                @test J[k] === Scythe.dbhyp(Scythe.ahyp_smooth(P.a, mu), mu)
+                @test abs(J[k] - 0.5) < 1.0e-4                         # the affine slope
+            end
+            # OFF: the clipped form, J = dbhyp(0) = 1.
+            for (k, J) in ((P.kc, Soff.Jc), (P.kr, Soff.Jr), (P.ki, Soff.J_i1q))
+                @test J[k] === 1.0
+            end
+            # The PHYSICS reads the recovered, non-negative density either way.
+            @test Son.rho_c == Soff.rho_c && Son.rho_r == Soff.rho_r && Son.i1q == Soff.i1q
+            @test Son.rho_c[P.kc] === 0.0 && Son.rho_r[P.kr] === 0.0 && Son.i1q[P.ki] === 0.0
+            @test Son.Tk == Soff.Tk
+            # Away from the lobes the Jacobians are the clipped ones, identical doubles.
+            @test Son.Jc[others] == Soff.Jc[others] && Son.Jr[others] == Soff.Jr[others]
+            @test Son.J_i1q[others] == Soff.J_i1q[others]
+        end
+        mktempdir() do tmpdir
+            # The healthy production column, one full step from a state whose transformed
+            # mass slots are all at or above zero (asserted): not a bit moves.
+            function run_clean_tr(tr)
+                m, patch, mod, info = make_ice_lid_mtile(tmpdir, :dirichlet;
+                    geometry = "RiRk",
+                    extra_options = Dict{Symbol,Any}(:water_lobe_transport => tr))
+                vars = info.vars
+                kDim = mod.grid_params.kDim
+                ncols = div(size(patch.physical, 1), kDim)
+                mass = [Scythe.mc_slot(vars, "rho_c"), Scythe.mc_slot(vars, "rho_r"),
+                        info.iqs...]
+                minnu = minimum(patch.physical[:, mass, 1])
+                for c in 1:ncols
+                    Scythe.advance_column(m, c, 1)
+                end
+                Scythe.calcTendency(m)
+                gridTransform!(patch)
+                return copy(patch.physical), copy(m.expdot_n), minnu
+            end
+            Pon, Eon, minnu = run_clean_tr(true)
+            Poff, Eoff, _ = run_clean_tr(false)
+            @test minnu >= 0.0
+            @test Eon == Eoff
+            @test Pon == Poff
+        end
+        # ... and under `:none` there is no clip and no continuation: a cloud that rings
+        # clearly negative is bitwise the same run with the switch either way.
+        mktempdir() do tmpdir
+            mA, pA, _, gpA = ctrans_rirk(tmpdir, "lt_none_on"; transform = :none)
+            mB, pB, _, gpB = ctrans_rirk(tmpdir, "lt_none_off"; transform = :none,
+                extra_options = Dict{Symbol,Any}(:water_lobe_transport => false))
+            cloudy_run!(mA, pA, gpA, 20)
+            cloudy_run!(mB, pB, gpB, 20)
+            @test minimum(ctrans_rho_c(pA, gpA, :none)) < -1.0e-6       # the premise
+            @test pA.physical == pB.physical
+        end
+    end
+
     @testset "ice: 𝒟 and the deposition drive clip" begin
         # TeX Eqs. Dwi and qss_ice_shift, and the ice mirror of the liquid clip in
         # `qss_condensation_rates`.
