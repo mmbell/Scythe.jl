@@ -363,8 +363,12 @@ end
                        cfg_errmsg(() -> build_model(s("physics.horizontal_mixing.water=true"))))
         @test occursin("numerics.exact_si",
                        cfg_errmsg(() -> build_model(s("numerics.exact_si=true"))))
-        @test occursin("smagorinsky",
-                       cfg_errmsg(() -> build_model(s("physics.horizontal_mixing.scheme=smagorinsky"))))
+        # Smagorinsky now exists on the slice too; what is refused is a scheme with no length.
+        @test build_model(s("physics.horizontal_mixing.scheme=smagorinsky")) isa ModelParameters
+        @test occursin("no length scale",
+                       cfg_errmsg(() -> build_model(s("physics.horizontal_mixing.scheme=smagorinsky",
+                                                      "physics.horizontal_mixing.Ls=0",
+                                                      "physics.horizontal_mixing.C_s=0"))))
         @test occursin("output.restart_interval",
                        cfg_errmsg(() -> build_model(s("run.segment_length=3600.0",
                                                       "output.restart_interval=0.0"))))

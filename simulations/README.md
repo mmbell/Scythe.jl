@@ -351,8 +351,9 @@ HORIZONTAL eddy mixing only; vertical mixing belongs to `boundary_layer`.
 
 | key | type | default | description |
 |---|---|---|---|
-| `scheme` | string (enum) | `"none"` | `smagorinsky` (cylindrical geometries only), `constant` or `none`. |
-| `Ls` | float | `500.0` | Smagorinsky length scale [m]. |
+| `scheme` | string (enum) | `"none"` | `smagorinsky` (horizontal-plane strain, every geometry), `constant` or `none`. |
+| `Ls` | float | `500.0` | Smagorinsky length scale [m], the same on every patch (default = the axisym TC's tuned value); 0 = use `C_s` × each patch's horizontal cell width instead, on any geometry. |
+| `C_s` | float | `0.2` | Smagorinsky constant; read ONLY when `Ls = 0`, then the length scale is `C_s·Δx` per patch (Δx = that patch's i-cell width). |
 | `K_min` | float | `25.0` | Smagorinsky viscosity floor [m²/s]. |
 | `K` | float | `0.0` | constant momentum viscosity [m²/s] (`constant` only). |
 | `heat` | bool | `true` | also mix entropy/heat with K/Pr_t. |
@@ -720,6 +721,7 @@ Retired (refused with a message):
 
 | key | type | owned by | description |
 |---|---|---|---|
+| `C_s` | float | `physics.horizontal_mixing.C_s` (refused in `[extra.physical_params]`) | Smagorinsky constant; read only when Ls is 0 or absent, then > 0 turns Smagorinsky on with length C_s * (patch i-cell width) (moist_compressible.jl) |
 | `Cd` | float | `physics.surface.Cd` (refused in `[extra.physical_params]`) | drag coefficient; negative = Komori wind-dependent drag (mc_surface_layer.jl, primitive_equations.jl) |
 | `Ck` | float | `physics.surface.Ck` (refused in `[extra.physical_params]`) | enthalpy/moisture exchange coefficient (mc_surface_layer.jl, primitive_equations.jl) |
 | `H` | float |  | shallow-water mean depth [m] (shallowWaterModels.jl) |
@@ -737,7 +739,7 @@ Retired (refused with a message):
 | `Kvdiff` | float |  | vertical momentum eddy viscosity [m^2/s]; required key (moist_compressible.jl, exact_si.jl) |
 | `Kvdiff_heat` | float |  | vertical heat diffusivity [m^2/s]; default Kvdiff (moist_compressible.jl, exact_si.jl) |
 | `Kvdiff_water` | float |  | vertical water diffusivity [m^2/s]; refused with ice and two-moment rain (moist_compressible.jl, exact_si.jl) |
-| `Ls` | float | `physics.horizontal_mixing.Ls` (refused in `[extra.physical_params]`) | Smagorinsky length scale [m]; > 0 turns Smagorinsky on (moist_compressible.jl) |
+| `Ls` | float | `physics.horizontal_mixing.Ls` (refused in `[extra.physical_params]`) | Smagorinsky length scale [m]; > 0 turns Smagorinsky on with this length on every patch (moist_compressible.jl) |
 | `Ls_bl` | float |  | PV-mixing model: boundary-layer mixing length [m] (shallowWaterModels.jl) |
 | `Ls_free` | float |  | PV-mixing model: free-atmosphere mixing length [m] (shallowWaterModels.jl) |
 | `N_0` | float | `physics.microphysics.N_0` (refused in `[extra.physical_params]`) | rain DSD intercept [1/m^4] (moist_compressible.jl, netcdf_output.jl) |

@@ -6859,6 +6859,30 @@ end
     error(String(take!(io)))
 end
 
+"""
+    smagorinsky_length(model) -> Float64
+
+The Smagorinsky length scale `Ls` [m] of THIS patch, and so whether the scheme is on
+(`> 0`). ONE rule on every geometry (it is the `[physics.horizontal_mixing]` rule):
+
+- `physical_params[:Ls] > 0` — that absolute length, unchanged on every patch. `:C_s` is not
+  read at all, so a configuration that sets an absolute length (the axisymmetric TC, 500 m)
+  computes exactly the `Ls` it always did.
+- otherwise `:C_s > 0` — `C_s·Δx`, with Δx this patch's horizontal cell width
+  `(iMax − iMin)/num_cells_i`, the same Δx the MYNN scale-aware taper takes
+  (`mc_mynn_state`). Per patch, because a nest's grid_params carry the nest's own span and
+  cell count: the length refines with the grid, as a Smagorinsky length should.
+- otherwise `0.0` — the scheme is off (both keys absent is every non-Smagorinsky run).
+"""
+function smagorinsky_length(model::ModelParameters)
+    Ls = get(model.physical_params, :Ls, 0.0)
+    Ls > 0.0 && return Ls
+    C_s = get(model.physical_params, :C_s, 0.0)
+    C_s > 0.0 || return 0.0
+    gp = model.grid_params
+    return C_s * ((Float64(gp.iMax) - Float64(gp.iMin)) / gp.num_cells_i)
+end
+
 # ── Equation set ───────────────────────────────────────────────────────────────
 
 """
@@ -7183,7 +7207,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     max_N_c = get(model.physical_params, :max_N_c, 100.0)
 
     # Louis boundary layer (vertical mixing + surface drag; mc_boundary_layer.jl)
-    # and Smagorinsky horizontal closure (Ls > 0 replaces the constant Khdiff in
+    # and Smagorinsky horizontal closure (a length scale > 0 replaces the constant Khdiff in
     # the momentum diffusion). Both default OFF so existing configurations are
     # bit-identical.
     louis_bl = get(model.options, :louis_bl, false)::Bool
@@ -7255,7 +7279,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # are bit-identical; the TC configs enable it. Spline (RiRk) vertical only.
     sd_si = get(model.options, :state_dependent_si, false)::Bool
     l_inf = get(model.physical_params, :l_inf, 80.0)
-    Ls = get(model.physical_params, :Ls, 0.0)
+    Ls = smagorinsky_length(model)
     K_min = get(model.physical_params, :K_min, 0.0)
     use_smag = Ls > 0.0
 
@@ -8126,7 +8150,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     sd_xx = S.sd_xx
     mc_sd_lap!(sd_xx, geom, p, rho_d, pv, rdv, r)
 
-    # Smagorinsky horizontal eddy viscosity (Ls > 0): flow-dependent K(strain)
+    # Smagorinsky horizontal eddy viscosity (length scale Ls > 0, absolute or
+    # C_s·Δx -- see where Ls is resolved above): flow-dependent K(strain)
     # replaces the constant Khdiff in the momentum diffusion and its FRIC_KE
     # energy sink below. Computed BEFORE the heat diffusion because heat can be
     # tied to it (the Khdiff_heat < 0 sentinel below).
@@ -8154,7 +8179,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     QDOT_TH = S.QDOT_TH
     if Khdiff_heat < 0.0
         use_smag || error("physical_params[:Khdiff_heat] < 0 selects the Smagorinsky " *
-                          "heat diffusivity, which requires Ls > 0")
+                          "heat diffusivity, which requires the Smagorinsky scheme " *
+                          "(:Ls > 0, or :C_s > 0 with :Ls = 0)")
         @. QDOT_TH = rho_d * Tk * (K_smag / Pr_t) * sd_xx
     else
         @. QDOT_TH = rho_d * Tk * Khdiff_heat * sd_xx
@@ -8814,7 +8840,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # and box every use — the same trap the state-dependent SI hit.
         if Khdiff_water < 0.0
             use_smag || error("physical_params[:Khdiff_water] < 0 selects the " *
-                              "Smagorinsky water diffusivity, which requires Ls > 0")
+                              "Smagorinsky water diffusivity, which requires the " *
+                              "Smagorinsky scheme (:Ls > 0, or :C_s > 0 with :Ls = 0)")
             # Total water rho_w' = rho_t' - rho_d' (dry air is NOT mixed: only the
             # water rides on rho_t here, so rho_d's own tendency is untouched).
             mc_w_kdiff!(WLAP,  geom, K_smag, rtv, r)

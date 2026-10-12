@@ -116,10 +116,18 @@ function validate(cfg::RunConfig)
     (num.exact_si && num.state_dependent_si) && error(
         "config: numerics.exact_si and numerics.state_dependent_si are structurally " *
         "incompatible; set one of them to false")
-    (hm.scheme === :smagorinsky && !es.cyl) && error(
-        "config: physics.horizontal_mixing.scheme = \"smagorinsky\" exists only for the " *
-        "cylindrical equation sets (axisym, RLR); run.equation_set = " *
-        "\"$(cfg.run.equation_set)\" is horizontally inviscid apart from the spline filter")
+    if hm.scheme === :smagorinsky
+        # One length-scale rule on every geometry (the HorizontalMixing docstring): Ls > 0
+        # absolute, Ls = 0 -> C_s * the patch's cell width. Both zero would leave the scheme
+        # selected and doing nothing, which is a configuration mistake, not a choice.
+        (hm.Ls >= 0.0 && hm.C_s >= 0.0 && hm.K_min >= 0.0) || error(
+            "config: physics.horizontal_mixing.Ls, C_s and K_min must be >= 0 (got Ls = " *
+            "$(hm.Ls), C_s = $(hm.C_s), K_min = $(hm.K_min))")
+        (hm.Ls > 0.0 || hm.C_s > 0.0) || error(
+            "config: physics.horizontal_mixing.scheme = \"smagorinsky\" with Ls = 0 and " *
+            "C_s = 0 has no length scale; set Ls > 0 (an absolute length on every patch) " *
+            "or leave Ls = 0 and set C_s > 0 (C_s times each patch's cell width)")
+    end
     (rad.solar === :diurnal && !(-90.0 <= rad.latitude <= 90.0)) && error(
         "config: physics.radiation.solar = \"diurnal\" needs physics.radiation.latitude in " *
         "[-90, 90], got $(rad.latitude)")
@@ -237,6 +245,10 @@ function build_physics(cfg::RunConfig; start_hour::Float64 = cfg.physics.radiati
     # ── horizontal mixing (vertical mixing belongs to the BL; the Kvdiff* are required keys)
     if hm.scheme === :smagorinsky
         p[:Ls] = hm.Ls
+        # :C_s only when it is the rule in force (Ls = 0): the driver ignores it beside a
+        # positive Ls, and an absolute-Ls configuration (the TC) then emits exactly the
+        # keys it always did.
+        hm.Ls == 0.0 && (p[:C_s] = hm.C_s)
         p[:K_min] = hm.K_min
         p[:Khdiff] = 0.0
         p[:Khdiff_heat] = hm.heat ? -1.0 : 0.0      # < 0 sentinel: Smagorinsky K/Pr_t

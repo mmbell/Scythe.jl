@@ -80,7 +80,7 @@ const RAIN_MOMENT_CHOICES = (0, 1, 2)
 const WATER_TRANSFORMS = (:none, :bhyp, :bhyp_smooth)
 "Allowed `physics.boundary_layer.scheme` values."
 const BL_SCHEMES = (:mynn, :louis, :none)
-"Allowed `physics.horizontal_mixing.scheme` values (smagorinsky exists only for the cylindrical geometries)."
+"Allowed `physics.horizontal_mixing.scheme` values."
 const HMIX_SCHEMES = (:smagorinsky, :constant, :none)
 "Allowed `numerics.positivity` values: `auto` applies the positivity rule at build, `off` never does."
 const POSITIVITY_MODES = (:auto, :off)
@@ -446,18 +446,35 @@ end
 
 `[physics.horizontal_mixing]` — HORIZONTAL eddy mixing only; vertical mixing belongs to `boundary_layer`.
 
-- `scheme::Symbol` — `smagorinsky` (cylindrical geometries only), `constant` or `none`.
-- `Ls::Float64` — Smagorinsky length scale [m].
+- `scheme::Symbol` — `smagorinsky` (horizontal-plane strain, every geometry), `constant` or `none`.
+- `Ls::Float64` — Smagorinsky length scale [m], the same on every patch (default = the axisym TC's tuned value); 0 = use `C_s` × each patch's horizontal cell width instead, on any geometry.
+- `C_s::Float64` — Smagorinsky constant; read ONLY when `Ls = 0`, then the length scale is `C_s·Δx` per patch (Δx = that patch's i-cell width).
 - `K_min::Float64` — Smagorinsky viscosity floor [m²/s].
 - `K::Float64` — constant momentum viscosity [m²/s] (`constant` only).
 - `heat::Bool` — also mix entropy/heat with K/Pr_t.
 - `water::Bool` — also mix water with K/Sc_t (NOT energy consistent; refused with ice).
 - `Pr_t::Float64` — turbulent Prandtl number.
 - `Sc_t::Float64` — turbulent Schmidt number.
+
+THE LENGTH SCALE RULE is one rule on every geometry: `Ls > 0` is an absolute length used
+unchanged on every patch (and `C_s` is not read); `Ls = 0` makes it `C_s·Δx`, with Δx the
+patch's own horizontal cell width `(iMax − iMin)/num_cells_i` (the same Δx the MYNN
+scale-aware taper uses), so it refines with a nest. The default `Ls = 500` is the absolute
+length the axisymmetric TC was tuned with, kept so that a TC configuration which leaves `Ls`
+unset is unchanged; a run that wants the grid-scaled form — the XZ slice is the case it was
+written for — sets `Ls = 0` (and `C_s`, default 0.2, if not the default).
+
+What "strain" means: the HORIZONTAL-PLANE deformation only, `K = max(L² √(2 S_ij S_ij), K_min)`
+over i, j in the horizontal plane. On the cylinders `S_rr = ∂u/∂r`, `S_λλ = (1/r)∂v/∂λ + u/r`,
+`S_rλ`; on the XZ slice the plane has one direction and the one component is `S_xx = ∂u/∂x`,
+so `K = max(L² √2 |∂u/∂x|, K_min)`. `∂w/∂x` and `∂u/∂z` are vertical shear and belong to the
+boundary-layer scheme; `∂w/∂z` is `−∂u/∂x` by continuity and would count the same
+deformation twice.
 """
 Base.@kwdef struct HorizontalMixing <: AbstractConfigSection
     scheme::Symbol = :none
     Ls::Float64 = 500.0
+    C_s::Float64 = 0.2
     K_min::Float64 = 25.0
     K::Float64 = 0.0
     heat::Bool = true
@@ -913,7 +930,8 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :Kvdiff_water  => (Float64, "vertical water diffusivity [m^2/s]; refused with ice and two-moment rain (moist_compressible.jl, exact_si.jl)"),
     :Pr_t          => (Float64, "turbulent Prandtl number for Smagorinsky heat mixing (moist_compressible.jl)"),
     :Sc_t          => (Float64, "turbulent Schmidt number for Smagorinsky water mixing (moist_compressible.jl)"),
-    :Ls            => (Float64, "Smagorinsky length scale [m]; > 0 turns Smagorinsky on (moist_compressible.jl)"),
+    :Ls            => (Float64, "Smagorinsky length scale [m]; > 0 turns Smagorinsky on with this length on every patch (moist_compressible.jl)"),
+    :C_s           => (Float64, "Smagorinsky constant; read only when Ls is 0 or absent, then > 0 turns Smagorinsky on with length C_s * (patch i-cell width) (moist_compressible.jl)"),
     :K_min         => (Float64, "Smagorinsky viscosity floor [m^2/s] (moist_compressible.jl)"),
     :l_inf         => (Float64, "Louis asymptotic mixing length [m] (moist_compressible.jl)"),
     :mynn_K_max    => (Float64, "counted safety cap on the MYNN exchange coefficient [m^2/s] (mynn_state.jl)"),
@@ -1057,7 +1075,8 @@ const OWNED_PHYSICAL_KEYS = Dict{Symbol,String}(
     :Pr_t           => "physics.horizontal_mixing.Pr_t",
     :Sc_t           => "physics.horizontal_mixing.Sc_t",
     :Ls             => "physics.horizontal_mixing.Ls",
-    :K_min          => "physics.horizontal_mixing.K_min",
+    :C_s            => "physics.horizontal_mixing.C_s",
+    :K_min         => "physics.horizontal_mixing.K_min",
     :l_inf          => "physics.boundary_layer.l_inf",
     :mynn_K_max     => "physics.boundary_layer.K_max",
     :alpha          => "physics.sponge.alpha",

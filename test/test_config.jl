@@ -418,6 +418,55 @@ end
     end
 end
 
+@testset "horizontal mixing: the Smagorinsky length rule" begin
+    @test HorizontalMixing().Ls == 500.0 && HorizontalMixing().C_s == 0.2
+    mktempdir() do dir
+        cf(xs...) = load_config(set = ["output.dir=$(dir)", xs...])
+        SM = "physics.horizontal_mixing.scheme=smagorinsky"
+        # Round trip of the new key.
+        c = cf(SM, "physics.horizontal_mixing.Ls=0", "physics.horizontal_mixing.C_s=0.3")
+        @test load_config(write_config(c, joinpath(dir, "hm.toml"))) == c
+
+        # scheme none emits neither key; the driver then has no length.
+        _, p = Scythe.build_physics(cf())
+        @test !haskey(p, :Ls) && !haskey(p, :C_s)
+        @test Scythe.smagorinsky_length(build_model(cf())) == 0.0
+
+        # XZ, Ls > 0 (the default 500): absolute, :C_s not emitted.
+        m = build_model(cf(SM))
+        @test m.physical_params[:Ls] == 500.0 && !haskey(m.physical_params, :C_s)
+        @test Scythe.smagorinsky_length(m) == 500.0
+        # XZ, Ls = 0: C_s times this grid's cell width (300 km / 50 cells).
+        m = build_model(cf(SM, "physics.horizontal_mixing.Ls=0"))
+        @test m.physical_params[:C_s] == 0.2
+        @test Scythe.smagorinsky_length(m) == 0.2 * (300.0e3 / 50)
+        m = build_model(cf(SM, "physics.horizontal_mixing.Ls=0", "physics.horizontal_mixing.C_s=0.4"))
+        @test Scythe.smagorinsky_length(m) == 0.4 * (300.0e3 / 50)
+        @test m.physical_params[:Khdiff_heat] == -1.0     # heat on Smagorinsky by default
+
+        # Refusals: no length at all; negatives.
+        msg = errmsg(() -> build_model(cf(SM, "physics.horizontal_mixing.Ls=0",
+                                          "physics.horizontal_mixing.C_s=0")))
+        @test occursin("no length scale", msg) && occursin("C_s", msg)
+        @test occursin("must be >= 0", errmsg(() -> build_model(cf(SM,
+                                              "physics.horizontal_mixing.C_s=-0.2"))))
+
+        # NESTS: the C_s length is per patch, from each patch's own cell width; an absolute
+        # Ls is the same on every patch (the TC as shipped: bitwise what it was).
+        tc = joinpath(pkgdir(Scythe), "simulations", "tc_axisym", "scythe_config.toml")
+        tcf(xs...) = load_config(tc; set = ["output.dir=$(dir)", xs...])
+        models, _ = Scythe.build_nest(build_model(tcf()))
+        @test length(models) > 1
+        @test all(Scythe.smagorinsky_length(mm) == 500.0 for mm in models)
+        @test all(!haskey(mm.physical_params, :C_s) for mm in models)
+        models, _ = Scythe.build_nest(build_model(tcf("physics.horizontal_mixing.Ls=0")))
+        dxs = [(mm.grid_params.iMax - mm.grid_params.iMin) / mm.grid_params.num_cells_i
+               for mm in models]
+        @test length(unique(dxs)) == length(models)   # the nests do differ
+        @test [Scythe.smagorinsky_length(mm) for mm in models] == 0.2 .* dxs
+    end
+end
+
 @testset "paths" begin
     mktempdir() do root
         root = realpath(root)

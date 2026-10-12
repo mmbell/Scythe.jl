@@ -67,6 +67,37 @@ using SparseArrays
         @test K ≈ fill(2.0 * Ls^2 * a, n)
     end
 
+    @testset "Smagorinsky strain closure (XZ): K = max(Ls^2 sqrt(2) |u_x|, K_min)" begin
+        # The slice's horizontal plane has one direction, so S_ij has one component,
+        # S_xx = u_x. A travelling-wave u = U sin(kx) has u_x = U k cos(kx): K must follow
+        # |cos| pointwise, sit on the floor at the nodes of u_x, and ignore everything that is
+        # not u_x (the vertical shear, w, the curvature r and a v the slice does not carry).
+        n = 64
+        x = collect(range(0.0, 3.0e4; length=n))
+        kw = 2pi / 1.0e4
+        U = 10.0
+        Ls = 640.0
+        K_min = 2000.0            # binds near the nodes of u_x (peak K ~ 3.6e3 m^2/s)
+        uv = (f = U .* sin.(kw .* x), f_x = U * kw .* cos.(kw .* x), f_xx = zeros(n),
+              f_z = fill(3.0e-2, n), f_zz = zeros(n), f_l = nothing, f_ll = nothing)
+        K = zeros(n)
+        Scythe.mc_smag_k!(K, Scythe.MCCartesianXZ(), uv, nothing, x, Ls, K_min)
+        Kexp = max.(Ls^2 * sqrt(2.0) .* abs.(U * kw .* cos.(kw .* x)), K_min)
+        @test K ≈ Kexp rtol = 1e-14
+        @test maximum(K) ≈ Ls^2 * sqrt(2.0) * U * kw rtol = 1e-3   # sampled near a crest
+        @test count(K .== K_min) > 0 && count(K .> K_min) > 0     # floor near the nodes only
+        # The vertical shear does not enter: same K with u_z = 0.
+        uv0z = merge(uv, (f_z = zeros(n),))
+        K2 = zeros(n)
+        Scythe.mc_smag_k!(K2, Scythe.MCCartesianXZ(), uv0z, nothing, x, Ls, K_min)
+        @test K2 == K
+        # A uniform wind has no deformation: the floor everywhere, exactly.
+        uvc = (f = fill(7.0, n), f_x = zeros(n), f_xx = zeros(n), f_z = zeros(n),
+               f_zz = zeros(n), f_l = nothing, f_ll = nothing)
+        Scythe.mc_smag_k!(K, Scythe.MCCartesianXZ(), uvc, nothing, x, Ls, K_min)
+        @test all(K .== K_min)
+    end
+
     # ──────────────────────────────────────────────
     # 3. Driver-level: axisym RiRk tile machinery
     # ──────────────────────────────────────────────
@@ -103,7 +134,8 @@ using SparseArrays
     function make_bl_mtile(tmpdir; louis_bl=true, Cd=-1.0, Ls=0.0, K_min=0.0,
                            sfc_wind_factor=1.0, l_inf=80.0, dry=false,
                            ctrans=:none, rtrans=:none, cmu=1.0e-7, rmu=1.0e-7,
-                           equation_set="moist_compressible_axisym")
+                           equation_set="moist_compressible_axisym",
+                           extra_pp=Dict{Symbol,Float64}())
         cyl = equation_set != "moist_compressible_XZ"
         # Every name-keyed dict must come from mc_var_names, not a literal: a stale key is
         # ignored silently rather than raising (Scythe.check_mc_var_names is the backstop).
@@ -125,13 +157,13 @@ using SparseArrays
             ts = 0.1, integration_time = 1.0, output_interval = 1.0,
             equation_set = equation_set,
             ref_state_file = ref_file, grid_params = gp,
-            physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
+            physical_params = merge(Dict(:Khdiff => 0.0, :Kvdiff => 0.0,
                                    :Kvdiff_heat => 0.0, :Kvdiff_water => 0.0,
                                    :tau_qss => 10.0, :alpha => 0.0, :z_damp => 20.0e3,
                                    :f => 0.0, :Cd => Cd, :Ls => Ls, :K_min => K_min,
                                    :l_inf => l_inf,
                                    :condensate_mu => cmu, :rain_mu => rmu,
-                                   :sfc_wind_factor => sfc_wind_factor),
+                                   :sfc_wind_factor => sfc_wind_factor), extra_pp),
             options = Dict{Symbol,Any}(:semiimplicit => true,
                            :exact_reference_state => true,
                            :precipitation => false, :louis_bl => louis_bl,
@@ -588,14 +620,133 @@ using SparseArrays
     end
 
     # ──────────────────────────────────────────────
-    # 8. Guard rails
+    # 8. Smagorinsky on the Cartesian slice (driver level)
     # ──────────────────────────────────────────────
-    @testset "Smagorinsky on the Cartesian slice errors" begin
-        mktempdir() do tmpdir
-            mtile, patch, model, gp, z = make_bl_mtile(tmpdir; louis_bl=false,
-                                                       Ls=200.0, K_min=5.0,
-                                                       equation_set="moist_compressible_XZ")
-            @test_throws Exception Scythe.advance_column(mtile, 1, 1)
+    # The XZ fixture: iMin = 100 km to iMax = 125.6 km in 8 cells, so Δx = 3200 m and
+    # C_s = 0.2 resolves to Ls = 640 m. Dry adiabatic base (no vapor channel to leak into).
+    # Every assertion is on the difference of two tiles advanced from the SAME state, so
+    # advection, PGF and buoyancy cancel identically and what is left is the mixing.
+    """Advance every column of two XZ tiles (physical_params extras `ppa`, `ppb`) from the
+    state `setup!` writes; return expdot_a − expdot_b and tile a's handles."""
+    function xz_pair(setup!, ppa, ppb; K_min=5.0)
+        local D, patch_a, mtile_a, z_a
+        mktempdir() do tmp1
+            mktempdir() do tmp2
+                out = []
+                for (tmp, pp) in ((tmp1, ppa), (tmp2, ppb))
+                    mtile, patch, model, gp, z = make_bl_mtile(tmp; louis_bl=false, Cd=0.0,
+                        dry=true, Ls=0.0, K_min=K_min, equation_set="moist_compressible_XZ",
+                        extra_pp=pp)
+                    setup!(patch, model.grid_params.vars, gp.kDim, z)
+                    spectralTransform!(patch)
+                    gridTransform!(patch)
+                    for c in 1:div(size(patch.physical, 1), gp.kDim)
+                        Scythe.advance_column(mtile, c, 1)
+                    end
+                    push!(out, (mtile, patch, z))
+                end
+                (mtile_a, patch_a, z_a) = out[1]
+                D = out[1][1].expdot_n .- out[2][1].expdot_n
+            end
         end
+        return D, patch_a, mtile_a, z_a
+    end
+    XL0, XL = 100.0e3, 25.6e3
+    # u = U sin(2 pi xi) and w = W sin(pi z/H) sin(2 pi xi), xi = (x - iMin)/L: both vanish at
+    # the Dirichlet side walls and w at the ground and lid. A smooth horizontal strain field.
+    set_strain! = (patch, vars, kDim, z) -> begin
+        pts = Scythe.getGridpoints(patch)
+        for i in 1:size(patch.physical, 1)
+            xi = (pts[i, 1] - XL0) / XL
+            zz = pts[i, 2]
+            patch.physical[i, vars["u"], 1] = 8.0 * sin(2pi * xi)
+            patch.physical[i, vars["w"], 1] = 2.0 * sin(pi * zz / 2000.0) * sin(2pi * xi)
+        end
+    end
+    SMAG = Dict(:C_s => 0.2)                 # Ls = 0 in the fixture: C_s * dx = 640 m
+
+    @testset "XZ Smagorinsky: K pointwise from the tile's own u_x, Ls = C_s*dx" begin
+        D, patch, mtile, z = xz_pair(set_strain!, SMAG, Dict{Symbol,Float64}())
+        vars = mtile.model.grid_params.vars
+        ui, wi = vars["u"], vars["w"]
+        u_x = patch.physical[:, ui, 2]
+        Kexp = max.(640.0^2 * sqrt(2.0) .* abs.(u_x), 5.0)
+        @test maximum(Kexp) > 100.0 * 5.0    # the strain really lifts K off the floor
+        # u and w are mixed with that K: their tendency differences are K*u_xx, K*w_xx.
+        @test D[:, ui] ≈ Kexp .* patch.physical[:, ui, 3] rtol = 1e-12
+        @test D[:, wi] ≈ Kexp .* patch.physical[:, wi, 3] rtol = 1e-12
+        @test maximum(abs.(D[:, ui])) > 0.0
+        # The analytic strain, through the filtered spline: K ~ Ls^2 sqrt2 U (2 pi/L) at a crest.
+        @test maximum(Kexp) ≈ 640.0^2 * sqrt(2.0) * 8.0 * 2pi / XL rtol = 0.05
+        # An absolute Ls = 640 is the same scheme: bitwise.
+        D2, _, _, _ = xz_pair(set_strain!, Dict(:Ls => 640.0, :C_s => 0.9),
+                              Dict{Symbol,Float64}())
+        @test D2 == D          # and C_s is not read beside a positive Ls
+    end
+
+    @testset "XZ Smagorinsky: E_t loses exactly the KE the momentum mixing removes" begin
+        # Heat mixing OFF, so momentum is the whole difference. Friction is a resolved-KE
+        # sink to the subgrid with internal energy held: E_t moves by rho_t (u du + w dw)
+        # and p and Q_ss do not move at all.
+        D, patch, mtile, z = xz_pair(set_strain!, SMAG, Dict{Symbol,Float64}())
+        vars = mtile.model.grid_params.vars
+        kDim = mtile.model.grid_params.kDim
+        rho_tbar = view(Scythe.ref_rho_t(mtile.ref_state), :, 1)
+        rt = [rho_tbar[mod1(i, kDim)] + patch.physical[i, vars["rho_t"], 1]
+              for i in 1:size(patch.physical, 1)]
+        u = patch.physical[:, vars["u"], 1]
+        w = patch.physical[:, vars["w"], 1]
+        dKE = rt .* ((u .* D[:, vars["u"]]) .+ (w .* D[:, vars["w"]]))
+        # To the rounding of the E_t tendency SUM the difference is taken from: its pressure
+        # work (E_t + p)·div is O(100) W/m^3 against a friction of O(1e-4), so the floor is a
+        # few ulps of the former, not of the latter.
+        Ei = vars["E_t"]
+        @test isapprox(D[:, Ei], dKE; rtol = 0.0,
+                       atol = 1.0e-14 * maximum(abs.(mtile.expdot_n[:, Ei])))
+        @test maximum(abs.(dKE)) > 0.0
+        # Its domain integral is a SINK (K u u_xx integrates to -K u_x^2 up to the walls).
+        @test sum(dKE) < 0.0
+        @test all(D[:, vars["p"]] .== 0.0)
+        @test all(D[:, vars["Q_ss"]] .== 0.0)
+        @test all(D[:, vars["rho_t"]] .== 0.0) && all(D[:, vars["rho_d"]] .== 0.0)
+    end
+
+    @testset "XZ Smagorinsky: the heat sentinel mixes s_d with K_smag/Pr_t" begin
+        # At rest K_smag is the floor K_min everywhere, so the sentinel (Khdiff_heat < 0)
+        # must give the SAME heating, bit for bit, as a constant Khdiff_heat = K_min/Pr_t.
+        # A cos(2 pi xi) pressure perturbation gives the dry entropy an x-structure.
+        set_warm! = (patch, vars, kDim, z) -> begin
+            pts = Scythe.getGridpoints(patch)
+            for i in 1:size(patch.physical, 1)
+                patch.physical[i, vars["p"], 1] = 50.0 * cos(2pi * (pts[i, 1] - XL0) / XL)
+            end
+        end
+        Ds, patch, mtile, _ = xz_pair(set_warm!, Dict(:C_s => 0.2, :Khdiff_heat => -1.0),
+                                      Dict(:C_s => 0.2, :Khdiff_heat => 0.0))
+        Dc, _, _, _ = xz_pair(set_warm!, Dict(:Khdiff_heat => 5.0),
+                              Dict(:Khdiff_heat => 0.0))
+        vars = mtile.model.grid_params.vars
+        @test maximum(abs.(Ds[:, vars["E_t"]])) > 0.0     # it really heats
+        @test Ds == Dc
+        # With strain, the sentinel follows K_smag (larger than the floor somewhere).
+        set_both! = (patch, vars, kDim, z) -> (set_strain!(patch, vars, kDim, z);
+                                               set_warm!(patch, vars, kDim, z))
+        Dh, _, _, _ = xz_pair(set_both!, Dict(:C_s => 0.2, :Khdiff_heat => -1.0),
+                              Dict(:C_s => 0.2, :Khdiff_heat => 0.0))
+        @test maximum(abs.(Dh[:, vars["E_t"]])) > 10.0 * maximum(abs.(Ds[:, vars["E_t"]]))
+        @test all(Dh[:, vars["u"]] .== 0.0)              # heat leaves momentum alone
+    end
+
+    @testset "XZ Smagorinsky: resting uniform state is a no-op; scheme none is inert" begin
+        # The resting reference state: no strain (K = K_min), no curvature in anything, so
+        # every mixing tendency is K_min * 0 -- exactly zero in every slot.
+        set_rest! = (patch, vars, kDim, z) -> nothing
+        D, _, _, _ = xz_pair(set_rest!, Dict(:C_s => 0.2, :Khdiff_heat => -1.0),
+                             Dict{Symbol,Float64}())
+        @test all(D .== 0.0)
+        # Scheme none (Ls = 0, no C_s) and an explicit C_s = 0 are the same, bitwise, on a
+        # state that WOULD be mixed.
+        D0, _, _, _ = xz_pair(set_strain!, Dict(:C_s => 0.0), Dict{Symbol,Float64}())
+        @test all(D0 .== 0.0)
     end
 end

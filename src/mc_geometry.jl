@@ -340,14 +340,30 @@ end
 end
 
 """
-Smagorinsky-type horizontal eddy viscosity from the horizontal strain tensor,
-`K = max(Ls² √(2 S_ij S_ij), K_min)` — the same closure as Twoway_PV_mixing
-(shallowWaterModels.jl), with the cylindrical strain components
-`S_rr = ∂u/∂r`, `S_λλ = (1/r)∂v/∂λ + u/r`, `S_rλ = ½((1/r)∂u/∂λ + ∂v/∂r − v/r)`.
-Vertical shear is deliberately excluded: the Louis scheme owns vertical mixing on
-the anisotropic grid. Methods exist only for the cylindrical geometries; a config
-with `Ls > 0` on any other trait errors at the first step.
+Smagorinsky-type horizontal eddy viscosity from the HORIZONTAL-PLANE strain tensor,
+`K = max(Ls² √(2 S_ij S_ij), K_min)`, i, j over the horizontal plane only — the same
+closure as Twoway_PV_mixing (shallowWaterModels.jl). The cylindrical strain components
+are `S_rr = ∂u/∂r`, `S_λλ = (1/r)∂v/∂λ + u/r`, `S_rλ = ½((1/r)∂u/∂λ + ∂v/∂r − v/r)`.
+
+On the XZ slice the horizontal plane has ONE direction, so the tensor has one component,
+`S_xx = ∂u/∂x`, and `2 S_ij S_ij = 2 (∂u/∂x)²`: `K = max(Ls² √2 |∂u/∂x|, K_min)`. This is
+the axisymmetric closure with the curvature (`u/r`) and rotation (`v`) terms gone, which is
+what the slice is. Nothing else in the 2-D deformation belongs here: `∂w/∂x` and `∂u/∂z`
+are the vertical shear, which the boundary-layer scheme owns on this anisotropic grid
+(Δz ≪ Δx — a horizontal K built from them would mix horizontally at the rate set by
+vertical shear), and `∂w/∂z = −∂u/∂x` to the anelastic order of the slice, so adding the
+`S_zz` term would count the same convergence twice.
+
+`Ls` arrives already resolved (absolute, or `C_s·Δx` per patch, in `mc_driver!`); this
+function does not know which.
 """
+@inline function mc_smag_k!(K, ::MCCartesianXZ, uv, vv, r, Ls, K_min)
+    u_x = uv.f_x
+    # sqrt(2 S_xx S_xx), written as the tensor norm rather than as sqrt(2)*abs(u_x) so the
+    # three geometries read as one closure term for term.
+    @. K = max(Ls * Ls * sqrt(2.0 * (u_x * u_x)), K_min)
+    return nothing
+end
 @inline function mc_smag_k!(K, ::MCAxisymRZ, uv, vv, r, Ls, K_min)
     u = uv.f; u_x = uv.f_x
     v = vv.f; v_x = vv.f_x
@@ -365,7 +381,7 @@ end
     return nothing
 end
 mc_smag_k!(K, geom::MCGeometry, uv, vv, r, Ls, K_min) =
-    error("Smagorinsky horizontal diffusion (Ls > 0) is implemented only for the " *
+    error("Smagorinsky horizontal diffusion is implemented for the XZ slice and the " *
           "cylindrical geometries (axisym, RLR); got $(typeof(geom))")
 
 """
