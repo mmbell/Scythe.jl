@@ -2821,13 +2821,24 @@ function check_mc_var_names(model::ModelParameters)
                        ("BCB", gp.BCB), ("BCT", gp.BCT), ("l_q", gp.l_q),
                        ("positivity", gp.positivity),
                        ("spline_filter", gp.spline_filter))
-        for key in keys(d)
-            key == "default" && continue
+        for key0 in keys(d)
+            key0 == "default" && continue
+            # `l_q` alone also takes PER-DIRECTION keys: Springsteel reads `"<var>_k"` (and
+            # `"<var>_j"` on RRR) as that variable's vertical (second-horizontal) filter
+            # length, falling back to its horizontal value (`build_l_q`). Such a key is
+            # checked by the slot name it qualifies — so a stale `"rho_c_k"` under the
+            # cloud transform is refused with the same hint as a stale `"rho_c"` — and
+            # never by its own spelling, which no slot has. The suffix is honoured on
+            # `l_q` ONLY: no other dict has a per-direction key, so `"u_k"` anywhere else
+            # is the same silent-miss this check exists to catch.
+            suffix = (label == "l_q" && (endswith(key0, "_k") || endswith(key0, "_j"))) ?
+                     key0[end-1:end] : ""
+            key = key0[1:end-length(suffix)]
             key in expected && continue
             hint = key in stale ?
                 " — that species is transformed, so the key must be " *
-                "\"$(MC_NU_ALIAS[key])\"" : ""
-            error("grid_params.$label declares \"$key\", which is not a slot name of this " *
+                "\"$(MC_NU_ALIAS[key])$(suffix)\"" : ""
+            error("grid_params.$label declares \"$key0\", which is not a slot name of this " *
                   "configuration$(hint). Expected names: $(sort(collect(expected))). " *
                   "Build every name-keyed dict from `Scythe.mc_var_names(options)`; a stale " *
                   "key in $label would be ignored silently rather than raising.")

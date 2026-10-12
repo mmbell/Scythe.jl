@@ -340,6 +340,84 @@ end
     end
 end
 
+@testset "spline filter: horizontal and vertical l_q" begin
+    SS = Scythe.Springsteel
+    @test Numerics().l_q == 2.0
+    @test Numerics().l_q_horizontal == 0.0 && Numerics().l_q_vertical == 0.0
+    mktempdir() do dir
+        cf(xs...) = load_config(set = ["output.dir=$(dir)", xs...])
+        vars(cfg) = Scythe.mc_var_names(first(Scythe.build_physics(cfg));
+                                        cyl = EQUATION_SETS[cfg.run.equation_set].cyl)
+
+        # Round trip of the two new keys.
+        cfg = cf("numerics.l_q_horizontal=1.0", "numerics.l_q_vertical=2.5")
+        back = load_config(write_config(cfg, joinpath(dir, "lq.toml")))
+        @test back == cfg
+        @test back.numerics.l_q_horizontal == 1.0 && back.numerics.l_q_vertical == 2.5
+
+        # INHERIT: both 0 is the one-entry dict every run had before the split -- and so is
+        # any setting that resolves both directions to one value.
+        @test Scythe.build_l_q(cf(), vars(cf())) == Dict("default" => 2.0)
+        @test build_model(cf()).grid_params.l_q == Dict("default" => 2.0)
+        @test Scythe.build_l_q(cf("numerics.l_q=1.5"), vars(cf())) == Dict("default" => 1.5)
+        @test Scythe.build_l_q(cf("numerics.l_q_horizontal=3.0", "numerics.l_q_vertical=3.0"),
+                               vars(cf())) == Dict("default" => 3.0)
+        @test Scythe.build_l_q(cf("numerics.l_q_vertical=2.0"), vars(cf())) ==
+              Dict("default" => 2.0)
+
+        # SPLIT: horizontal is the default, vertical one `_k` key per slot of THIS
+        # configuration -- the default config carries the transformed `nu_*` names, ice and
+        # `rho_e`, so `check_mc_var_names` (run by build_model) is genuinely exercised.
+        c1 = cf("numerics.l_q_horizontal=1.0")
+        m1 = build_model(c1)
+        lq = m1.grid_params.l_q
+        vs = vars(c1)
+        @test "nu_c" in vs && "rho_e" in vs
+        @test lq["default"] == 1.0
+        @test Set(keys(lq)) == Set(["default"; [v * "_k" for v in vs]])
+        @test all(lq[v * "_k"] == 2.0 for v in vs)
+        # ... and the BUILT grid carries it: every horizontal spline at 1.0, every vertical
+        # one at 2.0. This is what Springsteel actually made of the dict, not the dict.
+        grid = SS.createGrid(m1.grid_params)
+        gvars = m1.grid_params.vars
+        @test all(grid.ibasis.data[z, gvars[v]].params.l_q == 1.0
+                  for v in vs for z in axes(grid.ibasis.data, 1))
+        @test all(grid.kbasis.data[gvars[v]].params.l_q == 2.0 for v in vs)
+        # The vertical override alone, the other way round.
+        m2 = build_model(cf("numerics.l_q_vertical=3.0"))
+        g2 = SS.createGrid(m2.grid_params)
+        @test all(g2.ibasis.data[1, i].params.l_q == 2.0 for i in values(m2.grid_params.vars))
+        @test all(g2.kbasis.data[i].params.l_q == 3.0 for i in values(m2.grid_params.vars))
+        # The unsplit grid is the old grid.
+        g0 = SS.createGrid(build_model(cf()).grid_params)
+        @test all(g0.kbasis.data[i].params.l_q == 2.0 for i in 1:length(g0.kbasis.data))
+
+        # check_mc_var_names: a `_k` key is checked by the slot it qualifies, on l_q only.
+        bad = deepcopy(m1)
+        bad.grid_params.l_q["rho_c_k"] = 1.0
+        m = errmsg(() -> Scythe.check_mc_var_names(bad))
+        @test occursin("\"rho_c_k\"", m) && occursin("\"nu_c_k\"", m)
+        bad = deepcopy(m1)
+        bad.grid_params.l_q["bogus_k"] = 1.0
+        @test occursin("bogus_k", errmsg(() -> Scythe.check_mc_var_names(bad)))
+        bad = deepcopy(m1)
+        bad.grid_params.BCB["u_k"] = bad.grid_params.BCB["u"]
+        @test occursin("grid_params.BCB declares \"u_k\"",
+                       errmsg(() -> Scythe.check_mc_var_names(bad)))
+
+        # Refusals: negative lengths, and a vertical length on the Chebyshev vertical.
+        @test occursin("numerics.l_q_vertical",
+                       errmsg(() -> build_model(cf("numerics.l_q_vertical=-1.0"))))
+        @test occursin("numerics.l_q_horizontal",
+                       errmsg(() -> build_model(cf("numerics.l_q_horizontal=-0.5"))))
+        @test occursin("numerics.l_q ", errmsg(() -> build_model(cf("numerics.l_q=-2.0"))))
+        m = errmsg(() -> build_model(cf("run.equation_set=moist_compressible_axisym",
+                                        "grid.geometry=RZ", "boundary_conditions.lateral=walls",
+                                        "numerics.l_q_vertical=1.0")))
+        @test occursin("numerics.l_q_vertical", m) && occursin("Chebyshev", m)
+    end
+end
+
 @testset "paths" begin
     mktempdir() do root
         root = realpath(root)

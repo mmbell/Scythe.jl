@@ -380,7 +380,9 @@ solver choices; leave alone unless you know why (boundary conditions live in `[b
 | `exact_si` | bool | `false` | exact coupled SI solve; incompatible with `state_dependent_si`. |
 | `horizontal_semiimplicit` | bool | `false` | horizontal semi-implicit acoustic terms (XZ RiRk only). |
 | `wall_bc_tau` | float | `300.0` | relaxation timescale [s] of the `p` lid/ground condition under `boundary_conditions.vertical_scalars` or `vertical_scalars_lid` = `r1t1x`; `inf` = none. |
-| `l_q` | float | `2.0` | B-spline spectral filter length, every variable, both directions. |
+| `l_q` | float | `2.0` | B-spline spectral filter length, every variable, every direction not overridden below. |
+| `l_q_horizontal` | float | `0.0` | filter length of the horizontal B-spline (x / r); 0 = inherit `l_q`. |
+| `l_q_vertical` | float | `0.0` | filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical). |
 | `cfl_interval` | float | `0.0` | CFL report cadence [s]; 0 = `output.interval`, resolved at build. |
 
 ### `[diagnostics]`

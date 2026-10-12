@@ -510,8 +510,18 @@ end
 - `exact_si::Bool` — exact coupled SI solve; incompatible with `state_dependent_si`.
 - `horizontal_semiimplicit::Bool` — horizontal semi-implicit acoustic terms (XZ RiRk only).
 - `wall_bc_tau::Float64` — relaxation timescale [s] of the `p` lid/ground condition under `boundary_conditions.vertical_scalars` or `vertical_scalars_lid` = `r1t1x`; `inf` = none.
-- `l_q::Float64` — B-spline spectral filter length, every variable, both directions.
+- `l_q::Float64` — B-spline spectral filter length, every variable, every direction not overridden below.
+- `l_q_horizontal::Float64` — filter length of the horizontal B-spline (x / r); 0 = inherit `l_q`.
+- `l_q_vertical::Float64` — filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical).
 - `cfl_interval::Float64` — CFL report cadence [s]; 0 = `output.interval`, resolved at build.
+
+The filter lengths are separate because the two directions do different jobs: the
+vertical `l_q` is load-bearing for the semi-implicit acoustic solve (its column operators
+are built on the filtered vertical basis, reference/SI_VERTICAL_CEILING.md), while the
+horizontal one only sets how hard the grid scale is damped along the slice. An azimuthal
+(Fourier) axis has no filter length, so on `RLR` `l_q_horizontal` is the radial filter.
+0 means "inherit" for both, so to filter one direction with `l_q = 0` (an interpolating
+fit) set `l_q = 0` and give the OTHER direction its own value.
 """
 Base.@kwdef struct Numerics <: AbstractConfigSection
     positivity::Symbol = :auto
@@ -520,6 +530,8 @@ Base.@kwdef struct Numerics <: AbstractConfigSection
     horizontal_semiimplicit::Bool = false
     wall_bc_tau::Float64 = 300.0
     l_q::Float64 = 2.0
+    l_q_horizontal::Float64 = 0.0
+    l_q_vertical::Float64 = 0.0
     cfl_interval::Float64 = 0.0
 end
 

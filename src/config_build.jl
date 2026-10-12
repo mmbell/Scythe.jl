@@ -86,6 +86,18 @@ function validate(cfg::RunConfig)
         "checkpoint, which finalize_model writes only when restart_interval > 0")
     cfg.output.interval > 0.0 || error("config: output.interval must be positive")
 
+    # ── spline filter lengths (0 = inherit numerics.l_q, so negatives are the only typo)
+    for (key, v) in (("l_q", num.l_q), ("l_q_horizontal", num.l_q_horizontal),
+                     ("l_q_vertical", num.l_q_vertical))
+        (isfinite(v) && v >= 0.0) || error(
+            "config: numerics.$key = $v must be finite and >= 0" *
+            (key == "l_q" ? "" : " (0 = inherit numerics.l_q)"))
+    end
+    (g.geometry == "RZ" && num.l_q_vertical != 0.0) && error(
+        "config: numerics.l_q_vertical = $(num.l_q_vertical) is refused on grid.geometry = " *
+        "\"RZ\": its vertical is a Chebyshev basis, which has no filter length. Leave " *
+        "l_q_vertical = 0 (numerics.l_q then filters the horizontal spline only)")
+
     # ── physics pairings
     (ice && bl.scheme === :louis) && error(
         "config: physics.microphysics.ice = \"ishmael\" with physics.boundary_layer.scheme = " *
@@ -579,6 +591,37 @@ function build_positivity(cfg::RunConfig, options)
 end
 
 """
+    build_l_q(cfg, vars) -> Dict{String,Float64}
+
+The `l_q` dict of the `GridParameters`: the B-spline filter length per variable and per
+direction, from `numerics.l_q` / `l_q_horizontal` / `l_q_vertical` (0 = inherit `l_q`).
+
+Springsteel resolves a variable's HORIZONTAL (i) filter as `l_q[var]`, falling back to
+`l_q["default"]`, and its VERTICAL (k) filter as `l_q["<var>_k"]`, falling back to that
+variable's horizontal value (src/factory.jl, the RiRk / RLR / RRR constructors; a `_j` key
+does the same for the second horizontal direction of RRR, which then inherits the
+horizontal value here as it should). There is no `"default_k"`, so a split is written as
+`"default" => horizontal` plus one `"<var>_k" => vertical` per prognostic slot, the slot
+names coming from the same `mc_var_names` list as every other name-keyed dict
+(`check_mc_var_names` accepts exactly those `_k` keys).
+
+When the two directions resolve to the same value the dict is `Dict("default" => l_q)` —
+the one-entry dict every configuration had before the split existed — so an unsplit run
+builds the identical grid, not merely an equivalent one.
+"""
+function build_l_q(cfg::RunConfig, vars::AbstractVector{<:AbstractString})
+    num = cfg.numerics
+    lh = num.l_q_horizontal > 0.0 ? num.l_q_horizontal : num.l_q
+    lv = num.l_q_vertical > 0.0 ? num.l_q_vertical : num.l_q
+    lq = Dict{String,Float64}("default" => lh)
+    lv == lh && return lq
+    for v in vars
+        lq[string(v, "_k")] = lv
+    end
+    return lq
+end
+
+"""
     build_model(cfg::RunConfig; segment = nothing) -> ModelParameters | NestedModelParameters
 
 Turn a validated `RunConfig` into the model description: a `ModelParameters` for one patch
@@ -633,7 +676,7 @@ function build_model(cfg::RunConfig; segment::Union{Nothing,NamedTuple} = nothin
         num_cells_i = sum(g.num_cells),          # nests: per-patch grids come from build_nest
         kMin = 0.0, kMax = g.z_top,
         vsize...,
-        l_q = Dict("default" => cfg.numerics.l_q),
+        l_q = build_l_q(cfg, vars),
         positivity = positivity,
         mw...,
         BCL = bcl, BCR = bcr, BCB = bcb, BCT = bct,
