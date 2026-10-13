@@ -6860,6 +6860,113 @@ end
 end
 
 """
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, slot, Sc_t)
+
+Add `K∇²_h(φ)/Sc_t` to `expdot[:, slot]` for one column, `φ` being prognostic slot `slot`:
+the geometry's horizontal Laplacian (`mc_w_kdiff!`) read from the slot's own views, built
+HERE from the physical array (`grid` is `(physical = …,)`; see [`mc_water_mixing!`](@ref)
+for why not in the driver), accumulated through an explicit loop (an indexed `.+=` materializes the slice and
+allocates). `K` is a column vector (Smagorinsky) or a scalar (constant); `Sc_t` is the
+turbulent Schmidt number, or an exact `1.0` when the scalar already carries it.
+"""
+@inline function mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, slot,
+                                    Sc_t)
+    sv = mc_slot_views(grid, colstart, colend, slot, geom)
+    mc_w_kdiff!(LAP, geom, K, sv, r)
+    @inbounds for i in eachindex(LAP)
+        expdot[colstart + i - 1, slot] += LAP[i] / Sc_t
+    end
+    return nothing
+end
+
+"""
+    mc_water_mixing!(expdot, physical, gridpoints, physical_params, LAP, LAP2, geom, K,
+                     Sc_t, colstart, colend, rv_i, nr_i, ice_idx)
+
+The horizontal water-species mixing of one column (`physical_params[:Khdiff_water] ≠ 0`):
+EVERY water species with the ONE coefficient `K/Sc_t`, in this order —
+
+1. slot 3, total water `ρ_t' − ρ_d'` (dry air is not mixed, so `ρ_d`'s own tendency is
+   untouched and only the water rides on `ρ_t`);
+2. slot 8 rain and slot 9 cloud (ν under a transform), slot 7 `Q_ss`;
+3. the rain number `n_r` (two-moment rain, `nr_i > 0`). It mixes with the same coefficient
+   as the rain MASS, and must: mixing one without the other rescales the mean drop size of
+   every column the operator touches, and the fall speeds, evaporation timescale and
+   self-collection all read that size;
+4. the prognostic vapor `ρ_v'` (`rv_i`) — so that `ρ_v + ρ_c + ρ_r + Σρ_i` moves with slot 3
+   by the linearity of the operator instead of through the reconciliation nudge;
+5. under ISHMAEL (`ice_idx` nonzero), all twelve ice slots — each species' mass, number and
+   two volume moments — for the rain-number reason, one category further out: a crystal's
+   mass is `ρ_i/n_i` and its habit `a_i/n_i`, `c_i/n_i`, so one K for all four leaves them
+   unrescaled.
+
+Steps 1-3 are the slots and the order the leg always had, so they receive bitwise the
+tendency they did; 4 and 5 are new. Called from the two branches of [`mc_driver!`](@ref)
+with a CONCRETE `K` (vector `K_smag` or scalar), which makes this the function barrier that
+keeps the diffusivity unboxed. Not energy consistent — `E_t` and `p` are not sourced.
+
+COMPILE COST, MEASURED — why this is `@noinline` and takes PLAIN ARRAYS. The leg's own code
+compiles in well under a second; what it can cost is the LLVM codegen of `mc_driver!` around
+the call. First-call time of the driver (XZ, then axisym + Louis BL + Smagorinsky; one
+thread, the test_allocations tiles, which never take the branch; the two "views" rows are
+the allocation suite's testset times at two threads beside a running model):
+
+| how the leg is reached                                         | XZ    | axisym-Louis |
+|----------------------------------------------------------------|-------|--------------|
+| base (d3964bf: seven Laplacians inline, no vapor / ice)        |  51 s |  58 s        |
+| inlined, nineteen Laplacians on the driver's views             |   —   | > 80 min     |
+| `@noinline`, taking the driver's view NamedTuples              | ~300 s | > 20 min    |
+| `@noinline`, taking `mtile`                                    | 218 s |  75 s        |
+| `@noinline`, a one-line body, taking `mtile`                   | 187 s |  66 s        |
+| `@noinline`, taking the grid struct and `model`                |  55 s | 174 s        |
+| `@noinline`, taking arrays + the `physical_params` Dict (this) |  48 s |  55 s        |
+
+The fourth row is the diagnosis: the cost is not this function's body but handing the
+driver's large immutable structs (`mtile`, the grid, `model`) — or its views — to an opaque
+call in the middle of a body that keeps hundreds of them live. Only the heap-allocated
+`Matrix`/`Array`/`Dict` cross here; the slot views and the metric are rebuilt from them.
+
+HOW WELL THE SUM CLOSES (test/test_horizontal_water_mixing.jl, sharp seeds on a periodic
+slice, K = 2000 m²/s, a 50 s mixing-only step): under `:none` the change in
+`(ρ_t − ρ_d) − (ρ_v + ρ_c + ρ_r + Σρ_i)` is 1.3e-13 of the water moved — one linear operator
+on a sum. Under `:bhyp` it is 0.3 μ in absolute terms at the knee points (`0 < ν ≲ μ`, where
+`f'` runs from 1 to 2), and at the LOBE points — where the spline fit of a sharp feature rings
+into `ν < 0` and `ahyp` floors the recovered density at zero (`f' = 0`) — the density slot 3
+receives does not reach any species: it lifts the negative `ν` toward zero instead, i.e. it
+shrinks the lobe pool `Σ 2 min(ν, 0)` (by 8 % in that step), and the vapor nudge absorbs the
+difference. That is the ν-space convention, not a missing term.
+"""
+@noinline function mc_water_mixing!(expdot::Matrix{Float64}, physical::Array{Float64,3},
+                                    gridpoints::Matrix{Float64}, physical_params,
+                                    LAP, LAP2, geom::MCGeometry, K, Sc_t::Float64,
+                                    colstart::Int64, colend::Int64, rv_i::Int64,
+                                    nr_i::Int64, ice_idx::NTuple{12,Int64})
+    # Rebuilt from the plain arrays: `mc_slot_views` and `mc_metric` read only these fields.
+    grid = (physical = physical,)
+    r = mc_metric(geom, (physical_params = physical_params,), gridpoints, colstart, colend)
+    rtv = mc_slot_views(grid, colstart, colend, 3, geom)
+    rdv = mc_slot_views(grid, colstart, colend, 2, geom)
+    mc_w_kdiff!(LAP,  geom, K, rtv, r)
+    mc_w_kdiff!(LAP2, geom, K, rdv, r)
+    @inbounds for i in eachindex(LAP)
+        expdot[colstart + i - 1, 3] += (LAP[i] - LAP2[i]) / Sc_t
+    end
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 8, Sc_t)
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 9, Sc_t)
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 7, Sc_t)
+    nr_i > 0 && mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, nr_i,
+                                   Sc_t)
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, rv_i, Sc_t)
+    # One loop, one call site: the body is compiled once rather than twelve times.
+    @inbounds for j in 1:12
+        s = ice_idx[j]
+        s > 0 && mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, s,
+                                    Sc_t)
+    end
+    return nothing
+end
+
+"""
     smagorinsky_length(model) -> Float64
 
 The Smagorinsky length scale `Ls` [m] of THIS patch, and so whether the scheme is on
@@ -7163,18 +7270,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
               "not implemented: the budget rows are the liquid mass channels, so the ice " *
               "mass and its number/volume moments have nowhere to report. Add ice blocks to " *
               "`MC_WATER_STATS` before enabling it.")
-    end
-    if ice_on && Khdiff_water != 0.0
-        # The horizontal counterpart, refused for the same reason and one more. The block
-        # mixes rho_t, rho_d, rho_c and rho_r and takes the vapor Laplacian as the remainder
-        # — which with ice inside rho_t is not the vapor — and it is explicitly NOT energy
-        # consistent even for liquid (see the block itself). Mixing an ice MASS without its
-        # number and volume moments would also rescale every crystal the operator touches.
-        error("physical_params[:Khdiff_water] != 0 with options[:ice_microphysics] = " *
-              ":ishmael is not implemented: the horizontal water mixing implies the vapor " *
-              "from the liquid species, and mixing an ice mass without its n/a/c moments " *
-              "rescales the crystals of every column it touches. Set Khdiff_water = 0 or " *
-              "add the twelve ice Laplacians (and the energy consistency they need).")
     end
     if ice_on && Kvdiff_water > 0.0
         # `_diffusion_water_step!` diffuses rho_t/rho_c/rho_r and IMPLIES the vapor as the
@@ -8775,15 +8870,35 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # convention); > 0 is a constant diffusivity. Same K*grad^2 (not div(K grad))
     # approximation as the momentum and heat terms.
     #
-    # WHAT CHANGED WITH THE PROGNOSTIC VAPOR, and what deliberately did not. This block still
-    # mixes total water, cloud, rain and Q_ss and gives the VAPOR SLOT no Laplacian of its own.
-    # While the vapor was a residual that was automatic -- mixing rho_t and the condensates WAS
-    # mixing the vapor. It is no longer: the vapor's countermove now arrives through the
-    # reconciliation nudge, on tau_rec rather than instantaneously, so a diffused column's
-    # partition closes on the nudge timescale instead of pointwise. That is a deliberate
-    # deferral and not an oversight -- adding K*grad^2(rho_v') here is one more Laplacian, but
-    # a water mixing that is honest about energy has to source E_t and p alongside the mass
-    # (see above), and that rewrite is where the vapor leg belongs.
+    # EVERY WATER SPECIES, ONE COEFFICIENT. The leg mixes total water (slot 3), the prognostic
+    # vapor, cloud, rain and the rain number, and under ISHMAEL all twelve ice slots — each
+    # species' mass AND its number and two volume moments — with the SAME K_water (K_smag/Sc_t
+    # or the constant). Two reasons, one per kind of slot:
+    #
+    #   * THE PARTITION. Slot 3 is the conservation anchor and `ρ_v + ρ_c + ρ_r + Σρ_i` must
+    #     stay on it. The Laplacian is linear, so mixing every member of the sum with one K
+    #     moves the sum by exactly what slot 3 moves. Leave a member out and the gap it opens
+    #     is the WHOLE of that member's Laplacian: while the vapor was a residual of slot 3
+    #     that was automatic, but since it is prognostic a vapor left out of this block is
+    #     reconciled only through the nudge on `tau_rec`, i.e. a diffused column's partition
+    #     closes on the nudge timescale instead of pointwise — and an ice mass left out is
+    #     dragged onto the vapor by the same nudge (the old refusal said "implies vapor from
+    #     the liquid species"; that stopped being true when ρ_v became prognostic). What
+    #     remains is the ν-space convention below: slot 3 mixes in DENSITY, the transformed
+    #     slots in ν, so the sum closes to O(μ²/ρ²) of the mixed mass above the knee, not to
+    #     rounding. Under `:none` it closes to rounding.
+    #   * THE MOMENTS. ISHMAEL carries number and the two volume moments as densities, so a
+    #     crystal's mass is ρ_i/n_i and its habit a_i/n_i, c_i/n_i. Mixing the mass alone (or
+    #     with a different K) rescales every crystal the operator touches; mixing all four
+    #     with one K leaves the per-crystal ratios of a uniform-habit population unchanged
+    #     (exactly under `:none`, because K∇²(m·n) = m·K∇²n for uniform m — pointwise, so
+    #     this holds for the variable K_smag too). The rain number follows the rain mass for
+    #     the same reason (see below).
+    #
+    # The vapor slot is a perturbation against ρ̄_v(z); the horizontal Laplacian of a z-only
+    # profile is zero on every geometry, so `K∇²ρ_v'` IS `K∇²ρ_v`, the same as slot 3's
+    # `ρ_t' − ρ_d'`. Q_ss is mixed as before. ρ_e (the MYNN TKE) is not water and is not
+    # mixed here. STILL NOT ENERGY CONSISTENT: E_t and p are not sourced (see above).
     if Khdiff_water != 0.0
         # UNDER A TRANSFORM THIS MIXES THE CONTROL VARIABLE, AND THAT IS THE INTENDED FORM.
         # The Laplacian is applied to the slot, so with `condensate_transform`/`rain_transform`
@@ -8834,74 +8949,36 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # it is the only mc term that did, and it was never in the allocation gate because
         # Khdiff_water is 0.0 in every shipped configuration). Same convention as the Louis
         # BL's apply loop. It is also the only additive mc block, which is why `.=`
-        # everywhere else was fine.
-        # The two branches stay SEPARATE and each carries its own loops: hoisting the
-        # diffusivity into one variable would give it type `Union{Vector{Float64},Float64}`
-        # and box every use — the same trap the state-dependent SI hit.
+        # everywhere else was fine. The loop lives in `mc_water_mix_slot!`.
+        # The two branches stay SEPARATE: hoisting the diffusivity into one variable would
+        # give it type `Union{Vector{Float64},Float64}` and box every use — the same trap the
+        # state-dependent SI hit. Each branch calls `mc_water_mixing!` with a CONCRETE K,
+        # which is a function barrier: the callee is compiled once per K type.
+        #
+        # Slots 8 and 9 (and the rain number and the twelve ice slots) are the transformed
+        # ones: under a transform their views are ν, and `K∇²ν` is the intended operator (see
+        # the block comment above). No Jacobian — the tendency is already in the slot's own
+        # units.
+        # Plain arrays and slot INDICES, not the views above or the tile: see
+        # `mc_water_mixing!` for the measured compile cost of handing the driver's structs
+        # across the call. A zero index = not registered.
+        ice_idx = ice_on ?
+            (IS.i1_q, IS.i1_n, IS.i1_a, IS.i1_c, IS.i2_q, IS.i2_n, IS.i2_a, IS.i2_c,
+             IS.i3_q, IS.i3_n, IS.i3_a, IS.i3_c) : ntuple(_ -> 0, Val(12))
+        nr_mix = rain_2m ? nr_i : 0
         if Khdiff_water < 0.0
             use_smag || error("physical_params[:Khdiff_water] < 0 selects the " *
                               "Smagorinsky water diffusivity, which requires the " *
                               "Smagorinsky scheme (:Ls > 0, or :C_s > 0 with :Ls = 0)")
-            # Total water rho_w' = rho_t' - rho_d' (dry air is NOT mixed: only the
-            # water rides on rho_t here, so rho_d's own tendency is untouched).
-            mc_w_kdiff!(WLAP,  geom, K_smag, rtv, r)
-            mc_w_kdiff!(WLAP2, geom, K_smag, rdv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 3] += (WLAP[i] - WLAP2[i]) / Sc_t
-            end
-            # Slots 8 and 9 are the transformed ones: under a transform `rrv`/`rcv` are ν,
-            # and `K∇²ν` is the intended operator (see the block comment above). No
-            # Jacobian — the tendency is already in the slot's own units.
-            mc_w_kdiff!(WLAP, geom, K_smag, rrv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 8] += WLAP[i] / Sc_t
-            end
-            mc_w_kdiff!(WLAP, geom, K_smag, rcv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 9] += WLAP[i] / Sc_t
-            end
-            mc_w_kdiff!(WLAP, geom, K_smag, qsv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 7] += WLAP[i] / Sc_t
-            end
-            # The rain NUMBER mixes with the same coefficient as the rain MASS, and must:
-            # mixing one without the other rescales the mean drop size of every column the
-            # operator touches, and the fall speeds, evaporation timescale and
-            # self-collection all read that size. (This is the horizontal counterpart of the
-            # refusal the VERTICAL water diffusion raises for the same reason — there the
-            # solve is implicit and adding n_r to it is real work; here it is one more
-            # Laplacian.)
-            if rain_2m
-                mc_w_kdiff!(WLAP, geom, K_smag, nrv, r)
-                @inbounds for i in eachindex(WLAP)
-                    expdot[colstart + i - 1, nr_i] += WLAP[i] / Sc_t
-                end
-            end
+            mc_water_mixing!(expdot, grid.physical, gridpoints, model.physical_params,
+                             WLAP, WLAP2, geom, K_smag, Sc_t, colstart, colend, rv_i,
+                             nr_mix, ice_idx)
         else
-            mc_w_kdiff!(WLAP,  geom, Khdiff_water, rtv, r)
-            mc_w_kdiff!(WLAP2, geom, Khdiff_water, rdv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 3] += WLAP[i] - WLAP2[i]
-            end
-            mc_w_kdiff!(WLAP, geom, Khdiff_water, rrv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 8] += WLAP[i]
-            end
-            mc_w_kdiff!(WLAP, geom, Khdiff_water, rcv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 9] += WLAP[i]
-            end
-            mc_w_kdiff!(WLAP, geom, Khdiff_water, qsv, r)
-            @inbounds for i in eachindex(WLAP)
-                expdot[colstart + i - 1, 7] += WLAP[i]
-            end
-            # Same coefficient as the rain mass — see the note in the Smagorinsky branch.
-            if rain_2m
-                mc_w_kdiff!(WLAP, geom, Khdiff_water, nrv, r)
-                @inbounds for i in eachindex(WLAP)
-                    expdot[colstart + i - 1, nr_i] += WLAP[i]
-                end
-            end
+            # The constant diffusivity is already K/Sc_t (`build_physics`), so the divisor is
+            # an exact 1.0 — the identity in IEEE, bitwise the undivided form this had.
+            mc_water_mixing!(expdot, grid.physical, gridpoints, model.physical_params,
+                             WLAP, WLAP2, geom, Khdiff_water, 1.0, colstart, colend, rv_i,
+                             nr_mix, ice_idx)
         end
     end
 
@@ -9466,8 +9543,11 @@ Four things do feed it, and they are the ones to watch:
    vertical acoustic mass flux carries. The vapor slot is not in that solve (the SI structure
    is deliberately untouched by Stage A), so that transport reaches the vapor only through
    this nudge. On a resting base both legs are zero and nothing is fed.
-2. **The horizontal water mixing** (`Khdiff_water`, off by default), which mixes `rho_t` and
-   the condensates and gives this slot no Laplacian.
+2. **The horizontal water mixing** (`Khdiff_water`, off by default). It now mixes this slot
+   too, with the K every other species takes, so it no longer feeds the nudge through the
+   vapor's own Laplacian — only through the ν-space convention of the transformed slots
+   (O(μ) at the knee, and the mass slot 3 sends into a clipped ν < 0 lobe, which no species
+   receives; see `mc_water_mixing!`).
 3. **`clamp_water!`'s floor** (opt-in), which moves a condensate and leaves `rho_t` alone.
 4. **The independent ADVECTION of the condensates themselves** — the §2c feeder, and the
    dominant one on the ice arm. Sedimentation telescopes (`rho_t` and the falling species

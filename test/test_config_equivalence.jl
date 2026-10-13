@@ -359,8 +359,8 @@ end
         s(xs...) = load_config(CEQ_OWB; set = ["output.dir=$(dir)", xs...])
         @test occursin("physics.boundary_layer.scheme",
                        cfg_errmsg(() -> build_model(s("physics.boundary_layer.scheme=louis"))))
-        @test occursin("horizontal_mixing.water",
-                       cfg_errmsg(() -> build_model(s("physics.horizontal_mixing.water=true"))))
+        # Water mixing with ISHMAEL is no longer refused: the leg mixes every ice moment.
+        @test build_model(s("physics.horizontal_mixing.water=true")) isa ModelParameters
         @test occursin("numerics.exact_si",
                        cfg_errmsg(() -> build_model(s("numerics.exact_si=true"))))
         # Smagorinsky now exists on the slice too; what is refused is a scheme with no length.

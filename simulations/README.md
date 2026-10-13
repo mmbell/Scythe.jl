@@ -357,7 +357,7 @@ HORIZONTAL eddy mixing only; vertical mixing belongs to `boundary_layer`.
 | `K_min` | float | `25.0` | Smagorinsky viscosity floor [m²/s]. |
 | `K` | float | `0.0` | constant momentum viscosity [m²/s] (`constant` only). |
 | `heat` | bool | `true` | also mix entropy/heat with K/Pr_t. |
-| `water` | bool | `false` | also mix water with K/Sc_t (NOT energy consistent; refused with ice). |
+| `water` | bool | `false` | also mix every water species with K/Sc_t: total water, vapor, cloud, rain (+ number) and, with ice, every ice mass and moment, all with the one K (NOT energy consistent). |
 | `Pr_t` | float | `1.0` | turbulent Prandtl number. |
 | `Sc_t` | float | `1.0` | turbulent Schmidt number. |
 
@@ -734,7 +734,7 @@ Retired (refused with a message):
 | `Kh` | float |  | legacy horizontal diffusivity [m^2/s] (shallowWaterModels.jl, tcblModels.jl, primitive_equations.jl) |
 | `Khdiff` | float | `physics.horizontal_mixing.K` (refused in `[extra.physical_params]`) | horizontal momentum eddy viscosity [m^2/s]; required key (moist_compressible.jl, primitive_equations.jl) |
 | `Khdiff_heat` | float | `physics.horizontal_mixing.heat` (refused in `[extra.physical_params]`) | horizontal heat diffusivity [m^2/s]; < 0 = Smagorinsky K/Pr_t (moist_compressible.jl) |
-| `Khdiff_water` | float | `physics.horizontal_mixing.water` (refused in `[extra.physical_params]`) | horizontal water diffusivity [m^2/s]; < 0 = Smagorinsky K/Sc_t; refused with ice (moist_compressible.jl) |
+| `Khdiff_water` | float | `physics.horizontal_mixing.water` (refused in `[extra.physical_params]`) | horizontal water diffusivity [m^2/s], every water species and ice moment; < 0 = Smagorinsky K/Sc_t (moist_compressible.jl) |
 | `Kv_mudiff` | float |  | primitive equations: vertical mu diffusivity (primitive_equations.jl) |
 | `Kvdiff` | float |  | vertical momentum eddy viscosity [m^2/s]; required key (moist_compressible.jl, exact_si.jl) |
 | `Kvdiff_heat` | float |  | vertical heat diffusivity [m^2/s]; default Kvdiff (moist_compressible.jl, exact_si.jl) |

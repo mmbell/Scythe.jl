@@ -35,6 +35,7 @@ const TEST_FILES = [
     ("test_mynn_fidelity.jl",               :physics),
     ("test_mynn_edmf_live.jl",              :physics),
     ("test_mynn_ice.jl",                    :physics),
+    ("test_horizontal_water_mixing.jl",     :physics),
     ("test_mynn_io.jl",                     :io),
     ("test_idealized_init.jl",              :core),
     ("test_spectralGrid.jl",                :core),

@@ -452,7 +452,7 @@ end
 - `K_min::Float64` — Smagorinsky viscosity floor [m²/s].
 - `K::Float64` — constant momentum viscosity [m²/s] (`constant` only).
 - `heat::Bool` — also mix entropy/heat with K/Pr_t.
-- `water::Bool` — also mix water with K/Sc_t (NOT energy consistent; refused with ice).
+- `water::Bool` — also mix every water species with K/Sc_t: total water, vapor, cloud, rain (+ number) and, with ice, every ice mass and moment, all with the one K (NOT energy consistent).
 - `Pr_t::Float64` — turbulent Prandtl number.
 - `Sc_t::Float64` — turbulent Schmidt number.
 
@@ -927,7 +927,7 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :Kvdiff        => (Float64, "vertical momentum eddy viscosity [m^2/s]; required key (moist_compressible.jl, exact_si.jl)"),
     :Khdiff_heat   => (Float64, "horizontal heat diffusivity [m^2/s]; < 0 = Smagorinsky K/Pr_t (moist_compressible.jl)"),
     :Kvdiff_heat   => (Float64, "vertical heat diffusivity [m^2/s]; default Kvdiff (moist_compressible.jl, exact_si.jl)"),
-    :Khdiff_water  => (Float64, "horizontal water diffusivity [m^2/s]; < 0 = Smagorinsky K/Sc_t; refused with ice (moist_compressible.jl)"),
+    :Khdiff_water  => (Float64, "horizontal water diffusivity [m^2/s], every water species and ice moment; < 0 = Smagorinsky K/Sc_t (moist_compressible.jl)"),
     :Kvdiff_water  => (Float64, "vertical water diffusivity [m^2/s]; refused with ice and two-moment rain (moist_compressible.jl, exact_si.jl)"),
     :Pr_t          => (Float64, "turbulent Prandtl number for Smagorinsky heat mixing (moist_compressible.jl)"),
     :Sc_t          => (Float64, "turbulent Schmidt number for Smagorinsky water mixing (moist_compressible.jl)"),

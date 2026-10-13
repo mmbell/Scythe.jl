@@ -135,7 +135,7 @@ sst        = 302.65                  # [K] 29.5 C: keeps SST - T_air > 0 at ever
 # An axisymmetric TC has no asymmetries to provide radial mixing, so the resolved radial
 # gradients are damped only by this closure; heat is mixed with K/Pr_t (without it the
 # thermodynamic fields had no horizontal mixing at all). Water mixing stays off (not
-# energy consistent; refused with ice).
+# energy consistent: E_t and p are not sourced with the water it moves).
 scheme = "smagorinsky"               # K_min = 25 m^2/s, heat = true (defaults)
 # The absolute length the TC was tuned with, pinned here: the default is Ls = 0, i.e.
 # C_s * each patch's cell width, which on the TC's nests would be a different closure.

@@ -526,6 +526,24 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
                                                   :ice_number_realization => true)))
         moist_compressible_XZ(mtile_nr, 1, kDim_nr, 2)        # compile
         @test (@allocations moist_compressible_XZ(mtile_nr, 1, kDim_nr, 2)) == 0
+
+        # HORIZONTAL WATER MIXING WITH ICE: every species and all twelve ice moments through
+        # `mc_water_mixing!`, both branches — the Smagorinsky vector K (C_s * dx) and the
+        # constant scalar — under the bhyp transforms the RCE runs with. The two branches
+        # are the function barrier that keeps the diffusivity's type concrete.
+        for kw in (Dict(:Khdiff_water => -1.0, :C_s => 0.2, :K_min => 5.0, :Sc_t => 1.0),
+                   Dict(:Khdiff_water => 500.0))
+            mtile_hw, kDim_hw = build_mc_tile(extra_params = merge(Dict(:N_r => 1.0e-3), kw),
+                                              precipitation = true,
+                                              extra_options = merge(ice_opts,
+                                                  Dict{Symbol,Any}(
+                                                      :condensate_transform => :bhyp,
+                                                      :rain_transform => :bhyp,
+                                                      :rain_number_transform => :bhyp,
+                                                      :ice_transform => :bhyp)))
+            moist_compressible_XZ(mtile_hw, 1, kDim_hw, 2)    # compile
+            @test (@allocations moist_compressible_XZ(mtile_hw, 1, kDim_hw, 2)) == 0
+        end
     end
 
     @testset "per-column allocations stay zero on the axisymmetric cylinder" begin

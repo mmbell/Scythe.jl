@@ -106,10 +106,9 @@ function validate(cfg::RunConfig)
     (ice && mp.rain_moments == 1) && error(
         "config: physics.microphysics.ice = \"ishmael\" requires two-moment rain; set " *
         "physics.microphysics.rain_moments = 2 (or 0 = auto)")
-    (ice && hm.water) && error(
-        "config: physics.horizontal_mixing.water = true is refused with " *
-        "physics.microphysics.ice = \"ishmael\" (the water mixing is not energy consistent " *
-        "and is refused by the ice set)")
+    # physics.horizontal_mixing.water = true with ISHMAEL is allowed: the leg mixes all twelve
+    # ice slots (mass, number and both volume moments) with the one K the vapor and liquid
+    # take (`mc_water_mixing!`). It is still NOT energy consistent, ice or no ice.
     (ice && cfg.diagnostics.water_budget_trace > 0) && error(
         "config: diagnostics.water_budget_trace > 0 is refused with " *
         "physics.microphysics.ice = \"ishmael\" (the budget probe is warm-rain only)")

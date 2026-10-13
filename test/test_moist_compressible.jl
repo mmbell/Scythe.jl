@@ -5097,8 +5097,10 @@ using Springsteel
             @test_throws ErrorException Scythe.advance_column(m, 1, 1)
             mod.physical_params[:Kvdiff_water] = 0.0
 
+            # The HORIZONTAL water mixing is no longer refused: it mixes all twelve ice slots
+            # with the one K (test_horizontal_water_mixing.jl).
             mod.physical_params[:Khdiff_water] = 1.0
-            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            @test Scythe.advance_column(m, 1, 1) === nothing
             mod.physical_params[:Khdiff_water] = 0.0
 
             mod.options[:louis_bl] = true
