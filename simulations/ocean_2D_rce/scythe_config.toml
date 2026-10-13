@@ -12,8 +12,8 @@
 #   - physics.surface: fluxes on, stability-aware surface layer
 #   - physics.microphysics: ISHMAEL ice, two-moment rain, bhyp control-variable transforms
 #   - physics.radiation: diurnal all-sky RRTMGP
-#   - physics.horizontal_mixing: none -- Smagorinsky exists only for the cylindrical sets,
-#     so this case is horizontally inviscid apart from the B-spline spectral filter (l_q = 2.0)
+#   - physics.horizontal_mixing: none -- this case is horizontally inviscid apart from the
+#     B-spline spectral filter (l_q = 2.0); Smagorinsky (Ls = 0 default: C_s * dx) is opt-in
 #   - physics.sponge: the Durran & Klemp (1983) sponge, alpha 0.02 /s, z_damp 17 km
 #   - numerics.state_dependent_si = true: implicit acoustic coefficients from the current
 #     column state; this case (and examples/full.toml) are the FIRST to exercise it on XZ -- it had

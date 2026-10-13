@@ -352,7 +352,7 @@ HORIZONTAL eddy mixing only; vertical mixing belongs to `boundary_layer`.
 | key | type | default | description |
 |---|---|---|---|
 | `scheme` | string (enum) | `"none"` | `smagorinsky` (horizontal-plane strain, every geometry), `constant` or `none`. |
-| `Ls` | float | `500.0` | Smagorinsky length scale [m], the same on every patch (default = the axisym TC's tuned value); 0 = use `C_s` × each patch's horizontal cell width instead, on any geometry. |
+| `Ls` | float | `0.0` | Smagorinsky length scale [m]; 0 (the default) = `C_s` × each patch's horizontal cell width, on any geometry; > 0 = that absolute length, the same on every patch. |
 | `C_s` | float | `0.2` | Smagorinsky constant; read ONLY when `Ls = 0`, then the length scale is `C_s·Δx` per patch (Δx = that patch's i-cell width). |
 | `K_min` | float | `25.0` | Smagorinsky viscosity floor [m²/s]. |
 | `K` | float | `0.0` | constant momentum viscosity [m²/s] (`constant` only). |
@@ -739,7 +739,7 @@ Retired (refused with a message):
 | `Kvdiff` | float |  | vertical momentum eddy viscosity [m^2/s]; required key (moist_compressible.jl, exact_si.jl) |
 | `Kvdiff_heat` | float |  | vertical heat diffusivity [m^2/s]; default Kvdiff (moist_compressible.jl, exact_si.jl) |
 | `Kvdiff_water` | float |  | vertical water diffusivity [m^2/s]; refused with ice and two-moment rain (moist_compressible.jl, exact_si.jl) |
-| `Ls` | float | `physics.horizontal_mixing.Ls` (refused in `[extra.physical_params]`) | Smagorinsky length scale [m]; > 0 turns Smagorinsky on with this length on every patch (moist_compressible.jl) |
+| `Ls` | float | `physics.horizontal_mixing.Ls` (refused in `[extra.physical_params]`) | Smagorinsky length scale [m]; > 0 = this absolute length on every patch, 0 = C_s * each patch's cell width (moist_compressible.jl) |
 | `Ls_bl` | float |  | PV-mixing model: boundary-layer mixing length [m] (shallowWaterModels.jl) |
 | `Ls_free` | float |  | PV-mixing model: free-atmosphere mixing length [m] (shallowWaterModels.jl) |
 | `N_0` | float | `physics.microphysics.N_0` (refused in `[extra.physical_params]`) | rain DSD intercept [1/m^4] (moist_compressible.jl, netcdf_output.jl) |

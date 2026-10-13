@@ -419,7 +419,9 @@ end
 end
 
 @testset "horizontal mixing: the Smagorinsky length rule" begin
-    @test HorizontalMixing().Ls == 500.0 && HorizontalMixing().C_s == 0.2
+    # Default: Ls = 0, i.e. the grid-scaled C_s * dx on every patch of every geometry. The
+    # absolute 500 m the axisymmetric TC was tuned with is pinned in that case's own config.
+    @test HorizontalMixing().Ls == 0.0 && HorizontalMixing().C_s == 0.2
     mktempdir() do dir
         cf(xs...) = load_config(set = ["output.dir=$(dir)", xs...])
         SM = "physics.horizontal_mixing.scheme=smagorinsky"
@@ -432,11 +434,15 @@ end
         @test !haskey(p, :Ls) && !haskey(p, :C_s)
         @test Scythe.smagorinsky_length(build_model(cf())) == 0.0
 
-        # XZ, Ls > 0 (the default 500): absolute, :C_s not emitted.
-        m = build_model(cf(SM))
+        # XZ, Ls > 0 set explicitly: absolute, :C_s not emitted.
+        m = build_model(cf(SM, "physics.horizontal_mixing.Ls=500"))
         @test m.physical_params[:Ls] == 500.0 && !haskey(m.physical_params, :C_s)
         @test Scythe.smagorinsky_length(m) == 500.0
-        # XZ, Ls = 0: C_s times this grid's cell width (300 km / 50 cells).
+        # XZ, Ls left at its default 0: C_s times this grid's cell width (300 km / 50 cells),
+        # the same as writing Ls = 0 explicitly.
+        m = build_model(cf(SM))
+        @test m.physical_params[:Ls] == 0.0 && m.physical_params[:C_s] == 0.2
+        @test Scythe.smagorinsky_length(m) == 0.2 * (300.0e3 / 50)
         m = build_model(cf(SM, "physics.horizontal_mixing.Ls=0"))
         @test m.physical_params[:C_s] == 0.2
         @test Scythe.smagorinsky_length(m) == 0.2 * (300.0e3 / 50)
@@ -452,9 +458,12 @@ end
                                               "physics.horizontal_mixing.C_s=-0.2"))))
 
         # NESTS: the C_s length is per patch, from each patch's own cell width; an absolute
-        # Ls is the same on every patch (the TC as shipped: bitwise what it was).
+        # Ls is the same on every patch. The TC as shipped pins Ls = 500 in its own config,
+        # so it is bitwise what it was before the default moved to 0.
         tc = joinpath(pkgdir(Scythe), "simulations", "tc_axisym", "scythe_config.toml")
         tcf(xs...) = load_config(tc; set = ["output.dir=$(dir)", xs...])
+        @test tcf().physics.horizontal_mixing.Ls == 500.0
+        @test tcf().physics.horizontal_mixing.Ls != HorizontalMixing().Ls   # a pin, not the default
         models, _ = Scythe.build_nest(build_model(tcf()))
         @test length(models) > 1
         @test all(Scythe.smagorinsky_length(mm) == 500.0 for mm in models)

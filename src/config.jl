@@ -447,7 +447,7 @@ end
 `[physics.horizontal_mixing]` — HORIZONTAL eddy mixing only; vertical mixing belongs to `boundary_layer`.
 
 - `scheme::Symbol` — `smagorinsky` (horizontal-plane strain, every geometry), `constant` or `none`.
-- `Ls::Float64` — Smagorinsky length scale [m], the same on every patch (default = the axisym TC's tuned value); 0 = use `C_s` × each patch's horizontal cell width instead, on any geometry.
+- `Ls::Float64` — Smagorinsky length scale [m]; 0 (the default) = `C_s` × each patch's horizontal cell width, on any geometry; > 0 = that absolute length, the same on every patch.
 - `C_s::Float64` — Smagorinsky constant; read ONLY when `Ls = 0`, then the length scale is `C_s·Δx` per patch (Δx = that patch's i-cell width).
 - `K_min::Float64` — Smagorinsky viscosity floor [m²/s].
 - `K::Float64` — constant momentum viscosity [m²/s] (`constant` only).
@@ -459,10 +459,11 @@ end
 THE LENGTH SCALE RULE is one rule on every geometry: `Ls > 0` is an absolute length used
 unchanged on every patch (and `C_s` is not read); `Ls = 0` makes it `C_s·Δx`, with Δx the
 patch's own horizontal cell width `(iMax − iMin)/num_cells_i` (the same Δx the MYNN
-scale-aware taper uses), so it refines with a nest. The default `Ls = 500` is the absolute
-length the axisymmetric TC was tuned with, kept so that a TC configuration which leaves `Ls`
-unset is unchanged; a run that wants the grid-scaled form — the XZ slice is the case it was
-written for — sets `Ls = 0` (and `C_s`, default 0.2, if not the default).
+scale-aware taper uses), so it refines with a nest. The default is `Ls = 0`: the grid-scaled
+length is the closure's own definition and the only one that is resolution-general, so every
+geometry gets it unless a configuration says otherwise. The axisymmetric TC was tuned with an
+absolute `Ls = 500` m and pins that value in `simulations/tc_axisym/scythe_config.toml`, so it
+is unchanged; any other configuration that relied on the old 500 m default must now set it.
 
 What "strain" means: the HORIZONTAL-PLANE deformation only, `K = max(L² √(2 S_ij S_ij), K_min)`
 over i, j in the horizontal plane. On the cylinders `S_rr = ∂u/∂r`, `S_λλ = (1/r)∂v/∂λ + u/r`,
@@ -473,7 +474,7 @@ deformation twice.
 """
 Base.@kwdef struct HorizontalMixing <: AbstractConfigSection
     scheme::Symbol = :none
-    Ls::Float64 = 500.0
+    Ls::Float64 = 0.0
     C_s::Float64 = 0.2
     K_min::Float64 = 25.0
     K::Float64 = 0.0
@@ -930,7 +931,7 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :Kvdiff_water  => (Float64, "vertical water diffusivity [m^2/s]; refused with ice and two-moment rain (moist_compressible.jl, exact_si.jl)"),
     :Pr_t          => (Float64, "turbulent Prandtl number for Smagorinsky heat mixing (moist_compressible.jl)"),
     :Sc_t          => (Float64, "turbulent Schmidt number for Smagorinsky water mixing (moist_compressible.jl)"),
-    :Ls            => (Float64, "Smagorinsky length scale [m]; > 0 turns Smagorinsky on with this length on every patch (moist_compressible.jl)"),
+    :Ls            => (Float64, "Smagorinsky length scale [m]; > 0 = this absolute length on every patch, 0 = C_s * each patch's cell width (moist_compressible.jl)"),
     :C_s           => (Float64, "Smagorinsky constant; read only when Ls is 0 or absent, then > 0 turns Smagorinsky on with length C_s * (patch i-cell width) (moist_compressible.jl)"),
     :K_min         => (Float64, "Smagorinsky viscosity floor [m^2/s] (moist_compressible.jl)"),
     :l_inf         => (Float64, "Louis asymptotic mixing length [m] (moist_compressible.jl)"),
