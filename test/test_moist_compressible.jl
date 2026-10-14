@@ -2386,10 +2386,20 @@ using Springsteel
         # channel need rho_r >= RHO_R_MIN). Liquid -> liquid conversion must leave every
         # thermodynamic slot BIT-identical to a precipitation-off run; only rho_r grows
         # (cloud is the diagnostic residual, so it shrinks automatically).
+        #
+        # Pinned to `cloud_evap_realization = false`. With the cloud donor's realization ON,
+        # `AUTO_COLL` joins the cloud's ONE conductance (`cloud_evap_realized`, the share
+        # rule), so switching autoconversion on lowers `J₀(κ_tot Δt)` and with it the
+        # realized EVAPORATION at every evaporating cloud point -- the thermodynamic slots then
+        # differ from the precipitation-off arm by ~3e-5 relative (measured), through the
+        # evaporation and not through the conversion. What this test pins is the conversion's
+        # own inertness, so it runs on the unrealized draw; the share itself is
+        # test_cloud_evap_realization.jl's.
         mktempdir() do tmpdir
             args = (; q_l=3.0e-3, kDim=16, num_cells=8)
             function run_once(precip)
-                mtile, patch, model, _ = make_mc_mtile(tmpdir; args..., precipitation=precip)
+                mtile, patch, model, _ = make_mc_mtile(tmpdir; args..., precipitation=precip,
+                    extra_options=Dict{Symbol,Any}(:cloud_evap_realization => false))
                 ncols = div(size(patch.physical, 1), model.grid_params.kDim)
                 for c in 1:ncols; Scythe.advance_column(mtile, c, 1); end
                 return mtile
@@ -4787,9 +4797,14 @@ using Springsteel
         mktempdir() do tmpdir
             args = (; q_l = 3.0e-3, kDim = 16, num_cells = 8)
             two = Dict{Symbol,Any}(:rain_moments => 2)
+            # On the unrealized cloud draw, for the reason given in "autoconversion is
+            # thermodynamically inert": with the cloud donor's realization on, a different
+            # conversion closure is a different share of the cloud's one J₀ and so a different
+            # realized evaporation.
             function run_once(precip, opts)
                 m, _, mod, _ = make_mc_mtile(tmpdir; args..., precipitation = precip,
-                                             extra_options = opts)
+                    extra_options = merge(opts,
+                        Dict{Symbol,Any}(:cloud_evap_realization => false)))
                 ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
                 for c in 1:ncols; Scythe.advance_column(m, c, 1); end
                 return m
@@ -6135,7 +6150,14 @@ using Springsteel
                                               n_i = 1.0e6, rho_r = 1.0e-4, n_r = 1.0e3,
                                               ts = 1.0,
                                               extra_options = Dict{Symbol,Any}(
-                                                  :ice_attr_census => true))
+                                                  :ice_attr_census => true,
+                                                  # The rain-donor breach this precondition
+                                                  # needs is a ONE-ULP rounding of a saturated
+                                                  # J₀; the cloud donor's realization moves the
+                                                  # riming of cloud and lands the fixture at
+                                                  # 0.9999999999999984 instead. The cloud is
+                                                  # not what this test is about.
+                                                  :cloud_evap_realization => false))
             ncols = div(size(m.tile.physical, 1), mod.grid_params.kDim)
             m.mc_water_stats .= 0.0
             for t in 1:6, c in 1:ncols

@@ -141,6 +141,14 @@ const MC_SCRATCH_SLOTS = (
     # themselves before λ and N are formed, so the pair, the slot and the census all read the
     # one realized conductance. Exactly 1.0 wherever the rain does not evaporate.
     :kappa_ev, :f_rain,
+    # The CLOUD donor's counterpart (`cloud_evap_realized`): `kappa_c` is its WARM sink
+    # conductance `(max(−Q̇_c, 0) + AUTO_COLL)/ρ_c` at the frozen state, written right after
+    # the `AUTO_COLL` closure and read again inside `mc_ice_sources!`, which completes the
+    # cloud donor's total with the ice legs. `f_cloud` is that donor's factor `J₀(κ_tot Δt)` —
+    # the warm value, overwritten with the full one wherever the ice loop runs — applied to
+    # every cloud sink: `AUTO_COLL`, the evaporation (`Q̇_c`/`1/τ_c` clipped, `qc_bar`
+    # unclipped) and the ice legs' `f_qc`. Exactly 1.0 wherever the cloud has no sink.
+    :kappa_c, :f_cloud,
     :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
     # Two-moment rain number (options[:rain_moments] == 2). Same six-way shape the mass
     # slot has — control variable, its gradient, the Jacobian, the recovered density, the
@@ -1919,19 +1927,24 @@ const MC_POP_WARNED = MC_ATTR_LAST + 5
 """Last row of the population block."""
 const MC_POP_LAST = MC_POP_WARNED
 """
-The CLOUD-EVAPORATION BOUND census of `mc_water_stats`, written in `mc_driver!` wherever
-[`cloud_evap_bound`](@ref) changes the cloud channel's draw, and reported by
+The CLOUD-EVAPORATION REALIZATION census of `mc_water_stats`, written in `mc_driver!` wherever
+[`cloud_evap_realized`](@ref) changes the cloud channel's draw, and reported by
 [`mc_stiffness_trace`](@ref).
 
 | constant | quantity |
 |---|---|
-| `MC_CEVAP_PTS`  | cumulative gridpoint-steps at which the step-mean cloud evaporation exceeded the cloud present |
-| `MC_CEVAP_HELD` | cumulative evaporation withheld, `Σ (q̄_c,bounded − q̄_c)·Δt` over points and steps [kg/m³ · gridpoint-steps] |
+| `MC_CEVAP_PTS`  | cumulative gridpoint-steps at which the cloud donor's factor `J₀(κ_c,tot Δt) < 1` realized the step-mean cloud evaporation below its unrealized value |
+| `MC_CEVAP_HELD` | cumulative evaporation withheld, `Σ (q̄_c,realized − q̄_c)·Δt` over points and steps [kg/m³ · gridpoint-steps] |
 | `MC_CEVAP_MAX`  | run-maximum of that withheld mass at one point in one step [kg/m³] |
 
+`MC_CEVAP_PTS` counts EVERY evaporating point with cloud (`J₀ < 1` wherever the reservoir has a
+sink — see `cloud_evap_realized`), so it is a measure of where the realization acts, not of
+where something was "exceeded"; `HELD` and `MAX` are the informative rows. Evaporation only:
+the same factor on `AUTO_COLL` and the ice legs is not counted here.
+
 CUMULATIVE, and written in BOTH modes, like the anchor and population blocks:
-`options[:cloud_evap_realization] = false` stops the bound, never the measurement, so the off
-arm reports where it WOULD have acted and by how much.
+`options[:cloud_evap_realization] = false` stops the realization, never the measurement, so the
+off arm reports what it WOULD have withheld.
 """
 const MC_CEVAP_PTS = MC_POP_LAST + 1
 @doc (@doc MC_CEVAP_PTS)
@@ -2194,60 +2207,111 @@ habit moment carries no water and never enters the partition.
     CLOUD_EVAP_REALIZATION_DEFAULT
 
 The value `options[:cloud_evap_realization]` takes when the key is absent. See
-[`cloud_evap_bound`](@ref).
+[`cloud_evap_realized`](@ref).
 """
 const CLOUD_EVAP_REALIZATION_DEFAULT = true
 
 """
-    cloud_evap_bound(qc_bar, rho_c, dt) -> Float64
+    cloud_donor_conductance(qdot_c, auto_coll, rho_c) -> Float64
 
-The CLOUD donor's bound on its evaporation draw (`options[:cloud_evap_realization]`, default
-true): the step-mean cloud phase change `qc_bar` [kg m⁻³ s⁻¹] returned unchanged unless it
-would evaporate more than the cloud present over the step, in which case exactly that cloud:
+The CLOUD reservoir's WARM sink conductance at the frozen state, `κ_c = (max(−Q̇_c, 0) +
+max(AUTO_COLL, 0))/ρ_c` [s⁻¹]: the evaporation of `qss_condensation_rates` and the conversion
+to rain, written on the reservoir they both draw on so they can enter ONE total with the ice
+legs (see [`cloud_evap_realized`](@ref)). Condensation is a source and contributes nothing —
+the `max` on `Q̇_c` is a sign test, not a limiter, and so is the one on `AUTO_COLL`, which is
+non-negative by construction. An exact `0.0` where there is no cloud (`ρ_c ≤ 0`), which is
+what keeps the cloud-free path bitwise.
+"""
+@inline function cloud_donor_conductance(qdot_c::Float64, auto_coll::Float64, rho_c::Float64)
+    rho_c > 0.0 || return 0.0
+    return (max(-qdot_c, 0.0) + max(auto_coll, 0.0)) / rho_c
+end
 
-    qc_bar                    if qc_bar ≥ 0 or −qc_bar·Δt ≤ max(ρ_c, 0)
-    −max(ρ_c, 0)/Δt           otherwise (an exact +0.0 where max(ρ_c, 0) = 0)
+"""
+    cloud_evap_realized(qc_bar, f_c) -> Float64
 
-**Why it is needed.** The `Q_ss` relaxation pair's exponential propagator bounds the
+The CLOUD donor's realization of its evaporation draw (`options[:cloud_evap_realization]`,
+default true): an evaporating step-mean cloud phase change `qc_bar < 0` [kg m⁻³ s⁻¹] is realized
+as `qc_bar · f_c`, where `f_c = J₀(κ_c,tot Δt)` is the cloud reservoir's ONE donor factor; the
+condensation side (`qc_bar ≥ 0`) is returned untouched, `===`.
+
+**Why the cloud needs it.** The `Q_ss` relaxation pair's exponential propagator bounds the
 SUPERSATURATION, not the cloud: in subsaturated air the step-mean evaporation is the vapor
 deficit times the cloud's conductance, `≈ Δt·|Q̄_ss|/((1 + 𝒬_s)τ_c)` over a step, and nothing
-compares it with `ρ_c` — `1/τ_c` falls only like `ρ_c^{1/3}` (like `ρ_c` once the closure
+compared it with `ρ_c` — `1/τ_c` falls only like `ρ_c^{1/3}` (like `ρ_c` once the closure
 counts 1 μm drops), so wherever `Δt/τ_c` times the deficit exceeds the cloud — a thin cloud in
-dry air, or a stiff step — the draw is larger than the reservoir. The cloud slot then falls
+dry air, or a stiff step — the draw was larger than the reservoir. The cloud slot then fell
 only to `ν ≈ 0` (its recovery cannot go below zero) while the pressure, the vapor and `Q_ss`
 took the FULL draw: latent cooling and vapor for cloud that was not there. Measured on the 2-D
 RCE at a convective burst peak (2026-10-14): ~1.1 K of spurious cooling per 10 min.
 
-**The rain's sibling, not its twin.** The rain channel's bound
-(`options[:rain_evap_realization]`) is a `J₀` realization factor on the state-`n` conductance
-because the rain shares its reservoir with the ice legs and that construction is what bounds
-the SUM. The cloud's evaporation is bounded by itself, at the step-mean, because that is the
-number every consumer reads: it is applied in the ETD pre-compute to the very `qc_bar` that
-builds `dv` (vapor), `d1` (pressure), `d9 = Δt·J_c·qc_bar` (the cloud slot, through its own
-Jacobian, exactly as every other cloud increment is) and — through `−Δt(1 + 𝒬_s)·Δq̄_c` — the
-propagated `Q_ss^{n+1}`, so the exchange closes on the cloud removed. Where the liquid drive is
-CLIPPED the step-mean IS the frozen rate, so the bound is applied there to `Q̇_c` and `1/τ_c`
-at state `n` instead (the rain's fold site), where it reaches the `N` that carries a clipped
-flux. E_t carries no phase-change term and is untouched either way.
+**The rule: a realization factor, not a cap.** Every donor-reservoir sink in this file is
+rate-limited by the step-mean realization factor of an exponential relaxation,
+[`relaxation_realization`](@ref)`(rate, reservoir, Δt) = J₀(κΔt) = (1 − e^{−κΔt})/(κΔt)` —
+an INTEGRATOR coefficient multiplying a rate, never a `Δt` written into the rate. It tends to
+1 as `Δt → 0` (the realized draw is the rate to `O(κΔt)`, so the scheme converges to the same
+ODE), and as `Δt → ∞` the converted mass `rate·J₀·Δt = ρ(1 − e^{−κΔt})` tends to the
+reservoir and never reaches it: no `min`, no branch, no kink where a cap would engage. The
+hard cap this replaces (9acd5b8, `cloud_evap_bound`: `−ρ_c/Δt` past the reservoir, else the
+identity) was exactly that kink, and its limiter was a `Δt` in a rate law — the step size
+changed the equation being solved wherever it bound.
 
-A hard bound rather than a smooth factor, deliberately: it is the identity (`===`) everywhere
-it does not bind, so a column with ample cloud is BITWISE the unbounded answer, and where it
-binds the realized draw is the reservoir and not an approximation to it. The condensation side
-(`qc_bar ≥ 0`) is never touched. Not shared with `AUTO_COLL` or the ice legs on the cloud,
-which stay on the multistep with their own realization (`f_qc`).
+**The SHARE: one conductance for the whole cloud reservoir.** Four sinks draw on `ρ_c` in one
+step: evaporation, autoconversion + collection (`AUTO_COLL`), and with ice the homogeneous
+freezing `ṁ_hf,c` and the cloud half of every species' riming (`prdr₀_c`). Per the share rule
+they are realized on the reservoir's TOTAL conductance and each takes `rate_j·J₀(κ_tot Δt)`,
+so it is the SUM that is bounded, not each sink separately — two caps (or two factors) on one
+reservoir let the draws add to two reservoirs. `κ_tot` is built ONCE per point:
+
+  * the warm part `κ_c` = [`cloud_donor_conductance`](@ref)`(Q̇_c, AUTO_COLL, ρ_c)`, formed in
+    `mc_driver!` right after the `AUTO_COLL` closure (moist_compressible.jl:8616), where
+    the warm-path factor `f_cloud = J₀(κ_c Δt)` is written;
+  * with ice on, `mc_ice_sources!` completes it — `_ice_donor_factors(...; kc = κ_c)` adds
+    `κ_c q_c` to `ṁ_hf,c + Σ prdr₀_c` (:5633), so the ice legs' `f_qc` IS `f_cloud`, and
+    that value overwrites the column at every gridpoint (:6601; bitwise the warm one where
+    no ice leg draws);
+  * the fold below the ice block then applies that one `f_cloud` to `AUTO_COLL` (:8808;
+    and, two-moment, to its rain-number partner `n_auto`, the same collisions), and to `Q̇_c`
+    and `1/τ_c` where the liquid drive is CLIPPED (:8826; the step-mean IS the frozen rate
+    there and its flux lives in `N`, so it must be realized before `etd_nl` is formed — the
+    rain's fold site);
+  * where the drive is UNCLIPPED the ETD pre-compute (:9878) applies it to the step-mean
+    `qc_bar` — the one number that builds `dv` (vapor), `d1` (pressure), `d9 = Δt·J_c·qc_bar`
+    (the cloud slot, through its own Jacobian) — and `Q_ss^{n+1}` gives back the unrealized part,
+    `−Δt(1 + 𝒬_s)·Δq̄_c`, so the exchange closes on the cloud actually removed. E_t carries no
+    phase-change term and is untouched.
+
+**What the evaporation's conductance is, and what that costs.** The evaporation enters `κ_tot`
+at its FROZEN state-`n` rate `Q̇_c`, exactly as the rain's does (`kappa_ev`): the step-mean
+`qc_bar` does not exist until the propagator has run, which is after the ice legs and
+`AUTO_COLL` have to be realized, and making the ice legs wait for it would mean restructuring
+the step. Where the drive is clipped the two are the same number; where it is unclipped the
+realized draw is `qc_bar·J₀(κ_tot Δt)` with `κ_tot` built on `Q̇_c`, so the bound on the SUM is
+exact when `|q̄_c| ≤ |Q̇_c|` (the relaxing `Q_ss` decays toward its equilibrium over the step,
+which is the usual case) and holds to `O(Δt)` otherwise. A sign flip inside the step (`Q̇_c ≥ 0`,
+`qc_bar < 0`) leaves the evaporation out of `κ_tot` and realizes it on the other sinks' factor
+alone — `1.0`, the unrealized draw, where it is the only one.
+
+**Not "bitwise where it does not bind".** That argument belonged to the cap and is retired with
+it: `J₀ < 1` at EVERY evaporating point with cloud, so every such point's draw — and, through
+the share, its `AUTO_COLL` and ice legs — is changed, by `O(κΔt)` where the cloud is ample.
+That is correct, not a cost: `J₀` is the exact step-mean of the depletion the rate implies, and
+the rate taken at face value over the whole step was the first-order error the cap only ever
+truncated at the reservoir. What IS bitwise: the zero-cloud path (`κ_c = 0` and
+`relaxation_realization` returns an exact `1.0` at a zero rate or reservoir), every cloud-free
+point, the condensation itself (a condensing point's `AUTO_COLL` and ice legs still take the
+factor), and the whole switch-off arm (`options[:cloud_evap_realization] = false`:
+`f_qc` loses the `κ_c` term, `AUTO_COLL` and the evaporation are not scaled — the pre-9acd5b8
+unbounded draw); the census (`MC_CEVAP_*`) still measures in both modes.
 """
-@inline function cloud_evap_bound(qc_bar::Float64, rho_c::Float64, dt::Float64)
-    qc_bar < 0.0 || return qc_bar
-    avail = max(rho_c, 0.0)
-    (-(qc_bar * dt)) > avail || return qc_bar
-    return avail > 0.0 ? -(avail / dt) : 0.0
-end
+@inline cloud_evap_realized(qc_bar::Float64, f_c::Float64) =
+    qc_bar < 0.0 ? qc_bar * f_c : qc_bar
 
 """
     _cloud_evap_census!(st, tid, held)
 
-Record one binding of [`cloud_evap_bound`](@ref) — `held` the withheld evaporation over the
-step [kg/m³] — into the `MC_CEVAP_*` rows. A measurement only.
+Record one realization of [`cloud_evap_realized`](@ref) — `held` the withheld evaporation over
+the step [kg/m³] — into the `MC_CEVAP_*` rows. A measurement only.
 """
 @inline function _cloud_evap_census!(st::Matrix{Float64}, tid::Int, held::Float64)
     size(st, 2) == 0 && return nothing
@@ -5176,7 +5240,7 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
   max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))
   population reconciliation (number-less ice mass rho_empty; 0 while every species with mass carries number):
   max rho_empty = $(maximum(view(st, MC_POP_MAX, :))) kg/m^3, (gridpoint x species)-steps = $(Int(sum(view(st, MC_POP_PTS, :)))), mass to rain = $(sum(view(st, MC_POP_RAIN, :))) kg/m^3, ice number seeded = $(sum(view(st, MC_POP_SEED, :))) /m^3 (seed = :$(get(mtile.model.options, :ice_population_seed, :local)))
-  cloud evaporation bound (step-mean draw past the cloud present; $(get(mtile.model.options, :cloud_evap_realization, CLOUD_EVAP_REALIZATION_DEFAULT) ? "BOUNDED" : "OFF: measured, not applied")):
+  cloud evaporation realization (J0 on the cloud donor's total conductance; $(get(mtile.model.options, :cloud_evap_realization, CLOUD_EVAP_REALIZATION_DEFAULT) ? "REALIZED" : "OFF: measured, not applied")):
   gridpoint-steps = $(Int(sum(view(st, MC_CEVAP_PTS, :)))), withheld (gridpoint-sum) = $(sum(view(st, MC_CEVAP_HELD, :))) kg/m^3, max at one point = $(maximum(view(st, MC_CEVAP_MAX, :))) kg/m^3$areport"""
     return nothing
 end
@@ -5435,7 +5499,18 @@ const ISHMAEL_M_LARGE = let a3 = 1.0e-3^3,
 end
 
 """
-    _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt) -> (f_qc, f_qr, f_nr)
+    _cloud_ice_draw(hf, p1, p2, p3) -> Float64
+
+The ICE legs on the cloud reservoir, in mixing-ratio units: homogeneous freezing `ṁ_hf,c` plus
+the cloud half of every species' riming `prdr₀_c` — the sum [`_ice_donor_factors`](@ref) forms
+`f_qc` on, kept in one place so the census-only factor of the realization-off arm in
+`mc_ice_sources!` cannot drift from it.
+"""
+@inline _cloud_ice_draw(hf, p1, p2, p3) =
+    hf.mim + ((p1.prdr0_c + p2.prdr0_c) + p3.prdr0_c)
+
+"""
+    _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt; kc = 0.0) -> (f_qc, f_qr, f_nr)
 
 The realization factor of each LIQUID DONOR RESERVOIR at one gridpoint: cloud mass, rain mass,
 rain number. One factor per reservoir, formed from that reservoir's TOTAL sink conductance over
@@ -5456,7 +5531,11 @@ the supersaturation pair, where `λ = Σ τ⁻¹` and each channel takes its sha
 
 # The legs, by reservoir
 
-  * `q_c`  homogeneous freezing `ṁ_hf,c`, and the CLOUD half of every species' riming;
+  * `q_c`  homogeneous freezing `ṁ_hf,c`, the CLOUD half of every species' riming, and — with
+           `options[:cloud_evap_realization]` — the cloud's WARM sinks, evaporation and
+           `AUTO_COLL`, through the conductance `kc` the caller supplies
+           ([`cloud_donor_conductance`](@ref)); the factor is then the cloud donor's ONE
+           `f_cloud`, applied to every one of its sinks ([`cloud_evap_realized`](@ref));
   * `q_r`  homogeneous freezing `ṁ_hf,r`, Bigg `ṁ_Bigg`, the RAIN half of every species'
            riming, every species' ice-rain collection `dQRfzri`, and — since Stage 2b —
            EVAPORATION, through the conductance `kev` the caller supplies;
@@ -5536,8 +5615,8 @@ Every factor is an exact `1.0` where its reservoir has no sink, which is what ke
 conversion-free path — and the whole warm and dry path, where this block never runs — bitwise.
 """
 @inline function _ice_donor_factors(hf, bg, p1, p2, p3, qc::Float64, qr::Float64,
-                                    nr::Float64, kev::Float64, dt::Float64)
-    rim_c = (p1.prdr0_c + p2.prdr0_c) + p3.prdr0_c
+                                    nr::Float64, kev::Float64, dt::Float64;
+                                    kc::Float64 = 0.0)
     rim_r = (p1.prdr0_r + p2.prdr0_r) + p3.prdr0_r
     col_q = (p1.rr.dQRfzri + p2.rr.dQRfzri) + p3.rr.dQRfzri
     col_n = (p1.rr.dNfzri + p2.rr.dNfzri) + p3.rr.dNfzri
@@ -5548,7 +5627,10 @@ conversion-free path — and the whole warm and dry path, where this block never
     # constant of proportionality.
     ev_r = kev * qr
     ev_n = kev * nr
-    f_qc = relaxation_realization(hf.mim + rim_c, qc, dt)
+    # The CLOUD's total: the ice legs plus its warm sinks (evaporation + AUTO_COLL) through
+    # the conductance `kc` the caller supplies (`cloud_evap_realized`). `kc = 0.0` adds an
+    # exact zero to a non-negative sum — the pre-realization factor, bitwise.
+    f_qc = relaxation_realization(_cloud_ice_draw(hf, p1, p2, p3) + kc * qc, qc, dt)
     f_qr = relaxation_realization((((hf.mimr + bg.mbiggr) + rim_r) + col_q) + ev_r, qr, dt)
     f_nr = relaxation_realization((((hf.nimr + bg.nbiggr) + nrn) + col_n) + ev_n, nr, dt)
     return (f_qc, f_qr, f_nr)
@@ -6210,7 +6292,8 @@ liquid that struck the crystal while no mass and no `L_f` move — TeX §Departu
 function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                          active::Bool, var_check_source::Bool, anchor_rates::Bool,
                          attr_census::Bool, agg_caps::Bool, rain_evap_real::Bool,
-                         shed::Bool, ice_n_real::Bool, rain_pop_gate::Bool,
+                         cloud_evap_real::Bool, shed::Bool, ice_n_real::Bool,
+                         rain_pop_gate::Bool,
                          tau_hf::Float64, tau_act::Float64, tau_vc::Float64,
                          stats, stats_tid::Int64)
 
@@ -6505,7 +6588,18 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         # the rain donor's total where ice legs also draw. Zero, hence inert, wherever the rain
         # is not evaporating or `options[:rain_evap_realization]` is off.
         kev = S.kappa_ev[i]
-        (f_qc, f_qr, f_nr) = _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt)
+        # The CLOUD donor's warm conductance (`kappa_c`, staged beside `AUTO_COLL`): its
+        # evaporation and its conversion to rain join the ice legs in ONE total, so `f_qc` is
+        # the cloud's single factor and every sink on the reservoir is realized on it
+        # (`cloud_evap_realized`). Written back to `f_cloud` at EVERY gridpoint, as `f_rain`
+        # is — bitwise the warm value where no ice leg draws. With the realization OFF the
+        # legs keep their ice-only factor (the pre-9acd5b8 construction, bitwise) and the
+        # column still receives the FULL factor, which only the census reads.
+        kc = S.kappa_c[i]
+        (f_qc, f_qr, f_nr) = _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt;
+                                                kc = cloud_evap_real ? kc : 0.0)
+        S.f_cloud[i] = cloud_evap_real ? f_qc :
+            relaxation_realization(_cloud_ice_draw(hf, p1, p2, p3) + kc * qc, qc, dt)
         # The rain donor's factor now covers every sink on the reservoir, so it — not the
         # warm-path `J₀(κ_evΔt)` this overwrites — is what the fold below the ice block puts
         # into `invtau_r`/`Qdot_r`, and hence into λ, into `N` and into the rain transfer.
@@ -7569,8 +7663,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # — i.e. it restores the pre-Stage-2b answer BITWISE, on the warm path as well as the ice
     # one. Forensics only. Env `SCYTHE_O01_EVAPREAL=0` in benchmarks/o01_rainfall.jl.
     rain_evap_real = get(model.options, :rain_evap_realization, true)::Bool
-    # The CLOUD donor's bound on its evaporation draw (`cloud_evap_bound`): default ON; `false`
-    # restores the unbounded draw bitwise. The `MC_CEVAP_*` census is written either way.
+    # The CLOUD donor's realization (`cloud_evap_realized`): every sink on the cloud —
+    # evaporation, AUTO_COLL, the ice legs — on ONE factor `J₀(κ_tot Δt)`. Default ON; `false`
+    # restores the pre-9acd5b8 unrealized draw bitwise (the ice legs' `f_qc` without the warm
+    # conductance, `AUTO_COLL` and the evaporation unscaled). The `MC_CEVAP_*` census is
+    # written either way.
     cloud_evap_real = get(model.options, :cloud_evap_realization,
                           CLOUD_EVAP_REALIZATION_DEFAULT)::Bool
     # STAGE 1b: whether each ICE SPECIES' NUMBER is realized on its OWN donor conductance
@@ -8502,6 +8599,26 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         fill!(Fnr_z, 0.0)
     end
 
+    # ── The CLOUD DONOR's warm conductance and its factor (`cloud_evap_realized`) ──────────
+    # HERE, the first point at which both warm sinks of the cloud exist: the evaporation
+    # `Q̇_c` (frozen at state `n` by the closure above, the rain's `kappa_ev` convention) and
+    # the conversion `AUTO_COLL`. `κ_c` is their sum over the reservoir, one conductance, and
+    # `J₀(κ_c Δt)` is the cloud's factor wherever no ice leg draws on it; `mc_ice_sources!`
+    # completes the total with `ṁ_hf,c` and the riming and overwrites the factor at every
+    # point it visits. Formed in the ISHMAEL mixing-ratio units (`q_c = max(ρ_c, 0)/ρ_d`) the
+    # ice loop forms it in, so the two expressions are bitwise the same number where the ice
+    # legs are zero. Formed in BOTH modes — the census measures what the off arm would have
+    # withheld — and applied only below (the fold), gated on `cloud_evap_real`. An exact
+    # `κ_c = 0`, `f = 1.0` with no cloud.
+    kappa_c = S.kappa_c
+    f_cloud = S.f_cloud
+    @inbounds for i in eachindex(kappa_c)
+        kc = cloud_donor_conductance(Qdot[i], AUTO_COLL[i], rho_c[i])
+        kappa_c[i] = kc
+        qc_i = max(rho_c[i], 0.0) / rho_d[i]
+        f_cloud[i] = relaxation_realization(kc * qc_i, qc_i, model.ts)
+    end
+
     # ── Ice: process sources and sedimentation ─────────────────────────────────
     #
     # Each of the twelve slots gets a source accumulator `SRC_*` (the `Q̇_{i,k}`, `Ṅ_k`, `Ȧ_k`,
@@ -8542,7 +8659,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_ice_sources!(S, mtile.ishmael_tables, model.ts, max_N_c,
                         get(model.options, :condensation, true)::Bool,
                         get(model.options, :ice_var_check, true)::Bool,
-                        ice_anchor_rts, ice_attr, ice_agg_caps, rain_evap_real, ice_shed,
+                        ice_anchor_rts, ice_attr, ice_agg_caps, rain_evap_real,
+                        cloud_evap_real, ice_shed,
                         ice_n_real, rain_pop_gate,
                         get(model.physical_params, :tau_homogeneous, 5.0),
                         get(model.physical_params, :tau_activation, 1.0),
@@ -8662,12 +8780,38 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # bound applied to the wrong sign. FROZEN at state `n`, like every classification the step
     # freezes.
     #
-    # The CLOUD's evaporation bound (`cloud_evap_bound`) acts HERE only where the drive is
-    # CLIPPED: a clipped channel's step-mean IS its frozen rate and its flux lives in `N`, so
-    # the bound has to reach `Q̇_c` and `1/τ_c` at state `n`, before `N` is formed from them —
-    # scaling the conductance by the same ratio keeps `Q̇_c(1 + 𝒬_s) = drive·τ_c^{-1}`, which is
-    # what `etd_nl` is written in. Where the drive is unclipped the bound acts on the step-mean
-    # in the ETD pre-compute instead. Identity wherever it does not bind.
+    # ── The REALIZED CLOUD SINKS (`cloud_evap_realized`) ────────────────────────────────
+    # `f_cloud` is final here for the same reason `f_rain` is: `mc_ice_sources!` has
+    # completed the cloud donor's total. ONE factor, every sink on the reservoir:
+    #
+    #   * `AUTO_COLL` — the conversion to rain, which is the SAME array the rain slot reads
+    #     as its source, so the liquid-to-liquid pair stays equal and opposite; under two
+    #     moments its rain-number partner `n_auto` takes the same factor (the same collisions;
+    #     accretion adds no drops), recomputed from the state-`n` arguments `AUTO_COLL` was
+    #     formed from rather than staged in a column. Nothing between the closure and this
+    #     point reads `AUTO_COLL` except `kappa_c` itself, which wants the unrealized rate.
+    #   * the EVAPORATION, where the drive is CLIPPED (in the loop below): a clipped channel's
+    #     step-mean IS its frozen rate and its flux lives in `N`, so the factor has to reach
+    #     `Q̇_c` and `1/τ_c` at state `n`, before `N` is formed from them — scaling both by the
+    #     one factor keeps `Q̇_c(1 + 𝒬_s) = drive·τ_c^{-1}`, which is what `etd_nl` is written
+    #     in. Where the drive is unclipped the factor acts on the step-mean `qc_bar` in the ETD
+    #     pre-compute instead. Only where the cloud EVAPORATES at state `n` — the `evap_now`
+    #     mirror: a donor factor bounds a draw, and condensation is a source.
+    #   * the ice legs already carry it, as `f_qc`.
+    #
+    # Gated on `cloud_evap_real`; the census of the evaporation is written in both modes.
+    if cloud_evap_real && precipitation
+        @inbounds for i in eachindex(AUTO_COLL)
+            fc = f_cloud[i]
+            ac = AUTO_COLL[i]
+            (fc < 1.0 && ac > 0.0) || continue
+            AUTO_COLL[i] = fc * ac
+            if rain_2m
+                n_auto = rain_autoconversion_2m(rho_c[i], rho_d[i], max_N_c)[2]
+                NR_SRC[i] += (fc - 1.0) * n_auto
+            end
+        end
+    end
     cev_st = mtile.mc_water_stats
     cev_tid = Threads.threadid()
     if get(model.options, :condensation, true)::Bool
@@ -8679,11 +8823,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             invtau = invtau_c[i] + invtau_r[i]
             drive_cap = max(rho_v[i], 0.0) - rho_vs[i]
             if drive_cap < Q_ss[i]
-                qcb = cloud_evap_bound(Qdot[i], rho_c[i], model.ts)
+                qcb = cloud_evap_realized(Qdot[i], f_cloud[i])
                 if qcb != Qdot[i]
                     _cloud_evap_census!(cev_st, cev_tid, (qcb - Qdot[i]) * model.ts)
                     if cloud_evap_real
-                        invtau_c[i] = invtau_c[i] * (qcb / Qdot[i])
+                        invtau_c[i] = f_cloud[i] * invtau_c[i]
                         Qdot[i] = qcb
                         invtau = invtau_c[i] + invtau_r[i]
                     end
@@ -9706,30 +9850,32 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # classification is untouched: it is a statement about the drive, not about the rate,
         # and the fold applies only where the channel is a SINK of the rain at state `n` —
         # the `evap_now` mirror of `sub_now`, since a donor factor bounds a draw and rain
-        # condensation is a source. (The CLOUD channel is not realized this way: `q_c` carries
-        # its own donor factor for the ice legs, and its evaporation is BOUNDED at the step-mean
-        # just below — `cloud_evap_bound`.)
+        # condensation is a source. (The CLOUD channel is not realized this way: its one donor
+        # factor `f_cloud` — evaporation, `AUTO_COLL` and the ice legs on one `κ_tot` — is
+        # applied to the step-mean just below, `cloud_evap_realized`.)
         qc_bar = 0.0
         qr_bar = 0.0
         if clipped_l
-            # Already bounded at the fold, where a clipped flux enters `N`.
+            # Already realized at the fold, where a clipped flux enters `N`.
             qc_bar = Qdot[i]
             qr_bar = Qdot_r[i]
         else
             qb = qbar * invtau_l / (1.0 + Q_s[i])
             qc_bar = invtau_c[i] == 0.0 ? 0.0 : qb * (invtau_c[i] / invtau_l)
             qr_bar = invtau_r[i] == 0.0 ? 0.0 : qb * (invtau_r[i] / invtau_l)
-            # ── THE CLOUD DONOR'S BOUND on its evaporation (`cloud_evap_bound`) ──────────
+            # ── THE CLOUD DONOR'S REALIZATION of its evaporation (`cloud_evap_realized`) ──
             # The propagator bounds `Q_ss`, not `ρ_c`: the deficit can ask a thin cloud for
             # more than it holds, and `d9` alone cannot take the slot below `ν = 0` while
-            # `dv`, `d1` and `Q_ss^{n+1}` would take the full draw. Bounded HERE, on the one
-            # number all of them are built from below, and `Q_ss^{n+1}` gives back what was not
-            # realized: its liquid loss over the step is `Δt(1 + 𝒬_s)(q̄_c + q̄_r)` (the
-            # psychrometric cancellation, `qb` above), so `−Δt(1 + 𝒬_s)·Δq̄_c`. `λ ≠ 0` here
-            # whenever the cloud evaporates (an unclipped channel's conductance IS `λ`), so
-            # `etd_qnp1` is the value `relaxation_adjustment_qss!` writes. `===` the old
-            # `qc_bar` wherever it does not bind.
-            qcb = cloud_evap_bound(qc_bar, rho_c[i], ts)
+            # `dv`, `d1` and `Q_ss^{n+1}` would take the full draw. Realized HERE, at the cloud
+            # donor's one factor `f_cloud = J₀(κ_tot Δt)` (the same number `AUTO_COLL` and the
+            # ice legs carry), on the one number all of them are built from below, and
+            # `Q_ss^{n+1}` gives back what was not realized: its liquid loss over the step is
+            # `Δt(1 + 𝒬_s)(q̄_c + q̄_r)` (the psychrometric cancellation, `qb` above), so
+            # `−Δt(1 + 𝒬_s)·Δq̄_c`. `λ ≠ 0` here whenever the cloud evaporates (an unclipped
+            # channel's conductance IS `λ`), so `etd_qnp1` is the value
+            # `relaxation_adjustment_qss!` writes. `J₀ < 1` at every evaporating point with
+            # cloud; `===` the unrealized `qc_bar` only where it condenses or `f_cloud = 1.0`.
+            qcb = cloud_evap_realized(qc_bar, f_cloud[i])
             if qcb != qc_bar
                 _cloud_evap_census!(stx, tid_x, (qcb - qc_bar) * ts)
                 if cloud_evap_real
