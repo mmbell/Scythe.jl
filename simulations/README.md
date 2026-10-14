@@ -385,6 +385,7 @@ solver choices; leave alone unless you know why (boundary conditions live in `[b
 | `l_q_horizontal` | float | `0.0` | filter length of the horizontal B-spline (x / r); 0 = inherit `l_q`. |
 | `l_q_vertical` | float | `0.0` | filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical). |
 | `cfl_interval` | float | `0.0` | CFL report cadence [s]; 0 = `output.interval`, resolved at build. |
+| `temperature` | string (enum) | `"eos"` | the model temperature every consumer reads (microphysics, radiation, surface layer, boundary layer, output): `eos` = `p/(rho_d R_d + rho_v R_v)` from the prognostic pressure and vapor (default since 2026-10-14), `energy` = the closed-form total-energy retrieval, which reads the clipped condensate and warms by ~2.5 K per 1e-3 kg/m3 of clipped lobe. `E_t` stays prognostic either way; the output's `T_split` and `E_residual` measure the disagreement. |
 
 ### `[diagnostics]`
 
@@ -578,6 +579,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
 | `initial_conditions.balanced_vortex.profile` | `re87`, `rankine` |
 | `initial_conditions.method` | `balanced_vortex`, `temperature_noise`, `temperature_bubble`, `file` |
 | `numerics.positivity` | `auto`, `off` |
+| `numerics.temperature` | `eos`, `energy` |
 | `output.formats` | `csv`, `netcdf`, `netcdf_raw` |
 | `output.netcdf_grid` | `regular` |
 | `physics.boundary_layer.mynn_fidelity` | a fidelity name, `fortran` or `scythe`, or a comma list of deviations from `gtr_local`, `K_interface`, `sqfac1`, `pdk1`, `exner_single`, `rmol_sfc`, `flux_clip` |
@@ -701,12 +703,14 @@ co2_ppm = 280.0
 | `state_minima_trace` | int | `diagnostics.state_minima_trace` (refused in `[extra.options]`) | state-minima print interval [steps]; 0 = off (semiimplicit.jl) |
 | `stiffness_trace` | int | `diagnostics.stiffness_trace` (refused in `[extra.options]`) | stiffness-census print interval [steps]; 0 = off (moist_compressible.jl) |
 | `surface_fluxes` | bool | `physics.surface.fluxes` (refused in `[extra.options]`) | surface momentum/heat/moisture fluxes (moist_compressible.jl, mc_surface_layer.jl) |
+| `temperature` | string (enum) | `numerics.temperature` (refused in `[extra.options]`) | model temperature: :eos = p/(rho_d R_d + rho_v R_v) (default) or :energy = the closed-form total-energy retrieval (moist_compressible.jl, radiation.jl, semiimplicit.jl, netcdf_output.jl) |
 | `u_max` | float | `diagnostics.timestep_advisory.u_max` (refused in `[extra.options]`) | timestep advisory: expected peak horizontal wind [m/s] (reference_state.jl) |
 | `vertical_mixing` | bool | `physics.boundary_layer.scheme` (refused in `[extra.options]`) | legacy primitive equations: vertical mixing on/off (primitive_equations.jl) |
 | `w_max` | float | `diagnostics.timestep_advisory.w_max` (refused in `[extra.options]`) | timestep advisory: expected peak vertical wind [m/s] (reference_state.jl) |
 | `wall_bc_tau` | float | `numerics.wall_bc_tau` (refused in `[extra.options]`) | relaxation timescale [s] of the R1T1X wall BC; Inf = none (semiimplicit.jl) |
 | `water_budget_trace` | int | `diagnostics.water_budget_trace` (refused in `[extra.options]`) | water-budget print interval [steps]; 0 = off (moist_compressible.jl) |
 | `water_lobe_attribution` | bool |  | the vapor residual and the ice anchor headroom read each transformed water-mass slot's clipped negative lobe through the odd continuation of ahyp; default FALSE until the slots' below-zero transport is consistent with rho_t (measured 2026-10-07: the slots hold a 4-6.5 kg/m2 negative pool rho_t does not, so attributing it inflates the vapor by ~10% of the column); true enables it (moist_compressible.jl) |
+| `water_lobe_transport` | bool |  | below nu = 0 the continuity terms of each transformed water-mass slot (cloud, rain, ice masses) read the odd continuation ahyp_signed and its Jacobian, so the slots are transported consistently with the linear rho_t; default true, false restores the clipped-point forms (J = 1, rho = 0) for forensics (moist_compressible.jl) |
 | `water_warn_dT` | float |  | temperature-mismatch warning threshold [K] of the water reconciliation (moist_compressible.jl) |
 | `xsi_lid_rows` | string |  | exact_si lid boundary rows: "strong" or weak (exact_si.jl, exact_si_rlr.jl) |
 | `xsi_rlr_axis_dirichlet` | bool |  | exact_si RLR: Dirichlet axis rows in the per-wavenumber solve (exact_si_rlr.jl) |

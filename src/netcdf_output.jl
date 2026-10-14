@@ -11,8 +11,9 @@
 # consumer had to rebuild the reference state from the run's `.ref` file, guess the
 # control-variable transforms out of `scythe_out.log`, and redo the retrieval. All of that
 # is known exactly HERE, inside the model, at zero reconstruction risk: the reference is
-# the object `createModelTile` built, the transforms are `model.options`, and the retrieval
-# is the same `retrieve_temperature` the column driver calls.
+# the object `createModelTile` built, the transforms are `model.options`, and the temperature
+# is the one the column driver reads (`options[:temperature]`: `eos_temperature` or
+# `retrieve_temperature`), written beside the other one and their split.
 #
 # THREE LAYERS, deliberately separated:
 #
@@ -169,6 +170,7 @@ struct DerivedConfig
     Nc_cm3::Float64           # cloud droplet number for reflectivity [cm^-3]
     N0_source::String         # provenance of N0, written as a global attribute
     cond_floor::Bool          # options[:condensate_floor] === :diagnostic
+    temperature::Symbol       # options[:temperature]: which temperature `T` is (`temperature_mode`)
 end
 
 "Default Marshall-Palmer rain intercept [m^-4] when the run declares none."
@@ -205,7 +207,8 @@ function derived_config(model::ModelParameters)
         n0_on ? n0 : REFL_N0_DEFAULT,
         get(pp, :max_N_c, 100.0),
         n0_on ? "physical_params[:N_0]" : "default $(REFL_N0_DEFAULT)",
-        condensate_floor_mode(opts))
+        condensate_floor_mode(opts),
+        temperature_mode(opts))
 end
 
 # ── Reference profiles on the regular output grid ─────────────────────────────
@@ -326,9 +329,17 @@ The order is the model's own:
  2. **add the reference back** for the five reference-relative controls, and for the vapor,
     whose reference is the DERIVED `ρ̄_t − ρ̄_d − ρ̄_c` of [`vapor_slot`](@ref) rather than
     `ref_rho_v` -- the same expression `mc_driver!` adds back;
- 3. **retrieve the temperature** with [`retrieve_temperature`](@ref) from the available
-    enthalpy `M = p + E_t − ρ_t(ke + gz)`, reading the FLOORED condensate exactly where
-    `cfg.cond_floor` says the run's thermodynamics reads it (`options[:condensate_floor]`);
+ 3. **the temperature**, BOTH ways: `T_energy` = [`retrieve_temperature`](@ref) from the
+    available enthalpy `M = p + E_t − ρ_t(ke + gz)`, reading the FLOORED condensate exactly
+    where `cfg.cond_floor` says the run's thermodynamics reads it
+    (`options[:condensate_floor]`), and `T_eos` = [`eos_temperature`](@ref)`(p, ρ_d, ρ_v)`
+    with the raw vapor. `T` is the one the run's thermodynamics reads (`cfg.temperature`,
+    `options[:temperature]`), and two diagnostics measure their disagreement whatever the
+    mode: `T_split = T_energy − T_eos` and `E_residual = E_t − E_implied`, the prognostic
+    total energy minus the one the state implies at `T_eos` ([`implied_total_energy`](@ref):
+    `(ρ_d, ρ_v, ρ_liq, ρ_ice)` as the retrieval reads them, the PROGNOSTIC `ρ_t` in the
+    mechanical term), with its column integral `column_E_residual` [J/m²] beside the
+    column `E_t`, `column_E_t`;
  4. saturation, potential temperature, mixing ratios, entropy and θ_e;
  5. reflectivity, the rain fall speed of the run's OWN closure (two-moment when
     `rain_moments == 2`), the sedimentation rain rate and its surface value;
@@ -392,7 +403,15 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     else
         rho_ice
     end
-    T = retrieve_temperature.(M, rho_d, rho_t, rho_liq_t, rho_ice_t)
+    T_energy = retrieve_temperature.(M, rho_d, rho_t, rho_liq_t, rho_ice_t)
+    T_eos = eos_temperature.(p, rho_d, rho_v)
+    T = cfg.temperature === :eos ? T_eos : T_energy
+    # The two measures of the split (see the docstring). Mode-INDEPENDENT definitions: both
+    # are what they are whichever temperature the run reads, so an :energy run and an :eos
+    # run can be compared on the same numbers.
+    T_split = T_energy .- T_eos
+    E_residual = E_t .- implied_total_energy.(T_eos, rho_d, rho_v, rho_liq_t, rho_ice_t, rho_t,
+                                              ke .+ (gravity .* col(z)))
 
     # ── (4) Saturation and the thermodynamic diagnostics ────────────────────
     p_hPa = p ./ 100.0
@@ -483,6 +502,9 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     if haskey(slots, :rho_e)
         out = merge(out, (; rho_e = slots.rho_e, e = slots.rho_e ./ rho_t))
     end
+    out = merge(out, (; T_energy, T_eos, T_split, E_residual,
+                        column_E_residual = _column_integral(E_residual, z),
+                        column_E_t = _column_integral(E_t, z)))
     return out
 end
 
@@ -703,13 +725,18 @@ function netcdf_output_context(grid::AbstractGrid, model::ModelParameters)
         "reflectivity_N0_m4" => cfg.N0,
         "reflectivity_Nc_cm3" => cfg.Nc_cm3,
         "reflectivity_source" => cfg.N0_source,
-        "temperature_retrieval" =>
-            "T = (M + rho_liq*(L_v0 - (Cpv-Cl)T_0) + rho_ice*(L_s0 - (Cpv-Ci)T_0)) / " *
+        "temperature_retrieval" => (cfg.temperature === :eos ?
+            "eos: T = p / (rho_d*Rd + rho_v*Rv) with the prognostic (unfloored) vapor " *
+            "(options[:temperature] = :eos); T_energy is the total-energy retrieval below. " :
+            "energy (options[:temperature] = :energy): T = T_energy; T_eos = p / " *
+            "(rho_d*Rd + rho_v*Rv). ") *
+            "T_energy = (M + rho_liq*(L_v0 - (Cpv-Cl)T_0) + rho_ice*(L_s0 - (Cpv-Ci)T_0)) / " *
             "((rho_d*Cpd + (rho_t-rho_d)*Cpv) - rho_liq*(Cpv-Cl) - rho_ice*(Cpv-Ci)), " *
             "M = p + E_t - rho_t*(ke + g z); condensate read " *
             (cfg.cond_floor ? "FLOORED at zero per species (options[:condensate_floor] " *
                               "= :diagnostic), state left raw" :
                               "RAW (options[:condensate_floor] = :none)"),
+        "temperature" => String(cfg.temperature),
         "condensate_floor" => cfg.cond_floor ? "diagnostic" : "none")
 
     return NetCDFOutputContext(active, x_reg, z_reg, ref_profiles, cfg, attrs, nothing)
@@ -986,6 +1013,30 @@ end
 
 
 """
+    temperature_split_summary(d, x, z) -> NamedTuple
+
+Domain summary of the temperature split and the energy residual of one snapshot's derived
+fields `d` ([`mc_derived_fields`](@ref)) on the regular grid `(x, z)`: `max_abs` = max|T_split|
+[K] with its signed value `at_max` and location `x_max`/`z_max`, `mean_abs` = the domain mean
+of |T_split| (unweighted over the regular points), `lid_mean` = the mean T_split on the top
+output level, `colres_mean` = the domain mean of `column_E_residual` [J/m²] and `colres_frac`
+that divided by the domain mean column `E_t`. Printed at every output time by
+[`write_netcdf_comprehensive`](@ref) and written to the file's global attributes
+(`T_split_<name>`), so the drift is in the log and the file of every run.
+"""
+function temperature_split_summary(d, x::AbstractVector, z::AbstractVector)
+    sp = d.T_split
+    m, idx = findmax(abs.(sp))
+    i, k = Tuple(CartesianIndices(sp)[idx])
+    cres = sum(d.column_E_residual) / length(d.column_E_residual)
+    cet = sum(d.column_E_t) / length(d.column_E_t)
+    return (; max_abs = m, at_max = sp[i, k], x_max = Float64(x[i]), z_max = Float64(z[k]),
+              mean_abs = sum(abs, sp) / length(sp),
+              lid_mean = sum(view(sp, :, size(sp, 2))) / size(sp, 1),
+              colres_mean = cres, colres_frac = cres / cet)
+end
+
+"""
     write_netcdf_comprehensive(path, grid, model, t, ctx, physics = nothing) -> Nothing
 
 Write ONE comprehensive `<tag>.nc` snapshot: prognostic primes, raw transformed control
@@ -1049,6 +1100,17 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
     rho_e_i > 0 && (slots = merge(slots, (; rho_e = slot(rho_e_i))))
 
     d = mc_derived_fields(ctx.z_reg, slots, ref, cfg)
+    tdiag = temperature_split_summary(d, ctx.x_reg, ctx.z_reg)
+    # At the OUTPUT cadence, into the run's (segment) log: the temperature split and the energy
+    # residual are the measurements the `options[:temperature]` decision rests on, so every run
+    # records them whether or not anyone opens the file. One line, master side, no worker cost.
+    println("Scythe: T/E split t=$(t) s [T=$(cfg.temperature)]: " *
+            "max|T_split|=$(round(tdiag.max_abs; sigdigits=4)) K " *
+            "(T_split=$(round(tdiag.at_max; sigdigits=4)) at x=$(round(tdiag.x_max; digits=1)) " *
+            "z=$(round(tdiag.z_max; digits=1))), mean|T_split|=$(round(tdiag.mean_abs; sigdigits=4)) K, " *
+            "lid mean T_split=$(round(tdiag.lid_mean; sigdigits=4)) K; " *
+            "column E_t-E_implied=$(round(tdiag.colres_mean; sigdigits=6)) J/m2 " *
+            "(domain mean; $(round(tdiag.colres_frac; sigdigits=4)) of column E_t)")
 
     cyl = _mc_is_cylindrical(model.equation_set)
 
@@ -1058,6 +1120,9 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         end
         # `Libc.strftime` rather than `Dates.format`: Dates is not a Scythe dependency
         # (it is a test-only extra), and a timestamp is not worth adding one for.
+        for (k, v) in pairs(tdiag)
+            ds.attrib["T_split_" * String(k)] = v
+        end
         ds.attrib["history"] = "Created " *
             Libc.strftime("%Y-%m-%d %H:%M:%S", time()) * " by Scythe.write_output"
 
@@ -1155,7 +1220,20 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         end
 
         # ── Retrieved thermodynamics ──
-        wr("T", d.T, "K", "temperature (closed-form nonlinear retrieval)")
+        wr("T", d.T, "K", cfg.temperature === :eos ?
+           "temperature, equation of state p / (rho_d Rd + rho_v Rv) (the model temperature)" :
+           "temperature, closed-form total-energy retrieval (the model temperature)")
+        wr("T_energy", d.T_energy, "K",
+           "closed-form total-energy retrieval of the temperature (condensate as the run's " *
+           "thermodynamics reads it)")
+        wr("T_eos", d.T_eos, "K", "equation-of-state temperature p / (rho_d Rd + rho_v Rv)")
+        wr("T_split", d.T_split, "K", "T_energy - T_eos")
+        wr("E_residual", d.E_residual, "J m-3",
+           "E_t - E_implied: prognostic total energy minus the BF02 total energy of " *
+           "(rho_d, rho_v, rho_liq, rho_ice) at T_eos plus rho_t (ke + g z)")
+        wrx("column_E_residual", d.column_E_residual, "J m-2",
+            "column integral of E_residual")
+        wrx("column_E_t", d.column_E_t, "J m-2", "column integral of E_t")
         wr("theta", d.theta, "K", "potential temperature")
         wr("theta_e", d.theta_e, "K", "reversible equivalent potential temperature")
         # Floored at this diagnostic interface (max(rho_v, 0), as radiation reads it); the

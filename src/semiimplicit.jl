@@ -227,10 +227,11 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # retrieval pipeline the equation set runs each step, so at rest the diffused
     # perturbations s_t' and rho_v' are zero BIT-FOR-BIT and diffusion cannot cook the
     # base (the reference's own Tbar is not bit-identical to the retrieved T). Empty
-    # vectors for every other equation set.
-    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar, :rho_vbar_z, :Pxi_prof),
+    # vectors for every other equation set. `Tbar` is the resting temperature in the run's
+    # `options[:temperature]` mode (see `mc_reference_diagnostics`).
+    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar, :rho_vbar_z, :Pxi_prof, :Tbar),
                             Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64},
-                                  Vector{Float64}}}
+                                  Vector{Float64}, Vector{Float64}}}
     # One NamedTuple of full-tile-length work vectors for `Twoway_PV_mixing`'s 13 broadcast
     # temporaries. Empty for every other set. See `_allocate_sw_scratch` for why there is one
     # workspace per TILE here rather than one per thread as `mc_scratch` has.
@@ -458,8 +459,11 @@ function build_reference_state(model::ModelParameters, z_values::Vector{Float64}
         # Rebuild Q_ssbar through the model's own retrieval so the resting column is
         # a discrete fixed point (see consistent_qss_reference). Opt-in, off by
         # default: it moves every pressure-reference baseline (BF02, O01, Straka).
+        # Built for the run's temperature mode: the two modes' resting temperatures differ at
+        # fit level, so a Q_ssbar built for one is not a fixed point of the other.
         if get(model.options, :consistent_qss_reference, false)::Bool
-            ref_state = consistent_qss_reference(ref_state, z_values, ref_column)
+            ref_state = consistent_qss_reference(ref_state, z_values, ref_column;
+                                                 temperature = temperature_mode(model.options))
         end
     elseif (model.options[:exact_reference_state])
         ref_state = physical_ref ?
@@ -566,10 +570,11 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     mc_ref_diag = if uses_pressure_reference(model.equation_set) &&
                      !isempty(model.ref_state_file)
         mc_reference_diagnostics(ref_state,
-                                 tilepoints[1:model.grid_params.kDim, end])
+                                 tilepoints[1:model.grid_params.kDim, end];
+                                 temperature = temperature_mode(model.options))
     else
         (s_tbar = Float64[], rho_vbar = Float64[], rho_vbar_z = Float64[],
-         Pxi_prof = Float64[])
+         Pxi_prof = Float64[], Tbar = Float64[])
     end
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
@@ -2324,10 +2329,16 @@ A fourth line tracks the collapse class that kills a run with `p < 0` (the §2c 
 retrieval heating → w / sound-speed runaway → vertical SI past its limit): the minimum
 `p/p̄` (`p = p' + p̄(z)`, flagged below half its reference or at a non-positive value),
 the maximum `|w|`, and the maximum retrieved `T` (flagged when non-positive or non-finite),
-each with its location. `T` is the driver's closed-form retrieval from the RAW prognostic
-state — `M = p + E_t − ρ_t(½(u²+v²+w²) + gz)`, condensate through `recover_rho_c` /
+each with its location. `T` is the MODEL temperature in the run's `options[:temperature]`
+mode: under `:eos` (default) `p/(ρ_d R_d + ρ_v R_v)` with the prognostic vapor, under
+`:energy` the driver's closed-form retrieval from the RAW prognostic state —
+`M = p + E_t − ρ_t(½(u²+v²+w²) + gz)`, condensate through `recover_rho_c` /
 `recover_total` — the same reconstruction `radiation_column_state!` uses (no condensate
 floor, no anchor cap), so it is what the driver would retrieve with those devices idle.
+
+The same line reports `max|T_split|`, `T_split = T_energy − T_eos`, both evaluated as just
+described whatever the mode, with its location: the split between the energy retrieval and
+the equation of state that `options[:temperature]` exists to measure (see `eos_temperature`).
 """
 function state_minima_trace(mtile::ModelTile, t::Int64)
     interval = Int(get(mtile.model.options, :state_minima_trace, 0))
@@ -2372,6 +2383,12 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
     itrans = ice_transform_mode(model.options)
     imu = ice_mu(model.physical_params, 1)
     zc = size(mtile.tilepoints, 2)
+    teos = temperature_mode(model.options) === :eos
+    rvp = view(phys, :, slots.rho_v, 1)
+    rho_vbar = mtile.mc_ref_diag.rho_vbar
+    max_split = -Inf
+    max_si = 1
+    split_k = 0.0
     min_pfrac = Inf
     min_pi = 1
     max_absw = -Inf
@@ -2417,7 +2434,15 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
         rho_ice = ice_on ? ((recover_total(i1q[i], itrans, imu) +
                              recover_total(i2q[i], itrans, imu)) +
                             recover_total(i3q[i], itrans, imu)) : 0.0
-        Tk = retrieve_temperature(M, rho_dk, rho_tk, rho_liq, rho_ice)
+        T_energy = retrieve_temperature(M, rho_dk, rho_tk, rho_liq, rho_ice)
+        T_eos = eos_temperature(pp[i] + pbar[k], rho_dk, rvp[i] + rho_vbar[k])
+        Tk = teos ? T_eos : T_energy
+        sp = T_energy - T_eos
+        if abs(sp) > max_split
+            max_split = abs(sp)
+            max_si = i
+            split_k = sp
+        end
         if !(Tk > 0.0) || !isfinite(Tk)
             # A bad T wins the slot outright: it is the one to locate.
             if !bad_T
@@ -2460,7 +2485,9 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
                 (low_p ? "  << LOW P" : "") *
                 "; max|w|=$(round(max_absw; sigdigits=4)) m/s at $(loc(max_wi))" *
                 "; max T=$(round(max_T; sigdigits=5)) K at $(loc(max_Ti))" *
-                (bad_T ? "  << BAD T" : ""))
+                (bad_T ? "  << BAD T" : "") *
+                " [T=$(teos ? "eos" : "energy")]" *
+                "; max|T_split|=$(round(split_k; sigdigits=4)) K at $(loc(max_si))")
     end
     return nothing
 end

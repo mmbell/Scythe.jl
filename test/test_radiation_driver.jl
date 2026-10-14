@@ -564,11 +564,18 @@ using SparseArrays
             # is the whole reason a resting base is a discrete fixed point.
             rho_vbar = mtile.mc_ref_diag.rho_vbar
 
-            # The resting temperature as the DRIVER defines it: `mc_reference_diagnostics`
-            # closed-form retrieval on the bar profiles at ke = 0, rho_r = 0, rho_i = 0.
-            Tbar = [Scythe.retrieve_temperature(
-                        pbar[k] + E_tbar[k] - rho_tbar[k] * (gravity * z[k]),
-                        rho_dbar[k], rho_tbar[k], rho_cbar[k]) for k in 1:kDim]
+            # The resting temperature as the DRIVER defines it: `mc_reference_diagnostics`'
+            # `Tbar`, in the run's `options[:temperature]` mode (the EOS temperature of the bar
+            # profiles by default; the closed-form retrieval at ke = 0, rho_r = 0, rho_i = 0
+            # under :energy). Under :eos it is exactly the EOS of the three profiles below.
+            Tbar = mtile.mc_ref_diag.Tbar
+            if Scythe.temperature_mode(mtile.model.options) === :eos
+                @test Tbar == Scythe.eos_temperature.(pbar, rho_dbar, rho_vbar)
+            else
+                @test Tbar == [Scythe.retrieve_temperature(
+                                   pbar[k] + E_tbar[k] - rho_tbar[k] * (gravity * z[k]),
+                                   rho_dbar[k], rho_tbar[k], rho_cbar[k]) for k in 1:kDim]
+            end
             # A real tropical sounding, not a degenerate one -- otherwise "reproduces the
             # reference" could be true of an all-zeros bug.
             @test 295.0 < Tbar[1] < 305.0

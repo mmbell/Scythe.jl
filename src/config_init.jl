@@ -46,7 +46,8 @@ function build_reference_state(cfg::RunConfig, patch, gp;
                        Springsteel.ref_rho_v(ref_phys)[:, 1],
                        zeros(kDim))
     ref = Springsteel.exact_pressure_reference_state(String(path), z, column; hydrostatic = hydro)
-    cfg.reference_state.consistent_qss && (ref = consistent_qss_reference(ref, z, column))
+    cfg.reference_state.consistent_qss &&
+        (ref = consistent_qss_reference(ref, z, column; temperature = cfg.numerics.temperature))
     println("Reference: sounding = $(basename(sounding)), sfc p = " *
             "$(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits = 2)) hPa " *
             "(hydrostatic = $hydro, consistent_qss = $(cfg.reference_state.consistent_qss))")

@@ -38,9 +38,11 @@ using NCDatasets
 
     plain_cfg(; has_v = false, ice = false, itrans = :none, ctrans = :none, rtrans = :none,
                 cond_floor = false, rain_moments = 1, N0 = 8.0e6, Nc = 100.0,
-                cmu = 1.0e-7, rmu = 1.0e-7, imu = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)) =
+                cmu = 1.0e-7, rmu = 1.0e-7, imu = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16),
+                temperature = :eos) =
         Scythe.DerivedConfig(ctrans, cmu, rtrans, rmu, :none, 1.0, itrans, imu,
-                             rain_moments, ice, has_v, N0, Nc, "test", cond_floor)
+                             rain_moments, ice, has_v, N0, Nc, "test", cond_floor,
+                             temperature)
 
     "A 3-column, nk-level dry-ish state with a plausible p/rho_d/E_t and no condensate."
     function synthetic_slots(z; rho_r = nothing, rho_v = nothing)
@@ -67,12 +69,19 @@ using NCDatasets
         slots = synthetic_slots(z)
         d = Scythe.mc_derived_fields(z, slots, ref, cfg)
 
-        @testset "temperature is the model's own retrieval, bitwise" begin
+        @testset "temperature is the model's own, bitwise, in either mode" begin
+            # T is the temperature the run's thermodynamics reads (`options[:temperature]`):
+            # the EOS one by default, the closed-form retrieval under :energy. Both are written
+            # (T_eos, T_energy) whatever the mode.
+            @test all(d.T .=== Scythe.eos_temperature.(d.p, d.rho_d, d.rho_v))
+            @test all(d.T_eos .=== d.T)
             # The 4-argument method delegates with rho_ice = 0.0 and that identity is
             # bitwise (see `retrieve_temperature`); with cond_floor off and ice off the
             # derived layer must land on exactly that number.
             T_ref = Scythe.retrieve_temperature.(d.M, d.rho_d, d.rho_t, d.rho_liq)
-            @test all(d.T .=== T_ref)
+            @test all(d.T_energy .=== T_ref)
+            de = Scythe.mc_derived_fields(z, slots, ref, plain_cfg(temperature = :energy))
+            @test all(de.T .=== T_ref)
             @test all(150.0 .< d.T .< 350.0)
             # ...and M is the available enthalpy the retrieval is defined against.
             M_ref = d.p .+ d.E_t .- d.rho_t .* (d.ke .+ gravity .* reshape(z, 1, :))
@@ -91,10 +100,14 @@ using NCDatasets
         end
 
         @testset "RH == 1 at saturation" begin
-            # T does not depend on rho_v (the vapor is its own slot), so the saturation
-            # density can be computed from the first pass and fed back.
-            sat = rho_v_sat.(d.T, d.p ./ 100.0)
-            ds = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = sat)), ref, cfg)
+            # Under the :energy retrieval T does not depend on rho_v (the vapor is its own
+            # slot), so the saturation density can be computed from the first pass and fed
+            # back. (The EOS temperature reads rho_v, so this one-pass construction is the
+            # retrieval's; RH itself is the same expression in either mode.)
+            cfg_e = plain_cfg(temperature = :energy)
+            de = Scythe.mc_derived_fields(z, slots, ref, cfg_e)
+            sat = rho_v_sat.(de.T, de.p ./ 100.0)
+            ds = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = sat)), ref, cfg_e)
             @test all(abs.(ds.RH .- 1.0) .< 1.0e-12)
             @test all(ds.rho_v .≈ sat)
         end
@@ -105,11 +118,15 @@ using NCDatasets
             # never a state to repair) does not print as a negative humidity. The vapor, its
             # mixing ratio and the precipitable water stay RAW, and the two deficit fields
             # carry the negativity instead.
-            sat = rho_v_sat.(d.T, d.p ./ 100.0)
+            # (On the :energy retrieval, whose T does not read rho_v, so `sat` below is the
+            # saturation density of the T the RH is formed against.)
+            cfg_e = plain_cfg(temperature = :energy)
+            de = Scythe.mc_derived_fields(z, slots, ref, cfg_e)
+            sat = rho_v_sat.(de.T, de.p ./ 100.0)
             rv = copy(sat) .* 0.5
             rv[2, 2] = -3.0e-4; rv[3, 4] = -1.0e-6
             neg = rv .< 0.0
-            dr = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv)), ref, cfg)
+            dr = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv)), ref, cfg_e)
             @test all(dr.RH .>= 0.0)
             @test all(dr.RH[neg] .=== 0.0)
             @test all(dr.RH[.!neg] .== (rv ./ sat)[.!neg])
@@ -118,7 +135,8 @@ using NCDatasets
             imu = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)
             raw0 = ntuple(_ -> zeros(3, length(z)), 12)
             di = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv, ice = raw0)), ref,
-                                          plain_cfg(ice = true, itrans = :bhyp, imu = imu))
+                                          plain_cfg(ice = true, itrans = :bhyp, imu = imu,
+                                                    temperature = :energy))
             @test all(di.RH_ice .>= 0.0)
             @test all(di.RH_ice[neg] .=== 0.0)
         end
@@ -288,8 +306,10 @@ using NCDatasets
             # State stays RAW under the floor -- the floor is a reader, not a clamp.
             @test all(df.rho_c .== neg)
             @test all(df.rho_liq .== dn.rho_liq)
-            # ...and the temperature differs, because the retrieval read the floored value.
-            @test all(df.T .!= dn.T)
+            # ...and the retrieved temperature differs, because the retrieval read the
+            # floored value; the EOS temperature (the default T) reads no condensate at all.
+            @test all(df.T_energy .!= dn.T_energy)
+            @test df.T == dn.T && df.T == df.T_eos
         end
     end
 

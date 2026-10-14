@@ -428,6 +428,114 @@ end
     retrieve_temperature(M, rho_d, rho_t, rho_liq, 0.0)
 
 """
+    eos_temperature(p, rho_d, rho_v)
+
+The EQUATION-OF-STATE temperature `T = p / (ρ_d R_d + ρ_v R_v)` [K]: the temperature the
+prognostic pressure and the two gas densities imply. The condensates exert no partial pressure,
+so they do not enter, and neither does `E_t`.
+
+This is the model temperature under `options[:temperature] = :eos` (the default; see
+[`temperature_mode`](@ref)). Why it replaced [`retrieve_temperature`](@ref) is the file header's
+criterion applied to T itself. The energy retrieval reads the condensates through their
+RECOVERED densities, which the `:bhyp` transforms clip at zero, while `ρ_t` and `E_t` carry the
+transported feature's signed lobe: wherever a lobe is clipped the retrieval sees liquid that is
+not there and credits it with `L_v/C_f` — about +2.5 K per 1e-3 kg/m³ of lobe. The pressure,
+which carries the latent heating that actually happened (the ETD increments to slot 1), is
+untouched by the clip, so the two temperatures SPLIT: +4 K in the 2-D RCE control's convective
+burst, +24 K with the Stage L device on (measured 2026-10-14). The dynamics feels `T_eos`
+through `p`; with the energy retrieval the microphysics, radiation, surface layer and output
+felt `T_ret`.
+
+`T_eos` is well conditioned now that the vapor is prognostic. Its inputs are large (`p`, `ρ_d`)
+except the vapor, which enters at `R_v ρ_v / (R_d ρ_d) ≈ 1.6 q_v` of the denominator, so a
+lobe-sized vapor error aloft is ~0.1 K — the retrieved quantity is not small compared with the
+terms in it, which is the criterion. (When the vapor was the RESIDUAL of `ρ_t − ρ_d − ρ_c`, this
+expression would have inherited that residual's conditioning; that is why it was not chosen then.)
+
+`ρ_v` is whatever vapor the thermodynamics reads at the call site — in every current caller the
+prognostic slot plus the derived reference `ρ̄_v`, UNFLOORED. A negative vapor (a resolution
+diagnostic, never clamped) lowers the denominator by `R_v|ρ_v|`, which is harmless: it would take
+`ρ_v < −(R_d/R_v) ρ_d` to make it vanish.
+"""
+@inline eos_temperature(p, rho_d, rho_v) = p / ((rho_d * Rd) + (rho_v * Rv))
+
+"The `options[:temperature]` values: `:eos` (the default) and `:energy`. See [`temperature_mode`](@ref)."
+const TEMPERATURE_MODES = (:eos, :energy)
+
+"""
+    temperature_mode(options) -> Symbol
+
+How the moist-compressible set diagnoses its temperature, `options[:temperature]`:
+
+- `:eos` (default) — [`eos_temperature`](@ref), `T = p/(ρ_d R_d + ρ_v R_v)`, at every consumer.
+- `:energy` — the closed-form Bryan & Fritsch total-energy retrieval
+  [`retrieve_temperature`](@ref)`(M, ρ_d, ρ_t, ρ_liq, ρ_ice)`, bitwise the code before the
+  switch existed (2026-10-14).
+
+Under either mode `E_t` stays a conserved prognostic; under `:eos` it no longer DEFINES T, and
+the energy the state implies drifts from it by (i) the condensate-clipping inconsistency the
+retrieval used to absorb and (ii) the pressure equation's own non-conservation. That drift is
+measured, not corrected: [`implied_total_energy`](@ref) and the `E_residual`/`T_split` fields of
+the comprehensive NetCDF file.
+
+Resolved once per column (one `Dict` read, the `get(model.options, …)` pattern the driver uses
+for every switch) and refused loudly when it names neither mode — a typo here would silently
+pick a temperature.
+"""
+function temperature_mode(options)::Symbol
+    m = get(options, :temperature, :eos)
+    m in TEMPERATURE_MODES || error("options[:temperature] = $(repr(m)) is not a temperature " *
+        "mode; use :eos (T = p/(rho_d R_d + rho_v R_v), the default) or :energy (the " *
+        "closed-form total-energy retrieval, the pre-2026-10-14 model temperature)")
+    return m
+end
+
+"""
+    model_temperature(teos, M, p, rho_d, rho_t, rho_v, rho_liq, rho_ice)
+
+The model temperature at one point under the resolved mode: [`eos_temperature`](@ref)`(p, ρ_d,
+ρ_v)` when `teos`, else [`retrieve_temperature`](@ref)`(M, ρ_d, ρ_t, ρ_liq, ρ_ice)` — the latter
+the IDENTICAL call every site made before the switch, so `teos = false` is bitwise the old code.
+Every consumer that used to call the retrieval calls this, with the inputs it already formed.
+"""
+@inline model_temperature(teos::Bool, M, p, rho_d, rho_t, rho_v, rho_liq, rho_ice) =
+    teos ? eos_temperature(p, rho_d, rho_v) :
+           retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
+
+"""
+    implied_total_energy(Tk, rho_d, rho_v, rho_liq, rho_ice, rho_t, geo)
+
+The total energy density [J/m³] the state `(T, ρ_d, ρ_v, ρ_liq, ρ_ice)` implies, in the model's
+OWN energy definition — the one the reference build and every initializer write
+(`ρ_d e_i(T, q_v, q_l) + ρ_t(ke + gz)`, Springsteel `_pressure_reference`,
+`moist_temperature_noise_mc!`), with the ice term of [`retrieve_temperature`](@ref):
+
+    E = ρ_d·internal_energy_bf02(T, q_v, q_l) + ρ_i (C_pv T − L_s(T)) + ρ_t·geo
+
+`internal_energy_bf02` references energies to vapor, so a condensed phase carries
+`C_pv T − L(T)`; the ice term is the same with `L_s`. `geo = ke + gz` is the mechanical part, and
+it multiplies the PROGNOSTIC `ρ_t`, not `ρ_d + ρ_v + ρ_liq + ρ_ice`: that keeps the ρ_t
+redundancy (a separate question, reference/RHO_T_RETIREMENT_DESIGN.md) out of this measure, so
+`E_t − E` is the THERMAL inconsistency alone.
+
+Evaluated at `T_eos` (so `p = (ρ_d R_d + ρ_v R_v) T_eos` holds by construction) and with the
+same condensate the retrieval reads, the residual against the prognostic energy is EXACTLY
+(expand `C_f T − p`; `L_v`, `L_s` are affine in T)
+
+    E_t − E(T_eos) = D·(T_ret − T_eos) + X·C_pv·T_eos,    X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice
+
+with `D` the retrieval's denominator. On a consistent state both terms vanish and so does the
+residual, to rounding; otherwise the first is the energy the state would have to shed or gain
+for the two temperatures to agree and the second the heat content of the mass the partition
+does not account for (the reconciliation gap, or a clipped lobe the linear `ρ_t` carries).
+Diagnostic only — nothing in the model reads it.
+"""
+@inline function implied_total_energy(Tk, rho_d, rho_v, rho_liq, rho_ice, rho_t, geo)
+    return ((rho_d * internal_energy_bf02(Tk, rho_v / rho_d, rho_liq / rho_d)) +
+            (rho_ice * ((Cpv * Tk) - L_s(Tk)))) + (rho_t * geo)
+end
+
+"""
     moist_entropy_total(Tk, rho_d, q_v, q_l)
     moist_entropy_total(Tk, rho_d, q_v, q_l, q_i)
 
@@ -488,16 +596,24 @@ end
 moist_entropy_total(Tk, rho_d, q_v, q_l) = moist_entropy_total(Tk, rho_d, q_v, q_l, 0.0)
 
 """
-    mc_reference_diagnostics(ref_state, z) -> (s_tbar, rho_vbar, rho_vbar_z, Pxi_prof)
+    mc_reference_diagnostics(ref_state, z; temperature = :eos)
+        -> (s_tbar, rho_vbar, rho_vbar_z, Pxi_prof, Tbar)
 
 Consistently-RETRIEVED diagnostics of the resting reference for the vertical moist
 diffusion: the moist entropy `s_tbar` and clamped vapor density `rho_vbar`, computed
-through the exact pipeline `moist_compressible_XZ` runs each step (retrieval at rest,
+through the exact pipeline `moist_compressible_XZ` runs each step (temperature at rest,
 clamped partition, `moist_entropy_total`). The reference's own `Tbar` is NOT
-bit-identical to the retrieved temperature, so subtracting profiles built from it
-would leave a spurious O(retrieval tolerance) perturbation that diffusion then acts
+bit-identical to the model's resting temperature, so subtracting profiles built from it
+would leave a spurious O(fit error) perturbation that diffusion then acts
 on; with these, a resting base has `s_t' ≡ 0` and `rho_v' ≡ 0` bit-for-bit and every
 moist diffusive tendency vanishes exactly.
+
+`Tbar` (returned, and carried on the tile as `mc_ref_diag.Tbar`) is that resting temperature
+itself, in the run's `temperature` mode ([`temperature_mode`](@ref)): under `:eos` it is
+`eos_temperature(p̄, ρ̄_d, ρ̄_v)` with the DERIVED `ρ̄_v` below — the doubles `mc_driver!` forms at
+rest, since `0.0 + x === x` — and under `:energy` the retrieval of the fitted `(p̄, Ē_t, ρ̄_t,
+ρ̄_c)`. Springsteel's stored `ref.Tbar` is neither: it is the pointwise EOS temperature of the
+UNFITTED sounding, which differs from both at fit level.
 
 `rho_vbar` is ALSO the reference the prognostic vapor slot is carried against — the slot holds
 `ρ_v' = ρ_v − ρ̄_v` with `ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c` — and `rho_vbar_z` is that profile's vertical
@@ -506,8 +622,9 @@ so the total gradient `ρ_v'_z + ρ̄_v_z` the advection reads is the exact deri
 initializer subtracts the SAME expression, which is what makes the resting reconciliation
 `δ̄ = res_rho_t − ρ_v` identically zero rather than zero to fit tolerance.
 """
-function mc_reference_diagnostics(ref_state, z)
+function mc_reference_diagnostics(ref_state, z; temperature::Symbol = :eos)
 
+    teos = temperature_mode(Dict(:temperature => temperature)) === :eos
     pbar = ref_pressure(ref_state)
     rho_dbar = ref_rho_d(ref_state)
     rho_tbar = ref_rho_t(ref_state)
@@ -518,6 +635,7 @@ function mc_reference_diagnostics(ref_state, z)
     rho_vbar = zeros(Float64, n)
     rho_vbar_z = zeros(Float64, n)
     Pxi_prof = zeros(Float64, n)
+    Tbar = zeros(Float64, n)
     for k in 1:n
         p = pbar[k, 1]
         rho_d = rho_dbar[k, 1]
@@ -533,12 +651,16 @@ function mc_reference_diagnostics(ref_state, z)
         # every expression must match mc_driver! bit-for-bit.
         geo = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0)) + (gravity * z[k])
         M = p + (E_tbar[k, 1]) - (rho_t * geo)
-        Tk = retrieve_temperature(M, rho_d, rho_t, rho_c)
         # The DERIVED reference vapor, ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c. This is the profile the
         # prognostic vapor slot is carried against, so writing it in exactly this form (and
         # not from Springsteel's fitted `ref_rho_v`, which differs at fit level) is what makes
         # a resting base a discrete fixed point: `res_rho_t − ρ_v` is then identically 0.0.
+        # Formed BEFORE the temperature, because under `:eos` the temperature reads it.
         rho_v = rho_t - rho_d - rho_c
+        # The resting temperature in the run's mode — `rho_v` above is bit-for-bit the
+        # driver's `rho_vp + rho_vbar` at rest, so the EOS branch is too.
+        Tk = model_temperature(teos, M, p, rho_d, rho_t, rho_v, rho_c, 0.0)
+        Tbar[k] = Tk
         q_v = rho_v / rho_d
         q_l = rho_c / rho_d
         s_tbar[k] = moist_entropy_total(Tk, rho_d, q_v, q_l)
@@ -561,11 +683,11 @@ function mc_reference_diagnostics(ref_state, z)
         Pxi_prof[k] = ((C_vt + R_m) / C_vt) * p / rho_t
     end
     return (s_tbar = s_tbar, rho_vbar = rho_vbar, rho_vbar_z = rho_vbar_z,
-            Pxi_prof = Pxi_prof)
+            Pxi_prof = Pxi_prof, Tbar = Tbar)
 end
 
 """
-    consistent_qss_reference(ref, z, column) -> PressureReferenceState
+    consistent_qss_reference(ref, z, column; temperature = :eos) -> PressureReferenceState
 
 Rebuild the reference water partition (`Q_ssbar`, and on a cloudy base `rho_cbar`/`rho_vbar`)
 so the RESTING state is a discrete fixed point of the equation set. Opt-in through
@@ -621,13 +743,25 @@ The VALUE slots are the raw targets (not the filtered fit): the fixed point depe
 exactly, while the derivative slots — which come from a spline fit of those values — multiply
 `w ≡ 0` at rest and so cannot disturb it.
 
+**The temperature is the run's** (`temperature`, = `options[:temperature]`; see
+[`temperature_mode`](@ref)). Everything above is written for the `:energy` retrieval it was
+built on; under `:eos` (the default) `T` is instead `eos_temperature(p̄, ρ̄_d, ρ̄_t − ρ̄_d − ρ_c)`
+— the same derived vapor, so the same doubles the driver forms at rest — and the cloudy Newton
+uses `dT/dρ_c = T R_v/(ρ_d R_d + ρ_v R_v)` (cloud displacing vapor at fixed `p̄`, `ρ̄_w`). The
+two modes give `Q_ssbar` profiles that differ at FIT level (the retrieval and the EOS disagree
+on the fitted reference by exactly the fit error this function exists to remove), so a
+reference built for one mode is not a fixed point of the other: the builder and the run must
+agree, which is why every caller passes the run's option.
+
 Errors per level if the intended outcome is not actually reached: a cloud-free level that is
 actually supersaturated (which needs a condensate-bearing reference, not a condensing one), or
 a cloudy level whose Newton solve leaves no cloud (the sounding is not saturated there).
 """
 function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
-                                  z::AbstractVector{Float64}, column)
+                                  z::AbstractVector{Float64}, column;
+                                  temperature::Symbol = :eos)
 
+    teos = temperature_mode(Dict(:temperature => temperature)) === :eos
     pbar = ref_pressure(ref)
     rho_dbar = Springsteel.ref_rho_d(ref)
     rho_tbar = ref_rho_t(ref)
@@ -654,13 +788,21 @@ function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
         if cloudy
             cloudy_levels += 1
             # Newton on g(rho_c) = rho_c - (rho_w - rho_vs(T(rho_c), p)), whose derivative
-            # is 1 + (drho_vs/dT)(dT/drho_c) with dT/drho_c = L_v(T)/D — see the docstring.
+            # is 1 + (drho_vs/dT)(dT/drho_c) — see the docstring. Under `:energy`
+            # dT/drho_c = L_v(T)/D (differentiate the closed-form retrieval at fixed M);
+            # under `:eos` the cloud enters T only by displacing vapor at fixed rho_w and p,
+            # T = p/(rho_d R_d + (rho_w - rho_c) R_v), so dT/drho_c = T R_v/(rho_d R_d + rho_v R_v).
+            # Either way the slope is positive and the Newton map is the same contraction.
             Cfactor = (rho_d * Cpd) + (rho_w * Cpv)
             for _ in 1:50
-                Tk = retrieve_temperature(M, rho_d, rho_t, rho_c)
+                Tk = model_temperature(teos, M, p, rho_d, rho_t, rho_w - rho_c, rho_c, 0.0)
                 g = rho_c - (rho_w - rho_v_sat(Tk, p_hPa))
                 D = Cfactor - (rho_c * (Cpv - Cl))
-                gp = 1.0 + (drho_vsat_dT(Tk, p_hPa) * L_v(Tk) / D)
+                # (The `:energy` line is the pre-switch expression to the last operator.)
+                gp = teos ?
+                    1.0 + (drho_vsat_dT(Tk, p_hPa) *
+                           (Tk * Rv / ((rho_d * Rd) + ((rho_w - rho_c) * Rv)))) :
+                    1.0 + (drho_vsat_dT(Tk, p_hPa) * L_v(Tk) / D)
                 drc = -g / gp
                 rho_c += drc
                 abs(drc) < 1.0e-15 && break
@@ -671,14 +813,16 @@ function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
             Q_ss_new[k] = 0.0
         else
             rho_c_new[k] = rho_c            # exactly 0.0
-            Tk = retrieve_temperature(M, rho_d, rho_t, rho_c)
+            # `rho_w - rho_c` is the derived vapor `(ρ̄_t − ρ̄_d) − ρ̄_c`, the doubles
+            # `mc_reference_diagnostics` hands the driver as ρ̄_v.
+            Tk = model_temperature(teos, M, p, rho_d, rho_t, rho_w - rho_c, rho_c, 0.0)
             Q_ss_new[k] = (rho_w - rho_c) - rho_v_sat(Tk, p_hPa)
         end
         rho_v_new[k] = rho_w - rho_c_new[k]
 
         # VERIFY the run-time outcome through the driver's own expressions, rather than
         # assuming the algebra above reached it.
-        Tk_run = retrieve_temperature(M, rho_d, rho_t, rho_c_new[k])
+        Tk_run = model_temperature(teos, M, p, rho_d, rho_t, rho_v_new[k], rho_c_new[k], 0.0)
         rho_vs = rho_v_sat(Tk_run, p_hPa)
         q_c = rho_c_new[k] / rho_d
         S = Q_ss_new[k] / rho_vs
@@ -7364,6 +7508,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # condensation closure's kinked cloud, see `lobe_relaxation_increment`; the consistent
     # forms change the pool by a few per cent.)
     lobe_tr = get(model.options, :water_lobe_transport, true)::Bool
+    # THE MODEL TEMPERATURE (`temperature_mode`): `:eos`, T = p/(ρ_d R_d + ρ_v R_v), unless the
+    # run asks for the `:energy` retrieval. Read once per column, like every switch here.
+    teos = temperature_mode(model.options) === :eos
     # The LID of every sedimentation-flux fit (rain mass, its energy, rain number, the twelve
     # ice moments, the ice energy): `:dirichlet` (the default and the physics) fits the flux
     # on `flux_column` — the slot's basis with F = 0 at the lid, since no hydrometeor enters
@@ -8017,7 +8164,23 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             rho_ice_t[i] > head && (rho_ice_t[i] = head)
         end
     end
-    Tk = S.Tk;   @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq_t, rho_ice_t)
+    # THE MODEL TEMPERATURE, and everything downstream in this step reads it: the guard below,
+    # the saturation density and its partials, Q_s, the condensation closure and the ETD
+    # pre-compute, the ice sources, the surface layer, the Louis/MYNN boundary layer, E_sed,
+    # the entropy. Under `:eos` (default) it is the equation-of-state temperature of the
+    # prognostic pressure and the two gas densities, with `rho_v` the PROGNOSTIC vapor staged
+    # above (`rho_vp + rho_vbar`, unfloored — negative vapor is a resolution diagnostic, and the
+    # EOS denominator is harmless to it; see `eos_temperature`). It reads NO condensate, so
+    # neither the `condensate_floor` nor the ice anchor cap enters T any more; both still shape
+    # `q_l`/`q_i` (hence C_vt, R_m, γ_m, Q_s) below, as before. Under `:energy` it is the
+    # closed-form total-energy retrieval on the floored/capped condensate — the pre-switch
+    # line, bitwise. Why the switch: `eos_temperature` (the clipped-lobe phantom latent heat).
+    Tk = S.Tk
+    if teos
+        @. Tk = eos_temperature(p, rho_d, rho_v)
+    else
+        @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq_t, rho_ice_t)
+    end
     # LOCATED STATE GUARD (see `check_column_state`): p, ρ_d, ρ_t and T must be positive and
     # finite before anything consumes them — the saturation lookups just below, the sd_si
     # coefficient γ_m p/ρ_t, the microphysics. The §2c death class (retrieval heating → w /
@@ -8827,6 +8990,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     imp_c_d_z = S.imp_c_d_z
     imp_c_e = S.imp_c_e
     imp_c_e_z = S.imp_c_e_z
+    # `imp_c_e = (E_t + p)/ρ_t` and `sd_pxi = γ_m p/ρ_t` are UNCHANGED by `options[:temperature]`
+    # and deliberately so. Neither reads a temperature: the first is the total enthalpy per unit
+    # mass that the E_t CONTINUITY flux `∂z((E_t + p) w)` carries, i.e. the linearization of a
+    # conserved prognostic's own flux, and stays exact for as long as E_t is prognostic; the
+    # second is the pressure equation's sound-speed coefficient, built from p, ρ_t and the
+    # composition alone. Rewriting either through T_eos would linearize a DIFFERENT operator
+    # from the one the explicit tendencies integrate, which is the AI2* staging error the
+    # operator-consistent SI was built to remove.
     if sd_si
         @. imp_c_d = rho_d / rho_t
         @. imp_c_d_z = ((rho_d_z * rho_t) - (rho_d * rho_t_z)) / (rho_t^2)
@@ -10681,19 +10852,27 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
             fill!(rho_ice_star, 0.0)
             fill!(rho_ice_t_star, 0.0)
         end
-        @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, rho_liq_star,
-                                         rho_ice_t_star)
+        # The PROGNOSTIC vapor of the star state, `ρ_v'* + ρ̄_v` — the same
+        # `perturbation + derived reference` construction `mc_driver!` stages, so the star
+        # state and the n state agree about what the vapor IS. It used to be reassembled here
+        # as the density residual, which is now a DIFFERENT number by the reconciliation gap;
+        # reading the slot is what keeps the two phases consistent. Formed BEFORE the
+        # temperature (it used to follow it), because under `:eos` the temperature reads it.
+        @. rho_v_star = rhov_v + rho_vbar
+        # The star-state temperature in the run's mode — the SAME choice and the same
+        # unfloored prognostic vapor as `mc_driver!`, so the increments built here and the
+        # state they are applied to agree about T (see `temperature_mode`).
+        if temperature_mode(mtile.model.options) === :eos
+            @. T_star = eos_temperature(p_star, rho_d_star, rho_v_star)
+        else
+            @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, rho_liq_star,
+                                             rho_ice_t_star)
+        end
         @. p_hPa_star = p_star / 100.0
         @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
         @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
         rho_vs_star = S.df_rho_vs_star
         @. rho_vs_star = rho_v_sat(T_star, p_hPa_star)
-        # The PROGNOSTIC vapor of the star state, `ρ_v'* + ρ̄_v` — the same
-        # `perturbation + derived reference` construction `mc_driver!` stages, so the star
-        # state and the n state agree about what the vapor IS. It used to be reassembled here
-        # as the density residual, which is now a DIFFERENT number by the reconciliation gap;
-        # reading the slot is what keeps the two phases consistent.
-        @. rho_v_star = rhov_v + rho_vbar
         q_v_star = S.df_q_v_star
         q_l_star = S.df_q_l_star
         q_i_star = S.df_q_i_star

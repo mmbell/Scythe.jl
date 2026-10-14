@@ -22,6 +22,7 @@ const TEST_FILES = [
     ("test_etd_relaxation.jl",              :core),
     ("test_ice_anchor_reconcile.jl",        :core),
     ("test_moist_compressible.jl",          :moist),
+    ("test_eos_temperature.jl",             :moist),
     ("test_radiation.jl",                   :physics),
     ("test_radiation_driver.jl",            :physics),
     ("test_radiation_rrtmgp.jl",            :physics),

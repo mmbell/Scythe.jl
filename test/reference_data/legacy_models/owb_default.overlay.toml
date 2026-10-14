@@ -22,6 +22,7 @@ stability = false
 
 [numerics]
 state_dependent_si = false
+temperature = "energy"               # legacy: T from the total-energy retrieval (pre-2026-10-14)
 
 [boundary_conditions]
 vertical_scalars = "d2"             # legacy: one wall condition, ground AND lid

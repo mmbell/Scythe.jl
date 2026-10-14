@@ -859,7 +859,9 @@ using Springsteel
 
     @testset "condensation closure at rest" begin
         mktempdir() do tmpdir
-            mtile, patch, model, col = make_mc_mtile(tmpdir)
+            # The production reference (`consistent_qss_reference`): the unseeded base is a
+            # discrete fixed point, so everything below is the seed's doing.
+            mtile, patch, model, col = make_mc_mtile(tmpdir; consistent_qss = true)
             kDim = model.grid_params.kDim
             vars = model.grid_params.vars
             qss_i = vars["Q_ss"]
@@ -890,9 +892,32 @@ using Springsteel
             half = div(kDim, 2)
             @test all(S.Qdot_bar[1:half] .> 0.0)         # condensing
             @test all(S.etd_d1[1:half] .> 0.0)           # ...and that raises the pressure
-            # The supersaturation relaxes: downward in what the multistep still carries, and
-            # downward in the value the exponential update actually writes.
-            @test all(mtile.expdot_n[perturbed, qss_i] .< 0.0)
+            # The supersaturation relaxes. The sink is carried in exactly ONE of two places,
+            # chosen per point by the drive clip `max(rho_v,0) - rho_vs < Q_ss` (frozen at n):
+            # clipped, the whole constant flux `-drive/tau` is in the multistep's `N`
+            # (`expdot`, < 0, etd_lam = 0); unclipped, it is the ETD conductance `etd_lam > 0`
+            # acting on `Q_ss`, and `N` holds only the `qss_relaxation` reconciliation.
+            #
+            # WHICH branch a seeded point takes is NOT physics here and must not be asserted:
+            # the seed sets `Q_ss = rho_v'` exactly, so the clip is a TIE broken by the spline
+            # fit of the seed (a step in z): the fitted `p'/(R_v T)` and `rho_v'` disagree by
+            # ~3e-8 kg/m^3 (6e-4 relative) at the levels next to the step's ringing. Under the
+            # EOS temperature that disagreement is a temperature (T = p/(rho_d R_d + rho_v R_v))
+            # and flips 2 of the 8 seeded levels (z = 191, 691 m) to the unclipped branch, where
+            # `N` is +7e-10 (the reconciliation crumb) beside a conductance of 0.46/s; under the
+            # energy retrieval all 8 happen to clip. `consistent_qss_reference` does not change
+            # this -- the tie is in the seed, not in the reference. The old `all(expdot < 0)`
+            # asserted the branch; what is asserted now is the physics on either branch: each
+            # point carries the sink in one of the two halves, and the TOTAL rate on Q_ss,
+            # `N - etd_lam*Q_ss`, is a sink everywhere.
+            last = (ncols - 1) * kDim .+ (1:half)        # the scratch column's seeded rows
+            N_q = mtile.expdot_n[last, qss_i]
+            lam = S.etd_lam[1:half]
+            Q_n = mtile.tile.physical[last, qss_i, 1]
+            @test all(((lam .== 0.0) .& (N_q .< 0.0)) .| (lam .> 0.0))
+            @test all((N_q .- (lam .* Q_n)) .< 0.0)
+            # ...and downward in the value the exponential update actually writes, at every
+            # seeded point of every column.
             @test all(mtile.var_np1[perturbed, qss_i] .<
                       mtile.tile.physical[perturbed, qss_i, 1])
             @test all(isfinite.(mtile.var_np1))
@@ -1777,14 +1802,40 @@ using Springsteel
             @test all(x -> x ≈ d / tau_rec, S.VREC)
             @test all(>(0.0), S.VREC)
 
-            # THERMODYNAMICALLY INERT. retrieve_temperature reads rho_t, the condensed
-            # masses and E_t — never the vapor — so a gap of this size must not move T at
-            # all. Bitwise, because the retrieval's inputs are the same doubles.
-            @test S.Tk == T_rest
+            # THERMODYNAMICALLY INERT UNDER THE ENERGY RETRIEVAL ONLY. retrieve_temperature
+            # reads rho_t, the condensed masses and E_t — never the vapor — so under
+            # `:energy` a gap of this size must not move T at all (bitwise, because the
+            # retrieval's inputs are the same doubles; asserted on a second tile below).
+            # Under the default `:eos` the vapor is in the equation of state: removing d at
+            # fixed p raises T by exactly the EOS response, which is what the nudge's
+            # restoring tendency then undoes. It is not inert there, and that is the point
+            # of asserting the formula rather than equality.
+            @test S.Tk == Scythe.eos_temperature.(S.p, S.rho_d, S.rho_v)
+            @test all(S.Tk .> T_rest)
             # The conserved slots take nothing from it either.
             @test maximum(abs.(mtile.expdot_n[:, model.grid_params.vars["rho_t"]])) == 0.0
             @test maximum(abs.(mtile.expdot_n[:, model.grid_params.vars["rho_d"]])) == 0.0
             @test maximum(abs.(mtile.expdot_n[:, model.grid_params.vars["E_t"]])) == 0.0
+        end
+        # The :energy tile: the same seed leaves the retrieval bitwise unmoved.
+        mktempdir() do tmpdir
+            mtile, patch, model, col = make_mc_mtile(tmpdir;
+                extra_options = Dict{Symbol,Any}(:temperature => :energy))
+            kDim = model.grid_params.kDim
+            npts = size(patch.physical, 1)
+            ncols = div(npts, kDim)
+            rv_i = mtile.mc_slots.rho_v
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 1)
+            end
+            T_rest = copy(mtile.mc_scratch[Threads.threadid()].Tk)
+            for i in 1:npts
+                patch.physical[i, rv_i, 1] -= 1.0e-5
+            end
+            for c in 1:ncols
+                Scythe.advance_column(mtile, c, 2)
+            end
+            @test mtile.mc_scratch[Threads.threadid()].Tk == T_rest
         end
     end
 
@@ -6684,10 +6735,20 @@ using Springsteel
             # anchor-capped partition and the phantom L_s credit is gone; with the cap
             # ablated it reads the full credit. On the admissible column the cap never
             # binds and the two configurations are bitwise identical.
-            m_nf = run_ice(Dict{Symbol,Any}(:ice_anchor_floor => false); rho_i = 5.0e-3)
+            #
+            # The cap protects the ENERGY retrieval, so this is asserted under
+            # `options[:temperature] = :energy`. Under the default `:eos` the model temperature
+            # reads no condensate at all, so the phantom has no temperature to credit and the
+            # cap cannot move T — asserted too, bitwise.
+            en = Dict{Symbol,Any}(:temperature => :energy)
+            m_nf = run_ice(merge(en, Dict{Symbol,Any}(:ice_anchor_floor => false)); rho_i = 5.0e-3)
+            m_en = run_ice(en; rho_i = 5.0e-3)
             S_nf = m_nf.mc_scratch[tid]
-            @test maximum(S_nf.Tk) - maximum(S_on.Tk) > 5.0
-            @test all(S_on.Tk .<= S_nf.Tk .+ 1.0e-12)
+            S_en = m_en.mc_scratch[tid]
+            @test maximum(S_nf.Tk) - maximum(S_en.Tk) > 5.0
+            @test all(S_en.Tk .<= S_nf.Tk .+ 1.0e-12)
+            m_nf_eos = run_ice(Dict{Symbol,Any}(:ice_anchor_floor => false); rho_i = 5.0e-3)
+            @test m_nf_eos.mc_scratch[tid].Tk == S_on.Tk
             m_nf_ok = run_ice(Dict{Symbol,Any}(:ice_anchor_floor => false); rho_i = 1.0e-5)
             m_ok = run_ice(on; rho_i = 1.0e-5)
             @test m_ok.expdot_n == m_nf_ok.expdot_n

@@ -184,6 +184,7 @@ function build_physics(cfg::RunConfig; start_hour::Float64 = cfg.physics.radiati
     num.horizontal_semiimplicit && (o[:horizontal_semiimplicit] = true)
     o[:wall_bc_tau] = num.wall_bc_tau
     num.cfl_interval > 0.0 && (o[:cfl_interval] = num.cfl_interval)
+    o[:temperature] = num.temperature
     o[:vertical_mixing] = false      # legacy primitive-equation switch; the BL owns vertical mixing
 
     # ── microphysics

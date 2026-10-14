@@ -1162,7 +1162,8 @@ identical to it so the two agree BITWISE at rest:
   columns to the last bit;
 - `ke = 0.0` (u = v = w = 0) enters `M` in the same associativity,
   `M = p + E_t - rho_t*(ke + g z)`;
-- the retrieval and its counted [170, 350] K clamp are the same call.
+- the temperature (`model_temperature`, the run's mode) and its counted [170, 350] K clamp
+  are the same call.
 
 `z` is column 1's height coordinate, which is every column's: the vertical mish is
 identical across a tile.
@@ -1195,6 +1196,11 @@ function radiation_reference_column!(work::RadiationWork, mtile::ModelTile,
     ice_on = ice_registered(slots)
     itrans = ice_transform_mode(model.options)
     imu = ice_mu(model.physical_params, 1)
+    # The model temperature in the run's mode (`temperature_mode`): the radiation must see the
+    # temperature the driver's microphysics and surface layer see. Under `:eos` it reads the
+    # unfloored prognostic vapor `rho_v` below, as the driver does; the `max(ρ_v, 0)` floor of
+    # the RRTMGP hand-off (radiation_state.jl) is applied AFTER, to the gas column only.
+    teos = temperature_mode(model.options) === :eos
 
     want_cond = cond !== nothing
     ice_cond = want_cond && ice_on
@@ -1219,7 +1225,7 @@ function radiation_reference_column!(work::RadiationWork, mtile::ModelTile,
         ke = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0) + (0.0 * 0.0))
         M = p + E_t - (rho_t * (ke + (gravity * z[k])))
         rho_liq = rho_c + rho_r
-        Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
+        Tk = model_temperature(teos, M, p, rho_d, rho_t, rho_v, rho_liq, rho_ice)
         if Tk < 170.0
             Tk = 170.0; rs.n_clamp_tk += 1
         elseif Tk > 350.0
@@ -1296,8 +1302,10 @@ reuses its helpers rather than restating them:
   (`:bhyp`) is reconstructed, not read raw;
 - `ke = ½(u² + v² + w²)` is INCLUDED. It is tempting to drop as a small term; at 90 m/s
   it is worth about 4 K in the retrieval, which is a 1 K/day error in the cooling profile;
-- `M = p + E_t − ρ_t(ke + gz)` and `Tk = retrieve_temperature(M, ρ_d, ρ_t, ρ_liq, ρ_ice)`
-  are the driver's closed-form retrieval.
+- `Tk` is the model temperature in the run's `options[:temperature]` mode, as the driver forms
+  it: `eos_temperature(p, ρ_d, ρ_v)` under `:eos` (the default), or under `:energy`
+  `M = p + E_t − ρ_t(ke + gz)` and `retrieve_temperature(M, ρ_d, ρ_t, ρ_liq, ρ_ice)`, the
+  closed-form retrieval.
 
 The retrieved temperature is CLAMPED to [170, 350] K and every clamp is COUNTED in
 `rs.n_clamp_tk`. A solver fed a temperature outside its lookup range either errors or
@@ -1355,6 +1363,11 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
     ice_on = ice_registered(slots)
     itrans = ice_transform_mode(model.options)
     imu = ice_mu(model.physical_params, 1)
+    # The model temperature in the run's mode (`temperature_mode`): the radiation must see the
+    # temperature the driver's microphysics and surface layer see. Under `:eos` it reads the
+    # unfloored prognostic vapor `rho_v` below, as the driver does; the `max(ρ_v, 0)` floor of
+    # the RRTMGP hand-off (radiation_state.jl) is applied AFTER, to the gas column only.
+    teos = temperature_mode(model.options) === :eos
     # The ice views are formed UNCONDITIONALLY, against slot 1 (pressure, which every
     # configuration has) when ice is off, and READ only under `ice_on`. The obvious
     # `ice_on ? view(...) : nothing` costs an allocation per column per view: a
@@ -1415,7 +1428,7 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
         ke = 0.5 * ((u[k] * u[k]) + (vk * vk) + (w[k] * w[k]))
         M = p + E_t - (rho_t * (ke + (gravity * z[k])))
         rho_liq = rho_c + rho_r
-        Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
+        Tk = model_temperature(teos, M, p, rho_d, rho_t, rho_v, rho_liq, rho_ice)
         if Tk < 170.0
             Tk = 170.0; rs.n_clamp_tk += 1
         elseif Tk > 350.0

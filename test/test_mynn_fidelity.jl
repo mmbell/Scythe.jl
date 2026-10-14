@@ -376,9 +376,14 @@ using .MYNNTestFixtures
             @test Km_f[j1] == 0.0
             @test Km_d[j1] == 0.0
             @test Kh_d[j1] == 0.0
-            # The top level has only the wall below it, so it is unchanged.
-            @test Km_d[jn] == Km_f[jn]
-            @test Kh_d[jn] == Kh_f[jn]
+            # The top level has only the wall below it, so it is unchanged -- in VALUE, not in
+            # bits: the deviation forms `(el*S)*q` and the colocated form `(el*q)*S`, so the two
+            # agree only to the last ulp. The `==` this used to be held by coincidence of the
+            # operands and broke (1 ulp on K_h) when the model temperature became the EOS one
+            # (2026-10-14), which changes the state these products are taken on, not the
+            # arithmetic.
+            @test isapprox(Km_d[jn], Km_f[jn]; rtol = 1.0e-12)
+            @test isapprox(Kh_d[jn], Kh_f[jn]; rtol = 1.0e-12)
             # ...and every interior level is `q` times the WALL AVERAGE. Cross-multiplied
             # so `q` (which the state does not expose) cancels and no division by a
             # possibly-zero level is needed.

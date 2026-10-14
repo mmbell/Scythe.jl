@@ -84,6 +84,8 @@ const BL_SCHEMES = (:mynn, :louis, :none)
 const HMIX_SCHEMES = (:smagorinsky, :constant, :none)
 "Allowed `numerics.positivity` values: `auto` applies the positivity rule at build, `off` never does."
 const POSITIVITY_MODES = (:auto, :off)
+"Allowed `numerics.temperature` values (`options[:temperature]`; `TEMPERATURE_MODES` in src/moist_compressible.jl)."
+const TEMPERATURE_CHOICES = (:eos, :energy)
 "Allowed `output.netcdf_grid` values (`:mish` is reserved in `validate_output_options` and refused)."
 const NETCDF_GRIDS = (:regular,)
 
@@ -532,6 +534,7 @@ end
 - `l_q_horizontal::Float64` — filter length of the horizontal B-spline (x / r); 0 = inherit `l_q`.
 - `l_q_vertical::Float64` — filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical).
 - `cfl_interval::Float64` — CFL report cadence [s]; 0 = `output.interval`, resolved at build.
+- `temperature::Symbol` — the model temperature every consumer reads (microphysics, radiation, surface layer, boundary layer, output): `eos` = `p/(rho_d R_d + rho_v R_v)` from the prognostic pressure and vapor (default since 2026-10-14), `energy` = the closed-form total-energy retrieval, which reads the clipped condensate and warms by ~2.5 K per 1e-3 kg/m3 of clipped lobe. `E_t` stays prognostic either way; the output's `T_split` and `E_residual` measure the disagreement.
 
 The filter lengths are separate because the two directions do different jobs: the
 vertical `l_q` is load-bearing for the semi-implicit acoustic solve (its column operators
@@ -551,6 +554,7 @@ Base.@kwdef struct Numerics <: AbstractConfigSection
     l_q_horizontal::Float64 = 0.0
     l_q_vertical::Float64 = 0.0
     cfl_interval::Float64 = 0.0
+    temperature::Symbol = :eos
 end
 
 """
@@ -721,7 +725,8 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (Radiation, :solar)                        => RADIATION_SOLAR_MODES,
     (Radiation, :forcing)                      => RADIATION_FORCINGS,
     (HorizontalMixing, :scheme)                => HMIX_SCHEMES,
-    (Numerics, :positivity)                    => POSITIVITY_MODES)
+    (Numerics, :positivity)                    => POSITIVITY_MODES,
+    (Numerics, :temperature)                   => TEMPERATURE_CHOICES)
 
 _join_path(path::AbstractString, f) = isempty(path) ? string(f) : string(path, ".", f)
 
@@ -811,6 +816,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :hydrostatic_reference    => (Bool, "discretely hydrostatic reference state (semiimplicit.jl)"),
     :state_dependent_si       => (Bool, "vertical SI implicit coefficients from the current column state (moist_compressible.jl)"),
     :exact_si                 => (Bool, "exact coupled semi-implicit acoustic solve, variant 1 (exact_si.jl, moist_compressible.jl)"),
+    :temperature              => (Symbol, "model temperature: :eos = p/(rho_d R_d + rho_v R_v) (default) or :energy = the closed-form total-energy retrieval (moist_compressible.jl, radiation.jl, semiimplicit.jl, netcdf_output.jl)"),
     :exact_si_ax0             => (Bool, "exact_si axisym: experimental axis-row treatment of the radial operator (exact_si.jl)"),
     :exact_si_zero_x          => (Bool, "exact_si diagnostic: zero the horizontal increments (exact_si.jl)"),
     :xsi_lid_rows             => (String, "exact_si lid boundary rows: \"strong\" or weak (exact_si.jl, exact_si_rlr.jl)"),
@@ -1049,6 +1055,7 @@ const OWNED_OPTION_KEYS = Dict{Symbol,String}(
     :horizontal_semiimplicit   => "numerics.horizontal_semiimplicit",
     :wall_bc_tau               => "numerics.wall_bc_tau",
     :cfl_interval              => "numerics.cfl_interval",
+    :temperature               => "numerics.temperature",
     :output_formats            => "output.formats",
     :netcdf_grid               => "output.netcdf_grid",
     :netcdf_derivatives        => "output.netcdf_derivatives",

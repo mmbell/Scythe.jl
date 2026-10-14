@@ -74,6 +74,10 @@ const IMPLICIT_DEFAULTS = Dict{String,Any}(
     "options.mynn_init"                => ":taper",  # src/mynn_state.jl:829
     "options.mynn_output"              => "false",   # src/mynn_state.jl:849
     "options.radiation_output"         => "false",   # src/radiation_state.jl:595
+    # NOT the library default (that is :eos since 2026-10-14) but the legacy drivers' physics:
+    # the key did not exist and every consumer read the total-energy retrieval, which is
+    # exactly :energy (bitwise; test/test_eos_temperature.jl). The base overlays pin it.
+    "options.temperature"              => ":energy", # src/moist_compressible.jl temperature_mode
     "physical_params.Khdiff_water"     => 0.0,       # src/moist_compressible.jl:6773
     "physical_params.Pr_t"             => 1.0,       # src/moist_compressible.jl:6770
     "physical_params.Sc_t"             => 1.0)       # src/moist_compressible.jl:6774
@@ -182,7 +186,8 @@ const EXPECTED_DELTAS = Dict(
             "options.louis_bl" => ("true", missing),
             "options.mynn" => (missing, "true"),
             "options.sfc_stability" => (missing, "true"),
-            "options.wall_bc_tau" => ("Inf", "300.0"))),
+            "options.wall_bc_tau" => ("Inf", "300.0"),
+            "options.temperature" => (missing, ":eos"))),
         bc_changed = merge(ceq_lid([LID_SCALARS; "v"; "nu_c"]), Dict("BCT.nu_r" => (BC_D2, BC_NATURAL))),
         renamed = Dict{String,String}(),
         added = ceq_added(12), templates = ceq_templates("nu_r")),
@@ -192,7 +197,8 @@ const EXPECTED_DELTAS = Dict(
         changes = Dict(
             "options.consistent_qss_reference" => (missing, "true"),
             "options.hydrostatic_reference" => (missing, "true"),
-            "options.state_dependent_si" => (missing, "true")),
+            "options.state_dependent_si" => (missing, "true"),
+            "options.temperature" => (missing, ":eos")),
         bc_changed = ceq_lid([LID_SCALARS; "nu_c"; "rho_e"]), renamed = Dict{String,String}(),
         added = Dict{String,Int}(), templates = Dict{String,Any}()),
     # OWB: Louis -> MYNN (+ rho_e), ice (two-moment rain, bhyp on every water slot: rho_r/rho_c
@@ -215,7 +221,8 @@ const EXPECTED_DELTAS = Dict(
             "options.mynn" => (missing, "true"),
             "options.sfc_stability" => (missing, "true"),
             "grid_params.positivity.rho_r.i" => (0.0, missing),
-            "grid_params.positivity.rho_r.k" => (0.0, missing)),
+            "grid_params.positivity.rho_r.k" => (0.0, missing),
+            "options.temperature" => (missing, ":eos")),
         # nu_c is the renamed rho_c: its lid goes natural with the rest of the family.
         bc_changed = merge(ceq_lid(LID_SCALARS), Dict{String,Any}("BCB.nu_c" => (missing, BC_NATURAL), "BCT.nu_c" => (missing, BC_NATURAL))),
         renamed = Dict("rho_r" => "nu_r", "rho_c" => "nu_c"),
