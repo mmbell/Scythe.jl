@@ -244,6 +244,11 @@ const MC_SCRATCH_SLOTS = (
     :etd_lam, :etd_nl, :etd_dep_a, :etd_dep_b, :etd_qbar, :etd_qnp1,
     :etd_d1, :etd_d8, :etd_d9, :etd_dv, :etd_di1, :etd_di2, :etd_di3,
     :Qdot_bar, :Qdot_r_bar, :Qdep_bar,
+    #    The LOBE RELAXATION's increments (`lobe_relaxation_increment`, Stage L): cloud, rain
+    #    and the three ice masses, formed in the same pre-compute window from the state-`n`
+    #    control variables and the gate terms, applied beside `etd_d8`/`etd_d9`. Written only
+    #    under `options[:lobe_relaxation]`, and read only then.
+    :etd_dlc, :etd_dlr, :etd_dli1, :etd_dli2, :etd_dli3,
     #    The HABIT PARTITION of the deposition increment (`ishmael_deposition_partition`) is
     #    evaluated ONCE per step, at the STEP-MEAN rate, alongside the mass it partitions —
     #    the a/c-moment sources and the sublimation number sink are the same realized
@@ -2000,6 +2005,104 @@ habit moment carries no water and never enters the partition.
 
 @doc (@doc ahyp_signed)
 @inline clipped_lobe(n, rho, mu) = n < 0.0 ? ahyp_signed(n, mu) - rho : 0.0
+
+"""
+    LOBE_RELAXATION_DEFAULT
+
+The value `options[:lobe_relaxation]` takes when the key is absent. See
+[`lobe_relaxation_increment`](@ref).
+"""
+const LOBE_RELAXATION_DEFAULT = false
+
+"""
+    lobe_relaxation_increment(nu, a) -> dnu
+    lobe_relaxation_cap(dnu, nu_star) -> dnu_applied
+
+THE LOBE RELAXATION (`options[:lobe_relaxation]`, `physical_params[:tau_lobe]`, default 10 s;
+Stage L of reference/RHO_T_RETIREMENT_DESIGN.md). **A pragmatic device, not physics** — the
+author's, adopted knowingly: it removes a numerical artifact that nothing in the physics can
+act on, and it is not a parameterization of any process.
+
+**What it removes.** A phase change writes a KINK into the cloud control variable `ν_c`: a
+real, flat boundary-layer sheet held saturated by LW cooling and MYNN mixing has a top sharper
+than one mish cell, and the condensation closure re-imposes it every step through the ETD
+increment `d9`. The per-step patch REFIT (`spectralTransform!` → `tileTransform!`, Ooyama's
+`ε = (l_q Δx/2π)⁶` filter) answers a kink by ringing, and above the sheet, in subsaturated
+air, the ring is NEGATIVE. There `ρ_c = ahyp(ν_c) = 0`, so `qss_condensation_rates` sees the
+channel CLOSED (`q_c ≤ 1e-8` and `S ≤ 1e-4` give `invtau_c = 0`) — while the POSITIVE rings
+are evaporated. The rectification is one-sided: the refit makes a negative ν pool every step
+and nothing ever takes it back. Measured on the 2-D RCE restart, closed budget, 24–25 h: FIT
+−0.172 kg m⁻², ETD −0.017, MYNN +0.014, everything else 0, reproducing the control pool to
+4e-17; −0.03 → −0.65 kg m⁻² over 24–27 h in a horizontally uniform layer at 1.5–4.5 km. The
+1-D toy (same Springsteel spline, grid, BCs and `l_q`) gives −0.56 kg m⁻² per hour against a
+0.13 kg m⁻² held cloud; with this device on τ = 10 s, −0.007. The kink is physical, the lobe
+is numerical, and `l_q` is not the lever (`l_q_vertical` 1.5 changes the pool by 3 %; 1.0
+gives NaN in 55 s).
+
+**What it does.** For each TRANSFORMED water-MASS slot — cloud `ν_c`, rain `ν_r`, the three
+ice masses `ν_{i,k}`, each only under `:bhyp` — at every point where `ν^n < 0` and the
+species' channel is CLOSED, the slot receives the exponential relaxation toward zero
+
+    Δν = −ν^n (1 − e^{−Δt/τ_lobe}),       `a = 1 − e^{−Δt/τ_lobe} = −expm1(−Δt/τ_lobe)`,
+
+a `Δt`-free rate law (`dν/dt = −ν/τ_lobe` on the lobe, integrated exactly over the step) in
+the τ class of `tau_rho_v_rec`, `tau_qss` and `tau_ice_anchor`: a drift correction, never a
+shock. `a ∈ [0, 1]`, so the device's own step `ν(1 − a)` can reach zero but never cross it.
+**CHANNEL CLOSED** means the recovered density is 0 (`ν ≤ 0` under `:bhyp`) and EVERY process
+term the slot receives at that point is an exact `0.0` at state `n`:
+
+  * cloud — the step-mean phase change `qc_bar`, `AUTO_COLL` and (ice on) `ICE_C`; for cloud
+    this IS the `qss_condensation_rates` gate, read off its result;
+  * rain — `qr_bar`, `AUTO_COLL`, (ice on) `ICE_R`, AND the sedimentation divergence `Fr_z`:
+    rain falling into a lobe point opens the channel, because the flux will fill it. `Fr_z`
+    is a FITTED divergence, so any positive rain anywhere in the column leaves it nonzero
+    almost everywhere in that column — the gate is then conservatively open;
+  * ice masses — the slot's `SRC_*` (ISHMAEL, anchor and population sources), the ETD
+    deposition increment `di*`, and `F_*_z`, with the same column-wide reading as rain.
+
+It is computed in `mc_driver!`'s ETD pre-compute window, where all of these and the state-`n`
+`ν` (the post-refit value the step started from) are in hand, and applied by
+[`relaxation_adjustment_qss!`](@ref) as a slot increment beside `d8`/`d9` — after the explicit
+advance, before the acoustic solve, in the step phase the condensation increments use, and on
+both the vertical-only and `exact_si` paths. It is NOT a write to `tile.physical` at the start
+of the step: the derivative layers the driver reads (`f_z`, `f_zz`) would go stale against it.
+
+`lobe_relaxation_cap` bounds the applied increment by the post-advance value: the slot is
+lifted at most to `ν* = 0`, and not at all where the explicit advance already left `ν* ≥ 0`
+(a lobe point that advection or mixing filled within the step). Where `ν* < 0` the result
+`ν* + Δν_applied ≤ 0`, and where `ν* ≥ 0` nothing is applied, so the recovered density at
+`n+1` is never changed by the device: `ahyp(ν* + Δν_applied) = ahyp(ν*)`. (The note's form
+applies `Δν` unbounded; the
+two agree wherever the slot's own tendency is non-positive at the lobe point, which is every
+point of the pre-convective layer.)
+
+**Water-neutral by construction while ρ_t is prognostic.** No recovered mass moves, so ρ_t,
+ρ_d, the vapor, E_t, p, Q_ss, `res_rho_t`, the temperature retrieval and every rate are
+bitwise untouched by it on the step it acts; only the next refit sees a shallower lobe.
+Refused with `options[:water_lobe_attribution] = true`: attribution reads the lobe into
+`res_rho_t`, so relaxing it would move the vapor through the nudge and the device would stop
+being water-neutral (both would act on the same lobes). Under `:none` a slot IS its density
+(nothing to relax); under `:bhyp_smooth` a lobe point carries a recovered density in
+`(−μ, 0)` that the relaxation would move, so those slots are skipped too.
+
+**NOT relaxed: ice NUMBER and HABIT moments, rain number.** The mass relaxation moves no
+recovered mass, so no recovered per-particle quantity changes and the moments have nothing to
+stay consistent with; their own negative lobes carry no water and are already inert (the
+population gate needs a positive carried number, the anchor and population devices read
+`max(moment, 0)`). Whether they need a device of their own is open.
+
+**STAGE 3 NOTE — this form is only valid while ρ_t is a prognostic.** Once ρ_t is retired and
+`ρ_w ≡ 2Σ_k ν_k`, raising `ν_k` toward 0 raises `ρ_w`: UNPAIRED, this device becomes a
+SECULAR WATER SOURCE at the lobe feed rate, ~0.17 kg m⁻² h⁻¹ in the pre-convective RCE
+window. At Stage 3 it must become a ρ_w-neutral pair through the exchange entry point
+(`water_exchange!`): `Δν_v = −Δν_k`, the vapor the closure species (physically the partner is
+the ETD evaporation overdraw the closed channel could not realize). Forgetting this is a
+silent conservation bug; Stage 3's paired-form test `Σ_k Δν_k = 0` is the guard.
+"""
+@inline lobe_relaxation_increment(nu, a) = nu < 0.0 ? -(a * nu) : 0.0
+
+@doc (@doc lobe_relaxation_increment)
+@inline lobe_relaxation_cap(dnu, nu_star) = min(dnu, max(-nu_star, 0.0))
 
 """
     condensate_slot(rho_c, rho_cbar, transform, mu) -> slot value
@@ -7062,6 +7165,23 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # accounting — the residual that drove 15–32 % of the 2-D RCE domain to negative vapor —
     # bitwise, for forensics.
     lobe_attr = get(model.options, :water_lobe_attribution, false)::Bool
+    # LOBE RELAXATION (Stage L; see `lobe_relaxation_increment`): the pragmatic device that
+    # relaxes a transformed water-mass slot's refit lobe toward ν = 0 on `tau_lobe` where the
+    # species' channel is closed. `false` is bitwise the code without it. It and the
+    # attribution above would act on the SAME lobes — attribution reads them into
+    # `res_rho_t`, so relaxing them would move the vapor through the nudge — and the pair is
+    # refused rather than resolved silently.
+    lobe_relax = get(model.options, :lobe_relaxation, LOBE_RELAXATION_DEFAULT)::Bool
+    tau_lobe = get(model.physical_params, :tau_lobe, 10.0)
+    if lobe_relax
+        lobe_attr && error("options[:lobe_relaxation] = true and " *
+                           "options[:water_lobe_attribution] = true act on the same " *
+                           "negative lobes: attribution reads them into res_rho_t, so " *
+                           "relaxing them moves the vapor through the nudge and the " *
+                           "relaxation stops being water-neutral. Set one of them to false.")
+        tau_lobe > 0.0 || error("physical_params[:tau_lobe] = $(tau_lobe) must be > 0 " *
+                                "(the lobe relaxation timescale, s)")
+    end
     # The LID of every sedimentation-flux fit (rain mass, its energy, rain number, the twelve
     # ice moments, the ice energy): `:dirichlet` (the default and the physics) fits the flux
     # on `flux_column` — the slot's basis with F = 0 at the lid, since no hydrometeor enters
@@ -9128,6 +9248,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # Block B of the ATTRIBUTION census (`MC_ATTR_QR_EVAP`/`MC_ATTR_QR_COMB`), opt-in with
     # the other three blocks.
     attr_on = census_on && ice_attr
+    # The LOBE RELAXATION (see `lobe_relaxation_increment`), per slot: only a `:bhyp` slot has
+    # a lobe whose recovered density is exactly 0, so only those are relaxed. `a_lobe` is the
+    # exact one-step fraction of the rate law, `1 − e^{−Δt/τ_lobe}`.
+    lr_c = lobe_relax && ctrans === :bhyp
+    lr_r = lobe_relax && rtrans === :bhyp
+    lr_i = lobe_relax && ice_on && itrans === :bhyp
+    a_lobe = lobe_relax ? -expm1(-ts / tau_lobe) : 0.0
+    etd_dlc = S.etd_dlc; etd_dlr = S.etd_dlr
+    etd_dli1 = S.etd_dli1; etd_dli2 = S.etd_dli2; etd_dli3 = S.etd_dli3
     @inbounds for i in eachindex(etd_lam)
         g = colstart + i - 1
         invtau_l = invtau_c[i] + invtau_r[i]
@@ -9340,6 +9469,43 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         end
         etd_d1[i] = ts * (R_m[i] / C_vt[i]) * heat
 
+        # ── LOBE RELAXATION (Stage L): the closed-channel gate, read off the very terms the
+        # slot is about to receive ──────────────────────────────────────────────────────────
+        # HERE because this is the one window in which every term the gate needs is final for
+        # the step and in hand together: the step-mean phase change just formed (`qc_bar`,
+        # `qr_bar`, the deposition increments `etd_di*`), the conversion `AUTO_COLL`, the ice
+        # back-reactions `ICE_C`/`ICE_R`, the ISHMAEL+anchor+population sources `SRC_*`, the
+        # fitted sedimentation divergences `Fr_z`/`F_*_z` — and the state-`n` control variable,
+        # which IS the post-refit value the step started from. A point is relaxed only where
+        # `ν^n < 0` (recovered density 0 under `:bhyp`) and every one of those terms is an
+        # exact `0.0`: the gate is the physics' own statement that nothing acts there, not a
+        # threshold of ours. For the cloud, `qc_bar == 0` is exactly `qss_condensation_rates`'
+        # `invtau_c = 0` branch (`q_c ≤ 1e-8` and `S ≤ 1e-4`): the CLIPPED branch above copies
+        # `Qdot`, which is `invtau_c·drive` and an exact zero with it.
+        #
+        # The increments are applied by `relaxation_adjustment_qss!`, bounded there by the
+        # post-advance value (`lobe_relaxation_cap`), so no recovered mass moves.
+        if lobe_relax
+            etd_dlc[i] = (lr_c && qc_bar == 0.0 && AUTO_COLL[i] == 0.0 &&
+                          (!ice_on || S.ICE_C[i] == 0.0)) ?
+                lobe_relaxation_increment(nu_c[i], a_lobe) : 0.0
+            etd_dlr[i] = (lr_r && qr_bar == 0.0 && AUTO_COLL[i] == 0.0 && Fr_z[i] == 0.0 &&
+                          (!ice_on || S.ICE_R[i] == 0.0)) ?
+                lobe_relaxation_increment(nu_r[i], a_lobe) : 0.0
+            if lr_i
+                etd_dli1[i] = (S.SRC_i1q[i] == 0.0 && etd_di1[i] == 0.0 &&
+                               S.F_i1q_z[i] == 0.0) ?
+                    lobe_relaxation_increment(S.nu_i1q[i], a_lobe) : 0.0
+                etd_dli2[i] = (S.SRC_i2q[i] == 0.0 && etd_di2[i] == 0.0 &&
+                               S.F_i2q_z[i] == 0.0) ?
+                    lobe_relaxation_increment(S.nu_i2q[i], a_lobe) : 0.0
+                etd_dli3[i] = (S.SRC_i3q[i] == 0.0 && etd_di3[i] == 0.0 &&
+                               S.F_i3q_z[i] == 0.0) ?
+                    lobe_relaxation_increment(S.nu_i3q[i], a_lobe) : 0.0
+            else
+                etd_dli1[i] = 0.0; etd_dli2[i] = 0.0; etd_dli3[i] = 0.0
+            end
+        end
     end
 
     # Depletion census of the water species. HERE, not next to the tendency assembly: this is
@@ -9819,6 +9985,49 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
             dn1[i] != 0.0 && (vnp1[g, n1] += dn1[i])
             dn2[i] != 0.0 && (vnp1[g, n2] += dn2[i])
             dn3[i] != 0.0 && (vnp1[g, n3] += dn3[i])
+        end
+    end
+    # The LOBE RELAXATION (Stage L; `lobe_relaxation_increment`), applied in the same phase as
+    # the condensation increments it sits beside, and bounded by the post-advance value so the
+    # device never lifts a slot above ν = 0: no recovered mass moves, ρ_t and the vapor are
+    # untouched. The rain and ice masses are TOTALS (the slot is ν); the cloud slot is a
+    # perturbation against ν̄_c, recovered here as the state-`n` total minus the state-`n`
+    # slot (an exact 0.0 whenever ρ̄_c ≡ 0, which is every current configuration). Number and
+    # habit moments are never touched.
+    if get(mtile.model.options, :lobe_relaxation, LOBE_RELAXATION_DEFAULT)::Bool
+        phys = mtile.tile.physical
+        dlc = S.etd_dlc; dlr = S.etd_dlr
+        nuc = S.nu_c
+        @inbounds for i in eachindex(lam)
+            g = colstart + i - 1
+            if dlc[i] != 0.0
+                nustar = vnp1[g, 9] + (nuc[i] - phys[g, 9, 1])
+                d = lobe_relaxation_cap(dlc[i], nustar)
+                d != 0.0 && (vnp1[g, 9] += d)
+            end
+            if dlr[i] != 0.0
+                d = lobe_relaxation_cap(dlr[i], vnp1[g, 8])
+                d != 0.0 && (vnp1[g, 8] += d)
+            end
+        end
+        if ice_on
+            dli1 = S.etd_dli1; dli2 = S.etd_dli2; dli3 = S.etd_dli3
+            i1 = IS.i1_q; i2 = IS.i2_q; i3 = IS.i3_q
+            @inbounds for i in eachindex(lam)
+                g = colstart + i - 1
+                if dli1[i] != 0.0
+                    d = lobe_relaxation_cap(dli1[i], vnp1[g, i1])
+                    d != 0.0 && (vnp1[g, i1] += d)
+                end
+                if dli2[i] != 0.0
+                    d = lobe_relaxation_cap(dli2[i], vnp1[g, i2])
+                    d != 0.0 && (vnp1[g, i2] += d)
+                end
+                if dli3[i] != 0.0
+                    d = lobe_relaxation_cap(dli3[i], vnp1[g, i3])
+                    d != 0.0 && (vnp1[g, i3] += d)
+                end
+            end
         end
     end
     return nothing

@@ -649,6 +649,7 @@ co2_ppm = 280.0
 | `ice_shed_above_t0` | bool |  | shed riming to rain above T_0 (moist_compressible.jl) |
 | `ice_transform` | string (enum) | `physics.microphysics.ice_transform` (refused in `[extra.options]`) | control variable of the twelve ice slots: :none, :bhyp, :bhyp_smooth (moist_compressible.jl) |
 | `ice_var_check` | bool |  | ISHMAEL var_check write-back as a relaxation source (moist_compressible.jl) |
+| `lobe_relaxation` | bool |  | relax a transformed water-mass slot's (cloud, rain, the three ice masses) refit lobe nu < 0 toward 0 on physical_params[:tau_lobe] where that species' channel is closed (recovered density 0, every process term of the slot exactly 0); moves no recovered mass, water-neutral while rho_t is prognostic; a pragmatic device, not physics (Stage L, reference/RHO_T_RETIREMENT_DESIGN.md); refused with water_lobe_attribution (moist_compressible.jl) |
 | `louis_bl` | bool | `physics.boundary_layer.scheme` (refused in `[extra.options]`) | Louis first-order vertical mixing (moist_compressible.jl, mc_surface_layer.jl) |
 | `mynn` | bool | `physics.boundary_layer.scheme` (refused in `[extra.options]`) | MYNN-EDMF boundary layer (mynn_state.jl, mc_surface_layer.jl, netcdf_output.jl) |
 | `mynn_check_values` | bool |  | MYNN finite-value checks every call (mynn_state.jl) |
@@ -792,6 +793,7 @@ Retired (refused with a message):
 | `tau_homogeneous` | float |  | homogeneous freezing timescale [s] (moist_compressible.jl) |
 | `tau_ice_anchor` | float |  | ice anchor removal timescale [s] (moist_compressible.jl) |
 | `tau_ice_population` | float |  | ice population source timescale [s] (moist_compressible.jl) |
+| `tau_lobe` | float |  | lobe relaxation timescale [s] of options[:lobe_relaxation]; default 10 (moist_compressible.jl) |
 | `tau_qss` | float | `physics.microphysics.tau_qss` (refused in `[extra.physical_params]`) | QSS relaxation timescale [s] (moist_compressible.jl) |
 | `tau_rho_v_rec` | float |  | vapor reconciliation timescale [s] (moist_compressible.jl) |
 | `tau_varcheck` | float |  | ISHMAEL var_check relaxation timescale [s] (moist_compressible.jl) |

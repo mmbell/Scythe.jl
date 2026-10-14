@@ -841,6 +841,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :rain_evap_realization    => (Bool, "per-donor realization bound on rain evaporation (moist_compressible.jl)"),
     :rain_population_gate     => (Bool, "skip two-moment rain sinks where the carried rain number is not a population (moist_compressible.jl)"),
     :water_lobe_attribution   => (Bool, "the vapor residual and the ice anchor headroom read each transformed water-mass slot's clipped negative lobe through the odd continuation of ahyp; default FALSE until the slots' below-zero transport is consistent with rho_t (measured 2026-10-07: the slots hold a 4-6.5 kg/m2 negative pool rho_t does not, so attributing it inflates the vapor by ~10% of the column); true enables it (moist_compressible.jl)"),
+    :lobe_relaxation          => (Bool, "relax a transformed water-mass slot's (cloud, rain, the three ice masses) refit lobe nu < 0 toward 0 on physical_params[:tau_lobe] where that species' channel is closed (recovered density 0, every process term of the slot exactly 0); moves no recovered mass, water-neutral while rho_t is prognostic; a pragmatic device, not physics (Stage L, reference/RHO_T_RETIREMENT_DESIGN.md); refused with water_lobe_attribution (moist_compressible.jl)"),
     :sedimentation_flux_lid   => (Symbol, "lid of every sedimentation-flux fit: :dirichlet (default, F = 0 at the lid) or :natural (forensics: the slot's own lid BC, lets hydrometeors fall in from above) (moist_compressible.jl)"),
     :ice_microphysics         => (Symbol, "ice scheme: :ishmael or :none (moist_compressible.jl, radiation_state.jl, mc_mynn_bl.jl)"),
     :ice_agg_caps             => (Bool, "ISHMAEL aggregation caps on the unit pass (moist_compressible.jl)"),
@@ -961,6 +962,7 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :tau_homogeneous  => (Float64, "homogeneous freezing timescale [s] (moist_compressible.jl)"),
     :tau_varcheck     => (Float64, "ISHMAEL var_check relaxation timescale [s] (moist_compressible.jl)"),
     :tau_ice_anchor   => (Float64, "ice anchor removal timescale [s] (moist_compressible.jl)"),
+    :tau_lobe         => (Float64, "lobe relaxation timescale [s] of options[:lobe_relaxation]; default 10 (moist_compressible.jl)"),
     :tau_ice_population => (Float64, "ice population source timescale [s] (moist_compressible.jl)"),
     :ishmael_tables_path => (String, "ISHMAEL collection tables file; NOT settable: physical_params is Dict{Symbol,Float64} (semiimplicit.jl)"),
     # ── radiation
