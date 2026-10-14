@@ -1389,7 +1389,8 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :x_wrc, :x_wrc_n, :x_wrr, :x_wrr_n,
                         :x_wmlt, :x_wmlt_n, :x_wmri, :x_wmri_n,
                         :x_wpts, :x_wmass, :x_wfa, :x_wdfa, :x_wheld,
-                        :o_max, :o_pts, :o_rain, :o_seed, :o_warned)
+                        :o_max, :o_pts, :o_rain, :o_seed, :o_warned,
+                        :e_pts, :e_held, :e_max)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -1771,8 +1772,30 @@ const MC_POP_RAIN = MC_ATTR_LAST + 3
 const MC_POP_SEED = MC_ATTR_LAST + 4
 @doc (@doc MC_POP_MAX)
 const MC_POP_WARNED = MC_ATTR_LAST + 5
-"""Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
+"""Last row of the population block."""
 const MC_POP_LAST = MC_POP_WARNED
+"""
+The CLOUD-EVAPORATION BOUND census of `mc_water_stats`, written in `mc_driver!` wherever
+[`cloud_evap_bound`](@ref) changes the cloud channel's draw, and reported by
+[`mc_stiffness_trace`](@ref).
+
+| constant | quantity |
+|---|---|
+| `MC_CEVAP_PTS`  | cumulative gridpoint-steps at which the step-mean cloud evaporation exceeded the cloud present |
+| `MC_CEVAP_HELD` | cumulative evaporation withheld, `Σ (q̄_c,bounded − q̄_c)·Δt` over points and steps [kg/m³ · gridpoint-steps] |
+| `MC_CEVAP_MAX`  | run-maximum of that withheld mass at one point in one step [kg/m³] |
+
+CUMULATIVE, and written in BOTH modes, like the anchor and population blocks:
+`options[:cloud_evap_realization] = false` stops the bound, never the measurement, so the off
+arm reports where it WOULD have acted and by how much.
+"""
+const MC_CEVAP_PTS = MC_POP_LAST + 1
+@doc (@doc MC_CEVAP_PTS)
+const MC_CEVAP_HELD = MC_POP_LAST + 2
+@doc (@doc MC_CEVAP_PTS)
+const MC_CEVAP_MAX = MC_POP_LAST + 3
+"""Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
+const MC_CEVAP_LAST = MC_CEVAP_MAX
 """
 Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
 1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
@@ -2022,6 +2045,75 @@ habit moment carries no water and never enters the partition.
 
 @doc (@doc ahyp_signed)
 @inline clipped_lobe(n, rho, mu) = n < 0.0 ? ahyp_signed(n, mu) - rho : 0.0
+
+"""
+    CLOUD_EVAP_REALIZATION_DEFAULT
+
+The value `options[:cloud_evap_realization]` takes when the key is absent. See
+[`cloud_evap_bound`](@ref).
+"""
+const CLOUD_EVAP_REALIZATION_DEFAULT = true
+
+"""
+    cloud_evap_bound(qc_bar, rho_c, dt) -> Float64
+
+The CLOUD donor's bound on its evaporation draw (`options[:cloud_evap_realization]`, default
+true): the step-mean cloud phase change `qc_bar` [kg m⁻³ s⁻¹] returned unchanged unless it
+would evaporate more than the cloud present over the step, in which case exactly that cloud:
+
+    qc_bar                    if qc_bar ≥ 0 or −qc_bar·Δt ≤ max(ρ_c, 0)
+    −max(ρ_c, 0)/Δt           otherwise (an exact +0.0 where max(ρ_c, 0) = 0)
+
+**Why it is needed.** The `Q_ss` relaxation pair's exponential propagator bounds the
+SUPERSATURATION, not the cloud: in subsaturated air the step-mean evaporation is the vapor
+deficit times the cloud's conductance, `≈ Δt·|Q̄_ss|/((1 + 𝒬_s)τ_c)` over a step, and nothing
+compares it with `ρ_c` — `1/τ_c` falls only like `ρ_c^{1/3}` (like `ρ_c` once the closure
+counts 1 μm drops), so wherever `Δt/τ_c` times the deficit exceeds the cloud — a thin cloud in
+dry air, or a stiff step — the draw is larger than the reservoir. The cloud slot then falls
+only to `ν ≈ 0` (its recovery cannot go below zero) while the pressure, the vapor and `Q_ss`
+took the FULL draw: latent cooling and vapor for cloud that was not there. Measured on the 2-D
+RCE at a convective burst peak (2026-10-14): ~1.1 K of spurious cooling per 10 min.
+
+**The rain's sibling, not its twin.** The rain channel's bound
+(`options[:rain_evap_realization]`) is a `J₀` realization factor on the state-`n` conductance
+because the rain shares its reservoir with the ice legs and that construction is what bounds
+the SUM. The cloud's evaporation is bounded by itself, at the step-mean, because that is the
+number every consumer reads: it is applied in the ETD pre-compute to the very `qc_bar` that
+builds `dv` (vapor), `d1` (pressure), `d9 = Δt·J_c·qc_bar` (the cloud slot, through its own
+Jacobian, exactly as every other cloud increment is) and — through `−Δt(1 + 𝒬_s)·Δq̄_c` — the
+propagated `Q_ss^{n+1}`, so the exchange closes on the cloud removed. Where the liquid drive is
+CLIPPED the step-mean IS the frozen rate, so the bound is applied there to `Q̇_c` and `1/τ_c`
+at state `n` instead (the rain's fold site), where it reaches the `N` that carries a clipped
+flux. E_t carries no phase-change term and is untouched either way.
+
+A hard bound rather than a smooth factor, deliberately: it is the identity (`===`) everywhere
+it does not bind, so a column with ample cloud is BITWISE the unbounded answer, and where it
+binds the realized draw is the reservoir and not an approximation to it. The condensation side
+(`qc_bar ≥ 0`) is never touched. Not shared with `AUTO_COLL` or the ice legs on the cloud,
+which stay on the multistep with their own realization (`f_qc`).
+"""
+@inline function cloud_evap_bound(qc_bar::Float64, rho_c::Float64, dt::Float64)
+    qc_bar < 0.0 || return qc_bar
+    avail = max(rho_c, 0.0)
+    (-(qc_bar * dt)) > avail || return qc_bar
+    return avail > 0.0 ? -(avail / dt) : 0.0
+end
+
+"""
+    _cloud_evap_census!(st, tid, held)
+
+Record one binding of [`cloud_evap_bound`](@ref) — `held` the withheld evaporation over the
+step [kg/m³] — into the `MC_CEVAP_*` rows. A measurement only.
+"""
+@inline function _cloud_evap_census!(st::Matrix{Float64}, tid::Int, held::Float64)
+    size(st, 2) == 0 && return nothing
+    @inbounds begin
+        st[MC_CEVAP_PTS, tid] += 1.0
+        st[MC_CEVAP_HELD, tid] += held
+        held > st[MC_CEVAP_MAX, tid] && (st[MC_CEVAP_MAX, tid] = held)
+    end
+    return nothing
+end
 
 """
     LOBE_RELAXATION_DEFAULT
@@ -4939,7 +5031,9 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
   anchor reconciliation (partition defect delta_part; 0 until glaciation onset):
   max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))
   population reconciliation (number-less ice mass rho_empty; 0 while every species with mass carries number):
-  max rho_empty = $(maximum(view(st, MC_POP_MAX, :))) kg/m^3, (gridpoint x species)-steps = $(Int(sum(view(st, MC_POP_PTS, :)))), mass to rain = $(sum(view(st, MC_POP_RAIN, :))) kg/m^3, ice number seeded = $(sum(view(st, MC_POP_SEED, :))) /m^3 (seed = :$(get(mtile.model.options, :ice_population_seed, :local)))$areport"""
+  max rho_empty = $(maximum(view(st, MC_POP_MAX, :))) kg/m^3, (gridpoint x species)-steps = $(Int(sum(view(st, MC_POP_PTS, :)))), mass to rain = $(sum(view(st, MC_POP_RAIN, :))) kg/m^3, ice number seeded = $(sum(view(st, MC_POP_SEED, :))) /m^3 (seed = :$(get(mtile.model.options, :ice_population_seed, :local)))
+  cloud evaporation bound (step-mean draw past the cloud present; $(get(mtile.model.options, :cloud_evap_realization, CLOUD_EVAP_REALIZATION_DEFAULT) ? "BOUNDED" : "OFF: measured, not applied")):
+  gridpoint-steps = $(Int(sum(view(st, MC_CEVAP_PTS, :)))), withheld (gridpoint-sum) = $(sum(view(st, MC_CEVAP_HELD, :))) kg/m^3, max at one point = $(maximum(view(st, MC_CEVAP_MAX, :))) kg/m^3$areport"""
     return nothing
 end
 
@@ -7328,6 +7422,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # — i.e. it restores the pre-Stage-2b answer BITWISE, on the warm path as well as the ice
     # one. Forensics only. Env `SCYTHE_O01_EVAPREAL=0` in benchmarks/o01_rainfall.jl.
     rain_evap_real = get(model.options, :rain_evap_realization, true)::Bool
+    # The CLOUD donor's bound on its evaporation draw (`cloud_evap_bound`): default ON; `false`
+    # restores the unbounded draw bitwise. The `MC_CEVAP_*` census is written either way.
+    cloud_evap_real = get(model.options, :cloud_evap_realization,
+                          CLOUD_EVAP_REALIZATION_DEFAULT)::Bool
     # STAGE 1b: whether each ICE SPECIES' NUMBER is realized on its OWN donor conductance
     # rather than on its mass factor (TeX §donor_relax; see the number-donor block in
     # `mc_ice_sources!`). Default OFF — `false` sets every number factor to the species' mass
@@ -8400,6 +8498,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # and scaling a source by the rate at which freezing empties the reservoir would be a
     # bound applied to the wrong sign. FROZEN at state `n`, like every classification the step
     # freezes.
+    #
+    # The CLOUD's evaporation bound (`cloud_evap_bound`) acts HERE only where the drive is
+    # CLIPPED: a clipped channel's step-mean IS its frozen rate and its flux lives in `N`, so
+    # the bound has to reach `Q̇_c` and `1/τ_c` at state `n`, before `N` is formed from them —
+    # scaling the conductance by the same ratio keeps `Q̇_c(1 + 𝒬_s) = drive·τ_c^{-1}`, which is
+    # what `etd_nl` is written in. Where the drive is unclipped the bound acts on the step-mean
+    # in the ETD pre-compute instead. Identity wherever it does not bind.
+    cev_st = mtile.mc_water_stats
+    cev_tid = Threads.threadid()
     if get(model.options, :condensation, true)::Bool
         @inbounds for i in eachindex(invtau_r)
             evap_now = Qdot_r[i] < 0.0
@@ -8409,6 +8516,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             invtau = invtau_c[i] + invtau_r[i]
             drive_cap = max(rho_v[i], 0.0) - rho_vs[i]
             if drive_cap < Q_ss[i]
+                qcb = cloud_evap_bound(Qdot[i], rho_c[i], model.ts)
+                if qcb != Qdot[i]
+                    _cloud_evap_census!(cev_st, cev_tid, (qcb - Qdot[i]) * model.ts)
+                    if cloud_evap_real
+                        invtau_c[i] = invtau_c[i] * (qcb / Qdot[i])
+                        Qdot[i] = qcb
+                        invtau = invtau_c[i] + invtau_r[i]
+                    end
+                end
                 etd_lam[i] = 0.0
                 etd_nl[i] = -drive_cap * invtau
             else
@@ -9419,17 +9535,37 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # classification is untouched: it is a statement about the drive, not about the rate,
         # and the fold applies only where the channel is a SINK of the rain at state `n` —
         # the `evap_now` mirror of `sub_now`, since a donor factor bounds a draw and rain
-        # condensation is a source. (The CLOUD channel is not realized: `q_c` carries its own
-        # donor factor for the ice legs and its evaporation is not part of this construction.)
+        # condensation is a source. (The CLOUD channel is not realized this way: `q_c` carries
+        # its own donor factor for the ice legs, and its evaporation is BOUNDED at the step-mean
+        # just below — `cloud_evap_bound`.)
         qc_bar = 0.0
         qr_bar = 0.0
         if clipped_l
+            # Already bounded at the fold, where a clipped flux enters `N`.
             qc_bar = Qdot[i]
             qr_bar = Qdot_r[i]
         else
             qb = qbar * invtau_l / (1.0 + Q_s[i])
             qc_bar = invtau_c[i] == 0.0 ? 0.0 : qb * (invtau_c[i] / invtau_l)
             qr_bar = invtau_r[i] == 0.0 ? 0.0 : qb * (invtau_r[i] / invtau_l)
+            # ── THE CLOUD DONOR'S BOUND on its evaporation (`cloud_evap_bound`) ──────────
+            # The propagator bounds `Q_ss`, not `ρ_c`: the deficit can ask a thin cloud for
+            # more than it holds, and `d9` alone cannot take the slot below `ν = 0` while
+            # `dv`, `d1` and `Q_ss^{n+1}` would take the full draw. Bounded HERE, on the one
+            # number all of them are built from below, and `Q_ss^{n+1}` gives back what was not
+            # realized: its liquid loss over the step is `Δt(1 + 𝒬_s)(q̄_c + q̄_r)` (the
+            # psychrometric cancellation, `qb` above), so `−Δt(1 + 𝒬_s)·Δq̄_c`. `λ ≠ 0` here
+            # whenever the cloud evaporates (an unclipped channel's conductance IS `λ`), so
+            # `etd_qnp1` is the value `relaxation_adjustment_qss!` writes. `===` the old
+            # `qc_bar` wherever it does not bind.
+            qcb = cloud_evap_bound(qc_bar, rho_c[i], ts)
+            if qcb != qc_bar
+                _cloud_evap_census!(stx, tid_x, (qcb - qc_bar) * ts)
+                if cloud_evap_real
+                    etd_qnp1[i] -= ts * ((1.0 + Q_s[i]) * (qcb - qc_bar))
+                    qc_bar = qcb
+                end
+            end
         end
         # ── The step-mean ICE rates (Eq. dep_rate at Q̄_ss + 𝒟) ──
         # `a·Q̄_ss + b` is the same affine drive `mc_ice_sources!` classified: `Q̄_ss + 𝒟` where

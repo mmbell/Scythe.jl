@@ -7478,7 +7478,12 @@ using Springsteel
         @test Scythe.MC_ATTR_LAST == Scythe.MC_ATTR_WARM_PTS + 4
         @test Scythe.MC_POP_MAX == Scythe.MC_ATTR_LAST + 1
         @test Scythe.MC_POP_LAST == Scythe.MC_POP_MAX + 4
-        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_POP_LAST
+        # ...and the CLOUD-EVAPORATION BOUND census after that, which is now the final row.
+        @test Scythe.MC_CEVAP_PTS == Scythe.MC_POP_LAST + 1
+        @test Scythe.MC_CEVAP_LAST == Scythe.MC_CEVAP_PTS + 2
+        @test length(Scythe.MC_WATER_STATS) == Scythe.MC_CEVAP_LAST
+        @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_PTS] == :e_pts
+        @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_MAX] == :e_max
         @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_GAP] == :a_gap
         @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_REMOVED] == :a_rem
         @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_FIRST] == :x_hom
