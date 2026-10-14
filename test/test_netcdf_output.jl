@@ -178,6 +178,54 @@ using NCDatasets
             any(moist) && @test all((T_dry ./ d.T)[moist] .> 1.0 + 1.0e-6)   # the old form was warmer
         end
 
+        @testset "theta_e reads the model's own pressure" begin
+            # Through 2026-10-14 theta_e came from Springsteel's reversible_theta_e(s, rho_d,
+            # q_v, q_l), which rebuilds p INTERNALLY as the ideal-gas pressure of (T, rho_d,
+            # rho_v). Wherever the retrieved T and the prognostic p disagree with that EOS --
+            # a convective burst: 1077 hPa against the model's 1013 -- it read 5-7 K low at
+            # RH 0.2-0.3. The new form is the same Emanuel (1994) eq. 4.5.11 with the model's p.
+            TD = Springsteel.Thermodynamics
+            # (a) Where the state IS on the ideal-gas EOS, the two agree to the entropy round
+            # trip (temperature(entropy(T)) is exact up to one exp/log pair, ~1e-15 relative;
+            # the exponent chain amplifies that by < 10^3): rtol 1e-12, saturated and not.
+            rho_d = 1.12; Tk = 298.0
+            for (RHt, q_l) in ((1.0, 1.5e-3), (0.25, 0.0), (0.6, 2.0e-4))
+                rho_v = RHt * 100.0 * TD.sat_pressure_liquid_buck(Tk, 1000.0) / (Rv * Tk)
+                q_v = rho_v / rho_d
+                p_hPa = 0.01 * (Rd * rho_d + Rv * rho_v) * Tk
+                old = TD.reversible_theta_e(TD.entropy(Tk, rho_d, q_v), rho_d, q_v, q_l)
+                new = Scythe.reversible_theta_e_pT(p_hPa, Tk, q_v, q_l)
+                @test new ≈ old rtol = 1.0e-12
+            end
+            # (b) An unsaturated point with a known (p, T, q_v), against eq. 4.5.11 written out.
+            p_hPa = 900.0; Tk = 290.0; q_v = 0.004; q_l = 0.0
+            e = p_hPa * q_v / (TD.Eps + q_v)
+            es = TD.sat_pressure_liquid_buck(Tk, p_hPa)
+            cpt = Cpd + TD.Cl * (q_v + q_l)
+            expect = Tk * (p_0 / (p_hPa - e))^(Rd / cpt) * (e / es)^(-Rv * q_v / cpt) *
+                     exp((2.501e6 + (TD.Cpv - TD.Cl) * (Tk - 273.16)) * q_v / (cpt * Tk))
+            @test Scythe.reversible_theta_e_pT(p_hPa, Tk, q_v, q_l) ≈ expect rtol = 1.0e-14
+            @test 300.0 < expect < 320.0                   # a plausible value, not a slip
+            # (c) Off the EOS it follows the model's p, not the rebuilt one: the old form's
+            # p_ideal = 1077 hPa where the model carries 1013 hPa reads ~5 K low at RH 0.25.
+            Tk = 300.0; rho_d = 1.2
+            rho_v = 0.25 * 100.0 * TD.sat_pressure_liquid_buck(Tk, 1000.0) / (Rv * Tk)
+            q_v = rho_v / rho_d
+            old = TD.reversible_theta_e(TD.entropy(Tk, rho_d, q_v), rho_d, q_v, 0.0)
+            new = Scythe.reversible_theta_e_pT(1013.0, Tk, q_v, 0.0)
+            @test 0.01 * (Rd * rho_d + Rv * rho_v) * Tk > 1030.0   # the state is off its EOS
+            @test new - old > 2.0
+            # (d) The derived field is exactly that function of the file's own p, T, q_v, q_c.
+            sat = rho_v_sat.(d.T, d.p ./ 100.0)
+            rv = 0.3 .* sat; rv[2, 3] = sat[2, 3]; rv[1, 2] = -1.0e-6
+            cl = zeros(3, length(z)); cl[2, 3] = 1.0e-3; cl[3, 1] = -2.0e-5
+            dt = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv, cloud = cl)), ref, cfg)
+            @test all(dt.theta_e .=== Scythe.reversible_theta_e_pT.(dt.p ./ 100.0, dt.T,
+                                                                    max.(dt.q_v, 0.0),
+                                                                    max.(dt.q_c, 0.0)))
+            @test all(isfinite, dt.theta_e)
+        end
+
         @testset "rain rate is the sedimentation flux of the run's own fall speed" begin
             rr = fill(1.0e-3, 3, length(z))
             dr = Scythe.mc_derived_fields(z, merge(slots, (; rain = rr)), ref, cfg)
@@ -397,6 +445,10 @@ using NCDatasets
                 # The humidity is floored at this interface, and says so.
                 @test occursin("max(rho_v, 0)", ds["RH"].attrib["long_name"])
                 @test all(Array(ds["RH"])[1, :, :] .>= 0.0)
+                # theta_e names its definition, and the pressure it reads.
+                @test occursin("Emanuel (1994) eq. 4.5.11", ds["theta_e"].attrib["definition"])
+                @test occursin("model pressure", ds["theta_e"].attrib["definition"])
+                @test all(isfinite, Array(ds["theta_e"])[1, :, :])
                 @test all(Array(ds["rho_w_deficit"])[1, :, :] .<= 0.0)
                 @test all(Array(ds["condensate_lobe"])[1, :, :] .== 0.0)   # no transform
                 # This fixture has no v, no rain number, no ice and no TKE.

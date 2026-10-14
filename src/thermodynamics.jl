@@ -282,6 +282,35 @@ function reversible_theta_e(s::Float64, xi::Float64, mu::Float64, mu_l::Float64 
 end
 
 """
+    reversible_theta_e_pT(p_hPa, Tk, q_v, q_l=0.0)
+
+Reversible equivalent potential temperature [K] (Emanuel 1994, eq. 4.5.11) from a GIVEN
+total pressure `p_hPa` [hPa] and temperature `Tk`:
+
+    θ_e = T (p₀/p_d)^(R_d/c) · H^(−q_v R_v/c) · exp(L_v(T) q_v / (c T)),   c = c_pd + c_l q_t
+
+with `e = p q_v/(ε + q_v)`, `p_d = p − e`, `H = e / e_s` (Buck over liquid at (T, p)) and
+`q_t = q_v + q_l`: the same constants, the same saturation curve and the same expression as
+`Springsteel.Thermodynamics.reversible_theta_e(s, rho_d, q_v, q_l)`. The ONLY difference
+is where p comes from. The Springsteel form takes `(s, rho_d, q_v)` and rebuilds p
+internally as the ideal-gas pressure of the entropy-inverted state, which is the model's p
+only while the retrieved T and the prognostic p satisfy that EOS; in a convective burst
+they did not (1077 hPa rebuilt against the model's 1013 hPa) and the output θ_e read 5-7 K
+low at RH 0.2-0.3. On the EOS the two agree to roundoff (test_netcdf_output.jl).
+"""
+function reversible_theta_e_pT(p_hPa::Float64, Tk::Float64, q_v::Float64,
+                               q_l::Float64 = 0.0)
+
+    c = Cpd + (Cl * (q_v + q_l))
+    e = vapor_pressure(p_hPa, q_v)
+    es = sat_pressure_liquid_buck(Tk, p_hPa)
+    theta_term = Tk * (p_0 / (p_hPa - e))^(Rd / c)
+    H_term = (e / es)^((-Rv * q_v) / c)
+    exp_term = exp(L_v(Tk) * q_v / (c * Tk))
+    return theta_term * H_term * exp_term
+end
+
+"""
     theta_rho(s, xi, mu, mu_l=0.0)
 
 Density potential temperature [K] from the prognostic variables. Thin adapter

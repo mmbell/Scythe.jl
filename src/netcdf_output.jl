@@ -421,8 +421,11 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     q_r = rho_r ./ rho_d
     q_i = ice === nothing ? nothing : rho_ice_t ./ rho_d
     s = Springsteel.Thermodynamics.entropy.(T, rho_d, max.(q_v, 0.0))
-    theta_e = Springsteel.Thermodynamics.reversible_theta_e.(s, rho_d, max.(q_v, 0.0),
-                                                             max.(q_c, 0.0))
+    # theta_e from the model's OWN p and T (`reversible_theta_e_pT`), not Springsteel's
+    # (s, rho_d, q_v) form, which rebuilds p as the ideal-gas pressure of the entropy state:
+    # in a convective burst that was 1077 hPa against the model's 1013 hPa and theta_e read
+    # 5-7 K low at RH 0.2-0.3 (2026-10-14). On the EOS the two agree to roundoff.
+    theta_e = reversible_theta_e_pT.(p_hPa, T, max.(q_v, 0.0), max.(q_c, 0.0))
 
     # ── (5) Radar and precipitation ─────────────────────────────────────────
     reflectivity = reflectivity_dBZ.(rho_c, rho_r, cfg.N0, cfg.Nc_cm3 * 1.0e6)
@@ -1167,6 +1170,11 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         wr("q_c", d.q_c, "kg kg-1", "cloud mixing ratio, rho_c / rho_d")
         wr("q_r", d.q_r, "kg kg-1", "rain mixing ratio, rho_r / rho_d")
         ice_on && wr("q_i", d.q_i, "kg kg-1", "ice mixing ratio, rho_ice / rho_d")
+        # theta_e's definition, including WHICH pressure it reads (see mc_derived_fields).
+        ds["theta_e"].attrib["definition"] =
+            "Emanuel (1994) eq. 4.5.11 reversible theta_e, q_t = q_v + q_c (rain and ice " *
+            "excluded), H over liquid (Buck), from the model pressure p and temperature T " *
+            "(not an ideal-gas pressure rebuilt from entropy)"
 
         # ── MYNN TKE, when the run carries the rho_e slot ──
         if rho_e_i > 0
