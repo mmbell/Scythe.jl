@@ -426,10 +426,14 @@ handling to copy.
     rtr = rtrans_on ? rain_transform_mode(opts) : :none
     itr = ice_on ? ice_transform_mode(opts) : :none
     lp = lp && (ctr !== :none || rtr !== :none || itr !== :none)
+    # THE WATER CLOSURE (`_mynn_realized_rate`): the vapor leg is the residual of the
+    # total-water leg and the realized species legs. It realizes every transformed leg at
+    # every point, so where it is on the clip-gap partner above has nothing left to book.
+    wc = get(opts, :mynn_water_closure, MYNN_WATER_CLOSURE_DEFAULT)::Bool
     _mynn_apply_column!(MY, S, MN, geom, colstart, n, ci, z, uv, wv, vv, expdot,
                         IS.rho_v, re_i, sx.tau_u, sx.tau_v, F_sh, F_q,
                         2.0 * z[2], ed, IS, ice_on, nr_on,
-                        lp, ctr, get(pp, :condensate_mu, 1.0e-7), rtr,
+                        lp && !wc, wc, ctr, get(pp, :condensate_mu, 1.0e-7), rtr,
                         get(pp, :rain_mu, 1.0e-7), itr, ice_on ? ice_mu(pp, 1) : 1.0,
                         mtile.model.ts)
     return nothing
@@ -478,6 +482,68 @@ evaluated where it is applied, not a claim about the other operators sharing the
     nn = nu + (ts * srate)
     (nu >= 0.0 && nn >= 0.0) && return 0.0
     return ((recover_total(nn, trans, mu) - recover_total(nu, trans, mu)) / ts) - rate
+end
+
+"""
+    MYNN_WATER_CLOSURE_DEFAULT
+
+The value `options[:mynn_water_closure]` takes when the key is absent. See
+[`_mynn_realized_rate`](@ref).
+"""
+const MYNN_WATER_CLOSURE_DEFAULT = true
+
+"""
+    _mynn_realized_rate(nu, srate, rate, ts, trans, mu) -> Float64
+
+THE MYNN WATER CLOSURE (`options[:mynn_water_closure]`, default true): the rate at which one
+water species' RECOVERED density moves under its MYNN leg, and the vapor leg made the residual
+of the total-water leg and those rates,
+
+    ρ̇_v := ρ̇_w − (ρ̇_c,real + ρ̇_r,real + Σ_k ρ̇_ik,real),
+    ρ̇_x,real = [recover(ν_x + Δt J_x·rate_x) − recover(ν_x)]/Δt     (`rate_x` under `:none`)
+
+so `ρ_v + ρ_liq + ρ_ice` moves by exactly what `ρ_t` does and the partition gap
+`X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice` is not touched by the boundary layer. The flux-form
+energy carry `S_Ew` is unchanged (`E_t` still receives a divergence that telescopes); what
+changes is its thermal remainder, `Qdot_w = dS_Ew − c_w ρ̇_w − c_v ρ̇_v + L_f Σρ̇_ik`, now
+evaluated on the REALIZED increments, so `E_t − E_implied(T_eos)` is held by the leg to second
+order in its increment.
+
+WHAT IT CLOSES (the `S2:my_water` term of the closed budget, cloudy 2-D RCE restart, after the
+four partner commits). The species are not legs of one column: the total-water leg is fitted
+from `K_h ∂z(ρ_t − ρ_d)`, the vapor from `K_h ∂z ρ_v`, the cloud and rain from
+`K_h ∂z ν/J` (the gradient of the FITTED control variable through the Jacobian), the ice masses
+from their own columns and boundary conditions. The fits are linear and share a basis, but
+their INPUTS do not sum: `∂z(ρ_t − ρ_d) − ∂zρ_v − ∂zν_c/J_c − ∂zν_r/J_r` is the gradient of
+the partition gap plus the commutator of the fit with the transform, which at a cloud edge,
+where `ν` is far from linear in `ρ`, is not small. Each kilogram of that mismatch enters `ρ_t`
+with the liquid energy `c_w` and no species, so `R` opens by `(C_pv T − L_v)` per kg and `X`
+drifts — (a) of the split below. The leg's species are also moved in `ν` and realized
+through the transform's curvature, `O((Δt·rate)²/ρ)` per step at a healthy point and the whole
+increment in a clipped lobe — (c); [`_mynn_clip_gap`](@ref) closed only the clipped part.
+Making the vapor the residual closes both: it is the same bookkeeping the ETD
+exchange realization and the refit partner use (the species' recovered change is the fact, the
+vapor takes the difference with its latent heat in `p`), and it SUBSUMES the clip-gap partner —
+its gap is the clipped-point part of `rate_real − rate`, booked here through `Qdot_w` with
+exactly [`phase_change_partner`](@ref)'s coefficients (`C_pt = C_vt + R_m`) — so with the
+closure on `options[:mynn_exchange_realization]` is not read.
+
+MEASURED on that restart (closed budget, each part a finite difference of `R` over its own
+AB3-weighted increment): (a) is the whole term, to the fourth digit, in every 600 s window,
+growing from +0.08 to several W/m² as the cloud deepens; (c) at healthy points is ~1e-5 W/m²;
+the closure's own leg — (b), the energy carry evaluated on the realized increments — leaves
+~1e-5 W/m², its second order. The mismatch is a gradient inconsistency of the inputs, not an
+energy-carry error and not the linearization.
+
+What it does NOT do: the vapor leg is no longer column-conservative by itself (it carries the
+species' boundary-flux mismatch; `ρ_t` and `E_t` still are), and it is bitwise the fitted vapor
+leg only where every water leg is an exact zero (`K_h = 0`) — on an untransformed or a cloud-free
+column the vapor still moves by whatever the fits' mismatch is there. `false` is bitwise the
+code without it. `@inline`, plain scalars: called per gridpoint from `_mynn_apply_column!`.
+"""
+@inline function _mynn_realized_rate(nu, srate, rate, ts, trans::Symbol, mu)
+    trans === :none && return rate
+    return (recover_total(nu + (ts * srate), trans, mu) - recover_total(nu, trans, mu)) / ts
 end
 
 """
@@ -1446,7 +1512,7 @@ that value actually is and report it.
                                        tau_u::Float64, tau_v::Float64,
                                        F_sh::Float64, F_q::Float64, delta::Float64, ed,
                                        IS::MCSlots, ice_on::Bool, nr_on::Bool,
-                                       lp::Bool, ctr::Symbol, cmu::Float64,
+                                       lp::Bool, wc::Bool, ctr::Symbol, cmu::Float64,
                                        rtr::Symbol, rmu::Float64,
                                        itr::Symbol, imu::Float64, ts::Float64)
     u = uv.f
@@ -1522,8 +1588,27 @@ that value actually is and report it.
 
         qdot_h = pdk1 ? (QDOT_V[i] + (F_sh * gz)) + (Pdrag - Psfc) :
                         QDOT_V[i] + (F_sh * gz)
+        # THE WATER CLOSURE (`_mynn_realized_rate`): the vapor leg is the total-water leg
+        # less the species' REALIZED rates, and the ice's energy share is booked on its
+        # realized rate too. Off, `vleg` and `ri` are the fitted divergences, bitwise.
+        if wc
+            ri = ice_on ?
+                ((_mynn_realized_rate(S.nu_i1q[i], S.J_i1q[i] * MN.div_i1q[i], MN.div_i1q[i],
+                                      ts, itr, imu) +
+                  _mynn_realized_rate(S.nu_i2q[i], S.J_i2q[i] * MN.div_i2q[i], MN.div_i2q[i],
+                                      ts, itr, imu)) +
+                 _mynn_realized_rate(S.nu_i3q[i], S.J_i3q[i] * MN.div_i3q[i], MN.div_i3q[i],
+                                     ts, itr, imu)) : 0.0
+            vleg = (div_w[i] -
+                    (_mynn_realized_rate(S.nu_c[i], Jc[i] * div_c[i], div_c[i], ts, ctr, cmu) +
+                     _mynn_realized_rate(S.nu_r[i], Jr[i] * div_r[i], div_r[i], ts, rtr, rmu))) -
+                   ri
+        else
+            ri = ice_on ? ((MN.div_i1q[i] + MN.div_i2q[i]) + MN.div_i3q[i]) : 0.0
+            vleg = div_v[i]
+        end
         rw = div_w[i] + (F_q * gz)
-        rv = div_v[i] + (F_q * gz)
+        rv = vleg + (F_q * gz)
         cw = (Cpv*Tk[i]) - Lv[i] + ke[i] + (gravity*z[i])
         cv = Lv[i] - (Rv*Tk[i])
 
@@ -1535,9 +1620,8 @@ that value actually is and report it.
             # zero ice divergence is `(cw*div_w) - 0.0`, which is `=== cw*div_w` for every
             # double — `x + 0.0` would flip a `-0.0` and, one spline fit later, show up as
             # a sign-of-zero difference in a warm increment.
-            qw_i = ice_on ? (L_s(Tk[i]) - Lv[i]) *
-                            (((MN.div_i1q[i] + MN.div_i2q[i]) + MN.div_i3q[i])) : 0.0
-            qdot_w = VD_Ew[i] - ((cw*div_w[i]) - qw_i) - (cv*div_v[i])
+            qw_i = ice_on ? (L_s(Tk[i]) - Lv[i]) * ri : 0.0
+            qdot_w = VD_Ew[i] - ((cw*div_w[i]) - qw_i) - (cv*vleg)
         else
             dE_w = (cw*rw) + (cv*rv)
             qdot_w = 0.0

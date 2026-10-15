@@ -11,7 +11,10 @@
 #   3. `options[:refit_partner]` — the spline refit's change in recovered condensate is booked
 #      as condensation (the author's decision, 2026-10-16);
 #   4. `options[:vapor_nudge_partner]` — the vapor reconciliation nudge gets the pressure
-#      partner that holds E_implied.
+#      partner that holds E_implied;
+#   5. `options[:mynn_water_closure]` — the MYNN vapor leg is the residual of the total-water
+#      leg and the species' realized rates, so the boundary layer leaves the partition and R
+#      closed.
 #
 # Every assertion is on ONE step of tiles advanced from the same state, so the property tested
 # is the operator's own. The tile is the lobe-relaxation fixture: a periodic XZ slice with
@@ -356,6 +359,8 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                                                         num_cells_k = 25, ctrans = :bhyp,
                                                         rtrans = :bhyp)
                 mo.options[:mynn_exchange_realization] = on
+                # the clip-gap device alone: the water closure (section 5) subsumes it
+                mo.options[:mynn_water_closure] = false
                 seed!(p, mo, gp.kDim, z, col; lobe)
                 F.step_all!(m, p, gp.kDim)
                 arms[tag] = (; m, p, mo, gp, x = copy(p.physical[:, :, 1]))
@@ -562,6 +567,97 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test arms[true] == arms[false]
             @test Scythe.VAPOR_NUDGE_PARTNER_DEFAULT === true
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :vapor_nudge_partner)
+        end
+    end
+
+    # ── 5. the MYNN water closure ────────────────────────────────────────────────────
+    # A mixed layer carrying a healthy boundary-layer cloud and rain on 200 m cells, the
+    # TKE live: one forward step of the MYNN tendency alone (closure tile minus the
+    # closure-off control), applied to the state n.
+    @testset "MYNN water closure: one step leaves the partition and R closed" begin
+        isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
+        F = Main.MYNNTestFixtures
+        mktempdir() do tmp
+            function seed!(patch, mo, kDim, z, col; e0 = 0.4)
+                V = mo.grid_params.vars
+                c = Scythe.mc_slot(V, "rho_c"); r = Scythe.mc_slot(V, "rho_r")
+                u = F.bl_jet(z, 12.0, 500.0)
+                rho_t = col.rho_d .+ col.rho_v
+                for j in 1:size(patch.physical, 1)
+                    k = mod1(j, kDim); zz = z[k]
+                    patch.physical[j, V["u"], 1] = u[k]
+                    haskey(V, "rho_e") &&
+                        (patch.physical[j, V["rho_e"], 1] = rho_t[k] * e0 * exp(-zz / 1500.0))
+                    bump = 2.0e-3 * exp(-((zz - 800.0) / 600.0)^2)
+                    rc = 4.0e-4 * exp(-((zz - 700.0) / 400.0)^2) + 1.0e-6
+                    rr = 1.0e-4 * exp(-((zz - 400.0) / 400.0)^2) + 1.0e-6
+                    patch.physical[j, V["rho_v"], 1] = rho_t[k] * bump
+                    patch.physical[j, V["rho_t"], 1] = rho_t[k] * bump + rc + rr
+                    patch.physical[j, c, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, MU)
+                    patch.physical[j, r, 1] = Scythe.rain_slot(rr, :bhyp, MU)
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+            end
+            arms = Dict{Any,Any}()
+            for (tag, mynn, wc, e0) in (("on", true, true, 0.4), ("off", true, false, 0.4),
+                                        ("ctl", false, true, 0.4),
+                                        ("k0_on", true, true, 0.0),
+                                        ("k0_off", true, false, 0.0))
+                m, p, mo, gp, z, col = F.make_mynn_tile(tmp; mynn = mynn, init = :zero,
+                                                        num_cells_k = 25, kMax = 5.0e3,
+                                                        fluxes = false, ctrans = :bhyp,
+                                                        rtrans = :bhyp)
+                mo.options[:mynn_water_closure] = wc
+                seed!(p, mo, gp.kDim, z, col; e0)
+                F.step_all!(m, p, gp.kDim)
+                arms[tag] = (; m, p, mo, gp, x = copy(p.physical[:, :, 1]))
+            end
+            mo = arms["on"].mo; V = mo.grid_params.vars; ts = mo.ts
+            rv_i = V["rho_v"]
+            nf = size(arms["ctl"].m.expdot_n, 2)
+            x = arms["on"].x
+            @test x == arms["off"].x
+            @test all(x[:, 9] .> 0.0) && all(x[:, 8] .> 0.0)    # healthy: no clipped lobe
+            R0, rl0, rv0 = residual(arms["on"].m, x)
+            gap(X, rl, rv) = X[:, 3] .- X[:, 2] .- rv .- rl    # perturbation partition gap
+            g0 = gap(x, rl0, rv0)
+            out = Dict{String,Any}()
+            for tag in ("on", "off")
+                D = arms[tag].m.expdot_n[:, 1:nf] .- arms["ctl"].m.expdot_n
+                x1 = copy(x); x1[:, 1:nf] .+= ts .* D
+                R1, rl1, rv1 = residual(arms[tag].m, x1)
+                out[tag] = (; D, dR = R1 .- R0, dg = gap(x1, rl1, rv1) .- g0,
+                            dw = ts .* D[:, 3])
+            end
+            on = out["on"]; off = out["off"]
+            # total water and the energy flux are the same legs in both arms
+            @test on.D[:, 3] == off.D[:, 3]
+            @test on.D[:, 6] == off.D[:, 6]
+            dwmax = maximum(abs.(on.dw))
+            @test dwmax > 1.0e-8                                # the water legs are live
+            # OFF: the total-water leg and the species legs disagree -- the partition gap
+            # opens, and R with it by ~(C_pv T - L) per kg of it (measured: 6e-3 of the
+            # largest water increment, R by 3e-4 J/m3 in one 0.5 s step)
+            @test maximum(abs.(off.dg)) > 1.0e-4 * dwmax
+            # ON: vapor + recovered species move by exactly the total-water increment
+            # (measured 3e-19 kg/m3: rounding)
+            @test maximum(abs.(on.dg)) <= 1.0e-12 * dwmax + 1.0e-18
+            # ...and R is unchanged but for the second order of the step (measured 1.9e-4
+            # of the off arm's largest opening, 9e-5 of its column sum)
+            @test maximum(abs.(on.dR)) <= 1.0e-3 * maximum(abs.(off.dR))
+            @test sum(abs.(on.dR)) <= 1.0e-3 * sum(abs.(off.dR))
+            # K_h = 0 (no TKE): every leg is an exact zero and the switch is bitwise
+            @test arms["k0_on"].m.expdot_n == arms["k0_off"].m.expdot_n
+            # allocation-free with the closure acting
+            m = arms["on"].m; kDim = arms["on"].gp.kDim
+            Scythe.moist_compressible_XZ(m, 1, kDim, 2)
+            @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 2)) == 0
+            @test Scythe.MYNN_WATER_CLOSURE_DEFAULT === true
+            @test haskey(Scythe.KNOWN_OPTION_KEYS, :mynn_water_closure)
+            # both water switches pass the MYNN option validation a config run goes through
+            @test :mynn_water_closure in Scythe.MYNN_OPTION_KEYS
+            @test :mynn_exchange_realization in Scythe.MYNN_OPTION_KEYS
         end
     end
 end

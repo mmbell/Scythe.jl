@@ -695,7 +695,9 @@ const EMPTY_MYNN = MYNNState()
 const MYNN_OPTION_KEYS = Set{Symbol}((
     :mynn, :mynn_interval, :mynn_edmf, :mynn_edmf_mom, :mynn_closure, :mynn_scale_aware,
     :mynn_init, :mynn_fidelity, :mynn_water_carry, :mynn_mix_numbers, :mynn_output,
-    :mynn_trace, :mynn_check_values))
+    :mynn_trace, :mynn_check_values,
+    # the water partition's realization switches (mc_mynn_bl.jl), read per column there
+    :mynn_exchange_realization, :mynn_water_closure))
 
 const MYNN_INIT_MODES = (:taper, :zero)
 # The Symbol values `:mynn_fidelity` accepts. `:scythe` is the one BUNDLE and, since
