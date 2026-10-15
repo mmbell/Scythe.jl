@@ -416,10 +416,68 @@ handling to copy.
                              rtv, rdv, rcv, rrv, rvv, rho_e, ctrans_on, rtrans_on,
                              IS, ice_on, nr_on)
 
+    # The RECOVERED-CHANGE PARTNER of the transformed mass legs (`_mynn_clip_gap`): resolved
+    # here, once per column, from the same option `Dict` every switch is read from, and
+    # handed down as plain values.
+    opts = mtile.model.options
+    pp = mtile.model.physical_params
+    lp = get(opts, :mynn_exchange_realization, MYNN_EXCHANGE_REALIZATION_DEFAULT)::Bool
+    ctr = ctrans_on ? condensate_transform_mode(opts) : :none
+    rtr = rtrans_on ? rain_transform_mode(opts) : :none
+    itr = ice_on ? ice_transform_mode(opts) : :none
+    lp = lp && (ctr !== :none || rtr !== :none || itr !== :none)
     _mynn_apply_column!(MY, S, MN, geom, colstart, n, ci, z, uv, wv, vv, expdot,
                         IS.rho_v, re_i, sx.tau_u, sx.tau_v, F_sh, F_q,
-                        2.0 * z[2], ed, IS, ice_on, nr_on)
+                        2.0 * z[2], ed, IS, ice_on, nr_on,
+                        lp, ctr, get(pp, :condensate_mu, 1.0e-7), rtr,
+                        get(pp, :rain_mu, 1.0e-7), itr, ice_on ? ice_mu(pp, 1) : 1.0,
+                        mtile.model.ts)
     return nothing
+end
+
+"""
+    MYNN_EXCHANGE_REALIZATION_DEFAULT
+
+The value `options[:mynn_exchange_realization]` takes when the key is absent. See
+[`_mynn_clip_gap`](@ref).
+"""
+const MYNN_EXCHANGE_REALIZATION_DEFAULT = true
+
+"""
+    _mynn_clip_gap(nu, srate, rate, ts, trans, mu) -> Float64
+
+THE MYNN LEG OF A TRANSFORMED MASS SLOT, REALIZED ON THE RECOVERED DENSITY
+(`options[:mynn_exchange_realization]`, default true). The cloud, rain and ice-mass legs are
+eddy fluxes of the DENSITY, `rate = ∂z(K_h ∂z ρ)`, folded into the slot as `J·rate`; the
+total-water leg moves `ρ_t` by the full mixed mass and the flux-form energy carry `S_Ew` gives
+`E_t` the energy of exactly that mass (`c_w` per kg of liquid, `c_i` per kg of ice). Both assume
+the species' recovered density changes by `rate`. Where the slot is in, or is driven into, a
+clipped lobe (`ν < 0`), the recovered density does not move — mixing a cloud edge into its own
+negative lobe moves `ρ_t`, `E_t` and `ν` and puts no liquid anywhere — and `R = E_t − E_implied`
+opens by the liquid's `(C_pv T − L)` per kg: the `S2:my_water` term of the 2026-10-16 budget
+(−44 W/m² on the cloudy RCE restart, −230 late in the window).
+
+The gap is the recovered rate a forward step of the slot's own increment realizes, minus the
+assumed one:
+
+    gap = [recover(ν + Δt J·rate) − recover(ν)]/Δt − rate
+
+and it is booked as a phase change of its own by [`phase_change_partner`](@ref) (as RATES into
+the same `expdot` row the legs fold into): the mass the slot could not hold goes to — or comes
+from — the vapor, with its latent heat in `p` and its `Q_ss` share, so `ρ_v + ρ_liq + ρ_ice`
+moves by the mixed mass and `E_implied` by the carried energy. The vertical flux form and its
+column conservation are untouched — no leg's divergence changes; the partner is pointwise.
+
+ONLY WHERE THE CLIP ACTS: `ν ≥ 0` at both ends of the step returns an exact `0.0`, so a column
+with no lobe is bitwise the code without the partner (the healthy-point Jacobian linearization
+across one step, `O((Δt·rate)²/μ)`, is the multistep's business, not a missing partner). The
+estimate is a forward step of THIS leg alone, at the state-`n` `ν` — the gap the leg opens
+evaluated where it is applied, not a claim about the other operators sharing the step.
+"""
+@inline function _mynn_clip_gap(nu, srate, rate, ts, trans::Symbol, mu)
+    nn = nu + (ts * srate)
+    (nu >= 0.0 && nn >= 0.0) && return 0.0
+    return ((recover_total(nn, trans, mu) - recover_total(nu, trans, mu)) / ts) - rate
 end
 
 """
@@ -1387,7 +1445,10 @@ that value actually is and report it.
                                        uv, wv, vv, expdot, rv_i::Int64, re_i::Int64,
                                        tau_u::Float64, tau_v::Float64,
                                        F_sh::Float64, F_q::Float64, delta::Float64, ed,
-                                       IS::MCSlots, ice_on::Bool, nr_on::Bool)
+                                       IS::MCSlots, ice_on::Bool, nr_on::Bool,
+                                       lp::Bool, ctr::Symbol, cmu::Float64,
+                                       rtr::Symbol, rmu::Float64,
+                                       itr::Symbol, imu::Float64, ts::Float64)
     u = uv.f
     w = wv.f
     rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
@@ -1496,6 +1557,36 @@ that value actually is and report it.
         expdot[j, 6] += (qdot_E + dE_w) + dE_mom
         expdot[j, 7] += rv - (drvs_dT[i]*dT_v) - (drvs_dp[i]*(dp_v + dp_q))
         expdot[j, re_i] += ((div_e[i] + Ps) + (Pb - eps)) + Psfc
+
+        # The RECOVERED-CHANGE PARTNER of the transformed mass legs (`_mynn_clip_gap`): an
+        # exact zero wherever no slot is in or entering its clipped lobe, and then nothing
+        # here touches `expdot` at all.
+        if lp
+            gl = 0.0
+            gi = 0.0
+            ctr !== :none && (gl += _mynn_clip_gap(S.nu_c[i], Jc[i] * div_c[i], div_c[i],
+                                                   ts, ctr, cmu))
+            rtr !== :none && (gl += _mynn_clip_gap(S.nu_r[i], Jr[i] * div_r[i], div_r[i],
+                                                   ts, rtr, rmu))
+            if ice_on && itr !== :none
+                gi = (_mynn_clip_gap(S.nu_i1q[i], S.J_i1q[i] * MN.div_i1q[i], MN.div_i1q[i],
+                                     ts, itr, imu) +
+                      _mynn_clip_gap(S.nu_i2q[i], S.J_i2q[i] * MN.div_i2q[i], MN.div_i2q[i],
+                                     ts, itr, imu)) +
+                     _mynn_clip_gap(S.nu_i3q[i], S.J_i3q[i] * MN.div_i3q[i], MN.div_i3q[i],
+                                    ts, itr, imu)
+            end
+            if gl != 0.0 || gi != 0.0
+                ice_p = ice_on && itr !== :none
+                dpp, dvv, dqq = phase_change_partner(gl, gi, Tk[i], R_m[i], C_vt[i],
+                                                     S.C_pt[i], Lv[i],
+                                                     ice_p ? L_s(Tk[i]) : 0.0, S.Q_s[i],
+                                                     ice_p ? S.Q_s_i[i] : 0.0)
+                expdot[j, 1] += dpp
+                expdot[j, rv_i] += dvv
+                expdot[j, 7] += dqq
+            end
+        end
 
         bdry += wq[i] * (cw + cv) * F_q * gz
     end

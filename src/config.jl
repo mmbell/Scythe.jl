@@ -875,6 +875,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :mynn_init                => (Symbol, "MYNN TKE initialisation: :taper or :zero (mynn_state.jl)"),
     :mynn_fidelity            => (Union{Symbol,Vector{Symbol}}, "MYNN closure fidelity: :scythe, :fortran or a Vector of deviations (mynn_state.jl)"),
     :mynn_water_carry         => (Symbol, "MYNN water carry: :flux or :fixed_T (mynn_state.jl)"),
+    :mynn_exchange_realization => (Bool, "where a transformed water-mass slot (cloud, rain, the three ice masses) is in or is driven into its clipped lobe, the MYNN eddy leg's assumed density change and the recovered one differ; the gap is booked as a phase change (vapor, latent heat in p, Q_ss) so the water carry and E_t stay closed; default true, bitwise wherever no slot is clipped; false restores the unpartnered legs (mc_mynn_bl.jl)"),
     :mynn_mix_numbers         => (Bool, "MYNN also mixes the number densities (mynn_state.jl)"),
     :mynn_output              => (Bool, "per-tile MYNN NetCDF sidecar (mynn_state.jl)"),
     :mynn_trace               => (Bool, "MYNN per-call summary line (mynn_state.jl)"),

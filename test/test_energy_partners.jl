@@ -6,6 +6,8 @@
 #
 #   1. `options[:exchange_realization]` — the ETD phase change books its vapor, heat and Q_ss
 #      partners on the mass the slot's recovered density actually receives;
+#   2. `options[:mynn_exchange_realization]` — the MYNN eddy legs of the transformed mass slots
+#      book the mass a clipped lobe cannot hold as a phase change;
 #
 # Every assertion is on ONE step of tiles advanced from the same state, so the property tested
 # is the operator's own. The tile is the lobe-relaxation fixture: a periodic XZ slice with
@@ -291,6 +293,101 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         mktempdir() do tmp
             m, p, mo = ep_tile(tmp, "alloc"; seed! = seed_super!)
             kDim = mo.grid_params.kDim
+            Scythe.moist_compressible_XZ(m, 1, kDim, 2)
+            @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 2)) == 0
+        end
+    end
+
+    # ── 2. the MYNN mass legs on the recovered density ───────────────────────────────
+    @testset "_mynn_clip_gap: zero off the lobe, the unrealized rate in it" begin
+        mu = MU; ts = 0.5
+        # healthy at both ends: an exact zero, whatever the rate
+        @test Scythe._mynn_clip_gap(1.0e-5, 2.0e-6, 4.0e-6, ts, :bhyp, mu) === 0.0
+        @test Scythe._mynn_clip_gap(0.0, 0.0, 0.0, ts, :bhyp, mu) === 0.0
+        # inside the lobe and staying there: nothing is realized, the whole rate is the gap
+        @test Scythe._mynn_clip_gap(-1.0e-6, 2.0e-7, 4.0e-7, ts, :bhyp, mu) == -4.0e-7
+        # crossing zero upward: only the part above zero is realized
+        g = Scythe._mynn_clip_gap(-1.0e-7, 1.0e-6, 2.0e-6, ts, :bhyp, mu)
+        @test g ≈ (Scythe.ahyp(-1.0e-7 + 0.5e-6, mu) / ts) - 2.0e-6 rtol = 1e-14
+        @test -2.0e-6 < g < 0.0
+        # draining a thin slot through zero: the recovered loss is what was there
+        g = Scythe._mynn_clip_gap(1.0e-7, -1.0e-6, -2.0e-6, ts, :bhyp, mu)
+        @test g ≈ (-Scythe.ahyp(1.0e-7, mu) / ts) + 2.0e-6 rtol = 1e-14
+    end
+
+    @testset "MYNN cloud leg into a lobe: the exchange closes on the recovered density" begin
+        isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
+        F = Main.MYNNTestFixtures
+        mktempdir() do tmp
+            # A boundary-layer cloud (positive below ~700 m) under a negative-ν lobe layer
+            # (900-1600 m) inside the mixed layer: K_h mixes cloud up into the lobe, where the
+            # recovered density is 0 and stays 0.
+            function seed!(patch, mo, kDim, z, col; lobe = true)
+                V = mo.grid_params.vars
+                c = Scythe.mc_slot(V, "rho_c")
+                u = F.bl_jet(z, 12.0, 500.0)
+                rho_t = col.rho_d .+ col.rho_v
+                for j in 1:size(patch.physical, 1)
+                    k = mod1(j, kDim); zz = z[k]
+                    patch.physical[j, V["u"], 1] = u[k]
+                    haskey(V, "rho_e") &&
+                        (patch.physical[j, V["rho_e"], 1] = rho_t[k] * 0.4 * exp(-zz / 1500.0))
+                    bump = 2.0e-3 * exp(-((zz - 800.0) / 600.0)^2)
+                    rc = lobe ? 4.0e-4 * exp(-((zz - 300.0) / 300.0)^2) : 0.0
+                    patch.physical[j, V["rho_v"], 1] = rho_t[k] * bump
+                    patch.physical[j, V["rho_t"], 1] = rho_t[k] * bump + rc
+                    nu = Scythe.condensate_slot(rc, 0.0, :bhyp, MU)
+                    lobe && (nu -= 2.0e-6 * exp(-((zz - 1250.0) / 300.0)^2))
+                    patch.physical[j, c, 1] = nu
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+            end
+            arms = Dict{Any,Any}()
+            for (tag, mynn, on, lobe) in (("on", true, true, true), ("off", true, false, true),
+                                          ("ctl", false, true, true),
+                                          ("nl_on", true, true, false),
+                                          ("nl_off", true, false, false))
+                m, p, mo, gp, z, col = F.make_mynn_tile(tmp; mynn = mynn, init = :zero,
+                                                        num_cells_k = 25, ctrans = :bhyp,
+                                                        rtrans = :bhyp)
+                mo.options[:mynn_exchange_realization] = on
+                seed!(p, mo, gp.kDim, z, col; lobe)
+                F.step_all!(m, p, gp.kDim)
+                arms[tag] = (; m, p, mo, gp, x = copy(p.physical[:, :, 1]))
+            end
+            mo = arms["on"].mo; V = mo.grid_params.vars; kDim = arms["on"].gp.kDim
+            rv_i = V["rho_v"]; c = Scythe.mc_slot(V, "rho_c")
+            nf = size(arms["ctl"].m.expdot_n, 2)
+            Don = arms["on"].m.expdot_n[:, 1:nf] .- arms["ctl"].m.expdot_n
+            Doff = arms["off"].m.expdot_n[:, 1:nf] .- arms["ctl"].m.expdot_n
+            x = arms["on"].x
+            @test x == arms["off"].x
+            lobe = x[:, c] .< 0.0
+            @test count(lobe) > 0
+            # the cloud leg itself is untouched; so are rho_t and E_t (the flux form)
+            for v in (3, 6, 9)
+                @test Don[:, v] == Doff[:, v]
+            end
+            # at the lobe points the slot moves and the recovered density cannot
+            ts = mo.ts
+            ch = lobe .& (Don[:, 9] .!= 0.0) .& ((x[:, 9] .+ ts .* Don[:, 9]) .< 0.0)
+            @test count(ch) > 0
+            # OFF: the mixed-in cloud vanishes; ON: it is vapor, mass for mass
+            J = arms["on"].m.mc_scratch[Threads.threadid()].Jc     # (any column: uniform in x)
+            dens = Don[ch, 9] ./ J[mod1.(findall(ch), kDim)]
+            @test Don[ch, rv_i] .- Doff[ch, rv_i] ≈ dens rtol = 1.0e-10
+            # p and Q_ss carry the evaporation's partners, of the right sign
+            @test all(sign.(Don[ch, 1] .- Doff[ch, 1]) .== -sign.(dens))
+            # bitwise where the clip never acts: the same boundary layer with no condensate
+            # (on 1 km cells even a smooth cloud rings below zero somewhere, so the clean
+            # comparison is the cloud-free one; the masked one follows)
+            @test arms["nl_on"].m.expdot_n == arms["nl_off"].m.expdot_n
+            # and away from the lobe points in the lobed state
+            far = .!(lobe .| ((x[:, 9] .+ ts .* Don[:, 9]) .< 0.0))
+            @test Don[far, :] == Doff[far, :]
+            # allocation-free with the partner acting
+            m = arms["on"].m
             Scythe.moist_compressible_XZ(m, 1, kDim, 2)
             @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 2)) == 0
         end
