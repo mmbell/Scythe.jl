@@ -10463,6 +10463,149 @@ dry path is bitwise by construction rather than by arithmetic luck.)
 end
 
 """
+    phase_change_partner(dl, di, Tk, R_m, C_vt, C_pt, Lv, Ls, Q_s, Q_s_i) -> (dp, dv, dq)
+
+The PARTNER of a phase change: the pressure, vapor and supersaturation increments that go with
+`dl` [kg/m³] of vapor turned to liquid and `di` of vapor turned to ice (negative = evaporation,
+sublimation), at fixed `ρ_t`, `ρ_d`, `E_t` and kinetic energy. It is the step-mean ETD
+exchange's own formula (`etd_d1`/`etd_dv` and the `Q_ss` give-back in `mc_driver!`'s
+pre-compute) with the rate times `Δt` replaced by the mass:
+
+    dp = (R_m/C_vt)·[(L_v − R_v C_pt T/R_m)·dl + (L_s − R_v C_pt T/R_m)·di]
+    dv = −(dl + di)
+    dq = −(1 + 𝒬_s)·dl − (1 + 𝒬_{s,i})·di
+
+so the four consumers of one exchange can never disagree. WHY THIS IS THE ENERGY-NEUTRAL
+EXCHANGE: [`implied_total_energy`](@ref) carries a condensate at `C_pv T − L` and the vapor at
+`C_vv T` (energies referenced to vapor), so moving `δ` from vapor to liquid at fixed `T` changes
+`E` by `δ(R_v T − L_v)`; holding `E` (and so `R = E_t − E`) requires `ρ_d C_vt δT =
+(L_v − R_v T) δ`, and through `T = p/(ρ_d R_d + ρ_v R_v)` that is `δp = ρ_d R_m δT − R_v T δ`
+— the bracket above, since `C_pt = C_vt + R_m`. `𝒬_s` is [`Q_s_energy`](@ref) (`𝒬_{s,i}`
+[`Q_s_energy_ice`](@ref)): the saturation chain rule of exactly this `δT`, `δp`. Linear in
+`(dl, di)` at the frozen coefficients, as the ETD increments are: the residual it leaves is
+second order in the exchanged mass.
+"""
+@inline function phase_change_partner(dl, di, Tk, R_m, C_vt, C_pt, Lv, Ls, Q_s, Q_s_i)
+    b = Rv * C_pt * Tk / R_m
+    dp = (R_m / C_vt) * (((Lv - b) * dl) + ((Ls - b) * di))
+    dv = -(dl + di)
+    dq = -(((1.0 + Q_s) * dl) + ((1.0 + Q_s_i) * di))
+    return dp, dv, dq
+end
+
+"""
+    EXCHANGE_REALIZATION_DEFAULT
+
+The value `options[:exchange_realization]` takes when the key is absent. See
+[`_etd_exchange_realization!`](@ref).
+"""
+const EXCHANGE_REALIZATION_DEFAULT = true
+
+"""
+    _etd_exchange_realization!(vnp1, phys, S, colstart, ts, ctr, cmu, rtr, rmu, itr, imu,
+                               rv_i, i1, i2, i3)
+
+THE ETD EXCHANGE REALIZED ON THE RECOVERED DENSITY (`options[:exchange_realization]`, default
+true). The step-mean phase change books its vapor (`etd_dv`), its latent heat in `p`
+(`etd_d1`) and its `Q_ss` loss for the FULL requested mass `Δt·q̄_k` of each channel, while the
+transformed slot receives `etd_d* = Δt·J_k·q̄_k` with `J_k` frozen at the step's START — and the
+mass the model then holds is the RECOVERED change `ahyp(ν* + d) − ahyp(ν*)` from the
+post-explicit `ν*`, not `Δt q̄_k`. Where the two differ the exchange is open: in a clipped lobe
+(`ν* + d ≤ 0`, recovered density 0 before and after) condensation books vapor and heat for
+liquid that never appears, and at a thinning edge an over-drawn evaporation takes the slot
+through `ν = 0` while `p` and the vapor take the full draw. Each opening is a jump in
+`R = E_t − E_implied(T_eos)` — measured, it is the `S3:etd_liq` term of the 2026-10-16 closed
+budget (−17 W/m² on the cloudy RCE restart, +56 mid-window).
+
+The cure closes the exchange on what the slot ACTUALLY receives. Per gridpoint and per
+transformed mass slot `k` (cloud, rain, the three ice masses):
+
+    Δ_k = [ahyp(ν*_k + d_k) − ahyp(ν*_k)] − Δt·q̄_k
+
+and the difference is booked as a phase change of its own through
+[`phase_change_partner`](@ref) — liquid `Δ_c + Δ_r`, ice `Δ_i1 + Δ_i2 + Δ_i3` — applied to
+`p`, the vapor slot and `Q_ss^{n+1}` as increments of their own beside `etd_d1`, `etd_dv` and the
+propagated `Q_ss` (the scratch keeps the REQUESTED exchange, for the census and for a reader
+of the step). The sum is exactly the closed exchange on the
+recovered mass: vapor moves by `−Σ_k rec_k`, the heat bracket by `Σ_k rec_k` (the ETD's own
+coefficients scaled to the realized mass), `Q_ss` gives back `(1 + 𝒬)Δ_k` exactly as the
+cloud-donor realization's give-back does. The slot increments, the habit partition and the ice
+numbers are untouched: the RATES are still the J₀-realized step-means (the donor share rule
+stands), only their partners are re-booked on the mass that arrived. This SUBSUMES the cloud
+donor realization's role as an overdraft guard — an over-drawn slot's partner is the mass it
+gave — without retiring it, because the share between the sinks of one reservoir is a statement
+about the rates and stays where it is.
+
+What it does to a HEALTHY point (`ν ≫ μ`, `J ≈ ½`): `Δ_k` is the Jacobian's linearization error
+across the step, `O(Δν²/μ)`-small — an `O(μ)`-relative change, not zero, so the switch is not
+bitwise there. It IS bitwise under `:none` (the caller skips it: the recovered change is the
+requested one) and wherever every channel's increment is an exact zero.
+
+It runs in [`relaxation_adjustment_qss!`](@ref) AFTER the phase-change increments have landed
+and BEFORE the lobe relaxation, so each mass slot holds exactly `ν* + d_k` and `ν*` is
+`vnp1 − d_k` (one rounding of `ν* + d_k` away from the bits the explicit advance wrote —
+immaterial to a recovered difference). The lobe relaxation that follows moves `ν` only inside
+the clipped lobe and never across `ν = 0` (`lobe_relaxation_cap`), so it changes no recovered
+mass and needs no partner: the two compose. The cloud slot is a perturbation against `ν̄_c`; its
+total is `vnp1 + (ν_c^n − slot^n)`, the offset the lobe relaxation uses (an exact `0.0` whenever
+`ρ̄_c ≡ 0`). `@noinline` with plain arrays: called from inside the column step.
+"""
+@noinline function _etd_exchange_realization!(vnp1::Matrix{Float64}, phys::Array{Float64,3}, S,
+                                              colstart::Int, ts::Float64,
+                                              ctr::Symbol, cmu::Float64,
+                                              rtr::Symbol, rmu::Float64,
+                                              itr::Symbol, imu::Float64,
+                                              rv_i::Int, i1::Int, i2::Int, i3::Int)
+    d8 = S.etd_d8; d9 = S.etd_d9
+    qc = S.Qdot_bar; qr = S.Qdot_r_bar; nuc = S.nu_c
+    ice = i1 > 0 && itr !== :none
+    @inbounds for i in eachindex(d9)
+        g = colstart + i - 1
+        dl = 0.0
+        di = 0.0
+        if ctr !== :none && d9[i] != 0.0
+            n = vnp1[g, 9] + (nuc[i] - phys[g, 9, 1])
+            dl += _exchange_gap(n, d9[i], ts * qc[i], ctr, cmu)
+        end
+        if rtr !== :none && d8[i] != 0.0
+            dl += _exchange_gap(vnp1[g, 8], d8[i], ts * qr[i], rtr, rmu)
+        end
+        if ice
+            # The requested ice mass of species k is `Δt q_k`; the slot increment is
+            # `Δt J_k q_k`, so the request is recovered through the same Jacobian.
+            d = S.etd_di1[i]
+            d != 0.0 && (di += _exchange_gap(vnp1[g, i1], d, d / S.J_i1q[i], itr, imu))
+            d = S.etd_di2[i]
+            d != 0.0 && (di += _exchange_gap(vnp1[g, i2], d, d / S.J_i2q[i], itr, imu))
+            d = S.etd_di3[i]
+            d != 0.0 && (di += _exchange_gap(vnp1[g, i3], d, d / S.J_i3q[i], itr, imu))
+        end
+        (dl == 0.0 && di == 0.0) && continue
+        dp, dvv, dq = phase_change_partner(dl, di, S.Tk[i], S.R_m[i], S.C_vt[i], S.C_pt[i],
+                                           S.Lv[i], ice ? L_s(S.Tk[i]) : 0.0, S.Q_s[i],
+                                           ice ? S.Q_s_i[i] : 0.0)
+        vnp1[g, 1] += dp
+        vnp1[g, rv_i] += dvv
+        # Slot 7 is already `Q_ss^{n+1}` here — the propagated value where `λ ≠ 0`, the explicit
+        # predictor (which carried any clipped flux in `N`) where it was kept — so the
+        # give-back is one increment in both cases.
+        vnp1[g, 7] += dq
+    end
+    return nothing
+end
+
+"""
+    _exchange_gap(n_after, d, req, trans, mu) -> Float64
+
+The mass a transformed slot's RECOVERED density received over an increment `d` that has
+already landed (`n_after = ν* + d`), minus the mass `req` its partners were booked for. Exact
+zero where the two agree to the last bit.
+"""
+@inline function _exchange_gap(n_after, d, req, trans::Symbol, mu)
+    return (recover_total(n_after, trans, mu) - recover_total(n_after - d, trans, mu)) - req
+end
+
+"""
     relaxation_adjustment_qss!(mtile, colstart, colend, t)
 
 Apply the exponential propagator of the supersaturation relaxation pair, and the step-mean
@@ -10497,6 +10640,11 @@ advance, and stashed in the per-thread scratch columns (`etd_*`, `Qdot_bar`, `Qd
     bracket for the pressure). Because all of them are built from ONE step-mean rate per
     channel, the vapor removed, the mass condensed or deposited and the heat released are
     identical by construction.
+
+  * with `options[:exchange_realization]` (default on) the vapor, `p` and `Q_ss` partners of
+    each transformed mass slot are then re-booked on the mass its RECOVERED density actually
+    received ([`_etd_exchange_realization!`](@ref)) — before the lobe relaxation, which moves
+    no recovered mass.
 
 Where `λ = 0` the predictor is left exactly as `explicit_timestep` wrote it, so the dry path —
 and any point with no droplets, no rain and no ice — is bitwise the third-order multistep.
@@ -10556,6 +10704,26 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
             dn1[i] != 0.0 && (vnp1[g, n1] += dn1[i])
             dn2[i] != 0.0 && (vnp1[g, n2] += dn2[i])
             dn3[i] != 0.0 && (vnp1[g, n3] += dn3[i])
+        end
+    end
+    # THE EXCHANGE REALIZED ON THE RECOVERED DENSITY (`exchange_realization`): HERE, after every
+    # phase-change increment has landed and before the lobe relaxation moves any ν, so each
+    # transformed mass slot holds exactly `ν* + d` and its post-explicit `ν*` is one
+    # subtraction away. The vapor, heat and `Q_ss` partners are re-booked on the mass the slot's
+    # RECOVERED density actually received, as increments of their own; the ETD scratch is not
+    # touched, so the step's requested exchange stays readable. Skipped entirely without a
+    # water transform, where the recovered change IS the requested one.
+    model = mtile.model
+    if get(model.options, :exchange_realization, EXCHANGE_REALIZATION_DEFAULT)::Bool
+        ctr = condensate_transform_mode(model.options)
+        rtr = rain_transform_mode(model.options)
+        itr = ice_on ? ice_transform_mode(model.options) : :none
+        if ctr !== :none || rtr !== :none || itr !== :none
+            pp = model.physical_params
+            _etd_exchange_realization!(vnp1, mtile.tile.physical, S, colstart, model.ts,
+                ctr, get(pp, :condensate_mu, 1.0e-7), rtr, get(pp, :rain_mu, 1.0e-7),
+                itr, ice_on ? ice_mu(pp, 1) : 1.0, rv_i,
+                ice_on ? IS.i1_q : 0, ice_on ? IS.i2_q : 0, ice_on ? IS.i3_q : 0)
         end
     end
     # The LOBE RELAXATION (Stage L; `lobe_relaxation_increment`), applied in the same phase as

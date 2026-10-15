@@ -230,7 +230,9 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         # evaporation bound (9acd5b8, `options[:cloud_evap_realization]`, default on) landed
         # after the capture and legitimately binds on this fixture's thin sheet edges, so the
         # fixture pins it off: switch-off is bitwise the pre-bound code (its own tests), and
-        # the capture stays the authority on what `:energy` must reproduce.
+        # the capture stays the authority on what `:energy` must reproduce. The exchange
+        # realization (`options[:exchange_realization]`, default on) re-books the ETD partners
+        # on the recovered mass and is pinned off for the same reason.
         golden = Dict("warm" => (UInt128(195009073869525435707340911),
                                  UInt128(5214078536834308060992558166)),
                       "ice" => (UInt128(514673702508703115877210311),
@@ -238,7 +240,8 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         mktempdir() do tmp
             for (tag, ice) in (("warm", false), ("ice", true))
                 m, p, mo = eos_tile(tmp, tag; temperature = :energy, ice = ice,
-                    extra = Dict{Symbol,Any}(:cloud_evap_realization => false),
+                    extra = Dict{Symbol,Any}(:cloud_evap_realization => false,
+                                             :exchange_realization => false),
                     seed! = (p, x, V, c) -> eos_seed_sheet!(p, x, V, c; wamp = 0.5))
                 eos_run!(m, p, mo, 3)
                 @test all(isfinite, m.var_np1)
