@@ -7608,6 +7608,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # condensate shows up as an energy-consistent phase change rather than a drift of
     # E_t − E_implied. Default ON; `false` is bitwise the code without it.
     refit_partner = get(model.options, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool
+    # THE VAPOR NUDGE'S PRESSURE PARTNER (`vapor_nudge_partner_rate`): the vapor the
+    # reconciliation moves takes its internal energy from the sensible heat, so the nudge leaves
+    # E_t − E_implied alone. Default ON; `false` is bitwise the unpartnered nudge.
+    vrec_partner = get(model.options, :vapor_nudge_partner, VAPOR_NUDGE_PARTNER_DEFAULT)::Bool
     # THE MODEL TEMPERATURE (`temperature_mode`): `:eos`, T = p/(ρ_d R_d + ρ_v R_v), unless the
     # run asks for the `:energy` retrieval. Read once per column, like every switch here.
     teos = temperature_mode(model.options) === :eos
@@ -9380,9 +9384,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     #
     #
     # `VREC` is the reconciliation nudge (`rho_v_reconcile`), the second link of the
-    # Q_ss → ρ_v → ρ_t chain described at slot 7. It is thermodynamically INERT — the retrieval
-    # reads ρ_t, ρ_liq and ρ_ice and never the vapor — so it moves the partition and nothing
-    # else, and it is identically zero on a resting base.
+    # Q_ss → ρ_v → ρ_t chain described at slot 7. Under the `:energy` retrieval it is
+    # thermodynamically inert — that retrieval reads ρ_t, ρ_liq and ρ_ice and never the vapor;
+    # under the EOS temperature it is not, and its pressure partner follows it below. It is
+    # identically zero on a resting base.
     #
     # `VAPOR_SRC` is withheld from this tendency with the condensate sources it is the exact
     # negative of — all of it, because every one of its terms is a relaxation of `Q_ss`. It
@@ -9395,6 +9400,19 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     @. VREC = rho_v_reconcile(res_rho_t, rho_v, tau_rec)
     @turbo FORCING .= @. (-rho_v * div) + VREC
     @turbo expdot[colstart:colend, rv_i] .= @. ADV + FORCING
+    # ...and its PRESSURE PARTNER (`vapor_nudge_partner_rate`): under the EOS temperature the
+    # nudge is NOT thermodynamically inert — the vapor is in `T = p/(ρ_d R_d + ρ_v R_v)` — so
+    # the vapor it moves takes its internal energy from the sensible heat, through `p`, and
+    # leaves `E_t − E_implied` alone. Explicit loop and an exact-zero gate (the slot-3 rule): a
+    # resting base, where `VREC ≡ 0`, is not touched.
+    if vrec_partner
+        @inbounds for i in eachindex(VREC)
+            vr = VREC[i]
+            vr != 0.0 &&
+                (expdot[colstart + i - 1, 1] += vapor_nudge_partner_rate(vr, Tk[i], R_m[i],
+                                                                          C_vt[i]))
+        end
+    end
 
     # Rain NUMBER density (the appended slot, `options[:rain_moments] = 2`). The same
     # continuity form every other total takes — transform-invariant advection of the control
@@ -10328,6 +10346,45 @@ item 1 above lives.
 
     return (res_rho_t - rho_v) / tau_rec
 end
+
+"""
+    VAPOR_NUDGE_PARTNER_DEFAULT
+
+The value `options[:vapor_nudge_partner]` takes when the key is absent. See
+[`vapor_nudge_partner_rate`](@ref).
+"""
+const VAPOR_NUDGE_PARTNER_DEFAULT = true
+
+"""
+    vapor_nudge_partner_rate(vrec, Tk, R_m, C_vt) -> Float64
+
+THE PRESSURE PARTNER OF THE VAPOR NUDGE (`options[:vapor_nudge_partner]`, default true): the
+`p` tendency that makes [`rho_v_reconcile`](@ref)'s vapor source `VREC` neutral in
+`R = E_t − E_implied(T_eos)`,
+
+    ṗ = T·(R_v − (R_m/C_vt)·C_vv)·VREC.
+
+The nudge moves vapor at fixed `ρ_t`, `E_t` and condensate — it changes the partition, and
+under the EOS temperature that is not inert: with `p` held, `T = p/(ρ_d R_d + ρ_v R_v)` drops by
+`R_v T δ/(ρ_d R_m)`, and `E_implied` gains the vapor's `C_vv T δ` and loses `ρ_d C_vt` times the
+drop. Holding `E_implied` (so that the nudge leaves `R` alone) requires
+`ρ_d C_vt δT = −C_vv T δ` — the nudged vapor's internal energy is taken from the sensible heat,
+because `E_t` did not receive it — and through the equation of state
+`δp = ρ_d R_m δT + R_v T δ`, the bracket above. (The simpler `δp = R_v T δ` holds `T_eos` fixed
+and leaves `R` changed by `−C_vv T δ`: the vapor's internal energy created from nothing. The
+two differ by `(R_m/C_vt) C_vv T δ` ≈ 0.55 R_v T δ.) Measured, the unpartnered nudge is the
+`S2:vrec` term of the 2026-10-16 budget: +2.1 W/m² on the cloudy RCE restart.
+
+VAPOR ONLY, BY NECESSITY. If the gap `res_rho_t − ρ_v` came from condensate that vanished
+without a vapor partner (a clipped lobe of the linear `ρ_t`), its energy is in `E_t` at the
+LIQUID level and the honest partner would carry `L`; but the gap is the sum of every
+partition error the step makes — independent fits of `ρ_t`, `ρ_d` and the species, the clipped
+lobes, operator mismatches — and nothing at the nudge can attribute it. So it is booked as
+vapor appearing at fixed `E_implied`, and the lobe channels are closed at their sources
+instead (the exchange realization, the MYNN partner, the refit partner). `Q_ss` is not given a
+share: `qss_relaxation` reconciles it with the vapor on `τ_ss` as it always has.
+"""
+@inline vapor_nudge_partner_rate(vrec, Tk, R_m, C_vt) = Tk * (Rv - ((R_m / C_vt) * Cvv)) * vrec
 
 # ── ETD-AB3: the exponential multistep for the stiff Q_ss relaxation pair ──────
 #

@@ -232,9 +232,10 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         # fixture pins it off: switch-off is bitwise the pre-bound code (its own tests), and
         # the capture stays the authority on what `:energy` must reproduce. The exchange
         # realization (`options[:exchange_realization]`, default on) re-books the ETD partners
-        # on the recovered mass, and the refit partner (`options[:refit_partner]`, default on)
-        # books the refit's recovered change as condensation; both are pinned off for the same
-        # reason.
+        # on the recovered mass, the refit partner (`options[:refit_partner]`, default on)
+        # books the refit's recovered change as condensation, and the vapor nudge's pressure
+        # partner (`options[:vapor_nudge_partner]`, default on) moves p with the nudge; all three
+        # are pinned off for the same reason.
         golden = Dict("warm" => (UInt128(195009073869525435707340911),
                                  UInt128(5214078536834308060992558166)),
                       "ice" => (UInt128(514673702508703115877210311),
@@ -244,7 +245,8 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 m, p, mo = eos_tile(tmp, tag; temperature = :energy, ice = ice,
                     extra = Dict{Symbol,Any}(:cloud_evap_realization => false,
                                              :exchange_realization => false,
-                                             :refit_partner => false),
+                                             :refit_partner => false,
+                                             :vapor_nudge_partner => false),
                     seed! = (p, x, V, c) -> eos_seed_sheet!(p, x, V, c; wamp = 0.5))
                 eos_run!(m, p, mo, 3)
                 @test all(isfinite, m.var_np1)

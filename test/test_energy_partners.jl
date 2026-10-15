@@ -10,6 +10,8 @@
 #      book the mass a clipped lobe cannot hold as a phase change;
 #   3. `options[:refit_partner]` — the spline refit's change in recovered condensate is booked
 #      as condensation (the author's decision, 2026-10-16);
+#   4. `options[:vapor_nudge_partner]` — the vapor reconciliation nudge gets the pressure
+#      partner that holds E_implied.
 #
 # Every assertion is on ONE step of tiles advanced from the same state, so the property tested
 # is the operator's own. The tile is the lobe-relaxation fixture: a periodic XZ slice with
@@ -502,6 +504,64 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :refit_partner)
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :exchange_realization)
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :mynn_exchange_realization)
+        end
+    end
+
+    # ── 4. the vapor nudge's pressure partner ────────────────────────────────────────
+    @testset "vapor nudge partner: R unchanged by the nudge, bitwise when off" begin
+        mktempdir() do tmp
+            # A vapor GAP: rho_t carries 2e-4 kg/m3 more water than the species account for
+            # (the vapor slot is not raised with it), so res_rho_t - rho_v = gap and the nudge
+            # pulls the vapor up at gap/tau_rec. Cloud-free, so nothing else is partnered.
+            function seed_gap!(patch, pts, V)
+                for i in 1:size(patch.physical, 1)
+                    patch.physical[i, V["rho_t"], 1] = 2.0e-4 * exp(-((pts[i, end] - 3000.0) / 1500.0)^2)
+                end
+            end
+            arms = Dict{Bool,Any}()
+            for on in (true, false)
+                m, p, mo = ep_tile(tmp, "vn_$(on)"; seed! = seed_gap!,
+                                   opts_extra = Dict{Symbol,Any}(:vapor_nudge_partner => on))
+                advance_all!(m, p, mo)
+                arms[on] = (; m, p, mo, S = deepcopy(scratch(m)))
+            end
+            m1 = arms[true].m; m0 = arms[false].m; mo = arms[true].mo
+            kDim = mo.grid_params.kDim; nc = ncols(arms[true].p, mo)
+            col = ((nc - 1) * kDim + 1):(nc * kDim)
+            S = arms[true].S
+            @test maximum(S.VREC) > 0.0
+            # the only tendency difference is the partner, in p, exactly the formula
+            D = m1.expdot_n .- m0.expdot_n
+            rv_i = Scythe.mc_slot(mo.grid_params.vars, "rho_v")
+            @test all(iszero, D[:, setdiff(1:size(D, 2), [1])])
+            @test isapprox(D[col, 1], Scythe.vapor_nudge_partner_rate.(S.VREC, S.Tk, S.R_m, S.C_vt);
+                           rtol = 1.0e-8, atol = 1.0e-12)
+            # R: one forward step of the nudge with and without its partner, on the state n
+            x = copy(arms[true].p.physical[:, :, 1])
+            ts = mo.ts
+            R0, _, _ = residual(m1, x)
+            xv = copy(x); xv[col, rv_i] .+= ts .* S.VREC
+            Rv, _, _ = residual(m1, xv)
+            xp = copy(xv); xp[col, 1] .+= ts .* D[col, 1]
+            Rp, _, _ = residual(m1, xp)
+            dRv = abs.(Rv[col] .- R0[col]); dRp = abs.(Rp[col] .- R0[col])
+            act = S.VREC .> 1.0e-3 * maximum(S.VREC)
+            # unpartnered: at fixed p the vapor lowers T_eos and adds its C_vv T, so R moves by
+            # T(C_vv - C_vt R_v/R_m) per kg nudged (about -230 T)
+            expd = S.Tk .* (Scythe.Cvv .- (S.C_vt ./ S.R_m) .* Scythe.Rv) .* ts .* S.VREC
+            @test isapprox(dRv[act], abs.(expd[act]); rtol = 1.0e-3)
+            # partnered: second order in the nudged mass
+            @test all(dRp[act] .<= 1.0e-4 .* dRv[act])
+            # resting base / switch off: bitwise
+            for on in (true, false)
+                mA, pA, moA = ep_tile(tmp, "vr_$(on)";
+                                      opts_extra = Dict{Symbol,Any}(:vapor_nudge_partner => on))
+                advance_all!(mA, pA, moA)
+                arms[on] = mA.var_np1
+            end
+            @test arms[true] == arms[false]
+            @test Scythe.VAPOR_NUDGE_PARTNER_DEFAULT === true
+            @test haskey(Scythe.KNOWN_OPTION_KEYS, :vapor_nudge_partner)
         end
     end
 end
