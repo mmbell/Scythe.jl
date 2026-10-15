@@ -8,6 +8,8 @@
 #      partners on the mass the slot's recovered density actually receives;
 #   2. `options[:mynn_exchange_realization]` — the MYNN eddy legs of the transformed mass slots
 #      book the mass a clipped lobe cannot hold as a phase change;
+#   3. `options[:refit_partner]` — the spline refit's change in recovered condensate is booked
+#      as condensation (the author's decision, 2026-10-16);
 #
 # Every assertion is on ONE step of tiles advanced from the same state, so the property tested
 # is the operator's own. The tile is the lobe-relaxation fixture: a periodic XZ slice with
@@ -150,7 +152,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     function etd_stage(m, X0, kDim, nc)
         cs = (nc - 1) * kDim + 1
         m.var_np1 .= X0
-        Scythe.relaxation_adjustment_qss!(m, cs, cs + kDim - 1, 2)
+        Scythe.relaxation_adjustment_qss!(m, cs, cs + kDim - 1, 1)
         return copy(m.var_np1), cs:(cs + kDim - 1)
     end
 
@@ -390,6 +392,116 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             m = arms["on"].m
             Scythe.moist_compressible_XZ(m, 1, kDim, 2)
             @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 2)) == 0
+        end
+    end
+
+    # ── 3. the refit partner ─────────────────────────────────────────────────────────
+    """Step 1, the model's own refit (`calcTendency` + `gridTransform!`), step 2: returns the
+    pre-refit slots (var_np1 after step 1), the post-refit slots, and the tile."""
+    function refit_two_steps(tmp, tag; on = true, kw...)
+        m, p, mo = ep_tile(tmp, tag; opts_extra = Dict{Symbol,Any}(:refit_partner => on), kw...)
+        advance_all!(m, p, mo; t = 1)
+        xpre = copy(m.var_np1)
+        Scythe.calcTendency(m)
+        gridTransform!(p)
+        xpost = copy(p.physical[:, :, 1])
+        advance_all!(m, p, mo; t = 2)
+        return m, p, mo, xpre, xpost
+    end
+
+    @testset "refit partner: the refit's recovered change is booked as condensation" begin
+        mktempdir() do tmp
+            m1, p1, mo, xpre, xpost = refit_two_steps(tmp, "rf_on"; seed! = seed_sheet!)
+            m0, p0, _, xpre0, xpost0 = refit_two_steps(tmp, "rf_off"; seed! = seed_sheet!,
+                                                       on = false)
+            @test xpre == xpre0 && xpost == xpost0          # step 1 and the refit: identical
+            V = mo.grid_params.vars; kDim = mo.grid_params.kDim; nc = ncols(p1, mo)
+            rv_i = Scythe.mc_slot(V, "rho_v")
+            col = ((nc - 1) * kDim + 1):(nc * kDim)          # the scratch is the last column's
+            S1 = scratch(m1); S0 = scratch(m0)
+            dp = S1.etd_d1[1:kDim] .- S0.etd_d1[1:kDim]
+            dvv = S1.etd_dv[1:kDim] .- S0.etd_dv[1:kDim]
+            # the refit's change in recovered cloud, computed here independently
+            rc(x) = Scythe.recover_rho_c.(x[col, 9], 0.0, :bhyp, MU)
+            drho = rc(xpost) .- rc(xpre)
+            @test maximum(abs.(drho)) > 1.0e-7               # the sheet's refit does move it
+            # water: the vapor partner is exactly minus the recovered change
+            @test dvv ≈ -drho rtol = 1.0e-12 atol = 1.0e-22
+            # energy: on the pre-refit state, replacing the cloud slot by its refit value opens
+            # R by ~L*drho; the partner closes it to second order in drho
+            Rpre, _, _ = residual(m1, xpre)
+            xc = copy(xpre); xc[col, 9] .= xpost[col, 9]
+            Rc, _, _ = residual(m1, xc)
+            xp = copy(xc); xp[col, 1] .+= dp; xp[col, rv_i] .+= dvv
+            Rp, _, _ = residual(m1, xp)
+            open_ = abs.(Rc[col] .- Rpre[col]); closed = abs.(Rp[col] .- Rpre[col])
+            big = abs.(drho) .> 1.0e-3 * maximum(abs.(drho))
+            @test all(open_[big] .> 1.0e6 .* abs.(drho[big]))      # ~L per kg, unpartnered
+            @test all(closed[big] .<= 1.0e-3 .* open_[big])
+            @test sum(closed) <= 1.0e-3 * sum(open_)
+            # the Q_ss give-back rides with it: (1 + Q_s) per kg, of the vapor's sign
+            S = scratch(m1)
+            dq = S1.etd_qnp1[1:kDim] .- S0.etd_qnp1[1:kDim]
+            lam0 = S.etd_lam[1:kDim] .== 0.0
+            @test all((sign.(dq[big]) .== sign.(dvv[big])) .| lam0[big])
+            # nothing but p, the vapor and Q_ss moved in the ETD scratch
+            @test S1.etd_d9[1:kDim] == S0.etd_d9[1:kDim]
+            @test S1.etd_d8[1:kDim] == S0.etd_d8[1:kDim]
+        end
+    end
+
+    @testset "refit partner: inert at t = 1, under :none, and tiny on a smooth cloud" begin
+        mktempdir() do tmp
+            # t = 1: var_np1 holds no fitted state; the arms are bitwise one step in
+            st = Dict{Bool,Matrix{Float64}}()
+            for on in (true, false)
+                m, p, mo = ep_tile(tmp, "t1_$(on)"; seed! = seed_sheet!,
+                                   opts_extra = Dict{Symbol,Any}(:refit_partner => on))
+                advance_all!(m, p, mo; t = 1)
+                st[on] = copy(m.var_np1)
+            end
+            @test st[true] == st[false]
+            # :none: no transform, no partner, bitwise over a refit
+            m1, _, _, _, _ = refit_two_steps(tmp, "none_on"; tr = :none,
+                seed! = (p, x, V) -> seed_sheet!(p, x, V; tr = :none))
+            m0, _, _, _, _ = refit_two_steps(tmp, "none_off"; tr = :none, on = false,
+                seed! = (p, x, V) -> seed_sheet!(p, x, V; tr = :none))
+            @test m1.var_np1 == m0.var_np1
+            # a smooth, well-resolved cloud: the refit barely moves its recovered density
+            smooth!(patch, pts, V) = begin
+                c = Scythe.mc_slot(V, "rho_c")
+                for i in 1:size(patch.physical, 1)
+                    rcv = 2.0e-4 * exp(-((pts[i, end] - 4000.0) / 2500.0)^2)
+                    patch.physical[i, c, 1] = Scythe.condensate_slot(rcv, 0.0, :bhyp, MU)
+                    patch.physical[i, V["rho_t"], 1] = rcv
+                end
+            end
+            m1, p1, mo, xpre, xpost = refit_two_steps(tmp, "sm_on"; seed! = smooth!,
+                                                      rh = z -> 1.0)
+            m0, _, _, _, _ = refit_two_steps(tmp, "sm_off"; seed! = smooth!, rh = z -> 1.0,
+                                             on = false)
+            kDim = mo.grid_params.kDim
+            dvs = scratch(m1).etd_dv[1:kDim] .- scratch(m0).etd_dv[1:kDim]
+            # the refit's filter still moves a resolved cloud a little every step (the partner
+            # books that too: the decision is per recovered kilogram, not per lobe), but by a
+            # small fraction of the cloud: measured ~1e-3 of the 2e-4 kg/m3 peak
+            @test 0.0 < maximum(abs.(dvs)) < 1.0e-2 * 2.0e-4
+        end
+    end
+
+    @testset "refit partner: allocation-free acting, config round trip" begin
+        mktempdir() do tmp
+            m, p, mo = ep_tile(tmp, "rf_alloc"; seed! = seed_sheet!)
+            kDim = mo.grid_params.kDim
+            advance_all!(m, p, mo; t = 1)
+            Scythe.calcTendency(m); gridTransform!(p)
+            Scythe.moist_compressible_XZ(m, 1, kDim, 2)
+            Scythe.moist_compressible_XZ(m, 1, kDim, 2)
+            @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 2)) == 0
+            @test Scythe.REFIT_PARTNER_DEFAULT === true
+            @test haskey(Scythe.KNOWN_OPTION_KEYS, :refit_partner)
+            @test haskey(Scythe.KNOWN_OPTION_KEYS, :exchange_realization)
+            @test haskey(Scythe.KNOWN_OPTION_KEYS, :mynn_exchange_realization)
         end
     end
 end

@@ -7602,6 +7602,12 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # condensation closure's kinked cloud, see `lobe_relaxation_increment`; the consistent
     # forms change the pool by a few per cent.)
     lobe_tr = get(model.options, :water_lobe_transport, true)::Bool
+    # THE REFIT PARTNER (`_refit_partner_fold!`): the per-step spline refit's change in each
+    # transformed water-mass slot's RECOVERED density is booked as condensation — its vapor,
+    # latent heat in p and Q_ss partners — so the discretization error the refit makes in the
+    # condensate shows up as an energy-consistent phase change rather than a drift of
+    # E_t − E_implied. Default ON; `false` is bitwise the code without it.
+    refit_partner = get(model.options, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool
     # THE MODEL TEMPERATURE (`temperature_mode`): `:eos`, T = p/(ρ_d R_d + ρ_v R_v), unless the
     # run asks for the `:energy` retrieval. Read once per column, like every switch here.
     teos = temperature_mode(model.options) === :eos
@@ -10079,6 +10085,21 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         end
     end
 
+    # THE REFIT PARTNER (`_refit_partner_fold!`): HERE because this is the one window in which
+    # both sides of the last refit exist AND the ETD increments it rides with are formed — the
+    # slots loaded at the top of the step are the post-refit state `n`, and `var_np1` still holds
+    # (until `explicit_timestep` below) the pre-refit values the previous step wrote. The partner
+    # is folded into `etd_d1`/`etd_dv`/`etd_qnp1`, so it lands with the phase change, in
+    # `relaxation_adjustment_qss!`, as slot increments.
+    if refit_partner && t > 1 && (ctrans_on || rtrans_on || itrans_on)
+        _refit_partner_fold!(etd_d1, etd_dv, etd_qnp1, etd_lam, mtile.var_np1,
+                             mtile.tile.physical, nu_c, nu_r, S.nu_i1q, S.nu_i2q, S.nu_i3q,
+                             Tk, R_m, C_vt, C_pt, Lv, Q_s, S.Q_s_i, colstart,
+                             ctrans, cmu, rtrans, rmu, itrans, imu_q,
+                             itrans_on ? IS.i1_q : 0, itrans_on ? IS.i2_q : 0,
+                             itrans_on ? IS.i3_q : 0)
+    end
+
     # Depletion census of the water species. HERE, not next to the tendency assembly: this is
     # the last point at which `expdot` is still the tendency of the step about to be taken and
     # `expdot_nm1`/`expdot_nm2` are still the previous two levels (`explicit_timestep` rotates
@@ -10595,6 +10616,130 @@ total is `vnp1 + (ν_c^n − slot^n)`, the offset the lobe relaxation uses (an e
 end
 
 """
+    REFIT_PARTNER_DEFAULT
+
+The value `options[:refit_partner]` takes when the key is absent. See
+[`_refit_partner_fold!`](@ref).
+"""
+const REFIT_PARTNER_DEFAULT = true
+
+"""
+    refit_recovered_change(nu_after, nu_before, trans, mu) -> Float64
+
+The change of one transformed slot's RECOVERED density across a refit, `recover(ν_after) −
+recover(ν_before)`. An exact `0.0` where the refit left the control variable's bits alone.
+"""
+@inline refit_recovered_change(nu_after, nu_before, trans::Symbol, mu) =
+    recover_total(nu_after, trans, mu) - recover_total(nu_before, trans, mu)
+
+"""
+    _refit_partner_fold!(d1, dv, qnp1, lam, vnp1, phys, nu_c, nu_r, nu_i1, nu_i2, nu_i3,
+                         Tk, R_m, C_vt, C_pt, Lv, Q_s, Q_s_i, colstart,
+                         ctr, cmu, rtr, rmu, itr, imu, i1, i2, i3)
+
+THE REFIT PARTNER (`options[:refit_partner]`, default true). Every step the column states are
+refit (`calcTendency` → `spectralTransform!` → the next step's `tileTransform!`), and the refit
+of a TRANSFORMED slot changes its recovered density `ahyp(ν)` by an amount nothing partners:
+the transform is nonlinear, so filtering `ν` conserves `∫ν` and not `∫ρ`, and where the fit
+rings a sharp edge the clip at `ν = 0` takes the negative lobe out of the recovered field
+altogether. Condensate appears or vanishes with no vapor, no heat and no `Q_ss` change; `ρ_t`
+and `E_t` (linear, filtered as they are) do not follow it; and `R = E_t − E_implied(T_eos)`
+jumps every step. Measured on the cloudy 2-D RCE restart (2026-10-16 closed budget) it is the
+largest single term: +121 W/m² domain-mean, +534 late in the window.
+
+THE AUTHOR'S DECISION (2026-10-16): the refit's change in recovered condensate IS TREATED AS
+CONDENSATION. The lobes and the transform's non-conservation are a discretization error that
+will never be removed and will manifest as a phase change of water whatever the scheme;
+booking it as one, energy-consistently, every step removes the drift so long runs stay stable.
+Per gridpoint
+
+    δρ_k = recover(ν_k after the refit) − recover(ν_k before it),   k = cloud, rain, i1q, i2q, i3q
+
+summed into a liquid `δl` and an ice `δi` and booked through [`phase_change_partner`](@ref):
+vapor `−(δl + δi)`, the ETD latent-heat bracket in `p` (`L_v` liquid, `L_s` ice), `Q_ss` its
+`(1 + 𝒬)` give-back. Total water is untouched (`ρ_v + Σρ_k` moves by zero) and `R` by the
+second order of `δρ`. A diagnostic consequence, stated rather than hidden: wherever the refit
+SMOOTHS a cloud (its peak loses recovered mass, its flanks gain it) the partner books that as
+evaporation at the peak and condensation on the flanks, beside the vapor's and `ρ_t`'s own
+(linear) smoothing — the column integral is exact, the local profile carries the refit's
+commutator with the transform. That is the decision's content, not a side effect.
+
+WHERE. Both states exist only at one point: the slots `mc_driver!` loaded at the top of the
+step are the post-refit `ν` (`nu_*`, totals), and `var_np1` has not been touched since the
+previous step's last operator wrote the values that were fitted — until `explicit_timestep`
+overwrites it. The ETD pre-compute sits in that window, so the partner is computed there and
+FOLDED INTO THE ETD INCREMENTS (`d1 += δp`, `dv += δv`, and `Q_ss` through `qnp1`): it lands in
+[`relaxation_adjustment_qss!`](@ref) with the phase change, as slot increments, never written
+into `tile.physical` (whose derivative layers would go stale). Nothing is stashed — no scratch
+column is added (the scratch `NamedTuple` sits at an LLVM register-pressure cliff, see the
+lobe-transport commit) — and the cost is two recoveries per mass slot per gridpoint. Its
+coefficients are the state-`n` ones every ETD increment uses, i.e. those of the post-refit
+state the change produced. `Q_ss`: where `λ ≠ 0` the increment rides `qnp1` (the propagated
+value the adjustment writes); where `λ = 0` the predictor is kept and `qnp1` — never read there
+otherwise — is overwritten with the increment alone, which the adjustment then ADDS.
+
+WHAT IT DOES NOT TOUCH: the numbers and habit moments of the ice (a refit of `n_i` moves no
+water); untransformed slots (`:none`: a linear refit of a density is the refit `ρ_t` makes);
+`t == 1` (`var_np1` holds no fitted state; the caller skips it). Under NESTING the
+coupling-zone replacement between steps would be read as a refit too: the partner is a
+single-patch construction today.
+
+COMPATIBLE WITH THE LOBE RELAXATION (Stage L, `options[:lobe_relaxation]`): that device moves
+`ν < 0` toward 0 and never across it, so it changes no recovered density (`ahyp = 0` on both
+sides) and nothing it does is seen here; the two are not refused together. With the exchange
+realization ([`_etd_exchange_realization!`](@ref)) it composes additively: that one closes the
+ETD's own exchange on the mass the slot receives this step, this one books what the refit did
+to the mass before the step began. `@noinline` with plain arrays: called from mid-`mc_driver!`.
+"""
+@noinline function _refit_partner_fold!(d1::Vector{Float64}, dv::Vector{Float64},
+                                        qnp1::Vector{Float64}, lam::Vector{Float64},
+                                        vnp1::Matrix{Float64}, phys::Array{Float64,3},
+                                        nu_c::Vector{Float64}, nu_r::Vector{Float64},
+                                        nu_i1::Vector{Float64}, nu_i2::Vector{Float64},
+                                        nu_i3::Vector{Float64},
+                                        Tk::Vector{Float64}, R_m::Vector{Float64},
+                                        C_vt::Vector{Float64}, C_pt::Vector{Float64},
+                                        Lv::Vector{Float64}, Q_s::Vector{Float64},
+                                        Q_s_i::Vector{Float64}, colstart::Int,
+                                        ctr::Symbol, cmu::Float64,
+                                        rtr::Symbol, rmu::Float64,
+                                        itr::Symbol, imu::Float64,
+                                        i1::Int, i2::Int, i3::Int)
+    ice = i1 > 0 && itr !== :none
+    @inbounds for i in eachindex(d1)
+        g = colstart + i - 1
+        dl = 0.0
+        di = 0.0
+        # The cloud slot is a perturbation against ν̄_c: the pre-refit total is the slot plus
+        # the offset the post-refit total carries (an exact 0.0 when ρ̄_c ≡ 0).
+        ctr !== :none &&
+            (dl += refit_recovered_change(nu_c[i], vnp1[g, 9] + (nu_c[i] - phys[g, 9, 1]),
+                                          ctr, cmu))
+        rtr !== :none && (dl += refit_recovered_change(nu_r[i], vnp1[g, 8], rtr, rmu))
+        if ice
+            di = (refit_recovered_change(nu_i1[i], vnp1[g, i1], itr, imu) +
+                  refit_recovered_change(nu_i2[i], vnp1[g, i2], itr, imu)) +
+                 refit_recovered_change(nu_i3[i], vnp1[g, i3], itr, imu)
+        end
+        if dl == 0.0 && di == 0.0
+            lam[i] == 0.0 && (qnp1[i] = 0.0)
+            continue
+        end
+        dp, dvv, dq = phase_change_partner(dl, di, Tk[i], R_m[i], C_vt[i], C_pt[i], Lv[i],
+                                           ice ? L_s(Tk[i]) : 0.0, Q_s[i],
+                                           ice ? Q_s_i[i] : 0.0)
+        d1[i] += dp
+        dv[i] += dvv
+        if lam[i] != 0.0
+            qnp1[i] += dq
+        else
+            qnp1[i] = dq
+        end
+    end
+    return nothing
+end
+
+"""
     _exchange_gap(n_after, d, req, trans, mu) -> Float64
 
 The mass a transformed slot's RECOVERED density received over an increment `d` that has
@@ -10666,13 +10811,25 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
     qnp1 = S.etd_qnp1
     d1 = S.etd_d1; d8 = S.etd_d8; d9 = S.etd_d9; dv = S.etd_dv
     rv_i = IS.rho_v
+    # Whether `etd_qnp1` at a `λ = 0` point is the refit partner's `Q_ss` increment (see
+    # `_refit_partner_fold!`); the same three conditions the fold ran under.
+    rfp = t > 1 && get(mtile.model.options, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool &&
+          (condensate_transform_mode(mtile.model.options) !== :none ||
+           rain_transform_mode(mtile.model.options) !== :none ||
+           (ice_on && ice_transform_mode(mtile.model.options) !== :none))
 
     @inbounds for i in eachindex(lam)
         g = colstart + i - 1
         # λ = 0 is the ENTIRE dry path and every condensate-free point in a moist one: the
         # predictor `explicit_timestep` already wrote IS the exponential update there, so it is
         # left alone rather than recomputed (TeX: the reduction is bitwise, not asymptotic).
-        lam[i] != 0.0 && (vnp1[g, 7] = qnp1[i])
+        if lam[i] != 0.0
+            vnp1[g, 7] = qnp1[i]
+        elseif rfp && qnp1[i] != 0.0
+            # λ = 0 keeps the predictor; under the refit partner `etd_qnp1` there carries the
+            # partner's `Q_ss` increment and nothing else (`_refit_partner_fold!`).
+            vnp1[g, 7] += qnp1[i]
+        end
         d1[i] != 0.0 && (vnp1[g, 1] += d1[i])
         d8[i] != 0.0 && (vnp1[g, 8] += d8[i])
         d9[i] != 0.0 && (vnp1[g, 9] += d9[i])
