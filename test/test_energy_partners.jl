@@ -15,6 +15,7 @@
 #   5. `options[:mynn_water_closure]` — the MYNN vapor leg is the residual of the total-water
 #      leg and the species' realized rates, so the boundary layer leaves the partition and R
 #      closed.
+# Section 3b: the refit partner under nesting (`refit_reference_after_exchange!`).
 #
 # Every assertion is on ONE step of tiles advanced from the same state, so the property tested
 # is the operator's own. The tile is the lobe-relaxation fixture: a periodic XZ slice with
@@ -44,20 +45,22 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     """A periodic XZ RiRk tile, cloud and rain under `tr`. `opts_extra` is merged into the
     options; `seed!(patch, pts, V)` writes the perturbation state, which is then refit."""
     function ep_tile(tmpdir, tag; seed! = (p, x, V) -> nothing, opts_extra = Dict{Symbol,Any}(),
-                     precip = false, tr = :bhyp, ts = 0.5, rh = z -> 0.7)
+                     precip = false, tr = :bhyp, ts = 0.5, rh = z -> 0.7, ncell = NCELL,
+                     bcl = PeriodicBC(), bcr = PeriodicBC())
         opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
                                 :precipitation => precip, :vertical_mixing => false,
                                 :condensate_transform => tr, :rain_transform => tr)
         merge!(opts, opts_extra)
         varnames = Scythe.mc_var_names(opts)
         vars = Dict(v => i for (i, v) in enumerate(varnames))
-        side_bc = Dict{String,Any}(v => PeriodicBC() for v in varnames)
+        side_l = Dict{String,Any}(v => bcl for v in varnames)
+        side_r = Dict{String,Any}(v => bcr for v in varnames)
         wall_bc = merge(Dict{String,Any}(v => NeumannBC() for v in varnames),
                         Dict{String,Any}("w" => DirichletBC()))
         gp = GridParameters(geometry = "RiRk",
-            iMin = 0.0, iMax = SPAN, num_cells_i = NCELL,
+            iMin = 0.0, iMax = SPAN * ncell / NCELL, num_cells_i = ncell,
             kMin = 0.0, kMax = ZTOP, num_cells_k = NCELL_K,
-            BCL = side_bc, BCR = side_bc, BCB = wall_bc, BCT = wall_bc, vars = vars)
+            BCL = side_l, BCR = side_r, BCB = wall_bc, BCT = wall_bc, vars = vars)
         ref_file = joinpath(tmpdir, "ep_$(tag).ref")
         pp = Dict{Symbol,Float64}(:Khdiff => 0.0, :Kvdiff => 0.0, :Kvdiff_heat => 0.0,
                                   :Kvdiff_water => 0.0, :Kv_mudiff => 0.0,
@@ -509,6 +512,149 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :refit_partner)
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :exchange_realization)
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :mynn_exchange_realization)
+        end
+    end
+
+    # ── 3b. the refit partner under nesting ──────────────────────────────────────────
+    # The exchange a nest patch receives between steps sits between the partner's two
+    # states. `refit_reference_after_exchange!` (src/nesting.jl) is called by
+    # `advance_nested_timestep` right after the collar injection; these tests make the same
+    # call in the same place of the sequence (refit, exchange, call, step) on one tile.
+    advance_last!(m, p, mo, clast; t) =
+        (for c in 1:ncols(p, mo); c == clast || Scythe.advance_column(m, c, t); end;
+         Scythe.advance_column(m, clast, t))
+    no_inj = Tuple{Vector{Int},Array{Float64,3}}[]
+
+    @testset "refit partner under nesting: a parent's injected collar rows book nothing" begin
+        mktempdir() do tmp
+            arms = Dict{String,Any}()
+            for (tag, on, fix) in (("on", true, true), ("off", false, true),
+                                   ("nofix", true, false))
+                m, p, mo = ep_tile(tmp, "inj_$(tag)"; seed! = seed_sheet!,
+                                   opts_extra = Dict{Symbol,Any}(:refit_partner => on))
+                kDim = mo.grid_params.kDim; nc = ncols(p, mo)
+                col = ((nc - 1) * kDim + 1):(nc * kDim)
+                advance_all!(m, p, mo; t = 1)
+                xpre = copy(m.var_np1)
+                Scythe.calcTendency(m); gridTransform!(p)
+                xpost = copy(p.physical[:, :, 1])
+                # the collar: the upper half of the last column takes the child's state, a
+                # cloud of its own (ν raised by 3e-7, ρ_t with it)
+                rows = collect(col[(div(kDim, 2) + 1):end])
+                vals = copy(p.physical[rows, :, :])
+                vals[:, 9, 1] .+= 3.0e-7
+                vals[:, 3, 1] .+= 3.0e-7
+                p.physical[rows, :, :] .= vals
+                inj = [(rows, vals)]
+                fix && Scythe.refit_reference_after_exchange!(m, inj, 2)
+                fix && on && @test m.var_np1[rows, 9] == vals[:, 9, 1]
+                fix && !on && @test m.var_np1 == xpre          # partner off: nothing written
+                advance_all!(m, p, mo; t = 2)
+                arms[tag] = (; dv = copy(scratch(m).etd_dv[1:kDim]), xpre, xpost, kDim, col)
+            end
+            kDim = arms["on"].kDim; col = arms["on"].col
+            on = arms["on"].dv .- arms["off"].dv
+            nofix = arms["nofix"].dv .- arms["off"].dv
+            cz = (div(kDim, 2) + 1):kDim; own = 1:div(kDim, 2)
+            # the injected rows: the exchange is not booked, to the bit
+            @test all(on[cz] .== 0.0)
+            # ...where the unfixed partner books the child-parent cloud difference as
+            # condensation: the full recovered change of the 3e-7 ν step
+            rc(x) = Scythe.recover_rho_c.(x[col, 9], 0.0, :bhyp, MU)
+            @test maximum(abs.(nofix[cz])) > 1.0e-3 * maximum(abs.(rc(arms["on"].xpost)))
+            # the rest of the column: the refit's own change, untouched by the exchange
+            drho = rc(arms["on"].xpost) .- rc(arms["on"].xpre)
+            @test maximum(abs.(drho[own])) > 1.0e-7
+            @test on[own] ≈ -drho[own] rtol = 1.0e-12 atol = 1.0e-22
+            @test on[own] == nofix[own]
+        end
+    end
+
+    @testset "refit partner under nesting: a child's R3X coupling zone books nothing" begin
+        mktempdir() do tmp
+            NC = 8
+            arms = Dict{String,Any}()
+            for (tag, on, fix, clast) in (("on1", true, true, 1), ("off1", false, true, 1),
+                                          ("nofix1", true, false, 1),
+                                          ("onN", true, true, 3 * NC),
+                                          ("offN", false, true, 3 * NC),
+                                          ("nofixN", true, false, 3 * NC))
+                # A CHILD patch: `build_nest`'s FixedBC() (R3X, the parent's trio) on its
+                # left, the parent's donated ahat zero -- a parent with no cloud there
+                m, p, mo = ep_tile(tmp, "r3x_$(tag)"; seed! = seed_sheet!, ncell = NC,
+                                   bcl = Springsteel.FixedBC(), bcr = NeumannBC(),
+                                   opts_extra = Dict{Symbol,Any}(:refit_partner => on))
+                kDim = mo.grid_params.kDim
+                advance_all!(m, p, mo; t = 1)
+                # the child's own cloud in its first two cells grows past the parent's:
+                # the R3X refit pins it back, the exchange inside the refit
+                x = m.tilepoints[:, 1]
+                dx = (mo.grid_params.iMax - mo.grid_params.iMin) / NC
+                bump = x .< 2.0 * dx
+                m.var_np1[bump, 9] .+= 5.0e-7
+                xpre = copy(m.var_np1)
+                Scythe.calcTendency(m); gridTransform!(p)
+                xpost = copy(p.physical[:, :, 1])
+                fix && Scythe.refit_reference_after_exchange!(m, no_inj, 2)
+                advance_last!(m, p, mo, clast; t = 2)
+                col = ((clast - 1) * kDim + 1):(clast * kDim)
+                arms[tag] = (; dv = copy(scratch(m).etd_dv[1:kDim]), xpre, xpost, col,
+                             zone = copy(x .< Scythe.NEST_EXCHANGE_ZONE_CELLS * dx))
+            end
+            d(a, b) = arms[a].dv .- arms[b].dv
+            rc(a) = Scythe.recover_rho_c.(arms[a].xpost[arms[a].col, 9], 0.0, :bhyp, MU) .-
+                    Scythe.recover_rho_c.(arms[a].xpre[arms[a].col, 9], 0.0, :bhyp, MU)
+            zone = arms["on1"].zone
+            @test all(zone[arms["on1"].col]) && !any(zone[arms["onN"].col])
+            @test count(zone) == 3 * 3 * size(arms["on1"].xpre, 1) ÷ (3 * NC)
+            # in the coupling zone: nothing booked, to the bit -- where the unfixed partner
+            # books the pinned-back cloud as evaporation
+            @test all(d("on1", "off1") .== 0.0)
+            @test maximum(abs.(d("nofix1", "off1"))) > 0.1 * maximum(abs.(rc("on1")))
+            @test d("nofix1", "off1") ≈ -rc("on1") rtol = 1.0e-12 atol = 1.0e-22
+            # far from it (the right wall): the refit's own change, as on a single patch
+            @test maximum(abs.(rc("onN"))) > 1.0e-7
+            @test d("onN", "offN") ≈ -rc("onN") rtol = 1.0e-12 atol = 1.0e-22
+            @test d("onN", "offN") == d("nofixN", "offN")
+        end
+    end
+
+    @testset "refit partner under nesting: inert where it must be, a resting child exact" begin
+        mktempdir() do tmp
+            inj = [(collect(1:5), zeros(5, 1, 1))]
+            # t = 1 and a periodic single patch: nothing is written
+            m, p, mo = ep_tile(tmp, "inert"; seed! = seed_sheet!)
+            advance_all!(m, p, mo; t = 1)
+            x0 = copy(m.var_np1)
+            Scythe.refit_reference_after_exchange!(m, no_inj, 2)
+            @test m.var_np1 == x0
+            p.physical[1:5, 9, 1] .+= 1.0
+            Scythe.refit_reference_after_exchange!(m, inj, 1)
+            @test m.var_np1 == x0
+            # :none transforms: no transformed slot, nothing to re-take
+            mN, pN, moN = ep_tile(tmp, "inert_none"; tr = :none,
+                                  seed! = (p, x, V) -> seed_sheet!(p, x, V; tr = :none))
+            advance_all!(mN, pN, moN; t = 1)
+            xN = copy(mN.var_np1)
+            pN.physical[1:5, 9, 1] .+= 1.0
+            Scythe.refit_reference_after_exchange!(mN, inj, 2)
+            @test mN.var_np1 == xN
+            # a RESTING child (R3X left, ahat zero): a discrete fixed point with the
+            # re-take in the loop, and bitwise the partner-off run
+            st = Dict{Bool,Matrix{Float64}}()
+            for on in (true, false)
+                mr, pr, mor = ep_tile(tmp, "rest_$(on)"; ncell = 8,
+                                      bcl = Springsteel.FixedBC(), bcr = NeumannBC(),
+                                      opts_extra = Dict{Symbol,Any}(:refit_partner => on))
+                for t in 1:3
+                    Scythe.refit_reference_after_exchange!(mr, no_inj, t)
+                    advance_all!(mr, pr, mor; t)
+                    Scythe.calcTendency(mr); gridTransform!(pr)
+                end
+                st[on] = copy(mr.var_np1)
+            end
+            @test st[true] == st[false]
+            @test all(st[true][:, 8] .== 0.0) && all(st[true][:, 9] .== 0.0)
         end
     end
 

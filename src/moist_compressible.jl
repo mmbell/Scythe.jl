@@ -10737,9 +10737,12 @@ otherwise — is overwritten with the increment alone, which the adjustment then
 
 WHAT IT DOES NOT TOUCH: the numbers and habit moments of the ice (a refit of `n_i` moves no
 water); untransformed slots (`:none`: a linear refit of a density is the refit `ρ_t` makes);
-`t == 1` (`var_np1` holds no fitted state; the caller skips it). Under NESTING the
-coupling-zone replacement between steps would be read as a refit too: the partner is a
-single-patch construction today.
+`t == 1` (`var_np1` holds no fitted state; the caller skips it). Under NESTING the exchange
+between steps (the parent's collar injection, the child's R3X payload) sits between the same
+two states and would be read as a refit; `advance_nested_timestep` (and the exact-SI phase
+A) re-takes the reference after the exchange on the points it writes
+([`refit_reference_after_exchange!`](@ref), src/nesting.jl), so the partner books the refit
+and never the exchange.
 
 COMPATIBLE WITH THE LOBE RELAXATION (Stage L, `options[:lobe_relaxation]`): that device moves
 `ν < 0` toward 0 and never across it, so it changes no recovered density (`ahyp = 0` on both

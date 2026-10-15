@@ -596,6 +596,110 @@ struct NestChildLink
 end
 
 """
+    NEST_EXCHANGE_ZONE_CELLS
+
+How many of a CHILD patch's own cells, inward from each R3X (interface) side, the
+coupling-zone exchange is taken to write: the support of the pinned border trio. The trio
+is the basis functions `m = −1, 0, 1` (Springsteel `_border_matrix`), the last of which is
+nonzero out to `x_edge + 3Δx`; every mish point closer to the interface than that reads a
+coefficient the parent sets.
+"""
+const NEST_EXCHANGE_ZONE_CELLS = 3
+
+"""
+    refit_reference_after_exchange!(mtile, injections, t)
+
+THE REFIT PARTNER UNDER NESTING: re-take the partner's "before" reference AFTER the nest
+exchange, on the points the exchange writes, so [`_refit_partner_fold!`](@ref) measures the
+refit's own change in recovered condensate and never the exchange's.
+
+The partner compares the slots `mc_driver!` loads at the top of a step (the refit state in
+`tile.physical`) with the pre-refit `var_np1` the previous step wrote. On a nest patch two
+things stand between those, not one:
+
+  * PARENT, the collar injection (`advance_nested_timestep`, just above the call to this
+    function): after `tileTransform!` the collar rows of `physical` are OVERWRITTEN with the
+    child's evaluation, every variable and derivative slice. The parent's refit there is
+    discarded unseen; the change from `var_np1` is the child−parent difference of the whole
+    state (`ρ_t`, `E_t` and `p` jump with the condensate), not a phase change.
+  * CHILD, the R3X payload (`run_nested_patch`, after `calcTendency`): the parent's trio is
+    written into the border `ahat` and the b→a solve of `splineTransform!` honours it, so in
+    the child's coupling zone the refit IS the exchange — there is no post-refit, pre-exchange
+    state to compare against, on any ordering.
+
+Booked as condensation, either would put the parent−child mismatch of the condensate into
+the vapor and `p` with latent heat, while the same exchange moved `ρ_t` and `E_t` by their
+own mismatch. So on those points the reference is taken after the exchange: the transformed
+mass slots of `var_np1` are set to what `physical` now holds, and the partner there is an
+exact zero. The parent's collar rows are exactly the injected rows (`injections`). The child's
+zone is every point within [`NEST_EXCHANGE_ZONE_CELLS`](@ref) cells of an R3X side — the
+support of the pinned trio. Beyond it the pinned coefficients still reach the free ones
+through the banded Gram solve, at a geometrically decaying weight, and that remainder IS read
+as refit: measured on a 1-D R3X spline (`l_q = 2`), a unit jump of the parent's interface
+value moves the refit field by at most 1.0, 0.63, 0.22 in cells 1-3 and 0.070, 0.022, 0.006
+in cells 4-6 — a factor ~3 per cell.
+
+WHAT IS LEFT UNPAIRED, stated: in the zone the exchange changes `R = E_t − E_implied` by the
+difference of the two patches' own `R` there, as it changes every other field — the exchange
+is a coupling of states, each carrying its own books, not a process this patch can partner.
+
+Inert (returns at once) at `t == 1` (`var_np1` holds no fitted state and the partner does not
+run), off the moist sets, with `options[:refit_partner] = false`, and with no transformed
+mass slot; then nothing is written, so all of those are bitwise. `var_np1` is otherwise only
+written by `explicit_timestep` before it is next read, so the rows written here affect
+nothing but the partner.
+"""
+function refit_reference_after_exchange!(mtile::ModelTile,
+                                         injections::Vector{Tuple{Vector{Int}, Array{Float64,3}}},
+                                         t::Int64)
+    t > 1 || return nothing
+    model = mtile.model
+    uses_pressure_reference(model.equation_set) || return nothing
+    opts = model.options
+    get(opts, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool || return nothing
+    IS = mtile.mc_slots
+    sc = condensate_transform_mode(opts) !== :none ? 9 : 0
+    sr = rain_transform_mode(opts) !== :none ? 8 : 0
+    ion = ice_registered(IS) && ice_transform_mode(opts) !== :none
+    slots = (sc, sr, ion ? IS.i1_q : 0, ion ? IS.i2_q : 0, ion ? IS.i3_q : 0)
+    all(iszero, slots) && return nothing
+    vn = mtile.var_np1
+    ph = mtile.tile.physical
+    @inbounds for (rows, _) in injections, row in rows, s in slots
+        s > 0 && (vn[row, s] = ph[row, s, 1])
+    end
+    gp = model.grid_params
+    dx = (gp.iMax - gp.iMin) / gp.num_cells
+    lo = _r3x_side(gp.BCL, gp.vars) ? gp.iMin + (NEST_EXCHANGE_ZONE_CELLS * dx) : -Inf
+    hi = _r3x_side(gp.BCR, gp.vars) ? gp.iMax - (NEST_EXCHANGE_ZONE_CELLS * dx) : Inf
+    (lo == -Inf && hi == Inf) && return nothing
+    x = mtile.tilepoints
+    @inbounds for row in axes(vn, 1)
+        xi = x[row, 1]
+        (xi < lo || xi > hi) || continue
+        for s in slots
+            s > 0 && (vn[row, s] = ph[row, s, 1])
+        end
+    end
+    return nothing
+end
+
+"""
+    _r3x_side(bc, vars) -> Bool
+
+Whether a patch side is a nest interface the parent's payload writes: `build_nest` gives a
+child's interface side `FixedBC()` (NaN sentinels, the R3X path) for every variable.
+"""
+function _r3x_side(bc, vars)
+    _isr3x(b) = b isa Springsteel.BoundaryConditions && b.u isa Float64 && isnan(b.u)
+    bc isa AbstractDict || return _isr3x(bc)
+    for name in keys(vars)
+        _isr3x(get(bc, name, nothing)) && return true
+    end
+    return false
+end
+
+"""
     advance_nested_timestep(mtile, sharedSpectral, haloSend, haloReceive, t, injections)
 
 `advanceTimestep` with fine→coarse collar injection: after the tile transform
@@ -621,6 +725,9 @@ function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{F
             end
         end
     end
+    # The refit partner's reference, re-taken after the exchange on the points it wrote
+    # (the injected collar rows; a child's R3X zone): see `refit_reference_after_exchange!`.
+    refit_reference_after_exchange!(mtile, injections, t)
 
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
@@ -686,6 +793,9 @@ function advance_nested_timestepA(mtile::ModelTile, sharedSpectral::SharedArray{
             end
         end
     end
+    # The refit partner's reference, re-taken after the exchange on the points it wrote
+    # (the injected collar rows; a child's R3X zone): see `refit_reference_after_exchange!`.
+    refit_reference_after_exchange!(mtile, injections, t)
 
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
     state_minima_trace(mtile, t)
