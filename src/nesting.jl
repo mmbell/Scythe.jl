@@ -734,6 +734,7 @@ function advance_nested_timestep(mtile::ModelTile, sharedSpectral::SharedArray{F
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && mc_stiffness_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && energy_census_trace(mtile, t)
 
     # Radiative heating pre-pass: recompute (on the radiation cadence) or simply hold the
     # tile's `q_lw`/`q_sw` field, which every column then folds into `QDOT_TH`. HERE, and
@@ -802,6 +803,7 @@ function advance_nested_timestepA(mtile::ModelTile, sharedSpectral::SharedArray{
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && mc_stiffness_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && energy_census_trace(mtile, t)
     if t > 1
         exact_si_load_history!(mtile, hfields, t, rowstart)
     end

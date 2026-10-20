@@ -287,9 +287,18 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # the hot path. See `mc_surface_diag` and `surface_record!`
     # (src/mc_surface_layer.jl).
     #
+    surface::SurfaceDiag
+    # The tile's per-operator energy-budget state ([`EnergyBudget`](@ref),
+    # src/energy_budget.jl): the column quadrature and reference profiles every
+    # moist-compressible tile carries (the energy census reads them), plus — only under
+    # `options[:energy_budget]` — the accumulators and work columns of the budget hooks.
+    # CONCRETE for the `surface` reason (the driver reads `mtile.ebudget.active` once per
+    # column), and held HERE rather than in `mc_scratch`, whose NamedTuple sits at the LLVM
+    # compile cliff (`MC_SCRATCH_SLOTS`).
+    #
     # LAST field deliberately: every positional `ModelTile(...)` construction in the tree
     # is the one in `createModelTile` below, so appending here is a one-line change there.
-    surface::SurfaceDiag
+    ebudget::EnergyBudget
 end
 
 """
@@ -718,7 +727,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_mynn_state(model, tile, tilepoints),
         # ...and the surface-exchange diagnostic store (N2), from mc_surface_layer.jl,
         # which moved above this file for exactly the same struct-ordering reason.
-        mc_surface_diag(model, tile))
+        mc_surface_diag(model, tile),
+        # ...and the energy budget (src/energy_budget.jl, the same reason again).
+        mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag))
     return mtile
 end
 
@@ -1418,6 +1429,7 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && mc_stiffness_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && energy_census_trace(mtile, t)
 
     # Radiative heating pre-pass: recompute (on the radiation cadence) or simply hold the
     # tile's `q_lw`/`q_sw` field, which every column then folds into `QDOT_TH`. HERE, and

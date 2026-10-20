@@ -914,6 +914,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :column_state_guard       => (Bool, "located error when p, rho_d, rho_t or T is not positive/finite after the retrieval; default true, false is forensics only (moist_compressible.jl)"),
     :water_budget_trace       => (Int, "water-budget print interval [steps]; 0 = off (moist_compressible.jl)"),
     :stiffness_trace          => (Int, "stiffness-census print interval [steps]; 0 = off (moist_compressible.jl)"),
+    :energy_budget            => (Bool, "per-operator budget of R = E_t - E_implied and of the partition gap X = rho_t - rho_d - rho_v - rho_liq - rho_ice: each stage of the column step booked as a finite difference of the column integral, written per output time to energy_budget.csv beside the NetCDF output with a closure row (sum of stages = actual change); default false, which never calls the hooks; refused with exact_si (energy_budget.jl, moist_compressible.jl)"),
     :u_max                    => (Float64, "timestep advisory: expected peak horizontal wind [m/s] (reference_state.jl)"),
     :w_max                    => (Float64, "timestep advisory: expected peak vertical wind [m/s] (reference_state.jl)"),
     :bl_K_ref                 => (Float64, "timestep advisory: reference BL eddy diffusivity [m^2/s] (reference_state.jl)"),

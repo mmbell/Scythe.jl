@@ -116,6 +116,11 @@ include("radiation_state.jl")
 # that names it. Nothing in it references `ModelTile`, the geometry traits or the
 # equation sets, so the move is inert.
 include("mc_surface_layer.jl")
+# The per-operator ENERGY BUDGET (options[:energy_budget]) and its census, before
+# semiimplicit.jl for the same struct-ordering reason: `ModelTile` carries an `EnergyBudget`
+# concretely (see `EMPTY_ENERGY_BUDGET`). The functions it calls in moist_compressible.jl
+# are resolved at call time.
+include("energy_budget.jl")
 include("semiimplicit.jl")
 include("testModels.jl")
 include("shallowWaterModels.jl")

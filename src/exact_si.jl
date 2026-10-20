@@ -669,6 +669,7 @@ function advanceTimestepA(mtile::ModelTile, sharedSpectral::SharedArray{Float64}
     uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
     uses_pressure_reference(mtile.model.equation_set) && mc_stiffness_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && energy_census_trace(mtile, t)
     if t > 1
         exact_si_load_history!(mtile, hfields, t, rowstart)
     end

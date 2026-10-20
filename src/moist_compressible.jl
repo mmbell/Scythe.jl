@@ -1542,7 +1542,9 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :x_wmlt, :x_wmlt_n, :x_wmri, :x_wmri_n,
                         :x_wpts, :x_wmass, :x_wfa, :x_wdfa, :x_wheld,
                         :o_max, :o_pts, :o_rain, :o_seed, :o_warned,
-                        :e_pts, :e_held, :e_max)
+                        :e_pts, :e_held, :e_max,
+                        :r_dr, :r_booked, :l_c, :l_r, :l_i1, :l_i2, :l_i3,
+                        :x_max, :x_int, :x_pool, :ec_steps)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -1951,8 +1953,51 @@ const MC_CEVAP_PTS = MC_POP_LAST + 1
 const MC_CEVAP_HELD = MC_POP_LAST + 2
 @doc (@doc MC_CEVAP_PTS)
 const MC_CEVAP_MAX = MC_POP_LAST + 3
-"""Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
+"""Last row of the cloud-evaporation block of `mc_water_stats`."""
 const MC_CEVAP_LAST = MC_CEVAP_MAX
+"""
+The ENERGY / PARTITION census of `mc_water_stats` (plan Stage P4), reported by
+[`energy_census_trace`](@ref) at the output cadence as tile means and reset there.
+
+| constant | quantity (accumulated over the steps since the last report) |
+|---|---|
+| `MC_REFIT_DR`     | the column-integrated change of `R = E_t − E_implied` across the per-step refit, `(E_t⁺ − E_t⁻) − (E_implied⁺ − E_implied⁻)` (`⁻` the pre-refit `var_np1`, `⁺` the post-refit slots) [J/m², tile mean] |
+| `MC_REFIT_BOOKED` | the energy the refit partner booked for it, the column integral of `δp·C_vt/R_m` it folds into `p` [J/m², tile mean] |
+| `MC_LOBE_C`/`_R`/`_I1`/`_I2`/`_I3` | the Stage L lobe relaxation's applied `Δν` column integral, per species (cloud, rain, the three ice masses) [kg/m², tile mean]; exact zeros with the device off |
+| `MC_XGAP_MAX`     | the partition gap `max\\|X\\|`, `X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice`, over the tile at the report [kg/m³] |
+| `MC_XGAP_INT`     | the column integral of `X` at the report [kg/m², tile mean] |
+| `MC_XGAP_POOL`    | the lobe pool `Λ = Σ_k 2 min(ν_k, 0)` over the `:bhyp` mass slots, column integral at the report [kg/m², tile mean] |
+| `MC_ECEN_STEPS`   | steps since the last report (thread 1) |
+
+`MC_REFIT_DR` is the exact per-step refit residual the refit partner exists to close, measured
+on the two states the partner reads, so the pair says how well it does without a closed-budget
+run; it is written for every column at `t > 1`, partner on or off. The `X` rows are taken at the
+report from the output state itself (`tile.physical` after the refit), so they describe the
+same state as the output file. `MC_VAPOR_GAP` (the `res_rho_t − ρ_v` drift) is kept.
+"""
+const MC_REFIT_DR = MC_CEVAP_LAST + 1
+@doc (@doc MC_REFIT_DR)
+const MC_REFIT_BOOKED = MC_CEVAP_LAST + 2
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_C = MC_CEVAP_LAST + 3
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_R = MC_CEVAP_LAST + 4
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_I1 = MC_CEVAP_LAST + 5
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_I2 = MC_CEVAP_LAST + 6
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_I3 = MC_CEVAP_LAST + 7
+@doc (@doc MC_REFIT_DR)
+const MC_XGAP_MAX = MC_CEVAP_LAST + 8
+@doc (@doc MC_REFIT_DR)
+const MC_XGAP_INT = MC_CEVAP_LAST + 9
+@doc (@doc MC_REFIT_DR)
+const MC_XGAP_POOL = MC_CEVAP_LAST + 10
+@doc (@doc MC_REFIT_DR)
+const MC_ECEN_STEPS = MC_CEVAP_LAST + 11
+"""Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
+const MC_STATS_LAST = MC_ECEN_STEPS
 """
 Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
 1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
@@ -8891,6 +8936,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
 
     div = S.div; mc_divergence!(div, geom, u, u_x, w_z, vv, r)
 
+    # ── THE ENERGY BUDGET (`options[:energy_budget]`, src/energy_budget.jl) ──────────────
+    # One branch per hook site on one Bool read here; with the budget off no hook is ever
+    # called and the column step is the code without it. The hooks are `@noinline` and take
+    # the budget (a mutable struct, one pointer) and plain arrays — never the tile, the grid or
+    # the view NamedTuples (the `mc_water_mixing!` compile-cost measurement).
+    eb = mtile.ebudget
+    eb_on = eb.active
+    eb_on && eb_begin!(eb, colstart)
+
     # ── Horizontal diffusion ───────────────────────────────────────────────────
     # Turbulence diffuses momentum (u, w) and the moist entropy s_t (heat). Horizontally,
     # s_t is diffused by the chain rule on the DRY-exact form s_d = C_vd ln p - C_pd ln rho_d
@@ -8957,6 +9011,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @inbounds for i in eachindex(QDOT_TH)
             QDOT_TH[i] += q_lw[colstart + i - 1] + sw_s * q_sw[colstart + i - 1]
         end
+        eb_on && eb_rad!(eb, colstart, q_lw, q_sw, sw_s, R_m, C_vt)
     end
 
     # Horizontal frictional KE change [W/m^3]. Momentum diffusion is a resolved-KE SINK to
@@ -9068,6 +9123,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_u_kdiff!(KDIFF, geom, Khdiff, uv, vv, r)
     end
     @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF
+    eb_on && eb_put!(eb, EB_OP_HMOM, eb.ju, colstart, KDIFF)
 
     # w momentum (slot 5): perturbation PGF + total-density buoyancy loading, minus the
     # reference-linear PGF -pp_z/ρ̄_t (the acoustic remainder; see the slot-1 comment)
@@ -9085,6 +9141,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_w_kdiff!(KDIFF, geom, Khdiff, wv, r)
     end
     @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
+    eb_on && eb_put!(eb, EB_OP_HMOM, eb.jw, colstart, KDIFF)
 
     # Total energy (slot 6): -v·∇E_t - E_t∇·v - ∇·(pv) - ∇·(E_sed) + Q̇_therm + friction
     # sink. No condensation source (exact first law: phase change is not an energy source).
@@ -9110,6 +9167,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             expdot[colstart + i - 1, 6] -= E_sed_i_z[i]
         end
     end
+    eb_on && eb_put!(eb, EB_OP_HMOM, eb.jEt, colstart, FRIC_KE)
 
     # ── AI2* acoustic history staging ──
     # The linear vertical acoustic operator, evaluated on the CURRENT state with the same
@@ -9413,6 +9471,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                                                                           C_vt[i]))
         end
     end
+    eb_on && eb_vrec!(eb, colstart, VREC, Tk, R_m, C_vt, vrec_partner)
 
     # Rain NUMBER density (the appended slot, `options[:rain_moments] = 2`). The same
     # continuity form every other total takes — transform-invariant advection of the control
@@ -9659,6 +9718,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
             (IS.i1_q, IS.i1_n, IS.i1_a, IS.i1_c, IS.i2_q, IS.i2_n, IS.i2_a, IS.i2_c,
              IS.i3_q, IS.i3_n, IS.i3_a, IS.i3_c) : ntuple(_ -> 0, Val(12))
         nr_mix = rain_2m ? nr_i : 0
+        eb_on && eb_snap!(eb, expdot, colstart)
         if Khdiff_water < 0.0
             use_smag || error("physical_params[:Khdiff_water] < 0 selects the " *
                               "Smagorinsky water diffusivity, which requires the " *
@@ -9673,6 +9733,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                              WLAP, WLAP2, geom, Khdiff_water, 1.0, colstart, colend, rv_i,
                              nr_mix, ice_idx)
         end
+        eb_on && eb_take!(eb, EB_OP_HWATER, expdot, colstart)
     end
 
     # Tangential momentum (slot 9, cylindrical geometries only — no method body
@@ -9704,7 +9765,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # not `.+=` view broadcasts: the SubArray stops eliding at this function size
     # (the dE_w lesson). Behind `alpha > 0` so disabled configs are bit-identical
     # (an unconditional `+ 0.0` term could flip -0.0 tendencies).
+    (eb_on && alpha > 0.0) && eb_snap!(eb, expdot, colstart)
     mc_sponge!(expdot, geom, colstart, alpha, z_damp, z, u, w, vv, rho_t, ke)
+    (eb_on && alpha > 0.0) && eb_take!(eb, EB_OP_SPONGE, expdot, colstart)
 
     # ── Boundary layer (explicit vertical mixing + surface drag) ──
     # Added AFTER every slot is written: all contributions are additive (the Q_ss
@@ -9719,9 +9782,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # MachineScheduler over a register-pressure cliff and its compile time became
     # unbounded. See `mc_bl_apply!` for the measurement.
     if louis_bl || mynn_on
+        eb_on && eb_snap!(eb, expdot, colstart)
         mc_bl_apply!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
                      rrv, rvv, rev, expdot, l_inf, sfc, t, ctrans_on, rtrans_on,
                      louis_bl, mynn_on)
+        if eb_on
+            eb_take!(eb, EB_OP_BL, expdot, colstart)
+            eb_sfc!(eb, grid.physical, colstart, u[1], _louis_v1(geom, vv), Tk[1], rho_d[1],
+                    rho_t[1], S.rho_v[1], S.p[1], sfc, rho_t, Tk, R_m, C_vt, S.ke)
+        end
     end
 
     # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──
@@ -10109,14 +10178,24 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # (until `explicit_timestep` below) the pre-refit values the previous step wrote. The partner
     # is folded into `etd_d1`/`etd_dv`/`etd_qnp1`, so it lands with the phase change, in
     # `relaxation_adjustment_qss!`, as slot increments.
+    booked = 0.0
     if refit_partner && t > 1 && (ctrans_on || rtrans_on || itrans_on)
-        _refit_partner_fold!(etd_d1, etd_dv, etd_qnp1, etd_lam, mtile.var_np1,
+        eb_on && eb_partner_snap!(eb, etd_d1, etd_dv)
+        booked = _refit_partner_fold!(etd_d1, etd_dv, etd_qnp1, etd_lam, mtile.var_np1,
                              mtile.tile.physical, nu_c, nu_r, S.nu_i1q, S.nu_i2q, S.nu_i3q,
                              Tk, R_m, C_vt, C_pt, Lv, Q_s, S.Q_s_i, colstart,
                              ctrans, cmu, rtrans, rmu, itrans, imu_q,
                              itrans_on ? IS.i1_q : 0, itrans_on ? IS.i2_q : 0,
-                             itrans_on ? IS.i3_q : 0)
+                             itrans_on ? IS.i3_q : 0, eb.wz)
+        eb_on && eb_partner_take!(eb, etd_d1, etd_dv)
     end
+    # The REFIT census (`MC_REFIT_DR`, `MC_REFIT_BOOKED`): in the same window, for the same
+    # reason — the two states of the refit exist together only here. Every step after the
+    # first, partner on or off; reads only.
+    (t > 1 && census_on) &&
+        refit_dr_census!(eb, stx, tid_x, mtile.var_np1, mtile.tile.physical, colstart, booked)
+    # The budget's first mark of the step (state n), booking the refit that produced it.
+    eb_on && eb_refit!(eb, mtile.tile.physical, colstart)
 
     # Depletion census of the water species. HERE, not next to the tendency assembly: this is
     # the last point at which `expdot` is still the tendency of the step about to be taken and
@@ -10134,6 +10213,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
 
     # Advance the explicit terms
     explicit_timestep(mtile, colstart, colend, t)
+    eb_on && eb_explicit!(eb, mtile.var_np1, mtile.tile.physical, colstart, t, model.ts)
     # ...and rotate the microphysics sink history with it, so the next step's depletion
     # budgets see the same two levels the integrator will weight. Placed HERE, not further
     # down, because the exact_si branch returns from this function below: this is the last
@@ -10155,6 +10235,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # unsplit solve wants ALL explicit levels inside X* before it runs).
     if hsi_like
         horizontal_si_history!(mtile, colstart, colend, t)
+        eb_on && eb_mark!(eb, EB_HSI, mtile.var_np1, colstart)
     end
 
     # Exact (unsplit) 2-D semi-implicit: phase A ends here. The vertical AI2*
@@ -10170,6 +10251,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # mode was removed (expdot carries only the remainder; the linear vertical acoustic
     # terms are integrated here and nowhere else).
     semiimplicit_adjustment_p(mtile, colstart, colend, t)
+    eb_on && eb_mark!(eb, EB_SI, mtile.var_np1, colstart)
 
     # Implicit vertical diffusion of u, w (friction sink), the moist entropy s_t' (heat,
     # slaved onto p, E_t, Q_ss) and the water species (rho_w', rho_c', rho_r). Skipped
@@ -10177,12 +10259,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # refits the column and reapplies the spectral filter.
     if Kvdiff > 0.0 || Kvdiff_heat > 0.0 || Kvdiff_water > 0.0
         diffusion_timestep_mc(mtile, colstart, colend, t, geom)
+        eb_on && eb_mark!(eb, EB_VDIFF, mtile.var_np1, colstart)
     end
 
     # Negative water is not a representable state (see clamp_water!). LAST, so that
     # nothing downstream of it can reintroduce one: the acoustic solve and the vertical
     # diffusion have both had their say by here.
     clamp_water!(mtile, colstart, colend)
+    eb_on && eb_mark!(eb, EB_CLAMP, mtile.var_np1, colstart)
 
 end
 
@@ -10781,7 +10865,7 @@ remains what `_refit_partner_fold!` books today.
 """
     _refit_partner_fold!(d1, dv, qnp1, lam, vnp1, phys, nu_c, nu_r, nu_i1, nu_i2, nu_i3,
                          Tk, R_m, C_vt, C_pt, Lv, Q_s, Q_s_i, colstart,
-                         ctr, cmu, rtr, rmu, itr, imu, i1, i2, i3)
+                         ctr, cmu, rtr, rmu, itr, imu, i1, i2, i3, wz) -> booked
 
 THE REFIT PARTNER (`options[:refit_partner]`, default true). Every step the column states are
 refit (`calcTendency` → `spectralTransform!` → the next step's `tileTransform!`), and the refit
@@ -10853,8 +10937,13 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
                                         ctr::Symbol, cmu::Float64,
                                         rtr::Symbol, rmu::Float64,
                                         itr::Symbol, imu::Float64,
-                                        i1::Int, i2::Int, i3::Int)
+                                        i1::Int, i2::Int, i3::Int, wz::Vector{Float64})
     ice = i1 > 0 && itr !== :none
+    # The energy the partner books, `∫ δp·C_vt/R_m dz` with the column's quadrature `wz`
+    # (the `MC_REFIT_BOOKED` census row; returned, never read by the step). 0.0 when `wz`
+    # is not this column's (a tile with no budget geometry).
+    bw = length(wz) == length(d1)
+    booked = 0.0
     @inbounds for i in eachindex(d1)
         g = colstart + i - 1
         dl = 0.0
@@ -10884,8 +10973,9 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
         else
             qnp1[i] = dq
         end
+        bw && (booked += wz[i] * (dp * (C_vt[i] / R_m[i])))
     end
-    return nothing
+    return booked
 end
 
 """
@@ -11012,6 +11102,11 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
             dn3[i] != 0.0 && (vnp1[g, n3] += dn3[i])
         end
     end
+    # The energy budget's marks (src/energy_budget.jl): the ETD increments, refit partner
+    # included, have landed; the exchange realization and the lobe relaxation follow.
+    eb = mtile.ebudget
+    eb_on = eb.active
+    eb_on && eb_etd!(eb, vnp1, colstart)
     # THE EXCHANGE REALIZED ON THE RECOVERED DENSITY (`exchange_realization`): HERE, after every
     # phase-change increment has landed and before the lobe relaxation moves any ν, so each
     # transformed mass slot holds exactly `ν* + d` and its post-explicit `ν*` is one
@@ -11032,6 +11127,7 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
                 ice_on ? IS.i1_q : 0, ice_on ? IS.i2_q : 0, ice_on ? IS.i3_q : 0)
         end
     end
+    eb_on && eb_mark!(eb, EB_EXCH, vnp1, colstart)
     # The LOBE RELAXATION (Stage L; `lobe_relaxation_increment`), applied in the same phase as
     # the condensation increments it sits beside, and bounded by the post-advance value so the
     # device never lifts a slot above ν = 0: no recovered mass moves, ρ_t and the vapor are
@@ -11043,16 +11139,23 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
         phys = mtile.tile.physical
         dlc = S.etd_dlc; dlr = S.etd_dlr
         nuc = S.nu_c
+        # The Stage L census (`MC_LOBE_*`): the APPLIED increments' column integrals, per
+        # species, with the column quadrature; read only.
+        wz = eb.wz
+        cen = length(wz) == length(lam) && size(mtile.mc_water_stats, 2) > 0
+        lc = 0.0; lr = 0.0; l1 = 0.0; l2 = 0.0; l3 = 0.0
         @inbounds for i in eachindex(lam)
             g = colstart + i - 1
             if dlc[i] != 0.0
                 nustar = vnp1[g, 9] + (nuc[i] - phys[g, 9, 1])
                 d = lobe_relaxation_cap(dlc[i], nustar)
                 d != 0.0 && (vnp1[g, 9] += d)
+                cen && (lc += wz[i] * d)
             end
             if dlr[i] != 0.0
                 d = lobe_relaxation_cap(dlr[i], vnp1[g, 8])
                 d != 0.0 && (vnp1[g, 8] += d)
+                cen && (lr += wz[i] * d)
             end
         end
         if ice_on
@@ -11063,18 +11166,34 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
                 if dli1[i] != 0.0
                     d = lobe_relaxation_cap(dli1[i], vnp1[g, i1])
                     d != 0.0 && (vnp1[g, i1] += d)
+                    cen && (l1 += wz[i] * d)
                 end
                 if dli2[i] != 0.0
                     d = lobe_relaxation_cap(dli2[i], vnp1[g, i2])
                     d != 0.0 && (vnp1[g, i2] += d)
+                    cen && (l2 += wz[i] * d)
                 end
                 if dli3[i] != 0.0
                     d = lobe_relaxation_cap(dli3[i], vnp1[g, i3])
                     d != 0.0 && (vnp1[g, i3] += d)
+                    cen && (l3 += wz[i] * d)
                 end
             end
         end
+        if cen
+            st = mtile.mc_water_stats
+            tid = Threads.threadid()
+            wc = @inbounds eb.wxn[div(colstart - 1, length(lam)) + 1]
+            @inbounds begin
+                st[MC_LOBE_C, tid] += wc * lc
+                st[MC_LOBE_R, tid] += wc * lr
+                st[MC_LOBE_I1, tid] += wc * l1
+                st[MC_LOBE_I2, tid] += wc * l2
+                st[MC_LOBE_I3, tid] += wc * l3
+            end
+        end
     end
+    eb_on && eb_mark!(eb, EB_LOBE, vnp1, colstart)
     return nothing
 end
 

@@ -103,6 +103,16 @@ function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64;
         end
     end
 
+    # The per-operator energy budget (options[:energy_budget], src/energy_budget.jl): the
+    # workers' accumulators since the last output time, gathered and reset HERE, at the
+    # output cadence and nowhere else, and appended to `energy_budget.csv` beside the
+    # analysis files. Independent of the format list. An in-process caller with no workers
+    # writes nothing (it can call `energy_budget_snapshot!`/`energy_budget_rows` itself).
+    if energy_budget_on(model.options) && !isempty(workerids)
+        write_energy_budget(model.output_dir, t,
+                            energy_budget_rows(gather_energy_budget(workerids)))
+    end
+
     return nothing
 end
 
