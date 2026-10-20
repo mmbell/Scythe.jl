@@ -10572,6 +10572,63 @@ second order in the exchanged mass.
 end
 
 """
+    recovered_change_partner(dv, dl, di, Tk, rho_d, R_m, C_vt, Lv, Ls, drvs_dT, drvs_dp) -> (dp, dq)
+
+THE ONE PARTNER PRIMITIVE (plan E1): the pressure and `Q_ss` increments that hold
+`E_implied`, and so `R = E_t − E_implied(T_eos)`, when the RECOVERED vapor, liquid and ice
+densities change by `dv`, `dl`, `di` [kg/m³] with nothing else moving — `ρ_d`, `E_t` and the
+kinetic energy fixed. No water slot is written here: the recovered changes are the INPUTS (what
+an operator did to the reading the physics sees), and the partner is only their energy.
+
+WHY. [`implied_total_energy`](@ref) carries the vapor at `C_vv T` and a condensate at
+`C_pv T − L` (Springsteel `internal_energy_bf02`, energies referenced to vapor), and its
+temperature derivative at fixed densities is `ρ_d C_vt` (`dL_v/dT = C_pv − C_l`,
+`dL_s/dT = C_pv − C_i`). Holding it,
+
+    ρ_d C_vt δT = −[ C_vv T·dv + (C_pv T − L_v)·dl + (C_pv T − L_s)·di ],
+
+and the equation of state `p = (ρ_d R_d + ρ_v R_v) T = ρ_d R_m T` gives `δp = ρ_d R_m δT +
+R_v T dv` (the vapor enters the EOS, the condensates do not):
+
+    dp = (R_m/C_vt)·[(L_v − C_pv T)·dl + (L_s − C_pv T)·di] + T·(R_v − (R_m/C_vt)·C_vv)·dv
+    dq = dv − (∂ρ_v*/∂T·δT + ∂ρ_v*/∂p·dp)
+
+`dq` is the supersaturation `Q_ss = ρ_v − ρ_v*` moved by the vapor and by the saturation
+chain rule of the partner's own `δT`, `dp` (over water, as `Q_ss` is defined; `drvs_dp` per Pa,
+the driver's `S.drvs_dT`, `S.drvs_dp`). Linear at the frozen coefficients, so the residual it
+leaves is second order in the masses.
+
+THE TWO SPECIAL CASES (algebraically, through `C_pv − C_vv = R_v` and `C_pt = C_vt + R_m`;
+to rounding, not bitwise — the operation order differs):
+- `dv = −(dl + di)` is [`phase_change_partner`](@ref): the vapor coefficient folds into the
+  condensate brackets to give `L − R_v C_pt T/R_m`, and `dq = −(1 + 𝒬_s)·dl − (1 + 𝒬_{s,i})·di`
+  with `𝒬_s` [`Q_s_energy`](@ref), `𝒬_{s,i}` [`Q_s_energy_ice`](@ref).
+- `dl = di = 0` is [`vapor_nudge_partner_rate`](@ref) with the mass in place of the rate
+  (written as the identical expression, so `recovered_change_partner(δ, 0, 0, …)[1] ===
+  vapor_nudge_partner_rate(δ, …)`).
+
+A term whose mass is exactly zero is omitted, never added, so `x + 0.0` cannot flip a `−0.0`
+(the `mc_mynn_bl.jl` flux-carry convention): a vapor-only call is the nudge's bits and an
+all-zero call returns `dq === dv`. Not wired yet: from Stage 3 every partner passes the
+vapor's recovered change explicitly through this function.
+"""
+@inline function recovered_change_partner(dv, dl, di, Tk, rho_d, R_m, C_vt, Lv, Ls,
+                                          drvs_dT, drvs_dp)
+    cT = Cpv * Tk
+    # the condensates' (L − C_pv T)·δ, each only where its mass moved
+    hl = dl == 0.0 ? 0.0 : (Lv - cT) * dl
+    hc = di == 0.0 ? hl : hl + ((Ls - cT) * di)
+    # the vapor's pressure term, the identical expression to `vapor_nudge_partner_rate`
+    dpv = Tk * (Rv - ((R_m / C_vt) * Cvv)) * dv
+    dp = hc == 0.0 ? dpv : dpv + ((R_m / C_vt) * hc)
+    ev = Cvv * Tk * dv
+    dT = (ev == 0.0 ? hc : hc - ev) / (rho_d * C_vt)
+    dvs = (drvs_dT * dT) + (drvs_dp * dp)
+    dq = dvs == 0.0 ? dv : dv - dvs
+    return dp, dq
+end
+
+"""
     EXCHANGE_REALIZATION_DEFAULT
 
 The value `options[:exchange_realization]` takes when the key is absent. See
@@ -10688,6 +10745,38 @@ recover(ν_before)`. An exact `0.0` where the refit left the control variable's 
 """
 @inline refit_recovered_change(nu_after, nu_before, trans::Symbol, mu) =
     recover_total(nu_after, trans, mu) - recover_total(nu_before, trans, mu)
+
+"""
+    affine_defect(nu, trans, mu) -> Float64
+    affine_defect_change(nu_after, nu_before, trans, mu) -> Float64
+
+The AFFINE DEFECT of one transformed slot, `ε(ν) = recover(ν) − 2ν`: how far the recovered
+density sits from the linear water anchor `ρ_w = 2Σν`. Writing `2ν = ρ + μ s`, it is `−μ s`:
+under `:bhyp`, `ε ∈ (−μ, 0]` for `ν ≥ 0` (0 at `ν = 0`, → `−μ` deep above the knee) and
+`ε = −2ν > 0` in a clipped lobe (`ν < 0`, `ahyp = 0`). Under `:none` the slot IS the density and
+there is no anchor to depart from, so the defect is `0.0`.
+
+`affine_defect_change` is its change across a refit, written as the recovered change less the
+anchor's,
+
+    Δ = [recover(ν⁺) − recover(ν⁻)] − 2(ν⁺ − ν⁻)     (= ε(ν⁺) − ε(ν⁻)),
+
+which avoids differencing two O(ν) quantities to get an O(μ) one. It is exactly `0.0` where the
+refit left the bits alone (and always under `:none`), O(μ s) where the slot is affine on both
+sides, and `−2δν` in a deep clipped lobe — the lobe pool's growth at that point.
+
+This is the mass the retirement-form refit partner books (plan E2: under ρ_t retirement the
+water anchor is invariant across refit + partner, so only the departure of the recovered reading
+from it is unaccompanied by an `E_t` change). Not wired yet; [`refit_recovered_change`](@ref)
+remains what `_refit_partner_fold!` books today.
+"""
+@inline affine_defect(nu, trans::Symbol, mu) =
+    trans === :none ? 0.0 : recover_total(nu, trans, mu) - (2.0 * nu)
+
+@doc (@doc affine_defect)
+@inline affine_defect_change(nu_after, nu_before, trans::Symbol, mu) =
+    trans === :none ? 0.0 :
+    refit_recovered_change(nu_after, nu_before, trans, mu) - (2.0 * (nu_after - nu_before))
 
 """
     _refit_partner_fold!(d1, dv, qnp1, lam, vnp1, phys, nu_c, nu_r, nu_i1, nu_i2, nu_i3,

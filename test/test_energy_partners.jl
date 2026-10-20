@@ -26,6 +26,7 @@ using Test
 using Scythe
 using Springsteel
 using SparseArrays
+using Random
 using Springsteel: PeriodicBC, NeumannBC, DirichletBC
 
 @testset "energy-consistent water partners" begin
@@ -192,6 +193,143 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                                              rv + dv, rl + dl, di, rt, 0.0)
             @test abs(E2 - E0) > 0.5 * lin
         end
+    end
+
+    # ── 1b. the one partner primitive (plan E1) and the affine defect (plan E2) ──────
+    """A random thermodynamic point: `(Tk, rd, rv, rl, ri)` with the mixture coefficients and
+    saturation derivatives the driver's scratch holds (`S.R_m`, `S.C_vt`, `S.C_pt`, `S.Lv`,
+    `S.drvs_dT`, `S.drvs_dp`) and the two psychrometric factors."""
+    function rcp_point(rng)
+        Tk = 230.0 + 75.0 * rand(rng)
+        rd = 0.3 + 0.9 * rand(rng)
+        rv = 0.02 * rand(rng) * rd
+        rl = 2.0e-3 * rand(rng); ri = 2.0e-3 * rand(rng)
+        qv = rv / rd; ql = rl / rd; qi = ri / rd
+        C_vt = Scythe.Cvd + qv * Scythe.Cvv + ql * Scythe.Cl + qi * Scythe.Ci
+        R_m = Scythe.Rd + qv * Scythe.Rv
+        C_pt = C_vt + R_m
+        p = (rd * Scythe.Rd + rv * Scythe.Rv) * Tk
+        Lv = Scythe.L_v(Tk); Ls = Scythe.L_s(Tk)
+        dT = Scythe.drho_vsat_dT(Tk, p / 100.0); dP = Scythe.drho_vsat_dp(Tk, p / 100.0)
+        Qs = Scythe.Q_s_energy(Tk, p, rd, qv, ql, qi)
+        Qsi = Scythe.Q_s_energy_ice(Tk, p, rd, qv, ql, qi)
+        return (; Tk, rd, rv, rl, ri, p, C_vt, R_m, C_pt, Lv, Ls, dT, dP, Qs, Qsi)
+    end
+
+    @testset "recovered_change_partner holds E_implied for any recovered change" begin
+        rng = Random.MersenneTwister(20261019)
+        for _ in 1:200
+            x = rcp_point(rng)
+            # both condensates change the same way (a condensate-condensate swap at fixed vapor
+            # can cancel to nothing at p held, which would not test the partner) and the vapor
+            # by anything up to their sum, either sign
+            sg = rand(rng, (-1.0, 1.0))
+            dl = sg * 1.0e-6 * rand(rng); di = sg * 1.0e-6 * rand(rng)
+            dv = (2.0 * rand(rng) - 1.0) * (abs(dl) + abs(di))
+            dp, dq = Scythe.recovered_change_partner(dv, dl, di, x.Tk, x.rd, x.R_m, x.C_vt,
+                                                     x.Lv, x.Ls, x.dT, x.dP)
+            rt = x.rd + x.rv + x.rl + x.ri
+            E0 = Scythe.implied_total_energy(x.Tk, x.rd, x.rv, x.rl, x.ri, rt, 0.0)
+            T1 = Scythe.eos_temperature(x.p + dp, x.rd, x.rv + dv)
+            E1 = Scythe.implied_total_energy(T1, x.rd, x.rv + dv, x.rl + dl, x.ri + di, rt, 0.0)
+            # the energy the three moves carry, coefficient by coefficient
+            lin = abs(Scythe.Cvv * x.Tk * dv) + abs((Scythe.Cpv * x.Tk - x.Lv) * dl) +
+                  abs((Scythe.Cpv * x.Tk - x.Ls) * di)
+            @test abs(E1 - E0) <= 1.0e-4 * lin
+            # unpartnered (p held), the move opens E_implied by most of that energy
+            T2 = Scythe.eos_temperature(x.p, x.rd, x.rv + dv)
+            E2 = Scythe.implied_total_energy(T2, x.rd, x.rv + dv, x.rl + dl, x.ri + di, rt, 0.0)
+            @test abs(E2 - E0) > 0.5 * lin
+            # dq is the vapor's change less the saturation chain rule of the partner's dT, dp
+            dTk = -(Scythe.Cvv * x.Tk * dv + (Scythe.Cpv * x.Tk - x.Lv) * dl +
+                    (Scythe.Cpv * x.Tk - x.Ls) * di) / (x.rd * x.C_vt)
+            @test dq ≈ dv - (x.dT * dTk + x.dP * dp) rtol = 1.0e-12
+            # and dp, dT obey the equation of state: dp = ρ_d R_m dT + R_v T dv
+            @test dp ≈ x.rd * x.R_m * dTk + Scythe.Rv * x.Tk * dv rtol = 1.0e-10
+        end
+    end
+
+    @testset "recovered_change_partner: the phase change and the vapor nudge are special cases" begin
+        rng = Random.MersenneTwister(1015)
+        for _ in 1:200
+            x = rcp_point(rng)
+            dl, di = 1.0e-6 .* (2.0 .* rand(rng, 2) .- 1.0)
+            for (l, i) in ((dl, di), (dl, 0.0), (0.0, di))
+                dp0, dv0, dq0 = Scythe.phase_change_partner(l, i, x.Tk, x.R_m, x.C_vt, x.C_pt,
+                                                           x.Lv, x.Ls, x.Qs, x.Qsi)
+                dp, dq = Scythe.recovered_change_partner(dv0, l, i, x.Tk, x.rd, x.R_m, x.C_vt,
+                                                         x.Lv, x.Ls, x.dT, x.dP)
+                # rtol on the terms' scale: liquid condensing while ice sublimes can cancel
+                b = Scythe.Rv * x.C_pt * x.Tk / x.R_m
+                sp = (x.R_m / x.C_vt) * (abs((x.Lv - b) * l) + abs((x.Ls - b) * i))
+                sq = abs((1.0 + x.Qs) * l) + abs((1.0 + x.Qsi) * i)
+                @test isapprox(dp, dp0; rtol = 1.0e-13, atol = 1.0e-13 * sp)
+                @test isapprox(dq, dq0; rtol = 1.0e-13, atol = 1.0e-13 * sq)
+            end
+            ts = 0.5
+            vrec = 1.0e-7 * (2.0 * rand(rng) - 1.0)
+            dp, dq = Scythe.recovered_change_partner(vrec * ts, 0.0, 0.0, x.Tk, x.rd, x.R_m,
+                                                     x.C_vt, x.Lv, x.Ls, x.dT, x.dP)
+            @test dp ≈ Scythe.vapor_nudge_partner_rate(vrec, x.Tk, x.R_m, x.C_vt) * ts rtol = 1.0e-14
+            # with the mass itself as the "rate" the vapor-only partner is the nudge's bits
+            @test dp === Scythe.vapor_nudge_partner_rate(vrec * ts, x.Tk, x.R_m, x.C_vt)
+        end
+        # nothing moves: exact zeros, and a −0.0 vapor change is not flipped by the zero terms
+        x = rcp_point(Random.MersenneTwister(7))
+        dp, dq = Scythe.recovered_change_partner(0.0, 0.0, 0.0, x.Tk, x.rd, x.R_m, x.C_vt,
+                                                 x.Lv, x.Ls, x.dT, x.dP)
+        @test dp == 0.0 && dq == 0.0
+        dp, dq = Scythe.recovered_change_partner(-0.0, 0.0, 0.0, x.Tk, x.rd, x.R_m, x.C_vt,
+                                                 x.Lv, x.Ls, x.dT, x.dP)
+        @test dp === Scythe.vapor_nudge_partner_rate(-0.0, x.Tk, x.R_m, x.C_vt)
+        @test dq === -0.0
+    end
+
+    @testset "affine_defect and its change across a refit" begin
+        mu = MU
+        for nu in (0.0, 1.0e-9, 1.0e-7, 3.0e-6, 1.0e-3)
+            d = Scythe.affine_defect(nu, :bhyp, mu)
+            # 2ν = ρ + μ s with s ∈ [0, 1): the defect is −μ s ∈ (−μ, 0]
+            @test -mu < d <= 0.0
+            @test d ≈ Scythe.recover_total(nu, :bhyp, mu) - 2.0 * nu rtol = 1.0e-14 atol = 1.0e-22
+            @test Scythe.affine_defect(nu, :none, mu) === 0.0
+        end
+        @test Scythe.affine_defect(0.0, :bhyp, mu) === 0.0
+        for nu in (-1.0e-9, -4.0e-7, -2.0e-5)
+            @test Scythe.affine_defect(nu, :bhyp, mu) === -2.0 * nu
+            @test Scythe.affine_defect(nu, :none, mu) === 0.0
+        end
+        # deep above the knee the defect saturates at −μ
+        @test Scythe.affine_defect(1.0e-2, :bhyp, mu) ≈ -mu rtol = 1.0e-4   # −μ + μ²/(2ν)
+        # across a refit: exactly 0.0 where the bits did not change
+        for nu in (-3.0e-6, -0.0, 0.0, 2.0e-8, 5.0e-4)
+            @test Scythe.affine_defect_change(nu, nu, :bhyp, mu) === 0.0
+            @test Scythe.affine_defect_change(nu, nu, :none, mu) === 0.0
+        end
+        # a deep clipped lobe on both sides: the pool's growth, −2δν
+        a, b = -3.0e-6, -2.5e-6
+        @test Scythe.affine_defect_change(a, b, :bhyp, mu) === -2.0 * (a - b)
+        @test Scythe.affine_defect_change(a, b, :none, mu) === 0.0
+        # affine on both sides: O(μ s) and equal to the difference of the two defects
+        a, b = 4.0e-4, 3.9e-4
+        dd = Scythe.affine_defect_change(a, b, :bhyp, mu)
+        @test abs(dd) < 1.0e-3 * mu
+        @test dd ≈ Scythe.affine_defect(a, :bhyp, mu) - Scythe.affine_defect(b, :bhyp, mu) rtol = 1.0e-4
+        # it is the recovered change less the anchor's: Δ = δρ − 2δν
+        a, b = 3.0e-8, -1.0e-8
+        @test Scythe.affine_defect_change(a, b, :bhyp, mu) ===
+              Scythe.refit_recovered_change(a, b, :bhyp, mu) - 2.0 * (a - b)
+    end
+
+    @testset "the primitive and the defect allocate nothing" begin
+        x = rcp_point(Random.MersenneTwister(3))
+        Scythe.recovered_change_partner(1.0e-7, -2.0e-8, 3.0e-9, x.Tk, x.rd, x.R_m, x.C_vt,
+                                        x.Lv, x.Ls, x.dT, x.dP)
+        @test (@allocations Scythe.recovered_change_partner(1.0e-7, -2.0e-8, 3.0e-9, x.Tk,
+                   x.rd, x.R_m, x.C_vt, x.Lv, x.Ls, x.dT, x.dP)) == 0
+        Scythe.affine_defect(2.0e-7, :bhyp, MU); Scythe.affine_defect_change(2.0e-7, 1.0e-7, :bhyp, MU)
+        @test (@allocations Scythe.affine_defect(2.0e-7, :bhyp, MU)) == 0
+        @test (@allocations Scythe.affine_defect_change(2.0e-7, 1.0e-7, :bhyp, MU)) == 0
     end
 
     @testset "a clipped lobe: vapor and heat move by exactly the recovered change" begin
