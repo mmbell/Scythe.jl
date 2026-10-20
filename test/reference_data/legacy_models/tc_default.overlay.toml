@@ -6,6 +6,7 @@ integration_time = 1800.0
 
 [physics.microphysics]
 ice = "none"                         # warm rain, single-moment (rain_moments auto -> 1)
+vapor_transform = "none"             # legacy: the vapor slot is the density perturbation (pre-Stage 1)
 
 [physics.boundary_layer]
 scheme = "louis"

@@ -294,8 +294,10 @@ warm rain, ice and the water control variables.
 | `rain_transform` | string (enum) | `"bhyp"` | rain-slot control variable: `none`, `bhyp`, `bhyp_smooth`. |
 | `rain_number_transform` | string (enum) | `"bhyp"` | rain-number-slot control variable (two-moment rain). |
 | `ice_transform` | string (enum) | `"bhyp"` | control variable of the twelve ice slots. |
+| `vapor_transform` | string (enum) | `"bhyp"` | prognostic-vapor-slot control variable: `bhyp` (default since Stage 1 of the rho_t retirement: the slot is `nu_v' = bhyp(rho_v) - bhyp(rho_vbar)` and every reader sees `ahyp(nu_v) >= 0`) or `none` (the density perturbation). |
 | `condensate_mu` | float | `1.0e-7` | bhyp width for cloud [kg/m³]. |
 | `rain_mu` | float | `1.0e-7` | bhyp width for rain [kg/m³]. |
+| `vapor_mu` | float | `1.0e-9` | bhyp width for the vapor [kg/m³]; must be <= 1e-2 of the driest reference vapor. |
 | `N_0` | float | `8.0e6` | rain DSD intercept [m⁻⁴]. |
 | `N_r` | float | `0.001` | single-moment rain number parameter. |
 | `tau_qss` | float | `10.0` | QSS relaxation timescale [s]. |
@@ -471,7 +473,7 @@ Scythe: boundary conditions (1 patch; a single name = both lateral sides):
   Q_ss      periodic               natural    natural
   nu_r      periodic               natural    natural    sedimenting: flux fit F=0 at lid
   nu_c      periodic               natural    natural
-  rho_v     periodic               natural    natural
+  nu_v      periodic               natural    natural
   nu_nr     periodic               natural    natural    sedimenting: flux fit F=0 at lid
   nu_i1     periodic               natural    natural    sedimenting: flux fit F=0 at lid
   nu_ni1    periodic               natural    natural    sedimenting: flux fit F=0 at lid
@@ -504,7 +506,7 @@ Scythe: boundary conditions (1 patch; a single name = both lateral sides):
   Q_ss      neumann                natural    natural
   nu_r      neumann                natural    natural    sedimenting: flux fit F=0 at lid
   nu_c      neumann                natural    natural
-  rho_v     neumann                natural    natural
+  nu_v      neumann                natural    natural
   nu_nr     neumann                natural    natural    sedimenting: flux fit F=0 at lid
   nu_i1     neumann                natural    natural    sedimenting: flux fit F=0 at lid
   nu_ni1    neumann                natural    natural    sedimenting: flux fit F=0 at lid
@@ -541,7 +543,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
   nu_r      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural    sedimenting: flux fit F=0 at lid
   nu_c      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural
   v         p1 dirichlet|r3x      p2 natural|r3x        p3 natural|neumann    natural    natural
-  rho_v     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural
+  nu_v      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural
   nu_nr     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural    sedimenting: flux fit F=0 at lid
   nu_i1     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural    sedimenting: flux fit F=0 at lid
   nu_ni1    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural    sedimenting: flux fit F=0 at lid
@@ -592,6 +594,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
 | `physics.microphysics.rain_moments` | `0`, `1`, `2` |
 | `physics.microphysics.rain_number_transform` | `none`, `bhyp`, `bhyp_smooth` |
 | `physics.microphysics.rain_transform` | `none`, `bhyp`, `bhyp_smooth` |
+| `physics.microphysics.vapor_transform` | `none`, `bhyp` |
 | `physics.radiation.forcing` | `full`, `anomaly` |
 | `physics.radiation.method` | `gray`, `clearsky`, `allsky`, `allsky_clear` |
 | `physics.radiation.scheme` | `none`, `prescribed`, `rrtmgp` |
@@ -623,15 +626,18 @@ co2_ppm = 280.0
 | `bl_K_ref` | float | `diagnostics.timestep_advisory.bl_K_ref` (refused in `[extra.options]`) | timestep advisory: reference BL eddy diffusivity [m^2/s] (reference_state.jl) |
 | `cfl_interval` | float | `numerics.cfl_interval` (refused in `[extra.options]`) | CFL report cadence [s]; default output_interval (semiimplicit.jl, nesting.jl) |
 | `clamp_water` | bool |  | floor negative untransformed water at zero after each step (moist_compressible.jl) |
+| `cloud_evap_realization` | bool |  | cloud donor realization: evaporation, autoconversion/collection and the ice legs on the cloud each realized at rate*J0(kappa_tot*dt), kappa_tot the cloud reservoir's total conductance, so their sum never exceeds the cloud present; default true, false restores the unrealized draw (moist_compressible.jl) |
 | `column_state_guard` | bool |  | located error when p, rho_d, rho_t or T is not positive/finite after the retrieval; default true, false is forensics only (moist_compressible.jl) |
 | `condensate_floor` | string (enum) |  | cloud flooring at the thermodynamic interface: :none or :diagnostic (moist_compressible.jl) |
 | `condensate_transform` | string (enum) | `physics.microphysics.condensate_transform` (refused in `[extra.options]`) | cloud-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl) |
 | `condensation` | bool | `physics.microphysics.condensation` (refused in `[extra.options]`) | phase change on/off: QSS condensation and the ice transfers (moist_compressible.jl) |
 | `consistent_qss_reference` | bool | `reference_state.consistent_qss` (refused in `[extra.options]`) | reference Q_ss rebuilt consistently with the discrete retrieval (semiimplicit.jl, moist_compressible.jl) |
+| `energy_budget` | bool |  | per-operator budget of R = E_t - E_implied and of the partition gap X = rho_t - rho_d - rho_v - rho_liq - rho_ice: each stage of the column step booked as a finite difference of the column integral, written per output time to energy_budget.csv beside the NetCDF output with a closure row (sum of stages = actual change); default false, which never calls the hooks; refused with exact_si (energy_budget.jl, moist_compressible.jl) |
 | `exact_reference_state` | bool | `reference_state.exact` (refused in `[extra.options]`) | read the pre-balanced exact reference-state file (semiimplicit.jl) |
 | `exact_si` | bool | `numerics.exact_si` (refused in `[extra.options]`) | exact coupled semi-implicit acoustic solve, variant 1 (exact_si.jl, moist_compressible.jl) |
 | `exact_si_ax0` | bool |  | exact_si axisym: experimental axis-row treatment of the radial operator (exact_si.jl) |
 | `exact_si_zero_x` | bool |  | exact_si diagnostic: zero the horizontal increments (exact_si.jl) |
+| `exchange_realization` | bool |  | the ETD phase-change exchange of every transformed water-mass slot (cloud, rain, the three ice masses) books its vapor, latent heat in p and Q_ss give-back on the mass the slot's RECOVERED density actually receives, ahyp(nu*+d) - ahyp(nu*), not on the requested dt*qdot; default true, false restores the requested-mass booking bitwise (moist_compressible.jl) |
 | `horizontal_semiimplicit` | bool | `numerics.horizontal_semiimplicit` (refused in `[extra.options]`) | horizontal semi-implicit acoustic terms, XZ RiRk only (horizontal_si.jl, exact_si.jl) |
 | `hsi_cross_comp` | bool |  | horizontal SI factorization cross-term compensation, low-Courant experiments only (horizontal_si.jl) |
 | `hsi_scheme` | string |  | horizontal SI weights: "ai2s" or "am2" (horizontal_si.jl) |
@@ -658,6 +664,7 @@ co2_ppm = 280.0
 | `mynn_closure` | float |  | MYNN closure level; only 2.5 is ported (mynn_state.jl) |
 | `mynn_edmf` | int | `physics.boundary_layer.mynn_edmf` (refused in `[extra.options]`) | MYNN mass flux: 0 off, 1 on (mynn_state.jl) |
 | `mynn_edmf_mom` | bool |  | EDMF momentum transport (mynn_state.jl) |
+| `mynn_exchange_realization` | bool |  | where a transformed water-mass slot (cloud, rain, the three ice masses) is in or is driven into its clipped lobe, the MYNN eddy leg's assumed density change and the recovered one differ; the gap is booked as a phase change (vapor, latent heat in p, Q_ss) so the water carry and E_t stay closed; default true, bitwise wherever no slot is clipped; false restores the unpartnered legs; not read while :mynn_water_closure is on, which subsumes it (mc_mynn_bl.jl) |
 | `mynn_fidelity` | Union{Symbol, Vector{Symbol}} | `physics.boundary_layer.mynn_fidelity` (refused in `[extra.options]`) | MYNN closure fidelity: :scythe, :fortran or a Vector of deviations (mynn_state.jl) |
 | `mynn_init` | string (enum) | `physics.boundary_layer.mynn_init` (refused in `[extra.options]`) | MYNN TKE initialisation: :taper or :zero (mynn_state.jl) |
 | `mynn_interval` | float | `physics.boundary_layer.mynn_interval` (refused in `[extra.options]`) | MYNN call cadence [s] (mynn_state.jl) |
@@ -666,6 +673,7 @@ co2_ppm = 280.0
 | `mynn_scale_aware` | bool |  | MYNN scale-aware mixing length (mynn_state.jl) |
 | `mynn_trace` | bool | `diagnostics.mynn_trace` (refused in `[extra.options]`) | MYNN per-call summary line (mynn_state.jl) |
 | `mynn_water_carry` | string (enum) |  | MYNN water carry: :flux or :fixed_T (mynn_state.jl) |
+| `mynn_water_closure` | bool |  | the MYNN vapor leg is the residual of the total-water leg and the species legs' REALIZED (recovered-density) rates, and the water carry's thermal remainder is evaluated on those, so the boundary layer moves rho_v + rho_liq + rho_ice by exactly what it moves rho_t and holds E_t - E_implied; default true, bitwise where K_h = 0; false restores the independently fitted vapor leg (mc_mynn_bl.jl) |
 | `netcdf_derivatives` | bool | `output.netcdf_derivatives` (refused in `[extra.options]`) | :netcdf_raw also writes derivative slots (io.jl, netcdf_output.jl) |
 | `netcdf_grid` | string (enum) | `output.netcdf_grid` (refused in `[extra.options]`) | NetCDF output grid: :regular (netcdf_output.jl) |
 | `noise_seed` | int |  | Twoway_PV_mixing stochastic forcing seed (shallowWaterModels.jl) |
@@ -692,6 +700,7 @@ co2_ppm = 280.0
 | `rain_number_transform` | string (enum) | `physics.microphysics.rain_number_transform` (refused in `[extra.options]`) | rain-number-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl) |
 | `rain_population_gate` | bool |  | skip two-moment rain sinks where the carried rain number is not a population (moist_compressible.jl) |
 | `rain_transform` | string (enum) | `physics.microphysics.rain_transform` (refused in `[extra.options]`) | rain-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl) |
+| `refit_partner` | bool |  | the per-step spline refit's change in each transformed water-mass slot's RECOVERED density (cloud, rain, the three ice masses) is booked as condensation: vapor, latent heat in p and Q_ss partners folded into the ETD increments, so the refit's discretization error is an energy-consistent phase change instead of an E_t - E_implied drift; default true, false is bitwise the code without it (moist_compressible.jl) |
 | `sedimentation_flux_lid` | string (enum) |  | lid of every sedimentation-flux fit: :dirichlet (default, F = 0 at the lid) or :natural (forensics: the slot's own lid BC, lets hydrometeors fall in from above) (moist_compressible.jl) |
 | `semiimplicit` | bool | `(always on for moist_compressible)` (refused in `[extra.options]`) | legacy equation sets: semi-implicit time stepping on/off; always on for moist_compressible (primitive_equations.jl, semiimplicit.jl) |
 | `sfc_stability` | bool | `physics.surface.stability` (refused in `[extra.options]`) | Monin-Obukhov stability correction (mc_surface_layer.jl, mynn_state.jl) |
@@ -705,6 +714,8 @@ co2_ppm = 280.0
 | `surface_fluxes` | bool | `physics.surface.fluxes` (refused in `[extra.options]`) | surface momentum/heat/moisture fluxes (moist_compressible.jl, mc_surface_layer.jl) |
 | `temperature` | string (enum) | `numerics.temperature` (refused in `[extra.options]`) | model temperature: :eos = p/(rho_d R_d + rho_v R_v) (default) or :energy = the closed-form total-energy retrieval (moist_compressible.jl, radiation.jl, semiimplicit.jl, netcdf_output.jl) |
 | `u_max` | float | `diagnostics.timestep_advisory.u_max` (refused in `[extra.options]`) | timestep advisory: expected peak horizontal wind [m/s] (reference_state.jl) |
+| `vapor_nudge_partner` | bool |  | the vapor reconciliation nudge (rho_v_reconcile) gets the pressure partner T*(R_v - (R_m/C_vt) C_vv)*VREC that holds E_implied, so the nudged vapor's internal energy comes from the sensible heat and E_t - E_implied is unchanged by the nudge; default true, false is bitwise the unpartnered nudge (moist_compressible.jl) |
+| `vapor_transform` | string (enum) | `physics.microphysics.vapor_transform` (refused in `[extra.options]`) | prognostic-vapor-slot control variable: :none (library default, the density perturbation) or :bhyp (nu_v' = bhyp(rho_v) - bhyp(rho_vbar), recovered with ahyp; moist_compressible.jl, radiation.jl, netcdf_output.jl, semiimplicit.jl) |
 | `vertical_mixing` | bool | `physics.boundary_layer.scheme` (refused in `[extra.options]`) | legacy primitive equations: vertical mixing on/off (primitive_equations.jl) |
 | `w_max` | float | `diagnostics.timestep_advisory.w_max` (refused in `[extra.options]`) | timestep advisory: expected peak vertical wind [m/s] (reference_state.jl) |
 | `wall_bc_tau` | float | `numerics.wall_bc_tau` (refused in `[extra.options]`) | relaxation timescale [s] of the R1T1X wall BC; Inf = none (semiimplicit.jl) |
@@ -801,6 +812,7 @@ Retired (refused with a message):
 | `tau_qss` | float | `physics.microphysics.tau_qss` (refused in `[extra.physical_params]`) | QSS relaxation timescale [s] (moist_compressible.jl) |
 | `tau_rho_v_rec` | float |  | vapor reconciliation timescale [s] (moist_compressible.jl) |
 | `tau_varcheck` | float |  | ISHMAEL var_check relaxation timescale [s] (moist_compressible.jl) |
+| `vapor_mu` | float | `physics.microphysics.vapor_mu` (refused in `[extra.physical_params]`) | bhyp width for the vapor [kg/m^3], default 1e-9; refused above 1e-2 of the driest reference vapor (moist_compressible.jl, netcdf_output.jl) |
 | `z_damp` | float | `physics.sponge.z_damp` (refused in `[extra.physical_params]`) | bottom of the Rayleigh sponge [m] (moist_compressible.jl, primitive_equations.jl) |
 | `z_ref_level` | float |  | primitive equations: surface-layer reference height [m] (primitive_equations.jl) |
 

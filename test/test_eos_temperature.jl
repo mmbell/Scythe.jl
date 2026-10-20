@@ -246,7 +246,8 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                     extra = Dict{Symbol,Any}(:cloud_evap_realization => false,
                                              :exchange_realization => false,
                                              :refit_partner => false,
-                                             :vapor_nudge_partner => false),
+                                             :vapor_nudge_partner => false,
+                                             :vapor_transform => :none),
                     seed! = (p, x, V, c) -> eos_seed_sheet!(p, x, V, c; wamp = 0.5))
                 eos_run!(m, p, mo, 3)
                 @test all(isfinite, m.var_np1)

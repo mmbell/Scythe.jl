@@ -134,6 +134,11 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     `var_np1`: perturbation slots, slot 9 against `ν̄_c ≡ 0`, slot 8 a total)."""
     function residual(m, X; tr = :bhyp)
         mo = m.model; V = mo.grid_params.vars; kDim = mo.grid_params.kDim
+        # the vapor as the model reads it: `recover_rho_v` against the tile's own `nu_vbar`
+        # (≡ rho_vbar, bit for bit, under the default `vapor_transform = :none`)
+        vtr = Scythe.vapor_transform_mode(mo.options)
+        vmu = Scythe.vapor_mu(mo.physical_params)
+        nuvbar = Scythe.mc_nu_vbar(m)
         rs = m.ref_state
         pbar = Scythe.ref_pressure(rs)[:, 1]; rdbar = Scythe.ref_rho_d(rs)[:, 1]
         rtbar = Scythe.ref_rho_t(rs)[:, 1]; Ebar = Scythe.ref_total_energy(rs)[:, 1]
@@ -145,7 +150,9 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         for g in 1:n
             k = mod1(g, kDim)
             p = X[g, 1] + pbar[k]; rd = X[g, 2] + rdbar[k]; rt = X[g, 3] + rtbar[k]
-            u = X[g, 4]; w = X[g, 5]; Et = X[g, 6] + Ebar[k]; rv[g] = X[g, rv_i] + rvbar[k]
+            u = X[g, 4]; w = X[g, 5]; Et = X[g, 6] + Ebar[k]
+            rv[g] = vtr === :none ? X[g, rv_i] + rvbar[k] :
+                                    Scythe.recover_rho_v(X[g, rv_i], nuvbar[k], vtr, vmu)
             rl[g] = Scythe.recover_rho_c(X[g, 9], 0.0, tr, MU) +
                     Scythe.recover_rho_r(X[g, 8], tr, MU)
             geo = 0.5 * (u * u + w * w) + Scythe.gravity * z[g]
@@ -546,8 +553,10 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     # ── 3. the refit partner ─────────────────────────────────────────────────────────
     """Step 1, the model's own refit (`calcTendency` + `gridTransform!`), step 2: returns the
     pre-refit slots (var_np1 after step 1), the post-refit slots, and the tile."""
-    function refit_two_steps(tmp, tag; on = true, kw...)
-        m, p, mo = ep_tile(tmp, tag; opts_extra = Dict{Symbol,Any}(:refit_partner => on), kw...)
+    function refit_two_steps(tmp, tag; on = true, extra = Dict{Symbol,Any}(), kw...)
+        m, p, mo = ep_tile(tmp, tag;
+                           opts_extra = merge(Dict{Symbol,Any}(:refit_partner => on), extra),
+                           kw...)
         advance_all!(m, p, mo; t = 1)
         xpre = copy(m.var_np1)
         Scythe.calcTendency(m)
@@ -851,6 +860,139 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test arms[true] == arms[false]
             @test Scythe.VAPOR_NUDGE_PARTNER_DEFAULT === true
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :vapor_nudge_partner)
+        end
+    end
+
+    # ── 4b. the partners under the VAPOR CONTROL VARIABLE (options[:vapor_transform]) ──
+    # Stage 1 of the rho_t retirement: the vapor slot holds ν_v' = bhyp(ρ_v) − bhyp(ρ̄_v), the
+    # ETD's vapor increment, the exchange realization's and the refit partner's vapor partners
+    # arrive through J_v, and the nudge is the realized E6 rate law partnered on the recovered
+    # change. R (read with the RECOVERED vapor) must be held across each to the tolerances the
+    # density-vapor tests above hold it to.
+    VT = Dict{Symbol,Any}(:vapor_transform => :bhyp)
+    VMU = 1.0e-9
+    """`seed_super!` with the vapor slot written as the control-variable deviation."""
+    function seed_super_v!(patch, pts, V)
+        seed_sheet!(patch, pts, V)
+        rv_i = Scythe.mc_slot(V, "rho_v")
+        for i in 1:size(patch.physical, 1)
+            zz = pts[i, end]
+            zz > 1500.0 || continue
+            Tk = 300.0 - 0.0065 * zz
+            pp = 100000.0 * exp(-zz / 8000.0)
+            rvb = 0.7 * Scythe.rho_v_sat(Tk, pp / 100.0)
+            drv = (1.015 - 0.7) * Scythe.rho_v_sat(Tk, pp / 100.0)
+            patch.physical[i, rv_i, 1] += Scythe.bhyp(rvb + drv, VMU) - Scythe.bhyp(rvb, VMU)
+            patch.physical[i, V["rho_t"], 1] += drv
+            patch.physical[i, V["Q_ss"], 1] += drv
+        end
+    end
+
+    @testset "vapor control variable: the ETD exchange on a clipped lobe holds R" begin
+        mktempdir() do tmp
+            m, p, mo = ep_tile(tmp, "v_lobe"; seed! = seed_super_v!, opts_extra = VT)
+            advance_all!(m, p, mo)
+            kDim = mo.grid_params.kDim; nc = ncols(p, mo)
+            X0 = copy(m.var_np1)
+            X1, col = etd_stage(m, X0, kDim, nc)
+            R0, rl0, rv0 = residual(m, X0)
+            R1, rl1, rv1 = residual(m, X1)
+            S = scratch(m)
+            # the requested exchange in DENSITY: the ν increment over the frozen J_v
+            req = S.etd_dv[1:kDim] ./ Scythe.vapor_jacobian_column(S)[1:kDim]
+            dR = (R1 .- R0)[col]; drl = (rl1 .- rl0)[col]; drv = (rv1 .- rv0)[col]
+            Lv = S.Lv[1:kDim]
+            lobe = (X0[col, 9] .+ S.etd_d9[1:kDim] .< 0.0) .& (S.etd_d9[1:kDim] .> 0.0)
+            @test count(lobe) > 0
+            act = S.etd_dv[1:kDim] .!= 0.0
+            @test count(act) > count(lobe)
+            # no recovered vapor moves at a lobe point (the closed exchange)
+            @test all(abs.(drv[lobe]) .<= 1.0e-9 .* abs.(req[lobe]) .+ 1.0e-18)
+            # water: recovered vapor + recovered liquid unchanged at every active point (the
+            # vapor now through bhyp: O(μ_v)-relative, far inside the tolerance)
+            @test all(abs.(drv[act] .+ drl[act]) .<= 1.0e-9 .* abs.(req[act]) .+ 1.0e-18)
+            # R: second order in the exchanged mass, as with the density vapor
+            @test all(abs.(dR[act]) .<= 1.0e-3 .* Lv[act] .* abs.(req[act]))
+        end
+    end
+
+    @testset "vapor control variable: the refit partner holds R" begin
+        mktempdir() do tmp
+            m1, p1, mo, xpre, xpost = refit_two_steps(tmp, "vrf_on"; seed! = seed_sheet!,
+                                                      extra = VT)
+            m0, p0, _, xpre0, xpost0 = refit_two_steps(tmp, "vrf_off"; seed! = seed_sheet!,
+                                                       on = false, extra = VT)
+            @test xpre == xpre0 && xpost == xpost0
+            V = mo.grid_params.vars; kDim = mo.grid_params.kDim; nc = ncols(p1, mo)
+            rv_i = Scythe.mc_slot(V, "rho_v")
+            col = ((nc - 1) * kDim + 1):(nc * kDim)
+            S1 = scratch(m1); S0 = scratch(m0)
+            dp = S1.etd_d1[1:kDim] .- S0.etd_d1[1:kDim]
+            dvv = S1.etd_dv[1:kDim] .- S0.etd_dv[1:kDim]
+            rc(x) = Scythe.recover_rho_c.(x[col, 9], 0.0, :bhyp, MU)
+            drho = rc(xpost) .- rc(xpre)
+            @test maximum(abs.(drho)) > 1.0e-7
+            # water: the ν partner is J_v times minus the recovered change
+            @test dvv ≈ -(Scythe.vapor_jacobian_column(S1)[1:kDim] .* drho) rtol = 1.0e-12 atol = 1.0e-22
+            Rpre, _, rvpre = residual(m1, xpre)
+            xc = copy(xpre); xc[col, 9] .= xpost[col, 9]
+            Rc, _, _ = residual(m1, xc)
+            xp = copy(xc); xp[col, 1] .+= dp; xp[col, rv_i] .+= dvv
+            Rp, _, rvp = residual(m1, xp)
+            # ...and the RECOVERED vapor moves by minus the recovered cloud change
+            @test maximum(abs.((rvp .- rvpre)[col] .+ drho)) <= 1.0e-6 * maximum(abs.(drho))
+            open_ = abs.(Rc[col] .- Rpre[col]); closed = abs.(Rp[col] .- Rpre[col])
+            big = abs.(drho) .> 1.0e-3 * maximum(abs.(drho))
+            @test all(open_[big] .> 1.0e6 .* abs.(drho[big]))
+            @test all(closed[big] .<= 1.0e-3 .* open_[big])
+            @test sum(closed) <= 1.0e-3 * sum(open_)
+        end
+    end
+
+    @testset "vapor control variable: the E6 nudge and its partner hold R" begin
+        mktempdir() do tmp
+            function seed_gap!(patch, pts, V)
+                for i in 1:size(patch.physical, 1)
+                    patch.physical[i, V["rho_t"], 1] = 2.0e-4 * exp(-((pts[i, end] - 3000.0) / 1500.0)^2)
+                end
+            end
+            arms = Dict{Bool,Any}()
+            for on in (true, false)
+                m, p, mo = ep_tile(tmp, "vvn_$(on)"; seed! = seed_gap!,
+                    opts_extra = merge(VT, Dict{Symbol,Any}(:vapor_nudge_partner => on)))
+                advance_all!(m, p, mo)
+                arms[on] = (; m, p, mo, S = deepcopy(scratch(m)))
+            end
+            m1 = arms[true].m; m0 = arms[false].m; mo = arms[true].mo
+            kDim = mo.grid_params.kDim; nc = ncols(arms[true].p, mo)
+            col = ((nc - 1) * kDim + 1):(nc * kDim)
+            S = arms[true].S
+            rv_i = Scythe.mc_slot(mo.grid_params.vars, "rho_v")
+            @test maximum(S.VREC) > 0.0
+            # the slot rate is the ν-space E6 law; FORCING holds the realized recovered rate
+            x = copy(arms[true].p.physical[:, :, 1])
+            ts = mo.ts
+            nu = x[col, rv_i] .+ Scythe.mc_nu_vbar(m1)
+            @test S.VREC == Scythe.vapor_nudge_rate.(S.res_rho_t, nu, VMU, 10.0)
+            real = (Scythe.ahyp.(nu .+ ts .* S.VREC, VMU) .- Scythe.ahyp.(nu, VMU)) ./ ts
+            @test S.FORCING == real
+            # the only tendency difference is the partner, in p, of the REALIZED rate
+            D = m1.expdot_n .- m0.expdot_n
+            @test all(iszero, D[:, setdiff(1:size(D, 2), [1])])
+            @test isapprox(D[col, 1], Scythe.vapor_nudge_partner_rate.(real, S.Tk, S.R_m, S.C_vt);
+                           rtol = 1.0e-8, atol = 1.0e-12)
+            # R: one forward step of the nudge with and without its partner
+            R0, _, rv0 = residual(m1, x)
+            xv = copy(x); xv[col, rv_i] .+= ts .* S.VREC
+            Rv, _, rvv = residual(m1, xv)
+            xp = copy(xv); xp[col, 1] .+= ts .* D[col, 1]
+            Rp, _, _ = residual(m1, xp)
+            dRv = abs.(Rv[col] .- R0[col]); dRp = abs.(Rp[col] .- R0[col])
+            act = real .> 1.0e-3 * maximum(real)
+            @test count(act) > 0
+            @test all(dRp[act] .<= 1.0e-4 .* dRv[act])
+            # the realized change is the recovered vapor's own change over the step
+            @test (rvv .- rv0)[col] ≈ ts .* real rtol = 1.0e-9 atol = 1.0e-20
         end
     end
 

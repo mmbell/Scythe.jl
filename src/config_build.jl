@@ -196,6 +196,7 @@ function build_physics(cfg::RunConfig; start_hour::Float64 = cfg.physics.radiati
     o[:condensation] = mp.condensation
     o[:condensate_transform] = mp.condensate_transform
     o[:rain_transform] = mp.rain_transform
+    o[:vapor_transform] = mp.vapor_transform
     nmom == 2 && (o[:rain_number_transform] = mp.rain_number_transform)
     ice && (o[:ice_transform] = mp.ice_transform)
     p[:N_0] = mp.N_0
@@ -205,6 +206,7 @@ function build_physics(cfg::RunConfig; start_hour::Float64 = cfg.physics.radiati
     # legacy driver ran with and never wrote; write only a deliberate change.
     mp.condensate_mu != 1.0e-7 && (p[:condensate_mu] = mp.condensate_mu)
     mp.rain_mu != 1.0e-7 && (p[:rain_mu] = mp.rain_mu)
+    mp.vapor_mu != VAPOR_MU_DEFAULT && (p[:vapor_mu] = mp.vapor_mu)
 
     # ── boundary layer + surface layer
     if bl.scheme === :mynn

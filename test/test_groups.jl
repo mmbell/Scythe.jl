@@ -41,6 +41,7 @@ const TEST_FILES = [
     ("test_cloud_evap_realization.jl",      :physics),
     ("test_energy_partners.jl",             :physics),
     ("test_energy_budget.jl",               :physics),
+    ("test_vapor_transform.jl",             :physics),
     ("test_mynn_io.jl",                     :io),
     ("test_idealized_init.jl",              :core),
     ("test_spectralGrid.jl",                :core),

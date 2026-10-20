@@ -78,6 +78,9 @@ const IMPLICIT_DEFAULTS = Dict{String,Any}(
     # the key did not exist and every consumer read the total-energy retrieval, which is
     # exactly :energy (bitwise; test/test_eos_temperature.jl). The base overlays pin it.
     "options.temperature"              => ":energy", # src/moist_compressible.jl temperature_mode
+    # The vapor control variable (Stage 1 of the rho_t retirement): the library default is
+    # :none, the density vapor every legacy driver ran; the base overlays pin it.
+    "options.vapor_transform"          => ":none",   # src/moist_compressible.jl vapor_transform_mode
     "physical_params.Khdiff_water"     => 0.0,       # src/moist_compressible.jl:6773
     "physical_params.Pr_t"             => 1.0,       # src/moist_compressible.jl:6770
     "physical_params.Sc_t"             => 1.0)       # src/moist_compressible.jl:6774
@@ -155,13 +158,20 @@ const ICE_SLOTS = ["nu_i1", "nu_ni1", "nu_ai1", "nu_ci1", "nu_i2", "nu_ni2", "nu
 ceq_added(first_slot) = merge(Dict("nu_nr" => first_slot),
                               Dict(v => first_slot + i for (i, v) in enumerate(ICE_SLOTS)),
                               Dict("rho_e" => first_slot + 13))
-ceq_templates(rain) = merge(Dict(v => (lateral = "rho_v", vertical = rain) for v in ["nu_nr"; ICE_SLOTS]),
-                            Dict("rho_e" => (lateral = "rho_v", vertical = "rho_v")))
+# (`nu_v`: the production build's vapor slot, renamed under the vapor control variable)
+ceq_templates(rain) = merge(Dict(v => (lateral = "nu_v", vertical = rain) for v in ["nu_nr"; ICE_SLOTS]),
+                            Dict("rho_e" => (lateral = "nu_v", vertical = "nu_v")))
 
 # The ground and the lid of the scalar family: d2 in every legacy build, natural now
 # (`boundary_conditions.vertical_scalars` / `vertical_scalars_lid`).
 ceq_lid(vars) = Dict{String,Any}("$b.$v" => (BC_D2, BC_NATURAL) for v in vars for b in ("BCB", "BCT"))
 const LID_SCALARS = ["p", "rho_d", "rho_t", "E_t", "Q_ss", "rho_v", "u"]
+# Under the production vapor control variable (`physics.microphysics.vapor_transform = "bhyp"`)
+# the vapor slot is RENAMED rho_v -> nu_v (same slot): its lid/ground change rides on the new
+# name, the old name's BCs leave with the rename.
+const LID_SCALARS_NU = filter(!=("rho_v"), LID_SCALARS)
+const VAPOR_RENAMED_BC = Dict{String,Any}("BCB.nu_v" => (missing, BC_NATURAL),
+                                          "BCT.nu_v" => (missing, BC_NATURAL))
 
 const RAD_OPTIONS_ADDED = Dict(
     "options.radiation" => (missing, ":rrtmgp"), "options.radiation_method" => (missing, ":allsky"),
@@ -187,9 +197,11 @@ const EXPECTED_DELTAS = Dict(
             "options.mynn" => (missing, "true"),
             "options.sfc_stability" => (missing, "true"),
             "options.wall_bc_tau" => ("Inf", "300.0"),
-            "options.temperature" => (missing, ":eos"))),
-        bc_changed = merge(ceq_lid([LID_SCALARS; "v"; "nu_c"]), Dict("BCT.nu_r" => (BC_D2, BC_NATURAL))),
-        renamed = Dict{String,String}(),
+            "options.temperature" => (missing, ":eos"),
+            "options.vapor_transform" => (missing, ":bhyp"))),
+        bc_changed = merge(ceq_lid([LID_SCALARS_NU; "v"; "nu_c"]), VAPOR_RENAMED_BC,
+                           Dict("BCT.nu_r" => (BC_D2, BC_NATURAL))),
+        renamed = Dict("rho_v" => "nu_v"),
         added = ceq_added(12), templates = ceq_templates("nu_r")),
     # RCE: both reference-state fixes and the state-dependent SI (physics otherwise the
     # legacy default already: MYNN :scythe, ice, diurnal RRTMGP, stability).
@@ -198,8 +210,10 @@ const EXPECTED_DELTAS = Dict(
             "options.consistent_qss_reference" => (missing, "true"),
             "options.hydrostatic_reference" => (missing, "true"),
             "options.state_dependent_si" => (missing, "true"),
-            "options.temperature" => (missing, ":eos")),
-        bc_changed = ceq_lid([LID_SCALARS; "nu_c"; "rho_e"]), renamed = Dict{String,String}(),
+            "options.temperature" => (missing, ":eos"),
+            "options.vapor_transform" => (missing, ":bhyp")),
+        bc_changed = merge(ceq_lid([LID_SCALARS_NU; "nu_c"; "rho_e"]), VAPOR_RENAMED_BC),
+        renamed = Dict("rho_v" => "nu_v"),
         added = Dict{String,Int}(), templates = Dict{String,Any}()),
     # OWB: Louis -> MYNN (+ rho_e), ice (two-moment rain, bhyp on every water slot: rho_r/rho_c
     # become nu_r/nu_c and the rain positivity bound goes), NetCDF instead of CSV, a restart
@@ -222,10 +236,12 @@ const EXPECTED_DELTAS = Dict(
             "options.sfc_stability" => (missing, "true"),
             "grid_params.positivity.rho_r.i" => (0.0, missing),
             "grid_params.positivity.rho_r.k" => (0.0, missing),
-            "options.temperature" => (missing, ":eos")),
+            "options.temperature" => (missing, ":eos"),
+            "options.vapor_transform" => (missing, ":bhyp")),
         # nu_c is the renamed rho_c: its lid goes natural with the rest of the family.
-        bc_changed = merge(ceq_lid(LID_SCALARS), Dict{String,Any}("BCB.nu_c" => (missing, BC_NATURAL), "BCT.nu_c" => (missing, BC_NATURAL))),
-        renamed = Dict("rho_r" => "nu_r", "rho_c" => "nu_c"),
+        bc_changed = merge(ceq_lid(LID_SCALARS_NU), VAPOR_RENAMED_BC,
+                           Dict{String,Any}("BCB.nu_c" => (missing, BC_NATURAL), "BCT.nu_c" => (missing, BC_NATURAL))),
+        renamed = Dict("rho_r" => "nu_r", "rho_c" => "nu_c", "rho_v" => "nu_v"),
         added = ceq_added(11), templates = ceq_templates("nu_r")))
 
 "The expected `key => (old, new)` delta for one model (prefix = nest patch prefix or \"\")."
@@ -415,9 +431,10 @@ end
                   for v in keys(base.grid_params.vars) if v != "nu_r")
         # On XZ the two lateral dicts are one object: an `inner` override must not leak to `outer`.
         lr = build_model(ceq_load([CEQ_OWB]; dir = dir,
-                                  extra = ["boundary_conditions.override.rho_v.inner=natural"]))
-        @test lr.grid_params.BCL["rho_v"] == NaturalBC() && lr.grid_params.BCR["rho_v"] == NeumannBC()
-        @test sort(collect(keys(ceq_delta(old, ceq_fingerprint(lr))))) == ["grid_params.BCL.rho_v"]
+                                  extra = ["boundary_conditions.override.nu_v.inner=natural"]))
+        # (the vapor slot is `nu_v` under the production vapor control variable)
+        @test lr.grid_params.BCL["nu_v"] == NaturalBC() && lr.grid_params.BCR["nu_v"] == NeumannBC()
+        @test sort(collect(keys(ceq_delta(old, ceq_fingerprint(lr))))) == ["grid_params.BCL.nu_v"]
         # The table reports the override.
         cfgr = ceq_load([CEQ_OWB]; dir = dir, extra = ["boundary_conditions.override.nu_r.top=dirichlet"])
         r = only(filter(x -> x.variable == "nu_r", boundary_condition_table(ovr, cfgr)))

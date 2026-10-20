@@ -229,6 +229,10 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # base (the reference's own Tbar is not bit-identical to the retrieved T). Empty
     # vectors for every other equation set. `Tbar` is the resting temperature in the run's
     # `options[:temperature]` mode (see `mc_reference_diagnostics`).
+    # (The vapor control variable's reference `nu_vbar`/`nu_vbar_z` and the derived total
+    # reference `rho_tbar_w`/`_z` of `mc_reference_diagnostics` are NOT here but in
+    # `ebudget` — see `mc_nu_vbar`: widening this NamedTuple by four fields took the first
+    # call of `moist_compressible_SLR` over the LLVM cliff, measured 2026-10-20.)
     mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar, :rho_vbar_z, :Pxi_prof, :Tbar),
                             Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64},
                                   Vector{Float64}, Vector{Float64}}}
@@ -472,7 +476,10 @@ function build_reference_state(model::ModelParameters, z_values::Vector{Float64}
         # fit level, so a Q_ssbar built for one is not a fixed point of the other.
         if get(model.options, :consistent_qss_reference, false)::Bool
             ref_state = consistent_qss_reference(ref_state, z_values, ref_column;
-                                                 temperature = temperature_mode(model.options))
+                                                 temperature = temperature_mode(model.options),
+                                                 vapor_transform =
+                                                     vapor_transform_mode(model.options),
+                                                 vapor_mu = vapor_mu(model.physical_params))
         end
     elseif (model.options[:exact_reference_state])
         ref_state = physical_ref ?
@@ -576,15 +583,21 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Defined in moist_compressible.jl, which is included after this file — resolved at call
     # time, so the forward reference is fine.
     mc_scratch = _allocate_mc_scratch(tile, model)
-    mc_ref_diag = if uses_pressure_reference(model.equation_set) &&
+    ref_diag_full = if uses_pressure_reference(model.equation_set) &&
                      !isempty(model.ref_state_file)
         mc_reference_diagnostics(ref_state,
                                  tilepoints[1:model.grid_params.kDim, end];
-                                 temperature = temperature_mode(model.options))
+                                 mc_ref_diag_kwargs(model)...)
     else
         (s_tbar = Float64[], rho_vbar = Float64[], rho_vbar_z = Float64[],
-         Pxi_prof = Float64[], Tbar = Float64[])
+         Pxi_prof = Float64[], Tbar = Float64[], nu_vbar = Float64[], nu_vbar_z = Float64[],
+         rho_tbar_w = Float64[], rho_tbar_w_z = Float64[])
     end
+    # The tile keeps the five resting-state columns; the vapor-reference four ride on the
+    # energy budget's reference part (`mc_nu_vbar`), for the compile-cliff reason above.
+    mc_ref_diag = (s_tbar = ref_diag_full.s_tbar, rho_vbar = ref_diag_full.rho_vbar,
+                   rho_vbar_z = ref_diag_full.rho_vbar_z, Pxi_prof = ref_diag_full.Pxi_prof,
+                   Tbar = ref_diag_full.Tbar)
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
     # structural placeholder where a real one is not needed.
@@ -650,6 +663,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         # the water solve itself is refused under a transform.
         rname = rain_var_name(model.options)
         cname = condensate_var_name(model.options)
+        vname = vapor_var_name(model.options)
         mc_diffusion_matrices = (
             u             = mc_matrix("u",     Kv_mc,       1.25),
             u_first       = mc_matrix("u",     Kv_mc,       0.5),
@@ -667,8 +681,8 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
             # factorization for the same reason cloud and rain have theirs: the boundary
             # conditions are per-variable, and the vapor increment is solved rather than
             # implied now (see `_diffusion_water_step!`).
-            water_v       = mc_matrix("rho_v", Kv_water_mc, 1.25),
-            water_v_first = mc_matrix("rho_v", Kv_water_mc, 0.5))
+            water_v       = mc_matrix(vname,   Kv_water_mc, 1.25),
+            water_v_first = mc_matrix(vname,   Kv_water_mc, 0.5))
         # The cylindrical variants carry the tangential wind v (its own BCs) through
         # the same momentum solve as u/w.
         if haskey(model.grid_params.vars, "v")
@@ -729,7 +743,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         # which moved above this file for exactly the same struct-ordering reason.
         mc_surface_diag(model, tile),
         # ...and the energy budget (src/energy_budget.jl, the same reason again).
-        mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag))
+        mc_energy_budget(model, tile, tilepoints, ref_state, ref_diag_full))
     return mtile
 end
 
@@ -2398,6 +2412,10 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
     teos = temperature_mode(model.options) === :eos
     rvp = view(phys, :, slots.rho_v, 1)
     rho_vbar = mtile.mc_ref_diag.rho_vbar
+    # the vapor as the driver reads it (`recover_rho_v`; `nu_vbar ≡ rho_vbar` under `:none`)
+    nu_vbar = mc_nu_vbar(mtile)
+    vtrans = vapor_transform_mode(model.options)
+    vmu = vapor_mu(model.physical_params)
     max_split = -Inf
     max_si = 1
     split_k = 0.0
@@ -2447,7 +2465,9 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
                              recover_total(i2q[i], itrans, imu)) +
                             recover_total(i3q[i], itrans, imu)) : 0.0
         T_energy = retrieve_temperature(M, rho_dk, rho_tk, rho_liq, rho_ice)
-        T_eos = eos_temperature(pp[i] + pbar[k], rho_dk, rvp[i] + rho_vbar[k])
+        rvk = vtrans === :none ? rvp[i] + rho_vbar[k] :
+                                 recover_rho_v(rvp[i], nu_vbar[k], vtrans, vmu)
+        T_eos = eos_temperature(pp[i] + pbar[k], rho_dk, rvk)
         Tk = teos ? T_eos : T_energy
         sp = T_energy - T_eos
         if abs(sp) > max_split

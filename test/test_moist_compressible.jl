@@ -7562,11 +7562,13 @@ using Springsteel
         @test Scythe.MC_POP_MAX == Scythe.MC_ATTR_LAST + 1
         @test Scythe.MC_POP_LAST == Scythe.MC_POP_MAX + 4
         # ...and the CLOUD-EVAPORATION BOUND census after that, then the ENERGY census
-        # (Stage P4), which is now the final row.
+        # (Stage P4), whose vapor-control-variable row MC_VNEG (Stage 1) is now the final row.
         @test Scythe.MC_CEVAP_PTS == Scythe.MC_POP_LAST + 1
         @test Scythe.MC_CEVAP_LAST == Scythe.MC_CEVAP_PTS + 2
         @test Scythe.MC_REFIT_DR == Scythe.MC_CEVAP_LAST + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_ECEN_STEPS
+        @test Scythe.MC_VNEG == Scythe.MC_ECEN_STEPS + 1
+        @test Scythe.MC_STATS_LAST == Scythe.MC_VNEG
+        @test Scythe.MC_WATER_STATS[Scythe.MC_VNEG] == :v_neg
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_PTS] == :e_pts
         @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_MAX] == :e_max

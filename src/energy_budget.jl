@@ -147,6 +147,19 @@ mutable struct EnergyBudget
     const rtr::Symbol; const rmu::Float64
     const itr::Symbol; const imu::Float64
     const cond_floor::Bool
+    # The vapor control variable (`options[:vapor_transform]`): under `:bhyp` the vapor slot
+    # is ν_v' against `nu_vbar` and the recovered `ahyp(ν_v)` is what R and X read.
+    const vtr::Symbol; const vmu::Float64
+    const nu_vbar::Vector{Float64}
+    # ...its vertical gradient, and the derived total reference ρ̄_d + Σ α_k ν̄_k of the ρ_t
+    # retirement (`mc_reference_diagnostics`; built, not yet read). These four are the TILE's
+    # copies, read through `mc_nu_vbar` & co. by every consumer: they live here and not in
+    # `ModelTile.mc_ref_diag` because widening that NamedTuple tips `moist_compressible_SLR`
+    # over the LLVM compile cliff (measured 2026-10-20), and this struct already carries the
+    # tile's reference profiles.
+    const nu_vbar_z::Vector{Float64}
+    const rho_tbar_w::Vector{Float64}
+    const rho_tbar_w_z::Vector{Float64}
     # Accumulators, per column (active only).
     const dR::Matrix{Float64}          # (EB_NSTAGE, ncol) J/m^2 summed over steps
     const dX::Matrix{Float64}          # (EB_NSTAGE, ncol) kg/m^2 summed over steps
@@ -179,7 +192,8 @@ moist-compressible one with a reference state. Concrete, not `nothing`, for the
 const EMPTY_ENERGY_BUDGET = EnergyBudget(false, 0, 0, Float64[], Float64[], Float64[],
     Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0, 0,
-    :none, 1.0, :none, 1.0, :none, 1.0, false,
+    :none, 1.0, :none, 1.0, :none, 1.0, false, :none, 1.0, Float64[], Float64[], Float64[],
+    Float64[],
     zeros(0, 0), zeros(0, 0), Float64[], Float64[], Float64[], Float64[], Int[], Bool[],
     zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
     zeros(0, 0, 0), zeros(0, 0), zeros(0, 0))
@@ -295,6 +309,9 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
         ip, ird, irt, iu, iw, iEt, irv, iv, irc, irr, ii1, ii2, ii3, rs,
         pos(ip), pos(irt), pos(iu), pos(iw), pos(iv), pos(iEt), pos(irv),
         ctr, cmu, rtr, rmu, itr, imu, condensate_floor_mode(opts),
+        vapor_transform_mode(opts), vapor_mu(pp), copy(mc_ref_diag.nu_vbar),
+        copy(mc_ref_diag.nu_vbar_z), copy(mc_ref_diag.rho_tbar_w),
+        copy(mc_ref_diag.rho_tbar_w_z),
         zeros(EB_NSTAGE * na, ncol * na), zeros(EB_NSTAGE * na, ncol * na),
         zeros(ncol * na), zeros(ncol * na), zeros(ncol * na), zeros(ncol * na),
         zeros(Int, ncol * na), fill(false, ncol * na),
@@ -326,7 +343,8 @@ in the mechanical term.
         rd = _eb_get(A, g, eb.ird, l) + eb.rho_dbar[k]
         rt = _eb_get(A, g, eb.irt, l) + eb.rho_tbar[k]
         Et = _eb_get(A, g, eb.iEt, l) + eb.E_tbar[k]
-        rv = _eb_get(A, g, eb.irv, l) + eb.rho_vbar[k]
+        rv = eb.vtr === :none ? _eb_get(A, g, eb.irv, l) + eb.rho_vbar[k] :
+                                ahyp(_eb_get(A, g, eb.irv, l) + eb.nu_vbar[k], eb.vmu)
         u = _eb_get(A, g, eb.iu, l)
         w = _eb_get(A, g, eb.iw, l)
         v = eb.iv > 0 ? _eb_get(A, g, eb.iv, l) : 0.0
@@ -426,12 +444,15 @@ The radiative heating's tendency: `(R_m/C_vt) q` in `p` and `q` in `E_t`, `q = q
 end
 
 """
-    eb_vrec!(eb, colstart, VREC, Tk, R_m, C_vt, partner)
+    eb_vrec!(eb, colstart, VREC, VREAL, Tk, R_m, C_vt, partner)
 
 The vapor nudge `VREC` into the vapor slot and, when `partner`, its pressure partner
-`vapor_nudge_partner_rate` into `p` — the two terms the driver writes.
+`vapor_nudge_partner_rate` of `VREAL` into `p` — the two terms the driver writes. `VREAL` is
+`VREC` itself under `vapor_transform = :none`; under `:bhyp` `VREC` is the ν-space rate and
+`VREAL` the realized recovered vapor rate its partner is booked on (`_vapor_bhyp_tendency!`).
 """
 @noinline function eb_vrec!(eb::EnergyBudget, colstart::Int, VREC::Vector{Float64},
+                            VREAL::Vector{Float64},
                             Tk::Vector{Float64}, R_m::Vector{Float64}, C_vt::Vector{Float64},
                             partner::Bool)
     tn = eb.tn
@@ -439,8 +460,9 @@ The vapor nudge `VREC` into the vapor slot and, when `partner`, its pressure par
         g = colstart + k - 1
         vr = VREC[k]
         tn[g, eb.jrv, EB_OP_VREC] += vr
-        (partner && vr != 0.0) &&
-            (tn[g, eb.jp, EB_OP_VREC] += vapor_nudge_partner_rate(vr, Tk[k], R_m[k], C_vt[k]))
+        va = VREAL[k]
+        (partner && va != 0.0) &&
+            (tn[g, eb.jp, EB_OP_VREC] += vapor_nudge_partner_rate(va, Tk[k], R_m[k], C_vt[k]))
     end
     return nothing
 end
@@ -494,7 +516,7 @@ drag-work-minus-production heat stays in `bl`.
                            u1::Float64, v1::Float64, T1::Float64, rd1::Float64, rt1::Float64,
                            rv1::Float64, p1::Float64, sfc, rho_t::Vector{Float64},
                            Tk::Vector{Float64}, R_m::Vector{Float64}, C_vt::Vector{Float64},
-                           ke::Vector{Float64})
+                           ke::Vector{Float64}, J_v::Vector{Float64})
     z = eb.z
     sx = surface_exchange(u1, v1, T1, rd1, rt1, rv1, p1, z[1], sfc.SST, sfc)
     F_sh = sx.F_sh; F_q = sx.F_q; tau_u = sx.tau_u; tau_v = sx.tau_v
@@ -512,7 +534,9 @@ drag-work-minus-production heat stays in `bl`.
         sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cwv * F_q * gz)
         sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * F_q * gz)
         sq = F_q * gz
-        for (j, s) in ((eb.ju, su), (eb.jEt, sE), (eb.jp, sp), (eb.jrt, sq), (eb.jrv, sq))
+        # the vapor slot holds ν under the vapor control variable: its share through J_v
+        sv = eb.vtr === :none ? sq : J_v[k] * sq
+        for (j, s) in ((eb.ju, su), (eb.jEt, sE), (eb.jp, sp), (eb.jrt, sq), (eb.jrv, sv))
             tn[g, j, EB_OP_SFC] += s
             tn[g, j, EB_OP_BL] -= s
         end
@@ -730,6 +754,23 @@ integral [J/m²] summed over steps.
     return nothing
 end
 
+"""
+    _eb_vapor_negative_points(eb, phys) -> Int
+
+The `MC_VNEG` census: how many gridpoints of the state `phys` (`tile.physical`) carry a
+negative vapor CONTROL variable, `ν_v' + ν̄_v < 0` (under `:none` that is the density
+`ρ_v' + ρ̄_v`, since `nu_vbar ≡ rho_vbar` there).
+"""
+@noinline function _eb_vapor_negative_points(eb::EnergyBudget, phys::Array{Float64,3})
+    n = 0
+    kDim = eb.kDim
+    @inbounds for g in axes(phys, 1)
+        k = mod1(g, kDim)
+        (phys[g, eb.irv, 1] + eb.nu_vbar[k]) < 0.0 && (n += 1)
+    end
+    return n
+end
+
 # ── Master side: gather, assemble, write ────────────────────────────────────────────────
 
 """
@@ -866,6 +907,11 @@ function energy_census_trace(mtile, t::Int64)
     end
     fill!(view(st, MC_XGAP_MAX:MC_XGAP_POOL, :), 0.0)
     st[MC_XGAP_MAX, 1] = xm; st[MC_XGAP_INT, 1] = xi; st[MC_XGAP_POOL, 1] = li
+    # MC_VNEG: the vapor control variable's negative points at the output state.
+    nneg = _eb_vapor_negative_points(eb, phys)
+    fill!(view(st, MC_VNEG, :), 0.0)
+    st[MC_VNEG, 1] = Float64(nneg)
+    npts = size(phys, 1)
     secs = nst * model.ts
     s(r) = sum(view(st, r, :))
     f(x) = round(x; sigdigits = 4)
@@ -875,7 +921,8 @@ function energy_census_trace(mtile, t::Int64)
             "Stage L dnu per step (c, r, i1, i2, i3)=($(f(s(MC_LOBE_C) / nst)), " *
             "$(f(s(MC_LOBE_R) / nst)), $(f(s(MC_LOBE_I1) / nst)), $(f(s(MC_LOBE_I2) / nst)), " *
             "$(f(s(MC_LOBE_I3) / nst))) kg/m2, max|X|=$(f(xm)) kg/m3, int X=$(f(xi)) kg/m2, " *
-            "pool=$(f(li)) kg/m2")
+            "pool=$(f(li)) kg/m2, nu_v<0 points=$(nneg) " *
+            "($(f(100.0 * nneg / max(npts, 1))) %)")
     fill!(view(st, MC_REFIT_DR:MC_LOBE_I3, :), 0.0)
     st[MC_ECEN_STEPS, 1] = 0.0
     return nothing

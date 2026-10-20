@@ -435,7 +435,7 @@ handling to copy.
                         2.0 * z[2], ed, IS, ice_on, nr_on,
                         lp && !wc, wc, ctr, get(pp, :condensate_mu, 1.0e-7), rtr,
                         get(pp, :rain_mu, 1.0e-7), itr, ice_on ? ice_mu(pp, 1) : 1.0,
-                        mtile.model.ts)
+                        mtile.model.ts, vapor_transform_mode(opts) !== :none)
     return nothing
 end
 
@@ -1296,7 +1296,15 @@ well; the choice is documented rather than silent because both were available.
     Btransform!(col); Atransform!(col)
     Ixtransform(col, MN.div_w)
 
-    col.uMish .= Kh .* rvv.f_z
+    # Under the vapor control variable the slot gradient is ν_v's; the eddy flux is a MASS
+    # flux, so it is built from the density perturbation gradient `ν_v'_z / J_v` (exact to
+    # O((μ_v/ρ_v)²) against `∂z ρ_v'`, and exactly 0 at rest where `ν_v'_z ≡ 0`).
+    vj = vapor_transform_mode(mtile.model.options) !== :none
+    if vj
+        col.uMish .= Kh .* (rvv.f_z ./ vapor_jacobian_column(S))
+    else
+        col.uMish .= Kh .* rvv.f_z
+    end
     if mf
         _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_qv, work.s_sqv, colstart, n)
     end
@@ -1375,7 +1383,8 @@ well; the choice is documented rather than silent because both were available.
         @inbounds for i in 1:n
             cw = (Cpv*Tk[i]) - S.Lv[i] + S.ke[i] + (gravity*z[i])
             cv = S.Lv[i] - (Rv*Tk[i])
-            wk[i] = Kh[i]*((cw*(rtv.f_z[i] - rdv.f_z[i])) + (cv*rvv.f_z[i]))
+            rvz = vj ? rvv.f_z[i] / vapor_jacobian_column(S)[i] : rvv.f_z[i]
+            wk[i] = Kh[i]*((cw*(rtv.f_z[i] - rdv.f_z[i])) + (cv*rvz))
         end
         if ice_on
             # THE ICE ENERGY CARRY. `rho_w' = rho_t' - rho_d'` already INCLUDES the ice, so
@@ -1514,7 +1523,8 @@ that value actually is and report it.
                                        IS::MCSlots, ice_on::Bool, nr_on::Bool,
                                        lp::Bool, wc::Bool, ctr::Symbol, cmu::Float64,
                                        rtr::Symbol, rmu::Float64,
-                                       itr::Symbol, imu::Float64, ts::Float64)
+                                       itr::Symbol, imu::Float64, ts::Float64,
+                                       vj::Bool = false)
     u = uv.f
     w = wv.f
     rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
@@ -1637,7 +1647,8 @@ that value actually is and report it.
         expdot[j, 3] += rw
         expdot[j, 8] += Jr[i] * div_r[i]
         expdot[j, 9] += Jc[i] * div_c[i]
-        expdot[j, rv_i] += rv
+        # the vapor slot holds ν under the vapor control variable: its leg through J_v
+        expdot[j, rv_i] += vj ? vapor_jacobian_column(S)[i] * rv : rv
         expdot[j, 6] += (qdot_E + dE_w) + dE_mom
         expdot[j, 7] += rv - (drvs_dT[i]*dT_v) - (drvs_dp[i]*(dp_v + dp_q))
         expdot[j, re_i] += ((div_e[i] + Ps) + (Pb - eps)) + Psfc
@@ -1667,7 +1678,7 @@ that value actually is and report it.
                                                      ice_p ? L_s(Tk[i]) : 0.0, S.Q_s[i],
                                                      ice_p ? S.Q_s_i[i] : 0.0)
                 expdot[j, 1] += dpp
-                expdot[j, rv_i] += dvv
+                expdot[j, rv_i] += vj ? vapor_jacobian_column(S)[i] * dvv : dvv
                 expdot[j, 7] += dqq
             end
         end

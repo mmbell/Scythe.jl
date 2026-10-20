@@ -1188,6 +1188,11 @@ function radiation_reference_column!(work::RadiationWork, mtile::ModelTile,
     E_tbar = view(ref_total_energy(refstate), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(refstate), :, 1)
     rho_vbar = mtile.mc_ref_diag.rho_vbar
+    # The vapor slot's control variable (`vapor_transform_mode`): every vapor read below is
+    # `recover_rho_v` against `nu_vbar` (≡ `rho_vbar` under `:none`, bit for bit).
+    nu_vbar = mc_nu_vbar(mtile)
+    vtrans = vapor_transform_mode(model.options)
+    vmu = vapor_mu(model.physical_params)
 
     ctrans = condensate_transform_mode(model.options)
     cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
@@ -1215,7 +1220,9 @@ function radiation_reference_column!(work::RadiationWork, mtile::ModelTile,
         rho_d = rho_dbar[k]
         rho_t = rho_tbar[k]
         E_t = E_tbar[k]
-        rho_v = rho_vbar[k]
+        # the RESTING vapor as the driver reads it (`recover_rho_v` of a zero slot): ρ̄_v
+        # bitwise under `:none`, `ahyp(bhyp(ρ̄_v))` under the vapor control variable
+        rho_v = vtrans === :none ? rho_vbar[k] : recover_rho_v(0.0, nu_vbar[k], vtrans, vmu)
         rho_c = recover_rho_c(0.0, rho_cbar[k], ctrans, cmu)
         rho_r = recover_rho_r(0.0, rtrans, rmu)
         ri1 = ice_on ? recover_total(0.0, itrans, imu) : 0.0
@@ -1341,6 +1348,11 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
     E_tbar = view(ref_total_energy(refstate), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(refstate), :, 1)
     rho_vbar = mtile.mc_ref_diag.rho_vbar
+    # The vapor slot's control variable (`vapor_transform_mode`): every vapor read below is
+    # `recover_rho_v` against `nu_vbar` (≡ `rho_vbar` under `:none`, bit for bit).
+    nu_vbar = mc_nu_vbar(mtile)
+    vtrans = vapor_transform_mode(model.options)
+    vmu = vapor_mu(model.physical_params)
 
     # Slots 1-9 are hardcoded literals throughout the driver (see `MCSlots`); the vapour
     # and the ice masses are APPENDED and are resolved by name once, at tile creation.
@@ -1414,7 +1426,8 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
         rho_d = rho_dp[k] + rho_dbar[k]
         rho_t = rho_tp[k] + rho_tbar[k]
         E_t = E_tp[k] + E_tbar[k]
-        rho_v = rho_vp[k] + rho_vbar[k]
+        rho_v = vtrans === :none ? rho_vp[k] + rho_vbar[k] :
+                                   recover_rho_v(rho_vp[k], nu_vbar[k], vtrans, vmu)
         rho_c = recover_rho_c(nu_c[k], rho_cbar[k], ctrans, cmu)
         rho_r = recover_rho_r(nu_r[k], rtrans, rmu)
         # The three ice MASSES, kept as named values so the same recovery serves both the

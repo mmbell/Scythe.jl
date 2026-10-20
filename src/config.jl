@@ -78,6 +78,8 @@ const ICE_SCHEMES = (:ishmael, :none)
 const RAIN_MOMENT_CHOICES = (0, 1, 2)
 "Control-variable transforms the four `*_transform_mode` accessors accept (src/moist_compressible.jl)."
 const WATER_TRANSFORMS = (:none, :bhyp, :bhyp_smooth)
+"Allowed `physics.microphysics.vapor_transform` values (`vapor_transform_mode` in src/moist_compressible.jl)."
+const VAPOR_TRANSFORMS = (:none, :bhyp)
 "Allowed `physics.boundary_layer.scheme` values."
 const BL_SCHEMES = (:mynn, :louis, :none)
 "Allowed `physics.horizontal_mixing.scheme` values."
@@ -346,8 +348,10 @@ end
 - `rain_transform::Symbol` — rain-slot control variable: `none`, `bhyp`, `bhyp_smooth`.
 - `rain_number_transform::Symbol` — rain-number-slot control variable (two-moment rain).
 - `ice_transform::Symbol` — control variable of the twelve ice slots.
+- `vapor_transform::Symbol` — prognostic-vapor-slot control variable: `bhyp` (default since Stage 1 of the rho_t retirement: the slot is `nu_v' = bhyp(rho_v) - bhyp(rho_vbar)` and every reader sees `ahyp(nu_v) >= 0`) or `none` (the density perturbation).
 - `condensate_mu::Float64` — bhyp width for cloud [kg/m³].
 - `rain_mu::Float64` — bhyp width for rain [kg/m³].
+- `vapor_mu::Float64` — bhyp width for the vapor [kg/m³]; must be <= 1e-2 of the driest reference vapor.
 - `N_0::Float64` — rain DSD intercept [m⁻⁴].
 - `N_r::Float64` — single-moment rain number parameter.
 - `tau_qss::Float64` — QSS relaxation timescale [s].
@@ -361,8 +365,10 @@ Base.@kwdef struct Microphysics <: AbstractConfigSection
     rain_transform::Symbol = :bhyp
     rain_number_transform::Symbol = :bhyp
     ice_transform::Symbol = :bhyp
+    vapor_transform::Symbol = :bhyp
     condensate_mu::Float64 = 1.0e-7
     rain_mu::Float64 = 1.0e-7
+    vapor_mu::Float64 = 1.0e-9
     N_0::Float64 = 8.0e6
     N_r::Float64 = 1.0e-3
     tau_qss::Float64 = 10.0
@@ -717,6 +723,7 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (Microphysics, :rain_transform)            => WATER_TRANSFORMS,
     (Microphysics, :rain_number_transform)     => WATER_TRANSFORMS,
     (Microphysics, :ice_transform)             => WATER_TRANSFORMS,
+    (Microphysics, :vapor_transform)           => VAPOR_TRANSFORMS,
     (BoundaryLayer, :scheme)                   => BL_SCHEMES,
     (BoundaryLayer, :mynn_init)                => MYNN_INIT_MODES,
     (Surface, :roughness)                      => SFC_Z0_MODES,
@@ -839,6 +846,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :rain_moments             => (Int, "1 = single-moment rain, 2 = prognostic rain number n_r (moist_compressible.jl)"),
     :condensate_transform     => (Symbol, "cloud-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl)"),
     :rain_transform           => (Symbol, "rain-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl)"),
+    :vapor_transform          => (Symbol, "prognostic-vapor-slot control variable: :none (library default, the density perturbation) or :bhyp (nu_v' = bhyp(rho_v) - bhyp(rho_vbar), recovered with ahyp; moist_compressible.jl, radiation.jl, netcdf_output.jl, semiimplicit.jl)"),
     :rain_number_transform    => (Symbol, "rain-number-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl)"),
     :ice_transform            => (Symbol, "control variable of the twelve ice slots: :none, :bhyp, :bhyp_smooth (moist_compressible.jl)"),
     :condensate_floor         => (Symbol, "cloud flooring at the thermodynamic interface: :none or :diagnostic (moist_compressible.jl)"),
@@ -970,6 +978,7 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :N_r           => (Float64, "single-moment rain number parameter (moist_compressible.jl)"),
     :condensate_mu => (Float64, "bhyp width for cloud [kg/m^3] (moist_compressible.jl, netcdf_output.jl)"),
     :rain_mu       => (Float64, "bhyp width for rain [kg/m^3] (moist_compressible.jl, netcdf_output.jl)"),
+    :vapor_mu      => (Float64, "bhyp width for the vapor [kg/m^3], default 1e-9; refused above 1e-2 of the driest reference vapor (moist_compressible.jl, netcdf_output.jl)"),
     :mu_rain_n     => (Float64, "bhyp width for rain number [1/m^3] (moist_compressible.jl, netcdf_output.jl)"),
     :max_N_c       => (Float64, "cloud droplet number [1/cm^3] for ISHMAEL autoconversion (moist_compressible.jl, netcdf_output.jl)"),
     :tau_activation   => (Float64, "ice activation timescale [s] (moist_compressible.jl)"),
@@ -1038,6 +1047,7 @@ const OWNED_OPTION_KEYS = Dict{Symbol,String}(
     :condensation              => "physics.microphysics.condensation",
     :condensate_transform      => "physics.microphysics.condensate_transform",
     :rain_transform            => "physics.microphysics.rain_transform",
+    :vapor_transform           => "physics.microphysics.vapor_transform",
     :rain_number_transform     => "physics.microphysics.rain_number_transform",
     :ice_transform             => "physics.microphysics.ice_transform",
     :mynn                      => "physics.boundary_layer.scheme",
@@ -1109,6 +1119,7 @@ const OWNED_PHYSICAL_KEYS = Dict{Symbol,String}(
     :N_0            => "physics.microphysics.N_0",
     :condensate_mu  => "physics.microphysics.condensate_mu",
     :rain_mu        => "physics.microphysics.rain_mu",
+    :vapor_mu       => "physics.microphysics.vapor_mu",
     :latitude       => "physics.radiation.latitude",
     :start_doy      => "physics.radiation.start_doy",
     :start_hour     => "physics.radiation.start_hour",

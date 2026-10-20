@@ -1024,7 +1024,8 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                              ref::Springsteel.PressureReferenceState,
                              flds, r_axis::AbstractVector; zcol=2,
                              condensate_transform::Symbol=:none, condensate_mu=1.0e-7,
-                             rain_transform::Symbol=:none, rain_mu=1.0e-7)
+                             rain_transform::Symbol=:none, rain_mu=1.0e-7,
+                             vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
 
     vars = patch.params.vars
     p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
@@ -1089,7 +1090,8 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             # reconciliation nudge starts from the vortex's own partition and not from a
             # fit-level disagreement about what the reference vapor is.
             patch.physical[i, rho_v_i, 1] =
-                vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1])
+                vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1],
+                           vapor_transform, vapor_mu)
             patch.physical[i, v_i, 1] = v
             n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
             seed_ice_zero!(patch.physical, i, ice_i)
@@ -1384,7 +1386,9 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
                                  outer_iters::Int = 20, inner_iters::Int = 8,
                                  tol = 1.0e-11, verbose::Bool = true,
                                  condensate_transform::Symbol = :none, condensate_mu = 1.0e-7,
-                                 rain_transform::Symbol = :none, rain_mu = 1.0e-7)
+                                 rain_transform::Symbol = :none, rain_mu = 1.0e-7,
+                                 vapor_transform::Symbol = :none,
+                                 vapor_mu = VAPOR_MU_DEFAULT)
 
     npatch = length(patches)
     pbar     = ref_pressure(ref)[:, 1]
@@ -1621,7 +1625,10 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
             # the same (ρ_t, ρ_d) pair those two read is what keeps the initial state's
             # partition and its reconciliation gap consistent to the fit floor rather than
             # to the difference between two independently deconvolved fields.
-            rv_target[i] = vapor_slot(rho_v, rho_tbar[k], rho_dbar[k], rho_cbar[k])
+            # (the CONTROL-variable deviation under the vapor transform: the deconvolution
+            # then fits ν_v', the slot's own representation)
+            rv_target[i] = vapor_slot(rho_v, rho_tbar[k], rho_dbar[k], rho_cbar[k],
+                                      vapor_transform, vapor_mu)
             et_target[i] = ((rho_d * internal_energy_bf02(Tk, rho_v / rho_d, 0.0)) +
                             (rho_t * ((gravity * z) + (0.5 * vfit[i] * vfit[i])))) - E_tbar[k]
             qs_target[i] = (rho_v - rho_v_sat(Tk, p / 100.0)) - Q_ssbar[k]

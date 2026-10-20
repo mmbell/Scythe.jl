@@ -171,7 +171,16 @@ struct DerivedConfig
     N0_source::String         # provenance of N0, written as a global attribute
     cond_floor::Bool          # options[:condensate_floor] === :diagnostic
     temperature::Symbol       # options[:temperature]: which temperature `T` is (`temperature_mode`)
+    vtrans::Symbol            # options[:vapor_transform]: the vapor slot's control variable
+    vmu::Float64              # physical_params[:vapor_mu]
 end
+
+# The pre-vapor-transform 16-field form (the vapor slot is the density perturbation).
+DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice, has_v,
+              N0, Nc_cm3, N0_source, cond_floor, temperature) =
+    DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice,
+                  has_v, N0, Nc_cm3, N0_source, cond_floor, temperature, :none,
+                  VAPOR_MU_DEFAULT)
 
 "Default Marshall-Palmer rain intercept [m^-4] when the run declares none."
 const REFL_N0_DEFAULT = 8.0e6
@@ -208,7 +217,8 @@ function derived_config(model::ModelParameters)
         get(pp, :max_N_c, 100.0),
         n0_on ? "physical_params[:N_0]" : "default $(REFL_N0_DEFAULT)",
         condensate_floor_mode(opts),
-        temperature_mode(opts))
+        temperature_mode(opts),
+        vapor_transform_mode(opts), vapor_mu(pp))
 end
 
 # ── Reference profiles on the regular output grid ─────────────────────────────
@@ -385,7 +395,11 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     rho_t = slots.rho_t .+ col(ref.rho_tbar)
     E_t   = slots.E_t   .+ col(ref.E_tbar)
     Q_ss  = slots.Q_ss  .+ col(ref.Q_ssbar)
-    rho_v = slots.rho_v .+ col(ref.rho_tbar .- ref.rho_dbar .- ref.rho_cbar)
+    # The vapor slot is the control variable `ν_v'` under the vapor transform: the reader sees
+    # the recovered `ahyp(ν_v' + bhyp(ρ̄_v)) ≥ 0` (`recover_rho_v`), as the driver does.
+    rho_vbar_d = ref.rho_tbar .- ref.rho_dbar .- ref.rho_cbar
+    rho_v = cfg.vtrans === :none ? slots.rho_v .+ col(rho_vbar_d) :
+            recover_rho_v.(slots.rho_v, col(bhyp.(rho_vbar_d, cfg.vmu)), cfg.vtrans, cfg.vmu)
 
     # ── (3) Retrieval ───────────────────────────────────────────────────────
     u = slots.u; w = slots.w
@@ -1086,7 +1100,7 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
     rho_e_i = get(vars, "rho_e", 0)
 
     p_p = slot(vars["p"]); rho_d_p = slot(vars["rho_d"]); rho_t_p = slot(vars["rho_t"])
-    E_t_p = slot(vars["E_t"]); Q_ss_p = slot(vars["Q_ss"]); rho_v_p = slot(vars["rho_v"])
+    E_t_p = slot(vars["E_t"]); Q_ss_p = slot(vars["Q_ss"]); rho_v_p = slot(mc_slot(vars, "rho_v"))
     u = slot(vars["u"]); w = slot(vars["w"])
     rain_raw = slot(rain_i); cloud_raw = slot(cloud_i)
 
@@ -1169,8 +1183,15 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         wr("rho_t_prime", rho_t_p, "kg m-3", "total density perturbation")
         wr("E_t_prime",   E_t_p,   "J m-3",  "total energy density perturbation")
         wr("Q_ss_prime",  Q_ss_p,  "kg m-3", "supersaturation density perturbation")
-        wr("rho_v_prime", rho_v_p, "kg m-3",
-           "vapor density perturbation off rho_tbar - rho_dbar - rho_cbar")
+        if cfg.vtrans === :none
+            wr("rho_v_prime", rho_v_p, "kg m-3",
+               "vapor density perturbation off rho_tbar - rho_dbar - rho_cbar")
+        else
+            # the raw vapor control-variable deviation, under its own slot name
+            wr(vapor_var_name(model.options), rho_v_p, "kg m-3",
+               "vapor control variable deviation nu_v' = bhyp(rho_v) - bhyp(rho_vbar) " *
+               "(Ooyama biased hyperbolic, mu = $(cfg.vmu) kg m-3)")
+        end
 
         # ── Raw transformed control variables, under their OWN slot names, and only
         # where a transform is actually on. Under :none the slot IS the density and is

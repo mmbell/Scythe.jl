@@ -47,7 +47,9 @@ function build_reference_state(cfg::RunConfig, patch, gp;
                        zeros(kDim))
     ref = Springsteel.exact_pressure_reference_state(String(path), z, column; hydrostatic = hydro)
     cfg.reference_state.consistent_qss &&
-        (ref = consistent_qss_reference(ref, z, column; temperature = cfg.numerics.temperature))
+        (ref = consistent_qss_reference(ref, z, column; temperature = cfg.numerics.temperature,
+                                        vapor_transform = cfg.physics.microphysics.vapor_transform,
+                                        vapor_mu = cfg.physics.microphysics.vapor_mu))
     println("Reference: sounding = $(basename(sounding)), sfc p = " *
             "$(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits = 2)) hPa " *
             "(hydrostatic = $hydro, consistent_qss = $(cfg.reference_state.consistent_qss))")
@@ -103,6 +105,8 @@ function initialize_case!(cfg::RunConfig, model::Union{ModelParameters,NestedMod
     rtrans = rain_transform_mode(o)
     cmu = get(pp, :condensate_mu, 1.0e-7)
     rmu = get(pp, :rain_mu, 1.0e-7)
+    vtrans = vapor_transform_mode(o)
+    vmu = vapor_mu(pp)
 
     if method === :balanced_vortex
         es.cyl || error("config: initial_conditions.method = \"balanced_vortex\" needs a " *
@@ -127,7 +131,8 @@ function initialize_case!(cfg::RunConfig, model::Union{ModelParameters,NestedMod
                                 RH_bl = vx.rh_bl, z_bl = vx.z_bl,
                                 moist_profile = vx.moist_profile,
                                 condensate_transform = ctrans, condensate_mu = cmu,
-                                rain_transform = rtrans, rain_mu = rmu)
+                                rain_transform = rtrans, rain_mu = rmu,
+                    vapor_transform = vtrans, vapor_mu = vmu)
     else
         for p in patches
             gpts = getGridpoints(p)
@@ -137,14 +142,16 @@ function initialize_case!(cfg::RunConfig, model::Union{ModelParameters,NestedMod
                 moist_temperature_noise_mc!(p, gpts, ref;
                     z_max = nz.z_max, dT_max = nz.dT_max, seed = nz.seed, zcol = zcol,
                     condensate_transform = ctrans, condensate_mu = cmu,
-                    rain_transform = rtrans, rain_mu = rmu)
+                    rain_transform = rtrans, rain_mu = rmu,
+                    vapor_transform = vtrans, vapor_mu = vmu)
             else # :temperature_bubble
                 bb = cfg.initial_conditions.temperature_bubble
                 moist_temperature_bubble_mc!(p, gpts, ref;
                     xc = bb.xc, xr = bb.xr, zc = bb.zc, zr = bb.zr, dT_max = bb.dT_max,
                     zcol = zcol,
                     condensate_transform = ctrans, condensate_mu = cmu,
-                    rain_transform = rtrans, rain_mu = rmu)
+                    rain_transform = rtrans, rain_mu = rmu,
+                    vapor_transform = vtrans, vapor_mu = vmu)
             end
         end
     end

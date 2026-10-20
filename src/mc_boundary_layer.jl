@@ -279,6 +279,11 @@ carrying no cloud.
     R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv; Jc = S.Jc
     # Resolved once per tile in `MCSlots`, so this is a field load and not a name lookup.
     rv_i = mtile.mc_slots.rho_v
+    # Under the vapor control variable (`options[:vapor_transform] = :bhyp`) the vapor slot
+    # holds ν_v, and its share of the flux (surface moisture flux included) arrives as
+    # `J_v·ρ̇_v` — the cloud slot's rule, with the staged `vapor_jacobian_column(S)`.
+    vj = vapor_transform_mode(mtile.model.options) !== :none
+    J_v = vapor_jacobian_column(S)
     drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp
     ke = S.ke
     @inbounds for i in eachindex(Kv)
@@ -314,10 +319,10 @@ carrying no cloud.
                         ((Lv[i] - (Rv * Tk[i])) * vdot_v) +
                         (rho_t[i] * (((u[i] * du) + (w[i] * dw)) +
                                      (_louis_v(geom, vv, i) * dv)))
-        # The prognostic VAPOR slot takes the vapor's share of the flux directly. No
-        # Jacobian: it is an untransformed perturbation (see `Scythe.vapor_slot`), so a
-        # density rate reaches it unmodified — the one water slot for which that is true.
-        expdot[j, rv_i] += vdot_v
+        # The prognostic VAPOR slot takes the vapor's share of the flux directly: under
+        # `:none` it is an untransformed perturbation (see `Scythe.vapor_slot`), so the
+        # density rate reaches it unmodified; under the vapor transform through `J_v`.
+        expdot[j, rv_i] += vj ? J_v[i] * vdot_v : vdot_v
         expdot[j, 7] += vdot_v - (drvs_dT[i] * dT_v) -
                         (drvs_dp[i] * (dp_v + dp_q))
     end
