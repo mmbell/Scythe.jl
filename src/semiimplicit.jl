@@ -985,15 +985,24 @@ extension:
 - anything else (CSV) — the physical field is read with `read_physical_grid` and
   `spectralTransform!` fits the spectral coefficients from it.
 
+THE VAPOR CONTROL VARIABLE (`options[:vapor_transform] = :bhyp`). A checkpoint written under the
+density vapor (`vars` has `"rho_v"` where the model has `"nu_v"`, everything else identical) is
+CONVERTED on load by [`convert_vapor_checkpoint!`](@ref): `ν_v' = bhyp(ρ̄_v + ρ_v') − ν̄_v` with the
+model's own derived reference, the vapor slot alone refit. The reverse (a `"nu_v"` checkpoint
+into a `:none` model) is refused: `ahyp` is not invertible where the recovered vapor is 0.
+
 Runs on the master process before tiling; mutates and returns `patch`.
 """
 function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
     if endswith(model.initial_conditions, ".jld2")
         loaded = load_grid(model.initial_conditions)
+        # A density-vapor checkpoint into a vapor-control-variable model: converted below.
+        vconv = vapor_checkpoint_conversion(loaded.params.vars, patch.params.vars,
+                                            model.initial_conditions)
         (typeof(loaded) == typeof(patch) &&
          size(loaded.spectral) == size(patch.spectral) &&
          size(loaded.physical) == size(patch.physical) &&
-         loaded.params.vars == patch.params.vars) || error(
+         (vconv > 0 || loaded.params.vars == patch.params.vars)) || error(
             "restart archive $(model.initial_conditions) is not compatible with the " *
             "configured grid_params (geometry/size/vars mismatch): archive is " *
             "$(typeof(loaded)) spectral $(size(loaded.spectral)), grid is " *
@@ -1008,6 +1017,7 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
             update_mc_wall_bc!(patch, patch.physical)
             gridTransform!(patch)
         end
+        vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
     else
         read_physical_grid(model.initial_conditions, patch)
         spectralTransform!(patch)
@@ -1024,6 +1034,77 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
             gridTransform!(patch)
         end
     end
+    return patch
+end
+
+"""
+    vapor_checkpoint_conversion(vars_file, vars_model, path) -> Int
+
+The vapor slot index to convert when a checkpoint's variable map differs from the model's ONLY
+by the vapor's name — `"rho_v"` (density, written under `vapor_transform = :none`) in the file
+where the model carries `"nu_v"` (`:bhyp`) — and `0` when the maps agree or differ otherwise
+(the caller's compatibility check then decides). The reverse direction is refused here, by
+name: a `"nu_v"` checkpoint cannot be read as a density vapor (the clipped `ahyp` has no
+inverse where the recovered vapor is 0).
+"""
+function vapor_checkpoint_conversion(vars_file, vars_model, path)
+    vars_file == vars_model && return 0
+    if haskey(vars_file, "nu_v") && haskey(vars_model, "rho_v")
+        error("restart archive $(path) carries the vapor CONTROL variable \"nu_v\" " *
+              "(written under options[:vapor_transform] = :bhyp), but this model runs the " *
+              "density vapor \"rho_v\" (vapor_transform = :none). There is no conversion in " *
+              "that direction (ahyp is clipped at 0); run with vapor_transform = :bhyp.")
+    end
+    (haskey(vars_file, "rho_v") && haskey(vars_model, "nu_v") &&
+     vars_file["rho_v"] == vars_model["nu_v"]) || return 0
+    rest_f = Dict(k => v for (k, v) in vars_file if k != "rho_v")
+    rest_m = Dict(k => v for (k, v) in vars_model if k != "nu_v")
+    rest_f == rest_m || return 0
+    return vars_model["nu_v"]
+end
+
+"""
+    convert_vapor_checkpoint!(patch, model, iv)
+
+Convert the density-vapor slot `iv` of a just-loaded checkpoint (`patch.physical` regenerated,
+`patch.spectral` the archive's) to the vapor control variable of `model`
+(`options[:vapor_transform] = :bhyp`):
+
+    ν_v' = B(ρ̄_v + ρ_v') − ν̄_v ,   B(ρ) = bhyp(ρ; μ_v) for ρ ≥ 0,  −bhyp(−ρ; μ_v) for ρ < 0,
+
+with `ρ̄_v`, `ν̄_v` the model's OWN derived reference (`build_reference_state` +
+`mc_reference_diagnostics`, the objects every tile builds). A negative checkpoint vapor maps to
+the odd continuation (the inverse of `ahyp_signed`): `2ν ≈ ρ` there, so the water the linear
+ρ_t carries stays in the slot as a ν lobe (recovered 0, counted by `MC_VNEG`) rather than being
+dropped. Only the vapor slot is refit (its spectral column from the converted values); every
+other slot keeps the archive's coefficients bit for bit. Converted restarts are not
+like-for-like (design §8 item 8): validate from 24 h only.
+"""
+function convert_vapor_checkpoint!(patch::AbstractGrid, model::ModelParameters, iv::Int)
+    gp = model.grid_params
+    kDim = gp.kDim
+    z = getGridpoints(patch)[1:kDim, end]
+    ref_state = build_reference_state(model, collect(Float64, z), reference_column(patch, gp))
+    diag = mc_reference_diagnostics(ref_state, collect(Float64, z); mc_ref_diag_kwargs(model)...)
+    mu = vapor_mu(model.physical_params)
+    saved = copy(patch.spectral)
+    nneg = 0
+    @inbounds for g in axes(patch.physical, 1)
+        k = mod1(g, kDim)
+        rho = patch.physical[g, iv, 1] + diag.rho_vbar[k]
+        rho < 0.0 && (nneg += 1)
+        nu = rho >= 0.0 ? bhyp(rho, mu) : -bhyp(-rho, mu)
+        patch.physical[g, iv, 1] = nu - diag.nu_vbar[k]
+    end
+    spectralTransform!(patch)
+    for v in axes(patch.spectral, 2)
+        v == iv && continue
+        patch.spectral[:, v] .= view(saved, :, v)
+    end
+    gridTransform!(patch)
+    println("Scythe: converted the density-vapor checkpoint $(model.initial_conditions) to " *
+            "the vapor control variable nu_v (mu_v = $(mu) kg/m^3): $(nneg) of " *
+            "$(size(patch.physical, 1)) points carried negative vapor and enter as nu_v < 0.")
     return patch
 end
 

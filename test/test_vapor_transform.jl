@@ -22,7 +22,7 @@
 #      where ahyp(nu_v) does not move;
 #   7. (test_energy_partners.jl) R held across ETD / refit / nudge on a seeded lobe column;
 #   8. (test_energy_partners.jl "1b") the primitive's special cases.
-# Plus the setup refusals and the config plumbing.
+# Plus the setup refusals, the config plumbing and the checkpoint conversion on load.
 
 using Test
 using Scythe
@@ -439,6 +439,54 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     end
 
     # ── checkpoints ───────────────────────────────────────────────────────────────────
+    @testset "checkpoint: a density-vapor .jld2 converts on load into a :bhyp model" begin
+        mktempdir() do tmp
+            # a :none tile with a prognostic vapor bump, written as a checkpoint
+            d0 = joinpath(tmp, "a") * "/"
+            m0, p0, mo0 = F.vt_tile(tmp, "ck0"; vtr = :none, output_dir = d0,
+                seed! = (p, x, V, c) -> F.vt_seed_vapor!(p, x, V, c; amp = 0.0))
+            Scythe.write_restart(p0, mo0, 0.0)
+            path = Scythe.checkpoint_path(d0, 0.0)
+            @test isfile(path)
+            # the same configuration under :bhyp, initialised from that file
+            m1, p1, mo1 = F.vt_tile(tmp, "ck1"; vtr = :bhyp, initial_conditions = path)
+            patch = createGrid(mo1.grid_params)
+            Scythe.load_initial_conditions!(patch, mo1)
+            V0 = mo0.grid_params.vars; V1 = mo1.grid_params.vars
+            rv0 = V0["rho_v"]; rv1 = V1["nu_v"]
+            @test rv0 == rv1
+            kDim = mo1.grid_params.kDim
+            nc = div(size(patch.physical, 1), kDim)
+            rvbar = repeat(m1.mc_ref_diag.rho_vbar, nc)
+            nubar = repeat(Scythe.mc_nu_vbar(m1), nc)
+            # every other slot is the checkpoint's own fit, bitwise
+            for v in 1:length(V1)
+                v == rv1 && continue
+                @test patch.spectral[:, v] == p0.spectral[:, v]
+            end
+            # the vapor: nu' = bhyp(rho_vbar + rho_v') - nu_vbar, refit once
+            target = Scythe.bhyp.(rvbar .+ p0.physical[:, rv0, 1], VMU) .- nubar
+            @test maximum(abs.(patch.physical[:, rv1, 1] .- target)) <=
+                  1.0e-2 * maximum(abs.(target))
+            rec = Scythe.ahyp.(patch.physical[:, rv1, 1] .+ nubar, VMU)
+            @test maximum(abs.(rec .- (rvbar .+ p0.physical[:, rv0, 1]))) <=
+                  2.0e-2 * maximum(abs.(p0.physical[:, rv0, 1]))
+            # the reverse direction is refused, by name
+            d2 = joinpath(tmp, "b") * "/"
+            m2, p2, mo2 = F.vt_tile(tmp, "ck2"; vtr = :bhyp, output_dir = d2)
+            Scythe.write_restart(p2, mo2, 0.0)
+            m3, p3, mo3 = F.vt_tile(tmp, "ck3"; vtr = :none,
+                                    initial_conditions = Scythe.checkpoint_path(d2, 0.0))
+            err = try
+                Scythe.load_initial_conditions!(createGrid(mo3.grid_params), mo3); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("nu_v", sprint(showerror, err))
+        end
+    end
+
     @testset "allocation-free column step under :bhyp (warm and Louis)" begin
         mktempdir() do tmp
             for louis in (false, true)
