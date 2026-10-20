@@ -50,6 +50,12 @@ function o01_rain_diagnostics(model, ref, kDim)
     snaps = output_snapshots(model)
     peak_rate = 0.0
     onset = NaN
+    # T_eos twins (the model's own temperature since 2026-10-14; `Tk` from mc_state is the
+    # pre-2026-10-14 energy retrieval). Only the temperature-dependent rain diagnostics.
+    peak_rate_te = 0.0
+    onset_te = NaN
+    rate_int_te = Float64[]
+    eflux_int_te = Float64[]
     max_rr = 0.0
     min_rr = 0.0
     # The cloud undershoot was invisible in this CSV — only rain was reported — so every
@@ -83,9 +89,10 @@ function o01_rain_diagnostics(model, ref, kDim)
         df = CSV.read(path, DataFrame)
         ncols = div(nrow(df), kDim)
         surf = 1:kDim:nrow(df)
-        Tk, _, rho_d, rho_v, rho_c, rho_t, rho_r =
+        Tk, p_, rho_d, rho_v, rho_c, rho_t, rho_r =
             mc_state(df, ref, kDim, ncols; transform = ctf, mu = cmu,
                      rain_transform = rtf, rain_mu = rmu)
+        Te = mc_temperature_eos(p_, rho_d, rho_v)
         max_rr = max(max_rr, maximum(rho_r))
         min_rr = min(min_rr, minimum(rho_r))
         max_rc = max(max_rc, maximum(rho_c))
@@ -116,12 +123,24 @@ function o01_rain_diagnostics(model, ref, kDim)
         push!(times, t)
         push!(rate_int, sum(Wh .* R))
         push!(eflux_int, sum(Wh .* (rr_s .* Vt .* e_l)))      # F_E(z≈0), > 0 for e_l < 0
+        Vt_te = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Te[surf])
+        R_te = -rr_s .* Vt_te
+        pk_te = maximum(R_te)
+        peak_rate_te = max(peak_rate_te, pk_te)
+        isnan(onset_te) && pk_te > 1.0e-3 && (onset_te = t)
+        e_l_te = (Scythe.Cpv .* Te[surf]) .- Scythe.L_v.(Te[surf])
+        push!(rate_int_te, sum(Wh .* R_te))
+        push!(eflux_int_te, sum(Wh .* (rr_s .* Vt_te .* e_l_te)))
     end
     # Trapezoid over the 60 s output cadence (few-% cross-check, not the budget)
     accum_flux = 0.0
     accum_E = 0.0
+    accum_flux_te = 0.0
+    accum_E_te = 0.0
     for i in 1:(length(times) - 1)
         dt = times[i+1] - times[i]
+        accum_flux_te += 0.5 * (rate_int_te[i] + rate_int_te[i+1]) * dt
+        accum_E_te += 0.5 * (eflux_int_te[i] + eflux_int_te[i+1]) * dt
         accum_flux += 0.5 * (rate_int[i] + rate_int[i+1]) * dt
         accum_E += 0.5 * (eflux_int[i] + eflux_int[i+1]) * dt
     end
@@ -139,6 +158,12 @@ function o01_rain_diagnostics(model, ref, kDim)
         "min_rho_d_frac" => min_rd_frac,                # dry density / reference; 1 = untouched
         "accum_rainfall_flux_mm" => accum_flux / width, # cross-check of the exact budget
         "precip_energy_gain_Jm2" => accum_E / width,    # predicted domain E_t gain
+        # T_eos twins of the four T-dependent rows above (rain terminal velocity and the
+        # sensible/latent energy of the falling rain read T). Informational.
+        "peak_rain_rate_gm2s_teos" => 1000.0 * peak_rate_te,
+        "rain_onset_min_teos" => onset_te / 60.0,
+        "accum_rainfall_flux_mm_teos" => accum_flux_te / width,
+        "precip_energy_gain_Jm2_teos" => accum_E_te / width,
     )
 end
 

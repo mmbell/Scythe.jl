@@ -886,6 +886,8 @@ function o01_diagnostics(model)
     width = model.grid_params.iMax - model.grid_params.iMin
     predicted_gain_pct = 100.0 * diags["precip_energy_gain_Jm2"] * width / E0
     diags["energy_residual_pct"] = drift["energy_drift_pct"] - predicted_gain_pct
+    diags["energy_residual_pct_teos"] = drift["energy_drift_pct"] -
+        100.0 * diags["precip_energy_gain_Jm2_teos"] * width / E0
 
     return merge(diags, drift)
 end
@@ -1096,18 +1098,25 @@ function o01_nested_diagnostics(models, topo)
     min_w = Inf
     rate_int = zeros(ntimes)
     eflux_int = zeros(ntimes)
+    # T_eos twins of the T-dependent rain rows (see o01_rain_diagnostics)
+    peak_rate_te = 0.0
+    onset_te = NaN
+    rate_int_te = zeros(ntimes)
+    eflux_int_te = zeros(ntimes)
     Whs = [Float64[] for _ in 1:n]            # masked weights, filled lazily
     for j in 1:ntimes
         pk_t = 0.0
+        pk_t_te = 0.0
         for i in 1:n
             t, path = snaps[i][j]
             df = CSV.read(path, DataFrame)
             gp = models[i].grid_params
             ncols = div(nrow(df), kDim)
             surf = 1:kDim:nrow(df)
-            Tk, _, rho_d, rho_v, rho_c, rho_t, rho_r =
+            Tk, p_, rho_d, rho_v, rho_c, rho_t, rho_r =
                 mc_state(df, ref, kDim, ncols; transform = ctf, mu = cmu,
                          rain_transform = rtf, rain_mu = rmu)
+            Te = mc_temperature_eos(p_, rho_d, rho_v)
             mask = masks[i]
             colmask = repeat(mask, inner = kDim)
             max_rr = max(max_rr, maximum(rho_r[colmask]))
@@ -1133,16 +1142,28 @@ function o01_nested_diagnostics(models, topo)
             e_l = (Scythe.Cpv .* Tk[surf]) .- Scythe.L_v.(Tk[surf])
             rate_int[j] += sum(Whs[i] .* R)
             eflux_int[j] += sum(Whs[i] .* (rr_s .* Vt .* e_l))    # F_E(z≈0), > 0 for e_l < 0
+            Vt_te = Scythe.rain_terminal_velocity.(rr_s, rho_d[surf], Te[surf])
+            R_te = -rr_s .* Vt_te
+            pk_t_te = max(pk_t_te, maximum(R_te))
+            e_l_te = (Scythe.Cpv .* Te[surf]) .- Scythe.L_v.(Te[surf])
+            rate_int_te[j] += sum(Whs[i] .* R_te)
+            eflux_int_te[j] += sum(Whs[i] .* (rr_s .* Vt_te .* e_l_te))
         end
         peak_rate = max(peak_rate, pk_t)
+        peak_rate_te = max(peak_rate_te, pk_t_te)
+        isnan(onset_te) && pk_t_te > 1.0e-3 && (onset_te = times[j])
         if isnan(onset) && pk_t > 1.0e-3
             onset = times[j]
         end
     end
     accum_flux = 0.0
     accum_E = 0.0
+    accum_flux_te = 0.0
+    accum_E_te = 0.0
     for j in 1:(ntimes - 1)
         dt = times[j+1] - times[j]
+        accum_flux_te += 0.5 * (rate_int_te[j] + rate_int_te[j+1]) * dt
+        accum_E_te += 0.5 * (eflux_int_te[j] + eflux_int_te[j+1]) * dt
         accum_flux += 0.5 * (rate_int[j] + rate_int[j+1]) * dt
         accum_E += 0.5 * (eflux_int[j] + eflux_int[j+1]) * dt
     end
@@ -1159,6 +1180,10 @@ function o01_nested_diagnostics(models, topo)
         "min_rho_d_frac" => min_rd_frac,
         "accum_rainfall_flux_mm" => accum_flux / total_width,
         "precip_energy_gain_Jm2" => accum_E / total_width,
+        "peak_rain_rate_gm2s_teos" => 1000.0 * peak_rate_te,
+        "rain_onset_min_teos" => onset_te / 60.0,
+        "accum_rainfall_flux_mm_teos" => accum_flux_te / total_width,
+        "precip_energy_gain_Jm2_teos" => accum_E_te / total_width,
     )
 
     # Masked water/energy budgets across the nest
@@ -1183,6 +1208,8 @@ function o01_nested_diagnostics(models, topo)
     diags["energy_drift_pct"] = 100.0 * (EN - E0) / E0
     predicted_gain_pct = 100.0 * diags["precip_energy_gain_Jm2"] * total_width / E0
     diags["energy_residual_pct"] = diags["energy_drift_pct"] - predicted_gain_pct
+    diags["energy_residual_pct_teos"] = diags["energy_drift_pct"] -
+        100.0 * diags["precip_energy_gain_Jm2_teos"] * total_width / E0
 
     diags["max_w"] = max_w
     diags["min_w"] = min_w

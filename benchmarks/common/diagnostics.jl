@@ -276,6 +276,18 @@ function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
 end
 
 """
+    mc_temperature_eos(p, rho_d, rho_v)
+
+The MODEL's temperature since 2026-10-14 (`options[:temperature] = :eos`, the default):
+`Scythe.eos_temperature(p, rho_d, rho_v)`. `mc_state` still returns the closed-form ENERGY
+retrieval (`Scythe.retrieve_temperature`, the pre-2026-10-14 model temperature) as `Tk`, so
+every existing diagnostic and reference window is unchanged; the `*_teos` diagnostics beside
+them are computed with this instead. `p` and `rho_v` are the `mc_state` outputs (total, with
+the reference added back; `rho_v` signed and unfloored, as the model reads it).
+"""
+mc_temperature_eos(p, rho_d, rho_v) = Scythe.eos_temperature.(p, rho_d, rho_v)
+
+"""
     theta_perturbation(df, ref, kDim)
 
 Compute the potential temperature perturbation field from output entropy and
@@ -285,16 +297,21 @@ output ordering.
 """
 function theta_perturbation(df::DataFrame, ref, kDim::Int;
                             transform::Symbol = :none, mu = 1.0e-7,
-                            rain_transform::Symbol = :none, rain_mu = 1.0e-7)
+                            rain_transform::Symbol = :none, rain_mu = 1.0e-7,
+                            temperature::Symbol = :energy)
     npts = nrow(df)
     ncols = div(npts, kDim)
 
     # Total-energy set (moist_compressible): retrieve T from the prognostic
     # (p, E_t, Q_ss, densities), then θ = T·(p_0/p)^(Rd/Cpd) directly.
     if "E_t" in names(df)
-        Tk, p, _, _, _, _, _ = mc_state(df, ref, kDim, ncols;
+        Tk, p, rho_d_, rho_v_, _, _, _ = mc_state(df, ref, kDim, ncols;
                                         transform = transform, mu = mu,
                                         rain_transform = rain_transform, rain_mu = rain_mu)
+        # `temperature = :energy` (default) is the retrieval `mc_state` returns, unchanged;
+        # `:eos` is the model's own T (mc_temperature_eos).
+        temperature in (:energy, :eos) || error("temperature must be :energy or :eos")
+        temperature === :eos && (Tk = mc_temperature_eos(p, rho_d_, rho_v_))
         theta = Tk .* ((Scythe.p_0 .* 100.0) ./ p) .^ (Scythe.Rd / Scythe.Cpd)
         Tbar = Springsteel.reference_temperature(ref)
         pbar = Springsteel.ref_pressure(ref)[:, 1]
@@ -485,7 +502,13 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
             # E_t stays flat; see the entropy budget subsection of the TeX).
             s = Scythe.entropy.(Tk, rho_d, q_v)
             total_entropy = rho_d .* (s .+ (q_l .* Scythe.Cl .* log.(Tk ./ Scythe.T_0)))
+            # T_eos twin (the model's temperature since 2026-10-14); `entropy` above stays on
+            # the energy retrieval so the existing column is unchanged.
+            Te = mc_temperature_eos(p, rho_d, rho_v)
+            total_entropy_teos = rho_d .* (Scythe.entropy.(Te, rho_d, q_v) .+
+                                           (q_l .* Scythe.Cl .* log.(Te ./ Scythe.T_0)))
             return (dry_mass = domain_integral(reshape(rho_d, kDim, ncols), model),
+                    entropy_teos = domain_integral(reshape(total_entropy_teos, kDim, ncols), model),
                     water_mass = domain_integral(reshape(water_mass, kDim, ncols), model),
                     mass = domain_integral(reshape(rho_t, kDim, ncols), model),
                     energy = domain_integral(reshape(E_t, kDim, ncols), model),
@@ -573,6 +596,10 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
         "energy_drift_pct" => 100.0 * (final.energy - init.energy) / abs(init.energy),
         "entropy_drift_pct" => 100.0 * (final.entropy - init.entropy) / abs(init.entropy),
     )
+    if mc
+        pct_change["entropy_drift_pct_teos"] =
+            100.0 * (final.entropy_teos - init.entropy_teos) / abs(init.entropy_teos)
+    end
     # Check if any water mass exists before dividing by zero
     if abs(init.water_mass) > 0.0
         pct_change["water_mass_drift_pct"] = 100.0 * (final.water_mass - init.water_mass) / abs(init.water_mass)
@@ -582,6 +609,7 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
     if mc
         sprod, n_neg_v = mc_entropy_production(model, ref)
         pct_change["entropy_prod_rate"] = sprod
+        pct_change["entropy_prod_rate_teos"] = mc_entropy_production(model, ref; temperature = :eos)[1]
         # The companion the rate cannot be read without: `entropy_prod_rate` is now summed
         # only over rho_v > 0, so a run with many negative-vapor points reports a rate for a
         # shrinking fraction of the domain. See mc_entropy_production.
@@ -605,7 +633,7 @@ Also returns the number of points EXCLUDED (rho_v <= 0). Read the two together: 
 falling rate that comes with a rising exclusion count is not an improvement in
 irreversibility, it is a shrinking domain.
 """
-function mc_entropy_production(model, ref)
+function mc_entropy_production(model, ref; temperature::Symbol = :energy)
     kDim = model.grid_params.kDim
     tag = string(round(model.integration_time; digits=2))
     df = CSV.read(joinpath(model.output_dir, "$(tag)_physical.csv"), DataFrame)
@@ -615,6 +643,8 @@ function mc_entropy_production(model, ref)
         mu = get(model.physical_params, :condensate_mu, 1.0e-7),
         rain_transform = Scythe.rain_transform_mode(model.options),
         rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
+    temperature in (:energy, :eos) || error("temperature must be :energy or :eos")
+    temperature === :eos && (Tk = mc_temperature_eos(p, rho_d, rho_v))
     rho_vs = Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0)
     q_v = rho_v ./ rho_d
     q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
