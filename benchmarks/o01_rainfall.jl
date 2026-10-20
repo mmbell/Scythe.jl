@@ -401,6 +401,14 @@ function o01_model(opts::BenchmarkOptions)
         (options[:rain_transform] = Symbol(ENV["SCYTHE_O01_RTRANS"]))
     haskey(ENV, "SCYTHE_O01_RMU") &&
         (physical_params[:rain_mu] = parse(Float64, ENV["SCYTHE_O01_RMU"]))
+    # Which control variable the prognostic VAPOR slot carries (`Scythe.vapor_transform_mode`,
+    # Stage 1 of the rho_t retirement). Unset => `:bhyp`, the run-config default
+    # (`physics.microphysics.vapor_transform`): the slot is `nu_v' = bhyp(rho_v) - bhyp(rho_vbar)`
+    # and every reader sees `ahyp(nu_v) >= 0`. `=none` restores the density perturbation the
+    # committed references were seeded with, bitwise. Its width: SCYTHE_O01_VMU (default 1e-9).
+    options[:vapor_transform] = Symbol(get(ENV, "SCYTHE_O01_VTRANS", "bhyp"))
+    haskey(ENV, "SCYTHE_O01_VMU") &&
+        (physical_params[:vapor_mu] = parse(Float64, ENV["SCYTHE_O01_VMU"]))
 
     # How many moments of the rain DSD to carry. Unset => the key is absent => 1, the
     # single-moment Ooyama closure, bit-identical. "2" appends the prognostic rain number
@@ -831,7 +839,9 @@ function o01_init!(model)
     # The ICs are stored as perturbations from Q̄_ss, so the bubble must be differenced
     # against the SAME Q̄_ss createModelTile will add back.
     if get(reference_state_options(), :consistent_qss_reference, false)
-        ref = Scythe.consistent_qss_reference(ref, z, column)
+        ref = Scythe.consistent_qss_reference(ref, z, column;
+            vapor_transform = Scythe.vapor_transform_mode(model.options),
+            vapor_mu = Scythe.vapor_mu(model.physical_params))
     end
 
     # Hydrostatic sanity: residual of the balanced reference on its own column
@@ -842,9 +852,14 @@ function o01_init!(model)
             "max hydrostatic residual = $(maximum(abs.(residual))) Pa/m")
 
     patch.physical .= 0.0
+    # The vapor slot holds the run's control variable (`options[:vapor_transform]`); the
+    # bubble's moistened vapor is written through `vapor_slot` in that convention.
     Scythe.moist_temperature_bubble_mc!(patch, gridpoints, ref;
                                         xc = 75.0e3, xr = 16.0e3,
-                                        zc = 500.0, zr = 3000.0, dT_max = 3.0)
+                                        zc = 500.0, zr = 3000.0, dT_max = 3.0,
+                                        vapor_transform =
+                                            Scythe.vapor_transform_mode(model.options),
+                                        vapor_mu = Scythe.vapor_mu(model.physical_params))
     Scythe.write_ics_csv(model.initial_conditions, patch, gridpoints)
 end
 
@@ -989,7 +1004,10 @@ function o01_init_nested!(models, topo)
                                                 get(m.physical_params, :condensate_mu, 1.0e-7),
                                             rain_transform =
                                                 Scythe.rain_transform_mode(m.options),
-                                            rain_mu = get(m.physical_params, :rain_mu, 1.0e-7))
+                                            rain_mu = get(m.physical_params, :rain_mu, 1.0e-7),
+                                            vapor_transform =
+                                                Scythe.vapor_transform_mode(m.options),
+                                            vapor_mu = Scythe.vapor_mu(m.physical_params))
         Scythe.write_ics_csv(m.initial_conditions, p, gpts)
     end
 end

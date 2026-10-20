@@ -249,7 +249,8 @@ gap (`Scythe.rho_v_reconcile`), so a residual read of a post-Stage-A file would 
 diagnostic in place of the field.
 """
 function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
-                  rain_transform::Symbol = :none, rain_mu = 1.0e-7)
+                  rain_transform::Symbol = :none, rain_mu = 1.0e-7,
+                  vapor_mu = Scythe.VAPOR_MU_DEFAULT)
     pbar = Springsteel.ref_pressure(ref)[:, 1]
     rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
     rho_tbar = Springsteel.ref_rho_t(ref)[:, 1]
@@ -269,9 +270,15 @@ function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
     rho_liq = rho_c .+ rho_r
     Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
     # The vapor is a prognostic slot; see the docstring for the pre-Stage-A fallback.
-    rho_v = "rho_v" in names(df) ?
-        df.rho_v .+ repeat(rho_tbar .- rho_dbar .- rho_cbar, ncols) :
-        rho_t .- rho_d .- rho_liq
+    # Under `options[:vapor_transform] = :bhyp` the column is the CONTROL variable `nu_v`
+    # (`Scythe.vapor_slot`), recovered exactly as the kernel does against bhyp of the same
+    # derived reference; `vapor_mu` must be the run's (`physical_params[:vapor_mu]`).
+    rho_vbar_d = rho_tbar .- rho_dbar .- rho_cbar
+    rho_v = "rho_v" in names(df) ? df.rho_v .+ repeat(rho_vbar_d, ncols) :
+            "nu_v" in names(df) ?
+                Scythe.ahyp.(df.nu_v .+ repeat(Scythe.bhyp.(rho_vbar_d, vapor_mu), ncols),
+                             vapor_mu) :
+            rho_t .- rho_d .- rho_liq
     return Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r
 end
 
