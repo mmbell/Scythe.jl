@@ -56,9 +56,15 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     #
     # The measurements the windows are built from, both --stage mc --grid rirk:
     #   quick (2 km / 250 m): peak 59.94, onset 23 min, max w 9.87,
-    #                         max rho_r 13.12, accum 2.500
+    #                         max rho_r 13.12, accum 2.500   (2026-07-29)
+    #   quick re-measured 2026-10-20 on e81e00e (EOS temperature, J0 cloud evaporation,
+    #                         energy partners, natural walls, MYNN water closure):
+    #                         peak 45.96, onset 23 min, max w 11.42, max rho_r 9.50, accum 3.02
+    #                         -- the peak-rain window is re-centered on it (author decision
+    #                         2026-10-20); the regression CSV quick_mc_rirk_final.csv is re-seeded.
     #   full  (500 m / 83 m): peak 121.88, onset 31 min, max w 17.29,
-    #                         max rho_r 14.76, accum 3.200
+    #                         max rho_r 14.76, accum 3.200   (2026-07-29; NOT re-run on e81e00e --
+    #                         the re-centered peak window will need the full value when it is)
     # The mc stage always takes the QUICK tolerance (load_targets), so each window
     # must span BOTH resolutions, and the resolution sensitivity is the same one
     # O01 reports in his own Dx = 1 vs 2 km comparison (Fig. 6: ~125 vs ~75
@@ -73,7 +79,7 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     # seeds "the solution moved" guards.
     "ocean_warm_bubble" => Dict{String,Tuple{Float64,Float64,Float64,String}}(),
     "o01_rainfall" => Dict(
-        "peak_rain_rate_gm2s" => (90.0, 35.0, 40.0, "re-seeded 2026-07-29; O01 Fig. 6 range 75-125"),
+        "peak_rain_rate_gm2s" => (46.0, 35.0, 40.0, "re-centered 2026-10-20 on e81e00e (quick 45.96); was 90 (2026-07-29); O01 Fig. 6 range 75-125"),
         "max_rho_r_gm3"       => (14.0, 4.0,  5.0,  "re-seeded 2026-07-29; O01 Figs. 4-6, 11 show ~4"),
         "max_w"               => (13.5, 4.0,  5.5,  "re-seeded 2026-07-29 (quick 9.9, full 17.3)"),
         "rain_onset_min"      => (27.0, 6.0,  8.0,  "re-seeded 2026-07-29; O01 Fig. 6 ~25-40 min"),
@@ -149,7 +155,7 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
         # cloud was ~70% number-less mass (FINDINGS §5e); tolerances kept.
         "peak_rain_rate_gm2s"   => (50.1, 25.0, 30.0, "seeded 2026-08-31 (Stage D final)"),
         "max_rho_r_gm3"         => (12.1, 3.5,  4.0,  "seeded 2026-08-31 (supercooled rain survives to melt)"),
-        "max_w"                 => (4.7,  3.0,  3.5,  "seeded 2026-08-31 (Stage D final)"),
+        "max_w"                 => (10.0, 3.0,  3.5,  "re-centered 2026-10-20 on e81e00e (quick 9.98); was 4.7 (Stage D final 2026-08-31)"),
         "rain_onset_min"        => (23.0, 6.0,  8.0,  "seeded 2026-08-31 (unchanged since 2026-08-20)"),
         "accum_rainfall_mm"     => (3.7,  1.2,  1.4,  "seeded 2026-08-31 (Stage D final)"),
         "max_ice_water_path_mm" => (2.56, 1.5,  1.8,  "seeded 2026-08-31 (live cloud, phantom mass gone)"),
