@@ -534,6 +534,9 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # incompatible flags and unsupported geometries error loudly here, before
     # any allocation (defined in exact_si.jl; a no-op when the option is off).
     validate_exact_si_options(model)
+    # ...and of the water-slot slaving (`options[:si_water_slots]`): a mixed vertical wall family
+    # across the slaved water slots is refused (src/si_water_slaving.jl).
+    validate_si_water_slots(model)
 
     # Horizontal-acoustic history channel, allocated when either the ADI sweep
     # or the exact 2-D solve is on (exact_si shares the hacdot staging and the
@@ -1290,8 +1293,11 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
         etp_prof = get_val_from(w1, :(collect(
             view(Scythe.ref_total_energy(mtile.ref_state), :, 1) .+
             view(Scythe.ref_pressure(mtile.ref_state), :, 1))))
+        # The slaved water slots' reference shares (`options[:si_water_slots]`), from the
+        # same worker's tile (empty under :none).
+        water = get_val_from(w1, :(Scythe.si_water_hsi_profiles(mtile)))
         hsd = create_horizontal_solve_data(patch, model, Pxi_prof,
-                                           rho_tprof, rho_dprof, etp_prof)
+                                           rho_tprof, rho_dprof, etp_prof; water = water)
         hsi_u_incr = SharedArray{Float64,2}((patch.params.iDim * patch.params.kDim, 6))
         xpatch = patch.ibasis.data[1, 1].mishPoints
         kDim = model.grid_params.kDim

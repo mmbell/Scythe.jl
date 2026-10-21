@@ -388,6 +388,7 @@ solver choices; leave alone unless you know why (boundary conditions live in `[b
 | `l_q_vertical` | float | `0.0` | filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical). |
 | `cfl_interval` | float | `0.0` | CFL report cadence [s]; 0 = `output.interval`, resolved at build. |
 | `temperature` | string (enum) | `"eos"` | the model temperature every consumer reads (microphysics, radiation, surface layer, boundary layer, output): `eos` = `p/(rho_d R_d + rho_v R_v)` from the prognostic pressure and vapor (default since 2026-10-14), `energy` = the closed-form total-energy retrieval, which reads the clipped condensate and warms by ~2.5 K per 1e-3 kg/m3 of clipped lobe. `E_t` stays prognostic either way; the output's `T_split` and `E_residual` measure the disagreement. |
+| `si_water_slots` | string (enum) | `"mass"` | which water slots the acoustic semi-implicit solve slaves to its mass flux (Stage 2 of the rho_t retirement, `src/si_water_slaving.jl`): `mass` (default: vapor, cloud, rain and the three ice masses take their vertical acoustic flux implicitly, `dnu_k' = -dtau (c_k phi_z + c_k,z phi)`, so the water moves with the dry air under the one AI2* integrator and `rho_d' + sum alpha_k nu_k'` advances exactly as `rho_t'` does), `all` (`mass` plus the rain number and the nine ice number/habit moments) or `none` (every water species takes its acoustic compression explicitly, as before 2026-10-20). Refused with a mixed vertical wall family across the slaved slots (the `d2`/`r1t1x` families leave the sedimenting slots natural at the ground; `[extra.options] si_water_mixed_walls = true` runs it to measure). |
 
 ### `[diagnostics]`
 
@@ -581,6 +582,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
 | `initial_conditions.balanced_vortex.profile` | `re87`, `rankine` |
 | `initial_conditions.method` | `balanced_vortex`, `temperature_noise`, `temperature_bubble`, `file` |
 | `numerics.positivity` | `auto`, `off` |
+| `numerics.si_water_slots` | `none`, `mass`, `all` |
 | `numerics.temperature` | `eos`, `energy` |
 | `output.formats` | `csv`, `netcdf`, `netcdf_raw` |
 | `output.netcdf_grid` | `regular` |
@@ -706,6 +708,8 @@ co2_ppm = 280.0
 | `sfc_stability` | bool | `physics.surface.stability` (refused in `[extra.options]`) | Monin-Obukhov stability correction (mc_surface_layer.jl, mynn_state.jl) |
 | `sfc_stability_iterations` | int |  | fixed-point iterations of the stability solve, >= 1 (mc_surface_layer.jl) |
 | `sfc_z0` | string (enum) | `physics.surface.roughness` (refused in `[extra.options]`) | neutral roughness model: :komori, :gfdl_v7, :charnock (mc_surface_layer.jl) |
+| `si_water_mixed_walls` | bool |  | run si_water_slots with a mixed vertical wall family across the slaved water slots, to measure it (refused otherwise) (si_water_slaving.jl) |
+| `si_water_slots` | string (enum) | `numerics.si_water_slots` (refused in `[extra.options]`) | water slots slaved to the acoustic mass flux: :none (library default), :mass (vapor, cloud, rain, ice masses) or :all (plus the number/habit moments) (si_water_slaving.jl, moist_compressible.jl, horizontal_si.jl, exact_si.jl) |
 | `solar` | string (enum) | `physics.radiation.solar` (refused in `[extra.options]`) | shortwave forcing: :none, :fixed, :diurnal (radiation_state.jl) |
 | `state_dependent_si` | bool | `numerics.state_dependent_si` (refused in `[extra.options]`) | vertical SI implicit coefficients from the current column state (moist_compressible.jl) |
 | `state_deviation` | float | `diagnostics.timestep_advisory.state_deviation` (refused in `[extra.options]`) | timestep advisory: convective-ceiling target delta (reference_state.jl) |

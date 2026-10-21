@@ -540,6 +540,7 @@ end
 - `l_q_horizontal::Float64` — filter length of the horizontal B-spline (x / r); 0 = inherit `l_q`.
 - `l_q_vertical::Float64` — filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical).
 - `cfl_interval::Float64` — CFL report cadence [s]; 0 = `output.interval`, resolved at build.
+- `si_water_slots::Symbol` — which water slots the acoustic semi-implicit solve slaves to its mass flux (Stage 2 of the rho_t retirement, `src/si_water_slaving.jl`): `mass` (default: vapor, cloud, rain and the three ice masses take their vertical acoustic flux implicitly, `dnu_k' = -dtau (c_k phi_z + c_k,z phi)`, so the water moves with the dry air under the one AI2* integrator and `rho_d' + sum alpha_k nu_k'` advances exactly as `rho_t'` does), `all` (`mass` plus the rain number and the nine ice number/habit moments) or `none` (every water species takes its acoustic compression explicitly, as before 2026-10-20). Refused with a mixed vertical wall family across the slaved slots (the `d2`/`r1t1x` families leave the sedimenting slots natural at the ground; `[extra.options] si_water_mixed_walls = true` runs it to measure).
 - `temperature::Symbol` — the model temperature every consumer reads (microphysics, radiation, surface layer, boundary layer, output): `eos` = `p/(rho_d R_d + rho_v R_v)` from the prognostic pressure and vapor (default since 2026-10-14), `energy` = the closed-form total-energy retrieval, which reads the clipped condensate and warms by ~2.5 K per 1e-3 kg/m3 of clipped lobe. `E_t` stays prognostic either way; the output's `T_split` and `E_residual` measure the disagreement.
 
 The filter lengths are separate because the two directions do different jobs: the
@@ -561,6 +562,7 @@ Base.@kwdef struct Numerics <: AbstractConfigSection
     l_q_vertical::Float64 = 0.0
     cfl_interval::Float64 = 0.0
     temperature::Symbol = :eos
+    si_water_slots::Symbol = :mass
 end
 
 """
@@ -733,7 +735,8 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (Radiation, :forcing)                      => RADIATION_FORCINGS,
     (HorizontalMixing, :scheme)                => HMIX_SCHEMES,
     (Numerics, :positivity)                    => POSITIVITY_MODES,
-    (Numerics, :temperature)                   => TEMPERATURE_CHOICES)
+    (Numerics, :temperature)                   => TEMPERATURE_CHOICES,
+    (Numerics, :si_water_slots)                => SI_WATER_SLOT_MODES)
 
 _join_path(path::AbstractString, f) = isempty(path) ? string(f) : string(path, ".", f)
 
@@ -823,6 +826,8 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :hydrostatic_reference    => (Bool, "discretely hydrostatic reference state (semiimplicit.jl)"),
     :state_dependent_si       => (Bool, "vertical SI implicit coefficients from the current column state (moist_compressible.jl)"),
     :exact_si                 => (Bool, "exact coupled semi-implicit acoustic solve, variant 1 (exact_si.jl, moist_compressible.jl)"),
+    :si_water_slots           => (Symbol, "water slots slaved to the acoustic mass flux: :none (library default), :mass (vapor, cloud, rain, ice masses) or :all (plus the number/habit moments) (si_water_slaving.jl, moist_compressible.jl, horizontal_si.jl, exact_si.jl)"),
+    :si_water_mixed_walls     => (Bool, "run si_water_slots with a mixed vertical wall family across the slaved water slots, to measure it (refused otherwise) (si_water_slaving.jl)"),
     :temperature              => (Symbol, "model temperature: :eos = p/(rho_d R_d + rho_v R_v) (default) or :energy = the closed-form total-energy retrieval (moist_compressible.jl, radiation.jl, semiimplicit.jl, netcdf_output.jl)"),
     :exact_si_ax0             => (Bool, "exact_si axisym: experimental axis-row treatment of the radial operator (exact_si.jl)"),
     :exact_si_zero_x          => (Bool, "exact_si diagnostic: zero the horizontal increments (exact_si.jl)"),
@@ -1072,6 +1077,7 @@ const OWNED_OPTION_KEYS = Dict{Symbol,String}(
     :wall_bc_tau               => "numerics.wall_bc_tau",
     :cfl_interval              => "numerics.cfl_interval",
     :temperature               => "numerics.temperature",
+    :si_water_slots            => "numerics.si_water_slots",
     :output_formats            => "output.formats",
     :netcdf_grid               => "output.netcdf_grid",
     :netcdf_derivatives        => "output.netcdf_derivatives",

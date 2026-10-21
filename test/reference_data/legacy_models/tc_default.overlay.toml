@@ -25,3 +25,4 @@ sedimentation_lid = "wall"           # legacy TC left rain on the d2 wall condit
 [numerics]
 wall_bc_tau = "inf"                  # inert under d2; the legacy value
 temperature = "energy"               # legacy: T from the total-energy retrieval (pre-2026-10-14)
+si_water_slots = "none"              # legacy: every water species took its acoustic compression explicitly (pre-Stage 2)

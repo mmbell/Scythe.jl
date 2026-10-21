@@ -81,6 +81,13 @@ struct HorizontalSolveData{DU, DP, FA, FB}
     acoef::Vector{Float64}  # (b_iDim)
     tempcb::Matrix{Float64} # (b_kDim, iDim) forward-transform staging
     zwork::Vector{Float64}  # (kDim) ∂z work column for the w-history correction
+    # The slaved water slots (`options[:si_water_slots]`, src/si_water_slaving.jl): the
+    # referenced water slots and their reference shares s_k(z_k) = ν̄_k/ρ̄_w (kDim × n). Their
+    # increments split the anchor's water increment δρ_t − δρ_d (design option (iii), exact
+    # for these z-only coefficients). Empty under `:none`.
+    wslots::Vector{Int}
+    wshare::Matrix{Float64}
+    wlev::Matrix{Float64}   # (iDim, kDim) one water slot's correction plane
 end
 
 # Correction plane order in `dlev` (and the write-back loop): the var each
@@ -97,7 +104,8 @@ them from a worker's `ModelTile` (`model_loop`) or a local one (tests). XZ
 """
 function create_horizontal_solve_data(patch::AbstractGrid, model::ModelParameters,
         Pxi_prof::AbstractVector{Float64}, rho_tbar::AbstractVector{Float64},
-        rho_dbar::AbstractVector{Float64}, etp_bar::AbstractVector{Float64})
+        rho_dbar::AbstractVector{Float64}, etp_bar::AbstractVector{Float64};
+        water = nothing)
 
     model.grid_params.geometry == "RiRk" || error(
         "options[:horizontal_semiimplicit] is only implemented for the XZ RiRk " *
@@ -131,12 +139,26 @@ function create_horizontal_solve_data(patch::AbstractGrid, model::ModelParameter
     fact = build_set(1.25 * model.ts)
     fact_first = build_set(0.5 * model.ts)
 
+    # The slaved water slots: `water = si_water_hsi_profiles(mtile)` from a tile of this patch
+    # (the caller has the tile; this function does not). Required when the model slaves them.
+    if si_water_slots_mode(model.options) !== :none && water === nothing
+        error("options[:si_water_slots] = :$(si_water_slots_mode(model.options)) under the " *
+              "horizontal SI: pass create_horizontal_solve_data(...; water = " *
+              "Scythe.si_water_hsi_profiles(mtile)) so the sweep can split the anchor's water " *
+              "increment over the slaved water slots")
+    end
+    wslots, wshare = water === nothing ? (Int[], zeros(kDim, 0)) : water
+    isempty(wslots) && (wshare = zeros(kDim, 0))
+    size(wshare) == (kDim, length(wslots)) ||
+        error("create_horizontal_solve_data: the water share matrix must be kDim x n")
+
     return HorizontalSolveData(u_index, p_index, rhod_index, rhot_index, et_index,
         du, dp, (_is_dirichlet(bcl), _is_dirichlet(bcr)), fact, fact_first,
         collect(Pxi_prof), collect(rho_tbar), collect(rho_dbar), collect(etp_bar),
         zeros(iDim, kDim), zeros(iDim, kDim), zeros(iDim, kDim, 5),
         zeros(iDim, b_kDim), zeros(iDim), zeros(b_iDim), zeros(b_iDim),
-        zeros(b_kDim, iDim), zeros(kDim))
+        zeros(b_kDim, iDim), zeros(kDim),
+        collect(Int, wslots), Matrix{Float64}(wshare), zeros(iDim, kDim))
 end
 
 # Read chain: patch B coefficients → values (or ∂x, via `deriv`) at the physical
@@ -277,6 +299,20 @@ function horizontal_si_correct!(spectral::AbstractMatrix{Float64}, patch::Abstra
     _hsi_add_increment!(spectral, hsd, patch, hsd.rhod_index, view(dlev, :, :, 3))
     _hsi_add_increment!(spectral, hsd, patch, hsd.rhot_index, view(dlev, :, :, 4))
     _hsi_add_increment!(spectral, hsd, patch, hsd.et_index,   view(dlev, :, :, 5))
+    # The slaved water slots (`options[:si_water_slots]`): the anchor's water increment
+    # δρ_t − δρ_d split by the reference shares — one stored δρ_w plane, design option (iii),
+    # exact here because the horizontal coefficients are z-only, and Σ α_k δν_k = δρ_t − δρ_d
+    # to rounding. An all-zero plane (rest) is not added, so no coefficient changes sign.
+    wlev = hsd.wlev
+    for (n, ws) in enumerate(hsd.wslots)
+        anyw = false
+        @inbounds for k in 1:kDim, i in 1:iDim
+            x = hsd.wshare[k, n] * (dlev[i, k, 4] - dlev[i, k, 3])
+            wlev[i, k] = x
+            anyw |= x != 0.0
+        end
+        anyw && _hsi_add_increment!(spectral, hsd, patch, ws, wlev)
+    end
 
     # Per-point feeds for the workers, (i−1)·kDim + k row order. Planes 1–5:
     # the applied increments (X^{n+1} − X*)/Δτ of the (u, p, ρ_d, ρ_t, E_t)
@@ -342,6 +378,10 @@ function horizontal_si_history!(mtile::ModelTile, colstart::Int64, colend::Int64
         end
         dot_nm1 .= dot_n
     end
+    # The slaved water slots' horizontal histories (`options[:si_water_slots]`).
+    siw = si_water_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
+    siw.on && _siw_hsi_history!(mtile.var_np1, mtile.hacdot_n, mtile.hacdot_nm1, colstart,
+                                colend, siw, t, ts, am2)
     # Factorization cross-term compensation: +ν²·G on the w predictor before
     # the vertical solve (G lagged one step through the increment feed; zero
     # at t == 1). See horizontal_si_correct!'s plane-6 comment and the
@@ -407,6 +447,14 @@ function horizontal_si_load_increment!(mtile::ModelTile, incr::AbstractMatrix{Fl
             dst = view(mtile.hacdot_n, :, vars[var])
             copyto!(dst, view(incr, rows, plane))
             t == 2 && copyto!(view(mtile.hacdot_nm1, :, vars[var]), dst)
+        end
+        # The slaved water slots: the stored δρ_w plane (ρ_t minus ρ_d) split by the shares.
+        siw = si_water_set(opts, mtile.model.physical_params, mtile.mc_slots)
+        if siw.on
+            rc = Springsteel.ref_rho_c(mtile.ref_state)
+            _siw_hsi_stored!(mtile.hacdot_n, mtile.hacdot_nm1, incr, rows, siw, t,
+                             mc_nu_vbar(mtile), mc_nu_vbar_z(mtile), view(rc, :, 1),
+                             view(rc, :, 2), mtile.model.grid_params.kDim)
         end
     end
     # Cross-term compensation field G (plane 6), parked in hacdot_n's otherwise

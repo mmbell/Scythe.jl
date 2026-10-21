@@ -81,6 +81,9 @@ const IMPLICIT_DEFAULTS = Dict{String,Any}(
     # The vapor control variable (Stage 1 of the rho_t retirement): the library default is
     # :none, the density vapor every legacy driver ran; the base overlays pin it.
     "options.vapor_transform"          => ":none",   # src/moist_compressible.jl vapor_transform_mode
+    # The water-slot SI slaving (Stage 2 of the rho_t retirement): the library default is
+    # :none, the explicit water acoustics every legacy driver ran; the base overlays pin it.
+    "options.si_water_slots"           => ":none",   # src/si_water_slaving.jl si_water_slots_mode
     "physical_params.Khdiff_water"     => 0.0,       # src/moist_compressible.jl:6773
     "physical_params.Pr_t"             => 1.0,       # src/moist_compressible.jl:6770
     "physical_params.Sc_t"             => 1.0)       # src/moist_compressible.jl:6774
@@ -198,7 +201,8 @@ const EXPECTED_DELTAS = Dict(
             "options.sfc_stability" => (missing, "true"),
             "options.wall_bc_tau" => ("Inf", "300.0"),
             "options.temperature" => (missing, ":eos"),
-            "options.vapor_transform" => (missing, ":bhyp"))),
+            "options.vapor_transform" => (missing, ":bhyp"),
+            "options.si_water_slots" => (missing, ":mass"))),
         bc_changed = merge(ceq_lid([LID_SCALARS_NU; "v"; "nu_c"]), VAPOR_RENAMED_BC,
                            Dict("BCT.nu_r" => (BC_D2, BC_NATURAL))),
         renamed = Dict("rho_v" => "nu_v"),
@@ -211,7 +215,8 @@ const EXPECTED_DELTAS = Dict(
             "options.hydrostatic_reference" => (missing, "true"),
             "options.state_dependent_si" => (missing, "true"),
             "options.temperature" => (missing, ":eos"),
-            "options.vapor_transform" => (missing, ":bhyp")),
+            "options.vapor_transform" => (missing, ":bhyp"),
+            "options.si_water_slots" => (missing, ":mass")),
         bc_changed = merge(ceq_lid([LID_SCALARS_NU; "nu_c"; "rho_e"]), VAPOR_RENAMED_BC),
         renamed = Dict("rho_v" => "nu_v"),
         added = Dict{String,Int}(), templates = Dict{String,Any}()),
@@ -237,7 +242,8 @@ const EXPECTED_DELTAS = Dict(
             "grid_params.positivity.rho_r.i" => (0.0, missing),
             "grid_params.positivity.rho_r.k" => (0.0, missing),
             "options.temperature" => (missing, ":eos"),
-            "options.vapor_transform" => (missing, ":bhyp")),
+            "options.vapor_transform" => (missing, ":bhyp"),
+            "options.si_water_slots" => (missing, ":mass")),
         # nu_c is the renamed rho_c: its lid goes natural with the rest of the family.
         bc_changed = merge(ceq_lid(LID_SCALARS_NU), VAPOR_RENAMED_BC,
                            Dict{String,Any}("BCB.nu_c" => (missing, BC_NATURAL), "BCT.nu_c" => (missing, BC_NATURAL))),

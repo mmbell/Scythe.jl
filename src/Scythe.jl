@@ -143,6 +143,7 @@ include("mc_boundary_layer.jl")
 # exactly why it is NOT one of the three leaf mynn_* files (D11).
 include("mc_mynn_bl.jl")
 include("moist_compressible.jl")
+include("si_water_slaving.jl")   # Stage 2 of the rho_t retirement: nu-flux SI slaving of the water slots
 # The microphysics -> cloud-optics conversion (Stage S3a) needs `_ice_effective`
 # (moist_compressible.jl) and ISHMAEL_NU (ishmael.jl), and radiation.jl's driver calls
 # it directly, so it sits between the two.

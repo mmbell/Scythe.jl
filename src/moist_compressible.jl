@@ -9877,6 +9877,27 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @turbo expdot[colstart:colend, IS.i3_c] .= @. ADV + FORCING
     end
 
+    # ── The slaved WATER slots (`options[:si_water_slots]`, Stage 2 of the rho_t retirement) ──
+    # `_siw_driver!` (src/si_water_slaving.jl) stages the slaved slots' AI2* histories
+    # `impdot[k] = −(c_k φ_z + c_{k,z} φ)` from the SAME `imp_phi_z`/`phi_n` fit as the dry legs
+    # above (and, on the state-dependent path, restages `impdot[2]` with `c_d = ρ_d/ρ̂^w`), and
+    # adds the solve's linear operator back to their explicit tendencies (and the horizontal
+    # remainder/history under `hsi_like`) — HERE, after every water slot's `expdot` row exists.
+    # Behind a dispatch barrier and a non-inlined gate, deliberately: `mc_driver!`'s first-call
+    # compile sits at the LLVM cliff. Measured on the axisymmetric Louis tile (interleaved A/B
+    # against be03fe9, 2026-10-20): a DIRECT call here cost +75 s of first-call compile
+    # (153 -> 228 s), the barrier behind the inlined `si_water_slots_mode` test still +45 s,
+    # the barrier behind `_siw_enabled` (noinline) nothing (191/194 vs 194/196 s); XZ and SLR
+    # unchanged throughout. The price is one dynamic dispatch (10 boxed-argument allocations)
+    # per column, paid only when the slaving is on; under the library default `:none` the call
+    # is never made and the column allocates exactly what it did.
+    _siw_enabled(model.options) &&
+        Base.inferencebarrier(_siw_driver!)(expdot, impdot, mtile.hacdot_n, S.ADV, imp_c_d,
+            imp_c_d_z, imp_phi_z, phi_n, geom, uv, vv, r, colstart, sd_si, hsi_like,
+            model.options, model.physical_params, mtile.mc_slots, grid.physical, w, w_z,
+            rho_t, rho_t_z, rho_d, rho_d_z, rho_tbar, rho_tbar_z, rho_dbar, rho_dbar_z,
+            mc_nu_vbar(mtile), mc_nu_vbar_z(mtile), rho_cbar, rho_cbar_z)
+
     # ── The MYNN TKE density ρ_e = ρ_t·e [J/m³] (the appended slot, options[:mynn]) ──
     #
     # The same continuity form every other TOTAL in the set takes, with the closure's
@@ -11651,6 +11672,12 @@ slaved to the flux in flux form: `rho_t' -= Δτ ∂z φ` (conserves `∫rho_t'`
 `rho_d' -= Δτ ∂z(ρ̄_d/ρ̄_t φ)`, `E_t' -= Δτ ∂z((Ē_t+p̄)/ρ̄_t φ)`. Because the history
 staging mirrors this operator chain exactly, no part of the linear acoustic operator
 is left under explicit weights — the scheme has no vertical-acoustic Courant limit.
+
+Under `options[:si_water_slots] = :mass | :all` (src/si_water_slaving.jl) the water slots are
+slaved to the same φ in flux form, `ν_k' −= Δτ (c_k φ_z + c_{k,z} φ)`, with their AI2*
+histories applied here too, so that `Δ(ρ_d' + Σ α_k ν_k') = −Δτ ∂z φ` (the slot-3 increment)
+to rounding; on the state-dependent path ρ_d's coefficient then shares their denominator,
+`ρ_d/(ρ_d + Σ α_k ν_k)`. The library default `:none` is the code without them, bitwise.
 """
 function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64;
         apply_histories::Bool=true)
@@ -11710,6 +11737,7 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     # rho_tbar` union of Vector and SubArray boxes every broadcast it touches,
     # which showed up as per-column allocations in the flag-OFF path.)
     Pxi_vec = sd_si ? S.sd_pxi : Pxi_bar
+
 
     # Off-centered AI2* history terms (Durran & Blossey 2012). The AB3 predictor carries
     # only the acoustic REMAINDER, so the linear terms enter purely here: the explicit
@@ -11823,6 +11851,16 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     end
     view(mtile.var_np1,colstart:colend,et_index) .=
         et_nstar .- (ts_term .* ((c_e .* phi_z) .+ (c_e_z .* phi)))
+
+    # The slaved WATER slots (`options[:si_water_slots]`; src/si_water_slaving.jl): their AI2*
+    # histories, and `ν_k' −= Δτ (c_k φ_z + c_{k,z} φ)` so that Δ(ρ_d' + Σ α_k ν_k') = −Δτ φ_z, the
+    # slot-3 increment above, to rounding (on the state-dependent path ρ_d is re-advanced with
+    # c_d = ρ_d/ρ̂^w). ONE call, for the compile cliff; a no-op under the library default `:none`.
+    _siw_solve!(mtile.var_np1, mtile.impdot_n, mtile.impdot_nm1, colstart, colend, t, ts,
+                ts_term, apply_histories, sd_si, phi, phi_z, mtile.tile.physical, S.rho_d,
+                S.rho_d_z, c_d, c_d_z, rhod_nstar, rhod_index, mtile.model.options,
+                mtile.model.physical_params, mtile.mc_slots, mc_nu_vbar(mtile),
+                mc_nu_vbar_z(mtile), Springsteel.ref_rho_c(mtile.ref_state))
 
     # Store the applied implicit w increment as the next step's w history (see the
     # staging comment in mc_driver!): the exact operator the Helmholtz elimination

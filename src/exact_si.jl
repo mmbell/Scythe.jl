@@ -555,6 +555,11 @@ function apply_acoustic_histories!(mtile::ModelTile, colstart::Int64, colend::In
         end
         dot_nm1 .= dot_n
     end
+    # The slaved water slots' vertical histories (`options[:si_water_slots]`; exact_si is
+    # reference-linear, so only the referenced vapor/cloud slots carry one).
+    siw = si_water_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
+    siw.on && _siw_histories!(mtile.var_np1, mtile.impdot_n, mtile.impdot_nm1, colstart,
+                              colend, siw, false, t, ts)
     return nothing
 end
 
@@ -586,6 +591,20 @@ function exact_si_apply_column!(mtile::ModelTile, colstart::Int64, colend::Int64
         view(mtile.var_np1, colstart:colend, vars["rho_d"]) .+= view(hfields, rows, 4)
         view(mtile.var_np1, colstart:colend, vars["rho_t"]) .+= view(hfields, rows, 5)
         view(mtile.var_np1, colstart:colend, vars["E_t"]) .+= view(hfields, rows, 6)
+        # The slaved water slots (`options[:si_water_slots]`): the anchor's water increment
+        # (plane 5 − plane 4) split by the reference shares, with the flux-form s_z correction
+        # (src/si_water_slaving.jl `_siw_xsi_apply!`), after the w plane so φ^{n+1} = ρ̄_t w^{n+1}.
+        siw = si_water_set(model.options, model.physical_params, mtile.mc_slots)
+        if siw.on
+            rc = Springsteel.ref_rho_c(mtile.ref_state)
+            _siw_xsi_apply!(mtile.var_np1, hfields, rows, colstart, siw, ts_term, w_index,
+                            view(ref_rho_t(mtile.ref_state), :, 1),
+                            view(ref_rho_t(mtile.ref_state), :, 2),
+                            view(ref_rho_d(mtile.ref_state), :, 1),
+                            view(ref_rho_d(mtile.ref_state), :, 2),
+                            mc_nu_vbar(mtile), mc_nu_vbar_z(mtile),
+                            view(rc, :, 1), view(rc, :, 2))
+        end
         # RLR: apply the tangential-wind acoustic increment (plane 7). The v leg
         # is integrated θ = 1 (implicit-only, no stored explicit history) — the
         # self-consistent partner of the +n²/r² operator term (exact_si_rlr.jl);
