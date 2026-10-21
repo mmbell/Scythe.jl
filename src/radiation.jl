@@ -1184,7 +1184,9 @@ function radiation_reference_column!(work::RadiationWork, mtile::ModelTile,
 
     pbar = view(ref_pressure(refstate), :, 1)
     rho_dbar = view(ref_rho_d(refstate), :, 1)
-    rho_tbar = view(ref_rho_t(refstate), :, 1)
+    # the total-density reference the driver reads (the derived ρ̄_t^w under
+    # `options[:water_anchor] = :derived`; `mc_rho_tbar_ref`)
+    rho_tbar = view(mc_rho_tbar_ref(mtile), :, 1)
     E_tbar = view(ref_total_energy(refstate), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(refstate), :, 1)
     rho_vbar = mtile.mc_ref_diag.rho_vbar
@@ -1344,10 +1346,18 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
 
     pbar = view(ref_pressure(refstate), :, 1)
     rho_dbar = view(ref_rho_d(refstate), :, 1)
-    rho_tbar = view(ref_rho_t(refstate), :, 1)
+    # the total-density reference the driver reads (the derived ρ̄_t^w under
+    # `options[:water_anchor] = :derived`; `mc_rho_tbar_ref`)
+    rho_tbar = view(mc_rho_tbar_ref(mtile), :, 1)
     E_tbar = view(ref_total_energy(refstate), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(refstate), :, 1)
     rho_vbar = mtile.mc_ref_diag.rho_vbar
+    # The derived water anchor: the column's ρ_t is `ρ_d + Σ α_k ν_k` of its own slots.
+    wad = water_anchor_mode(model.options) === :derived
+    wset = water_anchor_set(model.options, model.physical_params, slots)
+    rho_cbar_zv = view(Springsteel.ref_rho_c(refstate), :, 2)
+    nu_vbar_z = mc_nu_vbar_z(mtile)
+    zs_w = siw_zslot(phys)
     # The vapor slot's control variable (`vapor_transform_mode`): every vapor read below is
     # `recover_rho_v` against `nu_vbar` (≡ `rho_vbar` under `:none`, bit for bit).
     nu_vbar = mc_nu_vbar(mtile)
@@ -1424,7 +1434,9 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
     @inbounds for k in 1:n
         p = pp[k] + pbar[k]
         rho_d = rho_dp[k] + rho_dbar[k]
-        rho_t = rho_tp[k] + rho_tbar[k]
+        rho_t = wad ? rho_d + first(_siw_W(phys, colstart + k - 1, zs_w, k, wset,
+                                           nu_vbar, nu_vbar_z, rho_cbar, rho_cbar_zv)) :
+                      rho_tp[k] + rho_tbar[k]
         E_t = E_tp[k] + E_tbar[k]
         rho_v = vtrans === :none ? rho_vp[k] + rho_vbar[k] :
                                    recover_rho_v(rho_vp[k], nu_vbar[k], vtrans, vmu)

@@ -49,7 +49,11 @@ function build_reference_state(cfg::RunConfig, patch, gp;
     cfg.reference_state.consistent_qss &&
         (ref = consistent_qss_reference(ref, z, column; temperature = cfg.numerics.temperature,
                                         vapor_transform = cfg.physics.microphysics.vapor_transform,
-                                        vapor_mu = cfg.physics.microphysics.vapor_mu))
+                                        vapor_mu = cfg.physics.microphysics.vapor_mu,
+                                        water_anchor = cfg.numerics.water_anchor,
+                                        condensate_transform =
+                                            cfg.physics.microphysics.condensate_transform,
+                                        condensate_mu = cfg.physics.microphysics.condensate_mu))
     println("Reference: sounding = $(basename(sounding)), sfc p = " *
             "$(round(Springsteel.ref_pressure(ref)[1, 1] / 100.0, digits = 2)) hPa " *
             "(hydrostatic = $hydro, consistent_qss = $(cfg.reference_state.consistent_qss))")

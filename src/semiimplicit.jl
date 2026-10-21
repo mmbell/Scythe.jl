@@ -479,7 +479,14 @@ function build_reference_state(model::ModelParameters, z_values::Vector{Float64}
                                                  temperature = temperature_mode(model.options),
                                                  vapor_transform =
                                                      vapor_transform_mode(model.options),
-                                                 vapor_mu = vapor_mu(model.physical_params))
+                                                 vapor_mu = vapor_mu(model.physical_params),
+                                                 water_anchor =
+                                                     water_anchor_mode(model.options),
+                                                 condensate_transform =
+                                                     condensate_transform_mode(model.options),
+                                                 condensate_mu = Float64(get(
+                                                     model.physical_params, :condensate_mu,
+                                                     1.0e-7)))
         end
     elseif (model.options[:exact_reference_state])
         ref_state = physical_ref ?
@@ -537,6 +544,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # ...and of the water-slot slaving (`options[:si_water_slots]`): a mixed vertical wall family
     # across the slaved water slots is refused (src/si_water_slaving.jl).
     validate_si_water_slots(model)
+    validate_water_anchor(model)
 
     # Horizontal-acoustic history channel, allocated when either the ADI sweep
     # or the exact 2-D solve is on (exact_si shares the hacdot staging and the
@@ -1022,10 +1030,13 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         # own wall derivative.
         gridTransform!(patch)
         if mc_wall_bc_active(patch)
-            update_mc_wall_bc!(patch, patch.physical)
+            update_mc_wall_bc!(patch, patch.physical; anchor = _mc_wall_anchor(model))
             gridTransform!(patch)
         end
         vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
+        # The derived water anchor's shadow starts AS the derived total: a checkpoint's slot 3
+        # carries the old run's partition gap (`init_water_anchor_shadow!`).
+        init_water_anchor_shadow!(patch, model)
     else
         _check_csv_vapor_name(model.initial_conditions, patch.params.vars)
         read_physical_grid(model.initial_conditions, patch)
@@ -1038,13 +1049,19 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         # is read from; rho_t' at the wall is insensitive to p's own condition, so
         # one iteration suffices.
         if mc_wall_bc_active(patch)
-            update_mc_wall_bc!(patch, patch.physical)
+            update_mc_wall_bc!(patch, patch.physical; anchor = _mc_wall_anchor(model))
             spectralTransform!(patch)
             gridTransform!(patch)
         end
+        init_water_anchor_shadow!(patch, model)
     end
     return patch
 end
+
+# The derived water anchor's member set for `update_mc_wall_bc!` (`nothing` outside the
+# moist-compressible sets, where the wall condition is never active).
+_mc_wall_anchor(model) = uses_pressure_reference(model.equation_set) ?
+    water_anchor_set(model.options, model.physical_params, mc_slots(model)) : nothing
 
 """
     _check_csv_vapor_name(path, vars)
@@ -1288,7 +1305,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
             "(pressure-reference) equation set")
         w1 = workerids[1]
         Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
-        rho_tprof = get_val_from(w1, :(collect(view(Scythe.ref_rho_t(mtile.ref_state), :, 1))))
+        rho_tprof = get_val_from(w1, :(collect(view(Scythe.mc_rho_tbar_ref(mtile), :, 1))))
         rho_dprof = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1))))
         etp_prof = get_val_from(w1, :(collect(
             view(Scythe.ref_total_energy(mtile.ref_state), :, 1) .+
@@ -1320,7 +1337,7 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     if xsi
         w1 = workerids[1]
         Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
-        rho_t2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_t(mtile.ref_state), :, 1:2))))
+        rho_t2 = get_val_from(w1, :(collect(view(Scythe.mc_rho_tbar_ref(mtile), :, 1:2))))
         rho_d2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1:2))))
         etp2 = get_val_from(w1, :(collect(
             view(Scythe.ref_total_energy(mtile.ref_state), :, 1:2) .+
@@ -1544,7 +1561,8 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         # tau = Inf (the shipped TC setting) freezes the wall data, so the whole
         # update is a no-op scaled by zero — skip it rather than redo the i-basis
         # fit, which allocates, on every step of every tile.
-        relax > 0.0 && update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax)
+        relax > 0.0 && update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax,
+                                          anchor = _mc_wall_anchor(mtile.model))
     end
 
     # Transform to local physical tile
@@ -1557,7 +1575,8 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     # state (relax = 1: this is an initialization, not a tracking update) and
     # redo the transform. Costs one extra tileTransform! on step 1 only.
     if t == 1 && wall_bc
-        update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax = 1.0)
+        update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax = 1.0,
+                           anchor = _mc_wall_anchor(mtile.model))
         tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
     end
 
@@ -2507,9 +2526,13 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
     vars = mtile.model.grid_params.vars
     kDim = mtile.model.grid_params.kDim
     rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
-    rho_tbar = view(ref_rho_t(mtile.ref_state), :, 1)
+    # the total density the model reads: slot 3 against Springsteel's ρ̄_t, or the derived
+    # ρ_d + Σ α_k ν_k against ρ̄_t^w under `options[:water_anchor] = :derived`
+    rho_tbar = view(mc_rho_tbar_ref(mtile), :, 1)
     rd = view(mtile.tile.physical, :, vars["rho_d"], 1)
     rt = view(mtile.tile.physical, :, vars["rho_t"], 1)
+    wad = water_anchor_mode(mtile.model.options) === :derived
+    wset = water_anchor_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
     min_frac = Inf
     min_i = 1
     min_tfrac = Inf
@@ -2567,12 +2590,13 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
             min_frac = frac
             min_i = i
         end
-        tfrac = rt[i] / rho_tbar[k] + 1.0
+        rti = wad ? anchor_rho_tp(rd[i], anchor_Wp(phys, i, 1, wset)) : rt[i]
+        tfrac = rti / rho_tbar[k] + 1.0
         if tfrac < min_tfrac
             min_tfrac = tfrac
             min_ti = i
         end
-        w = (rt[i] + rho_tbar[k]) - (rd[i] + rho_dbar[k])
+        w = (rti + rho_tbar[k]) - (rd[i] + rho_dbar[k])
         if w < min_w
             min_w = w
             min_wi = i
@@ -2588,7 +2612,7 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
             max_wi = i
         end
         rho_dk = rd[i] + rho_dbar[k]
-        rho_tk = rt[i] + rho_tbar[k]
+        rho_tk = rti + rho_tbar[k]
         vk = has_v ? vvv[i] : 0.0
         ke = 0.5 * ((uu[i] * uu[i]) + (vk * vk) + (ww[i] * ww[i]))
         M = (pp[i] + pbar[k]) + (etp[i] + E_tbar[k]) -
@@ -2635,7 +2659,9 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
                 (min_frac < 0.5 ? "  << LOW" : ""))
         println("  rho_t trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
                 "min rho_t/ref=$(round(min_tfrac; digits=4)) " *
-                "(rho_t=$(round(rt[min_ti] + rho_tbar[mod1(min_ti, kDim)]; sigdigits=4)), " *
+                "(rho_t=$(round((wad ? anchor_rho_tp(rd[min_ti], anchor_Wp(phys, min_ti, 1, wset)) :
+                                       rt[min_ti]) + rho_tbar[mod1(min_ti, kDim)];
+                                 sigdigits=4)), " *
                 "ref=$(round(rho_tbar[mod1(min_ti, kDim)]; sigdigits=4))) " *
                 "at $(loc(min_ti))" *
                 (min_tfrac < 0.5 ? "  << LOW" : ""))

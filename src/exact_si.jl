@@ -598,8 +598,8 @@ function exact_si_apply_column!(mtile::ModelTile, colstart::Int64, colend::Int64
         if siw.on
             rc = Springsteel.ref_rho_c(mtile.ref_state)
             _siw_xsi_apply!(mtile.var_np1, hfields, rows, colstart, siw, ts_term, w_index,
-                            view(ref_rho_t(mtile.ref_state), :, 1),
-                            view(ref_rho_t(mtile.ref_state), :, 2),
+                            view(mc_rho_tbar_ref(mtile), :, 1),
+                            view(mc_rho_tbar_ref(mtile), :, 2),
                             view(ref_rho_d(mtile.ref_state), :, 1),
                             view(ref_rho_d(mtile.ref_state), :, 2),
                             mc_nu_vbar(mtile), mc_nu_vbar_z(mtile),

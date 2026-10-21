@@ -389,6 +389,7 @@ solver choices; leave alone unless you know why (boundary conditions live in `[b
 | `cfl_interval` | float | `0.0` | CFL report cadence [s]; 0 = `output.interval`, resolved at build. |
 | `temperature` | string (enum) | `"eos"` | the model temperature every consumer reads (microphysics, radiation, surface layer, boundary layer, output): `eos` = `p/(rho_d R_d + rho_v R_v)` from the prognostic pressure and vapor (default since 2026-10-14), `energy` = the closed-form total-energy retrieval, which reads the clipped condensate and warms by ~2.5 K per 1e-3 kg/m3 of clipped lobe. `E_t` stays prognostic either way; the output's `T_split` and `E_residual` measure the disagreement. |
 | `si_water_slots` | string (enum) | `"mass"` | which water slots the acoustic semi-implicit solve slaves to its mass flux (Stage 2 of the rho_t retirement, `src/si_water_slaving.jl`): `mass` (default: vapor, cloud, rain and the three ice masses take their vertical acoustic flux implicitly, `dnu_k' = -dtau (c_k phi_z + c_k,z phi)`, so the water moves with the dry air under the one AI2* integrator and `rho_d' + sum alpha_k nu_k'` advances exactly as `rho_t'` does), `all` (`mass` plus the rain number and the nine ice number/habit moments) or `none` (every water species takes its acoustic compression explicitly, as before 2026-10-20). Refused with a mixed vertical wall family across the slaved slots (the `d2`/`r1t1x` families leave the sedimenting slots natural at the ground; `[extra.options] si_water_mixed_walls = true` runs it to measure). |
+| `water_anchor` | string (enum) | `"derived"` | what every reader takes as the total density (Stage 3 of the rho_t retirement, `src/si_water_slaving.jl` `water_anchor_mode`): `derived` (default: `rho_t = rho_d + sum_k alpha_k nu_k` over the water-mass slots, alpha = 2 transformed / 1 density, with the reference `rho_tbar_w = rho_dbar + sum alpha_k nu_kbar`; the vapor reconciliation nudge is gone, the vapor is the nu-space closure of every exchange, and slot 3 is a passive shadow of the old linear `rho_t` whose gap the census reports) or `slot` (the prognostic slot 3 is the total density, as before 2026-10-21). `physical_params` `Kvdiff_water > 0` is refused under `derived`. |
 
 ### `[diagnostics]`
 
@@ -584,6 +585,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
 | `numerics.positivity` | `auto`, `off` |
 | `numerics.si_water_slots` | `none`, `mass`, `all` |
 | `numerics.temperature` | `eos`, `energy` |
+| `numerics.water_anchor` | `slot`, `derived` |
 | `output.formats` | `csv`, `netcdf`, `netcdf_raw` |
 | `output.netcdf_grid` | `regular` |
 | `physics.boundary_layer.mynn_fidelity` | a fidelity name, `fortran` or `scythe`, or a comma list of deviations from `gtr_local`, `K_interface`, `sqfac1`, `pdk1`, `exner_single`, `rmol_sfc`, `flux_clip` |
@@ -723,6 +725,7 @@ co2_ppm = 280.0
 | `vertical_mixing` | bool | `physics.boundary_layer.scheme` (refused in `[extra.options]`) | legacy primitive equations: vertical mixing on/off (primitive_equations.jl) |
 | `w_max` | float | `diagnostics.timestep_advisory.w_max` (refused in `[extra.options]`) | timestep advisory: expected peak vertical wind [m/s] (reference_state.jl) |
 | `wall_bc_tau` | float | `numerics.wall_bc_tau` (refused in `[extra.options]`) | relaxation timescale [s] of the R1T1X wall BC; Inf = none (semiimplicit.jl) |
+| `water_anchor` | string (enum) | `numerics.water_anchor` (refused in `[extra.options]`) | the total density every reader takes: :slot (library default, the prognostic rho_t slot) or :derived (rho_d + sum_k alpha_k nu_k over the water-mass slots; the vapor nudge deleted, slot 3 a passive shadow) (si_water_slaving.jl, moist_compressible.jl, energy_budget.jl, radiation.jl, netcdf_output.jl) |
 | `water_budget_trace` | int | `diagnostics.water_budget_trace` (refused in `[extra.options]`) | water-budget print interval [steps]; 0 = off (moist_compressible.jl) |
 | `water_lobe_attribution` | bool |  | the vapor residual and the ice anchor headroom read each transformed water-mass slot's clipped negative lobe through the odd continuation of ahyp; default FALSE until the slots' below-zero transport is consistent with rho_t (measured 2026-10-07: the slots hold a 4-6.5 kg/m2 negative pool rho_t does not, so attributing it inflates the vapor by ~10% of the column); true enables it (moist_compressible.jl) |
 | `water_lobe_transport` | bool |  | below nu = 0 the continuity terms of each transformed water-mass slot (cloud, rain, ice masses) read the odd continuation ahyp_signed and its Jacobian, so the slots are transported consistently with the linear rho_t; default true, false restores the clipped-point forms (J = 1, rho = 0) for forensics (moist_compressible.jl) |

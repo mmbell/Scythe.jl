@@ -1289,7 +1289,20 @@ well; the choice is documented rather than silent because both were available.
     # `_mynn_column_inputs!` built (`rho_v/rho_t`, `(rho_v+rho_c)/rho_t`) and the plume
     # sums are in the same units, so `rho_t * (q_up - bar q)` is the partial-density mass
     # flux the diffusive `K_h dz(rho')` beside it already is.
-    col.uMish .= Kh .* (rtv.f_z .- rdv.f_z)
+    # Under the derived water anchor (`options[:water_anchor] = :derived`) the total-water
+    # gradient is the derived `∂z(ρ_t' − ρ_d') = Σ α_k ∂z ν_k'` (`anchor_Wp`): slot 3 is a
+    # shadow nothing reads.
+    wad = mtile.ebudget.wa
+    wset = water_anchor_set(mtile.model.options, mtile.model.physical_params, IS)
+    phys = mtile.tile.physical
+    zs_w = siw_zslot(phys)
+    if wad
+        @inbounds for i in 1:n
+            col.uMish[i] = Kh[i] * anchor_Wp(phys, colstart + i - 1, zs_w, wset)
+        end
+    else
+        col.uMish .= Kh .* (rtv.f_z .- rdv.f_z)
+    end
     if mf
         _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_qw, work.s_sqw, colstart, n)
     end
@@ -1384,7 +1397,9 @@ well; the choice is documented rather than silent because both were available.
             cw = (Cpv*Tk[i]) - S.Lv[i] + S.ke[i] + (gravity*z[i])
             cv = S.Lv[i] - (Rv*Tk[i])
             rvz = vj ? rvv.f_z[i] / vapor_jacobian_column(S)[i] : rvv.f_z[i]
-            wk[i] = Kh[i]*((cw*(rtv.f_z[i] - rdv.f_z[i])) + (cv*rvz))
+            dwz = wad ? anchor_Wp(phys, colstart + i - 1, zs_w, wset) :
+                        rtv.f_z[i] - rdv.f_z[i]
+            wk[i] = Kh[i]*((cw*dwz) + (cv*rvz))
         end
         if ice_on
             # THE ICE ENERGY CARRY. `rho_w' = rho_t' - rho_d'` already INCLUDES the ice, so

@@ -274,6 +274,33 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations Scythe.moist_compressible_axisym(mt_a, 1, kD_a, 2)) == 0
     end
 
+    @testset "per-column allocations under the derived water anchor equal :slot's" begin
+        # options[:water_anchor] = :derived (Stage 3, src/si_water_slaving.jl): the staging
+        # (`_anchor_stage!`), the shadow tendency, the derived buoyancy, the exchange closures
+        # and the partners read the slot views and the thread's scratch; none may allocate.
+        # Warm rain, both SI paths, slaved and explicit water, and the cylinder.
+        for siw in (:none, :mass), sd in (false, true)
+            xs = Dict{Symbol,Any}(:si_water_slots => siw, :state_dependent_si => sd)
+            xd = merge(xs, Dict{Symbol,Any}(:water_anchor => :derived))
+            md, kd = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3), precipitation = true,
+                                   extra_options = xd)
+            ms, ks = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3), precipitation = true,
+                                   extra_options = xs)
+            moist_compressible_XZ(md, 1, kd, 2)  # compile
+            moist_compressible_XZ(ms, 1, ks, 2)
+            @test (@allocations moist_compressible_XZ(md, 1, kd, 2)) ==
+                  (@allocations moist_compressible_XZ(ms, 1, ks, 2))
+            sd || @test (@allocations moist_compressible_XZ(md, 1, kd, 2)) == 0
+        end
+        mt_a, kD_a = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                   extra_params = Dict(:f => 5.0e-5, :alpha => 0.05,
+                                                       :z_damp => 3.2e3),
+                                   extra_options = Dict{Symbol,Any}(:si_water_slots => :mass,
+                                                                    :water_anchor => :derived))
+        Scythe.moist_compressible_axisym(mt_a, 1, kD_a, 2)
+        @test (@allocations Scythe.moist_compressible_axisym(mt_a, 1, kD_a, 2)) == 0
+    end
+
     @testset "per-column allocations stay zero with the Marshall-Palmer DSD" begin
         # N_0 > 0 routes the rain channel through invtau_rain_mp (mp_slope +
         # f_ventilation_mp); the keyword call and the MP branch must not box.

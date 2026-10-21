@@ -541,6 +541,7 @@ end
 - `l_q_vertical::Float64` — filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical).
 - `cfl_interval::Float64` — CFL report cadence [s]; 0 = `output.interval`, resolved at build.
 - `si_water_slots::Symbol` — which water slots the acoustic semi-implicit solve slaves to its mass flux (Stage 2 of the rho_t retirement, `src/si_water_slaving.jl`): `mass` (default: vapor, cloud, rain and the three ice masses take their vertical acoustic flux implicitly, `dnu_k' = -dtau (c_k phi_z + c_k,z phi)`, so the water moves with the dry air under the one AI2* integrator and `rho_d' + sum alpha_k nu_k'` advances exactly as `rho_t'` does), `all` (`mass` plus the rain number and the nine ice number/habit moments) or `none` (every water species takes its acoustic compression explicitly, as before 2026-10-20). Refused with a mixed vertical wall family across the slaved slots (the `d2`/`r1t1x` families leave the sedimenting slots natural at the ground; `[extra.options] si_water_mixed_walls = true` runs it to measure).
+- `water_anchor::Symbol` — what every reader takes as the total density (Stage 3 of the rho_t retirement, `src/si_water_slaving.jl` `water_anchor_mode`): `derived` (default: `rho_t = rho_d + sum_k alpha_k nu_k` over the water-mass slots, alpha = 2 transformed / 1 density, with the reference `rho_tbar_w = rho_dbar + sum alpha_k nu_kbar`; the vapor reconciliation nudge is gone, the vapor is the nu-space closure of every exchange, and slot 3 is a passive shadow of the old linear `rho_t` whose gap the census reports) or `slot` (the prognostic slot 3 is the total density, as before 2026-10-21). `physical_params` `Kvdiff_water > 0` is refused under `derived`.
 - `temperature::Symbol` — the model temperature every consumer reads (microphysics, radiation, surface layer, boundary layer, output): `eos` = `p/(rho_d R_d + rho_v R_v)` from the prognostic pressure and vapor (default since 2026-10-14), `energy` = the closed-form total-energy retrieval, which reads the clipped condensate and warms by ~2.5 K per 1e-3 kg/m3 of clipped lobe. `E_t` stays prognostic either way; the output's `T_split` and `E_residual` measure the disagreement.
 
 The filter lengths are separate because the two directions do different jobs: the
@@ -563,6 +564,7 @@ Base.@kwdef struct Numerics <: AbstractConfigSection
     cfl_interval::Float64 = 0.0
     temperature::Symbol = :eos
     si_water_slots::Symbol = :mass
+    water_anchor::Symbol = :derived
 end
 
 """
@@ -736,7 +738,8 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (HorizontalMixing, :scheme)                => HMIX_SCHEMES,
     (Numerics, :positivity)                    => POSITIVITY_MODES,
     (Numerics, :temperature)                   => TEMPERATURE_CHOICES,
-    (Numerics, :si_water_slots)                => SI_WATER_SLOT_MODES)
+    (Numerics, :si_water_slots)                => SI_WATER_SLOT_MODES,
+    (Numerics, :water_anchor)                  => WATER_ANCHOR_MODES)
 
 _join_path(path::AbstractString, f) = isempty(path) ? string(f) : string(path, ".", f)
 
@@ -827,6 +830,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :state_dependent_si       => (Bool, "vertical SI implicit coefficients from the current column state (moist_compressible.jl)"),
     :exact_si                 => (Bool, "exact coupled semi-implicit acoustic solve, variant 1 (exact_si.jl, moist_compressible.jl)"),
     :si_water_slots           => (Symbol, "water slots slaved to the acoustic mass flux: :none (library default), :mass (vapor, cloud, rain, ice masses) or :all (plus the number/habit moments) (si_water_slaving.jl, moist_compressible.jl, horizontal_si.jl, exact_si.jl)"),
+    :water_anchor             => (Symbol, "the total density every reader takes: :slot (library default, the prognostic rho_t slot) or :derived (rho_d + sum_k alpha_k nu_k over the water-mass slots; the vapor nudge deleted, slot 3 a passive shadow) (si_water_slaving.jl, moist_compressible.jl, energy_budget.jl, radiation.jl, netcdf_output.jl)"),
     :si_water_mixed_walls     => (Bool, "run si_water_slots with a mixed vertical wall family across the slaved water slots, to measure it (refused otherwise) (si_water_slaving.jl)"),
     :temperature              => (Symbol, "model temperature: :eos = p/(rho_d R_d + rho_v R_v) (default) or :energy = the closed-form total-energy retrieval (moist_compressible.jl, radiation.jl, semiimplicit.jl, netcdf_output.jl)"),
     :exact_si_ax0             => (Bool, "exact_si axisym: experimental axis-row treatment of the radial operator (exact_si.jl)"),
@@ -1078,6 +1082,7 @@ const OWNED_OPTION_KEYS = Dict{Symbol,String}(
     :cfl_interval              => "numerics.cfl_interval",
     :temperature               => "numerics.temperature",
     :si_water_slots            => "numerics.si_water_slots",
+    :water_anchor              => "numerics.water_anchor",
     :output_formats            => "output.formats",
     :netcdf_grid               => "output.netcdf_grid",
     :netcdf_derivatives        => "output.netcdf_derivatives",

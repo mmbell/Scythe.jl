@@ -241,9 +241,20 @@ function mynn_diagnostics(mtile::ModelTile)
     rho_tp = view(phys, :, 3, 1)
     rho_e = view(phys, :, rho_e_slot, 1)
     e = Vector{Float64}(undef, npoints)
+    # Under the derived water anchor (`options[:water_anchor] = :derived`) ρ_t is
+    # `ρ_d + Σ α_k ν_k`, the driver's `_anchor_stage!` total.
+    wad = water_anchor_mode(mtile.model.options) === :derived
+    wset = water_anchor_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
+    rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
+    rcref = Springsteel.ref_rho_c(mtile.ref_state)
+    zs_w = siw_zslot(phys)
     @inbounds for c in 1:ncol, k in 1:kDim
         j = (c - 1) * kDim + k
-        e[j] = rho_e[j] / (rho_tp[j] + rho_tbar[k])
+        rt = wad ? (phys[j, 2, 1] + rho_dbar[k]) +
+                   first(_siw_W(phys, j, zs_w, k, wset, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile),
+                                view(rcref, :, 1), view(rcref, :, 2))) :
+                   rho_tp[j] + rho_tbar[k]
+        e[j] = rho_e[j] / rt
     end
 
     # ── Coordinates: the exact radiation_io.jl convention (used for every MC geometry,

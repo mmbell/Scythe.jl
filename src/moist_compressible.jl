@@ -627,7 +627,8 @@ mc_ref_diag_kwargs(model) =
        vapor_transform = vapor_transform_mode(model.options),
        vapor_mu = vapor_mu(model.physical_params),
        condensate_transform = condensate_transform_mode(model.options),
-       condensate_mu = Float64(get(model.physical_params, :condensate_mu, 1.0e-7)))
+       condensate_mu = Float64(get(model.physical_params, :condensate_mu, 1.0e-7)),
+       water_anchor = water_anchor_mode(model.options))
 
 """
     mc_reference_diagnostics(ref_state, z; temperature = :eos)
@@ -674,11 +675,16 @@ function mc_reference_diagnostics(ref_state, z; temperature::Symbol = :eos,
                                   vapor_transform::Symbol = :none,
                                   vapor_mu::Float64 = VAPOR_MU_DEFAULT,
                                   condensate_transform::Symbol = :none,
-                                  condensate_mu::Float64 = 1.0e-7)
+                                  condensate_mu::Float64 = 1.0e-7,
+                                  water_anchor::Symbol = :slot)
 
     teos = temperature_mode(Dict(:temperature => temperature)) === :eos
     vtr = vapor_transform_mode(Dict(:vapor_transform => vapor_transform))
     vbh = vtr === :bhyp
+    # The DERIVED water anchor (`water_anchor_mode`): every resting quantity that reads the
+    # total density reads `ρ̄_t^w` (below) instead of Springsteel's fitted `ρ̄_t` — the doubles
+    # the driver forms at rest under `:derived` (`ρ̄_d + (α_v ν̄_v + α_c ν̄_c)`).
+    wad = water_anchor_mode(Dict(:water_anchor => water_anchor)) === :derived
     pbar = ref_pressure(ref_state)
     rho_dbar = ref_rho_d(ref_state)
     rho_tbar = ref_rho_t(ref_state)
@@ -708,7 +714,6 @@ function mc_reference_diagnostics(ref_state, z; temperature::Symbol = :eos,
         # retrieval and entropy below are the ice ones with rho_i/q_i = 0.0, bitwise);
         # every expression must match mc_driver! bit-for-bit.
         geo = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0)) + (gravity * z[k])
-        M = p + (E_tbar[k, 1]) - (rho_t * geo)
         # The DERIVED reference vapor, ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c. This is the profile the
         # prognostic vapor slot is carried against, so writing it in exactly this form (and
         # not from Springsteel's fitted `ref_rho_v`, which differs at fit level) is what makes
@@ -724,9 +729,22 @@ function mc_reference_diagnostics(ref_state, z; temperature::Symbol = :eos,
         else
             nu_vbar[k] = rho_v
         end
+        # The derived total reference ρ̄_t^w = ρ̄_d + α_v ν̄_v + α_c ν̄_c (design §3.3), and the
+        # total every resting reader below takes: Springsteel's ρ̄_t under `:slot`, ρ̄_t^w under
+        # the derived anchor.
+        if condensate_transform === :none
+            nuc = rho_c; nuc_z = rho_cbar[k, 2]; ac = 1.0
+        else
+            nuc = bhyp(rho_c, condensate_mu)
+            nuc_z = dbhyp(rho_c, condensate_mu) * rho_cbar[k, 2]; ac = 2.0
+        end
+        av = vbh ? 2.0 : 1.0
+        rho_tbar_w[k] = rho_d + ((av * nu_vbar[k]) + (ac * nuc))
+        rt_read = wad ? rho_tbar_w[k] : rho_t
+        M = p + (E_tbar[k, 1]) - (rt_read * geo)
         # The resting temperature in the run's mode — `rho_v` above is bit-for-bit the
         # driver's `rho_vp + rho_vbar` at rest, so the EOS branch is too.
-        Tk = model_temperature(teos, M, p, rho_d, rho_t, rho_v, rho_c, 0.0)
+        Tk = model_temperature(teos, M, p, rho_d, rt_read, rho_v, rho_c, 0.0)
         Tbar[k] = Tk
         q_v = rho_v / rho_d
         q_l = rho_c / rho_d
@@ -737,15 +755,6 @@ function mc_reference_diagnostics(ref_state, z; temperature::Symbol = :eos,
         # comes from keeps the two consistent to the last bit.
         rho_vbar_z[k] = rho_tbar[k, 2] - rho_dbar[k, 2] - rho_cbar[k, 2]
         nu_vbar_z[k] = vbh ? dbhyp(rho_vbar[k], vapor_mu) * rho_vbar_z[k] : rho_vbar_z[k]
-        # The derived total reference ρ̄_t^w = ρ̄_d + α_v ν̄_v + α_c ν̄_c (design §3.3).
-        if condensate_transform === :none
-            nuc = rho_c; nuc_z = rho_cbar[k, 2]; ac = 1.0
-        else
-            nuc = bhyp(rho_c, condensate_mu)
-            nuc_z = dbhyp(rho_c, condensate_mu) * rho_cbar[k, 2]; ac = 2.0
-        end
-        av = vbh ? 2.0 : 1.0
-        rho_tbar_w[k] = rho_d + ((av * nu_vbar[k]) + (ac * nuc))
         rho_tbar_w_z[k] = rho_dbar[k, 2] + ((av * nu_vbar_z[k]) + (ac * nuc_z))
         # Local reference sound speed squared γ_m(z)·p̄(z)/ρ̄_t(z) for the acoustic
         # linearization. A DOMAIN-MEAN c̄² (Springsteel's sound_speed_sq) leaves the
@@ -757,7 +766,7 @@ function mc_reference_diagnostics(ref_state, z; temperature::Symbol = :eos,
         # remainder O(perturbation) at every level.
         C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
         R_m = Rd + (q_v * Rv)
-        Pxi_prof[k] = ((C_vt + R_m) / C_vt) * p / rho_t
+        Pxi_prof[k] = ((C_vt + R_m) / C_vt) * p / rt_read
     end
     if vbh
         # Design §3.4: the vapor must be affine (ρ ≫ μ_v) wherever there is a reference.
@@ -859,12 +868,24 @@ function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
                                   z::AbstractVector{Float64}, column;
                                   temperature::Symbol = :eos,
                                   vapor_transform::Symbol = :none,
-                                  vapor_mu::Float64 = VAPOR_MU_DEFAULT)
+                                  vapor_mu::Float64 = VAPOR_MU_DEFAULT,
+                                  water_anchor::Symbol = :slot,
+                                  condensate_transform::Symbol = :none,
+                                  condensate_mu::Float64 = 1.0e-7)
 
     teos = temperature_mode(Dict(:temperature => temperature)) === :eos
     vbh = vapor_transform_mode(Dict(:vapor_transform => vapor_transform)) === :bhyp
     # what the driver reads at rest for a derived reference vapor `rv`
     rec(rv) = vbh ? ahyp(bhyp(rv, vapor_mu), vapor_mu) : rv
+    # The total density the driver reads at rest (`water_anchor_mode`): Springsteel's fitted
+    # `ρ̄_t` under `:slot`; under the derived anchor `ρ̄_t^w = ρ̄_d + (α_v ν̄_v + α_c ν̄_c)` of the
+    # partition being solved for (`mc_reference_diagnostics`' expression), so the `:energy`
+    # retrieval and `M` see the doubles the run forms. The EOS temperature reads no total.
+    wad = water_anchor_mode(Dict(:water_anchor => water_anchor)) === :derived
+    cbh = condensate_transform !== :none
+    rtw(rt, rd, rv, rc) = !wad ? rt :
+        rd + (((vbh ? 2.0 * bhyp(rv, vapor_mu) : rv)) +
+              (cbh ? 2.0 * bhyp(rc, condensate_mu) : rc))
     pbar = ref_pressure(ref)
     rho_dbar = Springsteel.ref_rho_d(ref)
     rho_tbar = ref_rho_t(ref)
@@ -898,7 +919,10 @@ function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
             # Either way the slope is positive and the Newton map is the same contraction.
             Cfactor = (rho_d * Cpd) + (rho_w * Cpv)
             for _ in 1:50
-                Tk = model_temperature(teos, M, p, rho_d, rho_t, rec(rho_w - rho_c), rho_c, 0.0)
+                rt_k = rtw(rho_t, rho_d, rho_w - rho_c, rho_c)
+                M_k = p + E_tbar[k, 1] - (rt_k * (gravity * z[k]))
+                Tk = model_temperature(teos, wad ? M_k : M, p, rho_d, rt_k,
+                                       rec(rho_w - rho_c), rho_c, 0.0)
                 g = rho_c - (rho_w - rho_v_sat(Tk, p_hPa))
                 D = Cfactor - (rho_c * (Cpv - Cl))
                 # (The `:energy` line is the pre-switch expression to the last operator.)
@@ -918,15 +942,20 @@ function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
             rho_c_new[k] = rho_c            # exactly 0.0
             # `rho_w - rho_c` is the derived vapor `(ρ̄_t − ρ̄_d) − ρ̄_c`, the doubles
             # `mc_reference_diagnostics` hands the driver as ρ̄_v.
-            Tk = model_temperature(teos, M, p, rho_d, rho_t, rec(rho_w - rho_c), rho_c, 0.0)
+            rt_k = rtw(rho_t, rho_d, rho_w - rho_c, rho_c)
+            M_k = p + E_tbar[k, 1] - (rt_k * (gravity * z[k]))
+            Tk = model_temperature(teos, wad ? M_k : M, p, rho_d, rt_k, rec(rho_w - rho_c),
+                                   rho_c, 0.0)
             Q_ss_new[k] = rec(rho_w - rho_c) - rho_v_sat(Tk, p_hPa)
         end
         rho_v_new[k] = rho_w - rho_c_new[k]
 
         # VERIFY the run-time outcome through the driver's own expressions, rather than
         # assuming the algebra above reached it.
-        Tk_run = model_temperature(teos, M, p, rho_d, rho_t, rec(rho_v_new[k]), rho_c_new[k],
-                                   0.0)
+        rt_r = rtw(rho_t, rho_d, rho_v_new[k], rho_c_new[k])
+        M_r = p + E_tbar[k, 1] - (rt_r * (gravity * z[k]))
+        Tk_run = model_temperature(teos, wad ? M_r : M, p, rho_d, rt_r, rec(rho_v_new[k]),
+                                   rho_c_new[k], 0.0)
         rho_vs = rho_v_sat(Tk_run, p_hPa)
         q_c = rho_c_new[k] / rho_d
         S = Q_ss_new[k] / rho_vs
@@ -1450,7 +1479,7 @@ function _wall_deriv_spline(grid, v::Int)
     end
 end
 
-function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0)
+function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0, anchor = nothing)
     gp = grid.params
     kDim = gp.kDim
     iDim = gp.iDim
@@ -1478,10 +1507,15 @@ function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0)
     # A cell mean is a smoother rather than an amplifier. It is biased by O(dz) times
     # the true gradient, which is the right trade: the wall condition needs to track
     # the BALANCED state's wall value, not resolve a grid-scale feature.
+    # Under the derived water anchor (`anchor`, the `water_anchor_set` with `on`) ρ_t' is
+    # `ρ_d' + Σ α_k ν_k'` over the same boundary cell; slot 3 is a shadow nothing reads.
+    wa = anchor !== nothing && anchor.on
+    rtp(n) = wa ? anchor_rho_tp(src[n, vars["rho_d"], 1], anchor_Wp(src, n, 1, anchor)) :
+                  src[n, rhot_i, 1]
     if haskey(kcol.params.BCL, "X1")
         @inbounds for r in 1:iDim
             n = (r - 1) * kDim + 1
-            rt = (src[n, rhot_i, 1] + src[n+1, rhot_i, 1] + src[n+2, rhot_i, 1]) / 3
+            rt = (rtp(n) + rtp(n + 1) + rtp(n + 2)) / 3
             old = wall_du[r, p_i, 1, 1]
             wall_du[r, p_i, 1, 1] = old + relax * ((-gravity * rt) - old)
         end
@@ -1489,7 +1523,7 @@ function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0)
     if haskey(kcol.params.BCR, "X1")
         @inbounds for r in 1:iDim
             n = r * kDim
-            rt = (src[n, rhot_i, 1] + src[n-1, rhot_i, 1] + src[n-2, rhot_i, 1]) / 3
+            rt = (rtp(n) + rtp(n - 1) + rtp(n - 2)) / 3
             old = wall_du[r, p_i, 2, 1]
             wall_du[r, p_i, 2, 1] = old + relax * ((-gravity * rt) - old)
         end
@@ -1640,7 +1674,9 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :o_max, :o_pts, :o_rain, :o_seed, :o_warned,
                         :e_pts, :e_held, :e_max,
                         :r_dr, :r_booked, :l_c, :l_r, :l_i1, :l_i2, :l_i3,
-                        :x_max, :x_int, :x_pool, :ec_steps, :v_neg, :v_neg_mass)
+                        :x_max, :x_int, :x_pool, :ec_steps, :v_neg, :v_neg_mass,
+                        :w_part, :w_neg, :w_neg_pts, :w_int, :w_src, :w_budget, :w_seen,
+                        :shadow_max, :shadow_int)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -2098,8 +2134,43 @@ const MC_ECEN_STEPS = MC_CEVAP_LAST + 11
 const MC_VNEG = MC_CEVAP_LAST + 12
 @doc (@doc MC_REFIT_DR)
 const MC_VNEG_MASS = MC_CEVAP_LAST + 13
+"""
+The WATER-ANCHOR census of `mc_water_stats` (Stage 3 of the ρ_t retirement, design §5.4),
+reported by [`energy_census_trace`](@ref) at the output cadence, beside the partition rows
+above. `ρ_w` is the water anchor: `Σ_k α_k ν_k` under `options[:water_anchor] = :derived`,
+`ρ_t − ρ_d` of slot 3 under `:slot`.
+
+| constant | quantity |
+|---|---|
+| `MC_W_PART`     | the partition gap `X = ρ_w − Σ_k ρ_k = B + Λ`, column integral at the report [kg/m², tile mean] (the `MC_VAPOR_GAP` successor; equal to `MC_XGAP_INT`) |
+| `MC_W_NEG`      | the transformed mass slots' negative water `Σ_k α_k min(ν_k, 0)`, column integral at the report [kg/m², tile mean] |
+| `MC_W_NEG_PTS`  | gridpoints with `ρ_w < 0` at the report [points] |
+| `MC_W_INT`      | `∫ρ_w` at the report [kg/m², tile mean] |
+| `MC_W_SRC`      | the surface sources since the last report, `Σ_steps Δt·(F_q − ∫∂z F_sed dz)` — the moisture flux and the sedimentation flux through the ground [kg/m², tile mean] |
+| `MC_W_BUDGET`   | the domain water budget of the last interval, `Δ∫ρ_w − MC_W_SRC` [kg/m², tile mean]; 0 at the first report |
+| `MC_W_SEEN`     | 1 once a report has set `MC_W_INT` (thread 1) |
+| `MC_SHADOW_MAX` | under `:derived`, the shadow gap `max\\|G\\|`, `G = ρ_t'^slot − (ρ_d' + Σ_k α_k ν_k')` — slot 3, the passive shadow of the linear ρ_t, against the derived total — at the report [kg/m³] |
+| `MC_SHADOW_INT` | its column integral at the report [kg/m², tile mean] |
+"""
+const MC_W_PART = MC_CEVAP_LAST + 14
+@doc (@doc MC_W_PART)
+const MC_W_NEG = MC_CEVAP_LAST + 15
+@doc (@doc MC_W_PART)
+const MC_W_NEG_PTS = MC_CEVAP_LAST + 16
+@doc (@doc MC_W_PART)
+const MC_W_INT = MC_CEVAP_LAST + 17
+@doc (@doc MC_W_PART)
+const MC_W_SRC = MC_CEVAP_LAST + 18
+@doc (@doc MC_W_PART)
+const MC_W_BUDGET = MC_CEVAP_LAST + 19
+@doc (@doc MC_W_PART)
+const MC_W_SEEN = MC_CEVAP_LAST + 20
+@doc (@doc MC_W_PART)
+const MC_SHADOW_MAX = MC_CEVAP_LAST + 21
+@doc (@doc MC_W_PART)
+const MC_SHADOW_INT = MC_CEVAP_LAST + 22
 """Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
-const MC_STATS_LAST = MC_VNEG_MASS
+const MC_STATS_LAST = MC_SHADOW_INT
 """
 Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
 1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
@@ -7753,16 +7824,22 @@ difference. That is the ν-space convention, not a missing term.
                                     gridpoints::Matrix{Float64}, physical_params,
                                     LAP, LAP2, geom::MCGeometry, K, Sc_t::Float64,
                                     colstart::Int64, colend::Int64, rv_i::Int64,
-                                    nr_i::Int64, ice_idx::NTuple{12,Int64})
+                                    nr_i::Int64, ice_idx::NTuple{12,Int64},
+                                    rt_mix::Bool = true)
     # Rebuilt from the plain arrays: `mc_slot_views` and `mc_metric` read only these fields.
     grid = (physical = physical,)
     r = mc_metric(geom, (physical_params = physical_params,), gridpoints, colstart, colend)
-    rtv = mc_slot_views(grid, colstart, colend, 3, geom)
-    rdv = mc_slot_views(grid, colstart, colend, 2, geom)
-    mc_w_kdiff!(LAP,  geom, K, rtv, r)
-    mc_w_kdiff!(LAP2, geom, K, rdv, r)
-    @inbounds for i in eachindex(LAP)
-        expdot[colstart + i - 1, 3] += (LAP[i] - LAP2[i]) / Sc_t
+    # Step 1 is the slot-3 total-water leg; under the derived anchor (`rt_mix = false`) it is
+    # deleted — slot 3 is a shadow nothing reads, and ρ_w = Σ α_k ν_k moves by Σ α_k K∇²ν_k
+    # = K∇²ρ_w exactly by linearity (steps 2-5).
+    if rt_mix
+        rtv = mc_slot_views(grid, colstart, colend, 3, geom)
+        rdv = mc_slot_views(grid, colstart, colend, 2, geom)
+        mc_w_kdiff!(LAP,  geom, K, rtv, r)
+        mc_w_kdiff!(LAP2, geom, K, rdv, r)
+        @inbounds for i in eachindex(LAP)
+            expdot[colstart + i - 1, 3] += (LAP[i] - LAP2[i]) / Sc_t
+        end
     end
     mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 8, Sc_t)
     mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 9, Sc_t)
@@ -8068,6 +8145,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     vtrans = vapor_transform_mode(model.options)
     vtrans_on = vtrans !== :none
     vmu = vapor_mu(model.physical_params)
+    # THE WATER ANCHOR (`water_anchor_mode`, Stage 3 of the ρ_t retirement): under `:derived`
+    # every reader below takes ρ_t = ρ_d + Σ_k α_k ν_k (`_anchor_stage!`), the reference
+    # ρ̄_t^w, and the vapor carries no reconciliation nudge; slot 3 is a passive shadow. The
+    # combinations it cannot run are refused at setup (`validate_water_anchor`).
+    wad = _wa_derived(model.options)
     if vtrans_on && Kvdiff_water > 0.0
         # The implicit water diffusion solves the vapor slot as a DENSITY and rho_t - rho_d as
         # total water; under the vapor control variable both would be the wrong equation
@@ -8344,8 +8426,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     pbar_z = view(ref_pressure(refstate),:,2)
     rho_dbar = view(ref_rho_d(refstate),:,1)
     rho_dbar_z = view(ref_rho_d(refstate),:,2)
-    rho_tbar = view(ref_rho_t(refstate),:,1)
-    rho_tbar_z = view(ref_rho_t(refstate),:,2)
+    # The total-density reference: Springsteel's fitted ρ̄_t, or the derived ρ̄_t^w under the
+    # derived anchor (`mc_rho_tbar_ref`; one `Matrix{Float64}` either way).
+    rtb_m = wad ? mtile.ebudget.rho_tbar_ref : ref_rho_t(refstate)
+    rho_tbar = view(rtb_m,:,1)
+    rho_tbar_z = view(rtb_m,:,2)
     E_tbar = view(ref_total_energy(refstate),:,1)
     E_tbar_z = view(ref_total_energy(refstate),:,2)
     Q_ssbar = view(ref_qss(refstate),:,1)
@@ -8503,6 +8588,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     p_z = S.p_z;         @. p_z = pp_z + pbar_z
     rho_d_z = S.rho_d_z; @. rho_d_z = rho_dp_z + rho_dbar_z
     rho_t_z = S.rho_t_z; @. rho_t_z = rho_tp_z + rho_tbar_z
+    # THE DERIVED ANCHOR: the totals ρ_t, ρ_{t,z} and the perturbation ρ_t' every reader below
+    # takes, over the slot-based ones just formed. The perturbation lands in `res_rho_t`, a
+    # column the derived anchor frees (the nudge's residual is deleted with the nudge).
+    wad && _anchor_stage!(rho_t, rho_t_z, S.res_rho_t, grid.physical, colstart, zslot(geom),
+                          water_anchor_set(model.options, model.physical_params, IS), rho_d,
+                          rho_d_z, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile), rho_cbar,
+                          rho_cbar_z)
     E_t_z = S.E_t_z;     @. E_t_z = E_tp_z + E_tbar_z
     Q_ss_z = S.Q_ss_z;   @. Q_ss_z = Q_ssp_z + Q_ssbar_z
     # The DENSITY vertical gradient, f'(n)·∂z n = ∂z n / J — self-consistent with the recovered
@@ -8658,9 +8750,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     res_rho_t = S.res_rho_t
     if lobe_attr
         @. res_rho_t = rho_t - rho_d - rho_liq - rho_ice - lobe_w
-    else
+    elseif !wad
         @. res_rho_t = rho_t - rho_d - rho_liq - rho_ice
     end
+    # (under the derived anchor `res_rho_t` holds the derived ρ_t' — see `_anchor_stage!`)
     q_v = S.q_v;     @. q_v = rho_v / rho_d
     q_l = S.q_l;     @. q_l = rho_liq_t / rho_d      # thermodynamic reader: see rho_liq_t
     q_i = S.q_i;     @. q_i = rho_ice_t / rho_d      # ditto; exactly 0.0 with ice off
@@ -9381,6 +9474,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
 
     # Total mass continuity (slot 3): the only source is the sedimentation flux
     # divergence, identical to slot 8's so rain and total water cannot drift apart.
+    if wad
+        # THE SHADOW (derived anchor): slot 3 advected on its OWN total gradient (slot plus
+        # ρ̄_t^w, staged in KDIFF, free until slot 4) and given its own `−ρ_s ∇·u`.
+        @. KDIFF = rho_tp_z + rho_tbar_z
+        mc_advect!(ADV, geom, u, w, vv, r, rho_tp_x, KDIFF, rtv.f_l)
+        _anchor_shadow_tendency!(expdot, grid.physical, colstart, ADV, rho_t, rho_t_z,
+                                 rho_tbar, rho_tbar_z, div, w, w_z, Fr_z, sd_si)
+    else
     mc_advect!(ADV, geom, u, w, vv, r, rho_tp_x, rho_t_z, rtv.f_l)
     if sd_si
         @turbo FORCING .= @. (-rho_t * div) + ((rho_t * w_z) + (rho_t_z * w)) - Fr_z
@@ -9388,6 +9489,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @turbo FORCING .= @. (-rho_t * div) + ((rho_tbar * w_z) + (rho_tbar_z * w)) - Fr_z
     end
     @turbo expdot[colstart:colend,3] .= @. ADV + FORCING
+    end
     # The ICE sedimentation rate `Q̇_sed_i = Σ_k ∂F_{ρ,k}/∂z`, the second mass flux out of the
     # total water (TeX Eq. ice_mass). Applied as a SEPARATE accumulation rather than folded
     # into the expression above, so the ice-free path's `@turbo` expression is untouched
@@ -9416,7 +9518,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # w momentum (slot 5): perturbation PGF + total-density buoyancy loading, minus the
     # reference-linear PGF -pp_z/ρ̄_t (the acoustic remainder; see the slot-1 comment)
     mc_advect!(ADV, geom, u, w, vv, r, w_x, w_z, wv.f_l)
-    if sd_si
+    if wad
+        # the derived ρ_t' (staged in `res_rho_t` by `_anchor_stage!`)
+        _anchor_w_forcing!(FORCING, S.res_rho_t, rho_t, pp_z, rho_tbar, sd_si)
+    elseif sd_si
         # With ρ̂_t = ρ_tⁿ the linear PGF −pp_z/ρ̂_t cancels the full
         # perturbation PGF exactly: the explicit w remainder is pure buoyancy.
         @turbo FORCING .= @. (-gravity * rho_tp) / rho_t
@@ -9754,8 +9859,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         _vapor_bhyp_tendency!(expdot, grid.physical, rv_i, colstart, ADV, FORCING, VREC,
                               J_v, rho_v, res_rho_t, div, mc_nu_vbar(mtile), Tk,
                               rho_d, R_m, C_vt, Lv, drvs_dT, drvs_dp, model.ts, vmu,
-                              tau_rec, lobe_tr, vrec_partner)
-        eb_on && eb_vrec!(eb, colstart, VREC, FORCING, Tk, R_m, C_vt, vrec_partner)
+                              tau_rec, lobe_tr, vrec_partner, !wad)
+        (eb_on && !wad) && eb_vrec!(eb, colstart, VREC, FORCING, Tk, R_m, C_vt, vrec_partner)
+    elseif wad
+        # THE DERIVED ANCHOR, density vapor: the continuity equation alone — no nudge (the
+        # vapor is the closure of every exchange; there is no ρ_t budget to nudge it onto).
+        @turbo FORCING .= @. -rho_v * div
+        @turbo expdot[colstart:colend, rv_i] .= @. ADV + FORCING
     else
         @. VREC = rho_v_reconcile(res_rho_t, rho_v, tau_rec)
         @turbo FORCING .= @. (-rho_v * div) + VREC
@@ -10029,13 +10139,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                               "Smagorinsky scheme (:Ls > 0, or :C_s > 0 with :Ls = 0)")
             mc_water_mixing!(expdot, grid.physical, gridpoints, model.physical_params,
                              WLAP, WLAP2, geom, K_smag, Sc_t, colstart, colend, rv_i,
-                             nr_mix, ice_idx)
+                             nr_mix, ice_idx, !wad)
         else
             # The constant diffusivity is already K/Sc_t (`build_physics`), so the divisor is
             # an exact 1.0 — the identity in IEEE, bitwise the undivided form this had.
             mc_water_mixing!(expdot, grid.physical, gridpoints, model.physical_params,
                              WLAP, WLAP2, geom, Khdiff_water, 1.0, colstart, colend, rv_i,
-                             nr_mix, ice_idx)
+                             nr_mix, ice_idx, !wad)
         end
         eb_on && eb_take!(eb, EB_OP_HWATER, expdot, colstart)
     end
@@ -10500,6 +10610,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # first, partner on or off; reads only.
     (t > 1 && census_on) &&
         refit_dr_census!(eb, stx, tid_x, mtile.var_np1, mtile.tile.physical, colstart, booked)
+    # The domain water budget's surface source (`MC_W_SRC`): the step's moisture flux (held by
+    # the boundary layer's surface store) and the sedimentation through the ground.
+    census_on && water_source_census!(eb, stx, tid_x, colstart, ts, mtile.surface, Fr_z,
+                                      Fi_z, ice_on)
     # The budget's first mark of the step (state n), booking the refit that produced it.
     eb_on && eb_refit!(eb, mtile.tile.physical, colstart)
 
@@ -10835,7 +10949,19 @@ the slot assembly; the budget hook reads it) and its `p` tendency is the vapor-o
                                          C_vt::Vector{Float64}, Lv::Vector{Float64},
                                          drvs_dT::Vector{Float64}, drvs_dp::Vector{Float64},
                                          ts::Float64, mu::Float64, tau::Float64,
-                                         lobe_tr::Bool, partner::Bool)
+                                         lobe_tr::Bool, partner::Bool, nudge::Bool = true)
+    if !nudge
+        # THE DERIVED ANCHOR (`options[:water_anchor] = :derived`): the nudge is DELETED, not
+        # relaxed — there is no prognostic ρ_t to reconcile the vapor with; it is the ν-space
+        # closure of every exchange. Advection and the J_v-weighted divergence only.
+        @inbounds for i in eachindex(VREC)
+            g = colstart + i - 1
+            nu = phys[g, rv_i, 1] + nu_vbar[i]
+            rs = lobe_tr ? lobe_transport_density(nu, rho_v[i], mu) : rho_v[i]
+            expdot[g, rv_i] = ADV[i] + (-(J_v[i] * (rs * div[i])))
+        end
+        return nothing
+    end
     @inbounds for i in eachindex(VREC)
         g = colstart + i - 1
         nu = phys[g, rv_i, 1] + nu_vbar[i]
@@ -11693,8 +11819,10 @@ function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::In
     Pxi_bar = mtile.mc_ref_diag.Pxi_prof
     rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
     rho_dbar_z = view(ref_rho_d(mtile.ref_state),:,2)
-    rho_tbar = view(ref_rho_t(mtile.ref_state),:,1)
-    rho_tbar_z = view(ref_rho_t(mtile.ref_state),:,2)
+    # the total-density reference every reader takes (the derived ρ̄_t^w under
+    # `options[:water_anchor] = :derived`; `mc_rho_tbar_ref`)
+    rho_tbar = view(mc_rho_tbar_ref(mtile),:,1)
+    rho_tbar_z = view(mc_rho_tbar_ref(mtile),:,2)
     E_tbar = view(ref_total_energy(mtile.ref_state),:,1)
     E_tbar_z = view(ref_total_energy(mtile.ref_state),:,2)
     pbar = view(ref_pressure(mtile.ref_state),:,1)
@@ -11960,6 +12088,13 @@ function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64,
     p_star = S.df_p_star;         @. p_star = p_v + pbar
     rho_d_star = S.df_rho_d_star; @. rho_d_star = rhod_v + rho_dbar
     rho_t_star = S.df_rho_t_star; @. rho_t_star = rhot_v + rho_tbar
+    # the derived total of the star state under `options[:water_anchor] = :derived`
+    _wa_derived(mtile.model.options) &&
+        _anchor_star!(rho_t_star, vnp1, colstart,
+                      water_anchor_set(mtile.model.options, mtile.model.physical_params,
+                                       mtile.mc_slots),
+                      rho_d_star, mc_nu_vbar(mtile),
+                      view(Springsteel.ref_rho_c(mtile.ref_state), :, 1))
 
     # The heat and water maps need the retrieved star-state thermodynamics; the
     # momentum-only path skips the retrieval entirely.

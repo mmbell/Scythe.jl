@@ -160,6 +160,12 @@ mutable struct EnergyBudget
     const nu_vbar_z::Vector{Float64}
     const rho_tbar_w::Vector{Float64}
     const rho_tbar_w_z::Vector{Float64}
+    # The water anchor (`options[:water_anchor]`, Stage 3): `wa` under `:derived`, where every
+    # reader takes ρ_t = ρ_d + Σ α_k ν_k and the reference `rho_tbar_ref` = (ρ̄_t^w, ∂z ρ̄_t^w,
+    # Springsteel's ∂zz) — the matrix `mc_rho_tbar_ref` hands out (Springsteel's `ref_rho_t` is
+    # handed out under `:slot`, and this field is then an empty matrix).
+    const wa::Bool
+    const rho_tbar_ref::Matrix{Float64}
     # Accumulators, per column (active only).
     const dR::Matrix{Float64}          # (EB_NSTAGE, ncol) J/m^2 summed over steps
     const dX::Matrix{Float64}          # (EB_NSTAGE, ncol) kg/m^2 summed over steps
@@ -193,7 +199,7 @@ const EMPTY_ENERGY_BUDGET = EnergyBudget(false, 0, 0, Float64[], Float64[], Floa
     Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0, 0,
     :none, 1.0, :none, 1.0, :none, 1.0, false, :none, 1.0, Float64[], Float64[], Float64[],
-    Float64[],
+    Float64[], false, zeros(0, 0),
     zeros(0, 0), zeros(0, 0), Float64[], Float64[], Float64[], Float64[], Int[], Bool[],
     zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
     zeros(0, 0, 0), zeros(0, 0), zeros(0, 0))
@@ -298,6 +304,16 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
     pos(s) = s == 0 ? 0 : findfirst(==(s), rs)
     nrs = length(rs)
     nt = Threads.maxthreadid()
+    # The derived water anchor's reference matrix (`mc_rho_tbar_ref`).
+    wa = water_anchor_mode(opts) === :derived
+    rtref = if wa
+        m = copy(ref_rho_t(ref_state))
+        m[:, 1] .= mc_ref_diag.rho_tbar_w
+        m[:, 2] .= mc_ref_diag.rho_tbar_w_z
+        m
+    else
+        zeros(0, 0)
+    end
     npts = size(tile.physical, 1)
     na = active ? 1 : 0                # zero-size accumulators when inactive
     return EnergyBudget(active, kDim, nvars, wz, z, wx, wxn,
@@ -311,7 +327,7 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
         ctr, cmu, rtr, rmu, itr, imu, condensate_floor_mode(opts),
         vapor_transform_mode(opts), vapor_mu(pp), copy(mc_ref_diag.nu_vbar),
         copy(mc_ref_diag.nu_vbar_z), copy(mc_ref_diag.rho_tbar_w),
-        copy(mc_ref_diag.rho_tbar_w_z),
+        copy(mc_ref_diag.rho_tbar_w_z), wa, rtref,
         zeros(EB_NSTAGE * na, ncol * na), zeros(EB_NSTAGE * na, ncol * na),
         zeros(ncol * na), zeros(ncol * na), zeros(ncol * na), zeros(ncol * na),
         zeros(Int, ncol * na), fill(false, ncol * na),
@@ -371,10 +387,130 @@ in the mechanical term.
         rl = eb.cond_floor ? max(rc, 0.0) + max(rr, 0.0) : rc + rr
         T = eos_temperature(p, rd, rv)
         geo = (0.5 * (((u * u) + (v * v)) + (w * w))) + (gravity * eb.z[k])
-        R = Et - implied_total_energy(T, rd, rv, rl, ri, rt, geo)
-        X = (((rt - rd) - rv) - rl) - ri
+        if eb.wa
+            # THE DERIVED WATER ANCHOR (plan E9): the mechanical term reads `ρ_d + ρ_w`,
+            # `ρ_w = Σ α_k ν_k`, and the partition gap is `X = ρ_w − Σ_k ρ_k = B + Λ`.
+            W = _eb_W(eb, A, g, l, k)
+            R = Et - implied_total_energy(T, rd, rv, rl, ri, rd + W, geo)
+            X = ((W - rv) - rl) - ri
+        else
+            R = Et - implied_total_energy(T, rd, rv, rl, ri, rt, geo)
+            X = (((rt - rd) - rv) - rl) - ri
+        end
     end
     return R, X, lam
+end
+
+# The water anchor's member weights (`_water_member_set`): 2 for a transformed slot, 1 for a
+# density slot — read off the budget's own transform record.
+@inline _eb_alpha(tr::Symbol) = tr === :none ? 1.0 : 2.0
+
+"""
+    _eb_W(eb, A, g, l, k) -> Float64
+
+The water anchor `ρ_w = Σ_k α_k ν_k` of the TOTALS at row `g` of `A` (level `k`), in the fixed
+member order of `_siw_W` (vapor against `nu_vbar`, cloud against `nu_cbar`, rain, the three ice
+masses; first term assigned) — the doubles the driver's `_anchor_stage!` forms.
+"""
+@inline function _eb_W(eb::EnergyBudget, A, g::Int, l::Int, k::Int)
+    @inbounds begin
+        W = _eb_alpha(eb.vtr) * (_eb_get(A, g, eb.irv, l) + eb.nu_vbar[k])
+        W = W + (_eb_alpha(eb.ctr) * (_eb_get(A, g, eb.irc, l) + eb.nu_cbar[k]))
+        W = W + (_eb_alpha(eb.rtr) * _eb_get(A, g, eb.irr, l))
+        if eb.ii1 > 0
+            ai = _eb_alpha(eb.itr)
+            W = W + (ai * _eb_get(A, g, eb.ii1, l))
+            W = W + (ai * _eb_get(A, g, eb.ii2, l))
+            W = W + (ai * _eb_get(A, g, eb.ii3, l))
+        end
+    end
+    return W
+end
+
+"""
+    _eb_Wp(eb, A, g, l) -> Float64
+
+The same sum over the SLOTS as carried (`W' = Σ α_k ν_k'`), for the derived perturbation
+`ρ_t' = ρ_d' + W'` (`anchor_Wp`'s member order).
+"""
+@inline function _eb_Wp(eb::EnergyBudget, A, g::Int, l::Int)
+    @inbounds begin
+        W = _eb_alpha(eb.vtr) * _eb_get(A, g, eb.irv, l)
+        W = W + (_eb_alpha(eb.ctr) * _eb_get(A, g, eb.irc, l))
+        W = W + (_eb_alpha(eb.rtr) * _eb_get(A, g, eb.irr, l))
+        if eb.ii1 > 0
+            ai = _eb_alpha(eb.itr)
+            W = W + (ai * _eb_get(A, g, eb.ii1, l))
+            W = W + (ai * _eb_get(A, g, eb.ii2, l))
+            W = W + (ai * _eb_get(A, g, eb.ii3, l))
+        end
+    end
+    return W
+end
+
+"""
+    _eb_water_column(eb, A, g0, l) -> (∫ρ_w, ∫Σα min(ν,0), n(ρ_w<0), ∫G, max|G|)
+
+The water-anchor census of one column (`MC_W_*`, `MC_SHADOW_*`): the anchor `ρ_w`
+(`_eb_W` under the derived anchor, `ρ_t − ρ_d` of slot 3 otherwise), the members' negative
+water `Σ_k α_k min(ν_k, 0)`, the points with `ρ_w < 0`, and under the derived anchor the shadow
+gap `G = ρ_t'^slot − (ρ_d' + W')`, integrated with the mish's Gauss weights.
+"""
+@inline function _eb_water_column(eb::EnergyBudget, A, g0::Int, l::Int)
+    Wi = 0.0; Ni = 0.0; nn = 0; Gi = 0.0; Gm = 0.0
+    av = _eb_alpha(eb.vtr); ac = _eb_alpha(eb.ctr); ar = _eb_alpha(eb.rtr)
+    ai = _eb_alpha(eb.itr)
+    @inbounds for k in 1:eb.kDim
+        g = g0 + k
+        wz = eb.wz[k]
+        if eb.wa
+            W = _eb_W(eb, A, g, l, k)
+            G = _eb_get(A, g, eb.irt, l) -
+                anchor_rho_tp(_eb_get(A, g, eb.ird, l), _eb_Wp(eb, A, g, l))
+            Gi += wz * G
+            aG = abs(G)
+            aG > Gm && (Gm = aG)
+        else
+            W = (_eb_get(A, g, eb.irt, l) + eb.rho_tbar[k]) -
+                (_eb_get(A, g, eb.ird, l) + eb.rho_dbar[k])
+        end
+        Wi += wz * W
+        W < 0.0 && (nn += 1)
+        neg = (av * min(_eb_get(A, g, eb.irv, l) + eb.nu_vbar[k], 0.0)) +
+              (ac * min(_eb_get(A, g, eb.irc, l) + eb.nu_cbar[k], 0.0)) +
+              (ar * min(_eb_get(A, g, eb.irr, l), 0.0))
+        if eb.ii1 > 0
+            neg += ai * ((min(_eb_get(A, g, eb.ii1, l), 0.0) +
+                          min(_eb_get(A, g, eb.ii2, l), 0.0)) +
+                         min(_eb_get(A, g, eb.ii3, l), 0.0))
+        end
+        Ni += wz * neg
+    end
+    return Wi, Ni, nn, Gi, Gm
+end
+
+"""
+    water_source_census!(eb, st, tid, colstart, ts, sd, Fr_z, Fi_z, ice)
+
+`MC_W_SRC`: this column's surface water source over one step, `Δt·(F_q − ∫∂z F_sed dz)` — the
+moisture flux and the sedimentation flux leaving through the ground (`Fsed_z` the summed fitted
+rain and ice mass-flux divergences, integrated with the mish's Gauss weights, so a zero-flux lid
+leaves the ground flux) — weighted by the column's share of the tile [kg/m², tile mean].
+"""
+@noinline function water_source_census!(eb::EnergyBudget, st::Matrix{Float64}, tid::Int,
+                                        colstart::Int, ts::Float64, sd::SurfaceDiag,
+                                        Fr_z::Vector{Float64}, Fi_z::Vector{Float64},
+                                        ice::Bool)
+    length(eb.wz) == length(Fr_z) || return nothing
+    ci = _eb_col(eb, colstart)
+    F_q = sd.active ? (@inbounds sd.F_q[ci]) : 0.0
+    sed = 0.0
+    @inbounds for k in eachindex(Fr_z)
+        f = ice ? Fr_z[k] + Fi_z[k] : Fr_z[k]
+        sed += eb.wz[k] * f
+    end
+    @inbounds st[MC_W_SRC, tid] += eb.wxn[ci] * (ts * (F_q - sed))
+    return nothing
 end
 
 """
@@ -925,6 +1061,20 @@ function energy_census_trace(mtile, t::Int64)
     fill!(view(st, MC_VNEG:MC_VNEG_MASS, :), 0.0)
     st[MC_VNEG, 1] = Float64(nneg)
     st[MC_VNEG_MASS, 1] = vlobe
+    # The water-anchor rows (MC_W_*, MC_SHADOW_*), at the output state.
+    wi = 0.0; ni = 0.0; nwn = 0; gi = 0.0; gm = 0.0
+    for ci in eachindex(eb.wxn)
+        a, b, c, d, e = _eb_water_column(eb, phys, (ci - 1) * kDim, 1)
+        wi += eb.wxn[ci] * a; ni += eb.wxn[ci] * b; nwn += c
+        gi += eb.wxn[ci] * d; gm = max(gm, e)
+    end
+    src = sum(view(st, MC_W_SRC, :))
+    seen = st[MC_W_SEEN, 1] > 0.0
+    budget = seen ? (wi - st[MC_W_INT, 1]) - src : 0.0
+    fill!(view(st, MC_W_PART:MC_SHADOW_INT, :), 0.0)
+    st[MC_W_PART, 1] = xi; st[MC_W_NEG, 1] = ni; st[MC_W_NEG_PTS, 1] = Float64(nwn)
+    st[MC_W_INT, 1] = wi; st[MC_W_BUDGET, 1] = budget; st[MC_W_SEEN, 1] = 1.0
+    st[MC_SHADOW_MAX, 1] = gm; st[MC_SHADOW_INT, 1] = gi
     npts = size(phys, 1)
     secs = nst * model.ts
     s(r) = sum(view(st, r, :))
@@ -936,7 +1086,11 @@ function energy_census_trace(mtile, t::Int64)
             "$(f(s(MC_LOBE_R) / nst)), $(f(s(MC_LOBE_I1) / nst)), $(f(s(MC_LOBE_I2) / nst)), " *
             "$(f(s(MC_LOBE_I3) / nst))) kg/m2, max|X|=$(f(xm)) kg/m3, int X=$(f(xi)) kg/m2, " *
             "pool=$(f(li)) kg/m2, nu_v<0 points=$(nneg) " *
-            "($(f(100.0 * nneg / max(npts, 1))) %), vapor lobe=$(f(vlobe)) kg/m2")
+            "($(f(100.0 * nneg / max(npts, 1))) %), vapor lobe=$(f(vlobe)) kg/m2; " *
+            "water anchor [$(eb.wa ? "derived" : "slot")]: int rho_w=$(f(wi)) kg/m2, " *
+            "budget=$(f(budget)) kg/m2 (src=$(f(src)), rel " *
+            "$(f(budget / max(abs(wi), eps())))), neg water=$(f(ni)) kg/m2, " *
+            "rho_w<0 points=$(nwn), shadow gap int=$(f(gi)) kg/m2 max=$(f(gm)) kg/m3")
     fill!(view(st, MC_REFIT_DR:MC_LOBE_I3, :), 0.0)
     st[MC_ECEN_STEPS, 1] = 0.0
     return nothing

@@ -7568,7 +7568,9 @@ using Springsteel
         @test Scythe.MC_REFIT_DR == Scythe.MC_CEVAP_LAST + 1
         @test Scythe.MC_VNEG == Scythe.MC_ECEN_STEPS + 1
         @test Scythe.MC_VNEG_MASS == Scythe.MC_VNEG + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_VNEG_MASS
+        # the water-anchor block (Stage 3) follows MC_VNEG_MASS and is now the final block
+        @test Scythe.MC_W_PART == Scythe.MC_VNEG_MASS + 1
+        @test Scythe.MC_STATS_LAST == Scythe.MC_SHADOW_INT
         @test Scythe.MC_WATER_STATS[Scythe.MC_VNEG] == :v_neg
         @test Scythe.MC_WATER_STATS[Scythe.MC_VNEG_MASS] == :v_neg_mass
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST

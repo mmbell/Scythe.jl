@@ -272,7 +272,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     @testset "MC_VNEG: the census counts the nu_v < 0 points at the report" begin
         @test Scythe.MC_VNEG == Scythe.MC_ECEN_STEPS + 1
         @test Scythe.MC_VNEG_MASS == Scythe.MC_VNEG + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_VNEG_MASS
+        # the water-anchor block (Stage 3) follows MC_VNEG_MASS and is now the final block
+        @test Scythe.MC_W_PART == Scythe.MC_VNEG_MASS + 1
+        @test Scythe.MC_STATS_LAST == Scythe.MC_SHADOW_INT
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         mktempdir() do tmp
             for vtr in (:bhyp, :none)

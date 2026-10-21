@@ -12,6 +12,7 @@ vapor_transform = "none"             # legacy: the vapor slot is the density per
 state_dependent_si = false
 temperature = "energy"               # legacy: T from the total-energy retrieval (pre-2026-10-14)
 si_water_slots = "none"              # legacy: every water species took its acoustic compression explicitly (pre-Stage 2)
+water_anchor = "slot"                # legacy: the prognostic rho_t slot was the total density every reader took (pre-Stage 3)
 
 [boundary_conditions]
 vertical_scalars = "d2"             # legacy: one wall condition, ground AND lid

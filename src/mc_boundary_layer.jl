@@ -253,7 +253,19 @@ carrying no cloud.
     # closure leaves the partition exactly closed and opens no reconciliation gap.
     VDOT_w = S.VDOT_w
     rho_tp_z = rtv.f_z; rho_dp_z = rdv.f_z
-    col.uMish .= Kv .* (rho_tp_z .- rho_dp_z)
+    if mtile.ebudget.wa
+        # the derived water anchor: `∂z(ρ_t' − ρ_d') = Σ α_k ∂z ν_k'` (`anchor_Wp`); slot 3 is a
+        # shadow nothing reads
+        wset = water_anchor_set(mtile.model.options, mtile.model.physical_params,
+                                mtile.mc_slots)
+        phys = mtile.tile.physical
+        zs_w = siw_zslot(phys)
+        @inbounds for i in eachindex(Kv)
+            col.uMish[i] = Kv[i] * anchor_Wp(phys, colstart + i - 1, zs_w, wset)
+        end
+    else
+        col.uMish .= Kv .* (rho_tp_z .- rho_dp_z)
+    end
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_w)

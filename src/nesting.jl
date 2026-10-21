@@ -961,7 +961,7 @@ function run_nested_patch(patch::AbstractGrid, model::ModelParameters,
     if xsi
         w1 = workerids[1]
         Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
-        rho_t2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_t(mtile.ref_state), :, 1:2))))
+        rho_t2 = get_val_from(w1, :(collect(view(Scythe.mc_rho_tbar_ref(mtile), :, 1:2))))
         rho_d2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1:2))))
         etp2 = get_val_from(w1, :(collect(
             view(Scythe.ref_total_energy(mtile.ref_state), :, 1:2) .+

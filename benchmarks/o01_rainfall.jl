@@ -861,7 +861,10 @@ function o01_init!(model)
     if get(reference_state_options(), :consistent_qss_reference, false)
         ref = Scythe.consistent_qss_reference(ref, z, column;
             vapor_transform = Scythe.vapor_transform_mode(model.options),
-            vapor_mu = Scythe.vapor_mu(model.physical_params))
+            vapor_mu = Scythe.vapor_mu(model.physical_params),
+            water_anchor = Scythe.water_anchor_mode(model.options),
+            condensate_transform = Scythe.condensate_transform_mode(model.options),
+            condensate_mu = Float64(get(model.physical_params, :condensate_mu, 1.0e-7)))
     end
 
     # Hydrostatic sanity: residual of the balanced reference on its own column
