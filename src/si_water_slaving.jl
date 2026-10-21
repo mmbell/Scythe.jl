@@ -1089,3 +1089,185 @@ function validate_water_anchor(model)
         "partition against slot 3 (rule 2); refused under " * why)
     return nothing
 end
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WATER EXCHANGE WITH THE VAPOR AS ν-SPACE CLOSURE — Stage 3b (design §5.2, plan E4/E5/E8)
+#
+# Under the derived anchor every process that moves water between species applies its
+# non-vapor ν increments as before and the vapor receives
+#
+#     Δν_v = −(Σ_{k≠v} α_k Δν_k)/α_v                         (`water_exchange_dv`)
+#
+# in ONE fixed order (cloud, rain, the three ice masses), so ρ_w = Σ α_k ν_k is invariant under
+# every exchange to rounding (exactly: with all α = 2 the doublings and the halving are exact,
+# and α_v Δν_v is the negated sum bit for bit). Sites: the ETD step-mean increments, the
+# multistep exchange sources (AUTO_COLL, the ice back-reactions ICE_C/ICE_R, the twelve ice
+# SRC_* including the anchor source and the population reconcile), the sedimentation knee
+# closure and the paired Stage L.
+# ═════════════════════════════════════════════════════════════════════════════
+
+"""
+    water_exchange_dv(av, ac, ar, ai, dc, dr, d1, d2, d3) -> Δν_v
+
+THE ONE CLOSURE: the vapor's ν increment of a water exchange whose non-vapor ν increments are
+`dc` (cloud), `dr` (rain), `d1..d3` (the ice masses), weights `α` (`water_anchor_set`):
+`−((((α_c dc + α_r dr) + α_i d1) + α_i d2) + α_i d3)/α_v`. With every `α = 2` it is bitwise
+`−((((dc + dr) + d1) + d2) + d3)` (doubling and halving are exact). An all-zero exchange gives
+`−0.0`, which every caller skips, so a quiet point is untouched bitwise.
+"""
+@inline water_exchange_dv(av, ac, ar, ai, dc, dr, d1, d2, d3) =
+    -(((((ac * dc) + (ar * dr)) + (ai * d1)) + (ai * d2)) + (ai * d3)) / av
+
+"""
+    water_exchange_multistep_rate(av, ac, ar, ai, Jc, Jr, J1, J2, J3, ac_rate, ice_c, ice_r,
+                                  s1, s2, s3) -> ν̇_v
+
+The vapor's ν RATE closing the multistep exchange sources (the ones that stay on AB3): the
+cloud receives `J_c(ICE_C − AUTO_COLL)`, the rain `J_r(ICE_R + AUTO_COLL)`, each ice mass
+`J_k SRC_k` (the ISHMAEL process sources with the anchor source and the population reconcile
+folded in), and the vapor `water_exchange_dv` of those ν rates. Autoconversion alone gives the
+vapor `(J_c − J_r)·AUTO_COLL`: zero above both knees (design §5.2).
+"""
+@inline water_exchange_multistep_rate(av, ac, ar, ai, Jc, Jr, J1, J2, J3, acr, ice_c, ice_r,
+                                      s1, s2, s3) =
+    water_exchange_dv(av, ac, ar, ai, Jc * (ice_c - acr), Jr * (ice_r + acr), J1 * s1,
+                      J2 * s2, J3 * s3)
+
+"""
+    sedimentation_knee_closure(av, ar, ai, Jr, J1, J2, J3, Frz, F1z, F2z, F3z) -> ν̇_v
+
+Plan E8 (design condition d): the falling species' slots receive `−J_k F_{k,z}`, so ρ_w would
+lose `α_k J_k F_{k,z}` (`2J_k F_z`, not `F_z`, at a knee); the vapor takes the remainder,
+`ν̇_v = Σ_k (α_k J_k − 1) F_{k,z}/α_v` (`(J_k − ½) F_{k,z}` with every α = 2), so ρ_w loses exactly
+the fitted flux divergence `Σ_k F_{k,z}` and the rainfall double entry closes. An exact zero
+where nothing falls (or above every knee, to the rounding of `2·½ − 1`).
+"""
+@inline sedimentation_knee_closure(av, ar, ai, Jr, J1, J2, J3, Frz, F1z, F2z, F3z) =
+    (((((ar * Jr) - 1.0) * Frz) + (((ai * J1) - 1.0) * F1z)) +
+     ((((ai * J2) - 1.0) * F2z) + (((ai * J3) - 1.0) * F3z))) / av
+
+"""
+    _water_exchange_multistep!(expdot, phys, S, colstart, rv_i, ws, ice, precip, nvb, vtr,
+                               vmu, ts)
+
+Under the derived anchor, add to the vapor slot's tendency the closure of the multistep
+exchange (`water_exchange_multistep_rate`) and of the sedimentation (`sedimentation_knee_closure`),
+with their partners: the multistep exchange's vapor share — the ice gained from no liquid,
+`(ICE_C + ICE_R) + Σ_k SRC_k` (DeMott nucleation, splinters, the anchor source, the population
+seed, `var_check`) — is booked as deposition/sublimation through `phase_change_partner`
+(latent heat `L_s` in `p`, the `(1 + 𝒬_{s,i})` share of `Q_ss`; `FRZ_NET` already carries the
+liquid↔ice `L_f`); the sedimentation closure's vapor through the primitive alone (plan E8,
+`primitive(rec_v, 0, 0)` on the realized recovered rate). `@noinline`, the scratch and plain
+arrays.
+"""
+@noinline function _water_exchange_multistep!(expdot::Matrix{Float64}, phys::Array{Float64,3},
+                                              S, colstart::Int, rv_i::Int, ws::SIWaterSet,
+                                              ice::Bool, precip::Bool,
+                                              nvb::Vector{Float64}, vtr::Symbol,
+                                              vmu::Float64, ts::Float64)
+    av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]; ai = ws.alpha[4]
+    Jc = S.Jc; Jr = S.Jr; AC = S.AUTO_COLL; Frz = S.Fr_z
+    @inbounds for i in eachindex(Jc)
+        g = colstart + i - 1
+        acr = precip ? AC[i] : 0.0
+        if ice
+            x = water_exchange_multistep_rate(av, ac, ar, ai, Jc[i], Jr[i], S.J_i1q[i],
+                    S.J_i2q[i], S.J_i3q[i], acr, S.ICE_C[i], S.ICE_R[i], S.SRC_i1q[i],
+                    S.SRC_i2q[i], S.SRC_i3q[i])
+            xs = sedimentation_knee_closure(av, ar, ai, Jr[i], S.J_i1q[i], S.J_i2q[i],
+                    S.J_i3q[i], Frz[i], S.F_i1q_z[i], S.F_i2q_z[i], S.F_i3q_z[i])
+            dep = (S.ICE_C[i] + S.ICE_R[i]) + ((S.SRC_i1q[i] + S.SRC_i2q[i]) + S.SRC_i3q[i])
+        else
+            x = acr == 0.0 ? 0.0 :
+                water_exchange_dv(av, ac, ar, ai, -(Jc[i] * acr), Jr[i] * acr, 0.0, 0.0, 0.0)
+            xs = Frz[i] == 0.0 ? 0.0 : (((ar * Jr[i]) - 1.0) * Frz[i]) / av
+            dep = 0.0
+        end
+        x != 0.0 && (expdot[g, rv_i] += x)
+        if dep != 0.0
+            dp, _, dq = phase_change_partner(0.0, dep, S.Tk[i], S.R_m[i], S.C_vt[i],
+                                             S.C_pt[i], S.Lv[i], L_s(S.Tk[i]), S.Q_s[i],
+                                             S.Q_s_i[i])
+            expdot[g, 1] += dp
+            expdot[g, 7] += dq
+        end
+        if xs != 0.0
+            expdot[g, rv_i] += xs
+            nu = phys[g, rv_i, 1] + nvb[i]
+            rv = (recover_rho_v(ts * xs, nu, vtr, vmu) - recover_rho_v(0.0, nu, vtr, vmu)) / ts
+            if rv != 0.0
+                dp, dq = recovered_change_partner(rv, 0.0, 0.0, S.Tk[i], S.rho_d[i], S.R_m[i],
+                                                  S.C_vt[i], S.Lv[i], 0.0, S.drvs_dT[i],
+                                                  S.drvs_dp[i])
+                expdot[g, 1] += dp
+                expdot[g, 7] += dq
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    _lobe_relax_paired!(vnp1, phys, S, colstart, rv_i, i1, i2, i3, ice, ws, nvb, vtr, vmu)
+        -> (Δν_c, Δν_r, Δν_i1, Δν_i2, Δν_i3) per point summed with `S`-independent weights by the caller
+
+THE PAIRED STAGE L (plan E5, design risk 4): under the derived anchor the lobe relaxation's
+capped increments `Δν_k = lobe_relaxation_cap(−ν_k(1 − e^{−Δt/τ}), ν*)` on the closed channels
+are a water EXCHANGE with the vapor: `Δν_v = water_exchange_dv(…)`, so ρ_w is untouched. The
+recovered condensate is 0 before and after (the cap keeps ν ≤ 0), the recovered vapor falls by
+`ahyp(ν_v) − ahyp(ν_v + Δν_v)`, and the partner is the primitive of that vapor change ALONE — no
+latent heat (`recovered_change_partner(rec_v, 0, 0, …)` into `p` and `Q_ss`). Returns the column
+increments it applied per point through `out` (the caller's census). `@noinline`.
+"""
+@noinline function _lobe_relax_paired!(vnp1::Matrix{Float64}, phys::Array{Float64,3}, S,
+                                       colstart::Int, rv_i::Int, i1::Int, i2::Int, i3::Int,
+                                       ice::Bool, ws::SIWaterSet, nvb::Vector{Float64},
+                                       vtr::Symbol, vmu::Float64, wz::Vector{Float64},
+                                       cen::Bool)
+    av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]; ai = ws.alpha[4]
+    dlc = S.etd_dlc; dlr = S.etd_dlr; nuc = S.nu_c
+    lc = 0.0; lr = 0.0; l1 = 0.0; l2 = 0.0; l3 = 0.0
+    @inbounds for i in eachindex(dlc)
+        g = colstart + i - 1
+        dc = 0.0; dr = 0.0; d1 = 0.0; d2 = 0.0; d3 = 0.0
+        if dlc[i] != 0.0
+            dc = lobe_relaxation_cap(dlc[i], vnp1[g, 9] + (nuc[i] - phys[g, 9, 1]))
+            dc != 0.0 && (vnp1[g, 9] += dc)
+        end
+        if dlr[i] != 0.0
+            dr = lobe_relaxation_cap(dlr[i], vnp1[g, 8])
+            dr != 0.0 && (vnp1[g, 8] += dr)
+        end
+        if ice
+            if S.etd_dli1[i] != 0.0
+                d1 = lobe_relaxation_cap(S.etd_dli1[i], vnp1[g, i1])
+                d1 != 0.0 && (vnp1[g, i1] += d1)
+            end
+            if S.etd_dli2[i] != 0.0
+                d2 = lobe_relaxation_cap(S.etd_dli2[i], vnp1[g, i2])
+                d2 != 0.0 && (vnp1[g, i2] += d2)
+            end
+            if S.etd_dli3[i] != 0.0
+                d3 = lobe_relaxation_cap(S.etd_dli3[i], vnp1[g, i3])
+                d3 != 0.0 && (vnp1[g, i3] += d3)
+            end
+        end
+        if cen
+            w = wz[i]
+            lc += w * dc; lr += w * dr; l1 += w * d1; l2 += w * d2; l3 += w * d3
+        end
+        (dc == 0.0 && dr == 0.0 && d1 == 0.0 && d2 == 0.0 && d3 == 0.0) && continue
+        dv = water_exchange_dv(av, ac, ar, ai, dc, dr, d1, d2, d3)
+        nu0 = vnp1[g, rv_i] + nvb[i]
+        vnp1[g, rv_i] += dv
+        rec = recover_rho_v(vnp1[g, rv_i], nvb[i], vtr, vmu) - recover_rho_v(0.0, nu0, vtr, vmu)
+        if rec != 0.0
+            dp, dq = recovered_change_partner(rec, 0.0, 0.0, S.Tk[i], S.rho_d[i], S.R_m[i],
+                                              S.C_vt[i], S.Lv[i], 0.0, S.drvs_dT[i],
+                                              S.drvs_dp[i])
+            vnp1[g, 1] += dp
+            vnp1[g, 7] += dq
+        end
+    end
+    return (lc, lr, l1, l2, l3)
+end

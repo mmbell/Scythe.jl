@@ -12,7 +12,7 @@
 # keeps its own transport and SI increment and FEEDS NOTHING (the shadow, MC_SHADOW_*).
 # `:slot` (the library default) is the code before this stage, bitwise.
 #
-# 3a (this commit): the option and config; `:slot` bitwise against goldens captured at
+# 3a: the option and config; `:slot` bitwise against goldens captured at
 # 44da59c; the resting fixed point under `:derived` (every consumer on rho_tbar_w, the EOS and
 # the `:energy` temperature, both SI paths, warm and ice); dry bitwise; slot 3 feeds nothing;
 # the shadow starts at exactly 0.0; the setup refusals; the census rows; the R1T1X wall
@@ -363,5 +363,119 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         @test d.rho_tbar_w ≈ ref.rho_dbar .+ 2.0 .* nvb .+ 2.0 .* ncb rtol = 1.0e-14
         @test d.rho_w_deficit == min.(d.rho_t .- (slots.rho_d .+ reshape(ref.rho_dbar, 1, nz)), 0.0) ||
               all(d.rho_w_deficit .== 0.0)
+    end
+
+    # ══ 3b: the exchange closure (water_exchange_dv and its sites) ══════════════════
+    @testset "3b: every exchange block is rho_w-neutral (sum_k alpha_k dnu_k == 0)" begin
+        # one scalar identity per block, on the closure every site uses, for the production
+        # weights (every slot transformed: alpha = 2) and a mixed set (density vapor)
+        for (av, ac, ar, ai) in ((2.0, 2.0, 2.0, 2.0), (1.0, 2.0, 2.0, 2.0), (1.0, 1.0, 1.0, 1.0))
+            sumw(dv, dc, dr, d1, d2, d3) = ((((((ac * dc) + (ar * dr)) + (ai * d1)) + (ai * d2)) +
+                                            (ai * d3)) + (av * dv))
+            blocks = (
+                "condensation"  => (3.1e-7, 0.0, 0.0, 0.0, 0.0),
+                "rain evap"     => (0.0, -2.7e-8, 0.0, 0.0, 0.0),
+                "deposition"    => (0.0, 0.0, 4.4e-9, 1.3e-10, 7.0e-9),
+                "cond+evap+dep" => (1.9e-7, -3.3e-8, 2.2e-9, 0.0, -1.1e-9))
+            for (name, (dc, dr, d1, d2, d3)) in blocks
+                dv = Scythe.water_exchange_dv(av, ac, ar, ai, dc, dr, d1, d2, d3)
+                @test sumw(dv, dc, dr, d1, d2, d3) == 0.0
+            end
+            # the multistep sources: riming/freezing (liquid -> ice), melting (ice -> rain),
+            # autoconversion/collection (cloud -> rain), the population warm branch (ice ->
+            # rain), the anchor source (ice removed), DeMott nucleation (vapor -> ice)
+            Jc, Jr, J1, J2, J3 = 0.5000003, 0.71, 0.5, 0.62, 0.5
+            for (name, (acr, ic, ir, s1, s2, s3)) in (
+                    "riming"       => (0.0, -2.0e-7, 0.0, 2.0e-7, 0.0, 0.0),
+                    "freezing"     => (0.0, 0.0, -5.0e-8, 0.0, 0.0, 5.0e-8),
+                    "melting"      => (0.0, 0.0, 3.0e-8, -1.0e-8, -2.0e-8, 0.0),
+                    "autoconv"     => (4.0e-8, 0.0, 0.0, 0.0, 0.0, 0.0),
+                    "population"   => (0.0, 0.0, 7.0e-9, 0.0, -7.0e-9, 0.0),
+                    "anchor"       => (0.0, 0.0, 0.0, -3.0e-9, -1.0e-9, -2.0e-9),
+                    "nucleation"   => (0.0, 0.0, 0.0, 1.0e-12, 0.0, 0.0))
+                x = Scythe.water_exchange_multistep_rate(av, ac, ar, ai, Jc, Jr, J1, J2, J3,
+                                                         acr, ic, ir, s1, s2, s3)
+                @test sumw(x, Jc * (ic - acr), Jr * (ir + acr), J1 * s1, J2 * s2, J3 * s3) == 0.0
+            end
+            # autoconversion above both knees moves no vapor
+            @test Scythe.water_exchange_multistep_rate(av, ac, ar, ai, 0.5, 0.5, 0.5, 0.5, 0.5,
+                                                       4.0e-8, 0.0, 0.0, 0.0, 0.0, 0.0) == 0.0
+            # sedimentation: rho_w loses EXACTLY the fitted flux divergence (plan E8)
+            for (Jr_, J1_, Frz, F1z) in ((0.5, 0.5, 2.0e-6, 3.0e-7), (0.83, 0.5000002, -1.0e-6, 0.0),
+                                         (1.0, 0.9, 5.0e-7, -2.0e-7))
+                xs = Scythe.sedimentation_knee_closure(av, ar, ai, Jr_, J1_, 0.5, 0.5, Frz, F1z,
+                                                       0.0, 0.0)
+                drw = (ar * (-Jr_ * Frz)) + (ai * (-J1_ * F1z)) + (av * xs)
+                @test drw ≈ -(Frz + F1z) rtol = 1.0e-14 atol = 1.0e-22
+            end
+            @test Scythe.sedimentation_knee_closure(2.0, 2.0, 2.0, 0.5, 0.5, 0.5, 0.5,
+                                                    1.0e-6, 2.0e-7, 0.0, 0.0) == 0.0
+        end
+        @test Scythe.water_exchange_dv(2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0) === -0.0
+        # with every alpha = 2 the closure is bitwise the plain nu-sum (doubling/halving exact)
+        for dc in (3.0e-7, -1.7e-9), dr in (0.0, 2.2e-8)
+            @test Scythe.water_exchange_dv(2.0, 2.0, 2.0, 2.0, dc, dr, 1.0e-9, 0.0, 3.0e-10) ===
+                  -((((dc + dr) + 1.0e-9) + 0.0) + 3.0e-10)
+        end
+    end
+
+    @testset "3b: the ETD stage and the paired Stage L are rho_w-neutral in the model" begin
+        # A supersaturated sheet column (nucleation over the lobes, condensation in the sheet,
+        # rain falling and evaporating below), one step, then the ETD stage re-applied on the
+        # state it started from: sum_k alpha_k dnu_k over the water slots is zero to rounding
+        # at every point, the vapor's increment IS the closure (no other write), and with the
+        # paired Stage L on the recovered cloud is untouched by the relaxation.
+        mktempdir() do tmp
+            super! = (p, x, V, c) -> begin
+                F.vt_seed!(p, x, V, c; amp = 1.0e-3)
+                kD = length(c.Tk)
+                for i in 1:size(p.physical, 1)
+                    zz = x[i, end]; k = mod1(i, kD)
+                    zz > 1500.0 || continue
+                    drv = 0.33 * Scythe.rho_v_sat(c.Tk[k], c.p_Pa[k] / 100.0)
+                    p.physical[i, V["nu_v"], 1] += Scythe.bhyp(c.rho_v[k] + drv, 1.0e-9) -
+                                                    Scythe.bhyp(c.rho_v[k], 1.0e-9)
+                    p.physical[i, V["Q_ss"], 1] += drv
+                    p.physical[i, V["nu_r"], 1] = Scythe.bhyp(2.0e-4 * exp(-((zz - 800.0) / 500.0)^2), 1.0e-7)
+                end
+            end
+            for ice in (false, true), lobe in (false, true)
+                ex = derived(; lobe_relaxation = lobe)
+                m, p, mo = F.vt_tile(tmp, "etd_$(ice)_$(lobe)"; vtr = :bhyp, ice, extra = ex,
+                                     seed! = super!)
+                F.vt_run!(m, p, mo, 3)
+                kD = mo.grid_params.kDim; nc = F.vt_ncols(p, mo)
+                V = mo.grid_params.vars
+                ws = Scythe.water_anchor_set(mo.options, mo.physical_params, Scythe.mc_slots(mo))
+                wsl = [s for s in ws.slot[1:6] if s > 0]
+                wal = [ws.alpha[j] for j in 1:6 if ws.slot[j] > 0]
+                worst = 0.0; scale = 0.0; nz = 0
+                rcbits = true
+                for c in 1:nc
+                    cs = (c - 1) * kD + 1; rows = cs:(cs + kD - 1)
+                    Scythe.advance_column(m, c, 4)
+                    X0 = copy(m.var_np1)
+                    S = m.mc_scratch[Threads.threadid()]
+                    m.var_np1 .= X0
+                    Scythe.relaxation_adjustment_qss!(m, cs, cs + kD - 1, 4)
+                    for g in rows
+                        d = [m.var_np1[g, s] - X0[g, s] for s in wsl]
+                        sw = sum(wal .* d)
+                        worst = max(worst, abs(sw)); scale = max(scale, maximum(abs, wal .* d))
+                        any(!=(0.0), d) && (nz += 1)
+                        if lobe
+                            n0 = X0[g, V["nu_c"]]; n1 = m.var_np1[g, V["nu_c"]]
+                            # where the device acted (nu <= 0 before and after) no recovered
+                            # cloud moved
+                            (n0 < 0.0 && n1 <= 0.0) &&
+                                (rcbits &= Scythe.ahyp(n0, 1.0e-7) === Scythe.ahyp(n1, 1.0e-7))
+                        end
+                    end
+                end
+                @test nz > 0
+                @test worst <= 1.0e-10 * scale
+                lobe && @test rcbits
+            end
+        end
     end
 end

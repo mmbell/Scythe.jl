@@ -8591,8 +8591,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # THE DERIVED ANCHOR: the totals ρ_t, ρ_{t,z} and the perturbation ρ_t' every reader below
     # takes, over the slot-based ones just formed. The perturbation lands in `res_rho_t`, a
     # column the derived anchor frees (the nudge's residual is deleted with the nudge).
+    wset = water_anchor_set(model.options, model.physical_params, IS)
     wad && _anchor_stage!(rho_t, rho_t_z, S.res_rho_t, grid.physical, colstart, zslot(geom),
-                          water_anchor_set(model.options, model.physical_params, IS), rho_d,
+                          wset, rho_d,
                           rho_d_z, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile), rho_cbar,
                           rho_cbar_z)
     E_t_z = S.E_t_z;     @. E_t_z = E_tp_z + E_tbar_z
@@ -9987,6 +9988,12 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @turbo expdot[colstart:colend, IS.i3_c] .= @. ADV + FORCING
     end
 
+    # ── THE EXCHANGE CLOSURE of the multistep sources and of the sedimentation (derived
+    #    anchor; `_water_exchange_multistep!`): every slot's exchange term is final here, so
+    #    the vapor receives their ν-space closure and ρ_w = Σ α_k ν_k moves by none of them. ──
+    wad && _water_exchange_multistep!(expdot, grid.physical, S, colstart, rv_i, wset, ice_on,
+                                      precipitation, mc_nu_vbar(mtile), vtrans, vmu, model.ts)
+
     # ── The MYNN TKE density ρ_e = ρ_t·e [J/m³] (the appended slot, options[:mynn]) ──
     #
     # The same continuity form every other TOTAL in the set takes, with the closure's
@@ -10539,6 +10546,16 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         etd_dv[i] = vtrans_on ? J_v[i] * (ts * vsrc) : ts * vsrc
         etd_d8[i] = ts * Jr[i] * qr_bar
         etd_d9[i] = ts * Jc[i] * qc_bar
+        # THE DERIVED ANCHOR: the vapor is the ν-space CLOSURE of the step-mean exchange
+        # (`water_exchange_dv`, plan E4), with the ETD's own frozen-at-n Jacobians in the
+        # condensate increments — so ρ_w is untouched by the phase change.
+        if wad
+            etd_dv[i] = water_exchange_dv(wset.alpha[1], wset.alpha[2], wset.alpha[3],
+                                          wset.alpha[4], etd_d9[i], etd_d8[i],
+                                          ice_on ? etd_di1[i] : 0.0,
+                                          ice_on ? etd_di2[i] : 0.0,
+                                          ice_on ? etd_di3[i] : 0.0)
+        end
         # The latent heating of the pressure equation, in the bracket slot 1 carried it in
         # (TeX Eqs. thermo_p, thermo_p_ice): deposition's coefficient is condensation's with
         # `L_v → L_s` and nothing else, and freezing — which has no `(1+𝒬)` partner and stayed
@@ -10602,7 +10619,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
                              Tk, R_m, C_vt, C_pt, Lv, Q_s, S.Q_s_i, colstart,
                              ctrans, cmu, rtrans, rmu, itrans, imu_q,
                              itrans_on ? IS.i1_q : 0, itrans_on ? IS.i2_q : 0,
-                             itrans_on ? IS.i3_q : 0, eb.wz, vtrans_on, J_v)
+                             itrans_on ? IS.i3_q : 0, eb.wz, vtrans_on, J_v, !wad)
         eb_on && eb_partner_take!(eb, etd_d1, etd_dv)
     end
     # The REFIT census (`MC_REFIT_DR`, `MC_REFIT_BOOKED`): in the same window, for the same
@@ -11333,7 +11350,7 @@ realization (plan decision E4).
                                               rtr::Symbol, rmu::Float64,
                                               itr::Symbol, imu::Float64,
                                               rv_i::Int, i1::Int, i2::Int, i3::Int,
-                                              vj::Bool = false)
+                                              vj::Bool = false, water_side::Bool = true)
     d8 = S.etd_d8; d9 = S.etd_d9
     qc = S.Qdot_bar; qr = S.Qdot_r_bar; nuc = S.nu_c
     ice = i1 > 0 && itr !== :none
@@ -11365,7 +11382,9 @@ realization (plan decision E4).
         vnp1[g, 1] += dp
         # Under the vapor control variable (`vj`) the vapor slot holds ν: its share of the
         # re-booked exchange arrives through the frozen-at-n `J_v`, as `etd_dv` did.
-        vnp1[g, rv_i] += vj ? vapor_jacobian_column(S)[i] * dvv : dvv
+        # (no vapor write under the derived anchor, `water_side = false`: the vapor already
+        # received the closure of the exchange, `etd_dv`)
+        water_side && (vnp1[g, rv_i] += vj ? vapor_jacobian_column(S)[i] * dvv : dvv)
         # Slot 7 is already `Q_ss^{n+1}` here — the propagated value where `λ ≠ 0`, the explicit
         # predictor (which carried any clipped flux in `N`) where it was kept — so the
         # give-back is one increment in both cases.
@@ -11500,7 +11519,8 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
                                         itr::Symbol, imu::Float64,
                                         i1::Int, i2::Int, i3::Int, wz::Vector{Float64},
                                         vj::Bool = false,
-                                        Jv::Vector{Float64} = Float64[])
+                                        Jv::Vector{Float64} = Float64[],
+                                        water_side::Bool = true)
     ice = i1 > 0 && itr !== :none
     # The energy the partner books, `∫ δp·C_vt/R_m dz` with the column's quadrature `wz`
     # (the `MC_REFIT_BOOKED` census row; returned, never read by the step). 0.0 when `wz`
@@ -11532,7 +11552,9 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
         d1[i] += dp
         # Under the vapor control variable (`vj`) the vapor increment is a ν increment: the
         # density partner through the frozen-at-n `J_v` (Stage 1 keeps the water side).
-        dv[i] += vj ? Jv[i] * dvv : dvv
+        # (under the derived anchor `water_side = false`: no ν moves, ρ_w is invariant across
+        # the refit and its partner — plan E2)
+        water_side && (dv[i] += vj ? Jv[i] * dvv : dvv)
         if lam[i] != 0.0
             qnp1[i] += dq
         else
@@ -11690,7 +11712,7 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
                 ctr, get(pp, :condensate_mu, 1.0e-7), rtr, get(pp, :rain_mu, 1.0e-7),
                 itr, ice_on ? ice_mu(pp, 1) : 1.0, rv_i,
                 ice_on ? IS.i1_q : 0, ice_on ? IS.i2_q : 0, ice_on ? IS.i3_q : 0,
-                vapor_transform_mode(model.options) !== :none)
+                vapor_transform_mode(model.options) !== :none, !mtile.ebudget.wa)
         end
     end
     eb_on && eb_mark!(eb, EB_EXCH, vnp1, colstart)
@@ -11710,6 +11732,13 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
         wz = eb.wz
         cen = length(wz) == length(lam) && size(mtile.mc_water_stats, 2) > 0
         lc = 0.0; lr = 0.0; l1 = 0.0; l2 = 0.0; l3 = 0.0
+        if eb.wa
+            # THE PAIRED STAGE L (derived anchor, plan E5): the vapor pays the lobe's Δν.
+            lc, lr, l1, l2, l3 = _lobe_relax_paired!(vnp1, phys, S, colstart, rv_i,
+                ice_on ? IS.i1_q : 0, ice_on ? IS.i2_q : 0, ice_on ? IS.i3_q : 0, ice_on,
+                water_anchor_set(model.options, model.physical_params, IS), mc_nu_vbar(mtile),
+                vapor_transform_mode(model.options), vapor_mu(model.physical_params), wz, cen)
+        else
         @inbounds for i in eachindex(lam)
             g = colstart + i - 1
             if dlc[i] != 0.0
@@ -11745,6 +11774,7 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
                     cen && (l3 += wz[i] * d)
                 end
             end
+        end
         end
         if cen
             st = mtile.mc_water_stats
