@@ -409,6 +409,15 @@ function o01_model(opts::BenchmarkOptions)
     options[:vapor_transform] = Symbol(get(ENV, "SCYTHE_O01_VTRANS", "bhyp"))
     haskey(ENV, "SCYTHE_O01_VMU") &&
         (physical_params[:vapor_mu] = parse(Float64, ENV["SCYTHE_O01_VMU"]))
+    # Which water slots the acoustic SI slaves to its mass flux (`Scythe.si_water_slots_mode`,
+    # Stage 2 of the rho_t retirement). Unset => `:none`, NOT the run-config default `:mass`:
+    # this benchmark's vertical walls are a MIXED family across the water slots (Neumann
+    # scalars, the sedimenting rain/ice natural at both walls), which `:mass` refuses (design
+    # risk 2). SCYTHE_O01_SIWATER=mass (or all) with SCYTHE_O01_SIWATER_MIXED=1 runs it and
+    # measures that combination (`options[:si_water_mixed_walls]`).
+    options[:si_water_slots] = Symbol(get(ENV, "SCYTHE_O01_SIWATER", "none"))
+    haskey(ENV, "SCYTHE_O01_SIWATER_MIXED") &&
+        (options[:si_water_mixed_walls] = envflag("SCYTHE_O01_SIWATER_MIXED"))
 
     # How many moments of the rain DSD to carry. Unset => the key is absent => 1, the
     # single-moment Ooyama closure, bit-identical. "2" appends the prognostic rain number
