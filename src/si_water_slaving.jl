@@ -158,42 +158,73 @@ end
 """
     validate_si_water_slots(model)
 
-Setup-time refusal of MIXED vertical wall families across the slaved water set (design §8 risk 2;
-plan Stage 2 test 5). The slaved increments are pointwise mish values that each slot then refits
-on its OWN vertical basis; the identity `Δ(ρ_d' + Σ α_k ν_k') = Δρ_t'` survives the refit only if
-every member is fitted with one operator — the same ground and lid condition and the same
-vertical filter (`l_q`, `spline_filter`). Under the `d2` or `r1t1x` scalar families the
-sedimenting slots stay natural at the ground while the vapor and cloud take the family, so the
-rain/ice share of the water would carry a different wall fit (the "freeing rho_t alone" class of
-`[boundary_conditions]`). Refused unless `options[:si_water_mixed_walls] = true`, the explicit
-opt-in to MEASURE that combination (design §4.4 caveat 1: "refuse that combination, or measure
-it"). A no-op under `si_water_slots = :none` and for non-mc equation sets.
+Setup-time refusal of a slaved water set that does not share ONE fit operator with the anchor
+(design §8 risk 2; plan Stage 2 test 5). The slaved increments are pointwise mish values that
+each slot then refits on its OWN bases, so `Δ(ρ_d' + Σ α_k ν_k') = Δρ_t'` survives the refit only
+if `ρ_d`, `ρ_t` and every slaved slot are fitted identically: the same wall conditions on every
+side (`BCB`/`BCT`, `BCL`/`BCR`, and `BCU`/`BCD` on the 3-D box — the horizontal refit runs on
+every geometry, not only under the horizontal SI), the same vertical AND horizontal filter
+lengths (`l_q`, its `_k`/`_j` keys), the same `spline_filter`, and NO positivity bound (a bounded
+fit is nonlinear, so the sum of the bounded refits is not the refit of the sum — an untransformed
+`rho_r` under `numerics.positivity = auto` is the case that gets one). The sedimentation FLUX
+columns' zero-flux lid is not compared: those fit the fluxes, not the slaved increments.
+
+Under the `d2` or `r1t1x` scalar families the sedimenting slots stay natural at the ground while
+the vapor and cloud take the family (and `r1t1x` gives ρ_d/ρ_t Neumann), so those are refused.
+`options[:si_water_mixed_walls] = true` is the explicit opt-in to run and MEASURE such a
+combination (design §4.4 caveat 1: "refuse that combination, or measure it"). A no-op under
+`si_water_slots = :none` and for non-mc equation sets.
 """
 function validate_si_water_slots(model)
-    names = si_water_member_names(model)
-    isempty(names) && return nothing
+    water = si_water_member_names(model)
+    isempty(water) && return nothing
     get(model.options, :si_water_mixed_walls, false)::Bool && return nothing
     gp = model.grid_params
+    mode = si_water_slots_mode(model.options)
+    names = ["rho_d"; "rho_t"; water]
     dflt(d, v) = haskey(d, v) ? d[v] : get(d, "default", nothing)
-    lqk(v) = haskey(gp.l_q, v * "_k") ? gp.l_q[v * "_k"] :
-             haskey(gp.l_q, v) ? gp.l_q[v] : get(gp.l_q, "default", nothing)
-    sig(v) = (dflt(gp.BCB, v), dflt(gp.BCT, v), lqk(v), get(gp.spline_filter, v, nothing))
-    ref = names[1]; s0 = sig(ref)
-    for v in names[2:end]
-        s = sig(v)
-        s == s0 && continue
-        what = s[1] != s0[1] ? "ground BC (BCB) $(s[1]) vs $(s0[1])" :
-               s[2] != s0[2] ? "lid BC (BCT) $(s[2]) vs $(s0[2])" :
-               s[3] != s0[3] ? "vertical l_q $(s[3]) vs $(s0[3])" : "spline_filter"
-        error("options[:si_water_slots] = :$(si_water_slots_mode(model.options)) slaves the " *
-              "water slots $(join(names, ", ")) to the acoustic mass flux, but \"$(v)\" and " *
-              "\"$(ref)\" do not share one vertical operator ($(what)). The slaved increments " *
-              "are refit slot by slot, so a mixed wall family breaks the water/anchor identity " *
-              "at the wall (design risk 2: under d2/r1t1x families the sedimenting slots stay " *
-              "natural at the ground). Use one family for every water slot (the natural " *
-              "family: [boundary_conditions] vertical_scalars = vertical_scalars_lid = " *
-              "\"natural\", sedimentation_lid = \"natural\"), or set numerics.si_water_slots = " *
-              "\"none\", or set options[:si_water_mixed_walls] = true to run and MEASURE it.")
+    lqh(v) = haskey(gp.l_q, v) ? gp.l_q[v] : get(gp.l_q, "default", nothing)
+    lqv(v) = haskey(gp.l_q, v * "_k") ? gp.l_q[v * "_k"] : lqh(v)
+    lqj(v) = haskey(gp.l_q, v * "_j") ? gp.l_q[v * "_j"] : lqh(v)
+    aspects = (("ground BC (BCB)", v -> dflt(gp.BCB, v)),
+               ("lid BC (BCT)", v -> dflt(gp.BCT, v)),
+               ("inner/left BC (BCL)", v -> dflt(gp.BCL, v)),
+               ("outer/right BC (BCR)", v -> dflt(gp.BCR, v)),
+               ("y BC (BCU)", v -> dflt(gp.BCU, v)),
+               ("y BC (BCD)", v -> dflt(gp.BCD, v)),
+               ("vertical l_q", lqv),
+               ("horizontal l_q", lqh),
+               ("second horizontal l_q", lqj),
+               ("spline_filter", v -> get(gp.spline_filter, v, nothing)))
+    hint = "Use one family for every water slot and the anchor (the natural family: " *
+           "[boundary_conditions] vertical_scalars = vertical_scalars_lid = \"natural\", " *
+           "sedimentation_lid = \"natural\", no per-variable override or filter on these " *
+           "slots), or set numerics.si_water_slots = \"none\", or set " *
+           "options[:si_water_mixed_walls] = true to run and MEASURE it."
+    for v in names
+        if haskey(gp.positivity, v) && !isempty(gp.positivity[v])
+            error("options[:si_water_slots] = :$(mode) slaves $(join(water, ", ")) to the " *
+                  "acoustic mass flux, but \"$(v)\" carries a positivity bound " *
+                  "($(gp.positivity[v])): a bounded fit is nonlinear, so the slaved increments " *
+                  "would not sum through the refit to the anchor's (an untransformed rho_r " *
+                  "under numerics.positivity = auto gets one). Transform the slot " *
+                  "(physics.microphysics.rain_transform = \"bhyp\"), set numerics.positivity " *
+                  "= \"off\", or " * hint)
+        end
+    end
+    for (label, f) in aspects
+        ref = names[1]; s0 = f(ref)
+        for v in names[2:end]
+            sv = f(v)
+            isequal(sv, s0) && continue
+            error("options[:si_water_slots] = :$(mode) slaves the water slots " *
+                  "$(join(water, ", ")) to the acoustic mass flux, but \"$(v)\" and " *
+                  "\"$(ref)\" do not share one fit operator ($(label): $(sv) vs $(s0)). The " *
+                  "slaved increments are refit slot by slot, so a mixed family breaks the " *
+                  "water/anchor identity Δ(ρ_d' + Σ α ν') = Δρ_t' at the refit (design risk 2: " *
+                  "under d2/r1t1x families the sedimenting slots stay natural at the ground). " *
+                  hint)
+        end
     end
     return nothing
 end
@@ -651,6 +682,11 @@ slaved water increments from the anchor's own planes, `δν_k = s_k (δρ_t − 
 already applied) — algebraically `c_k·drt − Δτ c_{k,z} φ^{n+1}` with `c_k = s_k(1 − c_d)`, the
 formula plane 4 uses for ρ_d, and `Σ α_k δν_k = δρ_t − δρ_d` to rounding. Called AFTER the
 w/ρ_d/ρ_t planes have been added. Skipped where the increment is 0.
+
+Note on φ^{n+1}: the `s_{k,z}` term takes it as `ρ̄_t · vnp1[w]` (the w plane applied), while
+the solve's ρ_d plane used its own per-mode `phin1`. On XZ/axisym the two differ by rounding; on
+RLR by the azimuthally truncated part of w* (the ragged per-n solve). The identity is unaffected
+(Σ α_k s_{k,z} = 0 to rounding whatever φ is used); only the flux-form correction's accuracy is.
 """
 @noinline function _siw_xsi_apply!(vnp1::Matrix{Float64}, hf::AbstractMatrix{Float64},
                                    rows::UnitRange{Int}, colstart::Int, ws::SIWaterSet,

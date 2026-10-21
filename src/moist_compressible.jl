@@ -10508,6 +10508,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # `expdot_nm1`/`expdot_nm2` are still the previous two levels (`explicit_timestep` rotates
     # them), so the increment measured is exactly the one applied — including the horizontal
     # water mixing and the boundary-layer contributions added after slot 8/9 were assembled.
+    # (Not quite final under `options[:si_water_slots] ≠ :none`: the slaved water slots' acoustic
+    # add-back is added later, inside `explicit_timestep` (`_siw_stage!`). The probe is refused
+    # with any water transform, and the run-config default is transformed, so no run reads both;
+    # under `:none`, the library default, the statement holds.)
     # The phase change no longer travels through `expdot` at all, so the DIRECT increments the
     # relaxation adjustment is about to apply are handed over beside it (`etd_d*`) together
     # with the step-mean rates themselves; see `water_depletion_probe!`.

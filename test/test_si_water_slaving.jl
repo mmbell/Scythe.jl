@@ -32,10 +32,13 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
     # the horizontal sweep need rigid walls) and per-slot ground BC overrides.
     function siw_tile(tmpdir, tag; seed! = (p, x, V, col) -> nothing, vtr = :bhyp,
                       ice = false, tr = :bhyp, ts = 0.5, rh = z -> 0.7, walls = false,
+                      rc_ref = nothing, cqss = true, bct_override = Dict{String,Any}(),
+                      side_override = Dict{String,Any}(), lq = Dict("default" => 2.0),
+                      sfilt = Dict{String,Any}(), pos = Dict{String,Any}(),
                       bcb_override = Dict{String,Any}(), extra = Dict{Symbol,Any}(),
                       pp_extra = Dict{Symbol,Float64}())
         opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
-                                :consistent_qss_reference => true,
+                                :consistent_qss_reference => cqss,
                                 :hydrostatic_reference => true,
                                 :precipitation => ice, :vertical_mixing => false,
                                 :condensate_transform => tr, :rain_transform => tr,
@@ -56,10 +59,13 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         wall_bc = merge(Dict{String,Any}(v => NeumannBC() for v in varnames),
                         Dict{String,Any}("w" => DirichletBC()))
         bcb = merge(wall_bc, bcb_override)
+        bct = merge(wall_bc, bct_override)
+        bcl = merge(side_bc, side_override)
         gp = GridParameters(geometry = "RiRk",
             iMin = 0.0, iMax = F.SPAN, num_cells_i = F.NCELL,
             kMin = 0.0, kMax = F.ZTOP, num_cells_k = F.NCELL_K,
-            BCL = side_bc, BCR = side_bc, BCB = bcb, BCT = wall_bc, vars = vars)
+            BCL = bcl, BCR = side_bc, BCB = bcb, BCT = bct, vars = vars, l_q = lq,
+            spline_filter = sfilt, positivity = pos)
         ref_file = joinpath(tmpdir, "siw_$(tag).ref")
         pp = Dict{Symbol,Float64}(:Khdiff => 0.0, :Kvdiff => 0.0, :Kvdiff_heat => 0.0,
                                   :Kvdiff_water => 0.0, :Kv_mudiff => 0.0,
@@ -75,7 +81,9 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         pts = Scythe.getGridpoints(patch)
         z = pts[1:gp.kDim, end]
         col = F.vt_column(z, rh)
-        Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+        # `rc_ref`: a CLOUDY reference (a saturated layer carrying rho_cbar(z) > 0)
+        rcb = rc_ref === nothing ? col.rho_c : rc_ref.(z)
+        Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, rcb)
         patch.physical .= 0.0
         seed!(patch, pts, gp.vars, col)
         spectralTransform!(patch)
@@ -368,6 +376,153 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         end
     end
 
+    # ── 1e. a CLOUDY reference: the share-form z-terms are live ──────────────────
+    # Every other fixture has a cloud-free base, where s_v = 1/α_v exactly and s_{v,z} = 0, so
+    # the reference path's `s_{k,z}(1 − c_d) − s_k c_{d,z}` and exact_si's
+    # `−Δτ s_{k,z}(1 − c_d) φ^{n+1}` were never exercised (and Σ α s_{k,z} = 0 hides a wrong
+    # coefficient from the identity). Here the base carries a cloud layer rho_cbar(z) > 0 with a
+    # gradient, and each species' increment is checked against the derivation computed
+    # independently from the reference profiles, not only the sum.
+    cl_rc(z) = 3.0e-4 * exp(-((z - 2250.0) / 700.0)^2)
+    cloudy(tmpdir, tag; kw...) = seeded_tile(tmpdir, tag; rc_ref = cl_rc, cqss = false, kw...)
+    # The reference shares and their derivatives, independently: s_k = ν̄_k/ρ̄_w with
+    # ν̄_v = bhyp(ρ̄_v) (the tile's derived ρ̄_v), ν̄_c = bhyp(ρ̄_c), α = 2 for both.
+    function shares(m)
+        rcm = Springsteel.ref_rho_c(m.ref_state)
+        rcb = rcm[:, 1]; rcbz = rcm[:, 2]
+        mu_c = 1.0e-7
+        rvb = m.mc_ref_diag.rho_vbar; rvbz = m.mc_ref_diag.rho_vbar_z
+        nv = [Scythe.bhyp(x, VMU) for x in rvb]; nvz = [Scythe.dbhyp(x, VMU) for x in rvb] .* rvbz
+        nc = [Scythe.bhyp(x, mu_c) for x in rcb]; ncz = [Scythe.dbhyp(x, mu_c) for x in rcb] .* rcbz
+        W = 2 .* (nv .+ nc); Wz = 2 .* (nvz .+ ncz)
+        sv = nv ./ W; svz = (nvz .* W .- nv .* Wz) ./ W .^ 2
+        sc = nc ./ W; scz = (ncz .* W .- nc .* Wz) ./ W .^ 2
+        rtb = Springsteel.ref_rho_t(m.ref_state); rdb = Springsteel.ref_rho_d(m.ref_state)
+        cd = rdb[:, 1] ./ rtb[:, 1]
+        cdz = (rdb[:, 2] .* rtb[:, 1] .- rdb[:, 1] .* rtb[:, 2]) ./ rtb[:, 1] .^ 2
+        return (; sv, svz, sc, scz, cd, cdz, rt = rtb[:, 1])
+    end
+    rel(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), floatmin())
+
+    @testset "cloudy reference: reference vertical path, per species and the identity" begin
+        mktempdir() do tmpdir
+            m, p, mo = cloudy(tmpdir, "cl_ref";
+                extra = Dict{Symbol,Any}(:si_water_slots => :mass, :state_dependent_si => false))
+            @test maximum(Springsteel.ref_rho_c(m.ref_state)[:, 1]) > 1.0e-4
+            F.vt_run!(m, p, mo, 3)
+            V = mo.grid_params.vars
+            sh = shares(m)
+            @test maximum(abs, sh.scz) > 0.0 && maximum(abs, sh.svz) > 0.0   # the z-terms live
+            kDim = mo.grid_params.kDim
+            t = 4; tt = 1.25 * mo.ts
+            rv = m.mc_slots.rho_v; members = mass_members(m)
+            worst = 0.0; ev = 0.0; ec = 0.0
+            for c in 1:ncols(p, mo)
+                cs = (c - 1) * kDim + 1; ce = cs + kDim - 1
+                Scythe.advance_column(m, c, t)
+                for (k, _) in members; m.var_np1[cs:ce, k] .= 0.0; end
+                m.var_np1[cs:ce, V["rho_d"]] .= 0.0; m.var_np1[cs:ce, V["rho_t"]] .= 0.0
+                Scythe.semiimplicit_adjustment_p(m, cs, ce, t; apply_histories = false)
+                worst = max(worst, first(identity_ratio(m.var_np1, cs:ce, V["rho_d"],
+                                                        V["rho_t"], members)))
+                S = m.mc_scratch[Threads.threadid()]
+                phi = Scythe.scratch_column(m, V["w"]).uMish; phiz = S.si_phi_z
+                om = 1.0 .- sh.cd
+                for (k, s_, sz) in ((rv, sh.sv, sh.svz), (9, sh.sc, sh.scz))
+                    ck = s_ .* om; ckz = sz .* om .- s_ .* sh.cdz
+                    want = .-(tt .* (ck .* phiz .+ ckz .* phi))
+                    e = rel(m.var_np1[cs:ce, k], want)
+                    k == rv ? (ev = max(ev, e)) : (ec = max(ec, e))
+                end
+            end
+            @info "cloudy reference vertical" worst ev ec
+            @test worst <= 2.0
+            @test ev <= 1.0e-12 && ec <= 1.0e-12
+        end
+    end
+
+    @testset "cloudy reference: exact_si phase B, per species from the stored planes" begin
+        mktempdir() do tmpdir
+            m, p, mo = cloudy(tmpdir, "cl_xsi"; walls = true,
+                extra = Dict{Symbol,Any}(:si_water_slots => :mass, :exact_si => true))
+            esd = make_esd(m, p, mo)
+            hfields = zeros(size(p.physical, 1), Scythe.XSI_NPLANES)
+            for t in 1:3; xsi_step!(m, p, mo, esd, hfields, t); end
+            V = mo.grid_params.vars
+            sh = shares(m)
+            members = mass_members(m); rv = m.mc_slots.rho_v
+            t = 4; tt = 1.25 * mo.ts; kDim = mo.grid_params.kDim
+            Scythe.exact_si_load_history!(m, hfields, t, 1)
+            for c in 1:ncols(p, mo); Scythe.advance_column(m, c, t); end
+            npts = size(p.physical, 1)
+            xstar = hcat(m.var_np1[:, V["u"]], m.var_np1[:, V["w"]], m.var_np1[:, V["p"]])
+            Scythe.exact_si_solve!(hfields, esd, p, mo, t, xstar)
+            for (k, _) in members; m.var_np1[:, k] .= 0.0; end
+            m.var_np1[:, V["rho_d"]] .= 0.0; m.var_np1[:, V["rho_t"]] .= 0.0
+            for c in 1:ncols(p, mo)
+                cs = (c - 1) * kDim + 1
+                Scythe.exact_si_apply_column!(m, cs, cs + kDim - 1, t, hfields, 1)
+            end
+            r, _, _ = identity_ratio(m.var_np1, 1:npts, V["rho_d"], V["rho_t"], members)
+            # δν_k = s_k (δρ_t − δρ_d) − Δτ s_{k,z} (1 − c_d) φ^{n+1}, φ^{n+1} = ρ̄_t w^{n+1}
+            lev = [mod1(g, kDim) for g in 1:npts]
+            dw = hfields[:, 5] .- hfields[:, 4]
+            phin1 = sh.rt[lev] .* m.var_np1[:, V["w"]]
+            corr = 0.0
+            errs = map(((rv, sh.sv, sh.svz), (9, sh.sc, sh.scz))) do (k, s_, sz)
+                ztrm = tt .* (sz[lev] .* (1.0 .- sh.cd[lev])) .* phin1
+                corr = max(corr, maximum(abs, ztrm))
+                rel(m.var_np1[:, k], s_[lev] .* dw .- ztrm)
+            end
+            @info "cloudy reference exact_si" r errs corr
+            @test corr > 0.0                    # the flux-form correction is live
+            @test r <= 2.0
+            @test all(<=(1.0e-12), errs)
+        end
+    end
+
+    @testset "cloudy reference: horizontal sweep, per species and the identity" begin
+        mktempdir() do tmpdir
+            m, p, mo = cloudy(tmpdir, "cl_hsi"; walls = true,
+                extra = Dict{Symbol,Any}(:si_water_slots => :mass,
+                                         :horizontal_semiimplicit => true))
+            water = Scythe.si_water_hsi_profiles(m)
+            @test water[1] == [m.mc_slots.rho_v, 9]      # vapor and cloud both carry a share
+            sh = shares(m)
+            @test rel(water[2][:, 1], sh.sv) <= 1.0e-14 && rel(water[2][:, 2], sh.sc) <= 1.0e-14
+            hsd = Scythe.create_horizontal_solve_data(p, mo, m.mc_ref_diag.Pxi_prof,
+                collect(view(Springsteel.ref_rho_t(m.ref_state), :, 1)),
+                collect(view(Springsteel.ref_rho_d(m.ref_state), :, 1)),
+                collect(view(Springsteel.ref_total_energy(m.ref_state), :, 1) .+
+                        view(Springsteel.ref_pressure(m.ref_state), :, 1)); water)
+            npts = size(p.physical, 1); V = mo.grid_params.vars
+            u_incr = zeros(npts, 6)
+            for t in 1:4
+                t > 1 && Scythe.horizontal_si_load_increment!(m, u_incr, t, 1)
+                for c in 1:ncols(p, mo); Scythe.advance_column(m, c, t); end
+                Scythe.calcTendency(m)
+                if t == 4
+                    sp = p.spectral
+                    for v in (V["rho_d"], V["rho_t"], m.mc_slots.rho_v, 9); sp[:, v] .= 0.0; end
+                    Scythe.horizontal_si_correct!(sp, p, mo, hsd, t)
+                    # the last water plane is the cloud's: s_c(z)·(δρ_t − δρ_d)
+                    want = [sh.sc[k] * (hsd.dlev[i, k, 4] - hsd.dlev[i, k, 3])
+                            for i in axes(hsd.wlev, 1), k in axes(hsd.wlev, 2)]
+                    ec = rel(hsd.wlev, want)
+                    cw = maximum(abs, (sp[:, V["rho_d"]] .+ 2 .* sp[:, m.mc_slots.rho_v] .+
+                                       2 .* sp[:, 9]) .- sp[:, V["rho_t"]])
+                    @info "cloudy reference hsi" ec cw
+                    @test ec <= 1.0e-15
+                    @test maximum(abs, sp[:, 9]) > 0.0
+                    @test cw <= 1.0e-10 * maximum(abs, sp[:, V["rho_t"]])
+                else
+                    u_incr .= Scythe.horizontal_si_correct!(p.spectral, p, mo, hsd, t)
+                end
+                gridTransform!(p)
+            end
+        end
+    end
+
     # ── 2/3. rest and dry are bitwise ─────────────────────────────────────────────
     bits(A) = reinterpret(UInt64, vec(copy(A)))
     function run_pair(tmpdir, tag; nsteps = 6, seeded = false, kw...)
@@ -481,29 +636,51 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
     end
 
     # ── 5. mixed wall families are refused ────────────────────────────────────────
-    @testset "a mixed vertical wall family across the slaved slots is refused" begin
+    @testset "a slaved set that does not share the anchor's fit operator is refused" begin
         mktempdir() do tmpdir
-            rain_free = Dict{String,Any}("nu_r" => NaturalBC())
-            err = try
-                siw_tile(tmpdir, "mixed"; bcb_override = rain_free,
-                         extra = Dict{Symbol,Any}(:si_water_slots => :mass))
+            msg(; kw...) = try
+                siw_tile(tmpdir, "ref_$(hash(kw))"; kw...)
                 ""
             catch e
                 sprint(showerror, e)
             end
-            @test occursin("do not share one vertical operator", err)
-            @test occursin("nu_r", err)
-            @test occursin("si_water_slots", err)
-            # :none never checks; the explicit measurement opt-in builds
-            @test siw_tile(tmpdir, "mixed_none"; bcb_override = rain_free,
-                           extra = Dict{Symbol,Any}(:si_water_slots => :none))[1] isa Scythe.ModelTile
-            @test siw_tile(tmpdir, "mixed_measure"; bcb_override = rain_free,
-                           extra = Dict{Symbol,Any}(:si_water_slots => :mass,
-                                                    :si_water_mixed_walls => true))[1] isa
-                  Scythe.ModelTile
+            on = Dict{Symbol,Any}(:si_water_slots => :mass)
+            nat = NaturalBC()
+            branches = [
+                ("ground BC (BCB)", "nu_r", (; bcb_override = Dict{String,Any}("nu_r" => nat))),
+                ("lid BC (BCT)", "nu_c", (; bct_override = Dict{String,Any}("nu_c" => nat))),
+                ("inner/left BC (BCL)", "nu_v",
+                 (; walls = true, side_override = Dict{String,Any}("nu_v" => nat))),
+                ("vertical l_q", "nu_c", (; lq = Dict("default" => 2.0, "nu_c_k" => 1.0))),
+                ("horizontal l_q", "nu_r",
+                 (; lq = Dict("default" => 2.0, "nu_r" => 1.0, "nu_r_k" => 2.0))),
+                # the ANCHOR slots are compared too
+                ("ground BC (BCB)", "rho_t", (; bcb_override = Dict{String,Any}("rho_t" => nat))),
+                ("vertical l_q", "rho_d", (; lq = Dict("default" => 2.0, "rho_d_k" => 1.0)))]
+            for (label, v, kw) in branches
+                err = msg(; extra = on, kw...)
+                @test occursin("do not share one fit operator", err)
+                @test occursin(label, err)
+                @test occursin("\"$(v)\"", err)
+                # :none never checks; the measurement opt-in builds
+                @test msg(; extra = Dict{Symbol,Any}(:si_water_slots => :none), kw...) == ""
+                @test msg(; extra = merge(on, Dict{Symbol,Any}(:si_water_mixed_walls => true)),
+                          kw...) == ""
+            end
+            # spline_filter: Springsteel accepts no spline_filter on the RiRk directions, so the
+            # branch is driven on a built model's grid parameters directly
+            mt, _, mo = siw_tile(tmpdir, "sf"; extra = on)
+            mo.grid_params.spline_filter["nu_c"] = Dict(:k => Springsteel.GaussianFilter(sigma = 2.0))
+            err = try Scythe.validate_si_water_slots(mo); "" catch e; sprint(showerror, e) end
+            @test occursin("spline_filter", err) && occursin("\"nu_c\"", err)
+            # a positivity bound (an untransformed rho_r under positivity = auto)
+            err = msg(; tr = :none, extra = on,
+                      pos = Dict{String,Any}("rho_r" => Dict(:k => 0.0)))
+            @test occursin("positivity bound", err) && occursin("\"rho_r\"", err)
+            @test msg(; tr = :none, extra = Dict{Symbol,Any}(:si_water_slots => :none),
+                      pos = Dict{String,Any}("rho_r" => Dict(:k => 0.0))) == ""
             # a uniform family builds
-            @test siw_tile(tmpdir, "uniform"; extra = Dict{Symbol,Any}(:si_water_slots => :mass))[1] isa
-                  Scythe.ModelTile
+            @test msg(; extra = on) == ""
         end
     end
 
@@ -569,9 +746,10 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
 
     @testset "feeder 1: the acoustic step no longer opens the water gap (sd=$(sd))" for sd in (true, false)
         # The gap the slaving closes is the PARTITION gap δ = ρ_t − ρ_d − Σ α ν (the anchor
-        # minus the water sum the slots carry). Isolated: smooth vapor and w, no cloud kink
-        # (whose refit ringing is the dominant, separate feeder), no condensation, the vapor
-        # nudge off (it closes δ by design). With the slots slaved the acoustic step leaves δ
+        # minus the water sum the slots carry). Isolated: smooth vapor, a smooth cloud layer and
+        # w, no cloud kink (whose refit ringing is the dominant, separate feeder), no
+        # condensation, the vapor nudge and the refit partner off (each moves the vapor against
+        # the anchor by design: the nudge to close δ, the partner's Stage 1 water side). With the slots slaved the acoustic step leaves δ
         # at rounding; without, the explicit water compression and the implicit anchor disagree
         # every step (measured: 5.9e-7 at w ~ 0.5 m/s, 5.9e-6 at 5 m/s over 40 steps; slaved
         # ≤ 2e-17).
@@ -579,12 +757,23 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             m0, _, _ = siw_tile(tmpdir, "gap_probe_$(sd)")
             rvb = rvbar(m0)
             gap = Dict{Symbol,Float64}()
+            gapnc = 0.0
             for mode in (:none, :mass)
                 m, p, mo = siw_tile(tmpdir, "gap_$(sd)_$(mode)";
-                    seed! = (pa, x, V, c) -> F.vt_seed_vapor!(pa, x, V, c; vtr = :bhyp,
-                        vmu = VMU, rho_vbar = rvb, amp = 0.0, vamp = 0.0, wamp = 5.0),
+                    seed! = (pa, x, V, c) -> begin
+                        F.vt_seed_vapor!(pa, x, V, c; vtr = :bhyp, vmu = VMU, rho_vbar = rvb,
+                                         amp = 0.0, vamp = 0.0, wamp = 5.0)
+                        # a smooth CLOUD layer (well above its knee), carried in rho_t, so the
+                        # condensate slot's acoustic flux is in the gap too, not the vapor's alone
+                        for i in 1:size(pa.physical, 1)
+                            rc = 4.0e-4 * exp(-((x[i, end] - 4000.0) / 900.0)^2)
+                            pa.physical[i, Scythe.mc_slot(V, "rho_c"), 1] =
+                                Scythe.condensate_slot(rc, 0.0, :bhyp, F.MU)
+                            pa.physical[i, V["rho_t"], 1] += rc
+                        end
+                    end,
                     extra = Dict{Symbol,Any}(:si_water_slots => mode, :state_dependent_si => sd,
-                                             :condensation => false),
+                                             :condensation => false, :refit_partner => false),
                     pp_extra = Dict{Symbol,Float64}(:tau_rho_v_rec => 1.0e12))
                 V = mo.grid_params.vars
                 ws = Scythe.si_water_set(merge(mo.options,
@@ -596,13 +785,25 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                     for (k, a) in members; d .-= a .* p.physical[:, k, 1]; end
                     d
                 end
-                g0 = dgap()
+                dgapnc() = begin
+                    d = dgap()
+                    d .+= 2 .* p.physical[:, 9, 1]          # the cloud left out of the sum
+                    d
+                end
+                g0 = dgap(); g0nc = dgapnc()
                 F.vt_run!(m, p, mo, 40)
                 gap[mode] = maximum(abs, dgap() .- g0)
+                mode === :mass && (gapnc = maximum(abs, dgapnc() .- g0nc))
             end
-            @info "partition-gap change over 40 steps (acoustic feeder)" sd gap[:none] gap[:mass]
+            @info "partition-gap change over 40 steps (acoustic feeder)" sd gap[:none] gap[:mass] gapnc
             @test gap[:none] > 1.0e-7
-            @test gap[:mass] < 1.0e-14
+            # vapor alone: <= 2e-17. With the cloud the slaved run keeps ~1e-8: the cloud's
+            # Gaussian tail reaches its knee (rho_c ~ mu_c at 6.9 km), where the explicit
+            # `+D_k w_z` term of design 4.2 is by construction left explicit.
+            @test gap[:mass] < 1.0e-2 * gap[:none]
+            # the cloud's own slaved flux is not negligible: leaving the cloud slot out of the
+            # sum opens the gap by its acoustic transport, so the test above pins it too
+            @test gapnc > 1.0e2 * gap[:mass]
         end
     end
 end
