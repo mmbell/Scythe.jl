@@ -497,6 +497,12 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
                              neg_part.(slots.ice[5], cfg.imu[1])) .+
                             neg_part.(slots.ice[9], cfg.imu[1])
     end
+    # The VAPOR's clipped lobe under the vapor control variable (`vapor_transform = :bhyp`):
+    # the same continuation of the vapor slot where ν_v < 0 (the recovered `rho_v` reads 0
+    # there). The partition gap holds it beside the condensate lobe; kept as its own field so
+    # `condensate_lobe` keeps its name's meaning. An exact zero field under `:none`.
+    vapor_lobe = cfg.vtrans === :none ? zeros(Float64, n_i, n_k) :
+        neg_part.(slots.rho_v .+ col(bhyp.(rho_vbar_d, cfg.vmu)), cfg.vmu)
 
     # ── (6) Column integrals ────────────────────────────────────────────────
     PW = _column_integral(rho_v, z)
@@ -507,7 +513,7 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     out = (; p, rho_d, rho_t, E_t, Q_ss, rho_v, rho_c, rho_r, rho_liq, rho_ice,
              u, w, ke, M, T, theta, theta_e, s, RH, q_v, q_c, q_r,
              reflectivity, Vt, rain_rate, precip_rate, rho_w_deficit, condensate_lobe,
-             PW, column_cloud_water, column_rain_water)
+             vapor_lobe, PW, column_cloud_water, column_rain_water)
     v === nothing || (out = merge(out, (; v)))
     n_r === nothing || (out = merge(out, (; n_r)))
     if ice !== nothing
@@ -1188,7 +1194,7 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
                "vapor density perturbation off rho_tbar - rho_dbar - rho_cbar")
         else
             # the raw vapor control-variable deviation, under its own slot name
-            wr(vapor_var_name(model.options), rho_v_p, "kg m-3",
+            wr(vapor_var_name(model.options), rho_v_p, "1",
                "vapor control variable deviation nu_v' = bhyp(rho_v) - bhyp(rho_vbar) " *
                "(Ooyama biased hyperbolic, mu = $(cfg.vmu) kg m-3)")
         end
@@ -1288,6 +1294,9 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
            "clipped negative lobe of the transformed cloud, rain and ice-mass control " *
            "variables, sum of ahyp_signed(nu) over slots with nu < 0 (the recovered " *
            "densities read 0 there); 0 where no transform is declared")
+        cfg.vtrans === :none || wr("vapor_lobe", d.vapor_lobe, "kg m-3",
+           "clipped negative lobe of the vapor control variable nu_v (vapor_transform = " *
+           "bhyp), ahyp_signed(nu_v) where nu_v < 0 (rho_v reads 0 there); 0 under :none")
 
         # ── Radar and precipitation ──
         wr("reflectivity", d.reflectivity, "dBZ", "S-band equivalent radar reflectivity")

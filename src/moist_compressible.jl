@@ -1640,7 +1640,7 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :o_max, :o_pts, :o_rain, :o_seed, :o_warned,
                         :e_pts, :e_held, :e_max,
                         :r_dr, :r_booked, :l_c, :l_r, :l_i1, :l_i2, :l_i3,
-                        :x_max, :x_int, :x_pool, :ec_steps, :v_neg)
+                        :x_max, :x_int, :x_pool, :ec_steps, :v_neg, :v_neg_mass)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -2062,8 +2062,9 @@ The ENERGY / PARTITION census of `mc_water_stats` (plan Stage P4), reported by
 | `MC_LOBE_C`/`_R`/`_I1`/`_I2`/`_I3` | the Stage L lobe relaxation's applied `Δν` column integral, per species (cloud, rain, the three ice masses) [kg/m², tile mean]; exact zeros with the device off |
 | `MC_XGAP_MAX`     | the partition gap `max\\|X\\|`, `X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice`, over the tile at the report [kg/m³] |
 | `MC_XGAP_INT`     | the column integral of `X` at the report [kg/m², tile mean] |
-| `MC_XGAP_POOL`    | the lobe pool `Λ = Σ_k 2 min(ν_k, 0)` over the `:bhyp` mass slots, column integral at the report [kg/m², tile mean] |
+| `MC_XGAP_POOL`    | the lobe pool `Λ = Σ_k 2 min(ν_k, 0)` over the `:bhyp` mass slots (the vapor's included under `vapor_transform = :bhyp`), column integral at the report [kg/m², tile mean] |
 | `MC_ECEN_STEPS`   | steps since the last report (thread 1) |
+| `MC_VNEG_MASS`    | the vapor lobe's water under `vapor_transform = :bhyp`, the column integral of `2 min(ν_v, 0)` at the report [kg/m², tile mean]: the vapor share of `MC_XGAP_POOL` (which includes it), `0.0` under `:none` |
 | `MC_VNEG`         | the number of gridpoints of the tile whose VAPOR control variable is negative at the report, `ν_v < 0` (`ρ_v < 0` under `vapor_transform = :none`, where the slot is the density); the physics reads `ahyp(ν_v) = 0` there under `:bhyp` [points] |
 
 `MC_REFIT_DR` is the exact per-step refit residual the refit partner exists to close, measured
@@ -2095,8 +2096,10 @@ const MC_XGAP_POOL = MC_CEVAP_LAST + 10
 const MC_ECEN_STEPS = MC_CEVAP_LAST + 11
 @doc (@doc MC_REFIT_DR)
 const MC_VNEG = MC_CEVAP_LAST + 12
+@doc (@doc MC_REFIT_DR)
+const MC_VNEG_MASS = MC_CEVAP_LAST + 13
 """Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
-const MC_STATS_LAST = MC_VNEG
+const MC_STATS_LAST = MC_VNEG_MASS
 """
 Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
 1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
@@ -2660,15 +2663,26 @@ what `mc_driver!` adds back.
 
 """
     vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar, transform, mu) -> slot value
+    vapor_control(rho_v, mu) -> nu_v
 
 [`vapor_slot`](@ref) under the vapor control variable ([`vapor_transform_mode`](@ref)): the
 4-argument perturbation, bit for bit, under `:none`; under `:bhyp` the CONTROL-variable
-deviation `bhyp(ρ_v) − bhyp(ρ̄_v)` against the same derived `ρ̄_v`, which is exactly `0.0` where
-`ρ_v` is the reference (the same `bhyp` of the same doubles).
+deviation `vapor_control(ρ_v) − vapor_control(ρ̄_v)` against the same derived `ρ̄_v`, which is
+exactly `0.0` where `ρ_v` is the reference (the same function of the same doubles).
+
+`vapor_control` is `bhyp` for `ρ ≥ 0` (bit for bit) and the odd continuation `−bhyp(−ρ)`
+below — the inverse of [`ahyp_signed`](@ref), the map [`convert_vapor_checkpoint!`](@ref)
+uses. `bhyp` itself is not defined for a negative density: it is non-monotone there
+(`bhyp(−1.5μ) = +0.75μ`) and singular at `−μ`, and an initializer that forms the vapor as a
+residual (`balanced_vortex_native!`: `ρ_t − ρ_d`) can produce one. A negative density then
+enters as a ν lobe (`2ν ≈ ρ`, recovered 0), never as a positive vapor.
 """
+@inline vapor_control(rho_v, mu) = rho_v >= 0.0 ? bhyp(rho_v, mu) : -bhyp(-rho_v, mu)
+
+@doc (@doc vapor_slot(::Any, ::Any, ::Any, ::Any, ::Symbol, ::Any))
 @inline function vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar, transform::Symbol, mu)
     transform === :none && return vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar)
-    return bhyp(rho_v, mu) - bhyp(rho_tbar - rho_dbar - rho_cbar, mu)
+    return vapor_control(rho_v, mu) - vapor_control(rho_tbar - rho_dbar - rho_cbar, mu)
 end
 
 """
@@ -3079,6 +3093,21 @@ What changes under `:bhyp`, all in `mc_driver!` and the readers of the slot:
 
 ρ_t stays prognostic and the nudge stays on (Stage 3 deletes both). `:bhyp_smooth` is refused:
 a vapor recovered into `(−μ, 0)` would reach the equation of state negative.
+
+**KNOWN OPENING, closed at Stage 3 by the vapor-closure term `rec_v` of the exchange
+realization (plan decision E4).** Every density-space tendency reaches the slot as
+`J_v·rate` — the ETD vapor increment `etd_dv`, the exchange realization's vapor write, the
+refit partner's `dv` fold, the MYNN legs (water closure and clip-gap partner), the Louis leg
+including the surface moisture flux — and nothing books the difference between the density
+those moves REQUEST and what `ahyp(ν_v)` actually RECEIVES. Where the vapor is affine they
+agree to O(μ_v); at a vapor-lobe point (`ν_v < 0`) or where a sink overdraws the vapor through
+zero they do not, and `R = E_t − E_implied` and the partition gap `X` open at FIRST order
+wherever `MC_VNEG > 0`. (Reviewer's check: a lobe at `ν = −5e-6`, `J_v = ½`, requested
+`δρ = 1e-6`, realized `0.0`; an overdraw of `−2e-6`, realized `−1e-6`.) Two smaller items of
+the same class: the refit partner books the condensates' recovered change but not the vapor
+slot's OWN non-affine refit change (it shows in `MC_REFIT_DR`); and the MYNN vapor mass flux is
+built from `ν_v'_z/J_v`, which differs from `∂z ρ_v'` by `ρ̄_v,z (J̄_v/J_v − 1)` — negligible
+wherever the vapor is affine, first order only inside the knee.
 """
 @inline function vapor_transform_mode(options)
     mode = get(options, :vapor_transform, :none)::Symbol
@@ -10726,8 +10755,10 @@ away linearly (the 2026-10-05 offline runaway, slot −6.5e-3 by 72 h), and its 
 - is BITWISE ZERO at rest: `res = ρ̄_v > 0` there and `ν̄_v ≡ bhyp(ρ̄_v)`, the same function of
   the same doubles;
 - reproduces `J_v·(res − ρ_v)/τ` in the affine regime (`ρ_v, res ≫ μ_v`) to `O(μ_v/ρ_v)`;
-- decays ν_v to 0 without crossing when `res ≤ 0` (target `bhyp(0) = 0`, and an Euler step
-  `ν(1 − Δt/τ)` with `Δt < τ` never changes sign);
+- decays ν_v to 0 without crossing when `res ≤ 0` (target `bhyp(0) = 0`): an EULER step
+  `ν(1 − Δt/τ)` with `Δt < τ` never changes sign. Under the model's AB3 multistep a crossing
+  can occur (the extrapolated rate of a decaying ν overshoots); the crossed point is a vapor
+  lobe that reads `ahyp = 0` and the next step's rate pulls it back up — harmless;
 - pulls a vapor lobe (`ν_v < 0`) UP toward its target and never pushes it further down.
 
 `Δt`-free, no cap. Its pressure partner is booked on the RECOVERED change it realizes over one
@@ -11156,6 +11187,15 @@ the clipped lobe and never across `ν = 0` (`lobe_relaxation_cap`), so it change
 mass and needs no partner: the two compose. The cloud slot is a perturbation against `ν̄_c`; its
 total is `vnp1 + (ν_c^n − slot^n)`, the offset the lobe relaxation uses (an exact `0.0` whenever
 `ρ̄_c ≡ 0`). `@noinline` with plain arrays: called from inside the column step.
+
+UNDER THE VAPOR CONTROL VARIABLE (`vj`, `options[:vapor_transform] = :bhyp`) the vapor write is
+`J_v·dv` with the frozen-at-n `J_v`, and — the KNOWN STAGE 1 OPENING documented at
+[`vapor_transform_mode`](@ref) — nothing here books what `ahyp(ν_v)` actually receives: at a
+vapor-lobe point (`ν_v < 0`) or where the step overdraws the vapor through zero, the recovered
+vapor moves by less than `dv` (by nothing in a deep lobe) while `p` and `Q_ss` took the full
+partner, so `R` and `X` open at first order wherever `MC_VNEG > 0`. Stage 3 closes it with
+the vapor-closure term `rec_v = [ahyp(ν_v^{n+1}) − ahyp(ν_v^{n+1} − Δν_v)] + Σ_k req_k` of this
+realization (plan decision E4).
 """
 @noinline function _etd_exchange_realization!(vnp1::Matrix{Float64}, phys::Array{Float64,3}, S,
                                               colstart::Int, ts::Float64,

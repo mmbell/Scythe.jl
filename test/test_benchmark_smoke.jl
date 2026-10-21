@@ -13,6 +13,44 @@ include(joinpath(@__DIR__, "..", "benchmarks", "common", "harness.jl"))
 # its OWN reference file and target windows, while an UNARMED call (the default arm="")
 # must be completely unaffected -- byte-identical to the path/lookup construction before
 # the `arm` keyword existed at all.
+# The regression comparison under the vapor control variable (compare_reference's `vapor`
+# keyword): a nu_v run is compared to a nu_v reference directly, and to a density-vapor
+# reference through the recovered vapor ahyp(nu_v' + bhyp(rho_vbar)) - rho_vbar.
+@testset "Benchmark harness: vapor control variable regression comparison" begin
+    mktempdir() do dir
+        kD = 4; nc = 3; mu = 1.0e-9
+        rvb = [1.2e-2, 6.0e-3, 2.0e-3, 4.0e-4]
+        rb = repeat(rvb, nc)
+        dv = 1.0e-4 .* sin.(1:(kD * nc))                    # the density perturbation
+        nu = Scythe.bhyp.(rb .+ dv, mu) .- Scythe.bhyp.(rb, mu)
+        z = repeat(collect(1.0:kD), nc)
+        wcsv(path, cols) = open(path, "w") do io
+            ks = collect(keys(cols))
+            println(io, join(ks, ","))
+            for i in eachindex(z)
+                println(io, join((repr(cols[k][i]) for k in ks), ","))
+            end
+        end
+        out = joinpath(dir, "out.csv"); refd = joinpath(dir, "ref_rho_v.csv")
+        refn = joinpath(dir, "ref_nu_v.csv")
+        wcsv(out, Dict("z" => z, "nu_v" => nu))
+        wcsv(refd, Dict("z" => z, "rho_v" => dv))
+        wcsv(refn, Dict("z" => z, "nu_v" => nu))
+        # recovered against the density reference: passes (round trip ~1e-16)
+        ok, st = compare_reference(out, refd, ["nu_v"]; vapor = (rvb, kD, mu))
+        @test ok === true && st["nu_v"][1] < 1.0e-9
+        # a wrong recovery (the raw nu column read as density) would fail by ~1/2
+        ok2, st2 = compare_reference(out, refd, ["nu_v"]; vapor = (rvb, kD, 1.0e-2))
+        @test st2["nu_v"][1] > st["nu_v"][1]
+        # nu_v to nu_v directly
+        ok3, st3 = compare_reference(out, refn, ["nu_v"])
+        @test ok3 === true && st3["nu_v"][1] == 0.0
+        # without the reference vapor a density reference is not comparable: skipped
+        ok4, st4 = compare_reference(out, refd, ["nu_v"])
+        @test ok4 === nothing && isempty(st4)
+    end
+end
+
 @testset "Benchmark harness: arm-aware reference keying" begin
     quick_opts = BenchmarkOptions(:quick, STAGE_MC, :rirk, 1, false, false, 1.0, 1, false, false)
     full_opts  = BenchmarkOptions(:full,  STAGE_MC, :rirk, 1, false, false, 1.0, 1, false, false)

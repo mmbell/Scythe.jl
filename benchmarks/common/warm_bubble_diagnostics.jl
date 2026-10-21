@@ -91,7 +91,8 @@ function o01_rain_diagnostics(model, ref, kDim)
         surf = 1:kDim:nrow(df)
         Tk, p_, rho_d, rho_v, rho_c, rho_t, rho_r =
             mc_state(df, ref, kDim, ncols; transform = ctf, mu = cmu,
-                     rain_transform = rtf, rain_mu = rmu)
+                     rain_transform = rtf, rain_mu = rmu,
+                     vapor_mu = Scythe.vapor_mu(model.physical_params))
         Te = mc_temperature_eos(p_, rho_d, rho_v)
         max_rr = max(max_rr, maximum(rho_r))
         min_rr = min(min_rr, minimum(rho_r))

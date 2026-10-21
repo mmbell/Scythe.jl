@@ -151,6 +151,22 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         @test Scythe.recover_rho_v(0.0, nub, :bhyp, mu) === Scythe.ahyp(nub, mu)
         @test Scythe.recover_rho_v(1.0e-4, rvb, :none, mu) === 1.0e-4 + rvb
         @test Scythe.recover_rho_v(-2.0 * nub, nub, :bhyp, mu) === 0.0   # a vapor lobe reads 0
+        # a NEGATIVE input density maps to the odd continuation, never through the
+        # non-monotone / singular bhyp(ρ < 0) (bhyp(−1.5μ) = +0.75μ, a pole at −μ)
+        for r in (-1.5 * mu, -mu, -0.3 * mu, -2.0e-6)
+            @test Scythe.vapor_control(r, mu) === -Scythe.bhyp(-r, mu)
+            @test Scythe.vapor_control(r, mu) < 0.0
+            @test Scythe.vapor_slot(r, 1.2, 1.19, 0.0, :bhyp, mu) ===
+                  -Scythe.bhyp(-r, mu) - Scythe.bhyp(rbar, mu)
+            @test Scythe.ahyp(Scythe.vapor_control(r, mu), mu) === 0.0          # reads 0
+            @test Scythe.ahyp_signed(Scythe.vapor_control(r, mu), mu) ≈ r rtol = 1.0e-12
+        end
+        @test Scythe.bhyp(-1.5 * mu, mu) > 0.0         # why the guard exists
+        for r in (0.0, 1.0e-12, 3.0e-3)
+            @test Scythe.vapor_control(r, mu) === Scythe.bhyp(r, mu)
+        end
+        @test Scythe.vapor_slot(-1.0e-3, 1.2, 1.19, 0.0, :none, mu) ===
+              Scythe.vapor_slot(-1.0e-3, 1.2, 1.19, 0.0)
     end
 
     # ── the derived reference and the setup refusals ─────────────────────────────────
@@ -255,7 +271,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     # ── 5. the census ─────────────────────────────────────────────────────────────────
     @testset "MC_VNEG: the census counts the nu_v < 0 points at the report" begin
         @test Scythe.MC_VNEG == Scythe.MC_ECEN_STEPS + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_VNEG
+        @test Scythe.MC_VNEG_MASS == Scythe.MC_VNEG + 1
+        @test Scythe.MC_STATS_LAST == Scythe.MC_VNEG_MASS
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         mktempdir() do tmp
             for vtr in (:bhyp, :none)
@@ -280,6 +297,23 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                     Scythe.energy_census_trace(m, t)
                 end
                 @test sum(view(m.mc_water_stats, Scythe.MC_VNEG, :)) == nneg
+                # MC_VNEG_MASS: the vapor lobe 2 min(ν_v, 0) integrated with the census's own
+                # quadrature under :bhyp, 0.0 under :none; under :bhyp the pool includes it
+                # (no condensate lobe here, so the pool IS the vapor lobe)
+                eb = m.ebudget; kD = mo.grid_params.kDim
+                ref_mass = vtr === :bhyp ?
+                    sum(eb.wxn[div(g - 1, kD) + 1] * eb.wz[mod1(g, kD)] * 2.0 * min(nu[g], 0.0)
+                        for g in eachindex(nu)) : 0.0
+                vm = sum(view(m.mc_water_stats, Scythe.MC_VNEG_MASS, :))
+                pool = sum(view(m.mc_water_stats, Scythe.MC_XGAP_POOL, :))
+                if vtr === :bhyp
+                    @test vm < 0.0
+                    @test vm ≈ ref_mass rtol = 1.0e-12
+                    @test pool ≈ vm rtol = 1.0e-10
+                else
+                    @test vm === 0.0
+                    @test pool === 0.0
+                end
             end
             # rest: zero
             m, p, mo = F.vt_tile(tmp, "vneg_rest"; vtr = :bhyp)
@@ -400,9 +434,33 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             @test S.Tk == Scythe.eos_temperature.(S.p, S.rho_d, S.rho_v)
             # J_v is the lobe-transport Jacobian of the slot
             @test Scythe.vapor_jacobian_column(S) == Scythe.lobe_transport_jacobian.(nu, S.rho_v, VMU)
+            # the state-minima trace's T_eos reads the RECOVERED vapor: its reported max T is
+            # the max over the tile of eos_temperature(p, ρ_d, ahyp(ν_v))
+            mo.options[:state_minima_trace] = 1
+            out = mktemp() do path, io
+                redirect_stdout(io) do
+                    Scythe.state_minima_trace(m, 1)
+                end
+                flush(io)
+                read(path, String)
+            end
+            delete!(mo.options, :state_minima_trace)
+            mt = match(r"max T=([0-9.eE+-]+) K", out)
+            @test mt !== nothing
+            nc = div(size(p.physical, 1), kDim)
+            V = mo.grid_params.vars
+            pall = p.physical[:, V["p"], 1] .+ repeat(Springsteel.ref_pressure(m.ref_state)[:, 1], nc)
+            rdall = p.physical[:, V["rho_d"], 1] .+ repeat(Springsteel.ref_rho_d(m.ref_state)[:, 1], nc)
+            nuall = p.physical[:, m.mc_slots.rho_v, 1] .+ repeat(Scythe.mc_nu_vbar(m), nc)
+            Trec = Scythe.eos_temperature.(pall, rdall, Scythe.ahyp.(nuall, VMU))
+            @test parse(Float64, mt.captures[1]) == round(maximum(Trec); sigdigits = 5)
+            # ...and its T_split is formed with the recovered vapor: the raw negative vapor
+            # would give a different (hotter) T_eos aloft
+            Traw = Scythe.eos_temperature.(pall, rdall, nuall)
+            @test maximum(abs.(Traw .- Trec)) > 0.0
         end
-        # the netCDF derived fields read the recovered vapor (zero references: the derived
-        # ρ̄_v is 0, so the slot is the control variable itself)
+        # the netCDF derived fields read the recovered vapor against bhyp of a NONZERO derived
+        # reference ρ̄_t − ρ̄_d − ρ̄_c (so the shift by the transformed reference is exercised)
         z = collect(range(0.0, 12000.0; length = 13))
         n_i = 3; n_k = length(z)
         Tf(i, zz) = 300.0 - 0.0065 * zz + 0.5 * i
@@ -410,19 +468,29 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         rv = [0.7 * Scythe.rho_v_sat(Tf(i, z[k]), p[i, k] / 100.0) for i in 1:n_i, k in 1:n_k]
         rd = [(p[i, k] - Scythe.Rv * Tf(i, z[k]) * rv[i, k]) / (Scythe.Rd * Tf(i, z[k]))
               for i in 1:n_i, k in 1:n_k]
-        nu = Scythe.bhyp.(rv, VMU); nu[2, 7] = -1.0e-5
+        rdb = vec(rd[2, :]); rvb = 0.9 .* vec(rv[2, :]); rcb = zeros(n_k)
+        rtb = rdb .+ rvb
         zp = zeros(n_k)
-        ref = Scythe.RegularReferenceProfiles(z, zp, zp, zp, zp, zp, zp, zp, zp)
-        slots = (; p, rho_d = rd, rho_t = rd .+ rv, E_t = zeros(n_i, n_k), Q_ss = zeros(n_i, n_k),
+        ref = Scythe.RegularReferenceProfiles(z, zp, rdb, rvb, rcb, rtb, zp, zp, zp)
+        rvb_d = (rtb .- rdb) .- rcb                       # the writer's derived reference
+        nub = Scythe.bhyp.(rvb_d, VMU)
+        nu = Scythe.bhyp.(rv, VMU) .- reshape(nub, 1, n_k)  # the slot: ν_v' against ν̄_v
+        nu[2, 7] = -1.0e-5 - nub[7]                      # a vapor lobe
+        slots = (; p, rho_d = rd .- reshape(rdb, 1, n_k), rho_t = rd .+ rv .- reshape(rtb, 1, n_k),
+                   E_t = zeros(n_i, n_k), Q_ss = zeros(n_i, n_k),
                    rho_v = nu, u = zeros(n_i, n_k), w = zeros(n_i, n_k),
                    rain = zeros(n_i, n_k), cloud = zeros(n_i, n_k))
         cfg = Scythe.DerivedConfig(:bhyp, 1.0e-7, :bhyp, 1.0e-7, :none, 1.0, :none,
                                    (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16), 1, false, false,
                                    8.0e6, 100.0, "test", false, :eos, :bhyp, VMU)
         d = Scythe.mc_derived_fields(z, slots, ref, cfg)
-        @test d.rho_v == Scythe.ahyp.(nu, VMU)
+        @test d.rho_v == Scythe.ahyp.(nu .+ reshape(nub, 1, n_k), VMU)
+        mask = trues(n_i, n_k); mask[2, 7] = false
+        @test maximum(abs.(d.rho_v[mask] .- rv[mask]) ./ rv[mask]) < 1.0e-12
         @test d.rho_v[2, 7] === 0.0
-        @test all(d.T_eos .=== Scythe.eos_temperature.(p, rd, d.rho_v))
+        @test all(d.T_eos .=== Scythe.eos_temperature.(p, d.rho_d, d.rho_v))
+        @test d.vapor_lobe[2, 7] ≈ Scythe.ahyp_signed(-1.0e-5, VMU) rtol = 1.0e-12
+        @test count(!iszero, d.vapor_lobe) == 1
         # the old 16-field constructor is :none
         cfg0 = Scythe.DerivedConfig(:bhyp, 1.0e-7, :bhyp, 1.0e-7, :none, 1.0, :none,
                                     (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16), 1, false, false,
@@ -442,9 +510,18 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     @testset "checkpoint: a density-vapor .jld2 converts on load into a :bhyp model" begin
         mktempdir() do tmp
             # a :none tile with a prognostic vapor bump, written as a checkpoint
+            # (a NEGATIVE vapor region above 8 km, slot −2 ρ̄_v, so the odd-continuation branch
+            # of the map is exercised)
             d0 = joinpath(tmp, "a") * "/"
-            m0, p0, mo0 = F.vt_tile(tmp, "ck0"; vtr = :none, output_dir = d0,
-                seed! = (p, x, V, c) -> F.vt_seed_vapor!(p, x, V, c; amp = 0.0))
+            function seed_ck!(p, x, V, c)
+                F.vt_seed_vapor!(p, x, V, c; amp = 0.0)
+                rv_i = Scythe.mc_slot(V, "rho_v")
+                kD = length(c.Tk)
+                for i in 1:size(p.physical, 1)
+                    x[i, end] > 8.0e3 && (p.physical[i, rv_i, 1] = -2.0 * c.rho_v[mod1(i, kD)])
+                end
+            end
+            m0, p0, mo0 = F.vt_tile(tmp, "ck0"; vtr = :none, output_dir = d0, seed! = seed_ck!)
             Scythe.write_restart(p0, mo0, 0.0)
             path = Scythe.checkpoint_path(d0, 0.0)
             @test isfile(path)
@@ -464,13 +541,40 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 v == rv1 && continue
                 @test patch.spectral[:, v] == p0.spectral[:, v]
             end
+            # THE POINTWISE MAP, exactly: bhyp(ρ) − ν̄_v where ρ ≥ 0, −bhyp(−ρ) − ν̄_v below
+            col0 = copy(p0.physical[:, rv0, 1])
+            rho0 = col0 .+ rvbar
+            @test count(<(0.0), rho0) > 0 && count(>(0.0), rho0) > 0
+            nn = Scythe.vapor_slot_from_density!(col0, m1.mc_ref_diag.rho_vbar,
+                                                 Scythe.mc_nu_vbar(m1), kDim, VMU)
+            @test nn == count(<(0.0), rho0)
+            for g in eachindex(rho0)
+                want = rho0[g] >= 0.0 ? Scythe.bhyp(rho0[g], VMU) - nubar[g] :
+                                        -Scythe.bhyp(-rho0[g], VMU) - nubar[g]
+                @test isapprox(col0[g], want; rtol = 1.0e-12, atol = 1.0e-12 * abs(nubar[g]))
+            end
+            # ...and through the load (one refit of the converted column): the lobe region
+            # stays a ν lobe (recovered 0), the positive region recovers its density
+            neg = rho0 .< 0.0
+            nu1 = patch.physical[:, rv1, 1] .+ nubar
+            @test all(nu1[neg] .< 0.0)
+            @test all(Scythe.ahyp.(nu1[neg], VMU) .== 0.0)
             # the vapor: nu' = bhyp(rho_vbar + rho_v') - nu_vbar, refit once
-            target = Scythe.bhyp.(rvbar .+ p0.physical[:, rv0, 1], VMU) .- nubar
-            @test maximum(abs.(patch.physical[:, rv1, 1] .- target)) <=
-                  1.0e-2 * maximum(abs.(target))
+            # the loaded vapor IS the one refit of the mapped column (built independently here:
+            # the archive's state, the mapped vapor written in, one spectral + grid transform)
+            q = createGrid(mo1.grid_params)
+            q.spectral .= p0.spectral
+            gridTransform!(q)
+            q.physical[:, rv1, 1] .= col0
+            spectralTransform!(q)
+            gridTransform!(q)
+            @test isapprox(patch.physical[:, rv1, 1], q.physical[:, rv1, 1]; rtol = 1.0e-12)
+            # and away from the step at 8 km (whose refit rings) the recovered vapor is the
+            # archived density to the refit of a smooth field
+            zz = repeat(m1.tilepoints[1:kDim, end], nc)
+            far = zz .< 5.0e3
             rec = Scythe.ahyp.(patch.physical[:, rv1, 1] .+ nubar, VMU)
-            @test maximum(abs.(rec .- (rvbar .+ p0.physical[:, rv0, 1]))) <=
-                  2.0e-2 * maximum(abs.(p0.physical[:, rv0, 1]))
+            @test maximum(abs.(rec[far .& .!neg] .- rho0[far .& .!neg]) ./ rho0[far .& .!neg]) < 1.0e-2
             # the reverse direction is refused, by name
             d2 = joinpath(tmp, "b") * "/"
             m2, p2, mo2 = F.vt_tile(tmp, "ck2"; vtr = :bhyp, output_dir = d2)
@@ -484,6 +588,18 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             end
             @test err isa ErrorException
             @test occursin("nu_v", sprint(showerror, err))
+            # a CSV initial condition with a density vapor column is refused by name
+            csv = joinpath(tmp, "ic_rho_v.csv")
+            Scythe.write_ics_csv(csv, p0, Scythe.getGridpoints(p0))
+            m4, p4, mo4 = F.vt_tile(tmp, "ck4"; vtr = :bhyp, initial_conditions = csv)
+            err = try
+                Scythe.load_initial_conditions!(createGrid(mo4.grid_params), mo4); nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            msg = sprint(showerror, err)
+            @test occursin("rho_v", msg) && occursin("vapor_transform = :none", msg)
         end
     end
 

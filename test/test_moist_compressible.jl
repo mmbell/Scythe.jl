@@ -7567,8 +7567,10 @@ using Springsteel
         @test Scythe.MC_CEVAP_LAST == Scythe.MC_CEVAP_PTS + 2
         @test Scythe.MC_REFIT_DR == Scythe.MC_CEVAP_LAST + 1
         @test Scythe.MC_VNEG == Scythe.MC_ECEN_STEPS + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_VNEG
+        @test Scythe.MC_VNEG_MASS == Scythe.MC_VNEG + 1
+        @test Scythe.MC_STATS_LAST == Scythe.MC_VNEG_MASS
         @test Scythe.MC_WATER_STATS[Scythe.MC_VNEG] == :v_neg
+        @test Scythe.MC_WATER_STATS[Scythe.MC_VNEG_MASS] == :v_neg_mass
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_PTS] == :e_pts
         @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_MAX] == :e_max

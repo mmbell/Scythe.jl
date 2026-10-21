@@ -124,7 +124,7 @@ function frame_fields(path)
     # `mc_water` (inside mc_state) cross-checks that against the column names.
     Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r =
         mc_state(df, ref, kDim, nc; transform = trans.ctrans, mu = trans.cmu,
-                 rain_transform = trans.rtrans, rain_mu = trans.rmu)
+                 rain_transform = trans.rtrans, rain_mu = trans.rmu, vapor_mu = trans.vmu)
     q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
     q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
     s = Scythe.entropy.(Tk, rho_d, q_v)

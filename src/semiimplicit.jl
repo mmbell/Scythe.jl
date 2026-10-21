@@ -990,6 +990,11 @@ density vapor (`vars` has `"rho_v"` where the model has `"nu_v"`, everything els
 CONVERTED on load by [`convert_vapor_checkpoint!`](@ref): `ν_v' = bhyp(ρ̄_v + ρ_v') − ν̄_v` with the
 model's own derived reference, the vapor slot alone refit. The reverse (a `"nu_v"` checkpoint
 into a `:none` model) is refused: `ahyp` is not invertible where the recovered vapor is 0.
+NOT checked: a `nu_v` checkpoint loaded into a `nu_v` model with a DIFFERENT
+`physical_params[:vapor_mu]` is read as if the widths agreed (the same gap the cloud, rain and
+ice widths already have). A CSV initial condition with a `rho_v` column into a `nu_v` model is
+refused by [`_check_csv_vapor_name`](@ref) (no conversion: run it under `vapor_transform =
+:none`).
 
 Runs on the master process before tiling; mutates and returns `patch`.
 """
@@ -1019,6 +1024,7 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         end
         vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
     else
+        _check_csv_vapor_name(model.initial_conditions, patch.params.vars)
         read_physical_grid(model.initial_conditions, patch)
         spectralTransform!(patch)
         gridTransform!(patch)
@@ -1035,6 +1041,46 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         end
     end
     return patch
+end
+
+"""
+    _check_csv_vapor_name(path, vars)
+
+A CSV initial condition written under the density vapor (a `rho_v` column) cannot initialize a
+vapor-control-variable model (`nu_v`): Springsteel's reader would only say "Grid is missing
+variable nu_v". Refuse with the actual reason and the way to read it. There is no conversion
+for a CSV (its fields are the raw mish values, written by an initializer for one convention);
+run with `vapor_transform = :none`, or regenerate the IC under `:bhyp`.
+"""
+function _check_csv_vapor_name(path, vars)
+    (haskey(vars, "nu_v") && isfile(path)) || return nothing
+    header = split(strip(first(eachline(path))), ',')
+    ("rho_v" in header && !("nu_v" in header)) || return nothing
+    error("initial-condition CSV $(path) carries the DENSITY vapor column \"rho_v\", but " *
+          "this model carries the vapor control variable \"nu_v\" " *
+          "(options[:vapor_transform] = :bhyp, physics.microphysics.vapor_transform). A CSV " *
+          "is not converted: run with vapor_transform = :none (\"none\" in the config) to " *
+          "read it as written, or regenerate the initial condition under :bhyp.")
+end
+
+"""
+    vapor_slot_from_density!(slot, rho_vbar, nu_vbar, kDim, mu) -> Int
+
+The pointwise map of [`convert_vapor_checkpoint!`](@ref), in place on one slot column (z
+fastest, `kDim` levels): `slot ← vapor_control(rho_vbar + slot) − nu_vbar`, i.e.
+`bhyp(ρ) − ν̄_v` for `ρ ≥ 0` and `−bhyp(−ρ) − ν̄_v` below. Returns the number of negative
+densities met.
+"""
+function vapor_slot_from_density!(slot::AbstractVector{Float64}, rho_vbar::Vector{Float64},
+                                  nu_vbar::Vector{Float64}, kDim::Int, mu::Float64)
+    nneg = 0
+    @inbounds for g in eachindex(slot)
+        k = mod1(g, kDim)
+        rho = slot[g] + rho_vbar[k]
+        rho < 0.0 && (nneg += 1)
+        slot[g] = vapor_control(rho, mu) - nu_vbar[k]
+    end
+    return nneg
 end
 
 """
@@ -1088,14 +1134,8 @@ function convert_vapor_checkpoint!(patch::AbstractGrid, model::ModelParameters, 
     diag = mc_reference_diagnostics(ref_state, collect(Float64, z); mc_ref_diag_kwargs(model)...)
     mu = vapor_mu(model.physical_params)
     saved = copy(patch.spectral)
-    nneg = 0
-    @inbounds for g in axes(patch.physical, 1)
-        k = mod1(g, kDim)
-        rho = patch.physical[g, iv, 1] + diag.rho_vbar[k]
-        rho < 0.0 && (nneg += 1)
-        nu = rho >= 0.0 ? bhyp(rho, mu) : -bhyp(-rho, mu)
-        patch.physical[g, iv, 1] = nu - diag.nu_vbar[k]
-    end
+    nneg = vapor_slot_from_density!(view(patch.physical, :, iv, 1), diag.rho_vbar,
+                                    diag.nu_vbar, kDim, mu)
     spectralTransform!(patch)
     for v in axes(patch.spectral, 2)
         v == iv && continue

@@ -185,7 +185,8 @@ function o01_rain_diagnostics(model, ref, kDim)
             transform = Scythe.condensate_transform_mode(model.options),
             mu = get(model.physical_params, :condensate_mu, 1.0e-7),
             rain_transform = Scythe.rain_transform_mode(model.options),
-            rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
+            rain_mu = get(model.physical_params, :rain_mu, 1.0e-7),
+            vapor_mu = Scythe.vapor_mu(model.physical_params))
         max_rr = max(max_rr, maximum(rho_r))
         min_rr = min(min_rr, minimum(rho_r))
         max_v = max(max_v, maximum(abs.(df.v)))

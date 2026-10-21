@@ -136,7 +136,8 @@ function owb_surface_diagnostics(model, ref, kDim)
         surf = 1:kDim:nrow(df)
         Tk, p, rho_d, rho_v, _, rho_t, _ =
             mc_state(df, ref, kDim, ncols; transform = ctf, mu = cmu,
-                     rain_transform = rtf, rain_mu = rmu)
+                     rain_transform = rtf, rain_mu = rmu,
+                     vapor_mu = Scythe.vapor_mu(model.physical_params))
         if isempty(Wh)
             Wh = gauss_cell_weights(ncols, gp.num_cells, gp.iMax - gp.iMin,
                                     ncols ÷ gp.num_cells, gp.quadrature)

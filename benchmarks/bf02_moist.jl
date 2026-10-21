@@ -469,7 +469,8 @@ function bf02_moist_diagnostics(model)
             transform = Scythe.condensate_transform_mode(model.options),
             mu = get(model.physical_params, :condensate_mu, 1.0e-7),
             rain_transform = Scythe.rain_transform_mode(model.options),
-            rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
+            rain_mu = get(model.physical_params, :rain_mu, 1.0e-7),
+            vapor_mu = Scythe.vapor_mu(model.physical_params))
         diags["min_rho_d_frac"] =
             minimum(rho_d ./ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols))
         diags["min_rho_w_gm3"] = 1000.0 * minimum(rho_t .- rho_d)

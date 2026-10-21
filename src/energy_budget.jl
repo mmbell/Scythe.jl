@@ -330,7 +330,8 @@ end
 """
     _eb_point_RX(eb, A, g, l, k) -> (R, X, Λ)
 
-`R`, `X` and the lobe pool `Λ = Σ_k 2 min(ν_k, 0)` (over the `:bhyp` mass slots) at row `g`
+`R`, `X` and the lobe pool `Λ = Σ_k 2 min(ν_k, 0)` (over the `:bhyp` mass slots, the vapor's
+included under `vapor_transform = :bhyp`) at row `g`
 of the state `A` (`var_np1`, `tile.physical` with `l = 1`, or a work column with `l` the
 thread), level `k`. The definitions are the netCDF writer's (`mc_derived_fields`): the
 recovered condensate as the thermodynamics reads it (floored under
@@ -364,6 +365,9 @@ in the mechanical term.
             eb.itr === :bhyp &&
                 (lam += 2.0 * ((min(s1, 0.0) + min(s2, 0.0)) + min(s3, 0.0)))
         end
+        # ...and the VAPOR's lobe under the vapor control variable: X contains it too, so the
+        # pool stays an honest partition of X (an exact no-op under `:none`).
+        eb.vtr === :bhyp && (lam += 2.0 * min(_eb_get(A, g, eb.irv, l) + eb.nu_vbar[k], 0.0))
         rl = eb.cond_floor ? max(rc, 0.0) + max(rr, 0.0) : rc + rr
         T = eos_temperature(p, rd, rv)
         geo = (0.5 * (((u * u) + (v * v)) + (w * w))) + (gravity * eb.z[k])
@@ -755,20 +759,29 @@ integral [J/m²] summed over steps.
 end
 
 """
-    _eb_vapor_negative_points(eb, phys) -> Int
+    _eb_vapor_negative_points(eb, phys) -> (Int, Float64)
 
-The `MC_VNEG` census: how many gridpoints of the state `phys` (`tile.physical`) carry a
-negative vapor CONTROL variable, `ν_v' + ν̄_v < 0` (under `:none` that is the density
-`ρ_v' + ρ̄_v`, since `nu_vbar ≡ rho_vbar` there).
+The `MC_VNEG` / `MC_VNEG_MASS` census: how many gridpoints of the state `phys`
+(`tile.physical`) carry a negative vapor CONTROL variable, `ν_v' + ν̄_v < 0` (under `:none`
+that is the density `ρ_v' + ρ̄_v`, since `nu_vbar ≡ rho_vbar` there), and — under
+`vapor_transform = :bhyp` only — the vapor lobe's water, the tile-mean column integral of
+`2 min(ν_v, 0)` [kg/m²], the vapor share of `MC_XGAP_POOL` (`0.0` under `:none`, where there is
+no transform and so no lobe).
 """
 @noinline function _eb_vapor_negative_points(eb::EnergyBudget, phys::Array{Float64,3})
     n = 0
+    m = 0.0
     kDim = eb.kDim
+    bh = eb.vtr === :bhyp
     @inbounds for g in axes(phys, 1)
         k = mod1(g, kDim)
-        (phys[g, eb.irv, 1] + eb.nu_vbar[k]) < 0.0 && (n += 1)
+        nu = phys[g, eb.irv, 1] + eb.nu_vbar[k]
+        if nu < 0.0
+            n += 1
+            bh && (m += eb.wxn[div(g - 1, kDim) + 1] * (eb.wz[k] * (2.0 * nu)))
+        end
     end
-    return n
+    return n, m
 end
 
 # ── Master side: gather, assemble, write ────────────────────────────────────────────────
@@ -908,9 +921,10 @@ function energy_census_trace(mtile, t::Int64)
     fill!(view(st, MC_XGAP_MAX:MC_XGAP_POOL, :), 0.0)
     st[MC_XGAP_MAX, 1] = xm; st[MC_XGAP_INT, 1] = xi; st[MC_XGAP_POOL, 1] = li
     # MC_VNEG: the vapor control variable's negative points at the output state.
-    nneg = _eb_vapor_negative_points(eb, phys)
-    fill!(view(st, MC_VNEG, :), 0.0)
+    nneg, vlobe = _eb_vapor_negative_points(eb, phys)
+    fill!(view(st, MC_VNEG:MC_VNEG_MASS, :), 0.0)
     st[MC_VNEG, 1] = Float64(nneg)
+    st[MC_VNEG_MASS, 1] = vlobe
     npts = size(phys, 1)
     secs = nst * model.ts
     s(r) = sum(view(st, r, :))
@@ -922,7 +936,7 @@ function energy_census_trace(mtile, t::Int64)
             "$(f(s(MC_LOBE_R) / nst)), $(f(s(MC_LOBE_I1) / nst)), $(f(s(MC_LOBE_I2) / nst)), " *
             "$(f(s(MC_LOBE_I3) / nst))) kg/m2, max|X|=$(f(xm)) kg/m3, int X=$(f(xi)) kg/m2, " *
             "pool=$(f(li)) kg/m2, nu_v<0 points=$(nneg) " *
-            "($(f(100.0 * nneg / max(npts, 1))) %)")
+            "($(f(100.0 * nneg / max(npts, 1))) %), vapor lobe=$(f(vlobe)) kg/m2")
     fill!(view(st, MC_REFIT_DR:MC_LOBE_I3, :), 0.0)
     st[MC_ECEN_STEPS, 1] = 0.0
     return nothing

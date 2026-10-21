@@ -94,6 +94,7 @@ function detect_transforms(dir::AbstractString)
     ctrans, rtrans, nrtrans = :none, :none, :none
     cmu, rmu = 1.0e-7, 1.0e-7
     nrmu = 1.0                  # mu_rain_n default [#/m^3], see rain_number_transform_mode
+    vmu = Scythe.VAPOR_MU_DEFAULT   # vapor_mu default [kg/m^3], see vapor_transform_mode
     log = joinpath(dir, "scythe_out.log")
     if isfile(log)
         txt = try
@@ -113,9 +114,11 @@ function detect_transforms(dir::AbstractString)
         m === nothing || (nrtrans = Symbol(m.captures[1]))
         m = match(r":mu_rain_n\s*=>\s*([0-9.eE+-]+)", txt)
         m === nothing || (nrmu = parse(Float64, m.captures[1]))
+        m = match(r":vapor_mu\s*=>\s*([0-9.eE+-]+)", txt)
+        m === nothing || (vmu = parse(Float64, m.captures[1]))
     end
     return (ctrans = ctrans, cmu = cmu, rtrans = rtrans, rmu = rmu,
-            nrtrans = nrtrans, nrmu = nrmu)
+            nrtrans = nrtrans, nrmu = nrmu, vmu = vmu)
 end
 
 """
@@ -305,7 +308,8 @@ output ordering.
 function theta_perturbation(df::DataFrame, ref, kDim::Int;
                             transform::Symbol = :none, mu = 1.0e-7,
                             rain_transform::Symbol = :none, rain_mu = 1.0e-7,
-                            temperature::Symbol = :energy)
+                            temperature::Symbol = :energy,
+                            vapor_mu = Scythe.VAPOR_MU_DEFAULT)
     npts = nrow(df)
     ncols = div(npts, kDim)
 
@@ -314,7 +318,8 @@ function theta_perturbation(df::DataFrame, ref, kDim::Int;
     if "E_t" in names(df)
         Tk, p, rho_d_, rho_v_, _, _, _ = mc_state(df, ref, kDim, ncols;
                                         transform = transform, mu = mu,
-                                        rain_transform = rain_transform, rain_mu = rain_mu)
+                                        rain_transform = rain_transform, rain_mu = rain_mu,
+                                        vapor_mu = vapor_mu)
         # `temperature = :energy` (default) is the retrieval `mc_state` returns, unchanged;
         # `:eos` is the model's own T (mc_temperature_eos).
         temperature in (:energy, :eos) || error("temperature must be :energy or :eos")
@@ -497,7 +502,8 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
                 transform = Scythe.condensate_transform_mode(model.options),
                 mu = get(model.physical_params, :condensate_mu, 1.0e-7),
                 rain_transform = Scythe.rain_transform_mode(model.options),
-                rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
+                rain_mu = get(model.physical_params, :rain_mu, 1.0e-7),
+                vapor_mu = Scythe.vapor_mu(model.physical_params))
             E_t = df.E_t .+ repeat(Springsteel.ref_total_energy(ref)[:, 1], ncols)
             # Clamp for the entropy diagnostic: in dry air the residual vapor sits at
             # 0 ± roundoff, and entropy() takes log(q_v).
@@ -649,7 +655,8 @@ function mc_entropy_production(model, ref; temperature::Symbol = :energy)
         transform = Scythe.condensate_transform_mode(model.options),
         mu = get(model.physical_params, :condensate_mu, 1.0e-7),
         rain_transform = Scythe.rain_transform_mode(model.options),
-        rain_mu = get(model.physical_params, :rain_mu, 1.0e-7))
+        rain_mu = get(model.physical_params, :rain_mu, 1.0e-7),
+        vapor_mu = Scythe.vapor_mu(model.physical_params))
     temperature in (:energy, :eos) || error("temperature must be :energy or :eos")
     temperature === :eos && (Tk = mc_temperature_eos(p, rho_d, rho_v))
     rho_vs = Springsteel.Thermodynamics.rho_v_sat.(Tk, p ./ 100.0)

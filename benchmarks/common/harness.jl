@@ -430,22 +430,45 @@ function check_targets(diags::Dict{String,Float64}, targets::Vector{Target})
 end
 
 """
-    compare_reference(output_csv, reference_csv, varnames; rtol=1.0e-6)
+    compare_reference(output_csv, reference_csv, varnames; rtol=1.0e-6, vapor=nothing)
 
 Compare the value columns of a model output CSV against a committed reference.
 Returns (pass, Dict of var => (rel_l2, max_abs_diff)), or `(nothing, Dict())` when the two
 files do not carry the same variables at all — which is not a failure but an absence of a
 comparison, and must not be reported as either a pass or a regression.
+
+THE VAPOR CONTROL VARIABLE (`options[:vapor_transform] = :bhyp`). A run whose vapor column is
+`nu_v` is compared `nu_v` to `nu_v` when the reference has that column, and otherwise — the
+reference written under the density vapor, `rho_v` — by RECOVERING the run's column:
+`ahyp(nu_v' + bhyp(rho_vbar)) - rho_vbar` against the reference's `rho_v'`, with
+`vapor = (rho_vbar, kDim, mu)` the run's DERIVED reference vapor `rho_tbar - rho_dbar -
+rho_cbar` (the profile the slot is carried against), z fastest. Which comparison was made is
+printed. Without `vapor` a `nu_v`-against-`rho_v` pair is skipped like any other renamed slot.
 """
 function compare_reference(output_csv::String, reference_csv::String,
-                           varnames::Vector{String}; rtol=1.0e-6)
+                           varnames::Vector{String}; rtol=1.0e-6, vapor=nothing)
     out = CSV.read(output_csv, DataFrame)
     ref = CSV.read(reference_csv, DataFrame)
+    # The vapor: nu_v against nu_v, or the recovered density against a density reference.
+    vapor_cmp = Dict{String,Function}()
+    if "nu_v" in varnames
+        if "nu_v" in names(ref)
+            println("  Vapor: nu_v compared to the reference's nu_v directly.")
+        elseif "rho_v" in names(ref) && vapor !== nothing
+            rvb, kD, vmu = vapor
+            println("  Vapor: the run's nu_v recovered (ahyp against bhyp of the derived " *
+                    "reference, mu_v = $(vmu)) and compared to the reference's rho_v.")
+            vapor_cmp["nu_v"] = function (o, r)
+                rb = repeat(rvb, div(nrow(o), kD))
+                (Scythe.ahyp.(o[!, "nu_v"] .+ Scythe.bhyp.(rb, vmu), vmu) .- rb, r[!, "rho_v"])
+            end
+        end
+    end
     # A run that declares a control-variable transform carries DIFFERENT prognostics from the
     # committed (untransformed) reference — `nu_c` where the reference has `rho_c` — and the
     # names say so. Comparing them column by column is meaningless: even where the physics is
     # identical the values differ by the map. Skip, and say why.
-    missing_cols = setdiff(varnames, names(ref))
+    missing_cols = setdiff(setdiff(varnames, keys(vapor_cmp)), names(ref))
     if !isempty(missing_cols)
         println("  Reference comparison SKIPPED: this run carries $(missing_cols), which the " *
                 "committed reference does not. A transformed run is not comparable to an " *
@@ -460,8 +483,7 @@ function compare_reference(output_csv::String, reference_csv::String,
     stats = Dict{String,Tuple{Float64,Float64}}()
     pass = true
     for var in varnames
-        a = out[!, var]
-        b = ref[!, var]
+        a, b = haskey(vapor_cmp, var) ? vapor_cmp[var](out, ref) : (out[!, var], ref[!, var])
         scale = max(sqrt(sum(abs2, b)), eps())
         rel_l2 = sqrt(sum(abs2, a .- b)) / scale
         max_abs = maximum(abs.(a .- b))
@@ -664,7 +686,23 @@ function run_benchmark(name::String, opts::BenchmarkOptions;
             end
         else
             println("\nRegression vs committed reference ($(basename(ref_csv))):")
-            regression_ok, regression_stats = compare_reference(output_csv, ref_csv, varnames)
+            # A vapor-control-variable run against a density-vapor reference compares the
+            # RECOVERED vapor (see `compare_reference`): the run's derived reference vapor.
+            # The reference is the one every tile built (`Scythe.build_reference_state`, with
+            # the run's hydrostatic / consistent_qss options), not a re-read of the file.
+            vapor = nothing
+            if "nu_v" in varnames
+                vpatch = createGrid(model.grid_params)
+                kD = model.grid_params.kDim
+                vz = collect(Float64, Scythe.getGridpoints(vpatch)[1:kD, end])
+                rref = Scythe.build_reference_state(model, vz,
+                           Scythe.reference_column(vpatch, model.grid_params))
+                rvb = (Springsteel.ref_rho_t(rref)[:, 1] .- Springsteel.ref_rho_d(rref)[:, 1]) .-
+                      Springsteel.ref_rho_c(rref)[:, 1]
+                vapor = (rvb, kD, Scythe.vapor_mu(model.physical_params))
+            end
+            regression_ok, regression_stats = compare_reference(output_csv, ref_csv, varnames;
+                                                                vapor = vapor)
             if isempty(regression_stats)
                 regression_ok === nothing ||
                     println("  FAIL (incomparable grids — no per-variable stats)")
