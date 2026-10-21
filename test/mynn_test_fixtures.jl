@@ -67,7 +67,8 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
                         init = :zero, interval = 20.0, K_max = Inf,
                         water_carry = :flux, ctrans = :none, rtrans = :none,
                         l_inf = 80.0, lapse = 0.004, Ck = 1.0e-3,
-                        fidelity = :fortran, sfc_stability = false, trace = false)
+                        fidelity = :fortran, sfc_stability = false, trace = false,
+                        extra_options = Dict{Symbol,Any}())
     opts_names = Dict{Symbol,Any}(:condensate_transform => ctrans,
                                   :rain_transform => rtrans)
     mynn && (opts_names[:mynn] = true)
@@ -132,6 +133,7 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
         # where the sidecar itself is tested, with its own `mktempdir` output_dir.
         options[:mynn_output] = false
     end
+    merge!(options, extra_options)
     model = ModelParameters(
         ts = ts, integration_time = 10.0 * ts, output_interval = 10.0 * ts,
         equation_set = "moist_compressible_XZ",

@@ -10612,14 +10612,15 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # is folded into `etd_d1`/`etd_dv`/`etd_qnp1`, so it lands with the phase change, in
     # `relaxation_adjustment_qss!`, as slot increments.
     booked = 0.0
-    if refit_partner && t > 1 && (ctrans_on || rtrans_on || itrans_on)
+    if refit_partner && t > 1 && (ctrans_on || rtrans_on || itrans_on || (wad && vtrans_on))
         eb_on && eb_partner_snap!(eb, etd_d1, etd_dv)
         booked = _refit_partner_fold!(etd_d1, etd_dv, etd_qnp1, etd_lam, mtile.var_np1,
                              mtile.tile.physical, nu_c, nu_r, S.nu_i1q, S.nu_i2q, S.nu_i3q,
                              Tk, R_m, C_vt, C_pt, Lv, Q_s, S.Q_s_i, colstart,
                              ctrans, cmu, rtrans, rmu, itrans, imu_q,
                              itrans_on ? IS.i1_q : 0, itrans_on ? IS.i2_q : 0,
-                             itrans_on ? IS.i3_q : 0, eb.wz, vtrans_on, J_v, !wad)
+                             itrans_on ? IS.i3_q : 0, eb.wz, vtrans_on, J_v, !wad,
+                             rho_d, drvs_dT, drvs_dp, rv_i, mc_nu_vbar(mtile), vtrans, vmu)
         eb_on && eb_partner_take!(eb, etd_d1, etd_dv)
     end
     # The REFIT census (`MC_REFIT_DR`, `MC_REFIT_BOOKED`): in the same window, for the same
@@ -11350,7 +11351,11 @@ realization (plan decision E4).
                                               rtr::Symbol, rmu::Float64,
                                               itr::Symbol, imu::Float64,
                                               rv_i::Int, i1::Int, i2::Int, i3::Int,
-                                              vj::Bool = false, water_side::Bool = true)
+                                              vj::Bool = false, water_side::Bool = true,
+                                              nvb::Vector{Float64} = Float64[],
+                                              vtr::Symbol = :none, vmu::Float64 = 1.0e-9)
+    water_side || return _etd_exchange_closure!(vnp1, phys, S, colstart, ts, ctr, cmu, rtr,
+                                                rmu, itr, imu, rv_i, i1, i2, i3, nvb, vtr, vmu)
     d8 = S.etd_d8; d9 = S.etd_d9
     qc = S.Qdot_bar; qr = S.Qdot_r_bar; nuc = S.nu_c
     ice = i1 > 0 && itr !== :none
@@ -11388,6 +11393,90 @@ realization (plan decision E4).
         # Slot 7 is already `Q_ss^{n+1}` here — the propagated value where `λ ≠ 0`, the explicit
         # predictor (which carried any clipped flux in `N`) where it was kept — so the
         # give-back is one increment in both cases.
+        vnp1[g, 7] += dq
+    end
+    return nothing
+end
+
+"""
+    _etd_exchange_closure!(vnp1, phys, S, colstart, ts, ctr, cmu, rtr, rmu, itr, imu, rv_i,
+                           i1, i2, i3, nvb, vtr, vmu)
+
+THE EXCHANGE REALIZATION UNDER THE DERIVED ANCHOR (plan E4). The ETD booked its heat and its
+`Q_ss` loss for the REQUESTED exchange — `phase_change_partner` of `Δt q̄_k`, algebraically
+`primitive(−Σ_k req_k, req_l, req_i)` — while the slots received `d_k = Δt J_k q̄_k` and the
+vapor their ν-space CLOSURE `Δν_v = etd_dv`. The recovered changes are then
+`rec_k = recover(ν*_k + d_k) − recover(ν*_k)` and `rec_v = recover(ν_v^{n+1}) −
+recover(ν_v^{n+1} − Δν_v)`, and the difference is booked with the primitive (plan E1):
+
+    gl = Σ_liquid (rec_k − req_k),  gi = Σ_ice (rec_k − req_k)          (`_exchange_gap`)
+    gv = rec_v + Σ_k req_k
+    (dp, dq) = recovered_change_partner(gv, gl, gi, …)   into p and Q_ss^{n+1}
+
+so the exchange is booked on what every reading received: `E_implied` moves by the latent heat
+of the RECOVERED change and `R` holds to second order. The vapor slot is NOT written (it holds
+the closure; ρ_w is invariant). Healthy point (`J ≈ ½`): `gv`, `gl` are `O(Δν²/μ)`. Deep clipped
+lobe: recovered cloud 0, the vapor moves by `rec_v ≈ 2Δν_v = −2α_c d/α_v`, and the net `p` move
+is `κ·rec_v` with no latent heat — water moved from the vapor into the lobe at fixed `R`, the
+exact inverse of the paired Stage L. THE JACOBIAN at a clipped point is the ETD's own
+frozen-at-n `J_k` (the lobe-transport continuation `dbhyp(ahyp_smooth(−ν))` below zero under
+`options[:water_lobe_transport]`, `dbhyp(0) = 1` without it): the closure increment is
+`−α_k d_k/α_v` whatever it is. `@noinline`.
+"""
+@noinline function _etd_exchange_closure!(vnp1::Matrix{Float64}, phys::Array{Float64,3}, S,
+                                          colstart::Int, ts::Float64, ctr::Symbol,
+                                          cmu::Float64, rtr::Symbol, rmu::Float64,
+                                          itr::Symbol, imu::Float64, rv_i::Int, i1::Int,
+                                          i2::Int, i3::Int, nvb::Vector{Float64},
+                                          vtr::Symbol, vmu::Float64)
+    d8 = S.etd_d8; d9 = S.etd_d9; dvc = S.etd_dv
+    qc = S.Qdot_bar; qr = S.Qdot_r_bar; nuc = S.nu_c
+    ice = i1 > 0
+    itr_on = itr !== :none
+    @inbounds for i in eachindex(d9)
+        g = colstart + i - 1
+        gl = 0.0; gi = 0.0; req = 0.0
+        if d9[i] != 0.0
+            rq = ts * qc[i]
+            req += rq
+            ctr !== :none && (gl += _exchange_gap(vnp1[g, 9] + (nuc[i] - phys[g, 9, 1]), d9[i],
+                                                  rq, ctr, cmu))
+        end
+        if d8[i] != 0.0
+            rq = ts * qr[i]
+            req += rq
+            rtr !== :none && (gl += _exchange_gap(vnp1[g, 8], d8[i], rq, rtr, rmu))
+        end
+        if ice
+            d = S.etd_di1[i]
+            if d != 0.0
+                rq = d / S.J_i1q[i]; req += rq
+                itr_on && (gi += _exchange_gap(vnp1[g, i1], d, rq, itr, imu))
+            end
+            d = S.etd_di2[i]
+            if d != 0.0
+                rq = d / S.J_i2q[i]; req += rq
+                itr_on && (gi += _exchange_gap(vnp1[g, i2], d, rq, itr, imu))
+            end
+            d = S.etd_di3[i]
+            if d != 0.0
+                rq = d / S.J_i3q[i]; req += rq
+                itr_on && (gi += _exchange_gap(vnp1[g, i3], d, rq, itr, imu))
+            end
+        end
+        dv = dvc[i]
+        gv = 0.0
+        if dv != 0.0 || req != 0.0
+            nn = vnp1[g, rv_i] + nvb[i]
+            rec = dv == 0.0 ? 0.0 :
+                recover_rho_v(0.0, nn, vtr, vmu) - recover_rho_v(-dv, nn, vtr, vmu)
+            gv = rec + req
+        end
+        (gl == 0.0 && gi == 0.0 && gv == 0.0) && continue
+        dp, dq = recovered_change_partner(gv, gl, gi, S.Tk[i], S.rho_d[i], S.R_m[i],
+                                          S.C_vt[i], S.Lv[i], ice ? L_s(S.Tk[i]) : 0.0,
+                                          S.drvs_dT[i], S.drvs_dp[i])
+        vnp1[g, 1] += dp
         vnp1[g, 7] += dq
     end
     return nothing
@@ -11520,13 +11609,25 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
                                         i1::Int, i2::Int, i3::Int, wz::Vector{Float64},
                                         vj::Bool = false,
                                         Jv::Vector{Float64} = Float64[],
-                                        water_side::Bool = true)
+                                        water_side::Bool = true,
+                                        rho_d::Vector{Float64} = Float64[],
+                                        drvs_dT::Vector{Float64} = Float64[],
+                                        drvs_dp::Vector{Float64} = Float64[],
+                                        rv_i::Int = 0, nvb::Vector{Float64} = Float64[],
+                                        vtr::Symbol = :none, vmu::Float64 = 1.0e-9)
     ice = i1 > 0 && itr !== :none
     # The energy the partner books, `∫ δp·C_vt/R_m dz` with the column's quadrature `wz`
     # (the `MC_REFIT_BOOKED` census row; returned, never read by the step). 0.0 when `wz`
     # is not this column's (a tile with no budget geometry).
     bw = length(wz) == length(d1)
     booked = 0.0
+    # THE DERIVED ANCHOR (`water_side = false`, plan E2/E3): book the AFFINE DEFECT of each
+    # transformed slot, `Δ_k = [recover(ν⁺) − recover(ν⁻)] − 2(ν⁺ − ν⁻)`, through the primitive
+    # (`recovered_change_partner`: `λ_l` for cloud and rain, `λ_i` for the ice masses, the
+    # vapor's defect at κ), energy only — no ν moves, ρ_w is invariant across refit + partner.
+    water_side || return _refit_partner_defect!(d1, qnp1, lam, vnp1, phys, nu_c, nu_r, nu_i1,
+        nu_i2, nu_i3, Tk, R_m, C_vt, Lv, colstart, ctr, cmu, rtr, rmu, itr, imu, i1, i2, i3,
+        wz, rho_d, drvs_dT, drvs_dp, rv_i, nvb, vtr, vmu)
     @inbounds for i in eachindex(d1)
         g = colstart + i - 1
         dl = 0.0
@@ -11555,6 +11656,80 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
         # (under the derived anchor `water_side = false`: no ν moves, ρ_w is invariant across
         # the refit and its partner — plan E2)
         water_side && (dv[i] += vj ? Jv[i] * dvv : dvv)
+        if lam[i] != 0.0
+            qnp1[i] += dq
+        else
+            qnp1[i] = dq
+        end
+        bw && (booked += wz[i] * (dp * (C_vt[i] / R_m[i])))
+    end
+    return booked
+end
+
+"""
+    _refit_partner_defect!(d1, qnp1, lam, vnp1, phys, nu_c, nu_r, nu_i1, nu_i2, nu_i3, Tk, R_m,
+                           C_vt, Lv, colstart, ctr, cmu, rtr, rmu, itr, imu, i1, i2, i3, wz,
+                           rho_d, drvs_dT, drvs_dp, rv_i, nvb, vtr, vmu) -> booked
+
+THE REFIT PARTNER UNDER THE DERIVED ANCHOR (plan E2, E3). The water anchor `ρ_w = Σ α_k ν_k`
+is refit linearly, and the ETD writes its kinks into `p` (β r), `ν_c` (J_c r) and, under the
+closure, `ν_v` (−J_c r) — never into `E_t`; where a slot is affine (2ν = ρ + μs) the refit's
+ringing of that triple is itself a consistent phase change and `R` is untouched. What no
+operator accounts for is the departure of the RECOVERED reading from the anchor, per slot
+
+    Δ_k = [recover(ν_k⁺) − recover(ν_k⁻)] − 2(ν_k⁺ − ν_k⁻)          (`affine_defect_change`)
+
+— exactly `0.0` where the bits did not change, O(μ s) where affine on both sides, `−2δν_k` in a
+deep clipped lobe (the pool's growth at that point). It is booked with the primitive
+`recovered_change_partner(Δ_v, Δ_c + Δ_r, Δ_i1 + Δ_i2 + Δ_i3, …)`: the "condensate appears
+alone" coefficients `λ_l = (R_m/C_vt)(L_v − C_pv T)`, `λ_i` (with `L_s`), and the vapor's own
+defect at `κ = T(R_v − (R_m/C_vt) C_vv)` (E3; ≲ μ_v wherever the vapor is affine). ENERGY ONLY:
+no ν moves (the `dv` fold of the `:slot` arm is deleted), so ρ_w is invariant across the refit
+and its partner. Its column integral equals the full-recovered booking's (`∫2δν = 0` under the
+linear refit up to the boundary), so the measured closure is kept and only the pointwise dipole
+(the "peak evaporation / flank condensation") goes. `Q_ss`: as the `:slot` arm (`qnp1`).
+"""
+@noinline function _refit_partner_defect!(d1::Vector{Float64}, qnp1::Vector{Float64},
+                                          lam::Vector{Float64}, vnp1::Matrix{Float64},
+                                          phys::Array{Float64,3},
+                                          nu_c::Vector{Float64}, nu_r::Vector{Float64},
+                                          nu_i1::Vector{Float64}, nu_i2::Vector{Float64},
+                                          nu_i3::Vector{Float64}, Tk::Vector{Float64},
+                                          R_m::Vector{Float64}, C_vt::Vector{Float64},
+                                          Lv::Vector{Float64}, colstart::Int,
+                                          ctr::Symbol, cmu::Float64, rtr::Symbol,
+                                          rmu::Float64, itr::Symbol, imu::Float64,
+                                          i1::Int, i2::Int, i3::Int, wz::Vector{Float64},
+                                          rho_d::Vector{Float64}, drvs_dT::Vector{Float64},
+                                          drvs_dp::Vector{Float64}, rv_i::Int,
+                                          nvb::Vector{Float64}, vtr::Symbol, vmu::Float64)
+    ice = i1 > 0 && itr !== :none
+    bw = length(wz) == length(d1)
+    booked = 0.0
+    @inbounds for i in eachindex(d1)
+        g = colstart + i - 1
+        dl = 0.0
+        di = 0.0
+        dv = 0.0
+        ctr !== :none &&
+            (dl += affine_defect_change(nu_c[i], vnp1[g, 9] + (nu_c[i] - phys[g, 9, 1]),
+                                        ctr, cmu))
+        rtr !== :none && (dl += affine_defect_change(nu_r[i], vnp1[g, 8], rtr, rmu))
+        if ice
+            di = (affine_defect_change(nu_i1[i], vnp1[g, i1], itr, imu) +
+                  affine_defect_change(nu_i2[i], vnp1[g, i2], itr, imu)) +
+                 affine_defect_change(nu_i3[i], vnp1[g, i3], itr, imu)
+        end
+        vtr !== :none &&
+            (dv = affine_defect_change(phys[g, rv_i, 1] + nvb[i], vnp1[g, rv_i] + nvb[i],
+                                       vtr, vmu))
+        if dl == 0.0 && di == 0.0 && dv == 0.0
+            lam[i] == 0.0 && (qnp1[i] = 0.0)
+            continue
+        end
+        dp, dq = recovered_change_partner(dv, dl, di, Tk[i], rho_d[i], R_m[i], C_vt[i], Lv[i],
+                                          ice ? L_s(Tk[i]) : 0.0, drvs_dT[i], drvs_dp[i])
+        d1[i] += dp
         if lam[i] != 0.0
             qnp1[i] += dq
         else
@@ -11642,7 +11817,8 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
     rfp = t > 1 && get(mtile.model.options, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool &&
           (condensate_transform_mode(mtile.model.options) !== :none ||
            rain_transform_mode(mtile.model.options) !== :none ||
-           (ice_on && ice_transform_mode(mtile.model.options) !== :none))
+           (ice_on && ice_transform_mode(mtile.model.options) !== :none) ||
+           (mtile.ebudget.wa && vapor_transform_mode(mtile.model.options) !== :none))
 
     @inbounds for i in eachindex(lam)
         g = colstart + i - 1
@@ -11706,13 +11882,16 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
         ctr = condensate_transform_mode(model.options)
         rtr = rain_transform_mode(model.options)
         itr = ice_on ? ice_transform_mode(model.options) : :none
-        if ctr !== :none || rtr !== :none || itr !== :none
+        if ctr !== :none || rtr !== :none || itr !== :none ||
+           (mtile.ebudget.wa && vapor_transform_mode(model.options) !== :none)
             pp = model.physical_params
             _etd_exchange_realization!(vnp1, mtile.tile.physical, S, colstart, model.ts,
                 ctr, get(pp, :condensate_mu, 1.0e-7), rtr, get(pp, :rain_mu, 1.0e-7),
                 itr, ice_on ? ice_mu(pp, 1) : 1.0, rv_i,
                 ice_on ? IS.i1_q : 0, ice_on ? IS.i2_q : 0, ice_on ? IS.i3_q : 0,
-                vapor_transform_mode(model.options) !== :none, !mtile.ebudget.wa)
+                vapor_transform_mode(model.options) !== :none, !mtile.ebudget.wa,
+                mc_nu_vbar(mtile), vapor_transform_mode(model.options),
+                vapor_mu(model.physical_params))
         end
     end
     eb_on && eb_mark!(eb, EB_EXCH, vnp1, colstart)

@@ -435,7 +435,10 @@ handling to copy.
                         2.0 * z[2], ed, IS, ice_on, nr_on,
                         lp && !wc, wc, ctr, get(pp, :condensate_mu, 1.0e-7), rtr,
                         get(pp, :rain_mu, 1.0e-7), itr, ice_on ? ice_mu(pp, 1) : 1.0,
-                        mtile.model.ts, vapor_transform_mode(opts) !== :none)
+                        mtile.model.ts, vapor_transform_mode(opts) !== :none,
+                        mtile.ebudget.wa, mtile.tile.physical, mc_nu_vbar(mtile),
+                        vapor_transform_mode(opts), vapor_mu(pp),
+                        water_anchor_set(opts, pp, IS).alpha[1])
     return nothing
 end
 
@@ -1285,24 +1288,32 @@ well; the choice is documented rather than silent because both were available.
     Ixtransform(col, S.QDOT_V)
     Sh0, Sh1 = _mynn_edges(col)
 
+    # THE DERIVED WATER ANCHOR (plan E7): every water-mass slot gets its own ν flux column
+    # `K_h ∂z ν_k'` (+ plume `M_k/α_k`) and receives the fitted divergence directly; the
+    # total-water leg is the pointwise `Σ α_k ν̇_k` and the energy carry is regrouped by species
+    # (`_mynn_nu_legs!`). The number and habit moments keep their density legs.
+    SEw0 = 0.0; SEw1 = 0.0
+    if mtile.ebudget.wa
+        SEw0, SEw1 = _mynn_nu_legs!(mtile, MY, S, MN, work, colstart, n, z, rvv, rcv, IS,
+                                    ice_on, mf)
+        nr_on && _mynn_moment_leg!(mtile, MN.div_nr, Kh, S.nu_nr_z, S.Jnr, IS.n_r, n)
+        if ice_on
+            _mynn_moment_leg!(mtile, MN.div_i1n, Kh, S.nu_i1n_z, S.J_i1n, IS.i1_n, n)
+            _mynn_moment_leg!(mtile, MN.div_i1a, Kh, S.nu_i1a_z, S.J_i1a, IS.i1_a, n)
+            _mynn_moment_leg!(mtile, MN.div_i1c, Kh, S.nu_i1c_z, S.J_i1c, IS.i1_c, n)
+            _mynn_moment_leg!(mtile, MN.div_i2n, Kh, S.nu_i2n_z, S.J_i2n, IS.i2_n, n)
+            _mynn_moment_leg!(mtile, MN.div_i2a, Kh, S.nu_i2a_z, S.J_i2a, IS.i2_a, n)
+            _mynn_moment_leg!(mtile, MN.div_i2c, Kh, S.nu_i2c_z, S.J_i2c, IS.i2_c, n)
+            _mynn_moment_leg!(mtile, MN.div_i3n, Kh, S.nu_i3n_z, S.J_i3n, IS.i3_n, n)
+            _mynn_moment_leg!(mtile, MN.div_i3a, Kh, S.nu_i3a_z, S.J_i3a, IS.i3_a, n)
+            _mynn_moment_leg!(mtile, MN.div_i3c, Kh, S.nu_i3c_z, S.J_i3c, IS.i3_c, n)
+        end
+    else
     # The water legs. `work.s_sqw`/`work.s_sqv` are the SPECIFIC contents this step's
     # `_mynn_column_inputs!` built (`rho_v/rho_t`, `(rho_v+rho_c)/rho_t`) and the plume
     # sums are in the same units, so `rho_t * (q_up - bar q)` is the partial-density mass
     # flux the diffusive `K_h dz(rho')` beside it already is.
-    # Under the derived water anchor (`options[:water_anchor] = :derived`) the total-water
-    # gradient is the derived `∂z(ρ_t' − ρ_d') = Σ α_k ∂z ν_k'` (`anchor_Wp`): slot 3 is a
-    # shadow nothing reads.
-    wad = mtile.ebudget.wa
-    wset = water_anchor_set(mtile.model.options, mtile.model.physical_params, IS)
-    phys = mtile.tile.physical
-    zs_w = siw_zslot(phys)
-    if wad
-        @inbounds for i in 1:n
-            col.uMish[i] = Kh[i] * anchor_Wp(phys, colstart + i - 1, zs_w, wset)
-        end
-    else
-        col.uMish .= Kh .* (rtv.f_z .- rdv.f_z)
-    end
+    col.uMish .= Kh .* (rtv.f_z .- rdv.f_z)
     if mf
         _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_qw, work.s_sqw, colstart, n)
     end
@@ -1390,16 +1401,13 @@ well; the choice is documented rather than silent because both were available.
         _mynn_moment_leg!(mtile, MN.div_i3c, Kh, S.nu_i3c_z, S.J_i3c, IS.i3_c, n)
     end
 
-    SEw0 = 0.0; SEw1 = 0.0
     if MY.water_carry === :flux
         wk = MN.wk
         @inbounds for i in 1:n
             cw = (Cpv*Tk[i]) - S.Lv[i] + S.ke[i] + (gravity*z[i])
             cv = S.Lv[i] - (Rv*Tk[i])
             rvz = vj ? rvv.f_z[i] / vapor_jacobian_column(S)[i] : rvv.f_z[i]
-            dwz = wad ? anchor_Wp(phys, colstart + i - 1, zs_w, wset) :
-                        rtv.f_z[i] - rdv.f_z[i]
-            wk[i] = Kh[i]*((cw*dwz) + (cv*rvz))
+            wk[i] = Kh[i]*((cw*(rtv.f_z[i] - rdv.f_z[i])) + (cv*rvz))
         end
         if ice_on
             # THE ICE ENERGY CARRY. `rho_w' = rho_t' - rho_d'` already INCLUDES the ice, so
@@ -1450,6 +1458,8 @@ well; the choice is documented rather than silent because both were available.
         fill!(MN.div_Ew, 0.0)
     end
 
+    end
+
     e_col = MN.e
     @inbounds for i in 1:n
         e_col[i] = rho_e[i] / rho_t[i]
@@ -1470,6 +1480,124 @@ well; the choice is documented rather than silent because both were available.
 end
 
 """
+    _mynn_nu_legs!(mtile, MY, S, MN, work, colstart, n, z, rvv, rcv, IS, ice, mf)
+        -> (S_Ew(bottom), S_Ew(top))
+
+THE MYNN WATER LEGS UNDER THE DERIVED ANCHOR (plan E7). Each water-mass slot k (vapor, cloud,
+rain, the three ice masses) gets its own ν flux column `u_k = K_h ∂z ν_k'` — the slot's own
+fitted gradient, the perturbation as every leg here mixes — plus, for the vapor and the cloud,
+the plume mass flux `M_k/α_k` (`M_v = ρ_t Σ(a w q_v)`, `M_c = M_w − M_v`, the `:slot` arm's
+plume sums), fitted on the shared basis (slot 8's column, the ice masses on their own) and
+differentiated: `ν̇_k = D[u_k]`, applied to the slot DIRECTLY (no `J·div`). The total-water
+leg is then `div_w := Σ_k α_k ν̇_k` pointwise — exact by the linearity of D, so ρ_w moves by the
+sum of the species' legs and nothing else (one column fit saved). The energy carry is the same
+flux-form column regrouped by species,
+
+    S_Ew = Fit[K_h Σ_k e_k α_k ν_{k,z} − Σ_k e_k M_k],
+    e_v = C_vv T + ke + gz,  e_c = e_r = C_pv T − L_v + ke + gz,  e_i = C_pv T − L_s + ke + gz
+
+(the `:slot` arm's `c_w ρ_{w,z} + c_v ρ_{v,z} − L_f ρ_{i,z}` with `c_w + c_v = e_v`), still
+telescoping: the D3 identity's right side is unchanged. Returns its boundary values.
+"""
+@noinline function _mynn_nu_legs!(mtile::ModelTile, MY::MYNNState, S, MN::MYNNColumnScratch,
+                                  work::MYNNWork, colstart::Int64, n::Int64, z, rvv, rcv,
+                                  IS::MCSlots, ice::Bool, mf::Bool)
+    ws = water_anchor_set(mtile.model.options, mtile.model.physical_params, IS)
+    av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]; ai = ws.alpha[4]
+    Kh = MN.Kh; rho_t = S.rho_t; Tk = S.Tk
+    s_aw = MY.s_aw
+    col = scratch_column(mtile, 8)
+    # vapor
+    @inbounds for i in 1:n
+        col.uMish[i] = Kh[i] * rvv.f_z[i]
+    end
+    if mf
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            col.uMish[i] -= (rho_t[i] / av) * (MY.s_aw_qv[j] - (s_aw[j] * work.s_sqv[i]))
+        end
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_v)
+    # cloud
+    @inbounds for i in 1:n
+        col.uMish[i] = Kh[i] * rcv.f_z[i]
+    end
+    if mf
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            col.uMish[i] -= (rho_t[i] / ac) *
+                ((MY.s_aw_qw[j] - (s_aw[j] * work.s_sqw[i])) -
+                 (MY.s_aw_qv[j] - (s_aw[j] * work.s_sqv[i])))
+        end
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_c)
+    # rain (no plume: the plumes carry no precipitation)
+    @inbounds for i in 1:n
+        col.uMish[i] = Kh[i] * S.nu_r_z[i]
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_r)
+    # the three ice masses, each on its own column
+    if ice
+        _mynn_nu_leg!(mtile, MN.div_i1q, Kh, S.nu_i1q_z, IS.i1_q, n)
+        _mynn_nu_leg!(mtile, MN.div_i2q, Kh, S.nu_i2q_z, IS.i2_q, n)
+        _mynn_nu_leg!(mtile, MN.div_i3q, Kh, S.nu_i3q_z, IS.i3_q, n)
+    end
+    # the total-water leg, pointwise
+    div_w = MN.div_w
+    @inbounds for i in 1:n
+        w = ((av * MN.div_v[i]) + (ac * MN.div_c[i])) + (ar * MN.div_r[i])
+        ice && (w = ((w + (ai * MN.div_i1q[i])) + (ai * MN.div_i2q[i])) +
+                    (ai * MN.div_i3q[i]))
+        div_w[i] = w
+    end
+    # the energy carry, by species
+    SEw0 = 0.0; SEw1 = 0.0
+    if MY.water_carry === :flux
+        wk = MN.wk
+        @inbounds for i in 1:n
+            geo = S.ke[i] + (gravity * z[i])
+            ev = (Cvv * Tk[i]) + geo
+            el = ((Cpv * Tk[i]) - S.Lv[i]) + geo
+            c = (ev * (av * rvv.f_z[i])) +
+                (el * ((ac * rcv.f_z[i]) + (ar * S.nu_r_z[i])))
+            if ice
+                ei = ((Cpv * Tk[i]) - L_s(Tk[i])) + geo
+                c += ei * (ai * ((S.nu_i1q_z[i] + S.nu_i2q_z[i]) + S.nu_i3q_z[i]))
+            end
+            wk[i] = Kh[i] * c
+            if mf
+                j = colstart + i - 1
+                tv = rho_t[i] * (MY.s_aw_qv[j] - (s_aw[j] * work.s_sqv[i]))
+                tw = rho_t[i] * (MY.s_aw_qw[j] - (s_aw[j] * work.s_sqw[i]))
+                wk[i] -= (ev * tv) + (el * (tw - tv))
+            end
+        end
+        col.uMish .= wk
+        Btransform!(col); Atransform!(col)
+        Ixtransform(col, MN.div_Ew)
+        SEw0, SEw1 = _mynn_edges(col)
+    else
+        fill!(MN.div_Ew, 0.0)
+    end
+    return SEw0, SEw1
+end
+
+"One ν-space leg of an ice MASS on its own column: `D[K_h ∂z ν]` (no Jacobian; plan E7)."
+@noinline function _mynn_nu_leg!(mtile::ModelTile, div, Kh, nu_z, slot::Int64, n::Int64)
+    c = scratch_column(mtile, slot)
+    @inbounds for i in 1:n
+        c.uMish[i] = Kh[i] * nu_z[i]
+    end
+    Btransform!(c)
+    Atransform!(c)
+    Ixtransform(c, div)
+    return nothing
+end
+
+"""
     _mynn_moment_apply!(expdot, div, J, slot, colstart, n)
 
 Fold one fitted moment divergence into its prognostic slot (S8): `expdot[j, slot] += J·div`.
@@ -1479,10 +1607,12 @@ is a flux of the quantity, and the increment goes back the other way through `d�
 an exact `1.0` with no transform declared, and `1.0 * x === x`, so the untransformed slot
 receives the raw divergence.
 """
+@inline _mynn_J(J::AbstractVector, i) = @inbounds J[i]
+@inline _mynn_J(J::Float64, i) = J
 @inline function _mynn_moment_apply!(expdot, div, J, slot::Int64,
                                      colstart::Int64, n::Int64)
     @inbounds for i in 1:n
-        expdot[colstart + i - 1, slot] += J[i] * div[i]
+        expdot[colstart + i - 1, slot] += _mynn_J(J, i) * div[i]
     end
     return nothing
 end
@@ -1539,7 +1669,11 @@ that value actually is and report it.
                                        lp::Bool, wc::Bool, ctr::Symbol, cmu::Float64,
                                        rtr::Symbol, rmu::Float64,
                                        itr::Symbol, imu::Float64, ts::Float64,
-                                       vj::Bool = false)
+                                       vj::Bool = false, wad::Bool = false,
+                                       phys::Array{Float64,3} = zeros(0, 0, 0),
+                                       nvb::Vector{Float64} = Float64[],
+                                       vtr::Symbol = :none, vmu::Float64 = 1.0e-9,
+                                       av::Float64 = 2.0)
     u = uv.f
     w = wv.f
     rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
@@ -1613,6 +1747,51 @@ that value actually is and report it.
 
         qdot_h = pdk1 ? (QDOT_V[i] + (F_sh * gz)) + (Pdrag - Psfc) :
                         QDOT_V[i] + (F_sh * gz)
+        if wad
+            # THE DERIVED ANCHOR (plan E7): the species' ν legs land directly; ρ_w (the
+            # shadow slot 3 too) moves by `Σ α_k ν̇_k` plus the surface flux; `E_t` receives the
+            # flux-form carry and the THERMAL REMAINDER is what the recovered reading did not
+            # receive of it, `qdot_w = dE_w − Σ_k e_k^int real_k − geo Σ α_k ν̇_k`, with the
+            # REALIZED recovered rate of every species, the vapor included.
+            Fv = F_q * gz
+            nvv = MN.div_v[i] + (Fv / av)
+            nuv = phys[j, rv_i, 1] + nvb[i]
+            real_v = (recover_rho_v(ts * nvv, nuv, vtr, vmu) -
+                      recover_rho_v(0.0, nuv, vtr, vmu)) / ts
+            real_l = _mynn_realized_rate(S.nu_c[i], div_c[i], div_c[i], ts, ctr, cmu) +
+                     _mynn_realized_rate(S.nu_r[i], div_r[i], div_r[i], ts, rtr, rmu)
+            real_i = ice_on ?
+                ((_mynn_realized_rate(S.nu_i1q[i], MN.div_i1q[i], MN.div_i1q[i], ts, itr, imu) +
+                  _mynn_realized_rate(S.nu_i2q[i], MN.div_i2q[i], MN.div_i2q[i], ts, itr, imu)) +
+                 _mynn_realized_rate(S.nu_i3q[i], MN.div_i3q[i], MN.div_i3q[i], ts, itr, imu)) :
+                0.0
+            sw = div_w[i] + Fv
+            geo = ke[i] + (gravity * z[i])
+            ev = (Cvv * Tk[i]) + geo
+            if flux_carry
+                dE_w = VD_Ew[i] + (ev * Fv)
+            else
+                dE_w = 0.0
+            end
+            eint = ((Cvv * Tk[i]) * real_v) + ((((Cpv * Tk[i]) - Lv[i]) * real_l) +
+                   (ice_on ? (((Cpv * Tk[i]) - L_s(Tk[i])) * real_i) : 0.0))
+            qdot_w = (dE_w - eint) - (geo * sw)
+            qdot_E = (qdot_h - Pb) + eps
+            qdot_th = qdot_E + qdot_w
+            dT_v = qdot_th / (rho_d[i] * C_vt[i])
+            dp_v = (R_m[i] / C_vt[i]) * qdot_th
+            dp_q = Rv * Tk[i] * real_v
+            expdot[j, 1] += dp_v + dp_q
+            expdot[j, 3] += sw
+            expdot[j, 8] += div_r[i]
+            expdot[j, 9] += div_c[i]
+            expdot[j, rv_i] += nvv
+            expdot[j, 6] += (qdot_E + dE_w) + dE_mom
+            expdot[j, 7] += real_v - (drvs_dT[i]*dT_v) - (drvs_dp[i]*(dp_v + dp_q))
+            expdot[j, re_i] += ((div_e[i] + Ps) + (Pb - eps)) + Psfc
+            bdry += wq[i] * ev * Fv
+            continue
+        end
         # THE WATER CLOSURE (`_mynn_realized_rate`): the vapor leg is the total-water leg
         # less the species' REALIZED rates, and the ice's energy share is booked on its
         # realized rate too. Off, `vleg` and `ri` are the fitted divergences, bitwise.
@@ -1709,7 +1888,21 @@ that value actually is and report it.
     if nr_on
         _mynn_moment_apply!(expdot, MN.div_nr, S.Jnr, IS.n_r, colstart, n)
     end
-    if ice_on
+    if ice_on && wad
+        # the ice MASSES' ν legs land directly (plan E7); the moments as below
+        _mynn_moment_apply!(expdot, MN.div_i1q, 1.0, IS.i1_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2q, 1.0, IS.i2_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3q, 1.0, IS.i3_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1n, S.J_i1n, IS.i1_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1a, S.J_i1a, IS.i1_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1c, S.J_i1c, IS.i1_c, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2n, S.J_i2n, IS.i2_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2a, S.J_i2a, IS.i2_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2c, S.J_i2c, IS.i2_c, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3n, S.J_i3n, IS.i3_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3a, S.J_i3a, IS.i3_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3c, S.J_i3c, IS.i3_c, colstart, n)
+    elseif ice_on
         _mynn_moment_apply!(expdot, MN.div_i1q, S.J_i1q, IS.i1_q, colstart, n)
         _mynn_moment_apply!(expdot, MN.div_i1n, S.J_i1n, IS.i1_n, colstart, n)
         _mynn_moment_apply!(expdot, MN.div_i1a, S.J_i1a, IS.i1_a, colstart, n)

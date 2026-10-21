@@ -1087,6 +1087,10 @@ function validate_water_anchor(model)
         "slot 3 as the water anchor (the res_rho_t - rho_v gap census); refused under " * why)
     get(opts, :clamp_water, false) === true && error("options[:clamp_water] balances the " *
         "partition against slot 3 (rule 2); refused under " * why)
+    get(opts, :mynn_water_carry, :flux) === :fixed_T && error("options[:mynn_water_carry] " *
+        "= :fixed_T (the local fixed-temperature water map) is not implemented under " * why *
+        ": the boundary layer's water legs are nu legs whose energy carry is the flux-form " *
+        "column regrouped by species. Use the default :flux carry.")
     return nothing
 end
 

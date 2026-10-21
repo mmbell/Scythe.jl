@@ -478,4 +478,379 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             end
         end
     end
+
+    # ══ 3c: the partners re-derived (plan E2, E4, E7) ══════════════════════════════════
+    # R and X per point of a slot matrix (var_np1's layout) through the tile's own budget
+    # reading: under the derived anchor the mechanical term reads rho_d + rho_w (E9) and
+    # X = rho_w - sum_k rho_k.
+    RX(m, X) = begin
+        eb = m.ebudget; kD = eb.kDim; n = size(X, 1)
+        R = zeros(n); Xg = zeros(n)
+        for g in 1:n
+            r, x, _ = Scythe._eb_point_RX(eb, X, g, 1, mod1(g, kD))
+            R[g] = r; Xg[g] = x
+        end
+        R, Xg
+    end
+
+    @testset "3c E2: the refit partner books the affine defect, energy only" begin
+        mktempdir() do tmp
+            arms = Dict{Any,Any}()
+            for seed in (:sheet, :uniform)
+                sd! = seed === :sheet ? (p, x, V, c) -> F.vt_seed!(p, x, V, c; amp = 1.0e-3) :
+                    (p, x, V, c) -> begin
+                        for i in 1:size(p.physical, 1)
+                            p.physical[i, V["nu_c"], 1] = Scythe.condensate_slot(1.0e-3, 0.0,
+                                                                                 :bhyp, F.MU)
+                        end
+                    end
+                ex = derived(; refit_partner = true, exchange_realization = false)
+                m0, p0, mo0 = F.vt_tile(tmp, "rp_$(seed)"; vtr = :bhyp, extra = ex, seed! = sd!)
+                F.vt_run!(m0, p0, mo0, 2)
+                # the SAME state into both arms: the partner on and off from here
+                for on in (true, false)
+                    m = deepcopy(m0); mo = m.model
+                    mo.options[:refit_partner] = on
+                    pre = copy(m.var_np1)            # the pre-refit state the step reads
+                    phys = copy(m.tile.physical)     # the post-refit state n
+                    kD = mo.grid_params.kDim
+                    Scythe.advance_column(m, 1, 3)
+                    S = m.mc_scratch[Threads.threadid()]
+                    arms[(on, seed)] = (; m, mo, pre, phys, d1 = copy(S.etd_d1),
+                                          dv = copy(S.etd_dv), d8 = copy(S.etd_d8),
+                                          d9 = copy(S.etd_d9), q = copy(S.etd_qnp1),
+                                          Tk = copy(S.Tk), R_m = copy(S.R_m), C_vt = copy(S.C_vt),
+                                          Lv = copy(S.Lv), nu_c = copy(S.nu_c), rows = 1:kD)
+                end
+            end
+            for seed in (:sheet, :uniform)
+                a = arms[(true, seed)]; b = arms[(false, seed)]
+                # the water increments of the ETD are bitwise those of the unpartnered arm
+                @test a.dv == b.dv
+                @test a.d8 == b.d8
+                @test a.d9 == b.d9
+                dp = a.d1 .- b.d1
+                V = a.mo.grid_params.vars
+                # the defect booked, independently: Delta_c = [ahyp(nu+) - ahyp(nu-)] - 2 dnu
+                lam = (a.R_m ./ a.C_vt) .* (a.Lv .- (Scythe.Cpv .* a.Tk))
+                npre = a.pre[a.rows, V["nu_c"]]; npost = a.phys[a.rows, V["nu_c"], 1]
+                dfc = [Scythe.affine_defect_change(npost[k], npre[k], :bhyp, F.MU)
+                       for k in eachindex(npre)]
+                full = [Scythe.refit_recovered_change(npost[k], npre[k], :bhyp, F.MU)
+                        for k in eachindex(npre)]
+                if seed === :sheet
+                    # deep lobe points (nu < 0 on both sides, nu moved): the booking is the
+                    # defect, -2 dnu, the pool's growth
+                    lobe = [k for k in eachindex(npre) if npre[k] < -10 * F.MU &&
+                            npost[k] < -10 * F.MU && npre[k] != npost[k]]
+                    @test !isempty(lobe)
+                    for k in lobe
+                        @test dfc[k] ≈ -2.0 * (npost[k] - npre[k]) rtol = 1.0e-10
+                    end
+                    # above-knee points: the defect is O(mu), the full recovered change is 2 dnu,
+                    # so the OLD form would book lambda_l * 2 dnu there (the negative control)
+                    hi = [k for k in eachindex(npre) if npre[k] > 1.0e3 * F.MU &&
+                          npost[k] > 1.0e3 * F.MU && abs(npost[k] - npre[k]) > 1.0e-9]
+                    @test !isempty(hi)
+                    for k in hi
+                        @test abs(dfc[k]) <= 1.0e-3 * abs(full[k])
+                        @test abs(full[k] - 2.0 * (npost[k] - npre[k])) <= 1.0e-3 * abs(full[k])
+                    end
+                    # the p partner IS the primitive of the defect (cloud is the only
+                    # transformed condensate that moved; the vapor rides at kappa)
+                    @test maximum(abs, dp) > 0.0
+                    for k in lobe
+                        @test dp[k] ≈ lam[k] * dfc[k] rtol = 1.0e-3
+                    end
+                else
+                    # a smooth resolved cloud: the partner books <= 1e-3 of lambda_l * drho_l
+                    d = [abs(dp[k]) / max(abs(lam[k] * full[k]), 1.0e-300) for k in eachindex(full)
+                         if abs(full[k]) > 1.0e-12]
+                    @test isempty(d) || maximum(d) <= 1.0e-3
+                end
+            end
+        end
+    end
+
+    @testset "3c E4: the exchange realization closes on the recovered change (vapor as closure)" begin
+        # Supersaturated air over a ringing sheet: condensation is requested at lobe points
+        # (recovered cloud 0). One ETD stage re-applied on the post-explicit state: at a deep
+        # lobe the cloud stays at recovered 0, the vapor's recovered change is ~ -2d (d the
+        # ETD's cloud increment), the net p move is kappa * rec_v (no latent heat) to 1e-8,
+        # sum_k alpha_k dnu_k is unchanged by the realization, and R is held.
+        mktempdir() do tmp
+            super! = (p, x, V, c) -> begin
+                F.vt_seed!(p, x, V, c; amp = 1.0e-3)
+                kD = length(c.Tk)
+                for i in 1:size(p.physical, 1)
+                    zz = x[i, end]; k = mod1(i, kD)
+                    zz > 1500.0 || continue
+                    drv = 0.33 * Scythe.rho_v_sat(c.Tk[k], c.p_Pa[k] / 100.0)
+                    p.physical[i, V["nu_v"], 1] += Scythe.bhyp(c.rho_v[k] + drv, 1.0e-9) -
+                                                    Scythe.bhyp(c.rho_v[k], 1.0e-9)
+                    p.physical[i, V["Q_ss"], 1] += drv
+                end
+            end
+            for lt in (true, false)
+                ex = derived(; water_lobe_transport = lt, refit_partner = false)
+                m, p, mo = F.vt_tile(tmp, "xr_$(lt)"; vtr = :bhyp, extra = ex, seed! = super!)
+                F.vt_run!(m, p, mo, 3)
+                kD = mo.grid_params.kDim; V = mo.grid_params.vars
+                found = 0
+                for c in 1:F.vt_ncols(p, mo)
+                    cs = (c - 1) * kD + 1; rows = cs:(cs + kD - 1)
+                    Scythe.advance_column(m, c, 4)
+                    S = m.mc_scratch[Threads.threadid()]
+                    # the post-explicit state: undo this column's ETD stage is not possible,
+                    # so re-apply it on the stage's input reconstructed from the increments
+                    X1 = copy(m.var_np1)
+                    X0 = copy(X1)
+                    m.var_np1 .= X0
+                    mo.options[:exchange_realization] = false
+                    Scythe.relaxation_adjustment_qss!(m, cs, cs + kD - 1, 4)
+                    Xa = copy(m.var_np1)
+                    m.var_np1 .= X0
+                    mo.options[:exchange_realization] = true
+                    Scythe.relaxation_adjustment_qss!(m, cs, cs + kD - 1, 4)
+                    Xb = copy(m.var_np1)
+                    m.var_np1 .= X1
+                    Ra, _ = RX(m, Xa); Rb, _ = RX(m, Xb); R0, _ = RX(m, X0)
+                    nvb = Scythe.mc_nu_vbar(m)
+                    for (k, g) in enumerate(rows)
+                        d = S.etd_d9[k]
+                        nstar = X0[g, V["nu_c"]]
+                        (d > 0.0 && nstar + d < -10 * F.MU) || continue
+                        found += 1
+                        # the Jacobian the closure uses at the clipped point is the ETD's own
+                        J = S.Jc[k]
+                        Jexp = lt ? Scythe.dbhyp(Scythe.ahyp_smooth(-(nstar - 0.0), F.MU), F.MU) :
+                                    1.0
+                        @test d ≈ mo.ts * J * S.Qdot_bar[k] rtol = 1.0e-14
+                        lt || @test J == 1.0
+                        # the closure: the vapor's nu moved by -d (alpha_c = alpha_v = 2)
+                        @test S.etd_dv[k] == -d
+                        # the realization moved no water slot
+                        for s in (V["nu_v"], V["nu_c"], V["nu_r"])
+                            @test Xb[g, s] == Xa[g, s]
+                        end
+                        # recovered cloud stays 0; recovered vapor moved by ~ -2d
+                        @test Scythe.ahyp(Xb[g, V["nu_c"]], F.MU) == 0.0
+                        rv0 = Scythe.ahyp(X0[g, V["nu_v"]] + nvb[k], 1.0e-9)
+                        rv1 = Scythe.ahyp(Xb[g, V["nu_v"]] + nvb[k], 1.0e-9)
+                        @test (rv1 - rv0) ≈ -2.0 * d rtol = 1.0e-6
+                        # net p (ETD + realization): kappa * rec_v, no latent heat
+                        kap = S.Tk[k] * (Scythe.Rv - (S.R_m[k] / S.C_vt[k]) * Scythe.Cvv)
+                        @test (Xb[g, 1] - X0[g, 1]) ≈ kap * (rv1 - rv0) rtol = 1.0e-8
+                        # R held: |dR| <= 1e-3 L_v |req| (the unrealized arm opens ~L_v req)
+                        req = mo.ts * S.Qdot_bar[k]
+                        @test abs(Rb[g] - R0[g]) <= 1.0e-3 * S.Lv[k] * abs(req)
+                        @test abs(Ra[g] - R0[g]) > 0.3 * S.Lv[k] * abs(req)
+                    end
+                end
+                @test found > 0
+            end
+        end
+    end
+
+    @testset "3c E7: MYNN under the derived anchor — nu legs, div_w = sum, R held" begin
+        MF = Main.MYNNTestFixtures
+        mktempdir() do tmp
+            function seed!(patch, mo, kDim, z, col; e0 = 0.4)
+                V = mo.grid_params.vars
+                c = Scythe.mc_slot(V, "rho_c"); r = Scythe.mc_slot(V, "rho_r")
+                u = MF.bl_jet(z, 12.0, 500.0)
+                rho_t = col.rho_d .+ col.rho_v
+                for j in 1:size(patch.physical, 1)
+                    k = mod1(j, kDim); zz = z[k]
+                    patch.physical[j, V["u"], 1] = u[k]
+                    haskey(V, "rho_e") &&
+                        (patch.physical[j, V["rho_e"], 1] = rho_t[k] * e0 * exp(-zz / 1500.0))
+                    bump = 2.0e-3 * exp(-((zz - 800.0) / 600.0)^2)
+                    # a cloud whose edge rings negative (sharp top) and a healthy rain
+                    rc = max(0.0, 4.0e-4 * (1.0 - ((zz - 700.0) / 300.0)^2))
+                    rr = 1.0e-4 * exp(-((zz - 400.0) / 400.0)^2) + 1.0e-6
+                    patch.physical[j, V["rho_v"], 1] = rho_t[k] * bump
+                    patch.physical[j, V["rho_t"], 1] = rho_t[k] * bump + rc + rr
+                    patch.physical[j, c, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, F.MU)
+                    patch.physical[j, r, 1] = Scythe.rain_slot(rr, :bhyp, F.MU)
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+            end
+            arms = Dict{Any,Any}()
+            for (tag, mynn, wa, wc, e0) in (("d", true, :derived, true, 0.4),
+                                            ("dctl", false, :derived, true, 0.4),
+                                            ("s_off", true, :slot, false, 0.4),
+                                            ("sctl", false, :slot, true, 0.4),
+                                            ("d_k0", true, :derived, true, 0.0),
+                                            ("dctl_k0", false, :derived, true, 0.0))
+                m, p, mo, gp, z, col = MF.make_mynn_tile(tmp; mynn = mynn, init = :zero,
+                                                         num_cells_k = 25, kMax = 5.0e3,
+                                                         fluxes = false, ctrans = :bhyp,
+                                                         rtrans = :bhyp,
+                                                         extra_options = Dict{Symbol,Any}(
+                                                             :water_anchor => wa,
+                                                             :mynn_water_closure => wc))
+                seed!(p, mo, gp.kDim, z, col; e0)
+                Scythe.init_water_anchor_shadow!(p, mo)
+                MF.step_all!(m, p, gp.kDim)
+                arms[tag] = (; m, p, mo, gp, x = copy(p.physical[:, :, 1]))
+            end
+            mo = arms["d"].mo; V = mo.grid_params.vars; ts = mo.ts
+            nf = size(arms["dctl"].m.expdot_n, 2)
+            x = arms["d"].x
+            D = arms["d"].m.expdot_n[:, 1:nf] .- arms["dctl"].m.expdot_n
+            MN = arms["d"].m.mynn.colscratch[Threads.threadid()]
+            # last column's legs: the sum of alpha * the slots' MYNN tendencies is div_w
+            kD = arms["d"].gp.kDim; nc = div(size(x, 1), kD)
+            rows = ((nc - 1) * kD + 1):(nc * kD)
+            # (the fixture's vapor is a density slot: alpha_v = 1; cloud and rain bhyp)
+            sumnu = (D[rows, V["rho_v"]] .+ 2.0 .* D[rows, Scythe.mc_slot(V, "rho_c")]) .+
+                    2.0 .* D[rows, Scythe.mc_slot(V, "rho_r")]
+            @test maximum(abs, sumnu .- MN.div_w) <= 4 * eps() * maximum(abs, MN.div_w) + 1.0e-30
+            # the shadow receives the same sum
+            @test D[rows, 3] ≈ MN.div_w rtol = 1.0e-12
+            # R held by the closed legs, against the :slot arm without the water closure
+            R0, X0 = RX(arms["d"].m, x)
+            x1 = copy(x); x1[:, 1:nf] .+= ts .* D
+            R1, X1 = RX(arms["d"].m, x1)
+            Ds = arms["s_off"].m.expdot_n[:, 1:nf] .- arms["sctl"].m.expdot_n
+            Rs0, _ = RX(arms["s_off"].m, x)
+            xs = copy(x); xs[:, 1:nf] .+= ts .* Ds
+            Rs1, _ = RX(arms["s_off"].m, xs)
+            # R held to 1e-4 of the energy the legs moved (the :slot arm without the water
+            # closure opens it at first order; here it is the second order of one step)
+            Es = ts .* abs.(D[:, V["E_t"]])
+            @test maximum(abs, R1 .- R0) <= 1.0e-4 * maximum(Es)
+            # ...and against that unclosed :slot arm (measured 2.1e-4 of it: the second order
+            # of one 0.5 s step, 9.6e-7 of the energy moved)
+            @test maximum(abs, R1 .- R0) <= 1.0e-3 * maximum(abs, Rs1 .- Rs0)
+            @info "MYNN derived dR" maximum(abs, R1 .- R0) maximum(Es) maximum(abs, Rs1 .- Rs0)
+            # the D3 column identity: sum_k w_k (dE_t + drho_e) = bdry_E, to round-off
+            re_i = V["rho_e"]
+            wq = MF.gauss_weights(kD, 25, 5.0e3)
+            lhs = sum(wq .* (D[rows, V["E_t"]] .+ arms["d"].m.expdot_n[rows, re_i]))
+            rhs = arms["d"].m.mynn.bdry_E[nc]
+            scale = sum(wq .* abs.(D[rows, V["E_t"]])) + sum(wq .* abs.(arms["d"].m.expdot_n[rows, re_i]))
+            @test abs(lhs - rhs) <= 1.0e-10 * scale
+            # rho_w moves by the legs exactly, the pool absorbs the water the clip holds
+            @test maximum(abs, ts .* D[:, 3]) > 1.0e-8
+            # K_h = 0: every water leg is an exact zero (the drag still acts on u)
+            Dk = arms["d_k0"].m.expdot_n[:, 1:nf] .- arms["dctl_k0"].m.expdot_n
+            for s in (V["rho_v"], Scythe.mc_slot(V, "rho_c"), Scythe.mc_slot(V, "rho_r"), 3, 7)
+                @test all(==(0.0), Dk[:, s])
+            end
+        end
+    end
+
+    @testset "3c: horizontal water mixing under :derived moves rho_w by K lap(rho_w)" begin
+        # the slot-3 leg is gone (the shadow is not mixed); rho_w = sum alpha nu moves by
+        # sum alpha K lap(nu) = K lap(rho_w), by linearity, to rounding
+        mktempdir() do tmp
+            ex(k) = merge(derived(), Dict{Symbol,Any}(:si_water_slots => :mass))
+            seed! = (p, x, V, c) -> begin
+                F.vt_seed!(p, x, V, c)
+                for i in 1:size(p.physical, 1)
+                    p.physical[i, V["nu_c"], 1] *= (1.0 + 0.5 * sin(2pi * x[i, 1] / F.SPAN))
+                    p.physical[i, V["nu_v"], 1] += 1.0e-4 * sin(2pi * x[i, 1] / F.SPAN) *
+                                                    exp(-((x[i, end] - 2000.0) / 800.0)^2)
+                end
+            end
+            m1, p1, mo1 = F.vt_tile(tmp, "hm_on"; vtr = :bhyp, extra = derived(), seed!,
+                                    pp_extra = Dict{Symbol,Float64}(:Khdiff_water => 2000.0))
+            m0, p0, mo0 = F.vt_tile(tmp, "hm_off"; vtr = :bhyp, extra = derived(), seed!)
+            for c in 1:F.vt_ncols(p1, mo1)
+                Scythe.advance_column(m1, c, 1); Scythe.advance_column(m0, c, 1)
+            end
+            D = m1.expdot_n .- m0.expdot_n
+            V = mo1.grid_params.vars
+            @test all(==(0.0), D[:, 3])                          # the shadow is not mixed
+            ws = Scythe.water_anchor_set(mo1.options, mo1.physical_params, Scythe.mc_slots(mo1))
+            drw = zeros(size(D, 1)); lap = zeros(size(D, 1))
+            for j in 1:6
+                s = ws.slot[j]; a = ws.alpha[j]
+                (s == 0 || a == 0.0) && continue
+                drw .+= a .* D[:, s]
+                lap .+= a .* (2000.0 .* p1.physical[:, s, 3])      # K * d2/dx2 (XZ)
+            end
+            @test maximum(abs, drw .- lap) <= 1.0e-12 * maximum(abs, lap) +
+                                               1.0e-13 * maximum(abs, m1.expdot_n)
+        end
+    end
+
+    @testset "3c: closed periodic transport-only column: rho_w integral at the O(mu V) bound" begin
+        # condensation off, no precipitation, no BL: transport and the acoustics alone. The
+        # nu continuity is -div(nu u) + D_k div(u) (D_k <= mu_k/2), so the rho_w integral
+        # moves at most by the knee terms: sum_k mu_k V per unit time.
+        mktempdir() do tmp
+            ex = derived(; condensation = false)
+            m, p, mo = F.vt_tile(tmp, "tr"; vtr = :bhyp, extra = ex,
+                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; wamp = 2.0))
+            Scythe.init_water_anchor_shadow!(p, mo)
+            eb = m.ebudget; kD = eb.kDim; nc = F.vt_ncols(p, mo)
+            W(P) = sum(eb.wxn[c] * Scythe._eb_water_column(eb, P, (c - 1) * kD, 1)[1] for c in 1:nc)
+            w0 = W(p.physical)
+            Gs(P) = sum(eb.wxn[c] * sum(eb.wz[k] * (P[(c - 1) * kD + k, 3, 1] + eb.rho_tbar_ref[k, 1] -
+                                                 (P[(c - 1) * kD + k, 2, 1] + eb.rho_dbar[k]))
+                                       for k in 1:kD) for c in 1:nc)
+            g0 = Gs(p.physical)
+            nstep = 40
+            F.vt_run!(m, p, mo, nstep)
+            w1 = W(p.physical)
+            # the knee bound sum_k (mu_k/2) |div v| over the column and the run (div v of
+            # the seeded w: 2 pi / ztop * wamp at most)
+            divmax = 2.0 * pi / F.ZTOP * 2.0
+            bound = 0.5 * (1.0e-9 + 2.0 * F.MU) * divmax * F.ZTOP * (nstep * mo.ts)
+            # and the linear shadow's own change, the conservation class of the old rho_t
+            # (product-rule advection and the refit conserve no integral exactly)
+            @info "transport-only rho_w integral change" dW = w1 - w0 bound w0 dshadow = Gs(p.physical) - g0
+            @test abs(w1 - w0) <= bound
+        end
+    end
+
+    @testset "3c: the P3 budget closes under :derived with the new terms" begin
+        mktempdir() do tmp
+            for ice in (false, true), lobe in (false, true)
+                ex = derived(; energy_budget = true, lobe_relaxation = lobe)
+                m, p, mo = F.vt_tile(tmp, "ebd_$(ice)_$(lobe)"; vtr = :bhyp, ice, extra = ex,
+                                     seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+                F.vt_run!(m, p, mo, 6)
+                snap = Scythe.energy_budget_snapshot!(m)
+                tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
+                tX = vec(sum(snap.dX[collect(Scythe.EB_TOP), :]; dims = 1))
+                @test maximum(abs, snap.actualR .- tR) <= 1.0e-10 * maximum(abs, snap.actualR) +
+                                                         1.0e-12 * maximum(abs, snap.dR)
+                @test maximum(abs, snap.actualX .- tX) <= 1.0e-10 * maximum(abs, snap.actualX) +
+                                                         1.0e-12 * maximum(abs, snap.dX)
+                # the nudge row is an exact zero: there is no nudge
+                @test all(==(0.0), snap.dR[Scythe.EB_OP_ROW[Scythe.EB_OP_VREC], :])
+            end
+        end
+    end
+
+    @testset "3c: the paired Stage L holds R at the kappa coefficient (no latent heat)" begin
+        # On the ringing sheet with the device on: across the lobe stage, R moves by
+        # <= 1e-4 of the kappa-energy moved; the negative control books the latent (beta)
+        # coefficient instead and opens R by > 0.5 lambda_l 2 a |nu_c|.
+        mktempdir() do tmp
+            m, p, mo = F.vt_tile(tmp, "sl"; vtr = :bhyp,
+                                 extra = derived(; lobe_relaxation = true, energy_budget = true),
+                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+            F.vt_run!(m, p, mo, 4)
+            snap = Scythe.energy_budget_snapshot!(m)
+            F.vt_run!(m, p, mo, 2; t0 = 5)
+            snap = Scythe.energy_budget_snapshot!(m)
+            lr = snap.dR[Scythe.EB_LOBE, :]
+            lx = snap.dX[Scythe.EB_LOBE, :]
+            st = m.mc_water_stats
+            moved = abs(sum(view(st, Scythe.MC_LOBE_C, :)))
+            @test moved > 0.0
+            Tk = 285.0
+            kap = Tk * (Scythe.Rv - 0.55 * Scythe.Cvv)
+            # the energy the kappa partner moved, column-integrated over 2 steps: ~kappa * 2 dnu
+            @test maximum(abs, lr) <= 1.0e-4 * abs(kap) * 2.0 * moved * 2 + 1.0e-6
+            # X (the pool) DOES change: the lobe is filled from the vapor
+            @test maximum(abs, lx) > 0.0
+        end
+    end
 end

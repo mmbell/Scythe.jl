@@ -253,15 +253,14 @@ carrying no cloud.
     # closure leaves the partition exactly closed and opens no reconciliation gap.
     VDOT_w = S.VDOT_w
     rho_tp_z = rtv.f_z; rho_dp_z = rdv.f_z
-    if mtile.ebudget.wa
-        # the derived water anchor: `∂z(ρ_t' − ρ_d') = Σ α_k ∂z ν_k'` (`anchor_Wp`); slot 3 is a
-        # shadow nothing reads
-        wset = water_anchor_set(mtile.model.options, mtile.model.physical_params,
-                                mtile.mc_slots)
-        phys = mtile.tile.physical
-        zs_w = siw_zslot(phys)
+    wad = mtile.ebudget.wa
+    rvv_z = view(mtile.tile.physical, colstart:colend, mtile.mc_slots.rho_v, siw_zslot(mtile.tile.physical))
+    if wad
+        # THE DERIVED ANCHOR (plan E7, Louis): the VAPOR leg is fitted directly, in ν space
+        # (`K ∂z ν_v'`, the slot's own gradient), and the total-water fit is deleted — VDOT_w
+        # holds the vapor's ν rate from here on.
         @inbounds for i in eachindex(Kv)
-            col.uMish[i] = Kv[i] * anchor_Wp(phys, colstart + i - 1, zs_w, wset)
+            col.uMish[i] = Kv[i] * rvv_z[i]
         end
     else
         col.uMish .= Kv .* (rho_tp_z .- rho_dp_z)
@@ -275,9 +274,10 @@ carrying no cloud.
     # `Kv ∂z ν'` — not a mass flux. `S.bl_rho_cp_z` is `∂z ρ_c'`, staged in mc_driver! from
     # `S.rho_c_z = ∂z ν / J`, so VDOT_c is a DENSITY rate on both branches and everything
     # downstream of it needs no further thought. See the docstring.
-    if ctrans_on
+    if ctrans_on && !wad
         col.uMish .= Kv .* S.bl_rho_cp_z
     else
+        # (under the derived anchor the cloud leg is ν space too: `K ∂z ν_c'`)
         col.uMish .= Kv .* rcv.f_z
     end
     Btransform!(col)
@@ -298,6 +298,9 @@ carrying no cloud.
     J_v = vapor_jacobian_column(S)
     drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp
     ke = S.ke
+    wad && return _louis_apply_derived!(mtile, S, geom, colstart, z, uv, wv, vv, expdot,
+                                        tau_u, tau_v, F_sh, F_q, delta, VD_u, VD_w, VD_v,
+                                        QDOT_V, VDOT_w, VDOT_c)
     @inbounds for i in eachindex(Kv)
         j = colstart + i - 1
         gz = z[i] < delta ? 2.0 * inv_delta * (1.0 - (z[i] * inv_delta)) : 0.0
@@ -337,6 +340,70 @@ carrying no cloud.
         expdot[j, rv_i] += vj ? J_v[i] * vdot_v : vdot_v
         expdot[j, 7] += vdot_v - (drvs_dT[i] * dT_v) -
                         (drvs_dp[i] * (dp_v + dp_q))
+    end
+    return nothing
+end
+
+
+"""
+    _louis_apply_derived!(mtile, S, geom, colstart, z, uv, wv, vv, expdot, tau_u, tau_v,
+                          F_sh, F_q, delta, VD_u, VD_w, VD_v, QDOT_V, VDOT_v, VDOT_c)
+
+The Louis BL's slot increments under the derived water anchor (plan E7): the vapor and cloud
+legs are ν rates (`VDOT_v`, `VDOT_c`, fitted from the slots' own gradients) landing on their
+slots directly, the surface moisture flux enters the vapor as `F_q g/α_v`, the shadow slot 3
+receives `Σ α_k ν̇_k + F_q g`, and the energy carry is the fixed-temperature map on the
+REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke + gz)·ρ̇_w` (so
+`E_t − E_implied` is held to second order, the pool absorbing the water difference); `p` gets
+`R_v T ρ̇_v` and the heating, `Q_ss` the realized vapor less the saturation chain rule.
+"""
+@noinline function _louis_apply_derived!(mtile::ModelTile, S, geom::MCGeometry,
+                                         colstart::Int64, z, uv, wv, vv, expdot,
+                                         tau_u::Float64, tau_v::Float64, F_sh::Float64,
+                                         F_q::Float64, delta::Float64, VD_u, VD_w, VD_v,
+                                         QDOT_V, VDOT_v, VDOT_c)
+    opts = mtile.model.options; pp = mtile.model.physical_params
+    ws = water_anchor_set(opts, pp, mtile.mc_slots)
+    av = ws.alpha[1]; ac = ws.alpha[2]
+    ctr = condensate_transform_mode(opts); cmu = get(pp, :condensate_mu, 1.0e-7)
+    vtr = vapor_transform_mode(opts); vmu = vapor_mu(pp)
+    ts = mtile.model.ts
+    phys = mtile.tile.physical
+    rv_i = mtile.mc_slots.rho_v
+    nvb = mc_nu_vbar(mtile)
+    u = uv.f; w = wv.f
+    rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
+    R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv
+    inv_delta = 1.0 / delta
+    @inbounds for i in eachindex(VD_u)
+        j = colstart + i - 1
+        gz = z[i] < delta ? 2.0 * inv_delta * (1.0 - (z[i] * inv_delta)) : 0.0
+        du = (VD_u[i] - (tau_u * gz)) / rho_t[i]
+        dw = VD_w[i] / rho_t[i]
+        dv = _louis_dv(geom, VD_v, rho_t, tau_v, gz, i)
+        expdot[j, 4] += du
+        expdot[j, 5] += dw
+        _louis_add_v!(geom, expdot, j, dv)
+        qdot = QDOT_V[i] + (F_sh * gz)
+        Fv = F_q * gz
+        nvv = VDOT_v[i] + (Fv / av)
+        ncc = VDOT_c[i]
+        nuv = phys[j, rv_i, 1] + nvb[i]
+        real_v = (recover_rho_v(ts * nvv, nuv, vtr, vmu) - recover_rho_v(0.0, nuv, vtr, vmu)) / ts
+        real_c = _mynn_realized_rate(S.nu_c[i], ncc, ncc, ts, ctr, cmu)
+        sw = ((av * VDOT_v[i]) + (ac * ncc)) + Fv
+        geo = S.ke[i] + (gravity * z[i])
+        dT_v = qdot / (rho_d[i] * C_vt[i])
+        dp_v = (R_m[i] / C_vt[i]) * qdot
+        dp_q = Rv * Tk[i] * real_v
+        expdot[j, 1] += dp_v + dp_q
+        expdot[j, 3] += sw
+        expdot[j, 9] += ncc
+        expdot[j, 6] += qdot + ((((Cvv * Tk[i]) * real_v) + (((Cpv * Tk[i]) - Lv[i]) * real_c)) +
+                                (geo * sw)) +
+                        (rho_t[i] * (((u[i] * du) + (w[i] * dw)) + (_louis_v(geom, vv, i) * dv)))
+        expdot[j, rv_i] += nvv
+        expdot[j, 7] += real_v - (S.drvs_dT[i] * dT_v) - (S.drvs_dp[i] * (dp_v + dp_q))
     end
     return nothing
 end
