@@ -1151,8 +1151,8 @@ where nothing falls (or above every knee, to the rounding of `2·½ − 1`).
      ((((ai * J2) - 1.0) * F2z) + (((ai * J3) - 1.0) * F3z))) / av
 
 """
-    _water_exchange_multistep!(expdot, phys, S, colstart, rv_i, ws, ice, precip, nvb, vtr,
-                               vmu, ts)
+    _water_exchange_multistep!(expdot, phys, S, colstart, rv_i, options, physical_params, IS,
+                               ice, precip, nvb, vtr, vmu, ts)
 
 Under the derived anchor, add to the vapor slot's tendency the closure of the multistep
 exchange (`water_exchange_multistep_rate`) and of the sedimentation (`sedimentation_knee_closure`),
@@ -1165,10 +1165,12 @@ liquid↔ice `L_f`); the sedimentation closure's vapor through the primitive alo
 arrays.
 """
 @noinline function _water_exchange_multistep!(expdot::Matrix{Float64}, phys::Array{Float64,3},
-                                              S, colstart::Int, rv_i::Int, ws::SIWaterSet,
+                                              S, colstart::Int, rv_i::Int, options,
+                                              physical_params, IS::MCSlots,
                                               ice::Bool, precip::Bool,
                                               nvb::Vector{Float64}, vtr::Symbol,
                                               vmu::Float64, ts::Float64)
+    ws = water_anchor_set(options, physical_params, IS)
     av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]; ai = ws.alpha[4]
     Jc = S.Jc; Jr = S.Jr; AC = S.AUTO_COLL; Frz = S.Fr_z
     @inbounds for i in eachindex(Jc)
@@ -1193,7 +1195,7 @@ arrays.
                                              S.C_pt[i], S.Lv[i], L_s(S.Tk[i]), S.Q_s[i],
                                              S.Q_s_i[i])
             expdot[g, 1] += dp
-            expdot[g, 7] += dq
+            _qss_share!(expdot, S, g, i, dq, ts)
         end
         if xs != 0.0
             expdot[g, rv_i] += xs
@@ -1204,9 +1206,21 @@ arrays.
                                                   S.C_vt[i], S.Lv[i], 0.0, S.drvs_dT[i],
                                                   S.drvs_dp[i])
                 expdot[g, 1] += dp
-                expdot[g, 7] += dq
+                _qss_share!(expdot, S, g, i, dq, ts)
             end
         end
+    end
+    return nothing
+end
+
+# A partner's Q_ss share: where the stiff propagator owns slot 7 this step (`λ ≠ 0`, its
+# predictor is discarded and N^n was already consumed) as a direct increment of the
+# propagated value, otherwise as a tendency of the multistep (which keeps the predictor).
+@inline function _qss_share!(expdot, S, g::Int, i::Int, dq::Float64, ts::Float64)
+    @inbounds if S.etd_lam[i] != 0.0
+        S.etd_qnp1[i] += ts * dq
+    else
+        expdot[g, 7] += dq
     end
     return nothing
 end
@@ -1274,4 +1288,82 @@ increments it applied per point through `out` (the caller's census). `@noinline`
         end
     end
     return (lc, lr, l1, l2, l3)
+end
+
+
+"""
+    _etd_closure!(dv, d9, d8, d1, d2, d3, ice, options, physical_params, IS)
+
+The ETD's vapor increment under the derived anchor: `dv[i] = water_exchange_dv(…, d9, d8,
+d1, d2, d3)` at every point of the column (the cloud, rain and ice-mass step-mean increments
+already formed), overwriting the density-space `J_v·Δt·vsrc` the pre-compute wrote. `@noinline`.
+"""
+@noinline function _etd_closure!(dv::Vector{Float64}, d9::Vector{Float64},
+                                 d8::Vector{Float64}, d1::Vector{Float64},
+                                 d2::Vector{Float64}, d3::Vector{Float64}, ice::Bool,
+                                 options, physical_params, IS::MCSlots)
+    ws = water_anchor_set(options, physical_params, IS)
+    av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]; ai = ws.alpha[4]
+    @inbounds for i in eachindex(dv)
+        dv[i] = water_exchange_dv(av, ac, ar, ai, d9[i], d8[i], ice ? d1[i] : 0.0,
+                                  ice ? d2[i] : 0.0, ice ? d3[i] : 0.0)
+    end
+    return nothing
+end
+
+
+"""
+    _water_exchange_stage!(mtile, colstart, colend, t)
+
+The derived anchor's per-column work on the explicit side, called from `explicit_timestep`
+(after `mc_driver!` has assembled every tendency and the ETD increments, before the AB3
+combination and before `var_np1` is overwritten), reading the tile and the thread's scratch,
+which still hold the column the driver assembled:
+
+1. the multistep exchange and sedimentation closures into the vapor's tendency
+   (`_water_exchange_multistep!`);
+2. the ETD closure `etd_dv = water_exchange_dv(…)` (`_etd_closure!`);
+3. the refit partner as the affine-defect booking (`_refit_partner_defect!`, plan E2/E3) —
+   `var_np1` still holds the pre-refit state and the slots the post-refit one — with the energy
+   budget's partner marks and the `MC_REFIT_BOOKED` census.
+
+WHY HERE: the multistep closure's call site in `mc_driver!` took the first-call compile of the
+axisymmetric Louis tile from ~310 s to more than 40 min (the LLVM cliff of
+reference/HANDOFF_DRIVER_COMPILE_CLIFF.md, measured 2026-10-21); the `_siw_stage!` precedent.
+"""
+@noinline function _water_exchange_stage!(mtile::ModelTile, colstart::Int, colend::Int, t::Int)
+    model = mtile.model
+    opts = model.options; pp = model.physical_params
+    IS = mtile.mc_slots
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+    ice = ice_registered(IS)
+    precip = get(opts, :precipitation, false)::Bool
+    vtr = vapor_transform_mode(opts); vmu = vapor_mu(pp)
+    nvb = mc_nu_vbar(mtile)
+    phys = mtile.tile.physical
+    rv_i = IS.rho_v
+    _water_exchange_multistep!(mtile.expdot_n, phys, S, colstart, rv_i, opts, pp, IS, ice,
+                               precip, nvb, vtr, vmu, model.ts)
+    _etd_closure!(S.etd_dv, S.etd_d9, S.etd_d8, S.etd_di1, S.etd_di2, S.etd_di3, ice,
+                  opts, pp, IS)
+    ctr = condensate_transform_mode(opts); rtr = rain_transform_mode(opts)
+    itr = ice ? ice_transform_mode(opts) : :none
+    if t > 1 && get(opts, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool &&
+       (ctr !== :none || rtr !== :none || itr !== :none || vtr !== :none)
+        eb = mtile.ebudget
+        eb.active && eb_partner_snap!(eb, S.etd_d1, S.etd_dv)
+        itr_on = itr !== :none
+        booked = _refit_partner_defect!(S.etd_d1, S.etd_qnp1, S.etd_lam, mtile.var_np1, phys,
+            S.nu_c, S.nu_r, S.nu_i1q, S.nu_i2q, S.nu_i3q, S.Tk, S.R_m, S.C_vt, S.Lv, colstart,
+            ctr, Float64(get(pp, :condensate_mu, 1.0e-7)), rtr, Float64(get(pp, :rain_mu, 1.0e-7)),
+            itr, ice ? ice_mu(pp, 1) : 1.0,
+            itr_on ? IS.i1_q : 0, itr_on ? IS.i2_q : 0, itr_on ? IS.i3_q : 0, eb.wz,
+            S.rho_d, S.drvs_dT, S.drvs_dp, rv_i, nvb, vtr, vmu)
+        eb.active && eb_partner_take!(eb, S.etd_d1, S.etd_dv)
+        st = mtile.mc_water_stats
+        if size(st, 2) > 0 && length(eb.wz) == colend - colstart + 1
+            @inbounds st[MC_REFIT_BOOKED, Threads.threadid()] += eb.wxn[_eb_col(eb, colstart)] * booked
+        end
+    end
+    return nothing
 end

@@ -8591,9 +8591,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # THE DERIVED ANCHOR: the totals ρ_t, ρ_{t,z} and the perturbation ρ_t' every reader below
     # takes, over the slot-based ones just formed. The perturbation lands in `res_rho_t`, a
     # column the derived anchor frees (the nudge's residual is deleted with the nudge).
-    wset = water_anchor_set(model.options, model.physical_params, IS)
     wad && _anchor_stage!(rho_t, rho_t_z, S.res_rho_t, grid.physical, colstart, zslot(geom),
-                          wset, rho_d,
+                          water_anchor_set(model.options, model.physical_params, IS), rho_d,
                           rho_d_z, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile), rho_cbar,
                           rho_cbar_z)
     E_t_z = S.E_t_z;     @. E_t_z = E_tp_z + E_tbar_z
@@ -9988,12 +9987,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @turbo expdot[colstart:colend, IS.i3_c] .= @. ADV + FORCING
     end
 
-    # ── THE EXCHANGE CLOSURE of the multistep sources and of the sedimentation (derived
-    #    anchor; `_water_exchange_multistep!`): every slot's exchange term is final here, so
-    #    the vapor receives their ν-space closure and ρ_w = Σ α_k ν_k moves by none of them. ──
-    wad && _water_exchange_multistep!(expdot, grid.physical, S, colstart, rv_i, wset, ice_on,
-                                      precipitation, mc_nu_vbar(mtile), vtrans, vmu, model.ts)
-
     # ── The MYNN TKE density ρ_e = ρ_t·e [J/m³] (the appended slot, options[:mynn]) ──
     #
     # The same continuity form every other TOTAL in the set takes, with the closure's
@@ -10546,16 +10539,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         etd_dv[i] = vtrans_on ? J_v[i] * (ts * vsrc) : ts * vsrc
         etd_d8[i] = ts * Jr[i] * qr_bar
         etd_d9[i] = ts * Jc[i] * qc_bar
-        # THE DERIVED ANCHOR: the vapor is the ν-space CLOSURE of the step-mean exchange
-        # (`water_exchange_dv`, plan E4), with the ETD's own frozen-at-n Jacobians in the
-        # condensate increments — so ρ_w is untouched by the phase change.
-        if wad
-            etd_dv[i] = water_exchange_dv(wset.alpha[1], wset.alpha[2], wset.alpha[3],
-                                          wset.alpha[4], etd_d9[i], etd_d8[i],
-                                          ice_on ? etd_di1[i] : 0.0,
-                                          ice_on ? etd_di2[i] : 0.0,
-                                          ice_on ? etd_di3[i] : 0.0)
-        end
         # The latent heating of the pressure equation, in the bracket slot 1 carried it in
         # (TeX Eqs. thermo_p, thermo_p_ice): deposition's coefficient is condensation's with
         # `L_v → L_s` and nothing else, and freezing — which has no `(1+𝒬)` partner and stayed
@@ -10612,15 +10595,16 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # is folded into `etd_d1`/`etd_dv`/`etd_qnp1`, so it lands with the phase change, in
     # `relaxation_adjustment_qss!`, as slot increments.
     booked = 0.0
-    if refit_partner && t > 1 && (ctrans_on || rtrans_on || itrans_on || (wad && vtrans_on))
+    # (under the derived anchor the partner is the affine-defect booking of
+    # `_water_exchange_stage!`, called from `explicit_timestep`)
+    if refit_partner && t > 1 && (ctrans_on || rtrans_on || itrans_on) && !wad
         eb_on && eb_partner_snap!(eb, etd_d1, etd_dv)
         booked = _refit_partner_fold!(etd_d1, etd_dv, etd_qnp1, etd_lam, mtile.var_np1,
                              mtile.tile.physical, nu_c, nu_r, S.nu_i1q, S.nu_i2q, S.nu_i3q,
                              Tk, R_m, C_vt, C_pt, Lv, Q_s, S.Q_s_i, colstart,
                              ctrans, cmu, rtrans, rmu, itrans, imu_q,
                              itrans_on ? IS.i1_q : 0, itrans_on ? IS.i2_q : 0,
-                             itrans_on ? IS.i3_q : 0, eb.wz, vtrans_on, J_v, !wad,
-                             rho_d, drvs_dT, drvs_dp, rv_i, mc_nu_vbar(mtile), vtrans, vmu)
+                             itrans_on ? IS.i3_q : 0, eb.wz, vtrans_on, J_v)
         eb_on && eb_partner_take!(eb, etd_d1, etd_dv)
     end
     # The REFIT census (`MC_REFIT_DR`, `MC_REFIT_BOOKED`): in the same window, for the same
@@ -11608,26 +11592,15 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
                                         itr::Symbol, imu::Float64,
                                         i1::Int, i2::Int, i3::Int, wz::Vector{Float64},
                                         vj::Bool = false,
-                                        Jv::Vector{Float64} = Float64[],
-                                        water_side::Bool = true,
-                                        rho_d::Vector{Float64} = Float64[],
-                                        drvs_dT::Vector{Float64} = Float64[],
-                                        drvs_dp::Vector{Float64} = Float64[],
-                                        rv_i::Int = 0, nvb::Vector{Float64} = Float64[],
-                                        vtr::Symbol = :none, vmu::Float64 = 1.0e-9)
+                                        Jv::Vector{Float64} = Float64[])
     ice = i1 > 0 && itr !== :none
     # The energy the partner books, `∫ δp·C_vt/R_m dz` with the column's quadrature `wz`
     # (the `MC_REFIT_BOOKED` census row; returned, never read by the step). 0.0 when `wz`
     # is not this column's (a tile with no budget geometry).
     bw = length(wz) == length(d1)
     booked = 0.0
-    # THE DERIVED ANCHOR (`water_side = false`, plan E2/E3): book the AFFINE DEFECT of each
-    # transformed slot, `Δ_k = [recover(ν⁺) − recover(ν⁻)] − 2(ν⁺ − ν⁻)`, through the primitive
-    # (`recovered_change_partner`: `λ_l` for cloud and rain, `λ_i` for the ice masses, the
-    # vapor's defect at κ), energy only — no ν moves, ρ_w is invariant across refit + partner.
-    water_side || return _refit_partner_defect!(d1, qnp1, lam, vnp1, phys, nu_c, nu_r, nu_i1,
-        nu_i2, nu_i3, Tk, R_m, C_vt, Lv, colstart, ctr, cmu, rtr, rmu, itr, imu, i1, i2, i3,
-        wz, rho_d, drvs_dT, drvs_dp, rv_i, nvb, vtr, vmu)
+    # (under the derived anchor the partner is `_refit_partner_defect!`, called from
+    # `_water_exchange_stage!`: the affine defect, energy only, plan E2/E3)
     @inbounds for i in eachindex(d1)
         g = colstart + i - 1
         dl = 0.0
@@ -11653,9 +11626,7 @@ to the mass before the step began. `@noinline` with plain arrays: called from mi
         d1[i] += dp
         # Under the vapor control variable (`vj`) the vapor increment is a ν increment: the
         # density partner through the frozen-at-n `J_v` (Stage 1 keeps the water side).
-        # (under the derived anchor `water_side = false`: no ν moves, ρ_w is invariant across
-        # the refit and its partner — plan E2)
-        water_side && (dv[i] += vj ? Jv[i] * dvv : dvv)
+        dv[i] += vj ? Jv[i] * dvv : dvv
         if lam[i] != 0.0
             qnp1[i] += dq
         else

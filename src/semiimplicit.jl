@@ -2352,6 +2352,12 @@ function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::
     # `mc_driver!`, whose first-call compile sits at the LLVM cliff (see `_siw_stage!`).
     uses_pressure_reference(mtile.model.equation_set) && _siw_enabled(mtile.model.options) &&
         _siw_stage!(mtile, colstart, colend)
+    # The derived water anchor's exchange closures and its refit partner (Stage 3,
+    # src/si_water_slaving.jl `_water_exchange_stage!`): here for the same reason, the first-call
+    # compile of `mc_driver!` (the multistep closure's call site there took the axisymmetric
+    # Louis tile over the LLVM cliff, measured 2026-10-21).
+    uses_pressure_reference(mtile.model.equation_set) && _wa_derived(mtile.model.options) &&
+        _water_exchange_stage!(mtile, colstart, colend, t)
 
     for v in 1:length(mtile.model.grid_params.vars)
         physical = view(mtile.tile.physical,colstart:colend,v,1)
