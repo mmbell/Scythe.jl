@@ -1083,6 +1083,8 @@ function validate_water_anchor(model)
     haskey(pp, :tau_rho_v_rec) && error("physical_params[:tau_rho_v_rec] configures the " *
         "vapor reconciliation nudge, which is deleted under " * why * ". Remove the key or " *
         "set numerics.water_anchor = \"slot\".")
+    get(opts, :refit_partner_form, :defect) in (:defect, :recovered) ||
+        error("options[:refit_partner_form] must be :defect (default) or :recovered")
     get(opts, :water_budget_trace, 0) > 0 && error("options[:water_budget_trace] reads " *
         "slot 3 as the water anchor (the res_rho_t - rho_v gap census); refused under " * why)
     get(opts, :clamp_water, false) === true && error("options[:clamp_water] balances the " *
@@ -1358,7 +1360,9 @@ reference/HANDOFF_DRIVER_COMPILE_CLIFF.md, measured 2026-10-21); the `_siw_stage
             ctr, Float64(get(pp, :condensate_mu, 1.0e-7)), rtr, Float64(get(pp, :rain_mu, 1.0e-7)),
             itr, ice ? ice_mu(pp, 1) : 1.0,
             itr_on ? IS.i1_q : 0, itr_on ? IS.i2_q : 0, itr_on ? IS.i3_q : 0, eb.wz,
-            S.rho_d, S.drvs_dT, S.drvs_dp, rv_i, nvb, vtr, vmu)
+            S.rho_d, S.drvs_dT, S.drvs_dp, rv_i, nvb, vtr, vmu,
+            get(opts, :refit_partner_form, :defect)::Symbol === :recovered,
+            get(opts, :refit_partner_vapor, true)::Bool)
         eb.active && eb_partner_take!(eb, S.etd_d1, S.etd_dv)
         st = mtile.mc_water_stats
         if size(st, 2) > 0 && length(eb.wz) == colend - colstart + 1

@@ -581,6 +581,93 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
+    @testset "energy bisection forms: refit_partner_form = :recovered, refit_partner_vapor = false" begin
+        mktempdir() do tmp
+            ex = derived(; refit_partner = true, exchange_realization = false)
+            m0, p0, mo0 = F.vt_tile(tmp, "bis"; vtr = :bhyp, extra = ex,
+                                    seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; amp = 1.0e-3))
+            F.vt_run!(m0, p0, mo0, 2)
+            arm(kv...) = begin
+                m = deepcopy(m0); mo = m.model
+                for (k, v) in kv
+                    mo.options[k] = v
+                end
+                pre = copy(m.var_np1); phys = copy(m.tile.physical)
+                Scythe.advance_column(m, 1, 3)
+                S = m.mc_scratch[Threads.threadid()]
+                (; mo, pre, phys, d1 = copy(S.etd_d1), dv = copy(S.etd_dv), d9 = copy(S.etd_d9),
+                   Tk = copy(S.Tk), R_m = copy(S.R_m), C_vt = copy(S.C_vt), Lv = copy(S.Lv))
+            end
+            off = arm(:refit_partner => false)
+            dfl = arm()
+            rec = arm(:refit_partner_form => :recovered)
+            nov = arm(:refit_partner_vapor => false)
+            V = off.mo.grid_params.vars
+            kD = off.mo.grid_params.kDim
+            npre = off.pre[1:kD, V["nu_c"]]; npost = off.phys[1:kD, V["nu_c"], 1]
+            full = [Scythe.refit_recovered_change(npost[k], npre[k], :bhyp, F.MU) for k in 1:kD]
+            dfc = [Scythe.affine_defect_change(npost[k], npre[k], :bhyp, F.MU) for k in 1:kD]
+            # every form is energy only: the water increments are the unpartnered arm's
+            for a in (dfl, rec, nov)
+                @test a.dv == off.dv
+                @test a.d9 == off.d9
+            end
+            # :recovered books the full recovered change at the :slot coefficients
+            # (phase_change_partner's dp, the vapor -(dl) in the bracket)
+            prc = [Scythe.phase_change_partner(full[k], 0.0, off.Tk[k], off.R_m[k], off.C_vt[k],
+                                               off.C_vt[k] + off.R_m[k], off.Lv[k], 0.0, 0.0,
+                                               0.0)[1] for k in 1:kD]
+            @test maximum(abs, prc) > 0.0
+            @test (rec.d1 .- off.d1) ≈ prc rtol = 1.0e-9 atol = 1.0e-12 * maximum(abs, prc)
+            # refit_partner_vapor = false: the cloud's defect alone, no kappa Delta_v
+            pdc = [Scythe.recovered_change_partner(0.0, dfc[k], 0.0, off.Tk[k], 1.0, off.R_m[k],
+                                                   off.C_vt[k], off.Lv[k], 0.0, 0.0, 0.0)[1]
+                   for k in 1:kD]
+            @test (nov.d1 .- off.d1) ≈ pdc rtol = 1.0e-9 atol = 1.0e-12 * maximum(abs, prc)
+            # ...and the default differs from it by the vapor term exactly where nu_v moved
+            nvb = Scythe.mc_nu_vbar(m0)
+            dvv = [Scythe.affine_defect_change(off.phys[k, V["nu_v"], 1] + nvb[k],
+                                               off.pre[k, V["nu_v"]] + nvb[k], :bhyp,
+                                               Scythe.vapor_mu(off.mo.physical_params))
+                   for k in 1:kD]
+            @test any(!=(0.0), dvv)
+            @test all(k -> (dvv[k] == 0.0) == (dfl.d1[k] == nov.d1[k]), 1:kD)
+            # the form is validated
+            bad = derived(; refit_partner_form = :full)
+            @test_throws ErrorException F.vt_tile(tmp, "bisbad"; vtr = :bhyp, extra = bad)
+        end
+        # E-c: the derived R functional on a :slot tile (the same state into both)
+        mktempdir() do tmp
+            got = Dict{Symbol,Any}()
+            for fn in (:model, :derived)
+                m, p, mo = F.vt_tile(tmp, "ebf_$(fn)"; vtr = :bhyp,
+                                     extra = Dict{Symbol,Any}(:energy_budget => true,
+                                                              :energy_budget_functional => fn),
+                                     seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+                eb = m.ebudget
+                @test !eb.wa
+                @test eb.wR == (fn === :derived)
+                F.vt_run!(m, p, mo, 4)
+                A = m.tile.physical
+                g = 7; k = 7
+                R, X, _ = Scythe._eb_point_RX(eb, A, g, 1, k)
+                rt = A[g, eb.irt, 1] + eb.rho_tbar[k]; rd = A[g, eb.ird, 1] + eb.rho_dbar[k]
+                W = Scythe._eb_W(eb, A, g, 1, k)
+                geo = 0.5 * (A[g, eb.iu, 1]^2 + A[g, eb.iw, 1]^2) + Scythe.gravity * eb.z[k]
+                got[fn] = (; R, X, shift = (rt - (rd + W)) * geo)
+                snap = Scythe.energy_budget_snapshot!(m)
+                tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
+                @test maximum(abs, snap.actualR .- tR) <= 1.0e-10 * maximum(abs, snap.actualR) +
+                                                         1.0e-12 * maximum(abs, snap.dR)
+            end
+            # the trajectory is the same (the functional is diagnostic only); R differs by the
+            # mechanical term alone, X not at all
+            @test got[:derived].X == got[:model].X
+            @test got[:derived].shift == got[:model].shift
+            @test got[:derived].R ≈ got[:model].R + got[:model].shift rtol = 1.0e-12
+        end
+    end
+
     @testset "3c E4: the exchange realization closes on the recovered change (vapor as closure)" begin
         # Supersaturated air over a ringing sheet: condensation is requested at lobe points
         # (recovered cloud 0). One ETD stage re-applied on the post-explicit state: at a deep

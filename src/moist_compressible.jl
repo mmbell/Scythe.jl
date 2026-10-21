@@ -11683,6 +11683,13 @@ no ν moves (the `dv` fold of the `:slot` arm is deleted), so ρ_w is invariant 
 and its partner. Its column integral equals the full-recovered booking's (`∫2δν = 0` under the
 linear refit up to the boundary), so the measured closure is kept and only the pointwise dipole
 (the "peak evaporation / flank condensation") goes. `Q_ss`: as the `:slot` arm (`qnp1`).
+
+BISECTION FORMS (the plan's energy fallback, kept as forensics; both defaults are the form
+above): `rec = true` (`options[:refit_partner_form] = :recovered`) books the FULL recovered
+change of the condensates instead of the defect, energy only, at the `:slot` arm's
+coefficients (`dv = −(δl + δi)` in the primitive, which is `phase_change_partner`'s `dp` to
+rounding) with no ν written; `vap = false` (`options[:refit_partner_vapor] = false`) drops the
+vapor's own defect term `κ Δ_v`.
 """
 @noinline function _refit_partner_defect!(d1::Vector{Float64}, qnp1::Vector{Float64},
                                           lam::Vector{Float64}, vnp1::Matrix{Float64},
@@ -11697,7 +11704,8 @@ linear refit up to the boundary), so the measured closure is kept and only the p
                                           i1::Int, i2::Int, i3::Int, wz::Vector{Float64},
                                           rho_d::Vector{Float64}, drvs_dT::Vector{Float64},
                                           drvs_dp::Vector{Float64}, rv_i::Int,
-                                          nvb::Vector{Float64}, vtr::Symbol, vmu::Float64)
+                                          nvb::Vector{Float64}, vtr::Symbol, vmu::Float64,
+                                          rec::Bool = false, vap::Bool = true)
     ice = i1 > 0 && itr !== :none
     bw = length(wz) == length(d1)
     booked = 0.0
@@ -11706,18 +11714,36 @@ linear refit up to the boundary), so the measured closure is kept and only the p
         dl = 0.0
         di = 0.0
         dv = 0.0
-        ctr !== :none &&
-            (dl += affine_defect_change(nu_c[i], vnp1[g, 9] + (nu_c[i] - phys[g, 9, 1]),
-                                        ctr, cmu))
-        rtr !== :none && (dl += affine_defect_change(nu_r[i], vnp1[g, 8], rtr, rmu))
-        if ice
-            di = (affine_defect_change(nu_i1[i], vnp1[g, i1], itr, imu) +
-                  affine_defect_change(nu_i2[i], vnp1[g, i2], itr, imu)) +
-                 affine_defect_change(nu_i3[i], vnp1[g, i3], itr, imu)
+        if rec
+            # BISECTION ARM E-a (`options[:refit_partner_form] = :recovered`): the FULL
+            # recovered change of each condensate, at the `:slot` arm's coefficients (vapor
+            # `−(δl + δi)` in the bracket, `phase_change_partner`), energy only: no ν moves.
+            ctr !== :none &&
+                (dl += refit_recovered_change(nu_c[i], vnp1[g, 9] + (nu_c[i] - phys[g, 9, 1]),
+                                              ctr, cmu))
+            rtr !== :none && (dl += refit_recovered_change(nu_r[i], vnp1[g, 8], rtr, rmu))
+            if ice
+                di = (refit_recovered_change(nu_i1[i], vnp1[g, i1], itr, imu) +
+                      refit_recovered_change(nu_i2[i], vnp1[g, i2], itr, imu)) +
+                     refit_recovered_change(nu_i3[i], vnp1[g, i3], itr, imu)
+            end
+            (dl == 0.0 && di == 0.0) || (dv = -(dl + di))
+        else
+            ctr !== :none &&
+                (dl += affine_defect_change(nu_c[i], vnp1[g, 9] + (nu_c[i] - phys[g, 9, 1]),
+                                            ctr, cmu))
+            rtr !== :none && (dl += affine_defect_change(nu_r[i], vnp1[g, 8], rtr, rmu))
+            if ice
+                di = (affine_defect_change(nu_i1[i], vnp1[g, i1], itr, imu) +
+                      affine_defect_change(nu_i2[i], vnp1[g, i2], itr, imu)) +
+                     affine_defect_change(nu_i3[i], vnp1[g, i3], itr, imu)
+            end
+            # BISECTION ARM E-b (`options[:refit_partner_vapor] = false`): the vapor's own
+            # defect `κ Δ_v` is not booked.
+            (vap && vtr !== :none) &&
+                (dv = affine_defect_change(phys[g, rv_i, 1] + nvb[i], vnp1[g, rv_i] + nvb[i],
+                                           vtr, vmu))
         end
-        vtr !== :none &&
-            (dv = affine_defect_change(phys[g, rv_i, 1] + nvb[i], vnp1[g, rv_i] + nvb[i],
-                                       vtr, vmu))
         if dl == 0.0 && di == 0.0 && dv == 0.0
             lam[i] == 0.0 && (qnp1[i] = 0.0)
             continue

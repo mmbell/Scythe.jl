@@ -166,6 +166,10 @@ mutable struct EnergyBudget
     # handed out under `:slot`, and this field is then an empty matrix).
     const wa::Bool
     const rho_tbar_ref::Matrix{Float64}
+    # The R FUNCTIONAL (`options[:energy_budget_functional]`): `wR` reads the derived
+    # mechanical term `(ρ_d + Σ α_k ν_k)·geo` in `R` (always under `wa`; on a `:slot` run only
+    # as the energy bisection's forensic arm E-c). `X` follows `wa` alone.
+    const wR::Bool
     # Accumulators, per column (active only).
     const dR::Matrix{Float64}          # (EB_NSTAGE, ncol) J/m^2 summed over steps
     const dX::Matrix{Float64}          # (EB_NSTAGE, ncol) kg/m^2 summed over steps
@@ -199,7 +203,7 @@ const EMPTY_ENERGY_BUDGET = EnergyBudget(false, 0, 0, Float64[], Float64[], Floa
     Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0, 0,
     :none, 1.0, :none, 1.0, :none, 1.0, false, :none, 1.0, Float64[], Float64[], Float64[],
-    Float64[], false, zeros(0, 0),
+    Float64[], false, zeros(0, 0), false,
     zeros(0, 0), zeros(0, 0), Float64[], Float64[], Float64[], Float64[], Int[], Bool[],
     zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
     zeros(0, 0, 0), zeros(0, 0), zeros(0, 0))
@@ -328,6 +332,7 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
         vapor_transform_mode(opts), vapor_mu(pp), copy(mc_ref_diag.nu_vbar),
         copy(mc_ref_diag.nu_vbar_z), copy(mc_ref_diag.rho_tbar_w),
         copy(mc_ref_diag.rho_tbar_w_z), wa, rtref,
+        wa || get(opts, :energy_budget_functional, :model)::Symbol === :derived,
         zeros(EB_NSTAGE * na, ncol * na), zeros(EB_NSTAGE * na, ncol * na),
         zeros(ncol * na), zeros(ncol * na), zeros(ncol * na), zeros(ncol * na),
         zeros(Int, ncol * na), fill(false, ncol * na),
@@ -393,6 +398,10 @@ in the mechanical term.
             W = _eb_W(eb, A, g, l, k)
             R = Et - implied_total_energy(T, rd, rv, rl, ri, rd + W, geo)
             X = ((W - rv) - rl) - ri
+        elseif eb.wR
+            # The energy bisection's arm E-c: the derived functional on a `:slot` run.
+            R = Et - implied_total_energy(T, rd, rv, rl, ri, rd + _eb_W(eb, A, g, l, k), geo)
+            X = (((rt - rd) - rv) - rl) - ri
         else
             R = Et - implied_total_energy(T, rd, rv, rl, ri, rt, geo)
             X = (((rt - rd) - rv) - rl) - ri
