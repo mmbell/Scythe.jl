@@ -689,6 +689,17 @@ function o01_model(opts::BenchmarkOptions)
             topbot_bc[nm] = NaturalBC()
         end
     end
+    # SCYTHE_O01_WALLS=production: the production vertical walls instead (simulations/tc_axisym
+    # and ocean_2D_rce since 7164c09/e7e091d: `[boundary_conditions] vertical_scalars =
+    # vertical_scalars_lid = "natural"`): EVERY variable natural at the ground and the lid, `w`
+    # Dirichlet zero. One wall family across the water slots, so `si_water_slots = :mass` runs
+    # without the mixed-wall opt-in. Unset (`benchmark`) is the committed configuration above.
+    o01_walls = get(ENV, "SCYTHE_O01_WALLS", "benchmark")
+    o01_walls in ("benchmark", "production") ||
+        error("SCYTHE_O01_WALLS = \"$(o01_walls)\": use benchmark (default) or production")
+    if o01_walls == "production"
+        topbot_bc = merge(Dict(v => NaturalBC() for v in vars), Dict("w" => DirichletBC()))
+    end
 
     # Attribution: sweep the cubic-spline filter length only on the water species.
     # Unset => Dict("default" => 2.0), which equals the struct default, so bit-identical.

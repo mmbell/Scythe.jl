@@ -2327,6 +2327,13 @@ second-order AB for t=2, third-order AB3 thereafter per Durran and Blossey 2012)
 """
 function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
 
+    # The water slaving's explicit side (`options[:si_water_slots]`, src/si_water_slaving.jl):
+    # stage the slaved slots' AI2* histories and add the solve's linear operator back into
+    # their tendencies BEFORE the AB3 combination below reads them. Here and not in
+    # `mc_driver!`, whose first-call compile sits at the LLVM cliff (see `_siw_stage!`).
+    uses_pressure_reference(mtile.model.equation_set) && _siw_enabled(mtile.model.options) &&
+        _siw_stage!(mtile, colstart, colend)
+
     for v in 1:length(mtile.model.grid_params.vars)
         physical = view(mtile.tile.physical,colstart:colend,v,1)
         var_np1 = view(mtile.var_np1,colstart:colend,v)

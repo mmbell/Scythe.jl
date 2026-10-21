@@ -247,6 +247,33 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
         @test (@allocations diffusion_timestep_mc(mtile_w, 1, kDim_w, 2)) == 0
     end
 
+    @testset "per-column allocations stay zero with the water slots slaved to the SI" begin
+        # options[:si_water_slots] = :mass / :all (src/si_water_slaving.jl): the explicit side
+        # (`_siw_stage!`, from `explicit_timestep`) and the solve side (`_siw_solve!`) read the
+        # tile and the thread's scratch; neither may allocate. Both the
+        # resting-reference and the state-dependent SI, warm rain on, and the cylinder.
+        for mode in (:mass, :all), sd in (false, true)
+            xo = Dict{Symbol,Any}(:si_water_slots => mode, :state_dependent_si => sd)
+            mt, kD = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3), precipitation = true,
+                                   extra_options = xo)
+            moist_compressible_XZ(mt, 1, kD, 2)  # compile
+            m0, k0 = build_mc_tile(extra_params = Dict(:N_r => 1.0e-3), precipitation = true,
+                                   extra_options = Dict{Symbol,Any}(:state_dependent_si => sd))
+            moist_compressible_XZ(m0, 1, k0, 2)
+            # equal to the slaving-off column (0 on the reference path; the state-dependent
+            # path's per-column Helmholtz assembly allocates the same either way)
+            @test (@allocations moist_compressible_XZ(mt, 1, kD, 2)) ==
+                  (@allocations moist_compressible_XZ(m0, 1, k0, 2))
+            sd || @test (@allocations moist_compressible_XZ(mt, 1, kD, 2)) == 0
+        end
+        mt_a, kD_a = build_mc_tile(equation_set = "moist_compressible_axisym",
+                                   extra_params = Dict(:f => 5.0e-5, :alpha => 0.05,
+                                                       :z_damp => 3.2e3),
+                                   extra_options = Dict{Symbol,Any}(:si_water_slots => :mass))
+        Scythe.moist_compressible_axisym(mt_a, 1, kD_a, 2)
+        @test (@allocations Scythe.moist_compressible_axisym(mt_a, 1, kD_a, 2)) == 0
+    end
+
     @testset "per-column allocations stay zero with the Marshall-Palmer DSD" begin
         # N_0 > 0 routes the rain channel through invtau_rain_mp (mp_slope +
         # f_ventilation_mp); the keyword call and the MP branch must not box.

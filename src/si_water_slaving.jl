@@ -451,46 +451,97 @@ history `hacdot[k] = −s_k(ρ̄_t − ρ̄_d)·LDIV` (the slot-2 pattern of the
 end
 
 """
-    _siw_driver!(expdot, impdot, hacdot, LDIV, imp_c_d, imp_c_d_z, phi_z, phi, geom, uv, vv,
-                 r, colstart, sd, hsi_like, options, physical_params, IS, phys, w, w_z,
-                 rho_t, rho_t_z, rho_d, rho_d_z, rho_tbar, rho_tbar_z, rho_dbar, rho_dbar_z,
-                 nvb, nvbz, rcb, rcbz)
+    _siw_stage!(mtile, colstart, colend)
 
-`mc_driver!`'s ONE call into the water slaving, after every water slot's explicit tendency has
-been assigned (its first-call compile sits at the LLVM cliff, so the driver body carries this
-call and nothing else). Under `options[:si_water_slots] = :none` it returns at once. Otherwise:
+The water slaving's per-column work on the EXPLICIT side, called from `explicit_timestep` (after
+`mc_driver!` has assembled every slot's explicit tendency, before the AB3 combination reads it)
+under `options[:si_water_slots] ≠ :none`:
 
 1. on the state-dependent path, restage the ρ_d history with `c_d = ρ_d/ρ̂^w`
    (`_siw_sd_cd!` into `imp_c_d`/`imp_c_d_z`, then `impdot[2] = −(c_d φ_z + c_{d,z} φ)` — the
    driver's expression, same operations);
-2. stage the slaved water slots' histories (`_siw_stage_impdot!`) from the SAME `phi_z`/`phi`
-   (`imp_phi_z`/`phi_n`) fit the dry legs used;
-3. add the solve's linear operator back into their explicit tendencies (`_siw_addback!`; with
-   the horizontal remainder and fresh history under `hsi_like`, whose linear divergence is
-   formed again into `LDIV` — its column has been reused since the `hsi_like` block).
+2. stage the slaved water slots' histories (`_siw_stage_impdot!`) from the SAME `imp_phi_z` /
+   `phi_n` fit the dry legs used (the driver's `S.imp_phi_z` and the w column's mish values,
+   `scratch_column(mtile, 5).uMish`, which nothing between the staging and the solve refits);
+3. add the solve's linear operator back into their explicit tendencies (`_siw_addback!`; with the
+   horizontal remainder and fresh history under the horizontal SI / exact 2-D solve, whose
+   linear divergence is formed again into `S.ADV`).
+
+WHY HERE and not in `mc_driver!`: that body's first-call compile sits at the LLVM cliff. Every
+call site tried there moved it — the ~30-argument call +33..+75 s on the axisymmetric Louis tile,
+a dispatch barrier nothing but 10-12 boxed arguments per column, the same arguments bundled into
+one stack struct within noise on the cylinder but past 35 min on the SLR shell (2026-10-21).
+`mc_driver!` is now byte-for-byte be03fe9's, and everything the slaving needs is read here from
+the tile and the thread's scratch, which still hold the column the driver just assembled.
 """
-@noinline function _siw_driver!(expdot, impdot, hacdot, LDIV, imp_c_d, imp_c_d_z, phi_z, phi,
-                                geom, uv, vv, r, colstart::Int, sd::Bool, hsi_like::Bool,
-                                options, physical_params, IS::MCSlots, phys, w, w_z,
-                                rho_t, rho_t_z, rho_d, rho_d_z, rho_tbar, rho_tbar_z,
-                                rho_dbar, rho_dbar_z, nvb, nvbz, rcb, rcbz)
-    ws = si_water_set(options, physical_params, IS)
+@noinline function _siw_stage!(mtile::ModelTile, colstart::Int, colend::Int)
+    model = mtile.model
+    opts = model.options
+    ws = si_water_set(opts, model.physical_params, mtile.mc_slots)
     ws.on || return nothing
-    zs = zslot(geom)
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+    sd = get(opts, :state_dependent_si, false)::Bool
+    hsi = get(opts, :horizontal_semiimplicit, false)::Bool
+    xsi = get(opts, :exact_si, false)::Bool
+    hsi_like = hsi || (xsi && !(get(opts, :exact_si_zero_x, false)::Bool))
+    phys = mtile.tile.physical
+    zs = siw_zslot(phys)
+    w_i = model.grid_params.vars["w"]
+    w = view(phys, colstart:colend, w_i, 1)
+    w_z = view(phys, colstart:colend, w_i, zs)
+    rs = mtile.ref_state
+    rtb = ref_rho_t(rs); rdb = ref_rho_d(rs); rc = Springsteel.ref_rho_c(rs)
+    rcb = view(rc, :, 1); rcbz = view(rc, :, 2)
+    nvb = mc_nu_vbar(mtile); nvbz = mc_nu_vbar_z(mtile)
+    phi = scratch_column(mtile, w_i).uMish
+    phi_z = S.imp_phi_z
+    impdot = mtile.impdot_n
     if sd
-        _siw_sd_cd!(imp_c_d, imp_c_d_z, rho_d, rho_d_z, phys, colstart, zs, ws,
+        _siw_sd_cd!(S.imp_c_d, S.imp_c_d_z, S.rho_d, S.rho_d_z, phys, colstart, zs, ws,
                     nvb, nvbz, rcb, rcbz)
-        @inbounds for i in eachindex(phi)
-            impdot[colstart + i - 1, 2] = -((imp_c_d[i] * phi_z[i]) + (imp_c_d_z[i] * phi[i]))
-        end
+        _siw_impdot2!(impdot, colstart, S.imp_c_d, S.imp_c_d_z, phi_z, phi)
     end
-    _siw_stage_impdot!(impdot, colstart, ws, sd, phys, zs, rho_d, rho_d_z, imp_c_d,
-                       imp_c_d_z, phi_z, phi, nvb, nvbz, rcb, rcbz)
-    hsi_like && mc_linear_div!(LDIV, geom, uv, vv, r)
-    fresh = hsi_like && (get(options, :hsi_x_history, "fresh") == "fresh")::Bool
-    _siw_addback!(expdot, colstart, ws, sd, phys, zs, w, w_z, rho_t, rho_t_z,
-                  rho_d, rho_d_z, rho_tbar, rho_tbar_z, rho_dbar, rho_dbar_z, nvb, nvbz,
-                  rcb, rcbz, hsi_like, LDIV, hacdot, fresh)
+    _siw_stage_impdot!(impdot, colstart, ws, sd, phys, zs, S.rho_d, S.rho_d_z, S.imp_c_d,
+                       S.imp_c_d_z, phi_z, phi, nvb, nvbz, rcb, rcbz)
+    LDIV = S.ADV
+    hsi_like && _siw_ldiv!(LDIV, mtile, colstart, colend)
+    fresh = hsi_like && (get(opts, :hsi_x_history, "fresh") == "fresh")::Bool
+    _siw_addback!(mtile.expdot_n, colstart, ws, sd, phys, zs, w, w_z, S.rho_t, S.rho_t_z,
+                  S.rho_d, S.rho_d_z, view(rtb, :, 1), view(rtb, :, 2), view(rdb, :, 1),
+                  view(rdb, :, 2), nvb, nvbz, rcb, rcbz, hsi_like, LDIV, mtile.hacdot_n, fresh)
+    return nothing
+end
+
+# `impdot[2] = −(c_d φ_z + c_{d,z} φ)`, the driver's broadcast, same operations.
+@noinline function _siw_impdot2!(impdot::Matrix{Float64}, colstart::Int, c_d, c_dz, phi_z, phi)
+    @inbounds for i in eachindex(phi)
+        impdot[colstart + i - 1, 2] = -((c_d[i] * phi_z[i]) + (c_dz[i] * phi[i]))
+    end
+    return nothing
+end
+
+# The reference-linear horizontal divergence the `hsi_like` block of `mc_driver!` forms
+# (`mc_linear_div!`), for the geometries the horizontal SI / exact 2-D solve run on.
+function _siw_ldiv!(LDIV, mtile::ModelTile, colstart::Int, colend::Int)
+    es = mtile.model.equation_set
+    if es == "moist_compressible_XZ"
+        _siw_ldiv_g!(LDIV, MCCartesianXZ(), mtile, colstart, colend)
+    elseif es == "moist_compressible_axisym"
+        _siw_ldiv_g!(LDIV, MCAxisymRZ(), mtile, colstart, colend)
+    elseif es == "moist_compressible_RLR"
+        _siw_ldiv_g!(LDIV, MCCylindricalRLR(), mtile, colstart, colend)
+    else
+        error("si_water_slots with the horizontal SI / exact 2-D solve: no linear horizontal " *
+              "divergence for equation set $(es)")
+    end
+    return nothing
+end
+function _siw_ldiv_g!(LDIV, geom, mtile::ModelTile, colstart::Int, colend::Int)
+    vars = mtile.model.grid_params.vars
+    uv = mc_slot_views(mtile.tile, colstart, colend, vars["u"], geom)
+    vv = has_v(geom) ? mc_slot_views(mtile.tile, colstart, colend, vars["v"], geom) : uv
+    r = mc_metric(geom, mtile.model, mtile.tilepoints, colstart, colend)
+    mc_linear_div!(LDIV, geom, uv, vv, r)
     return nothing
 end
 

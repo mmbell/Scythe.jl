@@ -559,7 +559,8 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                                          view(Springsteel.ref_rho_d(m.ref_state), :, 1),
                                          view(Springsteel.ref_rho_d(m.ref_state), :, 2),
                                          nv, nz, a, b, false, S.ADV, m.hacdot_n, false)
-            for f in (set, cd!, st!, sl!, hi!, ab!)
+            sg!() = Scythe._siw_stage!(m, 1, kD)
+            for f in (set, cd!, st!, sl!, hi!, ab!, sg!)
                 f()
                 @test (@allocations f()) == 0
             end

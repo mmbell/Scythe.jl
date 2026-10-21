@@ -9877,27 +9877,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @turbo expdot[colstart:colend, IS.i3_c] .= @. ADV + FORCING
     end
 
-    # ── The slaved WATER slots (`options[:si_water_slots]`, Stage 2 of the rho_t retirement) ──
-    # `_siw_driver!` (src/si_water_slaving.jl) stages the slaved slots' AI2* histories
-    # `impdot[k] = −(c_k φ_z + c_{k,z} φ)` from the SAME `imp_phi_z`/`phi_n` fit as the dry legs
-    # above (and, on the state-dependent path, restages `impdot[2]` with `c_d = ρ_d/ρ̂^w`), and
-    # adds the solve's linear operator back to their explicit tendencies (and the horizontal
-    # remainder/history under `hsi_like`) — HERE, after every water slot's `expdot` row exists.
-    # Behind a dispatch barrier and a non-inlined gate, deliberately: `mc_driver!`'s first-call
-    # compile sits at the LLVM cliff. Measured on the axisymmetric Louis tile (interleaved A/B
-    # against be03fe9, 2026-10-20): a DIRECT call here cost +75 s of first-call compile
-    # (153 -> 228 s), the barrier behind the inlined `si_water_slots_mode` test still +45 s,
-    # the barrier behind `_siw_enabled` (noinline) nothing (191/194 vs 194/196 s); XZ and SLR
-    # unchanged throughout. The price is one dynamic dispatch (10 boxed-argument allocations)
-    # per column, paid only when the slaving is on; under the library default `:none` the call
-    # is never made and the column allocates exactly what it did.
-    _siw_enabled(model.options) &&
-        Base.inferencebarrier(_siw_driver!)(expdot, impdot, mtile.hacdot_n, S.ADV, imp_c_d,
-            imp_c_d_z, imp_phi_z, phi_n, geom, uv, vv, r, colstart, sd_si, hsi_like,
-            model.options, model.physical_params, mtile.mc_slots, grid.physical, w, w_z,
-            rho_t, rho_t_z, rho_d, rho_d_z, rho_tbar, rho_tbar_z, rho_dbar, rho_dbar_z,
-            mc_nu_vbar(mtile), mc_nu_vbar_z(mtile), rho_cbar, rho_cbar_z)
-
     # ── The MYNN TKE density ρ_e = ρ_t·e [J/m³] (the appended slot, options[:mynn]) ──
     #
     # The same continuity form every other TOTAL in the set takes, with the closure's
