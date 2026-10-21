@@ -170,6 +170,10 @@ mutable struct EnergyBudget
     # mechanical term `(ρ_d + Σ α_k ν_k)·geo` in `R` (always under `wa`; on a `:slot` run only
     # as the energy bisection's forensic arm E-c). `X` follows `wa` alone.
     const wR::Bool
+    # Whether the boundary layer is MYNN (a `rho_e` slot) rather than Louis: under the derived
+    # anchor the two closures split the surface moisture flux's energy between `E_t` and `p`
+    # differently, and `eb_sfc!` mirrors whichever one ran (row labels only).
+    const mynn::Bool
     # Accumulators, per column (active only).
     const dR::Matrix{Float64}          # (EB_NSTAGE, ncol) J/m^2 summed over steps
     const dX::Matrix{Float64}          # (EB_NSTAGE, ncol) kg/m^2 summed over steps
@@ -203,7 +207,7 @@ const EMPTY_ENERGY_BUDGET = EnergyBudget(false, 0, 0, Float64[], Float64[], Floa
     Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0, 0,
     :none, 1.0, :none, 1.0, :none, 1.0, false, :none, 1.0, Float64[], Float64[], Float64[],
-    Float64[], false, zeros(0, 0), false,
+    Float64[], false, zeros(0, 0), false, false,
     zeros(0, 0), zeros(0, 0), Float64[], Float64[], Float64[], Float64[], Int[], Bool[],
     zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
     zeros(0, 0, 0), zeros(0, 0), zeros(0, 0))
@@ -333,6 +337,7 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
         copy(mc_ref_diag.nu_vbar_z), copy(mc_ref_diag.rho_tbar_w),
         copy(mc_ref_diag.rho_tbar_w_z), wa, rtref,
         wa || get(opts, :energy_budget_functional, :model)::Symbol === :derived,
+        haskey(model.grid_params.vars, "rho_e"),
         zeros(EB_NSTAGE * na, ncol * na), zeros(EB_NSTAGE * na, ncol * na),
         zeros(ncol * na), zeros(ncol * na), zeros(ncol * na), zeros(ncol * na),
         zeros(Int, ncol * na), fill(false, ncol * na),
@@ -678,13 +683,33 @@ drag-work-minus-production heat stays in `bl`.
         gz = 2.0 * inv_delta * (1.0 - (z[k] * inv_delta))
         u = phys[g, eb.iu, 1]
         v = eb.iv > 0 ? phys[g, eb.iv, 1] : 0.0
-        cwv = (Cvv * Tk[k]) + ke[k] + (gravity * z[k])
+        geo = ke[k] + (gravity * z[k])
+        cwv = (Cvv * Tk[k]) + geo
         su = -(tau_u * gz) / rho_t[k]
-        sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cwv * F_q * gz)
-        sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * F_q * gz)
         sq = F_q * gz
-        # the vapor slot holds ν under the vapor control variable: its share through J_v
-        sv = eb.vtr === :none ? sq : J_v[k] * sq
+        if eb.wa
+            # THE DERIVED ANCHOR (review B3): both closures put `F_q g/α_v` on the vapor's ν
+            # and carry its energy on the vapor's RECOVERED rate (linearized here, `ν̇/J_v`);
+            # Louis writes `C_vv T ρ̇_v + geo F_q g` into `E_t` and `R_v T ρ̇_v` into `p`, MYNN
+            # the flux-form `(C_vv T + geo) F_q g` into `E_t` and the thermal remainder
+            # `C_vv T (F_q g − ρ̇_v)` with `R_v T ρ̇_v` into `p`.
+            sv = sq / _eb_alpha(eb.vtr)
+            rec = eb.vtr === :none ? sv : sv / J_v[k]
+            ct = Cvv * Tk[k]
+            if eb.mynn
+                sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cwv * sq)
+                sp = ((R_m[k] / C_vt[k]) * ((F_sh * gz) + (ct * (sq - rec)))) +
+                     (Rv * Tk[k] * rec)
+            else
+                sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + ((ct * rec) + (geo * sq))
+                sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * rec)
+            end
+        else
+            sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cwv * F_q * gz)
+            sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * F_q * gz)
+            # the vapor slot holds ν under the vapor control variable: its share through J_v
+            sv = eb.vtr === :none ? sq : J_v[k] * sq
+        end
         for (j, s) in ((eb.ju, su), (eb.jEt, sE), (eb.jp, sp), (eb.jrt, sq), (eb.jrv, sv))
             tn[g, j, EB_OP_SFC] += s
             tn[g, j, EB_OP_BL] -= s

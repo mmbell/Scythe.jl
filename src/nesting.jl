@@ -643,9 +643,14 @@ WHAT IS LEFT UNPAIRED, stated: in the zone the exchange changes `R = E_t − E_i
 difference of the two patches' own `R` there, as it changes every other field — the exchange
 is a coupling of states, each carrying its own books, not a process this patch can partner.
 
+UNDER THE DERIVED ANCHOR the partner is [`_refit_partner_defect!`](@ref), which books the
+vapor's own defect `κ Δ_v` from the same two states; with `vapor_transform ≠ :none` the vapor
+slot is re-taken beside the condensates (so a parent→child vapor jump books nothing either),
+and it counts as a transformed slot for the early return below.
+
 Inert (returns at once) at `t == 1` (`var_np1` holds no fitted state and the partner does not
 run), off the moist sets, with `options[:refit_partner] = false`, and with no transformed
-mass slot; then nothing is written, so all of those are bitwise. `var_np1` is otherwise only
+mass slot (the vapor included under the derived anchor); then nothing is written, so all of those are bitwise. `var_np1` is otherwise only
 written by `explicit_timestep` before it is next read, so the rows written here affect
 nothing but the partner.
 """
@@ -661,7 +666,12 @@ function refit_reference_after_exchange!(mtile::ModelTile,
     sc = condensate_transform_mode(opts) !== :none ? 9 : 0
     sr = rain_transform_mode(opts) !== :none ? 8 : 0
     ion = ice_registered(IS) && ice_transform_mode(opts) !== :none
-    slots = (sc, sr, ion ? IS.i1_q : 0, ion ? IS.i2_q : 0, ion ? IS.i3_q : 0)
+    # Under the derived anchor the partner (`_refit_partner_defect!`) also books the VAPOR's
+    # defect from `var_np1[:, rho_v]` (its gate includes the vapor transform), so the vapor is
+    # re-taken too; under `:slot` the fold never reads it.
+    sv = (water_anchor_mode(opts) === :derived && vapor_transform_mode(opts) !== :none) ?
+         IS.rho_v : 0
+    slots = (sc, sr, ion ? IS.i1_q : 0, ion ? IS.i2_q : 0, ion ? IS.i3_q : 0, sv)
     all(iszero, slots) && return nothing
     vn = mtile.var_np1
     ph = mtile.tile.physical

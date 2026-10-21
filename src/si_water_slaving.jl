@@ -1158,13 +1158,24 @@ where nothing falls (or above every knee, to the rounding of `2·½ − 1`).
 
 Under the derived anchor, add to the vapor slot's tendency the closure of the multistep
 exchange (`water_exchange_multistep_rate`) and of the sedimentation (`sedimentation_knee_closure`),
-with their partners: the multistep exchange's vapor share — the ice gained from no liquid,
-`(ICE_C + ICE_R) + Σ_k SRC_k` (DeMott nucleation, splinters, the anchor source, the population
-seed, `var_check`) — is booked as deposition/sublimation through `phase_change_partner`
-(latent heat `L_s` in `p`, the `(1 + 𝒬_{s,i})` share of `Q_ss`; `FRZ_NET` already carries the
-liquid↔ice `L_f`); the sedimentation closure's vapor through the primitive alone (plan E8,
-`primitive(rec_v, 0, 0)` on the realized recovered rate). `@noinline`, the scratch and plain
-arrays.
+and book their energy ON THE REALIZED RECOVERED RATES (review B2, the sedimentation knee's form
+for all of them): with `ν̇_c = J_c(ICE_C − AUTO_COLL)`, `ν̇_r = J_r(ICE_R + AUTO_COLL)`,
+`ν̇_k = J_k SRC_k` and `ν̇_v` the two closures, each slot's recovered rate is
+`ρ̇_k = [recover(ν_k + Δt ν̇_k) − recover(ν_k)]/Δt`, and the partner is
+
+    recovered_change_partner(ρ̇_v, ρ̇_l − (ICE_C + ICE_R), ρ̇_i + (ICE_C + ICE_R), …)
+
+— the whole exchange's energy less the liquid→ice part `FRZ_NET = −(ICE_C + ICE_R)` that the
+process tendency already carries as `L_f` in `p` (the primitive is linear, so the remainder is
+the same primitive with the freezing taken out of the two condensate arguments). WHY NOT THE
+REQUESTED MASS: autoconversion at a rain knee (`J_r → 1`, `J_c = ½`) moves the vapor's ν by
+`(J_c − J_r) AC` and its recovered density by ~`−AC` while the liquid's recovered total is
+unchanged; nucleation or splinters into empty ice (`J_k = 1`) move the recovered vapor by `−2s`
+for `s` of ice. The requested-mass form booked neither the first nor the second `−s`; the
+realized form holds `R` to the second order of the rates (the E4 tolerance). Only the vapor
+and the condensates' exchange rates enter — the sedimentation's own fall moves its energy
+through the flux. `Q_ss` takes the primitive's share (`_qss_share!`). `@noinline`, the scratch
+and plain arrays.
 """
 @noinline function _water_exchange_multistep!(expdot::Matrix{Float64}, phys::Array{Float64,3},
                                               S, colstart::Int, rv_i::Int, options,
@@ -1174,46 +1185,71 @@ arrays.
                                               vmu::Float64, ts::Float64)
     ws = water_anchor_set(options, physical_params, IS)
     av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]; ai = ws.alpha[4]
+    ctr = condensate_transform_mode(options); rtr = rain_transform_mode(options)
+    cmu = Float64(get(physical_params, :condensate_mu, 1.0e-7))
+    rmu = Float64(get(physical_params, :rain_mu, 1.0e-7))
+    itr = ice ? ice_transform_mode(options) : :none
+    imu = ice ? ice_mu(physical_params, 1) : 1.0
     Jc = S.Jc; Jr = S.Jr; AC = S.AUTO_COLL; Frz = S.Fr_z
     @inbounds for i in eachindex(Jc)
         g = colstart + i - 1
         acr = precip ? AC[i] : 0.0
         if ice
+            icc = S.ICE_C[i]; icr = S.ICE_R[i]
+            s1 = S.SRC_i1q[i]; s2 = S.SRC_i2q[i]; s3 = S.SRC_i3q[i]
             x = water_exchange_multistep_rate(av, ac, ar, ai, Jc[i], Jr[i], S.J_i1q[i],
-                    S.J_i2q[i], S.J_i3q[i], acr, S.ICE_C[i], S.ICE_R[i], S.SRC_i1q[i],
-                    S.SRC_i2q[i], S.SRC_i3q[i])
+                    S.J_i2q[i], S.J_i3q[i], acr, icc, icr, s1, s2, s3)
             xs = sedimentation_knee_closure(av, ar, ai, Jr[i], S.J_i1q[i], S.J_i2q[i],
                     S.J_i3q[i], Frz[i], S.F_i1q_z[i], S.F_i2q_z[i], S.F_i3q_z[i])
-            dep = (S.ICE_C[i] + S.ICE_R[i]) + ((S.SRC_i1q[i] + S.SRC_i2q[i]) + S.SRC_i3q[i])
+            nc = Jc[i] * (icc - acr); nr = Jr[i] * (icr + acr)
+            n1 = S.J_i1q[i] * s1; n2 = S.J_i2q[i] * s2; n3 = S.J_i3q[i] * s3
+            frz = icc + icr
         else
+            icc = 0.0; icr = 0.0
             x = acr == 0.0 ? 0.0 :
                 water_exchange_dv(av, ac, ar, ai, -(Jc[i] * acr), Jr[i] * acr, 0.0, 0.0, 0.0)
             xs = Frz[i] == 0.0 ? 0.0 : (((ar * Jr[i]) - 1.0) * Frz[i]) / av
-            dep = 0.0
+            nc = -(Jc[i] * acr); nr = Jr[i] * acr
+            n1 = 0.0; n2 = 0.0; n3 = 0.0
+            frz = 0.0
         end
         x != 0.0 && (expdot[g, rv_i] += x)
-        if dep != 0.0
-            dp, _, dq = phase_change_partner(0.0, dep, S.Tk[i], S.R_m[i], S.C_vt[i],
-                                             S.C_pt[i], S.Lv[i], L_s(S.Tk[i]), S.Q_s[i],
-                                             S.Q_s_i[i])
-            expdot[g, 1] += dp
-            _qss_share!(expdot, S, g, i, dq, ts)
-        end
-        if xs != 0.0
-            expdot[g, rv_i] += xs
+        xs != 0.0 && (expdot[g, rv_i] += xs)
+        xv = x + xs
+        # the realized recovered rates (exact zeros where a slot's rate is zero)
+        rv = 0.0
+        if xv != 0.0
             nu = phys[g, rv_i, 1] + nvb[i]
-            rv = (recover_rho_v(ts * xs, nu, vtr, vmu) - recover_rho_v(0.0, nu, vtr, vmu)) / ts
-            if rv != 0.0
-                dp, dq = recovered_change_partner(rv, 0.0, 0.0, S.Tk[i], S.rho_d[i], S.R_m[i],
-                                                  S.C_vt[i], S.Lv[i], 0.0, S.drvs_dT[i],
-                                                  S.drvs_dp[i])
-                expdot[g, 1] += dp
-                _qss_share!(expdot, S, g, i, dq, ts)
-            end
+            rv = (recover_rho_v(ts * xv, nu, vtr, vmu) - recover_rho_v(0.0, nu, vtr, vmu)) / ts
         end
+        rl = 0.0
+        nc != 0.0 && (rl += _rec_rate(S.nu_c[i], nc, ctr, cmu, ts))
+        nr != 0.0 && (rl += _rec_rate(S.nu_r[i], nr, rtr, rmu, ts))
+        ri = 0.0
+        if ice
+            n1 != 0.0 && (ri += _rec_rate(S.nu_i1q[i], n1, itr, imu, ts))
+            n2 != 0.0 && (ri += _rec_rate(S.nu_i2q[i], n2, itr, imu, ts))
+            n3 != 0.0 && (ri += _rec_rate(S.nu_i3q[i], n3, itr, imu, ts))
+        end
+        # less the freezing FRZ_NET = -(ICE_C + ICE_R) already in p as L_f
+        if frz != 0.0
+            rl -= frz
+            ri += frz
+        end
+        (rv == 0.0 && rl == 0.0 && ri == 0.0) && continue
+        dp, dq = recovered_change_partner(rv, rl, ri, S.Tk[i], S.rho_d[i], S.R_m[i],
+                                          S.C_vt[i], S.Lv[i], ice ? L_s(S.Tk[i]) : 0.0,
+                                          S.drvs_dT[i], S.drvs_dp[i])
+        expdot[g, 1] += dp
+        _qss_share!(expdot, S, g, i, dq, ts)
     end
     return nothing
 end
+
+# The realized recovered RATE of a transformed slot at total `nu` under a ν rate `r` over `ts`
+# (`r` itself under `:none`, where the slot is the density).
+@inline _rec_rate(nu, r, tr::Symbol, mu, ts) =
+    tr === :none ? r : (recover_total(nu + (ts * r), tr, mu) - recover_total(nu, tr, mu)) / ts
 
 # A partner's Q_ss share: where the stiff propagator owns slot 7 this step (`λ ≠ 0`, its
 # predictor is discarded and N^n was already consumed) as a direct increment of the

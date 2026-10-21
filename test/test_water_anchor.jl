@@ -668,6 +668,171 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
+    @testset "nesting: an injected vapor jump books no refit energy (the vapor re-taken)" begin
+        # A parent's collar rows take the child's state between the refit and the step: here
+        # ONLY the vapor differs (nu_v raised by 2e-4 on the upper half of the last column).
+        # The derived partner books the vapor's own defect from var_np1, so without the vapor
+        # re-take the jump is booked at kappa; with it, nothing on those rows, to the bit. With
+        # every condensate untransformed the partner still runs (its gate has the vapor), so
+        # the early return must not fire.
+        mktempdir() do tmp
+            for tr in (:bhyp, :none)
+                arms = Dict{String,Any}()
+                for (tag, on, fix) in (("on", true, true), ("off", false, true),
+                                       ("nofix", true, false))
+                    m, p, mo = F.vt_tile(tmp, "nvj_$(tr)_$(tag)"; vtr = :bhyp, tr,
+                                         extra = derived(; refit_partner = on,
+                                                         exchange_realization = false),
+                                         seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+                    kD = mo.grid_params.kDim; nc = F.vt_ncols(p, mo)
+                    V = mo.grid_params.vars
+                    F.vt_run!(m, p, mo, 1)
+                    col = ((nc - 1) * kD + 1):(nc * kD)
+                    rows = collect(col[(div(kD, 2) + 1):end])
+                    vals = copy(p.physical[rows, :, :])
+                    vals[:, V["nu_v"], 1] .+= 2.0e-4
+                    p.physical[rows, :, :] .= vals
+                    inj = [(rows, vals)]
+                    fix && Scythe.refit_reference_after_exchange!(m, inj, 2)
+                    fix && on && @test m.var_np1[rows, V["nu_v"]] == vals[:, V["nu_v"], 1]
+                    for c in 1:nc
+                        Scythe.advance_column(m, c, 2)
+                    end
+                    arms[tag] = copy(m.mc_scratch[Threads.threadid()].etd_d1[1:kD])
+                end
+                kD = length(arms["on"]); cz = (div(kD, 2) + 1):kD
+                on = arms["on"] .- arms["off"]; nofix = arms["nofix"] .- arms["off"]
+                @test all(on[cz] .== 0.0)
+                @test maximum(abs, nofix[cz]) > 0.0
+                @test on[1:div(kD, 2)] == nofix[1:div(kD, 2)]
+            end
+        end
+    end
+
+    @testset "B2: the multistep closure books the REALIZED recovered change (knees)" begin
+        # One Euler step of exactly the multistep exchange at a knee, assembled by hand from
+        # the closure's own tendency (vapor nu, p): autoconversion from an above-knee cloud
+        # into empty rain (J_r at nu_r = 0), and -- on an ice tile -- a deposition source into
+        # empty ice (J_i at nu_i = 0). R is held to second order; the requested-mass form
+        # (no partner for AC, phase_change_partner(0, s) for the ice) opens R by
+        # kappa * (recovered vapor - booked vapor).
+        mktempdir() do tmp
+            for ice in (false, true)
+                m, p, mo = F.vt_tile(tmp, "b2_$(ice)"; vtr = :bhyp, ice,
+                                     extra = derived(; refit_partner = false),
+                                     seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; amp = 2.0e-3))
+                F.vt_run!(m, p, mo, 2)
+                kD = mo.grid_params.kDim; V = mo.grid_params.vars
+                Scythe.advance_column(m, 1, 3)
+                S = m.mc_scratch[Threads.threadid()]
+                IS = m.mc_slots
+                phys = m.tile.physical
+                X0 = copy(phys[:, :, 1])
+                nvb = Scythe.mc_nu_vbar(m)
+                ts = mo.ts
+                for f in (:AUTO_COLL, :ICE_C, :ICE_R, :Fr_z)
+                    fill!(getfield(S, f), 0.0)
+                end
+                if ice
+                    for f in (:SRC_i1q, :SRC_i2q, :SRC_i3q, :F_i1q_z, :F_i2q_z, :F_i3q_z)
+                        fill!(getfield(S, f), 0.0)
+                    end
+                end
+                rate = 1.0e-6
+                cases = ice ? (:ac, :dep) : (:ac,)
+                for case in cases
+                    # AC: an above-knee cloud point with (nearly) empty rain; dep: empty ice
+                    ks = case === :ac ?
+                        [k for k in 1:kD if S.nu_c[k] > 1.0e3 * F.MU &&
+                                            abs(X0[k, V["nu_r"]]) <= 10 * F.MU] :
+                        [k for k in 1:kD if X0[k, IS.rho_v] + nvb[k] > 1.0e-4]
+                    @test !isempty(ks)
+                    isempty(ks) && continue
+                    k = ks[1]
+                    ex = zeros(size(m.expdot_n))
+                    fill!(S.AUTO_COLL, 0.0)
+                    ice && fill!(S.SRC_i1q, 0.0)
+                    if case === :ac
+                        S.AUTO_COLL[k] = rate
+                    else
+                        # empty the species at the point: slot, scratch total, its Jacobian
+                        imu = Scythe.ice_mu(mo.physical_params, 1)
+                        X0[k, IS.i1_q] = 0.0; S.nu_i1q[k] = 0.0
+                        S.J_i1q[k] = Scythe.dbhyp(0.0, imu)
+                        S.SRC_i1q[k] = rate
+                    end
+                    Scythe._water_exchange_multistep!(ex, phys, S, 1, IS.rho_v, mo.options,
+                        mo.physical_params, IS, ice, true, nvb, :bhyp,
+                        Scythe.vapor_mu(mo.physical_params), ts)
+                    X1 = copy(X0)
+                    X1[k, IS.rho_v] += ts * ex[k, IS.rho_v]
+                    if case === :ac
+                        X1[k, 9] += ts * (-(S.Jc[k] * rate)); X1[k, 8] += ts * (S.Jr[k] * rate)
+                    else
+                        X1[k, IS.i1_q] += ts * (S.J_i1q[k] * rate)
+                    end
+                    Xn = copy(X1); Xo = copy(X1)
+                    Xn[k, 1] += ts * ex[k, 1]
+                    # the requested-mass booking
+                    bv = 0.0
+                    if case === :dep
+                        dpo, _, _ = Scythe.phase_change_partner(0.0, ts * rate, S.Tk[k], S.R_m[k],
+                            S.C_vt[k], S.C_pt[k], S.Lv[k], Scythe.L_s(S.Tk[k]), S.Q_s[k],
+                            S.Q_s_i[k])
+                        Xo[k, 1] += dpo
+                        bv = -ts * rate
+                    end
+                    rv0 = Scythe.ahyp(X0[k, IS.rho_v] + nvb[k], Scythe.vapor_mu(mo.physical_params))
+                    rv1 = Scythe.ahyp(X1[k, IS.rho_v] + nvb[k], Scythe.vapor_mu(mo.physical_params))
+                    rec = rv1 - rv0
+                    # the knee: AC moves the recovered vapor by ~-AC dt, the deposition by ~-2s dt
+                    @test rec ≈ (case === :ac ? -1.0 : -2.0) * ts * rate rtol = 0.2
+                    R0, _ = RX(m, X0); Rn, _ = RX(m, Xn); Ro, _ = RX(m, Xo)
+                    kap = S.Tk[k] * (Scythe.Rv - (S.R_m[k] / S.C_vt[k]) * Scythe.Cvv)
+                    gap = abs(kap * (rec - bv))
+                    @test gap > 0.0
+                    @test abs(Rn[k] - R0[k]) <= 1.0e-3 * gap
+                    @test abs(Ro[k] - R0[k]) > 0.5 * gap
+                end
+            end
+        end
+    end
+
+    @testset "B3: the sfc row mirrors the derived closures (Louis, MYNN; bhyp vapor)" begin
+        # Under the derived anchor both closures put F_q g/alpha_v on the vapor's nu (the
+        # shadow slot 3 F_q g); the budget hook moves exactly that out of the bl row. The
+        # sfc row's R is second order (energy-consistent surface exchange), the budget closes.
+        mktempdir() do tmp
+            for (tag, bl, ice) in (("louis", :louis, false), ("mynn", :mynn, false),
+                                   ("mynn_ice", :mynn, true))
+                ex = derived(; energy_budget = true, surface_fluxes = true)
+                bl === :mynn && (ex[:mynn] = true)
+                m, p, mo = F.vt_tile(tmp, "b3_$(tag)"; vtr = :bhyp, ice, louis = bl === :louis,
+                                     extra = ex,
+                                     seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+                eb = m.ebudget
+                @test eb.wa && eb.mynn == (bl === :mynn)
+                F.vt_run!(m, p, mo, 3)
+                kD = mo.grid_params.kDim
+                tn = eb.tn
+                g = 1   # the ground point of the first column: inside the delivery layer
+                sq = tn[g, eb.jrt, Scythe.EB_OP_SFC]
+                @test sq != 0.0
+                @test tn[g, eb.jrv, Scythe.EB_OP_SFC] == sq / 2.0
+                snap = Scythe.energy_budget_snapshot!(m)
+                tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
+                @test maximum(abs, snap.actualR .- tR) <= 1.0e-10 * maximum(abs, snap.actualR) +
+                                                         1.0e-12 * maximum(abs, snap.dR)
+                rows = Scythe.energy_budget_rows([snap])
+                sf = rows[findfirst(r -> r.stage == "explicit:sfc", rows)].dR_dt_Wm2
+                sd = m.surface
+                fq = maximum(abs, sd.F_q); fsh = maximum(abs, sd.F_sh)
+                @test fq > 0.0
+                @test abs(sf) < 1.0e-3 * (fsh + 2.5e6 * fq)
+            end
+        end
+    end
+
     @testset "3c E4: the exchange realization closes on the recovered change (vapor as closure)" begin
         # Supersaturated air over a ringing sheet: condensation is requested at lobe points
         # (recovered cloud 0). One ETD stage re-applied on the post-explicit state: at a deep
