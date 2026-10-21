@@ -418,6 +418,18 @@ function o01_model(opts::BenchmarkOptions)
     options[:si_water_slots] = Symbol(get(ENV, "SCYTHE_O01_SIWATER", "none"))
     haskey(ENV, "SCYTHE_O01_SIWATER_MIXED") &&
         (options[:si_water_mixed_walls] = envflag("SCYTHE_O01_SIWATER_MIXED"))
+    # What every reader takes as the total density (`Scythe.water_anchor_mode`, Stage 3 of the
+    # rho_t retirement). Unset => `:slot`, NOT the run-config default `:derived`, so the
+    # committed quick references are reproduced bitwise; SCYTHE_O01_WANCHOR=derived runs the
+    # derived anchor (rho_t = rho_d + sum_k alpha_k nu_k, slot 3 the shadow).
+    options[:water_anchor] = Symbol(get(ENV, "SCYTHE_O01_WANCHOR", "slot"))
+    # Generic forensic switches, `SCYTHE_O01_OPTS="key=val,key=val"` (`true`/`false` -> Bool,
+    # a number -> Float64, otherwise a Symbol), merged into `options` last.
+    for kv in split(get(ENV, "SCYTHE_O01_OPTS", ""), ','; keepempty = false)
+        k, v = strip.(split(kv, '='; limit = 2))
+        options[Symbol(k)] = v == "true" ? true : v == "false" ? false :
+                             something(tryparse(Float64, v), Symbol(v))
+    end
 
     # How many moments of the rain DSD to carry. Unset => the key is absent => 1, the
     # single-moment Ooyama closure, bit-identical. "2" appends the prognostic rain number

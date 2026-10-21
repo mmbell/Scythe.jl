@@ -2544,10 +2544,34 @@ end
 """
     LOBE_RELAXATION_DEFAULT
 
-The value `options[:lobe_relaxation]` takes when the key is absent. See
+The value `options[:lobe_relaxation]` takes when the key is absent under the prognostic-slot
+anchor (`options[:water_anchor] = :slot`). See [`lobe_relaxation_on`](@ref) and
 [`lobe_relaxation_increment`](@ref).
 """
 const LOBE_RELAXATION_DEFAULT = false
+
+"""
+    LOBE_RELAXATION_DERIVED_DEFAULT
+
+The value `options[:lobe_relaxation]` takes when the key is absent under the derived water
+anchor (`options[:water_anchor] = :derived`): ON, the plan's fixed decision E5 taken after the
+Stage 3 acceptance (2026-10-21: on the 24 -> 33 h RCE restart the paired relaxation holds the
+pre-convective lobe pool at -0.0125 kg/m2 at 27 h against the P2 control's -0.96, 98.7 % below,
+with the shadow gap and the paired energy booking unchanged in class).
+"""
+const LOBE_RELAXATION_DERIVED_DEFAULT = true
+
+"""
+    lobe_relaxation_on(options) -> Bool
+
+Whether the lobe relaxation (Stage L) runs: `options[:lobe_relaxation]` when set, else
+[`LOBE_RELAXATION_DERIVED_DEFAULT`](@ref) under the derived water anchor (where it is the
+PAIRED form, `_lobe_relax_paired!`) and [`LOBE_RELAXATION_DEFAULT`](@ref) under `:slot`.
+"""
+@inline lobe_relaxation_on(options) =
+    get(options, :lobe_relaxation,
+        water_anchor_mode(options) === :derived ? LOBE_RELAXATION_DERIVED_DEFAULT :
+                                                  LOBE_RELAXATION_DEFAULT)::Bool
 
 """
     lobe_relaxation_increment(nu, a) -> dnu
@@ -7958,7 +7982,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # attribution above would act on the SAME lobes — attribution reads them into
     # `res_rho_t`, so relaxing them would move the vapor through the nudge — and the pair is
     # refused rather than resolved silently.
-    lobe_relax = get(model.options, :lobe_relaxation, LOBE_RELAXATION_DEFAULT)::Bool
+    lobe_relax = lobe_relaxation_on(model.options)
     tau_lobe = get(model.physical_params, :tau_lobe, 10.0)
     if lobe_relax
         lobe_attr && error("options[:lobe_relaxation] = true and " *
@@ -11873,7 +11897,7 @@ function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::I
     # perturbation against ν̄_c, recovered here as the state-`n` total minus the state-`n`
     # slot (an exact 0.0 whenever ρ̄_c ≡ 0, which is every current configuration). Number and
     # habit moments are never touched.
-    if get(mtile.model.options, :lobe_relaxation, LOBE_RELAXATION_DEFAULT)::Bool
+    if lobe_relaxation_on(mtile.model.options)
         phys = mtile.tile.physical
         dlc = S.etd_dlc; dlr = S.etd_dlr
         nuc = S.nu_c

@@ -30,9 +30,12 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     F = Main.VaporTransformFixtures
     M = Main.MYNNTestFixtures
 
+    # (Stage L is pinned off here unless a test asks for it: its paired form defaults ON under
+    # the derived anchor since 3d, and most tests isolate one operator)
     derived(; sd = false, siw = :mass, extra...) =
         merge(Dict{Symbol,Any}(:water_anchor => :derived, :si_water_slots => siw,
-                               :state_dependent_si => sd, :si_water_mixed_walls => true),
+                               :state_dependent_si => sd, :si_water_mixed_walls => true,
+                               :lobe_relaxation => false),
               Dict{Symbol,Any}(extra))
 
     # ── 0. the option and the config ────────────────────────────────────────────────
@@ -43,6 +46,12 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             Dict{Symbol,Any}(:water_anchor => :sum))
         @test Scythe.WATER_ANCHOR_MODES == (:slot, :derived)
         @test Scythe.Numerics().water_anchor === :derived
+        # 3d: the paired Stage L defaults ON under the derived anchor, off under :slot
+        @test Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:water_anchor => :derived))
+        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}())
+        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:water_anchor => :slot))
+        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:water_anchor => :derived,
+                                                          :lobe_relaxation => false))
         @test haskey(Scythe.KNOWN_OPTION_KEYS, :water_anchor)
         for f in ("owb_default", "rce_default", "tc_default")
             s = read(joinpath(@__DIR__, "reference_data", "legacy_models",
