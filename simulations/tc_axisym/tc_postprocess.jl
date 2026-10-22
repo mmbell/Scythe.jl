@@ -132,6 +132,34 @@ has_mynn(ndir, tag) =
     any(f -> occursin(Regex("^" * Base.escape_string(tag) * raw"_mynn_i[0-9]+\.nc$"), f),
         readdir(ndir))
 
+# ── The run's water representation ────────────────────────────────────────────
+# The transforms and the water anchor the RUN used, from its resolved config (a segmented
+# tree's `<root>/scythe_config.toml`, through the same `build_physics` the run used); a legacy
+# tree predates every option here and gets the code defaults of its day (no transforms,
+# slot 3 the total density). Under `water_anchor = derived` slot 3 is a PASSIVE SHADOW: the
+# total density the run read is `rho_d + sum_k alpha_k nu_k` (alpha = 2 transformed, 1
+# density), which the comprehensive `<t>.nc` writes as `rho_t`; it is read from there when the
+# run wrote one beside the raw snapshot on the same grid, and rebuilt from the raw slots
+# otherwise (the model's member order: vapor, cloud, rain, the three ice masses).
+function detect_water_transforms(root)
+    if is_segmented_root(root)
+        cfg = Scythe.load_config(Scythe.run_config_file(root); set = ["output.dir=" * root])
+        o, pp = Scythe.build_physics(cfg)
+        ice = Scythe.ice_microphysics(o) === :ishmael
+        return (; ctrans = Scythe.condensate_transform_mode(o),
+                  cmu = Float64(get(pp, :condensate_mu, 1.0e-7)),
+                  rtrans = Scythe.rain_transform_mode(o),
+                  rmu = Float64(get(pp, :rain_mu, 1.0e-7)),
+                  vtrans = Scythe.vapor_transform_mode(o), vmu = Scythe.vapor_mu(pp),
+                  itrans = ice ? Scythe.ice_transform_mode(o) : :none,
+                  imu = ice ? Scythe.ice_mu(pp, 1) : 1.0,
+                  anchor = Scythe.water_anchor_mode(o))
+    end
+    return (; ctrans = :none, cmu = 1.0e-7, rtrans = :none, rmu = 1.0e-7, vtrans = :none,
+              vmu = 1.0e-9, itrans = :none, imu = 1.0, anchor = :slot)
+end
+const WTRANS = detect_water_transforms(indir)
+
 println("Postprocessing nest(s) $(join(nests, ", ")) of $indir " *
         "($(length(tc_segments(indir))) segment(s)), reference $reffile")
 
@@ -278,23 +306,63 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
         rho_t = rtp .+ col(bg.rho_tbar); E_t  = Etp .+ col(bg.E_tbar)
         Q_ss = Qssp .+ col(bg.Q_ssbar)
         rho_c = Scythe.recover_rho_c.(rcp, col(bg.rho_cbar), ctrans, WTRANS.cmu)
+        # The vapor slot: a density perturbation off rho_tbar - rho_dbar - rho_cbar, or under
+        # the vapor control variable `nu_v'` off bhyp of it (recovered as the model does).
+        rho_vbar_d = bg.rho_tbar .- bg.rho_dbar .- bg.rho_cbar
+        vname = haskey(ds, "nu_v") ? "nu_v" : (haskey(ds, "rho_v") ? "rho_v" : "")
+        vtr = vname == "nu_v" ? WTRANS.vtrans : :none
+        nvb = vtr === :none ? rho_vbar_d : Scythe.bhyp.(rho_vbar_d, WTRANS.vmu)
+        vslot = isempty(vname) ? nothing : rd2d(ds, vname, n_i, n_k)
+        # Ice masses (the first moment of each species), when the run carried ice
+        inames = [n for n in ("nu_i1", "nu_i2", "nu_i3", "rho_i1", "rho_i2", "rho_i3")
+                  if haskey(ds, n)]
+        ice_slots = [rd2d(ds, n, n_i, n_k) for n in inames]
+        itr = any(startswith("nu_"), inames) ? WTRANS.itrans : :none
+        rho_ice = isempty(ice_slots) ? zeros(n_i, n_k) :
+            reduce(+, (Scythe.recover_total.(sl, itr, WTRANS.imu) for sl in ice_slots))
+        # THE DERIVED WATER ANCHOR: slot 3 is the passive shadow, not the total density.
+        if WTRANS.anchor === :derived
+            vslot === nothing && error("$(rawpath): water_anchor = derived but no vapor slot")
+            compf = replace(rawpath, r"_raw\.nc$" => ".nc")
+            from_comp = false
+            if compf != rawpath && isfile(compf)
+                NCDataset(compf, "r") do dc
+                    if get(dc.attrib, "scythe_file_kind", nothing) == "comprehensive" &&
+                       haskey(dc, "rho_t") && length(dc["x"]) == n_i && length(dc["z"]) == n_k
+                        rho_t = rd2d(dc, "rho_t", n_i, n_k)
+                        from_comp = true
+                    end
+                end
+            end
+            if !from_comp
+                al(tr) = tr === :none ? 1.0 : 2.0
+                ncb = ctrans === :none ? bg.rho_cbar : Scythe.bhyp.(bg.rho_cbar, WTRANS.cmu)
+                W = (al(vtr) .* (vslot .+ col(nvb))) .+ (al(ctrans) .* (rcp .+ col(ncb)))
+                W = W .+ (al(rtrans) .* nu_r)
+                for sl in ice_slots
+                    W = W .+ (al(itr) .* sl)
+                end
+                rho_t = rho_d .+ W
+            end
+        end
 
         # Closed-form temperature retrieval from the PROGNOSTIC condensate (M is the
         # enthalpy balance the model solves).
         ke = has_v ? 0.5 .* (u .^ 2 .+ v .^ 2 .+ w .^ 2) : 0.5 .* (u .^ 2 .+ w .^ 2)
         M  = p .+ E_t .- rho_t .* (ke .+ Scythe.gravity .* col(z))
         rho_liq = rho_c .+ rho_r
-        T  = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
+        T  = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq, rho_ice)
         rho_vs = Springsteel.Thermodynamics.rho_v_sat.(T, p ./ 100.0)
         # The vapor is its OWN prognostic slot, carried against the derived reference
         # rho_tbar - rho_dbar - rho_cbar (`Scythe.vapor_slot`). Files written before it
         # became prognostic have no such variable; those fall back to the density residual,
         # which is what the model then meant by the vapor. The two now differ by the
         # reconciliation gap, so the fallback must not be used on a new file.
-        rho_v = haskey(ds, "rho_v") ?
-            rd2d(ds, "rho_v", n_i, n_k) .+
-                col(bg.rho_tbar .- bg.rho_dbar .- bg.rho_cbar) :
-            rho_t .- rho_d .- rho_liq
+        # (Under the derived anchor the residual fallback is refused above: there is always a
+        # vapor slot.)
+        rho_v = vslot === nothing ? rho_t .- rho_d .- rho_liq .- rho_ice :
+            (vtr === :none ? vslot .+ col(rho_vbar_d) :
+                             Scythe.recover_rho_v.(vslot, col(nvb), vtr, WTRANS.vmu))
 
         # Derived products
         refl = reflectivity_dBZ.(rho_c, rho_r, N0, Nc_cm3 * 1.0e6)
