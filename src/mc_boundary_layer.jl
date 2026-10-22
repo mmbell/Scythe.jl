@@ -283,6 +283,20 @@ carrying no cloud.
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_c)
+    if wad
+        # ...and the RAIN leg in ν space, `K ∂z ν_r'` (review D5): MYNN's ν-leg set (Louis
+        # refuses ice, so vapor, cloud and rain). Under `:slot` the total-water leg carried the
+        # rain's gradient and credited the vapor with it; the derived anchor has no
+        # total-water leg, so without this the rain was not mixed at all. Fitted into the
+        # entropy-gradient scratch, free once QDOT_V is formed above.
+        rrv_z = view(mtile.tile.physical, colstart:colend, 8, siw_zslot(mtile.tile.physical))
+        @inbounds for i in eachindex(Kv)
+            col.uMish[i] = Kv[i] * rrv_z[i]
+        end
+        Btransform!(col)
+        Atransform!(col)
+        Ixtransform(col, S.bl_s_z)
+    end
 
     # Apply to the prognostic slots (all additive; explicit loop, not view
     # broadcasts — the SubArray elision lesson at this function size). The
@@ -349,9 +363,10 @@ end
     _louis_apply_derived!(mtile, S, geom, colstart, z, uv, wv, vv, expdot, tau_u, tau_v,
                           F_sh, F_q, delta, VD_u, VD_w, VD_v, QDOT_V, VDOT_v, VDOT_c)
 
-The Louis BL's slot increments under the derived water anchor (plan E7): the vapor and cloud
-legs are ν rates (`VDOT_v`, `VDOT_c`, fitted from the slots' own gradients) landing on their
-slots directly, the surface moisture flux enters the vapor as `F_q g/α_v`, the shadow slot 3
+The Louis BL's slot increments under the derived water anchor (plan E7): the vapor, cloud and
+rain legs are ν rates (`VDOT_v`, `VDOT_c`, and the rain's `K ∂z ν_r'` in `S.bl_s_z`, review D5 —
+MYNN's ν-leg set; Louis refuses ice), fitted from the slots' own gradients, landing on their
+slots directly; the liquid carry reads the cloud's and the rain's realized rates together, the surface moisture flux enters the vapor as `F_q g/α_v`, the shadow slot 3
 receives `Σ α_k ν̇_k + F_q g`, and the energy carry is the fixed-temperature map on the
 REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke + gz)·ρ̇_w` (so
 `E_t − E_implied` is held to second order, the pool absorbing the water difference); `p` gets
@@ -364,8 +379,10 @@ REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke
                                          QDOT_V, VDOT_v, VDOT_c)
     opts = mtile.model.options; pp = mtile.model.physical_params
     ws = water_anchor_set(opts, pp, mtile.mc_slots)
-    av = ws.alpha[1]; ac = ws.alpha[2]
+    av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]
     ctr = condensate_transform_mode(opts); cmu = get(pp, :condensate_mu, 1.0e-7)
+    rtr = rain_transform_mode(opts); rmu = get(pp, :rain_mu, 1.0e-7)
+    VDOT_r = S.bl_s_z               # the rain's ν rate (`mc_louis_bl!`)
     vtr = vapor_transform_mode(opts); vmu = vapor_mu(pp)
     ts = mtile.model.ts
     phys = mtile.tile.physical
@@ -392,6 +409,14 @@ REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke
         real_v = (recover_rho_v(ts * nvv, nuv, vtr, vmu) - recover_rho_v(0.0, nuv, vtr, vmu)) / ts
         real_c = _mynn_realized_rate(S.nu_c[i], ncc, ncc, ts, ctr, cmu)
         sw = ((av * VDOT_v[i]) + (ac * ncc)) + Fv
+        # the rain leg (D5): its realized recovered rate joins the liquid's carry, its ν
+        # rate the anchor; only where it is nonzero (a K = 0 or rainless column is bitwise)
+        nrr = VDOT_r[i]
+        if nrr != 0.0
+            real_c += _mynn_realized_rate(S.nu_r[i], nrr, nrr, ts, rtr, rmu)
+            sw += ar * nrr
+            expdot[j, 8] += nrr
+        end
         geo = S.ke[i] + (gravity * z[i])
         dT_v = qdot / (rho_d[i] * C_vt[i])
         dp_v = (R_m[i] / C_vt[i]) * qdot

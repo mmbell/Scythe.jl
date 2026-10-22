@@ -895,6 +895,60 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
+    @testset "D5: Louis under :derived mixes the rain in nu space (MYNN's leg set)" begin
+        # A sheared column with cloud, a rain bump and the vapor bump: the Louis arm against
+        # the BL-off arm on the same state. The legs sum to the anchor (sum alpha D_k equals the
+        # shadow's D_3), the rain leg is nonzero, and R is held to 1e-4 of the energy the legs
+        # move; with K = 0 the rain slot is untouched bitwise.
+        mktempdir() do tmp
+            for shear in (true, false)
+                seedr! = (p, x, V, c) -> begin
+                    F.vt_seed!(p, x, V, c)
+                    for i in 1:size(p.physical, 1)
+                        zz = x[i, end]; k = mod1(i, length(c.Tk)); T = c.Tk[k]
+                        rr = 3.0e-4 * exp(-((zz - 1200.0) / 500.0)^2)
+                        p.physical[i, V["nu_r"], 1] = Scythe.rain_slot(rr, :bhyp, F.MU)
+                        p.physical[i, V["rho_t"], 1] += rr
+                        p.physical[i, V["E_t"], 1] += rr * ((Scythe.Cpv * T) - Scythe.L_v(T) +
+                                                            (Scythe.gravity * zz))
+                        shear && (p.physical[i, V["u"], 1] = 10.0 * tanh(zz / 800.0))
+                    end
+                end
+                arms = Dict{Bool,Any}()
+                # (K = 0 exactly through l_inf = 0: the mixing length is 0 at every level)
+                m0, p0, mo0 = F.vt_tile(tmp, "d5_$(shear)"; vtr = :bhyp, louis = true,
+                                        sfc = false, extra = derived(), seed! = seedr!,
+                                        pp_extra = Dict{Symbol,Float64}(:l_inf => shear ? 80.0 : 0.0))
+                F.vt_run!(m0, p0, mo0, 2)
+                for louis in (true, false)
+                    m = deepcopy(m0)
+                    m.model.options[:louis_bl] = louis
+                    for c in 1:F.vt_ncols(p0, mo0)
+                        Scythe.advance_column(m, c, 3)
+                    end
+                    arms[louis] = (; m, mo = m.model, x = copy(m.tile.physical[:, :, 1]),
+                                   e = copy(m.expdot_n))
+                end
+                mo = arms[true].mo; V = mo.grid_params.vars; ts = mo.ts
+                D = arms[true].e .- arms[false].e
+                if !shear
+                    @test all(==(0.0), D[:, V["nu_r"]])
+                    @test reinterpret(UInt64, arms[true].e[:, V["nu_r"]]) ==
+                          reinterpret(UInt64, arms[false].e[:, V["nu_r"]])
+                    continue
+                end
+                @test maximum(abs, D[:, V["nu_r"]]) > 0.0
+                sumnu = (2.0 .* D[:, V["nu_v"]] .+ 2.0 .* D[:, V["nu_c"]]) .+ 2.0 .* D[:, V["nu_r"]]
+                @test maximum(abs, sumnu .- D[:, 3]) <= 1.0e-12 * maximum(abs, D[:, 3])
+                R0, _ = RX(arms[true].m, arms[true].x)
+                x1 = copy(arms[true].x); x1 .+= ts .* D[:, 1:size(x1, 2)]
+                R1, _ = RX(arms[true].m, x1)
+                Es = ts .* abs.(D[:, V["E_t"]])
+                @test maximum(abs, R1 .- R0) <= 1.0e-4 * maximum(Es)
+            end
+        end
+    end
+
     @testset "3c E4: the exchange realization closes on the recovered change (vapor as closure)" begin
         # Supersaturated air over a ringing sheet: condensation is requested at lobe points
         # (recovered cloud 0). One ETD stage re-applied on the post-explicit state: at a deep
