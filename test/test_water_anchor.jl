@@ -285,7 +285,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     @testset "census: MC_W_*, MC_SHADOW_* layout and values" begin
         @test Scythe.MC_W_PART == Scythe.MC_VNEG_MASS + 1
         @test Scythe.MC_SHADOW_INT == Scythe.MC_W_PART + 8
-        @test Scythe.MC_STATS_LAST == Scythe.MC_SHADOW_INT
+        @test Scythe.MC_ANCHOR_INERT == Scythe.MC_SHADOW_INT + 1
+        @test Scythe.MC_STATS_LAST == Scythe.MC_ANCHOR_INERT
+        @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_INERT] == :anchor_inert
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         @test Scythe.MC_WATER_STATS[Scythe.MC_SHADOW_MAX] == :shadow_max
         mktempdir() do tmp
