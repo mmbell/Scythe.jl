@@ -1854,6 +1854,12 @@ written on every ice step of every run, whether or not the reconciliation SOURCE
 `options[:ice_anchor_source] = false` switches off the removal, never the measurement, so
 the off switch is a forensic tool and not a blindfold.
 
+UNDER THE DERIVED WATER ANCHOR (`options[:water_anchor] = :derived`) the four legs (source,
+floor, flux, rates) are INERT — the anchor `ρ_w = Σ α_k ν_k` cannot be exceeded, the implied
+vapor being `ahyp(ν_v) ≥ 0` — and `MC_ANCHOR_GAP` is the run-maximum of the SHADOW gap
+`|ρ_t'^slot − (ρ_d' + W')|` instead ([`_anchor_shadow_census!`](@ref)); `MC_ANCHOR_PTS` and
+`MC_ANCHOR_REMOVED` stay zero.
+
 `MC_ANCHOR_GAP` is what `MC_VAPOR_GAP` cannot see: during a detachment the vapor nudge
 succeeds — `res_rho_t − ρ_v → 0` while the partition itself is wrong — so the first gap
 census reads zero exactly when this one is the whole story. `MC_ANCHOR_REMOVED` is the
@@ -5031,6 +5037,29 @@ function _ice_anchor_reconcile!(S, st, tid::Int64, rho_t, rho_d, rho_liq, rho_ic
 end
 
 """
+    _anchor_shadow_census!(st, tid, phys, colstart, rho_tp)
+
+The `MC_ANCHOR_*` census under the DERIVED water anchor, where the four ice-anchor legs are
+inert (the anchor is `ρ_w = Σ α_k ν_k` itself and cannot be exceeded): `MC_ANCHOR_GAP` takes
+the run-maximum of the shadow gap `|G| = |ρ_t'^slot − (ρ_d' + W')|` over the column (`rho_tp`
+is the derived `ρ_t'` the driver staged in `res_rho_t`), so a detachment of the old linear `ρ_t`
+from the derived one is still seen; `MC_ANCHOR_PTS` and `MC_ANCHOR_REMOVED` stay zero (nothing
+binds, nothing is removed). `@noinline`.
+"""
+@noinline function _anchor_shadow_census!(st::Matrix{Float64}, tid::Int64,
+                                          phys::Array{Float64,3}, colstart::Int64,
+                                          rho_tp::Vector{Float64})
+    size(st, 2) > 0 || return nothing
+    gap = 0.0
+    @inbounds for i in eachindex(rho_tp)
+        a = abs(phys[colstart + i - 1, 3, 1] - rho_tp[i])
+        a > gap && (gap = a)
+    end
+    @inbounds gap > st[MC_ANCHOR_GAP, tid] && (st[MC_ANCHOR_GAP, tid] = gap)
+    return nothing
+end
+
+"""
     ice_population_rate(rho_ik, n_ik, rho_a, tau_pop) -> (rate, rho_empty)
 
 The NUMBER-LESS MASS of one ice species at one gridpoint and the rate at which it is returned
@@ -5565,7 +5594,10 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
     # and the anchor disagree), so an @info and not a warning; the reconciliation source
     # holds it at drift scale unless options[:ice_anchor_source] = false.
     agap = maximum(view(st, MC_ANCHOR_GAP, :))
-    if agap > 0.0 && st[MC_ANCHOR_WARNED, 1] == 0.0
+    if agap > 0.0 && st[MC_ANCHOR_WARNED, 1] == 0.0 && _wa_derived(mtile.model.options)
+        # (the derived anchor: the row is the shadow gap; MC_SHADOW_* reports it per output)
+        st[MC_ANCHOR_WARNED, 1] = 1.0
+    elseif agap > 0.0 && st[MC_ANCHOR_WARNED, 1] == 0.0
         st[MC_ANCHOR_WARNED, 1] = 1.0
         src_on = get(mtile.model.options, :ice_anchor_source, true)::Bool
         @info """PARTITION DETACHMENT: the advected ice moments exceed the rho_t anchor's headroom.
@@ -5631,7 +5663,7 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
   donor depletion actually applied (must stay <= 1 for the liquid and ice-MASS donors; the
   three ice-NUMBER rows are bounded only under options[:ice_number_realization]):
   $dreport
-  anchor reconciliation (partition defect delta_part; 0 until glaciation onset):
+  anchor reconciliation ($(_wa_derived(mtile.model.options) ? "INERT under the derived water anchor; max delta_part reads the shadow gap |rho_t'^slot - (rho_d' + W')|" : "partition defect delta_part; 0 until glaciation onset")):
   max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))
   population reconciliation (number-less ice mass rho_empty; 0 while every species with mass carries number):
   max rho_empty = $(maximum(view(st, MC_POP_MAX, :))) kg/m^3, (gridpoint x species)-steps = $(Int(sum(view(st, MC_POP_PTS, :)))), mass to rain = $(sum(view(st, MC_POP_RAIN, :))) kg/m^3, ice number seeded = $(sum(view(st, MC_POP_SEED, :))) /m^3 (seed = :$(get(mtile.model.options, :ice_population_seed, :local)))
@@ -7963,11 +7995,18 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # gates the SOURCE only — the `MC_ANCHOR_*` census measures the defect regardless, so
     # `false` reproduces the unreconciled configuration bitwise while still reporting it.
     tau_anchor = get(model.physical_params, :tau_ice_anchor, 10.0)
-    ice_anchor_src = get(model.options, :ice_anchor_source, true)::Bool
+    # UNDER THE DERIVED WATER ANCHOR all four legs are INERT (review D1): the anchor is
+    # ρ_w = Σ α_k ν_k itself, so the implied vapor is `ahyp(ν_v) ≥ 0` and the anchor cannot be
+    # exceeded by construction; read through `ρ_t − ρ_d = W` the headroom test
+    # `ρ_ice > W − ρ_liq` would instead fire at every vapor-lobe point with ice (`ρ_v + X < 0`,
+    # the pool), turning a transport-detachment guard into a vapor-negativity device. The
+    # census then reads the shadow gap (`_anchor_shadow_census!`).
+    wa_inert = !_wa_derived(model.options)
+    ice_anchor_src = get(model.options, :ice_anchor_source, true)::Bool && wa_inert
     # The reader-side leg (see the rho_ice_t block): applied only with ice registered.
-    ice_anchor_flr = get(model.options, :ice_anchor_floor, true)::Bool
+    ice_anchor_flr = get(model.options, :ice_anchor_floor, true)::Bool && wa_inert
     # The sedimentation leg (see the `anchor_f` scratch doc): applied only with ice on.
-    ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool
+    ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool && wa_inert
     # LOBE ATTRIBUTION (see `ahyp_signed` and the `lobe_w` block below): the vapor residual
     # and the anchor headroom read each transformed water-mass slot's clipped negative lobe
     # through the odd continuation of `ahyp`, so the lobe the linear ρ_t carries is the
@@ -8024,7 +8063,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # instability wherever the fall speed increases upward. Forensics only.
     sed_lid_dir = sedimentation_flux_lid_dirichlet(model.options)
     # The rate-side leg (see the read block in `mc_ice_sources!`): ditto.
-    ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool
+    ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool && wa_inert
     # The POPULATION reconciliation — the FOURTH tier of the chain (TeX §"Reconciliation of
     # the population"): ice mass whose carried number is not positive is orphaned by the
     # population gate, exempt from every rate AND from every device that could remove it, and
@@ -9109,7 +9148,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @inbounds for i in eachindex(af)
             head = anchor_headroom(rho_t[i] - rho_d[i], rho_liq[i], lobe_w[i])
             ri = rho_ice[i]
-            af[i] = (ri > head && ri > 0.0) ? head / ri : 1.0
+            af[i] = (wa_inert && ri > head && ri > 0.0) ? head / ri : 1.0
         end
         # Every process rate: deposition through the shared prognostic supersaturation, the
         # full ISHMAEL nucleation/riming/aggregation/melting set, and the twelve slot sources
@@ -9137,9 +9176,14 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # fraction δ/(ρ_i·τ_anchor) — per-particle state and species shares exactly
         # invariant, no latent heat, nothing in λ/N. See `ice_anchor_rate` for the law and
         # TeX §"Reconciliation of the condensate partition" for the derivation.
-        _ice_anchor_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
-                               rho_t, rho_d, rho_liq, rho_ice, lobe_w,
-                               tau_anchor, ice_anchor_src, model.ts)
+        if wa_inert
+            _ice_anchor_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
+                                   rho_t, rho_d, rho_liq, rho_ice, lobe_w,
+                                   tau_anchor, ice_anchor_src, model.ts)
+        else
+            _anchor_shadow_census!(mtile.mc_water_stats, Threads.threadid(), grid.physical,
+                                   colstart, S.res_rho_t)
+        end
 
         # The POPULATION RECONCILIATION — the fourth and last tier, in the same slot and for
         # the same reason as the third: the process sources are assembled and nothing has

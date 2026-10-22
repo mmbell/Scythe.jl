@@ -253,7 +253,14 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             for (k, v, pp) in ((:water_lobe_attribution, true, false),
                                (:vapor_nudge_partner, true, false),
                                (:water_budget_trace, 1, false),
-                               (:clamp_water, true, false))
+                               (:clamp_water, true, false),
+                               # subsumed devices: an explicit true is refused, not bypassed
+                               (:ice_anchor_source, true, false),
+                               (:ice_anchor_floor, true, false),
+                               (:ice_anchor_flux, true, false),
+                               (:ice_anchor_rates, true, false),
+                               (:mynn_water_closure, true, false),
+                               (:mynn_exchange_realization, true, false))
                 ex = derived(); ex[k] = v
                 @test_throws ErrorException F.vt_tile(tmp, "ref_$(k)"; vtr = :bhyp, extra = ex)
             end
@@ -261,8 +268,15 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 pp_extra = Dict{Symbol,Float64}(:Kvdiff_water => 1.0))
             @test_throws ErrorException F.vt_tile(tmp, "ref_tau"; vtr = :bhyp, extra = derived(),
                 pp_extra = Dict{Symbol,Float64}(:tau_rho_v_rec => 10.0))
+            # ...an explicit false is harmless
+            for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux,
+                      :ice_anchor_rates, :mynn_water_closure, :mynn_exchange_realization)
+                ex = derived(); ex[k] = false
+                @test F.vt_tile(tmp, "ok_$(k)"; vtr = :bhyp, extra = ex) isa Tuple
+            end
             # the same keys are fine under :slot
-            ex = Dict{Symbol,Any}(:water_lobe_attribution => false)
+            ex = Dict{Symbol,Any}(:water_lobe_attribution => false, :ice_anchor_source => true,
+                                  :mynn_water_closure => true)
             @test F.vt_tile(tmp, "ok_slot"; vtr = :bhyp, extra = ex) isa Tuple
         end
     end
@@ -833,6 +847,54 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
+    @testset "D1: the four ice-anchor legs are inert under :derived (census = shadow gap)" begin
+        # An ice tile whose vapor rings into a lobe beside real ice: read through
+        # rho_t - rho_d = W the headroom test fires there (rho_v + X < 0). Under :derived
+        # nothing binds: the reader cap, the sedimentation and rate shares are the raw ice,
+        # nothing is removed, and MC_ANCHOR_GAP reads the shadow gap; the :slot arm on the
+        # same seed still exercises the legs.
+        mktempdir() do tmp
+            seedice! = (p, x, V, c) -> begin
+                F.vt_seed!(p, x, V, c; amp = 1.0e-3, vamp = 3.0e-3)
+                kD = length(c.Tk)
+                for i in 1:size(p.physical, 1)
+                    zz = x[i, end]
+                    # ice in a layer where the vapor bump's flank is sharp; a vapor lobe there
+                    if 2500.0 < zz < 4500.0
+                        p.physical[i, V["nu_i1"], 1] = Scythe.bhyp(2.0e-4, 1.0e-9)
+                        p.physical[i, V["nu_v"], 1] -= 1.5 *
+                            Scythe.bhyp(c.rho_v[mod1(i, kD)], 1.0e-9)
+                    end
+                end
+            end
+            for wa in (:derived, :slot)
+                ex = wa === :derived ? derived() : Dict{Symbol,Any}()
+                m, p, mo = F.vt_tile(tmp, "d1_$(wa)"; vtr = :bhyp, ice = true, extra = ex,
+                                     seed! = seedice!)
+                F.vt_run!(m, p, mo, 3)
+                st = m.mc_water_stats
+                kD = mo.grid_params.kDim
+                Scythe.advance_column(m, 1, 4)
+                S = m.mc_scratch[Threads.threadid()]
+                if wa === :derived
+                    @test all(==(1.0), S.anchor_f)
+                    @test S.rho_ice_t == S.rho_ice
+                    @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
+                    @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) == 0.0
+                    G = maximum(abs, m.tile.physical[1:kD, 3, 1] .- S.res_rho_t)
+                    @test maximum(view(st, Scythe.MC_ANCHOR_GAP, :)) >= G
+                    # ...and the headroom test the legs WOULD read fires here (the measure)
+                    hit = count(i -> S.rho_ice[i] > Scythe.anchor_headroom(S.rho_t[i] - S.rho_d[i],
+                                                                           S.rho_liq[i], 0.0),
+                                1:kD)
+                    @test hit > 0
+                else
+                    @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) >= 0.0
+                end
+            end
+        end
+    end
+
     @testset "3c E4: the exchange realization closes on the recovered change (vapor as closure)" begin
         # Supersaturated air over a ringing sheet: condensation is requested at lobe points
         # (recovered cloud 0). One ETD stage re-applied on the post-explicit state: at a deep
@@ -949,9 +1011,10 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                                          num_cells_k = 25, kMax = 5.0e3,
                                                          fluxes = false, ctrans = :bhyp,
                                                          rtrans = :bhyp,
-                                                         extra_options = Dict{Symbol,Any}(
-                                                             :water_anchor => wa,
-                                                             :mynn_water_closure => wc))
+                                                         extra_options = merge(
+                                                             Dict{Symbol,Any}(:water_anchor => wa),
+                                                             wa === :derived ? Dict{Symbol,Any}() :
+                                                             Dict{Symbol,Any}(:mynn_water_closure => wc)))
                 seed!(p, mo, gp.kDim, z, col; e0)
                 Scythe.init_water_anchor_shadow!(p, mo)
                 MF.step_all!(m, p, gp.kDim)

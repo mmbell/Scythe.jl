@@ -1083,6 +1083,19 @@ function validate_water_anchor(model)
     haskey(pp, :tau_rho_v_rec) && error("physical_params[:tau_rho_v_rec] configures the " *
         "vapor reconciliation nudge, which is deleted under " * why * ". Remove the key or " *
         "set numerics.water_anchor = \"slot\".")
+    # Devices the derived anchor SUBSUMES (review D1 and the BL sub-check): inert there, so an
+    # explicit `true` is refused rather than silently bypassed (`false` is harmless).
+    for (k, what) in ((:ice_anchor_source, "the ice-anchor removal source"),
+                      (:ice_anchor_floor, "the ice-anchor reader cap"),
+                      (:ice_anchor_flux, "the ice-anchor sedimentation share"),
+                      (:ice_anchor_rates, "the ice-anchor rate share"),
+                      (:mynn_water_closure, "the MYNN total-water residual closure"),
+                      (:mynn_exchange_realization, "the MYNN clip-gap (lobe) partner"))
+        get(opts, k, nothing) === true && error("options[:$(k)] = true configures $(what), " *
+            "which is INERT under " * why * " (the anchor sum_k alpha_k nu_k cannot be " *
+            "exceeded, and every MYNN water leg is a nu leg realized on its own recovered " *
+            "rate). Remove the key or set numerics.water_anchor = \"slot\".")
+    end
     get(opts, :refit_partner_form, :defect) in (:defect, :recovered) ||
         error("options[:refit_partner_form] must be :defect (default) or :recovered")
     get(opts, :water_budget_trace, 0) > 0 && error("options[:water_budget_trace] reads " *
