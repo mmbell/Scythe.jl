@@ -1419,15 +1419,18 @@ reference/HANDOFF_DRIVER_COMPILE_CLIFF.md, measured 2026-10-21); the `_siw_stage
     nvb = mc_nu_vbar(mtile)
     phys = mtile.tile.physical
     rv_i = IS.rho_v
+    eb = mtile.ebudget
+    # (the energy budget isolates the closures as their own explicit row, `explicit:wexch`)
+    eb.active && eb_snap!(eb, mtile.expdot_n, colstart)
     _water_exchange_multistep!(mtile.expdot_n, phys, S, colstart, rv_i, opts, pp, IS, ice,
                                precip, nvb, vtr, vmu, model.ts)
+    eb.active && eb_take!(eb, EB_OP_WEXCH, mtile.expdot_n, colstart)
     _etd_closure!(S.etd_dv, S.etd_d9, S.etd_d8, S.etd_di1, S.etd_di2, S.etd_di3, ice,
                   opts, pp, IS)
     ctr = condensate_transform_mode(opts); rtr = rain_transform_mode(opts)
     itr = ice ? ice_transform_mode(opts) : :none
     if t > 1 && get(opts, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool &&
        (ctr !== :none || rtr !== :none || itr !== :none || vtr !== :none)
-        eb = mtile.ebudget
         eb.active && eb_partner_snap!(eb, S.etd_d1, S.etd_dv)
         itr_on = itr !== :none
         booked = _refit_partner_defect!(S.etd_d1, S.etd_qnp1, S.etd_lam, mtile.var_np1, phys,

@@ -45,7 +45,8 @@ rows ([`EB_TOP`](@ref)) are the ones that telescope.
 | `explicit:sfc` | the surface exchange: drag, sensible and moisture fluxes on the surface-layer profile |
 | `explicit:vrec` | the vapor reconciliation nudge and its pressure partner |
 | `explicit:hwater` | horizontal water mixing (`Khdiff_water`) |
-| `explicit:nonlin` | `explicit` minus the eight rows above: the cross terms of a nonlinear R |
+| `explicit:wexch` | under the derived anchor, the multistep exchange and sedimentation closures of the vapor and their partners (`_water_exchange_multistep!`) |
+| `explicit:nonlin` | `explicit` minus the nine rows above: the cross terms of a nonlinear R |
 | `etd` | the ETD phase-change increments landing (`relaxation_adjustment_qss!`), refit partner included |
 | `etd:refit_partner` | the refit partner's own increments (its `p` and vapor folds), at the post-explicit state |
 | `etd:phase` | `etd` minus `etd:refit_partner` |
@@ -64,22 +65,23 @@ and `nonlin` is the interaction of a nonlinear `R` only.
 """
 const EB_STAGES = ("refit", "explicit", "explicit:dyn", "explicit:rad", "explicit:hmom",
                    "explicit:sponge", "explicit:bl", "explicit:sfc", "explicit:vrec",
-                   "explicit:hwater", "explicit:nonlin", "etd", "etd:refit_partner",
+                   "explicit:hwater", "explicit:wexch", "explicit:nonlin", "etd",
+                   "etd:refit_partner",
                    "etd:phase", "exch_real", "lobe_relax", "hsi_hist", "acoustic_si",
                    "vdiff", "clamp")
 const EB_REFIT = 1
 const EB_EXPLICIT = 2
 const EB_X_DYN = 3
-const EB_X_NONLIN = 11
-const EB_ETD = 12
-const EB_ETD_PARTNER = 13
-const EB_ETD_PHASE = 14
-const EB_EXCH = 15
-const EB_LOBE = 16
-const EB_HSI = 17
-const EB_SI = 18
-const EB_VDIFF = 19
-const EB_CLAMP = 20
+const EB_X_NONLIN = 12
+const EB_ETD = 13
+const EB_ETD_PARTNER = 14
+const EB_ETD_PHASE = 15
+const EB_EXCH = 16
+const EB_LOBE = 17
+const EB_HSI = 18
+const EB_SI = 19
+const EB_VDIFF = 20
+const EB_CLAMP = 21
 const EB_NSTAGE = length(EB_STAGES)
 "The top-level rows of [`EB_STAGES`](@ref): the ones that telescope to the actual change."
 const EB_TOP = (EB_REFIT, EB_EXPLICIT, EB_ETD, EB_EXCH, EB_LOBE, EB_HSI, EB_SI, EB_VDIFF,
@@ -93,9 +95,10 @@ const EB_OP_BL = 4
 const EB_OP_SFC = 5
 const EB_OP_VREC = 6
 const EB_OP_HWATER = 7
-const EB_NOP = 7
+const EB_OP_WEXCH = 8
+const EB_NOP = 8
 "Row of [`EB_STAGES`](@ref) for each isolated explicit operator `EB_OP_*`."
-const EB_OP_ROW = (4, 5, 6, 7, 8, 9, 10)
+const EB_OP_ROW = (4, 5, 6, 7, 8, 9, 10, 11)
 
 """
     EnergyBudget

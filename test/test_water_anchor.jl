@@ -796,6 +796,10 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                         Xo[k, 1] += dpo
                         bv = -ts * rate
                     end
+                    # the closure's own anchor identity: sum alpha * (the exchange's nu rates) = 0
+                    nur = case === :ac ? (2.0 * (-(S.Jc[k] * rate)) + 2.0 * (S.Jr[k] * rate)) :
+                                         2.0 * (S.J_i1q[k] * rate)
+                    @test abs(2.0 * ex[k, IS.rho_v] + nur) <= 1.0e-15 * abs(nur)
                     rv0 = Scythe.ahyp(X0[k, IS.rho_v] + nvb[k], Scythe.vapor_mu(mo.physical_params))
                     rv1 = Scythe.ahyp(X1[k, IS.rho_v] + nvb[k], Scythe.vapor_mu(mo.physical_params))
                     rec = rv1 - rv0
@@ -985,6 +989,224 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 flush(io); read(path, String)
             end
             @test isempty(out2) && p2.physical == x0
+        end
+    end
+
+    @testset "review: E2 in the model -- the full-recovered form opens R at above-knee edges" begin
+        # One step from the same post-refit state with the partner in its default (defect)
+        # form and in the full-recovered form (`refit_partner_form = :recovered`, the
+        # bisection's arm E-a), each against the partner OFF. R is evaluated across the
+        # refit and the partner together, from the pre-refit var_np1 to the post-refit state
+        # with the partner's p applied: at above-knee cloud points the defect form leaves R
+        # where the refit put it to 1e-3 of lambda_l 2 dnu, while the recovered form opens it
+        # by lambda_l 2 dnu.
+        mktempdir() do tmp
+            ex = derived(; refit_partner = true, exchange_realization = false)
+            m0, p0, mo0 = F.vt_tile(tmp, "e2r"; vtr = :bhyp, extra = ex,
+                                    seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; amp = 1.0e-3))
+            F.vt_run!(m0, p0, mo0, 2)
+            arm(kv...) = begin
+                m = deepcopy(m0)
+                for (k, v) in kv
+                    m.model.options[k] = v
+                end
+                pre = copy(m.var_np1); phys = copy(m.tile.physical[:, :, 1])
+                Scythe.advance_column(m, 1, 3)
+                S = m.mc_scratch[Threads.threadid()]
+                (; m, pre, phys, d1 = copy(S.etd_d1), Tk = copy(S.Tk), R_m = copy(S.R_m),
+                   C_vt = copy(S.C_vt), Lv = copy(S.Lv))
+            end
+            # (the vapor's own kappa term off in both, so the two forms differ by the condensate)
+            off = arm(:refit_partner => false); dfl = arm(:refit_partner_vapor => false)
+            rec = arm(:refit_partner_form => :recovered)
+            V = mo0.grid_params.vars; kD = mo0.grid_params.kDim
+            R0, _ = RX(off.m, off.pre)
+            Rafter(a) = begin
+                X = copy(a.phys); X[1:kD, 1] .+= (a.d1 .- off.d1); first(RX(off.m, X))
+            end
+            Rd = Rafter(dfl); Rr = Rafter(rec); Rn = first(RX(off.m, off.phys))
+            npre = off.pre[1:kD, V["nu_c"]]; npost = off.phys[1:kD, V["nu_c"]]
+            # lambda_l in R units: the energy of condensate appearing alone, L_v - C_pv T
+            lam = off.Lv .- (Scythe.Cpv .* off.Tk)
+            hi = [k for k in 1:kD if npre[k] > 1.0e3 * F.MU && npost[k] > 1.0e3 * F.MU &&
+                  abs(npost[k] - npre[k]) > 1.0e-9]
+            @test !isempty(hi)
+            for k in hi
+                full = Scythe.refit_recovered_change(npost[k], npre[k], :bhyp, F.MU)
+                dfc = Scythe.affine_defect_change(npost[k], npre[k], :bhyp, F.MU)
+                scale = abs(lam[k] * 2.0 * (npost[k] - npre[k]))
+                # the recovered form opens R by ~lambda_l 2 dnu relative to the defect form (its
+                # coefficient carries the vapor's -(dl) as well: the :slot bracket, R units)
+                lamf = lam[k] - off.Tk[k] * ((off.C_vt[k] * Scythe.Rv / off.R_m[k]) - Scythe.Cvv)
+                @test abs((Rr[k] - Rd[k]) + ((lamf * full) - (lam[k] * dfc))) <= 2.0e-3 * scale
+                @test abs(Rr[k] - Rd[k]) > 0.5 * scale
+                # ...and the defect form books only O(mu) there, R where the refit left it
+                @test abs(Rd[k] - Rn[k]) <= 1.0e-3 * scale
+            end
+            @test abs(Rn[1] - R0[1]) >= 0.0
+        end
+    end
+
+    @testset "review: the paired Stage L's negative control books the latent coefficient" begin
+        # The paired lobe fill moves nu_c up by dc and nu_v down by dc; the recovered cloud
+        # stays 0 and the recovered vapor falls by rec ~ 2dc, partnered at kappa. Booking the
+        # latent coefficient instead (as if the recovered vapor had condensed) opens R by
+        # > 0.5 lambda_l |rec| at every moved point; the kappa form holds it to 1e-4 of that.
+        mktempdir() do tmp
+            m, p, mo = F.vt_tile(tmp, "slneg"; vtr = :bhyp, extra = derived(; lobe_relaxation = true),
+                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+            F.vt_run!(m, p, mo, 3)
+            Scythe.advance_column(m, 1, 4)
+            S = m.mc_scratch[Threads.threadid()]
+            IS = m.mc_slots; kD = mo.grid_params.kDim
+            X0 = copy(m.var_np1)
+            Xb = copy(X0)
+            ws = Scythe.water_anchor_set(mo.options, mo.physical_params, IS)
+            nvb = Scythe.mc_nu_vbar(m); vmu = Scythe.vapor_mu(mo.physical_params)
+            Scythe._lobe_relax_paired!(Xb, m.tile.physical, S, 1, IS.rho_v, 0, 0, 0, false, ws,
+                                       nvb, :bhyp, vmu, Float64[], false)
+            moved = [k for k in 1:kD if Xb[k, 9] != X0[k, 9]]
+            @test !isempty(moved)
+            R0, _ = RX(m, X0); Rb, _ = RX(m, Xb)
+            for k in moved
+                rec = Scythe.ahyp(Xb[k, IS.rho_v] + nvb[k], vmu) - Scythe.ahyp(X0[k, IS.rho_v] + nvb[k], vmu)
+                dpk, _ = Scythe.recovered_change_partner(rec, 0.0, 0.0, S.Tk[k], S.rho_d[k], S.R_m[k],
+                    S.C_vt[k], S.Lv[k], 0.0, S.drvs_dT[k], S.drvs_dp[k])
+                dpl, _, _ = Scythe.phase_change_partner(-rec, 0.0, S.Tk[k], S.R_m[k], S.C_vt[k],
+                    S.C_pt[k], S.Lv[k], 0.0, S.Q_s[k], 0.0)
+                Xn = copy(Xb); Xn[k, 1] += dpl - dpk
+                Rn, _ = RX(m, Xn)
+                lam = (S.R_m[k] / S.C_vt[k]) * (S.Lv[k] - Scythe.Cpv * S.Tk[k])
+                @test abs(rec) > 0.0
+                @test abs(Rb[k] - R0[k]) <= 1.0e-4 * abs(lam * rec)
+                @test abs(Rn[k] - R0[k]) > 0.5 * abs(lam * rec)
+            end
+        end
+    end
+
+    @testset "review: _qss_share! (lambda != 0 rides etd_qnp1, lambda = 0 the tendency)" begin
+        S = (; etd_lam = [0.3, 0.0], etd_qnp1 = [1.0, 2.0])
+        ex = zeros(2, 8)
+        Scythe._qss_share!(ex, S, 1, 1, 5.0, 0.5)
+        @test S.etd_qnp1[1] == 1.0 + 2.5 && ex[1, 7] == 0.0
+        Scythe._qss_share!(ex, S, 2, 2, 5.0, 0.5)
+        @test S.etd_qnp1[2] == 2.0 && ex[2, 7] == 5.0
+    end
+
+    @testset "review: P3 closes against an independent R, the closures on their own row" begin
+        # Warm rain (autoconversion, sedimentation) and ice: sum of the top-level rows per
+        # column against R(end) - R(start) computed here from the states themselves (state n
+        # before the first step, var_np1 after the last), not from the budget's own marks;
+        # the multistep closures are the explicit:wexch row, nonzero under :derived.
+        mktempdir() do tmp
+            for ice in (false, true)
+                m, p, mo = F.vt_tile(tmp, "p3i_$(ice)"; vtr = :bhyp, ice,
+                                     extra = derived(; energy_budget = true, precipitation = true),
+                                     seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; amp = 2.0e-3))
+                eb = m.ebudget; kD = eb.kDim; nc = F.vt_ncols(p, mo)
+                colR(A) = [first(Scythe._eb_column_RX(eb, A, (c - 1) * kD, 1)) for c in 1:nc]
+                Rs = colR(p.physical)
+                for t in 1:6
+                    for c in 1:nc
+                        Scythe.advance_column(m, c, t)
+                    end
+                    t < 6 && (Scythe.calcTendency(m); gridTransform!(p))
+                end
+                Re = colR(m.var_np1)
+                snap = Scythe.energy_budget_snapshot!(m)
+                tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
+                @test maximum(abs, tR .- (Re .- Rs)) <= 1.0e-10 * maximum(abs, Re .- Rs) +
+                                                      1.0e-12 * maximum(abs, snap.dR)
+                wx = snap.dR[Scythe.EB_OP_ROW[Scythe.EB_OP_WEXCH], :]
+                @test any(!=(0.0), view(eb.tnm1, :, :, Scythe.EB_OP_WEXCH))
+                @test all(isfinite, wx)
+            end
+        end
+    end
+
+    @testset "review: E7 MYNN with bhyp vapor, surface fluxes and ice -- R held, legs = anchor" begin
+        mktempdir() do tmp
+            arms = Dict{Bool,Any}()
+            for mynn in (true, false)
+                ex = derived()
+                mynn && (ex[:mynn] = true; ex[:surface_fluxes] = true)
+                m, p, mo = F.vt_tile(tmp, "e7i_$(mynn)"; vtr = :bhyp, ice = true, extra = ex,
+                                     seed! = (p, x, V, c) -> begin
+                                         F.vt_seed!(p, x, V, c)
+                                         for i in 1:size(p.physical, 1)
+                                             zz = x[i, end]
+                                             p.physical[i, V["u"], 1] = 10.0 * tanh(zz / 800.0)
+                                             (3000.0 < zz < 6000.0) &&
+                                                 (p.physical[i, V["nu_i1"], 1] = Scythe.bhyp(1.0e-4, 1.0e-9))
+                                         end
+                                     end)
+                Scythe.init_water_anchor_shadow!(p, mo; report = false)
+                for c in 1:F.vt_ncols(p, mo)
+                    Scythe.advance_column(m, c, 1)
+                end
+                arms[mynn] = (; m, mo, x = copy(p.physical[:, :, 1]), e = copy(m.expdot_n))
+            end
+            mo = arms[true].mo; V = mo.grid_params.vars; IS = arms[true].m.mc_slots
+            nf = size(arms[false].e, 2)
+            D = arms[true].e[:, 1:nf] .- arms[false].e
+            # the legs sum to the anchor's tendency (the shadow), ice mass legs included
+            sumnu = 2.0 .* (((D[:, IS.rho_v] .+ D[:, 9]) .+ D[:, 8]) .+
+                            ((D[:, IS.i1_q] .+ D[:, IS.i2_q]) .+ D[:, IS.i3_q]))
+            @test maximum(abs, D[:, IS.i1_q]) > 0.0
+            @test maximum(abs, sumnu .- D[:, 3]) <= 1.0e-12 * maximum(abs, D[:, 3])
+            x = arms[true].x[:, 1:nf]
+            R0, _ = RX(arms[true].m, x)
+            x1 = copy(x); x1 .+= mo.ts .* D
+            R1, _ = RX(arms[true].m, x1)
+            Es = mo.ts .* abs.(D[:, V["E_t"]])
+            @test maximum(abs, R1 .- R0) <= 1.0e-4 * maximum(Es)
+        end
+    end
+
+    @testset "review: MC_W_SRC / MC_W_BUDGET after real steps (Louis surface flux, rain)" begin
+        mktempdir() do tmp
+            m, p, mo = F.vt_tile(tmp, "wsrc"; vtr = :bhyp, louis = true, sfc = true,
+                                 extra = derived(; precipitation = true),
+                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; amp = 2.0e-3))
+            st = m.mc_water_stats
+            out = mktemp() do path, io
+                redirect_stdout(io) do
+                    for t in 1:41
+                        Scythe.energy_census_trace(m, t)
+                        for c in 1:F.vt_ncols(p, mo)
+                            Scythe.advance_column(m, c, t)
+                        end
+                        Scythe.calcTendency(m); gridTransform!(p)
+                    end
+                    Scythe.energy_census_trace(m, 42)
+                end
+                flush(io); read(path, String)
+            end
+            lines = filter(l -> occursin("energy census", l), split(out, '\n'))
+            @test length(lines) >= 2
+            getv(l, k) = parse(Float64, match(Regex(k * "=([-0-9.eE+]+)"), l).captures[1])
+            src = getv(lines[end], "src"); bud = getv(lines[end], "budget")
+            # the surface flux is real; the interval's water budget closes to a few percent of
+            # it (the transport's O(mu V) and the refit of rho_w), never by the source's size
+            @test src > 0.0
+            @test abs(bud) <= 0.05 * src
+        end
+    end
+
+    @testset "review: the three production wall families pass validate_water_anchor" begin
+        for case in ("tc_axisym", "ocean_2D_rce", "ocean_warm_bubble")
+            path = joinpath(@__DIR__, "..", "simulations", case, "scythe_config.toml")
+            mktempdir() do tmp
+                cfg = Scythe.load_config(path; set = ["output.dir=" * tmp])
+                @test cfg.numerics.water_anchor === :derived
+                mp = Scythe.build_model(cfg)
+                models = mp isa Scythe.NestedModelParameters ? first(Scythe.build_nest(mp)) : [mp]
+                @test !isempty(models)
+                for md in models
+                    @test Scythe.validate_si_water_slots(md) === nothing
+                    @test Scythe.validate_water_anchor(md) === nothing
+                end
+            end
         end
     end
 
