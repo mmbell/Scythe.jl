@@ -53,7 +53,7 @@ const XSI_RLR_NPLANES = 9
 
 struct ExactSIDataRLR{FT, SU, SP, SW, KP, KU}
     u_index::Int; w_index::Int; v_index::Int; p_index::Int
-    rhod_index::Int; rhot_index::Int; et_index::Int
+    rhod_index::Int; et_index::Int
     facts::Vector{FT}          # per-n factorization (index n+1), Δτ = 1.25·ts
     facts_first::Vector{FT}    # per-n factorization, Δτ = 0.5·ts (t == 1)
     nmax::Int
@@ -92,7 +92,7 @@ function create_exact_si_data_rlr(patch::AbstractGrid, model::ModelParameters,
 
     vars = model.grid_params.vars
     u_index = vars["u"]; w_index = vars["w"]; v_index = vars["v"]; p_index = vars["p"]
-    rhod_index = vars["rho_d"]; rhot_index = vars["rho_t"]; et_index = vars["E_t"]
+    rhod_index = vars["rho_d"]; et_index = vars["E_t"]
 
     iDim = patch.params.iDim; kDim = patch.params.kDim
     b_iDim = patch.params.b_iDim; b_kDim = patch.params.b_kDim
@@ -197,7 +197,7 @@ function create_exact_si_data_rlr(patch::AbstractGrid, model::ModelParameters,
     c_e = etp ./ rho_tb
     c_e_z = ((etp_z .* rho_tb) .- (etp .* rho_tb_z)) ./ (rho_tb .^ 2)
 
-    return ExactSIDataRLR(u_index, w_index, v_index, p_index, rhod_index, rhot_index,
+    return ExactSIDataRLR(u_index, w_index, v_index, p_index, rhod_index,
         et_index, facts, facts_first, nmax,
         Matrix(dx.M0), Matrix(dx.M1), collect(dx.W), Matrix(dx.Nb),
         Matrix(dz.M0), Matrix(dz.M1), collect(dz.W), Matrix(dz.Nb),

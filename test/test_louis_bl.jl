@@ -256,10 +256,12 @@ using SparseArrays
                 Scythe.advance_column(m_on, c, 1)
                 Scythe.advance_column(m_off, c, 1)
             end
+            # Slot 3 is the prognostic vapor since Stage 4 of the rho_t retirement (it was the
+            # total density, the vapor slot 11); the cylindrical set has 10 slots.
             scales = Dict(1 => 1.0e5, 2 => 1.0, 3 => 1.0, 4 => 1.0, 5 => 1.0,
-                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0, 10 => 1.0,
-                          11 => 1.0)                       # 11 = the prognostic vapor
-            for v in 1:11
+                          6 => 2.0e8, 7 => 1.0e-2, 8 => 1.0, 9 => 1.0, 10 => 1.0)
+            @test size(m_on.expdot_n, 2) == length(scales)
+            for v in 1:10
                 d = maximum(abs.(m_on.expdot_n[:, v] .- m_off.expdot_n[:, v]))
                 @test d / scales[v] < 1.0e-9
             end
@@ -415,10 +417,10 @@ using SparseArrays
         # the total-water and cloud increments are identically 0.0.
         #
         # This is the T-invariant vapor seed of the water-diffusion testsets:
-        # drho_t = drho_v = seed at fixed rho_d, with the vapor partial pressure
-        # (dp = Rv*T*seed) and the vapor internal + potential energy
-        # (dE_t = (Cvv*T + g*z)*seed) added so the retrieval is untouched. Q_ss moves
-        # with it so the tracker stays consistent and the reconciliation stays quiet.
+        # drho_v = seed at fixed rho_d (the derived total rho_t = rho_d + rho_v + ...
+        # follows it), with the vapor partial pressure (dp = Rv*T*seed) and the vapor
+        # internal + potential energy (dE_t = (Cvv*T + g*z)*seed) added so the retrieval is
+        # untouched. Q_ss moves with it so the tracker stays consistent.
         set_moist! = (patch, vars, kDim, z) -> begin
             col_bl = saturated_cloudy_column(z)
             for i in 1:size(patch.physical, 1)
@@ -428,10 +430,8 @@ using SparseArrays
                 patch.physical[i, vars["v"], 1] = V0 * sin(0.5 * pi * z[k] / H)^2
                 seed = z[k] < 1000.0 ? 1.0e-4 * (1.0 + cos(pi * z[k] / 1000.0)) : 0.0
                 Tref = col_bl.Tk[k]
-                patch.physical[i, vars["rho_t"], 1] += seed
-                # ...and the VAPOR SLOT, which is prognostic: `drho_t = drho_v = seed` is
-                # the whole point of the T-invariant seed, and leaving rho_v behind would
-                # make the bump a reconciliation gap rather than a moisture perturbation.
+                # The VAPOR SLOT (slot 3 since Stage 4 of the rho_t retirement; the old
+                # separate rho_t write went with the rho_t slot).
                 patch.physical[i, vars["rho_v"], 1] += seed
                 patch.physical[i, vars["Q_ss"], 1] += seed
                 patch.physical[i, vars["p"], 1] += Rv * Tref * seed
@@ -462,27 +462,23 @@ using SparseArrays
 
         # Interior mixing with zero surface nodes conserves the column energy of
         # the SCALAR channels (subtract the resolved-KE part, which tracks the
-        # momentum mixing and is not separately conservative) and total water
+        # momentum mixing and is not separately conservative) and total water. Total
+        # water is DERIVED since Stage 4 of the rho_t retirement: with no transforms it is
+        # the plain sum of the vapor, cloud and rain slot rates (alpha = 1 each).
         D6s = D6 .- rho_t .* ((u_fit .* D4) .+ (w_fit .* D5) .+ (v_fit .* D9))
         @test abs(trapz(z, D6s)) < 0.05 * trapz(z, abs.(D6s)) + 1.0e-30
-        @test abs(trapz(z, D3)) < 0.05 * trapz(z, abs.(D3)) + 1.0e-30
-
-        # THE VAPOR FLUX LANDS ON THE VAPOR SLOT. The closure mixes TOTAL water and CLOUD;
-        # the vapor's share of that flux is `vdot_v = vdot_w - vdot_c`, which used to be
-        # inferred after the fact from the other two and is now applied to slot rho_v
-        # directly. With no condensate transform the cloud Jacobian is an exact 1.0, so the
-        # three legs agree BITWISE and the closure opens no reconciliation gap at all.
         rv_i = vars["rho_v"]
-        Drv = D[rng, rv_i]; Dc = D[rng, vars["rho_c"]]
+        Drv = D[rng, rv_i]; Dc = D[rng, vars["rho_c"]]; Drr = D[rng, vars["rho_r"]]
+        Dw = Drv .+ Dc .+ Drr
+        @test abs(trapz(z, Dw)) < 0.05 * trapz(z, abs.(Dw)) + 1.0e-30
+
+        # THE VAPOR FLUX LANDS ON THE VAPOR SLOT (its own nu leg, K dz nu_v'). (The
+        # `vdot_v = vdot_w - vdot_c` identity against a total-water slot went with the
+        # Louis total-water leg at Stage 4 of the rho_t retirement.)
         @test maximum(abs.(Drv)) > 0.0                   # the leg is live
-        # Not `==`: D3 and Dc are each an on/off DIFFERENCE, so `D3 .- Dc` reassociates
-        # what the kernel computed as `vdot_w - vdot_c` in one expression. The agreement is
-        # eleven decades under the signal, which is that reassociation and nothing else.
-        sc = maximum(abs.(Drv))
-        @test maximum(abs.(Drv .- (D3 .- Dc))) < 1.0e-9 * sc
         @test all(isfinite.(Drv))
-        # ...and it conserves the column vapor for the same reason slot 3 conserves total
-        # water: interior mixing with zero surface nodes moves it around, not in or out.
+        # ...and it conserves the column vapor: interior mixing with zero surface nodes
+        # moves it around, not in or out.
         @test abs(trapz(z, Drv)) < 0.05 * trapz(z, abs.(Drv)) + 1.0e-30
     end
 
@@ -505,9 +501,9 @@ using SparseArrays
         # run to twelve significant figures.
         cloud(zk) = 1.0e-3 * (1.0 + (0.5 * cos(pi * zk / H)))
 
-        # Seed cloud as MASS, T-invariant: rho_t carries the same increment (so the vapor
-        # residual stays ~0 and the vapor rate is exactly zero in the CORRECT scheme --
-        # which is precisely the quantity the bug corrupts), liquid adds no partial
+        # Seed cloud as MASS, T-invariant: the vapor is untouched (so the vapor rate is
+        # exactly zero in the CORRECT scheme -- which is precisely the quantity the bug
+        # corrupts; the derived total rho_t follows the cloud), liquid adds no partial
         # pressure, and E_t takes the liquid internal + potential energy.
         function set_cloud!(tf)
             return (patch, vars, kDim, z) -> begin
@@ -520,7 +516,6 @@ using SparseArrays
                     # rho_cbar == 0 on the dry base, so nu' = bhyp(rho_c) with no
                     # background to subtract.
                     patch.physical[i, ci, 1] = Scythe.condensate_slot(rc, 0.0, tf, mu)
-                    patch.physical[i, vars["rho_t"], 1] += rc
                     patch.physical[i, vars["E_t"], 1] +=
                         ((Cl * col_bl.Tk[k]) + (gravity * z[k])) * rc
                 end
@@ -546,7 +541,11 @@ using SparseArrays
         # here exactly half the density rate, since J == 0.5 for rho_c >> mu -- being
         # subtracted from a density rate, so the transformed arm carried a spurious
         # vapor tendency of 0.5*rhodot_c into all three. With the flux built in density
-        # space they agree. Slot 3 (total water) never saw the bug and is the control.
+        # space they agree. Slot 3 (the vapor since Stage 4; the total water before) never saw
+        # the bug and is the control. (Since Stage 4 the cloud leg is the slot's own nu leg,
+        # K dz nu_c', and the energy carry reads the REALIZED recovered rates; the property
+        # held here -- the transformed arm's p, E_t and Q_ss equal the untransformed arm's
+        # in the affine regime -- is the same.)
         for s in (1, 3, 6, 7)
             scale = maximum(abs.(Dn[rng, s]))
             @test isapprox(Db[rng, s], Dn[rng, s]; atol = 1.0e-6 * scale + 1.0e-300)
@@ -580,8 +579,8 @@ using SparseArrays
         D0, _, _, _, _ = bl_increment(set_bare!; Cd=0.0, dry=true, ctrans=:bhyp, cmu=mu)
         @test all(D0[:, 9] .== 0.0)
 
-        # Rain is deliberately out of scope: the BL borrows slot 8's spline column as a
-        # basis but never its values, so `rain_transform` needs nothing here.
+        # Rain: the rain leg is the slot's own nu leg (K dz nu_r', review D5), and with no
+        # rain anywhere nu_r' == 0, so a transformed rain slot receives EXACTLY zero.
         Dr, _, _, _, _ = bl_increment(set_cloud!(:none); Cd=0.0, dry=true,
                                       rtrans=:bhyp, rmu=mu)
         @test all(Dr[:, 8] .== 0.0)
@@ -609,7 +608,6 @@ using SparseArrays
             for i in 1:size(patch.physical, 1)
                 k = mod1(i, kDim)
                 patch.physical[i, vars["v"], 1] = V0 * sin(0.5 * pi * z[k] / H)^2
-                patch.physical[i, vars["rho_t"], 1] -= 5.0e-6
                 patch.physical[i, vars["rho_v"], 1] -= 5.0e-6
             end
             compensate_ke!(patch, vars, kDim, z; dry=true)
@@ -691,8 +689,14 @@ using SparseArrays
         D, patch, mtile, z = xz_pair(set_strain!, SMAG, Dict{Symbol,Float64}())
         vars = mtile.model.grid_params.vars
         kDim = mtile.model.grid_params.kDim
-        rho_tbar = view(Scythe.ref_rho_t(mtile.ref_state), :, 1)
-        rt = [rho_tbar[mod1(i, kDim)] + patch.physical[i, vars["rho_t"], 1]
+        # rho_t is DERIVED (Stage 4 of the rho_t retirement): rho_d' + W' on the derived
+        # reference rho_tbar^w.
+        rho_tbar = view(Scythe.mc_rho_tbar_ref(mtile), :, 1)
+        ws = Scythe.water_anchor_set(mtile.model.options, mtile.model.physical_params,
+                                     mtile.mc_slots)
+        phys = patch.physical
+        rt = [rho_tbar[mod1(i, kDim)] +
+              Scythe.anchor_rho_tp(phys[i, vars["rho_d"], 1], Scythe.anchor_Wp(phys, i, 1, ws))
               for i in 1:size(patch.physical, 1)]
         u = patch.physical[:, vars["u"], 1]
         w = patch.physical[:, vars["w"], 1]
@@ -708,7 +712,7 @@ using SparseArrays
         @test sum(dKE) < 0.0
         @test all(D[:, vars["p"]] .== 0.0)
         @test all(D[:, vars["Q_ss"]] .== 0.0)
-        @test all(D[:, vars["rho_t"]] .== 0.0) && all(D[:, vars["rho_d"]] .== 0.0)
+        @test all(D[:, vars["rho_v"]] .== 0.0) && all(D[:, vars["rho_d"]] .== 0.0)
     end
 
     @testset "XZ Smagorinsky: the heat sentinel mixes s_d with K_smag/Pr_t" begin

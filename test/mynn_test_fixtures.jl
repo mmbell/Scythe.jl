@@ -197,7 +197,6 @@ function set_state!(patch, model, kDim, z, col; V0 = 12.0, zs = 500.0, e0 = 0.4,
         # with them the flux-form energy carry `S_Ew` -- live.
         bump = qpert * exp(-((z[k] - 800.0)/600.0)^2)
         patch.physical[j, vars["rho_v"], 1] = rho_t[k] * bump
-        patch.physical[j, vars["rho_t"], 1] = rho_t[k] * bump
         patch.physical[j, vars["rho_c"], 1] = rho_t[k] * 0.2 * bump
         patch.physical[j, vars["rho_r"], 1] = rho_t[k] * 0.1 * bump
         rei > 0 && (patch.physical[j, rei, 1] = rho_t[k] * e0 * exp(-z[k] / ze))

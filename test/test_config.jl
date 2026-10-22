@@ -239,6 +239,12 @@ end
         @test occursin("physics.radiation.method", m)
         m = errmsg(() -> load_config(f("[extra.options]\nsfc_z0 = \"charnock\"\n")))
         @test occursin("physics.surface.roughness", m)
+        # numerics.water_anchor: retired with slot 3 at Stage 4 (the derived anchor is the
+        # only behaviour), refused by name with the reason, whatever the value.
+        for wa in ("slot", "derived")
+            m = errmsg(() -> load_config(set = ["numerics.water_anchor=$wa"]))
+            @test occursin("numerics.water_anchor", m) && occursin("retired", m)
+        end
         # extra.options: retired key.
         @test occursin("retired", errmsg(() -> load_config(set = ["extra.options.vapor_retrieval=composite"])))
         # extra.options: wrong registered type.
@@ -320,7 +326,10 @@ end
             @test bcb[v] == NaturalBC()
             @test bct[v] == NaturalBC()
         end
-        for v in ("p", "rho_d", "rho_t", "E_t")
+        # (slot 3 is the vapor since Stage 4: there is no "rho_t" in `vars`)
+        @test !("rho_t" in vars)
+        rv = Scythe.vapor_var_name(options)   # "nu_v" under the default bhyp vapor
+        for v in ("p", "rho_d", rv, "E_t")
             @test bcb[v] == NaturalBC() && bct[v] == NaturalBC()
         end
         # d2 on both keys restores the old both-sides table exactly: the scalar family d2 at
@@ -335,7 +344,11 @@ end
                   "boundary_conditions.vertical_scalars_lid=r1t1x")
         _, _, bcb3, bct3 = Scythe.build_boundary_conditions(cfg3, options, vars)
         @test all(bcb3[v] == (v == "w" ? DirichletBC() : NaturalBC()) for v in vars)
-        @test bct3["p"] === Scythe.Springsteel.CubicBSpline.R1T1X && bct3["rho_t"] == NeumannBC()
+        # the acoustic set (rho_d, E_t, Q_ss; rho_t left it with its slot at Stage 4) is
+        # Neumann at an r1t1x lid, the vapor d2 like the rest of the family
+        @test bct3["p"] === Scythe.Springsteel.CubicBSpline.R1T1X && bct3["rho_d"] == NeumannBC()
+        @test bct3["E_t"] == NeumannBC() && bct3["Q_ss"] == NeumannBC()
+        @test bct3[rv] == SecondDerivativeBC()
         @test bct3["w"] == DirichletBC()
     end
 end

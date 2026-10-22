@@ -192,8 +192,9 @@ using SparseArrays
             # fixture than about the scheme.
             bump = qshape === :bump ? qpert * exp(-((z[k] - 800.0)/600.0)^2) :
                                       qpert * exp(-z[k]/2000.0)
+            # (no rho_t slot since Stage 4: the total density is derived from the water
+            # slots, so these bumps are already in it)
             patch.physical[j, vars["rho_v"], 1] = rho_t[k] * bump
-            patch.physical[j, vars["rho_t"], 1] = rho_t[k] * bump
             patch.physical[j, vars["rho_c"], 1] = rho_t[k] * 0.2 * bump
             patch.physical[j, vars["rho_r"], 1] = rho_t[k] * 0.1 * bump
             patch.physical[j, rei, 1] = rho_t[k] * e0 * exp(-z[k] / ze)
@@ -350,7 +351,11 @@ using SparseArrays
             @test sum(dQ[above]) > 0.0        # ...and puts it in up there
             # ...and the water goes the same way, which is the same statement about the
             # sign of `M_w` on a column whose moisture decreases upward.
-            dW = m1.expdot_n[rng, 3] .- m0.expdot_n[rng, 3]
+            # The total water is the sum of the (untransformed, alpha = 1) water slots
+            # since Stage 4 deleted the prognostic rho_t slot this used to read.
+            wv = mo1.grid_params.vars
+            dW = sum(m1.expdot_n[rng, wv[n]] .- m0.expdot_n[rng, wv[n]]
+                     for n in ("rho_v", "rho_c", "rho_r"))
             @test sum(dW[below]) < 0.0
             @test sum(dW[above]) > 0.0
             # The plume lifts LOW-momentum surface air, so `u_up - bar u < 0` aloft: the

@@ -87,7 +87,8 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             rr = rain * shape
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rc, 0.0, tr, MU)
             patch.physical[i, rr_i, 1] = Scythe.condensate_slot(rr, 0.0, tr, MU)
-            patch.physical[i, gp.vars["rho_t"], 1] = rc + rr  # the partition starts closed
+            # (no rho_t to close: slot 3 was retired at Stage 4 and the total is derived from
+            # the species, so the partition is closed by construction)
         end
         spectralTransform!(patch)
         gridTransform!(patch)
@@ -103,6 +104,15 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     scratch(m) = m.mc_scratch[Threads.threadid()]
     cevap_pts(m) = sum(view(m.mc_water_stats, Scythe.MC_CEVAP_PTS, :))
     cevap_held(m) = sum(view(m.mc_water_stats, Scythe.MC_CEVAP_HELD, :))
+    # The ETD's vapor increment under the derived water anchor (the only one since Stage 4 of
+    # the rho_t retirement): the nu-space CLOSURE of the condensate slots' realized increments,
+    # dv = -(alpha_c d9 + alpha_r d8)/alpha_v (`water_exchange_dv`; no ice here), so rho_w is
+    # invariant. (Under the retired `:slot` anchor it was the density draw ts*(-qc_bar).)
+    function closure_dv(m, S, idx)
+        ws = Scythe.water_anchor_set(m.model.options, m.model.physical_params, m.mc_slots)
+        return Scythe.water_exchange_dv.(ws.alpha[1], ws.alpha[2], ws.alpha[3], ws.alpha[4],
+                                         S.etd_d9[idx], S.etd_d8[idx], 0.0, 0.0, 0.0)
+    end
 
     """One step of two identically seeded tiles, realization `on` vs `off`."""
     function one_step(tmp, tag; kw...)
@@ -252,8 +262,9 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test all(S1.Qdot_bar[ev] .=== S0.Qdot_bar[ev] .* S1.f_cloud[ev])
             # ...and the draw never exceeds the cloud present, anywhere
             @test all(.-(S1.Qdot_bar .* ts) .<= max.(rc, 0.0) .* UP)
-            # (b) the VAPOR gains exactly the realized draw (no rain, no ice: vsrc = -qc_bar)
-            @test all(S1.etd_dv[ev] .=== ts .* (.-S1.Qdot_bar[ev]))
+            # (b) the VAPOR gains exactly the closure of the realized draw (no rain, no ice):
+            # the cloud slot's realized increment (c) through alpha_c/alpha_v
+            @test all(S1.etd_dv[ev] .=== closure_dv(m1, S1, ev))
             # (c) the CLOUD SLOT loses it through its own Jacobian
             @test all(S1.etd_d9[ev] .=== ts .* S1.Jc[ev] .* S1.Qdot_bar[ev])
             # (d) the PRESSURE's latent cooling is the same bracket on the realized rate
@@ -336,7 +347,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test all(.-(S1.Qdot_bar[ev] .* ts) .<= max.(S0.rho_c[ev], 0.0) .* UP)
             # N carries the realized flux, in the same ratio (no rain: the cloud is all of it)
             @test all(S1.etd_nl[ev] ./ S0.etd_nl[ev] .≈ S1.f_cloud[ev])
-            @test all(S1.etd_dv[ev] .=== ts .* (.-S1.Qdot_bar[ev]))
+            @test all(S1.etd_dv[ev] .=== closure_dv(m1, S1, ev))
             @test S1.etd_nl[.!ev] == S0.etd_nl[.!ev]
             @test cevap_pts(m1) == cevap_pts(m0) > 0.0
         end
@@ -371,7 +382,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test all(isapprox.(S1.etd_qnp1[un] .- S0.etd_qnp1[un],
                                 .-(ts .* (1.0 .+ S1.Q_s[un]) .* dq);
                                 rtol = 1.0e-9, atol = 1.0e-18))
-            @test all(S1.etd_dv[un] .=== ts .* (.-S1.Qdot_bar[un]))
+            @test all(S1.etd_dv[un] .=== closure_dv(m1, S1, un))
             @test S1.etd_lam == S0.etd_lam                # λ is not touched: J₀ is on q̄_c
         end
     end

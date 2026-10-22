@@ -14,7 +14,14 @@
 #   2. DELTAS. The PRODUCTION config (no overlay) minus the legacy default arm must be
 #      exactly `EXPECTED_DELTAS` -- every physics change the consolidation makes is listed.
 #   3. IC BYTES. `initialize_case!` with the legacy-pin overlay writes initial conditions
-#      and a reference file whose SHA-256 match the golden `.hashes.toml`.
+#      and a reference file whose SHA-256 match the golden `.stage4.hashes.toml` (the
+#      `.hashes.toml` capture converted to the Stage-4 slot layout, see below).
+#
+# STAGE 4 of the rho_t retirement deleted slot 3 (the prognostic "rho_t") and moved the vapor
+# into it. The golden fingerprints are the Stage-0 capture, in the old layout: `ceq_legacy`
+# maps them to the Stage-4 layout by that rule alone (`ceq_stage4_layout`: every rho_t entry
+# dropped, the vapor's slot 3, every slot after the vapor's old one moved one in) so the rest
+# of the comparison is unchanged.
 #   4. `validate` refusals, the segment override, the advisory keyword.
 #
 # Standalone:
@@ -84,9 +91,8 @@ const IMPLICIT_DEFAULTS = Dict{String,Any}(
     # The water-slot SI slaving (Stage 2 of the rho_t retirement): the library default is
     # :none, the explicit water acoustics every legacy driver ran; the base overlays pin it.
     "options.si_water_slots"           => ":none",   # src/si_water_slaving.jl si_water_slots_mode
-    # The derived water anchor (Stage 3 of the rho_t retirement): the library default is
-    # :slot, the prognostic rho_t every legacy driver read; the base overlays pin it.
-    "options.water_anchor"             => ":slot",   # src/si_water_slaving.jl water_anchor_mode
+    # (The derived water anchor, Stage 3, was pinned here as options.water_anchor; Stage 4
+    # retired the option -- the derived anchor is the only behaviour -- so the key is gone.)
     "physical_params.Khdiff_water"     => 0.0,       # src/moist_compressible.jl:6773
     "physical_params.Pr_t"             => 1.0,       # src/moist_compressible.jl:6770
     "physical_params.Sc_t"             => 1.0)       # src/moist_compressible.jl:6774
@@ -117,7 +123,37 @@ function legacy_basename(k::String, v)
     return v
 end
 
-ceq_legacy(arm) = Dict(k => legacy_basename(k, v) for (k, v) in ceq_flat(TOML.parsefile(joinpath(CEQ_LM, "$(arm).toml"))))
+"""
+The Stage-4 slot layout of a legacy fingerprint: per model (a nest: per patch) every entry
+keyed by the variable `rho_t` is dropped (slot 3, the prognostic total density, is deleted),
+the vapor (`rho_v`, or `nu_v`) takes slot 3, and every slot after the vapor's old one moves one
+in; the slots between are unchanged. Nothing else in the fingerprint depends on the layout.
+"""
+function ceq_stage4_layout(d::Dict)
+    out = Dict{String,Any}()
+    pre = unique(m.captures[1] for m in (match(r"^(.*grid_params\.)vars\.", k) for k in keys(d))
+                 if m !== nothing)
+    vold = Dict{String,Int}()
+    for g in pre
+        @assert d[g * "vars.rho_t"] == 3
+        vn = haskey(d, g * "vars.rho_v") ? "rho_v" : "nu_v"
+        vold[g] = d[g * "vars." * vn]
+    end
+    for (k, v) in d
+        endswith(k, ".rho_t") && occursin("grid_params.", k) && continue
+        m = match(r"^(.*grid_params\.)vars\.(.+)$", k)
+        if m === nothing
+            out[k] = v
+        else
+            sv = vold[m.captures[1]]
+            out[k] = v == sv ? 3 : (v > sv ? v - 1 : v)
+        end
+    end
+    return out
+end
+
+ceq_legacy(arm) = ceq_stage4_layout(Dict(k => legacy_basename(k, v)
+                                         for (k, v) in ceq_flat(TOML.parsefile(joinpath(CEQ_LM, "$(arm).toml")))))
 
 function ceq_fingerprint(m)
     fp = m isa NestedModelParameters ? nest_fingerprint(m) : model_fingerprint(m)
@@ -171,7 +207,7 @@ ceq_templates(rain) = merge(Dict(v => (lateral = "nu_v", vertical = rain) for v 
 # The ground and the lid of the scalar family: d2 in every legacy build, natural now
 # (`boundary_conditions.vertical_scalars` / `vertical_scalars_lid`).
 ceq_lid(vars) = Dict{String,Any}("$b.$v" => (BC_D2, BC_NATURAL) for v in vars for b in ("BCB", "BCT"))
-const LID_SCALARS = ["p", "rho_d", "rho_t", "E_t", "Q_ss", "rho_v", "u"]
+const LID_SCALARS = ["p", "rho_d", "E_t", "Q_ss", "rho_v", "u"]   # (rho_t: deleted, Stage 4)
 # Under the production vapor control variable (`physics.microphysics.vapor_transform = "bhyp"`)
 # the vapor slot is RENAMED rho_v -> nu_v (same slot): its lid/ground change rides on the new
 # name, the old name's BCs leave with the rename.
@@ -205,12 +241,11 @@ const EXPECTED_DELTAS = Dict(
             "options.wall_bc_tau" => ("Inf", "300.0"),
             "options.temperature" => (missing, ":eos"),
             "options.vapor_transform" => (missing, ":bhyp"),
-            "options.si_water_slots" => (missing, ":mass"),
-            "options.water_anchor" => (missing, ":derived"))),
+            "options.si_water_slots" => (missing, ":mass"))),
         bc_changed = merge(ceq_lid([LID_SCALARS_NU; "v"; "nu_c"]), VAPOR_RENAMED_BC,
                            Dict("BCT.nu_r" => (BC_D2, BC_NATURAL))),
         renamed = Dict("rho_v" => "nu_v"),
-        added = ceq_added(12), templates = ceq_templates("nu_r")),
+        added = ceq_added(11), templates = ceq_templates("nu_r")),
     # RCE: both reference-state fixes and the state-dependent SI (physics otherwise the
     # legacy default already: MYNN :scythe, ice, diurnal RRTMGP, stability).
     "rce" => (config = CEQ_RCE, arm = "rce_default_seg1",
@@ -220,8 +255,7 @@ const EXPECTED_DELTAS = Dict(
             "options.state_dependent_si" => (missing, "true"),
             "options.temperature" => (missing, ":eos"),
             "options.vapor_transform" => (missing, ":bhyp"),
-            "options.si_water_slots" => (missing, ":mass"),
-            "options.water_anchor" => (missing, ":derived")),
+            "options.si_water_slots" => (missing, ":mass")),
         bc_changed = merge(ceq_lid([LID_SCALARS_NU; "nu_c"; "rho_e"]), VAPOR_RENAMED_BC),
         renamed = Dict("rho_v" => "nu_v"),
         added = Dict{String,Int}(), templates = Dict{String,Any}()),
@@ -248,13 +282,12 @@ const EXPECTED_DELTAS = Dict(
             "grid_params.positivity.rho_r.k" => (0.0, missing),
             "options.temperature" => (missing, ":eos"),
             "options.vapor_transform" => (missing, ":bhyp"),
-            "options.si_water_slots" => (missing, ":mass"),
-            "options.water_anchor" => (missing, ":derived")),
+            "options.si_water_slots" => (missing, ":mass")),
         # nu_c is the renamed rho_c: its lid goes natural with the rest of the family.
         bc_changed = merge(ceq_lid(LID_SCALARS_NU), VAPOR_RENAMED_BC,
                            Dict{String,Any}("BCB.nu_c" => (missing, BC_NATURAL), "BCT.nu_c" => (missing, BC_NATURAL))),
         renamed = Dict("rho_r" => "nu_r", "rho_c" => "nu_c", "rho_v" => "nu_v"),
-        added = ceq_added(11), templates = ceq_templates("nu_r")))
+        added = ceq_added(10), templates = ceq_templates("nu_r")))
 
 "The expected `key => (old, new)` delta for one model (prefix = nest patch prefix or \"\")."
 function ceq_expected(spec, old::Dict, new::Dict, prefix::String)
@@ -341,7 +374,11 @@ end
         ("rce_default_seg1", [CEQ_RCE, ceq_ov("rce_default")]),
         ("tc_default", [CEQ_TC, ceq_ov("tc_default")]),
         ("tc_mynn_rad_stab", [CEQ_TC, ceq_ov("tc_default"), ceq_ov("tc_mynn_rad_stab")])]
-    golden = TOML.parsefile(joinpath(CEQ_LM, "$(arm).hashes.toml"))
+    # (the Stage-4 golden: the .hashes.toml ICs in the Stage-4 layout; the reference unchanged)
+    golden = TOML.parsefile(joinpath(CEQ_LM, "$(arm).stage4.hashes.toml"))
+    g0 = TOML.parsefile(joinpath(CEQ_LM, "$(arm).hashes.toml"))
+    @test keys(golden) == keys(g0)
+    @test all(golden[b] == g0[b] for b in keys(g0) if endswith(b, ".ref"))
     mktempdir() do dir
         cfg = ceq_load(overlays; dir = dir)
         m = build_model(cfg)
@@ -460,7 +497,7 @@ end
         nest = build_model(cfg)
         t = boundary_condition_table(nest, cfg)
         vars = Scythe.mc_var_names(nest.base.options; cyl = true)
-        @test length(vars) == 25
+        @test length(vars) == 24          # (25 before Stage 4 deleted slot 3)
         @test length(t) == 3 * length(vars)
         @test [r.patch for r in t] == repeat(1:3; inner = length(vars))
         @test [r.variable for r in t if r.patch == 2] == vars

@@ -151,8 +151,9 @@ using SparseArrays
             patch.physical[j, ui, 1] = u[k]
             patch.physical[j, wi, 1] = 0.0
             bump = qpert * exp(-((z[k] - 800.0) / 600.0)^2)
+            # (no rho_t slot since Stage 4: the total density is derived from the water
+            # slots, so the vapor and cloud bumps are already in it)
             patch.physical[j, vars["rho_v"], 1] = rho_t[k] * bump
-            patch.physical[j, vars["rho_t"], 1] = rho_t[k] * bump
             patch.physical[j, vars["rho_c"], 1] = rho_t[k] * 0.2 * bump
             rei > 0 && (patch.physical[j, rei, 1] = rho_t[k] * e0 * exp(-z[k] / ze))
         end
@@ -214,15 +215,13 @@ using SparseArrays
                     Scythe.total_slot(0.3 * amp[m] * sh2, tf, imu[m])
             end
             patch.physical[j, IS.n_r, 1] = n_r * sh
-            # The ice mass goes into rho_t and E_t too, not only into the ice slots: ice
-            # above the headroom `(rho_t - rho_d) - rho_liq` is a DETACHED partition, the
-            # anchor share drops below 1 and the state the test is measuring on is one the
-            # reconciliation is actively undoing. `C_pv T - L_s(T) + g z` is the model's
-            # own ice specific energy (the `E_sed_i` coefficient) and is exactly what
-            # leaves `retrieve_temperature` invariant when mass is added to `rho_t` and
-            # `rho_ice` together, so the sounding's temperature is unchanged by the blob.
+            # The ice mass goes into E_t too, not only into the ice slots (the derived
+            # rho_t, Stage 4, already counts the ice slots, so the total density carries it
+            # with no slot of its own). `C_pv T - L_s(T) + g z` is the model's own ice
+            # specific energy (the `E_sed_i` coefficient) and is exactly what leaves
+            # `retrieve_temperature` invariant when mass is added to `rho_t` and `rho_ice`
+            # together, so the sounding's temperature is unchanged by the blob.
             rho_i = (amp[1] * sh) + (0.3 * amp[1] * sh2)
-            patch.physical[j, vars["rho_t"], 1] += rho_i
             patch.physical[j, vars["E_t"], 1] +=
                 (((Cpv * col.Tk[k]) - L_s(col.Tk[k])) + (gravity * z[k])) * rho_i
         end
@@ -261,12 +260,17 @@ using SparseArrays
             set_warm!(p_no, mo_n, kDim, z, col)
             step_all!(m_ice, p_ice, kDim)
             step_all!(m_no, p_no, kDim)
-            # Slots 1..11 are the nine fixed slots, rho_v and n_r, and they carry the same
-            # index on both tiles (the twelve ice slots are appended after n_r and rho_e
-            # after them). The ice legs are exact zeros in every one of them, and that is
-            # an EQUALITY: `x - 0.0 === x` for every double, `x + 0.0` is not, and the S8
-            # arithmetic is written so that only the first form appears.
-            for s in 1:11
+            # Slots 1..10 are the nine fixed slots (the vapor is slot 3 since Stage 4) and
+            # n_r, and they carry the same index on both tiles (the twelve ice slots are
+            # appended after n_r and rho_e after them); checked by name. The ice legs are
+            # exact zeros in every one of them, and that is an EQUALITY: `x - 0.0 === x`
+            # for every double, `x + 0.0` is not, and the S8 arithmetic is written so that
+            # only the first form appears.
+            shared = [nm for nm in keys(mo_n.grid_params.vars) if nm != "rho_e"]
+            @test length(shared) == 10
+            for nm in shared
+                s = mo_i.grid_params.vars[nm]
+                @test s == mo_n.grid_params.vars[nm]
                 @test all(m_ice.expdot_n[:, s] .=== m_no.expdot_n[:, s])
             end
             @test all(m_ice.expdot_n[:, mo_i.grid_params.vars["rho_e"]] .===
@@ -474,11 +478,11 @@ using SparseArrays
     # ──────────────────────────────────────────────
     @testset "ice + :fixed_T water carry is refused; ice + MYNN is not" begin
         mktempdir() do tmp
-            m, p, mo, gpo, z, col = make_ice_tile(tmp; mynn = true, ice = true,
-                                                  water_carry = :fixed_T)
-            set_warm!(p, mo, gpo.kDim, z, col)
-            set_ice!(p, mo, gpo.kDim, z, col)
-            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
+            # Refused at tile creation (`validate_water_anchor`) since Stage 4, where the
+            # derived anchor's nu legs have no fixed-T map; it used to throw at the first
+            # column under the :slot default.
+            @test_throws ErrorException make_ice_tile(tmp; mynn = true, ice = true,
+                                                      water_carry = :fixed_T)
             # ...while the default :flux carry runs.
             m2, p2, mo2, gp2, z2, col2 = make_ice_tile(tmp; mynn = true, ice = true)
             set_warm!(p2, mo2, gp2.kDim, z2, col2)

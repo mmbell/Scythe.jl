@@ -173,14 +173,9 @@ struct DerivedConfig
     temperature::Symbol       # options[:temperature]: which temperature `T` is (`temperature_mode`)
     vtrans::Symbol            # options[:vapor_transform]: the vapor slot's control variable
     vmu::Float64              # physical_params[:vapor_mu]
-    water_anchor::Symbol      # options[:water_anchor]: :slot or :derived (`water_anchor_mode`)
 end
-
-# The pre-anchor 18-field form (the total density is the slot).
-DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice, has_v,
-              N0, Nc_cm3, N0_source, cond_floor, temperature, vtrans, vmu) =
-    DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice,
-                  has_v, N0, Nc_cm3, N0_source, cond_floor, temperature, vtrans, vmu, :slot)
+# (The total density is the derived ρ_d + Σ_k α_k ν_k; Stage 3's `water_anchor` field went with
+# the `:slot` anchor at Stage 4.)
 
 # The pre-vapor-transform 16-field form (the vapor slot is the density perturbation).
 DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice, has_v,
@@ -225,7 +220,7 @@ function derived_config(model::ModelParameters)
         n0_on ? "physical_params[:N_0]" : "default $(REFL_N0_DEFAULT)",
         condensate_floor_mode(opts),
         temperature_mode(opts),
-        vapor_transform_mode(opts), vapor_mu(pp), water_anchor_mode(opts))
+        vapor_transform_mode(opts), vapor_mu(pp))
 end
 
 # ── Reference profiles on the regular output grid ─────────────────────────────
@@ -332,7 +327,7 @@ The whole derived-product set of a moist-compressible snapshot, from the RAW slo
 on the regular grid.
 
 `z` is the regular output level vector; `slots` is a `NamedTuple` of `(n_i, n_k)` matrices
-keyed by ROLE, not by slot name -- `p, rho_d, rho_t, E_t, Q_ss, u, w, rain, cloud, rho_v`
+keyed by ROLE, not by slot name -- `p, rho_d, E_t, Q_ss, u, w, rain, cloud, rho_v`
 are required (the reference-relative ones hold PRIMES, `u`/`w`/`rain`/`cloud` hold whatever
 control variable the run declares), and `v`, `n_r`, `ice` (an `NTuple{12,Matrix}` in
 [`MC_ICE_VARS`](@ref) order) and `rho_e` are supplied when the configuration has them.
@@ -343,9 +338,11 @@ The order is the model's own:
     ([`recover_total`](@ref)), the cloud is a PERTURBATION off `ρ̄_c`
     ([`recover_rho_c`](@ref)), the twelve ice moments are totals with the width of their
     moment KIND ([`ice_mu`](@ref));
- 2. **add the reference back** for the five reference-relative controls, and for the vapor,
+ 2. **add the reference back** for the four reference-relative controls, and for the vapor,
     whose reference is the DERIVED `ρ̄_t − ρ̄_d − ρ̄_c` of [`vapor_slot`](@ref) rather than
-    `ref_rho_v` -- the same expression `mc_driver!` adds back;
+    `ref_rho_v` -- the same expression `mc_driver!` adds back; the total density is the
+    DERIVED `ρ_d + ρ_w`, `ρ_w = Σ_k α_k ν_k` (the driver's `_anchor_stage!`), against the
+    derived reference `ρ̄_t^w` (`rho_tbar_w`, written as `rho_tbar`);
  3. **the temperature**, BOTH ways: `T_energy` = [`retrieve_temperature`](@ref) from the
     available enthalpy `M = p + E_t − ρ_t(ke + gz)`, reading the FLOORED condensate exactly
     where `cfg.cond_floor` says the run's thermodynamics reads it
@@ -354,7 +351,7 @@ The order is the model's own:
     `options[:temperature]`), and two diagnostics measure their disagreement whatever the
     mode: `T_split = T_energy − T_eos` and `E_residual = E_t − E_implied`, the prognostic
     total energy minus the one the state implies at `T_eos` ([`implied_total_energy`](@ref):
-    `(ρ_d, ρ_v, ρ_liq, ρ_ice)` as the retrieval reads them, the PROGNOSTIC `ρ_t` in the
+    `(ρ_d, ρ_v, ρ_liq, ρ_ice)` as the retrieval reads them, the derived `ρ_t` in the
     mechanical term), with its column integral `column_E_residual` [J/m²] beside the
     column `E_t`, `column_E_t`;
  4. saturation, potential temperature, mixing ratios, entropy and θ_e;
@@ -369,7 +366,7 @@ water is a resolution diagnostic in this model, never a state to repair -- see
 reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md); `q_v`, `q_c`, `q_r` and the densities
 themselves are reported RAW so that diagnostic stays visible. `RH`/`RH_ice` read
 `max(ρ_v, 0)` — the floor radiation applies at its own interface — and the negativity they no
-longer show is carried by two fields of its own: `rho_w_deficit = min(ρ_t − ρ_d, 0)` and
+longer show is carried by two fields of its own: `rho_w_deficit = min(ρ_w, 0)` and
 `condensate_lobe`, the transformed condensate slots' clipped negative lobe under
 [`ahyp_signed`](@ref).
 """
@@ -399,7 +396,6 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     # ── (2) Totals ──────────────────────────────────────────────────────────
     p     = slots.p     .+ col(ref.pbar)
     rho_d = slots.rho_d .+ col(ref.rho_dbar)
-    rho_t = slots.rho_t .+ col(ref.rho_tbar)
     E_t   = slots.E_t   .+ col(ref.E_tbar)
     Q_ss  = slots.Q_ss  .+ col(ref.Q_ssbar)
     # The vapor slot is the control variable `ν_v'` under the vapor transform: the reader sees
@@ -407,35 +403,23 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     rho_vbar_d = ref.rho_tbar .- ref.rho_dbar .- ref.rho_cbar
     rho_v = cfg.vtrans === :none ? slots.rho_v .+ col(rho_vbar_d) :
             recover_rho_v.(slots.rho_v, col(bhyp.(rho_vbar_d, cfg.vmu)), cfg.vtrans, cfg.vmu)
-    # THE DERIVED WATER ANCHOR (`cfg.water_anchor = :derived`): the total density the run
-    # reads is `ρ_d + ρ_w`, `ρ_w = Σ_k α_k ν_k` over the water-mass slots (the driver's
-    # `_anchor_stage!`, member order vapor, cloud, rain, ice masses), against the derived
-    # reference `ρ̄_t^w`; slot 3 is the passive shadow (`rho_t_slot`, `water_shadow_gap`).
-    wad = cfg.water_anchor === :derived
-    rho_w = nothing; rho_t_slot = nothing; shadow_gap = nothing; rho_tbar_w = nothing
-    if wad
-        av = cfg.vtrans === :none ? 1.0 : 2.0
-        ac = cfg.ctrans === :none ? 1.0 : 2.0
-        ar = cfg.rtrans === :none ? 1.0 : 2.0
-        ai = cfg.itrans === :none ? 1.0 : 2.0
-        nvb = cfg.vtrans === :none ? rho_vbar_d : bhyp.(rho_vbar_d, cfg.vmu)
-        ncb = cfg.ctrans === :none ? ref.rho_cbar : bhyp.(ref.rho_cbar, cfg.cmu)
-        Wp = (av .* slots.rho_v) .+ (ac .* slots.cloud)
-        Wp = Wp .+ (ar .* slots.rain)
-        if cfg.ice && haskey(slots, :ice)
-            Wp = ((Wp .+ (ai .* slots.ice[1])) .+ (ai .* slots.ice[5])) .+ (ai .* slots.ice[9])
-        end
-        rho_tbar_w = ref.rho_dbar .+ ((av .* nvb) .+ (ac .* ncb))
-        rho_w = (av .* (slots.rho_v .+ col(nvb))) .+ (ac .* (slots.cloud .+ col(ncb)))
-        rho_w = rho_w .+ (ar .* slots.rain)
-        if cfg.ice && haskey(slots, :ice)
-            rho_w = ((rho_w .+ (ai .* slots.ice[1])) .+ (ai .* slots.ice[5])) .+
-                    (ai .* slots.ice[9])
-        end
-        rho_t = rho_d .+ rho_w
-        rho_t_slot = slots.rho_t .+ col(rho_tbar_w)
-        shadow_gap = slots.rho_t .- (slots.rho_d .+ Wp)
+    # THE DERIVED WATER ANCHOR: the total density the run reads is `ρ_d + ρ_w`,
+    # `ρ_w = Σ_k α_k ν_k` over the water-mass slots (the driver's `_anchor_stage!`, member
+    # order vapor, cloud, rain, ice masses), against the derived reference `ρ̄_t^w`.
+    av = cfg.vtrans === :none ? 1.0 : 2.0
+    ac = cfg.ctrans === :none ? 1.0 : 2.0
+    ar = cfg.rtrans === :none ? 1.0 : 2.0
+    ai = cfg.itrans === :none ? 1.0 : 2.0
+    nvb = cfg.vtrans === :none ? rho_vbar_d : bhyp.(rho_vbar_d, cfg.vmu)
+    ncb = cfg.ctrans === :none ? ref.rho_cbar : bhyp.(ref.rho_cbar, cfg.cmu)
+    rho_tbar_w = ref.rho_dbar .+ ((av .* nvb) .+ (ac .* ncb))
+    rho_w = (av .* (slots.rho_v .+ col(nvb))) .+ (ac .* (slots.cloud .+ col(ncb)))
+    rho_w = rho_w .+ (ar .* slots.rain)
+    if cfg.ice && haskey(slots, :ice)
+        rho_w = ((rho_w .+ (ai .* slots.ice[1])) .+ (ai .* slots.ice[5])) .+
+                (ai .* slots.ice[9])
     end
+    rho_t = rho_d .+ rho_w
 
     # ── (3) Retrieval ───────────────────────────────────────────────────────
     u = slots.u; w = slots.w
@@ -511,16 +495,14 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     precip_rate = rain_rate[:, 1]                # surface value, one per column
 
     # ── (5b) Negative-water diagnostics ─────────────────────────────────────
-    # The TOTAL-WATER deficit min(ρ_t − ρ_d, 0): where the conserved anchor itself holds less
-    # than no water — a transported lobe of the linear ρ_t, which no partition can make
-    # admissible.
-    rho_w_deficit = wad ? min.(rho_w, 0.0) : min.(rho_t .- rho_d, 0.0)
+    # The TOTAL-WATER deficit min(ρ_w, 0): where the water anchor itself holds less than no
+    # water — the control variables' negative lobes outweigh the rest of the column's water.
+    rho_w_deficit = min.(rho_w, 0.0)
     # The CLIPPED LOBE: Σ over the TRANSFORMED cloud, rain and ice-MASS slots of the slot's
     # negative part under the attribution continuation [`ahyp_signed`](@ref) — the water the
     # linear ρ_t carries as a transported condensate's negative lobe while the recovered
-    # densities above read 0 there. Under `:bhyp` it is exactly the `lobe_w` column mc_driver!
-    # hands back to the condensate in the vapor residual and the anchor headroom
-    # (`options[:water_lobe_attribution]`); under `:none` nothing is clipped and it is an exact
+    # densities above read 0 there (the column the retired `options[:water_lobe_attribution]`
+    # handed back to the condensate); under `:none` nothing is clipped and it is an exact
     # zero field. Number and habit moments carry no water and never enter.
     neg_part(nu, mu) = nu < 0.0 ? ahyp_signed(nu, mu) : 0.0
     condensate_lobe = zeros(Float64, n_i, n_k)
@@ -561,8 +543,7 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     out = merge(out, (; T_energy, T_eos, T_split, E_residual,
                         column_E_residual = _column_integral(E_residual, z),
                         column_E_t = _column_integral(E_t, z)))
-    wad && (out = merge(out, (; rho_t_slot, water_shadow_gap = shadow_gap, rho_tbar_w,
-                                column_water_shadow_gap = _column_integral(shadow_gap, z))))
+    out = merge(out, (; rho_tbar_w))
     return out
 end
 
@@ -1143,12 +1124,12 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
     v_i = get(vars, "v", 0)
     rho_e_i = get(vars, "rho_e", 0)
 
-    p_p = slot(vars["p"]); rho_d_p = slot(vars["rho_d"]); rho_t_p = slot(vars["rho_t"])
+    p_p = slot(vars["p"]); rho_d_p = slot(vars["rho_d"])
     E_t_p = slot(vars["E_t"]); Q_ss_p = slot(vars["Q_ss"]); rho_v_p = slot(mc_slot(vars, "rho_v"))
     u = slot(vars["u"]); w = slot(vars["w"])
     rain_raw = slot(rain_i); cloud_raw = slot(cloud_i)
 
-    slots = (; p = p_p, rho_d = rho_d_p, rho_t = rho_t_p, E_t = E_t_p, Q_ss = Q_ss_p,
+    slots = (; p = p_p, rho_d = rho_d_p, E_t = E_t_p, Q_ss = Q_ss_p,
                rho_v = rho_v_p, u = u, w = w, rain = rain_raw, cloud = cloud_raw)
     v_i > 0 && (slots = merge(slots, (; v = slot(v_i))))
     nr_i > 0 && (slots = merge(slots, (; n_r = slot(nr_i))))
@@ -1224,7 +1205,6 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         # ── Prognostic perturbations off the hydrostatic reference ──
         wr("p_prime",     p_p,     "Pa",     "pressure perturbation")
         wr("rho_d_prime", rho_d_p, "kg m-3", "dry-air density perturbation")
-        wr("rho_t_prime", rho_t_p, "kg m-3", "total density perturbation")
         wr("E_t_prime",   E_t_p,   "J m-3",  "total energy density perturbation")
         wr("Q_ss_prime",  Q_ss_p,  "kg m-3", "supersaturation density perturbation")
         if cfg.vtrans === :none
@@ -1262,7 +1242,8 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         # ── Totals ──
         wr("p",     d.p,     "Pa",     "total pressure")
         wr("rho_d", d.rho_d, "kg m-3", "total dry-air density")
-        wr("rho_t", d.rho_t, "kg m-3", "total density")
+        wr("rho_t", d.rho_t, "kg m-3",
+           "total density, the derived rho_d + sum_k alpha_k nu_k (the water anchor)")
         wr("E_t",   d.E_t,   "J m-3",  "total energy density")
         wr("Q_ss",  d.Q_ss,  "kg m-3", "supersaturation density")
         wr("rho_v", d.rho_v, "kg m-3", "water vapor density")
@@ -1327,17 +1308,7 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
 
         # ── Negative-water diagnostics: the negativity the humidity floor no longer shows ──
         wr("rho_w_deficit", d.rho_w_deficit, "kg m-3",
-           "total-water deficit, min(rho_t - rho_d, 0)")
-        # ── The derived water anchor's shadow (options[:water_anchor] = :derived) ──
-        if haskey(d, :rho_t_slot)
-            wr("rho_t_slot", d.rho_t_slot, "kg m-3",
-               "the passive slot-3 shadow of the linear total density, slot 3 + rho_tbar_w " *
-               "(rho_t is the derived rho_d + sum_k alpha_k nu_k)")
-            wr("water_shadow_gap", d.water_shadow_gap, "kg m-3",
-               "shadow gap rho_t_slot' - (rho_d' + sum_k alpha_k nu_k'), MC_SHADOW_*")
-            wrx("column_water_shadow_gap", d.column_water_shadow_gap, "kg m-2",
-                "column integral of water_shadow_gap")
-        end
+           "total-water deficit, min(rho_w, 0), rho_w = sum_k alpha_k nu_k")
         wr("condensate_lobe", d.condensate_lobe, "kg m-3",
            "clipped negative lobe of the transformed cloud, rain and ice-mass control " *
            "variables, sum of ahyp_signed(nu) over slots with nu < 0 (the recovered " *
@@ -1436,8 +1407,7 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
                                   ("rho_dbar", ref.rho_dbar, "kg m-3"),
                                   ("rho_vbar", ref.rho_vbar, "kg m-3"),
                                   ("rho_cbar", ref.rho_cbar, "kg m-3"),
-                                  ("rho_tbar", haskey(d, :rho_tbar_w) ? d.rho_tbar_w :
-                                               ref.rho_tbar, "kg m-3"),
+                                  ("rho_tbar", d.rho_tbar_w, "kg m-3"),
                                   ("E_tbar", ref.E_tbar, "J m-3"),
                                   ("Q_ssbar", ref.Q_ssbar, "kg m-3"),
                                   ("Tbar", ref.Tbar, "K"))

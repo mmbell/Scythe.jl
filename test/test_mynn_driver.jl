@@ -156,16 +156,17 @@ using SparseArrays
         # ...and it is a TOTAL, so the positivity bound needs no reference offset.
         @test Scythe.positivity_reference_profile("rho_e", nothing) === nothing
 
-        # Index arithmetic, XZ and cylindrical, plain and with the full ice family.
+        # Index arithmetic, XZ and cylindrical, plain and with the full ice family. Nine
+        # MC_VARS since Stage 4 (slot 3 is the vapor; the rho_t slot was deleted).
         plain = Dict{Symbol,Any}(:mynn => true)
-        @test findfirst(==("rho_e"), Scythe.mc_var_names(plain)) == 11
-        @test findfirst(==("rho_e"), Scythe.mc_var_names(plain; cyl = true)) == 12
+        @test findfirst(==("rho_e"), Scythe.mc_var_names(plain)) == 10
+        @test findfirst(==("rho_e"), Scythe.mc_var_names(plain; cyl = true)) == 11
         full = Dict{Symbol,Any}(:mynn => true, :rain_moments => 2,
                                 :ice_microphysics => :ishmael)
-        @test findfirst(==("rho_e"), Scythe.mc_var_names(full)) == 24
-        @test findfirst(==("rho_e"), Scythe.mc_var_names(full; cyl = true)) == 25
+        @test findfirst(==("rho_e"), Scythe.mc_var_names(full)) == 23
+        @test findfirst(==("rho_e"), Scythe.mc_var_names(full; cyl = true)) == 24
         # The ice block stays contiguous under the append.
-        @test Scythe.mc_var_names(full)[12:23] == collect(Scythe.MC_ICE_VARS)
+        @test Scythe.mc_var_names(full)[11:22] == collect(Scythe.MC_ICE_VARS)
     end
 
     # ──────────────────────────────────────────────
@@ -286,7 +287,7 @@ using SparseArrays
             @test m_on.mynn.work[1].n == gp_on.kDim
             # The slot is resolved by NAME, once, into the concrete MCSlots.
             @test m_on.mc_slots.rho_e == model_on.grid_params.vars["rho_e"]
-            @test m_on.mc_slots.rho_e == 11
+            @test m_on.mc_slots.rho_e == 10          # after the nine MC_VARS (Stage 4)
             # ...and appending it moved nothing.
             @test m_on.mc_slots.rho_v == m_off.mc_slots.rho_v
 
@@ -397,7 +398,7 @@ using SparseArrays
 
                 # Every shared slot, value for value (signed zeros aside, see below).
                 names_off = Scythe.mc_var_names(mod_off.options)
-                @test length(names_off) == 10
+                @test length(names_off) == 9          # the nine MC_VARS (Stage 4)
                 for nm in names_off
                     i_on = mod_on.grid_params.vars[nm]
                     i_off = mod_off.grid_params.vars[nm]
@@ -464,12 +465,13 @@ using SparseArrays
             @test (Scythe.advance_column(m, 1, 1); true)
             @test all(isfinite, m.expdot_n)
 
-            m2, p2, _, _, _ = make_mynn_mtile(tmp; mynn = true,
+            # Refused at tile creation (`validate_water_anchor`) since Stage 4: the derived
+            # anchor's nu legs have no fixed-T map, with or without ice. (It used to throw
+            # at the first column under the retired :slot default.)
+            @test_throws ErrorException make_mynn_mtile(tmp; mynn = true,
                 extra_opts = merge(ice_opts,
                     Dict{Symbol,Any}(:mynn_water_carry => :fixed_T)),
                 extra_params = Dict{Symbol,Float64}(:N_r => 1.0e-3))
-            spectralTransform!(p2); gridTransform!(p2)
-            @test_throws ErrorException Scythe.advance_column(m2, 1, 1)
         end
     end
 end

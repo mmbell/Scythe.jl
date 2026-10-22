@@ -429,7 +429,8 @@ using .MYNNTestFixtures
             wq = gauss_weights(kDim, nk, gp.kMax - gp.kMin)
 
             d_re = m_d.expdot_n[rng, re_i] .- m_f.expdot_n[rng, re_i]
-            d_Et = m_d.expdot_n[rng, 6] .- m_f.expdot_n[rng, 6]
+            d_Et = m_d.expdot_n[rng, mo.grid_params.vars["E_t"]] .-
+                   m_f.expdot_n[rng, mo.grid_params.vars["E_t"]]
             I_re = sum(wq .* d_re)
             I_Et = sum(wq .* d_Et)
             @test abs(I_re) > 0.0
@@ -444,8 +445,14 @@ using .MYNNTestFixtures
             MY = m_d.mynn
             @test MY.pmz[CI] != 0.0                 # written under :pdk1
             @test m_f.mynn.pmz[CI] == 0.0           # ...and never under :fortran
-            rho_t1 = m_d.tile.physical[first(rng), 3, 1] +
-                     Scythe.ref_rho_t(m_d.ref_state)[1, 1]
+            # rho_t(1) is the DERIVED total the driver stages (Stage 4 deleted the slot):
+            # rho_d' + sum_k alpha_k nu_k' on the reference rho_tbar_w.
+            g1 = first(rng)
+            wset = Scythe.water_anchor_set(m_d.model.options, m_d.model.physical_params,
+                                           m_d.mc_slots)
+            rho_t1 = Scythe.anchor_rho_tp(m_d.tile.physical[g1, mo.grid_params.vars["rho_d"], 1],
+                                          Scythe.anchor_Wp(m_d.tile.physical, g1, 1, wset)) +
+                     Scythe.mc_rho_tbar_ref(m_d)[1, 1]
             Psfc_e = rho_t1 * MY.ust[CI]^3 * MY.pmz[CI] / cM.karman
             delta = 2.0 * z[2]
             gz = [zk < delta ? 2.0 / delta * (1.0 - zk / delta) : 0.0 for zk in z]

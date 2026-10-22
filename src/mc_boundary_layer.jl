@@ -81,14 +81,14 @@ end
 end
 
 """
-    mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rtv, rdv, rcv,
-                 expdot, l_inf, sfc::SurfaceLayerParams, ctrans_on)
+    mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rcv,
+                 expdot, l_inf, sfc::SurfaceLayerParams)
 
 Louis boundary layer for one column of the total-energy set: eddy diffusivity
 `Kv = l(z)² |∂V/∂z|` with the Blackadar-blended length `l = 1/(1/(κz) + 1/l∞)`,
 applied to momentum (u, w, v), heat (the moist entropy s_t', in energy-flux form
-`F_h = ρ_d T Kv ∂z s_t'` so the column energy books telescope exactly) and water
-(total water ρ_w' and cloud ρ_c'; rain is left to sedimentation).
+`F_h = ρ_d T Kv ∂z s_t'` so the column energy books telescope exactly) and water (the vapor,
+cloud and rain control variables, each a ν leg `Kv ∂z ν_k'` of its own; Louis refuses ice).
 The SURFACE exchange itself is not computed here: `sfc` is the once-per-driver-call
 [`SurfaceLayerParams`](@ref) and [`surface_exchange`](@ref) (src/mc_surface_layer.jl)
 returns the stress `τ_u, τ_v` and the bulk fluxes `F_sh` [W/m²], `F_q` [kg/m²/s] from
@@ -97,59 +97,28 @@ the lowest mish-level state. On the DEFAULT configuration (`options[:sfc_z0] = :
 inline, bitwise: `τ = ρ_t Cd |U₁| u₁` with [`komori_cd`](@ref) when `Cd_param < 0`,
 `F_sh = ρ_d1 C_pd Ck U₁ (SST − T₁)` and `F_q = Ck U₁ (ρ_vs(SST, p₁) − ρ_v1)`, the
 exchange wind floored by the gustiness minimum `U_min`. `F_sh` goes into the heat column
-and `F_q` into the TOTAL-water column (the surface source adds vapor, so it reaches both
-ρ_w and the vapor slot). What the surface layer computes is now selectable; how it is
-DELIVERED (the analytic g(z) profile below) is not, and did not change.
+and `F_q` into the vapor (`F_q g/α_v` on its ν). What the surface layer computes is
+selectable; how it is DELIVERED (the analytic g(z) profile below) is not.
 
-The increments are mapped onto the prognostic slots with the model's canonical
-consistent mappings: momentum/E_t via the FRIC_KE invariant (E_t follows the
-resolved KE down; no dissipative heating), heat via the QDOT_TH pattern (slot 1
-`(R_m/C_vt)·Q̇`, slot 6 `+Q̇`, slot 7 through the saturation chain rule), and the
-water sources via the fixed-T map of `_diffusion_water_step!` (slot 3 `+ρ̇_w`,
-slot 9 `+ρ̇_c`, the vapor slot `+ρ̇_v`, slot 1 `+R_v T ρ̇_v`, slot 6
-`+(C_pv T − L_v + ke + gz) ρ̇_w + (L_v − R_v T) ρ̇_v`, slot 7
-`+ρ̇_v − ∂ρ_vs/∂p · R_v T ρ̇_v`, with `ρ̇_v = ρ̇_w − ρ̇_c`).
+The increments are mapped onto the prognostic slots with the model's canonical consistent
+mappings: momentum/E_t via the FRIC_KE invariant (E_t follows the resolved KE down; no
+dissipative heating), heat via the QDOT_TH pattern (slot 1 `(R_m/C_vt)·Q̇`, slot 6 `+Q̇`, slot
+7 through the saturation chain rule), and the water legs under the derived water anchor
+([`_louis_apply_derived!`](@ref), plan E7): each species' ν rate lands on its own slot directly
+and the energy carry is the fixed-temperature map on the REALIZED recovered rates. (The
+`:slot`-anchor form, which mixed the prognostic ρ_t' − ρ_d' as total water and implied the
+vapor as `ρ̇_w − ρ̇_c`, went with the ρ_t slot at Stage 4 of the ρ_t retirement.)
 
-`ρ̇_v` is still built as `ρ̇_w − ρ̇_c` and that is deliberate: this closure mixes TOTAL water,
-so the vapor's share of that flux is what the total carries minus what the cloud carries.
-What has changed is where it LANDS — it now sources the prognostic vapor slot directly
-instead of being inferred from the other two after the fact. The three legs stay mutually
-consistent by construction, so the reconciliation gap this closure opens is exactly zero.
+The rain leg is the slot's own `Kv ∂z ν_r'` (review D5), fitted on slot 8's column basis.
 
-`ctrans_on` says whether slot 9 carries a control variable rather than the cloud density
-(`Scythe.condensate_transform_mode`). It changes exactly two things, and BOTH ARE REQUIRED FOR
-CORRECTNESS — before it existed this function was silently wrong under the transform:
-
-* the cloud eddy flux is built from the perturbation DENSITY gradient `∂z ρ_c'`
-  (`S.bl_rho_cp_z`, staged by `mc_driver!` from `S.rho_c_z = ∂z ν / J`) instead of from
-  `rcv.f_z`, because an eddy flux of cloud water is a MASS flux. Only `f' = 1/J ∈ [1, 2]` is
-  needed — never `f''`, which is what makes this exactly fixable where the horizontal
-  Laplacian is not;
-* the slot-9 increment is multiplied by `J`. Everything else — slots 1, 3, 6, 7 — is left
-  alone, because with the flux built in density space `ρ̇_w`, `ρ̇_c` and `ρ̇_v = ρ̇_w − ρ̇_c` are
-  all density rates again, which is what those slots want. (That subtraction was the real
-  damage: a ν-rate minus a density rate, fed to the pressure, energy and Q_ss channels.)
-
-With `ctrans_on = false` the flux line is the original one verbatim and `J ≡ 1.0`, so the
-default path is bit-identical.
-
-Rain is NOT affected: this function touches slot 8 only by borrowing its spline column as a
-basis, never its values, so `rain_transform` needs nothing here.
-
-Two limits worth knowing. With a CLOUDY reference (ρ̄_c ≠ 0) the resting state is quiet to
-~1e-16 relative rather than exactly, because `J` is evaluated at `ahyp(bhyp(ρ̄_c))` whose round
-trip is 2.2e-16; every current configuration has ρ̄_c ≡ 0 and
-`Scythe.check_condensate_transform_ic` warns otherwise. And where `ν < 0` under `:bhyp`, the
-reconstructed gradient is the SMOOTH branch's `ν_z/J`, not the clipped map's zero — deliberate:
-the clipped form would zero the flux at the cloud edge and forbid the BL from ever mixing cloud
-into cloud-free air, and the resulting increment is a bounded ν-space rate over a region
-carrying no cloud.
+Where `ν < 0` under `:bhyp` the ν legs mix the lobe like any other ν (the recovered density reads
+0 there), and the energy carry books what the recovered reading actually receives (see
+`_mynn_nu_legs!` for the two consequences of mixing in ν space, which apply here too).
 """
 @noinline function mc_louis_bl!(mtile::ModelTile, S, geom::MCGeometry,
                                 colstart::Int64, colend::Int64, z,
-                                uv, wv, vv, rtv, rdv, rcv, expdot,
-                                l_inf::Float64, sfc::SurfaceLayerParams,
-                                ctrans_on::Bool)
+                                uv, wv, vv, rcv, expdot,
+                                l_inf::Float64, sfc::SurfaceLayerParams)
     u = uv.f; u_z = uv.f_z
     w = wv.f; w_z = wv.f_z
     rho_t = S.rho_t
@@ -245,117 +214,41 @@ carrying no cloud.
     Atransform!(col)
     Ixtransform(col, QDOT_V)
 
-    # Water: total water ρ_w' and CLOUD ρ_c', both straight from the perturbation
-    # slots. The vapor's share of the TOTAL-water flux is ρ̇_v = ρ̇_w − ρ̇_c (rain is left
-    # to sedimentation) — a decomposition of one eddy flux, not a retrieval of a field —
-    # and it now SOURCES the prognostic vapor slot rather than being inferred from the
-    # other two. Because all three legs come out of the same two column fits, this
-    # closure leaves the partition exactly closed and opens no reconciliation gap.
+    # Water (plan E7, Louis, the derived water anchor): the VAPOR leg is fitted directly, in
+    # ν space (`K ∂z ν_v'`, the slot's own gradient) — VDOT_w holds the vapor's ν rate.
     VDOT_w = S.VDOT_w
-    rho_tp_z = rtv.f_z; rho_dp_z = rdv.f_z
-    wad = mtile.ebudget.wa
     rvv_z = view(mtile.tile.physical, colstart:colend, mtile.mc_slots.rho_v, siw_zslot(mtile.tile.physical))
-    if wad
-        # THE DERIVED ANCHOR (plan E7, Louis): the VAPOR leg is fitted directly, in ν space
-        # (`K ∂z ν_v'`, the slot's own gradient), and the total-water fit is deleted — VDOT_w
-        # holds the vapor's ν rate from here on.
-        @inbounds for i in eachindex(Kv)
-            col.uMish[i] = Kv[i] * rvv_z[i]
-        end
-    else
-        col.uMish .= Kv .* (rho_tp_z .- rho_dp_z)
+    @inbounds for i in eachindex(Kv)
+        col.uMish[i] = Kv[i] * rvv_z[i]
     end
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_w)
 
+    # The CLOUD leg, ν space too: `K ∂z ν_c'` (the slot's own gradient).
     VDOT_c = S.VDOT_v            # (the ex-vapor scratch slot, now the cloud flux)
-    # Under a transform slot 9 is ν' = bhyp(ρ_c) − bhyp(ρ̄_c), and `Kv .* rcv.f_z` would fit
-    # `Kv ∂z ν'` — not a mass flux. `S.bl_rho_cp_z` is `∂z ρ_c'`, staged in mc_driver! from
-    # `S.rho_c_z = ∂z ν / J`, so VDOT_c is a DENSITY rate on both branches and everything
-    # downstream of it needs no further thought. See the docstring.
-    if ctrans_on && !wad
-        col.uMish .= Kv .* S.bl_rho_cp_z
-    else
-        # (under the derived anchor the cloud leg is ν space too: `K ∂z ν_c'`)
-        col.uMish .= Kv .* rcv.f_z
-    end
+    col.uMish .= Kv .* rcv.f_z
     Btransform!(col)
     Atransform!(col)
     Ixtransform(col, VDOT_c)
-    if wad
-        # ...and the RAIN leg in ν space, `K ∂z ν_r'` (review D5): MYNN's ν-leg set (Louis
-        # refuses ice, so vapor, cloud and rain). Under `:slot` the total-water leg carried the
-        # rain's gradient and credited the vapor with it; the derived anchor has no
-        # total-water leg, so without this the rain was not mixed at all. Fitted into the
-        # entropy-gradient scratch, free once QDOT_V is formed above.
-        rrv_z = view(mtile.tile.physical, colstart:colend, 8, siw_zslot(mtile.tile.physical))
-        @inbounds for i in eachindex(Kv)
-            col.uMish[i] = Kv[i] * rrv_z[i]
-        end
-        Btransform!(col)
-        Atransform!(col)
-        Ixtransform(col, S.bl_s_z)
-    end
-
-    # Apply to the prognostic slots (all additive; explicit loop, not view
-    # broadcasts — the SubArray elision lesson at this function size). The
-    # surface terms ride in on the analytic delivery profile g(z): drag −τ·g
-    # into the momentum, F_sh·g into the heating, F_q·g into both water rates.
-    R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv; Jc = S.Jc
-    # Resolved once per tile in `MCSlots`, so this is a field load and not a name lookup.
-    rv_i = mtile.mc_slots.rho_v
-    # Under the vapor control variable (`options[:vapor_transform] = :bhyp`) the vapor slot
-    # holds ν_v, and its share of the flux (surface moisture flux included) arrives as
-    # `J_v·ρ̇_v` — the cloud slot's rule, with the staged `vapor_jacobian_column(S)`.
-    vj = vapor_transform_mode(mtile.model.options) !== :none
-    J_v = vapor_jacobian_column(S)
-    drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp
-    ke = S.ke
-    wad && return _louis_apply_derived!(mtile, S, geom, colstart, z, uv, wv, vv, expdot,
-                                        tau_u, tau_v, F_sh, F_q, delta, VD_u, VD_w, VD_v,
-                                        QDOT_V, VDOT_w, VDOT_c)
+    # ...and the RAIN leg in ν space, `K ∂z ν_r'` (review D5): MYNN's ν-leg set (Louis refuses
+    # ice, so vapor, cloud and rain). Fitted into the entropy-gradient scratch, free once
+    # QDOT_V is formed above.
+    rrv_z = view(mtile.tile.physical, colstart:colend, 8, siw_zslot(mtile.tile.physical))
     @inbounds for i in eachindex(Kv)
-        j = colstart + i - 1
-        gz = z[i] < delta ? 2.0 * inv_delta * (1.0 - (z[i] * inv_delta)) : 0.0
-        du = (VD_u[i] - (tau_u * gz)) / rho_t[i]
-        dw = VD_w[i] / rho_t[i]
-        dv = _louis_dv(geom, VD_v, rho_t, tau_v, gz, i)
-        expdot[j, 4] += du
-        expdot[j, 5] += dw
-        _louis_add_v!(geom, expdot, j, dv)
-
-        # Heat (QDOT_TH pattern) and the fixed-T vapor pressure source. The
-        # surface moisture flux adds VAPOR, so it enters the TOTAL-water leg only and
-        # reaches the vapor slot through the ρ̇_w − ρ̇_c decomposition below; the cloud
-        # flux has no surface source (droplets do not evaporate off the sea surface).
-        qdot = QDOT_V[i] + (F_sh * gz)
-        vdot_w = VDOT_w[i] + (F_q * gz)
-        vdot_c = VDOT_c[i]
-        vdot_v = vdot_w - vdot_c
-        dT_v = qdot / (rho_d[i] * C_vt[i])
-        dp_v = (R_m[i] / C_vt[i]) * qdot
-        dp_q = Rv * Tk[i] * vdot_v
-        expdot[j, 1] += dp_v + dp_q
-        expdot[j, 3] += vdot_w
-        # The one Jacobian: slot 9 holds ν, so a density rate reaches it as J·ρ̇_c. `Jc` is an
-        # exact 1.0 with no transform declared (mc_driver! `fill!(Jc, 1.0)`) and `1.0*x === x`
-        # for every double, so this line is bit-identical on the default path — the same
-        # argument the slot-9 FORCING makes in moist_compressible.jl.
-        expdot[j, 9] += Jc[i] * vdot_c
-        expdot[j, 6] += qdot +
-                        (((Cpv * Tk[i]) - Lv[i] + ke[i] + (gravity * z[i])) * vdot_w) +
-                        ((Lv[i] - (Rv * Tk[i])) * vdot_v) +
-                        (rho_t[i] * (((u[i] * du) + (w[i] * dw)) +
-                                     (_louis_v(geom, vv, i) * dv)))
-        # The prognostic VAPOR slot takes the vapor's share of the flux directly: under
-        # `:none` it is an untransformed perturbation (see `Scythe.vapor_slot`), so the
-        # density rate reaches it unmodified; under the vapor transform through `J_v`.
-        expdot[j, rv_i] += vj ? J_v[i] * vdot_v : vdot_v
-        expdot[j, 7] += vdot_v - (drvs_dT[i] * dT_v) -
-                        (drvs_dp[i] * (dp_v + dp_q))
+        col.uMish[i] = Kv[i] * rrv_z[i]
     end
-    return nothing
+    Btransform!(col)
+    Atransform!(col)
+    Ixtransform(col, S.bl_s_z)
+
+    # Apply to the prognostic slots (all additive; explicit loops, not view broadcasts — the
+    # SubArray elision lesson at this function size). The surface terms ride in on the
+    # analytic delivery profile g(z): drag −τ·g into the momentum, F_sh·g into the heating,
+    # F_q·g into the vapor.
+    return _louis_apply_derived!(mtile, S, geom, colstart, z, uv, wv, vv, expdot,
+                                 tau_u, tau_v, F_sh, F_q, delta, VD_u, VD_w, VD_v,
+                                 QDOT_V, VDOT_w, VDOT_c)
 end
 
 
@@ -370,10 +263,9 @@ slots directly; the liquid carry reads the cloud's and the rain's realized rates
 Like the vapor and cloud legs, the rain leg's flux `K ∂z ν_r'` is fitted on the shared spline
 column (slot 8's basis, natural at the ground in every production configuration), so the
 diffusive flux at `z = 0` is FREE, not pinned to zero: whatever the fit puts there leaves or
-enters the column (a design consequence; the `:slot` arm's total-water leg had the same
-property). The surface moisture flux enters the vapor as `F_q g/α_v`, the shadow slot 3
-receives `Σ α_k ν̇_k + F_q g`, and the energy carry is the fixed-temperature map on the
-REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke + gz)·ρ̇_w` (so
+enters the column (a design consequence). The surface moisture flux enters the vapor as
+`F_q g/α_v`, the water sum moves by `Σ α_k ν̇_k + F_q g`, and the energy carry is the
+fixed-temperature map on the REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke + gz)·ρ̇_w` (so
 `E_t − E_implied` is held to second order, the pool absorbing the water difference); `p` gets
 `R_v T ρ̇_v` and the heating, `Q_ss` the realized vapor less the saturation chain rule.
 """
@@ -427,7 +319,6 @@ REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke
         dp_v = (R_m[i] / C_vt[i]) * qdot
         dp_q = Rv * Tk[i] * real_v
         expdot[j, 1] += dp_v + dp_q
-        expdot[j, 3] += sw
         expdot[j, 9] += ncc
         expdot[j, 6] += qdot + ((((Cvv * Tk[i]) * real_v) + (((Cpv * Tk[i]) - Lv[i]) * real_c)) +
                                 (geo * sw)) +

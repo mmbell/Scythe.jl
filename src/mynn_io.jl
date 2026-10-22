@@ -213,8 +213,8 @@ field, ...), which is also what `read_mynn` returns, so a reader written against
 one already knows them.
 
 `e = rho_e/rho_t` is the only derived quantity: `rho_e` is the appended TKE-density slot
-and `rho_t` is the same reconstruction `mc_driver!` uses every column (slot 3's
-perturbation plus the 1-D reference profile, indexed by the within-column layer).
+and `rho_t` is the same reconstruction `mc_driver!` uses every column (the derived
+`ρ_d + Σ_k α_k ν_k`, with the 1-D reference profiles indexed by the within-column layer).
 
 `edmf_a`/`edmf_w` are ZERO: the plume area-fraction and vertical-velocity sums are not
 separately held by `MYNNState` (only their mass-flux product `s_aw` is). They are here so
@@ -228,32 +228,24 @@ function mynn_diagnostics(mtile::ModelTile)
     kDim = MY.kDim
     npoints = ncol * kDim
 
-    # ── e = rho_e/rho_t, from the tile's own physical slot ──
+    # ── e = rho_e/rho_t, from the tile's own physical slots ──
     # `rho_e` (the appended TKE-density total) is `mtile.mc_slots.rho_e`; `rho_t` is the
-    # SAME reconstruction `mc_driver!` uses every column (`rho_tp + rho_tbar`): slot 3
-    # ("rho_t" is the third entry of both `MC_VARS` and `MC_VARS_CYL` -- see `MCSlots`)
-    # plus the 1-D reference profile, which (like every reference profile) is shared by
-    # every horizontal column and indexed by the WITHIN-COLUMN layer `k`, not the flat
-    # gridpoint `j`.
+    # SAME reconstruction `mc_driver!` uses every column: the derived `ρ_d + Σ α_k ν_k` (the
+    # driver's `_anchor_stage!` total), the references 1-D profiles shared by every horizontal
+    # column and indexed by the WITHIN-COLUMN layer `k`, not the flat gridpoint `j`.
     phys = mtile.tile.physical
     rho_e_slot = mtile.mc_slots.rho_e
-    rho_tbar = view(ref_rho_t(mtile.ref_state), :, 1)
-    rho_tp = view(phys, :, 3, 1)
     rho_e = view(phys, :, rho_e_slot, 1)
     e = Vector{Float64}(undef, npoints)
-    # Under the derived water anchor (`options[:water_anchor] = :derived`) ρ_t is
-    # `ρ_d + Σ α_k ν_k`, the driver's `_anchor_stage!` total.
-    wad = water_anchor_mode(mtile.model.options) === :derived
     wset = water_anchor_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
     rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
     rcref = Springsteel.ref_rho_c(mtile.ref_state)
     zs_w = siw_zslot(phys)
     @inbounds for c in 1:ncol, k in 1:kDim
         j = (c - 1) * kDim + k
-        rt = wad ? (phys[j, 2, 1] + rho_dbar[k]) +
-                   first(_siw_W(phys, j, zs_w, k, wset, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile),
-                                view(rcref, :, 1), view(rcref, :, 2))) :
-                   rho_tp[j] + rho_tbar[k]
+        rt = (phys[j, 2, 1] + rho_dbar[k]) +
+             first(_siw_W(phys, j, zs_w, k, wset, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile),
+                          view(rcref, :, 1), view(rcref, :, 2)))
         e[j] = rho_e[j] / rt
     end
 

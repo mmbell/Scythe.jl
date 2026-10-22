@@ -312,20 +312,27 @@ end
         model, patch, mtile = build_mc(tmpdir)
         vars = model.grid_params.vars
         W = rirk_mish_weights(patch.params)
-        rho_t_i = vars["rho_t"]; p_i = vars["p"]; u_i = vars["u"]; w_i = vars["w"]
+        p_i = vars["p"]; u_i = vars["u"]; w_i = vars["w"]
+        # ρ_t′ is DERIVED since Stage 4 of the ρ_t retirement (slot 3 deleted): the
+        # model's own `ρ_d′ + Σ_k α_k ν_k′` over the water-mass slots, row by row.
+        wset = Scythe.water_anchor_set(model.options, model.physical_params, mtile.mc_slots)
+        rho_tp(phys) = [Scythe.anchor_rho_tp(phys[g, vars["rho_d"], 1],
+                                             Scythe.anchor_Wp(phys, g, 1, wset))
+                        for g in axes(phys, 1)]
 
         # ── Control: the resting periodic base. If the periodic side walls injected
         #    anything at all — a seam mismatch, a Γ wraparound error — it would show
         #    up here first, because nothing else in this run is moving.
         rest_ic = seed!(patch, model, mtile; bubble = false, u0 = 0.0)
-        rest_M0 = dot(W, patch.physical[:, rho_t_i, 1])
+        rest_M0 = dot(W, rho_tp(patch.physical))
         resting, _ = run_single_process_simulation(model, rest_ic, NUM_TS)
-        rest_drift = abs(dot(W, resting[:, rho_t_i]) - rest_M0)
+        rest_drift = abs(dot(W, rho_tp(resting)) - rest_M0)
         @test all(isfinite, resting)
         @test rest_drift == 0.0
         # Every prognostic except Q_ss stays at EXACTLY zero for the whole run — the
         # periodic base is a discrete fixed point, bit for bit. Q_ss carries a
-        # 3.3e-8 residual because this config does not set
+        # small residual (3.3e-8 under the retired :slot anchor, 2.5e-16 measured under
+        # the derived one since Stage 4) because this config does not set
         # options[:consistent_qss_reference]; that is the known reference-fit crumb
         # that option exists to remove (test_moist_compressible.jl, "consistent_qss_
         # reference: the resting base is an EXACT fixed point"), not a seam effect.
@@ -341,17 +348,17 @@ end
 
         # ── The live run: warm bubble at 0.75·L riding a uniform u = 10 m/s.
         ic_spectral = seed!(patch, model, mtile; bubble = true, u0 = U0)
-        mass_0  = dot(W, patch.physical[:, rho_t_i, 1])
+        mass_0  = dot(W, rho_tp(patch.physical))
         # ∫|ρ_t′| is the physical scale the drift is measured against — ∫ρ_t′ itself
         # is a near-cancelling sum, so a ratio against it would flatter the result.
-        mass_scale = dot(W, abs.(patch.physical[:, rho_t_i, 1]))
+        mass_scale = dot(W, abs.(rho_tp(patch.physical)))
 
         single, _ = run_single_process_simulation(model, ic_spectral, NUM_TS)
         @test all(isfinite, single)
         @test maximum(abs.(single[:, p_i])) < 1.0e4      # bounded, not blowing up
         @test maximum(abs.(single[:, w_i])) > 1.0e-3     # the bubble did something
 
-        mass_drift = abs(dot(W, single[:, rho_t_i]) - mass_0) / mass_scale
+        mass_drift = abs(dot(W, rho_tp(single)) - mass_0) / mass_scale
         # The resting control's own drift is exactly 0, so the only tolerance that
         # means anything here is round-off on the quadrature sum itself.
         @test mass_drift < 1.0e-12
@@ -367,7 +374,7 @@ end
         spectralTransform!(final)
         k_pts = collect(LinRange(0.0, LZ, 21))
         seam_worst = 0.0
-        for name in ("p", "u", "w", "rho_t", "E_t")
+        for name in ("p", "u", "w", "rho_d", "rho_v", "E_t")   # rho_t is derived (Stage 4)
             v = vars[name]
             fL, fR, dL, dR = endpoint_pair(final, v, k_pts)
             scale = max(maximum(abs.(fL)), maximum(abs.(fR)))
@@ -381,7 +388,7 @@ end
         # response has reached the boundary, so the match above has content.
         fL, _, _, _ = endpoint_pair(final, p_i, k_pts)
         @test maximum(abs.(fL)) > 0.1
-        println("  seam agreement (worst of p,u,w,ρ_t,E_t, relative): $seam_worst; " *
+        println("  seam agreement (worst of p,u,w,ρ_d,ρ_v,E_t, relative): $seam_worst; " *
                 "|p′| at the seam = $(round(maximum(abs.(fL)), digits=3)) Pa")
 
         # ── Tiles.

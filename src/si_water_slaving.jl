@@ -2,35 +2,35 @@
 # ν-flux slaving of the water slots in the acoustic semi-implicit solve — Stage 2 of the ρ_t
 # retirement (reference/RHO_T_RETIREMENT_DESIGN.md §4.2 options (i′) and (iii), §6 Stage 2).
 #
-# The vertical acoustic solve advances ρ_t' by the implicit flux divergence −Δτ ∂z φ and ρ_d' by
-# −Δτ ∂z(c_d φ) (φ = ρ̂_t w), while every water species took its vertical compression −J ρ ∂z w
-# EXPLICITLY, under AB3. The density the SI slaves and the species that should add up to it
-# therefore advanced under two different integrators, and the difference was the first feeder of
-# the vapor gap `res_rho_t − ρ_v` (design §2). Here every water-mass slot k ∈ 𝒲 is slaved to the
-# same φ in flux form,
+# The vertical acoustic solve advanced ρ_t' (slot 3 until Stage 4) by the implicit flux divergence
+# −Δτ ∂z φ and ρ_d' by −Δτ ∂z(c_d φ) (φ = ρ̂_t w), while every water species took its vertical
+# compression −J ρ ∂z w EXPLICITLY, under AB3. The density the SI slaved and the species that
+# should add up to it therefore advanced under two different integrators, and the difference was
+# the first feeder of the old vapor gap (design §2). Here every water-mass slot k ∈ 𝒲 is slaved to
+# the same φ in flux form,
 #
 #     Δν_k' = −Δτ (c_k φ_z + c_{k,z} φ),
 #
 # its AI2* history `impdot[k] = −(c_k φ_z + c_{k,z} φ)` is staged from the SAME `imp_phi_z`/`phi_n`
 # fit the dry legs use, and the explicit tendency adds back the SAME linear operator evaluated on
-# the state at n (the product-rule remainder pattern of slots 2 and 3; `_siw_addback!`), so the
+# the state at n (the product-rule remainder pattern of slot 2; `_siw_addback!`), so the
 # equation is unchanged and only the integrator of its vertical acoustic part moves. Under `options[:si_water_slots] = :none` (the library
 # default) nothing here runs and every path is bitwise the code without it.
 #
 # THE COEFFICIENTS, and why they are not `ν_k/ρ_t` with the prognostic ρ_t.
 # The design's consistency statement is `c_d + Σ_k α_k c_k = 1` (α_k = 2 for a transformed slot,
-# 1 for a density slot), so `Δ(ρ_d' + Σ α_k ν_k') = −Δτ ∂z φ` = the slot-3 increment to rounding.
-# That needs a common denominator equal to `ρ_d + Σ α_k ν_k`, which in Stage 2 is NOT the
-# prognostic ρ_t: the two differ by the gap δ = ρ_t − ρ_d − Σ α_k ν_k (the vapor gap, the knee
-# bias B and the lobe pool Λ). Two forms close it exactly:
+# 1 for a density slot), so `Δ(ρ_d' + Σ α_k ν_k') = −Δτ ∂z φ` to rounding. That needs a common
+# denominator equal to `ρ_d + Σ α_k ν_k`, which in Stage 2 was NOT the prognostic ρ_t (the two
+# differed by the gap δ = ρ_t − ρ_d − Σ α_k ν_k: the vapor gap, the knee bias B and the lobe pool
+# Λ); since Stage 3 it IS the derived total every reader takes. Two forms close it exactly:
 #
 #   * STATE-DEPENDENT path (`options[:state_dependent_si]`): the denominator is the DERIVED
 #     working total ρ̂^w = ρ_d + Σ α_k ν_k of the state at n (design §4.2 "ρ̂_t = ρ_d + ρ_w,
 #     recomputed each step from the slots"), for c_d as well as for every c_k:
 #         c_d = ρ_d/ρ̂^w,  c_k = ν_k/ρ̂^w,  c_{·,z} by the quotient rule with ρ̂^w_z.
 #     Every constituent then moves with the one velocity φ/ρ̂^w; the Helmholtz problem, φ = ρ_t w,
-#     the w and p recoveries and the slot-3 update are untouched (so the acoustic operator — and
-#     its ceiling — is today's). The ρ_d coefficient moves by O(δ/ρ) from `ρ_d/ρ_t`.
+#     and the w and p recoveries are untouched (so the acoustic operator — and its ceiling — is
+#     Stage 2's).
 #   * REFERENCE paths (the resting-reference vertical solve, the horizontal ADI sweep, the exact
 #     2-D solve): the coefficients are z-only, so design option (iii) applies — the water share
 #     of the anchor's own increment, δρ_w = δρ_t − δρ_d, is split by the reference shares
@@ -74,7 +74,7 @@ retirement, design §4.2 (i′)):
   (i-c)), each with `c = ν_n/ρ̂` and no weight in the water sum.
 
 See `src/si_water_slaving.jl` for the coefficients on each path and why they close the identity
-`Δ(ρ_d' + Σ α_k ν_k') = Δρ_t'` (slot 3) to rounding.
+`Δ(ρ_d' + Σ α_k ν_k') = −Δτ ∂z φ` (the derived total's acoustic increment) to rounding.
 """
 @inline function si_water_slots_mode(options)
     mode = get(options, :si_water_slots, :none)::Symbol
@@ -167,8 +167,8 @@ end
 
 Setup-time refusal of a slaved water set that does not share ONE fit operator with the anchor
 (design §8 risk 2; plan Stage 2 test 5). The slaved increments are pointwise mish values that
-each slot then refits on its OWN bases, so `Δ(ρ_d' + Σ α_k ν_k') = Δρ_t'` survives the refit only
-if `ρ_d`, `ρ_t` and every slaved slot are fitted identically: the same wall conditions on every
+each slot then refits on its OWN bases, so `Δ(ρ_d' + Σ α_k ν_k') = −Δτ ∂z φ` survives the refit
+only if `ρ_d` and every slaved slot are fitted identically: the same wall conditions on every
 side (`BCB`/`BCT`, `BCL`/`BCR`, and `BCU`/`BCD` on the 3-D box — the horizontal refit runs on
 every geometry, not only under the horizontal SI), the same vertical AND horizontal filter
 lengths (`l_q`, its `_k`/`_j` keys), the same `spline_filter`, and NO positivity bound (a bounded
@@ -177,7 +177,7 @@ fit is nonlinear, so the sum of the bounded refits is not the refit of the sum �
 columns' zero-flux lid is not compared: those fit the fluxes, not the slaved increments.
 
 Under the `d2` or `r1t1x` scalar families the sedimenting slots stay natural at the ground while
-the vapor and cloud take the family (and `r1t1x` gives ρ_d/ρ_t Neumann), so those are refused.
+the vapor and cloud take the family (and `r1t1x` gives ρ_d Neumann), so those are refused.
 `options[:si_water_mixed_walls] = true` is the explicit opt-in to run and MEASURE such a
 combination (design §4.4 caveat 1: "refuse that combination, or measure it"). A no-op under
 `si_water_slots = :none` and for non-mc equation sets.
@@ -188,7 +188,7 @@ function validate_si_water_slots(model)
     get(model.options, :si_water_mixed_walls, false)::Bool && return nothing
     gp = model.grid_params
     mode = si_water_slots_mode(model.options)
-    names = ["rho_d"; "rho_t"; water]
+    names = ["rho_d"; water]
     dflt(d, v) = haskey(d, v) ? d[v] : get(d, "default", nothing)
     lqh(v) = haskey(gp.l_q, v) ? gp.l_q[v] : get(gp.l_q, "default", nothing)
     lqv(v) = haskey(gp.l_q, v * "_k") ? gp.l_q[v * "_k"] : lqh(v)
@@ -228,7 +228,7 @@ function validate_si_water_slots(model)
                   "$(join(water, ", ")) to the acoustic mass flux, but \"$(v)\" and " *
                   "\"$(ref)\" do not share one fit operator ($(label): $(sv) vs $(s0)). The " *
                   "slaved increments are refit slot by slot, so a mixed family breaks the " *
-                  "water/anchor identity Δ(ρ_d' + Σ α ν') = Δρ_t' at the refit (design risk 2: " *
+                  "water/anchor identity Δ(ρ_d' + Σ α ν') = −Δτ ∂z φ at the refit (design risk 2: " *
                   "under d2/r1t1x families the sedimenting slots stay natural at the ground). " *
                   hint)
         end
@@ -426,7 +426,8 @@ THE ADD-BACK IS THE SOLVE'S OWN LINEAR OPERATOR evaluated on the state at n, poi
 the gap would lose its vertical transport (measured: a seeded gap stops being a passive tracer).
 For the same reason ρ_d's state-dependent add-back is corrected here to the same operator (its
 `c_d = ρ_d/ρ̂^w`): the slot-2 expression `ρ_d w_z + ρ_{d,z} w` is replaced by `∂z(c_d φⁿ)`, the
-difference added. Then Σ over ρ_d and 𝒲 of the add-backs is slot 3's `∂z(ρ_t w)` to rounding, and
+difference added. Then Σ over ρ_d and 𝒲 of the add-backs is `∂z(ρ_t w)` of the derived total to
+rounding, and
 the gap is carried by `−∇·(δ v)` exactly as a passive tracer.
 
 With `hl` (the horizontal SI or the exact 2-D solve, `hsi_like`; `LDIV` the linear horizontal
@@ -796,10 +797,10 @@ function _siw_hsi_stored!(hacdot_n::Matrix{Float64}, hacdot_nm1::Matrix{Float64}
 end
 
 # ═════════════════════════════════════════════════════════════════════════════
-# THE DERIVED WATER ANCHOR — Stage 3 of the ρ_t retirement (design §3.2-3.3, §6 Stage 3;
-# plan §4 Stage 3, decision E9).
+# THE DERIVED WATER ANCHOR — Stages 3-4 of the ρ_t retirement (design §3.2-3.3, §6 Stages 3-4;
+# plan §4 Stages 3-4, decision E9).
 #
-# Under `options[:water_anchor] = :derived` every reader of the total density reads
+# Every reader of the total density reads
 #
 #     ρ_t  = ρ_d  + W ,   W  = Σ_k α_k ν_k      (the TOTAL control variables, ν_k' + ν̄_k)
 #     ρ_t' = ρ_d' + W',   W' = Σ_k α_k ν_k'     (the slots as carried)
@@ -808,52 +809,40 @@ end
 # over the water-MASS members 𝒲 (vapor, cloud, rain, the three ice masses; α = 2 for a
 # transformed slot, 1 for a density slot), in ONE fixed summation order — the order
 # `_siw_W`/`_siw_Wbar` use, so the total is bitwise Stage 2's working total ρ̂^w and at rest
-# (every slot 0.0) `ρ_t === ρ̄_t^w`. Slot 3 keeps its own transport and SI increment and FEEDS
-# NOTHING: it is the passive SHADOW of the linear ρ_t the design measures (`MC_SHADOW_*`).
-# `:slot` (the library default) is the code without this section, bitwise.
+# (every slot 0.0) `ρ_t === ρ̄_t^w`. Stage 3 kept the prognostic ρ_t as a passive shadow in slot
+# 3; Stage 4 deleted it, the vapor moving into slot 3. `options[:water_anchor]` is retired:
+# `:derived` is the only behaviour (an explicit `:derived` is accepted, `:slot` refused).
 # ═════════════════════════════════════════════════════════════════════════════
-
-"Allowed `options[:water_anchor]` values (`numerics.water_anchor`)."
-const WATER_ANCHOR_MODES = (:slot, :derived)
 
 """
     water_anchor_mode(options) -> Symbol
 
-What the model reads as the total density ρ_t (Stage 3 of the ρ_t retirement):
-
-- `:slot` — the library default: the prognostic slot 3, as before this stage. Bitwise.
-- `:derived` — the run-config default (`numerics.water_anchor`): `ρ_t = ρ_d + Σ_k α_k ν_k` over
-  the water-mass slots, its perturbation `ρ_d' + Σ α_k ν_k'` and the reference
-  `ρ̄_t^w = ρ̄_d + Σ α_k ν̄_k` at EVERY reader (the driver staging, `M`, the acoustic
-  coefficients, buoyancy, the PGF, friction and the sponge, the reference diagnostics and
-  `consistent_qss_reference`, the horizontal/exact SI data, radiation's reference
-  temperature, the R/X census, the netCDF `rho_t`/`rho_tbar`, the state trace and the R1T1X
-  wall estimate). The vapor reconciliation nudge is deleted (the vapor is the ν-space closure
-  of every exchange instead); slot 3 is a passive shadow (`MC_SHADOW_*`).
+What the model reads as the total density: always `:derived` (`ρ_t = ρ_d + Σ_k α_k ν_k` over the
+water-mass slots, its perturbation `ρ_d' + Σ α_k ν_k'` and the reference
+`ρ̄_t^w = ρ̄_d + Σ α_k ν̄_k`, at every reader). `options[:water_anchor]` is RETIRED (Stage 4 of
+the ρ_t retirement): an absent key or an explicit `:derived` is accepted, and `:slot` — the
+prognostic ρ_t slot every reader took up to Stage 3 — is refused by name, as is anything else.
 """
 @inline function water_anchor_mode(options)
-    mode = get(options, :water_anchor, :slot)::Symbol
-    mode in WATER_ANCHOR_MODES ||
-        error("options[:water_anchor] = :$(mode) is not recognized; use :slot (the library " *
-              "default: the prognostic rho_t slot is the total density every reader sees) " *
-              "or :derived (rho_t = rho_d + sum_k alpha_k nu_k over the water-mass slots; " *
-              "slot 3 a passive shadow)")
-    return mode
+    haskey(options, :water_anchor) || return :derived
+    mode = options[:water_anchor]
+    mode === :derived && return :derived
+    mode === :slot && error("options[:water_anchor] = :slot is retired: the prognostic rho_t " *
+        "slot it selected was deleted at Stage 4 of the rho_t retirement (slot 3 is the vapor; " *
+        "rho_t is the derived rho_d + sum_k alpha_k nu_k). The :slot lineage is in git history " *
+        "(Stage 3, development bf577b2). Remove the key.")
+    error("options[:water_anchor] = $(repr(mode)) is not recognized: the key is retired (Stage " *
+          "4 of the rho_t retirement) and the derived anchor is the only behaviour. Remove it.")
 end
-
-"Whether `options[:water_anchor] = :derived` (a function barrier for the column step)."
-@noinline _wa_derived(options) = water_anchor_mode(options) === :derived
 
 """
     water_anchor_set(options, physical_params, IS::MCSlots) -> SIWaterSet
 
-The water-MASS members of the derived anchor (`on` = `options[:water_anchor] = :derived`),
-with the weights and summation order of the SI slaving's set (`_water_member_set`); never a
-number or habit moment. Allocation-free.
+The water-MASS members of the derived anchor, with the weights and summation order of the SI
+slaving's set (`_water_member_set`); never a number or habit moment. Allocation-free.
 """
 @noinline water_anchor_set(options, physical_params, IS::MCSlots) =
-    _water_member_set(water_anchor_mode(options) === :derived, false, options,
-                      physical_params, IS)
+    _water_member_set(true, false, options, physical_params, IS)
 
 """
     anchor_Wp(phys, g, l, ws) -> Float64
@@ -889,17 +878,16 @@ reads the dry density's own bits.
 @inline anchor_rho_tp(rho_dp, Wp) = Wp == 0.0 ? rho_dp : rho_dp + Wp
 
 """
-    _anchor_stage!(rho_t, rho_t_z, rho_tp, phys, colstart, zs, ws, rho_d, rho_d_z,
-                   nvb, nvbz, rcb, rcbz)
+    _anchor_stage!(rho_t, rho_t_z, phys, colstart, zs, ws, rho_d, rho_d_z, nvb, nvbz, rcb, rcbz)
 
 The driver staging of the derived anchor for one column: the totals `ρ_t = ρ_d + W`,
 `ρ_{t,z} = ρ_{d,z} + W_z` (`_siw_W`, the members' totals from the slot views plus their
-references — bitwise Stage 2's ρ̂^w) and the perturbation `ρ_t' = ρ_d' + W'` (`anchor_rho_tp`),
-written over the slot-based columns. `@noinline` on plain arrays (the compile cliff).
+references — bitwise Stage 2's ρ̂^w). The perturbation `ρ_t' = ρ_d' + W'` is formed where its
+one reader needs it ([`_anchor_w_forcing!`](@ref)). `@noinline` on plain arrays (the compile
+cliff).
 """
 @noinline function _anchor_stage!(rho_t::AbstractVector{Float64},
-                                  rho_t_z::AbstractVector{Float64},
-                                  rho_tp::AbstractVector{Float64}, phys::Array{Float64,3},
+                                  rho_t_z::AbstractVector{Float64}, phys::Array{Float64,3},
                                   colstart::Int, zs::Int, ws::SIWaterSet,
                                   rho_d::AbstractVector{Float64},
                                   rho_d_z::AbstractVector{Float64}, nvb, nvbz, rcb, rcbz)
@@ -908,48 +896,28 @@ written over the slot-based columns. `@noinline` on plain arrays (the compile cl
         W, Wz = _siw_W(phys, g, zs, i, ws, nvb, nvbz, rcb, rcbz)
         rho_t[i] = rho_d[i] + W
         rho_t_z[i] = rho_d_z[i] + Wz
-        rho_tp[i] = anchor_rho_tp(phys[g, 2, 1], anchor_Wp(phys, g, 1, ws))
     end
     return nothing
 end
 
 """
-    _anchor_shadow_tendency!(expdot, phys, colstart, ADV, rho_t, rho_t_z, rho_tbar, rho_tbar_z,
-                             div, w, w_z, Fr_z, sd)
+    _anchor_w_forcing!(FORCING, rho_tp, phys, colstart, ws, rho_t, pp_z, rho_tbar, sd)
 
-Slot 3's tendency under the derived anchor: the SHADOW of the linear ρ_t, carried by its own
-transport — the advection `ADV` of its own total gradient (the caller fits it), its own
-`−ρ_s ∇·u` with `ρ_s = slot' + ρ̄_t^w`, the sedimentation `−F_{r,z}` — and the vertical acoustic
-add-back of the SOLVE's operator (`∂z(ρ̂ w)` with the derived ρ̂ on the state-dependent path, the
-reference one otherwise), so that the implicit increment slot 3 keeps (`−Δτ ∂z φ`) is the same
-operator. Nothing reads slot 3; this keeps it the old ρ_t equation.
-"""
-@noinline function _anchor_shadow_tendency!(expdot::Matrix{Float64}, phys::Array{Float64,3},
-                                            colstart::Int, ADV::Vector{Float64},
-                                            rho_t::Vector{Float64}, rho_t_z::Vector{Float64},
-                                            rho_tbar, rho_tbar_z, div::Vector{Float64},
-                                            w, w_z, Fr_z::Vector{Float64}, sd::Bool)
-    @inbounds for i in eachindex(ADV)
-        g = colstart + i - 1
-        rs = phys[g, 3, 1] + rho_tbar[i]
-        ab = sd ? ((rho_t[i] * w_z[i]) + (rho_t_z[i] * w[i])) :
-                  ((rho_tbar[i] * w_z[i]) + (rho_tbar_z[i] * w[i]))
-        expdot[g, 3] = ADV[i] + (((-rs * div[i]) + ab) - Fr_z[i])
-    end
-    return nothing
-end
-
-"""
-    _anchor_w_forcing!(FORCING, rho_tp, rho_t, pp_z, rho_tbar, sd)
-
-The w-equation's explicit buoyancy/PGF remainder on the derived perturbation `ρ_t'`: the
-driver's two expressions, `−g ρ_t'/ρ_t` (state-dependent SI) and
-`(−g ρ_t' − p'_z)/ρ_t + p'_z/ρ̄_t` (reference SI), on the derived columns.
+The w-equation's explicit buoyancy/PGF remainder on the derived perturbation
+`ρ_t' = ρ_d' + W'` (`anchor_rho_tp`, the `−0.0` select: a dry column's ρ_t' is ρ_d' bitwise),
+formed first into the scratch column `rho_tp` (the caller's free `KDIFF`): `−g ρ_t'/ρ_t`
+(state-dependent SI) and `(−g ρ_t' − p'_z)/ρ_t + p'_z/ρ̄_t` (reference SI), with ρ_t the
+derived total. `@noinline` on plain arrays (the compile cliff).
 """
 @noinline function _anchor_w_forcing!(FORCING::Vector{Float64}, rho_tp::Vector{Float64},
+                                      phys::Array{Float64,3}, colstart::Int, ws::SIWaterSet,
                                       rho_t::Vector{Float64}, pp_z, rho_tbar, sd::Bool)
-    # The driver's own `@turbo` expressions, so the instruction selection (and so the bits, on
-    # a dry column where ρ_t' = ρ_d') is the `:slot` path's.
+    @inbounds for i in eachindex(rho_tp)
+        g = colstart + i - 1
+        rho_tp[i] = anchor_rho_tp(phys[g, 2, 1], anchor_Wp(phys, g, 1, ws))
+    end
+    # The driver's own `@turbo` expressions (the instruction selection, and so the bits on a
+    # dry column where ρ_t' = ρ_d', are the pre-retirement prognostic-ρ_t path's).
     if sd
         @turbo FORCING .= @. (-gravity * rho_tp) / rho_t
     else
@@ -961,74 +929,12 @@ end
 """
     mc_rho_tbar_ref(mtile) -> Matrix{Float64}
 
-The `(kDim, 3)` total-density reference every reader takes (value, ∂z, ∂zz): Springsteel's
-fitted `ref_rho_t` under `options[:water_anchor] = :slot`, the derived `ρ̄_t^w` (and its
-gradient; the second derivative is Springsteel's, read by nothing in the moist-compressible set)
-under `:derived`. One `Matrix{Float64}` either way, so a `view(·, :, 1)` binding is type-stable.
+The `(kDim, 3)` total-density reference every reader takes (value, ∂z, ∂zz): the derived
+`ρ̄_t^w` and its gradient (the second derivative is Springsteel's fitted `ref_rho_t`'s, read by
+nothing in the moist-compressible set). One `Matrix{Float64}`, so a `view(·, :, 1)` binding is
+type-stable.
 """
-@inline mc_rho_tbar_ref(mtile) =
-    mtile.ebudget.wa ? mtile.ebudget.rho_tbar_ref : ref_rho_t(mtile.ref_state)
-
-"""
-    init_water_anchor_shadow!(grid, model) -> grid
-
-Under `options[:water_anchor] = :derived`, (re)start the slot-3 shadow AS the derived total:
-its spectral coefficients become the same linear combination of the members' coefficients,
-`a_3 = a_{ρ_d} + Σ_k α_k a_k` (the fixed member order), and the grid is re-transformed. The
-shadow's reference is then `ρ̄_t^w` and the shadow gap starts at the rounding of one linear
-transform (`MC_SHADOW_*`). Called once at initialization — after an initializer's fit and
-after a restart's load (a converted checkpoint's slot 3 carries the old run's partition gap,
-which would otherwise be read as shadow drift). A no-op under `:slot`; every other slot's
-coefficients are untouched.
-
-THE GAP IT DISCARDS IS PRINTED (`report`, default true): the pre-zero shadow gap of the loaded
-state, `G = ρ_t'^slot − (ρ_d' + W')` at the gridpoints, as its maximum `|G|` and its mean, on
-one line. On a restart of a derived run that is the shadow drift the previous segment
-accumulated, and RE-ZEROING ON EVERY LOAD means the `MC_SHADOW_*` census of a segmented run
-measures the drift of ONE segment, never the run's.
-
-WHAT THE SHADOW CAN AND CANNOT SEE (review D6, by construction): slot 3 keeps its own transport,
-its own `−ρ_s ∇·u`, the sedimentation and the acoustic increment of the solve's operator, so its
-gap from the derived total measures how far the linear ρ_t equation and the sum of the members'
-ν equations have drifted apart under the shared dynamics. It is BLIND to the boundary layer's
-water legs (MYNN, Louis: they write `Σ α_k ν̇_k` plus the surface flux into slot 3 with the
-members, so they move both sides identically) and to horizontal water mixing
-(`Khdiff_water`, likewise written as the same sum) — those operators can never open the gap,
-whatever they do to the members.
-"""
-function init_water_anchor_shadow!(grid, model; report::Bool = true)
-    uses_pressure_reference(model.equation_set) || return grid
-    water_anchor_mode(model.options) === :derived || return grid
-    ws = water_anchor_set(model.options, model.physical_params, mc_slots(model))
-    if report
-        ph = grid.physical
-        gm = 0.0; gs = 0.0
-        @inbounds for g in axes(ph, 1)
-            G = ph[g, 3, 1] - anchor_rho_tp(ph[g, 2, 1], anchor_Wp(ph, g, 1, ws))
-            gm = max(gm, abs(G)); gs += G
-        end
-        println("Scythe: water anchor shadow (re)started as the derived total; the discarded " *
-                "pre-zero shadow gap was max|G| = $(gm) kg/m3, mean G = " *
-                "$(gs / max(size(ph, 1), 1)) kg/m3")
-    end
-    sp = grid.spectral
-    @inbounds for r in axes(sp, 1)
-        W = 0.0; first = true
-        for j in 1:6
-            s = ws.slot[j]; a = ws.alpha[j]
-            (s == 0 || a == 0.0) && continue
-            v = a * sp[r, s]
-            if first
-                W = v; first = false
-            else
-                W = W + v
-            end
-        end
-        sp[r, 3] = W == 0.0 ? sp[r, 2] : sp[r, 2] + W
-    end
-    gridTransform!(grid)
-    return grid
-end
+@inline mc_rho_tbar_ref(mtile) = mtile.ebudget.rho_tbar_ref
 
 """
     anchor_W_value(A, g, i, ws, nvb, rcb) -> Float64
@@ -1076,7 +982,8 @@ end
     inert_ice_anchor_legs!(model)
     inert_ice_anchor_legs!(st, model)
 
-UNDER THE DERIVED WATER ANCHOR the four ice-anchor legs are INERT (review D1): the anchor is
+UNDER THE DERIVED WATER ANCHOR (the only one since Stage 4) the four ice-anchor legs are INERT
+(review D1): the anchor is
 `ρ_w = Σ α_k ν_k` itself, so the implied vapor is `ahyp(ν_v) ≥ 0` and the anchor cannot be
 exceeded by construction, while the headroom read through `ρ_t − ρ_d = W` would fire at every
 vapor-lobe point with ice (`ρ_v + X < 0`, the pool) — a transport-detachment guard turned into
@@ -1084,13 +991,12 @@ a vapor-negativity device. The first form sets `options[:ice_anchor_source]`, `[
 `[:ice_anchor_flux]` and `[:ice_anchor_rates]` to `false` (an explicit `true` was already refused
 by [`validate_water_anchor`](@ref)), so `mc_driver!` reads them off exactly as before; the
 second marks the stats matrix (`MC_ANCHOR_INERT`), so `_ice_anchor_reconcile!` measures nothing
-and `MC_ANCHOR_GAP` is the shadow gap ([`_anchor_shadow_census!`](@ref), every column).
+and the `MC_ANCHOR_*` rows read 0.0 (Stage 3's shadow-gap census went with slot 3 at Stage 4).
 Nothing here is in `mc_driver!`: a branch there tips `moist_compressible_SLR` over the LLVM
-compile cliff (measured 2026-10-22). A no-op under `:slot`.
+compile cliff (measured 2026-10-22). The legs' code stays for the Stage 5 decision.
 """
 function inert_ice_anchor_legs!(model)
     uses_pressure_reference(model.equation_set) || return nothing
-    water_anchor_mode(model.options) === :derived || return nothing
     for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux, :ice_anchor_rates)
         model.options[k] = false
     end
@@ -1098,7 +1004,7 @@ function inert_ice_anchor_legs!(model)
 end
 
 function inert_ice_anchor_legs!(st::Matrix{Float64}, model)
-    (size(st, 2) > 0 && water_anchor_mode(model.options) === :derived) || return st
+    size(st, 2) > 0 || return st
     @inbounds st[MC_ANCHOR_INERT, :] .= 1.0
     return st
 end
@@ -1106,51 +1012,50 @@ end
 """
     validate_water_anchor(model)
 
-Setup-time refusals of what the derived water anchor (`options[:water_anchor] = :derived`)
-cannot run, each naming the reason:
+Setup-time refusals of what the derived water anchor — the only one since Stage 4 of the ρ_t
+retirement — cannot run, each naming the reason:
 
-- `physical_params[:Kvdiff_water] > 0`: the implicit water diffusion solves `ρ_t' − ρ_d'` (slot
-  3) as the total water and implies the vapor from it; under the derived anchor slot 3 is a
-  shadow nothing reads (design §6 Stage 3: the ρ_w solve is retired);
+- `options[:water_anchor]` other than `:derived` ([`water_anchor_mode`](@ref): `:slot` is
+  retired with the prognostic ρ_t slot);
+- `physical_params[:Kvdiff_water] > 0`: the implicit water diffusion solved `ρ_t' − ρ_d'` (the
+  deleted slot 3) as the total water and implied the vapor from it (design §6 Stages 3-4: the
+  ρ_w solve and its matrices are retired);
 - `options[:water_lobe_attribution]`, `options[:vapor_nudge_partner]`,
-  `physical_params[:tau_rho_v_rec]`: they configure the vapor reconciliation nudge and its
-  residual `res_rho_t`, which the derived anchor DELETES (the vapor is the ν-space closure of
-  every exchange instead);
-- `options[:water_budget_trace]`, `options[:clamp_water]`: both read slot 3 as the water
-  anchor (the vapor-gap census, the floor's rule 2).
+  `physical_params[:tau_rho_v_rec]`: they configured the vapor reconciliation nudge and its
+  residual, deleted with the prognostic ρ_t (the vapor is the ν-space closure of every
+  exchange instead);
+- an explicit `true` for the four ice-anchor legs and the two MYNN slot-anchor water devices
+  (inert, [`inert_ice_anchor_legs!`](@ref));
+- `options[:clamp_water] = true` (its floor balanced the partition against slot 3), and
+  `options[:mynn_water_carry] = :fixed_T`;
+- `options[:water_budget_trace] > 0` with any water transform, two-moment rain or ice (the
+  driver's own reasons, raised here at setup: the budget rows are density-unit liquid
+  channels).
 
-A no-op under `:slot` and for non-mc equation sets.
+A no-op for non-mc equation sets.
 """
 function validate_water_anchor(model)
     uses_pressure_reference(model.equation_set) || return nothing
     o = model.options
-    # The energy bisection's forensic options, on either anchor.
+    water_anchor_mode(o)
+    # The energy bisection's forensic options.
     get(o, :energy_budget_functional, :model) in (:model, :derived) ||
         error("options[:energy_budget_functional] must be :model (default) or :derived")
     get(o, :refit_partner_form, :defect) in (:defect, :recovered) ||
         error("options[:refit_partner_form] must be :defect (default) or :recovered")
-    water_anchor_mode(o) === :derived ||
-        (get(o, :refit_partner_form, :defect) === :recovered &&
-         error("options[:refit_partner_form] = :recovered selects a form of the DERIVED " *
-               "anchor's refit partner; under numerics.water_anchor = \"slot\" the partner is " *
-               "the recovered-change fold and the key would be ignored. Remove it."))
-    water_anchor_mode(o) === :derived || return nothing
     pp = model.physical_params; opts = model.options
-    why = "options[:water_anchor] = :derived (numerics.water_anchor = \"derived\", the " *
-          "run-config default) reads rho_t = rho_d + sum_k alpha_k nu_k and keeps slot 3 as a " *
-          "passive shadow"
+    why = "the derived water anchor (rho_t = rho_d + sum_k alpha_k nu_k; the prognostic rho_t " *
+          "slot was deleted at Stage 4 of the rho_t retirement)"
     get(pp, :Kvdiff_water, 0.0) > 0.0 && error("physical_params[:Kvdiff_water] > 0 is " *
-        "refused under " * why * ": the implicit water diffusion solves slot 3 as the total " *
-        "water. Set Kvdiff_water = 0 or numerics.water_anchor = \"slot\".")
-    for (k, what) in ((:water_lobe_attribution, "the vapor residual res_rho_t"),
+        "refused under " * why * ": the implicit water diffusion solved the deleted rho_t slot " *
+        "as the total water. Set Kvdiff_water = 0 (the boundary layer mixes the water).")
+    for (k, what) in ((:water_lobe_attribution, "the vapor residual of the prognostic rho_t"),
                       (:vapor_nudge_partner, "the vapor reconciliation nudge"))
         haskey(opts, k) && opts[k] !== false && error("options[:$(k)] configures $(what), " *
-            "which is deleted under " * why * ". Remove the key or set " *
-            "numerics.water_anchor = \"slot\".")
+            "which is deleted under " * why * ". Remove the key.")
     end
     haskey(pp, :tau_rho_v_rec) && error("physical_params[:tau_rho_v_rec] configures the " *
-        "vapor reconciliation nudge, which is deleted under " * why * ". Remove the key or " *
-        "set numerics.water_anchor = \"slot\".")
+        "vapor reconciliation nudge, which is deleted under " * why * ". Remove the key.")
     # Devices the derived anchor SUBSUMES (review D1 and the BL sub-check): inert there, so an
     # explicit `true` is refused rather than silently bypassed (`false` is harmless).
     for (k, what) in ((:ice_anchor_source, "the ice-anchor removal source"),
@@ -1162,12 +1067,18 @@ function validate_water_anchor(model)
         get(opts, k, nothing) === true && error("options[:$(k)] = true configures $(what), " *
             "which is INERT under " * why * " (the anchor sum_k alpha_k nu_k cannot be " *
             "exceeded, and every MYNN water leg is a nu leg realized on its own recovered " *
-            "rate). Remove the key or set numerics.water_anchor = \"slot\".")
+            "rate). Remove the key.")
     end
-    get(opts, :water_budget_trace, 0) > 0 && error("options[:water_budget_trace] reads " *
-        "slot 3 as the water anchor (the res_rho_t - rho_v gap census); refused under " * why)
-    get(opts, :clamp_water, false) === true && error("options[:clamp_water] balances the " *
-        "partition against slot 3 (rule 2); refused under " * why)
+    if get(opts, :water_budget_trace, 0) > 0
+        (condensate_transform_mode(opts) === :none && rain_transform_mode(opts) === :none &&
+         vapor_transform_mode(opts) === :none && rain_moments(opts) == 1 &&
+         ice_microphysics(opts) === :none) || error("options[:water_budget_trace] needs the " *
+            "density lineage (no water transform, single-moment rain, no ice): its budget " *
+            "rows attribute density-unit tendencies of the three liquid channels.")
+    end
+    get(opts, :clamp_water, false) === true && error("options[:clamp_water] balanced the " *
+        "partition against the prognostic rho_t (its rule 2), which is deleted under " * why *
+        ". Remove the key; clamp_water! still measures the negative water.")
     get(opts, :mynn_water_carry, :flux) === :fixed_T && error("options[:mynn_water_carry] " *
         "= :fixed_T (the local fixed-temperature water map) is not implemented under " * why *
         ": the boundary layer's water legs are nu legs whose energy carry is the flux-form " *
@@ -1465,9 +1376,6 @@ reference/HANDOFF_DRIVER_COMPILE_CLIFF.md, measured 2026-10-21); the `_siw_stage
     _water_exchange_multistep!(mtile.expdot_n, phys, S, colstart, rv_i, opts, pp, IS, ice,
                                precip, nvb, vtr, vmu, model.ts)
     eb.active && eb_take!(eb, EB_OP_WEXCH, mtile.expdot_n, colstart)
-    # the MC_ANCHOR_* census under the derived anchor: the shadow gap, every column (D1)
-    _anchor_shadow_census!(mtile.mc_water_stats, Threads.threadid(), phys, colstart,
-                           S.res_rho_t)
     _etd_closure!(S.etd_dv, S.etd_d9, S.etd_d8, S.etd_di1, S.etd_di2, S.etd_di3, ice,
                   opts, pp, IS)
     ctr = condensate_transform_mode(opts); rtr = rain_transform_mode(opts)

@@ -6,9 +6,9 @@
 # `nu_v' = bhyp(rho_v) - nu_vbar`, `nu_vbar = bhyp(rho_vbar)` against the DERIVED reference vapor
 # `rho_vbar = rho_tbar - rho_dbar - rho_cbar`; every reader sees the recovered `ahyp(nu_v) >= 0`;
 # every density-space tendency reaches the slot through `J_v = dnu/drho` (with the lobe-
-# transport continuation below nu = 0); and the reconciliation nudge is the E6 realized,
-# bounded rate law toward `bhyp(max(res_rho_t, 0))`, partnered on the recovered change. rho_t
-# stays prognostic. `:none` (the library default) is bitwise the code before the option.
+# transport continuation below nu = 0). Since Stage 4 of the rho_t retirement the vapor IS slot
+# 3, rho_t is derived (rho_d + sum_k alpha_k nu_k) and the reconciliation nudge of Stage 1 is
+# gone with the prognostic rho_t. `:none` (the library default) is the density-vapor lineage.
 #
 # What has to hold (plan §4 Stage 1, tests first):
 #   1. `:none` and the absent key are bitwise e81e00e (golden checksums, warm/ice/Louis/MYNN);
@@ -17,10 +17,8 @@
 #   4. transport: the recovered vapor under `:bhyp`/1e-9 tracks `:none` to 1e-9 relative over
 #      1000 steps wherever rho_v > 0;
 #   5. the `MC_VNEG` census row counts the nu_v < 0 points;
-#   6. the nudge guard: with res_rho_t < 0 aloft nu_v never crosses below min(nu_v^n, 0); the
-#      old J_v*VREC form runs away to N dt res/tau; rest bitwise; the partner is an exact 0
-#      where ahyp(nu_v) does not move;
-#   7. (test_energy_partners.jl) R held across ETD / refit / nudge on a seeded lobe column;
+#   6. (retired at Stage 4 with the nudge it guarded);
+#   7. (test_energy_partners.jl) R held across ETD / refit on a seeded lobe column;
 #   8. (test_energy_partners.jl "1b") the primitive's special cases.
 # Plus the setup refusals, the config plumbing and the checkpoint conversion on load.
 
@@ -88,7 +86,6 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 for (tag, ice, louis) in (("warm", false, false), ("ice", true, false),
                                           ("louis", false, true))
                     m, p, mo = F.vt_tile(tmp, "g_$(tag)_$(vtr)"; vtr, ice, louis,
-                        extra = Dict{Symbol,Any}(:water_anchor => :derived),
                         seed! = (p, x, V, c) -> F.vt_seed_vapor!(p, x, V, c))
                     F.vt_run!(m, p, mo, 3)
                     V = mo.grid_params.vars
@@ -96,7 +93,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                     @test got[tag][1] == golden[tag][1]
                     @test got[tag][2] == golden[tag][2]
                 end
-                xo = Dict{Symbol,Any}(:water_anchor => :derived)
+                xo = Dict{Symbol,Any}()
                 vtr === nothing || (xo[:vapor_transform] = vtr)
                 m, p, mo, gp, z, col = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
                                                         ctrans = :none, rtrans = :none,
@@ -219,10 +216,11 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             @test_throws ErrorException F.vt_tile(tmp, "ref_wide"; vtr = :bhyp,
                 pp_extra = Dict{Symbol,Float64}(:vapor_mu => 1.0e-3))
             @test_throws ErrorException F.vt_tile(tmp, "ref_dry"; vtr = :bhyp, rh = z -> 0.0)
-            # Kvdiff_water (the implicit rho_w solve) is refused under the vapor transform
-            mk, pk, mok = F.vt_tile(tmp, "ref_kvw"; vtr = :bhyp,
+            # Kvdiff_water (the implicit rho_w solve, which read the deleted rho_t slot) is
+            # refused at tile creation since Stage 4 of the rho_t retirement (it used to be
+            # refused at the first column step under the vapor transform)
+            @test_throws ErrorException F.vt_tile(tmp, "ref_kvw"; vtr = :bhyp,
                 pp_extra = Dict{Symbol,Float64}(:Kvdiff_water => 10.0))
-            @test_throws ErrorException Scythe.advance_column(mk, 1, 1)
         end
     end
 
@@ -236,15 +234,29 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 F.vt_run!(m, p, mo, 5)
                 @test maximum(abs.(p.physical)) == 0.0
                 @test maximum(abs.(m.var_np1)) == 0.0
-                # every tendency is zero; the vapor and pressure slots' are +0.0 bit for bit
-                # (the cloud slot carries a -0.0 at rest under :none too)
+                # every tendency is zero; the pressure slot's is +0.0 bit for bit (the cloud
+                # slot carries a -0.0 at rest under :none too). The VAPOR slot's sign of zero is
+                # pinned exactly: its tendency is `ADV + (-(J_v (rho_v div)))` (div = +0.0, so the
+                # second term is -0.0) plus the exchange closure `water_exchange_dv` of zero
+                # exchanges, -(0.0)/alpha_v = -0.0, and a signed-zero sum keeps ADV's sign. ADV
+                # (`mc_advect!` of the zero state) is -0.0 at every level but the top four, where
+                # it is +0.0, so the warm and ice arms carry -0.0 below and +0.0 there. Under the
+                # retired `:slot` anchor the nudge rate's +0.0 was added after and made it +0.0
+                # everywhere; the same -0.0 pattern was measured at bf577b2 with
+                # `:water_anchor => :derived`. Louis adds its +0.0 legs last: +0.0 everywhere.
                 rv_i = m.mc_slots.rho_v
+                kD = mo.grid_params.kDim
                 @test all(m.expdot_n .== 0.0)
-                @test all(m.expdot_n[:, rv_i] .=== 0.0)
                 @test all(m.expdot_n[:, 1] .=== 0.0)
+                e = m.expdot_n[:, rv_i]
+                if louis
+                    @test all(e .=== 0.0)
+                else
+                    @test all(g -> e[g] === (mod1(g, kD) <= kD - 4 ? -0.0 : 0.0), eachindex(e))
+                end
                 Scythe.advance_column(m, 1, 6)
                 S = m.mc_scratch[Threads.threadid()]
-                @test all(S.VREC .=== 0.0)
+                louis || @test all(m.expdot_n[1:kD, rv_i] .=== S.ADV)
                 @test S.Tk == m.mc_ref_diag.Tbar
                 @test S.rho_v == Scythe.ahyp.(Scythe.mc_nu_vbar(m), VMU)
             end
@@ -256,8 +268,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         mktempdir() do tmp
             out = Dict{Symbol,Any}()
             for vtr in (:none, :bhyp)
-                # a clear column (no condensate), so the comparison is transport, the nudge
-                # (the rho_t gap at 3 km) and the thermodynamics, not a phase change. The
+                # a clear column (no condensate), so the comparison is transport and the
+                # thermodynamics, not a phase change. The
                 # :bhyp seed is formed against the sounding's vapor; bhyp is affine to
                 # (μ/ρ)² there, so against the model's derived reference it is the same
                 # density bump to far below the tolerance.
@@ -340,91 +352,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     end
 
     # ── 6. the nudge guard (E6) ───────────────────────────────────────────────────────
-    @testset "nudge guard: the E6 rate law, pointwise" begin
-        tau = 10.0; dt = 0.5; mu = VMU
-        # rest: target bhyp(res) == ν exactly -> the rate is +0.0
-        for rv in (1.0e-6, 4.0e-7, 1.3e-2)
-            nu = Scythe.bhyp(rv, mu)
-            @test Scythe.vapor_nudge_rate(rv, nu, mu, tau) === 0.0
-        end
-        # the affine regime reproduces J_v·VREC to O(μ/ρ)
-        rv = 1.0e-2; res = rv + 2.0e-5; nu = Scythe.bhyp(rv, mu)
-        @test Scythe.vapor_nudge_rate(res, nu, mu, tau) ≈
-              Scythe.dbhyp(rv, mu) * Scythe.rho_v_reconcile(res, rv, tau) rtol = 1.0e-6
-        # res < 0: the new law decays ν to 0 without crossing (N = 1000 Euler steps); the old
-        # J_v·VREC form runs away (the 2026-10-05 runaway): VREC → res/τ once ahyp(ν) = 0, so
-        # ν → N Δt J res/τ, with J = dbhyp(0) = 1 on the clipped form and → ½ on the
-        # lobe-transport continuation the slot's continuity terms use
-        res = -1.0e-3
-        N = 1000
-        for nu0 in (Scythe.bhyp(2.0e-3, mu), 0.0, -2.0e-6)
-            nnew = nu0; nclip = nu0; nlobe = nu0
-            for _ in 1:N
-                nnew += dt * Scythe.vapor_nudge_rate(res, nnew, mu, tau)
-                rc = Scythe.ahyp(nclip, mu)
-                nclip += dt * Scythe.dbhyp(max(rc, 0.0), mu) * Scythe.rho_v_reconcile(res, rc, tau)
-                rl = Scythe.ahyp(nlobe, mu)
-                nlobe += dt * Scythe.lobe_transport_jacobian(nlobe, rl, mu) *
-                         Scythe.rho_v_reconcile(res, rl, tau)
-            end
-            @test nnew >= min(nu0, 0.0)
-            @test abs(nnew) <= abs(nu0) + 1.0e-30
-            @test nclip ≈ N * dt * res / tau rtol = 0.05            # the runaway, clipped J
-            @test nlobe ≈ 0.5 * N * dt * res / tau rtol = 0.05      # ...and continued J
-        end
-        # the partner: an exact 0.0 where ahyp(ν_v) does not move (a lobe pulled toward 0)
-        nu = -3.0e-6
-        r = Scythe.vapor_nudge_rate(0.0, nu, mu, tau)
-        @test r > 0.0
-        @test Scythe.ahyp(nu + dt * r, mu) - Scythe.ahyp(nu, mu) === 0.0
-    end
-
-    @testset "nudge guard in the model: res_rho_t < 0 aloft, 1000 steps" begin
-        mktempdir() do tmp
-            # ρ_d raised by twice the reference vapor above 6 km (a smooth step), ρ_t and p not:
-            # the partition then has NO water for the vapor there, res_rho_t ≈ −ρ̄_v < 0, and
-            # rho_t' = p' = 0 leaves no buoyancy and no pressure gradient to start with. The
-            # vapor nudge drives the vapor toward zero; its pressure partner then makes the
-            # column move a little.
-            function seed_deficit!(patch, pts, V, col)
-                kDim = length(col.Tk)
-                for i in 1:size(patch.physical, 1)
-                    z = pts[i, end]; k = mod1(i, kDim)
-                    sw = 0.5 * (1.0 + tanh((z - 6000.0) / 600.0))
-                    patch.physical[i, V["rho_d"], 1] = 2.0 * col.rho_v[k] * sw
-                end
-            end
-            # where res_rho_t < 0 (one step of a twin tile)
-            mA, pA, moA = F.vt_tile(tmp, "guardA"; vtr = :bhyp, seed! = seed_deficit!)
-            Scythe.advance_column(mA, 1, 1)
-            aloft = copy(mA.mc_scratch[Threads.threadid()].res_rho_t) .< 0.0
-            @test count(aloft) > 0
-            m, p, mo = F.vt_tile(tmp, "guard"; vtr = :bhyp, seed! = seed_deficit!)
-            kDim = mo.grid_params.kDim
-            rv_i = m.mc_slots.rho_v
-            nc = div(size(p.physical, 1), kDim)
-            nubar = repeat(Scythe.mc_nu_vbar(m), nc)
-            nu0 = p.physical[:, rv_i, 1] .+ nubar
-            F.vt_run!(m, p, mo, 1000)
-            nuN = p.physical[:, rv_i, 1] .+ nubar
-            A = repeat(aloft, nc)
-            @test all(isfinite, p.physical)
-            # NO RUNAWAY. The old J_v·VREC form would take ν_v to ≈ N Δt res/(2τ) ≈ −1.7e-2
-            # here, 35x the initial vapor, deep negative. The new law decays it to 0; what is
-            # left is the per-step REFIT ringing of the kink the floored target has where
-            # res_rho_t crosses 0 (the same pattern with the partner off and w ≡ 0: it is the
-            # refit, not transport), which the nudge pulls back each step.
-            # The pointwise bound ν^{n+N} ≥ min(ν^n, 0) is the rate law's own property
-            # (testset above); in the model the refit's ring sits on top of it.
-            # (measured: min −2.9 %, max |ν| above the crossing level 3 %, at the crossing 13 %)
-            @test minimum(nuN[A]) >= -0.05 * maximum(nu0[A])
-            hi = A .& (repeat(m.tilepoints[1:kDim, end], nc) .> 6500.0)
-            @test count(hi) > 0
-            @test maximum(abs.(nuN[hi])) <= 0.05 * maximum(nu0[A])
-            # the vapor partner moved p (the nudge removed vapor at fixed E_t)
-            @test maximum(abs.(p.physical[:, mo.grid_params.vars["p"], 1])) > 0.0
-        end
-    end
+    # (Both nudge-guard testsets -- the E6 rate law pointwise and the res_rho_t < 0 model
+    # run -- are gone: the vapor reconciliation nudge, `vapor_nudge_rate`, `rho_v_reconcile`
+    # and `res_rho_t` were retired with slot 3 at Stage 4 of the rho_t retirement.)
 
     # ── recovery at the readers ───────────────────────────────────────────────────────
     @testset "readers see the recovered vapor: driver, state-minima, netCDF" begin
@@ -490,7 +420,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         nub = Scythe.bhyp.(rvb_d, VMU)
         nu = Scythe.bhyp.(rv, VMU) .- reshape(nub, 1, n_k)  # the slot: ν_v' against ν̄_v
         nu[2, 7] = -1.0e-5 - nub[7]                      # a vapor lobe
-        slots = (; p, rho_d = rd .- reshape(rdb, 1, n_k), rho_t = rd .+ rv .- reshape(rtb, 1, n_k),
+        slots = (; p, rho_d = rd .- reshape(rdb, 1, n_k),
                    E_t = zeros(n_i, n_k), Q_ss = zeros(n_i, n_k),
                    rho_v = nu, u = zeros(n_i, n_k), w = zeros(n_i, n_k),
                    rain = zeros(n_i, n_k), cloud = zeros(n_i, n_k))

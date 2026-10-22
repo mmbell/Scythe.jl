@@ -3,8 +3,12 @@
 # `physical_params[:tau_lobe]`). Where a cloud, rain or ice-mass control variable has been rung
 # below ν = 0 by the spline refit AND that species' channel is closed at the point (recovered
 # density 0, every process term of the slot exactly 0), ν is relaxed toward 0 as
-# ν ← ν·exp(−Δt/τ_lobe). Nothing else moves: the recovered density is 0 before and after, so
-# ρ_t, ρ_d, the vapor, E_t, p and Q_ss — and every number and habit moment — are untouched.
+# ν ← ν·exp(−Δt/τ_lobe). The recovered density is 0 before and after. Since Stage 4 of the ρ_t
+# retirement the only form is the PAIRED one (`_lobe_relax_paired!`, plan E5, default ON): the
+# vapor pays the lobe's Δν, Δν_v = −Σ_k α_k Δν_k/α_v, so the derived ρ_w = Σ_k α_k ν_k is
+# invariant, and the recovered vapor change gets its κ partner in p and Q_ss (no latent heat).
+# ρ_d, E_t, the momenta and every number and habit moment are untouched. (The unpaired,
+# water-neutral `:slot`-anchor form, which moved nothing but ν, went with slot 3.)
 #
 # Every assertion compares two tiles advanced from the SAME state with the device on and off,
 # on the SAME step (later steps legitimately diverge: the relaxed ν enters the next refit), so
@@ -118,26 +122,54 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         for i in 1:size(patch.physical, 1)
             rc = kink(pts[i, end])
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, MU)
-            patch.physical[i, V["rho_t"], 1] = rc      # the partition starts closed
         end
     end
 
     a_of(ts, tau) = -expm1(-ts / tau)
 
+    """The slots the paired device writes besides the lobe's own mass slot: the vapor that
+    pays it and the κ partner's p and Q_ss."""
+    paired_slots(V) = [Scythe.mc_slot(V, "rho_v"), Scythe.mc_slot(V, "p"),
+                       Scythe.mc_slot(V, "Q_ss")]
+
+    """THE DEVICE IN ISOLATION. The paired form's kappa partner moves p at the lobe points, and
+    the acoustic solve that follows it in the step spreads that p column-wide into w, rho_d and
+    E_t (physics, not a leak: the partner is an energy increment the solve must see). So the
+    pointwise statements are made on the relaxation stage alone: the LAST column's
+    `relaxation_adjustment_qss!` re-applied, in both arms, to the SAME slot matrix (the off
+    arm's post-step state) on the scratch the step left behind. The ETD and exchange
+    increments are identical in the two arms and cancel; what differs is Stage L. Returns the
+    on and off results and the column's rows."""
+    function stage_pair(m1, m0, mo)
+        kDim = mo.grid_params.kDim
+        cs = (div(size(m0.var_np1, 1), kDim) - 1) * kDim + 1
+        X0 = copy(m0.var_np1)
+        m1.var_np1 .= X0
+        Scythe.relaxation_adjustment_qss!(m1, cs, cs + kDim - 1, 1)
+        m0.var_np1 .= X0
+        Scythe.relaxation_adjustment_qss!(m0, cs, cs + kDim - 1, 1)
+        col = cs:(cs + kDim - 1)
+        return copy(m1.var_np1[col, :]), copy(m0.var_np1[col, :]), col
+    end
+
     # ── 1. inert ─────────────────────────────────────────────────────────────────────
     @testset "bitwise inert: switch off, every slot >= 0, rest, :none" begin
         mktempdir() do tmp
-            # (a) The switch off is the absent key's behaviour of the pre-stage code: the key
-            # set to `false` and to the shipped default resolve identically to its absence.
-            for v in (false, Scythe.LOBE_RELAXATION_DEFAULT)
+            # (a) The absent key is the shipped default, which is ON since Stage 4
+            # (`LOBE_RELAXATION_DERIVED_DEFAULT`; the `:slot` default `false` was deleted).
+            @test Scythe.LOBE_RELAXATION_DERIVED_DEFAULT === true
+            for v in (false, Scythe.LOBE_RELAXATION_DERIVED_DEFAULT)
                 mA, pA, moA = lr_tile(tmp, "abs_$(v)"; seed! = seed_sheet!, lobe = nothing)
                 mB, pB, moB = lr_tile(tmp, "set_$(v)"; seed! = seed_sheet!, lobe = v)
                 advance_all!(mA, pA, moA); advance_all!(mB, pB, moB)
-                v == Scythe.LOBE_RELAXATION_DEFAULT &&
+                v == Scythe.LOBE_RELAXATION_DERIVED_DEFAULT &&
                     (@test mA.var_np1 == mB.var_np1 && mA.expdot_n == mB.expdot_n)
+                v == false && (@test mA.var_np1 != mB.var_np1)
             end
             # (b) The sheet, on vs off: the tendencies are identical (the device is not a
-            # tendency), and the state differs ONLY at points whose state-n mass slot was < 0.
+            # tendency), and the relaxation stage differs ONLY at points whose state-n mass slot
+            # was < 0 (`stage_pair`: over the whole step the paired partner's p reaches the
+            # acoustic solve, which spreads it column-wide).
             m1, m0, p1, mo, nu_n = one_step(tmp, "sheet"; seed! = seed_sheet!)
             @test m1.expdot_n == m0.expdot_n
             V = mo.grid_params.vars
@@ -147,7 +179,10 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 anyneg .|= nu_n[:, s] .< 0.0
             end
             @test any(anyneg)                       # the sheet's refit does ring negative
-            @test m1.var_np1[.!anyneg, :] == m0.var_np1[.!anyneg, :]
+            A, B, col = stage_pair(m1, m0, mo)
+            loc = anyneg[col]
+            @test A != B                            # the device acts in this column
+            @test A[.!loc, :] == B[.!loc, :]
             # (c) Every slot >= 0 everywhere (cloud-free, no lobes): bitwise.
             m1, m0, _, _, nu_n = one_step(tmp, "clean")
             @test all(nu_n .== 0.0)
@@ -211,7 +246,6 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                     rvs = Scythe.rho_v_sat(Tk, pp / 100.0)
                     drv = (1.015 - 0.7) * rvs
                     patch.physical[i, rv_i, 1] += drv
-                    patch.physical[i, V["rho_t"], 1] += drv
                     patch.physical[i, V["Q_ss"], 1] += drv
                 end
             end
@@ -256,7 +290,6 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 for i in 1:size(patch.physical, 1)
                     rr = kink(pts[i, end]; zb = 2000.0, zt = 2900.0, amp = 3.0e-4)
                     patch.physical[i, r, 1] = Scythe.rain_slot(rr, :bhyp, MU)
-                    patch.physical[i, V["rho_t"], 1] = rr
                 end
             end
             m1, m0, p1, mo, nu_n = one_step(tmp, "rshaft"; seed! = seed_rshaft!,
@@ -267,27 +300,44 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         end
     end
 
-    # ── 3. water neutrality ──────────────────────────────────────────────────────────
-    @testset "water-neutral: only the lobe's nu moves; nothing recovered moves" begin
+    # ── 3. water neutrality: rho_w is invariant, the vapor pays ──────────────────────
+    @testset "rho_w-neutral: the lobe's nu and the paying vapor move; nothing recovered but the vapor" begin
         mktempdir() do tmp
             m1, m0, p1, mo, nu_n = one_step(tmp, "neutral"; seed! = seed_sheet!)
             V = mo.grid_params.vars
-            c = Scythe.mc_slot(V, "rho_c")
+            c = Scythe.mc_slot(V, "rho_c"); rv = Scythe.mc_slot(V, "rho_v")
             @test m1.var_np1[:, c] != m0.var_np1[:, c]          # the device did act
-            for s in 1:size(m1.var_np1, 2)
-                s == c && continue
-                @test m1.var_np1[:, s] == m0.var_np1[:, s]
-            end
-            # ρ_t, ρ_d, the vapor, E_t, p, Q_ss by name (the loop above covers them; this is
-            # the statement the note makes, spelled out)
-            for nm in ("rho_t", "rho_d", "rho_v", "E_t", "p", "Q_ss", "u", "w")
-                s = Scythe.mc_slot(V, nm)
-                @test m1.var_np1[:, s] == m0.var_np1[:, s]
-            end
-            # The recovered cloud is bitwise the same: 0 at every point the device touched.
+            # The recovered cloud is bitwise the same over the step: 0 at every point the
+            # device touched.
             rc1 = Scythe.recover_total.(m1.var_np1[:, c], :bhyp, MU)
             rc0 = Scythe.recover_total.(m0.var_np1[:, c], :bhyp, MU)
             @test rc1 == rc0
+            # The stage alone (`stage_pair`)
+            A, B, _ = stage_pair(m1, m0, mo)
+            ch = A[:, c] .!= B[:, c]
+            @test any(ch)
+            # every other slot but the paying vapor and the kappa partner's p, Q_ss: bitwise
+            for s in 1:size(A, 2)
+                (s == c || s in paired_slots(V)) && continue
+                @test A[:, s] == B[:, s]
+            end
+            for nm in ("rho_d", "E_t", "u", "w")
+                s = Scythe.mc_slot(V, nm)
+                @test A[:, s] == B[:, s]
+            end
+            # the paired slots move only where the device acted, and all three do move there
+            for s in paired_slots(V)
+                @test A[.!ch, s] == B[.!ch, s]
+                @test all(A[ch, s] .!= B[ch, s])
+            end
+            # the vapor pays: drho_v' = -(alpha_c/alpha_v) dnu_c (here 2/1), so the derived
+            # rho_w = sum_k alpha_k nu_k is unchanged to the rounding of the two additions
+            ws = Scythe.water_anchor_set(mo.options, mo.physical_params, m1.mc_slots)
+            dc = A[ch, c] .- B[ch, c]
+            dv = A[ch, rv] .- B[ch, rv]
+            @test dv ≈ -(ws.alpha[2] / ws.alpha[1]) .* dc rtol = 1.0e-10
+            @test all(dv .< 0.0)                    # lifting nu_c toward 0 costs vapor
+            @test all(Scythe.recover_total.(A[ch, c], :bhyp, MU) .== 0.0)
         end
     end
 
@@ -375,21 +425,35 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test all(m1.var_np1[:, q1] .<= 0.0)
             @test all(Scythe.recover_total.(m1.var_np1[:, q1], :bhyp,
                                             Scythe.MC_ICE_MU_DEFAULTS[1]) .== 0.0)
-            for s in 1:size(m1.var_np1, 2)
-                s == q1 && continue
-                @test m1.var_np1[:, s] == m0.var_np1[:, s]
+            # the stage alone (`stage_pair`): the number and habit moments, and everything but
+            # the paying vapor and its kappa partner, are untouched
+            A, B, _ = stage_pair(m1, m0, mo)
+            @test A[:, q1] != B[:, q1]
+            for s in 1:size(A, 2)
+                (s == q1 || s in paired_slots(V)) && continue
+                @test A[:, s] == B[:, s]
             end
+            for s in ii[2:4]
+                @test A[:, s] == B[:, s]
+            end
+            ws = Scythe.water_anchor_set(mo.options, mo.physical_params, m1.mc_slots)
+            rv = Scythe.mc_slot(V, "rho_v")
+            dq = A[:, q1] .- B[:, q1]
+            @test A[:, rv] .- B[:, rv] ≈ -(ws.alpha[4] / ws.alpha[1]) .* dq rtol = 1.0e-10
         end
     end
 
     # ── 6. refusal, config, allocations ──────────────────────────────────────────────
-    @testset "refused with water_lobe_attribution; tau_lobe must be positive" begin
+    @testset "water_lobe_attribution is retired; tau_lobe must be positive" begin
         mktempdir() do tmp
-            m, p, mo = lr_tile(tmp, "refuse"; lobe = true, attr = true)
-            @test_throws ErrorException Scythe.advance_column(m, 1, 1)
-            m, p, mo = lr_tile(tmp, "attr_off"; lobe = false, attr = true)
-            Scythe.advance_column(m, 1, 1)                     # attribution alone runs
-            @test all(isfinite, m.var_np1)
+            # The lobe attribution went with slot 3 (Stage 4): `true` is refused whatever the
+            # device's setting (the "attribution alone runs" arm is gone with it).
+            for lobe in (true, false)
+                @test_throws ErrorException begin
+                    m, p, mo = lr_tile(tmp, "refuse_$(lobe)"; lobe = lobe, attr = true)
+                    Scythe.advance_column(m, 1, 1)
+                end
+            end
             m, p, mo = lr_tile(tmp, "tau_neg"; lobe = true, tau = 0.0)
             @test_throws ErrorException Scythe.advance_column(m, 1, 1)
         end

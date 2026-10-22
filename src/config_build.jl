@@ -186,7 +186,6 @@ function build_physics(cfg::RunConfig; start_hour::Float64 = cfg.physics.radiati
     num.cfl_interval > 0.0 && (o[:cfl_interval] = num.cfl_interval)
     o[:temperature] = num.temperature
     o[:si_water_slots] = num.si_water_slots
-    o[:water_anchor] = num.water_anchor
     o[:vertical_mixing] = false      # legacy primitive-equation switch; the BL owns vertical mixing
 
     # ── microphysics
@@ -322,7 +321,7 @@ per-variable `override`:
 - `lateral = periodic`, XZ: `PeriodicBC` on every variable.
 - `vertical_scalars` (ground) and `vertical_scalars_lid` (lid) of every variable: `d2`
   SecondDerivativeBC, `natural` NaturalBC, `neumann` NeumannBC, `r1t1x` d2 with the acoustic
-  set (`rho_d, rho_t, E_t, Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w`
+  set (`rho_d, E_t, Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w`
   Dirichlet at both ends.
 - sedimentation: rain (+ rain number, + the twelve ice slots) NaturalBC at the ground so
   they can fall out; at the lid too when `sedimentation_lid = natural`, left on the
@@ -359,7 +358,7 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
             Dict{String,Any}(v => NeumannBC() for v in vars)
         else # :r1t1x
             d = Dict{String,Any}(v => SecondDerivativeBC() for v in vars)
-            for v in ("rho_d", "rho_t", "E_t", "Q_ss")
+            for v in ("rho_d", "E_t", "Q_ss")
                 d[v] = NeumannBC()
             end
             d["p"] = Springsteel.CubicBSpline.R1T1X

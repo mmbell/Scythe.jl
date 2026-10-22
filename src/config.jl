@@ -541,7 +541,7 @@ end
 - `l_q_vertical::Float64` — filter length of the vertical B-spline (z); 0 = inherit `l_q`; refused on `RZ` (Chebyshev vertical).
 - `cfl_interval::Float64` — CFL report cadence [s]; 0 = `output.interval`, resolved at build.
 - `si_water_slots::Symbol` — which water slots the acoustic semi-implicit solve slaves to its mass flux (Stage 2 of the rho_t retirement, `src/si_water_slaving.jl`): `mass` (default: vapor, cloud, rain and the three ice masses take their vertical acoustic flux implicitly, `dnu_k' = -dtau (c_k phi_z + c_k,z phi)`, so the water moves with the dry air under the one AI2* integrator and `rho_d' + sum alpha_k nu_k'` advances exactly as `rho_t'` does), `all` (`mass` plus the rain number and the nine ice number/habit moments) or `none` (every water species takes its acoustic compression explicitly, as before 2026-10-20). Refused with a mixed vertical wall family across the slaved slots (the `d2`/`r1t1x` families leave the sedimenting slots natural at the ground; `[extra.options] si_water_mixed_walls = true` runs it to measure).
-- `water_anchor::Symbol` — what every reader takes as the total density (Stage 3 of the rho_t retirement, `src/si_water_slaving.jl` `water_anchor_mode`): `derived` (default: `rho_t = rho_d + sum_k alpha_k nu_k` over the water-mass slots, alpha = 2 transformed / 1 density, with the reference `rho_tbar_w = rho_dbar + sum alpha_k nu_kbar`; the vapor reconciliation nudge is gone, the vapor is the nu-space closure of every exchange, and slot 3 is a passive shadow of the old linear `rho_t` whose gap the census reports) or `slot` (the prognostic slot 3 is the total density, as before 2026-10-21). `physical_params` `Kvdiff_water > 0` is refused under `derived`.
+- (`water_anchor` is retired: Stage 4 of the rho_t retirement deleted the prognostic rho_t slot, so the total density every reader takes is always the derived `rho_t = rho_d + sum_k alpha_k nu_k` over the water-mass slots, alpha = 2 transformed / 1 density, against `rho_tbar_w = rho_dbar + sum alpha_k nu_kbar`; a config that sets `numerics.water_anchor` is refused. `physical_params` `Kvdiff_water > 0` is refused.)
 - `temperature::Symbol` — the model temperature every consumer reads (microphysics, radiation, surface layer, boundary layer, output): `eos` = `p/(rho_d R_d + rho_v R_v)` from the prognostic pressure and vapor (default since 2026-10-14), `energy` = the closed-form total-energy retrieval, which reads the clipped condensate and warms by ~2.5 K per 1e-3 kg/m3 of clipped lobe. `E_t` stays prognostic either way; the output's `T_split` and `E_residual` measure the disagreement.
 
 The filter lengths are separate because the two directions do different jobs: the
@@ -564,7 +564,6 @@ Base.@kwdef struct Numerics <: AbstractConfigSection
     cfl_interval::Float64 = 0.0
     temperature::Symbol = :eos
     si_water_slots::Symbol = :mass
-    water_anchor::Symbol = :derived
 end
 
 """
@@ -738,8 +737,7 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (HorizontalMixing, :scheme)                => HMIX_SCHEMES,
     (Numerics, :positivity)                    => POSITIVITY_MODES,
     (Numerics, :temperature)                   => TEMPERATURE_CHOICES,
-    (Numerics, :si_water_slots)                => SI_WATER_SLOT_MODES,
-    (Numerics, :water_anchor)                  => WATER_ANCHOR_MODES)
+    (Numerics, :si_water_slots)                => SI_WATER_SLOT_MODES)
 
 _join_path(path::AbstractString, f) = isempty(path) ? string(f) : string(path, ".", f)
 
@@ -830,7 +828,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :state_dependent_si       => (Bool, "vertical SI implicit coefficients from the current column state (moist_compressible.jl)"),
     :exact_si                 => (Bool, "exact coupled semi-implicit acoustic solve, variant 1 (exact_si.jl, moist_compressible.jl)"),
     :si_water_slots           => (Symbol, "water slots slaved to the acoustic mass flux: :none (library default), :mass (vapor, cloud, rain, ice masses) or :all (plus the number/habit moments) (si_water_slaving.jl, moist_compressible.jl, horizontal_si.jl, exact_si.jl)"),
-    :water_anchor             => (Symbol, "the total density every reader takes: :slot (library default, the prognostic rho_t slot) or :derived (rho_d + sum_k alpha_k nu_k over the water-mass slots; the vapor nudge deleted, slot 3 a passive shadow) (si_water_slaving.jl, moist_compressible.jl, energy_budget.jl, radiation.jl, netcdf_output.jl)"),
+    :water_anchor             => (Symbol, "RETIRED (Stage 4 of the rho_t retirement): the derived anchor rho_t = rho_d + sum_k alpha_k nu_k is the only behaviour; :derived is accepted, :slot refused (si_water_slaving.jl)"),
     :si_water_mixed_walls     => (Bool, "run si_water_slots with a mixed vertical wall family across the slaved water slots, to measure it (refused otherwise) (si_water_slaving.jl)"),
     :temperature              => (Symbol, "model temperature: :eos = p/(rho_d R_d + rho_v R_v) (default) or :energy = the closed-form total-energy retrieval (moist_compressible.jl, radiation.jl, semiimplicit.jl, netcdf_output.jl)"),
     :exact_si_ax0             => (Bool, "exact_si axisym: experimental axis-row treatment of the radial operator (exact_si.jl)"),
@@ -859,19 +857,19 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :rain_number_transform    => (Symbol, "rain-number-slot control variable: :none, :bhyp, :bhyp_smooth (moist_compressible.jl)"),
     :ice_transform            => (Symbol, "control variable of the twelve ice slots: :none, :bhyp, :bhyp_smooth (moist_compressible.jl)"),
     :condensate_floor         => (Symbol, "cloud flooring at the thermodynamic interface: :none or :diagnostic (moist_compressible.jl)"),
-    :clamp_water              => (Bool, "floor negative untransformed water at zero after each step (moist_compressible.jl)"),
+    :clamp_water              => (Bool, "RETIRED with the rho_t slot its floor balanced against (Stage 4): true is refused; clamp_water! still measures (moist_compressible.jl, si_water_slaving.jl)"),
     :water_warn_dT            => (Float64, "temperature-mismatch warning threshold [K] of the water reconciliation (moist_compressible.jl)"),
     :rain_evap_realization    => (Bool, "per-donor realization bound on rain evaporation (moist_compressible.jl)"),
     :cloud_evap_realization   => (Bool, "cloud donor realization: evaporation, autoconversion/collection and the ice legs on the cloud each realized at rate*J0(kappa_tot*dt), kappa_tot the cloud reservoir's total conductance, so their sum never exceeds the cloud present; default true, false restores the unrealized draw (moist_compressible.jl)"),
     :rain_population_gate     => (Bool, "skip two-moment rain sinks where the carried rain number is not a population (moist_compressible.jl)"),
-    :water_lobe_attribution   => (Bool, "the vapor residual and the ice anchor headroom read each transformed water-mass slot's clipped negative lobe through the odd continuation of ahyp; default FALSE until the slots' below-zero transport is consistent with rho_t (measured 2026-10-07: the slots hold a 4-6.5 kg/m2 negative pool rho_t does not, so attributing it inflates the vapor by ~10% of the column); true enables it (moist_compressible.jl)"),
+    :water_lobe_attribution   => (Bool, "RETIRED with the rho_t slot whose vapor residual it fed (Stage 4): true is refused (si_water_slaving.jl)"),
     :exchange_realization     => (Bool, "the ETD phase-change exchange of every transformed water-mass slot (cloud, rain, the three ice masses) books its vapor, latent heat in p and Q_ss give-back on the mass the slot's RECOVERED density actually receives, ahyp(nu*+d) - ahyp(nu*), not on the requested dt*qdot; default true, false restores the requested-mass booking bitwise (moist_compressible.jl)"),
     :refit_partner            => (Bool, "the per-step spline refit's change in each transformed water-mass slot's RECOVERED density (cloud, rain, the three ice masses) is booked as condensation: vapor, latent heat in p and Q_ss partners folded into the ETD increments, so the refit's discretization error is an energy-consistent phase change instead of an E_t - E_implied drift; default true, false is bitwise the code without it (moist_compressible.jl)"),
-    :refit_partner_form       => (Symbol, "under numerics.water_anchor = derived, what the refit partner books: :defect (default, the affine defect recover(nu) - 2nu of every transformed water-mass slot, the vapor's included, energy only) or :recovered (forensics, the energy bisection's arm E-a: the full recovered change of the condensates at the :slot coefficients, energy only, no nu written) (moist_compressible.jl)"),
-    :refit_partner_vapor      => (Bool, "under numerics.water_anchor = derived and refit_partner_form = :defect, book the vapor's own affine defect (kappa Delta_v); default true, false is the energy bisection's arm E-b (moist_compressible.jl)"),
-    :energy_budget_functional => (Symbol, "the R functional energy_budget books: :model (default, the anchor the run uses: slot 3 under water_anchor = slot, rho_d + sum alpha nu under derived) or :derived (forensics, the energy bisection's arm E-c: the derived functional's mechanical term (rho_d + sum alpha nu) geo on a :slot run; X is unchanged) (energy_budget.jl)"),
-    :vapor_nudge_partner      => (Bool, "the vapor reconciliation nudge (rho_v_reconcile) gets the pressure partner T*(R_v - (R_m/C_vt) C_vv)*VREC that holds E_implied, so the nudged vapor's internal energy comes from the sensible heat and E_t - E_implied is unchanged by the nudge; default true, false is bitwise the unpartnered nudge (moist_compressible.jl)"),
-    :lobe_relaxation          => (Bool, "relax a transformed water-mass slot's (cloud, rain, the three ice masses) refit lobe nu < 0 toward 0 on physical_params[:tau_lobe] where that species' channel is closed (recovered density 0, every process term of the slot exactly 0); moves no recovered mass; under numerics.water_anchor = derived it is PAIRED with the vapor (the vapor pays the lobe's nu, kappa partner, no latent heat) and defaults ON, under slot it is water-neutral and defaults off; a pragmatic device, not physics (Stage L, reference/RHO_T_RETIREMENT_DESIGN.md); refused with water_lobe_attribution (moist_compressible.jl)"),
+    :refit_partner_form       => (Symbol, "what the refit partner books: :defect (default, the affine defect recover(nu) - 2nu of every transformed water-mass slot, the vapor's included) or :recovered (forensics, the energy bisection's arm E-a: the full recovered change) (moist_compressible.jl, si_water_slaving.jl)"),
+    :refit_partner_vapor      => (Bool, "under refit_partner_form = :defect, book the vapor's own affine defect (kappa Delta_v); default true, false is the energy bisection's arm E-b (si_water_slaving.jl)"),
+    :energy_budget_functional => (Symbol, "the R functional energy_budget books: :model (default) or :derived; both are the derived rho_d + sum alpha nu since Stage 4 (energy_budget.jl)"),
+    :vapor_nudge_partner      => (Bool, "RETIRED with the vapor reconciliation nudge (Stage 4): true is refused (si_water_slaving.jl)"),
+    :lobe_relaxation          => (Bool, "relax a transformed water-mass slot's (cloud, rain, the three ice masses) refit lobe nu < 0 toward 0 on physical_params[:tau_lobe] where that species' channel is closed (recovered density 0, every process term of the slot exactly 0); moves no recovered mass; PAIRED with the vapor (the vapor pays the lobe's nu, kappa partner, no latent heat), default ON; a pragmatic device, not physics (Stage L, reference/RHO_T_RETIREMENT_DESIGN.md) (moist_compressible.jl)"),
     :water_lobe_transport     => (Bool, "below nu = 0 the continuity terms of each transformed water-mass slot (cloud, rain, ice masses) read the odd continuation ahyp_signed and its Jacobian, so the slots are transported consistently with the linear rho_t; default true, false restores the clipped-point forms (J = 1, rho = 0) for forensics (moist_compressible.jl)"),
     :sedimentation_flux_lid   => (Symbol, "lid of every sedimentation-flux fit: :dirichlet (default, F = 0 at the lid) or :natural (forensics: the slot's own lid BC, lets hydrometeors fall in from above) (moist_compressible.jl)"),
     :ice_microphysics         => (Symbol, "ice scheme: :ishmael or :none (moist_compressible.jl, radiation_state.jl, mc_mynn_bl.jl)"),
@@ -897,8 +895,8 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :mynn_init                => (Symbol, "MYNN TKE initialisation: :taper or :zero (mynn_state.jl)"),
     :mynn_fidelity            => (Union{Symbol,Vector{Symbol}}, "MYNN closure fidelity: :scythe, :fortran or a Vector of deviations (mynn_state.jl)"),
     :mynn_water_carry         => (Symbol, "MYNN water carry: :flux or :fixed_T (mynn_state.jl)"),
-    :mynn_exchange_realization => (Bool, "where a transformed water-mass slot (cloud, rain, the three ice masses) is in or is driven into its clipped lobe, the MYNN eddy leg's assumed density change and the recovered one differ; the gap is booked as a phase change (vapor, latent heat in p, Q_ss) so the water carry and E_t stay closed; default true, bitwise wherever no slot is clipped; false restores the unpartnered legs; not read while :mynn_water_closure is on, which subsumes it (mc_mynn_bl.jl)"),
-    :mynn_water_closure       => (Bool, "the MYNN vapor leg is the residual of the total-water leg and the species legs' REALIZED (recovered-density) rates, and the water carry's thermal remainder is evaluated on those, so the boundary layer moves rho_v + rho_liq + rho_ice by exactly what it moves rho_t and holds E_t - E_implied; default true, bitwise where K_h = 0; false restores the independently fitted vapor leg (mc_mynn_bl.jl)"),
+    :mynn_exchange_realization => (Bool, "RETIRED with the :slot anchor (Stage 4): the derived anchor's MYNN legs are nu legs realized on their own recovered rates; true is refused (si_water_slaving.jl)"),
+    :mynn_water_closure       => (Bool, "RETIRED with the :slot anchor (Stage 4): the derived anchor's MYNN total-water leg is the pointwise sum of the species' nu legs; true is refused (si_water_slaving.jl)"),
     :mynn_mix_numbers         => (Bool, "MYNN also mixes the number densities (mynn_state.jl)"),
     :mynn_output              => (Bool, "per-tile MYNN NetCDF sidecar (mynn_state.jl)"),
     :mynn_trace               => (Bool, "MYNN per-call summary line (mynn_state.jl)"),
@@ -963,7 +961,7 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :Khdiff_heat   => (Float64, "horizontal heat diffusivity [m^2/s]; < 0 = Smagorinsky K/Pr_t (moist_compressible.jl)"),
     :Kvdiff_heat   => (Float64, "vertical heat diffusivity [m^2/s]; default Kvdiff (moist_compressible.jl, exact_si.jl)"),
     :Khdiff_water  => (Float64, "horizontal water diffusivity [m^2/s], every water species and ice moment; < 0 = Smagorinsky K/Sc_t (moist_compressible.jl)"),
-    :Kvdiff_water  => (Float64, "vertical water diffusivity [m^2/s]; refused with ice and two-moment rain (moist_compressible.jl, exact_si.jl)"),
+    :Kvdiff_water  => (Float64, "RETIRED (Stage 4): the implicit water diffusion solved the deleted rho_t slot as the total water; > 0 is refused (si_water_slaving.jl)"),
     :Pr_t          => (Float64, "turbulent Prandtl number for Smagorinsky heat mixing (moist_compressible.jl)"),
     :Sc_t          => (Float64, "turbulent Schmidt number for Smagorinsky water mixing (moist_compressible.jl)"),
     :Ls            => (Float64, "Smagorinsky length scale [m]; > 0 = this absolute length on every patch, 0 = C_s * each patch's cell width (moist_compressible.jl)"),
@@ -985,7 +983,7 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :sfc_wind_factor => (Float64, "multiplier from the lowest-level wind to the 10 m wind (mc_surface_layer.jl)"),
     # ── microphysics
     :tau_qss       => (Float64, "QSS relaxation timescale [s] (moist_compressible.jl)"),
-    :tau_rho_v_rec => (Float64, "vapor reconciliation timescale [s] (moist_compressible.jl)"),
+    :tau_rho_v_rec => (Float64, "RETIRED with the vapor reconciliation nudge (Stage 4): the key is refused (si_water_slaving.jl)"),
     :N_0           => (Float64, "rain DSD intercept [1/m^4] (moist_compressible.jl, netcdf_output.jl)"),
     :N_r           => (Float64, "single-moment rain number parameter (moist_compressible.jl)"),
     :condensate_mu => (Float64, "bhyp width for cloud [kg/m^3] (moist_compressible.jl, netcdf_output.jl)"),
@@ -1085,7 +1083,6 @@ const OWNED_OPTION_KEYS = Dict{Symbol,String}(
     :cfl_interval              => "numerics.cfl_interval",
     :temperature               => "numerics.temperature",
     :si_water_slots            => "numerics.si_water_slots",
-    :water_anchor              => "numerics.water_anchor",
     :output_formats            => "output.formats",
     :netcdf_grid               => "output.netcdf_grid",
     :netcdf_derivatives        => "output.netcdf_derivatives",
@@ -1236,6 +1233,18 @@ const MOVED_KEYS = Dict{String,String}(
     "numerics.wall_bc"              => "boundary_conditions.vertical_scalars",
     "numerics.sedimentation_top_bc" => "boundary_conditions.sedimentation_lid")
 
+"""
+    RETIRED_CONFIG_KEYS
+
+Config keys that no longer exist: full key → why. `load_config` refuses them with the reason
+instead of a bare unknown-key error.
+"""
+const RETIRED_CONFIG_KEYS = Dict{String,String}(
+    "numerics.water_anchor" => "Stage 4 of the rho_t retirement deleted the prognostic rho_t " *
+        "slot: the total density every reader takes is always the derived rho_d + " *
+        "sum_k alpha_k nu_k (the :slot lineage is in git history, Stage 3, development " *
+        "bf577b2). Remove the key")
+
 "What a `MOVED_KEYS` refusal adds when the new key does not carry the old meaning alone."
 const MOVED_KEY_NOTES = Dict{String,String}(
     "numerics.wall_bc" => "; it set the ground AND the lid, `vertical_scalars` is the ground " *
@@ -1259,6 +1268,8 @@ function from_dict(::Type{T}, d::AbstractDict, path::AbstractString = "") where 
         full = _join_path(path, k)
         haskey(MOVED_KEYS, full) && error("config: `$full` has moved to " *
             "`$(MOVED_KEYS[full])` (same values); set it there" * get(MOVED_KEY_NOTES, full, ""))
+        haskey(RETIRED_CONFIG_KEYS, full) &&
+            error("config: `$full` is retired: $(RETIRED_CONFIG_KEYS[full])")
         s in names || error("config: unknown key `$k` in [$(isempty(path) ? "top level" : path)]; " *
                             "valid keys: " * join(string.(names), ", "))
         kw[s] = _coerce(fieldtype(T, s), v, _join_path(path, k))

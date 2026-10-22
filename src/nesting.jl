@@ -610,8 +610,9 @@ const NEST_EXCHANGE_ZONE_CELLS = 3
     refit_reference_after_exchange!(mtile, injections, t)
 
 THE REFIT PARTNER UNDER NESTING: re-take the partner's "before" reference AFTER the nest
-exchange, on the points the exchange writes, so [`_refit_partner_fold!`](@ref) measures the
-refit's own change in recovered condensate and never the exchange's.
+exchange, on the points the exchange writes, so the refit partner
+([`_refit_partner_defect!`](@ref)) measures the refit's own change in recovered water and never
+the exchange's.
 
 The partner compares the slots `mc_driver!` loads at the top of a step (the refit state in
 `tile.physical`) with the pre-refit `var_np1` the previous step wrote. On a nest patch two
@@ -621,17 +622,16 @@ things stand between those, not one:
     function): after `tileTransform!` the collar rows of `physical` are OVERWRITTEN with the
     child's evaluation, every variable and derivative slice. The parent's refit there is
     discarded unseen; the change from `var_np1` is the child−parent difference of the whole
-    state (`ρ_t`, `E_t` and `p` jump with the condensate), not a phase change.
+    state (`E_t` and `p` jump with the water), not a phase change.
   * CHILD, the R3X payload (`run_nested_patch`, after `calcTendency`): the parent's trio is
     written into the border `ahat` and the b→a solve of `splineTransform!` honours it, so in
     the child's coupling zone the refit IS the exchange — there is no post-refit, pre-exchange
     state to compare against, on any ordering.
 
-Booked as condensation, either would put the parent−child mismatch of the condensate into
-the vapor and `p` with latent heat, while the same exchange moved `ρ_t` and `E_t` by their
-own mismatch. So on those points the reference is taken after the exchange: the transformed
-mass slots of `var_np1` are set to what `physical` now holds, and the partner there is an
-exact zero. The parent's collar rows are exactly the injected rows (`injections`). The child's
+Booked by the partner, either would put the parent−child mismatch of the water into `p` and
+`Q_ss` with latent heat, while the same exchange moved `E_t` by its own mismatch. So on those
+points the reference is taken after the exchange: the transformed mass slots of `var_np1` are
+set to what `physical` now holds, and the partner there is an exact zero. The parent's collar rows are exactly the injected rows (`injections`). The child's
 zone is every point within [`NEST_EXCHANGE_ZONE_CELLS`](@ref) cells of an R3X side — the
 support of the pinned trio. Beyond it the pinned coefficients still reach the free ones
 through the banded Gram solve, at a geometrically decaying weight, and that remainder IS read
@@ -643,14 +643,14 @@ WHAT IS LEFT UNPAIRED, stated: in the zone the exchange changes `R = E_t − E_i
 difference of the two patches' own `R` there, as it changes every other field — the exchange
 is a coupling of states, each carrying its own books, not a process this patch can partner.
 
-UNDER THE DERIVED ANCHOR the partner is [`_refit_partner_defect!`](@ref), which books the
-vapor's own defect `κ Δ_v` from the same two states; with `vapor_transform ≠ :none` the vapor
-slot is re-taken beside the condensates (so a parent→child vapor jump books nothing either),
-and it counts as a transformed slot for the early return below.
+The partner ([`_refit_partner_defect!`](@ref), the derived water anchor's) books the vapor's own
+defect `κ Δ_v` from the same two states; with `vapor_transform ≠ :none` the vapor slot is
+re-taken beside the condensates (so a parent→child vapor jump books nothing either), and it
+counts as a transformed slot for the early return below.
 
 Inert (returns at once) at `t == 1` (`var_np1` holds no fitted state and the partner does not
 run), off the moist sets, with `options[:refit_partner] = false`, and with no transformed
-mass slot (the vapor included under the derived anchor); then nothing is written, so all of those are bitwise. `var_np1` is otherwise only
+mass slot (the vapor included); then nothing is written, so all of those are bitwise. `var_np1` is otherwise only
 written by `explicit_timestep` before it is next read, so the rows written here affect
 nothing but the partner.
 """
@@ -666,11 +666,9 @@ function refit_reference_after_exchange!(mtile::ModelTile,
     sc = condensate_transform_mode(opts) !== :none ? 9 : 0
     sr = rain_transform_mode(opts) !== :none ? 8 : 0
     ion = ice_registered(IS) && ice_transform_mode(opts) !== :none
-    # Under the derived anchor the partner (`_refit_partner_defect!`) also books the VAPOR's
-    # defect from `var_np1[:, rho_v]` (its gate includes the vapor transform), so the vapor is
-    # re-taken too; under `:slot` the fold never reads it.
-    sv = (water_anchor_mode(opts) === :derived && vapor_transform_mode(opts) !== :none) ?
-         IS.rho_v : 0
+    # The partner (`_refit_partner_defect!`) also books the VAPOR's defect from
+    # `var_np1[:, rho_v]` (its gate includes the vapor transform), so the vapor is re-taken too.
+    sv = vapor_transform_mode(opts) !== :none ? IS.rho_v : 0
     slots = (sc, sr, ion ? IS.i1_q : 0, ion ? IS.i2_q : 0, ion ? IS.i3_q : 0, sv)
     all(iszero, slots) && return nothing
     vn = mtile.var_np1

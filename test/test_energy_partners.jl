@@ -4,18 +4,21 @@
 # than its partners assume opens the residual `R = E_t − E_implied(p, ρ_d, ρ_v, ρ_liq, ρ_ice,
 # T_eos)` (the closed per-operator budget of 2026-10-16). The cures, each a switch:
 #
-#   1. `options[:exchange_realization]` — the ETD phase change books its vapor, heat and Q_ss
-#      partners on the mass the slot's recovered density actually receives;
-#   2. `options[:mynn_exchange_realization]` — the MYNN eddy legs of the transformed mass slots
-#      book the mass a clipped lobe cannot hold as a phase change;
-#   3. `options[:refit_partner]` — the spline refit's change in recovered condensate is booked
-#      as condensation (the author's decision, 2026-10-16);
-#   4. `options[:vapor_nudge_partner]` — the vapor reconciliation nudge gets the pressure
-#      partner that holds E_implied;
-#   5. `options[:mynn_water_closure]` — the MYNN vapor leg is the residual of the total-water
-#      leg and the species' realized rates, so the boundary layer leaves the partition and R
-#      closed.
+#   1. `options[:exchange_realization]` — the ETD phase change books its heat and Q_ss partners
+#      on the mass the slots' recovered densities actually receive (under the derived water
+#      anchor, the only one since Stage 4 of the rho_t retirement, the vapor slot holds the
+#      nu-space closure of the exchange and is not re-written: rho_w = sum_k alpha_k nu_k is
+#      invariant and the realization is energy only);
+#   2. `options[:refit_partner]` — the spline refit's change in the recovered water is booked
+#      energy-consistently (under the derived anchor: the affine defect, energy only).
 # Section 3b: the refit partner under nesting (`refit_reference_after_exchange!`).
+#
+# RETIRED at Stage 4 with slot 3 (the prognostic rho_t), and their tests with them: the MYNN
+# clip-gap partner (`options[:mynn_exchange_realization]`, `_mynn_clip_gap`), the vapor
+# reconciliation nudge's pressure partner (`options[:vapor_nudge_partner]`,
+# `vapor_nudge_partner_rate`) and the MYNN total-water closure (`options[:mynn_water_closure]`).
+# The derived-anchor forms of the realization (E4), the refit partner (E2) and the MYNN legs
+# (E7) are tested in test_water_anchor.jl.
 #
 # Every assertion is on ONE step of tiles advanced from the same state, so the property tested
 # is the operator's own. The tile is the lobe-relaxation fixture: a periodic XZ slice with
@@ -48,9 +51,14 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     function ep_tile(tmpdir, tag; seed! = (p, x, V) -> nothing, opts_extra = Dict{Symbol,Any}(),
                      precip = false, tr = :bhyp, ts = 0.5, rh = z -> 0.7, ncell = NCELL,
                      bcl = PeriodicBC(), bcr = PeriodicBC())
+        # The lobe relaxation (Stage L) is held OFF: since Stage 4 it defaults ON (the paired
+        # form, which moves the vapor, p and Q_ss at lobe points inside the same ETD stage);
+        # these tests isolate the partners, as they did when Stage L defaulted off, and the
+        # paired Stage L has its own tests (test_lobe_relaxation.jl, test_water_anchor.jl).
         opts = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
                                 :precipitation => precip, :vertical_mixing => false,
-                                :condensate_transform => tr, :rain_transform => tr)
+                                :condensate_transform => tr, :rain_transform => tr,
+                                :lobe_relaxation => false)
         merge!(opts, opts_extra)
         varnames = Scythe.mc_var_names(opts)
         vars = Dict(v => i for (i, v) in enumerate(varnames))
@@ -99,7 +107,6 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         for i in 1:size(patch.physical, 1)
             rc = kink(pts[i, end])
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rc, 0.0, tr, MU)
-            patch.physical[i, V["rho_t"], 1] = rc
         end
     end
 
@@ -115,7 +122,6 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             pp = 100000.0 * exp(-zz / 8000.0)
             drv = (1.015 - 0.7) * Scythe.rho_v_sat(Tk, pp / 100.0)
             patch.physical[i, rv_i, 1] += drv
-            patch.physical[i, V["rho_t"], 1] += drv
             patch.physical[i, V["Q_ss"], 1] += drv
         end
     end
@@ -125,13 +131,15 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         rc_i = Scythe.mc_slot(V, "rho_c")
         for i in 1:size(patch.physical, 1)
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(amp, 0.0, :bhyp, MU)
-            patch.physical[i, V["rho_t"], 1] = amp
         end
     end
 
     # ── the residual R = E_t − E_implied(T_eos), pointwise, of a slot matrix ──────────
     """`R` and the recovered liquid at every gridpoint of the slot matrix `X` (the layout of
-    `var_np1`: perturbation slots, slot 9 against `ν̄_c ≡ 0`, slot 8 a total)."""
+    `var_np1`: perturbation slots, slot 9 against `ν̄_c ≡ 0`, slot 8 a total). The mechanical
+    term reads the DERIVED total `ρ_t = ρ_d + W`, `W = Σ_k α_k ν_k` over the water-mass slots
+    (the energy budget's definition, `_eb_point_RX`; there is no ρ_t slot since Stage 4). Also
+    returns `W` at every point."""
     function residual(m, X; tr = :bhyp)
         mo = m.model; V = mo.grid_params.vars; kDim = mo.grid_params.kDim
         # the vapor as the model reads it: `recover_rho_v` against the tile's own `nu_vbar`
@@ -141,15 +149,20 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         nuvbar = Scythe.mc_nu_vbar(m)
         rs = m.ref_state
         pbar = Scythe.ref_pressure(rs)[:, 1]; rdbar = Scythe.ref_rho_d(rs)[:, 1]
-        rtbar = Scythe.ref_rho_t(rs)[:, 1]; Ebar = Scythe.ref_total_energy(rs)[:, 1]
+        Ebar = Scythe.ref_total_energy(rs)[:, 1]
         rvbar = m.mc_ref_diag.rho_vbar
         z = m.tilepoints[:, end]
         rv_i = Scythe.mc_slot(V, "rho_v")
+        ws = Scythe.water_anchor_set(mo.options, mo.physical_params, m.mc_slots)
+        av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]
         n = size(X, 1)
-        R = zeros(n); rl = zeros(n); rv = zeros(n)
+        R = zeros(n); rl = zeros(n); rv = zeros(n); W = zeros(n); Wsc = zeros(n)
         for g in 1:n
             k = mod1(g, kDim)
-            p = X[g, 1] + pbar[k]; rd = X[g, 2] + rdbar[k]; rt = X[g, 3] + rtbar[k]
+            p = X[g, 1] + pbar[k]; rd = X[g, 2] + rdbar[k]
+            W[g] = av * (X[g, rv_i] + nuvbar[k]) + ac * X[g, 9] + ar * X[g, 8]
+            Wsc[g] = av * abs(X[g, rv_i] + nuvbar[k]) + ac * abs(X[g, 9]) + ar * abs(X[g, 8])
+            rt = rd + W[g]
             u = X[g, 4]; w = X[g, 5]; Et = X[g, 6] + Ebar[k]
             rv[g] = vtr === :none ? X[g, rv_i] + rvbar[k] :
                                     Scythe.recover_rho_v(X[g, rv_i], nuvbar[k], vtr, vmu)
@@ -159,8 +172,11 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             T = Scythe.eos_temperature(p, rd, rv[g])
             R[g] = Et - Scythe.implied_total_energy(T, rd, rv[g], rl[g], 0.0, rt, geo)
         end
-        return R, rl, rv
+        return R, rl, rv, W, Wsc
     end
+    # rho_w invariance through a stage, to the rounding of its slot additions: |ΔW| within a
+    # few ulps of the summands Σ α|ν| on either side
+    w_invariant(dW, sc0, sc1) = all(abs.(dW) .<= 8.0 * eps(Float64) .* (sc0 .+ sc1))
 
     """Re-apply the LAST column's relaxation adjustment of the step just taken onto the state
     `X0` (a copy, written into `m.var_np1` for the call): the ETD stage in isolation, on the
@@ -256,7 +272,11 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         end
     end
 
-    @testset "recovered_change_partner: the phase change and the vapor nudge are special cases" begin
+    # The vapor-alone pressure partner, `T(R_v − (R_m/C_vt) C_vv)·δ` (the expression the retired
+    # vapor nudge's `vapor_nudge_partner_rate` was, with a rate for the mass).
+    vapor_alone_dp(d, Tk, R_m, C_vt) = Tk * (Scythe.Rv - ((R_m / C_vt) * Scythe.Cvv)) * d
+
+    @testset "recovered_change_partner: the phase change and the vapor alone are special cases" begin
         rng = Random.MersenneTwister(1015)
         for _ in 1:200
             x = rcp_point(rng)
@@ -277,9 +297,9 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             vrec = 1.0e-7 * (2.0 * rand(rng) - 1.0)
             dp, dq = Scythe.recovered_change_partner(vrec * ts, 0.0, 0.0, x.Tk, x.rd, x.R_m,
                                                      x.C_vt, x.Lv, x.Ls, x.dT, x.dP)
-            @test dp ≈ Scythe.vapor_nudge_partner_rate(vrec, x.Tk, x.R_m, x.C_vt) * ts rtol = 1.0e-14
-            # with the mass itself as the "rate" the vapor-only partner is the nudge's bits
-            @test dp === Scythe.vapor_nudge_partner_rate(vrec * ts, x.Tk, x.R_m, x.C_vt)
+            @test dp ≈ vapor_alone_dp(vrec, x.Tk, x.R_m, x.C_vt) * ts rtol = 1.0e-14
+            # the vapor-only partner is that expression's bits
+            @test dp === vapor_alone_dp(vrec * ts, x.Tk, x.R_m, x.C_vt)
         end
         # nothing moves: exact zeros, and a −0.0 vapor change is not flipped by the zero terms
         x = rcp_point(Random.MersenneTwister(7))
@@ -288,7 +308,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         @test dp == 0.0 && dq == 0.0
         dp, dq = Scythe.recovered_change_partner(-0.0, 0.0, 0.0, x.Tk, x.rd, x.R_m, x.C_vt,
                                                  x.Lv, x.Ls, x.dT, x.dP)
-        @test dp === Scythe.vapor_nudge_partner_rate(-0.0, x.Tk, x.R_m, x.C_vt)
+        @test dp === vapor_alone_dp(-0.0, x.Tk, x.R_m, x.C_vt)
         @test dq === -0.0
     end
 
@@ -339,7 +359,12 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         @test (@allocations Scythe.affine_defect_change(2.0e-7, 1.0e-7, :bhyp, MU)) == 0
     end
 
-    @testset "a clipped lobe: vapor and heat move by exactly the recovered change" begin
+    @testset "a clipped lobe: the heat moves by exactly the recovered change" begin
+        # Under the derived water anchor (the only one since Stage 4) the ETD's vapor increment
+        # is the nu-space CLOSURE of the condensate increments (`etd_dv`, rho_w invariant), and
+        # the realization re-books only p and Q_ss on what the recovered densities received;
+        # the vapor slot is not re-written. (The `:slot` form, which moved the vapor by exactly
+        # the recovered cloud change, went with slot 3.)
         mktempdir() do tmp
             res = Dict{Bool,Any}()
             for on in (true, false)
@@ -349,41 +374,40 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 kDim = mo.grid_params.kDim; nc = ncols(p, mo)
                 X0 = copy(m.var_np1)
                 X1, col = etd_stage(m, X0, kDim, nc)
-                R0, rl0, rv0 = residual(m, X0)
-                R1, rl1, rv1 = residual(m, X1)
+                R0, rl0, rv0, W0, s0 = residual(m, X0)
+                R1, rl1, rv1, W1, s1 = residual(m, X1)
                 S = scratch(m)
                 rv_i = Scythe.mc_slot(mo.grid_params.vars, "rho_v")
                 res[on] = (; dR = (R1 .- R0)[col], drl = (rl1 .- rl0)[col],
-                           drv = (X1 .- X0)[col, rv_i], req = S.etd_dv[1:kDim],
+                           drv = (X1 .- X0)[col, rv_i], dW = (W1 .- W0)[col],
+                           Wsc0 = s0[col], Wsc1 = s1[col],
+                           x0v = X0[col, rv_i], x1v = X1[col, rv_i],
+                           dv = S.etd_dv[1:kDim], req = S.Qdot_bar[1:kDim] .* mo.ts,
                            z = m.tilepoints[col, end], nu = X0[col, 9],
                            Lv = copy(S.Lv), d9 = copy(S.etd_d9))
             end
             on = res[true]; off = res[false]
-            # the requested exchange is the same in both arms (one step, one state)
-            @test on.req == off.req
+            # the requested exchange and its closure are the same in both arms (one step, one
+            # state): the realization writes no water
+            @test on.dv == off.dv && on.req == off.req
+            @test on.x1v == on.x0v .+ on.dv && off.x1v == off.x0v .+ off.dv
             # lobe points: the slot is below zero and stays there -- condensation that never
             # appears in the recovered density
             lobe = (on.nu .+ on.d9 .< 0.0) .& (on.d9 .> 0.0)
             @test count(lobe) > 0
             @test all(on.drl[lobe] .== 0.0)
-            # OLD booking: vapor and heat for the full request -> R jumps by ~L*request
-            @test off.drv[lobe] ≈ off.req[lobe] rtol = 1.0e-9
-            @test all(abs.(off.dR[lobe]) .> 0.5 .* off.Lv[lobe] .* abs.(off.req[lobe]))
-            # NEW: the exchange is closed on the recovered mass -- no vapor moves at a lobe
-            # point, and the ETD leaves R unchanged to rounding of the exchanged energy
-            @test all(abs.(on.drv[lobe]) .<= 1.0e-12 .* abs.(on.req[lobe]))
-            act = on.req .!= 0.0
+            # rho_w is invariant through the ETD stage at every point, both arms (the closure)
+            act = on.dv .!= 0.0
             @test count(act) > count(lobe)
-            # water: vapor + recovered liquid unchanged by the ETD at every active point
-            @test all(abs.(on.drv[act] .+ on.drl[act]) .<= 1.0e-9 .* abs.(on.req[act]) .+ 1.0e-18)
-            # R: what is left is second order in the exchanged mass (the heat capacity the
-            # exchange itself changes, at the frozen ETD coefficients) -- measured 2e-4 of
-            # L*|request| where the step evaporates a thin sheet outright, 3000x below the
-            # off arm's opening there
+            @test w_invariant(on.dW, on.Wsc0, on.Wsc1) && w_invariant(off.dW, off.Wsc0, off.Wsc1)
+            # OFF (the requested booking): the heat of the full request with the recovered
+            # cloud not moving -> R jumps by ~L*request at the lobe points
+            @test all(abs.(off.dR[lobe]) .> 0.5 .* off.Lv[lobe] .* abs.(off.req[lobe]))
+            # ON: the exchange is booked on the recovered change, and the ETD leaves R unchanged
+            # to second order in the exchanged mass at every active point (the heat capacity the
+            # exchange itself changes, at the frozen ETD coefficients)
             @test all(abs.(on.dR[act]) .<= 1.0e-3 .* on.Lv[act] .* abs.(on.req[act]))
             @test maximum(abs.(on.dR[act])) < 1.0e-3 * maximum(abs.(off.dR[act]))
-            # the off arm's water is open by exactly the clipped request
-            @test maximum(abs.(off.drv[lobe] .+ off.drl[lobe])) > 0.0
         end
     end
 
@@ -404,9 +428,11 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             on = res[true]; off = res[false]
             act = on.req .!= 0.0
             @test count(act) == length(act)                 # it evaporates everywhere
-            # the two bookings differ, by the Jacobian's linearization error and no more
-            @test on.drv != off.drv
-            @test maximum(abs.(on.drv[act] .- off.drv[act]) ./ abs.(off.drv[act])) < 1.0e-6
+            # the derived realization writes no water: the vapor and cloud are bitwise the
+            # requested arm's (Stage 4; the `:slot` form re-booked the vapor here)
+            @test on.drv == off.drv && on.drl == off.drl
+            # the two heat bookings differ, by the Jacobian's linearization error and no more
+            @test on.dp != off.dp
             @test maximum(abs.(on.dp[act] .- off.dp[act]) ./ abs.(off.dp[act])) < 1.0e-6
         end
     end
@@ -453,102 +479,11 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         end
     end
 
-    # ── 2. the MYNN mass legs on the recovered density ───────────────────────────────
-    @testset "_mynn_clip_gap: zero off the lobe, the unrealized rate in it" begin
-        mu = MU; ts = 0.5
-        # healthy at both ends: an exact zero, whatever the rate
-        @test Scythe._mynn_clip_gap(1.0e-5, 2.0e-6, 4.0e-6, ts, :bhyp, mu) === 0.0
-        @test Scythe._mynn_clip_gap(0.0, 0.0, 0.0, ts, :bhyp, mu) === 0.0
-        # inside the lobe and staying there: nothing is realized, the whole rate is the gap
-        @test Scythe._mynn_clip_gap(-1.0e-6, 2.0e-7, 4.0e-7, ts, :bhyp, mu) == -4.0e-7
-        # crossing zero upward: only the part above zero is realized
-        g = Scythe._mynn_clip_gap(-1.0e-7, 1.0e-6, 2.0e-6, ts, :bhyp, mu)
-        @test g ≈ (Scythe.ahyp(-1.0e-7 + 0.5e-6, mu) / ts) - 2.0e-6 rtol = 1e-14
-        @test -2.0e-6 < g < 0.0
-        # draining a thin slot through zero: the recovered loss is what was there
-        g = Scythe._mynn_clip_gap(1.0e-7, -1.0e-6, -2.0e-6, ts, :bhyp, mu)
-        @test g ≈ (-Scythe.ahyp(1.0e-7, mu) / ts) + 2.0e-6 rtol = 1e-14
-    end
-
-    @testset "MYNN cloud leg into a lobe: the exchange closes on the recovered density" begin
-        isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
-        F = Main.MYNNTestFixtures
-        mktempdir() do tmp
-            # A boundary-layer cloud (positive below ~700 m) under a negative-ν lobe layer
-            # (900-1600 m) inside the mixed layer: K_h mixes cloud up into the lobe, where the
-            # recovered density is 0 and stays 0.
-            function seed!(patch, mo, kDim, z, col; lobe = true)
-                V = mo.grid_params.vars
-                c = Scythe.mc_slot(V, "rho_c")
-                u = F.bl_jet(z, 12.0, 500.0)
-                rho_t = col.rho_d .+ col.rho_v
-                for j in 1:size(patch.physical, 1)
-                    k = mod1(j, kDim); zz = z[k]
-                    patch.physical[j, V["u"], 1] = u[k]
-                    haskey(V, "rho_e") &&
-                        (patch.physical[j, V["rho_e"], 1] = rho_t[k] * 0.4 * exp(-zz / 1500.0))
-                    bump = 2.0e-3 * exp(-((zz - 800.0) / 600.0)^2)
-                    rc = lobe ? 4.0e-4 * exp(-((zz - 300.0) / 300.0)^2) : 0.0
-                    patch.physical[j, V["rho_v"], 1] = rho_t[k] * bump
-                    patch.physical[j, V["rho_t"], 1] = rho_t[k] * bump + rc
-                    nu = Scythe.condensate_slot(rc, 0.0, :bhyp, MU)
-                    lobe && (nu -= 2.0e-6 * exp(-((zz - 1250.0) / 300.0)^2))
-                    patch.physical[j, c, 1] = nu
-                end
-                spectralTransform!(patch)
-                gridTransform!(patch)
-            end
-            arms = Dict{Any,Any}()
-            for (tag, mynn, on, lobe) in (("on", true, true, true), ("off", true, false, true),
-                                          ("ctl", false, true, true),
-                                          ("nl_on", true, true, false),
-                                          ("nl_off", true, false, false))
-                m, p, mo, gp, z, col = F.make_mynn_tile(tmp; mynn = mynn, init = :zero,
-                                                        num_cells_k = 25, ctrans = :bhyp,
-                                                        rtrans = :bhyp)
-                mo.options[:mynn_exchange_realization] = on
-                # the clip-gap device alone: the water closure (section 5) subsumes it
-                mo.options[:mynn_water_closure] = false
-                seed!(p, mo, gp.kDim, z, col; lobe)
-                F.step_all!(m, p, gp.kDim)
-                arms[tag] = (; m, p, mo, gp, x = copy(p.physical[:, :, 1]))
-            end
-            mo = arms["on"].mo; V = mo.grid_params.vars; kDim = arms["on"].gp.kDim
-            rv_i = V["rho_v"]; c = Scythe.mc_slot(V, "rho_c")
-            nf = size(arms["ctl"].m.expdot_n, 2)
-            Don = arms["on"].m.expdot_n[:, 1:nf] .- arms["ctl"].m.expdot_n
-            Doff = arms["off"].m.expdot_n[:, 1:nf] .- arms["ctl"].m.expdot_n
-            x = arms["on"].x
-            @test x == arms["off"].x
-            lobe = x[:, c] .< 0.0
-            @test count(lobe) > 0
-            # the cloud leg itself is untouched; so are rho_t and E_t (the flux form)
-            for v in (3, 6, 9)
-                @test Don[:, v] == Doff[:, v]
-            end
-            # at the lobe points the slot moves and the recovered density cannot
-            ts = mo.ts
-            ch = lobe .& (Don[:, 9] .!= 0.0) .& ((x[:, 9] .+ ts .* Don[:, 9]) .< 0.0)
-            @test count(ch) > 0
-            # OFF: the mixed-in cloud vanishes; ON: it is vapor, mass for mass
-            J = arms["on"].m.mc_scratch[Threads.threadid()].Jc     # (any column: uniform in x)
-            dens = Don[ch, 9] ./ J[mod1.(findall(ch), kDim)]
-            @test Don[ch, rv_i] .- Doff[ch, rv_i] ≈ dens rtol = 1.0e-10
-            # p and Q_ss carry the evaporation's partners, of the right sign
-            @test all(sign.(Don[ch, 1] .- Doff[ch, 1]) .== -sign.(dens))
-            # bitwise where the clip never acts: the same boundary layer with no condensate
-            # (on 1 km cells even a smooth cloud rings below zero somewhere, so the clean
-            # comparison is the cloud-free one; the masked one follows)
-            @test arms["nl_on"].m.expdot_n == arms["nl_off"].m.expdot_n
-            # and away from the lobe points in the lobed state
-            far = .!(lobe .| ((x[:, 9] .+ ts .* Don[:, 9]) .< 0.0))
-            @test Don[far, :] == Doff[far, :]
-            # allocation-free with the partner acting
-            m = arms["on"].m
-            Scythe.moist_compressible_XZ(m, 1, kDim, 2)
-            @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 2)) == 0
-        end
-    end
+    # ── 2. (retired) the MYNN mass legs ──────────────────────────────────────────────
+    # "_mynn_clip_gap" and "MYNN cloud leg into a lobe" were deleted at Stage 4 of the rho_t
+    # retirement: the clip-gap partner (`options[:mynn_exchange_realization]`) was a `:slot`-
+    # anchor device and went with slot 3; the derived anchor's MYNN legs are nu legs realized on
+    # their own recovered rates (test_water_anchor.jl, "3c E7").
 
     # ── 3. the refit partner ─────────────────────────────────────────────────────────
     """Step 1, the model's own refit (`calcTendency` + `gridTransform!`), step 2: returns the
@@ -566,46 +501,11 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         return m, p, mo, xpre, xpost
     end
 
-    @testset "refit partner: the refit's recovered change is booked as condensation" begin
-        mktempdir() do tmp
-            m1, p1, mo, xpre, xpost = refit_two_steps(tmp, "rf_on"; seed! = seed_sheet!)
-            m0, p0, _, xpre0, xpost0 = refit_two_steps(tmp, "rf_off"; seed! = seed_sheet!,
-                                                       on = false)
-            @test xpre == xpre0 && xpost == xpost0          # step 1 and the refit: identical
-            V = mo.grid_params.vars; kDim = mo.grid_params.kDim; nc = ncols(p1, mo)
-            rv_i = Scythe.mc_slot(V, "rho_v")
-            col = ((nc - 1) * kDim + 1):(nc * kDim)          # the scratch is the last column's
-            S1 = scratch(m1); S0 = scratch(m0)
-            dp = S1.etd_d1[1:kDim] .- S0.etd_d1[1:kDim]
-            dvv = S1.etd_dv[1:kDim] .- S0.etd_dv[1:kDim]
-            # the refit's change in recovered cloud, computed here independently
-            rc(x) = Scythe.recover_rho_c.(x[col, 9], 0.0, :bhyp, MU)
-            drho = rc(xpost) .- rc(xpre)
-            @test maximum(abs.(drho)) > 1.0e-7               # the sheet's refit does move it
-            # water: the vapor partner is exactly minus the recovered change
-            @test dvv ≈ -drho rtol = 1.0e-12 atol = 1.0e-22
-            # energy: on the pre-refit state, replacing the cloud slot by its refit value opens
-            # R by ~L*drho; the partner closes it to second order in drho
-            Rpre, _, _ = residual(m1, xpre)
-            xc = copy(xpre); xc[col, 9] .= xpost[col, 9]
-            Rc, _, _ = residual(m1, xc)
-            xp = copy(xc); xp[col, 1] .+= dp; xp[col, rv_i] .+= dvv
-            Rp, _, _ = residual(m1, xp)
-            open_ = abs.(Rc[col] .- Rpre[col]); closed = abs.(Rp[col] .- Rpre[col])
-            big = abs.(drho) .> 1.0e-3 * maximum(abs.(drho))
-            @test all(open_[big] .> 1.0e6 .* abs.(drho[big]))      # ~L per kg, unpartnered
-            @test all(closed[big] .<= 1.0e-3 .* open_[big])
-            @test sum(closed) <= 1.0e-3 * sum(open_)
-            # the Q_ss give-back rides with it: (1 + Q_s) per kg, of the vapor's sign
-            S = scratch(m1)
-            dq = S1.etd_qnp1[1:kDim] .- S0.etd_qnp1[1:kDim]
-            lam0 = S.etd_lam[1:kDim] .== 0.0
-            @test all((sign.(dq[big]) .== sign.(dvv[big])) .| lam0[big])
-            # nothing but p, the vapor and Q_ss moved in the ETD scratch
-            @test S1.etd_d9[1:kDim] == S0.etd_d9[1:kDim]
-            @test S1.etd_d8[1:kDim] == S0.etd_d8[1:kDim]
-        end
-    end
+    # "refit partner: the refit's recovered change is booked as condensation" was deleted at
+    # Stage 4 of the rho_t retirement: it pinned the `:slot`-anchor form (the vapor partner
+    # exactly minus the recovered cloud change, folded into etd_dv by `_refit_partner_fold!`),
+    # which went with slot 3. The derived form books the AFFINE DEFECT, energy only, no nu
+    # written (`_refit_partner_defect!`; test_water_anchor.jl, "3c E2").
 
     @testset "refit partner: inert at t = 1, under :none, and tiny on a smooth cloud" begin
         mktempdir() do tmp
@@ -630,19 +530,27 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 for i in 1:size(patch.physical, 1)
                     rcv = 2.0e-4 * exp(-((pts[i, end] - 4000.0) / 2500.0)^2)
                     patch.physical[i, c, 1] = Scythe.condensate_slot(rcv, 0.0, :bhyp, MU)
-                    patch.physical[i, V["rho_t"], 1] = rcv
                 end
             end
             m1, p1, mo, xpre, xpost = refit_two_steps(tmp, "sm_on"; seed! = smooth!,
                                                       rh = z -> 1.0)
             m0, _, _, _, _ = refit_two_steps(tmp, "sm_off"; seed! = smooth!, rh = z -> 1.0,
                                              on = false)
-            kDim = mo.grid_params.kDim
-            dvs = scratch(m1).etd_dv[1:kDim] .- scratch(m0).etd_dv[1:kDim]
-            # the refit's filter still moves a resolved cloud a little every step (the partner
-            # books that too: the decision is per recovered kilogram, not per lobe), but by a
-            # small fraction of the cloud: measured ~1e-3 of the 2e-4 kg/m3 peak
-            @test 0.0 < maximum(abs.(dvs)) < 1.0e-2 * 2.0e-4
+            kDim = mo.grid_params.kDim; nc = ncols(p1, mo)
+            col = ((nc - 1) * kDim + 1):(nc * kDim)
+            S1 = scratch(m1); S0 = scratch(m0)
+            # the derived partner writes no water (Stage 4): the ETD's vapor increment is the
+            # partner-off arm's, bitwise
+            @test S1.etd_dv[1:kDim] == S0.etd_dv[1:kDim]
+            # the refit's filter still moves a resolved cloud a little every step, and the
+            # partner books the affine defect of that change: energy only, and a small fraction
+            # (<= 1e-3) of the latent heat lambda_l * drho the full recovered change would book
+            dps = S1.etd_d1[1:kDim] .- S0.etd_d1[1:kDim]
+            full = Scythe.refit_recovered_change.(xpost[col, 9], xpre[col, 9], :bhyp, MU)
+            lam = (S1.R_m[1:kDim] ./ S1.C_vt[1:kDim]) .*
+                  (S1.Lv[1:kDim] .- Scythe.Cpv .* S1.Tk[1:kDim])
+            @test maximum(abs.(full)) > 0.0
+            @test 0.0 < maximum(abs.(dps)) <= 1.0e-3 * maximum(abs.(lam .* full))
         end
     end
 
@@ -658,7 +566,6 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test Scythe.REFIT_PARTNER_DEFAULT === true
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :refit_partner)
             @test haskey(Scythe.KNOWN_OPTION_KEYS, :exchange_realization)
-            @test haskey(Scythe.KNOWN_OPTION_KEYS, :mynn_exchange_realization)
         end
     end
 
@@ -686,33 +593,36 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 Scythe.calcTendency(m); gridTransform!(p)
                 xpost = copy(p.physical[:, :, 1])
                 # the collar: the upper half of the last column takes the child's state, a
-                # cloud of its own (ν raised by 3e-7, ρ_t with it)
+                # cloud of its own (ν raised by 3e-7; the derived ρ_t moves with it)
                 rows = collect(col[(div(kDim, 2) + 1):end])
                 vals = copy(p.physical[rows, :, :])
                 vals[:, 9, 1] .+= 3.0e-7
-                vals[:, 3, 1] .+= 3.0e-7
                 p.physical[rows, :, :] .= vals
                 inj = [(rows, vals)]
                 fix && Scythe.refit_reference_after_exchange!(m, inj, 2)
                 fix && on && @test m.var_np1[rows, 9] == vals[:, 9, 1]
                 fix && !on && @test m.var_np1 == xpre          # partner off: nothing written
                 advance_all!(m, p, mo; t = 2)
-                arms[tag] = (; dv = copy(scratch(m).etd_dv[1:kDim]), xpre, xpost, kDim, col)
+                # the derived partner is ENERGY ONLY (Stage 4): its booking is the p increment
+                arms[tag] = (; d1 = copy(scratch(m).etd_d1[1:kDim]),
+                             dv = copy(scratch(m).etd_dv[1:kDim]), xpre, xpost, kDim, col)
             end
             kDim = arms["on"].kDim; col = arms["on"].col
-            on = arms["on"].dv .- arms["off"].dv
-            nofix = arms["nofix"].dv .- arms["off"].dv
+            on = arms["on"].d1 .- arms["off"].d1
+            nofix = arms["nofix"].d1 .- arms["off"].d1
             cz = (div(kDim, 2) + 1):kDim; own = 1:div(kDim, 2)
+            # no arm writes water (the derived partner books energy only)
+            @test arms["on"].dv == arms["off"].dv == arms["nofix"].dv
             # the injected rows: the exchange is not booked, to the bit
             @test all(on[cz] .== 0.0)
-            # ...where the unfixed partner books the child-parent cloud difference as
-            # condensation: the full recovered change of the 3e-7 ν step
+            # ...where the unfixed partner books the child-parent cloud difference (the affine
+            # defect of the 3e-7 nu step, which crosses the knee mu = 1e-7)
+            @test maximum(abs.(nofix[cz])) > 0.0
+            # the rest of the column: the refit's own booking, untouched by the exchange
             rc(x) = Scythe.recover_rho_c.(x[col, 9], 0.0, :bhyp, MU)
-            @test maximum(abs.(nofix[cz])) > 1.0e-3 * maximum(abs.(rc(arms["on"].xpost)))
-            # the rest of the column: the refit's own change, untouched by the exchange
             drho = rc(arms["on"].xpost) .- rc(arms["on"].xpre)
             @test maximum(abs.(drho[own])) > 1.0e-7
-            @test on[own] ≈ -drho[own] rtol = 1.0e-12 atol = 1.0e-22
+            @test maximum(abs.(on[own])) > 0.0
             @test on[own] == nofix[own]
         end
     end
@@ -745,7 +655,8 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 fix && Scythe.refit_reference_after_exchange!(m, no_inj, 2)
                 advance_last!(m, p, mo, clast; t = 2)
                 col = ((clast - 1) * kDim + 1):(clast * kDim)
-                arms[tag] = (; dv = copy(scratch(m).etd_dv[1:kDim]), xpre, xpost, col,
+                # the derived partner is ENERGY ONLY (Stage 4): its booking is the p increment
+                arms[tag] = (; dv = copy(scratch(m).etd_d1[1:kDim]), xpre, xpost, col,
                              zone = copy(x .< Scythe.NEST_EXCHANGE_ZONE_CELLS * dx))
             end
             d(a, b) = arms[a].dv .- arms[b].dv
@@ -755,13 +666,15 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             @test all(zone[arms["on1"].col]) && !any(zone[arms["onN"].col])
             @test count(zone) == 3 * 3 * size(arms["on1"].xpre, 1) ÷ (3 * NC)
             # in the coupling zone: nothing booked, to the bit -- where the unfixed partner
-            # books the pinned-back cloud as evaporation
+            # books the pinned-back cloud's affine defect (the `:slot` form's "the full
+            # recovered change as evaporation" amplitude went with slot 3; the derived form's
+            # amplitude is test_water_anchor.jl's "3c E2")
             @test all(d("on1", "off1") .== 0.0)
-            @test maximum(abs.(d("nofix1", "off1"))) > 0.1 * maximum(abs.(rc("on1")))
-            @test d("nofix1", "off1") ≈ -rc("on1") rtol = 1.0e-12 atol = 1.0e-22
-            # far from it (the right wall): the refit's own change, as on a single patch
+            @test maximum(abs.(rc("on1"))) > 1.0e-7
+            @test maximum(abs.(d("nofix1", "off1"))) > 0.0
+            # far from it (the right wall): the refit's own booking, as on a single patch
             @test maximum(abs.(rc("onN"))) > 1.0e-7
-            @test d("onN", "offN") ≈ -rc("onN") rtol = 1.0e-12 atol = 1.0e-22
+            @test maximum(abs.(d("onN", "offN"))) > 0.0
             @test d("onN", "offN") == d("nofixN", "offN")
         end
     end
@@ -805,70 +718,17 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         end
     end
 
-    # ── 4. the vapor nudge's pressure partner ────────────────────────────────────────
-    @testset "vapor nudge partner: R unchanged by the nudge, bitwise when off" begin
-        mktempdir() do tmp
-            # A vapor GAP: rho_t carries 2e-4 kg/m3 more water than the species account for
-            # (the vapor slot is not raised with it), so res_rho_t - rho_v = gap and the nudge
-            # pulls the vapor up at gap/tau_rec. Cloud-free, so nothing else is partnered.
-            function seed_gap!(patch, pts, V)
-                for i in 1:size(patch.physical, 1)
-                    patch.physical[i, V["rho_t"], 1] = 2.0e-4 * exp(-((pts[i, end] - 3000.0) / 1500.0)^2)
-                end
-            end
-            arms = Dict{Bool,Any}()
-            for on in (true, false)
-                m, p, mo = ep_tile(tmp, "vn_$(on)"; seed! = seed_gap!,
-                                   opts_extra = Dict{Symbol,Any}(:vapor_nudge_partner => on))
-                advance_all!(m, p, mo)
-                arms[on] = (; m, p, mo, S = deepcopy(scratch(m)))
-            end
-            m1 = arms[true].m; m0 = arms[false].m; mo = arms[true].mo
-            kDim = mo.grid_params.kDim; nc = ncols(arms[true].p, mo)
-            col = ((nc - 1) * kDim + 1):(nc * kDim)
-            S = arms[true].S
-            @test maximum(S.VREC) > 0.0
-            # the only tendency difference is the partner, in p, exactly the formula
-            D = m1.expdot_n .- m0.expdot_n
-            rv_i = Scythe.mc_slot(mo.grid_params.vars, "rho_v")
-            @test all(iszero, D[:, setdiff(1:size(D, 2), [1])])
-            @test isapprox(D[col, 1], Scythe.vapor_nudge_partner_rate.(S.VREC, S.Tk, S.R_m, S.C_vt);
-                           rtol = 1.0e-8, atol = 1.0e-12)
-            # R: one forward step of the nudge with and without its partner, on the state n
-            x = copy(arms[true].p.physical[:, :, 1])
-            ts = mo.ts
-            R0, _, _ = residual(m1, x)
-            xv = copy(x); xv[col, rv_i] .+= ts .* S.VREC
-            Rv, _, _ = residual(m1, xv)
-            xp = copy(xv); xp[col, 1] .+= ts .* D[col, 1]
-            Rp, _, _ = residual(m1, xp)
-            dRv = abs.(Rv[col] .- R0[col]); dRp = abs.(Rp[col] .- R0[col])
-            act = S.VREC .> 1.0e-3 * maximum(S.VREC)
-            # unpartnered: at fixed p the vapor lowers T_eos and adds its C_vv T, so R moves by
-            # T(C_vv - C_vt R_v/R_m) per kg nudged (about -230 T)
-            expd = S.Tk .* (Scythe.Cvv .- (S.C_vt ./ S.R_m) .* Scythe.Rv) .* ts .* S.VREC
-            @test isapprox(dRv[act], abs.(expd[act]); rtol = 1.0e-3)
-            # partnered: second order in the nudged mass
-            @test all(dRp[act] .<= 1.0e-4 .* dRv[act])
-            # resting base / switch off: bitwise
-            for on in (true, false)
-                mA, pA, moA = ep_tile(tmp, "vr_$(on)";
-                                      opts_extra = Dict{Symbol,Any}(:vapor_nudge_partner => on))
-                advance_all!(mA, pA, moA)
-                arms[on] = mA.var_np1
-            end
-            @test arms[true] == arms[false]
-            @test Scythe.VAPOR_NUDGE_PARTNER_DEFAULT === true
-            @test haskey(Scythe.KNOWN_OPTION_KEYS, :vapor_nudge_partner)
-        end
-    end
+    # ── 4. (retired) the vapor nudge's pressure partner ──────────────────────────────
+    # "vapor nudge partner: R unchanged by the nudge, bitwise when off" was deleted at Stage 4
+    # of the rho_t retirement: the vapor reconciliation nudge (`rho_v_reconcile`, VREC) and its
+    # partner (`options[:vapor_nudge_partner]`) went with slot 3, whose residual res_rho_t they
+    # relaxed the vapor toward.
 
     # ── 4b. the partners under the VAPOR CONTROL VARIABLE (options[:vapor_transform]) ──
-    # Stage 1 of the rho_t retirement: the vapor slot holds ν_v' = bhyp(ρ_v) − bhyp(ρ̄_v), the
-    # ETD's vapor increment, the exchange realization's and the refit partner's vapor partners
-    # arrive through J_v, and the nudge is the realized E6 rate law partnered on the recovered
-    # change. R (read with the RECOVERED vapor) must be held across each to the tolerances the
-    # density-vapor tests above hold it to.
+    # Stage 1 of the rho_t retirement: the vapor slot holds ν_v' = bhyp(ρ_v) − bhyp(ρ̄_v). R
+    # (read with the RECOVERED vapor) must be held across the ETD exchange to the tolerances the
+    # density-vapor tests above hold it to. (The refit partner's and the E6 nudge's vapor-CV
+    # tests pinned the `:slot` forms and went with slot 3 at Stage 4.)
     VT = Dict{Symbol,Any}(:vapor_transform => :bhyp)
     VMU = 1.0e-9
     """`seed_super!` with the vapor slot written as the control-variable deviation."""
@@ -883,7 +743,6 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             rvb = 0.7 * Scythe.rho_v_sat(Tk, pp / 100.0)
             drv = (1.015 - 0.7) * Scythe.rho_v_sat(Tk, pp / 100.0)
             patch.physical[i, rv_i, 1] += Scythe.bhyp(rvb + drv, VMU) - Scythe.bhyp(rvb, VMU)
-            patch.physical[i, V["rho_t"], 1] += drv
             patch.physical[i, V["Q_ss"], 1] += drv
         end
     end
@@ -895,195 +754,29 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             kDim = mo.grid_params.kDim; nc = ncols(p, mo)
             X0 = copy(m.var_np1)
             X1, col = etd_stage(m, X0, kDim, nc)
-            R0, rl0, rv0 = residual(m, X0)
-            R1, rl1, rv1 = residual(m, X1)
+            R0, rl0, rv0, W0, s0 = residual(m, X0)
+            R1, rl1, rv1, W1, s1 = residual(m, X1)
             S = scratch(m)
-            # the requested exchange in DENSITY: the ν increment over the frozen J_v
-            req = S.etd_dv[1:kDim] ./ Scythe.vapor_jacobian_column(S)[1:kDim]
-            dR = (R1 .- R0)[col]; drl = (rl1 .- rl0)[col]; drv = (rv1 .- rv0)[col]
+            # the requested exchange in DENSITY: the step-mean condensation (the derived
+            # anchor's etd_dv is its nu-space closure, Stage 4)
+            req = S.Qdot_bar[1:kDim] .* mo.ts
+            dR = (R1 .- R0)[col]; drl = (rl1 .- rl0)[col]; dW = (W1 .- W0)[col]
             Lv = S.Lv[1:kDim]
             lobe = (X0[col, 9] .+ S.etd_d9[1:kDim] .< 0.0) .& (S.etd_d9[1:kDim] .> 0.0)
             @test count(lobe) > 0
+            @test all(drl[lobe] .== 0.0)
             act = S.etd_dv[1:kDim] .!= 0.0
             @test count(act) > count(lobe)
-            # no recovered vapor moves at a lobe point (the closed exchange)
-            @test all(abs.(drv[lobe]) .<= 1.0e-9 .* abs.(req[lobe]) .+ 1.0e-18)
-            # water: recovered vapor + recovered liquid unchanged at every active point (the
-            # vapor now through bhyp: O(μ_v)-relative, far inside the tolerance)
-            @test all(abs.(drv[act] .+ drl[act]) .<= 1.0e-9 .* abs.(req[act]) .+ 1.0e-18)
+            # rho_w = sum alpha nu is invariant through the ETD stage (the vapor is the closure;
+            # the `:slot` form's "no recovered vapor moves at a lobe point" went with slot 3)
+            @test w_invariant(dW, s0[col], s1[col])
             # R: second order in the exchanged mass, as with the density vapor
             @test all(abs.(dR[act]) .<= 1.0e-3 .* Lv[act] .* abs.(req[act]))
         end
     end
 
-    @testset "vapor control variable: the refit partner holds R" begin
-        mktempdir() do tmp
-            m1, p1, mo, xpre, xpost = refit_two_steps(tmp, "vrf_on"; seed! = seed_sheet!,
-                                                      extra = VT)
-            m0, p0, _, xpre0, xpost0 = refit_two_steps(tmp, "vrf_off"; seed! = seed_sheet!,
-                                                       on = false, extra = VT)
-            @test xpre == xpre0 && xpost == xpost0
-            V = mo.grid_params.vars; kDim = mo.grid_params.kDim; nc = ncols(p1, mo)
-            rv_i = Scythe.mc_slot(V, "rho_v")
-            col = ((nc - 1) * kDim + 1):(nc * kDim)
-            S1 = scratch(m1); S0 = scratch(m0)
-            dp = S1.etd_d1[1:kDim] .- S0.etd_d1[1:kDim]
-            dvv = S1.etd_dv[1:kDim] .- S0.etd_dv[1:kDim]
-            rc(x) = Scythe.recover_rho_c.(x[col, 9], 0.0, :bhyp, MU)
-            drho = rc(xpost) .- rc(xpre)
-            @test maximum(abs.(drho)) > 1.0e-7
-            # water: the ν partner is J_v times minus the recovered change
-            @test dvv ≈ -(Scythe.vapor_jacobian_column(S1)[1:kDim] .* drho) rtol = 1.0e-12 atol = 1.0e-22
-            Rpre, _, rvpre = residual(m1, xpre)
-            xc = copy(xpre); xc[col, 9] .= xpost[col, 9]
-            Rc, _, _ = residual(m1, xc)
-            xp = copy(xc); xp[col, 1] .+= dp; xp[col, rv_i] .+= dvv
-            Rp, _, rvp = residual(m1, xp)
-            # ...and the RECOVERED vapor moves by minus the recovered cloud change
-            @test maximum(abs.((rvp .- rvpre)[col] .+ drho)) <= 1.0e-6 * maximum(abs.(drho))
-            open_ = abs.(Rc[col] .- Rpre[col]); closed = abs.(Rp[col] .- Rpre[col])
-            big = abs.(drho) .> 1.0e-3 * maximum(abs.(drho))
-            @test all(open_[big] .> 1.0e6 .* abs.(drho[big]))
-            @test all(closed[big] .<= 1.0e-3 .* open_[big])
-            @test sum(closed) <= 1.0e-3 * sum(open_)
-        end
-    end
-
-    @testset "vapor control variable: the E6 nudge and its partner hold R" begin
-        mktempdir() do tmp
-            function seed_gap!(patch, pts, V)
-                for i in 1:size(patch.physical, 1)
-                    patch.physical[i, V["rho_t"], 1] = 2.0e-4 * exp(-((pts[i, end] - 3000.0) / 1500.0)^2)
-                end
-            end
-            arms = Dict{Bool,Any}()
-            for on in (true, false)
-                m, p, mo = ep_tile(tmp, "vvn_$(on)"; seed! = seed_gap!,
-                    opts_extra = merge(VT, Dict{Symbol,Any}(:vapor_nudge_partner => on)))
-                advance_all!(m, p, mo)
-                arms[on] = (; m, p, mo, S = deepcopy(scratch(m)))
-            end
-            m1 = arms[true].m; m0 = arms[false].m; mo = arms[true].mo
-            kDim = mo.grid_params.kDim; nc = ncols(arms[true].p, mo)
-            col = ((nc - 1) * kDim + 1):(nc * kDim)
-            S = arms[true].S
-            rv_i = Scythe.mc_slot(mo.grid_params.vars, "rho_v")
-            @test maximum(S.VREC) > 0.0
-            # the slot rate is the ν-space E6 law; FORCING holds the realized recovered rate
-            x = copy(arms[true].p.physical[:, :, 1])
-            ts = mo.ts
-            nu = x[col, rv_i] .+ Scythe.mc_nu_vbar(m1)
-            @test S.VREC == Scythe.vapor_nudge_rate.(S.res_rho_t, nu, VMU, 10.0)
-            real = (Scythe.ahyp.(nu .+ ts .* S.VREC, VMU) .- Scythe.ahyp.(nu, VMU)) ./ ts
-            @test S.FORCING == real
-            # the only tendency difference is the partner, in p, of the REALIZED rate
-            D = m1.expdot_n .- m0.expdot_n
-            @test all(iszero, D[:, setdiff(1:size(D, 2), [1])])
-            @test isapprox(D[col, 1], Scythe.vapor_nudge_partner_rate.(real, S.Tk, S.R_m, S.C_vt);
-                           rtol = 1.0e-8, atol = 1.0e-12)
-            # R: one forward step of the nudge with and without its partner
-            R0, _, rv0 = residual(m1, x)
-            xv = copy(x); xv[col, rv_i] .+= ts .* S.VREC
-            Rv, _, rvv = residual(m1, xv)
-            xp = copy(xv); xp[col, 1] .+= ts .* D[col, 1]
-            Rp, _, _ = residual(m1, xp)
-            dRv = abs.(Rv[col] .- R0[col]); dRp = abs.(Rp[col] .- R0[col])
-            act = real .> 1.0e-3 * maximum(real)
-            @test count(act) > 0
-            @test all(dRp[act] .<= 1.0e-4 .* dRv[act])
-            # the realized change is the recovered vapor's own change over the step
-            @test (rvv .- rv0)[col] ≈ ts .* real rtol = 1.0e-9 atol = 1.0e-20
-        end
-    end
-
-    # ── 5. the MYNN water closure ────────────────────────────────────────────────────
-    # A mixed layer carrying a healthy boundary-layer cloud and rain on 200 m cells, the
-    # TKE live: one forward step of the MYNN tendency alone (closure tile minus the
-    # closure-off control), applied to the state n.
-    @testset "MYNN water closure: one step leaves the partition and R closed" begin
-        isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
-        F = Main.MYNNTestFixtures
-        mktempdir() do tmp
-            function seed!(patch, mo, kDim, z, col; e0 = 0.4)
-                V = mo.grid_params.vars
-                c = Scythe.mc_slot(V, "rho_c"); r = Scythe.mc_slot(V, "rho_r")
-                u = F.bl_jet(z, 12.0, 500.0)
-                rho_t = col.rho_d .+ col.rho_v
-                for j in 1:size(patch.physical, 1)
-                    k = mod1(j, kDim); zz = z[k]
-                    patch.physical[j, V["u"], 1] = u[k]
-                    haskey(V, "rho_e") &&
-                        (patch.physical[j, V["rho_e"], 1] = rho_t[k] * e0 * exp(-zz / 1500.0))
-                    bump = 2.0e-3 * exp(-((zz - 800.0) / 600.0)^2)
-                    rc = 4.0e-4 * exp(-((zz - 700.0) / 400.0)^2) + 1.0e-6
-                    rr = 1.0e-4 * exp(-((zz - 400.0) / 400.0)^2) + 1.0e-6
-                    patch.physical[j, V["rho_v"], 1] = rho_t[k] * bump
-                    patch.physical[j, V["rho_t"], 1] = rho_t[k] * bump + rc + rr
-                    patch.physical[j, c, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, MU)
-                    patch.physical[j, r, 1] = Scythe.rain_slot(rr, :bhyp, MU)
-                end
-                spectralTransform!(patch)
-                gridTransform!(patch)
-            end
-            arms = Dict{Any,Any}()
-            for (tag, mynn, wc, e0) in (("on", true, true, 0.4), ("off", true, false, 0.4),
-                                        ("ctl", false, true, 0.4),
-                                        ("k0_on", true, true, 0.0),
-                                        ("k0_off", true, false, 0.0))
-                m, p, mo, gp, z, col = F.make_mynn_tile(tmp; mynn = mynn, init = :zero,
-                                                        num_cells_k = 25, kMax = 5.0e3,
-                                                        fluxes = false, ctrans = :bhyp,
-                                                        rtrans = :bhyp)
-                mo.options[:mynn_water_closure] = wc
-                seed!(p, mo, gp.kDim, z, col; e0)
-                F.step_all!(m, p, gp.kDim)
-                arms[tag] = (; m, p, mo, gp, x = copy(p.physical[:, :, 1]))
-            end
-            mo = arms["on"].mo; V = mo.grid_params.vars; ts = mo.ts
-            rv_i = V["rho_v"]
-            nf = size(arms["ctl"].m.expdot_n, 2)
-            x = arms["on"].x
-            @test x == arms["off"].x
-            @test all(x[:, 9] .> 0.0) && all(x[:, 8] .> 0.0)    # healthy: no clipped lobe
-            R0, rl0, rv0 = residual(arms["on"].m, x)
-            gap(X, rl, rv) = X[:, 3] .- X[:, 2] .- rv .- rl    # perturbation partition gap
-            g0 = gap(x, rl0, rv0)
-            out = Dict{String,Any}()
-            for tag in ("on", "off")
-                D = arms[tag].m.expdot_n[:, 1:nf] .- arms["ctl"].m.expdot_n
-                x1 = copy(x); x1[:, 1:nf] .+= ts .* D
-                R1, rl1, rv1 = residual(arms[tag].m, x1)
-                out[tag] = (; D, dR = R1 .- R0, dg = gap(x1, rl1, rv1) .- g0,
-                            dw = ts .* D[:, 3])
-            end
-            on = out["on"]; off = out["off"]
-            # total water and the energy flux are the same legs in both arms
-            @test on.D[:, 3] == off.D[:, 3]
-            @test on.D[:, 6] == off.D[:, 6]
-            dwmax = maximum(abs.(on.dw))
-            @test dwmax > 1.0e-8                                # the water legs are live
-            # OFF: the total-water leg and the species legs disagree -- the partition gap
-            # opens, and R with it by ~(C_pv T - L) per kg of it (measured: 6e-3 of the
-            # largest water increment, R by 3e-4 J/m3 in one 0.5 s step)
-            @test maximum(abs.(off.dg)) > 1.0e-4 * dwmax
-            # ON: vapor + recovered species move by exactly the total-water increment
-            # (measured 3e-19 kg/m3: rounding)
-            @test maximum(abs.(on.dg)) <= 1.0e-12 * dwmax + 1.0e-18
-            # ...and R is unchanged but for the second order of the step (measured 1.9e-4
-            # of the off arm's largest opening, 9e-5 of its column sum)
-            @test maximum(abs.(on.dR)) <= 1.0e-3 * maximum(abs.(off.dR))
-            @test sum(abs.(on.dR)) <= 1.0e-3 * sum(abs.(off.dR))
-            # K_h = 0 (no TKE): every leg is an exact zero and the switch is bitwise
-            @test arms["k0_on"].m.expdot_n == arms["k0_off"].m.expdot_n
-            # allocation-free with the closure acting
-            m = arms["on"].m; kDim = arms["on"].gp.kDim
-            Scythe.moist_compressible_XZ(m, 1, kDim, 2)
-            @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 2)) == 0
-            @test Scythe.MYNN_WATER_CLOSURE_DEFAULT === true
-            @test haskey(Scythe.KNOWN_OPTION_KEYS, :mynn_water_closure)
-            # both water switches pass the MYNN option validation a config run goes through
-            @test :mynn_water_closure in Scythe.MYNN_OPTION_KEYS
-            @test :mynn_exchange_realization in Scythe.MYNN_OPTION_KEYS
-        end
-    end
+    # ── 5. (retired) the MYNN water closure ──────────────────────────────────────────
+    # "MYNN water closure: one step leaves the partition and R closed" was deleted at Stage 4:
+    # `options[:mynn_water_closure]` closed the MYNN vapor leg against slot 3's total-water leg,
+    # and both went with the slot (test_water_anchor.jl, "3c E7", is the derived MYNN test).
 end

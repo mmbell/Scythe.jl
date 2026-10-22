@@ -1,22 +1,21 @@
-# test/test_water_anchor.jl -- THE DERIVED WATER ANCHOR (`options[:water_anchor]`; Stage 3 of
-# the rho_t retirement, reference/RHO_T_RETIREMENT_DESIGN.md §3.2-3.3 and §6 Stage 3, the
-# plan's §4 Stage 3 and decision E9).
+# test/test_water_anchor.jl -- THE DERIVED WATER ANCHOR (Stages 3-4 of the rho_t retirement,
+# reference/RHO_T_RETIREMENT_DESIGN.md §3.2-3.3 and §6 Stages 3-4, the plan's §4 Stages 3-4 and
+# decision E9).
 #
-# Under `:derived` every reader of the total density takes
+# Every reader of the total density takes
 #
 #     rho_t  = rho_d  + sum_k alpha_k nu_k        rho_t' = rho_d' + sum_k alpha_k nu_k'
 #     rho_tbar_w = rho_dbar + sum_k alpha_k nu_kbar
 #
 # over the water-mass slots (vapor, cloud, rain, the three ice masses; alpha = 2 transformed,
-# 1 density), in one fixed summation order; the vapor reconciliation nudge is deleted; slot 3
-# keeps its own transport and SI increment and FEEDS NOTHING (the shadow, MC_SHADOW_*).
-# `:slot` (the library default) is the code before this stage, bitwise.
+# 1 density), in one fixed summation order; there is no vapor reconciliation nudge. Stage 3 kept
+# the prognostic rho_t as a passive shadow in slot 3; Stage 4 deleted it (the vapor IS slot 3) and
+# retired `options[:water_anchor]` (`:derived` the only behaviour, `:slot` refused).
 #
-# 3a: the option and config; `:slot` bitwise against goldens captured at
-# 44da59c; the resting fixed point under `:derived` (every consumer on rho_tbar_w, the EOS and
-# the `:energy` temperature, both SI paths, warm and ice); dry bitwise; slot 3 feeds nothing;
-# the shadow starts at exactly 0.0; the setup refusals; the census rows; the R1T1X wall
-# estimate; the netCDF derived fields.
+# The option's retirement; the derived anchor bitwise against the goldens re-seeded at bf577b2;
+# the resting fixed point (every consumer on rho_tbar_w, the EOS and the `:energy` temperature,
+# both SI paths, warm and ice); dry bitwise; the setup refusals; the census rows; the R1T1X wall
+# estimate; the netCDF derived fields; the 3b-3c exchange closure and partners.
 
 using Test
 using Scythe
@@ -26,37 +25,49 @@ using SparseArrays
 isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl")
 isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
 
-@testset "the derived water anchor (options[:water_anchor])" begin
+@testset "the derived water anchor (rho_t = rho_d + sum_k alpha_k nu_k)" begin
     F = Main.VaporTransformFixtures
     M = Main.MYNNTestFixtures
 
-    # (Stage L is pinned off here unless a test asks for it: its paired form defaults ON under
-    # the derived anchor since 3d, and most tests isolate one operator)
+    # (Stage L is pinned off here unless a test asks for it: its paired form defaults ON since
+    # 3d, and most tests isolate one operator)
     derived(; sd = false, siw = :mass, extra...) =
-        merge(Dict{Symbol,Any}(:water_anchor => :derived, :si_water_slots => siw,
+        merge(Dict{Symbol,Any}(:si_water_slots => siw,
                                :state_dependent_si => sd, :si_water_mixed_walls => true,
                                :lobe_relaxation => false),
               Dict{Symbol,Any}(extra))
 
-    # ── 0. the option and the config ────────────────────────────────────────────────
-    @testset "option, config default, legacy pins" begin
-        @test Scythe.water_anchor_mode(Dict{Symbol,Any}()) === :slot
+    # ── 0. the option is retired (Stage 4) ─────────────────────────────────────────
+    @testset "options[:water_anchor] is retired: :derived accepted, :slot refused" begin
+        @test Scythe.water_anchor_mode(Dict{Symbol,Any}()) === :derived
         @test Scythe.water_anchor_mode(Dict{Symbol,Any}(:water_anchor => :derived)) === :derived
+        msg = try
+            Scythe.water_anchor_mode(Dict{Symbol,Any}(:water_anchor => :slot)); ""
+        catch e
+            sprint(showerror, e)
+        end
+        @test occursin("retired", msg) && occursin("bf577b2", msg)
         @test_throws ErrorException Scythe.water_anchor_mode(
             Dict{Symbol,Any}(:water_anchor => :sum))
-        @test Scythe.WATER_ANCHOR_MODES == (:slot, :derived)
-        @test Scythe.Numerics().water_anchor === :derived
-        # 3d: the paired Stage L defaults ON under the derived anchor, off under :slot
-        @test Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:water_anchor => :derived))
-        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}())
-        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:water_anchor => :slot))
-        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:water_anchor => :derived,
-                                                          :lobe_relaxation => false))
+        @test !isdefined(Scythe, :WATER_ANCHOR_MODES)
+        @test !hasfield(Scythe.Numerics, :water_anchor)
+        # the paired Stage L is the default (its unpaired :slot form went with the anchor)
+        @test Scythe.lobe_relaxation_on(Dict{Symbol,Any}())
+        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:lobe_relaxation => false))
+        @test !isdefined(Scythe, :LOBE_RELAXATION_DEFAULT)
         @test haskey(Scythe.KNOWN_OPTION_KEYS, :water_anchor)
+        # the legacy pins no longer pin the anchor (the config key is retired)
         for f in ("owb_default", "rce_default", "tc_default")
             s = read(joinpath(@__DIR__, "reference_data", "legacy_models",
                               "$(f).overlay.toml"), String)
-            @test occursin("water_anchor = \"slot\"", s)
+            @test !occursin("water_anchor", s)
+        end
+        # an explicit :slot is refused at tile creation too
+        mktempdir() do tmp
+            @test_throws ErrorException F.vt_tile(tmp, "slot"; vtr = :bhyp,
+                extra = Dict{Symbol,Any}(:water_anchor => :slot))
+            @test F.vt_tile(tmp, "der"; vtr = :bhyp,
+                extra = Dict{Symbol,Any}(:water_anchor => :derived)) isa Tuple
         end
     end
 
@@ -64,12 +75,12 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     @testset ":derived is bitwise bf577b2 in the Stage-4 layout (golden capture)" begin
         # Three full steps of the seeded sheet + vapor bump + w under the vapor control
         # variable, on both SI paths, warm/ice/Louis, slaved and explicit water acoustics,
-        # Stage L at its derived default (on) and off; the MYNN fixture's live column (density
-        # slots). RE-SEEDED at bf577b2 under the derived anchor -- the anchor Stage 4 keeps as
-        # the only one -- and summed in the Stage-4 layout (`s4_checksum`: slot 3, the passive
-        # shadow no reader takes, left out; the vapor in its position), so Stage 4 is shown
-        # bitwise against the code it deletes slot 3 from. (The :slot goldens of 44da59c they
-        # replace are in git history, test/test_water_anchor.jl at bf577b2.)
+        # Stage L at its default (on) and off; the MYNN fixture's live column (density slots).
+        # RE-SEEDED at bf577b2 under the derived anchor (commit "goldens re-seeded on the
+        # derived anchor at bf577b2") and summed in the Stage-4 layout (`s4_checksum`: that
+        # commit's slot 3, the passive shadow no reader took, left out; the vapor in slot 3), so
+        # Stage 4 -- which deleted slot 3 -- is bitwise the code it deleted it from. (The :slot
+        # goldens of 44da59c they replaced are in git history.)
         golden = Dict(
             "ice_ref_none" => (UInt128(450493064178061304434132191), UInt128(16708174421919189982622981378)),
             "ice_sd_mass" => (UInt128(450522956953137210360097821), UInt128(16702167531451911314711355527)),
@@ -86,7 +97,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                                   ("ice_sd_mass", true, false, true, :mass, nothing),
                                                   ("ice_ref_none", true, false, false, :none, nothing),
                                                   ("louis_sd_none", false, true, true, :none, nothing))
-                extra = Dict{Symbol,Any}(:water_anchor => :derived, :si_water_slots => siw,
+                extra = Dict{Symbol,Any}(:si_water_slots => siw,
                                          :state_dependent_si => sd, :si_water_mixed_walls => true)
                 L === nothing || (extra[:lobe_relaxation] = L)
                 m, p, mo = F.vt_tile(tmp, "g_$(tag)"; vtr = :bhyp, ice, louis, extra,
@@ -98,9 +109,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 @test got[tag][2] == golden[tag][2]
             end
             m, p, mo, gp, z, col = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
-                                                    ctrans = :none, rtrans = :none,
-                                                    extra_options = Dict{Symbol,Any}(
-                                                        :water_anchor => :derived))
+                                                    ctrans = :none, rtrans = :none)
             M.set_state!(p, mo, gp.kDim, z, col; W0 = 0.3)
             for t in 1:3
                 M.step_all!(m, p, gp.kDim, t); Scythe.calcTendency(m); gridTransform!(p)
@@ -122,10 +131,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 extra = derived(; sd, siw, temperature = temp)
                 m, p, mo = F.vt_tile(tmp, "rest_$(ice)_$(sd)_$(siw)_$(temp)"; vtr = :bhyp,
                                      ice, extra)
-                Scythe.init_water_anchor_shadow!(p, mo)
                 eb = m.ebudget
                 # the reference every reader takes IS the derived one
-                @test eb.wa
                 @test Scythe.mc_rho_tbar_ref(m)[:, 1] == eb.rho_tbar_w
                 @test Scythe.mc_rho_tbar_ref(m)[:, 2] == eb.rho_tbar_w_z
                 # ...and the acoustic coefficient profile is built on it
@@ -143,14 +150,12 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     end
 
     # ── 3. dry ──────────────────────────────────────────────────────────────────────
-    @testset "dry: rho_t === rho_d and rho_t' === rho_d' bitwise under :derived" begin
+    @testset "dry: rho_t === rho_d and rho_t' === rho_d' bitwise" begin
         # A dry base (RH 0: every water slot an exact zero, so W' = 0.0 and the `-0.0` select
-        # returns rho_d' bitwise) with a w seed. Under :derived the staged total IS rho_d and
-        # the staged perturbation IS the rho_d slot, at every point and every step, so nothing
-        # the dynamics reads depends on a water slot. (The :slot arm is NOT bitwise the
-        # :derived one: its own slot 3 differs from rho_d' by rounding, 1.6e-19 after four
-        # steps, because the two continuity tendencies are different expressions; the arms
-        # agree to that rounding.)
+        # returns rho_d' bitwise) with a w seed: the staged total IS rho_d and the derived
+        # perturbation IS the rho_d slot, at every point and every step, so nothing the
+        # dynamics reads depends on a water slot. (Stage 3 compared this against the :slot
+        # arm, whose own slot 3 differed from rho_d' by rounding; both went at Stage 4.)
         mktempdir() do tmp
             seedw! = (p, x, V, c) -> begin
                 for i in 1:size(p.physical, 1)
@@ -162,105 +167,36 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             for sd in (false, true), siw in (:mass, :none)
                 md = F.vt_tile(tmp, "dry_d_$(sd)_$(siw)"; vtr = :none, rh = z -> 0.0,
                                extra = derived(; sd, siw), seed! = seedw!, cqss = false)
-                ms = F.vt_tile(tmp, "dry_s_$(sd)_$(siw)"; vtr = :none, rh = z -> 0.0,
-                               extra = Dict{Symbol,Any}(:state_dependent_si => sd,
-                                                        :si_water_slots => siw,
-                                                        :si_water_mixed_walls => true),
-                               seed! = seedw!, cqss = false)
-                Scythe.init_water_anchor_shadow!(md[2], md[3])
                 m = md[1]; S = m.mc_scratch[Threads.threadid()]; kD = md[3].grid_params.kDim
+                ws = Scythe.water_anchor_set(md[3].options, md[3].physical_params,
+                                             Scythe.mc_slots(md[3]))
                 ok = true
                 for t in 1:5
                     for c in 1:F.vt_ncols(md[2], md[3])
-                        Scythe.advance_column(m, c, t)
+                        ph = md[2].physical
                         rows = ((c - 1) * kD + 1):(c * kD)
+                        for g in rows
+                            ok &= Scythe.anchor_rho_tp(ph[g, 2, 1], Scythe.anchor_Wp(ph, g, 1, ws)) ===
+                                  ph[g, 2, 1]
+                        end
+                        Scythe.advance_column(m, c, t)
                         ok &= S.rho_t == S.rho_d
-                        ok &= S.res_rho_t == md[2].physical[rows, 2, 1]
                         ok &= S.rho_t_z == S.rho_d_z
                     end
                     Scythe.calcTendency(m); gridTransform!(md[2])
                 end
                 @test ok
-                F.vt_run!(ms..., 5)
-                oth = [j for j in 1:size(ms[1].var_np1, 2) if j != 3]
-                for j in oth
-                    a = ms[1].var_np1[:, j]; b = m.var_np1[:, j]
-                    @test maximum(abs, a .- b) <= 1.0e-12 * max(maximum(abs, a), 1.0e-300)
-                end
+                @test any(!=(0.0), m.var_np1[:, md[3].grid_params.vars["w"]])
             end
         end
     end
 
-    # ── 4. slot 3 feeds nothing ─────────────────────────────────────────────────────
-    @testset "slot 3 is a passive shadow: perturbing it moves nothing else" begin
-        # The same seeded state twice, once with a large extra perturbation in slot 3 only (a
-        # 'partition gap' the nudge would have acted on): under :derived every OTHER slot is
-        # bitwise the unperturbed run's — no reader, the nudge gone; under :slot it is not.
-        mktempdir() do tmp
-            bump!(p, x, V, c) = begin
-                F.vt_seed!(p, x, V, c)
-                for i in 1:size(p.physical, 1)
-                    p.physical[i, V["rho_t"], 1] += 2.0e-4 * exp(-((x[i, end] - 4000.0) / 800.0)^2)
-                end
-            end
-            for ice in (false, true), sd in (false, true)
-                ex = derived(; sd)
-                a = F.vt_tile(tmp, "pa_$(ice)_$(sd)"; vtr = :bhyp, ice, extra = ex,
-                              seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
-                b = F.vt_tile(tmp, "pb_$(ice)_$(sd)"; vtr = :bhyp, ice, extra = ex, seed! = bump!)
-                F.vt_run!(a..., 4); F.vt_run!(b..., 4)
-                others = [j for j in 1:size(a[1].var_np1, 2) if j != 3]
-                @test a[1].var_np1[:, others] == b[1].var_np1[:, others]
-                @test a[1].var_np1[:, 3] != b[1].var_np1[:, 3]
-            end
-            # the control: under :slot the same bump moves the dynamics
-            ex = Dict{Symbol,Any}(:si_water_slots => :mass, :si_water_mixed_walls => true)
-            a = F.vt_tile(tmp, "ps_a"; vtr = :bhyp, extra = ex,
-                          seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
-            b = F.vt_tile(tmp, "ps_b"; vtr = :bhyp, extra = ex, seed! = bump!)
-            F.vt_run!(a..., 4); F.vt_run!(b..., 4)
-            @test a[1].var_np1[:, 5] != b[1].var_np1[:, 5]
-        end
-    end
-
-    # ── 5. the shadow starts at exactly zero ────────────────────────────────────────
-    @testset "MC_SHADOW_GAP starts at 0.0 (spectrally exact, one transform rounding pointwise)" begin
-        mktempdir() do tmp
-            for ice in (false, true)
-                m, p, mo = F.vt_tile(tmp, "sh_$(ice)"; vtr = :bhyp, ice, extra = derived(),
-                                     seed! = (p, x, V, c) -> F.vt_seed_vapor!(p, x, V, c;
-                                         vtr = :none))
-                # the IC's slot 3 is NOT the derived total (the seed writes rho_t' = rc + dv)
-                eb = m.ebudget
-                kD = eb.kDim
-                nc = F.vt_ncols(p, mo)
-                gap(P) = maximum(Scythe._eb_water_column(eb, P, (c - 1) * kD, 1)[5] for c in 1:nc)
-                @test gap(p.physical) > 1.0e-6
-                Scythe.init_water_anchor_shadow!(p, mo)
-                # the shadow's spectral coefficients ARE the members' combination, exactly ...
-                ws = Scythe.water_anchor_set(mo.options, mo.physical_params, Scythe.mc_slots(mo))
-                comb = zeros(size(p.spectral, 1)); first = true
-                for j in 1:6
-                    sl = ws.slot[j]; a = ws.alpha[j]
-                    (sl == 0 || a == 0.0) && continue
-                    v = a .* p.spectral[:, sl]
-                    comb = first ? v : comb .+ v; first = false
-                end
-                @test p.spectral[:, 3] == p.spectral[:, 2] .+ comb
-                # ... and at the gridpoints the gap is one transform's rounding (exactly 0.0
-                # where a single member carries the column; 6.5e-19 kg/m3 with three)
-                @test gap(p.physical) <= 1.0e-15 * maximum(abs, p.physical[:, 3, 1])
-                # and it then measures something: the shadow is not the derived total once
-                # the operators have acted (nonlinear transport, the knee, the closures)
-                m.tile.physical .= p.physical
-                F.vt_run!(m, p, mo, 5)
-                @test 0.0 < gap(p.physical) < 1.0e-4
-            end
-        end
-    end
+    # (Stage 3's "slot 3 is a passive shadow" and "the shadow starts at 0.0" went with slot 3:
+    # there is no shadow to perturb or to start. The layout itself is pinned by
+    # test/test_slot3_audit.jl.)
 
     # ── 6. refusals ─────────────────────────────────────────────────────────────────
-    @testset "setup refusals under :derived" begin
+    @testset "setup refusals" begin
         mktempdir() do tmp
             for (k, v, pp) in ((:water_lobe_attribution, true, false),
                                (:vapor_nudge_partner, true, false),
@@ -286,65 +222,60 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 ex = derived(); ex[k] = false
                 @test F.vt_tile(tmp, "ok_$(k)"; vtr = :bhyp, extra = ex) isa Tuple
             end
-            # the same keys are fine under :slot
-            ex = Dict{Symbol,Any}(:water_lobe_attribution => false, :ice_anchor_source => true,
-                                  :mynn_water_closure => true)
-            @test F.vt_tile(tmp, "ok_slot"; vtr = :bhyp, extra = ex) isa Tuple
+            # an explicit false of the retired nudge/attribution keys is harmless too
+            for k in (:water_lobe_attribution, :vapor_nudge_partner)
+                ex = derived(); ex[k] = false
+                @test F.vt_tile(tmp, "okr_$(k)"; vtr = :bhyp, extra = ex) isa Tuple
+            end
+            # the budget trace needs the density lineage (no transform, 1-moment rain, no ice)
+            @test F.vt_tile(tmp, "ok_bt"; vtr = :none, tr = :none,
+                            extra = merge(derived(), Dict{Symbol,Any}(:water_budget_trace => 1))) isa Tuple
         end
     end
 
     # ── 7. the census rows ──────────────────────────────────────────────────────────
-    @testset "census: MC_W_*, MC_SHADOW_* layout and values" begin
+    @testset "census: MC_W_* layout and values" begin
         @test Scythe.MC_W_PART == Scythe.MC_VNEG_MASS + 1
-        @test Scythe.MC_SHADOW_INT == Scythe.MC_W_PART + 8
-        @test Scythe.MC_ANCHOR_INERT == Scythe.MC_SHADOW_INT + 1
+        @test Scythe.MC_W_SEEN == Scythe.MC_W_PART + 6
+        @test Scythe.MC_ANCHOR_INERT == Scythe.MC_W_SEEN + 1
         @test Scythe.MC_STATS_LAST == Scythe.MC_ANCHOR_INERT
         @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_INERT] == :anchor_inert
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
-        @test Scythe.MC_WATER_STATS[Scythe.MC_SHADOW_MAX] == :shadow_max
+        # the Stage 3 shadow rows went with slot 3, the vapor gap with the nudge
+        @test !isdefined(Scythe, :MC_SHADOW_MAX) && !isdefined(Scythe, :MC_SHADOW_INT)
+        @test !isdefined(Scythe, :MC_VAPOR_GAP)
+        @test !(:shadow_max in Scythe.MC_WATER_STATS) && !(:v_gap in Scythe.MC_WATER_STATS)
+        @test Scythe.MC_WATER_STATS[Scythe.MC_QSS_GAP] == :q_gap
         mktempdir() do tmp
-            for wa in (:slot, :derived)
-                ex = wa === :derived ? derived() :
-                    Dict{Symbol,Any}(:si_water_slots => :mass, :si_water_mixed_walls => true)
-                m, p, mo = F.vt_tile(tmp, "cen_$(wa)"; vtr = :bhyp, extra = ex,
-                                     seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
-                Scythe.init_water_anchor_shadow!(p, mo)
-                m.tile.physical .= p.physical
-                eb = m.ebudget; st = m.mc_water_stats
-                # an output step: t − 1 a multiple of the output interval (10 s / 0.5 s)
-                for t in 2:21
-                    Scythe.energy_census_trace(m, t)
-                end
-                # independent quadrature of the anchor and the partition gap
-                kD = eb.kDim; nc = F.vt_ncols(p, mo)
-                V = mo.grid_params.vars
-                wint = 0.0; xint = 0.0
-                for c in 1:nc
-                    a = 0.0; x = 0.0
-                    for k in 1:kD
-                        g = (c - 1) * kD + k
-                        W = wa === :derived ? Scythe._eb_W(eb, p.physical, g, 1, k) :
-                            (p.physical[g, V["rho_t"], 1] + eb.rho_tbar[k]) -
-                            (p.physical[g, V["rho_d"], 1] + eb.rho_dbar[k])
-                        a += eb.wz[k] * W
-                        x += eb.wz[k] * Scythe._eb_point_RX(eb, p.physical, g, 1, k)[2]
-                    end
-                    wint += eb.wxn[c] * a; xint += eb.wxn[c] * x
-                end
-                @test st[Scythe.MC_W_INT, 1] ≈ wint rtol = 1.0e-14
-                @test st[Scythe.MC_W_PART, 1] ≈ xint rtol = 1.0e-12
-                @test st[Scythe.MC_W_PART, 1] == st[Scythe.MC_XGAP_INT, 1]
-                @test st[Scythe.MC_W_SEEN, 1] == 1.0
-                if wa === :derived
-                    @test st[Scythe.MC_SHADOW_INT, 1] === 0.0
-                    @test st[Scythe.MC_SHADOW_MAX, 1] === 0.0
-                end
+            m, p, mo = F.vt_tile(tmp, "cen"; vtr = :bhyp, extra = derived(),
+                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+            m.tile.physical .= p.physical
+            eb = m.ebudget; st = m.mc_water_stats
+            # an output step: t − 1 a multiple of the output interval (10 s / 0.5 s)
+            for t in 2:21
+                Scythe.energy_census_trace(m, t)
             end
+            # independent quadrature of the anchor and the partition gap
+            kD = eb.kDim; nc = F.vt_ncols(p, mo)
+            wint = 0.0; xint = 0.0
+            for c in 1:nc
+                a = 0.0; x = 0.0
+                for k in 1:kD
+                    g = (c - 1) * kD + k
+                    a += eb.wz[k] * Scythe._eb_W(eb, p.physical, g, 1, k)
+                    x += eb.wz[k] * Scythe._eb_point_RX(eb, p.physical, g, 1, k)[2]
+                end
+                wint += eb.wxn[c] * a; xint += eb.wxn[c] * x
+            end
+            @test st[Scythe.MC_W_INT, 1] ≈ wint rtol = 1.0e-14
+            @test st[Scythe.MC_W_PART, 1] ≈ xint rtol = 1.0e-12
+            @test st[Scythe.MC_W_PART, 1] == st[Scythe.MC_XGAP_INT, 1]
+            @test st[Scythe.MC_W_SEEN, 1] == 1.0
         end
     end
 
     # ── 8. the R1T1X wall estimate reads the derived perturbation ───────────────────
-    @testset "update_mc_wall_bc! reads rho_d' + W' under :derived" begin
+    @testset "update_mc_wall_bc! reads rho_d' + W'" begin
         mktempdir() do tmp
             m, p, mo = F.vt_tile(tmp, "wall"; vtr = :bhyp, extra = derived(),
                                  seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
@@ -360,11 +291,13 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             @test rt ≈ ref rtol = 1.0e-14
             @test Scythe.anchor_rho_tp(-0.0, 0.0) === -0.0
             @test Scythe.anchor_rho_tp(1.0, -0.0) === 1.0
+            # the estimate needs the member set: without it, a located refusal
+            @test_throws ErrorException Scythe.update_mc_wall_bc!(p, p.physical)
         end
     end
 
     # ── 9. netCDF derived fields ────────────────────────────────────────────────────
-    @testset "netCDF: rho_t is rho_d + rho_w, the shadow is written beside it" begin
+    @testset "netCDF: rho_t is rho_d + rho_w (no rho_t slot)" begin
         z = collect(0.0:250.0:1000.0)
         nz = length(z)
         zp = zeros(nz)
@@ -373,33 +306,34 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                               zp, fill(290.0, nz))
         mk(f) = [f(i, k) for i in 1:2, k in 1:nz]
         slots = (; p = mk((i, k) -> 10.0 * i), rho_d = mk((i, k) -> 1.0e-3 * k),
-                   rho_t = mk((i, k) -> 0.5), E_t = mk((i, k) -> 0.0), Q_ss = mk((i, k) -> 0.0),
+                   E_t = mk((i, k) -> 0.0), Q_ss = mk((i, k) -> 0.0),
                    rho_v = mk((i, k) -> 1.0e-5 * i), u = mk((i, k) -> 0.0),
                    w = mk((i, k) -> 0.0), rain = mk((i, k) -> 2.0e-6),
                    cloud = mk((i, k) -> 3.0e-6 * k))
-        base = Scythe.DerivedConfig(:bhyp, 1.0e-7, :bhyp, 1.0e-7, :none, 1.0, :none,
-                                    (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16), 1, false, false,
-                                    8.0e6, 100.0, "t", false, :eos, :bhyp, 1.0e-9)
-        @test base.water_anchor === :slot
         cfg = Scythe.DerivedConfig(:bhyp, 1.0e-7, :bhyp, 1.0e-7, :none, 1.0, :none,
                                    (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16), 1, false, false,
-                                   8.0e6, 100.0, "t", false, :eos, :bhyp, 1.0e-9, :derived)
-        d0 = Scythe.mc_derived_fields(z, slots, ref, base)
+                                   8.0e6, 100.0, "t", false, :eos, :bhyp, 1.0e-9)
+        @test !hasfield(Scythe.DerivedConfig, :water_anchor)
         d = Scythe.mc_derived_fields(z, slots, ref, cfg)
-        @test !haskey(d0, :rho_t_slot)
+        for k in (:rho_t_slot, :water_shadow_gap, :column_water_shadow_gap)
+            @test !haskey(d, k)
+        end
         rvb = ref.rho_tbar .- ref.rho_dbar .- ref.rho_cbar
         nvb = Scythe.bhyp.(rvb, 1.0e-9); ncb = Scythe.bhyp.(ref.rho_cbar, 1.0e-7)
+        rw = zeros(2, nz)
         for i in 1:2, k in 1:nz
-            rw = 2.0 * (slots.rho_v[i, k] + nvb[k]) + 2.0 * (slots.cloud[i, k] + ncb[k]) +
-                 2.0 * slots.rain[i, k]
-            @test d.rho_t[i, k] ≈ (slots.rho_d[i, k] + ref.rho_dbar[k]) + rw rtol = 1.0e-14
-            wp = 2.0 * slots.rho_v[i, k] + 2.0 * slots.cloud[i, k] + 2.0 * slots.rain[i, k]
-            @test d.water_shadow_gap[i, k] ≈ slots.rho_t[i, k] - (slots.rho_d[i, k] + wp) rtol = 1.0e-14
-            @test d.rho_t_slot[i, k] ≈ slots.rho_t[i, k] + d.rho_tbar_w[k] rtol = 1.0e-14
+            rw[i, k] = 2.0 * (slots.rho_v[i, k] + nvb[k]) + 2.0 * (slots.cloud[i, k] + ncb[k]) +
+                       2.0 * slots.rain[i, k]
+            @test d.rho_t[i, k] ≈ (slots.rho_d[i, k] + ref.rho_dbar[k]) + rw[i, k] rtol = 1.0e-14
         end
         @test d.rho_tbar_w ≈ ref.rho_dbar .+ 2.0 .* nvb .+ 2.0 .* ncb rtol = 1.0e-14
-        @test d.rho_w_deficit == min.(d.rho_t .- (slots.rho_d .+ reshape(ref.rho_dbar, 1, nz)), 0.0) ||
-              all(d.rho_w_deficit .== 0.0)
+        @test d.rho_w_deficit == min.(rw, 0.0) || maximum(abs, d.rho_w_deficit .- min.(rw, 0.0)) <=
+              1.0e-15 * maximum(abs, rw)
+        # a negative water sum is reported where it is: a deep vapor lobe at one point
+        s2 = merge(slots, (; rho_v = mk((i, k) -> (i == 1 && k == 2) ? -1.0 : 1.0e-5 * i)))
+        d2 = Scythe.mc_derived_fields(z, s2, ref, cfg)
+        @test d2.rho_w_deficit[1, 2] < 0.0
+        @test count(<(0.0), d2.rho_w_deficit) == 1
     end
 
     # ══ 3b: the exchange closure (water_exchange_dv and its sites) ══════════════════
@@ -640,8 +574,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 @test a.dv == off.dv
                 @test a.d9 == off.d9
             end
-            # :recovered books the full recovered change at the :slot coefficients
-            # (phase_change_partner's dp, the vapor -(dl) in the bracket)
+            # :recovered books the full recovered change at phase_change_partner's coefficients
+            # (its dp, the vapor -(dl) in the bracket)
             prc = [Scythe.phase_change_partner(full[k], 0.0, off.Tk[k], off.R_m[k], off.C_vt[k],
                                                off.C_vt[k] + off.R_m[k], off.Lv[k], 0.0, 0.0,
                                                0.0)[1] for k in 1:kD]
@@ -660,17 +594,18 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                    for k in 1:kD]
             @test any(!=(0.0), dvv)
             @test all(k -> (dvv[k] == 0.0) == (dfl.d1[k] == nov.d1[k]), 1:kD)
-            # the forms are validated, on either anchor
+            # the forms are validated (the :slot refusal of :recovered went with the anchor)
             bad = derived(; refit_partner_form = :full)
             @test_throws ErrorException F.vt_tile(tmp, "bisbad"; vtr = :bhyp, extra = bad)
-            @test_throws ErrorException F.vt_tile(tmp, "bisslot"; vtr = :bhyp,
-                extra = Dict{Symbol,Any}(:refit_partner_form => :recovered))
+            @test F.vt_tile(tmp, "bisrec"; vtr = :bhyp,
+                extra = Dict{Symbol,Any}(:refit_partner_form => :recovered)) isa Tuple
             @test_throws ErrorException F.vt_tile(tmp, "bisfn"; vtr = :bhyp,
                 extra = Dict{Symbol,Any}(:energy_budget_functional => :slot3))
             @test F.vt_tile(tmp, "bisok"; vtr = :bhyp,
                 extra = Dict{Symbol,Any}(:refit_partner_form => :defect)) isa Tuple
         end
-        # E-c: the derived R functional on a :slot tile (the same state into both)
+        # E-c: :model and :derived name the same functional since Stage 4 (the :slot tile's own
+        # rho_t-slot functional went with it): the same trajectory books the same R and X bitwise
         mktempdir() do tmp
             got = Dict{Symbol,Any}()
             for fn in (:model, :derived)
@@ -679,26 +614,19 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                                               :energy_budget_functional => fn),
                                      seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
                 eb = m.ebudget
-                @test !eb.wa
-                @test eb.wR == (fn === :derived)
                 F.vt_run!(m, p, mo, 4)
                 A = m.tile.physical
                 g = 7; k = 7
                 R, X, _ = Scythe._eb_point_RX(eb, A, g, 1, k)
-                rt = A[g, eb.irt, 1] + eb.rho_tbar[k]; rd = A[g, eb.ird, 1] + eb.rho_dbar[k]
-                W = Scythe._eb_W(eb, A, g, 1, k)
-                geo = 0.5 * (A[g, eb.iu, 1]^2 + A[g, eb.iw, 1]^2) + Scythe.gravity * eb.z[k]
-                got[fn] = (; R, X, shift = (rt - (rd + W)) * geo)
+                got[fn] = (; R, X, A = copy(A))
                 snap = Scythe.energy_budget_snapshot!(m)
                 tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
                 @test maximum(abs, snap.actualR .- tR) <= 1.0e-10 * maximum(abs, snap.actualR) +
                                                          1.0e-12 * maximum(abs, snap.dR)
             end
-            # the trajectory is the same (the functional is diagnostic only); R differs by the
-            # mechanical term alone, X not at all
-            @test got[:derived].X == got[:model].X
-            @test got[:derived].shift == got[:model].shift
-            @test got[:derived].R ≈ got[:model].R + got[:model].shift rtol = 1.0e-12
+            @test got[:derived].A == got[:model].A
+            @test got[:derived].X === got[:model].X
+            @test got[:derived].R === got[:model].R
         end
     end
 
@@ -837,8 +765,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     end
 
     @testset "B3: the sfc row mirrors the derived closures (Louis, MYNN; bhyp vapor)" begin
-        # Under the derived anchor both closures put F_q g/alpha_v on the vapor's nu (the
-        # shadow slot 3 F_q g); the budget hook moves exactly that out of the bl row. The
+        # Both closures put F_q g/alpha_v on the vapor's nu; the budget hook moves exactly
+        # that out of the bl row. The
         # sfc row's R is second order (energy-consistent surface exchange), the budget closes.
         mktempdir() do tmp
             for (tag, bl, ice) in (("louis", :louis, false), ("mynn", :mynn, false),
@@ -849,14 +777,14 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                      extra = ex,
                                      seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
                 eb = m.ebudget
-                @test eb.wa && eb.mynn == (bl === :mynn)
+                @test eb.mynn == (bl === :mynn)
                 F.vt_run!(m, p, mo, 3)
                 kD = mo.grid_params.kDim
                 tn = eb.tn
                 g = 1   # the ground point of the first column: inside the delivery layer
-                sq = tn[g, eb.jrt, Scythe.EB_OP_SFC]
-                @test sq != 0.0
-                @test tn[g, eb.jrv, Scythe.EB_OP_SFC] == sq / 2.0
+                # (Stage 3 also pinned the shadow's own F_q g here, twice this; slot 3 is the
+                # vapor now)
+                @test tn[g, eb.jrv, Scythe.EB_OP_SFC] != 0.0
                 snap = Scythe.energy_budget_snapshot!(m)
                 tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
                 @test maximum(abs, snap.actualR .- tR) <= 1.0e-10 * maximum(abs, snap.actualR) +
@@ -871,12 +799,12 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
-    @testset "D1: the four ice-anchor legs are inert under :derived (census = shadow gap)" begin
+    @testset "D1: the four ice-anchor legs are inert (MC_ANCHOR_GAP reads 0.0)" begin
         # An ice tile whose vapor rings into a lobe beside real ice: read through
-        # rho_t - rho_d = W the headroom test fires there (rho_v + X < 0). Under :derived
-        # nothing binds: the reader cap, the sedimentation and rate shares are the raw ice,
-        # nothing is removed, and MC_ANCHOR_GAP reads the shadow gap; the :slot arm on the
-        # same seed still exercises the legs.
+        # rho_t - rho_d = W the headroom test fires there (rho_v + X < 0). Nothing binds: the
+        # reader cap, the sedimentation and rate shares are the raw ice, nothing is removed,
+        # and MC_ANCHOR_GAP -- Stage 3's shadow-gap census, which went with slot 3 -- reads
+        # 0.0. Forcing the rate and flux legs back on shows they would bind on this state.
         mktempdir() do tmp
             seedice! = (p, x, V, c) -> begin
                 F.vt_seed!(p, x, V, c; amp = 1.0e-3, vamp = 3.0e-3)
@@ -888,84 +816,59 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                         p.physical[i, V["nu_i1"], 1] = Scythe.bhyp(2.0e-4, 1.0e-9)
                         p.physical[i, V["nu_v"], 1] -= 1.5 *
                             Scythe.bhyp(c.rho_v[mod1(i, kD)], 1.0e-9)
-                        # ...and the linear rho_t short of the vapor there, so the :slot
-                        # anchor (slot 3) leaves the ice no headroom and its legs fire too
-                        p.physical[i, V["rho_t"], 1] -= c.rho_v[mod1(i, kD)] + 5.0e-3
                     end
                 end
             end
-            for wa in (:derived, :slot)
-                ex = wa === :derived ? derived() : Dict{Symbol,Any}()
-                m, p, mo = F.vt_tile(tmp, "d1_$(wa)"; vtr = :bhyp, ice = true, extra = ex,
-                                     seed! = seedice!)
-                F.vt_run!(m, p, mo, 3)
-                st = m.mc_water_stats
-                kD = mo.grid_params.kDim
-                # the gap row of THIS column step alone (it is a run maximum)
-                fill!(view(st, Scythe.MC_ANCHOR_GAP, :), 0.0)
-                mr = deepcopy(m)              # the same state, for the rate-leg check below
-                Scythe.advance_column(m, 1, 4)
-                S = m.mc_scratch[Threads.threadid()]
-                if wa === :derived
-                    # the legs are switched off at setup and the stats matrix marks them inert
-                    for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux,
-                              :ice_anchor_rates)
-                        @test mo.options[k] === false
-                    end
-                    @test all(==(1.0), view(st, Scythe.MC_ANCHOR_INERT, :))
-                    @test S.rho_ice_t == S.rho_ice
-                    # the RATE and FLUX legs directly: forcing them back on (past the validation) on the
-                    # same state changes the ice sources where the headroom binds; the default
-                    # arm's sources are the unshared ones
-                    rd0 = (copy(S.SRC_i1q), copy(S.invtau_i1), copy(S.F_i1q))
-                    mr.model.options[:ice_anchor_rates] = true
-                    mr.model.options[:ice_anchor_flux] = true
-                    Scythe.advance_column(mr, 1, 4)
-                    Sr = mr.mc_scratch[Threads.threadid()]
-                    @test any(<(1.0), Sr.anchor_f)
-                    @test (Sr.SRC_i1q, Sr.invtau_i1, Sr.F_i1q) != rd0
-                    @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
-                    @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) == 0.0
-                    G = maximum(abs, m.tile.physical[1:kD, 3, 1] .- S.res_rho_t)
-                    @test G > 0.0
-                    @test maximum(view(st, Scythe.MC_ANCHOR_GAP, :)) == G
-                    # ...and the headroom test the legs WOULD read fires here (the measure)
-                    hit = count(i -> S.rho_ice[i] > Scythe.anchor_headroom(S.rho_t[i] - S.rho_d[i],
-                                                                           S.rho_liq[i], 0.0),
-                                1:kD)
-                    @test hit > 0
-                else
-                    # the legs are live under :slot on this fixture: the census counts, the
-                    # rate/flux share (anchor_f, the rate leg's only input) binds below 1
-                    @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) > 0.0
-                    @test any(<(1.0), S.anchor_f)
-                    @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) > 0.0
-                end
+            m, p, mo = F.vt_tile(tmp, "d1"; vtr = :bhyp, ice = true, extra = derived(),
+                                 seed! = seedice!)
+            F.vt_run!(m, p, mo, 3)
+            st = m.mc_water_stats
+            kD = mo.grid_params.kDim
+            mr = deepcopy(m)              # the same state, for the rate-leg check below
+            Scythe.advance_column(m, 1, 4)
+            S = m.mc_scratch[Threads.threadid()]
+            # the legs are switched off at setup and the stats matrix marks them inert
+            for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux,
+                      :ice_anchor_rates)
+                @test mo.options[k] === false
             end
+            @test all(==(1.0), view(st, Scythe.MC_ANCHOR_INERT, :))
+            @test S.rho_ice_t == S.rho_ice
+            # the RATE and FLUX legs directly: forcing them back on (past the validation) on
+            # the same state changes the ice sources where the headroom binds; the default
+            # arm's sources are the unshared ones
+            rd0 = (copy(S.SRC_i1q), copy(S.invtau_i1), copy(S.F_i1q))
+            mr.model.options[:ice_anchor_rates] = true
+            mr.model.options[:ice_anchor_flux] = true
+            Scythe.advance_column(mr, 1, 4)
+            Sr = mr.mc_scratch[Threads.threadid()]
+            @test any(<(1.0), Sr.anchor_f)
+            @test (Sr.SRC_i1q, Sr.invtau_i1, Sr.F_i1q) != rd0
+            @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
+            @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) == 0.0
+            @test all(==(0.0), view(st, Scythe.MC_ANCHOR_GAP, :))
+            # ...and the headroom test the legs WOULD read fires here (the measure)
+            hit = count(i -> S.rho_ice[i] > Scythe.anchor_headroom(S.rho_t[i] - S.rho_d[i],
+                                                                   S.rho_liq[i], 0.0),
+                        1:kD)
+            @test hit > 0
         end
-    end
-
-    @testset "D1: MC_ANCHOR_GAP reads the shadow gap on a WARM :derived tile too" begin
+        # ...and on a warm tile
         mktempdir() do tmp
             m, p, mo = F.vt_tile(tmp, "d1w"; vtr = :bhyp, extra = derived(),
                                  seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
-            F.vt_run!(m, p, mo, 2)
-            st = m.mc_water_stats; kD = mo.grid_params.kDim
-            fill!(view(st, Scythe.MC_ANCHOR_GAP, :), 0.0)
-            Scythe.advance_column(m, 1, 3)
-            S = m.mc_scratch[Threads.threadid()]
-            G = maximum(abs, m.tile.physical[1:kD, 3, 1] .- S.res_rho_t)
-            @test G > 0.0
-            @test maximum(view(st, Scythe.MC_ANCHOR_GAP, :)) == G
+            F.vt_run!(m, p, mo, 3)
+            st = m.mc_water_stats
+            @test all(==(0.0), view(st, Scythe.MC_ANCHOR_GAP, :))
             @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
         end
     end
 
     @testset "D5: Louis under :derived mixes the rain in nu space (MYNN's leg set)" begin
         # A sheared column with cloud, a rain bump and the vapor bump: the Louis arm against
-        # the BL-off arm on the same state. The legs sum to the anchor (sum alpha D_k equals the
-        # shadow's D_3), the rain leg is nonzero, and R is held to 1e-4 of the energy the legs
-        # move; with K = 0 the rain slot is untouched bitwise.
+        # the BL-off arm on the same state. The rain leg is nonzero and R is held to 1e-4 of the
+        # energy the legs move; with K = 0 the rain slot is untouched bitwise. (Stage 3 also
+        # checked the legs against the shadow's D_3; the anchor IS that sum now.)
         mktempdir() do tmp
             for shear in (true, false)
                 seedr! = (p, x, V, c) -> begin
@@ -974,7 +877,6 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                         zz = x[i, end]; k = mod1(i, length(c.Tk)); T = c.Tk[k]
                         rr = 3.0e-4 * exp(-((zz - 1200.0) / 500.0)^2)
                         p.physical[i, V["nu_r"], 1] = Scythe.rain_slot(rr, :bhyp, F.MU)
-                        p.physical[i, V["rho_t"], 1] += rr
                         p.physical[i, V["E_t"], 1] += rr * ((Scythe.Cpv * T) - Scythe.L_v(T) +
                                                             (Scythe.gravity * zz))
                         shear && (p.physical[i, V["u"], 1] = 10.0 * tanh(zz / 800.0))
@@ -1004,8 +906,6 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                     continue
                 end
                 @test maximum(abs, D[:, V["nu_r"]]) > 0.0
-                sumnu = (2.0 .* D[:, V["nu_v"]] .+ 2.0 .* D[:, V["nu_c"]]) .+ 2.0 .* D[:, V["nu_r"]]
-                @test maximum(abs, sumnu .- D[:, 3]) <= 1.0e-12 * maximum(abs, D[:, 3])
                 R0, _ = RX(arms[true].m, arms[true].x)
                 x1 = copy(arms[true].x); x1 .+= ts .* D[:, 1:size(x1, 2)]
                 R1, _ = RX(arms[true].m, x1)
@@ -1015,44 +915,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
-    @testset "D6: a load re-zeroes the shadow and prints the gap it discards" begin
-        mktempdir() do tmp
-            m, p, mo = F.vt_tile(tmp, "d6"; vtr = :bhyp, extra = derived(),
-                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
-            F.vt_run!(m, p, mo, 2)
-            # a converted checkpoint's slot 3: the derived total plus a known gap
-            Scythe.init_water_anchor_shadow!(p, mo; report = false)
-            p.physical[:, 3, 1] .+= 2.5e-6
-            p.physical[5, 3, 1] += 1.0e-5
-            out = mktemp() do path, io
-                redirect_stdout(io) do
-                    Scythe.init_water_anchor_shadow!(p, mo)
-                end
-                flush(io); read(path, String)
-            end
-            @test occursin("pre-zero shadow gap", out)
-            mx = parse(Float64, match(r"max\|G\| = ([-0-9.eE+]+)", out).captures[1])
-            mn = parse(Float64, match(r"mean G = ([-0-9.eE+]+)", out).captures[1])
-            @test mx ≈ 1.25e-5 rtol = 1.0e-3
-            @test mn ≈ 2.5e-6 + 1.0e-5 / size(p.physical, 1) rtol = 1.0e-3
-            # ...and after it the gap is the rounding of one transform
-            ws = Scythe.water_anchor_set(mo.options, mo.physical_params, Scythe.mc_slots(mo))
-            G = [p.physical[g, 3, 1] - Scythe.anchor_rho_tp(p.physical[g, 2, 1],
-                                                            Scythe.anchor_Wp(p.physical, g, 1, ws))
-                 for g in axes(p.physical, 1)]
-            @test maximum(abs, G) <= 1.0e-12
-            # :slot: a no-op, nothing printed
-            m2, p2, mo2 = F.vt_tile(tmp, "d6s"; vtr = :bhyp)
-            x0 = copy(p2.physical)
-            out2 = mktemp() do path, io
-                redirect_stdout(io) do
-                    Scythe.init_water_anchor_shadow!(p2, mo2)
-                end
-                flush(io); read(path, String)
-            end
-            @test isempty(out2) && p2.physical == x0
-        end
-    end
+    # (D6, "a load re-zeroes the shadow", went with the shadow: a pre-Stage-4 checkpoint is
+    # converted by tools/convert_rho_t_checkpoint.jl, test/test_rho_t_conversion.jl.)
 
     @testset "review: E2 in the model -- the full-recovered form opens R at above-knee edges" begin
         # One step from the same post-refit state with the partner in its default (defect)
@@ -1099,7 +963,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 dfc = Scythe.affine_defect_change(npost[k], npre[k], :bhyp, F.MU)
                 scale = abs(lam[k] * 2.0 * (npost[k] - npre[k]))
                 # the recovered form opens R by ~lambda_l 2 dnu relative to the defect form (its
-                # coefficient carries the vapor's -(dl) as well: the :slot bracket, R units)
+                # coefficient carries the vapor's -(dl) as well: phase_change_partner's bracket, R units)
                 lamf = lam[k] - off.Tk[k] * ((off.C_vt[k] * Scythe.Rv / off.R_m[k]) - Scythe.Cvv)
                 @test abs((Rr[k] - Rd[k]) + ((lamf * full) - (lam[k] * dfc))) <= 2.0e-3 * scale
                 @test abs(Rr[k] - Rd[k]) > 0.5 * scale
@@ -1204,7 +1068,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
                 @test maximum(abs, tR .- (Re .- Rs)) <= 1.0e-8 * maximum(abs, Re .- Rs) +
                                                       1.0e-10 * maximum(abs, snap.dR)
-                # the explicit sub-rows (dyn, the eight isolated operators incl. wexch, nonlin)
+                # the explicit sub-rows (dyn, the seven isolated operators incl. wexch, nonlin)
                 # sum to the explicit row
                 subs = [Scythe.EB_X_DYN; collect(Scythe.EB_OP_ROW); Scythe.EB_X_NONLIN]
                 sx = vec(sum(snap.dR[subs, :]; dims = 1))
@@ -1233,7 +1097,6 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                                  (p.physical[i, V["nu_i1"], 1] = Scythe.bhyp(1.0e-4, 1.0e-9))
                                          end
                                      end)
-                Scythe.init_water_anchor_shadow!(p, mo; report = false)
                 for c in 1:F.vt_ncols(p, mo)
                     Scythe.advance_column(m, c, 1)
                 end
@@ -1242,11 +1105,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             mo = arms[true].mo; V = mo.grid_params.vars; IS = arms[true].m.mc_slots
             nf = size(arms[false].e, 2)
             D = arms[true].e[:, 1:nf] .- arms[false].e
-            # the legs sum to the anchor's tendency (the shadow), ice mass legs included
-            sumnu = 2.0 .* (((D[:, IS.rho_v] .+ D[:, 9]) .+ D[:, 8]) .+
-                            ((D[:, IS.i1_q] .+ D[:, IS.i2_q]) .+ D[:, IS.i3_q]))
+            # the ice mass legs are live (Stage 3 also summed the legs against the shadow's
+            # tendency; the anchor IS that sum since Stage 4)
             @test maximum(abs, D[:, IS.i1_q]) > 0.0
-            @test maximum(abs, sumnu .- D[:, 3]) <= 1.0e-12 * maximum(abs, D[:, 3])
             x = arms[true].x[:, 1:nf]
             R0, _ = RX(arms[true].m, x)
             x1 = copy(x); x1 .+= mo.ts .* D
@@ -1291,7 +1152,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             path = joinpath(@__DIR__, "..", "simulations", case, "scythe_config.toml")
             mktempdir() do tmp
                 cfg = Scythe.load_config(path; set = ["output.dir=" * tmp])
-                @test cfg.numerics.water_anchor === :derived
+                @test !hasproperty(cfg.numerics, :water_anchor)
                 mp = Scythe.build_model(cfg)
                 models = mp isa Scythe.NestedModelParameters ? first(Scythe.build_nest(mp)) : [mp]
                 @test !isempty(models)
@@ -1457,7 +1318,6 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                     rc = max(0.0, 4.0e-4 * (1.0 - ((zz - 700.0) / 300.0)^2))
                     rr = 1.0e-4 * exp(-((zz - 400.0) / 400.0)^2) + 1.0e-6
                     patch.physical[j, V["rho_v"], 1] = rho_t[k] * bump
-                    patch.physical[j, V["rho_t"], 1] = rho_t[k] * bump + rc + rr
                     patch.physical[j, c, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, F.MU)
                     patch.physical[j, r, 1] = Scythe.rain_slot(rr, :bhyp, F.MU)
                 end
@@ -1465,22 +1325,15 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 gridTransform!(patch)
             end
             arms = Dict{Any,Any}()
-            for (tag, mynn, wa, wc, e0) in (("d", true, :derived, true, 0.4),
-                                            ("dctl", false, :derived, true, 0.4),
-                                            ("s_off", true, :slot, false, 0.4),
-                                            ("sctl", false, :slot, true, 0.4),
-                                            ("d_k0", true, :derived, true, 0.0),
-                                            ("dctl_k0", false, :derived, true, 0.0))
+            # (Stage 3's :slot arms without the water closure, the unclosed reference, went
+            # with the :slot anchor)
+            for (tag, mynn, e0) in (("d", true, 0.4), ("dctl", false, 0.4),
+                                    ("d_k0", true, 0.0), ("dctl_k0", false, 0.0))
                 m, p, mo, gp, z, col = MF.make_mynn_tile(tmp; mynn = mynn, init = :zero,
                                                          num_cells_k = 25, kMax = 5.0e3,
                                                          fluxes = false, ctrans = :bhyp,
-                                                         rtrans = :bhyp,
-                                                         extra_options = merge(
-                                                             Dict{Symbol,Any}(:water_anchor => wa),
-                                                             wa === :derived ? Dict{Symbol,Any}() :
-                                                             Dict{Symbol,Any}(:mynn_water_closure => wc)))
+                                                         rtrans = :bhyp)
                 seed!(p, mo, gp.kDim, z, col; e0)
-                Scythe.init_water_anchor_shadow!(p, mo)
                 MF.step_all!(m, p, gp.kDim)
                 arms[tag] = (; m, p, mo, gp, x = copy(p.physical[:, :, 1]))
             end
@@ -1496,24 +1349,15 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             sumnu = (D[rows, V["rho_v"]] .+ 2.0 .* D[rows, Scythe.mc_slot(V, "rho_c")]) .+
                     2.0 .* D[rows, Scythe.mc_slot(V, "rho_r")]
             @test maximum(abs, sumnu .- MN.div_w) <= 4 * eps() * maximum(abs, MN.div_w) + 1.0e-30
-            # the shadow receives the same sum
-            @test D[rows, 3] ≈ MN.div_w rtol = 1.0e-12
-            # R held by the closed legs, against the :slot arm without the water closure
+            # R held by the closed legs
             R0, X0 = RX(arms["d"].m, x)
             x1 = copy(x); x1[:, 1:nf] .+= ts .* D
             R1, X1 = RX(arms["d"].m, x1)
-            Ds = arms["s_off"].m.expdot_n[:, 1:nf] .- arms["sctl"].m.expdot_n
-            Rs0, _ = RX(arms["s_off"].m, x)
-            xs = copy(x); xs[:, 1:nf] .+= ts .* Ds
-            Rs1, _ = RX(arms["s_off"].m, xs)
-            # R held to 1e-4 of the energy the legs moved (the :slot arm without the water
-            # closure opens it at first order; here it is the second order of one step)
+            # R held to 1e-4 of the energy the legs moved (an unclosed water leg opens it at
+            # first order; here it is the second order of one step)
             Es = ts .* abs.(D[:, V["E_t"]])
             @test maximum(abs, R1 .- R0) <= 1.0e-4 * maximum(Es)
-            # ...and against that unclosed :slot arm (measured 2.1e-4 of it: the second order
-            # of one 0.5 s step, 9.6e-7 of the energy moved)
-            @test maximum(abs, R1 .- R0) <= 1.0e-3 * maximum(abs, Rs1 .- Rs0)
-            @info "MYNN derived dR" maximum(abs, R1 .- R0) maximum(Es) maximum(abs, Rs1 .- Rs0)
+            @info "MYNN derived dR" maximum(abs, R1 .- R0) maximum(Es)
             # the D3 column identity: sum_k w_k (dE_t + drho_e) = bdry_E, to round-off
             re_i = V["rho_e"]
             wq = MF.gauss_weights(kD, 25, 5.0e3)
@@ -1521,18 +1365,19 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             rhs = arms["d"].m.mynn.bdry_E[nc]
             scale = sum(wq .* abs.(D[rows, V["E_t"]])) + sum(wq .* abs.(arms["d"].m.expdot_n[rows, re_i]))
             @test abs(lhs - rhs) <= 1.0e-10 * scale
-            # rho_w moves by the legs exactly, the pool absorbs the water the clip holds
-            @test maximum(abs, ts .* D[:, 3]) > 1.0e-8
+            # rho_w moves by the legs (the sum above), not by a vanishing amount
+            @test maximum(abs, ts .* sumnu) > 1.0e-8
             # K_h = 0: every water leg is an exact zero (the drag still acts on u)
             Dk = arms["d_k0"].m.expdot_n[:, 1:nf] .- arms["dctl_k0"].m.expdot_n
-            for s in (V["rho_v"], Scythe.mc_slot(V, "rho_c"), Scythe.mc_slot(V, "rho_r"), 3, 7)
+            for s in (V["rho_v"], Scythe.mc_slot(V, "rho_c"), Scythe.mc_slot(V, "rho_r"),
+                      V["Q_ss"])
                 @test all(==(0.0), Dk[:, s])
             end
         end
     end
 
     @testset "3c: horizontal water mixing under :derived moves rho_w by K lap(rho_w)" begin
-        # the slot-3 leg is gone (the shadow is not mixed); rho_w = sum alpha nu moves by
+        # rho_w = sum alpha nu moves by
         # sum alpha K lap(nu) = K lap(rho_w), by linearity, to rounding
         mktempdir() do tmp
             ex(k) = merge(derived(), Dict{Symbol,Any}(:si_water_slots => :mass))
@@ -1552,7 +1397,6 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             end
             D = m1.expdot_n .- m0.expdot_n
             V = mo1.grid_params.vars
-            @test all(==(0.0), D[:, 3])                          # the shadow is not mixed
             ws = Scythe.water_anchor_set(mo1.options, mo1.physical_params, Scythe.mc_slots(mo1))
             drw = zeros(size(D, 1)); lap = zeros(size(D, 1))
             for j in 1:6
@@ -1574,14 +1418,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             ex = derived(; condensation = false)
             m, p, mo = F.vt_tile(tmp, "tr"; vtr = :bhyp, extra = ex,
                                  seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; wamp = 2.0))
-            Scythe.init_water_anchor_shadow!(p, mo)
             eb = m.ebudget; kD = eb.kDim; nc = F.vt_ncols(p, mo)
             W(P) = sum(eb.wxn[c] * Scythe._eb_water_column(eb, P, (c - 1) * kD, 1)[1] for c in 1:nc)
             w0 = W(p.physical)
-            Gs(P) = sum(eb.wxn[c] * sum(eb.wz[k] * (P[(c - 1) * kD + k, 3, 1] + eb.rho_tbar_ref[k, 1] -
-                                                 (P[(c - 1) * kD + k, 2, 1] + eb.rho_dbar[k]))
-                                       for k in 1:kD) for c in 1:nc)
-            g0 = Gs(p.physical)
             nstep = 40
             F.vt_run!(m, p, mo, nstep)
             w1 = W(p.physical)
@@ -1589,9 +1428,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             # the seeded w: 2 pi / ztop * wamp at most)
             divmax = 2.0 * pi / F.ZTOP * 2.0
             bound = 0.5 * (1.0e-9 + 2.0 * F.MU) * divmax * F.ZTOP * (nstep * mo.ts)
-            # and the linear shadow's own change, the conservation class of the old rho_t
             # (product-rule advection and the refit conserve no integral exactly)
-            @info "transport-only rho_w integral change" dW = w1 - w0 bound w0 dshadow = Gs(p.physical) - g0
+            @info "transport-only rho_w integral change" dW = w1 - w0 bound w0
             @test abs(w1 - w0) <= bound
         end
     end
@@ -1610,8 +1448,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                                          1.0e-12 * maximum(abs, snap.dR)
                 @test maximum(abs, snap.actualX .- tX) <= 1.0e-10 * maximum(abs, snap.actualX) +
                                                          1.0e-12 * maximum(abs, snap.dX)
-                # the nudge row is an exact zero: there is no nudge
-                @test all(==(0.0), snap.dR[Scythe.EB_OP_ROW[Scythe.EB_OP_VREC], :])
+                # the nudge row went with the nudge (Stage 4)
+                @test !isdefined(Scythe, :EB_OP_VREC)
+                @test !any(r -> r.stage == "explicit:vrec", Scythe.energy_budget_rows([snap]))
             end
         end
     end

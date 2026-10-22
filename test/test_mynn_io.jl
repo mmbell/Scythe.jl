@@ -150,14 +150,21 @@ using NCDatasets
                 K_h_expected = permutedims(reshape(MY.K_h, kDim, MY.ncol))
                 @test K_h_file == K_h_expected
 
-                # `e = rho_e/rho_t` reconstructed independently here and compared.
+                # `e = rho_e/rho_t` reconstructed independently here and compared. rho_t is
+                # DERIVED (slot 3 is the vapor since Stage 4 of the rho_t retirement): the
+                # perturbation `rho_d' + W'` (`anchor_rho_tp`/`anchor_Wp`) on the derived
+                # reference `mc_rho_tbar_ref`, a different association from the writer's
+                # `(rho_d' + rho_dbar) + W` -- hence the rtol, not bitwise.
                 phys = mtile.tile.physical
-                rho_tbar = view(Springsteel.ref_rho_t(mtile.ref_state), :, 1)
+                rho_tbar = view(Scythe.mc_rho_tbar_ref(mtile), :, 1)
+                ws = Scythe.water_anchor_set(mtile.model.options, mtile.model.physical_params,
+                                             mtile.mc_slots)
                 rho_e_slot = mtile.mc_slots.rho_e
                 e_file = Array(ds["e"])[1, :, :]
                 for c in 1:MY.ncol, k in 1:kDim
                     j = (c - 1) * kDim + k
-                    expected = phys[j, rho_e_slot, 1] / (phys[j, 3, 1] + rho_tbar[k])
+                    rtp = Scythe.anchor_rho_tp(phys[j, 2, 1], Scythe.anchor_Wp(phys, j, 1, ws))
+                    expected = phys[j, rho_e_slot, 1] / (rtp + rho_tbar[k])
                     @test e_file[c, k] ≈ expected rtol=1.0e-12
                 end
 

@@ -51,11 +51,14 @@
         @test delta_c == delta_a + 4.0e-3
     end
 
-    @testset "the headroom sees the clipped lobe (water_lobe_attribution)" begin
-        # `lobe` is the summed CLIPPED LOBE of the transformed water-mass slots at the
-        # point (`clipped_lobe` through `ahyp_signed`, <= 0): water the linear rho_t carries
-        # as a transported condensate's negative lobe, which the recovered densities clip
-        # to zero. It is the condensate's, so it is not missing from the ice's headroom.
+    @testset "the headroom's lobe credit (the `lobe` keyword of ice_anchor_rate)" begin
+        # `lobe` is a summed CLIPPED LOBE of the transformed water-mass slots at the point
+        # (`clipped_lobe` through `ahyp_signed`, <= 0): water a linear total carries as a
+        # transported condensate's negative lobe, which the recovered densities clip to zero.
+        # It is the condensate's, so it is not missing from the ice's headroom. The model fed
+        # it through `options[:water_lobe_attribution]`, retired with slot 3 at Stage 4 of the
+        # rho_t retirement: the model now always passes 0.0 (the law below, bit for bit), and
+        # what is tested here is the pure function's keyword, which src keeps.
         tau = 10.0
         # Exactly the old law at lobe = 0.0 (the keyword's default, and its value at every
         # point whose slots are all non-negative) -- bitwise, over the admissible states and
@@ -740,8 +743,8 @@ end
 
         rate = 4.0e-5 / tau
         # TOTAL WATER IS CONSERVED TO THE LAST BIT: what the ice slot loses the rain slot
-        # gains, formed from the one number, so the transfer cannot manufacture vapor
-        # through `res_rho_t` the way an unbalanced exchange would.
+        # gains, formed from the one number, so the transfer cannot open the partition the
+        # way an unbalanced exchange would.
         @test all(S.SRC_i1q .≈ -rate)
         @test all(S.ICE_R .≈ rate)
         for i in eachindex(S.ICE_R)

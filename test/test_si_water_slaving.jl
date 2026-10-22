@@ -3,16 +3,20 @@
 # RHO_T_RETIREMENT_DESIGN.md §4.2 (i′)/(iii), §6 Stage 2; src/si_water_slaving.jl).
 #
 # What has to hold (plan §4 Stage 2, tests first):
-#   1. per column Δ(ρ_d' + Σ α_k ν_k') = Δρ_t' (slot 3) to rounding on the state-dependent
-#      path, the reference path, exact_si phase B and the horizontal sweep — and the same for
-#      the staged AI2* histories;
+#   1. per column Δ(ρ_d' + Σ α_k ν_k') = Δρ_t' to rounding on the state-dependent path, the
+#      reference path, exact_si phase B and the horizontal sweep — and the same for the staged
+#      AI2* histories. Since Stage 4 of the ρ_t retirement there is no ρ_t slot to read Δρ_t'
+#      from: the target is the anchor's own increment, which the solve forms and the deleted
+#      slot 3 used to receive bit for bit (−Δτ φ_z, the history −φ_z, exact_si's plane 5, the
+#      sweep's plane 4, the fresh horizontal history −ρ̄_t·LDIV);
 #   2. rest is bitwise: a resting column is a fixed point under :bhyp and :none vapor, every
 #      state, tendency and increment exactly as with the slaving off;
 #   3. dry is bitwise (every c_k = 0, the −0.0 select);
 #   4. the staged `impdot[k]` and the solve's increment are ONE operator (bitwise);
 #   5. a mixed vertical wall family across the slaved slots is refused at setup.
-# Plus the option and config plumbing, the allocation-free column, and the feeder-1 check
-# (the vapor gap no longer grows under the acoustic step).
+# Plus the option and config plumbing and the allocation-free column. (The feeder-1 check --
+# the slot-3-vs-water-sum partition gap under the acoustic step -- went with slot 3: the gap is
+# identically zero by construction now.)
 
 using Test
 using Scythe
@@ -101,14 +105,14 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
     function seed_all(m0; ice = false, vtr = :bhyp, tr = :bhyp, vamp = 1.0e-3)
         rvb = rvbar(m0)
         return (patch, pts, V, col) -> begin
-            # `vamp`: the vapor bump at 3 km raised in rho_t ONLY (a seeded partition gap)
+            # `vamp`: the vapor-energy bump at 3 km in E_t (the fixture's; until Stage 4 it was
+            # also a seeded partition gap in the prognostic rho_t)
             F.vt_seed_vapor!(patch, pts, V, col; vtr = vtr, vmu = VMU, rho_vbar = rvb, vamp)
             kDim = length(col.Tk)
             for i in 1:size(patch.physical, 1)
                 z = pts[i, end]
                 b = exp(-((z - 2500.0) / 800.0)^2) * (1.0 + 0.3 * sin(2pi * pts[i, 1] / F.SPAN))
                 rr = 4.0e-4 * b
-                patch.physical[i, V["rho_t"], 1] += rr
                 patch.physical[i, Scythe.mc_slot(V, "rho_r"), 1] =
                     tr === :none ? rr : Scythe.bhyp(rr, 1.0e-7)
                 if ice
@@ -120,7 +124,6 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                         for jm in 1:4
                             nm = Scythe.MC_ICE_VARS[4 * (sp - 1) + jm]
                             x = scale[jm] * gsp
-                            jm == 1 && (patch.physical[i, V["rho_t"], 1] += x)
                             patch.physical[i, Scythe.mc_slot(V, nm), 1] =
                                 tr === :none ? x :
                                 Scythe.bhyp(x, Scythe.ice_mu(Dict{Symbol,Any}(), jm))
@@ -149,20 +152,36 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
     ncols(p, mo) = div(size(p.physical, 1), mo.grid_params.kDim)
 
     # The identity residual |Δρ_d + Σ α Δν − Δρ_t| at every row, in units of the rounding of
-    # the summands: max over rows of residual / (ε · Σ|summands|). Returns (ratio, max|Δρ_t|,
-    # max over rows of the water share Σ α|Δν|, so a vacuous zero cannot pass).
-    function identity_ratio(D, rows, rd, rt, members)
+    # the summands: max over rows of residual / (ε · Σ|summands|). `T[g]` is the anchor's
+    # increment Δρ_t at row g (no slot carries it since Stage 4; the caller forms it exactly as
+    # the deleted slot 3 received it). Returns (ratio, max|Δρ_t|, max over rows of the water
+    # share Σ α|Δν|, so a vacuous zero cannot pass).
+    function identity_ratio(D, rows, rd, T, members)
         worst = 0.0; dmax = 0.0; wmax = 0.0
         for g in rows
-            s = D[g, rd]; scale = abs(D[g, rd]) + abs(D[g, rt]); wsum = 0.0
+            s = D[g, rd]; scale = abs(D[g, rd]) + abs(T[g]); wsum = 0.0
             for (k, a) in members
                 s += a * D[g, k]; scale += a * abs(D[g, k]); wsum += a * abs(D[g, k])
             end
-            r = abs(s - D[g, rt])
+            r = abs(s - T[g])
             scale > 0.0 && (worst = max(worst, r / (ep * scale)))
-            dmax = max(dmax, abs(D[g, rt])); wmax = max(wmax, wsum)
+            dmax = max(dmax, abs(T[g])); wmax = max(wmax, wsum)
         end
         return worst, dmax, wmax
+    end
+    # The total-density reference every reader takes: the derived ρ̄_t^w (Stage 4).
+    rtbar(m) = Scythe.mc_rho_tbar_ref(m)
+    # The fresh horizontal history of the anchor, −ρ̄_t^w·LDIV, per column (the deleted slot 3's
+    # `@. -rho_tbar * LDIV` of the driver's `hsi_like` block), from the tile's own state.
+    function hacdot_rt(m, p, mo)
+        kDim = mo.grid_params.kDim; T = zeros(size(p.physical, 1)); L = zeros(kDim)
+        rtb = view(rtbar(m), :, 1)
+        for c in 1:ncols(p, mo)
+            cs = (c - 1) * kDim + 1; ce = cs + kDim - 1
+            Scythe._siw_ldiv!(L, m, cs, ce)
+            T[cs:ce] .= @. -rtb * L
+        end
+        return T
     end
 
     # ── 0. the option ──────────────────────────────────────────────────────────────
@@ -177,7 +196,8 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         @test haskey(Scythe.KNOWN_OPTION_KEYS, :si_water_mixed_walls)
         @test Scythe.OWNED_OPTION_KEYS[:si_water_slots] == "numerics.si_water_slots"
         @test Scythe.Numerics().si_water_slots === :mass
-        IS = Scythe.MCSlots(10, 11, 12:23..., 0)
+        # the Stage-4 XZ layout: the vapor at 3, n_r at 10, the ice at 11-22
+        IS = Scythe.MCSlots(3, 10, 11:22..., 0)
         o = Dict{Symbol,Any}(:si_water_slots => :mass, :vapor_transform => :bhyp,
                              :condensate_transform => :bhyp, :rain_transform => :none,
                              :ice_microphysics => :ishmael, :ice_transform => :bhyp,
@@ -185,14 +205,14 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         ws = Scythe.si_water_set(o, Dict{Symbol,Float64}(), IS)
         @test ws.on
         act = [(ws.slot[j], ws.alpha[j], ws.ref[j]) for j in 1:16 if ws.slot[j] > 0]
-        @test act == [(10, 2.0, 1), (9, 2.0, 2), (8, 1.0, 0), (12, 2.0, 0), (16, 2.0, 0),
-                      (20, 2.0, 0)]
+        @test act == [(3, 2.0, 1), (9, 2.0, 2), (8, 1.0, 0), (11, 2.0, 0), (15, 2.0, 0),
+                      (19, 2.0, 0)]
         o[:si_water_slots] = :all
         ws = Scythe.si_water_set(o, Dict{Symbol,Float64}(), IS)
         act = [(ws.slot[j], ws.alpha[j]) for j in 1:16 if ws.slot[j] > 0]
         @test length(act) == 16
         @test [a for (_, a) in act[7:end]] == zeros(10)
-        @test Set(s for (s, _) in act[7:end]) == Set([11, 13, 14, 15, 17, 18, 19, 21, 22, 23])
+        @test Set(s for (s, _) in act[7:end]) == Set([10, 12, 13, 14, 16, 17, 18, 20, 21, 22])
         @test !Scythe.si_water_set(Dict{Symbol,Any}(), Dict{Symbol,Float64}(), IS).on
     end
 
@@ -205,24 +225,30 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                                          :state_dependent_si => sd))
             F.vt_run!(m, p, mo, 3)
             V = mo.grid_params.vars
-            rd = V["rho_d"]; rt = V["rho_t"]
+            rd = V["rho_d"]
             members = mass_members(m)
             @test length(members) == (ice ? 6 : 3)
             kDim = mo.grid_params.kDim
             t = 4
+            T = zeros(size(p.physical, 1))
             worst = 0.0; worst_h = 0.0; dmax = 0.0; wmax = 0.0
             for c in 1:ncols(p, mo)
                 cs = (c - 1) * kDim + 1; ce = cs + kDim - 1
                 Scythe.advance_column(m, c, t)
-                # (a) the staged histories: impdot[2] + Σ α impdot[k] = impdot[3]
-                r, _, _ = identity_ratio(m.impdot_n, cs:ce, rd, rt, members)
+                S = m.mc_scratch[Threads.threadid()]
+                # (a) the staged histories: impdot[2] + Σ α impdot[k] = −φ_z (the anchor's
+                # staged history, the deleted impdot[3]: `@. -imp_phi_z`)
+                T[cs:ce] .= @. -S.imp_phi_z
+                r, _, _ = identity_ratio(m.impdot_n, cs:ce, rd, T, members)
                 worst_h = max(worst_h, r)
                 # (b) the solve's slaved increments from a zero predictor (so the advanced
-                # value IS the increment, with no rounding of a carried state)
+                # value IS the increment, with no rounding of a carried state), against the
+                # anchor's −Δτ φ_z (the deleted slot 3 from a zero predictor, bit for bit)
                 for (k, _) in members; m.var_np1[cs:ce, k] .= 0.0; end
-                m.var_np1[cs:ce, rd] .= 0.0; m.var_np1[cs:ce, rt] .= 0.0
+                m.var_np1[cs:ce, rd] .= 0.0
                 Scythe.semiimplicit_adjustment_p(m, cs, ce, t; apply_histories = false)
-                r, d, w = identity_ratio(m.var_np1, cs:ce, rd, rt, members)
+                T[cs:ce] .= 0.0 .- (1.25 * mo.ts .* S.si_phi_z)
+                r, d, w = identity_ratio(m.var_np1, cs:ce, rd, T, members)
                 worst = max(worst, r); dmax = max(dmax, d); wmax = max(wmax, w)
             end
             @info "vertical identity" sd ice vtr worst worst_h dmax wmax
@@ -256,7 +282,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             cs = (c - 1) * kDim + 1; ce = cs + kDim - 1
             if check_col !== nothing
                 for (k, _) in check_col; m.var_np1[cs:ce, k] .= 0.0; end
-                m.var_np1[cs:ce, V["rho_d"]] .= 0.0; m.var_np1[cs:ce, V["rho_t"]] .= 0.0
+                m.var_np1[cs:ce, V["rho_d"]] .= 0.0
             end
             Scythe.exact_si_apply_column!(m, cs, ce, t, hfields, 1)
         end
@@ -266,7 +292,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
     end
     function make_esd(m, p, mo)
         Scythe.create_exact_si_data(p, mo, m.mc_ref_diag.Pxi_prof,
-            collect(view(Springsteel.ref_rho_t(m.ref_state), :, 1:2)),
+            collect(view(rtbar(m), :, 1:2)),
             collect(view(Springsteel.ref_rho_d(m.ref_state), :, 1:2)),
             collect(view(Springsteel.ref_total_energy(m.ref_state), :, 1:2) .+
                     view(Springsteel.ref_pressure(m.ref_state), :, 1:2)))
@@ -287,22 +313,29 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             t = 4
             kDim = mo.grid_params.kDim
             Scythe.exact_si_load_history!(m, hfields, t, 1)
-            for c in 1:ncols(p, mo); Scythe.advance_column(m, c, t); end
-            rh, _, _ = identity_ratio(m.impdot_n, 1:size(p.physical, 1), V["rho_d"], V["rho_t"],
+            Th = zeros(size(p.physical, 1))
+            for c in 1:ncols(p, mo)
+                Scythe.advance_column(m, c, t)
+                cs = (c - 1) * kDim + 1
+                Th[cs:(cs + kDim - 1)] .= @. -m.mc_scratch[Threads.threadid()].imp_phi_z
+            end
+            rh, _, _ = identity_ratio(m.impdot_n, 1:size(p.physical, 1), V["rho_d"], Th,
                                       members)
             # the horizontal (hacdot) histories too
             rhh, _, _ = identity_ratio(m.hacdot_n, 1:size(p.physical, 1), V["rho_d"],
-                                       V["rho_t"], members)
+                                       hacdot_rt(m, p, mo), members)
             npts = size(p.physical, 1)
             xstar = hcat(m.var_np1[:, V["u"]], m.var_np1[:, V["w"]], m.var_np1[:, V["p"]])
             Scythe.exact_si_solve!(hfields, esd, p, mo, t, xstar)
             for (k, _) in members; m.var_np1[:, k] .= 0.0; end
-            m.var_np1[:, V["rho_d"]] .= 0.0; m.var_np1[:, V["rho_t"]] .= 0.0
+            m.var_np1[:, V["rho_d"]] .= 0.0
             for c in 1:ncols(p, mo)
                 cs = (c - 1) * kDim + 1
                 Scythe.exact_si_apply_column!(m, cs, cs + kDim - 1, t, hfields, 1)
             end
-            r, d, w = identity_ratio(m.var_np1, 1:npts, V["rho_d"], V["rho_t"], members)
+            # the anchor's increment is plane 5 (δρ_t = −Δτ div^{n+1}; the deleted slot 3
+            # received it onto a zero predictor)
+            r, d, w = identity_ratio(m.var_np1, 1:npts, V["rho_d"], 0.0 .+ hfields[:, 5], members)
             @info "exact_si identity" vtr r rh rhh d w
             @test d > 0.0 && w > 1.0e-6 * d
             @test r <= 2.0
@@ -318,7 +351,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                                          :horizontal_semiimplicit => true))
             @test_throws ErrorException Scythe.create_horizontal_solve_data(p, mo,
                 m.mc_ref_diag.Pxi_prof,
-                collect(view(Springsteel.ref_rho_t(m.ref_state), :, 1)),
+                collect(view(rtbar(m), :, 1)),
                 collect(view(Springsteel.ref_rho_d(m.ref_state), :, 1)),
                 collect(view(Springsteel.ref_total_energy(m.ref_state), :, 1) .+
                         view(Springsteel.ref_pressure(m.ref_state), :, 1)))
@@ -326,7 +359,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             @test water[1] == [m.mc_slots.rho_v]        # cloud-free base: the vapor alone
             @test all(==(vtr === :bhyp ? 0.5 : 1.0), water[2])
             hsd = Scythe.create_horizontal_solve_data(p, mo, m.mc_ref_diag.Pxi_prof,
-                collect(view(Springsteel.ref_rho_t(m.ref_state), :, 1)),
+                collect(view(rtbar(m), :, 1)),
                 collect(view(Springsteel.ref_rho_d(m.ref_state), :, 1)),
                 collect(view(Springsteel.ref_total_energy(m.ref_state), :, 1) .+
                         view(Springsteel.ref_pressure(m.ref_state), :, 1)); water)
@@ -336,15 +369,23 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             for t in 1:4
                 t > 1 && Scythe.horizontal_si_load_increment!(m, u_incr, t, 1)
                 for c in 1:ncols(p, mo); Scythe.advance_column(m, c, t); end
+                # the anchor's fresh history from the state n the columns read (before
+                # calcTendency, which writes the advanced state into the tile)
+                Th = hacdot_rt(m, p, mo)
                 Scythe.calcTendency(m)
                 if t == 4
-                    rh, _, _ = identity_ratio(m.hacdot_n, 1:npts, V["rho_d"], V["rho_t"],
+                    rh, _, _ = identity_ratio(m.hacdot_n, 1:npts, V["rho_d"], Th,
                                               [(m.mc_slots.rho_v, vtr === :bhyp ? 2.0 : 1.0)])
                     # the sweep's coefficient increments from a zero carried state
                     sp = p.spectral
-                    for v in ("rho_d", "rho_t"); sp[:, V[v]] .= 0.0; end
+                    sp[:, V["rho_d"]] .= 0.0
                     sp[:, m.mc_slots.rho_v] .= 0.0
                     Scythe.horizontal_si_correct!(sp, p, mo, hsd, t)
+                    # the anchor's plane 4 (δρ_t) in B coefficients, as the deleted slot 3
+                    # received it: the same write-back, onto a zero column of ρ_d's basis
+                    spt = zeros(size(sp))
+                    Scythe._hsi_add_increment!(spt, hsd, p, V["rho_d"], view(hsd.dlev, :, :, 4))
+                    sprt = spt[:, V["rho_d"]]
                     a = vtr === :bhyp ? 2.0 : 1.0
                     # the physical-point correction planes the sweep wrote back: δρ_d (plane
                     # 3), δρ_t (plane 4) and the vapor's (the last water plane, `wlev`)
@@ -360,8 +401,8 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                     cw = 0.0; cmax = 0.0
                     for r in 1:size(sp, 1)
                         cw = max(cw, abs((sp[r, V["rho_d"]] + a * sp[r, m.mc_slots.rho_v]) -
-                                         sp[r, V["rho_t"]]))
-                        cmax = max(cmax, abs(sp[r, V["rho_t"]]))
+                                         sprt[r]))
+                        cmax = max(cmax, abs(sprt[r]))
                     end
                     @info "hsi identity" vtr worst rh dmax cw cmax
                     @test dmax > 0.0
@@ -397,10 +438,12 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         W = 2 .* (nv .+ nc); Wz = 2 .* (nvz .+ ncz)
         sv = nv ./ W; svz = (nvz .* W .- nv .* Wz) ./ W .^ 2
         sc = nc ./ W; scz = (ncz .* W .- nc .* Wz) ./ W .^ 2
-        rtb = Springsteel.ref_rho_t(m.ref_state); rdb = Springsteel.ref_rho_d(m.ref_state)
-        cd = rdb[:, 1] ./ rtb[:, 1]
-        cdz = (rdb[:, 2] .* rtb[:, 1] .- rdb[:, 1] .* rtb[:, 2]) ./ rtb[:, 1] .^ 2
-        return (; sv, svz, sc, scz, cd, cdz, rt = rtb[:, 1])
+        # the derived reference ρ̄_t^w = ρ̄_d + W̄ (Stage 4: every reader's), from the same W
+        rdb = Springsteel.ref_rho_d(m.ref_state)
+        rt = rdb[:, 1] .+ W; rtz = rdb[:, 2] .+ Wz
+        cd = rdb[:, 1] ./ rt
+        cdz = (rdb[:, 2] .* rt .- rdb[:, 1] .* rtz) ./ rt .^ 2
+        return (; sv, svz, sc, scz, cd, cdz, rt)
     end
     rel(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), floatmin())
 
@@ -417,15 +460,17 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             t = 4; tt = 1.25 * mo.ts
             rv = m.mc_slots.rho_v; members = mass_members(m)
             worst = 0.0; ev = 0.0; ec = 0.0
+            T = zeros(size(p.physical, 1))
             for c in 1:ncols(p, mo)
                 cs = (c - 1) * kDim + 1; ce = cs + kDim - 1
                 Scythe.advance_column(m, c, t)
                 for (k, _) in members; m.var_np1[cs:ce, k] .= 0.0; end
-                m.var_np1[cs:ce, V["rho_d"]] .= 0.0; m.var_np1[cs:ce, V["rho_t"]] .= 0.0
+                m.var_np1[cs:ce, V["rho_d"]] .= 0.0
                 Scythe.semiimplicit_adjustment_p(m, cs, ce, t; apply_histories = false)
-                worst = max(worst, first(identity_ratio(m.var_np1, cs:ce, V["rho_d"],
-                                                        V["rho_t"], members)))
                 S = m.mc_scratch[Threads.threadid()]
+                T[cs:ce] .= 0.0 .- (tt .* S.si_phi_z)
+                worst = max(worst, first(identity_ratio(m.var_np1, cs:ce, V["rho_d"],
+                                                        T, members)))
                 phi = Scythe.scratch_column(m, V["w"]).uMish; phiz = S.si_phi_z
                 om = 1.0 .- sh.cd
                 for (k, s_, sz) in ((rv, sh.sv, sh.svz), (9, sh.sc, sh.scz))
@@ -458,12 +503,12 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             xstar = hcat(m.var_np1[:, V["u"]], m.var_np1[:, V["w"]], m.var_np1[:, V["p"]])
             Scythe.exact_si_solve!(hfields, esd, p, mo, t, xstar)
             for (k, _) in members; m.var_np1[:, k] .= 0.0; end
-            m.var_np1[:, V["rho_d"]] .= 0.0; m.var_np1[:, V["rho_t"]] .= 0.0
+            m.var_np1[:, V["rho_d"]] .= 0.0
             for c in 1:ncols(p, mo)
                 cs = (c - 1) * kDim + 1
                 Scythe.exact_si_apply_column!(m, cs, cs + kDim - 1, t, hfields, 1)
             end
-            r, _, _ = identity_ratio(m.var_np1, 1:npts, V["rho_d"], V["rho_t"], members)
+            r, _, _ = identity_ratio(m.var_np1, 1:npts, V["rho_d"], 0.0 .+ hfields[:, 5], members)
             # δν_k = s_k (δρ_t − δρ_d) − Δτ s_{k,z} (1 − c_d) φ^{n+1}, φ^{n+1} = ρ̄_t w^{n+1}
             lev = [mod1(g, kDim) for g in 1:npts]
             dw = hfields[:, 5] .- hfields[:, 4]
@@ -491,7 +536,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             sh = shares(m)
             @test rel(water[2][:, 1], sh.sv) <= 1.0e-14 && rel(water[2][:, 2], sh.sc) <= 1.0e-14
             hsd = Scythe.create_horizontal_solve_data(p, mo, m.mc_ref_diag.Pxi_prof,
-                collect(view(Springsteel.ref_rho_t(m.ref_state), :, 1)),
+                collect(view(rtbar(m), :, 1)),
                 collect(view(Springsteel.ref_rho_d(m.ref_state), :, 1)),
                 collect(view(Springsteel.ref_total_energy(m.ref_state), :, 1) .+
                         view(Springsteel.ref_pressure(m.ref_state), :, 1)); water)
@@ -503,18 +548,22 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                 Scythe.calcTendency(m)
                 if t == 4
                     sp = p.spectral
-                    for v in (V["rho_d"], V["rho_t"], m.mc_slots.rho_v, 9); sp[:, v] .= 0.0; end
+                    for v in (V["rho_d"], m.mc_slots.rho_v, 9); sp[:, v] .= 0.0; end
                     Scythe.horizontal_si_correct!(sp, p, mo, hsd, t)
+                    # the anchor's plane 4 in B coefficients (the deleted slot 3's write-back)
+                    spt = zeros(size(sp))
+                    Scythe._hsi_add_increment!(spt, hsd, p, V["rho_d"], view(hsd.dlev, :, :, 4))
+                    sprt = spt[:, V["rho_d"]]
                     # the last water plane is the cloud's: s_c(z)·(δρ_t − δρ_d)
                     want = [sh.sc[k] * (hsd.dlev[i, k, 4] - hsd.dlev[i, k, 3])
                             for i in axes(hsd.wlev, 1), k in axes(hsd.wlev, 2)]
                     ec = rel(hsd.wlev, want)
                     cw = maximum(abs, (sp[:, V["rho_d"]] .+ 2 .* sp[:, m.mc_slots.rho_v] .+
-                                       2 .* sp[:, 9]) .- sp[:, V["rho_t"]])
+                                       2 .* sp[:, 9]) .- sprt)
                     @info "cloudy reference hsi" ec cw
                     @test ec <= 1.0e-15
                     @test maximum(abs, sp[:, 9]) > 0.0
-                    @test cw <= 1.0e-10 * maximum(abs, sp[:, V["rho_t"]])
+                    @test cw <= 1.0e-10 * maximum(abs, sprt)
                 else
                     u_incr .= Scythe.horizontal_si_correct!(p.spectral, p, mo, hsd, t)
                 end
@@ -551,7 +600,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                 @test bits(m1.expdot_n) == bits(m0.expdot_n)
                 @test bits(m1.expdot_nm1) == bits(m0.expdot_nm1)
                 # the dry legs' histories bitwise; the water rows hold exact zeros
-                for v in ("p", "rho_d", "rho_t", "w", "E_t")
+                for v in ("p", "rho_d", "w", "E_t")
                     i = mo0.grid_params.vars[v]
                     @test bits(m1.impdot_n[:, i]) == bits(m0.impdot_n[:, i])
                 end
@@ -602,7 +651,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                 S = m.mc_scratch[Threads.threadid()]
                 # φⁿ through the driver's own chain (w's column basis), as the staging fits it
                 wc = Scythe.scratch_column(m, 5)
-                rho_hat = sd ? S.rho_t : view(Springsteel.ref_rho_t(m.ref_state), :, 1)
+                rho_hat = sd ? S.rho_t : view(rtbar(m), :, 1)
                 wc.uMish .= rho_hat .* p.physical[cs:ce, V["w"], 1]
                 Springsteel.Btransform!(wc); Springsteel.Atransform!(wc)
                 phi = copy(Springsteel.Itransform!(wc))
@@ -614,7 +663,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                                        Scythe.mc_nu_vbar(m), Scythe.mc_nu_vbar_z(m),
                                        view(rc, :, 1), view(rc, :, 2))
                 else
-                    rdb = Springsteel.ref_rho_d(m.ref_state); rtb = Springsteel.ref_rho_t(m.ref_state)
+                    rdb = Springsteel.ref_rho_d(m.ref_state); rtb = rtbar(m)
                     @. cd = rdb[:, 1] / rtb[:, 1]
                     @. cdz = ((rdb[:, 2] * rtb[:, 1]) - (rdb[:, 1] * rtb[:, 2])) / (rtb[:, 1]^2)
                 end
@@ -654,8 +703,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                 ("vertical l_q", "nu_c", (; lq = Dict("default" => 2.0, "nu_c_k" => 1.0))),
                 ("horizontal l_q", "nu_r",
                  (; lq = Dict("default" => 2.0, "nu_r" => 1.0, "nu_r_k" => 2.0))),
-                # the ANCHOR slots are compared too
-                ("ground BC (BCB)", "rho_t", (; bcb_override = Dict{String,Any}("rho_t" => nat))),
+                # the ANCHOR's dry slot is compared too (its rho_t branch went with slot 3)
                 ("vertical l_q", "rho_d", (; lq = Dict("default" => 2.0, "rho_d_k" => 1.0)))]
             for (label, v, kw) in branches
                 err = msg(; extra = on, kw...)
@@ -731,8 +779,7 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             ab!() = Scythe._siw_addback!(m.expdot_n, 1, ws, sd, p.physical, 4,
                                          view(p.physical, 1:kD, 5, 1), view(p.physical, 1:kD, 5, 4),
                                          S.rho_t, S.rho_t_z, S.rho_d, S.rho_d_z,
-                                         view(Springsteel.ref_rho_t(m.ref_state), :, 1),
-                                         view(Springsteel.ref_rho_t(m.ref_state), :, 2),
+                                         view(rtbar(m), :, 1), view(rtbar(m), :, 2),
                                          view(Springsteel.ref_rho_d(m.ref_state), :, 1),
                                          view(Springsteel.ref_rho_d(m.ref_state), :, 2),
                                          nv, nz, a, b, false, S.ADV, m.hacdot_n, false)
@@ -744,66 +791,8 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         end
     end
 
-    @testset "feeder 1: the acoustic step no longer opens the water gap (sd=$(sd))" for sd in (true, false)
-        # The gap the slaving closes is the PARTITION gap δ = ρ_t − ρ_d − Σ α ν (the anchor
-        # minus the water sum the slots carry). Isolated: smooth vapor, a smooth cloud layer and
-        # w, no cloud kink (whose refit ringing is the dominant, separate feeder), no
-        # condensation, the vapor nudge and the refit partner off (each moves the vapor against
-        # the anchor by design: the nudge to close δ, the partner's Stage 1 water side). With the slots slaved the acoustic step leaves δ
-        # at rounding; without, the explicit water compression and the implicit anchor disagree
-        # every step (measured: 5.9e-7 at w ~ 0.5 m/s, 5.9e-6 at 5 m/s over 40 steps; slaved
-        # ≤ 2e-17).
-        mktempdir() do tmpdir
-            m0, _, _ = siw_tile(tmpdir, "gap_probe_$(sd)")
-            rvb = rvbar(m0)
-            gap = Dict{Symbol,Float64}()
-            gapnc = 0.0
-            for mode in (:none, :mass)
-                m, p, mo = siw_tile(tmpdir, "gap_$(sd)_$(mode)";
-                    seed! = (pa, x, V, c) -> begin
-                        F.vt_seed_vapor!(pa, x, V, c; vtr = :bhyp, vmu = VMU, rho_vbar = rvb,
-                                         amp = 0.0, vamp = 0.0, wamp = 5.0)
-                        # a smooth CLOUD layer (well above its knee), carried in rho_t, so the
-                        # condensate slot's acoustic flux is in the gap too, not the vapor's alone
-                        for i in 1:size(pa.physical, 1)
-                            rc = 4.0e-4 * exp(-((x[i, end] - 4000.0) / 900.0)^2)
-                            pa.physical[i, Scythe.mc_slot(V, "rho_c"), 1] =
-                                Scythe.condensate_slot(rc, 0.0, :bhyp, F.MU)
-                            pa.physical[i, V["rho_t"], 1] += rc
-                        end
-                    end,
-                    extra = Dict{Symbol,Any}(:si_water_slots => mode, :state_dependent_si => sd,
-                                             :condensation => false, :refit_partner => false),
-                    pp_extra = Dict{Symbol,Float64}(:tau_rho_v_rec => 1.0e12))
-                V = mo.grid_params.vars
-                ws = Scythe.si_water_set(merge(mo.options,
-                    Dict{Symbol,Any}(:si_water_slots => :mass)), mo.physical_params, m.mc_slots)
-                members = [(ws.slot[j], ws.alpha[j]) for j in 1:16
-                           if ws.slot[j] > 0 && ws.alpha[j] > 0.0]
-                dgap() = begin
-                    d = p.physical[:, V["rho_t"], 1] .- p.physical[:, V["rho_d"], 1]
-                    for (k, a) in members; d .-= a .* p.physical[:, k, 1]; end
-                    d
-                end
-                dgapnc() = begin
-                    d = dgap()
-                    d .+= 2 .* p.physical[:, 9, 1]          # the cloud left out of the sum
-                    d
-                end
-                g0 = dgap(); g0nc = dgapnc()
-                F.vt_run!(m, p, mo, 40)
-                gap[mode] = maximum(abs, dgap() .- g0)
-                mode === :mass && (gapnc = maximum(abs, dgapnc() .- g0nc))
-            end
-            @info "partition-gap change over 40 steps (acoustic feeder)" sd gap[:none] gap[:mass] gapnc
-            @test gap[:none] > 1.0e-7
-            # vapor alone: <= 2e-17. With the cloud the slaved run keeps ~1e-8: the cloud's
-            # Gaussian tail reaches its knee (rho_c ~ mu_c at 6.9 km), where the explicit
-            # `+D_k w_z` term of design 4.2 is by construction left explicit.
-            @test gap[:mass] < 1.0e-2 * gap[:none]
-            # the cloud's own slaved flux is not negligible: leaving the cloud slot out of the
-            # sum opens the gap by its acoustic transport, so the test above pins it too
-            @test gapnc > 1.0e2 * gap[:mass]
-        end
-    end
+    # "feeder 1: the acoustic step no longer opens the water gap" was deleted at Stage 4 of the
+    # rho_t retirement: it measured the partition gap rho_t - rho_d - sum alpha nu between the
+    # prognostic slot 3 and the water sum the slots carry, which is identically zero now that
+    # rho_t is derived from that sum.
 end

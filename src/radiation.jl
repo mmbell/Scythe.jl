@@ -1184,8 +1184,7 @@ function radiation_reference_column!(work::RadiationWork, mtile::ModelTile,
 
     pbar = view(ref_pressure(refstate), :, 1)
     rho_dbar = view(ref_rho_d(refstate), :, 1)
-    # the total-density reference the driver reads (the derived ρ̄_t^w under
-    # `options[:water_anchor] = :derived`; `mc_rho_tbar_ref`)
+    # the total-density reference the driver reads (the derived ρ̄_t^w; `mc_rho_tbar_ref`)
     rho_tbar = view(mc_rho_tbar_ref(mtile), :, 1)
     E_tbar = view(ref_total_energy(refstate), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(refstate), :, 1)
@@ -1346,14 +1345,12 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
 
     pbar = view(ref_pressure(refstate), :, 1)
     rho_dbar = view(ref_rho_d(refstate), :, 1)
-    # the total-density reference the driver reads (the derived ρ̄_t^w under
-    # `options[:water_anchor] = :derived`; `mc_rho_tbar_ref`)
+    # the total-density reference the driver reads (the derived ρ̄_t^w; `mc_rho_tbar_ref`)
     rho_tbar = view(mc_rho_tbar_ref(mtile), :, 1)
     E_tbar = view(ref_total_energy(refstate), :, 1)
     rho_cbar = view(Springsteel.ref_rho_c(refstate), :, 1)
     rho_vbar = mtile.mc_ref_diag.rho_vbar
     # The derived water anchor: the column's ρ_t is `ρ_d + Σ α_k ν_k` of its own slots.
-    wad = water_anchor_mode(model.options) === :derived
     wset = water_anchor_set(model.options, model.physical_params, slots)
     rho_cbar_zv = view(Springsteel.ref_rho_c(refstate), :, 2)
     nu_vbar_z = mc_nu_vbar_z(mtile)
@@ -1365,10 +1362,9 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
     vmu = vapor_mu(model.physical_params)
 
     # Slots 1-9 are hardcoded literals throughout the driver (see `MCSlots`); the vapour
-    # and the ice masses are APPENDED and are resolved by name once, at tile creation.
+    # (slot 3) and the ice masses are resolved by name once, at tile creation.
     pp = view(phys, colstart:colend, 1, 1)
     rho_dp = view(phys, colstart:colend, 2, 1)
-    rho_tp = view(phys, colstart:colend, 3, 1)
     u = view(phys, colstart:colend, 4, 1)
     w = view(phys, colstart:colend, 5, 1)
     E_tp = view(phys, colstart:colend, 6, 1)
@@ -1434,9 +1430,8 @@ function radiation_column_state!(work::RadiationWork, mtile::ModelTile,
     @inbounds for k in 1:n
         p = pp[k] + pbar[k]
         rho_d = rho_dp[k] + rho_dbar[k]
-        rho_t = wad ? rho_d + first(_siw_W(phys, colstart + k - 1, zs_w, k, wset,
-                                           nu_vbar, nu_vbar_z, rho_cbar, rho_cbar_zv)) :
-                      rho_tp[k] + rho_tbar[k]
+        rho_t = rho_d + first(_siw_W(phys, colstart + k - 1, zs_w, k, wset,
+                                     nu_vbar, nu_vbar_z, rho_cbar, rho_cbar_zv))
         E_t = E_tp[k] + E_tbar[k]
         rho_v = vtrans === :none ? rho_vp[k] + rho_vbar[k] :
                                    recover_rho_v(rho_vp[k], nu_vbar[k], vtrans, vmu)

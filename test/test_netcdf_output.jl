@@ -50,14 +50,15 @@ using NCDatasets
         m(f) = [f(i, z[k]) for i in 1:n_i, k in 1:n_k]
         p     = m((i, zz) -> 1.0e5 * exp(-zz / 8000.0) + 100.0 * i)
         rho_d = m((i, zz) -> 1.15 * exp(-zz / 8500.0))
-        rho_t = copy(rho_d)
         # A total energy that puts the retrieval in the troposphere: E_t ~ rho_d*Cvd*T + gz.
         E_t   = m((i, zz) -> 1.15 * exp(-zz / 8500.0) * (718.0 * 290.0 + gravity * zz))
         u     = m((i, zz) -> 2.0 * i)
         w     = m((i, zz) -> 0.1 * zz / 1000.0)
         rain  = rho_r === nothing ? zeros(n_i, n_k) : rho_r
         rv    = rho_v === nothing ? zeros(n_i, n_k) : rho_v
-        return (; p, rho_d, rho_t, E_t, Q_ss = zeros(n_i, n_k), rho_v = rv,
+        # (No `rho_t`: the total density is DERIVED, rho_d + sum_k alpha_k nu_k, since
+        # Stage 4 of the rho_t retirement; with no water here it is rho_d itself.)
+        return (; p, rho_d, E_t, Q_ss = zeros(n_i, n_k), rho_v = rv,
                   u, w, rain, cloud = zeros(n_i, n_k))
     end
 
@@ -100,13 +101,26 @@ using NCDatasets
         end
 
         @testset "RH == 1 at saturation" begin
-            # Under the :energy retrieval T does not depend on rho_v (the vapor is its own
-            # slot), so the saturation density can be computed from the first pass and fed
-            # back. (The EOS temperature reads rho_v, so this one-pass construction is the
-            # retrieval's; RH itself is the same expression in either mode.)
+            # Since Stage 4 of the rho_t retirement the total density is DERIVED (rho_d +
+            # rho_w), so the :energy retrieval reads rho_v through rho_t too and the old
+            # one-pass construction (compute rho_vs from the vapor-free pass, feed it back) is
+            # no longer saturated. Iterate the fixed point rho_v = rho_vs(T(rho_v)) instead;
+            # RH itself is the same expression in either mode.
             cfg_e = plain_cfg(temperature = :energy)
             de = Scythe.mc_derived_fields(z, slots, ref, cfg_e)
             sat = rho_v_sat.(de.T, de.p ./ 100.0)
+            # (a contraction: dT/drho_v ~ -(C_pv T + g z)/(rho_d C_vd) times d rho_vs/dT; the
+            # stopping test is a decade under the RH tolerance below; the iteration floors at
+            # ~1.4e-14, the rounding of rho_vs(T) through the retrieval)
+            delta = Inf
+            for _ in 1:2000
+                di = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = sat)), ref, cfg_e)
+                new = rho_v_sat.(di.T, di.p ./ 100.0)
+                delta = maximum(abs.(new .- sat) ./ new)
+                sat = new
+                delta < 1.0e-13 && break
+            end
+            @test delta < 1.0e-13
             ds = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = sat)), ref, cfg_e)
             @test all(abs.(ds.RH .- 1.0) .< 1.0e-12)
             @test all(ds.rho_v .≈ sat)
@@ -118,8 +132,9 @@ using NCDatasets
             # never a state to repair) does not print as a negative humidity. The vapor, its
             # mixing ratio and the precipitable water stay RAW, and the two deficit fields
             # carry the negativity instead.
-            # (On the :energy retrieval, whose T does not read rho_v, so `sat` below is the
-            # saturation density of the T the RH is formed against.)
+            # (The retrieval reads rho_v through the derived rho_t since Stage 4, so the
+            # saturation density the RH is formed against is that of the state's OWN T: `satr`
+            # below, from `dr`.)
             cfg_e = plain_cfg(temperature = :energy)
             de = Scythe.mc_derived_fields(z, slots, ref, cfg_e)
             sat = rho_v_sat.(de.T, de.p ./ 100.0)
@@ -129,7 +144,8 @@ using NCDatasets
             dr = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv)), ref, cfg_e)
             @test all(dr.RH .>= 0.0)
             @test all(dr.RH[neg] .=== 0.0)
-            @test all(dr.RH[.!neg] .== (rv ./ sat)[.!neg])
+            satr = rho_v_sat.(dr.T, dr.p ./ 100.0)
+            @test all(dr.RH[.!neg] .== (rv ./ satr)[.!neg])
             @test dr.rho_v == rv                           # the state, raw
             @test any(dr.q_v .< 0.0)                       # ... and its mixing ratio
             imu = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)
@@ -142,22 +158,27 @@ using NCDatasets
         end
 
         @testset "rho_w_deficit and condensate_lobe" begin
-            # The TOTAL-WATER deficit min(rho_t - rho_d, 0): zero wherever the anchor holds
-            # water, the anchor's own value where it does not.
-            rt = copy(slots.rho_t)
-            rt[1, 3] -= 2.0e-4; rt[2, 5] -= 1.0e-9
-            dd = Scythe.mc_derived_fields(z, merge(slots, (; rho_t = rt)), ref, cfg)
-            @test dd.rho_w_deficit == min.(dd.rho_t .- dd.rho_d, 0.0)
+            # The TOTAL-WATER deficit min(rho_w, 0), rho_w = sum_k alpha_k nu_k the derived
+            # water anchor: zero wherever the anchor holds water, the anchor's own value where
+            # it does not. Untransformed and on the flat (zero) reference, rho_w is the vapor
+            # + cloud + rain slots exactly, so the expected field is written directly.
+            rv = zeros(3, length(z)); rv[1, 3] = -2.0e-4; rv[2, 5] = -1.0e-9
+            rv[3, 2] = 1.0e-4                       # a positive vapor ...
+            cl0 = zeros(3, length(z)); cl0[3, 2] = -5.0e-5   # ... outweighing a negative cloud
+            dd = Scythe.mc_derived_fields(z, merge(slots, (; rho_v = rv, cloud = cl0)), ref, cfg)
+            @test dd.rho_w_deficit == min.(rv .+ cl0, 0.0)
             @test dd.rho_w_deficit[1, 3] < 0.0 && dd.rho_w_deficit[2, 5] < 0.0
             @test count(<(0.0), dd.rho_w_deficit) == 2
+            # ...and the derived total is rho_d + rho_w.
+            @test dd.rho_t == dd.rho_d .+ (rv .+ cl0)
             # No transform: nothing is clipped, so nothing is hidden -- an exact zero field
             # even where the (untransformed) cloud slot is negative.
             ncl = zeros(3, length(z)); ncl[2, 2] = -1.0e-4
             dn = Scythe.mc_derived_fields(z, merge(slots, (; cloud = ncl)), ref, cfg)
             @test all(x -> x === 0.0, dn.condensate_lobe)
             # Transformed: the sum over the cloud, rain and ICE-MASS slots of the slot's
-            # negative part under the attribution continuation `ahyp_signed` -- the same
-            # `lobe_w` mc_driver! subtracts from the vapor residual. Number and habit
+            # negative part under the attribution continuation `ahyp_signed` (the column the
+            # lobe attribution, retired at Stage 4, handed back to the condensate). Number and habit
             # moments carry no water and must not enter.
             mu = 1.0e-7
             imu = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)
@@ -449,7 +470,7 @@ using NCDatasets
                 # "seconds since ..." would decode to a DateTime; ours is plain seconds).
                 @test ds["time"].var[1] == 3600.0
 
-                inventory = ["p_prime", "rho_d_prime", "rho_t_prime", "E_t_prime",
+                inventory = ["p_prime", "rho_d_prime", "E_t_prime",
                              "Q_ss_prime", "rho_v_prime",
                              "p", "rho_d", "rho_t", "E_t", "Q_ss", "rho_v", "rho_c",
                              "rho_r", "u", "w",
@@ -471,6 +492,12 @@ using NCDatasets
                 @test all(isfinite, Array(ds["theta_e"])[1, :, :])
                 @test all(Array(ds["rho_w_deficit"])[1, :, :] .<= 0.0)
                 @test all(Array(ds["condensate_lobe"])[1, :, :] .== 0.0)   # no transform
+                # The rho_t slot and the derived anchor's passive shadow went with slot 3 at
+                # Stage 4 of the rho_t retirement: none of their fields is written.
+                for nm in ("rho_t_prime", "rho_t_slot", "water_shadow_gap",
+                           "column_water_shadow_gap")
+                    @test !haskey(ds, nm)
+                end
                 # This fixture has no v, no rain number, no ice and no TKE.
                 for nm in ("v", "n_r", "rho_i1", "rho_e", "nu_c", "nu_r", "RH_ice")
                     @test !haskey(ds, nm)

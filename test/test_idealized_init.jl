@@ -411,7 +411,9 @@ using Springsteel
                                           condensate_mu=1.0e-7,
                                           rain_transform::Symbol=:none, rain_mu=1.0e-7)
         vars = patch.params.vars
-        p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
+        # (No rho_t slot: it was deleted at Stage 4 of the rho_t retirement; the total is
+        # derived, rho_d + rho_v + ... , so the pre-refactor write of slot 3 went with it.)
+        p_i = vars["p"]; rho_d_i = vars["rho_d"]
         et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = Scythe.mc_slot(vars, "rho_r")
         rho_c_i = Scythe.mc_slot(vars, "rho_c")
         # The prognostic VAPOR slot, present in every configuration of this set (see `MC_VARS`).
@@ -460,7 +462,6 @@ using Springsteel
                 Q_ss = rho_v - Springsteel.Thermodynamics.rho_v_sat(Tk, p_ref / 100.0)
                 patch.physical[i, p_i, 1] = 0.0
                 patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
-                patch.physical[i, rho_t_i, 1] = rho_t - rho_tbar[k, 1]
                 patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
                 patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
                 patch.physical[i, rho_r_i, 1] = Scythe.rain_slot(0.0, rain_transform, rain_mu)

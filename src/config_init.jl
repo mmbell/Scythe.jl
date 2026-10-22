@@ -50,7 +50,6 @@ function build_reference_state(cfg::RunConfig, patch, gp;
         (ref = consistent_qss_reference(ref, z, column; temperature = cfg.numerics.temperature,
                                         vapor_transform = cfg.physics.microphysics.vapor_transform,
                                         vapor_mu = cfg.physics.microphysics.vapor_mu,
-                                        water_anchor = cfg.numerics.water_anchor,
                                         condensate_transform =
                                             cfg.physics.microphysics.condensate_transform,
                                         condensate_mu = cfg.physics.microphysics.condensate_mu))

@@ -5,8 +5,8 @@
 # the reference-linear HORIZONTAL acoustic pair
 #
 #     ∂u/∂t  = −(1/ρ̄_t) ∂x p′,      ∂p′/∂t = −Pξ̄(z) ρ̄_t ∂x u
-#     slaved: ∂ρ_t′/∂t = −ρ̄_t ∂x u,  ∂ρ_d′/∂t = −ρ̄_d ∂x u,
-#             ∂E_t′/∂t = −(Ē_t+p̄) ∂x u
+#     slaved: ∂ρ_d′/∂t = −ρ̄_d ∂x u,  ∂E_t′/∂t = −(Ē_t+p̄) ∂x u,
+#             and the water slots' share of the derived total's δρ_t = −Δτ ρ̄_t ∂x u
 #
 # is integrated with the same AI2* off-centering as the vertical legs. The
 # explicit history levels are applied per column in `mc_driver!`
@@ -23,7 +23,8 @@
 #     (I − Δτ² Pξ̄(z_k) ∂xx) u^{n+1} = u* − (Δτ/ρ̄_t(z_k)) ∂x p′*
 #
 #     p′^{n+1}  = p′*  − Δτ Pξ̄ ρ̄_t ∂x u^{n+1}
-#     ρ_t′^{n+1} = ρ_t′* − Δτ ρ̄_t ∂x u^{n+1}      (+ the ρ_d′/E_t′ analogues)
+#     δρ_t = −Δτ ρ̄_t ∂x u^{n+1}      (+ the ρ_d′/E_t′ analogues; δρ_t is split over the
+#                                   water slots, there is no ρ_t slot since Stage 4)
 #
 # Operator consistency across the AI2* time levels (THE stability requirement —
 # see reference/SI_VERTICAL_CEILING.md) is by construction:
@@ -60,7 +61,6 @@ struct HorizontalSolveData{DU, DP, FA, FB}
     u_index::Int
     p_index::Int
     rhod_index::Int
-    rhot_index::Int
     et_index::Int
     du::DU                  # (M0, M1, W, Nb) on u's i-basis
     dp::DP                  # (M0, M1, W, Nb) on p's i-basis
@@ -92,7 +92,7 @@ end
 
 # Correction plane order in `dlev` (and the write-back loop): the var each
 # plane belongs to is looked up from these fields at use sites.
-const _HSI_PLANES = (:u_index, :p_index, :rhod_index, :rhot_index, :et_index)
+const _HSI_PLANES = (:u_index, :p_index, :rhod_index, :et_index)
 
 """
     create_horizontal_solve_data(patch, model, Pxi_prof, rho_tbar, rho_dbar, etp_bar)
@@ -113,7 +113,7 @@ function create_horizontal_solve_data(patch::AbstractGrid, model::ModelParameter
         "are later phases")
     vars = model.grid_params.vars
     u_index = vars["u"]; p_index = vars["p"]
-    rhod_index = vars["rho_d"]; rhot_index = vars["rho_t"]; et_index = vars["E_t"]
+    rhod_index = vars["rho_d"]; et_index = vars["E_t"]
 
     iDim = patch.params.iDim; kDim = patch.params.kDim
     b_iDim = patch.params.b_iDim; b_kDim = patch.params.b_kDim
@@ -152,7 +152,7 @@ function create_horizontal_solve_data(patch::AbstractGrid, model::ModelParameter
     size(wshare) == (kDim, length(wslots)) ||
         error("create_horizontal_solve_data: the water share matrix must be kDim x n")
 
-    return HorizontalSolveData(u_index, p_index, rhod_index, rhot_index, et_index,
+    return HorizontalSolveData(u_index, p_index, rhod_index, et_index,
         du, dp, (_is_dirichlet(bcl), _is_dirichlet(bcr)), fact, fact_first,
         collect(Pxi_prof), collect(rho_tbar), collect(rho_dbar), collect(etp_bar),
         zeros(iDim, kDim), zeros(iDim, kDim), zeros(iDim, kDim, 5),
@@ -238,7 +238,7 @@ end
 Apply the implicit horizontal acoustic correction to the merged patch
 B coefficients `spectral` (the `sharedSpectral` array in `model_loop`, or
 `patch.spectral` in single-process tests). Solves the per-level u-form
-Helmholtz and updates u/p′/ρ_d′/ρ_t′/E_t′ as B-coefficient increments. Returns
+Helmholtz and updates u/p′/ρ_d′/E_t′ (and the slaved water slots) as B-coefficient increments. Returns
 an `(npts × 2)` matrix at the patch physical points (row order
 `(i−1)·kDim + k`): column 1 the applied u increment `(u^{n+1} − u*)/Δτ` (the
 u-leg AI2* history) and column 2 the staleness correction `−∂z δp/ρ̄_t` to the
@@ -297,7 +297,8 @@ function horizontal_si_correct!(spectral::AbstractMatrix{Float64}, patch::Abstra
     _hsi_add_increment!(spectral, hsd, patch, hsd.u_index,    view(dlev, :, :, 1))
     _hsi_add_increment!(spectral, hsd, patch, hsd.p_index,    view(dlev, :, :, 2))
     _hsi_add_increment!(spectral, hsd, patch, hsd.rhod_index, view(dlev, :, :, 3))
-    _hsi_add_increment!(spectral, hsd, patch, hsd.rhot_index, view(dlev, :, :, 4))
+    # (plane 4 is the derived total's increment δρ_t; no slot receives it since Stage 4 of the
+    # ρ_t retirement — the water slots take its water share below)
     _hsi_add_increment!(spectral, hsd, patch, hsd.et_index,   view(dlev, :, :, 5))
     # The slaved water slots (`options[:si_water_slots]`): the anchor's water increment
     # δρ_t − δρ_d split by the reference shares — one stored δρ_w plane, design option (iii),
@@ -365,7 +366,7 @@ function horizontal_si_history!(mtile::ModelTile, colstart::Int64, colend::Int64
     # explicit history too (staged by mc_stage_v_acoustic!), matching the pressure
     # azimuthal-divergence leg — the symmetric AI2* the split requires.
     leg_vars = exact_si_is_rlr(mtile.model) ?
-        ("p", "rho_d", "rho_t", "u", "E_t", "v") : ("p", "rho_d", "rho_t", "u", "E_t")
+        ("p", "rho_d", "u", "E_t", "v") : ("p", "rho_d", "u", "E_t")
     for var in leg_vars
         index = vars[var]
         nstar = view(mtile.var_np1, colstart:colend, index)
@@ -443,7 +444,7 @@ function horizontal_si_load_increment!(mtile::ModelTile, incr::AbstractMatrix{Fl
     # a grid-scale residual under the explicit AI2* weights (the slow
     # oblique-mode leak measured in model_tests/hsi_growth_probe.jl).
     if x_hist == "stored"
-        for (plane, var) in ((2, "p"), (3, "rho_d"), (4, "rho_t"), (5, "E_t"))
+        for (plane, var) in ((2, "p"), (3, "rho_d"), (5, "E_t"))
             dst = view(mtile.hacdot_n, :, vars[var])
             copyto!(dst, view(incr, rows, plane))
             t == 2 && copyto!(view(mtile.hacdot_nm1, :, vars[var]), dst)

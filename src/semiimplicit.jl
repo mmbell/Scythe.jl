@@ -22,9 +22,10 @@ Resolved indices of the moist-compressible set's APPENDED prognostic slots.
 
 Slots 1-9 (and `v` at 10 on the cylindrical/3-D variants) are hardcoded literals throughout
 `mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`. Everything after that block is
-APPENDED, so its index depends on the geometry — the prognostic vapor `rho_v` is 10 on the XZ
-slice and 11 wherever `v` is carried, and the rain number `n_r` one further out again — and
-the ONLY way to know it is by name, through `Scythe.mc_var_names(options)` and `mc_slot`.
+APPENDED, so its index depends on the geometry — the rain number `n_r` is 10 on the XZ slice
+and 11 wherever `v` is carried — and the ONLY way to know it is by name, through
+`Scythe.mc_var_names(options)` and `mc_slot`. The prognostic vapor is slot 3 on every
+geometry since Stage 4 of the ρ_t retirement, and is resolved by name like the rest.
 
 That lookup is a `Dict{String,Int}` hash and the driver runs once per COLUMN, so it is done
 exactly once, here, when the tile is built. A field per slot, all `Int`, all `0` when the
@@ -47,8 +48,9 @@ Both are free; a nested layout would have made the first one an index computatio
 """
 struct MCSlots
     """
-    Prognostic vapor density perturbation ρ_v' [kg/m³] — 10 on the XZ slice, 11 wherever `v`
-    is carried. Present in EVERY moist-compressible configuration (0 only for a non-mc set).
+    Prognostic vapor perturbation, ρ_v' [kg/m³] (ν_v' under the vapor control variable) — slot
+    3 on every geometry since Stage 4 of the ρ_t retirement. Present in EVERY
+    moist-compressible configuration (0 only for a non-mc set).
     """
     rho_v::Int
     "Prognostic rain number density [#/m³] under `options[:rain_moments] = 2`; 0 otherwise."
@@ -480,8 +482,6 @@ function build_reference_state(model::ModelParameters, z_values::Vector{Float64}
                                                  vapor_transform =
                                                      vapor_transform_mode(model.options),
                                                  vapor_mu = vapor_mu(model.physical_params),
-                                                 water_anchor =
-                                                     water_anchor_mode(model.options),
                                                  condensate_transform =
                                                      condensate_transform_mode(model.options),
                                                  condensate_mu = Float64(get(
@@ -545,7 +545,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # across the slaved water slots is refused (src/si_water_slaving.jl).
     validate_si_water_slots(model)
     validate_water_anchor(model)
-    # ...and, under the derived anchor, the four ice-anchor legs switched off (review D1)
+    # ...and the four ice-anchor legs switched off (inert under the derived anchor; review D1)
     inert_ice_anchor_legs!(model)
 
     # Horizontal-acoustic history channel, allocated when either the ADI sweep
@@ -645,16 +645,12 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
     end
 
-    # The total-energy set diffuses momentum (u, w; Kvdiff), the diagnosed moist entropy
-    # s_t (heat; Kvdiff_heat, defaulting to Kvdiff), and the water species (Kvdiff_water:
-    # total water and vapor on the rho_t operator, rain on its own). Each needs its own
-    # factorization: the boundary conditions differ (straka93 free-slip u, bf02 no-slip;
-    # w a rigid lid; scalars Neumann, rho_r possibly Natural at the surface for rain
-    # outflow), and the coefficients are independent. s_t rides on the Neumann E_t
-    # column; the water species rho_w' (on the rho_t operator), rho_v', rho_c' and rho_r
-    # each get their own solve. Nothing is implied — the vapor is prognostic, so it is
-    # solved like the others and the four increments reconcile through the nudge rather
-    # than closing pointwise (see `_diffusion_water_step!`).
+    # The total-energy set diffuses momentum (u, w; Kvdiff) and the diagnosed moist entropy
+    # s_t (heat; Kvdiff_heat, defaulting to Kvdiff). Each needs its own factorization: the
+    # boundary conditions differ (straka93 free-slip u, bf02 no-slip; w a rigid lid; scalars
+    # Neumann), and the coefficients are independent. s_t rides on the Neumann E_t column.
+    # (The water solves, `Kvdiff_water`, went with the prognostic ρ_t slot whose operator the
+    # total water was solved on: Stage 4 of the ρ_t retirement; the key is refused.)
     # Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are
     # cached, so `diffusion_timestep_mc` never factorizes per column.
     # Built only when a coefficient is positive: at K = 0 a vertical solve is not the
@@ -663,39 +659,18 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     mc_diffusion_matrices = NamedTuple()
     Kv_mc = get(model.physical_params, :Kvdiff, 0.0)
     Kv_heat_mc = get(model.physical_params, :Kvdiff_heat, Kv_mc)
-    Kv_water_mc = get(model.physical_params, :Kvdiff_water, 0.0)
-    if uses_pressure_reference(model.equation_set) &&
-            (Kv_mc > 0.0 || Kv_heat_mc > 0.0 || Kv_water_mc > 0.0)
+    if uses_pressure_reference(model.equation_set) && (Kv_mc > 0.0 || Kv_heat_mc > 0.0)
         bcb = model.grid_params.BCB
         bct = model.grid_params.BCT
         mc_matrix(var, K, coeff) = calc_Helmholtz_diffusion_matrix(tile, model,
             coeff * model.ts * K; bc_bottom = bcb[var], bc_top = bct[var])
-        # The BC dicts are keyed by SLOT NAME, which the transforms rename (see
-        # `mc_var_names`). This block runs whenever any vertical diffusivity is positive —
-        # including a momentum-only configuration — so the names must be resolved even though
-        # the water solve itself is refused under a transform.
-        rname = rain_var_name(model.options)
-        cname = condensate_var_name(model.options)
-        vname = vapor_var_name(model.options)
         mc_diffusion_matrices = (
             u             = mc_matrix("u",     Kv_mc,       1.25),
             u_first       = mc_matrix("u",     Kv_mc,       0.5),
             w             = mc_matrix("w",     Kv_mc,       1.25),
             w_first       = mc_matrix("w",     Kv_mc,       0.5),
             heat          = mc_matrix("E_t",   Kv_heat_mc,  1.25),
-            heat_first    = mc_matrix("E_t",   Kv_heat_mc,  0.5),
-            water         = mc_matrix("rho_t", Kv_water_mc, 1.25),
-            water_first   = mc_matrix("rho_t", Kv_water_mc, 0.5),
-            water_r       = mc_matrix(rname,   Kv_water_mc, 1.25),
-            water_r_first = mc_matrix(rname,   Kv_water_mc, 0.5),
-            water_c       = mc_matrix(cname,   Kv_water_mc, 1.25),
-            water_c_first = mc_matrix(cname,   Kv_water_mc, 0.5),
-            # The prognostic VAPOR carries no transform, so its name is fixed. Its own
-            # factorization for the same reason cloud and rain have theirs: the boundary
-            # conditions are per-variable, and the vapor increment is solved rather than
-            # implied now (see `_diffusion_water_step!`).
-            water_v       = mc_matrix(vname,   Kv_water_mc, 1.25),
-            water_v_first = mc_matrix(vname,   Kv_water_mc, 0.5))
+            heat_first    = mc_matrix("E_t",   Kv_heat_mc,  0.5))
         # The cylindrical variants carry the tangential wind v (its own BCs) through
         # the same momentum solve as u/w.
         if haskey(model.grid_params.vars, "v")
@@ -1010,12 +985,19 @@ ice widths already have). A CSV initial condition with a `rho_v` column into a `
 refused by [`_check_csv_vapor_name`](@ref) (no conversion: run it under `vapor_transform =
 :none`).
 
+THE PRE-STAGE-4 LAYOUT (a `"rho_t"` slot 3, the vapor appended). A `.jld2` checkpoint in it is
+REFUSED, the message naming `tools/convert_rho_t_checkpoint.jl` and its invocation
+(`vapor_checkpoint_conversion`; src/checkpoint_conversion.jl); a CSV with a `rho_t` column is
+read by name, its `rho_t` column ignored (`_check_csv_layout`).
+
 Runs on the master process before tiling; mutates and returns `patch`.
 """
 function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
     if endswith(model.initial_conditions, ".jld2")
         loaded = load_grid(model.initial_conditions)
-        # A density-vapor checkpoint into a vapor-control-variable model: converted below.
+        # A density-vapor checkpoint into a vapor-control-variable model: converted below. A
+        # PRE-STAGE-4 checkpoint (slot 3 the prognostic rho_t) is refused there, naming the
+        # converter (src/checkpoint_conversion.jl).
         vconv = vapor_checkpoint_conversion(loaded.params.vars, patch.params.vars,
                                             model.initial_conditions)
         (typeof(loaded) == typeof(patch) &&
@@ -1027,7 +1009,7 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
             "$(typeof(loaded)) spectral $(size(loaded.spectral)), grid is " *
             "$(typeof(patch)) spectral $(size(patch.spectral))")
         patch.spectral .= loaded.spectral
-        # The wall condition needs rho_t', which only exists after a first pass;
+        # The wall condition needs the derived rho_t', which only exists after a first pass;
         # take it from the unconditioned transform, then redo the fit with the
         # walls set. Converged: the wall value of rho_t' is insensitive to p's
         # own wall derivative.
@@ -1037,10 +1019,8 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
             gridTransform!(patch)
         end
         vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
-        # The derived water anchor's shadow starts AS the derived total: a checkpoint's slot 3
-        # carries the old run's partition gap (`init_water_anchor_shadow!`).
-        init_water_anchor_shadow!(patch, model)
     else
+        _check_csv_layout(model.initial_conditions, patch.params.vars)
         _check_csv_vapor_name(model.initial_conditions, patch.params.vars)
         read_physical_grid(model.initial_conditions, patch)
         spectralTransform!(patch)
@@ -1056,7 +1036,6 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
             spectralTransform!(patch)
             gridTransform!(patch)
         end
-        init_water_anchor_shadow!(patch, model)
     end
     return patch
 end
@@ -1065,111 +1044,6 @@ end
 # moist-compressible sets, where the wall condition is never active).
 _mc_wall_anchor(model) = uses_pressure_reference(model.equation_set) ?
     water_anchor_set(model.options, model.physical_params, mc_slots(model)) : nothing
-
-"""
-    _check_csv_vapor_name(path, vars)
-
-A CSV initial condition written under the density vapor (a `rho_v` column) cannot initialize a
-vapor-control-variable model (`nu_v`): Springsteel's reader would only say "Grid is missing
-variable nu_v". Refuse with the actual reason and the way to read it. There is no conversion
-for a CSV (its fields are the raw mish values, written by an initializer for one convention);
-run with `vapor_transform = :none`, or regenerate the IC under `:bhyp`.
-"""
-function _check_csv_vapor_name(path, vars)
-    (haskey(vars, "nu_v") && isfile(path)) || return nothing
-    header = split(strip(first(eachline(path))), ',')
-    ("rho_v" in header && !("nu_v" in header)) || return nothing
-    error("initial-condition CSV $(path) carries the DENSITY vapor column \"rho_v\", but " *
-          "this model carries the vapor control variable \"nu_v\" " *
-          "(options[:vapor_transform] = :bhyp, physics.microphysics.vapor_transform). A CSV " *
-          "is not converted: run with vapor_transform = :none (\"none\" in the config) to " *
-          "read it as written, or regenerate the initial condition under :bhyp.")
-end
-
-"""
-    vapor_slot_from_density!(slot, rho_vbar, nu_vbar, kDim, mu) -> Int
-
-The pointwise map of [`convert_vapor_checkpoint!`](@ref), in place on one slot column (z
-fastest, `kDim` levels): `slot ← vapor_control(rho_vbar + slot) − nu_vbar`, i.e.
-`bhyp(ρ) − ν̄_v` for `ρ ≥ 0` and `−bhyp(−ρ) − ν̄_v` below. Returns the number of negative
-densities met.
-"""
-function vapor_slot_from_density!(slot::AbstractVector{Float64}, rho_vbar::Vector{Float64},
-                                  nu_vbar::Vector{Float64}, kDim::Int, mu::Float64)
-    nneg = 0
-    @inbounds for g in eachindex(slot)
-        k = mod1(g, kDim)
-        rho = slot[g] + rho_vbar[k]
-        rho < 0.0 && (nneg += 1)
-        slot[g] = vapor_control(rho, mu) - nu_vbar[k]
-    end
-    return nneg
-end
-
-"""
-    vapor_checkpoint_conversion(vars_file, vars_model, path) -> Int
-
-The vapor slot index to convert when a checkpoint's variable map differs from the model's ONLY
-by the vapor's name — `"rho_v"` (density, written under `vapor_transform = :none`) in the file
-where the model carries `"nu_v"` (`:bhyp`) — and `0` when the maps agree or differ otherwise
-(the caller's compatibility check then decides). The reverse direction is refused here, by
-name: a `"nu_v"` checkpoint cannot be read as a density vapor (the clipped `ahyp` has no
-inverse where the recovered vapor is 0).
-"""
-function vapor_checkpoint_conversion(vars_file, vars_model, path)
-    vars_file == vars_model && return 0
-    if haskey(vars_file, "nu_v") && haskey(vars_model, "rho_v")
-        error("restart archive $(path) carries the vapor CONTROL variable \"nu_v\" " *
-              "(written under options[:vapor_transform] = :bhyp), but this model runs the " *
-              "density vapor \"rho_v\" (vapor_transform = :none). There is no conversion in " *
-              "that direction (ahyp is clipped at 0); run with vapor_transform = :bhyp.")
-    end
-    (haskey(vars_file, "rho_v") && haskey(vars_model, "nu_v") &&
-     vars_file["rho_v"] == vars_model["nu_v"]) || return 0
-    rest_f = Dict(k => v for (k, v) in vars_file if k != "rho_v")
-    rest_m = Dict(k => v for (k, v) in vars_model if k != "nu_v")
-    rest_f == rest_m || return 0
-    return vars_model["nu_v"]
-end
-
-"""
-    convert_vapor_checkpoint!(patch, model, iv)
-
-Convert the density-vapor slot `iv` of a just-loaded checkpoint (`patch.physical` regenerated,
-`patch.spectral` the archive's) to the vapor control variable of `model`
-(`options[:vapor_transform] = :bhyp`):
-
-    ν_v' = B(ρ̄_v + ρ_v') − ν̄_v ,   B(ρ) = bhyp(ρ; μ_v) for ρ ≥ 0,  −bhyp(−ρ; μ_v) for ρ < 0,
-
-with `ρ̄_v`, `ν̄_v` the model's OWN derived reference (`build_reference_state` +
-`mc_reference_diagnostics`, the objects every tile builds). A negative checkpoint vapor maps to
-the odd continuation (the inverse of `ahyp_signed`): `2ν ≈ ρ` there, so the water the linear
-ρ_t carries stays in the slot as a ν lobe (recovered 0, counted by `MC_VNEG`) rather than being
-dropped. Only the vapor slot is refit (its spectral column from the converted values); every
-other slot keeps the archive's coefficients bit for bit. Converted restarts are not
-like-for-like (design §8 item 8): validate from 24 h only.
-"""
-function convert_vapor_checkpoint!(patch::AbstractGrid, model::ModelParameters, iv::Int)
-    gp = model.grid_params
-    kDim = gp.kDim
-    z = getGridpoints(patch)[1:kDim, end]
-    ref_state = build_reference_state(model, collect(Float64, z), reference_column(patch, gp))
-    diag = mc_reference_diagnostics(ref_state, collect(Float64, z); mc_ref_diag_kwargs(model)...)
-    mu = vapor_mu(model.physical_params)
-    saved = copy(patch.spectral)
-    nneg = vapor_slot_from_density!(view(patch.physical, :, iv, 1), diag.rho_vbar,
-                                    diag.nu_vbar, kDim, mu)
-    spectralTransform!(patch)
-    for v in axes(patch.spectral, 2)
-        v == iv && continue
-        patch.spectral[:, v] .= view(saved, :, v)
-    end
-    gridTransform!(patch)
-    println("Scythe: converted the density-vapor checkpoint $(model.initial_conditions) to " *
-            "the vapor control variable nu_v (mu_v = $(mu) kg/m^3): $(nneg) of " *
-            "$(size(patch.physical, 1)) points carried negative vapor and enter as nu_v < 0.")
-    return patch
-end
 
 """
     initialize_model(model, workerids)
@@ -2359,7 +2233,7 @@ function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::
     # src/si_water_slaving.jl `_water_exchange_stage!`): here for the same reason, the first-call
     # compile of `mc_driver!` (the multistep closure's call site there took the axisymmetric
     # Louis tile over the LLVM cliff, measured 2026-10-21).
-    uses_pressure_reference(mtile.model.equation_set) && _wa_derived(mtile.model.options) &&
+    uses_pressure_reference(mtile.model.equation_set) &&
         _water_exchange_stage!(mtile, colstart, colend, t)
 
     for v in 1:length(mtile.model.grid_params.vars)
@@ -2502,16 +2376,16 @@ undershoots (the `log`-DomainError blow-up class); leave off in production.
 Three quantities, all reconstructed as full fields from perturbation + reference:
 
 - `ρ_d = ρ_d' + ρ̄_d(z)`, flagged below half its reference;
-- `ρ_t = ρ_t' + ρ̄_t(z)`, likewise;
-- `ρ_w = ρ_t - ρ_d`, the TOTAL WATER, flagged when it goes negative at all.
+- `ρ_t`, the derived total `ρ_d + Σ_k α_k ν_k` against `ρ̄_t^w`, likewise;
+- `ρ_w = ρ_t - ρ_d = Σ_k α_k ν_k`, the TOTAL WATER, flagged when it goes negative at all.
 
 The water is the one with a meaningful zero. `ρ_d` and `ρ_t` sit ~5 orders of
 magnitude clear of zero in every configuration run to date, so a half-reference
-breach in either is a blow-up, not a positive-definiteness problem. `ρ_w` is a
-DIFFERENCE of two prognostics, each fitted independently, so it can go negative
-from fit error alone while both parents stay healthy — and no per-field spline
-bound can prevent that, since `ρ_t - ρ_d ≥ 0` is not a constraint on either
-field's coefficients. Hence it is measured here rather than clamped anywhere.
+breach in either is a blow-up, not a positive-definiteness problem. `ρ_w` is a sum of
+control variables, each fitted independently, and a negative ν lobe (the recovered density
+reads 0 there) can carry it below zero while every recovered species stays non-negative — no
+per-field spline bound can prevent that. Hence it is measured here rather than clamped
+anywhere.
 
 A fourth line tracks the collapse class that kills a run with `p < 0` (the §2c death:
 retrieval heating → w / sound-speed runaway → vertical SI past its limit): the minimum
@@ -2535,12 +2409,9 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
     vars = mtile.model.grid_params.vars
     kDim = mtile.model.grid_params.kDim
     rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
-    # the total density the model reads: slot 3 against Springsteel's ρ̄_t, or the derived
-    # ρ_d + Σ α_k ν_k against ρ̄_t^w under `options[:water_anchor] = :derived`
+    # the total density the model reads: the derived ρ_d + Σ α_k ν_k against ρ̄_t^w
     rho_tbar = view(mc_rho_tbar_ref(mtile), :, 1)
     rd = view(mtile.tile.physical, :, vars["rho_d"], 1)
-    rt = view(mtile.tile.physical, :, vars["rho_t"], 1)
-    wad = water_anchor_mode(mtile.model.options) === :derived
     wset = water_anchor_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
     min_frac = Inf
     min_i = 1
@@ -2599,7 +2470,7 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
             min_frac = frac
             min_i = i
         end
-        rti = wad ? anchor_rho_tp(rd[i], anchor_Wp(phys, i, 1, wset)) : rt[i]
+        rti = anchor_rho_tp(rd[i], anchor_Wp(phys, i, 1, wset))
         tfrac = rti / rho_tbar[k] + 1.0
         if tfrac < min_tfrac
             min_tfrac = tfrac
@@ -2668,9 +2539,8 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
                 (min_frac < 0.5 ? "  << LOW" : ""))
         println("  rho_t trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
                 "min rho_t/ref=$(round(min_tfrac; digits=4)) " *
-                "(rho_t=$(round((wad ? anchor_rho_tp(rd[min_ti], anchor_Wp(phys, min_ti, 1, wset)) :
-                                       rt[min_ti]) + rho_tbar[mod1(min_ti, kDim)];
-                                 sigdigits=4)), " *
+                "(rho_t=$(round(anchor_rho_tp(rd[min_ti], anchor_Wp(phys, min_ti, 1, wset)) +
+                                rho_tbar[mod1(min_ti, kDim)]; sigdigits=4)), " *
                 "ref=$(round(rho_tbar[mod1(min_ti, kDim)]; sigdigits=4))) " *
                 "at $(loc(min_ti))" *
                 (min_tfrac < 0.5 ? "  << LOW" : ""))

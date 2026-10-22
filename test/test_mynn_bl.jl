@@ -52,11 +52,12 @@ using .MYNNTestFixtures
 
             D = m_on.expdot_n[:, 1:size(m_off.expdot_n, 2)] .- m_off.expdot_n
             # rho_d (slot 2) carries no boundary-layer source at all: the closure mixes
-            # the moist total and the vapour, never the dry air by itself.
-            @test all(iszero, D[:, 2])
-            # ...and every slot that should move, does.
-            rv_i = mo.grid_params.vars["rho_v"]
-            for v in (1, 3, 4, 5, 6, 7, 8, 9, rv_i)
+            # the water species, never the dry air by itself.
+            @test all(iszero, D[:, mo.grid_params.vars["rho_d"]])
+            # ...and every slot that should move, does (by name: slot 3 is the vapor since
+            # Stage 4 deleted the rho_t slot).
+            for v in (mo.grid_params.vars[n] for n in ("p", "rho_v", "u", "w", "E_t",
+                                                       "Q_ss", "rho_r", "rho_c"))
                 @test maximum(abs.(D[:, v])) > 0.0
             end
             # The TKE slot exists only on the `on` tile.
@@ -130,24 +131,16 @@ using .MYNNTestFixtures
         end
     end
 
-    @testset ":fixed_T water carry: the residual <c_z F> is measured, not zero" begin
-        # D7's other leg, and the reason the flux form is the default. With the LOCAL
-        # fixed-T map E_t receives `c_w rho_dot_w + c_v rho_dot_v` instead of the
-        # divergence of `c_w S_w + c_v S_v`, and the two differ by `S_w dc_w/dz +
-        # S_v dc_v/dz` -- an energy source that does NOT telescope to a boundary value,
-        # so the column identity is open by exactly that amount. Asserting closure here
-        # would be asserting something false; what the stage owes is the NUMBER.
+    @testset ":fixed_T water carry is refused at setup" begin
+        # The residual measurement of the LOCAL fixed-T map that lived here went with the
+        # :slot anchor (retired with slot 3 at Stage 4): under the derived anchor the
+        # boundary layer's water legs are nu legs with no fixed-T map, so the carry is
+        # refused at tile creation (`validate_water_anchor`). The flux form's closure is
+        # the testset above (its (50, 0.5, Cd = -1, fluxes) arm is the old comparison's).
         mktempdir() do tmp
-            r_ft, scale_ft, = budget_residual(tmp; num_cells_k = 50, ts = 0.5,
-                                              Cd = -1.0, fluxes = true,
-                                              water_carry = :fixed_T)
-            r_fx, scale_fx, = budget_residual(tmp; num_cells_k = 50, ts = 0.5,
-                                              Cd = -1.0, fluxes = true,
-                                              water_carry = :flux)
-            @info "water carry: column budget residual" fixed_T_abs=abs(r_ft) fixed_T_rel=abs(r_ft)/scale_ft flux_rel=abs(r_fx)/scale_fx
-            @test isfinite(r_ft)
-            # The flux form closes; the fixed-T map does not, and by more than round-off.
-            @test abs(r_fx) <= 1.0e-12 * scale_fx
+            @test_throws ErrorException budget_residual(tmp; num_cells_k = 50, ts = 0.5,
+                                                        Cd = -1.0, fluxes = true,
+                                                        water_carry = :fixed_T)
         end
     end
 

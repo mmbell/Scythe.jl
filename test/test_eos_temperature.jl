@@ -135,11 +135,14 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
     end
 
     """A kinked cloud sheet 200-1150 m of amplitude `amp`, added at FIXED T: p unchanged (a
-    condensate exerts no partial pressure), rho_t and E_t carrying the cloud's mass and its
-    BF02 energy rho_c (C_pv T - L_v(T) + g z). Where the sheet is resolved the state is
-    therefore thermodynamically consistent; its top is sharper than one 500 m cell, so the
-    refit rings the cloud slot, rho_t and E_t below zero in the air above — a clipped lobe of
-    exactly the kind the convective burst makes. `wamp` adds a smooth w."""
+    condensate exerts no partial pressure), E_t carrying the cloud's BF02 energy
+    rho_c (C_pv T - L_v(T) + g z) and the derived total rho_t = rho_d + sum_k alpha_k nu_k its
+    mass (until Stage 4 of the rho_t retirement the mass was also written into the prognostic
+    rho_t slot, which no reader of the derived anchor took). Where the sheet is resolved the
+    state is therefore thermodynamically consistent; its top is sharper than one 500 m cell, so
+    the refit rings the cloud slot (and with it the derived rho_t) and E_t below zero in the air
+    above — a clipped lobe of exactly the kind the convective burst makes. `wamp` adds a smooth
+    w."""
     eos_kink(z; zb = 200.0, zt = 1150.0, amp = 1.0e-3) =
         max(0.0, amp * (z - zb) * (zt - z) / ((zt - zb) / 2)^2)
 
@@ -151,7 +154,6 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             rc = eos_kink(z; amp)
             T = col.Tk[k]
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, EOS_MU)
-            patch.physical[i, V["rho_t"], 1] = rc
             patch.physical[i, V["E_t"], 1] = rc * ((Cpv * T) - L_v(T) + (gravity * z))
             patch.physical[i, V["w"], 1] = wamp * sin(2pi * pts[i, 1] / EOS_SPAN) *
                                            sin(pi * z / EOS_ZTOP)
@@ -246,7 +248,6 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                     extra = Dict{Symbol,Any}(:cloud_evap_realization => false,
                                              :exchange_realization => false,
                                              :refit_partner => false,
-                                             :water_anchor => :derived,
                                              :vapor_transform => :none),
                     seed! = (p, x, V, c) -> eos_seed_sheet!(p, x, V, c; wamp = 0.5))
                 eos_run!(m, p, mo, 3)
@@ -339,7 +340,12 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                 kDim = mo.grid_params.kDim
                 Scythe.advance_column(m, 1, 1)
                 S = m.mc_scratch[Threads.threadid()]
-                rtp = p.physical[1:kDim, mo.grid_params.vars["rho_t"], 1]
+                # rho_t' is DERIVED (Stage 4 of the rho_t retirement): rho_d' + W', the
+                # signed water sum of the slots, so the cloud slot's ringing lobe is in it.
+                ws = Scythe.water_anchor_set(mo.options, mo.physical_params, m.mc_slots)
+                rtp = [Scythe.anchor_rho_tp(p.physical[g, mo.grid_params.vars["rho_d"], 1],
+                                            Scythe.anchor_Wp(p.physical, g, 1, ws))
+                       for g in 1:kDim]
                 D = (S.rho_d .* Cpd .+ (S.rho_t .- S.rho_d) .* Cpv) .-
                     S.rho_liq_t .* (Cpv - Cl)
                 res[mode] = (dT = S.Tk .- m.mc_ref_diag.Tbar, rtp = rtp,
@@ -348,13 +354,14 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                              z = Scythe.getGridpoints(p)[1:kDim, end])
             end
             e = res[:energy]; o = res[:eos]
-            # The lobe: the refit rang the cloud slot AND rho_t below zero above the sheet; the
-            # recovery clips the slot to 0 there, rho_t keeps the lobe.
+            # The lobe: the refit rang the cloud slot (and so the derived rho_t) below zero above
+            # the sheet; the recovery clips the slot to 0 there, rho_t keeps the lobe.
             lobe = findall((e.nu_c .< 0.0) .& (e.rtp .< -1.0e-6))
             @test length(lobe) >= 2
             @test all(e.rho_c[lobe] .== 0.0)
             # :energy credits the clipped lobe with phantom latent heat. The seed puts the
-            # lobe's mass AND its BF02 energy into rho_t and E_t, so the retrieval sees
+            # lobe's mass (through the cloud slot) AND its BF02 energy into rho_t and E_t, so the
+            # retrieval sees
             # M' = rho_t'(C_pv T - L_v(T)) and C_f' = rho_t' C_pv with no liquid to hold the
             # latent part: dT = -L_v(Tbar) rho_t'/D > 0, D the state's own denominator. The
             # ringing of E_t and of rho_t are separate fits, hence the tolerance.
@@ -433,7 +440,9 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             V = mo.grid_params.vars
             @test maximum(abs.(p.physical[:, V["p"], 1])) < 1.0e-9
             @test maximum(abs.(p.physical[:, V["E_t"], 1])) < 1.0e-6
-            for nm in ("rho_d", "rho_t", "u", "w", "Q_ss", "rho_r", "rho_c", "rho_v")
+            # (no "rho_t": the slot was deleted at Stage 4; the derived total is rho_d plus the
+            # water slots, every one of which is held here)
+            for nm in ("rho_d", "u", "w", "Q_ss", "rho_r", "rho_c", "rho_v")
                 @test maximum(abs.(p.physical[:, V[nm], 1])) < 1.0e-12
             end
         end
@@ -442,7 +451,9 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
     # ── 6. the output diagnostics ────────────────────────────────────────────────────
     @testset "NetCDF diagnostics: T_energy, T_eos, T_split, E_residual" begin
         # A 3-column state built CONSISTENTLY (E_t from the implied energy at the EOS T) plus a
-        # clipped-lobe-like phantom: the cloud slot reads 0 while rho_t carries -1e-4.
+        # clipped lobe: the cloud slot is a negative nu_c = -5e-5 (recovered 0) and the derived
+        # rho_t = rho_d + rho_v + 2 nu_c carries its 2 nu_c = -1e-4. (Until Stage 4 of the rho_t
+        # retirement the lobe was written into a prognostic rho_t slot directly.)
         z = collect(range(0.0, 12000.0; length = 13))
         n_i = 3; n_k = length(z)
         Tf(i, zz) = 300.0 - 0.0065 * zz + 0.5 * i
@@ -454,13 +465,16 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         geo = 0.5 .* (u .^ 2 .+ w .^ 2) .+ gravity .* reshape(z, 1, n_k)
         Tk = [Tf(i, z[k]) for i in 1:n_i, k in 1:n_k]
         E = Scythe.implied_total_energy.(Tk, rd, rv, 0.0, 0.0, rt, geo)
-        lobe = zeros(n_i, n_k); lobe[2, 7] = -1.0e-4
-        rt_l = rt .+ lobe
+        cl = zeros(n_i, n_k); cl[2, 7] = -5.0e-5
+        lobe = 2.0 .* cl
+        # The writer's own association (`mc_derived_fields`: rho_d .+ (rho_v .+ 2 nu_c) on the
+        # flat zero reference), so the T_energy / E_residual comparisons below stay bitwise.
+        rt_l = rd .+ (rv .+ lobe)
         E_l = E .+ lobe .* ((Cpv .* Tk) .- L_v.(Tk) .+ geo)       # the lobe's own energy
         zp = zeros(n_k)
         ref = Scythe.RegularReferenceProfiles(z, zp, zp, zp, zp, zp, zp, zp, zp)
-        slots = (; p, rho_d = rd, rho_t = rt_l, E_t = E_l, Q_ss = zeros(n_i, n_k), rho_v = rv,
-                   u, w, rain = zeros(n_i, n_k), cloud = zeros(n_i, n_k))
+        slots = (; p, rho_d = rd, E_t = E_l, Q_ss = zeros(n_i, n_k), rho_v = rv,
+                   u, w, rain = zeros(n_i, n_k), cloud = cl)
         for mode in (:eos, :energy)
             cfg = Scythe.DerivedConfig(:bhyp, 1.0e-7, :bhyp, 1.0e-7, :none, 1.0, :none,
                                        (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16), 1, false, false,

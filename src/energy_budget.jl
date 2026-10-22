@@ -7,7 +7,10 @@
 # the moist-compressible set,
 #
 #     R = E_t − E_implied(T_eos, ρ_d, ρ_v, ρ_liq, ρ_ice, ρ_t·geo)        [J/m³]
-#     X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice                                  [kg/m³]
+#     X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice = ρ_w − Σ_k ρ_k                [kg/m³]
+#
+# with ρ_t the derived total ρ_d + ρ_w, ρ_w = Σ_k α_k ν_k (the water anchor; the prognostic ρ_t
+# slot went at Stage 4 of the ρ_t retirement)
 #
 # (`implied_total_energy`, the netCDF `E_residual`), integrated over the column with the
 # mish's Gauss weights. Each stage is a FINITE DIFFERENCE of the column integral over the
@@ -43,12 +46,11 @@ rows ([`EB_TOP`](@ref)) are the ones that telescope.
 | `explicit:sponge` | the Rayleigh sponge (`mc_sponge!`) |
 | `explicit:bl` | the boundary layer (MYNN or Louis), less its surface exchange |
 | `explicit:sfc` | the surface exchange: drag, sensible and moisture fluxes on the surface-layer profile |
-| `explicit:vrec` | the vapor reconciliation nudge and its pressure partner |
 | `explicit:hwater` | horizontal water mixing (`Khdiff_water`) |
-| `explicit:wexch` | under the derived anchor, the multistep exchange and sedimentation closures of the vapor and their partners (`_water_exchange_multistep!`) |
-| `explicit:nonlin` | `explicit` minus the nine rows above: the cross terms of a nonlinear R |
+| `explicit:wexch` | the multistep exchange and sedimentation closures of the vapor and their partners (`_water_exchange_multistep!`) |
+| `explicit:nonlin` | `explicit` minus the eight rows above: the cross terms of a nonlinear R |
 | `etd` | the ETD phase-change increments landing (`relaxation_adjustment_qss!`), refit partner included |
-| `etd:refit_partner` | the refit partner's own increments (its `p` and vapor folds), at the post-explicit state |
+| `etd:refit_partner` | the refit partner's own increments (its `p` and `Q_ss` booking, `_refit_partner_defect!`), at the post-explicit state |
 | `etd:phase` | `etd` minus `etd:refit_partner` |
 | `exch_real` | the exchange realization (`_etd_exchange_realization!`) |
 | `lobe_relax` | the lobe relaxation (Stage L) |
@@ -61,10 +63,11 @@ Each `explicit:<op>` row is `R(xⁿ + δ_op) − R(xⁿ)` with `δ_op` the opera
 increment (its tendency history kept here, rotated as `explicit_timestep` rotates `expdot`), so
 the rows are evaluated with the state-`n` coefficients and do not telescope; `dyn`'s increment
 is the actual increment minus the isolated ones, so the eight increments sum to the actual one
-and `nonlin` is the interaction of a nonlinear `R` only.
+and `nonlin` is the interaction of a nonlinear `R` only. (Stage 3's `explicit:vrec` row, the
+vapor reconciliation nudge, went with the nudge's code at Stage 4.)
 """
 const EB_STAGES = ("refit", "explicit", "explicit:dyn", "explicit:rad", "explicit:hmom",
-                   "explicit:sponge", "explicit:bl", "explicit:sfc", "explicit:vrec",
+                   "explicit:sponge", "explicit:bl", "explicit:sfc",
                    "explicit:hwater", "explicit:wexch", "explicit:nonlin", "etd",
                    "etd:refit_partner",
                    "etd:phase", "exch_real", "lobe_relax", "hsi_hist", "acoustic_si",
@@ -72,16 +75,16 @@ const EB_STAGES = ("refit", "explicit", "explicit:dyn", "explicit:rad", "explici
 const EB_REFIT = 1
 const EB_EXPLICIT = 2
 const EB_X_DYN = 3
-const EB_X_NONLIN = 12
-const EB_ETD = 13
-const EB_ETD_PARTNER = 14
-const EB_ETD_PHASE = 15
-const EB_EXCH = 16
-const EB_LOBE = 17
-const EB_HSI = 18
-const EB_SI = 19
-const EB_VDIFF = 20
-const EB_CLAMP = 21
+const EB_X_NONLIN = 11
+const EB_ETD = 12
+const EB_ETD_PARTNER = 13
+const EB_ETD_PHASE = 14
+const EB_EXCH = 15
+const EB_LOBE = 16
+const EB_HSI = 17
+const EB_SI = 18
+const EB_VDIFF = 19
+const EB_CLAMP = 20
 const EB_NSTAGE = length(EB_STAGES)
 "The top-level rows of [`EB_STAGES`](@ref): the ones that telescope to the actual change."
 const EB_TOP = (EB_REFIT, EB_EXPLICIT, EB_ETD, EB_EXCH, EB_LOBE, EB_HSI, EB_SI, EB_VDIFF,
@@ -93,12 +96,11 @@ const EB_OP_HMOM = 2
 const EB_OP_SPONGE = 3
 const EB_OP_BL = 4
 const EB_OP_SFC = 5
-const EB_OP_VREC = 6
-const EB_OP_HWATER = 7
-const EB_OP_WEXCH = 8
-const EB_NOP = 8
+const EB_OP_HWATER = 6
+const EB_OP_WEXCH = 7
+const EB_NOP = 7
 "Row of [`EB_STAGES`](@ref) for each isolated explicit operator `EB_OP_*`."
-const EB_OP_ROW = (4, 5, 6, 7, 8, 9, 10, 11)
+const EB_OP_ROW = (4, 5, 6, 7, 8, 9, 10)
 
 """
     EnergyBudget
@@ -115,7 +117,7 @@ the grid, the view NamedTuples) to an opaque call (the `mc_water_mixing!` measur
 mutable struct crosses as one pointer, like the `Matrix` arguments beside it. It is held by
 the tile (`mtile.ebudget`) and adds nothing to `MC_SCRATCH_SLOTS`.
 
-`rs` lists the slots `R` and `X` read (`p, ρ_d, ρ_t, u, w, E_t, ρ_v, [v], cloud, rain, [the
+`rs` lists the slots `R` and `X` read (`p, ρ_d, u, w, E_t, ρ_v, [v], cloud, rain, [the
 three ice masses]`); the tendency histories and the work columns carry only those, and
 `j*` is each role's position in `rs`.
 """
@@ -133,17 +135,16 @@ mutable struct EnergyBudget
     # Reference profiles of the perturbation slots (kDim).
     const pbar::Vector{Float64}
     const rho_dbar::Vector{Float64}
-    const rho_tbar::Vector{Float64}
     const E_tbar::Vector{Float64}
     const rho_vbar::Vector{Float64}
     const rho_cbar::Vector{Float64}
     const nu_cbar::Vector{Float64}
     # Slot indices (0 = absent).
-    const ip::Int; const ird::Int; const irt::Int; const iu::Int; const iw::Int
+    const ip::Int; const ird::Int; const iu::Int; const iw::Int
     const iEt::Int; const irv::Int; const iv::Int; const irc::Int; const irr::Int
     const ii1::Int; const ii2::Int; const ii3::Int
     const rs::Vector{Int}
-    const jp::Int; const jrt::Int; const ju::Int; const jw::Int; const jv::Int
+    const jp::Int; const ju::Int; const jw::Int; const jv::Int
     const jEt::Int; const jrv::Int
     # Transforms and the thermodynamic reading of the condensate.
     const ctr::Symbol; const cmu::Float64
@@ -155,7 +156,7 @@ mutable struct EnergyBudget
     const vtr::Symbol; const vmu::Float64
     const nu_vbar::Vector{Float64}
     # ...its vertical gradient, and the derived total reference ρ̄_d + Σ α_k ν̄_k of the ρ_t
-    # retirement (`mc_reference_diagnostics`; built, not yet read). These four are the TILE's
+    # retirement (`mc_reference_diagnostics`). These four are the TILE's
     # copies, read through `mc_nu_vbar` & co. by every consumer: they live here and not in
     # `ModelTile.mc_ref_diag` because widening that NamedTuple tips `moist_compressible_SLR`
     # over the LLVM compile cliff (measured 2026-10-20), and this struct already carries the
@@ -163,16 +164,10 @@ mutable struct EnergyBudget
     const nu_vbar_z::Vector{Float64}
     const rho_tbar_w::Vector{Float64}
     const rho_tbar_w_z::Vector{Float64}
-    # The water anchor (`options[:water_anchor]`, Stage 3): `wa` under `:derived`, where every
-    # reader takes ρ_t = ρ_d + Σ α_k ν_k and the reference `rho_tbar_ref` = (ρ̄_t^w, ∂z ρ̄_t^w,
-    # Springsteel's ∂zz) — the matrix `mc_rho_tbar_ref` hands out (Springsteel's `ref_rho_t` is
-    # handed out under `:slot`, and this field is then an empty matrix).
-    const wa::Bool
+    # The derived water anchor's total-density reference `rho_tbar_ref` = (ρ̄_t^w, ∂z ρ̄_t^w,
+    # Springsteel's ∂zz) — the matrix `mc_rho_tbar_ref` hands out to every reader (ρ_t =
+    # ρ_d + Σ α_k ν_k, the only anchor since Stage 4; `R`'s mechanical term reads it too).
     const rho_tbar_ref::Matrix{Float64}
-    # The R FUNCTIONAL (`options[:energy_budget_functional]`): `wR` reads the derived
-    # mechanical term `(ρ_d + Σ α_k ν_k)·geo` in `R` (always under `wa`; on a `:slot` run only
-    # as the energy bisection's forensic arm E-c). `X` follows `wa` alone.
-    const wR::Bool
     # Whether the boundary layer is MYNN (a `rho_e` slot) rather than Louis: under the derived
     # anchor the two closures split the surface moisture flux's energy between `E_t` and `p`
     # differently, and `eb_sfc!` mirrors whichever one ran (row labels only).
@@ -207,10 +202,10 @@ moist-compressible one with a reference state. Concrete, not `nothing`, for the
 `SurfaceDiag` reason: the driver reads `mtile.ebudget.active` once per column.
 """
 const EMPTY_ENERGY_BUDGET = EnergyBudget(false, 0, 0, Float64[], Float64[], Float64[],
-    Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0, 0,
+    Float64[], Float64[], Float64[], Float64[], Float64[], Float64[], Float64[],
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Int[], 0, 0, 0, 0, 0, 0,
     :none, 1.0, :none, 1.0, :none, 1.0, false, :none, 1.0, Float64[], Float64[], Float64[],
-    Float64[], false, zeros(0, 0), false, false,
+    Float64[], zeros(0, 0), false,
     zeros(0, 0), zeros(0, 0), Float64[], Float64[], Float64[], Float64[], Int[], Bool[],
     zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0), zeros(0, 0, 0),
     zeros(0, 0, 0), zeros(0, 0), zeros(0, 0))
@@ -304,11 +299,11 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
     imu = ice ? ice_mu(pp, 1) : 1.0
     rho_cbar = collect(Float64, view(Springsteel.ref_rho_c(ref_state), :, 1))
     nu_cbar = ctr === :none ? copy(rho_cbar) : bhyp.(rho_cbar, cmu)
-    ip = vars["p"]; ird = vars["rho_d"]; irt = vars["rho_t"]; iu = vars["u"]
+    ip = vars["p"]; ird = vars["rho_d"]; iu = vars["u"]
     iw = vars["w"]; iEt = vars["E_t"]; irv = IS.rho_v; iv = get(vars, "v", 0)
     irc = mc_slot(vars, "rho_c"); irr = mc_slot(vars, "rho_r")
     ii1 = ice ? IS.i1_q : 0; ii2 = ice ? IS.i2_q : 0; ii3 = ice ? IS.i3_q : 0
-    rs = Int[ip, ird, irt, iu, iw, iEt, irv]
+    rs = Int[ip, ird, iu, iw, iEt, irv]
     iv > 0 && push!(rs, iv)
     push!(rs, irc, irr)
     ice && push!(rs, ii1, ii2, ii3)
@@ -316,30 +311,23 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
     nrs = length(rs)
     nt = Threads.maxthreadid()
     # The derived water anchor's reference matrix (`mc_rho_tbar_ref`).
-    wa = water_anchor_mode(opts) === :derived
-    rtref = if wa
-        m = copy(ref_rho_t(ref_state))
-        m[:, 1] .= mc_ref_diag.rho_tbar_w
-        m[:, 2] .= mc_ref_diag.rho_tbar_w_z
-        m
-    else
-        zeros(0, 0)
-    end
+    water_anchor_mode(opts)
+    rtref = copy(ref_rho_t(ref_state))
+    rtref[:, 1] .= mc_ref_diag.rho_tbar_w
+    rtref[:, 2] .= mc_ref_diag.rho_tbar_w_z
     npts = size(tile.physical, 1)
     na = active ? 1 : 0                # zero-size accumulators when inactive
     return EnergyBudget(active, kDim, nvars, wz, z, wx, wxn,
         collect(Float64, view(ref_pressure(ref_state), :, 1)),
         collect(Float64, view(ref_rho_d(ref_state), :, 1)),
-        collect(Float64, view(ref_rho_t(ref_state), :, 1)),
         collect(Float64, view(ref_total_energy(ref_state), :, 1)),
         copy(mc_ref_diag.rho_vbar), rho_cbar, nu_cbar,
-        ip, ird, irt, iu, iw, iEt, irv, iv, irc, irr, ii1, ii2, ii3, rs,
-        pos(ip), pos(irt), pos(iu), pos(iw), pos(iv), pos(iEt), pos(irv),
+        ip, ird, iu, iw, iEt, irv, iv, irc, irr, ii1, ii2, ii3, rs,
+        pos(ip), pos(iu), pos(iw), pos(iv), pos(iEt), pos(irv),
         ctr, cmu, rtr, rmu, itr, imu, condensate_floor_mode(opts),
         vapor_transform_mode(opts), vapor_mu(pp), copy(mc_ref_diag.nu_vbar),
         copy(mc_ref_diag.nu_vbar_z), copy(mc_ref_diag.rho_tbar_w),
-        copy(mc_ref_diag.rho_tbar_w_z), wa, rtref,
-        wa || get(opts, :energy_budget_functional, :model)::Symbol === :derived,
+        copy(mc_ref_diag.rho_tbar_w_z), rtref,
         haskey(model.grid_params.vars, "rho_e"),
         zeros(EB_NSTAGE * na, ncol * na), zeros(EB_NSTAGE * na, ncol * na),
         zeros(ncol * na), zeros(ncol * na), zeros(ncol * na), zeros(ncol * na),
@@ -364,14 +352,13 @@ included under `vapor_transform = :bhyp`) at row `g`
 of the state `A` (`var_np1`, `tile.physical` with `l = 1`, or a work column with `l` the
 thread), level `k`. The definitions are the netCDF writer's (`mc_derived_fields`): the
 recovered condensate as the thermodynamics reads it (floored under
-`options[:condensate_floor] = :diagnostic`), `T_eos` from the raw vapor, the PROGNOSTIC `ρ_t`
-in the mechanical term.
+`options[:condensate_floor] = :diagnostic`), `T_eos` from the raw vapor, the derived
+`ρ_t = ρ_d + ρ_w` in the mechanical term.
 """
 @inline function _eb_point_RX(eb::EnergyBudget, A, g::Int, l::Int, k::Int)
     @inbounds begin
         p = _eb_get(A, g, eb.ip, l) + eb.pbar[k]
         rd = _eb_get(A, g, eb.ird, l) + eb.rho_dbar[k]
-        rt = _eb_get(A, g, eb.irt, l) + eb.rho_tbar[k]
         Et = _eb_get(A, g, eb.iEt, l) + eb.E_tbar[k]
         rv = eb.vtr === :none ? _eb_get(A, g, eb.irv, l) + eb.rho_vbar[k] :
                                 ahyp(_eb_get(A, g, eb.irv, l) + eb.nu_vbar[k], eb.vmu)
@@ -400,20 +387,11 @@ in the mechanical term.
         rl = eb.cond_floor ? max(rc, 0.0) + max(rr, 0.0) : rc + rr
         T = eos_temperature(p, rd, rv)
         geo = (0.5 * (((u * u) + (v * v)) + (w * w))) + (gravity * eb.z[k])
-        if eb.wa
-            # THE DERIVED WATER ANCHOR (plan E9): the mechanical term reads `ρ_d + ρ_w`,
-            # `ρ_w = Σ α_k ν_k`, and the partition gap is `X = ρ_w − Σ_k ρ_k = B + Λ`.
-            W = _eb_W(eb, A, g, l, k)
-            R = Et - implied_total_energy(T, rd, rv, rl, ri, rd + W, geo)
-            X = ((W - rv) - rl) - ri
-        elseif eb.wR
-            # The energy bisection's arm E-c: the derived functional on a `:slot` run.
-            R = Et - implied_total_energy(T, rd, rv, rl, ri, rd + _eb_W(eb, A, g, l, k), geo)
-            X = (((rt - rd) - rv) - rl) - ri
-        else
-            R = Et - implied_total_energy(T, rd, rv, rl, ri, rt, geo)
-            X = (((rt - rd) - rv) - rl) - ri
-        end
+        # THE DERIVED WATER ANCHOR (plan E9): the mechanical term reads `ρ_d + ρ_w`,
+        # `ρ_w = Σ α_k ν_k`, and the partition gap is `X = ρ_w − Σ_k ρ_k = B + Λ`.
+        W = _eb_W(eb, A, g, l, k)
+        R = Et - implied_total_energy(T, rd, rv, rl, ri, rd + W, geo)
+        X = ((W - rv) - rl) - ri
     end
     return R, X, lam
 end
@@ -466,31 +444,20 @@ The same sum over the SLOTS as carried (`W' = Σ α_k ν_k'`), for the derived p
 end
 
 """
-    _eb_water_column(eb, A, g0, l) -> (∫ρ_w, ∫Σα min(ν,0), n(ρ_w<0), ∫G, max|G|)
+    _eb_water_column(eb, A, g0, l) -> (∫ρ_w, ∫Σα min(ν,0), n(ρ_w<0))
 
-The water-anchor census of one column (`MC_W_*`, `MC_SHADOW_*`): the anchor `ρ_w`
-(`_eb_W` under the derived anchor, `ρ_t − ρ_d` of slot 3 otherwise), the members' negative
-water `Σ_k α_k min(ν_k, 0)`, the points with `ρ_w < 0`, and under the derived anchor the shadow
-gap `G = ρ_t'^slot − (ρ_d' + W')`, integrated with the mish's Gauss weights.
+The water-anchor census of one column (`MC_W_*`): the anchor `ρ_w` (`_eb_W`), the members'
+negative water `Σ_k α_k min(ν_k, 0)` and the points with `ρ_w < 0`, integrated with the mish's
+Gauss weights. (Stage 3's shadow gap of slot 3 went with the slot at Stage 4.)
 """
 @inline function _eb_water_column(eb::EnergyBudget, A, g0::Int, l::Int)
-    Wi = 0.0; Ni = 0.0; nn = 0; Gi = 0.0; Gm = 0.0
+    Wi = 0.0; Ni = 0.0; nn = 0
     av = _eb_alpha(eb.vtr); ac = _eb_alpha(eb.ctr); ar = _eb_alpha(eb.rtr)
     ai = _eb_alpha(eb.itr)
     @inbounds for k in 1:eb.kDim
         g = g0 + k
         wz = eb.wz[k]
-        if eb.wa
-            W = _eb_W(eb, A, g, l, k)
-            G = _eb_get(A, g, eb.irt, l) -
-                anchor_rho_tp(_eb_get(A, g, eb.ird, l), _eb_Wp(eb, A, g, l))
-            Gi += wz * G
-            aG = abs(G)
-            aG > Gm && (Gm = aG)
-        else
-            W = (_eb_get(A, g, eb.irt, l) + eb.rho_tbar[k]) -
-                (_eb_get(A, g, eb.ird, l) + eb.rho_dbar[k])
-        end
+        W = _eb_W(eb, A, g, l, k)
         Wi += wz * W
         W < 0.0 && (nn += 1)
         neg = (av * min(_eb_get(A, g, eb.irv, l) + eb.nu_vbar[k], 0.0)) +
@@ -503,7 +470,7 @@ gap `G = ρ_t'^slot − (ρ_d' + W')`, integrated with the mish's Gauss weights.
         end
         Ni += wz * neg
     end
-    return Wi, Ni, nn, Gi, Gm
+    return Wi, Ni, nn
 end
 
 """
@@ -601,30 +568,6 @@ The radiative heating's tendency: `(R_m/C_vt) q` in `p` and `q` in `E_t`, `q = q
 end
 
 """
-    eb_vrec!(eb, colstart, VREC, VREAL, Tk, R_m, C_vt, partner)
-
-The vapor nudge `VREC` into the vapor slot and, when `partner`, its pressure partner
-`vapor_nudge_partner_rate` of `VREAL` into `p` — the two terms the driver writes. `VREAL` is
-`VREC` itself under `vapor_transform = :none`; under `:bhyp` `VREC` is the ν-space rate and
-`VREAL` the realized recovered vapor rate its partner is booked on (`_vapor_bhyp_tendency!`).
-"""
-@noinline function eb_vrec!(eb::EnergyBudget, colstart::Int, VREC::Vector{Float64},
-                            VREAL::Vector{Float64},
-                            Tk::Vector{Float64}, R_m::Vector{Float64}, C_vt::Vector{Float64},
-                            partner::Bool)
-    tn = eb.tn
-    @inbounds for k in 1:eb.kDim
-        g = colstart + k - 1
-        vr = VREC[k]
-        tn[g, eb.jrv, EB_OP_VREC] += vr
-        va = VREAL[k]
-        (partner && va != 0.0) &&
-            (tn[g, eb.jp, EB_OP_VREC] += vapor_nudge_partner_rate(va, Tk[k], R_m[k], C_vt[k]))
-    end
-    return nothing
-end
-
-"""
     eb_snap!(eb, expdot, colstart)
 
 Snapshot this column's `expdot` (the rs slots) before an operator that adds to it in place.
@@ -665,7 +608,8 @@ The surface exchange's share of the boundary layer's tendency, rebuilt from the 
 same surface profile `g(z) = 2/δ (1 − z/δ)`, `δ = 2 z₂`: drag `−τ g/ρ_t` on `u` (and `v`) and
 its work `−(τ_u u + τ_v v) g` in `E_t`; the sensible flux `F_sh g` in `E_t` and `(R_m/C_vt)F_sh g`
 in `p`; the moisture flux `F_q g` in `ρ_t` and `ρ_v`, its energy `(C_vv T + ke + gz) F_q g` in
-`E_t` (the closures' `c_w + c_v`) and `R_v T F_q g` in `p`. It is moved from the `bl` row to
+`E_t` (the closures' `c_w + c_v`) and `R_v T F_q g` in `p` (as each closure books it on the
+vapor's recovered rate, below). It is moved from the `bl` row to
 the `sfc` row (the closures write it inside their own loop). Under MYNN's `:pdk1` deviation the
 drag-work-minus-production heat stays in `bl`.
 """
@@ -690,32 +634,23 @@ drag-work-minus-production heat stays in `bl`.
         cwv = (Cvv * Tk[k]) + geo
         su = -(tau_u * gz) / rho_t[k]
         sq = F_q * gz
-        if eb.wa
-            # THE DERIVED ANCHOR (review B3): both closures put `F_q g/α_v` on the vapor's ν
-            # and carry its energy on the vapor's RECOVERED rate (linearized here, `ν̇/J_v`);
-            # Louis writes `C_vv T ρ̇_v + geo F_q g` into `E_t` and `R_v T ρ̇_v` into `p`, MYNN
-            # the flux-form `(C_vv T + geo) F_q g` into `E_t` and the thermal remainder
-            # `C_vv T (F_q g − ρ̇_v)` with `R_v T ρ̇_v` into `p`.
-            sv = sq / _eb_alpha(eb.vtr)
-            rec = eb.vtr === :none ? sv : sv / J_v[k]
-            ct = Cvv * Tk[k]
-            if eb.mynn
-                sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cwv * sq)
-                sp = ((R_m[k] / C_vt[k]) * ((F_sh * gz) + (ct * (sq - rec)))) +
-                     (Rv * Tk[k] * rec)
-            else
-                sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + ((ct * rec) + (geo * sq))
-                sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * rec)
-            end
+        # Both closures put `F_q g/α_v` on the vapor's ν and carry its energy on the vapor's
+        # RECOVERED rate (linearized here, `ν̇/J_v`; review B3); Louis writes
+        # `C_vv T ρ̇_v + geo F_q g` into `E_t` and `R_v T ρ̇_v` into `p`, MYNN the flux-form
+        # `(C_vv T + geo) F_q g` into `E_t` and the thermal remainder `C_vv T (F_q g − ρ̇_v)`
+        # with `R_v T ρ̇_v` into `p`.
+        sv = sq / _eb_alpha(eb.vtr)
+        rec = eb.vtr === :none ? sv : sv / J_v[k]
+        ct = Cvv * Tk[k]
+        if eb.mynn
+            sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cwv * sq)
+            sp = ((R_m[k] / C_vt[k]) * ((F_sh * gz) + (ct * (sq - rec)))) +
+                 (Rv * Tk[k] * rec)
         else
-            # (the :slot arm's own association, bitwise a4bd88f: ((C_vv T + ke) + g z))
-            cws = (Cvv * Tk[k]) + ke[k] + (gravity * z[k])
-            sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cws * F_q * gz)
-            sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * F_q * gz)
-            # the vapor slot holds ν under the vapor control variable: its share through J_v
-            sv = eb.vtr === :none ? sq : J_v[k] * sq
+            sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + ((ct * rec) + (geo * sq))
+            sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * rec)
         end
-        for (j, s) in ((eb.ju, su), (eb.jEt, sE), (eb.jp, sp), (eb.jrt, sq), (eb.jrv, sv))
+        for (j, s) in ((eb.ju, su), (eb.jEt, sE), (eb.jp, sp), (eb.jrv, sv))
             tn[g, j, EB_OP_SFC] += s
             tn[g, j, EB_OP_BL] -= s
         end
@@ -731,8 +666,8 @@ end
 """
     eb_partner_snap!(eb, d1, dv) / eb_partner_take!(eb, d1, dv)
 
-Around `_refit_partner_fold!`: the partner's own `p` and vapor increments, `after − before`
-of the ETD columns it folds into.
+Around the refit partner (`_refit_partner_defect!`): its own `p` and vapor increments,
+`after − before` of the ETD columns it books into.
 """
 @noinline function eb_partner_snap!(eb::EnergyBudget, d1::Vector{Float64},
                                     dv::Vector{Float64})
@@ -1100,20 +1035,18 @@ function energy_census_trace(mtile, t::Int64)
     fill!(view(st, MC_VNEG:MC_VNEG_MASS, :), 0.0)
     st[MC_VNEG, 1] = Float64(nneg)
     st[MC_VNEG_MASS, 1] = vlobe
-    # The water-anchor rows (MC_W_*, MC_SHADOW_*), at the output state.
-    wi = 0.0; ni = 0.0; nwn = 0; gi = 0.0; gm = 0.0
+    # The water-anchor rows (MC_W_*), at the output state.
+    wi = 0.0; ni = 0.0; nwn = 0
     for ci in eachindex(eb.wxn)
-        a, b, c, d, e = _eb_water_column(eb, phys, (ci - 1) * kDim, 1)
+        a, b, c = _eb_water_column(eb, phys, (ci - 1) * kDim, 1)
         wi += eb.wxn[ci] * a; ni += eb.wxn[ci] * b; nwn += c
-        gi += eb.wxn[ci] * d; gm = max(gm, e)
     end
     src = sum(view(st, MC_W_SRC, :))
     seen = st[MC_W_SEEN, 1] > 0.0
     budget = seen ? (wi - st[MC_W_INT, 1]) - src : 0.0
-    fill!(view(st, MC_W_PART:MC_SHADOW_INT, :), 0.0)
+    fill!(view(st, MC_W_PART:MC_W_SEEN, :), 0.0)
     st[MC_W_PART, 1] = xi; st[MC_W_NEG, 1] = ni; st[MC_W_NEG_PTS, 1] = Float64(nwn)
     st[MC_W_INT, 1] = wi; st[MC_W_BUDGET, 1] = budget; st[MC_W_SEEN, 1] = 1.0
-    st[MC_SHADOW_MAX, 1] = gm; st[MC_SHADOW_INT, 1] = gi
     npts = size(phys, 1)
     secs = nst * model.ts
     s(r) = sum(view(st, r, :))
@@ -1126,10 +1059,10 @@ function energy_census_trace(mtile, t::Int64)
             "$(f(s(MC_LOBE_I3) / nst))) kg/m2, max|X|=$(f(xm)) kg/m3, int X=$(f(xi)) kg/m2, " *
             "pool=$(f(li)) kg/m2, nu_v<0 points=$(nneg) " *
             "($(f(100.0 * nneg / max(npts, 1))) %), vapor lobe=$(f(vlobe)) kg/m2; " *
-            "water anchor [$(eb.wa ? "derived" : "slot")]: int rho_w=$(f(wi)) kg/m2, " *
+            "water anchor: int rho_w=$(f(wi)) kg/m2, " *
             "budget=$(f(budget)) kg/m2 (src=$(f(src)), rel " *
             "$(f(budget / max(abs(wi), eps())))), neg water=$(f(ni)) kg/m2, " *
-            "rho_w<0 points=$(nwn), shadow gap int=$(f(gi)) kg/m2 max=$(f(gm)) kg/m3")
+            "rho_w<0 points=$(nwn)")
     fill!(view(st, MC_REFIT_DR:MC_LOBE_I3, :), 0.0)
     st[MC_ECEN_STEPS, 1] = 0.0
     return nothing

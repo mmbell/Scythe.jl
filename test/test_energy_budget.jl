@@ -142,7 +142,8 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
             rc = eb_kink(z; amp)
             T = col.Tk[k]
             patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, EB_MU)
-            patch.physical[i, V["rho_t"], 1] = rc
+            # (no rho_t write: the slot was deleted at Stage 4 of the rho_t retirement; the
+            # derived total rho_d + sum_k alpha_k nu_k carries the cloud's mass through rc_i)
             patch.physical[i, V["E_t"], 1] = rc * ((Cpv * T) - L_v(T) + (gravity * z))
             patch.physical[i, V["w"], 1] = wamp * sin(2pi * pts[i, 1] / EB_SPAN) *
                                            sin(pi * z / EB_ZTOP)
@@ -199,8 +200,12 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                     # The sub-rows split their stage: the explicit operators + nonlin, and the
                     # refit partner + the phase change.
                     xs = ["explicit:dyn", "explicit:rad", "explicit:hmom", "explicit:sponge",
-                          "explicit:bl", "explicit:sfc", "explicit:vrec", "explicit:hwater",
+                          "explicit:bl", "explicit:sfc", "explicit:hwater", "explicit:wexch",
                           "explicit:nonlin"]
+                    # (`explicit:vrec`, the vapor nudge's row, went with the nudge at Stage 4;
+                    # `explicit:wexch`, the derived anchor's exchange/sedimentation closures,
+                    # is a sub-row of `explicit` too and is live now that the derived anchor is
+                    # the only one)
                     se = sum(stage(rows, s).dR_dt_Wm2 for s in xs)
                     @test se ≈ stage(rows, "explicit").dR_dt_Wm2 rtol = 1.0e-9
                     sp = stage(rows, "etd:refit_partner").dR_dt_Wm2 +
@@ -211,9 +216,12 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                     rf = stage(rows, "refit").dR_dt_Wm2
                     pa = stage(rows, "etd:refit_partner").dR_dt_Wm2
                     @test abs(rf) > 100.0 && sign(pa) == -sign(rf)
-                    # Off-device rows are exact zeros on this fixture.
+                    # Off-device rows are exact zeros on this fixture. (`lobe_relax` is not off
+                    # any more: Stage L defaults ON under the derived anchor, the only anchor
+                    # since Stage 4, so its row is live here; it is held to an exact zero with
+                    # the device off in the "Stage L" and "dry column" testsets below.)
                     for s in ("explicit:rad", "explicit:sponge", "explicit:bl", "explicit:sfc",
-                              "explicit:hwater", "lobe_relax", "hsi_hist", "vdiff", "clamp")
+                              "explicit:hwater", "hsi_hist", "vdiff", "clamp")
                         @test stage(rows, s).dR_dt_Wm2 == 0.0
                     end
                 end
@@ -236,7 +244,8 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
                       "ice" => (UInt128(452461145111928252279513276),
                                 UInt128(19483817701529031587034710963)))
         got = Dict{String,Any}()
-        WA = Dict{Symbol,Any}(:water_anchor => :derived)
+        # (the derived anchor is the only one since Stage 4: no key, the default exercised)
+        WA = Dict{Symbol,Any}()
         mktempdir() do tmp
             for (tag, ice) in (("warm", false), ("ice", true))
                 for (arm, extra) in (("absent", WA),

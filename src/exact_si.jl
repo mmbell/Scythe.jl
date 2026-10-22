@@ -80,7 +80,6 @@ struct ExactSIData{FA, FB, SU, SW, SP, KP, KU}
     w_index::Int
     p_index::Int
     rhod_index::Int
-    rhot_index::Int
     et_index::Int
     fact::FA               # 2-D factorization, Δτ = 1.25·ts
     fact_first::FB         # 2-D factorization, Δτ = 0.5·ts (t == 1)
@@ -214,7 +213,7 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
         "exact_si is only implemented for the XZ RiRk geometry")
     vars = model.grid_params.vars
     u_index = vars["u"]; w_index = vars["w"]; p_index = vars["p"]
-    rhod_index = vars["rho_d"]; rhot_index = vars["rho_t"]; et_index = vars["E_t"]
+    rhod_index = vars["rho_d"]; et_index = vars["E_t"]
 
     iDim = patch.params.iDim; kDim = patch.params.kDim
     b_iDim = patch.params.b_iDim; b_kDim = patch.params.b_kDim
@@ -320,7 +319,7 @@ function create_exact_si_data(patch::AbstractGrid, model::ModelParameters,
     r_wall_l = axisym ? Float64(model.grid_params.iMin) : 1.0
     r_wall_r = axisym ? Float64(model.grid_params.iMax) : 1.0
 
-    return ExactSIData(u_index, w_index, p_index, rhod_index, rhot_index, et_index,
+    return ExactSIData(u_index, w_index, p_index, rhod_index, et_index,
         fact, fact_first,
         Matrix(dx.M0), Matrix(dx.M1), collect(dx.W), Matrix(dx.Nb),
         Matrix(dz.M0), Matrix(dz.M1), collect(dz.W), Matrix(dz.Nb),
@@ -543,7 +542,7 @@ function apply_acoustic_histories!(mtile::ModelTile, colstart::Int64, colend::In
         t::Int64)
     vars = mtile.model.grid_params.vars
     ts = mtile.model.ts
-    for var in ("p", "w", "rho_d", "rho_t", "E_t")
+    for var in ("p", "w", "rho_d", "E_t")
         index = vars[var]
         nstar = view(mtile.var_np1, colstart:colend, index)
         dot_n = view(mtile.impdot_n, colstart:colend, index)
@@ -589,9 +588,10 @@ function exact_si_apply_column!(mtile::ModelTile, colstart::Int64, colend::Int64
         view(mtile.var_np1, colstart:colend, w_index) .+= view(hfields, rows, 2)
         view(mtile.var_np1, colstart:colend, vars["p"]) .+= view(hfields, rows, 3)
         view(mtile.var_np1, colstart:colend, vars["rho_d"]) .+= view(hfields, rows, 4)
-        view(mtile.var_np1, colstart:colend, vars["rho_t"]) .+= view(hfields, rows, 5)
         view(mtile.var_np1, colstart:colend, vars["E_t"]) .+= view(hfields, rows, 6)
-        # The slaved water slots (`options[:si_water_slots]`): the anchor's water increment
+        # Plane 5 is the derived total's increment δρ_t = −Δτ div^{n+1}; no slot receives it
+        # (the prognostic ρ_t slot was deleted at Stage 4 of the ρ_t retirement). The slaved
+        # water slots (`options[:si_water_slots]`) take the anchor's water increment
         # (plane 5 − plane 4) split by the reference shares, with the flux-form s_z correction
         # (src/si_water_slaving.jl `_siw_xsi_apply!`), after the w plane so φ^{n+1} = ρ̄_t w^{n+1}.
         siw = si_water_set(model.options, model.physical_params, mtile.mc_slots)

@@ -44,6 +44,7 @@ const TEST_FILES = [
     ("test_vapor_transform.jl",             :physics),
     ("test_si_water_slaving.jl",            :physics),
     ("test_water_anchor.jl",                :physics),
+    ("test_slot3_audit.jl",                 :core),
     ("test_mynn_io.jl",                     :io),
     ("test_idealized_init.jl",              :core),
     ("test_spectralGrid.jl",                :core),

@@ -78,3 +78,18 @@ Scratch redirection: `SCYTHE_BENCH_TAG=_stage0capture_owb_mynn_ice_rad` -> a fre
 - `rce_ice0_louis.toml` -- capture OK (4.9 s)
 - `owb_default.toml`, `owb_default.hashes.toml` -- capture OK (9.3 s)
 - `owb_mynn_ice_rad.toml` -- capture OK (5.4 s)
+
+## Stage 4 of the rho_t retirement (slot 3 deleted)
+
+The captures above are in the pre-Stage-4 slot layout (slot 3 = the prognostic `rho_t`, the
+vapor appended at 10 on the slice / 11 on the cylinders). They are NOT re-captured:
+`test/test_config_equivalence.jl` maps each fingerprint to the Stage-4 layout by rule alone
+(`ceq_stage4_layout`: every `rho_t` entry dropped, the vapor at slot 3, every slot after its old
+one moved one in), and compares the IC bytes against `<arm>.stage4.hashes.toml` -- the
+`.hashes.toml` initial conditions as `initialize_case!` wrote them at bf577b2, converted to the
+Stage-4 layout by the CSV path of `tools/convert_rho_t_checkpoint.jl` (the rho_t column dropped,
+the vapor column moved, every value's text unchanged; the reference files are unchanged). The
+overlays no longer pin `numerics.water_anchor`: the option is retired.
+
+- `owb_default.stage4.hashes.toml`, `rce_default_seg1.stage4.hashes.toml`,
+  `tc_default.stage4.hashes.toml`, `tc_mynn_rad_stab.stage4.hashes.toml`

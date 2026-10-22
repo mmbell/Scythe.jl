@@ -1028,7 +1028,7 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                              vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
 
     vars = patch.params.vars
-    p_i = vars["p"]; rho_d_i = vars["rho_d"]; rho_t_i = vars["rho_t"]
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]
     u_i = vars["u"]; w_i = vars["w"]; et_i = vars["E_t"]
     qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
     rho_c_i = mc_slot(vars, "rho_c")
@@ -1070,7 +1070,6 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             Q_ss = rho_v - rho_v_sat(Tk, p / 100.0)
             patch.physical[i, p_i, 1] = p - pbar[k, 1]
             patch.physical[i, rho_d_i, 1] = rho_d - rho_dbar[k, 1]
-            patch.physical[i, rho_t_i, 1] = rho_t - rho_tbar[k, 1]
             patch.physical[i, u_i, 1] = 0.0
             patch.physical[i, w_i, 1] = 0.0
             patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
@@ -1086,9 +1085,8 @@ function balanced_vortex_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
             patch.physical[i, rho_c_i, 1] =
                 condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
             # The prognostic vapor, against the DERIVED reference ρ̄_t − ρ̄_d − ρ̄_c — the
-            # same expression `mc_reference_diagnostics` and `res_rho_t` form, so the
-            # reconciliation nudge starts from the vortex's own partition and not from a
-            # fit-level disagreement about what the reference vapor is.
+            # same expression `mc_reference_diagnostics` forms, so the state's derived total
+            # ρ_d + ρ_w is the vortex's own ρ_t (rho_t above, which also sets E_t).
             patch.physical[i, rho_v_i, 1] =
                 vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1],
                            vapor_transform, vapor_mu)
@@ -1344,6 +1342,49 @@ function _native_deconvolve!(mish::AbstractMatrix{Float64}, patch, vi::Int,
 end
 
 """
+    _native_working_grid(patch) -> SpringsteelGrid
+
+THE WORKING TOTAL DENSITY of [`balanced_vortex_native!`](@ref): a one-variable grid (`"rho_t"`)
+on the patch's own mish, with `rho_d`'s boundary conditions, filter lengths and spline filter on
+every side — the field the balance is solved for (`ρ_t'` deconvolved from the fitted `∂z p'`),
+which until Stage 4 of the ρ_t retirement lived in the patch's own prognostic slot 3 (the
+scalar family gave `rho_t` and `rho_d` the same conditions, and `r1t1x` both Neumann). The
+transforms are per variable, so fitting it here is bitwise the old slot's fit, and the patch's
+own slots are bitwise what they were.
+"""
+function _native_working_grid(patch)
+    gp = patch.params
+    one(d) = (haskey(d, "rho_d") ? Dict("rho_t" => d["rho_d"]) :
+              haskey(d, "default") ? Dict("rho_t" => d["default"]) : empty(d))
+    lq = Dict{String,Float64}()
+    haskey(gp.l_q, "default") && (lq["default"] = gp.l_q["default"])
+    for sfx in ("", "_k", "_j")
+        haskey(gp.l_q, "rho_d" * sfx) && (lq["rho_t" * sfx] = gp.l_q["rho_d" * sfx])
+    end
+    keep = Dict{Symbol,Any}(:vars => Dict("rho_t" => 1),
+                            :BCL => one(gp.BCL), :BCR => one(gp.BCR), :BCB => one(gp.BCB),
+                            :BCT => one(gp.BCT), :BCU => one(gp.BCU), :BCD => one(gp.BCD),
+                            :l_q => lq,
+                            :max_wavenumber => merge(Dict{String,Int64}(
+                                k => v for (k, v) in gp.max_wavenumber if k == "default"),
+                                haskey(gp.max_wavenumber, "rho_d") ?
+                                    Dict("rho_t" => gp.max_wavenumber["rho_d"]) :
+                                    Dict{String,Int64}()),
+                            :spline_filter => haskey(gp.spline_filter, "rho_d") ?
+                                Dict("rho_t" => gp.spline_filter["rho_d"]) :
+                                empty(gp.spline_filter),
+                            :positivity => empty(gp.positivity))
+    wgp = Springsteel.SpringsteelGridParameters(;
+        (n => (haskey(keep, n) ? keep[n] : getproperty(gp, n)) for n in propertynames(gp))...)
+    return createGrid(wgp)
+end
+
+"The nest interface metadata of the working grid (one variable): `meta` with `nvars = 1`."
+_native_working_meta(m::Springsteel.PatchInterfaceMetadata) =
+    Springsteel.PatchInterfaceMetadata((f === :nvars ? 1 : getfield(m, f)
+                                        for f in fieldnames(Springsteel.PatchInterfaceMetadata))...)
+
+"""
     balanced_vortex_native!(patches, topo, ref; kwargs...) -> Vector{Matrix{Float64}}
 
 Solve the gradient-wind / hydrostatic balance for a tropical-cyclone vortex
@@ -1406,12 +1447,16 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
     mishes   = Vector{Matrix{Float64}}(undef, npatch)
     payloads = [Vector{Any}() for _ in 1:npatch]   # incoming R3X data per patch
     diag     = Vector{Any}(undef, npatch)
+    # The working total density ρ_t' of every patch, on a grid of its own
+    # (`_native_working_grid`), with its own R3X payloads.
+    works     = [_native_working_grid(p) for p in patches]
+    wpayloads = [Vector{Any}() for _ in 1:npatch]
 
     for ip in _nest_parent_order(topo, npatch)
         patch = patches[ip]
         gp    = patch.params
         vars  = gp.vars
-        p_i = vars["p"]; rd_i = vars["rho_d"]; rt_i = vars["rho_t"]
+        p_i = vars["p"]; rd_i = vars["rho_d"]
         u_i = vars["u"]; w_i = vars["w"];      et_i = vars["E_t"]
         qs_i = vars["Q_ss"]; rr_i = mc_slot(vars, "rho_r"); v_i = vars["v"]
         rc_i = mc_slot(vars, "rho_c")
@@ -1445,6 +1490,8 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         end
 
         mish = zeros(Float64, npts, nvar)
+        work = works[ip]
+        wmish = zeros(Float64, npts, 1)       # the working ρ_t' (column 1 of `work`)
         # ── (1) tangential wind, then C from the FITTED v ──────────────────────
         i = 1
         for c in 1:ncol, k in 1:kDim
@@ -1479,15 +1526,15 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
                 rhot_target[i] = -patch.physical[i, p_i, 4] / gravity   # slot 4 = ∂z
                 i += 1
             end
-            mish[:, rt_i] .= rhot_target
-            rt_fiterr, rt_fitidx = _native_deconvolve!(mish, patch, rt_i, rhot_target,
-                                                      payloads[ip]; iters = inner_iters)
+            wmish[:, 1] .= rhot_target
+            rt_fiterr, rt_fitidx = _native_deconvolve!(wmish, work, 1, rhot_target,
+                                                      wpayloads[ip]; iters = inner_iters)
             # G = pp_x - ρ_t·C  ==  -ρ_t·expdot[u]   (the gradient-wind residual)
             # H = pp_z + g·ρ_t'                      (the hydrostatic residual)
             i = 1
             gw_res = 0.0; hy_res = 0.0
             for _ in 1:ncol, k in 1:kDim
-                rtp   = patch.physical[i, rt_i, 1]
+                rtp   = work.physical[i, 1, 1]
                 rho_t = rtp + rho_tbar[k]
                 G[i]  = patch.physical[i, p_i, 2] - (rho_t * Cfit[i])
                 H[i]  = patch.physical[i, p_i, 4] + (gravity * rtp)
@@ -1518,7 +1565,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
             _native_fit!(patch, mish, payloads[ip])
             i = 1
             for _ in 1:ncol, k in 1:kDim
-                rho_t = patch.physical[i, rt_i, 1] + rho_tbar[k]
+                rho_t = work.physical[i, 1, 1] + rho_tbar[k]
                 G[i]  = patch.physical[i, p_i, 2] - (rho_t * Cfit[i])
                 i += 1
             end
@@ -1550,7 +1597,7 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         for c in 1:ncol, k in 1:kDim
             r = rmish[c]; z = zmish[k]
             p     = patch.physical[i, p_i, 1] + pbar[k]
-            rho_t = patch.physical[i, rt_i, 1] + rho_tbar[k]
+            rho_t = work.physical[i, 1, 1] + rho_tbar[k]
             v     = vfit[i]
             rho_d = rho_t / (1.0 + q_vbar[k])
             rho_v = rho_t - rho_d
@@ -1616,15 +1663,15 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         for c in 1:ncol, k in 1:kDim
             z = zmish[k]
             p     = patch.physical[i, p_i, 1] + pbar[k]
-            rho_t = patch.physical[i, rt_i, 1] + rho_tbar[k]
+            rho_t = work.physical[i, 1, 1] + rho_tbar[k]
             rho_d = patch.physical[i, rd_i, 1] + rho_dbar[k]
             rho_v = rho_t - rho_d
             Tk    = p / ((rho_d * Rd) + (rho_v * Rv))
             # The vapor is PROGNOSTIC, so it gets a target and a deconvolution of its own,
             # chained off the settled ρ_t/ρ_d exactly as E_t and Q_ss are. Seeding it from
             # the same (ρ_t, ρ_d) pair those two read is what keeps the initial state's
-            # partition and its reconciliation gap consistent to the fit floor rather than
-            # to the difference between two independently deconvolved fields.
+            # derived total ρ_d + ρ_w on the balanced ρ_t to the fit floor rather than to the
+            # difference between two independently deconvolved fields.
             # (the CONTROL-variable deviation under the vapor transform: the deconvolution
             # then fits ν_v', the slot's own representation)
             rv_target[i] = vapor_slot(rho_v, rho_tbar[k], rho_dbar[k], rho_cbar[k],
@@ -1649,9 +1696,11 @@ function balanced_vortex_native!(patches::AbstractVector, topo,
         for j in topo.child_ifaces[ip]
             itf = topo.interfaces[j]
             push!(payloads[itf.child], (itf.meta, compute_interface_payload(itf.meta, patch)))
+            wm = _native_working_meta(itf.meta)
+            push!(wpayloads[itf.child], (wm, compute_interface_payload(wm, work)))
         end
 
-        diag[ip] = _native_residual_report(patch, ip, gp, kDim, ncol, rho_tbar, Cfit,
+        diag[ip] = _native_residual_report(patch, work, ip, gp, kDim, ncol, rho_tbar, Cfit,
                                            anchor_right, isempty(pifs), verbose)
         verbose && println("    patch $ip rho_t fit floor at r = " *
                            "$(round(gpts[rt_fitidx, 1] / 1e3; digits=1)) km, z = " *
@@ -1709,7 +1758,7 @@ function _native_moisten(rho_v, rho_d, Tk, p, rho_t, r, z, RHbar, RHbl, RH_core,
 end
 
 """
-    _native_residual_report(patch, ip, gp, kDim, ncol, rho_tbar, Cfit,
+    _native_residual_report(patch, work, ip, gp, kDim, ncol, rho_tbar, Cfit,
                             anchor_right, is_root, verbose) -> NamedTuple
 
 Discrete gradient-wind and hydrostatic residuals of the patch's FITTED state
@@ -1723,17 +1772,17 @@ away:
 - `junction` -- the end cells in r on the parent side of a child patch, whose
               three border coefficients are the parent's and are not ours to move.
 """
-function _native_residual_report(patch, ip, gp, kDim, ncol, rho_tbar, Cfit,
+function _native_residual_report(patch, work, ip, gp, kDim, ncol, rho_tbar, Cfit,
                                  anchor_right, is_root, verbose)
     vars = gp.vars
-    p_i = vars["p"]; rt_i = vars["rho_t"]
+    p_i = vars["p"]
     mubar = gp.mubar
     npts = ncol * kDim
     ures = Vector{Float64}(undef, npts)
     wres = Vector{Float64}(undef, npts)
     i = 1
     for _ in 1:ncol, k in 1:kDim
-        rtp = patch.physical[i, rt_i, 1]
+        rtp = work.physical[i, 1, 1]        # the working ρ_t' (`_native_working_grid`)
         rho_t = rtp + rho_tbar[k]
         ures[i] = -(patch.physical[i, p_i, 2] - (rho_t * Cfit[i])) / rho_t
         wres[i] = -(patch.physical[i, p_i, 4] + (gravity * rtp)) / rho_t

@@ -123,9 +123,11 @@ function vt_run!(m, p, mo, nsteps; t0 = 1)
 end
 
 """A kinked cloud sheet 200-1150 m of amplitude `amp` (its top sharper than one 500 m cell,
-so the refit rings the cloud slot below zero above it), added at FIXED T: rho_t and E_t carry
-the cloud's mass and BF02 energy. A vapor bump `vamp` at 3 km (rho_t carries it, E_t its
-C_vv T + g z) and a smooth w `wamp`."""
+so the refit rings the cloud slot below zero above it), added at FIXED T: E_t carries the
+cloud's BF02 energy (and the derived total ρ_d + Σ α ν its mass). A vapor-energy bump `vamp`
+at 3 km in E_t (its C_vv T + g z; until Stage 4 of the ρ_t retirement the bump was also written
+into the prognostic ρ_t slot, which no reader of the derived anchor took) and a smooth w
+`wamp`."""
 vt_kink(z; zb = 200.0, zt = 1150.0, amp = 1.0e-3) =
     max(0.0, amp * (z - zb) * (zt - z) / ((zt - zb) / 2)^2)
 
@@ -138,7 +140,6 @@ function vt_seed!(patch, pts, V, col; amp = 1.0e-3, wamp = 0.5, vamp = 1.0e-3)
         T = col.Tk[k]
         dv = vamp * exp(-((z - 3000.0) / 1200.0)^2)
         patch.physical[i, rc_i, 1] = Scythe.condensate_slot(rc, 0.0, :bhyp, MU)
-        patch.physical[i, V["rho_t"], 1] = rc + dv
         patch.physical[i, V["E_t"], 1] = rc * ((Cpv * T) - L_v(T) + (gravity * z)) +
                                           dv * ((Scythe.Cvv * T) + (gravity * z))
         patch.physical[i, V["w"], 1] = wamp * sin(2pi * pts[i, 1] / SPAN) * sin(pi * z / ZTOP)
@@ -146,9 +147,9 @@ function vt_seed!(patch, pts, V, col; amp = 1.0e-3, wamp = 0.5, vamp = 1.0e-3)
     return nothing
 end
 
-"""[`vt_seed!`](@ref) plus a PROGNOSTIC vapor bump `vslot` at 5 km, raised in rho_t and E_t too
-(so no gap there), written into the vapor slot through `Scythe.vapor_slot` under the tile's
-own transform (`vtr`, `vmu`) -- the density perturbation under `:none`."""
+"""[`vt_seed!`](@ref) plus a PROGNOSTIC vapor bump `vslot` at 5 km, raised in E_t too, written
+into the vapor slot through `Scythe.vapor_slot` under the tile's own transform (`vtr`, `vmu`)
+-- the density perturbation under `:none`."""
 function vt_seed_vapor!(patch, pts, V, col; vslot = 5.0e-4, vtr = :none, vmu = 1.0e-9,
                         rho_vbar = nothing, kw...)
     vt_seed!(patch, pts, V, col; kw...)
@@ -164,7 +165,6 @@ function vt_seed_vapor!(patch, pts, V, col; vslot = 5.0e-4, vtr = :none, vmu = 1
             rvb = rho_vbar[k]
             patch.physical[i, rv_i, 1] = Scythe.bhyp(rvb + dv, vmu) - Scythe.bhyp(rvb, vmu)
         end
-        patch.physical[i, V["rho_t"], 1] += dv
         patch.physical[i, V["E_t"], 1] += dv * ((Scythe.Cvv * T) + (gravity * z))
     end
     return nothing

@@ -156,9 +156,12 @@ using SparseArrays
         @test F_sh > 0.0
         @test F_q > 0.0
 
-        D1 = D[rng, 1]; D3 = D[rng, 3]; D6 = D[rng, 6]; D7 = D[rng, 7]
+        D1 = D[rng, vars["p"]]; D3 = D[rng, vars["rho_v"]]
+        D6 = D[rng, vars["E_t"]]; D7 = D[rng, vars["Q_ss"]]
 
-        # Total water gain telescopes to F_q exactly (up to the spline fit)
+        # Total water gain telescopes to F_q exactly (up to the spline fit). The surface
+        # flux enters the vapor slot alone (slot 3 since Stage 4, which deleted the rho_t
+        # slot that used to carry it as the total water), so its gain IS the total.
         @test isapprox(trapz(z, D3), F_q; rtol=0.1)
 
         # Energy gain = sensible flux + the internal+potential energy the vapor
@@ -192,11 +195,11 @@ using SparseArrays
         vars = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS_CYL))
         v1 = patch.physical[rng, vars["v"], 1][1]
         F_q = 1.0e-3 * abs(v1) * rho_v_sat(Tbar[1], pbar[1] / 100.0)
-        @test isapprox(trapz(z, D[rng, 3]), F_q; rtol=0.1)
+        @test isapprox(trapz(z, D[rng, vars["rho_v"]]), F_q; rtol=0.1)
         # Energy gain reduces to the vapor internal+potential energy term
         ke1 = 0.5 * v1^2
         want_E = ((Cvv * Tbar[1]) + (gravity * z[1]) + ke1) * F_q
-        @test isapprox(trapz(z, D[rng, 6]), want_E; rtol=0.1)
+        @test isapprox(trapz(z, D[rng, vars["E_t"]]), want_E; rtol=0.1)
     end
 
     @testset "calm limit: no wind, no fluxes (bitwise)" begin
@@ -208,12 +211,15 @@ using SparseArrays
         U_min = 5.0
         D, patch, gp, z, mtile = sfc_increment(0.0; U_min=U_min)
         kDim = gp.kDim
+        vars = gp.vars
         pbar = Springsteel.ref_pressure(mtile.ref_state)[:, 1]
         F_q = 1.0e-3 * U_min * rho_v_sat(301.15, pbar[1] / 100.0)
-        @test isapprox(trapz(z, D[1:kDim, 3]), F_q; rtol=0.1)
-        # No momentum drag from the floor (u1 = v1 = 0: the stress is still 0)
-        @test maximum(abs.(D[:, 4])) == 0.0
-        @test maximum(abs.(D[:, 9])) == 0.0
+        @test isapprox(trapz(z, D[1:kDim, vars["rho_v"]]), F_q; rtol=0.1)
+        # No momentum drag from the floor (u1 = v1 = 0: the stress is still 0). By name:
+        # the literal 9 this read was rho_c, not v (v is 10 on the cylinder).
+        @test maximum(abs.(D[:, vars["u"]])) == 0.0
+        @test maximum(abs.(D[:, vars["v"]])) == 0.0
+        @test maximum(abs.(D[:, vars["rho_c"]])) == 0.0
     end
 
     # ──────────────────────────────────────────────
@@ -226,7 +232,7 @@ using SparseArrays
         for V0 in (10.0, 20.0)
             D, patch, gp, z, mtile = sfc_increment(V0)
             kDim = gp.kDim
-            push!(got, trapz(z, D[1:kDim, 3]))
+            push!(got, trapz(z, D[1:kDim, vars["rho_v"]]))
             push!(v1s, patch.physical[1:kDim, vars["v"], 1][1])
         end
         @test isapprox(got[2] / got[1], v1s[2] / v1s[1]; rtol=0.02)

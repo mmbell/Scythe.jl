@@ -1,9 +1,11 @@
 # test/test_horizontal_water_mixing.jl -- the horizontal water-species mixing leg of
 # `mc_driver!` (`physical_params[:Khdiff_water]`, `physics.horizontal_mixing.water`): EVERY
 # water species mixes with ONE coefficient K_water = K/Sc_t (Smagorinsky or constant) --
-# total water (slot 3), the prognostic vapor, cloud and rain (and the rain number), and
-# under ISHMAEL all three ice species' mass AND number and habit moments, so crystals are
-# not rescaled by the operator.
+# the prognostic vapor, cloud and rain (and the rain number), and under ISHMAEL all three
+# ice species' mass AND number and habit moments, so crystals are not rescaled by the
+# operator. (The total-water leg on slot 3 was retired with slot 3 at Stage 4 of the rho_t
+# retirement: the total is derived, rho_t = rho_d + sum_k alpha_k nu_k, so it moves with the
+# species legs by construction.)
 #
 # Every assertion is on the DIFFERENCE of two tiles advanced from the same state with the
 # mixing on and off, so advection, the pressure gradient, buoyancy and every microphysical
@@ -122,8 +124,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                         ri_sum += q
                     end
                 end
-                # Total water carries every species, so the partition starts closed.
-                patch.physical[i, V["rho_t"], 1] = rv + rc + rr + ri_sum
+                # (no rho_t to close: the total is derived from the species since Stage 4)
             end
         end
         spectralTransform!(patch)
@@ -161,7 +162,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         return [gw[mod1(div(i - 1, kDim) + 1, 3)] for i in 1:size(patch.physical, 1)]
     end
 
-    """The water slots the leg mixes, by role (slot 3 is handled separately)."""
+    """The water slots the leg mixes, by role."""
     function water_slots(model; ice = true)
         V = model.grid_params.vars
         s = [Scythe.mc_slot(V, r) for r in ("rho_v", "rho_c", "rho_r", "n_r", "Q_ss")]
@@ -182,10 +183,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                     @test sc > 0.0                       # the seed really has x-structure
                     @test isapprox(D[:, s], expect; rtol = 0.0, atol = tol(m, s, expect))
                 end
-                # Slot 3 mixes WATER only: rho_t' - rho_d' (dry air is not mixed).
-                e3 = K .* (p.physical[:, V["rho_t"], 3] .- p.physical[:, V["rho_d"], 3])
-                @test isapprox(D[:, V["rho_t"]], e3; rtol = 0.0,
-                               atol = tol(m, V["rho_t"], e3))
+                # (the slot-3 total-water assertion went with slot 3 at Stage 4)
                 # Nothing else moves: no dry air, momentum, energy, pressure.
                 for nm in ("rho_d", "u", "w", "E_t", "p")
                     @test all(D[:, V[nm]] .== 0.0)
@@ -229,9 +227,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 worst = 0.0
                 for s in slots, k in 1:kDim
                     idx = k:kDim:size(p.physical, 1)
-                    phixx = s == V["rho_t"] ?
-                        p.physical[idx, s, 3] .- p.physical[idx, V["rho_d"], 3] :
-                        p.physical[idx, s, 3]
+                    phixx = p.physical[idx, s, 3]
                     E = Kv[idx] .* phixx
                     gross = sum(w[idx] .* abs.(E))
                     gross > 0.0 && (worst = max(worst, abs(sum(w[idx] .* E)) / gross))
@@ -239,7 +235,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 return worst
             end
             _, _, p, mo = mix_increment(tmp, "mc_const"; Kw = 2000.0, tr = :none)
-            slots = vcat(water_slots(mo), mo.grid_params.vars["rho_t"])
+            slots = water_slots(mo)
             rel_const = closure(fill(2000.0, size(p.physical, 1)), p, mo, slots)
             @test rel_const < 1.0e-12
             _, _, p, mo = mix_increment(tmp, "mc_smag"; Kw = -1.0, C_s = 0.2, tr = :none)
@@ -302,68 +298,18 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
         end
     end
 
-    @testset "the species sum stays on slot 3: rho_v + Σ condensates = rho_t − rho_d" begin
-        # gap = (ρ_t' − ρ_d') − (ρ_v' + ρ_c + ρ_r + Σρ_i): with every species mixed by the
-        # same K, the mixing's contribution to the gap is zero under `:none` (one linear
-        # operator on a sum). Under `:bhyp` slot 3 mixes in DENSITY and the condensates in
-        # ν, and the recovered density rate is f'(ν)·K∇²ν: equal to K∇²ρ to O(μ²/ρ²) above
-        # the knee, but ZERO where the spline fit of a sharp feature rings into ν < 0 (`ahyp`
-        # is floored there, f' = 0). At those LOBE points the mass slot 3 receives does not
-        # reach any species — it goes into lifting the negative ν toward zero, i.e. into
-        # shrinking the lobe pool Σ 2 min(ν, 0) — so the gap is measured separately on and
-        # off the lobes, and the pool is checked to shrink. Without the vapor term — the leg
-        # as it was — the gap would be the whole vapor Laplacian (`old`).
-        mktempdir() do tmp
-            dt = 50.0
-            for tr in (:none, :bhyp)
-                D, _, p, mo = mix_increment(tmp, "gap_$(tr)"; Kw = 2000.0, tr = tr)
-                V = mo.grid_params.vars
-                ii = Scythe.mc_ice_slot_indices(V)
-                mass = [(Scythe.mc_slot(V, "rho_c"), MU_C), (Scythe.mc_slot(V, "rho_r"), MU_C)]
-                for k in 1:3
-                    push!(mass, (ii[4k-3], Scythe.MC_ICE_MU_DEFAULTS[4k-3]))
-                end
-                nu(s, d) = p.physical[:, s, 1] .+ d .* D[:, s]
-                function gap(d)
-                    g = nu(V["rho_t"], d) .- nu(V["rho_v"], d)
-                    for (s, mu) in mass
-                        g .-= Scythe.recover_total.(nu(s, d), tr, mu)
-                    end
-                    return g
-                end
-                # Under `:none` nothing is floored, so there is no lobe class: every point
-                # must close to rounding.
-                lobe = falses(size(D, 1))
-                if tr !== :none
-                    for (s, _) in mass
-                        lobe .|= (nu(s, 0.0) .< 0.0) .| (nu(s, dt) .< 0.0)
-                    end
-                end
-                dgap = gap(dt) .- gap(0.0)
-                moved = maximum(dt .* abs.(D[:, V["rho_t"]]))
-                rel = maximum(abs.(dgap[.!lobe])) / moved
-                rel_lobe = any(lobe) ? maximum(abs.(dgap[lobe])) / moved : 0.0
-                old = maximum(abs.(dt .* D[:, V["rho_v"]])) / moved
-                pool(d) = sum(sum(2.0 .* min.(nu(s, d), 0.0)) for (s, _) in mass)
-                @info "species-sum gap from one mixing step / max water moved" tr rel rel_lobe old n_lobe = count(lobe) pool0 = pool(0.0) pool1 = pool(dt)
-                @test old > 0.1                          # the vapor term is not negligible
-                # `:none`: rounding. `:bhyp`, off the lobes: the knee points (0 < ν ≲ μ, where
-                # f' runs from 1 to 2) carry an ABSOLUTE error of order μ per step — the O(μ)
-                # convention error, measured 0.3 μ here (1.4e-3 of the water moved).
-                if tr === :none
-                    @test rel < 1.0e-12
-                else
-                    @test maximum(abs.(dgap[.!lobe])) < MU_C
-                end
-                if tr === :bhyp
-                    @test any(lobe)                      # the sharp seeds do ring
-                    @test pool(dt) > pool(0.0)           # mixing shrinks the lobe pool
-                end
-            end
-        end
-    end
+    # "the species sum stays on slot 3" was deleted at Stage 4 of the rho_t retirement: its
+    # subject was the agreement of the slot-3 total-water leg with the species legs, and that
+    # leg went with slot 3. The derived total rho_w = sum_k alpha_k nu_k is linear in the slots,
+    # so the mixing moves it by K lap(rho_w) by construction (test_water_anchor.jl, "3c:
+    # horizontal water mixing under :derived"); the partition gap the species' recovered
+    # densities leave against it is the multi-step test below.
 
     @testset "the species-sum gap does not grow over several full steps" begin
+        # The partition gap against the DERIVED total (Stage 4): X' = W' - rho_v' - sum_k rho_k
+        # with W' = sum_k alpha_k nu_k' (`anchor_Wp`; the vapor is a density here, alpha = 1,
+        # and every transformed mass slot is its own total, alpha = 2) -- the affine defects and
+        # the lobe pool of the transformed species.
         mktempdir() do tmp
             nsteps = 10
             res = Dict{Float64,Float64}()
@@ -371,8 +317,9 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
                 m, p, mo = hwm_tile(tmp, "gs_$(Kw)"; Khdiff_water = Kw, tr = :bhyp)
                 V = mo.grid_params.vars
                 ii = Scythe.mc_ice_slot_indices(V)
+                ws = Scythe.water_anchor_set(mo.options, mo.physical_params, m.mc_slots)
                 function gapmax()
-                    g = p.physical[:, V["rho_t"], 1] .- p.physical[:, V["rho_d"], 1] .-
+                    g = [Scythe.anchor_Wp(p.physical, j, 1, ws) for j in 1:size(p.physical, 1)] .-
                         p.physical[:, V["rho_v"], 1] .-
                         Scythe.recover_total.(p.physical[:, V["nu_c"], 1], :bhyp, MU_C) .-
                         Scythe.recover_total.(p.physical[:, V["nu_r"], 1], :bhyp, MU_C)
@@ -393,7 +340,7 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
             end
             @info "species-sum gap growth over 10 steps [kg/m^3]" off = res[0.0] on = res[2000.0]
             # The mixing adds at most O(μ) per step of gap on top of what the unmixed run
-            # already carries (advection of each species on its own fit, the nudges).
+            # already carries (advection of each species on its own fit).
             @test abs(res[2000.0] - res[0.0]) < nsteps * MU_C
         end
     end
