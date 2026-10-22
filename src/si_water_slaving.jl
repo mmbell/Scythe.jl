@@ -980,11 +980,37 @@ transform (`MC_SHADOW_*`). Called once at initialization — after an initialize
 after a restart's load (a converted checkpoint's slot 3 carries the old run's partition gap,
 which would otherwise be read as shadow drift). A no-op under `:slot`; every other slot's
 coefficients are untouched.
+
+THE GAP IT DISCARDS IS PRINTED (`report`, default true): the pre-zero shadow gap of the loaded
+state, `G = ρ_t'^slot − (ρ_d' + W')` at the gridpoints, as its maximum `|G|` and its mean, on
+one line. On a restart of a derived run that is the shadow drift the previous segment
+accumulated, and RE-ZEROING ON EVERY LOAD means the `MC_SHADOW_*` census of a segmented run
+measures the drift of ONE segment, never the run's.
+
+WHAT THE SHADOW CAN AND CANNOT SEE (review D6, by construction): slot 3 keeps its own transport,
+its own `−ρ_s ∇·u`, the sedimentation and the acoustic increment of the solve's operator, so its
+gap from the derived total measures how far the linear ρ_t equation and the sum of the members'
+ν equations have drifted apart under the shared dynamics. It is BLIND to the boundary layer's
+water legs (MYNN, Louis: they write `Σ α_k ν̇_k` plus the surface flux into slot 3 with the
+members, so they move both sides identically) and to horizontal water mixing
+(`Khdiff_water`, likewise written as the same sum) — those operators can never open the gap,
+whatever they do to the members.
 """
-function init_water_anchor_shadow!(grid, model)
+function init_water_anchor_shadow!(grid, model; report::Bool = true)
     uses_pressure_reference(model.equation_set) || return grid
     water_anchor_mode(model.options) === :derived || return grid
     ws = water_anchor_set(model.options, model.physical_params, mc_slots(model))
+    if report
+        ph = grid.physical
+        gm = 0.0; gs = 0.0
+        @inbounds for g in axes(ph, 1)
+            G = ph[g, 3, 1] - anchor_rho_tp(ph[g, 2, 1], anchor_Wp(ph, g, 1, ws))
+            gm = max(gm, abs(G)); gs += G
+        end
+        println("Scythe: water anchor shadow (re)started as the derived total; the discarded " *
+                "pre-zero shadow gap was max|G| = $(gm) kg/m3, mean G = " *
+                "$(gs / max(size(ph, 1), 1)) kg/m3")
+    end
     sp = grid.spectral
     @inbounds for r in axes(sp, 1)
         W = 0.0; first = true

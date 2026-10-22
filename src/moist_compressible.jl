@@ -2157,6 +2157,12 @@ above. `ρ_w` is the water anchor: `Σ_k α_k ν_k` under `options[:water_anchor
 | `MC_W_SEEN`     | 1 once a report has set `MC_W_INT` (thread 1) |
 | `MC_SHADOW_MAX` | under `:derived`, the shadow gap `max\\|G\\|`, `G = ρ_t'^slot − (ρ_d' + Σ_k α_k ν_k')` — slot 3, the passive shadow of the linear ρ_t, against the derived total — at the report [kg/m³] |
 | `MC_SHADOW_INT` | its column integral at the report [kg/m², tile mean] |
+
+AN OPEN ITEM, recorded (Stage 3 review D7): on the 2-D RCE 24 → 27 h restart under the derived
+anchor `MC_W_BUDGET` summed to −0.137 kg/m² against +0.254 kg/m² of surface sources, and the
+shadow (the old linear ρ_t equation) lost the same amount — so the residual is not a Stage 3
+term but one the old `ρ_t` shares: transport, the SI increment, or the census's own source
+accounting (`MC_W_SRC`'s sedimentation term through the ground). Not yet attributed.
 """
 const MC_W_PART = MC_CEVAP_LAST + 14
 @doc (@doc MC_W_PART)

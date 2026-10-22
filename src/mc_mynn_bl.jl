@@ -1498,6 +1498,23 @@ flux-form column regrouped by species,
 
 (the `:slot` arm's `c_w ρ_{w,z} + c_v ρ_{v,z} − L_f ρ_{i,z}` with `c_w + c_v = e_v`), still
 telescoping: the D3 identity's right side is unchanged. Returns its boundary values.
+
+TWO CONSEQUENCES OF MIXING IN ν SPACE, stated (Stage 3 review, BL sub-check; neither is a
+conservation defect — `ρ_w` is invariant pointwise and `E_t` telescopes):
+
+* CONDENSATE LOBES DIFFUSE. A cloud, rain or ice-mass lobe (`ν < 0`, recovered density 0) is
+  mixed like any other ν, so at a lobe edge the leg moves recovered condensate that the
+  linear `ν` flux does not carry one-for-one (`ahyp` clips one side). The energy is carried on
+  each species' REALIZED recovered rate, so the thermal remainder `qdot_w` books the
+  difference as heating where the recovered mass appears or vanishes: a column-neutral
+  (the flux-form `S_Ew` telescopes), latent-scale heating DIPOLE across the lobe edge, with
+  `R` held to second order.
+* ICE MASS IS MIXED IN ν SPACE, THE ICE MOMENTS IN DENSITY SPACE. The three ice masses are
+  water-mass slots and take a ν leg here; their numbers, axes and habit moments are not in
+  `ρ_w` and keep the density-space legs of the `:slot` arm (`options[:mynn_mix_numbers]`).
+  The per-particle state is therefore not exactly invariant under the leg wherever an ice
+  mass is off its affine branch (near the knee or in a lobe); the water and the energy are
+  unaffected.
 """
 @noinline function _mynn_nu_legs!(mtile::ModelTile, MY::MYNNState, S, MN::MYNNColumnScratch,
                                   work::MYNNWork, colstart::Int64, n::Int64, z, rvv, rcv,

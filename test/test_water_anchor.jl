@@ -949,6 +949,45 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
+    @testset "D6: a load re-zeroes the shadow and prints the gap it discards" begin
+        mktempdir() do tmp
+            m, p, mo = F.vt_tile(tmp, "d6"; vtr = :bhyp, extra = derived(),
+                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+            F.vt_run!(m, p, mo, 2)
+            # a converted checkpoint's slot 3: the derived total plus a known gap
+            Scythe.init_water_anchor_shadow!(p, mo; report = false)
+            p.physical[:, 3, 1] .+= 2.5e-6
+            p.physical[5, 3, 1] += 1.0e-5
+            out = mktemp() do path, io
+                redirect_stdout(io) do
+                    Scythe.init_water_anchor_shadow!(p, mo)
+                end
+                flush(io); read(path, String)
+            end
+            @test occursin("pre-zero shadow gap", out)
+            mx = parse(Float64, match(r"max\|G\| = ([-0-9.eE+]+)", out).captures[1])
+            mn = parse(Float64, match(r"mean G = ([-0-9.eE+]+)", out).captures[1])
+            @test mx ≈ 1.25e-5 rtol = 1.0e-3
+            @test mn ≈ 2.5e-6 + 1.0e-5 / size(p.physical, 1) rtol = 1.0e-3
+            # ...and after it the gap is the rounding of one transform
+            ws = Scythe.water_anchor_set(mo.options, mo.physical_params, Scythe.mc_slots(mo))
+            G = [p.physical[g, 3, 1] - Scythe.anchor_rho_tp(p.physical[g, 2, 1],
+                                                            Scythe.anchor_Wp(p.physical, g, 1, ws))
+                 for g in axes(p.physical, 1)]
+            @test maximum(abs, G) <= 1.0e-12
+            # :slot: a no-op, nothing printed
+            m2, p2, mo2 = F.vt_tile(tmp, "d6s"; vtr = :bhyp)
+            x0 = copy(p2.physical)
+            out2 = mktemp() do path, io
+                redirect_stdout(io) do
+                    Scythe.init_water_anchor_shadow!(p2, mo2)
+                end
+                flush(io); read(path, String)
+            end
+            @test isempty(out2) && p2.physical == x0
+        end
+    end
+
     @testset "3c E4: the exchange realization closes on the recovered change (vapor as closure)" begin
         # Supersaturated air over a ringing sheet: condensation is requested at lobe points
         # (recovered cloud 0). One ETD stage re-applied on the post-explicit state: at a deep
