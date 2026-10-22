@@ -708,7 +708,9 @@ drag-work-minus-production heat stays in `bl`.
                 sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * rec)
             end
         else
-            sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cwv * F_q * gz)
+            # (the :slot arm's own association, bitwise a4bd88f: ((C_vv T + ke) + g z))
+            cws = (Cvv * Tk[k]) + ke[k] + (gravity * z[k])
+            sE = (-((tau_u * u) + (tau_v * v)) * gz) + (F_sh * gz) + (cws * F_q * gz)
             sp = ((R_m[k] / C_vt[k]) * F_sh * gz) + (Rv * Tk[k] * F_q * gz)
             # the vapor slot holds ν under the vapor control variable: its share through J_v
             sv = eb.vtr === :none ? sq : J_v[k] * sq

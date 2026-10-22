@@ -646,9 +646,15 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                    for k in 1:kD]
             @test any(!=(0.0), dvv)
             @test all(k -> (dvv[k] == 0.0) == (dfl.d1[k] == nov.d1[k]), 1:kD)
-            # the form is validated
+            # the forms are validated, on either anchor
             bad = derived(; refit_partner_form = :full)
             @test_throws ErrorException F.vt_tile(tmp, "bisbad"; vtr = :bhyp, extra = bad)
+            @test_throws ErrorException F.vt_tile(tmp, "bisslot"; vtr = :bhyp,
+                extra = Dict{Symbol,Any}(:refit_partner_form => :recovered))
+            @test_throws ErrorException F.vt_tile(tmp, "bisfn"; vtr = :bhyp,
+                extra = Dict{Symbol,Any}(:energy_budget_functional => :slot3))
+            @test F.vt_tile(tmp, "bisok"; vtr = :bhyp,
+                extra = Dict{Symbol,Any}(:refit_partner_form => :defect)) isa Tuple
         end
         # E-c: the derived R functional on a :slot tile (the same state into both)
         mktempdir() do tmp
@@ -868,6 +874,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                         p.physical[i, V["nu_i1"], 1] = Scythe.bhyp(2.0e-4, 1.0e-9)
                         p.physical[i, V["nu_v"], 1] -= 1.5 *
                             Scythe.bhyp(c.rho_v[mod1(i, kD)], 1.0e-9)
+                        # ...and the linear rho_t short of the vapor there, so the :slot
+                        # anchor (slot 3) leaves the ice no headroom and its legs fire too
+                        p.physical[i, V["rho_t"], 1] -= c.rho_v[mod1(i, kD)] + 5.0e-3
                     end
                 end
             end
@@ -878,6 +887,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 F.vt_run!(m, p, mo, 3)
                 st = m.mc_water_stats
                 kD = mo.grid_params.kDim
+                # the gap row of THIS column step alone (it is a run maximum)
+                fill!(view(st, Scythe.MC_ANCHOR_GAP, :), 0.0)
                 Scythe.advance_column(m, 1, 4)
                 S = m.mc_scratch[Threads.threadid()]
                 if wa === :derived
@@ -886,16 +897,37 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                     @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
                     @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) == 0.0
                     G = maximum(abs, m.tile.physical[1:kD, 3, 1] .- S.res_rho_t)
-                    @test maximum(view(st, Scythe.MC_ANCHOR_GAP, :)) >= G
+                    @test G > 0.0
+                    @test maximum(view(st, Scythe.MC_ANCHOR_GAP, :)) == G
                     # ...and the headroom test the legs WOULD read fires here (the measure)
                     hit = count(i -> S.rho_ice[i] > Scythe.anchor_headroom(S.rho_t[i] - S.rho_d[i],
                                                                            S.rho_liq[i], 0.0),
                                 1:kD)
                     @test hit > 0
                 else
-                    @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) >= 0.0
+                    # the legs are live under :slot on this fixture: the census counts, the
+                    # rate/flux share (anchor_f, the rate leg's only input) binds below 1
+                    @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) > 0.0
+                    @test any(<(1.0), S.anchor_f)
+                    @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) > 0.0
                 end
             end
+        end
+    end
+
+    @testset "D1: MC_ANCHOR_GAP reads the shadow gap on a WARM :derived tile too" begin
+        mktempdir() do tmp
+            m, p, mo = F.vt_tile(tmp, "d1w"; vtr = :bhyp, extra = derived(),
+                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+            F.vt_run!(m, p, mo, 2)
+            st = m.mc_water_stats; kD = mo.grid_params.kDim
+            fill!(view(st, Scythe.MC_ANCHOR_GAP, :), 0.0)
+            Scythe.advance_column(m, 1, 3)
+            S = m.mc_scratch[Threads.threadid()]
+            G = maximum(abs, m.tile.physical[1:kD, 3, 1] .- S.res_rho_t)
+            @test G > 0.0
+            @test maximum(view(st, Scythe.MC_ANCHOR_GAP, :)) == G
+            @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
         end
     end
 
@@ -1019,12 +1051,13 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             # (the vapor's own kappa term off in both, so the two forms differ by the condensate)
             off = arm(:refit_partner => false); dfl = arm(:refit_partner_vapor => false)
             rec = arm(:refit_partner_form => :recovered)
+            dfp = arm()             # the PRODUCTION default: the defect form with the vapor's kappa term
             V = mo0.grid_params.vars; kD = mo0.grid_params.kDim
             R0, _ = RX(off.m, off.pre)
             Rafter(a) = begin
                 X = copy(a.phys); X[1:kD, 1] .+= (a.d1 .- off.d1); first(RX(off.m, X))
             end
-            Rd = Rafter(dfl); Rr = Rafter(rec); Rn = first(RX(off.m, off.phys))
+            Rd = Rafter(dfl); Rr = Rafter(rec); Rp = Rafter(dfp); Rn = first(RX(off.m, off.phys))
             npre = off.pre[1:kD, V["nu_c"]]; npost = off.phys[1:kD, V["nu_c"]]
             # lambda_l in R units: the energy of condensate appearing alone, L_v - C_pv T
             lam = off.Lv .- (Scythe.Cpv .* off.Tk)
@@ -1040,10 +1073,12 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 lamf = lam[k] - off.Tk[k] * ((off.C_vt[k] * Scythe.Rv / off.R_m[k]) - Scythe.Cvv)
                 @test abs((Rr[k] - Rd[k]) + ((lamf * full) - (lam[k] * dfc))) <= 2.0e-3 * scale
                 @test abs(Rr[k] - Rd[k]) > 0.5 * scale
-                # ...and the defect form books only O(mu) there, R where the refit left it
+                # ...and the defect form books only O(mu) there, R where the refit left it --
+                # with and without the vapor's kappa term (the production default is with it)
                 @test abs(Rd[k] - Rn[k]) <= 1.0e-3 * scale
+                @test abs(Rp[k] - Rn[k]) <= 1.0e-3 * scale
+                @test abs(Rr[k] - Rp[k]) > 0.5 * scale
             end
-            @test abs(Rn[1] - R0[1]) >= 0.0
         end
     end
 
@@ -1104,8 +1139,30 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                      extra = derived(; energy_budget = true, precipitation = true),
                                      seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c; amp = 2.0e-3))
                 eb = m.ebudget; kD = eb.kDim; nc = F.vt_ncols(p, mo)
-                colR(A) = [first(Scythe._eb_column_RX(eb, A, (c - 1) * kD, 1)) for c in 1:nc]
-                Rs = colR(p.physical)
+                # R written out here, independently of `_eb_point_RX`/`_eb_column_RX`: the
+                # derived functional with every water-mass slot :bhyp (vapor against nu_vbar,
+                # cloud against nu_cbar), T from the EOS, the column's Gauss weights
+                pp = mo.physical_params
+                vmu = Scythe.vapor_mu(pp); cmu = F.MU; rmu = F.MU
+                imu = ice ? Scythe.ice_mu(pp, 1) : 1.0
+                ii = ice ? (m.mc_slots.i1_q, m.mc_slots.i2_q, m.mc_slots.i3_q) : ()
+                Rpt(A, g, k) = begin
+                    p_ = A[g, 1] + eb.pbar[k]; rd = A[g, 2] + eb.rho_dbar[k]
+                    Et = A[g, 6] + eb.E_tbar[k]
+                    nv = A[g, m.mc_slots.rho_v] + eb.nu_vbar[k]; rv = Scythe.ahyp(nv, vmu)
+                    nc_ = A[g, 9] + eb.nu_cbar[k]; nr = A[g, 8]
+                    rl = Scythe.ahyp(nc_, cmu) + Scythe.ahyp(nr, rmu)
+                    ri = 0.0; Wi = 0.0
+                    for s in ii
+                        ri += Scythe.ahyp(A[g, s], imu); Wi += 2.0 * A[g, s]
+                    end
+                    W = 2.0 * nv + 2.0 * nc_ + 2.0 * nr + Wi
+                    T = p_ / (rd * Scythe.Rd + rv * Scythe.Rv)
+                    geo = 0.5 * (A[g, 4]^2 + A[g, 5]^2) + Scythe.gravity * eb.z[k]
+                    Et - Scythe.implied_total_energy(T, rd, rv, rl, ri, rd + W, geo)
+                end
+                colR(A) = [sum(eb.wz[k] * Rpt(A, (c - 1) * kD + k, k) for k in 1:kD) for c in 1:nc]
+                Rs = colR(p.physical[:, :, 1])
                 for t in 1:6
                     for c in 1:nc
                         Scythe.advance_column(m, c, t)
@@ -1115,8 +1172,14 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 Re = colR(m.var_np1)
                 snap = Scythe.energy_budget_snapshot!(m)
                 tR = vec(sum(snap.dR[collect(Scythe.EB_TOP), :]; dims = 1))
-                @test maximum(abs, tR .- (Re .- Rs)) <= 1.0e-10 * maximum(abs, Re .- Rs) +
-                                                      1.0e-12 * maximum(abs, snap.dR)
+                @test maximum(abs, tR .- (Re .- Rs)) <= 1.0e-8 * maximum(abs, Re .- Rs) +
+                                                      1.0e-10 * maximum(abs, snap.dR)
+                # the explicit sub-rows (dyn, the eight isolated operators incl. wexch, nonlin)
+                # sum to the explicit row
+                subs = [Scythe.EB_X_DYN; collect(Scythe.EB_OP_ROW); Scythe.EB_X_NONLIN]
+                sx = vec(sum(snap.dR[subs, :]; dims = 1))
+                @test maximum(abs, sx .- snap.dR[Scythe.EB_EXPLICIT, :]) <=
+                      1.0e-12 * maximum(abs, snap.dR[subs, :])
                 wx = snap.dR[Scythe.EB_OP_ROW[Scythe.EB_OP_WEXCH], :]
                 @test any(!=(0.0), view(eb.tnm1, :, :, Scythe.EB_OP_WEXCH))
                 @test all(isfinite, wx)
@@ -1205,6 +1268,62 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 for md in models
                     @test Scythe.validate_si_water_slots(md) === nothing
                     @test Scythe.validate_water_anchor(md) === nothing
+                end
+            end
+        end
+    end
+
+    @testset "B2: pure freezing -- L_f counted exactly once, realized = old where affine" begin
+        # A pure freezing increment F (the cloud loses F to ice1: ICE_C = -F, SRC_i1q = +F): the
+        # process tendency carries (R_m/C_vt) L_f FRZ_NET with FRZ_NET = -(ICE_C + ICE_R) = F;
+        # the closure's partner must add nothing more, so p moves by (R_m/C_vt)(L_s - L_v) F in
+        # total. Exact under untransformed condensate (every J = 1, recovery the identity); at
+        # an above-knee point under :bhyp the realized booking equals the old requested-mass
+        # one (which books dep = ICE_C + ICE_R + sum SRC = 0) to O(curvature).
+        mktempdir() do tmp
+            for tr in (:none, :bhyp)
+                m, p, mo = F.vt_tile(tmp, "b2f_$(tr)"; vtr = :bhyp, ice = true, tr,
+                                     extra = derived(; refit_partner = false),
+                                     seed! = (p, x, V, c) -> begin
+                                         F.vt_seed!(p, x, V, c; amp = 2.0e-3)
+                                         for i in 1:size(p.physical, 1)
+                                             (300.0 < x[i, end] < 1100.0) &&
+                                                 (p.physical[i, V[haskey(V, "nu_i1") ? "nu_i1" : "rho_i1"], 1] =
+                                                      tr === :none ? 1.0e-3 : Scythe.bhyp(1.0e-3, 1.0e-9))
+                                         end
+                                     end)
+                F.vt_run!(m, p, mo, 2)
+                Scythe.advance_column(m, 1, 3)
+                S = m.mc_scratch[Threads.threadid()]
+                IS = m.mc_slots; kD = mo.grid_params.kDim
+                imu = Scythe.ice_mu(mo.physical_params, 1)
+                ks = tr === :none ?
+                    [k for k in 1:kD if S.nu_c[k] > 1.0e-5 && S.nu_i1q[k] > 1.0e-5] :
+                    [k for k in 1:kD if S.nu_c[k] > 1.0e3 * F.MU && S.nu_i1q[k] > 1.0e3 * imu]
+                @test !isempty(ks)
+                isempty(ks) && continue
+                k = ks[1]
+                for f in (:AUTO_COLL, :ICE_C, :ICE_R, :Fr_z, :SRC_i1q, :SRC_i2q, :SRC_i3q,
+                          :F_i1q_z, :F_i2q_z, :F_i3q_z)
+                    fill!(getfield(S, f), 0.0)
+                end
+                Fz = 1.0e-7
+                S.ICE_C[k] = -Fz; S.SRC_i1q[k] = Fz
+                ex = zeros(size(m.expdot_n))
+                Scythe._water_exchange_multistep!(ex, m.tile.physical, S, 1, IS.rho_v, mo.options,
+                    mo.physical_params, IS, true, true, Scythe.mc_nu_vbar(m), :bhyp,
+                    Scythe.vapor_mu(mo.physical_params), mo.ts)
+                frz = (S.R_m[k] / S.C_vt[k]) * (Scythe.L_f(S.Tk[k]) * (-(S.ICE_C[k] + S.ICE_R[k])))
+                want = (S.R_m[k] / S.C_vt[k]) * ((Scythe.L_s(S.Tk[k]) - S.Lv[k]) * Fz)
+                if tr === :none
+                    # nothing beyond FRZ_NET's L_f: the closure's p and vapor are exact zeros
+                    @test ex[k, 1] == 0.0
+                    @test ex[k, IS.rho_v] == 0.0
+                    @test abs((frz + ex[k, 1]) - want) <= 1.0e-14 * abs(want)
+                else
+                    # realized = the old (zero) booking to the curvature of the transform
+                    @test abs(ex[k, 1]) <= 1.0e-6 * abs(want)
+                    @test abs((frz + ex[k, 1]) - want) <= 1.0e-6 * abs(want)
                 end
             end
         end

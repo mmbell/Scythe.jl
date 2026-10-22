@@ -8007,12 +8007,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # `ρ_ice > W − ρ_liq` would instead fire at every vapor-lobe point with ice (`ρ_v + X < 0`,
     # the pool), turning a transport-detachment guard into a vapor-negativity device. The
     # census then reads the shadow gap (`_anchor_shadow_census!`).
-    wa_inert = !_wa_derived(model.options)
-    ice_anchor_src = get(model.options, :ice_anchor_source, true)::Bool && wa_inert
+    # `anchor_legs_on`: true = the four legs are ACTIVE (`:slot`), false = inert (`:derived`).
+    anchor_legs_on = !_wa_derived(model.options)
+    ice_anchor_src = get(model.options, :ice_anchor_source, true)::Bool && anchor_legs_on
     # The reader-side leg (see the rho_ice_t block): applied only with ice registered.
-    ice_anchor_flr = get(model.options, :ice_anchor_floor, true)::Bool && wa_inert
+    ice_anchor_flr = get(model.options, :ice_anchor_floor, true)::Bool && anchor_legs_on
     # The sedimentation leg (see the `anchor_f` scratch doc): applied only with ice on.
-    ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool && wa_inert
+    ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool && anchor_legs_on
     # LOBE ATTRIBUTION (see `ahyp_signed` and the `lobe_w` block below): the vapor residual
     # and the anchor headroom read each transformed water-mass slot's clipped negative lobe
     # through the odd continuation of `ahyp`, so the lobe the linear ρ_t carries is the
@@ -8069,7 +8070,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # instability wherever the fall speed increases upward. Forensics only.
     sed_lid_dir = sedimentation_flux_lid_dirichlet(model.options)
     # The rate-side leg (see the read block in `mc_ice_sources!`): ditto.
-    ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool && wa_inert
+    ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool && anchor_legs_on
     # The POPULATION reconciliation — the FOURTH tier of the chain (TeX §"Reconciliation of
     # the population"): ice mass whose carried number is not positive is orphaned by the
     # population gate, exempt from every rate AND from every device that could remove it, and
@@ -9139,6 +9140,10 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # energy and appear in no other equation, exactly as the rain number's does not.
     Fi_z = S.Fi_z
     E_sed_i_z = S.E_sed_i_z
+    # The MC_ANCHOR_* census under the derived anchor: the shadow gap, on every column (warm
+    # or ice), the legs being inert there (see `anchor_legs_on`).
+    anchor_legs_on || _anchor_shadow_census!(mtile.mc_water_stats, Threads.threadid(),
+                                             grid.physical, colstart, S.res_rho_t)
     if ice_on
         # The ice psychrometric factor (TeX Eq. Qs_ice) — `Q_s_energy` with L_v -> L_s in both
         # latent slots, the two saturation derivatives still over WATER. Formed here rather
@@ -9154,7 +9159,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         @inbounds for i in eachindex(af)
             head = anchor_headroom(rho_t[i] - rho_d[i], rho_liq[i], lobe_w[i])
             ri = rho_ice[i]
-            af[i] = (wa_inert && ri > head && ri > 0.0) ? head / ri : 1.0
+            af[i] = (anchor_legs_on && ri > head && ri > 0.0) ? head / ri : 1.0
         end
         # Every process rate: deposition through the shared prognostic supersaturation, the
         # full ISHMAEL nucleation/riming/aggregation/melting set, and the twelve slot sources
@@ -9182,14 +9187,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # fraction δ/(ρ_i·τ_anchor) — per-particle state and species shares exactly
         # invariant, no latent heat, nothing in λ/N. See `ice_anchor_rate` for the law and
         # TeX §"Reconciliation of the condensate partition" for the derivation.
-        if wa_inert
-            _ice_anchor_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
-                                   rho_t, rho_d, rho_liq, rho_ice, lobe_w,
-                                   tau_anchor, ice_anchor_src, model.ts)
-        else
-            _anchor_shadow_census!(mtile.mc_water_stats, Threads.threadid(), grid.physical,
-                                   colstart, S.res_rho_t)
-        end
+        # (under the derived anchor the legs are inert and the census reads the shadow gap,
+        # for every column, ice or not: `_anchor_shadow_census!` above)
+        anchor_legs_on && _ice_anchor_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
+                                                 rho_t, rho_d, rho_liq, rho_ice, lobe_w,
+                                                 tau_anchor, ice_anchor_src, model.ts)
 
         # The POPULATION RECONCILIATION — the fourth and last tier, in the same slot and for
         # the same reason as the third: the process sources are assembled and nothing has

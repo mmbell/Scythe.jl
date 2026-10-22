@@ -366,7 +366,12 @@ end
 The Louis BL's slot increments under the derived water anchor (plan E7): the vapor, cloud and
 rain legs are ν rates (`VDOT_v`, `VDOT_c`, and the rain's `K ∂z ν_r'` in `S.bl_s_z`, review D5 —
 MYNN's ν-leg set; Louis refuses ice), fitted from the slots' own gradients, landing on their
-slots directly; the liquid carry reads the cloud's and the rain's realized rates together, the surface moisture flux enters the vapor as `F_q g/α_v`, the shadow slot 3
+slots directly; the liquid carry reads the cloud's and the rain's realized rates together.
+Like the vapor and cloud legs, the rain leg's flux `K ∂z ν_r'` is fitted on the shared spline
+column (slot 8's basis, natural at the ground in every production configuration), so the
+diffusive flux at `z = 0` is FREE, not pinned to zero: whatever the fit puts there leaves or
+enters the column (a design consequence; the `:slot` arm's total-water leg had the same
+property). The surface moisture flux enters the vapor as `F_q g/α_v`, the shadow slot 3
 receives `Σ α_k ν̇_k + F_q g`, and the energy carry is the fixed-temperature map on the
 REALIZED recovered rates, `δE_t = C_vv T ρ̇_v + (C_pv T − L_v) ρ̇_c + (ke + gz)·ρ̇_w` (so
 `E_t − E_implied` is held to second order, the pool absorbing the water difference); `p` gets

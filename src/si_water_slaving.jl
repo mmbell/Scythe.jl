@@ -1092,7 +1092,18 @@ A no-op under `:slot` and for non-mc equation sets.
 """
 function validate_water_anchor(model)
     uses_pressure_reference(model.equation_set) || return nothing
-    water_anchor_mode(model.options) === :derived || return nothing
+    o = model.options
+    # The energy bisection's forensic options, on either anchor.
+    get(o, :energy_budget_functional, :model) in (:model, :derived) ||
+        error("options[:energy_budget_functional] must be :model (default) or :derived")
+    get(o, :refit_partner_form, :defect) in (:defect, :recovered) ||
+        error("options[:refit_partner_form] must be :defect (default) or :recovered")
+    water_anchor_mode(o) === :derived ||
+        (get(o, :refit_partner_form, :defect) === :recovered &&
+         error("options[:refit_partner_form] = :recovered selects a form of the DERIVED " *
+               "anchor's refit partner; under numerics.water_anchor = \"slot\" the partner is " *
+               "the recovered-change fold and the key would be ignored. Remove it."))
+    water_anchor_mode(o) === :derived || return nothing
     pp = model.physical_params; opts = model.options
     why = "options[:water_anchor] = :derived (numerics.water_anchor = \"derived\", the " *
           "run-config default) reads rho_t = rho_d + sum_k alpha_k nu_k and keeps slot 3 as a " *
@@ -1122,8 +1133,6 @@ function validate_water_anchor(model)
             "exceeded, and every MYNN water leg is a nu leg realized on its own recovered " *
             "rate). Remove the key or set numerics.water_anchor = \"slot\".")
     end
-    get(opts, :refit_partner_form, :defect) in (:defect, :recovered) ||
-        error("options[:refit_partner_form] must be :defect (default) or :recovered")
     get(opts, :water_budget_trace, 0) > 0 && error("options[:water_budget_trace] reads " *
         "slot 3 as the water anchor (the res_rho_t - rho_v gap census); refused under " * why)
     get(opts, :clamp_water, false) === true && error("options[:clamp_water] balances the " *
