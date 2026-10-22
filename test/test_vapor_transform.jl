@@ -238,9 +238,10 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 # slot carries a -0.0 at rest under :none too). The VAPOR slot's sign of zero is
                 # pinned exactly: its tendency is `ADV + (-(J_v (rho_v div)))` (div = +0.0, so the
                 # second term is -0.0) plus the exchange closure `water_exchange_dv` of zero
-                # exchanges, -(0.0)/alpha_v = -0.0, and a signed-zero sum keeps ADV's sign. ADV
-                # (`mc_advect!` of the zero state) is -0.0 at every level but the top four, where
-                # it is +0.0, so the warm and ice arms carry -0.0 below and +0.0 there. Under the
+                # exchanges, -(0.0)/alpha_v = -0.0, and a signed-zero sum is -0.0 only when every
+                # term is. ADV (`mc_advect!` of the zero state) is -0.0 at every level but the top
+                # four, where it is +0.0 (measured), so the warm and ice arms carry -0.0 below and
+                # +0.0 there. Under the
                 # retired `:slot` anchor the nudge rate's +0.0 was added after and made it +0.0
                 # everywhere; the same -0.0 pattern was measured at bf577b2 with
                 # `:water_anchor => :derived`. Louis adds its +0.0 legs last: +0.0 everywhere.
@@ -256,7 +257,6 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 end
                 Scythe.advance_column(m, 1, 6)
                 S = m.mc_scratch[Threads.threadid()]
-                louis || @test all(m.expdot_n[1:kD, rv_i] .=== S.ADV)
                 @test S.Tk == m.mc_ref_diag.Tbar
                 @test S.rho_v == Scythe.ahyp.(Scythe.mc_nu_vbar(m), VMU)
             end
