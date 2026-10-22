@@ -1,0 +1,9 @@
+# Stage-4 IC bytes of the legacy pin: the initial conditions `initialize_case!` wrote at
+# bf577b2 for this arm (bitwise the `.hashes.toml` golden; independent of water_anchor),
+# CONVERTED to the Stage-4 slot layout (the rho_t column dropped, the vapor column moved to
+# the third variable position, every value's text unchanged: the CSV path of
+# tools/convert_rho_t_checkpoint.jl). The reference file is unchanged by Stage 4.
+"nest1_tc_ics.csv" = "bbea1598fc2e1041d3dad135281e399576c9c5866887f79f639a71ff7951340f"
+"nest2_tc_ics.csv" = "f345e260f4d08096284e9bb49a511728eb2ae6654f9cd873f61c2edc2371d531"
+"nest3_tc_ics.csv" = "ba2175ab62621381b507a331363e228ea2a338f1fd6f44fe205a5bc1c5b5e1cc"
+"tc_exact.ref" = "2aa05a980fd5048e469488f0182152e86b7d9a2bb53907333d96449229608ab7"

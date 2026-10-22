@@ -29,7 +29,10 @@ using Springsteel
 using SparseArrays
 using Springsteel: PeriodicBC, NeumannBC, DirichletBC
 
+isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl")
+
 @testset "energy budget (options[:energy_budget]) and the energy census" begin
+    EB_F = Main.VaporTransformFixtures
 
     import Springsteel.Thermodynamics: rho_v_sat, L_v, Rd, Rv, Cpv, gravity
 
@@ -221,28 +224,37 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     end
 
     # ── 2. a diagnostic: bitwise off, absent and on ──────────────────────────────────
-    @testset "the budget never moves the state (golden capture at 5f3d8fe)" begin
+    @testset "the budget never moves the state (golden capture, re-seeded at bf577b2)" begin
         # Four full steps of the sheet with a w perturbation under the DEFAULT options (every
-        # partner on), captured from the code at 5f3d8fe, before the budget and the census
-        # existed: every bit of the advanced state and of the refit patch.
-        golden = Dict("warm" => (UInt128(201977187784593728530128693),
-                                 UInt128(5254826617149631798926498051)),
-                      "ice" => (UInt128(518765332282877531866518034),
-                                UInt128(21734643342216131928348215359)))
+        # partner on) and the derived water anchor: every bit of the advanced state and of the
+        # refit patch, off, absent and on. First captured at 5f3d8fe, before the budget and the
+        # census existed (on the prognostic rho_t slot; in git history); RE-SEEDED at bf577b2
+        # under the derived anchor for Stage 4 of the rho_t retirement and summed in the
+        # Stage-4 layout (`s4_checksum`, slot 3 left out).
+        golden = Dict("warm" => (UInt128(157978091336163910647445010),
+                                 UInt128(4159059066839494850290072784)),
+                      "ice" => (UInt128(452461145111928252279513276),
+                                UInt128(19483817701529031587034710963)))
+        got = Dict{String,Any}()
+        WA = Dict{Symbol,Any}(:water_anchor => :derived)
         mktempdir() do tmp
             for (tag, ice) in (("warm", false), ("ice", true))
-                for (arm, extra) in (("absent", Dict{Symbol,Any}()),
-                                     ("off", Dict{Symbol,Any}(:energy_budget => false)),
-                                     ("on", ON))
+                for (arm, extra) in (("absent", WA),
+                                     ("off", merge(WA, Dict{Symbol,Any}(:energy_budget => false))),
+                                     ("on", merge(WA, ON)))
                     m, p, mo = eb_tile(tmp, "gold_$(tag)_$(arm)"; ice = ice, extra = extra,
                                        seed! = sheet!())
                     @test m.ebudget.active == (arm == "on")
                     eb_run!(m, p, mo, 4)
-                    @test eb_checksum(m.var_np1) == golden[tag][1]
-                    @test eb_checksum(p.physical) == golden[tag][2]
+                    V = mo.grid_params.vars
+                    got[tag] = (EB_F.s4_checksum(m.var_np1, V), EB_F.s4_checksum(p.physical, V))
+                    @test got[tag][1] == golden[tag][1]
+                    @test got[tag][2] == golden[tag][2]
                 end
             end
         end
+        get(ENV, "SCYTHE_PRINT_GOLDENS", "") == "1" &&
+            foreach(k -> println("GOLDEN energy_budget $(k) => $(got[k])"), sort(collect(keys(got))))
     end
 
     # ── 3. the census ─────────────────────────────────────────────────────────────────

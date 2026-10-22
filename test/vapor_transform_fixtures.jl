@@ -173,4 +173,27 @@ end
 "Order-sensitive exact checksum of a Float64 array (bit patterns, position-weighted)."
 vt_checksum(A) = sum(UInt128(reinterpret(UInt64, x)) * UInt128(j) for (j, x) in enumerate(vec(A)))
 
+"""
+    s4_perm(vars) -> Vector{Int}
+
+The slot columns of a state array in the STAGE-4 LAYOUT of the rho_t retirement (slot 3 deleted,
+the vapor -- `"rho_v"` or `"nu_v"` -- moved into its position, every later slot one further in):
+`p, rho_d, <vapor>, u, w, E_t, Q_ss, ...` in the order the remaining names have in `vars`. On a
+layout that already has no `"rho_t"` and the vapor at 3 it is the identity, so a checksum taken
+through it means the same thing on both sides of Stage 4: the goldens re-seeded at bf577b2 (slot
+3 the derived anchor's passive shadow, which no reader takes) compare against the Stage-4 state
+bit for bit.
+"""
+function s4_perm(vars)
+    names = first.(sort(collect(vars), by = last))
+    vname = haskey(vars, "nu_v") ? "nu_v" : "rho_v"
+    rest = filter(n -> n != "rho_t" && n != vname, names)
+    return [vars[n] for n in [rest[1:2]; vname; rest[3:end]]]
+end
+
+"""[`vt_checksum`](@ref) of a slot matrix (`var_np1`) or a patch's `physical` array, read in the
+Stage-4 layout ([`s4_perm`](@ref)): the dropped slot 3 is not part of the sum."""
+s4_checksum(A::AbstractMatrix, vars) = vt_checksum(A[:, s4_perm(vars)])
+s4_checksum(A::AbstractArray{<:Any,3}, vars) = vt_checksum(A[:, s4_perm(vars), :])
+
 end # module

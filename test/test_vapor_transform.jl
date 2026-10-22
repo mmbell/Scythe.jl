@@ -68,39 +68,51 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         @test haskey(Scythe.KNOWN_PHYSICAL_KEYS, :vapor_mu)
     end
 
-    # ── 1. :none is bitwise the code before the option ───────────────────────────────
-    @testset ":none and the absent key are bitwise e81e00e (golden capture)" begin
+    # ── 1. :none under the derived anchor is bitwise bf577b2 (goldens re-seeded) ─────
+    @testset ":none and the absent key are bitwise bf577b2 under the derived anchor (golden capture)" begin
         # Three full steps of the seeded sheet + vapor gap + prognostic vapor bump + w, every
-        # partner at its default (on), captured from e81e00e before `:vapor_transform`
-        # existed: every bit of the advanced state and of the refit patch. The MYNN arm is the
-        # MYNN fixture's live column (water closure on). Both the absent key and an explicit
+        # partner at its default, under the DENSITY vapor (`:none`, the lineage Stage 4 keeps)
+        # and the derived water anchor: every bit of the advanced state and of the refit patch,
+        # summed in the Stage-4 layout (`s4_checksum`, slot 3 left out). RE-SEEDED at bf577b2
+        # for Stage 4 (the :slot captures of e81e00e they replace are in git history). The
+        # MYNN arm is the MYNN fixture's live column. Both the absent key and an explicit
         # `:none` must reproduce it.
         golden = Dict(
-            "warm"  => (UInt128(169252779686602122146478612), UInt128(5225351638953938681038074388)),
-            "ice"   => (UInt128(490794160314241089222425181), UInt128(18828796087419452106590956635)),
-            "louis" => (UInt128(169252780240349897207505981), UInt128(5225351639192754644858391880)),
-            "mynn"  => (UInt128(311926319919379716218570141), UInt128(10944031763325494353189912505)))
+            "warm"  => (UInt128(142915621527357590253966986), UInt128(4149923313041501232666007140)),
+            "ice"   => (UInt128(441432207685183255402351023), UInt128(16692133582680391659604219621)),
+            "louis" => (UInt128(142915621818324870191366622), UInt128(4149923316936704154065483632)),
+            "mynn"  => (UInt128(259941565336452810300720602), UInt128(9083517470135141505831894328)))
+        got = Dict{String,Any}()
         mktempdir() do tmp
             for vtr in (nothing, :none)
                 for (tag, ice, louis) in (("warm", false, false), ("ice", true, false),
                                           ("louis", false, true))
                     m, p, mo = F.vt_tile(tmp, "g_$(tag)_$(vtr)"; vtr, ice, louis,
+                        extra = Dict{Symbol,Any}(:water_anchor => :derived),
                         seed! = (p, x, V, c) -> F.vt_seed_vapor!(p, x, V, c))
                     F.vt_run!(m, p, mo, 3)
-                    @test F.vt_checksum(m.var_np1) == golden[tag][1]
-                    @test F.vt_checksum(p.physical) == golden[tag][2]
+                    V = mo.grid_params.vars
+                    got[tag] = (F.s4_checksum(m.var_np1, V), F.s4_checksum(p.physical, V))
+                    @test got[tag][1] == golden[tag][1]
+                    @test got[tag][2] == golden[tag][2]
                 end
+                xo = Dict{Symbol,Any}(:water_anchor => :derived)
+                vtr === nothing || (xo[:vapor_transform] = vtr)
                 m, p, mo, gp, z, col = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
-                                                        ctrans = :none, rtrans = :none)
-                vtr === nothing || (mo.options[:vapor_transform] = vtr)
+                                                        ctrans = :none, rtrans = :none,
+                                                        extra_options = xo)
                 M.set_state!(p, mo, gp.kDim, z, col; W0 = 0.3)
                 for t in 1:3
                     M.step_all!(m, p, gp.kDim, t); Scythe.calcTendency(m); gridTransform!(p)
                 end
-                @test F.vt_checksum(m.var_np1) == golden["mynn"][1]
-                @test F.vt_checksum(p.physical) == golden["mynn"][2]
+                V = mo.grid_params.vars
+                got["mynn"] = (F.s4_checksum(m.var_np1, V), F.s4_checksum(p.physical, V))
+                @test got["mynn"][1] == golden["mynn"][1]
+                @test got["mynn"][2] == golden["mynn"][2]
             end
         end
+        get(ENV, "SCYTHE_PRINT_GOLDENS", "") == "1" &&
+            foreach(k -> println("GOLDEN vapor_transform $(k) => $(got[k])"), sort(collect(keys(got))))
     end
 
     # ── 2. the identities ─────────────────────────────────────────────────────────────

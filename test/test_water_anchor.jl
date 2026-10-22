@@ -60,46 +60,58 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
-    # ── 1. :slot is bitwise 44da59c ─────────────────────────────────────────────────
-    @testset ":slot and the absent key are bitwise 44da59c (golden capture)" begin
+    # ── 1. the derived anchor is bitwise bf577b2 (goldens re-seeded for Stage 4) ───────
+    @testset ":derived is bitwise bf577b2 in the Stage-4 layout (golden capture)" begin
         # Three full steps of the seeded sheet + vapor bump + w under the vapor control
-        # variable, captured at 44da59c (Stage 2 tip) before `:water_anchor` existed, on both
-        # SI paths, warm/ice/Louis, slaved and explicit water acoustics; the MYNN fixture's
-        # live column (density slots).
+        # variable, on both SI paths, warm/ice/Louis, slaved and explicit water acoustics,
+        # Stage L at its derived default (on) and off; the MYNN fixture's live column (density
+        # slots). RE-SEEDED at bf577b2 under the derived anchor -- the anchor Stage 4 keeps as
+        # the only one -- and summed in the Stage-4 layout (`s4_checksum`: slot 3, the passive
+        # shadow no reader takes, left out; the vapor in its position), so Stage 4 is shown
+        # bitwise against the code it deletes slot 3 from. (The :slot goldens of 44da59c they
+        # replace are in git history, test/test_water_anchor.jl at bf577b2.)
         golden = Dict(
-            "ice_ref_none" => (UInt128(499824252298858703554839616), UInt128(18847435755383941090396674041)),
-            "ice_sd_mass" => (UInt128(499824456177364866899577122), UInt128(18843588167511347091832914358)),
-            "louis_sd_none" => (UInt128(179638334862226154838288795), UInt128(5247592769137669402363025278)),
-            "mynn" => (UInt128(311926319919379716218570141), UInt128(10944031763325494353189912505)),
-            "warm_ref_mass" => (UInt128(179638421285913927342441771), UInt128(5243771931477366918674490696)),
-            "warm_sd_mass" => (UInt128(179638412199414936570312397), UInt128(5244273292793073352352678301)))
+            "ice_ref_none" => (UInt128(450493064178061304434132191), UInt128(16708174421919189982622981378)),
+            "ice_sd_mass" => (UInt128(450522956953137210360097821), UInt128(16702167531451911314711355527)),
+            "louis_sd_none" => (UInt128(153225797257218708615625605), UInt128(4161365005745085063565262245)),
+            "mynn" => (UInt128(259941565336452810300720602), UInt128(9083517470135141505831894328)),
+            "warm_ref_mass" => (UInt128(153255406839976044843615595), UInt128(4159909797005285220324910434)),
+            "warm_sd_mass" => (UInt128(153255592928187686350140522), UInt128(4159883272548581250276531110)),
+            "warm_sd_mass_Loff" => (UInt128(152861113079180180520662138), UInt128(4161403458526496820893803699)))
+        got = Dict{String,Any}()
         mktempdir() do tmp
-            for wa in (nothing, :slot)
-                for (tag, ice, louis, sd, siw) in (("warm_ref_mass", false, false, false, :mass),
-                                                   ("warm_sd_mass", false, false, true, :mass),
-                                                   ("ice_sd_mass", true, false, true, :mass),
-                                                   ("ice_ref_none", true, false, false, :none),
-                                                   ("louis_sd_none", false, true, true, :none))
-                    extra = Dict{Symbol,Any}(:si_water_slots => siw, :state_dependent_si => sd,
-                                             :si_water_mixed_walls => true)
-                    wa === nothing || (extra[:water_anchor] = wa)
-                    m, p, mo = F.vt_tile(tmp, "g_$(tag)_$(wa)"; vtr = :bhyp, ice, louis, extra,
-                        seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
-                    F.vt_run!(m, p, mo, 3)
-                    @test F.vt_checksum(m.var_np1) == golden[tag][1]
-                    @test F.vt_checksum(p.physical) == golden[tag][2]
-                end
-                m, p, mo, gp, z, col = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
-                                                        ctrans = :none, rtrans = :none)
-                wa === nothing || (mo.options[:water_anchor] = wa)
-                M.set_state!(p, mo, gp.kDim, z, col; W0 = 0.3)
-                for t in 1:3
-                    M.step_all!(m, p, gp.kDim, t); Scythe.calcTendency(m); gridTransform!(p)
-                end
-                @test F.vt_checksum(m.var_np1) == golden["mynn"][1]
-                @test F.vt_checksum(p.physical) == golden["mynn"][2]
+            for (tag, ice, louis, sd, siw, L) in (("warm_ref_mass", false, false, false, :mass, nothing),
+                                                  ("warm_sd_mass", false, false, true, :mass, nothing),
+                                                  ("warm_sd_mass_Loff", false, false, true, :mass, false),
+                                                  ("ice_sd_mass", true, false, true, :mass, nothing),
+                                                  ("ice_ref_none", true, false, false, :none, nothing),
+                                                  ("louis_sd_none", false, true, true, :none, nothing))
+                extra = Dict{Symbol,Any}(:water_anchor => :derived, :si_water_slots => siw,
+                                         :state_dependent_si => sd, :si_water_mixed_walls => true)
+                L === nothing || (extra[:lobe_relaxation] = L)
+                m, p, mo = F.vt_tile(tmp, "g_$(tag)"; vtr = :bhyp, ice, louis, extra,
+                    seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
+                F.vt_run!(m, p, mo, 3)
+                V = mo.grid_params.vars
+                got[tag] = (F.s4_checksum(m.var_np1, V), F.s4_checksum(p.physical, V))
+                @test got[tag][1] == golden[tag][1]
+                @test got[tag][2] == golden[tag][2]
             end
+            m, p, mo, gp, z, col = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
+                                                    ctrans = :none, rtrans = :none,
+                                                    extra_options = Dict{Symbol,Any}(
+                                                        :water_anchor => :derived))
+            M.set_state!(p, mo, gp.kDim, z, col; W0 = 0.3)
+            for t in 1:3
+                M.step_all!(m, p, gp.kDim, t); Scythe.calcTendency(m); gridTransform!(p)
+            end
+            V = mo.grid_params.vars
+            got["mynn"] = (F.s4_checksum(m.var_np1, V), F.s4_checksum(p.physical, V))
+            @test got["mynn"][1] == golden["mynn"][1]
+            @test got["mynn"][2] == golden["mynn"][2]
         end
+        get(ENV, "SCYTHE_PRINT_GOLDENS", "") == "1" &&
+            foreach(k -> println("GOLDEN water_anchor $(k) => $(got[k])"), sort(collect(keys(got))))
     end
 
     # ── 2. the resting fixed point ──────────────────────────────────────────────────

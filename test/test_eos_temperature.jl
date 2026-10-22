@@ -27,7 +27,10 @@ using Springsteel
 using SparseArrays
 using Springsteel: PeriodicBC, NeumannBC, DirichletBC
 
+isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl")
+
 @testset "EOS temperature (options[:temperature])" begin
+    EOS_F = Main.VaporTransformFixtures
 
     import Springsteel.Thermodynamics: rho_v_sat, internal_energy_bf02, L_v, L_s,
         Rd, Rv, Cpd, Cpv, Cl, Ci, gravity
@@ -222,39 +225,40 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     end
 
     # ── 2. :energy is the pre-switch code, bitwise ───────────────────────────────────
-    @testset ":energy is bitwise the pre-switch code (golden capture at 9e81c33)" begin
+    @testset ":energy is bitwise bf577b2 under the derived anchor (golden capture)" begin
         # Three full steps of the seeded sheet with a w perturbation, warm and with ice, under
-        # the production reference build (hydrostatic + consistent_qss). The checksums were
-        # captured from the code at 9e81c33, before `options[:temperature]` existed (the key
-        # was ignored there): every bit of the advanced state and of the refit patch. The cloud
-        # evaporation bound (9acd5b8, `options[:cloud_evap_realization]`, default on) landed
-        # after the capture and legitimately binds on this fixture's thin sheet edges, so the
-        # fixture pins it off: switch-off is bitwise the pre-bound code (its own tests), and
-        # the capture stays the authority on what `:energy` must reproduce. The exchange
-        # realization (`options[:exchange_realization]`, default on) re-books the ETD partners
-        # on the recovered mass, the refit partner (`options[:refit_partner]`, default on)
-        # books the refit's recovered change as condensation, and the vapor nudge's pressure
-        # partner (`options[:vapor_nudge_partner]`, default on) moves p with the nudge; all three
-        # are pinned off for the same reason.
-        golden = Dict("warm" => (UInt128(195009073869525435707340911),
-                                 UInt128(5214078536834308060992558166)),
-                      "ice" => (UInt128(514673702508703115877210311),
-                                UInt128(18783613703269848698067810129)))
+        # the production reference build (hydrostatic + consistent_qss) and the `:energy`
+        # retrieval. First captured at 9e81c33, before `options[:temperature]` existed (that
+        # capture, on the prognostic rho_t slot, is in git history); RE-SEEDED at bf577b2 under
+        # the derived water anchor for Stage 4 of the rho_t retirement, and summed in the
+        # Stage-4 layout (`s4_checksum`: slot 3, the passive shadow, left out). The cloud
+        # evaporation bound, the exchange realization and the refit partner stay pinned off as
+        # in the original capture (each is bitwise its own switch-off), so the fixture still
+        # isolates the retrieval; the density vapor (`:vapor_transform => :none`) as before.
+        golden = Dict("warm" => (UInt128(161122335957649786769422633),
+                                 UInt128(4162737462651284037572250466)),
+                      "ice" => (UInt128(457800712936917242225469130),
+                                UInt128(16736897797215895292863035670)))
+        got = Dict{String,Any}()
         mktempdir() do tmp
             for (tag, ice) in (("warm", false), ("ice", true))
                 m, p, mo = eos_tile(tmp, tag; temperature = :energy, ice = ice,
                     extra = Dict{Symbol,Any}(:cloud_evap_realization => false,
                                              :exchange_realization => false,
                                              :refit_partner => false,
-                                             :vapor_nudge_partner => false,
+                                             :water_anchor => :derived,
                                              :vapor_transform => :none),
                     seed! = (p, x, V, c) -> eos_seed_sheet!(p, x, V, c; wamp = 0.5))
                 eos_run!(m, p, mo, 3)
                 @test all(isfinite, m.var_np1)
-                @test eos_checksum(m.var_np1) == golden[tag][1]
-                @test eos_checksum(p.physical) == golden[tag][2]
+                V = mo.grid_params.vars
+                got[tag] = (EOS_F.s4_checksum(m.var_np1, V), EOS_F.s4_checksum(p.physical, V))
+                @test got[tag][1] == golden[tag][1]
+                @test got[tag][2] == golden[tag][2]
             end
         end
+        get(ENV, "SCYTHE_PRINT_GOLDENS", "") == "1" &&
+            foreach(k -> println("GOLDEN eos $(k) => $(got[k])"), sort(collect(keys(got))))
     end
 
     @testset "the driver's T is each mode's own formula, bitwise" begin
