@@ -382,6 +382,30 @@ struct StateRow
 end
 
 """
+    total_density(R, df) -> rho_t
+
+The total density the retrieval reads. A pre-Stage-4 snapshot carries the prognostic `rho_t`
+column and it is read as before. Since Stage 4 of the rho_t retirement that slot is gone and
+the model's total is DERIVED, `rho_t = rho_d + sum_k alpha_k nu_k` over the water slots
+(`Scythe.anchor_W_value`); this script reads the density layout only (alpha = 1, `rho_*`
+columns: vapor and cloud are perturbations off `rho_vbar = rho_tbar - rho_dbar - rho_cbar` and
+`rho_cbar`, rain a total), and refuses a transformed (`nu_*`) or ice-bearing snapshot.
+NOTE for M2 on post-Stage-4 output: the "residual vapor" `rho_t - rho_d - liq_out` is then the
+vapor the swapped condensate would leave at a FIXED derived total -- a what-if; the model itself
+no longer has a residual vapor.
+"""
+function total_density(R, df)
+    tile(v) = repeat(v, R.ncols)
+    "rho_t" in names(df) && return df.rho_t .+ tile(R.rho_tbar)
+    bad = filter(c -> startswith(c, "nu_") || startswith(c, "rho_i"), names(df))
+    isempty(bad) || error("total_density: this script reads the untransformed, ice-free " *
+                          "layout only; the snapshot has $(bad)")
+    rho_vbar = (R.rho_tbar .- R.rho_dbar) .- R.rho_cbar
+    return (df.rho_d .+ tile(R.rho_dbar)) .+ (((df.rho_v .+ tile(rho_vbar)) .+
+            (df.rho_c .+ tile(R.rho_cbar))) .+ df.rho_r)
+end
+
+"""
     thermo(R, df) -> (M, rho_d, rho_t, rho_r, rho_c)
 
 The retrieval's arguments on FULL fields, so a caller can substitute any
@@ -392,7 +416,7 @@ function thermo(R, df)
     tile(v) = repeat(v, R.ncols)
     p     = df.p     .+ tile(R.pbar)
     rho_d = df.rho_d .+ tile(R.rho_dbar)
-    rho_t = df.rho_t .+ tile(R.rho_tbar)
+    rho_t = total_density(R, df)
     E_t   = df.E_t   .+ tile(R.E_tbar)
     rho_c = df.rho_c .+ tile(R.rho_cbar)
     ke = 0.5 .* ((df.u .^ 2) .+ (df.w .^ 2))
@@ -558,7 +582,7 @@ function mu_cost(R, df, mu)
     tile(v) = repeat(v, R.ncols)
     p     = df.p     .+ tile(R.pbar)
     rho_d = df.rho_d .+ tile(R.rho_dbar)
-    rho_t = df.rho_t .+ tile(R.rho_tbar)
+    rho_t = total_density(R, df)
     E_t   = df.E_t   .+ tile(R.E_tbar)
     ke = 0.5 .* ((df.u .^ 2) .+ (df.w .^ 2))
     M  = p .+ E_t .- (rho_t .* (ke .+ (Scythe.gravity .* df.z)))

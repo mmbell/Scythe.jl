@@ -1,3 +1,9 @@
+# RETIRED WITH SLOT 3 (Stage 4 of the rho_t retirement, 2026-10). This forensic sweep measured
+# the RESIDUAL vapor rho_t - rho_d - rho_c - rho_r of the prognostic rho_t slot; that slot is
+# deleted, the vapor is its own prognostic (slot 3) and the total density is DERIVED from the
+# water slots, so the residual it studies no longer exists. Kept as the record of that
+# investigation; it reads only pre-Stage-4 snapshots (which carry a "rho_t" column) and fails on
+# newer output by design.
 # =============================================================================
 # Where does the negative RESIDUAL VAPOR come from?
 #

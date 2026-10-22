@@ -100,6 +100,12 @@ associated with the Chebyshev vertical basis.
 
 ## Positivity bounds for rho_d / rho_t: available, tested, and OFF
 
+> **Stage 4 of the rho_t retirement (2026-10):** the prognostic `rho_t` slot is deleted;
+> `rho_t = rho_d + sum_k alpha_k nu_k` is derived from the water slots, so only the `rho_d`
+> half of this section still describes a prognostic field. `rho_w` is now that derived sum
+> (it goes negative only where the slots' negative lobes outweigh the column's water), and
+> the `min_rho_w_gm3` rows below read it. The text is kept as the record of the decision.
+
 The spline positivity limiter already supports the two prognostic densities.
 `positivity_reference_profile` (src/moist_compressible.jl) recognizes `"rho_d"`
 and `"rho_t"`, so `install_positivity_bounds!` installs the reference-offset

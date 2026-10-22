@@ -71,8 +71,7 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c",
-                 "rho_v"]
+# (The slot list is `Scythe.mc_var_names(options)`, resolved after the options below.)
 
 # HUMIDIFIED Dunion moist-tropical sounding (WRF input_sounding format): RH floors
 # of 0.90 (z <= 1.6 km) / 0.88 (<= 3.2 km) / 0.85 (<= 4.5 km) applied to the
@@ -99,12 +98,12 @@ const N_0_MP = parse(Float64, get(ENV, "SCYTHE_O01_N0", "0.0"))
 # the RiRk grid at both resolutions — the cubic B-spline Galerkin filter is the
 # only dissipation, which is the near-inviscid goal. (Kv = 5 and 25 were tested
 # and change the solution by < 1%; raise these if a future configuration needs
-# damping, they feed the momentum/heat/water solves independently.) The rain
-# shafts do ring: min(rho_r) undershoots reach ~ -1.8 g/m^3 at 500 m resolution
+# damping, they feed the momentum/heat solves independently; the implicit WATER
+# diffusion, Kvdiff_water, was retired with the prognostic rho_t slot at Stage 4 and
+# > 0 is refused.) The rain shafts do ring: min(rho_r) undershoots reach ~ -1.8 g/m^3 at 500 m resolution
 # (all rate functions are negative-safe; reported as min_rho_r_gm3).
 const KV_MOM = 0.0
 const KV_HEAT = 0.0
-const KV_WATER = 0.0
 
 function o01_model(opts::BenchmarkOptions)
     if opts.mode == :full
@@ -162,7 +161,6 @@ function o01_model(opts::BenchmarkOptions)
     # optimum for the dominant modes.
     physical_params = Dict(:Khdiff => 0.0, :Kvdiff => KV_MOM,
                            :Khdiff_heat => 0.0, :Kvdiff_heat => KV_HEAT,
-                           :Kvdiff_water => KV_WATER,
                            :tau_qss => 10.0, :N_r => N_R, :N_0 => N_0_MP,
                            :alpha => 0.02, :z_damp => 17.0e3)
     options = merge(Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
@@ -200,52 +198,14 @@ function o01_model(opts::BenchmarkOptions)
     # This knob sweeps that tradeoff. Unset => 10.0, the committed default, bitwise.
     haskey(ENV, "SCYTHE_O01_TAUQSS") &&
         (physical_params[:tau_qss] = parse(Float64, ENV["SCYTHE_O01_TAUQSS"]))
-    # The second link of the same chain: the timescale on which the PROGNOSTIC vapor is
-    # reconciled with the vapor the conserved rho_t budget implies (`Scythe.rho_v_reconcile`).
-    # Unset => 10.0, the committed default, bitwise. Short tau_rec projects rho_v onto the
-    # density budget every few steps and throws away the transported field's smoothness --
-    # which is the thing the prognostic vapor was introduced to buy; long tau_rec lets the
-    # partition drift (watch the reconciliation gap in the water summary). This knob sweeps
-    # that tradeoff, and it is the one that replaced SCYTHE_O01_VAPOR/BLEND_T0T1/BLEND_DCAP:
-    # those chose between two DIAGNOSTIC vapors, and there is no diagnostic vapor any more.
-    haskey(ENV, "SCYTHE_O01_TAUREC") &&
-        (physical_params[:tau_rho_v_rec] = parse(Float64, ENV["SCYTHE_O01_TAUREC"]))
-    # The third link of the chain (Stage C): the timescale on which the advected ice
-    # PARTITION is reconciled with the water the conserved rho_t anchor supports
-    # (`Scythe.ice_anchor_rate`; TeX §Reconciliation of the condensate partition). Unset =>
-    # 10.0, the committed default, bitwise. Sized by measurement: at the recorded
-    # transport-phase feed (<= 1.7e-6 kg/m^3/s across the three preserved dying runs) the
-    # detachment equilibrates at F*tau -- a ~0.16 K retrieval excursion at 10 s, thirty
-    # times under the 5 K ship-the-cap criterion. Ice-arm only; inert (and the knob
-    # meaningless) with ice off.
-    haskey(ENV, "SCYTHE_O01_TAUANCHOR") &&
-        (physical_params[:tau_ice_anchor] = parse(Float64, ENV["SCYTHE_O01_TAUANCHOR"]))
-    # The anchor-reconciliation SOURCE switch. Unset => on (the committed default). `=0`
-    # drops the removal while the MC_ANCHOR_* census keeps measuring the defect -- the
-    # bitwise reproduction of the unreconciled §2c configuration, for forensics:
-    #   SCYTHE_O01_ICE=1 SCYTHE_O01_RAIN_MOMENTS=2 SCYTHE_O01_ANCHOR=0 SCYTHE_O01_TS=0.3
-    # reproduces the 2454.9 s detachment death.
-    haskey(ENV, "SCYTHE_O01_ANCHOR") &&
-        (options[:ice_anchor_source] = ENV["SCYTHE_O01_ANCHOR"] != "0")
-    # The reader-side leg of the same reconciliation: the thermodynamic interface's
-    # rho_ice_t capped at the anchor headroom (the `condensate_floor` device class —
-    # readers only, no write-back, no mass conversion). Unset => on (the committed
-    # default): the terminal §2c burst is a per-step fit oscillation at the front that no
-    # tau-relaxation outruns, and the cap is what breaks its retrieval amplifier. `=0`
-    # drops the cap (state and census unaffected) for forensics.
-    haskey(ENV, "SCYTHE_O01_ANCHORFLOOR") &&
-        (options[:ice_anchor_floor] = ENV["SCYTHE_O01_ANCHORFLOOR"] != "0")
-    # The sedimentation leg of the same reconciliation: the flux assemblies transport the
-    # anchor-supported share of each ice moment (one factor per gridpoint, all twelve
-    # fluxes, telescoping preserved exactly), so phantom mass cannot move rho_t or E_t by
-    # falling. Unset => on (the committed default). `=0` drops it for forensics.
-    haskey(ENV, "SCYTHE_O01_ANCHORFLUX") &&
-        (options[:ice_anchor_flux] = ENV["SCYTHE_O01_ANCHORFLUX"] != "0")
-    # The rate-side leg: every ISHMAEL process rate reads the anchor-supported share of
-    # the ice population (same single factor; per-particle state untouched; melt on
-    # phantom ice is the channel it closes). Unset => on. `=0` drops it for forensics.
-    haskey(ENV, "SCYTHE_O01_ANCHORRATES") &&
-        (options[:ice_anchor_rates] = ENV["SCYTHE_O01_ANCHORRATES"] != "0")
+    # (SCYTHE_O01_TAUREC, the second link -- the vapor reconciliation nudge's tau_rho_v_rec --
+    # was retired with the prognostic rho_t slot at Stage 4: the vapor IS the anchor's member
+    # now, and `physical_params[:tau_rho_v_rec]` is refused.)
+    # (The Stage C ice-anchor reconciliation knobs -- SCYTHE_O01_TAUANCHOR and the four leg
+    # switches SCYTHE_O01_ANCHOR / _ANCHORFLOOR / _ANCHORFLUX / _ANCHORRATES -- went at Stage 4
+    # of the rho_t retirement: under the derived anchor rho_w = sum_k alpha_k nu_k the four legs
+    # are INERT (`Scythe.inert_ice_anchor_legs!`; the anchor cannot be exceeded by
+    # construction) and an explicit `true` is refused by `Scythe.validate_water_anchor`.)
     # The per-channel ATTRIBUTION census (`Scythe.MC_ATTR_*`): which LEG the `MC_DONOR_*`
     # breaches come from -- the six q_r legs at the breach points, rain evaporation at the
     # applied step-mean, the q_i melt/aggregation split, and what runs above the melting
@@ -418,11 +378,9 @@ function o01_model(opts::BenchmarkOptions)
     options[:si_water_slots] = Symbol(get(ENV, "SCYTHE_O01_SIWATER", "none"))
     haskey(ENV, "SCYTHE_O01_SIWATER_MIXED") &&
         (options[:si_water_mixed_walls] = envflag("SCYTHE_O01_SIWATER_MIXED"))
-    # What every reader takes as the total density (`Scythe.water_anchor_mode`, Stage 3 of the
-    # rho_t retirement). Unset => `:slot`, NOT the run-config default `:derived`, so the
-    # committed quick references are reproduced bitwise; SCYTHE_O01_WANCHOR=derived runs the
-    # derived anchor (rho_t = rho_d + sum_k alpha_k nu_k, slot 3 the shadow).
-    options[:water_anchor] = Symbol(get(ENV, "SCYTHE_O01_WANCHOR", "slot"))
+    # (SCYTHE_O01_WANCHOR went at Stage 4 of the rho_t retirement: the prognostic rho_t slot is
+    # deleted and every reader takes the derived total rho_t = rho_d + sum_k alpha_k nu_k, the
+    # only anchor there is; `options[:water_anchor] = :slot` is refused.)
     # Generic forensic switches, `SCYTHE_O01_OPTS="key=val,key=val"` (`true`/`false` -> Bool,
     # a number -> Float64, otherwise a Symbol), merged into `options` last.
     for kv in split(get(ENV, "SCYTHE_O01_OPTS", ""), ','; keepempty = false)
@@ -874,7 +832,6 @@ function o01_init!(model)
         ref = Scythe.consistent_qss_reference(ref, z, column;
             vapor_transform = Scythe.vapor_transform_mode(model.options),
             vapor_mu = Scythe.vapor_mu(model.physical_params),
-            water_anchor = Scythe.water_anchor_mode(model.options),
             condensate_transform = Scythe.condensate_transform_mode(model.options),
             condensate_mu = Float64(get(model.physical_params, :condensate_mu, 1.0e-7)))
     end
@@ -1178,7 +1135,7 @@ function o01_nested_diagnostics(models, topo)
             max_rc = max(max_rc, maximum(rho_c[colmask]))
             min_rc = min(min_rc, minimum(rho_c[colmask]))
             min_rv = min(min_rv, minimum(rho_v[colmask]))
-            min_rw = min(min_rw, minimum((rho_t .- rho_d)[colmask]))
+            min_rw = min(min_rw, minimum((rho_t .- rho_d)[colmask]))   # derived rho_w
             min_rd_frac = min(min_rd_frac,
                               minimum((rho_d ./
                                        repeat(Springsteel.ref_rho_d(ref)[:, 1],
@@ -1240,8 +1197,8 @@ function o01_nested_diagnostics(models, topo)
         "precip_energy_gain_Jm2_teos" => accum_E_te / total_width,
     )
 
-    # Masked water/energy budgets across the nest
-    rho_wbar = Springsteel.ref_rho_t(ref)[:, 1] .- Springsteel.ref_rho_d(ref)[:, 1]
+    # Masked water/energy budgets across the nest. The water is the model's derived total
+    # rho_w = sum_k alpha_k nu_k (`mc_water_anchor`), the quantity the run conserves.
     E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
     function nest_budget(j)
         W = 0.0
@@ -1249,7 +1206,7 @@ function o01_nested_diagnostics(models, topo)
         for i in 1:n
             df = CSV.read(snaps[i][j][2], DataFrame)
             ncols = div(nrow(df), kDim)
-            rho_w = (df.rho_t .- df.rho_d) .+ repeat(rho_wbar, ncols)
+            rho_w = mc_water_anchor(df, ref, ncols, models[i])
             E_t = df.E_t .+ repeat(E_tbar, ncols)
             W += domain_integral(reshape(rho_w, kDim, ncols), models[i], masks[i])
             E += domain_integral(reshape(E_t, kDim, ncols), models[i], masks[i])

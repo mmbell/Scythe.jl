@@ -1,3 +1,9 @@
+# RETIRED WITH SLOT 3 (Stage 4 of the rho_t retirement, 2026-10). This measured how the acoustic
+# SI's two discrete operators split the prognostic rho_t slot from rho_d; that slot is deleted
+# and rho_t is DERIVED (rho_d + sum_k alpha_k nu_k), so the rho_t/rho_d split it studies no
+# longer exists (the water slots' own SI slaving is `options[:si_water_slots]`,
+# src/si_water_slaving.jl). Kept as the record of that investigation; it reads only pre-Stage-4
+# snapshots.
 # =============================================================================
 # Does the ACOUSTIC SOLVE drive rho_t and rho_d apart?
 #

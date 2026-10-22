@@ -22,7 +22,7 @@
 #
 # ── Reading conventions (see benchmarks/common/rce_io.jl for the shared helpers) ──
 #
-# Regular-grid prognostics (p, rho_d, rho_t, E_t, Q_ss, rho_v, rho_c, rho_r, u, w, T,
+# Regular-grid fields (p, rho_d, rho_t (derived), E_t, Q_ss, rho_v, rho_c, rho_r, u, w, T,
 # theta, theta_e, RH, q_v, q_c, q_r, rho_ice/q_i, rho_e/e) are true spline evaluations on
 # the file's regular (x, z) grid. Physics-group fields (K_m, K_h, e, mynn_*, radiation
 # q_lw/q_sw/q_sw_applied/dT_*/olr/.../surface F_sh/F_q/tau_u/.../ust/U10/...) are linearly

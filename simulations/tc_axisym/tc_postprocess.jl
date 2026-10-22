@@ -23,8 +23,9 @@
 #
 # The raw <t>.nc snapshots written by a run carry only the PROGNOSTIC control
 # variables, and the moist-compressible set stores most of them as PERTURBATIONS
-# off a hydrostatic PressureReferenceState (p, rho_d, rho_t, E_t, Q_ss are primes;
-# u, w, v, rho_r are full). This script, for every snapshot in each nest:
+# off a hydrostatic PressureReferenceState (p, rho_d, the vapor, E_t, Q_ss are primes;
+# u, w, v, rho_r are full; the total density rho_t is DERIVED, not a slot, since Stage 4
+# of the rho_t retirement). This script, for every snapshot in each nest:
 #
 #   1. reconstructs the z-only reference profiles on the netCDF's regular z grid
 #      by fitting the run's own reference column (from <root>/reference.ref) and
@@ -133,14 +134,17 @@ has_mynn(ndir, tag) =
         readdir(ndir))
 
 # ── The run's water representation ────────────────────────────────────────────
-# The transforms and the water anchor the RUN used, from its resolved config (a segmented
-# tree's `<root>/scythe_config.toml`, through the same `build_physics` the run used); a legacy
-# tree predates every option here and gets the code defaults of its day (no transforms,
-# slot 3 the total density). Under `water_anchor = derived` slot 3 is a PASSIVE SHADOW: the
-# total density the run read is `rho_d + sum_k alpha_k nu_k` (alpha = 2 transformed, 1
-# density), which the comprehensive `<t>.nc` writes as `rho_t`; it is read from there when the
-# run wrote one beside the raw snapshot on the same grid, and rebuilt from the raw slots
-# otherwise (the model's member order: vapor, cloud, rain, the three ice masses).
+# The transforms the RUN used, from its resolved config (a segmented tree's
+# `<root>/scythe_config.toml`, through the same `build_physics` the run used); a legacy tree
+# predates every option here and gets the code defaults of its day (no transforms).
+#
+# THE TOTAL DENSITY IS DERIVED (the only water anchor since Stage 4 of the rho_t retirement
+# deleted the prognostic slot): `rho_t = rho_d + sum_k alpha_k nu_k` (alpha = 2 transformed,
+# 1 density), which the comprehensive `<t>.nc` writes as `rho_t`; it is read from there when
+# the run wrote one beside the raw snapshot on the same grid, and rebuilt from the raw slots
+# otherwise (the model's member order: vapor, cloud, rain, the three ice masses). A
+# pre-Stage-4 raw file's `rho_t` slot is ignored (convert such runs with
+# tools/convert_rho_t_checkpoint.jl to restart them).
 function detect_water_transforms(root)
     if is_segmented_root(root)
         cfg = Scythe.load_config(Scythe.run_config_file(root); set = ["output.dir=" * root])
@@ -152,11 +156,10 @@ function detect_water_transforms(root)
                   rmu = Float64(get(pp, :rain_mu, 1.0e-7)),
                   vtrans = Scythe.vapor_transform_mode(o), vmu = Scythe.vapor_mu(pp),
                   itrans = ice ? Scythe.ice_transform_mode(o) : :none,
-                  imu = ice ? Scythe.ice_mu(pp, 1) : 1.0,
-                  anchor = Scythe.water_anchor_mode(o))
+                  imu = ice ? Scythe.ice_mu(pp, 1) : 1.0)
     end
     return (; ctrans = :none, cmu = 1.0e-7, rtrans = :none, rmu = 1.0e-7, vtrans = :none,
-              vmu = 1.0e-9, itrans = :none, imu = 1.0, anchor = :slot)
+              vmu = 1.0e-9, itrans = :none, imu = 1.0)
 end
 const WTRANS = detect_water_transforms(indir)
 
@@ -203,8 +206,7 @@ function reference_background(x, z_reg)
     mubar = round(Int, nmish / (n_k - 1))
     mubar * (n_k - 1) == nmish ||
         error("Cannot infer mubar: $nmish mish levels vs $(n_k-1) cells")
-    vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c", "v",
-            "rho_v"]
+    vars = Scythe.MC_VARS_CYL     # names only matter for this throwaway grid's BCs
     bc = Dict(v => NeumannBC() for v in vars)
     gp = Scythe.compute_derived_params(GridParameters(; geometry = "RiRk",
         iMin = x[1], iMax = x[end], num_cells_i = max(n_i - 1, 1),
@@ -285,7 +287,7 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
 
         # Prognostic slots (primes for the reference-referenced ones; full otherwise)
         pp    = rd2d(ds, "p", n_i, n_k);     rdp = rd2d(ds, "rho_d", n_i, n_k)
-        rtp   = rd2d(ds, "rho_t", n_i, n_k); Etp = rd2d(ds, "E_t", n_i, n_k)
+        Etp   = rd2d(ds, "E_t", n_i, n_k)
         Qssp  = rd2d(ds, "Q_ss", n_i, n_k)
         u     = rd2d(ds, "u", n_i, n_k);     w   = rd2d(ds, "w", n_i, n_k)
         # Slots 8 and 9 may carry Ooyama control variables rather than densities, and the
@@ -303,7 +305,7 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
         # Totals = prime + background(z), broadcast over radius
         col(a) = reshape(a, 1, n_k)
         p    = pp   .+ col(bg.pbar);     rho_d = rdp .+ col(bg.rho_dbar)
-        rho_t = rtp .+ col(bg.rho_tbar); E_t  = Etp .+ col(bg.E_tbar)
+        E_t  = Etp .+ col(bg.E_tbar)
         Q_ss = Qssp .+ col(bg.Q_ssbar)
         rho_c = Scythe.recover_rho_c.(rcp, col(bg.rho_cbar), ctrans, WTRANS.cmu)
         # The vapor slot: a density perturbation off rho_tbar - rho_dbar - rho_cbar, or under
@@ -320,30 +322,31 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
         itr = any(startswith("nu_"), inames) ? WTRANS.itrans : :none
         rho_ice = isempty(ice_slots) ? zeros(n_i, n_k) :
             reduce(+, (Scythe.recover_total.(sl, itr, WTRANS.imu) for sl in ice_slots))
-        # THE DERIVED WATER ANCHOR: slot 3 is the passive shadow, not the total density.
-        if WTRANS.anchor === :derived
-            vslot === nothing && error("$(rawpath): water_anchor = derived but no vapor slot")
-            compf = replace(rawpath, r"_raw\.nc$" => ".nc")
-            from_comp = false
-            if compf != rawpath && isfile(compf)
-                NCDataset(compf, "r") do dc
-                    if get(dc.attrib, "scythe_file_kind", nothing) == "comprehensive" &&
-                       haskey(dc, "rho_t") && length(dc["x"]) == n_i && length(dc["z"]) == n_k
-                        rho_t = rd2d(dc, "rho_t", n_i, n_k)
-                        from_comp = true
-                    end
+        # THE DERIVED WATER ANCHOR (see detect_water_transforms): rho_t = rho_d + W.
+        vslot === nothing && error("$(rawpath): no vapor slot (rho_v / nu_v); the derived " *
+                                   "total density needs it")
+        haskey(ds, "rho_t") && @warn(string(rawpath, " carries a pre-Stage-4 rho_t slot; ",
+                                            "it is ignored and the derived total used"),
+                                     maxlog = 1)
+        compf = replace(rawpath, r"_raw\.nc$" => ".nc")
+        rho_t = nothing
+        if compf != rawpath && isfile(compf)
+            NCDataset(compf, "r") do dc
+                if get(dc.attrib, "scythe_file_kind", nothing) == "comprehensive" &&
+                   haskey(dc, "rho_t") && length(dc["x"]) == n_i && length(dc["z"]) == n_k
+                    rho_t = rd2d(dc, "rho_t", n_i, n_k)
                 end
             end
-            if !from_comp
-                al(tr) = tr === :none ? 1.0 : 2.0
-                ncb = ctrans === :none ? bg.rho_cbar : Scythe.bhyp.(bg.rho_cbar, WTRANS.cmu)
-                W = (al(vtr) .* (vslot .+ col(nvb))) .+ (al(ctrans) .* (rcp .+ col(ncb)))
-                W = W .+ (al(rtrans) .* nu_r)
-                for sl in ice_slots
-                    W = W .+ (al(itr) .* sl)
-                end
-                rho_t = rho_d .+ W
+        end
+        if rho_t === nothing
+            al(tr) = tr === :none ? 1.0 : 2.0
+            ncb = ctrans === :none ? bg.rho_cbar : Scythe.bhyp.(bg.rho_cbar, WTRANS.cmu)
+            W = (al(vtr) .* (vslot .+ col(nvb))) .+ (al(ctrans) .* (rcp .+ col(ncb)))
+            W = W .+ (al(rtrans) .* nu_r)
+            for sl in ice_slots
+                W = W .+ (al(itr) .* sl)
             end
+            rho_t = rho_d .+ W
         end
 
         # Closed-form temperature retrieval from the PROGNOSTIC condensate (M is the
@@ -353,16 +356,11 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
         rho_liq = rho_c .+ rho_r
         T  = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq, rho_ice)
         rho_vs = Springsteel.Thermodynamics.rho_v_sat.(T, p ./ 100.0)
-        # The vapor is its OWN prognostic slot, carried against the derived reference
-        # rho_tbar - rho_dbar - rho_cbar (`Scythe.vapor_slot`). Files written before it
-        # became prognostic have no such variable; those fall back to the density residual,
-        # which is what the model then meant by the vapor. The two now differ by the
-        # reconciliation gap, so the fallback must not be used on a new file.
-        # (Under the derived anchor the residual fallback is refused above: there is always a
-        # vapor slot.)
-        rho_v = vslot === nothing ? rho_t .- rho_d .- rho_liq .- rho_ice :
-            (vtr === :none ? vslot .+ col(rho_vbar_d) :
-                             Scythe.recover_rho_v.(vslot, col(nvb), vtr, WTRANS.vmu))
+        # The vapor is its OWN prognostic slot (slot 3), carried against the derived reference
+        # rho_tbar - rho_dbar - rho_cbar (`Scythe.vapor_slot`). (Files from before it became
+        # prognostic, which needed the residual rho_t - rho_d - rho_liq, are refused above.)
+        rho_v = vtr === :none ? vslot .+ col(rho_vbar_d) :
+                                Scythe.recover_rho_v.(vslot, col(nvb), vtr, WTRANS.vmu)
 
         # Derived products
         refl = reflectivity_dBZ.(rho_c, rho_r, N0, Nc_cm3 * 1.0e6)
@@ -401,13 +399,12 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
             # Primes (perturbations off the hydrostatic reference)
             wr("p_prime",     pp,   "Pa",     "pressure perturbation")
             wr("rho_d_prime", rdp,  "kg m-3", "dry-air density perturbation")
-            wr("rho_t_prime", rtp,  "kg m-3", "total density perturbation")
             wr("E_t_prime",   Etp,  "J m-3",  "total energy density perturbation")
             wr("Q_ss_prime",  Qssp, "kg m-3", "supersaturation density perturbation")
             # Totals (background added back)
             wr("p",     p,     "Pa",     "total pressure")
             wr("rho_d", rho_d, "kg m-3", "total dry-air density")
-            wr("rho_t", rho_t, "kg m-3", "total density")
+            wr("rho_t", rho_t, "kg m-3", "total density (derived: rho_d + sum_k alpha_k nu_k)")
             wr("E_t",   E_t,   "J m-3",  "total energy density")
             wr("Q_ss",  Q_ss,  "kg m-3", "supersaturation density")
             # Carried full prognostic fields
@@ -579,6 +576,8 @@ function process_snapshot(rawpath, outpath, bg, z_reg, tsec, rad = nothing, mynn
             # Pass through any control-variable derivative slots that were output
             # (derived products get none). These are extra data variables in the
             # source beyond the value slots handled above.
+            # ("rho_t" stays in the set: a pre-Stage-4 raw file's slot must not be passed
+            # through on top of the derived total written above.)
             handled = Set(["time", "x", "z", "p", "rho_d", "rho_t", "u", "w",
                            "E_t", "Q_ss", "rho_r", "rho_c", "nu_r", "nu_c", "v",
                            "rho_v"])

@@ -197,7 +197,7 @@ println("Run: $dir  ($(nested ? "$npatch-patch nest" : "single grid"))")
 # The nest patches share one vertical grid and one o01_exact.ref at the base
 # directory, so rho_cbar(z) is built once and reused. The reference cloud is
 # zero on the subsaturated Dunion sounding, but add it for correctness.
-vars = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
+vars = Scythe.MC_VARS      # slot names only matter for the throwaway grid below
 scalar_bc = Dict(v => NeumannBC() for v in vars)
 
 # Build rho_cbar from the FIRST patch's kDim (all patches share it). The throwaway

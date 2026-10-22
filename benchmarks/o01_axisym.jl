@@ -44,7 +44,7 @@ const DUNION_SOUNDING = joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "dunion_MT_
 const N_R = 1.0e-3
 const KV_MOM = 0.0
 const KV_HEAT = 0.0
-const KV_WATER = 0.0
+# (No Kvdiff_water: the implicit water diffusion was retired with the rho_t slot at Stage 4.)
 
 function o01_axisym_model(opts::BenchmarkOptions)
     if opts.mode == :full
@@ -65,7 +65,6 @@ function o01_axisym_model(opts::BenchmarkOptions)
     # (the mc sponge is momentum-only with the KE routed to E_t).
     physical_params = Dict(:Khdiff => 0.0, :Kvdiff => KV_MOM,
                            :Khdiff_heat => 0.0, :Kvdiff_heat => KV_HEAT,
-                           :Kvdiff_water => KV_WATER,
                            :tau_qss => 10.0, :N_r => N_R,
                            :alpha => 0.02, :z_damp => 17.0e3,
                            :f => 0.0)
@@ -155,8 +154,8 @@ end
 function water_path_mm(path, model, ref, kDim)
     df = CSV.read(path, DataFrame)
     ncols = div(nrow(df), kDim)
-    rho_wbar = Springsteel.ref_rho_t(ref)[:, 1] .- Springsteel.ref_rho_d(ref)[:, 1]
-    rho_w = (df.rho_t .- df.rho_d) .+ repeat(rho_wbar, ncols)
+    # The derived total water sum_k alpha_k nu_k (the rho_t slot was deleted at Stage 4).
+    rho_w = mc_water_anchor(df, ref, ncols, model)
     W = domain_integral(reshape(rho_w, kDim, ncols), model)
     return W / (model.grid_params.iMax - model.grid_params.iMin)
 end

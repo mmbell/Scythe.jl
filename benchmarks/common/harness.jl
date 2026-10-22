@@ -73,7 +73,7 @@ const STAGE_PE_RHOD_PD = Symbol("pe-rho_d-pd")
 # smoothing conserves the entropy-density integral ∫sigma (equation set PE_SIGMA_XZ).
 const STAGE_PE_SIGMA = Symbol("pe-sigma")
 
-# Total-energy stage: prognostic p / rho_d / rho_t / E_t / Q_ss on a pressure-based
+# Total-energy stage: prognostic p / rho_d / rho_v / E_t / Q_ss on a pressure-based
 # reference (equation set moist_compressible_XZ). All conserved quantities are extensive
 # flux-form prognostics; T is diagnosed and the vapor/cloud partition follows from Q_ss.
 const STAGE_MC = Symbol("mc")

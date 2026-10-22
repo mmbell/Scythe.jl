@@ -16,12 +16,13 @@ function output_snapshots(model)
     return sort(pairs, by = first)
 end
 
-"""Domain-mean total water path [mm] of a snapshot (1 kg/m² of water ≡ 1 mm)."""
+"""Domain-mean total water path [mm] of a snapshot (1 kg/m² of water ≡ 1 mm): the model's
+derived total water `rho_w = sum_k alpha_k nu_k` (`mc_water_anchor`; the prognostic rho_t
+slot it was once read from as `rho_t - rho_d` was deleted at Stage 4)."""
 function water_path_mm(path, model, ref, kDim)
     df = CSV.read(path, DataFrame)
     ncols = div(nrow(df), kDim)
-    rho_wbar = Springsteel.ref_rho_t(ref)[:, 1] .- Springsteel.ref_rho_d(ref)[:, 1]
-    rho_w = (df.rho_t .- df.rho_d) .+ repeat(rho_wbar, ncols)
+    rho_w = mc_water_anchor(df, ref, ncols, model)
     W = domain_integral(reshape(rho_w, kDim, ncols), model)   # kg/m per unit y
     return W / (model.grid_params.iMax - model.grid_params.iMin)
 end
@@ -70,15 +71,16 @@ function o01_rain_diagnostics(model, ref, kDim)
     # ways a RESIDUAL vapor could fail (rho_w < 0 was the shadow of a negative rho_c, which
     # cancels in the residual; rho_v < 0 at healthy rho_w meant the condensate had claimed
     # more water than the column held — see the STAGE 5 RESOLUTION of
-    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md). Now the two are independent fields,
-    # and rho_w - (rho_v + rho_c + rho_r) is the reconciliation gap instead.
+    # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md). Since Stage 4 of the rho_t
+    # retirement rho_t is DERIVED (rho_w = sum_k alpha_k nu_k, mc_state/mc_water_anchor), so
+    # min rho_w < 0 says the control variables' negative lobes outweigh the column's water.
     min_rw = Inf
     # Dry-density headroom, as a FRACTION of the reference (rho_d spans two decades over the
     # column, so an absolute minimum would only ever report the model top). Diagnostic only:
     # rho_d has no rate sinks at all, so it cannot be depleted the way rho_c is — a fraction
     # that departs from 1 by more than rounding means the dynamics are moving mass, and one
     # that approaches 0 is a blow-up, not a positive-definiteness problem. Positivity bounds
-    # for rho_d/rho_t exist and are tested but stay OFF (benchmarks/FUTURE_WORK.md); this is
+    # for rho_d exist and are tested but stay OFF (benchmarks/FUTURE_WORK.md); this is
     # the number that would say when to reconsider.
     min_rd_frac = Inf
     times = Float64[]

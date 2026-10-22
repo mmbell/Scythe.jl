@@ -28,7 +28,8 @@
 # Layers are Scythe's mish points; MYNN's layer thickness dz comes from faces at the
 # midpoints between mish points plus z = 0 and z = z_top (the radiation convention,
 # src/radiation.jl), so sum(dz) = z_top and zw(k) = sum(dz(1:k-1)) in the driver.
-# `sqv` is SPECIFIC humidity rho_v/rho_t and `rho` the MOIST density rho_t, the
+# `sqv` is SPECIFIC humidity rho_v/rho_t and `rho` the MOIST density rho_t (the derived
+# total, rho_d + sum_k alpha_k nu_k, since Stage 4 of the rho_t retirement), the
 # conventions of mynnedmf_wrapper.F90; `ts` is T_sfc/exner(1) (the wrapper's "theta").
 #
 # case3_tc_rmw reads `<tc-dir>/nest1/<tc-t>_physical.csv`, so --tc-dir must point at a
@@ -262,10 +263,30 @@ let
         c = argmax(vlow)
         rows = ((c - 1) * kDim + 1):(c * kDim)
         d = df[rows, :]
-        p3 = d.p .+ pbar; rd3 = d.rho_d .+ rdbar; rt3 = d.rho_t .+ rtbar; E3 = d.E_t .+ E_tbar
+        p3 = d.p .+ pbar; rd3 = d.rho_d .+ rdbar; E3 = d.E_t .+ E_tbar
         rc3 = Scythe.recover_rho_c.(d.nu_c, rcbar, :bhyp, cmu)
         rr3 = Scythe.recover_rho_r.(d.nu_r, :bhyp, rmu)
-        rv3 = d.rho_v .+ (rtbar .- rdbar .- rcbar)
+        # The vapor (slot 3) is a perturbation off the derived rho_tbar - rho_dbar - rho_cbar:
+        # the density, or under the vapor transform nu_v' off bhyp of it.
+        rvb = rtbar .- rdbar .- rcbar
+        vmu = Scythe.VAPOR_MU_DEFAULT
+        hasnuv = "nu_v" in names(d)
+        rv3 = hasnuv ? Scythe.recover_rho_v.(d.nu_v, Scythe.bhyp.(rvb, vmu), :bhyp, vmu) :
+                       d.rho_v .+ rvb
+        # The total density: a pre-Stage-4 CSV's prognostic rho_t slot, or (since Stage 4 of
+        # the rho_t retirement) the model's DERIVED rho_d + sum_k alpha_k nu_k over vapor,
+        # cloud, rain and any ice masses (alpha = 2 transformed, 1 density; Scythe.anchor_W_value).
+        rt3 = if "rho_t" in names(d)
+            d.rho_t .+ rtbar
+        else
+            W = hasnuv ? 2.0 .* (d.nu_v .+ Scythe.bhyp.(rvb, vmu)) : d.rho_v .+ rvb
+            W = (W .+ (2.0 .* (d.nu_c .+ Scythe.bhyp.(rcbar, cmu)))) .+ (2.0 .* d.nu_r)
+            for sp in 1:3
+                "nu_i$sp" in names(d) && (W = W .+ (2.0 .* d[!, "nu_i$sp"]))
+                "rho_i$sp" in names(d) && (W = W .+ d[!, "rho_i$sp"])
+            end
+            rd3 .+ W
+        end
         ke = 0.5 .* (d.u .^ 2 .+ d.v .^ 2 .+ d.w .^ 2)          # cylinders carry v in ke (mc_ke!)
         M = p3 .+ E3 .- rt3 .* (ke .+ T.gravity .* zm)
         Tk3 = Scythe.retrieve_temperature.(M, rd3, rt3, rc3 .+ rr3)

@@ -35,9 +35,8 @@ const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 # intensive entropy "s" (pd) or the entropy density "sigma" (moist-compressible).
 const PE_VARS_PD = ["s", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
 const PE_VARS_SIGMA = ["sigma", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
-# Total-energy variant (runs dry here: rho_t = rho_d, Q_ss tracks -rho_v_sat)
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c",
-                 "rho_v"]
+# Total-energy variant (runs dry here: the derived rho_t = rho_d, Q_ss tracks -rho_v_sat)
+const MC_VARS = Scythe.MC_VARS     # untransformed slot names (Scythe.mc_var_names)
 function bf02_dry_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w"]
     stage == STAGE_MC && return MC_VARS

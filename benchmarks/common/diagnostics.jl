@@ -232,6 +232,68 @@ function mc_ice(df; itrans::Symbol = :none, imu = 1.0e-12)
 end
 
 """
+    mc_water_anchor(df, ref, ncols; ctrans, cmu, vapor_mu) -> rho_w
+
+The model's TOTAL WATER `rho_w = sum_k alpha_k nu_k` (totals, z fastest) rebuilt from the
+water-mass columns of an output DataFrame -- the derived water anchor every reader in the model
+takes since Stage 4 of the rho_t retirement deleted the prognostic `rho_t` slot (slot 3 is the
+vapor now). Exactly `Scythe.anchor_W_value` / `mc_derived_fields` (src/netcdf_output.jl), in the
+same member order: vapor, cloud, rain, the three ice masses; `alpha_k = 2` for a transformed
+slot (`nu_*` column), 1 for a density (`rho_*`). The vapor and cloud columns are PERTURBATIONS
+and get their references back -- `nu_vbar = bhyp(rho_vbar)` (or `rho_vbar`) with the derived
+`rho_vbar = rho_tbar - rho_dbar - rho_cbar`, and `bhyp(rho_cbar)` (or `rho_cbar`) -- while rain
+and ice are totals. The total density is `rho_t = rho_d + rho_w`.
+
+`ctrans`/`rtrans` are the run's cloud and rain transform modes (as for [`mc_water`](@ref),
+which validates the column names against them; `nothing` = read the mode off the column name)
+and `cmu` the cloud width; the vapor and ice alphas follow the column names.
+Under a transform `rho_w` is the anchor's LINEAR sum `2 nu`, not the recovered densities' sum:
+that is the quantity the model conserves and reads, so a budget built on it closes.
+"""
+function mc_water_anchor(df, ref, ncols::Int; ctrans = nothing, cmu = 1.0e-7,
+                         rtrans = nothing, vapor_mu = Scythe.VAPOR_MU_DEFAULT)
+    rho_dbar = Springsteel.ref_rho_d(ref)[:, 1]
+    rho_cbar = Springsteel.ref_rho_c(ref)[:, 1]
+    rho_vbar = (Springsteel.ref_rho_t(ref)[:, 1] .- rho_dbar) .- rho_cbar
+    cols = names(df)
+    rho_w = if "nu_v" in cols
+        2.0 .* (df.nu_v .+ repeat(Scythe.bhyp.(rho_vbar, vapor_mu), ncols))
+    elseif "rho_v" in cols
+        df.rho_v .+ repeat(rho_vbar, ncols)
+    else
+        error("no vapor column (\"rho_v\" or \"nu_v\") in this output (it has $(cols))")
+    end
+    # The cloud and rain: transformed by the run's mode when given, else by the column name.
+    craw, cnamed = water_column(df, "rho_c")
+    ctr = ctrans === nothing ? cnamed : ctrans !== :none
+    rho_w = rho_w .+ (ctr ? 2.0 .* (craw .+ repeat(Scythe.bhyp.(rho_cbar, cmu), ncols)) :
+                      craw .+ repeat(rho_cbar, ncols))
+    rraw, rnamed = water_column(df, "rho_r")
+    rtr = rtrans === nothing ? rnamed : rtrans !== :none
+    rho_w = rho_w .+ ((rtr ? 2.0 : 1.0) .* rraw)
+    for s in 1:3
+        if "nu_i$s" in cols
+            rho_w = rho_w .+ (2.0 .* df[!, "nu_i$s"])
+        elseif "rho_i$s" in cols
+            rho_w = rho_w .+ df[!, "rho_i$s"]
+        end
+    end
+    return rho_w
+end
+
+"""
+    mc_water_anchor(df, ref, ncols, model) -> rho_w
+
+[`mc_water_anchor`](@ref) with the transforms and widths read off `model`.
+"""
+mc_water_anchor(df, ref, ncols::Int, model) =
+    mc_water_anchor(df, ref, ncols;
+                    ctrans = Scythe.condensate_transform_mode(model.options),
+                    cmu = get(model.physical_params, :condensate_mu, 1.0e-7),
+                    rtrans = Scythe.rain_transform_mode(model.options),
+                    vapor_mu = Scythe.vapor_mu(model.physical_params))
+
+"""
     mc_state(df, ref, kDim, ncols)
 
 Reconstruct the thermodynamic state of the total-energy set (moist_compressible) from a
@@ -244,12 +306,14 @@ density, and reading it raw would be silently wrong by a factor of two in the li
 Returns the recovered `rho_r` alongside, so callers never have to touch the raw column.
 
 **The vapor comes from the `rho_v` COLUMN**, added to the DERIVED reference
-`rho_tbar - rho_dbar - rho_cbar` the slot is carried against (`Scythe.vapor_slot`). Output
-written before the vapor became prognostic has no such column, and for those files this falls
-back to the density residual `rho_t - rho_d - rho_liq` — which is what the model used to mean
-by the vapor. The two are no longer the same number: their difference is the reconciliation
-gap (`Scythe.rho_v_reconcile`), so a residual read of a post-Stage-A file would report a drift
-diagnostic in place of the field.
+`rho_tbar - rho_dbar - rho_cbar` the slot is carried against (`Scythe.vapor_slot`).
+
+**The total density is DERIVED**: `rho_t = rho_d + rho_w` with `rho_w` the anchor sum of
+[`mc_water_anchor`](@ref), as the model reads it since Stage 4 of the rho_t retirement deleted
+the prognostic `rho_t` slot. A pre-Stage-4 file still carries its `rho_t` column, and for those
+the column is read as before (and, for output older than the prognostic vapor, the vapor falls
+back to the residual `rho_t - rho_d - rho_liq`); convert such runs with
+tools/convert_rho_t_checkpoint.jl to read them the new way.
 """
 function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
                   rain_transform::Symbol = :none, rain_mu = 1.0e-7,
@@ -261,18 +325,22 @@ function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
     E_tbar = Springsteel.ref_total_energy(ref)[:, 1]
     p = df.p .+ repeat(pbar, ncols)
     rho_d = df.rho_d .+ repeat(rho_dbar, ncols)
-    rho_t = df.rho_t .+ repeat(rho_tbar, ncols)
     E_t = df.E_t .+ repeat(E_tbar, ncols)
     # Slots 8 and 9 are not necessarily densities: under a transform the output column holds
     # the CONTROL variable and the density has to be recovered, exactly as the kernel does.
     # `:none` is the plain add / plain read, bit for bit.
     rho_c, rho_r = mc_water(df, rho_cbar, ncols; ctrans = transform, cmu = mu,
                             rtrans = rain_transform, rmu = rain_mu)
+    # The derived total density (the model's own since Stage 4), or a legacy file's column.
+    legacy = "rho_t" in names(df)
+    rho_t = legacy ? df.rho_t .+ repeat(rho_tbar, ncols) :
+            rho_d .+ mc_water_anchor(df, ref, ncols; ctrans = transform, cmu = mu,
+                                     rtrans = rain_transform, vapor_mu = vapor_mu)
     ke = 0.5 .* (df.u .^ 2 .+ df.w .^ 2)
     M = p .+ E_t .- (rho_t .* (ke .+ Scythe.gravity .* df.z))
     rho_liq = rho_c .+ rho_r
     Tk = Scythe.retrieve_temperature.(M, rho_d, rho_t, rho_liq)
-    # The vapor is a prognostic slot; see the docstring for the pre-Stage-A fallback.
+    # The vapor is a prognostic slot; see the docstring for the legacy (pre-Stage-A) fallback.
     # Under `options[:vapor_transform] = :bhyp` the column is the CONTROL variable `nu_v`
     # (`Scythe.vapor_slot`), recovered exactly as the kernel does against bhyp of the same
     # derived reference; `vapor_mu` must be the run's (`physical_params[:vapor_mu]`).
@@ -281,7 +349,8 @@ function mc_state(df, ref, kDim, ncols; transform::Symbol = :none, mu = 1.0e-7,
             "nu_v" in names(df) ?
                 Scythe.ahyp.(df.nu_v .+ repeat(Scythe.bhyp.(rho_vbar_d, vapor_mu), ncols),
                              vapor_mu) :
-            rho_t .- rho_d .- rho_liq
+            legacy ? rho_t .- rho_d .- rho_liq :
+            error("no vapor column (\"rho_v\" or \"nu_v\") in this output")
     return Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r
 end
 
@@ -488,8 +557,8 @@ function conservation_drift(model, ref; liquid_vars::Vector{String}=String[])
     # sigma (entropy-density) set additionally stores slot 1 as sigma = rho_d*s.
     pd = Scythe.uses_physical_reference(model.equation_set)
     # The total-energy set (moist_compressible) integrates its extensive prognostics
-    # directly: mass from rho_d/rho_t and energy from E_t itself, which IS the
-    # corrected total-energy diagnostic E_t = ρ_d e_i + ρ_t(ke + gz) of
+    # directly: mass from rho_d and the derived rho_t = rho_d + rho_w (mc_water_anchor), and
+    # energy from E_t itself, which IS the corrected total-energy diagnostic E_t = ρ_d e_i + ρ_t(ke + gz) of
     # reference/Scythe_moist_compressible.tex.
     mc = Scythe.uses_pressure_reference(model.equation_set)
 

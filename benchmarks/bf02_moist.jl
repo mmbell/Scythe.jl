@@ -43,9 +43,9 @@ const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 const PE_VARS_PD = ["s", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
 # Entropy-density variant: slot 1 carries sigma = rho_d*s instead of s
 const PE_VARS_SIGMA = ["sigma", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
-# Total-energy variant: prognostic p/rho_d/rho_t/E_t/Q_ss; rho_v and rho_c are diagnostic
-const MC_VARS = ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c",
-                 "rho_v"]
+# Total-energy variant: prognostic p/rho_d/rho_v/E_t/Q_ss (the vapor is slot 3 since Stage 4 of
+# the rho_t retirement; rho_t is derived, rho_d + sum_k alpha_k nu_k)
+const MC_VARS = Scythe.MC_VARS     # untransformed slot names (Scythe.mc_var_names)
 function bf02_moist_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
     stage == STAGE_MC && return MC_VARS
@@ -458,13 +458,13 @@ function bf02_moist_diagnostics(model)
         "theta_e_bubble_top_km" => theta_e_bubble_height(theta_e_p, z) / 1000.0,
     )
     if opts.stage == STAGE_MC
-        # Positive-definiteness monitors for the prognostic density pair. Diagnostic only —
-        # no target, no clamp. rho_d has no rate sinks at all and rho_t's only sink is the
-        # fitted sedimentation flux divergence, so neither can be depleted the way rho_c is;
-        # min_rho_d_frac departing from 1 just says the dynamics are moving mass. The
-        # quantity with a meaningful zero is the water rho_w = rho_t - rho_d, and because it
-        # is a DIFFERENCE of two independently fitted fields no per-field spline bound can
-        # protect it. Both are measured, not enforced (benchmarks/FUTURE_WORK.md).
+        # Positive-definiteness monitors. Diagnostic only — no target, no clamp. rho_d has no
+        # rate sinks at all, so it cannot be depleted the way rho_c is; min_rho_d_frac
+        # departing from 1 just says the dynamics are moving mass. The quantity with a
+        # meaningful zero is the water rho_w = rho_t - rho_d — since Stage 4 of the rho_t
+        # retirement the DERIVED sum_k alpha_k nu_k over the water slots (mc_state), so it
+        # goes negative only where the slots' negative lobes outweigh the column's water.
+        # Both are measured, not enforced (benchmarks/FUTURE_WORK.md).
         _, _, rho_d, _, _, rho_t, _ = mc_state(df, ref, kDim, ncols;
             transform = Scythe.condensate_transform_mode(model.options),
             mu = get(model.physical_params, :condensate_mu, 1.0e-7),

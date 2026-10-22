@@ -176,7 +176,7 @@ function bc_section(io)
     | `vertical_scalars = "d2"` | bottom of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
     | `vertical_scalars = "natural"` | bottom of every variable: natural (unconstrained); then the rules below |
     | `vertical_scalars = "neumann"` | bottom of every variable: neumann; then the rules below |
-    | `vertical_scalars = "r1t1x"` | bottom as `d2`, except `rho_d`, `rho_t`, `E_t`, `Q_ss` neumann and `p` r1t1x (the rigid-wall pressure condition `dp'/dz = -g rho_t'`, installed before every fit; relaxed on `numerics.wall_bc_tau`) |
+    | `vertical_scalars = "r1t1x"` | bottom as `d2`, except `rho_d`, `E_t`, `Q_ss` neumann and `p` r1t1x (the rigid-wall pressure condition `dp'/dz = -g rho_t'` on the derived `rho_t'`, installed before every fit; relaxed on `numerics.wall_bc_tau`) |
     | `vertical_scalars_lid = <same values>` | the same rule at the top of every variable (default `natural`; `d2` at the lid drifts warm over days); then the rules below |
     | (always) | `w` dirichlet (zero) at bottom and top, whatever `vertical_scalars` and `vertical_scalars_lid` |
     | (always) | the sedimenting slots (rain; the rain number under two-moment rain; the twelve ice slots under ISHMAEL) natural at the bottom, so they fall out |
