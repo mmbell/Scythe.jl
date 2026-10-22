@@ -1073,6 +1073,37 @@ the slot-based column. `@noinline`, plain arrays.
 end
 
 """
+    inert_ice_anchor_legs!(model)
+    inert_ice_anchor_legs!(st, model)
+
+UNDER THE DERIVED WATER ANCHOR the four ice-anchor legs are INERT (review D1): the anchor is
+`ρ_w = Σ α_k ν_k` itself, so the implied vapor is `ahyp(ν_v) ≥ 0` and the anchor cannot be
+exceeded by construction, while the headroom read through `ρ_t − ρ_d = W` would fire at every
+vapor-lobe point with ice (`ρ_v + X < 0`, the pool) — a transport-detachment guard turned into
+a vapor-negativity device. The first form sets `options[:ice_anchor_source]`, `[:ice_anchor_floor]`,
+`[:ice_anchor_flux]` and `[:ice_anchor_rates]` to `false` (an explicit `true` was already refused
+by [`validate_water_anchor`](@ref)), so `mc_driver!` reads them off exactly as before; the
+second marks the stats matrix (`MC_ANCHOR_INERT`), so `_ice_anchor_reconcile!` measures nothing
+and `MC_ANCHOR_GAP` is the shadow gap ([`_anchor_shadow_census!`](@ref), every column).
+Nothing here is in `mc_driver!`: a branch there tips `moist_compressible_SLR` over the LLVM
+compile cliff (measured 2026-10-22). A no-op under `:slot`.
+"""
+function inert_ice_anchor_legs!(model)
+    uses_pressure_reference(model.equation_set) || return nothing
+    water_anchor_mode(model.options) === :derived || return nothing
+    for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux, :ice_anchor_rates)
+        model.options[k] = false
+    end
+    return nothing
+end
+
+function inert_ice_anchor_legs!(st::Matrix{Float64}, model)
+    (size(st, 2) > 0 && water_anchor_mode(model.options) === :derived) || return st
+    @inbounds st[MC_ANCHOR_INERT, :] .= 1.0
+    return st
+end
+
+"""
     validate_water_anchor(model)
 
 Setup-time refusals of what the derived water anchor (`options[:water_anchor] = :derived`)
@@ -1434,6 +1465,9 @@ reference/HANDOFF_DRIVER_COMPILE_CLIFF.md, measured 2026-10-21); the `_siw_stage
     _water_exchange_multistep!(mtile.expdot_n, phys, S, colstart, rv_i, opts, pp, IS, ice,
                                precip, nvb, vtr, vmu, model.ts)
     eb.active && eb_take!(eb, EB_OP_WEXCH, mtile.expdot_n, colstart)
+    # the MC_ANCHOR_* census under the derived anchor: the shadow gap, every column (D1)
+    _anchor_shadow_census!(mtile.mc_water_stats, Threads.threadid(), phys, colstart,
+                           S.res_rho_t)
     _etd_closure!(S.etd_dv, S.etd_d9, S.etd_d8, S.etd_di1, S.etd_di2, S.etd_di3, ice,
                   opts, pp, IS)
     ctr = condensate_transform_mode(opts); rtr = rain_transform_mode(opts)

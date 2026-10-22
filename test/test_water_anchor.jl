@@ -889,11 +889,27 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                 kD = mo.grid_params.kDim
                 # the gap row of THIS column step alone (it is a run maximum)
                 fill!(view(st, Scythe.MC_ANCHOR_GAP, :), 0.0)
+                mr = deepcopy(m)              # the same state, for the rate-leg check below
                 Scythe.advance_column(m, 1, 4)
                 S = m.mc_scratch[Threads.threadid()]
                 if wa === :derived
-                    @test all(==(1.0), S.anchor_f)
+                    # the legs are switched off at setup and the stats matrix marks them inert
+                    for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux,
+                              :ice_anchor_rates)
+                        @test mo.options[k] === false
+                    end
+                    @test all(==(1.0), view(st, Scythe.MC_ANCHOR_INERT, :))
                     @test S.rho_ice_t == S.rho_ice
+                    # the RATE and FLUX legs directly: forcing them back on (past the validation) on the
+                    # same state changes the ice sources where the headroom binds; the default
+                    # arm's sources are the unshared ones
+                    rd0 = (copy(S.SRC_i1q), copy(S.invtau_i1), copy(S.F_i1q))
+                    mr.model.options[:ice_anchor_rates] = true
+                    mr.model.options[:ice_anchor_flux] = true
+                    Scythe.advance_column(mr, 1, 4)
+                    Sr = mr.mc_scratch[Threads.threadid()]
+                    @test any(<(1.0), Sr.anchor_f)
+                    @test (Sr.SRC_i1q, Sr.invtau_i1, Sr.F_i1q) != rd0
                     @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
                     @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) == 0.0
                     G = maximum(abs, m.tile.physical[1:kD, 3, 1] .- S.res_rho_t)
