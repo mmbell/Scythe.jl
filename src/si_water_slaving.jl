@@ -1,6 +1,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# ν-flux slaving of the water slots in the acoustic semi-implicit solve — Stage 2 of the ρ_t
-# retirement (reference/RHO_T_RETIREMENT_DESIGN.md §4.2 options (i′) and (iii), §6 Stage 2).
+# THE WATER ANCHOR AND EVERYTHING THAT KEEPS IT — the ρ_t retirement's code
+# (reference/RHO_T_RETIREMENT_DESIGN.md; reference/Scythe_moist_compressible.tex §"The derived
+# total density"). This file hosts, in order:
+#
+#   1. the ν-flux SLAVING of the water slots in the acoustic semi-implicit solve (Stage 2,
+#      `options[:si_water_slots]`, library default :none, run-config default :mass) — the rest
+#      of this header;
+#   2. the DERIVED WATER ANCHOR API (Stages 3-4): `water_anchor_set` (the members, weights
+#      α_k = 2 transformed / 1 density, and the fixed summation order shared with the slaving),
+#      `anchor_Wp`/`anchor_W_value`/`anchor_rho_tp`, the driver staging `_anchor_stage!` and its
+#      readers (`_anchor_w_forcing!`, `_anchor_star!`): every reader of the total density takes
+#      ρ_t = ρ_d + Σ_k α_k ν_k, ρ_t' = ρ_d' + Σ_k α_k ν_k', ρ̄_t^w = ρ̄_d + Σ_k α_k ν̄_k;
+#      `validate_water_anchor`, the setup refusals of every retired device (the nudge, slot 3's
+#      water diffusion, the clamp floor, the lobe attribution, the MYNN slot-anchor closures,
+#      the four ice-anchor legs deleted at Stage 5);
+#   3. the EXCHANGE CLOSURE (Stage 3b): `water_exchange_dv`, the ONE function every water
+#      exchange's vapor increment comes from (the ETD increments `_etd_closure!`, the multistep
+#      sources `water_exchange_multistep_rate`, the paired Stage L `_lobe_relax_paired!`), the
+#      sedimentation knee closure, and `_water_exchange_stage!`, which runs the closures and the
+#      affine-defect refit partner from `explicit_timestep` (outside `mc_driver!`, for the
+#      compile cliff; reference/HANDOFF_DRIVER_COMPILE_CLIFF.md).
+#
+# The energy side (the partner primitive `recovered_change_partner`, the refit and ETD partners)
+# is in src/moist_compressible.jl; the per-stage budget of R and X in src/energy_budget.jl.
+#
+# ── 1. ν-flux slaving of the water slots in the acoustic semi-implicit solve — Stage 2
+#    (reference/RHO_T_RETIREMENT_DESIGN.md §4.2 options (i′) and (iii), §6 Stage 2).
 #
 # The vertical acoustic solve advanced ρ_t' (slot 3 until Stage 4) by the implicit flux divergence
 # −Δτ ∂z φ and ρ_d' by −Δτ ∂z(c_d φ) (φ = ρ̂_t w), while every water species took its vertical
@@ -1062,26 +1087,33 @@ function validate_water_anchor(model)
 end
 
 # ═════════════════════════════════════════════════════════════════════════════
-# WATER EXCHANGE WITH THE VAPOR AS ν-SPACE CLOSURE — Stage 3b (design §5.2, plan E4/E5/E8)
+# 3. WATER EXCHANGE WITH THE VAPOR AS ν-SPACE CLOSURE — Stage 3b (design §5.2, plan E4/E5/E8)
 #
-# Under the derived anchor every process that moves water between species applies its
-# non-vapor ν increments as before and the vapor receives
+# Every process that moves water between species applies its non-vapor ν increments as before
+# and the vapor receives
 #
 #     Δν_v = −(Σ_{k≠v} α_k Δν_k)/α_v                         (`water_exchange_dv`)
 #
 # in ONE fixed order (cloud, rain, the three ice masses), so ρ_w = Σ α_k ν_k is invariant under
 # every exchange to rounding (exactly: with all α = 2 the doublings and the halving are exact,
-# and α_v Δν_v is the negated sum bit for bit). Sites: the ETD step-mean increments, the
-# multistep exchange sources (AUTO_COLL, the ice back-reactions ICE_C/ICE_R, the twelve ice
-# SRC_* including the population reconcile), the sedimentation knee
-# closure and the paired Stage L.
+# and α_v Δν_v is the negated sum bit for bit). Exchange sites, all through `water_exchange_dv`:
+# the ETD step-mean increments (`_etd_closure!`), the multistep exchange sources (AUTO_COLL,
+# the ice back-reactions ICE_C/ICE_R, the twelve ice SRC_* including the population
+# reconcile; `water_exchange_multistep_rate`) and the paired Stage L (`_lobe_relax_paired!`).
+# The sedimentation knee closure (`sedimentation_knee_closure`) is the one other water term in
+# the vapor slot: not an exchange between species but the fall's ν/ρ mismatch, closed so that
+# ρ_w loses exactly the fitted flux divergence. Every other write to the vapor slot is a
+# transport-class term (advection and −J_v ρ_v ∇·v, the acoustic slaving, the boundary-layer ν
+# leg with the surface flux, horizontal mixing), linear in ν, not an exchange.
 # ═════════════════════════════════════════════════════════════════════════════
 
 """
     water_exchange_dv(av, ac, ar, ai, dc, dr, d1, d2, d3) -> Δν_v
 
-THE ONE CLOSURE: the vapor's ν increment of a water exchange whose non-vapor ν increments are
-`dc` (cloud), `dr` (rain), `d1..d3` (the ice masses), weights `α` (`water_anchor_set`):
+THE ONE CLOSURE, and the single entry point for the vapor's share of every water exchange (the
+ETD increments, the multistep sources, the paired Stage L; see the section header): the vapor's
+ν increment of a water exchange whose non-vapor ν increments are `dc` (cloud), `dr` (rain),
+`d1..d3` (the ice masses), weights `α` (`water_anchor_set`):
 `−((((α_c dc + α_r dr) + α_i d1) + α_i d2) + α_i d3)/α_v`. With every `α = 2` it is bitwise
 `−((((dc + dr) + d1) + d2) + d3)` (doubling and halving are exact). An all-zero exchange gives
 `−0.0`, which every caller skips, so a quiet point is untouched bitwise.

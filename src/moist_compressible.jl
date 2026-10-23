@@ -1,10 +1,15 @@
 # Total-energy moist compressible equation set.
 #
-# Prognostic variables (XZ slice): p [Pa], rho_d, rho_t, u, w, E_t [J/m^3], Q_ss
-# [kg/m^3], rho_r, rho_c, rho_v. EVERY WATER SPECIES IS PROGNOSTIC — vapor, cloud, rain
-# and (under options[:ice_microphysics]) the twelve ice moments — and temperature
-# follows in CLOSED FORM from the Bryan & Fritsch (2002) total energy (see
-# retrieve_temperature), with no iteration and no dependence on the partition.
+# Prognostic variables (`MC_VARS`, XZ slice): p [Pa], rho_d, the vapor (`nu_v` under
+# vapor_transform = :bhyp, `rho_v` under :none), u, w, E_t [J/m^3], Q_ss [kg/m^3], the rain
+# (`nu_r`/`rho_r`) and the cloud (`nu_c`/`rho_c`); the cylindrical and spherical sets add v as
+# slot 10 (`MC_VARS_CYL`), and `mc_var_names` appends, when registered, n_r (two-moment rain),
+# the twelve ice moments (ice_microphysics = :ishmael) and rho_e (MYNN). EVERY WATER SPECIES
+# IS PROGNOSTIC and THE TOTAL DENSITY IS NOT: every reader takes the DERIVED
+# rho_t = rho_d + sum_k alpha_k nu_k (item 6 below). The model temperature is the
+# equation-of-state T = p/(rho_d R_d + rho_v R_v) (`eos_temperature`, options[:temperature] =
+# :eos, the default); the closed-form Bryan & Fritsch (2002) total-energy retrieval
+# (`retrieve_temperature`) is the :energy alternative and an output diagnostic.
 #
 # ── The criterion this equation set converged on
 #
@@ -12,8 +17,9 @@
 # BEING DIFFERENCED. That is the whole content of a long campaign, and it is worth
 # stating before the history, because it is what decides the next such question too.
 #
-# T is safe: it is large, and it comes out of a linear retrieval whose inputs are the
-# conserved p, E_t, rho_t. A small water species retrieved as the residual of large
+# T is safe: it is large, and it comes out of a formula whose inputs are large (the
+# equation of state from p, rho_d, rho_v; the energy retrieval from p, E_t and the total
+# density). A small water species retrieved as the residual of large
 # ones is not safe, and the failure is CONDITIONING — not a bug to be fixed inside the
 # retrieval, but a property of which variable was chosen to be the leftover.
 #
@@ -50,8 +56,8 @@
 # 5. THE VAPOR CONTROL VARIABLE (Stage 1 of the rho_t retirement; `vapor_transform_mode`).
 #    Under `options[:vapor_transform] = :bhyp` the vapor slot carries Ooyama's
 #    nu_v' = bhyp(rho_v) - bhyp(rho_vbar) (mu_v = 1e-9) like the condensates, every reader sees
-#    ahyp(nu_v) >= 0, every density-space tendency enters through J_v, and the reconciliation
-#    nudge of that stage was the realized, bounded rate law of plan decision E6.
+#    ahyp(nu_v) >= 0 and every density-space tendency enters through J_v. The library default
+#    is :none (the density slot, bitwise the code before); the run configuration selects :bhyp.
 #
 # 6. THE DERIVED WATER ANCHOR (Stages 3-4 of the rho_t retirement). rho_t is no longer a
 #    prognostic: every reader takes rho_t = rho_d + sum_k alpha_k nu_k over the water-mass
@@ -59,9 +65,36 @@
 #    its perturbation rho_d' + sum_k alpha_k nu_k' and the reference
 #    rho_tbar^w = rho_dbar + sum_k alpha_k nu_kbar (`water_anchor_set`, `_anchor_stage!`).
 #    The vapor is the nu-space closure of every exchange (`water_exchange_dv`), so total
-#    water is conserved by construction and there is no reconciliation nudge. Stage 4
-#    deleted slot 3: the vapor (`nu_v`, `rho_v` under vapor_transform = :none) IS slot 3.
-#    Pre-Stage-4 checkpoints are converted by tools/convert_rho_t_checkpoint.jl.
+#    water is conserved by construction and there is no reconciliation of the vapor onto a
+#    second statement of the water. Stage 4 deleted slot 3: the vapor (`nu_v`, `rho_v` under
+#    vapor_transform = :none) IS slot 3. Pre-Stage-4 checkpoints are converted by
+#    tools/convert_rho_t_checkpoint.jl (src/checkpoint_conversion.jl).
+#
+# ── The two anchors, the partners and the census (reference/RHO_T_RETIREMENT_DESIGN.md,
+#    reference/Scythe_moist_compressible.tex §"The derived total density")
+#
+# Two LINEAR anchors, E_t and the water rho_w = sum_k alpha_k nu_k, each invariant under every
+# exchange and acted on by the linear operators alone (advection, refit/filter, the SI
+# slaving, horizontal mixing, R3X). One RECOVERED reading the physics sees: T_eos and
+# rho_k = ahyp(nu_k). Two residuals measure the difference:
+#   R = E_t - E_implied(T_eos, recovered species, (rho_d + rho_w) geo)   (`implied_total_energy`)
+#   X = rho_w - sum_k ahyp(nu_k) = B + Lambda (knee bias >= 0, lobe pool <= 0)
+# RULE: an operator that changes the recovered reading differently from the anchors gets a
+# PARTNER that holds R through p and Q_ss; nothing moves a nu to hold X. Every partner is
+# `recovered_change_partner`: the refit partner books the affine defect, energy only
+# (`_refit_partner_defect!`, lambda_l, lambda_i, kappa); the ETD exchange realization books the
+# recovered gap (`_etd_exchange_closure!`); the multistep and sedimentation closures book their
+# realized recovered rates (`_water_exchange_multistep!`); the MYNN and Louis boundary layers
+# have one nu leg per water-mass slot with the energy carry regrouped by species
+# (`_mynn_nu_legs!`, `_louis_apply_derived!`); the paired Stage L books kappa only
+# (`_lobe_relax_paired!`, default OFF, `LOBE_RELAXATION_DERIVED_DEFAULT`).
+# Where they live: src/si_water_slaving.jl (the derived anchor, `water_exchange_dv`, the
+# closures, the acoustic slaving, the setup refusals), this file (the primitive, the refit and
+# ETD partners, the driver), src/energy_budget.jl (`options[:energy_budget]`, the per-stage
+# finite differences of R and X, and the census these rows are reported by).
+# Census rows (`mc_water_stats`, `energy_census_trace`): MC_REFIT_DR / MC_REFIT_BOOKED,
+# MC_XGAP_MAX / _INT / _POOL, MC_VNEG / MC_VNEG_MASS, MC_LOBE_*, MC_W_PART / _NEG / _NEG_PTS /
+# _INT / _SRC / _BUDGET, and MC_QSS_GAP below.
 #
 # ── The one remaining reconciliation
 #
@@ -82,16 +115,17 @@
 # Negative water is a RESOLUTION DIAGNOSTIC and is never clamped
 # (reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md): a positive-definite spike the
 # vertical basis cannot resolve undershoots on the way in, and the size of that
-# undershoot is the signal that the column wants more nodes. `clamp_water!` floors
-# rho_c and rho_r after every column step; because rho_t is prognostic and the phase
-# change is internal to the water, that floor is exactly a phase change — total water
-# and E_t are untouched and the retrieval supplies the matching latent heat — so it
-# conserves mass, water and energy by construction.
+# undershoot is the signal that the column wants more nodes. `clamp_water!` measures it
+# after every column step and writes nothing (its floor, options[:clamp_water] = true,
+# balanced the partition against the prognostic rho_t and is refused since Stage 4). Under
+# the transforms the negative lobe stays in the control variable and the recovered density
+# reads 0 (the lobe pool of X; MC_XGAP_POOL, MC_VNEG_MASS).
 #
 # ── Conservation and the first law
 #
-# The conserved quantities (rho_d, rho_t, E_t) are extensive flux-form prognostics,
-# so the Galerkin low-pass filter preserves their integrals (no Jensen drift). The
+# The conserved quantities (rho_d, E_t and the water anchor rho_w) are extensive and
+# linear in the flux-form prognostics, so the Galerkin low-pass filter preserves their
+# integrals (no Jensen drift). The
 # energy equation is the exact first law: phase change carries no energy source
 # (the R_v*T*ln(H) term of the entropy identity is entropy production, which
 # cancels exactly against the production hidden in T*ds_t; see
@@ -521,9 +555,10 @@ OWN energy definition — the one the reference build and every initializer writ
 
 `internal_energy_bf02` references energies to vapor, so a condensed phase carries
 `C_pv T − L(T)`; the ice term is the same with `L_s`. `geo = ke + gz` is the mechanical part, and
-it multiplies the PROGNOSTIC `ρ_t`, not `ρ_d + ρ_v + ρ_liq + ρ_ice`: that keeps the ρ_t
-redundancy (a separate question, reference/RHO_T_RETIREMENT_DESIGN.md) out of this measure, so
-`E_t − E` is the THERMAL inconsistency alone.
+it multiplies the total density every reader takes — the DERIVED `ρ_t = ρ_d + ρ_w`,
+`ρ_w = Σ_k α_k ν_k` (plan E9; the prognostic ρ_t was retired at Stage 4) — not
+`ρ_d + ρ_v + ρ_liq + ρ_ice`, so the mechanical energy of the partition gap stays out of this
+measure and `E_t − E` is the THERMAL inconsistency.
 
 Evaluated at `T_eos` (so `p = (ρ_d R_d + ρ_v R_v) T_eos` holds by construction) and with the
 same condensate the retrieval reads, the residual against the prognostic energy is EXACTLY
@@ -531,11 +566,14 @@ same condensate the retrieval reads, the residual against the prognostic energy 
 
     E_t − E(T_eos) = D·(T_ret − T_eos) + X·C_pv·T_eos,    X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice
 
-with `D` the retrieval's denominator. On a consistent state both terms vanish and so does the
-residual, to rounding; otherwise the first is the energy the state would have to shed or gain
-for the two temperatures to agree and the second the heat content of the mass the partition
-does not account for (the reconciliation gap, or a clipped lobe the linear `ρ_t` carries).
-Diagnostic only — nothing in the model reads it.
+with `D` the retrieval's denominator and, under the derived anchor, `X = ρ_w − Σ_k ahyp(ν_k) =
+B + Λ` the partition gap (the knee bias `B ≥ 0` and the lobe pool `Λ ≤ 0`; census
+`MC_XGAP_*`, `MC_W_PART`). On a consistent state both terms vanish and so does the residual, to
+rounding; otherwise the first is the energy the state would have to shed or gain for the two
+temperatures to agree and the second the heat content of the water the recovered partition
+does not account for (a clipped lobe the linear anchor carries). The model never reads it: it
+is what every energy partner holds (`recovered_change_partner`) and what the netCDF
+`E_residual` and the energy budget (src/energy_budget.jl) measure.
 """
 @inline function implied_total_energy(Tk, rho_d, rho_v, rho_liq, rho_ice, rho_t, geo)
     return ((rho_d * internal_energy_bf02(Tk, rho_v / rho_d, rho_liq / rho_d)) +
@@ -2282,7 +2320,8 @@ anchor headroom. Today it is a DIAGNOSTIC only (the netCDF `condensate_lobe`). E
 rates, the fall speeds, radiation — keeps the recovered, non-negative density. Nothing is
 written back; this is accounting, not a state repair.
 
-**Why it is OFF by default (2026-10-07).** The closure assumes every negative slot lobe is also
+**Why it was never switched on (2026-10-07; the device was deleted with the prognostic ρ_t at
+Stage 4, and `clipped_lobe` survives as a diagnostic).** The closure assumed every negative slot lobe is also
 in the linear `ρ_t`. Measured on the ocean_2D_rce output that is false for most of the lobe
 mass: after the first convective burst the transformed slots hold a negative pool of 4-6.5
 kg/m² (10 % of the column water) that `ρ_t` does not, because the slots are not transported
@@ -2291,8 +2330,7 @@ in-cloud value is 1/2, so a flux divergence ringing at a condensate edge moves t
 equivalent mass in the slot, and only the negative side survives the physics). With the
 attribution on, that pool is handed to the vapor: a 1 h restart from the 30 h checkpoint
 put the species sum 5.7 kg/m² ABOVE the conserved `ρ_t - ρ_d` over 70 % of the domain. The
-switch stays off until the below-zero transport is consistent and the pool is gone; then
-this closure is exact to ~2μ per slot.
+switch stayed off until the device was deleted.
 
 **Measured 2026-10-08: the transport inconsistency is real but is NOT what makes the pool.**
 [`lobe_transport_jacobian`](@ref) now makes the below-zero continuity terms consistent, but an
@@ -3467,8 +3505,7 @@ end
 
 The slot index of a water species by ROLE rather than by name, accepting either the density
 name or its transformed alias. `role` is `"rho_v"`, `"rho_c"`, `"rho_r"`, `"n_r"`, or any
-entry of [`MC_ICE_VARS`](@ref). (`rho_v` carries no transform, so for it this is a plain
-`vars` lookup with a loud failure message.)
+entry of [`MC_ICE_VARS`](@ref); `"rho_v"` resolves `"nu_v"` under the vapor transform.
 
 Every `vars["rho_c"]`-style lookup in the kernel goes through this, so that a transformed
 configuration cannot produce a `KeyError` deep in a solver — and, more importantly, so that the
