@@ -239,10 +239,10 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         # census existed (on the prognostic rho_t slot; in git history); RE-SEEDED at bf577b2
         # under the derived anchor for Stage 4 of the rho_t retirement and summed in the
         # Stage-4 layout (`s4_checksum`, slot 3 left out).
-        golden = Dict("warm" => (UInt128(157978091336163910647445010),
-                                 UInt128(4159059066839494850290072784)),
-                      "ice" => (UInt128(452461145111928252279513276),
-                                UInt128(19483817701529031587034710963)))
+        golden = Dict("warm" => (UInt128(157606634960239587946259219),
+                                 UInt128(4167038103528354491640813737)),
+                      "ice" => (UInt128(451825243419528058947592109),
+                                UInt128(19486616508510399785925558772)))
         got = Dict{String,Any}()
         # (the derived anchor is the only one since Stage 4: no key, the default exercised)
         WA = Dict{Symbol,Any}()

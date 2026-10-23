@@ -76,9 +76,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         # MYNN arm is the MYNN fixture's live column. Both the absent key and an explicit
         # `:none` must reproduce it.
         golden = Dict(
-            "warm"  => (UInt128(142915621527357590253966986), UInt128(4149923313041501232666007140)),
-            "ice"   => (UInt128(441432207685183255402351023), UInt128(16692133582680391659604219621)),
-            "louis" => (UInt128(142915621818324870191366622), UInt128(4149923316936704154065483632)),
+            "warm"  => (UInt128(142555738086957176692364298), UInt128(4151400111650453995826857756)),
+            "ice"   => (UInt128(441078978215146199125823757), UInt128(16718446589831356995192893660)),
+            "louis" => (UInt128(142555738721084531363846075), UInt128(4151400123595029663328582793)),
             "mynn"  => (UInt128(259941565336452810300720602), UInt128(9083517470135141505831894328)))
         got = Dict{String,Any}()
         mktempdir() do tmp

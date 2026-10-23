@@ -237,10 +237,10 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         # evaporation bound, the exchange realization and the refit partner stay pinned off as
         # in the original capture (each is bitwise its own switch-off), so the fixture still
         # isolates the retrieval; the density vapor (`:vapor_transform => :none`) as before.
-        golden = Dict("warm" => (UInt128(161122335957649786769422633),
-                                 UInt128(4162737462651284037572250466)),
-                      "ice" => (UInt128(457800712936917242225469130),
-                                UInt128(16736897797215895292863035670)))
+        golden = Dict("warm" => (UInt128(160500112986675926945275230),
+                                 UInt128(4160599780023766036486627828)),
+                      "ice" => (UInt128(457306923469739045305603228),
+                                UInt128(16732791901480019128418617366)))
         got = Dict{String,Any}()
         mktempdir() do tmp
             for (tag, ice) in (("warm", false), ("ice", true))

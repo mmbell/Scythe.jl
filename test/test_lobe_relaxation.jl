@@ -4,7 +4,7 @@
 # below ν = 0 by the spline refit AND that species' channel is closed at the point (recovered
 # density 0, every process term of the slot exactly 0), ν is relaxed toward 0 as
 # ν ← ν·exp(−Δt/τ_lobe). The recovered density is 0 before and after. Since Stage 4 of the ρ_t
-# retirement the only form is the PAIRED one (`_lobe_relax_paired!`, plan E5, default ON): the
+# retirement the only form is the PAIRED one (`_lobe_relax_paired!`, plan E5, default OFF since 2026-10-22): the
 # vapor pays the lobe's Δν, Δν_v = −Σ_k α_k Δν_k/α_v, so the derived ρ_w = Σ_k α_k ν_k is
 # invariant, and the recovered vapor change gets its κ partner in p and Q_ss (no latent heat).
 # ρ_d, E_t, the momenta and every number and habit moment are untouched. (The unpaired,
@@ -155,16 +155,18 @@ using Springsteel: PeriodicBC, NeumannBC, DirichletBC
     # ── 1. inert ─────────────────────────────────────────────────────────────────────
     @testset "bitwise inert: switch off, every slot >= 0, rest, :none" begin
         mktempdir() do tmp
-            # (a) The absent key is the shipped default, which is ON since Stage 4
-            # (`LOBE_RELAXATION_DERIVED_DEFAULT`; the `:slot` default `false` was deleted).
-            @test Scythe.LOBE_RELAXATION_DERIVED_DEFAULT === true
-            for v in (false, Scythe.LOBE_RELAXATION_DERIVED_DEFAULT)
+            # (a) The absent key is the shipped default, which is OFF (2026-10-22: the author's
+            # decision after the 24 -> 33 h RCE acceptance; `LOBE_RELAXATION_DERIVED_DEFAULT`).
+            @test Scythe.LOBE_RELAXATION_DERIVED_DEFAULT === false
+            @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}())
+            @test Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:lobe_relaxation => true))
+            for v in (false, true)
                 mA, pA, moA = lr_tile(tmp, "abs_$(v)"; seed! = seed_sheet!, lobe = nothing)
                 mB, pB, moB = lr_tile(tmp, "set_$(v)"; seed! = seed_sheet!, lobe = v)
                 advance_all!(mA, pA, moA); advance_all!(mB, pB, moB)
                 v == Scythe.LOBE_RELAXATION_DERIVED_DEFAULT &&
                     (@test mA.var_np1 == mB.var_np1 && mA.expdot_n == mB.expdot_n)
-                v == false && (@test mA.var_np1 != mB.var_np1)
+                v == true && (@test mA.var_np1 != mB.var_np1)
             end
             # (b) The sheet, on vs off: the tendencies are identical (the device is not a
             # tendency), and the relaxation stage differs ONLY at points whose state-n mass slot

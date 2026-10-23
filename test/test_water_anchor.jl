@@ -29,8 +29,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     F = Main.VaporTransformFixtures
     M = Main.MYNNTestFixtures
 
-    # (Stage L is pinned off here unless a test asks for it: its paired form defaults ON since
-    # 3d, and most tests isolate one operator)
+    # (Stage L is pinned off here unless a test asks for it: its paired form defaults OFF since
+    # 2026-10-22 (ON at 3d-Stage 4), and most tests isolate one operator)
     derived(; sd = false, siw = :mass, extra...) =
         merge(Dict{Symbol,Any}(:si_water_slots => siw,
                                :state_dependent_si => sd, :si_water_mixed_walls => true,
@@ -51,8 +51,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             Dict{Symbol,Any}(:water_anchor => :sum))
         @test !isdefined(Scythe, :WATER_ANCHOR_MODES)
         @test !hasfield(Scythe.Numerics, :water_anchor)
-        # the paired Stage L is the default (its unpaired :slot form went with the anchor)
-        @test Scythe.lobe_relaxation_on(Dict{Symbol,Any}())
+        # the paired Stage L is OFF by default (its unpaired :slot form went with the anchor)
+        @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}())          # default OFF since 2026-10-22
+        @test Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:lobe_relaxation => true))
         @test !Scythe.lobe_relaxation_on(Dict{Symbol,Any}(:lobe_relaxation => false))
         @test !isdefined(Scythe, :LOBE_RELAXATION_DEFAULT)
         @test haskey(Scythe.KNOWN_OPTION_KEYS, :water_anchor)
@@ -75,19 +76,19 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     @testset ":derived is bitwise bf577b2 in the Stage-4 layout (golden capture)" begin
         # Three full steps of the seeded sheet + vapor bump + w under the vapor control
         # variable, on both SI paths, warm/ice/Louis, slaved and explicit water acoustics,
-        # Stage L at its default (on) and off; the MYNN fixture's live column (density slots).
+        # Stage L at its default (off since 2026-10-22) and, in warm_sd_mass_Loff, explicitly off; the MYNN fixture's live column (density slots).
         # RE-SEEDED at bf577b2 under the derived anchor (commit "goldens re-seeded on the
         # derived anchor at bf577b2") and summed in the Stage-4 layout (`s4_checksum`: that
         # commit's slot 3, the passive shadow no reader took, left out; the vapor in slot 3), so
         # Stage 4 -- which deleted slot 3 -- is bitwise the code it deleted it from. (The :slot
         # goldens of 44da59c they replaced are in git history.)
         golden = Dict(
-            "ice_ref_none" => (UInt128(450493064178061304434132191), UInt128(16708174421919189982622981378)),
-            "ice_sd_mass" => (UInt128(450522956953137210360097821), UInt128(16702167531451911314711355527)),
-            "louis_sd_none" => (UInt128(153225797257218708615625605), UInt128(4161365005745085063565262245)),
+            "ice_ref_none" => (UInt128(450224177523620091832450478), UInt128(16724276067019028487362748467)),
+            "ice_sd_mass" => (UInt128(450135032853604003313210400), UInt128(16721237030045733241856926394)),
+            "louis_sd_none" => (UInt128(152950367953519289627603109), UInt128(4163463348091461409742611322)),
             "mynn" => (UInt128(259941565336452810300720602), UInt128(9083517470135141505831894328)),
-            "warm_ref_mass" => (UInt128(153255406839976044843615595), UInt128(4159909797005285220324910434)),
-            "warm_sd_mass" => (UInt128(153255592928187686350140522), UInt128(4159883272548581250276531110)),
+            "warm_ref_mass" => (UInt128(152861134490070766720784798), UInt128(4161890573290701135418390872)),
+            "warm_sd_mass" => (UInt128(152861113079180180520662138), UInt128(4161403458526496820893803699)),
             "warm_sd_mass_Loff" => (UInt128(152861113079180180520662138), UInt128(4161403458526496820893803699)))
         got = Dict{String,Any}()
         mktempdir() do tmp

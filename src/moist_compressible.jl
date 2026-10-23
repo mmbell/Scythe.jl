@@ -2544,21 +2544,23 @@ end
 """
     LOBE_RELAXATION_DERIVED_DEFAULT
 
-The value `options[:lobe_relaxation]` takes when the key is absent: ON, the plan's fixed
-decision E5 taken after the Stage 3 acceptance of the derived water anchor (2026-10-21: on the
-24 -> 33 h RCE restart the paired relaxation holds the pre-convective lobe pool at
--0.0125 kg/m2 at 27 h against the P2 control's -0.96, 98.7 % below, with the paired energy
-booking unchanged in class). (Its `:slot`-anchor sibling `LOBE_RELAXATION_DEFAULT = false` went
-with the prognostic ρ_t at Stage 4.)
+The value `options[:lobe_relaxation]` takes when the key is absent: OFF (author's decision
+2026-10-22, reversing the plan's fixed decision E5 "default ON after acceptance"). In the
+24 -> 33 h RCE acceptance the paired relaxation dried the 1.5-4.5 km layer after the
+convective burst (mean rho_v 9.0 -> 6.7 g/m3 at 33 h, against 9.05 with it off) and the
+negative-vapor area peaked at 16 % during the burst; the arm without it still held the
+pre-convective lobe pool 84 % below the control (-0.158 against -0.96 kg/m2 at 27 h). An
+explicit `lobe_relaxation = true` stays fully supported. (Its `:slot`-anchor sibling
+`LOBE_RELAXATION_DEFAULT = false` went with the prognostic rho_t at Stage 4.)
 """
-const LOBE_RELAXATION_DERIVED_DEFAULT = true
+const LOBE_RELAXATION_DERIVED_DEFAULT = false
 
 """
     lobe_relaxation_on(options) -> Bool
 
 Whether the lobe relaxation (Stage L) runs: `options[:lobe_relaxation]` when set, else
-[`LOBE_RELAXATION_DERIVED_DEFAULT`](@ref). It is always the PAIRED form
-(`_lobe_relax_paired!`): the vapor pays the lobe's Δν, so ρ_w is invariant.
+[`LOBE_RELAXATION_DERIVED_DEFAULT`](@ref) (`false`: off unless asked for). It is always the
+PAIRED form (`_lobe_relax_paired!`): the vapor pays the lobe's Δν, so ρ_w is invariant.
 """
 @inline lobe_relaxation_on(options) =
     get(options, :lobe_relaxation, LOBE_RELAXATION_DERIVED_DEFAULT)::Bool
