@@ -90,10 +90,6 @@ struct HorizontalSolveData{DU, DP, FA, FB}
     wlev::Matrix{Float64}   # (iDim, kDim) one water slot's correction plane
 end
 
-# Correction plane order in `dlev` (and the write-back loop): the var each
-# plane belongs to is looked up from these fields at use sites.
-const _HSI_PLANES = (:u_index, :p_index, :rhod_index, :et_index)
-
 """
     create_horizontal_solve_data(patch, model, Pxi_prof, rho_tbar, rho_dbar, etp_bar)
 

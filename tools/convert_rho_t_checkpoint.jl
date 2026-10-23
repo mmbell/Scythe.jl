@@ -12,8 +12,12 @@
 #
 # * A checkpoint that carries a vapor slot (every checkpoint written since Stage A): the
 #   conversion is a pure permutation of the spectral and physical columns, exact; no config is
-#   read. A density-vapor checkpoint ("rho_v") restarting a vapor-control-variable model
-#   ("nu_v") is then converted ON LOAD by the model, as before Stage 4.
+#   needed. What it DROPS is the old run's partition gap rho_t'(slot) - (rho_d' + W'): the
+#   restarted total (the derived rho_d + sum_k alpha_k nu_k) differs from the old run's
+#   prognostic rho_t by exactly that. With --config the tool prints its maximum and column
+#   integral; without, it says the gap was not measured. A density-vapor checkpoint ("rho_v")
+#   restarting a vapor-control-variable model ("nu_v") is then converted ON LOAD by the model,
+#   as before Stage 4.
 # * A checkpoint with NO vapor slot (pre-Stage A): the vapor is derived from slot 3 so that the
 #   water sum equals the old rho_t - rho_d (nu_v' = (rho_t - rho_d - sum_{k!=v} alpha_k nu_k)/alpha_v
 #   - nu_vbar), against the reference of the model the config describes; `--config` is required.
@@ -59,7 +63,10 @@ function main(args)
         m = build_model(cfg)
         m isa ModelParameters || error("--config: a nested configuration has one model per " *
                                        "patch; convert each patch's checkpoint with a " *
-                                       "single-patch config of that patch")
+                                       "single-patch config of that patch. The converted " *
+                                       "segment checkpoints are then fed back to the nested " *
+                                       "run through initial_conditions.method = \"file\" " *
+                                       "(one converted file per patch, in initial_conditions.file.paths).")
         model = m
     end
     Scythe.convert_rho_t_checkpoint(src, dst; model)

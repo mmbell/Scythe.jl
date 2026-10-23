@@ -83,6 +83,31 @@ isdefined(Main, :VaporTransformFixtures) || include(joinpath(@__DIR__, "vapor_tr
                     f in keyed || f === :vars || @test isequal(getproperty(new.params, f),
                                                                getproperty(p.params, f))
                 end
+                # the dropped partition gap: zero (to rounding) for this synthetic checkpoint,
+                # whose slot 3 IS the derived total; a planted gap is measured exactly
+                gap = Scythe.rho_t_partition_gap(old, new, mo)
+                kD = mo.grid_params.kDim
+                @test gap.ncol == div(size(p.physical, 1), kD)
+                @test gap.max_abs <= 1.0e-14 && gap.col_max <= 1.0e-10
+                old2 = deepcopy(old)
+                g0 = kD + 3                          # column 2, level 3
+                old2.physical[g0, 3, 1] += 1.0e-6
+                gap2 = Scythe.rho_t_partition_gap(old2, new, mo)
+                @test abs(gap2.max_abs - 1.0e-6) <= 1.0e-12
+                zc = Scythe.getGridpoints(new)[1:kD, end]
+                @test abs(gap2.col_max - 0.5e-6 * (zc[4] - zc[2])) <= 1.0e-9 * gap2.col_max
+                @test gap2.col_mean ≈ gap2.col_max / gap2.ncol rtol = 1.0e-6
+                # the report says what is dropped, with and without the model
+                capture(f) = mktemp() do path, io
+                    redirect_stdout(f, io); flush(io); read(path, String)
+                end
+                r1 = capture(() -> Scythe.convert_rho_t_grid(old2; model = mo))
+                @test occursin("dropped partition gap", r1)
+                mm = match(r"max = ([-+0-9.eE]+) kg/m\^3", r1)
+                @test mm !== nothing && abs(parse(Float64, mm.captures[1]) - 1.0e-6) <= 1.0e-12
+                @test occursin("differs from the old run's prognostic rho_t", r1)
+                r0 = capture(() -> Scythe.convert_rho_t_grid(old2))
+                @test occursin("NOT measured", r0) && occursin("--config", r0)
                 # a Stage-4 grid is not converted twice
                 @test occursin("already in the Stage-4 layout",
                                errmsg(() -> Scythe.convert_rho_t_grid(new; report = false)))
@@ -171,6 +196,16 @@ isdefined(Main, :VaporTransformFixtures) || include(joinpath(@__DIR__, "vapor_tr
             @test readlines(dst) == want
             @test occursin("exists", errmsg(() -> Scythe.convert_rho_t_csv(src, dst)))
             @test occursin("no rho_t column", errmsg(() -> Scythe.convert_rho_t_csv(dst, dst * ".2")))
+            # CRLF line ends, trailing blank lines, and the planar coordinate names x, y
+            hxy = "x,y,z,p,rho_d,rho_t,u,w,E_t,Q_ss,rho_r,rho_c,rho_v"
+            rxy = "1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0"
+            crlf = joinpath(tmp, "crlf_ics.csv")
+            write(crlf, hxy * "\r\n" * rxy * "\r\n\r\n\r\n")
+            dcr = joinpath(tmp, "crlf_new.csv")
+            Scythe.convert_rho_t_csv(crlf, dcr)
+            @test read(dcr, String) ==
+                  "x,y,z,p,rho_d,rho_v,u,w,E_t,Q_ss,rho_r,rho_c\n" *
+                  "1.0,2.0,3.0,4.0,5.0,13.0,7.0,8.0,9.0,10.0,11.0,12.0\n"
             nov = joinpath(tmp, "nov_ics.csv")
             write(nov, "r,z,p,rho_d,rho_t,u\n0.0,0.0,1.0,2.0,3.0,4.0\n")
             @test occursin("no vapor column", errmsg(() -> Scythe.convert_rho_t_csv(nov, nov * ".2")))

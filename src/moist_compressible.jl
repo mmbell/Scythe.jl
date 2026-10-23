@@ -3642,13 +3642,17 @@ function check_mc_var_names(model::ModelParameters)
     itrans = ice_transform_mode(model.options)
     mynn = get(model.options, :mynn, false) === true
     vtrans = vapor_transform_mode(model.options)
-    (ctrans === :none && rtrans === :none && nrtrans === :none && nmoments == 1 &&
-     ice === :none && !mynn && vtrans === :none) && return nothing
-
     gp = model.grid_params
-    expected = Set(mc_var_names(model.options;
-                                cyl = haskey(gp.vars, "v") &&
-                                      gp.vars["v"] == 10))
+    # The canonical slot list of this configuration. `cyl` is read from the presence of "v"
+    # alone: inferring it from `vars["v"] == 10` would call a stale cylindrical list (v
+    # shifted to 9) planar and check it against the wrong layout.
+    # The index check is the moist-compressible layout's: other equation sets carry their own.
+    mc = uses_pressure_reference(model.equation_set)
+    names = mc_var_names(model.options; cyl = haskey(gp.vars, "v"))
+    (ctrans === :none && rtrans === :none && nrtrans === :none && nmoments == 1 &&
+     ice === :none && !mynn && vtrans === :none) &&
+        (mc && _check_mc_var_indices(gp.vars, names); return nothing)
+    expected = Set(names)
     stale = String[]
     ctrans === :none || push!(stale, "rho_c")
     rtrans === :none || push!(stale, "rho_r")
@@ -3669,7 +3673,7 @@ function check_mc_var_names(model::ModelParameters)
             error("options[:rain_moments] = 2 declares the prognostic rain number slot " *
                   "\"$nrname\", but grid_params.vars does not have it (it has " *
                   "$(sort(collect(keys(gp.vars))))). The slot is APPENDED after the fixed " *
-                  "1-9 (+v) block and after the vapor slot, so its index is " *
+                  "1-9 (+v) block (the vapor is slot 3, inside it), so its index is " *
                   "geometry-dependent and only " *
                   "`Scythe.mc_var_names(options)` knows it — build `vars` from that.")
     end
@@ -3691,6 +3695,7 @@ function check_mc_var_names(model::ModelParameters)
                   "so its index is geometry- and option-dependent and only " *
                   "`Scythe.mc_var_names(options)` knows it — build `vars` from that.")
     end
+    mc && _check_mc_var_indices(gp.vars, names)
 
     for (label, d) in (("vars", gp.vars), ("BCL", gp.BCL), ("BCR", gp.BCR),
                        ("BCB", gp.BCB), ("BCT", gp.BCT), ("l_q", gp.l_q),
@@ -3718,6 +3723,30 @@ function check_mc_var_names(model::ModelParameters)
                   "Build every name-keyed dict from `Scythe.mc_var_names(options)`; a stale " *
                   "key in $label would be ignored silently rather than raising.")
         end
+    end
+    return nothing
+end
+
+"""
+    _check_mc_var_indices(vars, names) -> Nothing
+
+Every slot name of the configuration sits at its canonical index: `vars[n] == i` for every
+`(i, n)` in `enumerate(names)` (`names = mc_var_names(options; cyl)`). Every reader of the
+fixed block indexes it by LITERAL slot number (u is read as slot 4, Q_ss as slot 7), so a
+`vars` that names every slot but numbers them differently -- e.g. the pre-Stage-4 list with
+the total density `rho_t` deleted, which shifts u into the vapor's slot and the vapor into
+nu_c's -- would read u as the vapor without any key being missing. Checked under every option
+set of a moist-compressible equation set.
+"""
+function _check_mc_var_indices(vars, names)
+    for (i, n) in enumerate(names)
+        got = get(vars, n, nothing)
+        got == i && continue
+        error("grid_params.vars puts \"$n\" at slot $(something(got, "(absent)")), but this " *
+              "configuration's canonical layout has it at slot $i (" *
+              join(("$k=$j" for (j, k) in enumerate(names)), ", ") * "). Every reader of the " *
+              "fixed block indexes it by literal slot number, so a renumbered `vars` would " *
+              "silently read the wrong field. Build `vars` from `Scythe.mc_var_names(options)`.")
     end
     return nothing
 end
@@ -5653,7 +5682,7 @@ function water_budget_trace(mtile::ModelTile, t::Int64)
           post-fit(reconstruction) minima: rho_r = $post_r, rho_c = $post_c, rho_v = $post_v
           pre-fit(var_np1) minima: rho_r = $(minimum(view(st, MC_PRE_R, :))), rho_c = $(minimum(view(st, MC_PRE_C, :)))
           highest gridpoint with rho_c > 1e-6: $(isfinite(z_cloud) ? z_cloud : NaN) m
-          reconciliation gap (0 at rest by construction; tau_qss times the nudge rate): max|Q_ss - (rho_v - rho_vs)| = $(maximum(view(st, MC_QSS_GAP, :))) kg/m^3"""
+          reconciliation gap (0 at rest by construction; elsewhere the lag of the tau_qss relaxation): max|Q_ss - (rho_v - rho_vs)| = $(maximum(view(st, MC_QSS_GAP, :))) kg/m^3"""
 
         # The depletion census: how widely, and how hard, the step is draining each species,
         # and where the REMOVED depletion caps would have bound. `euler` is the forward-Euler
@@ -10389,31 +10418,31 @@ end
 #    equation_set string to one of these by name; all keep the moist_compressible
 #    prefix so uses_pressure_reference gates their scratch/reference plumbing) ──
 
-"Total-energy moist compressible set on a Cartesian XZ slice (RiRk/RZ grid), 10 vars."
+"Total-energy moist compressible set on a Cartesian XZ slice (RiRk/RZ grid), 9 vars."
 moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCCartesianXZ())
 
 """
 Axisymmetric r–z cylinder on the RiRk/RZ grid (gridpoint column 1 reinterpreted as
 radius, so the domain must sit at r > 0), with prognostic tangential wind v
-(`MC_VARS_CYL`, 11 vars) and optional f-plane rotation (`physical_params[:f]`).
+(`MC_VARS_CYL`, 10 vars) and optional f-plane rotation (`physical_params[:f]`).
 """
 moist_compressible_axisym(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCAxisymRZ())
 
-"3D r–λ–z cylinder on the RLR grid (`MC_VARS_CYL`, 11 vars, f-plane rotation optional)."
+"3D r–λ–z cylinder on the RLR grid (`MC_VARS_CYL`, 10 vars, f-plane rotation optional)."
 moist_compressible_RLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCCylindricalRLR())
 
 """
-3D Cartesian x–y–z box on the RRR grid (`MC_VARS_CYL`, 11 vars: v is the y-wind,
+3D Cartesian x–y–z box on the RRR grid (`MC_VARS_CYL`, 10 vars: v is the y-wind,
 f-plane rotation optional — +f v / −f u with no curvature terms).
 """
 moist_compressible_RRR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
     mc_driver!(mtile, colstart, colend, t, MCCartesianRRR())
 
 """
-3D spherical θ–λ–z shell on the SLR grid (`MC_VARS_CYL`, 11 vars: u is the
+3D spherical θ–λ–z shell on the SLR grid (`MC_VARS_CYL`, 10 vars: u is the
 θ-ward wind, v the zonal wind). Shallow atmosphere with metric radius
 `physical_params[:sphere_radius]` (default Earth) and full latitude-dependent
 Coriolis f = 2Ω cosθ from `physical_params[:Omega]` (NOT the cylinders' f-plane
@@ -10796,7 +10825,8 @@ recovered change's vapor partner into the vapor slot, went with the prognostic �
 It runs in [`relaxation_adjustment_qss!`](@ref) AFTER the phase-change increments have landed
 and BEFORE the lobe relaxation, so each mass slot holds exactly `ν* + d_k`. It is bitwise
 absent under `:none` everywhere (the caller skips it: the recovered change is the requested
-one) and wherever every channel's increment is an exact zero. `@noinline` with plain arrays.
+one) and wherever every channel's increment is an exact zero. This forwarder is a plain
+method; the callee, [`_etd_exchange_closure!`](@ref), is the `@noinline` one, with plain arrays.
 """
 _etd_exchange_realization!(vnp1::Matrix{Float64}, phys::Array{Float64,3}, S, colstart::Int,
                            ts::Float64, ctr::Symbol, cmu::Float64, rtr::Symbol, rmu::Float64,

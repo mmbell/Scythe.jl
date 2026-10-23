@@ -366,14 +366,15 @@ end
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
 function moist_fields(df, ref, kDim, base, stage;
                       ctransform::Symbol = :none, cmu = 1.0e-7,
-                      rtransform::Symbol = :none, rmu = 1.0e-7)
+                      rtransform::Symbol = :none, rmu = 1.0e-7,
+                      vmu = Scythe.VAPOR_MU_DEFAULT)
     ncols = div(nrow(df), kDim)
     if stage == STAGE_MC
         # Total-energy stage: retrieve (T, p) and the diagnostic water partition from
         # the prognostics, then reuse the transformed-variable theta_e diagnostic.
         Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r =
             mc_state(df, ref, kDim, ncols; transform = ctransform, mu = cmu,
-                     rain_transform = rtransform, rain_mu = rmu)
+                     rain_transform = rtransform, rain_mu = rmu, vapor_mu = vmu)
         q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
         q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
         s = Scythe.entropy.(Tk, rho_d, q_v)
@@ -446,7 +447,8 @@ function bf02_moist_diagnostics(model)
         ctransform = Scythe.condensate_transform_mode(model.options),
         cmu = get(model.physical_params, :condensate_mu, 1.0e-7),
         rtransform = Scythe.rain_transform_mode(model.options),
-        rmu = get(model.physical_params, :rain_mu, 1.0e-7))
+        rmu = get(model.physical_params, :rain_mu, 1.0e-7),
+        vmu = Scythe.vapor_mu(model.physical_params))
     z = reshape(df.z, kDim, ncols)[:, 1]
     diags = Dict(
         "max_theta_e_p" => maximum(theta_e_p),
@@ -491,7 +493,8 @@ if opts.plot
             ctransform = Scythe.condensate_transform_mode(model.options),
             cmu = get(model.physical_params, :condensate_mu, 1.0e-7),
             rtransform = Scythe.rain_transform_mode(model.options),
-            rmu = get(model.physical_params, :rain_mu, 1.0e-7))
+            rmu = get(model.physical_params, :rain_mu, 1.0e-7),
+            vmu = Scythe.vapor_mu(model.physical_params))
         x = reshape(df.r, kDim, ncols)[1, :]
         z = reshape(df.z, kDim, ncols)[:, 1]
         w = reshape(df.w, kDim, ncols)

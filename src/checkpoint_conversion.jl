@@ -14,7 +14,10 @@
 #     ([`convert_rho_t_checkpoint`](@ref)):
 #       - the common case (every checkpoint since Stage A carries a vapor slot): slot 3 is
 #         DROPPED and the vapor slot moved into its position, every later slot one further in —
-#         a pure permutation of the spectral and physical columns, exact;
+#         a pure permutation of the spectral and physical columns, exact. What is dropped is
+#         the old run's PARTITION GAP ρ_t'^slot − (ρ_d' + W'): the restarted total (the derived
+#         ρ_d + Σ_k α_k ν_k) differs from the old run's prognostic ρ_t by exactly that, and the
+#         conversion reports its maximum and column integral when it has the model;
 #       - a checkpoint with NO vapor slot (pre-Stage-A): the vapor is DERIVED from slot 3 so
 #         that the water sum equals the old ρ_t − ρ_d,
 #             α_v ν_v = (ρ_t − ρ_d) − Σ_{k≠v} α_k ν_k     (totals),   ν_v' = ν_v − ν̄_v,
@@ -98,7 +101,11 @@ A pre-Stage-4 grid (`old`, e.g. `load_grid` of a checkpoint) in the Stage-4 layo
 
 With a vapor slot in `old` (the common case) it is a permutation: slot 3 is dropped, the vapor
 moved into slot 3, and every surviving variable's spectral AND physical columns are copied bit
-for bit; `model` is not needed (and not read). Without one, the vapor is DERIVED from slot 3,
+for bit; `model` is not needed for that. What the permutation DROPS is the old run's partition
+gap `G = ρ_t'^slot − (ρ_d' + W')` (`W = Σ_k α_k ν_k`, the derived water): the restarted total
+differs from the old run's prognostic total by `G` pointwise. With `model` given (and its `vars`
+the converted layout) the report states `max|G|` and the largest and mean column integral
+`∫|G| dz` ([`rho_t_partition_gap`](@ref)); without it the report says the gap was not measured. Without one, the vapor is DERIVED from slot 3,
 `α_v ν_v = (ρ_t − ρ_d) − Σ_{k≠v} α_k ν_k` on the totals (the model's own reference: Springsteel's
 `ρ̄_t`, `ρ̄_d`, `ρ̄_c` and the derived `ν̄_v`), its spectral column refit from those gridpoint
 values with every other variable's coefficients kept; the new grid is then built from
@@ -117,15 +124,71 @@ function convert_rho_t_grid(old; model = nothing, report::Bool = true)
             new.spectral[:, i] .= view(old.spectral, :, j)
             new.physical[:, i, :] .= view(old.physical, :, j, :)
         end
-        report && println("Scythe: converted the pre-Stage-4 checkpoint layout: slot 3 " *
-                          "(rho_t) dropped, the vapor \"$(vname)\" moved from slot " *
-                          "$(vars_old[vname]) to slot 3 (columns copied exactly).")
+        report || return new
+        println("Scythe: converted the pre-Stage-4 checkpoint layout: slot 3 (rho_t) dropped, " *
+                "the vapor \"$(vname)\" moved from slot $(vars_old[vname]) to slot 3 (columns " *
+                "copied exactly).")
+        if model === nothing
+            println("Scythe: the dropped partition gap rho_t'(slot) - (rho_d' + W') was NOT " *
+                    "measured (it needs the model's reference: pass --config). The restarted " *
+                    "total rho_d + sum_k alpha_k nu_k differs from the old run's rho_t by it.")
+        else
+            gap = rho_t_partition_gap(old, new, model)
+            println("Scythe: dropped partition gap |rho_t'(slot) - (rho_d' + W')|: max = " *
+                    "$(gap.max_abs) kg/m^3; column integral max = $(gap.col_max), mean = " *
+                    "$(gap.col_mean) kg/m^2 over $(gap.ncol) columns. The restarted total " *
+                    "rho_d + sum_k alpha_k nu_k differs from the old run's prognostic rho_t by " *
+                    "exactly this gap (a converted restart is not like-for-like).")
+        end
         return new
     end
     model === nothing && error("convert_rho_t_grid: the checkpoint carries no vapor slot " *
         "(pre-Stage-A), so the vapor has to be derived from slot 3 against the model's " *
         "reference: pass `model` (the tool's `--config`).")
     return _convert_rho_t_derive_vapor(old, model; report)
+end
+
+"""
+    rho_t_partition_gap(old, new, model) -> (; max_abs, col_max, col_mean, ncol)
+
+The partition gap the layout permutation drops: `G = ρ_t'^slot − (ρ_d' + W')` at every gridpoint,
+evaluated as `(ρ_t'^slot + ρ̄_t) − (ρ_d' + ρ̄_d) − W` on the totals (`W = Σ_k α_k ν_k`, the
+derived water of the anchor member set, `anchor_W_value`), with `old` the pre-Stage-4 grid,
+`new` its converted Stage-4 grid and `model` the Stage-4 model (its `vars` must be `new`'s).
+`max_abs` is `max|G|` [kg/m³]; `col_max`/`col_mean` the largest and mean column integral
+`∫|G| dz` [kg/m²] (trapezoid on the mish levels).
+"""
+function rho_t_partition_gap(old, new, model)
+    gp = model.grid_params
+    new.params.vars == gp.vars || error("rho_t_partition_gap: the model's vars " *
+        "$(sort(collect(gp.vars), by = last)) are not the converted layout " *
+        "$(sort(collect(new.params.vars), by = last))")
+    kDim = gp.kDim
+    z = collect(Float64, getGridpoints(new)[1:kDim, end])
+    ref_state = build_reference_state(model, z, reference_column(new, gp))
+    diag = mc_reference_diagnostics(ref_state, z; mc_ref_diag_kwargs(model)...)
+    rtb = view(ref_rho_t(ref_state), :, 1)
+    rdb = view(ref_rho_d(ref_state), :, 1)
+    rcb = view(Springsteel.ref_rho_c(ref_state), :, 1)
+    ws = water_anchor_set(model.options, model.physical_params, mc_slots(model))
+    phys1 = view(new.physical, :, :, 1)
+    irt = old.params.vars["rho_t"]; ird = gp.vars["rho_d"]
+    npts = size(new.physical, 1)
+    ncol = div(npts, kDim)
+    max_abs = 0.0; col_max = 0.0; col_sum = 0.0
+    @inbounds for c in 1:ncol
+        integ = 0.0; gprev = 0.0
+        for k in 1:kDim
+            g = (c - 1) * kDim + k
+            W = anchor_W_value(phys1, g, k, ws, diag.nu_vbar, rcb)
+            G = abs((old.physical[g, irt, 1] + rtb[k]) - ((new.physical[g, ird, 1] + rdb[k]) + W))
+            max_abs = max(max_abs, G)
+            k > 1 && (integ += 0.5 * (G + gprev) * (z[k] - z[k - 1]))
+            gprev = G
+        end
+        col_max = max(col_max, integ); col_sum += integ
+    end
+    return (; max_abs, col_max, col_mean = col_sum / max(ncol, 1), ncol)
 end
 
 # The pre-Stage-A path: the vapor derived from slot 3 (see `convert_rho_t_grid`).
@@ -212,21 +275,32 @@ function convert_rho_t_checkpoint(src::AbstractString, dst::AbstractString; mode
     return dst
 end
 
+"The coordinate column names an initial-condition CSV can lead with (any geometry)."
+const CSV_COORD_COLUMNS = ("r", "l", "z", "x", "y")
+
 """
     convert_rho_t_csv(src, dst) -> dst
 
-The initial-condition CSV form of the layout conversion (`write_ics_csv`'s format: coordinate
-columns, then one column per variable in slot order): the `"rho_t"` column is dropped and the
-vapor column moved into the third variable position, every value's TEXT copied unchanged, so a
-CSV written before Stage 4 converts to the bytes the Stage-4 writer produces for the same state.
-`dst` must not exist.
+The initial-condition CSV form of the layout conversion (`write_ics_csv`'s format: the leading
+coordinate columns -- any of `r`, `l`, `z`, `x`, `y` -- then one column per variable in slot
+order): the `"rho_t"` column is dropped and the vapor column moved into the third variable
+position, every value's TEXT copied unchanged, so a CSV written before Stage 4 converts to the
+bytes the Stage-4 writer produces for the same state. CRLF line ends are read as LF and trailing
+blank lines are dropped; the output is LF. A CSV carries no reference, so the dropped partition
+gap (see [`convert_rho_t_grid`](@ref)) is not measured here. `dst` must not exist.
 """
 function convert_rho_t_csv(src::AbstractString, dst::AbstractString)
     ispath(dst) && error("convert_rho_t_csv: $(dst) exists; choose a new path")
-    lines = readlines(src)
+    lines = [String(rstrip(l, '\r')) for l in readlines(src)]
+    while !isempty(lines) && isempty(strip(lines[end]))
+        pop!(lines)
+    end
+    isempty(lines) && error("convert_rho_t_csv: $(src) is empty")
     header = split(lines[1], ',')
     "rho_t" in header || error("convert_rho_t_csv: $(src) has no rho_t column")
-    ncoord = count(h -> h in ("r", "l", "z"), header)
+    # the coordinate columns lead the header (write_ics_csv); count the leading run
+    ic = findfirst(h -> !(h in CSV_COORD_COLUMNS), header)
+    ncoord = ic === nothing ? length(header) : ic - 1
     vnames = header[(ncoord + 1):end]
     vars_old = Dict(String(n) => i for (i, n) in enumerate(vnames))
     names, vname = stage4_var_names(vars_old)

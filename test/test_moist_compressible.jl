@@ -2706,6 +2706,54 @@ using Springsteel
         @test_throws ErrorException Scythe.mc_slot(stale, "rho_v")
     end
 
+    @testset "check_mc_var_names: every slot at its canonical index, under every option set" begin
+        # The pre-Stage-4 list with "rho_t" simply deleted names every slot of the default
+        # configuration, so no key is missing or stale -- but u shifts to 3, where the readers'
+        # literal slot numbers expect the vapor, and the vapor lands at 9 (nu_c's slot). The
+        # index check must refuse it, with no option set at all (the old check returned before
+        # looking at anything when no transform or optional slot was on).
+        stale4 = ["p", "rho_d", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c", "rho_v"]
+        stale4_cyl = ["p", "rho_d", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c", "v", "rho_v"]
+        mkmodel(names, opts) = ModelParameters(
+            ts = 0.1, integration_time = 1.0, output_interval = 1.0,
+            equation_set = "moist_compressible_XZ", ref_state_file = "",
+            grid_params = GridParameters(geometry = "RZ", num_cells = 4, iMin = 0.0,
+                iMax = 1000.0, kMin = 0.0, kMax = 1000.0, kDim = 8,
+                BCL = Dict("default" => NeumannBC()), BCR = Dict("default" => NeumannBC()),
+                BCB = Dict("default" => NeumannBC()), BCT = Dict("default" => NeumannBC()),
+                vars = Dict(v => i for (i, v) in enumerate(names))),
+            physical_params = Dict(:Khdiff => 0.0), options = opts)
+        errmsg(f) = try f(); "" catch e; sprint(showerror, e) end
+        # (the first mismatch in canonical order is reported: the vapor, expected at 3)
+        m = errmsg(() -> Scythe.check_mc_var_names(mkmodel(stale4, Dict{Symbol,Any}())))
+        @test occursin("puts \"rho_v\" at slot 9", m)
+        @test occursin("canonical layout has it at slot 3", m)
+        @test occursin("u=4", m)
+        m = errmsg(() -> Scythe.check_mc_var_names(mkmodel(stale4_cyl, Dict{Symbol,Any}())))
+        @test occursin("puts \"rho_v\" at slot 10", m)
+        # ...and with the vapor transform on (the production path), the same list renamed
+        stale4_nu = replace(stale4, "rho_v" => "nu_v")
+        m = errmsg(() -> Scythe.check_mc_var_names(
+            mkmodel(stale4_nu, Dict{Symbol,Any}(:vapor_transform => :bhyp))))
+        @test occursin("puts \"nu_v\" at slot 9", m)
+        # the canonical lists pass, planar and cylindrical, under several option sets
+        for opts in (Dict{Symbol,Any}(),
+                     Dict{Symbol,Any}(:vapor_transform => :bhyp),
+                     Dict{Symbol,Any}(:vapor_transform => :bhyp, :condensate_transform => :bhyp,
+                                      :rain_transform => :bhyp, :rain_moments => 2,
+                                      :rain_number_transform => :bhyp,
+                                      :ice_microphysics => :ishmael, :ice_transform => :bhyp)),
+            cyl in (false, true)
+            @test Scythe.check_mc_var_names(
+                mkmodel(Scythe.mc_var_names(opts; cyl = cyl), opts)) === nothing
+        end
+        # a swapped pair inside the appended block is refused too (rain number vs first ice)
+        o2 = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael)
+        sw = Scythe.mc_var_names(o2)
+        sw[11], sw[12] = sw[12], sw[11]
+        @test occursin("canonical layout", errmsg(() -> Scythe.check_mc_var_names(mkmodel(sw, o2))))
+    end
+
     @testset "a stale vars dict fails at tile creation, not later" begin
         # `mc_slots` resolves rho_v with the THROWING lookup for every mc set, so a
         # configuration built from a pre-Stage-A name list stops at `createModelTile`. The
@@ -2715,7 +2763,10 @@ using Springsteel
         # a "rho_t" slot by name, whatever else the list holds.
         for names in (["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"],
                       ["p", "rho_d", "rho_t", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c",
-                       "rho_v"])
+                       "rho_v"],
+                      # the pre-Stage-4 list with "rho_t" deleted (every name present, every
+                      # index from 3 on shifted): refused by the canonical-index check
+                      ["p", "rho_d", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c", "rho_v"])
             mktempdir() do tmpdir
                 vars = Dict(v => i for (i, v) in enumerate(names))
                 scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
@@ -3483,14 +3534,21 @@ using Springsteel
                     vars = gp.vars),
                 physical_params = mo.physical_params, options = mo.options)
             @test_throws ErrorException Scythe.check_mc_var_names(stale)
-            # With no transform declared the guard is a no-op, whatever the names are.
-            @test Scythe.check_mc_var_names(ModelParameters(
-                ts = mo.ts, integration_time = mo.integration_time,
-                output_interval = mo.output_interval,
-                equation_set = mo.equation_set, ref_state_file = mo.ref_state_file,
-                grid_params = stale.grid_params,
-                physical_params = mo.physical_params,
-                options = Dict{Symbol,Any}())) === nothing
+            # With no transform declared the NAME checks are skipped, but the canonical-index
+            # check still runs (every option set): the transformed names "nu_c"/"nu_r" are not
+            # the untransformed layout's "rho_c"/"rho_r", so this vars is refused.
+            m0 = try
+                Scythe.check_mc_var_names(ModelParameters(
+                    ts = mo.ts, integration_time = mo.integration_time,
+                    output_interval = mo.output_interval,
+                    equation_set = mo.equation_set, ref_state_file = mo.ref_state_file,
+                    grid_params = stale.grid_params,
+                    physical_params = mo.physical_params,
+                    options = Dict{Symbol,Any}())); ""
+            catch e
+                sprint(showerror, e)
+            end
+            @test occursin("canonical layout", m0)
         end
     end
 

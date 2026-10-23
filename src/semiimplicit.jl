@@ -1014,11 +1014,14 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         # walls set. Converged: the wall value of rho_t' is insensitive to p's
         # own wall derivative.
         gridTransform!(patch)
+        # The density vapor is converted to nu_v BEFORE the wall condition is installed: the
+        # wall anchor reads the vapor slot as nu_v (the derived rho_t' of the model's own
+        # convention), so it must never see an unconverted density there.
+        vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
         if mc_wall_bc_active(patch)
             update_mc_wall_bc!(patch, patch.physical; anchor = _mc_wall_anchor(model))
             gridTransform!(patch)
         end
-        vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
     else
         _check_csv_layout(model.initial_conditions, patch.params.vars)
         _check_csv_vapor_name(model.initial_conditions, patch.params.vars)
