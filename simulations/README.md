@@ -645,10 +645,10 @@ co2_ppm = 280.0
 | `hsi_x_history` | string |  | horizontal SI x history: "fresh" or lagged (horizontal_si.jl, moist_compressible.jl) |
 | `hydrostatic_reference` | bool | `reference_state.hydrostatic` (refused in `[extra.options]`) | discretely hydrostatic reference state (semiimplicit.jl) |
 | `ice_agg_caps` | bool |  | ISHMAEL aggregation caps on the unit pass (moist_compressible.jl) |
-| `ice_anchor_floor` | bool |  | ice anchor reconciliation: floor leg (moist_compressible.jl) |
-| `ice_anchor_flux` | bool |  | ice anchor reconciliation: flux leg (moist_compressible.jl) |
-| `ice_anchor_rates` | bool |  | ice anchor reconciliation: rates leg (moist_compressible.jl) |
-| `ice_anchor_source` | bool |  | ice anchor removal source (the census is kept when off) (moist_compressible.jl) |
+| `ice_anchor_floor` | bool |  | RETIRED (Stage 5): the ice-anchor reader cap was deleted with the other three legs (inert under the derived water anchor); true is refused (si_water_slaving.jl) |
+| `ice_anchor_flux` | bool |  | RETIRED (Stage 5): the ice-anchor sedimentation share was deleted with the other three legs (inert under the derived water anchor); true is refused (si_water_slaving.jl) |
+| `ice_anchor_rates` | bool |  | RETIRED (Stage 5): the ice-anchor rate share was deleted with the other three legs (inert under the derived water anchor); true is refused (si_water_slaving.jl) |
+| `ice_anchor_source` | bool |  | RETIRED (Stage 5): the ice-anchor removal source and its MC_ANCHOR_* census were deleted with the other three legs (inert under the derived water anchor); true is refused (si_water_slaving.jl) |
 | `ice_attr_census` | bool |  | ice attribution census in the log (moist_compressible.jl) |
 | `ice_microphysics` | string (enum) | `physics.microphysics.ice` (refused in `[extra.options]`) | ice scheme: :ishmael or :none (moist_compressible.jl, radiation_state.jl, mc_mynn_bl.jl) |
 | `ice_number_realization` | bool |  | per-donor realization bound on the ice-number sinks (moist_compressible.jl) |
@@ -811,7 +811,7 @@ Retired (refused with a message):
 | `sw_toa_flux` | float |  | fixed-sun TOA shortwave flux [W/m^2] (radiation_state.jl) |
 | `tau_activation` | float |  | ice activation timescale [s] (moist_compressible.jl) |
 | `tau_homogeneous` | float |  | homogeneous freezing timescale [s] (moist_compressible.jl) |
-| `tau_ice_anchor` | float |  | ice anchor removal timescale [s] (moist_compressible.jl) |
+| `tau_ice_anchor` | float |  | RETIRED with the ice-anchor removal source (Stage 5): the key is refused (si_water_slaving.jl) |
 | `tau_ice_population` | float |  | ice population source timescale [s] (moist_compressible.jl) |
 | `tau_lobe` | float |  | lobe relaxation timescale [s] of options[:lobe_relaxation]; default 10 (moist_compressible.jl) |
 | `tau_qss` | float | `physics.microphysics.tau_qss` (refused in `[extra.physical_params]`) | QSS relaxation timescale [s] (moist_compressible.jl) |

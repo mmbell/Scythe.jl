@@ -204,8 +204,8 @@ function o01_model(opts::BenchmarkOptions)
     # (The Stage C ice-anchor reconciliation knobs -- SCYTHE_O01_TAUANCHOR and the four leg
     # switches SCYTHE_O01_ANCHOR / _ANCHORFLOOR / _ANCHORFLUX / _ANCHORRATES -- went at Stage 4
     # of the rho_t retirement: under the derived anchor rho_w = sum_k alpha_k nu_k the four legs
-    # are INERT (`Scythe.inert_ice_anchor_legs!`; the anchor cannot be exceeded by
-    # construction) and an explicit `true` is refused by `Scythe.validate_water_anchor`.)
+    # were INERT (the anchor cannot be exceeded by construction), and Stage 5 deleted them; an
+    # explicit `true` and `tau_ice_anchor` are refused by `Scythe.validate_water_anchor`.)
     # The per-channel ATTRIBUTION census (`Scythe.MC_ATTR_*`): which LEG the `MC_DONOR_*`
     # breaches come from -- the six q_r legs at the breach points, rain evaporation at the
     # applied step-mean, the q_i melt/aggregation split, and what runs above the melting

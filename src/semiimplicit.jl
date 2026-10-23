@@ -545,8 +545,6 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # across the slaved water slots is refused (src/si_water_slaving.jl).
     validate_si_water_slots(model)
     validate_water_anchor(model)
-    # ...and the four ice-anchor legs switched off (inert under the derived anchor; review D1)
-    inert_ice_anchor_legs!(model)
 
     # Horizontal-acoustic history channel, allocated when either the ADI sweep
     # or the exact 2-D solve is on (exact_si shares the hacdot staging and the
@@ -715,8 +713,7 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         mc_ref_diag,
         _allocate_sw_scratch(tile, model),
         uses_pressure_reference(model.equation_set) ?
-            inert_ice_anchor_legs!(zeros(Float64, length(MC_WATER_STATS), Threads.maxthreadid()),
-                                   model) :
+            zeros(Float64, length(MC_WATER_STATS), Threads.maxthreadid()) :
             zeros(Float64, length(MC_WATER_STATS), 0),
         mc_micro_n,
         mc_micro_nm1,

@@ -181,7 +181,6 @@ const SLOT3_ALLOWLIST = [
     ("src/moist_compressible.jl", "@turbo expdot[colstart:colend,8] .= @. ADV + FORCING", 1),
     ("src/moist_compressible.jl", "@turbo expdot[colstart:colend,9] .= @. ADV + FORCING", 1),
     ("src/moist_compressible.jl", "_ice_live_span(Q[3], N[3], rho_d, idx)) :", 1),
-    ("src/moist_compressible.jl", "abs((MLQ[1] + MLQ[2]) + MLQ[3]) * rhoair * dt)", 1),
     ("src/moist_compressible.jl", "ctr !== :none && (gl += _exchange_gap(vnp1[g, 9] + (nuc[i] - phys[g, 9, 1]), d9[i],", 1),
     ("src/moist_compressible.jl", "d8[i] != 0.0 && (vnp1[g, 8] += d8[i])", 1),
     ("src/moist_compressible.jl", "d9[i] != 0.0 && (vnp1[g, 9] += d9[i])", 1),

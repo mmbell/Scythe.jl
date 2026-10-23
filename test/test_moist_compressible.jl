@@ -1002,7 +1002,6 @@ using Springsteel
         # The neighbours are shown so the vertical structure of the collapse is visible.
         @test occursin("k=$(k0 - 1), z=$(z[k0 - 1]) m  (below)", msg)
         @test occursin("k=$(k0 + 1), z=$(z[k0 + 1]) m  (above)", msg)
-        @test occursin("anchor_headroom", msg)
         # Each of the other admissibility conditions trips it too.
         for (pp_, rd_, rt_, T_) in ((p, [0.0; rho_d[2:end]], rho_t, Tk),
                                     (p, rho_d, [rho_t[1:2]; -1.0; rho_t[4:end]], Tk),
@@ -6342,24 +6341,19 @@ using Springsteel
     # (The Stage C ice-ANCHOR RECONCILIATION testset — the removal source, the reader cap, the
     # sedimentation and rate shares on a column whose ice exceeded rho_t - rho_d - rho_liq —
     # was retired with slot 3 at Stage 4: under the derived anchor the headroom is
-    # Σ α_k ν_k - ρ_liq >= the ice by construction, so the four legs are inert
-    # (`inert_ice_anchor_legs!`), and an explicit `true` is refused. What survives is that.)
-    @testset "ice: the anchor-reconciliation legs are inert under the derived anchor" begin
+    # Σ α_k ν_k - ρ_liq >= the ice by construction, so the four legs were inert, and Stage 5
+    # deleted them. What survives is that an explicit `true` is refused.)
+    @testset "ice: the anchor-reconciliation legs are deleted" begin
         mktempdir() do tmpdir
             legs = (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux, :ice_anchor_rates)
             # A DETACHED-by-the-old-measure column: ice at ~2x what the prognostic rho_t's
             # headroom was (~2.4e-3 kg/m^3), seeded out of the vapor.
             m, patch, mod, _ = make_ice_mtile(tmpdir; rho_i = 5.0e-3)
             for k in legs
-                @test mod.options[k] === false               # switched off at setup
+                @test !haskey(mod.options, k)                # nothing sets them at setup
             end
             Scythe.advance_column(m, 1, 2)
             @test all(isfinite.(m.var_np1))
-            st = m.mc_water_stats
-            @test all(view(st, Scythe.MC_ANCHOR_INERT, :) .== 1.0)
-            @test all(view(st, Scythe.MC_ANCHOR_GAP, :) .== 0.0)
-            @test all(view(st, Scythe.MC_ANCHOR_PTS, :) .== 0.0)
-            @test all(view(st, Scythe.MC_ANCHOR_REMOVED, :) .== 0.0)
             for k in legs
                 o = copy(mod.options); o[k] = true
                 @test_throws ErrorException Scythe.validate_water_anchor(
@@ -7118,18 +7112,18 @@ using Springsteel
         @test Scythe.MC_STIFF_NAMES == ("cloud", "rain", "ice1", "ice2", "ice3")
         @test Scythe.MC_STIFF_WARNED ==
               Scythe.MC_STIFF_FIRST + Scythe.MC_STIFF_N * Scythe.MC_STIFF_CHANNELS
-        # The stiffness block is no longer last: the DONOR-DEPLETION block appends after it,
-        # and the ANCHOR-RECONCILIATION census (Stage C) after that.
+        # The stiffness block is no longer last: the DONOR-DEPLETION block appends after it
+        # (the ANCHOR-RECONCILIATION census of Stage C that followed it was deleted with the
+        # ice-anchor legs at Stage 5 of the rho_t retirement).
         @test Scythe.MC_DONOR_FIRST == Scythe.MC_STIFF_WARNED + 1
-        @test Scythe.MC_ANCHOR_GAP == Scythe.MC_DONOR_WARNED + 1
-        # ...and the per-channel ATTRIBUTION block (Stage 0a) after THAT, with the
-        # POPULATION-RECONCILIATION census (Stage 3a) last, which is what the final row of
-        # `MC_WATER_STATS` now is.
-        @test Scythe.MC_ATTR_FIRST == Scythe.MC_ANCHOR_WARNED + 1
+        @test !isdefined(Scythe, :MC_ANCHOR_GAP)
+        # ...and the per-channel ATTRIBUTION block (Stage 0a) after THAT, then the
+        # POPULATION-RECONCILIATION census (Stage 3a).
+        @test Scythe.MC_ATTR_FIRST == Scythe.MC_DONOR_WARNED + 1
         @test Scythe.MC_ATTR_CHANNELS == length(Scythe.MC_ATTR_NAMES)
         @test Scythe.MC_ATTR_WARM_PTS ==
               Scythe.MC_ATTR_FIRST + Scythe.MC_ATTR_N * Scythe.MC_ATTR_CHANNELS
-        @test Scythe.MC_ATTR_LAST == Scythe.MC_ATTR_WARM_PTS + 4
+        @test Scythe.MC_ATTR_LAST == Scythe.MC_ATTR_WARM_PTS + 1
         @test Scythe.MC_POP_MAX == Scythe.MC_ATTR_LAST + 1
         @test Scythe.MC_POP_LAST == Scythe.MC_POP_MAX + 4
         # ...and the CLOUD-EVAPORATION BOUND census after that, then the ENERGY census
@@ -7141,16 +7135,14 @@ using Springsteel
         @test Scythe.MC_VNEG_MASS == Scythe.MC_VNEG + 1
         # the water-anchor block (Stage 3) follows MC_VNEG_MASS and is now the final block
         @test Scythe.MC_W_PART == Scythe.MC_VNEG_MASS + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_ANCHOR_INERT
+        @test Scythe.MC_STATS_LAST == Scythe.MC_W_SEEN
         @test Scythe.MC_WATER_STATS[Scythe.MC_VNEG] == :v_neg
         @test Scythe.MC_WATER_STATS[Scythe.MC_VNEG_MASS] == :v_neg_mass
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_PTS] == :e_pts
         @test Scythe.MC_WATER_STATS[Scythe.MC_CEVAP_MAX] == :e_max
-        @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_GAP] == :a_gap
-        @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_REMOVED] == :a_rem
         @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_FIRST] == :x_hom
-        @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_WARM_HELD] == :x_wheld
+        @test Scythe.MC_WATER_STATS[Scythe.MC_ATTR_WARM_MASS] == :x_wmass
         @test Scythe.MC_WATER_STATS[Scythe.MC_POP_MAX] == :o_max
         @test Scythe.MC_WATER_STATS[Scythe.MC_POP_SEED] == :o_seed
         @test Scythe.MC_WATER_STATS[Scythe.MC_POP_WARNED] == :o_warned

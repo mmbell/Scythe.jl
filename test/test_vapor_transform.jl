@@ -298,7 +298,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         @test Scythe.MC_VNEG_MASS == Scythe.MC_VNEG + 1
         # the water-anchor block (Stage 3) follows MC_VNEG_MASS and is now the final block
         @test Scythe.MC_W_PART == Scythe.MC_VNEG_MASS + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_ANCHOR_INERT
+        @test Scythe.MC_STATS_LAST == Scythe.MC_W_SEEN
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         mktempdir() do tmp
             for vtr in (:bhyp, :none)

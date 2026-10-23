@@ -979,37 +979,6 @@ the slot-based column. `@noinline`, plain arrays.
 end
 
 """
-    inert_ice_anchor_legs!(model)
-    inert_ice_anchor_legs!(st, model)
-
-UNDER THE DERIVED WATER ANCHOR (the only one since Stage 4) the four ice-anchor legs are INERT
-(review D1): the anchor is
-`ρ_w = Σ α_k ν_k` itself, so the implied vapor is `ahyp(ν_v) ≥ 0` and the anchor cannot be
-exceeded by construction, while the headroom read through `ρ_t − ρ_d = W` would fire at every
-vapor-lobe point with ice (`ρ_v + X < 0`, the pool) — a transport-detachment guard turned into
-a vapor-negativity device. The first form sets `options[:ice_anchor_source]`, `[:ice_anchor_floor]`,
-`[:ice_anchor_flux]` and `[:ice_anchor_rates]` to `false` (an explicit `true` was already refused
-by [`validate_water_anchor`](@ref)), so `mc_driver!` reads them off exactly as before; the
-second marks the stats matrix (`MC_ANCHOR_INERT`), so `_ice_anchor_reconcile!` measures nothing
-and the `MC_ANCHOR_*` rows read 0.0 (Stage 3's shadow-gap census went with slot 3 at Stage 4).
-Nothing here is in `mc_driver!`: a branch there tips `moist_compressible_SLR` over the LLVM
-compile cliff (measured 2026-10-22). The legs' code stays for the Stage 5 decision.
-"""
-function inert_ice_anchor_legs!(model)
-    uses_pressure_reference(model.equation_set) || return nothing
-    for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux, :ice_anchor_rates)
-        model.options[k] = false
-    end
-    return nothing
-end
-
-function inert_ice_anchor_legs!(st::Matrix{Float64}, model)
-    size(st, 2) > 0 || return st
-    @inbounds st[MC_ANCHOR_INERT, :] .= 1.0
-    return st
-end
-
-"""
     validate_water_anchor(model)
 
 Setup-time refusals of what the derived water anchor — the only one since Stage 4 of the ρ_t
@@ -1024,8 +993,10 @@ retirement — cannot run, each naming the reason:
   `physical_params[:tau_rho_v_rec]`: they configured the vapor reconciliation nudge and its
   residual, deleted with the prognostic ρ_t (the vapor is the ν-space closure of every
   exchange instead);
-- an explicit `true` for the four ice-anchor legs and the two MYNN slot-anchor water devices
-  (inert, [`inert_ice_anchor_legs!`](@ref));
+- an explicit `true` for the four ice-anchor legs (`ice_anchor_source/_floor/_flux/_rates`,
+  deleted at Stage 5: under the derived anchor `Σ_k α_k ν_k` the anchor cannot be exceeded, the
+  implied vapor being `ahyp(ν_v) ≥ 0`, so they were inert from Stage 3 on) and the two MYNN
+  slot-anchor water devices; `physical_params[:tau_ice_anchor]` (the removal's timescale);
 - `options[:clamp_water] = true` (its floor balanced the partition against slot 3), and
   `options[:mynn_water_carry] = :fixed_T`;
 - `options[:water_budget_trace] > 0` with any water transform, two-moment rain or ice (the
@@ -1056,7 +1027,11 @@ function validate_water_anchor(model)
     end
     haskey(pp, :tau_rho_v_rec) && error("physical_params[:tau_rho_v_rec] configures the " *
         "vapor reconciliation nudge, which is deleted under " * why * ". Remove the key.")
-    # Devices the derived anchor SUBSUMES (review D1 and the BL sub-check): inert there, so an
+    haskey(pp, :tau_ice_anchor) && error("physical_params[:tau_ice_anchor] configured the " *
+        "ice-anchor removal source, which was deleted with the other three ice-anchor legs at " *
+        "Stage 5 of the rho_t retirement (under " * why * " the anchor cannot be exceeded). " *
+        "Remove the key.")
+    # Devices the derived anchor SUBSUMES (review D1 and the BL sub-check), deleted: an
     # explicit `true` is refused rather than silently bypassed (`false` is harmless).
     for (k, what) in ((:ice_anchor_source, "the ice-anchor removal source"),
                       (:ice_anchor_floor, "the ice-anchor reader cap"),
@@ -1065,9 +1040,9 @@ function validate_water_anchor(model)
                       (:mynn_water_closure, "the MYNN total-water residual closure"),
                       (:mynn_exchange_realization, "the MYNN clip-gap (lobe) partner"))
         get(opts, k, nothing) === true && error("options[:$(k)] = true configures $(what), " *
-            "which is INERT under " * why * " (the anchor sum_k alpha_k nu_k cannot be " *
-            "exceeded, and every MYNN water leg is a nu leg realized on its own recovered " *
-            "rate). Remove the key.")
+            "which is retired under " * why * " (the anchor sum_k alpha_k nu_k cannot be " *
+            "exceeded, so the four ice-anchor legs were deleted at Stage 5; every MYNN water " *
+            "leg is a nu leg realized on its own recovered rate). Remove the key.")
     end
     if get(opts, :water_budget_trace, 0) > 0
         (condensate_transform_mode(opts) === :none && rain_transform_mode(opts) === :none &&
@@ -1098,7 +1073,7 @@ end
 # every exchange to rounding (exactly: with all α = 2 the doublings and the halving are exact,
 # and α_v Δν_v is the negated sum bit for bit). Sites: the ETD step-mean increments, the
 # multistep exchange sources (AUTO_COLL, the ice back-reactions ICE_C/ICE_R, the twelve ice
-# SRC_* including the anchor source and the population reconcile), the sedimentation knee
+# SRC_* including the population reconcile), the sedimentation knee
 # closure and the paired Stage L.
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1120,7 +1095,7 @@ THE ONE CLOSURE: the vapor's ν increment of a water exchange whose non-vapor ν
 
 The vapor's ν RATE closing the multistep exchange sources (the ones that stay on AB3): the
 cloud receives `J_c(ICE_C − AUTO_COLL)`, the rain `J_r(ICE_R + AUTO_COLL)`, each ice mass
-`J_k SRC_k` (the ISHMAEL process sources with the anchor source and the population reconcile
+`J_k SRC_k` (the ISHMAEL process sources with the population reconcile
 folded in), and the vapor `water_exchange_dv` of those ν rates. Autoconversion alone gives the
 vapor `(J_c − J_r)·AUTO_COLL`: zero above both knees (design §5.2).
 """

@@ -203,7 +203,7 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
                                (:vapor_nudge_partner, true, false),
                                (:water_budget_trace, 1, false),
                                (:clamp_water, true, false),
-                               # subsumed devices: an explicit true is refused, not bypassed
+                               # retired devices: an explicit true is refused, not bypassed
                                (:ice_anchor_source, true, false),
                                (:ice_anchor_floor, true, false),
                                (:ice_anchor_flux, true, false),
@@ -238,9 +238,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     @testset "census: MC_W_* layout and values" begin
         @test Scythe.MC_W_PART == Scythe.MC_VNEG_MASS + 1
         @test Scythe.MC_W_SEEN == Scythe.MC_W_PART + 6
-        @test Scythe.MC_ANCHOR_INERT == Scythe.MC_W_SEEN + 1
-        @test Scythe.MC_STATS_LAST == Scythe.MC_ANCHOR_INERT
-        @test Scythe.MC_WATER_STATS[Scythe.MC_ANCHOR_INERT] == :anchor_inert
+        @test Scythe.MC_STATS_LAST == Scythe.MC_W_SEEN
+        @test Scythe.MC_WATER_STATS[Scythe.MC_W_SEEN] == :w_seen
         @test length(Scythe.MC_WATER_STATS) == Scythe.MC_STATS_LAST
         # the Stage 3 shadow rows went with slot 3, the vapor gap with the nudge
         @test !isdefined(Scythe, :MC_SHADOW_MAX) && !isdefined(Scythe, :MC_SHADOW_INT)
@@ -800,12 +799,21 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         end
     end
 
-    @testset "D1: the four ice-anchor legs are inert (MC_ANCHOR_GAP reads 0.0)" begin
-        # An ice tile whose vapor rings into a lobe beside real ice: read through
-        # rho_t - rho_d = W the headroom test fires there (rho_v + X < 0). Nothing binds: the
-        # reader cap, the sedimentation and rate shares are the raw ice, nothing is removed,
-        # and MC_ANCHOR_GAP -- Stage 3's shadow-gap census, which went with slot 3 -- reads
-        # 0.0. Forcing the rate and flux legs back on shows they would bind on this state.
+    @testset "D1: the four ice-anchor legs are deleted (Stage 5)" begin
+        # Inert under the derived anchor from Stage 3 on (the anchor sum_k alpha_k nu_k cannot
+        # be exceeded), deleted at Stage 5 with their census. An ice tile whose vapor rings
+        # into a lobe beside real ice -- where the old headroom test, read through
+        # rho_t - rho_d = W, would fire (rho_v + X < 0) -- runs with the raw ice read by the
+        # thermodynamics, and nothing of the legs is left.
+        for nm in (:ice_anchor_rate, :anchor_headroom, :_ice_anchor_reconcile!,
+                   :inert_ice_anchor_legs!, :MC_ANCHOR_GAP, :MC_ANCHOR_PTS,
+                   :MC_ANCHOR_REMOVED, :MC_ANCHOR_WARNED, :MC_ANCHOR_INERT,
+                   :MC_ATTR_WARM_FA, :MC_ATTR_WARM_DFA, :MC_ATTR_WARM_HELD)
+            @test !isdefined(Scythe, nm)
+        end
+        @test !(:anchor_f in Scythe.MC_SCRATCH_SLOTS)
+        @test !any(in(Scythe.MC_WATER_STATS), (:a_gap, :a_pts, :a_rem, :a_warned,
+                                                :anchor_inert, :x_wfa, :x_wdfa, :x_wheld))
         mktempdir() do tmp
             seedice! = (p, x, V, c) -> begin
                 F.vt_seed!(p, x, V, c; amp = 1.0e-3, vamp = 3.0e-3)
@@ -823,45 +831,26 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             m, p, mo = F.vt_tile(tmp, "d1"; vtr = :bhyp, ice = true, extra = derived(),
                                  seed! = seedice!)
             F.vt_run!(m, p, mo, 3)
-            st = m.mc_water_stats
             kD = mo.grid_params.kDim
-            mr = deepcopy(m)              # the same state, for the rate-leg check below
             Scythe.advance_column(m, 1, 4)
             S = m.mc_scratch[Threads.threadid()]
-            # the legs are switched off at setup and the stats matrix marks them inert
+            # nothing writes the old keys at setup any more
             for k in (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux,
                       :ice_anchor_rates)
-                @test mo.options[k] === false
+                @test !haskey(mo.options, k)
             end
-            @test all(==(1.0), view(st, Scythe.MC_ANCHOR_INERT, :))
+            # the thermodynamics reads the raw ice...
             @test S.rho_ice_t == S.rho_ice
-            # the RATE and FLUX legs directly: forcing them back on (past the validation) on
-            # the same state changes the ice sources where the headroom binds; the default
-            # arm's sources are the unshared ones
-            rd0 = (copy(S.SRC_i1q), copy(S.invtau_i1), copy(S.F_i1q))
-            mr.model.options[:ice_anchor_rates] = true
-            mr.model.options[:ice_anchor_flux] = true
-            Scythe.advance_column(mr, 1, 4)
-            Sr = mr.mc_scratch[Threads.threadid()]
-            @test any(<(1.0), Sr.anchor_f)
-            @test (Sr.SRC_i1q, Sr.invtau_i1, Sr.F_i1q) != rd0
-            @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
-            @test sum(view(st, Scythe.MC_ANCHOR_REMOVED, :)) == 0.0
-            @test all(==(0.0), view(st, Scythe.MC_ANCHOR_GAP, :))
-            # ...and the headroom test the legs WOULD read fires here (the measure)
-            hit = count(i -> S.rho_ice[i] > Scythe.anchor_headroom(S.rho_t[i] - S.rho_d[i],
-                                                                   S.rho_liq[i], 0.0),
-                        1:kD)
+            # ...on a state where the old headroom test would have bound
+            hit = count(i -> S.rho_ice[i] > max((S.rho_t[i] - S.rho_d[i]) -
+                                                max(S.rho_liq[i], 0.0), 0.0), 1:kD)
             @test hit > 0
+            @test all(isfinite, m.var_np1)
         end
-        # ...and on a warm tile
+        # the removal's timescale is refused by name
         mktempdir() do tmp
-            m, p, mo = F.vt_tile(tmp, "d1w"; vtr = :bhyp, extra = derived(),
-                                 seed! = (p, x, V, c) -> F.vt_seed!(p, x, V, c))
-            F.vt_run!(m, p, mo, 3)
-            st = m.mc_water_stats
-            @test all(==(0.0), view(st, Scythe.MC_ANCHOR_GAP, :))
-            @test sum(view(st, Scythe.MC_ANCHOR_PTS, :)) == 0.0
+            @test_throws ErrorException F.vt_tile(tmp, "ref_tia"; vtr = :bhyp, extra = derived(),
+                pp_extra = Dict{Symbol,Float64}(:tau_ice_anchor => 10.0))
         end
     end
 

@@ -185,14 +185,11 @@ const MC_SCRATCH_SLOTS = (
     :i3c, :nu_i3c, :nu_i3c_z, :J_i3c, :SRC_i3c, :F_i3c, :F_i3c_z,
     # Ice AGGREGATES over the three species: the total ice density (the retrieval's ρ_i),
     # what the thermodynamics reads under `condensate_floor`, the mixing ratio q_i, the
-    # summed MASS flux divergence (the only ice flux that reaches ρ_t) and the ice
+    # summed MASS flux divergence (the only ice flux the water anchor ρ_w loses) and the ice
     # sedimentation energy flux with its divergence (the only one that reaches E_t).
-    # `anchor_f` is the SEDIMENTATION anchor share (TeX §Reconciliation of the condensate
-    # partition, third leg): min(1, headroom/ρ_i) per gridpoint, exactly 1.0 where the
-    # partition is admissible, applied to all twelve flux assemblies so the phantom part of
-    # a detached ice mass does not fall. (Inert under the derived anchor, which is the only
-    # one since Stage 4; `inert_ice_anchor_legs!`.)
-    :rho_ice, :rho_ice_t, :q_i, :Fi_z, :E_sed_i, :E_sed_i_z, :anchor_f,
+    # (The sedimentation anchor share `anchor_f` of the ice-anchor legs was deleted with
+    # the legs at Stage 5 of the ρ_t retirement.)
+    :rho_ice, :rho_ice_t, :q_i, :Fi_z, :E_sed_i, :E_sed_i_z,
     # ── Ice PHYSICS (S8): the process rates the twelve slots and the shared thermodynamics
     # read. `Qdot_i<k>` is species k's deposition/sublimation rate [kg/m³/s] (TeX Eq.
     # dep_rate) and `invtau_i<k>` its relaxation rate for the stiffness census; `Q_s_i` is
@@ -1647,7 +1644,6 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :p_s1_max, :p_s1_n, :p_s2_max, :p_s2_n, :p_s3_max, :p_s3_n,
                         :p_n1_max, :p_n1_n, :p_n2_max, :p_n2_n, :p_n3_max, :p_n3_n,
                         :p_warned,
-                        :a_gap, :a_pts, :a_rem, :a_warned,
                         :x_hom, :x_hom_n, :x_bigg, :x_bigg_n,
                         :x_rime, :x_rime_n, :x_rimex, :x_rimex_n,
                         :x_coll, :x_coll_n, :x_melt, :x_melt_n,
@@ -1657,13 +1653,12 @@ const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
                         :x_asat, :x_asat_n,
                         :x_wrc, :x_wrc_n, :x_wrr, :x_wrr_n,
                         :x_wmlt, :x_wmlt_n, :x_wmri, :x_wmri_n,
-                        :x_wpts, :x_wmass, :x_wfa, :x_wdfa, :x_wheld,
+                        :x_wpts, :x_wmass,
                         :o_max, :o_pts, :o_rain, :o_seed, :o_warned,
                         :e_pts, :e_held, :e_max,
                         :r_dr, :r_booked, :l_c, :l_r, :l_i1, :l_i2, :l_i3,
                         :x_max, :x_int, :x_pool, :ec_steps, :v_neg, :v_neg_mass,
-                        :w_part, :w_neg, :w_neg_pts, :w_int, :w_src, :w_budget, :w_seen,
-                        :anchor_inert)
+                        :w_part, :w_neg, :w_neg_pts, :w_int, :w_src, :w_budget, :w_seen)
 
 """
 First row of the per-step budget block for each species in `mc_water_stats`.
@@ -1816,47 +1811,6 @@ const MC_DONOR_NAMES = ("q_c", "q_r(ice+evap)", "n_r", "q_i1(melt+agg)", "q_i2(m
                         "n_i1(melt+agg+subl)", "n_i2(melt+agg+subl)",
                         "n_i3(melt+agg+subl)")
 """
-The ANCHOR-RECONCILIATION census of `mc_water_stats` — the third reconciliation tier's
-diagnostic (TeX §"Reconciliation of the condensate partition"), written by
-[`_ice_anchor_reconcile!`](@ref) and reported by [`mc_stiffness_trace`](@ref).
-
-| constant | quantity |
-|---|---|
-| `MC_ANCHOR_GAP` | run-maximum of the partition defect `δ_part` (Eq. partition_gap) [kg/m³] |
-| `MC_ANCHOR_PTS` | cumulative gridpoint-steps with `δ_part > 0` |
-| `MC_ANCHOR_REMOVED` | cumulative removed mass, `Σ φ·Σₖmax(ρ_{i,k},0)·Δt` over points and steps [kg/m³ · gridpoint-steps] |
-| `MC_ANCHOR_WARNED` | internal: 1.0 once the once-per-run detachment `@info` has fired |
-
-CUMULATIVE, like the stiffness and donor blocks and unlike `MC_QSS_GAP`: that per-step row
-is written and reset only inside `water_budget_trace`, which refuses to run under `:ishmael` —
-an ice-arm census gated there would never record anything. This one is
-written on every ice step of every run, whether or not the reconciliation SOURCE is applied:
-`options[:ice_anchor_source] = false` switches off the removal, never the measurement, so
-the off switch is a forensic tool and not a blindfold.
-
-UNDER THE DERIVED WATER ANCHOR — the only one since Stage 4 of the ρ_t retirement — the four
-legs (source, floor, flux, rates) are INERT: the anchor `ρ_w = Σ α_k ν_k` cannot be exceeded,
-the implied vapor being `ahyp(ν_v) ≥ 0` (`inert_ice_anchor_legs!`, `MC_ANCHOR_INERT`), so all
-four rows read 0.0. Under Stage 3 `MC_ANCHOR_GAP` carried the shadow gap
-`|ρ_t'^slot − (ρ_d' + W')|`; the shadow went with slot 3, and the row is kept, reading 0.0,
-until Stage 5 decides the legs. The text below is the legs' design, for that decision.
-
-`MC_ANCHOR_GAP` was what the old vapor gap could not see: during a detachment the vapor nudge
-succeeded — the vapor gap → 0 while the partition itself was wrong — so the first gap
-census read zero exactly when this one was the whole story. `MC_ANCHOR_REMOVED` is the
-standing bias detector for the one-sided removal: an unweighted gridpoint-sum proxy (the
-same weighting as every domain sum in this census family), to be read against the ice
-water path — secular growth outside the glaciation front means `τ_anchor` is too short or
-the attribution is wrong.
-"""
-const MC_ANCHOR_GAP = MC_DONOR_WARNED + 1
-@doc (@doc MC_ANCHOR_GAP)
-const MC_ANCHOR_PTS = MC_DONOR_WARNED + 2
-@doc (@doc MC_ANCHOR_GAP)
-const MC_ANCHOR_REMOVED = MC_DONOR_WARNED + 3
-@doc (@doc MC_ANCHOR_GAP)
-const MC_ANCHOR_WARNED = MC_DONOR_WARNED + 4
-"""
 The ATTRIBUTION CENSUS of `mc_water_stats` — the per-CHANNEL decomposition of the two
 depletion breaches the `MC_DONOR_*` block convicts (TeX §"Donor relaxation and its
 realization", §"Reconciliation of the condensate partition"), written by
@@ -1867,7 +1821,7 @@ did it, and on the ice arm that is the whole question: the q_r breach could be r
 homogeneous freezing, ice-rain collection or (uncensused anywhere else) rain evaporation, and
 the q_i1 breach could be melting or aggregation. This block answers "which one" and nothing
 else. Same `[run-max, count]` layout as the two blocks above it, `MC_ATTR_N` rows per channel,
-then a five-scalar TAIL that is not a channel.
+then a two-scalar TAIL that is not a channel.
 
 The four measurement sites, in the order the step visits them:
 
@@ -1876,7 +1830,7 @@ The four measurement sites, in the order the step visits them:
 | A | `mc_ice_sources!`, at the q_r breach points only | the six legs of `−ICE_R` against `q_r` |
 | B | the ETD pre-compute, beside the sublimation census | rain EVAPORATION at the APPLIED step-mean, alone and combined with the ice draw |
 | C | `mc_ice_sources!` | the q_i1/q_i2 split between MELT and AGGREGATION |
-| D | `mc_ice_sources!`, `T > T_0 + 2` K | the above-freezing riming/melting loop, and the anchor share's withholding |
+| D | `mc_ice_sources!`, `T > T_0 + 2` K | the above-freezing riming/melting loop |
 
 Block A's counts PARTITION the `MC_DONOR_QR` count exactly: at every breach point (the
 combined `(−ICE_R/ρ_a + f_r κ_ev q_r)·Δt/q_r > 1` of Stage 2b, `mc_donor_census!`'s own
@@ -1909,16 +1863,13 @@ exists for its COUNT, which is what says whether removing those caps would move 
 `options[:ice_agg_caps] = false` (env `SCYTHE_O01_AGGCAPS=0`) is the switch that removes them,
 and this count is the measurement it is meant to be read against.
 
-The five-scalar TAIL, over `T > T_0` gridpoints that carry ice (block D, the melting-level
-question): gridpoint-steps, the summed RAW ice density (an unweighted gridpoint-sum proxy, the
-same weighting as every domain sum in this census family), the count and run-max of the
-rate-side anchor share `f_a` biting, and the WITHHELD MELT `Σ(1/f_a − 1)|Σ q̇_mlt| ρ_a Δt` —
-melting is linear in the population at fixed per-particle state, so `q̇_mlt/f_a` is what the
-RAW population would have melted and the difference is what the anchor share held back. Read
-together they decide whether sub-melting-level ice is anchor-REAL (`f_a = 1`, the withheld
-melt zero) or detached, which is the question Stage 3's leg-D exemption turns on.
+The two-scalar TAIL, over `T > T_0` gridpoints that carry ice (block D, the melting-level
+question): gridpoint-steps and the summed RAW ice density (an unweighted gridpoint-sum proxy,
+the same weighting as every domain sum in this census family). (Three more rows — the count
+and run-max of the rate-side anchor share `f_a` biting and the melt it withheld — went with
+the ice-anchor legs at Stage 5 of the ρ_t retirement: `f_a ≡ 1` under the derived anchor.)
 
-CUMULATIVE, like the stiffness, donor and anchor blocks. OPT-IN, unlike all three:
+CUMULATIVE, like the stiffness and donor blocks. OPT-IN, unlike all three:
 `mc_water_stats` is always allocated, so the block is written only where
 `options[:ice_attr_census]` is true (default false, env `SCYTHE_O01_ATTR=1`) and is otherwise
 never touched — an explicit flag is what makes an eighteen-channel census zero-cost on the
@@ -1968,9 +1919,13 @@ const MC_ATTR_CHANNELS = 18
 @doc (@doc MC_ATTR_QR_HOM)
 const MC_ATTR_N = 2
 @doc (@doc MC_ATTR_QR_HOM)
-const MC_ATTR_FIRST = MC_ANCHOR_WARNED + 1
+# (The ANCHOR-RECONCILIATION census, `MC_ANCHOR_GAP/_PTS/_REMOVED/_WARNED`, sat here: the four
+# ice-anchor legs it measured were deleted at Stage 5 of the ρ_t retirement — under the derived
+# water anchor `ρ_w = Σ_k α_k ν_k` the anchor cannot be exceeded, the implied vapor being
+# `ahyp(ν_v) ≥ 0`, so the rows read 0.0 on every run from Stage 3 on.)
+const MC_ATTR_FIRST = MC_DONOR_WARNED + 1
 """
-The five-scalar TAIL of the attribution census, over `T > T_0` gridpoints carrying ice.
+The two-scalar TAIL of the attribution census, over `T > T_0` gridpoints carrying ice.
 Not channels: they are sums and counts of the POPULATION, not of a depletion fraction, so
 they sit after the `MC_ATTR_CHANNELS` `[max, count]` pairs rather than inside them.
 
@@ -1978,21 +1933,12 @@ they sit after the `MC_ATTR_CHANNELS` `[max, count]` pairs rather than inside th
 |---|---|
 | `MC_ATTR_WARM_PTS`  | gridpoint-steps with `T > T_0` and `Σ_k ρ_{i,k} > 0` |
 | `MC_ATTR_WARM_MASS` | `Σ` of the RAW ice density over those points [kg/m³ · gridpoint-steps] |
-| `MC_ATTR_WARM_FA`   | how many of them had the rate-side anchor share `f_a < 1` |
-| `MC_ATTR_WARM_DFA`  | run-max of `1 − f_a` there |
-| `MC_ATTR_WARM_HELD` | `Σ(1/f_a − 1)·\\|Σ_k q̇_mlt\\|·ρ_a·Δt`, the melt the anchor share withheld |
 """
 const MC_ATTR_WARM_PTS = MC_ATTR_FIRST + (MC_ATTR_N * MC_ATTR_CHANNELS)
 @doc (@doc MC_ATTR_WARM_PTS)
 const MC_ATTR_WARM_MASS = MC_ATTR_WARM_PTS + 1
 @doc (@doc MC_ATTR_WARM_PTS)
-const MC_ATTR_WARM_FA = MC_ATTR_WARM_PTS + 2
-@doc (@doc MC_ATTR_WARM_PTS)
-const MC_ATTR_WARM_DFA = MC_ATTR_WARM_PTS + 3
-@doc (@doc MC_ATTR_WARM_PTS)
-const MC_ATTR_WARM_HELD = MC_ATTR_WARM_PTS + 4
-@doc (@doc MC_ATTR_WARM_PTS)
-const MC_ATTR_LAST = MC_ATTR_WARM_HELD
+const MC_ATTR_LAST = MC_ATTR_WARM_MASS
 """Channel labels for the attribution report, in `MC_ATTR_*` index order."""
 const MC_ATTR_NAMES = ("q_r: homogeneous (mimr)", "q_r: Bigg (mbig)",
                        "q_r: rain riming (realized)",
@@ -2021,8 +1967,8 @@ diagnostic (TeX §"Reconciliation of the population"), written by
 | `MC_POP_SEED`   | cumulative ICE number seeded below `T_0`, `Σ (ρ^∅/(m_seed τ_pop))·Δt` [#/m³ · gridpoint-steps]; `m_seed` is `ISHMAEL_M_MIN` or the large-crystal mass, per `options[:ice_population_seed]` |
 | `MC_POP_WARNED` | internal: 1.0 once the once-per-run number-less-mass `@info` has fired |
 
-CUMULATIVE, and written on every ice step whether or not the SOURCE is applied, exactly as
-the `MC_ANCHOR_*` block is: `options[:ice_population_source] = false` — and
+CUMULATIVE, and written on every ice step whether or not the SOURCE is applied:
+`options[:ice_population_source] = false` — and
 `options[:condensation] = false`, which switches this transfer off with the other phase
 changes — stop the transfer, never the measurement.
 
@@ -2030,10 +1976,10 @@ The rain NUMBER seeded above `T_0` is not a row of its own because it is not ind
 the warm branch seeds one drop per [`RAIN_2M_M_AUTO`](@ref) of returned mass, so it is
 `MC_POP_RAIN / RAIN_2M_M_AUTO` exactly.
 
-`MC_POP_MAX` is what `MC_ANCHOR_GAP` could not see: the anchor share of
-a number-less mass is measured to be exactly one (the water is real; only its phase
-REPRESENTATION is unusable), so the partition census reads zero at precisely the points this
-one convicts. Read `MC_POP_RAIN` against the surface rain accumulation and `MC_POP_SEED`
+`MC_POP_MAX` is what the (since deleted) ice-anchor partition census could not see: the
+anchor share of a number-less mass was measured to be exactly one (the water is real; only its
+phase REPRESENTATION is unusable), so that census read zero at precisely the points this one
+convicts. Read `MC_POP_RAIN` against the surface rain accumulation and `MC_POP_SEED`
 against the ice number path — a secular contribution from either says `τ_pop` is too short.
 """
 const MC_POP_MAX = MC_ATTR_LAST + 1
@@ -2159,18 +2105,8 @@ const MC_W_SRC = MC_CEVAP_LAST + 18
 const MC_W_BUDGET = MC_CEVAP_LAST + 19
 @doc (@doc MC_W_PART)
 const MC_W_SEEN = MC_CEVAP_LAST + 20
-"""
-    MC_ANCHOR_INERT
-
-Internal row of `mc_water_stats`, set to 1.0 on every thread column at tile creation under the
-DERIVED water anchor ([`inert_ice_anchor_legs!`](@ref)) and never written again: it tells
-[`_ice_anchor_reconcile!`](@ref) that the four ice-anchor legs are inert (review D1). Carried
-in the stats matrix, not read in `mc_driver!`, because a branch there tips
-`moist_compressible_SLR` over the LLVM compile cliff (measured 2026-10-22: > 40 min first call).
-"""
-const MC_ANCHOR_INERT = MC_CEVAP_LAST + 21
 """Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
-const MC_STATS_LAST = MC_ANCHOR_INERT
+const MC_STATS_LAST = MC_W_SEEN
 """
 Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
 1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
@@ -2597,7 +2533,7 @@ species' channel is CLOSED, the slot receives the exponential relaxation toward 
     Δν = −ν^n (1 − e^{−Δt/τ_lobe}),       `a = 1 − e^{−Δt/τ_lobe} = −expm1(−Δt/τ_lobe)`,
 
 a `Δt`-free rate law (`dν/dt = −ν/τ_lobe` on the lobe, integrated exactly over the step) in
-the τ class of `tau_rho_v_rec`, `tau_qss` and `tau_ice_anchor`: a drift correction, never a
+the τ class of `tau_qss` and `tau_ice_population`: a drift correction, never a
 shock. `a ∈ [0, 1]`, so the device's own step `ν(1 − a)` can reach zero but never cross it.
 **CHANNEL CLOSED** means the recovered density is 0 (`ν ≤ 0` under `:bhyp`) and EVERY process
 term the slot receives at that point is an exact `0.0` at state `n`:
@@ -2884,9 +2820,9 @@ continuity form.
 end
 
 """
-    _ice_flux!(mtile, F, F_z, x, w_fall, f_anchor, slot, dirichlet_lid = true) -> Nothing
+    _ice_flux!(mtile, F, F_z, x, w_fall, slot, dirichlet_lid = true) -> Nothing
 
-Form one ice moment's sedimentation flux `F = f_anchor·max(x, 0)·W` and its fitted divergence
+Form one ice moment's sedimentation flux `F = max(x, 0)·W` and its fitted divergence
 `∂F/∂z`, on THAT SLOT'S OWN spline basis — its own cells, l_q and GROUND condition, so a mass
 slot with a Natural bottom lets the crystals leave the domain while a moment with a different
 fit is not forced to agree with it — but with a ZERO-FLUX LID ([`flux_column`](@ref): the
@@ -2898,11 +2834,9 @@ ice TC run at the lid. `dirichlet_lid = false` restores that fit (forensics:
 `options[:sedimentation_flux_lid] = :natural`). On a Chebyshev vertical (RZ) the flux column
 IS the slot's own column — see `_allocate_flux_columns` for why.
 
-`f_anchor` is the sedimentation anchor share (the `anchor_f` scratch column): `min(1,
-headroom/ρ_i)` per gridpoint, exactly `1.0` — and this function bitwise its pre-Stage-C
-self — wherever the partition is admissible. One factor shared by all four moments of every
-species, so the size sorting and the mass/number correlation of what falls are untouched;
-the withheld phantom part stays in the slot for the reconciliation source to remove.
+(The sedimentation anchor share `f_anchor` that multiplied the product went with the
+ice-anchor legs at Stage 5 of the ρ_t retirement; the driver passed the scalar `1.0` under the
+derived anchor, so the product is bitwise what it was.)
 
 `w_fall` is the fall speed WEIGHTED BY THE MOMENT BEING TRANSPORTED (negative downward, like
 `Vt`), which is the whole reason each of the four moments gets its own flux: mass, number and
@@ -2926,14 +2860,9 @@ if no level has both a nonzero fall speed and a nonzero (positive) amount, `F` a
 its derivative is zero — it is the same numbers reached without the arithmetic, which is what
 keeps the zero-ice inertness gate BITWISE rather than merely small.
 """
-@inline function _ice_flux!(mtile::ModelTile, F, F_z, x, w_fall, f_anchor, slot::Int,
+@inline function _ice_flux!(mtile::ModelTile, F, F_z, x, w_fall, slot::Int,
                             dirichlet_lid::Bool = true)
-    # `f_anchor` is the sedimentation anchor share (see the `anchor_f` scratch doc): the
-    # transported amount is the anchor-supported part of the moment, with `f_anchor == 1.0`
-    # exactly — hence this line bitwise the unfactored product — wherever the partition is
-    # admissible. One shared factor across a species' four moments, so the size sorting and
-    # the mass/number correlation of what falls are untouched.
-    @. F = (f_anchor * max(x, 0.0)) * w_fall
+    @. F = max(x, 0.0) * w_fall
     live = false
     @inbounds for i in eachindex(F)
         if F[i] != 0.0
@@ -4846,138 +4775,6 @@ Allocation-free and loop-free: it runs once per channel per gridpoint inside
 end
 
 """
-    ice_anchor_rate(rho_t, rho_d, rho_liq, rho_ice, tau_anchor) -> (phi, delta)
-
-The rate law of the ANCHOR RECONCILIATION — the third tier of the reconciliation chain
-(TeX §"Reconciliation of the condensate partition", Eqs. partition_gap / partition_rec_eq).
-
-The twelve ice moments advect on their own fitted fields while the total water advects as
-one, so the summed ice mass and the anchor's headroom are two independent discretizations
-of the same physical water; at a sharp glaciation front they detach, the (since retired)
-vapor nudge faithfully closed the budget onto the unphysical partition, and
-the retrieval takes an `L_s` credit the heat capacity does not contain — the §2c death
-chain. The defect is
-
-    delta = max(0, rho_ice - max((rho_t - rho_d) - max(rho_liq, 0), 0))
-
-— the ice mass in excess of the headroom left after the POSITIVE liquid (a ringing negative
-liquid must not enlarge the ice's debit) — and the returned rate is one shared fraction per
-second, `phi = delta / (rho_ice · tau_anchor)`, applied by [`_ice_anchor_reconcile!`](@ref)
-to every moment of every species so the per-particle state and the species shares are
-exactly invariant.
-
-Properties (each is a test in test_ice_anchor_reconcile.jl):
-- ONE-SIDED and exactly `(0.0, 0.0)` on every admissible state — measured identically zero
-  from initialization through glaciation onset on the O01 ice arm, so the device is absent
-  from healthy air, bitwise;
-- `phi ≤ 1/tau_anchor` identically (`delta ≤ rho_ice` by construction), so the per-step
-  removed fraction is bounded by `Δt/τ_anchor ≪ 1` with no realization factor — and
-  `relaxation_realization` is the ready escalation if `τ_anchor` is ever pushed toward the
-  step;
-- Δt-free: the physics supplies a rate, the integrator supplies the step.
-
-`tau_anchor` is `physical_params[:tau_ice_anchor]` (default 10.0 s, the `tau_rec` class):
-at the measured transport-phase feed (≤ 1.7e-6 kg/m³/s, FINDINGS §Stage C) the detachment
-equilibrates at `F·τ ≈ 1.7e-5` kg/m³ — a 0.16 K retrieval excursion against the ~1e4
-K/(kg/m³) sensitivity the ts=0.3 death window calibrates.
-
-`lobe` (keyword, default `0.0`) is a clipped lobe to credit to the headroom (≤ 0; see
-[`anchor_headroom`](@ref)); the model always passes `0.0` since the lobe attribution went with
-the prognostic ρ_t (Stage 4), which is the law above, bit for bit.
-"""
-@inline function ice_anchor_rate(rho_t::Float64, rho_d::Float64, rho_liq::Float64,
-                                 rho_ice::Float64, tau_anchor::Float64; lobe::Float64 = 0.0)
-    head = anchor_headroom(rho_t - rho_d, rho_liq, lobe)
-    delta = max(rho_ice - head, 0.0)
-    phi = (delta > 0.0 && rho_ice > 0.0) ? delta / (rho_ice * tau_anchor) : 0.0
-    return phi, delta
-end
-
-"""
-    anchor_headroom(rho_w, rho_liq, lobe) -> headroom
-
-The water the conserved anchor leaves for the ice, `max((ρ_t − ρ_d) − max(ρ_liq, 0) − lobe, 0)`
-with `rho_w = ρ_t − ρ_d` — ONE expression for all four places that read it: the reconciliation
-rate ([`ice_anchor_rate`](@ref)), the reader-side cap on `rho_ice_t`, the sedimentation/rate
-share `anchor_f`, and the located column-state error.
-
-`lobe ≤ 0` was the summed [`clipped_lobe`](@ref) of the transformed condensate slots under the
-retired lobe attribution (`options[:water_lobe_attribution]`, which read it into the linear
-ρ_t's vapor residual; both went with the prognostic ρ_t at Stage 4). The model passes `0.0`,
-which is bitwise the headroom without it (`x − 0.0 === x`). Under the derived anchor `rho_w` is
-`Σ_k α_k ν_k` and the four legs that read this are inert ([`inert_ice_anchor_legs!`](@ref)).
-"""
-@inline anchor_headroom(rho_w, rho_liq, lobe) = max((rho_w - max(rho_liq, 0.0)) - lobe, 0.0)
-
-"""
-    _ice_anchor_reconcile!(S, st, tid, rho_t, rho_d, rho_liq, rho_ice, tau_anchor, apply, ts)
-
-One column's pass of the anchor reconciliation: measure the partition defect at every
-gridpoint into the `MC_ANCHOR_*` census, and — when `apply` — subtract
-`phi · max(moment, 0)` from all twelve ice `SRC_*` accumulators. INERT under the derived water
-anchor (the only one since Stage 4): `MC_ANCHOR_INERT` makes it return at once, so nothing is
-measured or removed ([`inert_ice_anchor_legs!`](@ref)); kept, with the legs, for the Stage 5
-decision.
-
-Runs AFTER [`mc_ice_sources!`](@ref) and before the sedimentation fluxes, so it composes
-with the process sources on the multistep exactly as the `var_check` consistency source
-does (`τ_vc = 5 s` there, `τ_anchor = 10 s` here — both continuous relaxations, no
-burst-spike hazard of the §2a′ class). Three deliberate non-couplings, per the TeX's third
-property: no term in `ρ_t`, `E_t`, or the retrieval (the removed mass was never in the
-anchor, so no latent credit accompanies it); no term in `invtau_i*`/`Qdot_i*` (it is a
-bookkeeping projection between two representations of one water, not a vapor exchange, so
-the `Q_ss` propagator's λ and N never see it); and no test of the population gate — the
-device exists precisely for the gate-orphaned points, where an `n = 0` mass drains while
-the carried zero number stays an exact zero.
-
-`max(moment, 0.0)` in every increment is the only asymmetry: the device may ONLY remove,
-so a moment ringing at its `-μ` transform floor contributes no (positive) source. Where the
-moments are positive the increments share one factor and the per-particle axes, effective
-density, aspect ratio and species shares are exactly invariant — the moment consistency the
-deferred `clamp_water!` ice floor owed and could not provide.
-
-`apply = false` (`options[:ice_anchor_source] = false`) keeps the census and drops the
-removal: the defect reproduction stays bitwise available for forensics, measured.
-"""
-function _ice_anchor_reconcile!(S, st, tid::Int64, rho_t, rho_d, rho_liq, rho_ice,
-                                tau_anchor::Float64, apply::Bool, ts::Float64)
-    # UNDER THE DERIVED ANCHOR the legs are inert: nothing measured here.
-    (size(st, 2) > 0 && @inbounds(st[MC_ANCHOR_INERT, tid]) != 0.0) && return nothing
-    gap = 0.0
-    pts = 0.0
-    rem = 0.0
-    @inbounds for i in eachindex(rho_ice)
-        phi, delta = ice_anchor_rate(rho_t[i], rho_d[i], rho_liq[i], rho_ice[i], tau_anchor)
-        delta > 0.0 || continue
-        delta > gap && (gap = delta)
-        pts += 1.0
-        (apply && phi > 0.0) || continue
-        q1 = max(S.i1q[i], 0.0); q2 = max(S.i2q[i], 0.0); q3 = max(S.i3q[i], 0.0)
-        rem += phi * ((q1 + q2) + q3) * ts
-        S.SRC_i1q[i] -= phi * q1
-        S.SRC_i2q[i] -= phi * q2
-        S.SRC_i3q[i] -= phi * q3
-        S.SRC_i1n[i] -= phi * max(S.i1n[i], 0.0)
-        S.SRC_i2n[i] -= phi * max(S.i2n[i], 0.0)
-        S.SRC_i3n[i] -= phi * max(S.i3n[i], 0.0)
-        S.SRC_i1a[i] -= phi * max(S.i1a[i], 0.0)
-        S.SRC_i2a[i] -= phi * max(S.i2a[i], 0.0)
-        S.SRC_i3a[i] -= phi * max(S.i3a[i], 0.0)
-        S.SRC_i1c[i] -= phi * max(S.i1c[i], 0.0)
-        S.SRC_i2c[i] -= phi * max(S.i2c[i], 0.0)
-        S.SRC_i3c[i] -= phi * max(S.i3c[i], 0.0)
-    end
-    if size(st, 2) > 0
-        @inbounds begin
-            gap > st[MC_ANCHOR_GAP, tid] && (st[MC_ANCHOR_GAP, tid] = gap)
-            st[MC_ANCHOR_PTS, tid] += pts
-            st[MC_ANCHOR_REMOVED, tid] += rem
-        end
-    end
-    return nothing
-end
-
-"""
     ice_population_rate(rho_ik, n_ik, rho_a, tau_pop) -> (rate, rho_empty)
 
 The NUMBER-LESS MASS of one ice species at one gridpoint and the rate at which it is returned
@@ -4995,11 +4792,10 @@ REMOVE it. Measured on the full-resolution O01 ice column, the ice below the mel
 number-less at 97–99.9% by mass over the final half hour, the largest concentrations sitting
 at the surface at 300 K; the timestep-limited quick configuration reproduces it at 99%.
 
-The anchor share of that mass is exactly one throughout, so this is NOT the phantom of
-[`ice_anchor_rate`](@ref): it is water the equations own, in a phase representation the
-equations cannot act on. Hence a separate tier, and hence the RAW carried moments here —
-`f_a` is the rate-side share for PROCESS rates, and the TeX's division of labour leaves the
-transport and the reconciliation sources alone reading the raw slots.
+The anchor share of that mass was measured to be exactly one throughout, so this is NOT the
+phantom the (since deleted, Stage 5 of the ρ_t retirement) ice-anchor reconciliation removed:
+it is water the equations own, in a phase representation the equations cannot act on. Hence a
+separate tier, reading the RAW carried moments.
 
     ρ^∅_{i,k} = max(ρ_{i,k}, 0)   where   ρ_{i,k} > QSMALL·ρ_a  and  n_{i,k} ≤ 0
               = 0                 otherwise
@@ -5214,14 +5010,13 @@ One column's pass of the POPULATION reconciliation: measure the number-less ice 
 species at every gridpoint into the `MC_POP_*` census, and — when `apply` — return it to the
 representation the environment dictates.
 
-Runs immediately after [`_ice_anchor_reconcile!`](@ref), in the same slot and for the same
-reason: the process sources are assembled, nothing has read them yet, and the twelve `SRC_i*`
-accumulators plus the three liquid back-reactions are all that either device writes. A
-separate pass rather than a block inside `mc_ice_sources!`'s gridpoint loop, on three grounds:
-it reads the RAW slots (`mc_ice_sources!`'s per-species locals are the `f_a`-shared ones, and
-the TeX's division of labour puts the reconciliation sources on the raw side with the
-transport); it is a reconciliation and not a rate, so its off-switch, its census and its
-`τ` belong beside leg A's rather than inside the ISHMAEL port; and the dead species whose
+Runs immediately after [`mc_ice_sources!`](@ref), because the process sources are assembled,
+nothing has read them yet, and the twelve `SRC_i*` accumulators plus the three liquid
+back-reactions are all this device writes. A separate pass rather than a block inside
+`mc_ice_sources!`'s gridpoint loop, on three grounds: it reads the RAW slots (the TeX's
+division of labour puts the reconciliation sources on the raw side with the transport); it is
+a reconciliation and not a rate, so its off-switch, its census and its `τ` do not belong inside
+the ISHMAEL port; and the dead species whose
 slots it writes are exactly the ones `_ice_empty_rates()` fills with hard zeros, so a pass
 that only ever ADDS to those zeros cannot disturb the bitwise inertness gates.
 
@@ -5507,11 +5302,8 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
           REPORTED, NOT LIMITED: no rate is clamped and no state is written back."""
     end
 
-    # (The ANCHOR census is inert under the derived water anchor, the only one since Stage 4:
-    # `MC_ANCHOR_*` read 0.0, so there is no first detachment to announce.)
-
-    # The POPULATION census: announce the FIRST number-less ice mass once per run. Like the
-    # anchor's, an @info and not a warning — four moments on four independent fits at three
+    # The POPULATION census: announce the FIRST number-less ice mass once per run. An @info
+    # and not a warning — four moments on four independent fits at three
     # weighted fall speeds do not stay mutually realizable, and the reconciliation source is
     # what returns the orphaned mass to a representation the rates can act on.
     pmax = maximum(view(st, MC_POP_MAX, :))
@@ -5555,7 +5347,7 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
                       for ch in 1:MC_ATTR_CHANNELS), "\n  ")
         areport = """\n  attribution of the donor breaches, per channel (block A's five q_r counts partition the q_r donor count):
   $achan
-  above T_0 carrying ice: gridpoint-steps = $(Int(sum(view(st, MC_ATTR_WARM_PTS, :)))), sum rho_ice (raw slots) = $(sum(view(st, MC_ATTR_WARM_MASS, :))) kg/m^3, points with f_a < 1 = $(Int(sum(view(st, MC_ATTR_WARM_FA, :)))), max (1 - f_a) = $(maximum(view(st, MC_ATTR_WARM_DFA, :))), withheld melt = $(sum(view(st, MC_ATTR_WARM_HELD, :))) kg/m^3"""
+  above T_0 carrying ice: gridpoint-steps = $(Int(sum(view(st, MC_ATTR_WARM_PTS, :)))), sum rho_ice (raw slots) = $(sum(view(st, MC_ATTR_WARM_MASS, :))) kg/m^3"""
     end
     @info """microphysics stiffness census step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
   cumulative over the run so far; > 1 means the relaxation is under-resolved
@@ -5563,8 +5355,6 @@ function mc_stiffness_trace(mtile::ModelTile, t::Int64)
   donor depletion actually applied (must stay <= 1 for the liquid and ice-MASS donors; the
   three ice-NUMBER rows are bounded only under options[:ice_number_realization]):
   $dreport
-  anchor reconciliation (INERT under the derived water anchor; every row reads 0):
-  max delta_part = $(maximum(view(st, MC_ANCHOR_GAP, :))) kg/m^3, gridpoint-steps = $(Int(sum(view(st, MC_ANCHOR_PTS, :)))), removed mass (gridpoint-sum) = $(sum(view(st, MC_ANCHOR_REMOVED, :)))
   population reconciliation (number-less ice mass rho_empty; 0 while every species with mass carries number):
   max rho_empty = $(maximum(view(st, MC_POP_MAX, :))) kg/m^3, (gridpoint x species)-steps = $(Int(sum(view(st, MC_POP_PTS, :)))), mass to rain = $(sum(view(st, MC_POP_RAIN, :))) kg/m^3, ice number seeded = $(sum(view(st, MC_POP_SEED, :))) /m^3 (seed = :$(get(mtile.model.options, :ice_population_seed, :local)))
   cloud evaporation realization (J0 on the cloud donor's total conductance; $(get(mtile.model.options, :cloud_evap_realization, CLOUD_EVAP_REALIZATION_DEFAULT) ? "REALIZED" : "OFF: measured, not applied")):
@@ -6616,7 +6406,7 @@ partners, their liquid debits and their share of the donor conductances at the C
 liquid that struck the crystal while no mass and no `L_f` move — TeX §Departures (e).
 """
 function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
-                         active::Bool, var_check_source::Bool, anchor_rates::Bool,
+                         active::Bool, var_check_source::Bool,
                          attr_census::Bool, agg_caps::Bool, rain_evap_real::Bool,
                          cloud_evap_real::Bool, shed::Bool, ice_n_real::Bool,
                          rain_pop_gate::Bool,
@@ -6641,7 +6431,7 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
     tid_x = stats_tid
     census_on = size(stx, 2) > 0
     # The per-channel ATTRIBUTION block (`MC_ATTR_*`) is OPT-IN on top of that: eighteen
-    # channels and a five-scalar tail are not something a run that is not asking the question
+    # channels and a two-scalar tail are not something a run that is not asking the question
     # should pay for, and `mc_water_stats` is allocated either way, so the flag is what makes
     # it free. Reported, never limiting; exactly zero on the warm/ice-free path.
     attr_on = census_on && attr_census
@@ -6826,22 +6616,15 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
         S.hab_dv[i] = dv
 
         # ── The three species: effective moments, then rates ──
-        # `fa` is the RATE-SIDE anchor share (TeX §Reconciliation of the condensate
-        # partition, the read-side completion): what every process rate sees is the
-        # anchor-supported part of the population, one shared factor so the per-particle
-        # state is untouched. Exactly 1.0 — these twelve lines bitwise their pre-Stage-C
-        # selves — wherever the partition is admissible. Sinks computed on the shared
-        # population and applied to the raw slots under-deplete relative to the raw mass,
-        # so every reservoir bound tightens, never loosens. The melting level is the
-        # channel this closes: melt on a phantom-laden q converts anchor-absent ice into
-        # anchor-real rain with real L_f, which no reader-side cap downstream could undo.
-        fa = anchor_rates ? S.anchor_f[i] : 1.0
-        q1 = fa * max(S.i1q[i], 0.0) / rhoair; n1 = fa * max(S.i1n[i], 0.0) / rhoair
-        a1 = fa * max(S.i1a[i], 0.0) / rhoair; c1 = fa * max(S.i1c[i], 0.0) / rhoair
-        q2 = fa * max(S.i2q[i], 0.0) / rhoair; n2 = fa * max(S.i2n[i], 0.0) / rhoair
-        a2 = fa * max(S.i2a[i], 0.0) / rhoair; c2 = fa * max(S.i2c[i], 0.0) / rhoair
-        q3 = fa * max(S.i3q[i], 0.0) / rhoair; n3 = fa * max(S.i3n[i], 0.0) / rhoair
-        a3 = fa * max(S.i3a[i], 0.0) / rhoair; c3 = fa * max(S.i3c[i], 0.0) / rhoair
+        # (The RATE-SIDE anchor share `f_a` that multiplied these twelve reads was deleted with
+        # the ice-anchor legs at Stage 5 of the ρ_t retirement; it was exactly 1.0 under the
+        # derived anchor, and `1.0 * x === x`, so the reads are bitwise what they were.)
+        q1 = max(S.i1q[i], 0.0) / rhoair; n1 = max(S.i1n[i], 0.0) / rhoair
+        a1 = max(S.i1a[i], 0.0) / rhoair; c1 = max(S.i1c[i], 0.0) / rhoair
+        q2 = max(S.i2q[i], 0.0) / rhoair; n2 = max(S.i2n[i], 0.0) / rhoair
+        a2 = max(S.i2a[i], 0.0) / rhoair; c2 = max(S.i2c[i], 0.0) / rhoair
+        q3 = max(S.i3q[i], 0.0) / rhoair; n3 = max(S.i3n[i], 0.0) / rhoair
+        a3 = max(S.i3a[i], 0.0) / rhoair; c3 = max(S.i3c[i], 0.0) / rhoair
 
         e1 = _ice_effective(q1, n1, a1, c1, 1)
         e2 = _ice_effective(q2, n2, a2, c2, 2)
@@ -7453,27 +7236,15 @@ function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
                 end
             end
 
-            # ── BLOCK D's TAIL: the sub-melting-level population, and what `f_a` withheld ──
-            # The RAW slots, not the anchor-shared `q_k`: the question is how much ice the
-            # transport actually put below the melting level, and `f_a` is the second half
-            # of the answer rather than part of the first.
+            # ── BLOCK D's TAIL: the sub-melting-level population ──
+            # The RAW slots: the question is how much ice the transport actually put below
+            # the melting level.
             if temp > T_0
                 rho_ice_raw = (max(S.i1q[i], 0.0) + max(S.i2q[i], 0.0)) + max(S.i3q[i], 0.0)
                 if rho_ice_raw > 0.0
                     @inbounds begin
                         stx[MC_ATTR_WARM_PTS, tid_x] += 1.0
                         stx[MC_ATTR_WARM_MASS, tid_x] += rho_ice_raw
-                        if fa < 1.0
-                            stx[MC_ATTR_WARM_FA, tid_x] += 1.0
-                            dfa = 1.0 - fa
-                            dfa > stx[MC_ATTR_WARM_DFA, tid_x] &&
-                                (stx[MC_ATTR_WARM_DFA, tid_x] = dfa)
-                            # Melting is linear in the population at fixed per-particle
-                            # state, so `q̇_mlt/f_a` is what the RAW population would melt.
-                            fa > 0.0 && (stx[MC_ATTR_WARM_HELD, tid_x] +=
-                                ((1.0 / fa) - 1.0) *
-                                abs((MLQ[1] + MLQ[2]) + MLQ[3]) * rhoair * dt)
-                        end
                     end
                 end
             end
@@ -7655,9 +7426,7 @@ Throw a LOCATED error when the retrieved column is thermodynamically inadmissibl
 `loc` is printed first as `key = value` pairs (step, model time, tile, column, horizontal
 coordinates — whatever the caller has); then, for the bad level and the levels immediately
 below and above it, the level index, `z`, and one line per entry of `fields` (a NamedTuple of
-column vectors, printed in order). When `fields` carries `rho_t`, `rho_d` and `rho_liq_t`, the
-ice anchor headroom [`anchor_headroom`](@ref) `max((ρ_t − ρ_d) − max(ρ_liq_t, 0), 0)` is
-printed as well. The message is built only on the failing path.
+column vectors, printed in order). The message is built only on the failing path.
 
 Why this exists (the §2c death class): a retrieval-heating burst drives a w / sound-speed
 runaway, the vertical semi-implicit solve is carried past its limit, and the total pressure
@@ -7681,16 +7450,11 @@ end
         println(io, "  $(key) = $(val)")
     end
     n = length(z)
-    has_head = haskey(fields, :rho_t) && haskey(fields, :rho_d) && haskey(fields, :rho_liq_t)
     for k in max(kbad - 1, 1):min(kbad + 1, n)
         tag = k == kbad ? "  << BAD LEVEL" : (k < kbad ? "  (below)" : "  (above)")
         println(io, "  level k=$(k), z=$(z[k]) m$(tag)")
         for (key, col) in pairs(fields)
             println(io, "    $(key) = $(col[k])")
-        end
-        if has_head
-            head = anchor_headroom(fields.rho_t[k] - fields.rho_d[k], fields.rho_liq_t[k], 0.0)
-            println(io, "    anchor_headroom = $(head)")
         end
     end
     error(String(take!(io)))
@@ -7865,18 +7629,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     Khdiff_heat = get(model.physical_params, :Khdiff_heat, Khdiff)
     Kvdiff_heat = get(model.physical_params, :Kvdiff_heat, Kvdiff)
     tau_qss = get(model.physical_params, :tau_qss, 10.0)
-    # The PARTITION reconciliation timescale — the third tier of the chain (TeX
-    # §"Reconciliation of the condensate partition"): the advected ice moments are pulled
-    # back inside the water the conserved ρ_t anchor supports, on the same class of
-    # timescale as the two tiers above it, and only where they exceed it. `ice_anchor_on`
-    # gates the SOURCE only — the `MC_ANCHOR_*` census measures the defect regardless, so
-    # `false` reproduces the unreconciled configuration bitwise while still reporting it.
-    tau_anchor = get(model.physical_params, :tau_ice_anchor, 10.0)
-    ice_anchor_src = get(model.options, :ice_anchor_source, true)::Bool
-    # The reader-side leg (see the rho_ice_t block): applied only with ice registered.
-    ice_anchor_flr = get(model.options, :ice_anchor_floor, true)::Bool
-    # The sedimentation leg (see the `anchor_f` scratch doc): applied only with ice on.
-    ice_anchor_flx = get(model.options, :ice_anchor_flux, true)::Bool
     # LOBE RELAXATION (Stage L; see `lobe_relaxation_increment`): the pragmatic device that
     # relaxes a transformed water-mass slot's refit lobe toward ν = 0 on `tau_lobe` where the
     # species' channel is closed, the vapor paying the lobe's Δν (the paired form). `false` is
@@ -7909,8 +7661,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # BC), the pre-2026-09-26 behaviour, whose extrapolated lid flux is inflow and a linear
     # instability wherever the fall speed increases upward. Forensics only.
     sed_lid_dir = sedimentation_flux_lid_dirichlet(model.options)
-    # The rate-side leg (see the read block in `mc_ice_sources!`): ditto.
-    ice_anchor_rts = get(model.options, :ice_anchor_rates, true)::Bool
     # The POPULATION reconciliation — the FOURTH tier of the chain (TeX §"Reconciliation of
     # the population"): ice mass whose carried number is not positive is orphaned by the
     # population gate, exempt from every rate AND from every device that could remove it, and
@@ -8521,32 +8271,13 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # The ice mirror of `rho_liq_t`, floored per species under `:diagnostic` for the same
     # reason: a spline undershoot in one ice mass must not reach the retrieval as negative
     # latent heat. `rho_ice` itself stays raw: the census must see the water partition the
-    # continuity equations actually carry.
-    #
-    # AND capped at the ANCHOR HEADROOM below (`ice_anchor_floor`, default on with ice):
-    # the reader-side leg of the partition reconciliation (TeX §Reconciliation of the
-    # condensate partition). The reconciliation SOURCE holds the accumulated detachment at
-    # drift scale, but the terminal §2c burst is a per-step grid-scale oscillation of the
-    # ice-mass fit at an under-resolved front — measured swinging ±50% PER STEP while the
-    # anchor water stays smooth — and no τ-relaxation outruns a per-step oscillation. What
-    # made it lethal was never the ringing itself but the AMPLIFIER: the retrieval credits
-    # each transient phantom with L_s (~1e4 K per kg/m³ measured), and the T spike closes
-    # the sound-speed/updraft loop that sharpens the front further. Capping what the
-    # thermodynamics READS at the water the anchor supports breaks that loop while state,
-    # continuity and the census all stay raw — nothing is written back and no
-    # mass is converted, exactly the `condensate_floor` device class. Binds only where the
-    # partition is inadmissible; bitwise inert everywhere else (strict branch, no scaling).
+    # continuity equations actually carry. (The reader-side cap at the ice-anchor headroom
+    # that followed was deleted with the ice-anchor legs at Stage 5 of the ρ_t retirement.)
     rho_ice_t = S.rho_ice_t
     if cond_floor && ice_on
         @. rho_ice_t = (max(i1q, 0.0) + max(i2q, 0.0)) + max(i3q, 0.0)
     else
         copyto!(rho_ice_t, rho_ice)
-    end
-    if ice_anchor_flr && ice_on
-        @inbounds for i in eachindex(rho_ice_t)
-            head = anchor_headroom(rho_t[i] - rho_d[i], rho_liq_t[i], 0.0)
-            rho_ice_t[i] > head && (rho_ice_t[i] = head)
-        end
     end
     # THE MODEL TEMPERATURE, and everything downstream in this step reads it: the guard below,
     # the saturation density and its partials, Q_s, the condensation closure and the ETD
@@ -8555,10 +8286,9 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # prognostic pressure and the two gas densities, with `rho_v` the PROGNOSTIC vapor staged
     # above (`rho_vp + rho_vbar`, unfloored — negative vapor is a resolution diagnostic, and the
     # EOS denominator is harmless to it; see `eos_temperature`). It reads NO condensate, so
-    # neither the `condensate_floor` nor the ice anchor cap enters T any more; both still shape
-    # `q_l`/`q_i` (hence C_vt, R_m, γ_m, Q_s) below, as before. Under `:energy` it is the
-    # closed-form total-energy retrieval on the floored/capped condensate — the pre-switch
-    # line, bitwise. Why the switch: `eos_temperature` (the clipped-lobe phantom latent heat).
+    # the `condensate_floor` does not enter T any more; it still shapes `q_l`/`q_i` (hence
+    # C_vt, R_m, γ_m, Q_s) below, as before. Under `:energy` it is the closed-form
+    # total-energy retrieval on the floored condensate — the pre-switch line, bitwise. Why the switch: `eos_temperature` (the clipped-lobe phantom latent heat).
     Tk = S.Tk
     if teos
         @. Tk = eos_temperature(p, rho_d, rho_v)
@@ -8907,18 +8637,6 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # latent slots, the two saturation derivatives still over WATER. Formed here rather
         # than beside `Q_s` because nothing but the ice reads it.
         @. S.Q_s_i = Q_s_energy_ice(Tk, p, rho_d, q_v, q_l, q_i)
-        # The ANCHOR SHARE column, computed once per column and read by three consumers:
-        # the process-rate reads inside `mc_ice_sources!` (rate-side leg, `anchor_rates`),
-        # the twelve flux assemblies below (sedimentation leg, `ice_anchor_flx`), and
-        # nothing else — the reconciliation source computes its own defect from the same
-        # states. Exactly 1.0 wherever the partition is admissible, which is what keeps
-        # every leg bitwise absent from healthy air.
-        af = S.anchor_f
-        @inbounds for i in eachindex(af)
-            head = anchor_headroom(rho_t[i] - rho_d[i], rho_liq[i], 0.0)
-            ri = rho_ice[i]
-            af[i] = (ri > head && ri > 0.0) ? head / ri : 1.0
-        end
         # Every process rate: deposition through the shared prognostic supersaturation, the
         # full ISHMAEL nucleation/riming/aggregation/melting set, and the twelve slot sources
         # they assemble into. Reads and writes the scratch only; see `mc_ice_sources!`.
@@ -8927,7 +8645,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         mc_ice_sources!(S, mtile.ishmael_tables, model.ts, max_N_c,
                         get(model.options, :condensation, true)::Bool,
                         get(model.options, :ice_var_check, true)::Bool,
-                        ice_anchor_rts, ice_attr, ice_agg_caps, rain_evap_real,
+                        ice_attr, ice_agg_caps, rain_evap_real,
                         cloud_evap_real, ice_shed,
                         ice_n_real, rain_pop_gate,
                         get(model.physical_params, :tau_homogeneous, 5.0),
@@ -8938,20 +8656,11 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # the reason the liquid census is: the once-per-run under-resolution warning has to be
         # able to see an excursion whether or not a diagnostic is switched on.
         mc_stiffness_census!(mtile, model.ts, S.invtau_i1, S.invtau_i2, S.invtau_i3)
-        # The ANCHOR RECONCILIATION — the third tier of the chain, after the process sources
-        # and before anything reads the SRC accumulators. It measures the partition defect
-        # δ_part at every gridpoint (census: MC_ANCHOR_*), and where the advected ice mass
-        # exceeds the anchor headroom it relaxes all twelve moments down by one shared
-        # fraction δ/(ρ_i·τ_anchor) — per-particle state and species shares exactly
-        # invariant, no latent heat, nothing in λ/N. See `ice_anchor_rate` for the law and
-        # TeX §"Reconciliation of the condensate partition" for the derivation.
-        _ice_anchor_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
-                               rho_t, rho_d, rho_liq, rho_ice,
-                               tau_anchor, ice_anchor_src, model.ts)
-
-        # The POPULATION RECONCILIATION — the fourth and last tier, in the same slot and for
-        # the same reason as the third: the process sources are assembled and nothing has
-        # read them yet. It is the exact complement of the population gate above — mass whose
+        # The POPULATION RECONCILIATION, after the process sources and before anything reads
+        # the SRC accumulators: the process sources are assembled and nothing has read them
+        # yet. (The ice-anchor reconciliation that ran here before it, with its reader cap,
+        # rate share and sedimentation share, was deleted at Stage 5 of the ρ_t retirement:
+        # under the derived anchor ρ_w = Σ_k α_k ν_k the anchor cannot be exceeded.) It is the exact complement of the population gate above — mass whose
         # carried number is not positive, which no rate may act on and which no device could
         # therefore remove — returned to a representation the equations can use: rain above
         # `T_0` with `L_f` absorbed through `FRZ_NET`, 2 μm crystals below it, on `τ_pop`.
@@ -8960,45 +8669,31 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # for the same reason `mc_ice_sources!` is: BOTH branches move water between
         # categories (the warm one moves mass and `L_f`, the cold one creates crystals), and
         # a run advertised as "no physics" — the transport-only fixtures included — must not.
-        # That is the one difference from leg A, which is a pure bookkeeping projection and
-        # runs regardless. The CENSUS is unaffected either way.
+        # The CENSUS is unaffected either way.
         _ice_population_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
                                    Tk, rho_d, tau_pop,
                                    ice_pop_src && get(model.options, :condensation,
                                                       true)::Bool,
                                    model.ts, pop_seed)
 
-        # The SEDIMENTATION ANCHOR SHARE (a leg of the partition reconciliation, TeX
-        # §Reconciliation of the condensate partition). At a detached point the slots carry
-        # more ice than the anchor holds; letting the phantom part FALL moves real ρ_t and
-        # real L_s-laden E_t for mass that was never in the anchor's books — measured
-        # pumping ~20 g/m³ of anchor water to the melting level and retrieving 454 K at
-        # points whose own partition was admissible. `af` (computed once, above the
-        # process-source call) is applied to ALL twelve flux assemblies below, so the ice
-        # slots and ρ_t/E_t keep receiving the identical discrete flux (the telescoping is
-        # preserved exactly) and what falls keeps its size sorting and mass/number
-        # correlation. Exactly 1.0 — bitwise absent — wherever the partition is
-        # admissible; the withheld phantom waits in the slot for the reconciliation
-        # source. `ice_anchor_flux = false` passes the scalar 1.0 instead (forensics).
-        afx = ice_anchor_flx ? af : 1.0
         # Each moment's flux at ITS OWN weighted fall speed — mass-weighted for the mass and
         # the two volume moments, number-weighted for the number. That is the whole reason
         # the four moments of a species cannot share one flux: the distribution SORTS as it
         # falls, and a number that sedimented at the mass-weighted speed would carry the small
         # crystals down as fast as the large ones. `ishmael_fall_speeds` has already applied
         # the 25 m/s cap and the melting size-sorting override.
-        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, S.Vi1m, afx, IS.i1_q, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, S.Vi1n, afx, IS.i1_n, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, S.Vi1m, afx, IS.i1_a, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, S.Vi1m, afx, IS.i1_c, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, S.Vi2m, afx, IS.i2_q, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, S.Vi2n, afx, IS.i2_n, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, S.Vi2m, afx, IS.i2_a, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, S.Vi2m, afx, IS.i2_c, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, S.Vi3m, afx, IS.i3_q, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, S.Vi3n, afx, IS.i3_n, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, S.Vi3m, afx, IS.i3_a, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, S.Vi3m, afx, IS.i3_c, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, S.Vi1m, IS.i1_q, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, S.Vi1n, IS.i1_n, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, S.Vi1m, IS.i1_a, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, S.Vi1m, IS.i1_c, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, S.Vi2m, IS.i2_q, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, S.Vi2n, IS.i2_n, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, S.Vi2m, IS.i2_a, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, S.Vi2m, IS.i2_c, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, S.Vi3m, IS.i3_q, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, S.Vi3n, IS.i3_n, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, S.Vi3m, IS.i3_a, sed_lid_dir)
+        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, S.Vi3m, IS.i3_c, sed_lid_dir)
 
         # The two AGGREGATES that reach the conserved variables. `Fi_z` is summed from the
         # three fitted mass-flux divergences rather than refitting their sum, so slot 3 and
