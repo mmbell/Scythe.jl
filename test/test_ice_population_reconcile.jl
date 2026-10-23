@@ -2,8 +2,9 @@
 # (The ANCHOR reconciliation of the condensate partition, Stage C -- `ice_anchor_rate`,
 # `anchor_headroom`, `_ice_anchor_reconcile!` and the reader/rate/sedimentation shares -- was
 # tested here until Stage 5 of the rho_t retirement deleted it: under the derived water
-# anchor rho_w = sum_k alpha_k nu_k the anchor cannot be exceeded, so the four legs had been
-# inert since Stage 3. test_water_anchor.jl pins that nothing of them is left.)
+# anchor the headroom read through rho_w is alpha_v nu_v + X_cond, which can be negative at a
+# vapor lobe beside ice, so the legs were made inert at setup (de822e5/a7d25dc) and then
+# deleted. test_water_anchor.jl pins that nothing of them is left.)
 # ─────────────────────────────────────────────────────────────────────────────
 # The population reconciliation (Stage 3a).
 # reference/Scythe_moist_compressible.tex §"Reconciliation of the population" is

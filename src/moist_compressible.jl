@@ -74,8 +74,9 @@
 #    reference/Scythe_moist_compressible.tex §"The derived total density")
 #
 # Two LINEAR anchors, E_t and the water rho_w = sum_k alpha_k nu_k, each invariant under every
-# exchange and acted on by the linear operators alone (advection, refit/filter, the SI
-# slaving, horizontal mixing, R3X). One RECOVERED reading the physics sees: T_eos and
+# exchange and changed only by the linear operators (advection, refit/filter, the SI slaving,
+# horizontal mixing, R3X) and by their own sources (the surface fluxes and the sedimentation
+# through the ground; radiation for E_t). One RECOVERED reading the physics sees: T_eos and
 # rho_k = ahyp(nu_k). Two residuals measure the difference:
 #   R = E_t - E_implied(T_eos, recovered species, (rho_d + rho_w) geo)   (`implied_total_energy`)
 #   X = rho_w - sum_k ahyp(nu_k) = B + Lambda (knee bias >= 0, lobe pool <= 0)
@@ -84,25 +85,27 @@
 # `recovered_change_partner`: the refit partner books the affine defect, energy only
 # (`_refit_partner_defect!`, lambda_l, lambda_i, kappa); the ETD exchange realization books the
 # recovered gap (`_etd_exchange_closure!`); the multistep and sedimentation closures book their
-# realized recovered rates (`_water_exchange_multistep!`); the MYNN and Louis boundary layers
-# have one nu leg per water-mass slot with the energy carry regrouped by species
-# (`_mynn_nu_legs!`, `_louis_apply_derived!`); the paired Stage L books kappa only
+# realized recovered rates (`_water_exchange_multistep!`); the MYNN boundary layer has one nu
+# leg per water-mass slot and Louis one each for the vapor, cloud and rain (it refuses ice),
+# with the energy carry regrouped by species (`_mynn_nu_legs!`, `_louis_apply_derived!`); the paired Stage L books kappa only
 # (`_lobe_relax_paired!`, default OFF, `LOBE_RELAXATION_DERIVED_DEFAULT`).
 # Where they live: src/si_water_slaving.jl (the derived anchor, `water_exchange_dv`, the
 # closures, the acoustic slaving, the setup refusals), this file (the primitive, the refit and
 # ETD partners, the driver), src/energy_budget.jl (`options[:energy_budget]`, the per-stage
 # finite differences of R and X, and the census these rows are reported by).
-# Census rows (`mc_water_stats`, `energy_census_trace`): MC_REFIT_DR / MC_REFIT_BOOKED,
-# MC_XGAP_MAX / _INT / _POOL, MC_VNEG / MC_VNEG_MASS, MC_LOBE_*, MC_W_PART / _NEG / _NEG_PTS /
-# _INT / _SRC / _BUDGET, and MC_QSS_GAP below.
+# Census rows (`mc_water_stats`, reported by `energy_census_trace`): MC_REFIT_DR /
+# MC_REFIT_BOOKED, MC_XGAP_MAX / _INT / _POOL, MC_VNEG / MC_VNEG_MASS, MC_LOBE_*, MC_W_PART /
+# _NEG / _NEG_PTS / _INT / _SRC / _BUDGET. (MC_QSS_GAP, below, is not one of them.)
 #
 # ── The one remaining reconciliation
 #
 # Q_ss is redundant with the prognostic vapor (Q_ss = rho_v - rho_vs) and is reconciled onto
 # it by a slow nudge, never by projection (`qss_relaxation`, tau_qss = 10 s by default, long
 # compared with the timestep, so transport keeps the smooth field and only the accumulated
-# inconsistency is removed). Its gap is measured every step (MC_QSS_GAP) and is identically
-# zero on a resting base by construction: the vapor slot is carried against the DERIVED
+# inconsistency is removed). Its gap MC_QSS_GAP is written only by `_qss_gap_census!` under
+# options[:water_budget_trace], which `validate_water_anchor` refuses whenever a water
+# transform, two-moment rain or ice is on, so under the run-config defaults it is never
+# written. The gap is identically zero on a resting base by construction: the vapor slot is carried against the DERIVED
 # profile rho_vbar = rho_tbar - rho_dbar - rho_cbar (Springsteel's fitted columns; see
 # vapor_slot, mc_reference_diagnostics).
 #
@@ -1958,9 +1961,11 @@ const MC_ATTR_CHANNELS = 18
 const MC_ATTR_N = 2
 @doc (@doc MC_ATTR_QR_HOM)
 # (The ANCHOR-RECONCILIATION census, `MC_ANCHOR_GAP/_PTS/_REMOVED/_WARNED`, sat here: the four
-# ice-anchor legs it measured were deleted at Stage 5 of the ρ_t retirement — under the derived
-# water anchor `ρ_w = Σ_k α_k ν_k` the anchor cannot be exceeded, the implied vapor being
-# `ahyp(ν_v) ≥ 0`, so the rows read 0.0 on every run from Stage 3 on.)
+# ice-anchor legs it measured were deleted at Stage 5 of the ρ_t retirement. Under the derived
+# water anchor `ρ_w = Σ_k α_k ν_k` the headroom read through ρ_w is `α_v ν_v + X_cond`, which
+# can be negative at a vapor lobe beside ice, so the test had become a vapor-negativity device;
+# the legs were made inert at setup (de822e5/a7d25dc; between 2c265e1 and de822e5 they were
+# active under :derived and fired) and the rows read PTS = REMOVED = 0 on the Stage 3 RCE arms.)
 const MC_ATTR_FIRST = MC_DONOR_WARNED + 1
 """
 The two-scalar TAIL of the attribution census, over `T > T_0` gridpoints carrying ice.
@@ -5072,7 +5077,7 @@ a mass source that arrives with no number of its own is AUTOCONVERSION's
 (`rain_autoconversion_2m`, `Ṅ = Q̇/RAIN_2M_M_AUTO`), so that is what is mirrored: one 25 μm
 drop per [`RAIN_2M_M_AUTO`](@ref) of returned mass, seeded into `ICE_NR` — the same slot,
 sign and units the melt credit uses. The a/c VOLUME moments of the dead species are relaxed
-by the SAME fraction `1/τ_pop` (leg A's shared-factor rule), so the species leaves in one
+by the SAME fraction `1/τ_pop` (one shared factor across the moments), so the species leaves in one
 piece; its number is already `≤ 0` and `max(n, 0) = 0` gives it nothing to relax.
 
 BELOW `T_0` the water is ice that has lost its crystals to the transport, and it is given
@@ -8697,7 +8702,8 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         # the SRC accumulators: the process sources are assembled and nothing has read them
         # yet. (The ice-anchor reconciliation that ran here before it, with its reader cap,
         # rate share and sedimentation share, was deleted at Stage 5 of the ρ_t retirement:
-        # under the derived anchor ρ_w = Σ_k α_k ν_k the anchor cannot be exceeded.) It is the exact complement of the population gate above — mass whose
+        # its headroom test read through ρ_w had become a vapor-negativity device.)
+        # It is the exact complement of the population gate above — mass whose
         # carried number is not positive, which no rate may act on and which no device could
         # therefore remove — returned to a representation the equations can use: rain above
         # `T_0` with `L_f` absorbed through `FRZ_NET`, 2 μm crystals below it, on `τ_pop`.

@@ -6340,9 +6340,10 @@ using Springsteel
 
     # (The Stage C ice-ANCHOR RECONCILIATION testset — the removal source, the reader cap, the
     # sedimentation and rate shares on a column whose ice exceeded rho_t - rho_d - rho_liq —
-    # was retired with slot 3 at Stage 4: under the derived anchor the headroom is
-    # Σ α_k ν_k - ρ_liq >= the ice by construction, so the four legs were inert, and Stage 5
-    # deleted them. What survives is that an explicit `true` is refused.)
+    # was retired with slot 3 at Stage 4. Under the derived anchor the headroom read through
+    # ρ_w is α_v ν_v + X_cond, which can be negative at a vapor lobe beside ice, so the test had
+    # become a vapor-negativity device: the legs were made inert at setup (de822e5/a7d25dc) and
+    # deleted at Stage 5. What survives is that an explicit `true` is refused.)
     @testset "ice: the anchor-reconciliation legs are deleted" begin
         mktempdir() do tmpdir
             legs = (:ice_anchor_source, :ice_anchor_floor, :ice_anchor_flux, :ice_anchor_rates)

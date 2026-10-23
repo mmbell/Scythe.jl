@@ -514,7 +514,7 @@ resting column produce EXACTLY zero rather than the floor's residue:
         sqc = S.rho_c[i] / rho_t[i]
         # The closure's ONE ice mixing ratio is the SUM of the three ISHMAEL species
         # (S8). `rho_ice_t` is the column the thermodynamics reads -- floored per species
-        # under `:condensate_floor` and capped at the anchor headroom -- so the closure's
+        # under `:condensate_floor` -- so the closure's
         # `q_i` and the retrieval's `q_i = rho_ice_t/rho_d` are the same water, and a
         # spline undershoot in one ice mass cannot reach `theta_l` as negative latent
         # heat. With ice OFF the driver fills it with exact zeros, so `sqi` is `0.0` and

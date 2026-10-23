@@ -15,9 +15,10 @@
 #      water diffusion, the clamp floor, the lobe attribution, the MYNN slot-anchor closures,
 #      the four ice-anchor legs deleted at Stage 5);
 #   3. the EXCHANGE CLOSURE (Stage 3b): `water_exchange_dv`, the ONE function every water
-#      exchange's vapor increment comes from (the ETD increments `_etd_closure!`, the multistep
-#      sources `water_exchange_multistep_rate`, the paired Stage L `_lobe_relax_paired!`), the
-#      sedimentation knee closure, and `_water_exchange_stage!`, which runs the closures and the
+#      exchange's vapor increment comes from (four call sites: the ETD increments
+#      `_etd_closure!`, the multistep sources `water_exchange_multistep_rate` on the ice branch
+#      of `_water_exchange_multistep!` and `water_exchange_dv` directly on its warm branch, the
+#      paired Stage L `_lobe_relax_paired!`), the sedimentation knee closure, and `_water_exchange_stage!`, which runs the closures and the
 #      affine-defect refit partner from `explicit_timestep` (outside `mc_driver!`, for the
 #      compile cliff; reference/HANDOFF_DRIVER_COMPILE_CLIFF.md).
 #
@@ -1019,9 +1020,11 @@ retirement — cannot run, each naming the reason:
   residual, deleted with the prognostic ρ_t (the vapor is the ν-space closure of every
   exchange instead);
 - an explicit `true` for the four ice-anchor legs (`ice_anchor_source/_floor/_flux/_rates`,
-  deleted at Stage 5: under the derived anchor `Σ_k α_k ν_k` the anchor cannot be exceeded, the
-  implied vapor being `ahyp(ν_v) ≥ 0`, so they were inert from Stage 3 on) and the two MYNN
-  slot-anchor water devices; `physical_params[:tau_ice_anchor]` (the removal's timescale);
+  deleted at Stage 5: under the derived anchor the headroom read through `ρ_w` is
+  `α_v ν_v + X_cond`, which can be negative at a vapor lobe beside ice, so the headroom test
+  had become a vapor-negativity device; the legs were made inert at setup (de822e5/a7d25dc),
+  then deleted with the census reading PTS = REMOVED = 0 on the Stage 3 RCE arms) and the two
+  MYNN slot-anchor water devices; `physical_params[:tau_ice_anchor]` (the removal's timescale);
 - `options[:clamp_water] = true` (its floor balanced the partition against slot 3), and
   `options[:mynn_water_carry] = :fixed_T`;
 - `options[:water_budget_trace] > 0` with any water transform, two-moment rain or ice (the
@@ -1054,8 +1057,8 @@ function validate_water_anchor(model)
         "vapor reconciliation nudge, which is deleted under " * why * ". Remove the key.")
     haskey(pp, :tau_ice_anchor) && error("physical_params[:tau_ice_anchor] configured the " *
         "ice-anchor removal source, which was deleted with the other three ice-anchor legs at " *
-        "Stage 5 of the rho_t retirement (under " * why * " the anchor cannot be exceeded). " *
-        "Remove the key.")
+        "Stage 5 of the rho_t retirement (under " * why * " the headroom test had become a " *
+        "vapor-negativity device). Remove the key.")
     # Devices the derived anchor SUBSUMES (review D1 and the BL sub-check), deleted: an
     # explicit `true` is refused rather than silently bypassed (`false` is harmless).
     for (k, what) in ((:ice_anchor_source, "the ice-anchor removal source"),
@@ -1065,9 +1068,10 @@ function validate_water_anchor(model)
                       (:mynn_water_closure, "the MYNN total-water residual closure"),
                       (:mynn_exchange_realization, "the MYNN clip-gap (lobe) partner"))
         get(opts, k, nothing) === true && error("options[:$(k)] = true configures $(what), " *
-            "which is retired under " * why * " (the anchor sum_k alpha_k nu_k cannot be " *
-            "exceeded, so the four ice-anchor legs were deleted at Stage 5; every MYNN water " *
-            "leg is a nu leg realized on its own recovered rate). Remove the key.")
+            "which is retired under " * why * " (the ice-anchor headroom read through rho_w " *
+            "is alpha_v nu_v + X_cond, a vapor-negativity test, so the four legs were deleted " *
+            "at Stage 5; every MYNN water leg is a nu leg realized on its own recovered rate). " *
+            "Remove the key.")
     end
     if get(opts, :water_budget_trace, 0) > 0
         (condensate_transform_mode(opts) === :none && rain_transform_mode(opts) === :none &&
@@ -1096,11 +1100,14 @@ end
 #
 # in ONE fixed order (cloud, rain, the three ice masses), so ρ_w = Σ α_k ν_k is invariant under
 # every exchange to rounding (exactly: with all α = 2 the doublings and the halving are exact,
-# and α_v Δν_v is the negated sum bit for bit). Exchange sites, all through `water_exchange_dv`:
-# the ETD step-mean increments (`_etd_closure!`), the multistep exchange sources (AUTO_COLL,
-# the ice back-reactions ICE_C/ICE_R, the twelve ice SRC_* including the population
-# reconcile; `water_exchange_multistep_rate`) and the paired Stage L (`_lobe_relax_paired!`).
-# The sedimentation knee closure (`sedimentation_knee_closure`) is the one other water term in
+# and α_v Δν_v is the negated sum bit for bit). Exchange sites, all through `water_exchange_dv`
+# (four call sites): the ETD step-mean increments (`_etd_closure!`), the multistep exchange
+# sources (AUTO_COLL, the ice back-reactions ICE_C/ICE_R, the twelve ice SRC_* including the
+# population reconcile) through `water_exchange_multistep_rate` on the ice branch of
+# `_water_exchange_multistep!` and `water_exchange_dv` directly on its warm (autoconversion
+# only) branch, and the paired Stage L (`_lobe_relax_paired!`). The sedimentation knee closure
+# (`sedimentation_knee_closure` on the ice branch, the same expression for rain alone written
+# inline on the warm branch) is the one other water term in
 # the vapor slot: not an exchange between species but the fall's ν/ρ mismatch, closed so that
 # ρ_w loses exactly the fitted flux divergence. Every other write to the vapor slot is a
 # transport-class term (advection and −J_v ρ_v ∇·v, the acoustic slaving, the boundary-layer ν
@@ -1110,8 +1117,9 @@ end
 """
     water_exchange_dv(av, ac, ar, ai, dc, dr, d1, d2, d3) -> Δν_v
 
-THE ONE CLOSURE, and the single entry point for the vapor's share of every water exchange (the
-ETD increments, the multistep sources, the paired Stage L; see the section header): the vapor's
+THE ONE CLOSURE, and the single entry point for the vapor's share of every water exchange (four
+call sites: the ETD increments, the multistep sources on both branches of
+`_water_exchange_multistep!`, the paired Stage L; see the section header): the vapor's
 ν increment of a water exchange whose non-vapor ν increments are `dc` (cloud), `dr` (rain),
 `d1..d3` (the ice masses), weights `α` (`water_anchor_set`):
 `−((((α_c dc + α_r dr) + α_i d1) + α_i d2) + α_i d3)/α_v`. With every `α = 2` it is bitwise

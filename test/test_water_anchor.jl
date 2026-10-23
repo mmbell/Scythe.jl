@@ -800,8 +800,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
     end
 
     @testset "D1: the four ice-anchor legs are deleted (Stage 5)" begin
-        # Inert under the derived anchor from Stage 3 on (the anchor sum_k alpha_k nu_k cannot
-        # be exceeded), deleted at Stage 5 with their census. An ice tile whose vapor rings
+        # Made inert at setup under the derived anchor (de822e5/a7d25dc: the headroom read
+        # through rho_w is alpha_v nu_v + X_cond, a vapor-negativity test), deleted at Stage 5
+        # with their census. An ice tile whose vapor rings
         # into a lobe beside real ice -- where the old headroom test, read through
         # rho_t - rho_d = W, would fire (rho_v + X < 0) -- runs with the raw ice read by the
         # thermodynamics, and nothing of the legs is left.

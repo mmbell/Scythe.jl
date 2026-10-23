@@ -203,9 +203,11 @@ function o01_model(opts::BenchmarkOptions)
     # now, and `physical_params[:tau_rho_v_rec]` is refused.)
     # (The Stage C ice-anchor reconciliation knobs -- SCYTHE_O01_TAUANCHOR and the four leg
     # switches SCYTHE_O01_ANCHOR / _ANCHORFLOOR / _ANCHORFLUX / _ANCHORRATES -- went at Stage 4
-    # of the rho_t retirement: under the derived anchor rho_w = sum_k alpha_k nu_k the four legs
-    # were INERT (the anchor cannot be exceeded by construction), and Stage 5 deleted them; an
-    # explicit `true` and `tau_ice_anchor` are refused by `Scythe.validate_water_anchor`.)
+    # of the rho_t retirement: under the derived anchor rho_w = sum_k alpha_k nu_k the headroom
+    # read through rho_w is alpha_v nu_v + X_cond, which can be negative at a vapor lobe beside
+    # ice, so the test had become a vapor-negativity device; the legs were made inert at setup
+    # (de822e5/a7d25dc) and Stage 5 deleted them; an explicit `true` and `tau_ice_anchor` are
+    # refused by `Scythe.validate_water_anchor`.)
     # The per-channel ATTRIBUTION census (`Scythe.MC_ATTR_*`): which LEG the `MC_DONOR_*`
     # breaches come from -- the six q_r legs at the breach points, rain evaporation at the
     # applied step-mean, the q_i melt/aggregation split, and what runs above the melting
@@ -250,8 +252,8 @@ function o01_model(opts::BenchmarkOptions)
     haskey(ENV, "SCYTHE_O01_EVAPREAL") &&
         (options[:rain_evap_realization] = ENV["SCYTHE_O01_EVAPREAL"] != "0")
     # The POPULATION-reconciliation timescale [s], the fourth tier of the reconciliation
-    # chain (Stage 3a; TeX §"Reconciliation of the population"). Unset => 10.0, the
-    # tau_anchor class, bitwise. Ice-arm only.
+    # chain (Stage 3a; TeX §"Reconciliation of the population"). Unset => 10.0 (the tau_qss
+    # class), bitwise. Ice-arm only.
     haskey(ENV, "SCYTHE_O01_TAUPOP") &&
         (physical_params[:tau_ice_population] = parse(Float64, ENV["SCYTHE_O01_TAUPOP"]))
     # The population-reconciliation SOURCE switch. Unset => on (the committed default): ice
