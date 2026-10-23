@@ -62,6 +62,13 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     #                         peak 45.96, onset 23 min, max w 11.42, max rho_r 9.50, accum 3.02
     #                         -- the peak-rain window is re-centered on it (author decision
     #                         2026-10-20); the regression CSV quick_mc_rirk_final.csv is re-seeded.
+    #   quick re-measured 2026-10-22 on ccbbdea (rho_t RETIRED: derived anchor rho_d + sum alpha nu,
+    #                         vapor nu_v in slot 3, exchange closure, affine-defect refit partner,
+    #                         Stage L off, no vapor nudge): peak 35.92, onset 23, max w 4.39,
+    #                         max rho_r 6.84, accum 3.06 -- max_w and max_rho_r windows re-centered
+    #                         (the old updraft was fed by the nudge returning the cloud-edge refit
+    #                         ring to the vapor; the slot anchor with the nudge off gives w 4.25);
+    #                         CSV re-seeded with the nu_v column in slot 3.
     #   full  (500 m / 83 m): peak 121.88, onset 31 min, max w 17.29,
     #                         max rho_r 14.76, accum 3.200   (2026-07-29; NOT re-run on e81e00e --
     #                         the re-centered peak window will need the full value when it is)
@@ -80,8 +87,8 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
     "ocean_warm_bubble" => Dict{String,Tuple{Float64,Float64,Float64,String}}(),
     "o01_rainfall" => Dict(
         "peak_rain_rate_gm2s" => (46.0, 35.0, 40.0, "re-centered 2026-10-20 on e81e00e (quick 45.96); was 90 (2026-07-29); O01 Fig. 6 range 75-125"),
-        "max_rho_r_gm3"       => (14.0, 4.0,  5.0,  "re-seeded 2026-07-29; O01 Figs. 4-6, 11 show ~4"),
-        "max_w"               => (13.5, 4.0,  5.5,  "re-seeded 2026-07-29 (quick 9.9, full 17.3)"),
+        "max_rho_r_gm3"       => (6.8,  4.0,  5.0,  "re-centered 2026-10-22 on ccbbdea (quick 6.84; the retired vapor nudge had fed the old 9.5-14); O01 Figs. 4-6, 11 show ~4"),
+        "max_w"               => (4.4,  4.0,  5.5,  "re-centered 2026-10-22 on ccbbdea (quick 4.39; the retired vapor nudge had fed the old 9.9-11.5; slot anchor with the nudge off gave 4.25); full NOT re-run"),
         "rain_onset_min"      => (27.0, 6.0,  8.0,  "re-seeded 2026-07-29; O01 Fig. 6 ~25-40 min"),
         "accum_rainfall_mm"   => (2.85, 1.0,  1.2,  "re-seeded 2026-07-29 (domain-mean rain-out)"),
     ),
