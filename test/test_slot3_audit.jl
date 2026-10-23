@@ -53,6 +53,9 @@ function slot3_audit_hits(root::AbstractString)
             endswith(f, ".jl") || continue
             rel = relpath(joinpath(dir, f), root)
             rel in SLOT3_WHOLE_FILE && continue
+            # Hidden directories (Jupyter's .ipynb_checkpoints, editor caches) are not source:
+            # the main checkout carries gitignored 2024-25 checkpoint copies of old files.
+            any(startswith(p, ".") for p in splitpath(rel)) && continue
             for l in eachline(joinpath(dir, f))
                 t = strip(l)
                 startswith(t, "#") && continue
