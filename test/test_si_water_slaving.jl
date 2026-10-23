@@ -214,6 +214,41 @@ isdefined(Main, :VaporTransformFixtures) || include("vapor_transform_fixtures.jl
         @test [a for (_, a) in act[7:end]] == zeros(10)
         @test Set(s for (s, _) in act[7:end]) == Set([10, 12, 13, 14, 16, 17, 18, 20, 21, 22])
         @test !Scythe.si_water_set(Dict{Symbol,Any}(), Dict{Symbol,Float64}(), IS).on
+
+        # The member set is WATER ONLY, in every geometry and under every option set: the
+        # momentum components u, v (the tangential/meridional/third wind component, slot 10 of
+        # the cylindrical layouts and a wind in any 3-D geometry), w and the non-water scalars
+        # p, rho_d, E_t, Q_ss are never slaved or anchored. The set is resolved by the water
+        # slot NAMES (rho_v/nu_v, rho_c/nu_c, rho_r/nu_r, the ice masses, and under :all the
+        # moments), the same way `mc_slots` resolves them. Author's question 2026-10-23.
+        NONWATER = ("p", "rho_d", "u", "v", "w", "E_t", "Q_ss", "rho_e")
+        for cyl in (false, true),
+            o in (Dict{Symbol,Any}(:si_water_slots => :all, :vapor_transform => :bhyp,
+                                   :condensate_transform => :bhyp, :rain_transform => :bhyp,
+                                   :rain_number_transform => :bhyp, :ice_microphysics => :ishmael,
+                                   :ice_transform => :bhyp, :rain_moments => 2),
+                  Dict{Symbol,Any}(:si_water_slots => :mass, :vapor_transform => :none,
+                                   :condensate_transform => :none, :rain_transform => :none),
+                  Dict{Symbol,Any}(:si_water_slots => :all, :vapor_transform => :bhyp,
+                                   :condensate_transform => :bhyp, :rain_transform => :bhyp,
+                                   :rain_moments => 1, :mynn => true))
+            names = Scythe.mc_var_names(o; cyl = cyl)
+            vars = Dict(n => i for (i, n) in enumerate(names))
+            rv = Scythe.mc_slot(vars, "rho_v")
+            nr = Scythe.rain_moments(o) == 2 ? Scythe.mc_slot(vars, "n_r") : 0
+            re = get(o, :mynn, false) === true ? Scythe.mc_slot(vars, "rho_e") : 0
+            ISn = Scythe.ice_microphysics(o) === :ishmael ?
+                Scythe.MCSlots(rv, nr, ntuple(j -> Scythe.mc_slot(vars, Scythe.MC_ICE_VARS[j]), 12)..., re) :
+                Scythe.MCSlots(rv, nr, ntuple(_ -> 0, 12)..., re)
+            ws = Scythe.si_water_set(o, Dict{Symbol,Float64}(), ISn)
+            members = [names[sl] for sl in ws.slot if sl > 0]
+            @test !isempty(members)
+            @test all(n -> !(n in NONWATER), members)
+            for forbidden in NONWATER
+                haskey(vars, forbidden) && @test !(vars[forbidden] in ws.slot)
+            end
+            cyl && @test vars["v"] == 10 && !(10 in ws.slot)
+        end
     end
 
     # ── 1. the identity, state-dependent and reference vertical paths ────────────────
