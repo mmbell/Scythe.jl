@@ -338,28 +338,23 @@ lid), because Springsteel's Chebyshev Dirichlet is a non-conservative point clam
 end
 
 """
-    sedimentation_flux_column(mtile, var_index, dirichlet_lid) -> column
-
-The column a sedimentation flux of slot `var_index` is fitted on: [`flux_column`](@ref)
-(zero-flux lid) when `dirichlet_lid`, else the slot's own [`scratch_column`](@ref) — the
-pre-fix behaviour, kept only as the `options[:sedimentation_flux_lid] = :natural`
-forensics switch.
-"""
-@inline sedimentation_flux_column(mtile::ModelTile, var_index::Int64, dirichlet_lid::Bool) =
-    dirichlet_lid ? flux_column(mtile, var_index) : scratch_column(mtile, var_index)
-
-"""
     sedimentation_flux_column(fcols, scols, var_index, dirichlet_lid) -> column
 
-The array method of [`sedimentation_flux_column`](@ref), for the driver stages that take the
-tile's `flux_columns`/`scratch_columns` matrices rather than the tile: the calling thread's
-column of `fcols` when `dirichlet_lid`, else of `scols` — the same object the tile method
-returns.
+The column a sedimentation flux of slot `var_index` is fitted on: the calling thread's
+[`flux_column`](@ref) (zero-flux lid) when `dirichlet_lid`, else the slot's own
+[`scratch_column`](@ref) — the pre-fix behaviour, kept only as the
+`options[:sedimentation_flux_lid] = :natural` forensics switch. Takes the tile's
+`flux_columns`/`scratch_columns` matrices rather than the tile (the driver stages never take
+the tile); `sedimentation_flux_column(mtile, var_index, dirichlet_lid)` forwards to it, for
+direct callers (test_moist_compressible's lid tests) — the same object either way.
 """
 @inline sedimentation_flux_column(fcols::AbstractMatrix, scols::AbstractMatrix,
                                   var_index::Int64, dirichlet_lid::Bool) =
     dirichlet_lid ? (@inbounds fcols[Threads.threadid(), var_index]) :
                     (@inbounds scols[Threads.threadid(), var_index])
+@inline sedimentation_flux_column(mtile::ModelTile, var_index::Int64, dirichlet_lid::Bool) =
+    sedimentation_flux_column(mtile.flux_columns, mtile.scratch_columns, var_index,
+                              dirichlet_lid)
 
 """Reusable per-thread vertical work columns, or an empty matrix if the grid has no k-basis."""
 _allocate_scratch_columns(::NoBasisArray, tile::AbstractGrid) = Matrix{Nothing}(undef, 0, 0)

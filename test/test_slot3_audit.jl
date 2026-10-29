@@ -140,8 +140,9 @@ const SLOT3_ALLOWLIST = [
     ("src/mc_boundary_layer.jl", "expdot[j, 7] += real_v - (S.drvs_dT[i] * dT_v) - (S.drvs_dp[i] * (dp_v + dp_q))", 1),
     ("src/mc_boundary_layer.jl", "expdot[j, 8] += nrr", 1),
     ("src/mc_boundary_layer.jl", "expdot[j, 9] += ncc", 1),
-    # src/mc_driver_stages.jl: the fixed MC layout (Q_ss 7), the ETD pre-compute moved out of mc_driver!
+    # src/mc_driver_stages.jl: the fixed MC layout (Q_ss 7) of the ETD pre-compute; the warm-stage NaN message naming rho_t
     ("src/mc_driver_stages.jl", "n0 = expdot[g, 7]", 1),
+    ("src/mc_driver_stages.jl", "\"rho_t = \$(rho_t[i]), rho_c = \$(rho_c[i]), rho_r = \$(rho_r[i])\\n\" *", 1),
     # src/mc_geometry.jl: the fixed MC layout (u 4, w 5, E_t 6, v 10); derivative plane 3 (d2/dx2) of a named var
     ("src/mc_geometry.jl", "@. expdot[colstart:colend, 10] += (pp_l / r) / rho_tbar", 1),
     ("src/mc_geometry.jl", "@turbo diffdot[colstart:colend, 10] .= @. Kvdiff * v_zz", 1),
@@ -164,7 +165,6 @@ const SLOT3_ALLOWLIST = [
     # src/microphysics.jl: thermo tuple element 3 = T
     ("src/microphysics.jl", "Tk = [x[3] for x in thermo]     # Temperature in K", 7),
     # src/moist_compressible.jl: the fixed MC layout (u 4, w 5, E_t 6, Q_ss 7, nu_r 8, nu_c 9); derivative/profile planes, ice category 3, a stats row, the rho_t refusal and the derived-rho_t diagnostic text
-    ("src/moist_compressible.jl", "\"rho_t = \$(rho_t[i]), rho_c = \$(rho_c[i]), rho_r = \$(rho_r[i])\\n\" *", 1),
     ("src/moist_compressible.jl", "((RfzQ[1] + RfzQ[2]) + RfzQ[3])", 1),
     ("src/moist_compressible.jl", "(-(r3.prdr_pre * (1.0 - r3.qcrimefrac)) - MLQ[3] - RfzQ[3]))", 1),
     ("src/moist_compressible.jl", "(-NRN[3] - MLN[3] - FzN[3]))", 1),

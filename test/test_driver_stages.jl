@@ -4,8 +4,9 @@
 # every split must leave the answer bit for bit what the inline driver produced.
 #
 # The captures were seeded at bdb0b48 (the inline driver, before any stage was moved) and are
-# NEVER re-seeded by the refactor (the three step-2 arms were added at 85e3743, bitwise
-# bdb0b48, before stages 5-6 moved): a mismatch is a broken move, not a new reference. Each arm
+# NEVER re-seeded by the refactor (the three step-2 arms were added at 85e3743 and the two
+# step-3 arms at d8b03a2, each bitwise bdb0b48, before the stages they cover moved): a
+# mismatch is a broken move, not a new reference. Each arm
 # runs three full steps (every column, then the refit) of the vapor-transform fixture tile
 # (or the MYNN fixture's live column) and sums every bit of the advanced state `var_np1`, of
 # the refit patch `physical` and of the water census matrix `mc_water_stats` (which the census
@@ -42,7 +43,9 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         "ice_nocond"     => (0x0000000000b3ffc21c93eaab97b09ccf, 0x0000000024f39e0ceba69a01916419f4, 0x00000000000000491bdaf6aee82b4624),
         # (ice_natlid equals ice: nothing reaches the lid in three steps; the arm pins the
         # scratch-column branch of the flux-column selection.)
-        "ice_natlid"     => (0x00000000016cda1b52284c4daf73910d, 0x0000000036052cc5a9f5732255d630dc, 0x00000000000000d540964f0210a02c8d))
+        "ice_natlid"     => (0x00000000016cda1b52284c4daf73910d, 0x0000000036052cc5a9f5732255d630dc, 0x00000000000000d540964f0210a02c8d),
+        "warm_floor_energy" => (0x000000000092887c87eceffb738bb53d, 0x000000000f5c9a6300b249685156577e, 0x000000000000014a78022f7ca7f137dc),
+        "warm_budget"    => (0x0000000000918d96ac4c7f44cc8c3cad, 0x000000000f46e41c50e453924c4ca1e0, 0x000000000000031c988f76b5001a4d24))
     lobe = Dict{Symbol,Any}(:lobe_relaxation => true, :ice_attr_census => true)
     arms = (
         ("warm",            false, false, nothing, Dict{Symbol,Any}(), true),
@@ -61,17 +64,31 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
         ("ice_nocond",      true,  false, nothing,
             Dict{Symbol,Any}(:condensation => false), true),
         ("ice_natlid",      true,  false, nothing,
-            Dict{Symbol,Any}(:sedimentation_flux_lid => :natural), true))
+            Dict{Symbol,Any}(:sedimentation_flux_lid => :natural), true),
+        # Step 3 (stages 3-4) branch coverage, seeded at d8b03a2 before those stages moved:
+        # the diagnostic condensate floor, the closed-form `:energy` temperature, the
+        # state-dependent SI coefficient (`S.sd_pxi`) and the rain-evaporation realization
+        # off, on precipitating single-moment rain; and the water-budget trace (the AB3 sink
+        # bounds `cap_*` and the depletion probe), which is refused under any water transform.
+        ("warm_floor_energy", false, false, nothing,
+            Dict{Symbol,Any}(:precipitation => true, :condensate_floor => :diagnostic,
+                             :temperature => :energy, :state_dependent_si => true,
+                             :rain_evap_realization => false), (; amp = 5.0e-3)),
+        ("warm_budget",     false, false, nothing,
+            Dict{Symbol,Any}(:precipitation => true, :water_budget_trace => 1),
+            (; amp = 5.0e-3), (; tr = :none)))
     got = Dict{String,Any}()
     mktempdir() do tmp
-        for (tag, ice, louis, vtr, extra, vbump) in arms
+        for arm in arms
+            (tag, ice, louis, vtr, extra, vbump) = arm[1:6]
+            tkw = length(arm) > 6 ? arm[7] : (;)   # extra `vt_tile` keywords
             # The prognostic vapor bump is written as a density perturbation, which is the
             # slot only under `:none`; the `:bhyp` arms keep the cloud sheet, E_t bump and w.
             # (`vbump` may instead be a NamedTuple of seed keywords, e.g. a thicker cloud.)
             skw = vbump isa NamedTuple ? vbump : (;)
             seed! = vbump !== false ? ((p, x, V, c) -> F.vt_seed_vapor!(p, x, V, c; skw...)) :
                                       ((p, x, V, c) -> F.vt_seed!(p, x, V, c))
-            m, p, mo = F.vt_tile(tmp, "ds_$(tag)"; vtr, ice, louis, extra, seed!)
+            m, p, mo = F.vt_tile(tmp, "ds_$(tag)"; vtr, ice, louis, extra, seed!, tkw...)
             F.vt_run!(m, p, mo, 3)
             got[tag] = ck(m, p)
             @testset "$(tag)" begin

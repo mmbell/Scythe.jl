@@ -11,6 +11,449 @@
 # ishmael.jl, and `mc_driver!` calls the stages; both resolve at the driver's first call.
 
 """
+    _thermo_stage!(S, geom, phys, gridpoints, u, w, pp, pbar, z, colstart, colend, t, ts,
+                   output_dir, f) -> nothing
+
+Stage 3 of `mc_driver!`: the diagnostic thermodynamic state of the column — `ke`, `geo`, `M`,
+the liquid and ice totals and their thermodynamic (floored) readings, the model temperature
+`Tk`, the located state guard, the saturation density and its partials, `q_v/q_l/q_i`, the
+mixture coefficients `C_vt`, `R_m`, `C_pt`, `gamma_m` (and `S.sd_pxi` under `f.sd_si`), `Lv`.
+
+`u`, `w`, `pp` are the slot views the driver binds (`view(phys, colstart:colend, slot, 1)`);
+the tangential wind `vv` is rebuilt here from `phys` with `mc_v_views` (it is a slot-view
+NamedTuple, never passed). `pbar` is the reference-pressure view, `z` the height view,
+`gridpoints`/`output_dir` only feed the guard's location message.
+`f = (; ice_on, cond_floor, teos, sd_si, column_state_guard)`.
+
+Writes (S): `ke`, `geo`, `M`, `rho_liq`, `rho_ice`, `rho_liq_t`, `rho_ice_t`, `Tk`, `p_hPa`,
+`rho_vs`, `q_v`, `q_l`, `q_i`, `C_vt`, `R_m`, `C_pt`, `gamma_m`, `sd_pxi`, `Lv`, `drvs_dT`,
+`drvs_dp`. Readers: STAGE_MAP.md (driver_split scratch).
+"""
+@noinline function _thermo_stage!(S, geom::MCGeometry, phys::Array{Float64,3},
+                                  gridpoints::Matrix{Float64}, u, w, pp, pbar, z,
+                                  colstart::Int, colend::Int, t::Int, ts::Float64,
+                                  output_dir::String, f::NamedTuple)
+    (; ice_on, cond_floor, teos, sd_si, column_state_guard) = f
+    # The tangential wind, rebuilt from the plain array (`nothing` on the Cartesian slice).
+    vv = mc_v_views(geom, (physical = phys,), colstart, colend)
+    # The columns the earlier stages wrote, under the names `mc_driver!` binds them to.
+    p = S.p; rho_d = S.rho_d; rho_v = S.rho_v; rho_t = S.rho_t; E_t = S.E_t; Q_ss = S.Q_ss
+    rho_c = S.rho_c; rho_r = S.rho_r; i1q = S.i1q; i2q = S.i2q; i3q = S.i3q
+    # Diagnostic thermodynamic state. EVERY water species is prognostic now — vapor, cloud,
+    # rain and the twelve ice moments — so the temperature retrieval is closed-form from the
+    # condensed masses and nothing in this block is a difference of large nearly-equal fields.
+    # See the file header for the chain that ended here.
+    ke = S.ke;   mc_ke!(ke, geom, u, w, vv)
+    geo = S.geo; @. geo = ke + (gravity * z)
+    M = S.M;     @. M = p + E_t - (rho_t * geo)
+    rho_liq = S.rho_liq; @. rho_liq = rho_c + rho_r
+    # The total ICE density, ρ_i = Σ_k ρ_{i,k} — the retrieval's second condensed mass and the
+    # third term of the vapor residual. Filled exactly where `rho_liq` is, and ZEROED (not
+    # left stale) when ice is off, because every consumer below reads it unconditionally: the
+    # `ρ_i = 0` arithmetic is EXACT (see `retrieve_temperature`), so an ice-free run is
+    # bitwise the code that had no ice, and one `fill!` per column is the price of not
+    # branching the whole thermodynamic block.
+    rho_ice = S.rho_ice
+    if ice_on
+        @. rho_ice = (i1q + i2q) + i3q
+    else
+        fill!(rho_ice, 0.0)
+    end
+    # What the THERMODYNAMICS reads. Under the default `:none` this is a copy of identical
+    # doubles, so the whole option is bitwise inert. Under `:diagnostic` it is the floored
+    # liquid, and ONLY the consumers below see it: the retrieval, q_l -> C_vt/R_m/gamma_m,
+    # Q_s_energy, the entropy and E_sed. `rho_liq` itself stays raw: the census and the
+    # sedimentation read the water partition as carried, and flooring a partition
+    # manufactures water.
+    rho_liq_t = S.rho_liq_t
+    if cond_floor
+        @. rho_liq_t = max(rho_c, 0.0) + max(rho_r, 0.0)
+    else
+        copyto!(rho_liq_t, rho_liq)
+    end
+    # The ice mirror of `rho_liq_t`, floored per species under `:diagnostic` for the same
+    # reason: a spline undershoot in one ice mass must not reach the retrieval as negative
+    # latent heat. `rho_ice` itself stays raw: the census must see the water partition the
+    # continuity equations actually carry. (The reader-side cap at the ice-anchor headroom
+    # that followed was deleted with the ice-anchor legs at Stage 5 of the ρ_t retirement.)
+    rho_ice_t = S.rho_ice_t
+    if cond_floor && ice_on
+        @. rho_ice_t = (max(i1q, 0.0) + max(i2q, 0.0)) + max(i3q, 0.0)
+    else
+        copyto!(rho_ice_t, rho_ice)
+    end
+    # THE MODEL TEMPERATURE, and everything downstream in this step reads it: the guard below,
+    # the saturation density and its partials, Q_s, the condensation closure and the ETD
+    # pre-compute, the ice sources, the surface layer, the Louis/MYNN boundary layer, E_sed,
+    # the entropy. Under `:eos` (default) it is the equation-of-state temperature of the
+    # prognostic pressure and the two gas densities, with `rho_v` the PROGNOSTIC vapor staged
+    # above (`rho_vp + rho_vbar`, unfloored — negative vapor is a resolution diagnostic, and the
+    # EOS denominator is harmless to it; see `eos_temperature`). It reads NO condensate, so
+    # the `condensate_floor` does not enter T any more; it still shapes `q_l`/`q_i` (hence
+    # C_vt, R_m, γ_m, Q_s) below, as before. Under `:energy` it is the closed-form
+    # total-energy retrieval on the floored condensate — the pre-switch line, bitwise. Why the switch: `eos_temperature` (the clipped-lobe phantom latent heat).
+    Tk = S.Tk
+    if teos
+        @. Tk = eos_temperature(p, rho_d, rho_v)
+    else
+        @. Tk = retrieve_temperature(M, rho_d, rho_t, rho_liq_t, rho_ice_t)
+    end
+    # LOCATED STATE GUARD (see `check_column_state`): p, ρ_d, ρ_t and T must be positive and
+    # finite before anything consumes them — the saturation lookups just below, the sd_si
+    # coefficient γ_m p/ρ_t, the microphysics. The §2c death class (retrieval heating → w /
+    # sound-speed runaway → vertical SI past its limit → p < 0) used to surface first as a bare
+    # `DomainError` in the ice kernel, and the liquid path let it straight through. One
+    # comparison pass per column; reads only, and the message is built only on failure.
+    # `options[:column_state_guard] = false` disables it — forensics only (a test that
+    # deliberately carries a diverged state bitwise through two paths).
+    column_state_guard &&
+    check_column_state(p, rho_d, rho_t, Tk, z,
+        vv === nothing ?
+            (; p, p_prime = pp, pbar, rho_d, rho_t, Tk, w, u, rho_v, rho_liq, rho_ice,
+               rho_ice_t, rho_liq_t, Q_ss, E_t, M) :
+            (; p, p_prime = pp, pbar, rho_d, rho_t, Tk, w, u, v = vv.f, rho_v, rho_liq,
+               rho_ice, rho_ice_t, rho_liq_t, Q_ss, E_t, M),
+        (; step = t, time_s = t * ts, tile = output_dir, tile_ts = ts,
+           colstart, colend, column = Base.div(colstart - 1, colend - colstart + 1) + 1,
+           coord1 = gridpoints[colstart, 1],
+           coord2 = zcoord(geom) == 3 ? gridpoints[colstart, 2] : NaN))
+    p_hPa = S.p_hPa;   @. p_hPa = p / 100.0
+    rho_vs = S.rho_vs; @. rho_vs = rho_v_sat(Tk, p_hPa)
+    q_v = S.q_v;     @. q_v = rho_v / rho_d
+    q_l = S.q_l;     @. q_l = rho_liq_t / rho_d      # thermodynamic reader: see rho_liq_t
+    q_i = S.q_i;     @. q_i = rho_ice_t / rho_d      # ditto; exactly 0.0 with ice off
+    # Ice enters the mixture heat capacity through `q_i C_i`, exactly as liquid does through
+    # `q_l C_l` — a condensed phase performs no expansion work (TeX Eq. mixture_C). `R_m` is
+    # untouched (ice exerts no partial pressure) and `C_pt = C_vt + R_m` still holds, so
+    # gamma_m and the acoustic coefficient change VALUE with q_i but not FORM.
+    C_vt = S.C_vt;   @. C_vt = Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)
+    R_m = S.R_m;     @. R_m = Rd + (q_v * Rv)
+    C_pt = S.C_pt;   @. C_pt = C_vt + R_m
+    gamma_m = S.gamma_m; @. gamma_m = C_pt / C_vt
+    # State-dependent acoustic coefficient Pξⁿ(z) = γ_m·p/ρ_t of the CURRENT
+    # column state — used by the remainder/history staging below and by
+    # semiimplicit_adjustment_p (same thread, same column, so the scratch
+    # column persists into the adjustment call).
+    if sd_si
+        @. S.sd_pxi = gamma_m * p / rho_t
+    end
+    Lv = S.Lv;           @. Lv = L_v(Tk)
+    drvs_dT = S.drvs_dT; @. drvs_dT = drho_vsat_dT(Tk, p_hPa)
+    drvs_dp = S.drvs_dp; @. drvs_dp = drho_vsat_dp(Tk, p_hPa)
+    return nothing
+end
+
+"""
+    _warm_micro_stage!(S, stx, micro_nm1, micro_nm2, fcols, scols, z, colstart, t, ts,
+                       N_r, N_0, max_N_c, nr_i, f) -> nothing
+
+Stage 4 of `mc_driver!`: the psychrometric factor `Q_s`, the (diagnostic) AB3 sink bounds
+`cap_*`, the two-channel condensation closure with the rain donor's evaporation conductance
+and warm factor, the liquid stiffness census, the warm-rain conversion (single- or
+two-moment) and its sedimentation-flux fits, and the cloud donor's warm conductance and
+factor.
+
+`stx` is `mtile.mc_water_stats`, `micro_nm1`/`micro_nm2` the micro history matrices (read
+only under `f.budget_trace`), `fcols`/`scols` the per-thread flux/scratch spline columns
+(`sedimentation_flux_column(fcols, scols, slot, f.sed_lid_dir)`), `nr_i` the rain-number
+slot. `f = (; budget_trace, condensation, rain_evap_real, precipitation, rain_2m,
+sed_lid_dir)`.
+
+Writes (S): `Q_s`, `cap_c/r/v` (budget trace only), `Qdot`, `Qdot_r`, `invtau_c`, `invtau_r`,
+`kappa_ev`, `f_rain`, `AUTO_COLL`, `NR_SRC`, `Vt`, `Vtn`, `Fr`, `E_sed`, `Fnr`, `Fr_z`, `E_sed_z`,
+`Fnr_z`, `kappa_c`, `f_cloud`; the stiffness census rows of `stx`.
+"""
+@noinline function _warm_micro_stage!(S, stx::Matrix{Float64}, micro_nm1::Matrix{Float64},
+                                      micro_nm2::Matrix{Float64}, fcols::AbstractMatrix,
+                                      scols::AbstractMatrix, z, colstart::Int, t::Int,
+                                      ts::Float64, N_r::Float64, N_0::Float64,
+                                      max_N_c::Float64, nr_i::Int, f::NamedTuple)
+    (; budget_trace, condensation, rain_evap_real, precipitation, rain_2m, sed_lid_dir) = f
+    # The columns the earlier stages wrote, under the names `mc_driver!` binds them to.
+    Tk = S.Tk; p = S.p; p_hPa = S.p_hPa; rho_d = S.rho_d; rho_v = S.rho_v; rho_vs = S.rho_vs
+    rho_c = S.rho_c; rho_r = S.rho_r; n_r = S.n_r; Q_ss = S.Q_ss; rho_t = S.rho_t
+    rho_liq = S.rho_liq; M = S.M; ke = S.ke; E_t = S.E_t; Lv = S.Lv
+    q_v = S.q_v; q_l = S.q_l; q_i = S.q_i
+    # Condensation: supersaturation relaxation with the energy-consistent
+    # psychrometric factor, split between the cloud and rain channels in proportion to
+    # their inverse timescales (1/tau = 1/tau_c + 1/tau_r). Qdot moves mass between the
+    # prognostic condensate (slot 9) and the prognostic vapor at fixed rho_t and E_t -- an
+    # equal and opposite pair of slot sources now, with rho_t untouched -- so the latent heat
+    # comes out of the retrieval and no adjustment step is needed after the timestep. With the
+    # rain channel inert (N_r = 0), Qdot is bit-identical to the single-category closure and
+    # Qdot_r is exactly zero.
+    Q_s = S.Q_s;   @. Q_s = Q_s_energy(Tk, p, rho_d, q_v, q_l, q_i)
+    Qdot = S.Qdot          # cloud channel
+    Qdot_r = S.Qdot_r      # rain channel
+    # `options[:condensation] = false` switches the phase change off ENTIRELY --
+    # both channels, condensation and evaporation. It is a DIAGNOSTIC control, not
+    # a physics option: `:precipitation => false` only zeroes N_r/N_0, which stops
+    # rain but leaves the cloud channel running, so a run advertised as "no
+    # physics" still evaporates cloud every step.
+    #
+    # It was introduced to diagnose the phantom-cloud drain (see the file header),
+    # back when rho_c was the residual and a subsaturated column could carry
+    # ~2e-6 kg/m^3 of cloud that was not there, evaporate it, and have it regenerated
+    # from the same fit error on the next step. With rho_c prognostic that pathway is
+    # closed -- a subsaturated column has rho_c = 0 exactly and both gates shut, so
+    # this switch should now make NO difference to a cloud-free initial state. That is
+    # a useful regression check in its own right (model_tests/tc_discrete_balance.jl),
+    # and it remains the clean separator between "the initial state is not a discrete
+    # steady state" and "the moisture is doing something".
+
+    # ── Depletion budgets: DIAGNOSTIC ONLY ─────────────────────────────────────
+    # These are the AB3-exact bounds the condensation rates used to be limited by. Nothing in
+    # the RHS reads them any more (see `qss_condensation_rates` for why the caps were removed);
+    # they are computed only when the depletion census is on, which then reports where they
+    # WOULD have bound -- the instrument that measures what removing them cost.
+    cap_c = S.cap_c
+    cap_r = S.cap_r
+    cap_v = S.cap_v
+    if budget_trace
+        @inbounds for i in eachindex(cap_c)
+            g = colstart + i - 1
+            cap_c[i] = _ab3_sink_bound(ts, t, max(rho_c[i], 0.0),
+                                       micro_nm1[g, MC_MICRO_C], micro_nm2[g, MC_MICRO_C])
+            cap_r[i] = _ab3_sink_bound(ts, t, max(rho_r[i], 0.0),
+                                       micro_nm1[g, MC_MICRO_R], micro_nm2[g, MC_MICRO_R])
+            # The vapor is a SINK channel too -- condensation removes it -- so its bound has
+            # the same form and is negated into a ceiling on `Qdot_c + Qdot_r` at the use site.
+            # The PROGNOSTIC `rho_v`: the measurement is of the vapor the closure actually
+            # reads, a slot rather than a retrieval.
+            cap_v[i] = _ab3_sink_bound(ts, t, max(rho_v[i], 0.0),
+                                       micro_nm1[g, MC_MICRO_V], micro_nm2[g, MC_MICRO_V])
+        end
+    end
+    invtau_c = S.invtau_c
+    invtau_r = S.invtau_r
+    # The LIQUID half of the stiff-relaxation split (TeX Eq. relax_linear; see
+    # `relaxation_adjustment_qss!`). The withheld slot-7 term is
+    # `−(Q̇_c + Q̇_r)(1 + 𝒬_s) = −Q_ss_drive·(τ_c^{-1} + τ_r^{-1})` — the psychrometric factor
+    # cancels at the RATE level, before any integral is taken, which is what keeps the
+    # cancellation intact under the exponential (TeX, second property). Splitting that term
+    # into `−λ Q_ss` and a `Q`-independent remainder is therefore a statement about the DRIVE
+    # CLIP and nothing else:
+    #
+    #   * UNCLIPPED (`Q_ss_drive == Q_ss`): the whole term is `−Q_ss·invtau`, i.e. entirely
+    #     the λ part, and it contributes NOTHING to `N`;
+    #   * CLIPPED (`Q_ss_drive == max(ρ_v,0) − ρ_v*`): the drive no longer depends on `Q_ss` at
+    #     all, so the whole term is a constant flux, contributes NOTHING to λ, and belongs in
+    #     `N` in full — exactly as the TeX states ("a channel whose drive is clipped by the
+    #     vapor-availability bound contributes its (then constant) flux to N and nothing to λ").
+    #
+    # The classification is FROZEN at state `n`, like every other coefficient the step freezes.
+    # The clip itself is recomputed here from the same three scratch columns
+    # `qss_condensation_rates` reads, so the two cannot disagree by so much as an ulp.
+    etd_lam = S.etd_lam
+    etd_nl = S.etd_nl
+    kappa_ev = S.kappa_ev
+    f_rain = S.f_rain
+    if condensation
+        # The closure reads the PROGNOSTIC `rho_v` (the call site is unchanged; what it is
+        # handed is now a transported slot rather than a difference of five fitted fields,
+        # which is the whole point of Stage A).
+        for i in 1:length(Qdot)
+            Qdot[i], Qdot_r[i], invtau_c[i], invtau_r[i] =
+                qss_condensation_rates(Q_ss[i], rho_v[i], rho_c[i], rho_r[i],
+                                       rho_d[i], Tk[i], p_hPa[i], Q_s[i],
+                                       ts, N_r, max_N_c; N_0=N_0,
+                                       rain_2m=rain_2m, n_r_density=n_r[i])
+            if isnan(Qdot[i]) || isnan(Qdot_r[i])
+                error("Qdot is NaN at index $i, time $(t)!\n" *
+                      "  T = $(Tk[i]) K, p = $(p[i]) Pa, rho_d = $(rho_d[i]), " *
+                      "rho_t = $(rho_t[i]), rho_c = $(rho_c[i]), rho_r = $(rho_r[i])\n" *
+                      "  rho_liq = $(rho_liq[i]), rho_v = $(rho_v[i]), " *
+                      "rho_vs = $(rho_vs[i]), Q_ss = $(Q_ss[i]), Q_s = $(Q_s[i])\n" *
+                      "  M = $(M[i]), ke = $(ke[i]), E_t = $(E_t[i]), " *
+                      "Qdot = $(Qdot[i]), Qdot_r = $(Qdot_r[i])")
+            end
+            # ── The RAIN DONOR's EVAPORATION CONDUCTANCE (Stage 2b) ──────────────────
+            # `κ_ev = max(−Q̇_r, 0)/ρ_r` at the frozen state: the rain's third sink, written
+            # on its own reservoir so it can join the donor total `_ice_donor_factors` forms
+            # (TeX §donor_relax). CONDENSATION onto rain is a source and contributes nothing,
+            # so the `max` is a sign test and not a limiter; below the census floor there is
+            # no reservoir to divide by and the conductance is an exact zero, which is what
+            # keeps the rain-free path — and the whole dry path — bitwise.
+            #
+            # The λ/N classification has moved OUT of this loop, because `invtau_r` is not
+            # final here. The rain donor's total needs the ice legs, which do not exist until
+            # `mc_ice_sources!` has run, and λ, N and the rain transfer must all read the ONE
+            # realized conductance. See the fold below the ice block.
+            kev = 0.0
+            if rain_evap_real && Qdot_r[i] < 0.0 &&
+               rho_r[i] > MC_DONOR_QFLOOR * rho_d[i]
+                kev = -Qdot_r[i] / rho_r[i]
+            end
+            kappa_ev[i] = kev
+            # The WARM-PATH factor. Evaporation is not ice-gated, so the rain donor has a
+            # factor wherever it evaporates whether or not any ice exists; where ice does
+            # exist `mc_ice_sources!` overwrites this with the full-conductance one, and with
+            # no ice legs the value it writes is bitwise this one. Formed through the same
+            # `relaxation_realization(rate, reservoir, dt)` the ice loop calls, on the same
+            # `q_r`, so the two expressions cannot drift apart.
+            qr_i = max(rho_r[i], 0.0) / rho_d[i]
+            f_rain[i] = relaxation_realization(kev * qr_i, qr_i, ts)
+        end
+    else
+        fill!(Qdot, 0.0)
+        fill!(Qdot_r, 0.0)
+        fill!(invtau_c, 0.0)
+        fill!(invtau_r, 0.0)
+        fill!(kappa_ev, 0.0)
+        fill!(f_rain, 1.0)
+    end
+    # Stiffness of the relaxation this step was asked to integrate, per channel. UNGATED: it
+    # is what stands in place of the depletion caps, and the once-per-run warning in
+    # `mc_stiffness_trace` has to be able to see an excursion whether or not anyone switched a
+    # diagnostic on. Reads the rates; changes none of them.
+    mc_stiffness_census!(stx, ts, invtau_c, invtau_r)
+
+    # Warm-rain conversion and sedimentation. Autoconversion + collection move cloud to
+    # rain — a liquid-to-liquid exchange, thermodynamically inert (T, p, E_t, Q_ss all
+    # unmoved; with the condensate prognostic it is now an equal and opposite pair of
+    # sources on slots 9 and 8, and rho_liq — hence the retrieval — does not move). The
+    # sedimentation flux F_r = rho_r*Vt (Vt <= 0) moves rain mass AND the energy it
+    # carries: e_l(T) + ke + gz per kg of liquid, with e_l = C_pv*T - L_v(T) in the
+    # BF02 internal-energy convention. Its divergence sources rho_r, rho_t and E_t with
+    # the SAME fitted -dF/dz, so the two densities cannot drift apart, and the column
+    # integral telescopes to the boundary fluxes — with a free (Natural) bottom BC on
+    # rho_r the surface flux removes rain from the domain. T is invariant under the
+    # local exchange (delta_E_t = (e_l+ke+gz)*delta_rho at delta_rho_r = delta_rho_t);
+    # the residual flux terms are the physical energy transport by falling rain. No p
+    # or Q_ss source: rain exerts no partial pressure, and the (small) sedimentation
+    # dT/dt is omitted from the saturation chain rule below (absorbed by the
+    # condensation relaxation).
+    #
+    # Under `rain_moments == 2` this whole closure switches to the ISHMAEL/Morrison
+    # exponential-DSD family and gains a NUMBER budget alongside it: `NR_SRC` collects
+    # autoconversion's number source, self-collection/breakup and the evaporation number
+    # loss, and `Vtn`/`Fnr`/`Fnr_z` are the number's own fall speed, flux and flux
+    # divergence, fitted on the n_r column (its own basis and BCs) rather than rho_r's.
+    # `Vt` then carries the MASS-weighted `vtrm` in place of `rain_terminal_velocity`, so
+    # rho_r, rho_t and E_t all still receive the same single mass flux divergence and the
+    # telescoping between them is untouched. Number carries no mass and no energy: `Fnr_z`
+    # sources the n_r slot and NOTHING else.
+    AUTO_COLL = S.AUTO_COLL
+    Fr_z = S.Fr_z
+    E_sed_z = S.E_sed_z
+    NR_SRC = S.NR_SRC
+    Fnr_z = S.Fnr_z
+    if precipitation && rain_2m
+        Vt = S.Vt
+        Vtn = S.Vtn
+        for i in 1:length(AUTO_COLL)
+            # KK2000 autoconversion (mass + rain number) and accretion (mass only), then
+            # Beheng self-collection with Verlinde-Cotton breakup and the evaporation number
+            # loss, at the FROZEN `Qdot_r` (the rain donor's realization factor is folded into
+            # that column below the ice block, after this loop has read it; the number's own
+            # factor `f_nr` realizes the ICE number legs, and this sink stays on the multistep
+            # beside self-collection, which carries no conductance either — see
+            # `_ice_donor_factors`).
+            #
+            # It is proportional to the `n`-RATE, not to the step-mean the mass now moves at
+            # (the rain condensation/evaporation channel is half of the withheld `Q_ss`
+            # relaxation pair). This is the same `O(Δt)` moment-consistency gap the ice habit
+            # partition carries, and the same decision: a NUMBER is not mass, vapor or heat,
+            # so the exchange closure is untouched, and the alternative — withholding this leg
+            # too and giving the number slot its own step-mean increment — buys a second-order
+            # correction to a diagnostic partition at the cost of another withheld channel.
+            # The mean drop size it sets is bounded by the mass and number it is derived from.
+            auto, n_auto = rain_autoconversion_2m(rho_c[i], rho_d[i], max_N_c)
+            AUTO_COLL[i] = auto + rain_accretion_2m(rho_c[i], rho_r[i], rho_d[i])
+            NR_SRC[i] = n_auto + rain_selfcollection_2m(rho_r[i], n_r[i], rho_d[i]) +
+                        rain_number_evaporation_2m(Qdot_r[i], rho_r[i], n_r[i])
+            w_m, w_n = rain_fall_speeds_2m(rho_r[i], n_r[i], rho_d[i])
+            Vt[i] = w_m
+            Vtn[i] = w_n
+        end
+        Fr = S.Fr;       @. Fr = max(rho_r, 0.0) * Vt
+        E_sed = S.E_sed; @. E_sed = Fr * ((Cpv * Tk) - Lv + ke + (gravity * z))
+        Fnr = S.Fnr;     @. Fnr = max(n_r, 0.0) * Vtn
+        r_col = sedimentation_flux_column(fcols, scols, 8, sed_lid_dir)
+        r_col.uMish .= Fr
+        Btransform!(r_col)
+        Atransform!(r_col)
+        Ixtransform(r_col, Fr_z)
+        r_col.uMish .= E_sed
+        Btransform!(r_col)
+        Atransform!(r_col)
+        Ixtransform(r_col, E_sed_z)
+        # The number flux on the n_r column: its OWN spline fit and its OWN boundary
+        # conditions, so a Natural bottom lets the drops leave the domain with the rain they
+        # carry rather than piling up at the ground.
+        nr_col = sedimentation_flux_column(fcols, scols, nr_i, sed_lid_dir)
+        nr_col.uMish .= Fnr
+        Btransform!(nr_col)
+        Atransform!(nr_col)
+        Ixtransform(nr_col, Fnr_z)
+    elseif precipitation
+        for i in 1:length(AUTO_COLL)
+            auto = autoconversion_density(max(rho_c[i], 0.0), rho_d[i])
+            coll = collection_density(max(rho_c[i], 0.0), rho_r[i], rho_d[i], Tk[i])
+            # The PURE conversion rate. This used to carry the joint cloud-depletion cap
+            # `min(auto + coll, max(Qdot - min(cap_c, 0), 0))` -- cloud's two sinks,
+            # evaporation and conversion to rain, sharing one `rho_c/ts`-sized budget. It went
+            # with the rest of the caps: it is a `ts`-dependent modification of a rate, so the
+            # equation being solved changed with the step size (see `qss_condensation_rates`).
+            # The cap's own justification -- that bounding the two sinks SEPARATELY let them
+            # sum to twice the budget -- was an argument for a joint budget over two
+            # independent ones, not an argument that either should exist.
+            #
+            # `water_depletion_probe!` still counts where this would have been pinned
+            # (`:d_c_cauto`), so the population the cap used to act on stays visible.
+            AUTO_COLL[i] = auto + coll
+        end
+        Vt = S.Vt;       @. Vt = rain_terminal_velocity(rho_r, rho_d, Tk)
+        Fr = S.Fr;       @. Fr = max(rho_r, 0.0) * Vt
+        E_sed = S.E_sed; @. E_sed = Fr * ((Cpv * Tk) - Lv + ke + (gravity * z))
+        # Fitted flux divergences on rho_r's column basis (its BCs decide whether the
+        # surface flux is free to be nonzero), same discrete d/dz as the advection.
+        r_col = sedimentation_flux_column(fcols, scols, 8, sed_lid_dir)
+        r_col.uMish .= Fr
+        Btransform!(r_col)
+        Atransform!(r_col)
+        Ixtransform(r_col, Fr_z)
+        r_col.uMish .= E_sed
+        Btransform!(r_col)
+        Atransform!(r_col)
+        Ixtransform(r_col, E_sed_z)
+    else
+        fill!(AUTO_COLL, 0.0)
+        fill!(Fr_z, 0.0)
+        fill!(E_sed_z, 0.0)
+    end
+    # The number channels are zeroed OUTSIDE the branch above so that
+    # `precipitation && !rain_2m` (which never touches them) and `!precipitation && rain_2m`
+    # (advection-only rain number) both leave them at an exact zero. Two `fill!`s on a kDim
+    # column; the single-moment path never reads them either way.
+    if rain_2m && !precipitation
+        fill!(NR_SRC, 0.0)
+        fill!(Fnr_z, 0.0)
+    end
+
+    # ── The CLOUD DONOR's warm conductance and its factor (`cloud_evap_realized`) ──────────
+    # HERE, the first point at which both warm sinks of the cloud exist: the evaporation
+    # `Q̇_c` (frozen at state `n` by the closure above, the rain's `kappa_ev` convention) and
+    # the conversion `AUTO_COLL`. `κ_c` is their sum over the reservoir, one conductance, and
+    # `J₀(κ_c Δt)` is the cloud's factor wherever no ice leg draws on it; `mc_ice_sources!`
+    # completes the total with `ṁ_hf,c` and the riming and overwrites the factor at every
+    # point it visits. Formed in the ISHMAEL mixing-ratio units (`q_c = max(ρ_c, 0)/ρ_d`) the
+    # ice loop forms it in, so the two expressions are bitwise the same number where the ice
+    # legs are zero. Formed in BOTH modes — the census measures what the off arm would have
+    # withheld — and applied only below (the fold), gated on `cloud_evap_real`. An exact
+    # `κ_c = 0`, `f = 1.0` with no cloud.
+    kappa_c = S.kappa_c
+    f_cloud = S.f_cloud
+    @inbounds for i in eachindex(kappa_c)
+        kc = cloud_donor_conductance(Qdot[i], AUTO_COLL[i], rho_c[i])
+        kappa_c[i] = kc
+        qc_i = max(rho_c[i], 0.0) / rho_d[i]
+        f_cloud[i] = relaxation_realization(kc * qc_i, qc_i, ts)
+    end
+    return nothing
+end
+
+"""
     _etd_precompute_stage!(S, expdot, expdot_nm1, expdot_nm2, Q_ssbar, J_v, stx,
                            colstart, t, ts, tid_x, f) -> nothing
 
