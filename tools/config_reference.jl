@@ -54,6 +54,7 @@ end
 
 "A default value as it would be written in TOML (`inf` for Inf, strings quoted)."
 function toml_text(v)
+    v === nothing && return "unset"
     v isa AbstractFloat && isinf(v) && return v > 0 ? "inf" : "-inf"
     tv = S._toml_value(v)
     tv isa AbstractDict && return isempty(tv) ? "{}" : "(table)"
@@ -64,7 +65,8 @@ end
 typename(T) = T === Vector{Symbol} ? "[string]" : T === Vector{String} ? "[string]" :
               T === Vector{Float64} ? "[float]" : T === Vector{Int} ? "[int]" :
               T === Symbol ? "string (enum)" : T === String ? "string" :
-              T === Float64 ? "float" : T === Int ? "int" : T === Bool ? "bool" :
+              T === Float64 ? "float" : T === Union{Nothing,Float64} ? "float (optional)" :
+              T === Int ? "int" : T === Bool ? "bool" :
               T <: AbstractDict ? "table" : string(T)
 
 md(s) = replace(string(s), "|" => "\\|")
@@ -162,7 +164,8 @@ function bc_section(io)
 
     Every prognostic variable has a boundary condition on each of its four sides: `inner` and
     `outer` (the axis and the outer wall on the cylindrical sets; left and right on XZ), and
-    `bottom` (the ground) and `top` (the lid). They are NOT listed one by one in the config:
+    `bottom` (the ground) and `top` (the lid); the 3-D box (RRR) adds the y faces `down`
+    (y = jMin) and `up` (y = jMax). They are NOT listed one by one in the config:
     `[boundary_conditions]` holds four family rules that `build_boundary_conditions`
     (src/config_build.jl) applies to the run's variable list, then the per-variable
     `override` entries, then `build_nest` sets the nest interfaces. What each family value
@@ -173,6 +176,8 @@ function bc_section(io)
     | `lateral = "walls"`, XZ | inner and outer: `u`, `w` dirichlet (zero); every other variable neumann (zero gradient) |
     | `lateral = "walls"`, cylindrical (the only choice) | inner (axis): `u`, `v` dirichlet; every other variable, `w` included, neumann. outer (wall): `u` dirichlet; every other variable, `v` and `w` included, neumann |
     | `lateral = "periodic"` (XZ, single patch only) | inner and outer: periodic on every variable |
+    | `lateral = "walls"`, RRR (the 3-D box) | inner and outer (the x faces): `u`, `w` dirichlet; down and up (the y faces): `v`, `w` dirichlet; every other variable neumann |
+    | `lateral = "periodic"`, RRR | all four faces: periodic on every variable |
     | `vertical_scalars = "d2"` | bottom of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
     | `vertical_scalars = "natural"` | bottom of every variable: natural (unconstrained); then the rules below |
     | `vertical_scalars = "neumann"` | bottom of every variable: neumann; then the rules below |
@@ -195,7 +200,8 @@ function bc_section(io)
     Sides: $(join(("`$(x)`" for x in S.BC_OVERRIDE_SIDES), ", ")). Values: $(join(("`$(x)`" for x in S.BC_OVERRIDE_VALUES), ", ")).
     The variable must be one the run has (an error lists them); `inner`/`outer` act on the
     domain's own edges (the first patch's inner side, the last patch's outer side), never on a
-    nest interface, and are refused under `lateral = "periodic"`.
+    nest interface, and are refused under `lateral = "periodic"`; so are `down`/`up`, which
+    exist on RRR only.
 
     Every run writes the resolved table to `<output.dir>/boundary_conditions.toml` (one
     `[[patch]]` per patch, one `[[patch.variable]]` per variable) and prints its compact

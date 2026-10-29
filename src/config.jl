@@ -56,14 +56,14 @@ abstract type AbstractConfigSection end
 # `ENUM_FIELDS` below) so a scheme added to, say, `RADIATION_METHODS` is accepted by the
 # config with no edit here. Only the sets that are born with the config live here.
 
-"Allowed `boundary_conditions.lateral` values: walls (cylindrical sets always take axis + outer wall) or periodic (XZ only; refused for the cylindrical sets at build)."
+"Allowed `boundary_conditions.lateral` values: walls (cylindrical sets always take axis + outer wall) or periodic (XZ and RRR; refused for the cylindrical sets at build)."
 const LATERAL_BCS = (:walls, :periodic)
 "Allowed `boundary_conditions.vertical_scalars` (ground) and `boundary_conditions.vertical_scalars_lid` (lid) values: the BC of every variable except `w` (and the sedimenting slots at the ground)."
 const VERTICAL_SCALAR_BCS = (:d2, :natural, :r1t1x, :neumann)
 "Allowed `boundary_conditions.sedimentation_lid` values: the lid BC of the rain/number/ice SLOTS (the sedimentation FLUX fit always has a zero-flux lid on a B-spline vertical)."
 const SEDIMENTATION_LID_BCS = (:natural, :wall)
-"Sides a `boundary_conditions.override` entry may name: `inner`/`outer` (cylindrical: axis/outer wall; XZ: left/right) and `bottom`/`top`."
-const BC_OVERRIDE_SIDES = ("inner", "outer", "bottom", "top")
+"Sides a `boundary_conditions.override` entry may name: `inner`/`outer` (cylindrical: axis/outer wall; XZ and RRR: the x faces), `bottom`/`top`, and `down`/`up` (RRR only: the y = jMin / jMax faces, Springsteel's BCD / BCU)."
+const BC_OVERRIDE_SIDES = ("inner", "outer", "bottom", "top", "down", "up")
 "Values a `boundary_conditions.override` entry may take: Springsteel's BC vocabulary (`r1t1x` = `CubicBSpline.R1T1X`, the inhomogeneous-Neumann pressure wall)."
 const BC_OVERRIDE_VALUES = ("natural", "dirichlet", "neumann", "second_derivative", "periodic", "r1t1x")
 "Allowed `initial_conditions.method` values."
@@ -159,6 +159,8 @@ end
 - `geometry::String` — Springsteel geometry name (`RiRk`, `RZ`, `RLR`, `RRR`); must suit `run.equation_set`.
 - `boundaries::Vector{Float64}` — patch edges [m], outermost last; length 2 = single patch.
 - `num_cells::Vector{Int}` — horizontal B-spline cells per patch; length `length(boundaries) - 1`.
+- `boundaries_j::Vector{Float64}` — RRR only (required there, refused elsewhere): the y edges [m] of the 3-D box, length 2 (one patch); empty = no second horizontal direction. Written only when set.
+- `num_cells_j::Vector{Int}` — RRR only (required there, refused elsewhere): y B-spline cells, length 1. Written only when set.
 - `z_top::Float64` — model lid [m].
 - `num_cells_k::Int` — vertical B-spline cells.
 """
@@ -166,6 +168,8 @@ Base.@kwdef struct GridSection <: AbstractConfigSection
     geometry::String = "RiRk"
     boundaries::Vector{Float64} = [0.0, 300.0e3]
     num_cells::Vector{Int} = [50]
+    boundaries_j::Vector{Float64} = Float64[]
+    num_cells_j::Vector{Int} = Int[]
     z_top::Float64 = 25.0e3
     num_cells_k::Int = 50
 end
@@ -175,11 +179,11 @@ end
 
 `[boundary_conditions]` — the boundary condition of every prognostic variable, set by four family rules plus per-variable overrides. The resolved per-variable table is written to `<output.dir>/boundary_conditions.toml` and printed at startup.
 
-- `lateral::Symbol` — `walls` or `periodic` (XZ only). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here.
+- `lateral::Symbol` — `walls` or `periodic` (XZ and RRR). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). RRR (the 3-D box): `lateral` governs all four faces; walls = `u`, `w` Dirichlet on the x faces (`inner`/`outer`) and `v`, `w` Dirichlet on the y faces (`down`/`up`), every other variable Neumann; periodic = all four faces. Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here.
 - `vertical_scalars::Symbol` — GROUND BC of every variable except `w` (always Dirichlet zero) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'`, rho_t' the derived total, installed before every fit). Natural by default: a surface layer is logarithmic, and `d2` forces the velocity and scalar gradients constant there. The whole family must share one condition (freeing `p` or `rho_t` alone blows up); with all of it natural the resting-column SI ceiling is 0.875-0.9375 s (0.9375-1.0 s under `d2`) and the 12 h no-physics TC hold is indistinguishable from `d2` (1.78% vs 1.73% of the deficit filled). Never `neumann`: on `p` at the ground it drains the pressure field.
 - `vertical_scalars_lid::Symbol` — LID BC of the same family (every variable except `w`, always Dirichlet zero), same values as `vertical_scalars`. Natural by default: `d2` at a rigid lid over-constrains the perturbation fields and drifts warm over days (multi-day 2D RCE: lid T anomaly 0.5 K at 48 h, crash at 277 h; restarted with a natural lid the anomaly decays). Clean at ts = 0.75 s on the RCE case; ts = 1.0 s showed a transient adjustment that `d2` did not.
 - `sedimentation_lid::Symbol` — lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars_lid`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top.
-- `override::Dict{String,Dict{String,String}}` — expert per-variable overrides applied after the family rules: `{<variable> = {<side> = <bc>}}` with side `inner`/`outer`/`bottom`/`top` and bc `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic` or `r1t1x`; `inner`/`outer` act on the domain's own edges (a nest interface is always the nesting's), refused under periodic.
+- `override::Dict{String,Dict{String,String}}` — expert per-variable overrides applied after the family rules: `{<variable> = {<side> = <bc>}}` with side `inner`/`outer`/`bottom`/`top` (plus `down`/`up`, the y = jMin / jMax faces, on RRR only) and bc `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic` or `r1t1x`; `inner`/`outer` act on the domain's own edges (a nest interface is always the nesting's), refused under periodic.
 """
 Base.@kwdef struct BoundaryConditionsSection <: AbstractConfigSection
     lateral::Symbol = :periodic
@@ -277,6 +281,7 @@ end
 `[initial_conditions.temperature_bubble]` — a warm ellipsoidal bubble (`moist_temperature_bubble_mc!`).
 
 - `xc::Float64` — bubble centre, horizontal [m].
+- `yc::Union{Nothing,Float64}` — RRR only (required there with this method, refused elsewhere): bubble centre in y [m]; the bubble is then round in the horizontal (`xr` in both x and y). Unset = the 2-D bubble. Written only when set.
 - `xr::Float64` — horizontal radius [m].
 - `zc::Float64` — bubble centre, vertical [m].
 - `zr::Float64` — vertical radius [m].
@@ -284,6 +289,7 @@ end
 """
 Base.@kwdef struct BubbleIC <: AbstractConfigSection
     xc::Float64 = 150.0e3
+    yc::Union{Nothing,Float64} = nothing
     xr::Float64 = 30.0e3
     zc::Float64 = 500.0
     zr::Float64 = 3000.0
@@ -1190,6 +1196,7 @@ function _coerce(::Type{Dict{String,Float64}}, v, where)
     v isa AbstractDict || _type_error(where, v, "a table of numbers")
     return Dict{String,Float64}(string(k) => _coerce(Float64, x, "$where.$k") for (k, x) in v)
 end
+_coerce(::Type{Union{Nothing,Float64}}, v, where) = _coerce(Float64, v, where)
 _coerce(::Type{Union{Symbol,Vector{Symbol}}}, v, where) =
     v isa AbstractVector ? _coerce(Vector{Symbol}, v, where) : _coerce(Symbol, v, where)
 _coerce(::Type{T}, v, where) where {T<:AbstractConfigSection} =
@@ -1430,7 +1437,16 @@ strings, `Inf` kept as a Float64 (the stdlib printer writes `inf`). Of the four 
 condition sub-tables only the active `method`'s is included.
 """
 to_dict(x::T) where {T<:AbstractConfigSection} =
-    Dict{String,Any}(string(f) => _toml_value(getfield(x, f)) for f in fieldnames(T))
+    Dict{String,Any}(string(f) => _toml_value(getfield(x, f)) for f in fieldnames(T)
+                     if !_unset_optional(x, f))
+
+# The RRR-only keys (`grid.boundaries_j`, `grid.num_cells_j`, `temperature_bubble.yc`) are
+# written only when set, so the canonical text -- and `config_hash` -- of every config that
+# does not use them is exactly what it was before they existed.
+_unset_optional(x::AbstractConfigSection, f::Symbol) = false
+_unset_optional(x::GridSection, f::Symbol) =
+    (f === :boundaries_j || f === :num_cells_j) && isempty(getfield(x, f))
+_unset_optional(x::BubbleIC, f::Symbol) = f === :yc && x.yc === nothing
 
 function to_dict(ic::InitialConditions)
     return Dict{String,Any}("method" => string(ic.method),

@@ -489,6 +489,165 @@ end
     end
 end
 
+@testset "RRR: the 3-D Cartesian box (grid, four lateral faces, bubble)" begin
+    # Stream C2/R2a. The second horizontal direction of the box is configured by
+    # grid.boundaries_j / grid.num_cells_j (required on RRR, refused elsewhere), the bubble
+    # gains a y centre (temperature_bubble.yc, RRR only), `lateral` governs all four faces and
+    # `override` gains the j faces `down` (y = jMin, Springsteel BCD) and `up` (y = jMax, BCU).
+    # None of it may touch the canonical text of a 2-D config: the new keys are written only
+    # when set, so every existing config hashes as it did.
+    @test GridSection().boundaries_j == Float64[] && GridSection().num_cells_j == Int[]
+    @test BubbleIC().yc === nothing
+    for c in (RunConfig(), RunConfig(initial_conditions = InitialConditions(method = :temperature_bubble)))
+        t = Scythe.canonical_toml(c)
+        @test !occursin("boundaries_j", t) && !occursin("num_cells_j", t) && !occursin("yc", t)
+    end
+    mktempdir() do dir
+        rrr = ["run.equation_set=moist_compressible_RRR", "grid.geometry=RRR",
+               "grid.boundaries=[0.0, 24.0e3]", "grid.num_cells=[6]",
+               "grid.boundaries_j=[0.0, 24.0e3]", "grid.num_cells_j=[6]",
+               "grid.z_top=4000.0", "grid.num_cells_k=8",
+               "boundary_conditions.lateral=walls",
+               "initial_conditions.method=temperature_bubble",
+               "initial_conditions.temperature_bubble.xc=12.0e3",
+               "initial_conditions.temperature_bubble.yc=12.0e3",
+               "initial_conditions.temperature_bubble.xr=8.0e3",
+               "initial_conditions.temperature_bubble.zc=500.0",
+               "initial_conditions.temperature_bubble.zr=1000.0",
+               "physics.radiation.scheme=none", "environment.f_latitude=0.0"]
+        cf(xs...) = load_config(set = ["output.dir=$(joinpath(dir, "out"))", rrr..., xs...])
+        cfg = cf()
+        @test cfg.grid.boundaries_j == [0.0, 24.0e3] && cfg.grid.num_cells_j == [6]
+        @test cfg.initial_conditions.temperature_bubble.yc == 12.0e3
+        # Round trip: the RRR keys are written and read back.
+        path = write_config(cfg, joinpath(dir, "rrr.toml"))
+        text = read(path, String)
+        @test occursin("boundaries_j", text) && occursin("num_cells_j", text) && occursin("yc", text)
+        back = load_config(path)
+        @test back == cfg && config_hash(back) == config_hash(cfg)
+
+        # ── refusals (all at build: the constructor only checks well-formedness)
+        bm(xs...) = errmsg(() -> build_model(cf(xs...)))
+        noj = filter(s -> !startswith(s, "grid.boundaries_j") && !startswith(s, "grid.num_cells_j"), rrr)
+        m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)", noj...])))
+        @test occursin("grid.boundaries_j", m) && occursin("RRR", m)
+        m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)",
+                                                        "grid.boundaries_j=[0.0, 1.0e3]",
+                                                        "grid.num_cells_j=[4]"])))
+        @test occursin("grid.boundaries_j", m) && occursin("RRR", m)
+        @test occursin("grid.num_cells_j", bm("grid.num_cells_j=[6, 6]"))
+        @test occursin("grid.boundaries_j", bm("grid.boundaries_j=[24.0e3, 0.0]"))
+        @test occursin("grid.num_cells_j", bm("grid.num_cells_j=[0]"))
+        # yc is the second horizontal coordinate: refused off RRR, required on it.
+        m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)",
+                         "initial_conditions.method=temperature_bubble",
+                         "initial_conditions.temperature_bubble.yc=1.0"])))
+        @test occursin("temperature_bubble.yc", m) && occursin("RRR", m)
+        noyc = filter(s -> !startswith(s, "initial_conditions.temperature_bubble.yc"), rrr)
+        m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)", noyc...])))
+        @test occursin("temperature_bubble.yc", m)
+        # A noise-started box needs no yc.
+        @test build_model(load_config(set = ["output.dir=$(dir)", noyc...,
+                                             "initial_conditions.method=temperature_noise"])) isa ModelParameters
+        # One patch; no horizontal SI / exact solve (neither has an RRR operator).
+        @test occursin("nest", bm("grid.boundaries=[0.0, 12.0e3, 24.0e3]", "grid.num_cells=[3, 6]"))
+        @test occursin("numerics.exact_si", bm("numerics.exact_si=true", "numerics.state_dependent_si=false"))
+        @test occursin("numerics.horizontal_semiimplicit", bm("numerics.horizontal_semiimplicit=true"))
+        # The j faces exist on RRR only, and a periodic pair is not overridden on one side.
+        m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)",
+                         "boundary_conditions.lateral=walls",
+                         "boundary_conditions.override.p.up=neumann"])))
+        @test occursin("override.p.up", m) && occursin("RRR", m)
+        m = bm("boundary_conditions.lateral=periodic", "boundary_conditions.override.p.down=natural")
+        @test occursin("periodic", m) && occursin("override.p.down", m)
+
+        # ── the build: one patch, all four lateral faces, v (slot 10) carried
+        model = build_model(cfg)
+        gp = model.grid_params
+        @test model isa ModelParameters && model.equation_set == "moist_compressible_RRR"
+        @test gp.geometry == "RRR"
+        @test (gp.jMin, gp.jMax, gp.num_cells_j) == (0.0, 24.0e3, 6)
+        vars = first.(sort(collect(gp.vars), by = last))
+        @test vars[10] == "v" && vars == Scythe.mc_var_names(model.options; cyl = true)
+        @test haskey(model.physical_params, :f)               # an f-plane box rotates
+        # walls: (u, w) Dirichlet on the x faces, (v, w) Dirichlet on the y faces, every
+        # other variable Neumann; the vertical families as on every geometry.
+        for v in vars
+            @test gp.BCL[v] == (v in ("u", "w") ? DirichletBC() : NeumannBC())
+            @test gp.BCR[v] == gp.BCL[v]
+            @test gp.BCD[v] == (v in ("v", "w") ? DirichletBC() : NeumannBC())
+            @test gp.BCU[v] == gp.BCD[v]
+        end
+        @test gp.BCB["w"] == DirichletBC() && gp.BCT["w"] == DirichletBC()
+        # periodic: every variable on all four faces.
+        gpp = build_model(cf("boundary_conditions.lateral=periodic")).grid_params
+        @test all(gpp.BCL[v] == PeriodicBC() && gpp.BCR[v] == PeriodicBC() &&
+                  gpp.BCD[v] == PeriodicBC() && gpp.BCU[v] == PeriodicBC() for v in vars)
+        # override: down/up act on the j faces only (the up and down dicts are separate).
+        gpo = build_model(cf("boundary_conditions.override.p.up=natural",
+                             "boundary_conditions.override.u.inner=natural")).grid_params
+        @test gpo.BCU["p"] == NaturalBC() && gpo.BCD["p"] == NeumannBC()
+        @test gpo.BCL["u"] == NaturalBC() && gpo.BCR["u"] == DirichletBC()
+        # 2-D sets still get the 4 dicts (positions 5, 6 are nothing) and no j BCs passed.
+        x2 = load_config(set = ["output.dir=$(dir)"])
+        o2, _ = Scythe.build_physics(x2)
+        bcs = Scythe.build_boundary_conditions(x2, o2, Scythe.mc_var_names(o2))
+        @test length(bcs) == 6 && bcs[5] === nothing && bcs[6] === nothing
+        # The resolved table reports the j faces on RRR (and only there).
+        t = Scythe.boundary_condition_table(model, cfg)
+        rv = only(filter(r -> r.variable == "v", t))
+        @test rv.down == "dirichlet" && rv.up == "dirichlet" && rv.inner == "neumann"
+        @test all(r.down == "" && r.up == "" for r in Scythe.boundary_condition_table(build_model(x2), x2))
+        f1 = Scythe.write_boundary_conditions(joinpath(dir, "bc.toml"), t)
+        @test only(filter(x -> x["name"] == "v", TOML.parsefile(f1)["patch"][1]["variable"]))["up"] == "dirichlet"
+        @test occursin("down|up", sprint(Scythe.print_boundary_conditions, t))
+
+        # Until the RRR halo/tile methods exist (stage R2c) the box builds but is refused at
+        # the run's preflight, by method lookup, rather than stepped through the generic
+        # (wrong-layout) exchange.
+        m = errmsg(() -> redirect_stdout(devnull) do
+            Scythe.preflight_checks(cfg)
+        end)
+        @test occursin("RRR", m) && occursin("R2c", m)
+        @test redirect_stdout(devnull) do
+            Scythe.preflight_checks(load_config(set = ["output.dir=$(dir)", "physics.radiation.scheme=none"]))
+        end === nothing
+
+        # ── the initial condition: a sphere-like bubble centred at (xc, yc, zc)
+        _, topo = Scythe.initialize_case!(cfg, model)
+        @test topo === nothing && isfile(model.initial_conditions)
+        patch = Scythe.createGrid(gp)
+        Scythe.read_physical_grid(model.initial_conditions, patch)
+        gpts = Scythe.getGridpoints(patch)
+        et = patch.physical[:, gp.vars["E_t"], 1]
+        imax = argmax(et)
+        kD = gp.kDim
+        # The warmest point is at the bubble centre's horizontal position, near zc.
+        x0, y0 = gpts[imax, 1], gpts[imax, 2]
+        dxs = unique(gpts[:, 1]); dys = unique(gpts[:, 2])
+        @test abs(x0 - 12.0e3) <= maximum(diff(sort(dxs)))
+        @test abs(y0 - 12.0e3) <= maximum(diff(sort(dys)))
+        # Square box, centred bubble, identical i/j mish: the field is x<->y symmetric.
+        key(i) = (gpts[i, 1], gpts[i, 2], gpts[i, 3])
+        lookup = Dict(key(i) => i for i in axes(gpts, 1))
+        worst = 0.0
+        for i in axes(gpts, 1)
+            j = lookup[(gpts[i, 2], gpts[i, 1], gpts[i, 3])]
+            worst = max(worst, abs(et[i] - et[j]))
+        end
+        @test worst <= 1.0e-12 * maximum(abs, et)
+        # It is a bubble, not a slab: outside it (here two opposite corners at the same
+        # level) the state is the horizontally uniform unperturbed one. (E_t' is not 0 there:
+        # the unperturbed point differs from the stored reference by the consistent-Q_ss
+        # reconstruction, as on the 2-D grids; it is the same at every such point.)
+        lvl(i) = gpts[i, 3] == gpts[imax, 3]
+        c1 = findfirst(i -> gpts[i, 1] == minimum(dxs) && gpts[i, 2] == minimum(dys) && lvl(i), axes(gpts, 1))
+        c2 = findfirst(i -> gpts[i, 1] == maximum(dxs) && gpts[i, 2] == maximum(dys) && lvl(i), axes(gpts, 1))
+        @test et[c1] == et[c2]
+        @test et[imax] - et[c1] > 100.0          # a 3 K bubble: ~2.4e2 J m^-3 at its centre
+    end
+end
+
 @testset "paths" begin
     mktempdir() do root
         root = realpath(root)

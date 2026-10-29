@@ -150,8 +150,8 @@ function initialize_case!(cfg::RunConfig, model::Union{ModelParameters,NestedMod
             else # :temperature_bubble
                 bb = cfg.initial_conditions.temperature_bubble
                 moist_temperature_bubble_mc!(p, gpts, ref;
-                    xc = bb.xc, xr = bb.xr, zc = bb.zc, zr = bb.zr, dT_max = bb.dT_max,
-                    zcol = zcol,
+                    xc = bb.xc, yc = bb.yc, xr = bb.xr, zc = bb.zc, zr = bb.zr,
+                    dT_max = bb.dT_max, zcol = zcol,
                     condensate_transform = ctrans, condensate_mu = cmu,
                     rain_transform = rtrans, rain_mu = rmu,
                     vapor_transform = vtrans, vapor_mu = vmu)

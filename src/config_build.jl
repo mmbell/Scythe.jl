@@ -41,12 +41,9 @@ function validate(cfg::RunConfig)
     num = cfg.numerics
     ice = mp.ice === :ishmael
 
-    cfg.run.equation_set == "moist_compressible_RRR" && error(
-        "config: run.equation_set = \"moist_compressible_RRR\" is reserved for the 3-D " *
-        "case and is not yet supported by build_model")
-
     # ── grid / timestep shape
     n = length(g.num_cells)
+    _validate_rrr(cfg, n)
     n >= 1 || error("config: grid.num_cells must have at least one entry")
     length(g.boundaries) == n + 1 || error(
         "config: grid.boundaries has $(length(g.boundaries)) entries but grid.num_cells has " *
@@ -70,7 +67,7 @@ function validate(cfg::RunConfig)
     bc.lateral === :periodic && n > 1 && error(
         "config: boundary_conditions.lateral = \"periodic\" with $n patches: nesting is not periodic")
     if bc.lateral === :periodic
-        for (var, sides) in bc.override, side in ("inner", "outer")
+        for (var, sides) in bc.override, side in ("inner", "outer", "down", "up")
             haskey(sides, side) && error("config: boundary_conditions.override.$var.$side is " *
                 "refused under boundary_conditions.lateral = \"periodic\" (a periodic pair " *
                 "cannot be overridden on one side)")
@@ -141,6 +138,59 @@ function validate(cfg::RunConfig)
             "config: physics.boundary_layer.mynn_interval = $(bl.mynn_interval) s is shorter " *
             "than the time step ($(tmax) s after timestep.scale); it must be >= ts")
     end
+    return nothing
+end
+
+"""
+    _validate_rrr(cfg, n)
+
+The rules of the 3-D Cartesian box (`grid.geometry = "RRR"`, Stream C2/R2a) and of its keys
+everywhere else. On RRR: `grid.boundaries_j` (2 increasing edges) and `grid.num_cells_j` (one
+positive count) are required; one patch only (`build_nest` is radial/x-only); no horizontal
+semi-implicit sweep and no exact unsplit solve (neither has an RRR operator); a
+`temperature_bubble` needs its y centre `yc`. Off RRR the three keys and the `down`/`up`
+override sides are refused, so a 2-D config cannot carry a value that nothing reads.
+"""
+function _validate_rrr(cfg::RunConfig, n::Int)
+    g = cfg.grid
+    rrr = g.geometry == "RRR"
+    bb = cfg.initial_conditions.temperature_bubble
+    if !rrr
+        (isempty(g.boundaries_j) && isempty(g.num_cells_j)) || error(
+            "config: grid.boundaries_j / grid.num_cells_j are the y axis of the 3-D box and " *
+            "are refused on grid.geometry = $(repr(g.geometry)); they are read on " *
+            "geometry = \"RRR\" only. Remove them")
+        bb.yc === nothing || error(
+            "config: initial_conditions.temperature_bubble.yc is the bubble's y centre on " *
+            "the 3-D box and is refused on grid.geometry = $(repr(g.geometry)) (RRR only)")
+        for (var, sides) in cfg.boundary_conditions.override, side in ("down", "up")
+            haskey(sides, side) && error(
+                "config: boundary_conditions.override.$var.$side: the `down`/`up` sides are " *
+                "the y faces of the 3-D box (RRR only); grid.geometry = $(repr(g.geometry)) " *
+                "has inner/outer/bottom/top")
+        end
+        return nothing
+    end
+    (length(g.boundaries_j) == 2 && length(g.num_cells_j) == 1) || error(
+        "config: grid.geometry = \"RRR\" needs grid.boundaries_j = [y_min, y_max] (2 " *
+        "entries, got $(length(g.boundaries_j))) and grid.num_cells_j = [cells] (1 entry, " *
+        "got $(length(g.num_cells_j))): the y axis of the box is one patch")
+    g.boundaries_j[2] > g.boundaries_j[1] || error(
+        "config: grid.boundaries_j = $(g.boundaries_j) must be strictly increasing")
+    g.num_cells_j[1] > 0 || error("config: grid.num_cells_j must be positive")
+    n == 1 || error(
+        "config: grid.geometry = \"RRR\" with $n patches (grid.num_cells): the 3-D box is " *
+        "not nested (build_nest nests in x/r only); use one patch")
+    num = cfg.numerics
+    num.exact_si && error(
+        "config: numerics.exact_si = true is refused on grid.geometry = \"RRR\": the exact " *
+        "unsplit acoustic solve has no 3-D Cartesian operator (RiRk and the RLR WIP only)")
+    num.horizontal_semiimplicit && error(
+        "config: numerics.horizontal_semiimplicit = true is refused on grid.geometry = " *
+        "\"RRR\": the horizontal semi-implicit sweep has no y leg")
+    (cfg.initial_conditions.method === :temperature_bubble && bb.yc === nothing) && error(
+        "config: initial_conditions.temperature_bubble.yc is required on grid.geometry = " *
+        "\"RRR\" (the bubble's y centre [m]; xr is its radius in x and y)")
     return nothing
 end
 
@@ -307,11 +357,12 @@ function build_physics(cfg::RunConfig; start_hour::Float64 = cfg.physics.radiati
 end
 
 """
-    build_boundary_conditions(cfg, options, vars) -> (BCL, BCR, BCB, BCT)
+    build_boundary_conditions(cfg, options, vars) -> (BCL, BCR, BCB, BCT, BCD, BCU)
 
-The four BC dicts for the base patch (`BCL`/`BCR` = the `inner`/`outer` sides, `BCB`/`BCT`
-= `bottom`/`top`), from the four `[boundary_conditions]` family rules, then the
-per-variable `override`:
+The BC dicts for the base patch (`BCL`/`BCR` = the `inner`/`outer` sides, `BCB`/`BCT`
+= `bottom`/`top`, and on the 3-D box `BCD`/`BCU` = the y faces `down`/`up`, Springsteel's
+j-direction pair; `nothing` on every other geometry, which has no j spline), from the four
+`[boundary_conditions]` family rules, then the per-variable `override`:
 
 - `lateral`, cylindrical (axisym, RLR): axis = Neumann on every variable except `u`, `v`
   Dirichlet; outer wall = Neumann except `u` Dirichlet (nest junctions are set by
@@ -319,6 +370,8 @@ per-variable `override`:
   side of every patch but the last).
 - `lateral = walls`, XZ: Neumann on every variable except `u`, `w` Dirichlet, both sides.
 - `lateral = periodic`, XZ: `PeriodicBC` on every variable.
+- `lateral = walls`, RRR: x faces as XZ (`u`, `w` Dirichlet); y faces `v`, `w` Dirichlet;
+  every other variable Neumann. `lateral = periodic`, RRR: `PeriodicBC` on all four faces.
 - `vertical_scalars` (ground) and `vertical_scalars_lid` (lid) of every variable: `d2`
   SecondDerivativeBC, `natural` NaturalBC, `neumann` NeumannBC, `r1t1x` d2 with the acoustic
   set (`rho_d, E_t, Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w`
@@ -347,6 +400,17 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
         bcl = merge(scalar, Dict{String,Any}("u" => DirichletBC(), "w" => DirichletBC()))
         bcr = bcl
     end
+    # The y faces of the 3-D box (Springsteel BCD = jMin, BCU = jMax); none elsewhere.
+    bcd = bcu = nothing
+    if cfg.grid.geometry == "RRR"
+        if bc.lateral === :periodic
+            bcd = Dict{String,Any}(v => PeriodicBC() for v in vars)
+        else
+            bcd = merge(Dict{String,Any}(v => NeumannBC() for v in vars),
+                        Dict{String,Any}("v" => DirichletBC(), "w" => DirichletBC()))
+        end
+        bcu = bcd
+    end
 
     # One vertical scalar-family dict per mode; the ground and the lid each take their own.
     function family(mode)
@@ -374,9 +438,15 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
     end
 
     if !isempty(bc.override)
-        # Copy before writing: under XZ the two lateral dicts are one object.
+        # Copy before writing: under XZ the two lateral dicts are one object (and so are
+        # the two y-face dicts of RRR).
         bcl, bcr = copy(bcl), copy(bcr)
         dicts = Dict("inner" => bcl, "outer" => bcr, "bottom" => bcb, "top" => bct)
+        if bcd !== nothing
+            bcd, bcu = copy(bcd), copy(bcu)
+            dicts["down"] = bcd
+            dicts["up"] = bcu
+        end
         for var in sort(collect(keys(bc.override)))
             var in vars || error("config: boundary_conditions.override.$var: this run has no " *
                 "variable $(repr(var)); its variables are " * join(vars, ", "))
@@ -385,7 +455,7 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
             end
         end
     end
-    return bcl, bcr, bcb, bct
+    return bcl, bcr, bcb, bct, bcd, bcu
 end
 
 """
@@ -449,8 +519,10 @@ bc_name(bc) = repr(bc)
 The boundary condition every prognostic variable ACTUALLY has, read back from the built
 grid parameters (for a nest: from `build_nest`'s per-patch grids, collars and interfaces
 included). One row per variable per patch, patches in order, variables in slot order:
-`(patch, variable, inner, outer, bottom, top, note)`, the BCs as [`bc_name`](@ref)s.
-`inner`/`outer` are the axis/outer wall on the cylinders, left/right on XZ.
+`(patch, variable, inner, outer, bottom, top, down, up, note)`, the BCs as
+[`bc_name`](@ref)s. `inner`/`outer` are the axis/outer wall on the cylinders, left/right
+(the x faces) on XZ and RRR; `down`/`up` are the y faces of the 3-D box (RRR) and `""`
+on every other geometry, where the file and the print leave them out.
 
 `note` says what the name alone does not: `sedimenting: flux fit F=0 at lid` (the
 sedimentation flux is fitted with a zero-flux lid whatever the slot's own lid BC;
@@ -469,14 +541,15 @@ function boundary_condition_table(m, cfg::RunConfig)
     bspline_k = models[1].grid_params.geometry != "RZ"
     flux_lid_f0 = bspline_k && sedimentation_flux_lid_dirichlet(opts)
     ov = cfg.boundary_conditions.override
-    rows = NamedTuple{(:patch, :variable, :inner, :outer, :bottom, :top, :note),
-                      Tuple{Int,String,String,String,String,String,String}}[]
+    rows = NamedTuple{(:patch, :variable, :inner, :outer, :bottom, :top, :down, :up, :note),
+                      Tuple{Int,String,String,String,String,String,String,String,String}}[]
     for (i, mm) in enumerate(models)
         gp = mm.grid_params
         vars = sort(collect(keys(gp.vars)); by = v -> gp.vars[v])
         for v in vars
             inner, outer = bc_name(gp.BCL[v]), bc_name(gp.BCR[v])
             bottom, top = bc_name(gp.BCB[v]), bc_name(gp.BCT[v])
+            down, up = gp.geometry == "RRR" ? (bc_name(gp.BCD[v]), bc_name(gp.BCU[v])) : ("", "")
             notes = String[]
             for (side, name, interior) in (("inner", inner, i > 1), ("outer", outer, i < n))
                 interior || continue
@@ -493,7 +566,8 @@ function boundary_condition_table(m, cfg::RunConfig)
                 isempty(sides) || push!(notes, "override: " * join(sides, ", "))
             end
             push!(rows, (patch = i, variable = v, inner = inner, outer = outer,
-                         bottom = bottom, top = top, note = join(notes, "; ")))
+                         bottom = bottom, top = top, down = down, up = up,
+                         note = join(notes, "; ")))
         end
     end
     return rows
@@ -506,8 +580,8 @@ const BC_TABLE_NAME = "boundary_conditions.toml"
     write_boundary_conditions(path, table; header = "") -> path
 
 Write a [`boundary_condition_table`](@ref) as TOML: one `[[patch]]` per patch (`index`),
-each holding one `[[patch.variable]]` per variable (`name, inner, outer, bottom, top`, and
-`note` when non-empty), in the table's order. `header` lines are written first as `#`
+each holding one `[[patch.variable]]` per variable (`name, inner, outer, bottom, top`, the
+y faces `down, up` on RRR, and `note` when non-empty), in the table's order. `header` lines are written first as `#`
 comments. Deterministic, so identical tables give identical files.
 """
 function write_boundary_conditions(path::AbstractString, table; header::AbstractString = "")
@@ -524,9 +598,9 @@ function write_boundary_conditions(path::AbstractString, table; header::Abstract
             for r in table
                 r.patch == p || continue
                 println(io, "\n    [[patch.variable]]")
-                for k in (:variable, :inner, :outer, :bottom, :top, :note)
+                for k in (:variable, :inner, :outer, :bottom, :top, :down, :up, :note)
                     x = getfield(r, k)
-                    (k === :note && isempty(x)) && continue
+                    (k in (:note, :down, :up) && isempty(x)) && continue
                     key = k === :variable ? "name" : string(k)
                     println(io, "    ", rpad(key, 6), " = \"", escape_string(x), "\"")
                 end
@@ -551,7 +625,10 @@ function print_boundary_conditions(io::IO, table)
     np = length(patches)
     vars = String[r.variable for r in table if r.patch == patches[1]]
     row(p, v) = table[findfirst(r -> r.patch == p && r.variable == v, table)]
-    lat(r) = r.inner == r.outer ? r.inner : "$(r.inner)|$(r.outer)"
+    # The 3-D box adds its y faces after the x faces: `x-faces ; y: down|up`.
+    latx(r) = r.inner == r.outer ? r.inner : "$(r.inner)|$(r.outer)"
+    laty(r) = r.down == r.up ? r.down : "$(r.down)|$(r.up)"
+    lat(r) = isempty(r.down) ? latx(r) : "$(latx(r)) ; y: $(laty(r))"
     iface(note) = join([x for x in split(note, "; ") if occursin(" = ", x)], ", ")
     lines = Vector{Vector{String}}()
     for v in vars
@@ -570,7 +647,9 @@ function print_boundary_conditions(io::IO, table)
         push!(cols, join(other, " | "))
         push!(lines, cols)
     end
-    hdr = ["variable", np == 1 ? "lateral (inner|outer)" : "lateral per patch (inner|outer)",
+    rrr = any(r -> !isempty(r.down), table)
+    hdr = ["variable", np == 1 ? (rrr ? "lateral (inner|outer ; y: down|up)" : "lateral (inner|outer)") :
+                                 "lateral per patch (inner|outer)",
            "bottom", "top", "note"]
     w = [maximum(length, [hdr[j]; [l[j] for l in lines]]) for j in 1:4]
     fmt(c) = rstrip(join((rpad(c[j], w[j]) for j in 1:4), "  ") * "  " * c[5])
@@ -667,8 +746,11 @@ function build_model(cfg::RunConfig; segment::Union{Nothing,NamedTuple} = nothin
                  (segment === nothing ? 0.0 : Float64(segment.t_offset) / 3600.0)
     options, physical = build_physics(cfg; start_hour = start_hour)
 
-    vars = mc_var_names(options; cyl = es.cyl)
-    bcl, bcr, bcb, bct = build_boundary_conditions(cfg, options, vars)
+    # `cyl` here means "carries the second horizontal wind v at slot 10": the cylinders
+    # and the 3-D box (where v is the y wind).
+    rrr = g.geometry == "RRR"
+    vars = mc_var_names(options; cyl = es.cyl || rrr)
+    bcl, bcr, bcb, bct, bcd, bcu = build_boundary_conditions(cfg, options, vars)
     positivity = build_positivity(cfg, options)
 
     # max_wavenumber: RLR carries the ring-native ragged truncation (-1 = per-ring support)
@@ -684,6 +766,10 @@ function build_model(cfg::RunConfig; segment::Union{Nothing,NamedTuple} = nothin
     end
     # The B-spline vertical is sized by cells; a Chebyshev (RZ) vertical by gridpoints.
     vsize = g.geometry == "RZ" ? (; kDim = 3 * g.num_cells_k) : (; num_cells_k = g.num_cells_k)
+    # The y axis of the 3-D box; nothing is passed on any other geometry, so a 2-D grid
+    # keeps Springsteel's defaults (and its fingerprint).
+    jaxis = rrr ? (; jMin = g.boundaries_j[1], jMax = g.boundaries_j[2],
+                     num_cells_j = g.num_cells_j[1], BCD = bcd, BCU = bcu) : (;)
 
     grid_params = GridParameters(;
         geometry = g.geometry,
@@ -691,6 +777,7 @@ function build_model(cfg::RunConfig; segment::Union{Nothing,NamedTuple} = nothin
         num_cells_i = sum(g.num_cells),          # nests: per-patch grids come from build_nest
         kMin = 0.0, kMax = g.z_top,
         vsize...,
+        jaxis...,
         l_q = build_l_q(cfg, vars),
         positivity = positivity,
         mw...,

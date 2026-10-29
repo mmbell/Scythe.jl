@@ -10605,7 +10605,7 @@ function _moist_temperature_perturbation_mc!(patch::AbstractGrid,
 end
 
 """
-    moist_temperature_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dT_max)
+    moist_temperature_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dT_max, yc = nothing)
 
 Ooyama (2001)-style warm-rain trigger for the total-energy set on a moist (vapor-bearing)
 `PressureReferenceState`: a constant-pressure temperature perturbation
@@ -10614,15 +10614,34 @@ relative humidity at the perturbed temperature (`ρ_v = H·ρ_v*(T)` with
 `H = ρ̄_v/ρ_v*(T̄)`), so the bubble carries extra moisture rather than drying out as it
 warms. The dry density follows from the moist EOS at constant pressure; E_t and Q_ss
 are computed pointwise before subtracting the reference; rho_r = 0.
+
+`yc` (the 3-D box, RRR: gridpoint column 2 is y) centres the bubble in y as well, with the
+same horizontal radius: `L² = ((x−xc)/xr)² + ((y−yc)/xr)² + ((z−zc)/zr)²`. `yc = nothing`
+(the default) is the 2-D bubble, evaluated by the original closure untouched — on the
+cylinders that is the axis-or-torus bubble that reads the radius only.
 """
 function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
                                       ref::Springsteel.PressureReferenceState;
                                       xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
-                                      dT_max=3.0, zcol=2,
+                                      dT_max=3.0, zcol=2, yc=nothing,
                                       condensate_transform::Symbol=:none,
                                       condensate_mu=1.0e-7,
                                       rain_transform::Symbol=:none, rain_mu=1.0e-7,
                                       vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
+    if yc !== nothing
+        zcol == 3 || error("moist_temperature_bubble_mc!: yc is the y centre of the 3-D " *
+                           "box (gridpoint columns x, y, z); got zcol = $zcol")
+        ycf = Float64(yc)
+        return _moist_temperature_perturbation_mc!(patch, gridpoints, ref,
+            function (i, k, x, z)
+                y = gridpoints[i, 2]
+                L = sqrt(((x - xc) / xr)^2 + ((y - ycf) / xr)^2 + ((z - zc) / zr)^2)
+                return L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+            end;
+            zcol=zcol, condensate_transform=condensate_transform,
+            condensate_mu=condensate_mu, rain_transform=rain_transform, rain_mu=rain_mu,
+            vapor_transform=vapor_transform, vapor_mu=vapor_mu)
+    end
     # The bubble IS its dT field; the expression is the one this function has always
     # evaluated, in the same order, so the committed benchmark references are bitwise.
     return _moist_temperature_perturbation_mc!(patch, gridpoints, ref,

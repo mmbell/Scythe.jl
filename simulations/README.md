@@ -177,6 +177,8 @@ the patches and the vertical axis.
 | `geometry` | string | `"RiRk"` | Springsteel geometry name (`RiRk`, `RZ`, `RLR`, `RRR`); must suit `run.equation_set`. |
 | `boundaries` | [float] | `[0.0, 300000.0]` | patch edges [m], outermost last; length 2 = single patch. |
 | `num_cells` | [int] | `[50]` | horizontal B-spline cells per patch; length `length(boundaries) - 1`. |
+| `boundaries_j` | [float] | `[]` | RRR only (required there, refused elsewhere): the y edges [m] of the 3-D box, length 2 (one patch); empty = no second horizontal direction. Written only when set. |
+| `num_cells_j` | [int] | `[]` | RRR only (required there, refused elsewhere): y B-spline cells, length 1. Written only when set. |
 | `z_top` | float | `25000.0` | model lid [m]. |
 | `num_cells_k` | int | `50` | vertical B-spline cells. |
 
@@ -186,11 +188,11 @@ the boundary condition of every prognostic variable, set by four family rules pl
 
 | key | type | default | description |
 |---|---|---|---|
-| `lateral` | string (enum) | `"periodic"` | `walls` or `periodic` (XZ only). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here. |
+| `lateral` | string (enum) | `"periodic"` | `walls` or `periodic` (XZ and RRR). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). RRR (the 3-D box): `lateral` governs all four faces; walls = `u`, `w` Dirichlet on the x faces (`inner`/`outer`) and `v`, `w` Dirichlet on the y faces (`down`/`up`), every other variable Neumann; periodic = all four faces. Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here. |
 | `vertical_scalars` | string (enum) | `"natural"` | GROUND BC of every variable except `w` (always Dirichlet zero) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'`, rho_t' the derived total, installed before every fit). Natural by default: a surface layer is logarithmic, and `d2` forces the velocity and scalar gradients constant there. The whole family must share one condition (freeing `p` or `rho_t` alone blows up); with all of it natural the resting-column SI ceiling is 0.875-0.9375 s (0.9375-1.0 s under `d2`) and the 12 h no-physics TC hold is indistinguishable from `d2` (1.78% vs 1.73% of the deficit filled). Never `neumann`: on `p` at the ground it drains the pressure field. |
 | `vertical_scalars_lid` | string (enum) | `"natural"` | LID BC of the same family (every variable except `w`, always Dirichlet zero), same values as `vertical_scalars`. Natural by default: `d2` at a rigid lid over-constrains the perturbation fields and drifts warm over days (multi-day 2D RCE: lid T anomaly 0.5 K at 48 h, crash at 277 h; restarted with a natural lid the anomaly decays). Clean at ts = 0.75 s on the RCE case; ts = 1.0 s showed a transient adjustment that `d2` did not. |
 | `sedimentation_lid` | string (enum) | `"natural"` | lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars_lid`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top. |
-| `override` | table | `{}` | expert per-variable overrides applied after the family rules: `{<variable> = {<side> = <bc>}}` with side `inner`/`outer`/`bottom`/`top` and bc `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic` or `r1t1x`; `inner`/`outer` act on the domain's own edges (a nest interface is always the nesting's), refused under periodic. |
+| `override` | table | `{}` | expert per-variable overrides applied after the family rules: `{<variable> = {<side> = <bc>}}` with side `inner`/`outer`/`bottom`/`top` (plus `down`/`up`, the y = jMin / jMax faces, on RRR only) and bc `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic` or `r1t1x`; `inner`/`outer` act on the domain's own edges (a nest interface is always the nesting's), refused under periodic. |
 
 ### `[timestep]`
 
@@ -258,6 +260,7 @@ a warm ellipsoidal bubble (`moist_temperature_bubble_mc!`).
 | key | type | default | description |
 |---|---|---|---|
 | `xc` | float | `150000.0` | bubble centre, horizontal [m]. |
+| `yc` | float (optional) | `unset` | RRR only (required there with this method, refused elsewhere): bubble centre in y [m]; the bubble is then round in the horizontal (`xr` in both x and y). Unset = the 2-D bubble. Written only when set. |
 | `xr` | float | `30000.0` | horizontal radius [m]. |
 | `zc` | float | `500.0` | bubble centre, vertical [m]. |
 | `zr` | float | `3000.0` | vertical radius [m]. |
@@ -418,7 +421,8 @@ inputs to the WARN-ONLY startup timestep report; they change nothing in the run.
 
 Every prognostic variable has a boundary condition on each of its four sides: `inner` and
 `outer` (the axis and the outer wall on the cylindrical sets; left and right on XZ), and
-`bottom` (the ground) and `top` (the lid). They are NOT listed one by one in the config:
+`bottom` (the ground) and `top` (the lid); the 3-D box (RRR) adds the y faces `down`
+(y = jMin) and `up` (y = jMax). They are NOT listed one by one in the config:
 `[boundary_conditions]` holds four family rules that `build_boundary_conditions`
 (src/config_build.jl) applies to the run's variable list, then the per-variable
 `override` entries, then `build_nest` sets the nest interfaces. What each family value
@@ -429,6 +433,8 @@ does, exactly:
 | `lateral = "walls"`, XZ | inner and outer: `u`, `w` dirichlet (zero); every other variable neumann (zero gradient) |
 | `lateral = "walls"`, cylindrical (the only choice) | inner (axis): `u`, `v` dirichlet; every other variable, `w` included, neumann. outer (wall): `u` dirichlet; every other variable, `v` and `w` included, neumann |
 | `lateral = "periodic"` (XZ, single patch only) | inner and outer: periodic on every variable |
+| `lateral = "walls"`, RRR (the 3-D box) | inner and outer (the x faces): `u`, `w` dirichlet; down and up (the y faces): `v`, `w` dirichlet; every other variable neumann |
+| `lateral = "periodic"`, RRR | all four faces: periodic on every variable |
 | `vertical_scalars = "d2"` | bottom of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
 | `vertical_scalars = "natural"` | bottom of every variable: natural (unconstrained); then the rules below |
 | `vertical_scalars = "neumann"` | bottom of every variable: neumann; then the rules below |
@@ -448,10 +454,11 @@ does, exactly:
 nu_r = { top = "dirichlet" }            # or a [boundary_conditions.override.nu_r] table
 ```
 
-Sides: `inner`, `outer`, `bottom`, `top`. Values: `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic`, `r1t1x`.
+Sides: `inner`, `outer`, `bottom`, `top`, `down`, `up`. Values: `natural`, `dirichlet`, `neumann`, `second_derivative`, `periodic`, `r1t1x`.
 The variable must be one the run has (an error lists them); `inner`/`outer` act on the
 domain's own edges (the first patch's inner side, the last patch's outer side), never on a
-nest interface, and are refused under `lateral = "periodic"`.
+nest interface, and are refused under `lateral = "periodic"`; so are `down`/`up`, which
+exist on RRR only.
 
 Every run writes the resolved table to `<output.dir>/boundary_conditions.toml` (one
 `[[patch]]` per patch, one `[[patch.variable]]` per variable) and prints its compact

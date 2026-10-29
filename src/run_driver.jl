@@ -526,6 +526,21 @@ function preflight_checks(cfg::RunConfig)
     println("  Springsteel      : required symbols present")
     validate(cfg)
     println("  config           : validates")
+    # The 3-D box builds (build_model, initialize_case!, the column tendencies) but cannot be
+    # TIME-STEPPED until the RRR tile halo / shared-array methods exist: `advanceTimestep`
+    # calls `extract_halo_values` / `write_tile_to_shared!` on every step, even on one
+    # worker, and RRR would fall to the generic (RiRk/RL-layout) method and exchange the
+    # wrong coefficients silently. Refused here, by method lookup, so the refusal lifts by
+    # itself when those methods land (close-out plan Stream C2, stage R2c).
+    if cfg.grid.geometry == "RRR" &&
+       which(extract_halo_values, Tuple{RRR_Grid}).sig ==
+       Tuple{typeof(extract_halo_values), AbstractGrid}
+        error("preflight: grid.geometry = \"RRR\" cannot be time-stepped yet: there is no " *
+              "RRR method of extract_halo_values / write_tile_to_shared! (src/semiimplicit.jl; " *
+              "close-out plan stage R2c), and the generic method would exchange the wrong " *
+              "spectral coefficients. build_model and initialize_case! work; run_simulation " *
+              "does not")
+    end
     if cfg.physics.radiation.scheme === :rrtmgp
         missing_artifacts = String[]
         for optics_type in (:gas, :cloud), lam in (:lw, :sw)
