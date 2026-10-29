@@ -41,7 +41,12 @@ else
     # Only single-segment runs are covered: build_model(cfg) with no segment override
     # targets seg_01, which is the run's only (and therefore final) segment here.
     owb = joinpath(@__DIR__, "..", "..", "benchmarks", "ocean_warm_bubble.jl")
-    if !isfile(owb)
+    if cfg.run.equation_set != "moist_compressible_XZ"
+        # owb_diagnostics reads the XZ slice layout; the cylinder/3-D example configs
+        # (examples/) are compared by examples/owb3d_compare.jl instead.
+        println("\nScythe: equation_set = $(cfg.run.equation_set) -- skipping the XZ OWB " *
+                "diagnostics table (examples/owb3d_compare.jl compares the cylinder runs)")
+    elseif !isfile(owb)
         println("\nScythe: benchmarks/ocean_warm_bubble.jl not found relative to this " *
                 "script -- skipping the OWB diagnostics table")
     elseif cfg.run.segment_length == 0.0
