@@ -689,6 +689,14 @@ function build_positivity(cfg::RunConfig, options)
     cfg.numerics.positivity === :off && return pos
     name = rain_var_name(options)
     name == "rho_r" || return pos
+    # Springsteel's RRR constructor installs no positivity bound (only the RiRk one applies
+    # `gp.positivity`), and Scythe's reference-aware bound installer indexes the 2-D basis
+    # layout: a bound here would be dropped silently. Refused until both carry it.
+    cfg.grid.geometry == "RRR" && error(
+        "config: numerics.positivity = \"auto\" would bound the untransformed rain slot " *
+        "rho_r, and the RRR box carries no positivity bounds yet (Springsteel's RRR grid " *
+        "constructor drops gp.positivity). Use a transformed rain slot " *
+        "(physics.microphysics.rain_transform, the default) or numerics.positivity = \"off\"")
     walls = EQUATION_SETS[cfg.run.equation_set].cyl || cfg.boundary_conditions.lateral === :walls
     pos[name] = walls ? Dict(:i => 0.0, :k => 0.0) : Dict(:k => 0.0)
     return pos

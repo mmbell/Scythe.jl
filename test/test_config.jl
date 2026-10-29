@@ -561,6 +561,12 @@ end
         m = bm("boundary_conditions.lateral=periodic", "boundary_conditions.override.p.down=natural")
         @test occursin("periodic", m) && occursin("override.p.down", m)
 
+        # An untransformed rain slot would get a positivity bound the RRR grid drops: refused.
+        m = bm("physics.microphysics.rain_transform=none")
+        @test occursin("positivity", m) && occursin("RRR", m)
+        @test build_model(cf("physics.microphysics.rain_transform=none",
+                             "numerics.positivity=off")) isa ModelParameters
+
         # ── the build: one patch, all four lateral faces, v (slot 10) carried
         model = build_model(cfg)
         gp = model.grid_params
@@ -602,15 +608,10 @@ end
         @test only(filter(x -> x["name"] == "v", TOML.parsefile(f1)["patch"][1]["variable"]))["up"] == "dirichlet"
         @test occursin("down|up", sprint(Scythe.print_boundary_conditions, t))
 
-        # Until the RRR halo/tile methods exist (stage R2c) the box builds but is refused at
-        # the run's preflight, by method lookup, rather than stepped through the generic
-        # (wrong-layout) exchange.
-        m = errmsg(() -> redirect_stdout(devnull) do
-            Scythe.preflight_checks(cfg)
-        end)
-        @test occursin("RRR", m) && occursin("R2c", m)
+        # The run's preflight accepts the box (stage R2c added the RRR halo/tile methods
+        # whose absence it used to refuse).
         @test redirect_stdout(devnull) do
-            Scythe.preflight_checks(load_config(set = ["output.dir=$(dir)", "physics.radiation.scheme=none"]))
+            Scythe.preflight_checks(cfg)
         end === nothing
 
         # ── the initial condition: a sphere-like bubble centred at (xc, yc, zc)

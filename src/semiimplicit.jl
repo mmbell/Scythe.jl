@@ -400,8 +400,21 @@ _allocate_scratch_columns(::NoBasisArray, tile::AbstractGrid) = Matrix{Nothing}(
 function _allocate_scratch_columns(kbasis, tile::AbstractGrid)
     nthreads = Threads.maxthreadid()
     nvars = size(tile.physical, 2)
-    return [deepcopy(kbasis.data[v]) for _ in 1:nthreads, v in 1:nvars]
+    return [deepcopy(_kbasis_column(kbasis, v)) for _ in 1:nthreads, v in 1:nvars]
 end
+
+"""
+    _kbasis_column(kbasis, v) -> the vertical basis object of variable `v`
+
+Every geometry but one carries ONE k spline (or Chebyshev column) per variable,
+`kbasis.data[v]`. The 3-D Cartesian box (RRR) carries one per (i, j) column,
+`kbasis.data[r, l, v]`, all with the variable's own parameters (the vertical is never
+decomposed), so its template is `data[1, 1, v]` -- the linear index `data[v]` would be
+column `(v, 1)` of variable 1 there.
+"""
+@inline _kbasis_column(kbasis, v::Integer) = _kbasis_column_data(kbasis.data, v)
+@inline _kbasis_column_data(data::AbstractArray{<:Any,3}, v::Integer) = data[1, 1, v]
+@inline _kbasis_column_data(data, v::Integer) = data[v]
 
 """
     _allocate_flux_columns(kbasis, tile, scratch_columns) -> Matrix
@@ -434,7 +447,7 @@ function _allocate_flux_columns(kbasis, tile::AbstractGrid, scratch)
     nthreads, nvars = size(scratch)
     if eltype(scratch) <: CubicBSpline.Spline1D
         # A periodic vertical (no mc set has one) has no lid to close: keep that basis.
-        lid = [let p = kbasis.data[v].params
+        lid = [let p = _kbasis_column(kbasis, v).params
                    p.BCL == CubicBSpline.PERIODIC ? p :
                    CubicBSpline.SplineParameters(xmin = p.xmin, xmax = p.xmax,
                        num_cells = p.num_cells, mubar = p.mubar, quadrature = p.quadrature,
@@ -944,6 +957,31 @@ function extract_halo_values(tile::Union{RLZ_Grid, RLR_Grid})
     return result
 end
 
+"""
+    extract_halo_values(tile::RRR_Grid)
+
+The 3-D Cartesian box stores `b_jDim*b_kDim` consecutive i-blocks of `b_iDim` rows (block
+`q = (z-1)*b_jDim + l` holds the i-direction coefficients of j-mode `l` and k-mode `z`;
+Springsteel transforms_cartesian.jl), so the 3-row right halo is the end of every block,
+in ascending block order -- the RiRk extraction with `b_kDim` blocks replaced by
+`b_jDim*b_kDim`, matching the column-major sparse indices of the RRR `calcHaloMap`.
+"""
+function extract_halo_values(tile::RRR_Grid)
+    b_iDim = tile.params.b_iDim
+    nblk = tile.params.b_jDim * tile.params.b_kDim
+    nvars = size(tile.spectral, 2)
+    result = zeros(Float64, 3 * nvars * nblk)
+    pos = 1
+    for v in 1:nvars
+        for q in 1:nblk
+            te = q * b_iDim   # last row of block q
+            result[pos:pos+2] .= tile.spectral[te-2:te, v]
+            pos += 3
+        end
+    end
+    return result
+end
+
 """Accumulate (add) spectral values at sparse map locations in a patch-sized array."""
 function accumulate_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
     idx = sparse_indices(map)
@@ -1001,6 +1039,28 @@ function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union
     for z in 1:b_kDim
         pp1 = (z - 1) * b_iDim_patch + siL
         tp1 = (z - 1) * b_iDim_tile + 1
+        sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
+    end
+end
+
+"""
+    write_tile_to_shared!(sharedSpectral, tile::RRR_Grid, b_iDim_patch)
+
+The 3-D Cartesian box: `b_jDim*b_kDim` i-blocks (see `extract_halo_values(::RRR_Grid)`);
+copy the inner rows of every block to its patch position. The box is decomposed in i
+only, so the tile and the patch share `b_jDim` and `b_kDim` and the patch block stride is
+`b_iDim_patch`.
+"""
+function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::RRR_Grid,
+                                b_iDim_patch::Int64)
+    siL = tile.params.spectralIndexL
+    b_iDim_tile = tile.params.b_iDim
+    nblk = tile.params.b_jDim * tile.params.b_kDim
+    inner_rows = b_iDim_tile - 4  # inner region excludes 3-row halo
+
+    for q in 1:nblk
+        pp1 = (q - 1) * b_iDim_patch + siL
+        tp1 = (q - 1) * b_iDim_tile + 1
         sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
     end
 end

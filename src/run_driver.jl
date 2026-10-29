@@ -526,21 +526,15 @@ function preflight_checks(cfg::RunConfig)
     println("  Springsteel      : required symbols present")
     validate(cfg)
     println("  config           : validates")
-    # The 3-D box builds (build_model, initialize_case!, the column tendencies) but cannot be
-    # TIME-STEPPED until the RRR tile halo / shared-array methods exist: `advanceTimestep`
-    # calls `extract_halo_values` / `write_tile_to_shared!` on every step, even on one
-    # worker, and RRR would fall to the generic (RiRk/RL-layout) method and exchange the
-    # wrong coefficients silently. Refused here, by method lookup, so the refusal lifts by
-    # itself when those methods land (close-out plan Stream C2, stage R2c).
-    if cfg.grid.geometry == "RRR" &&
-       which(extract_halo_values, Tuple{RRR_Grid}).sig ==
-       Tuple{typeof(extract_halo_values), AbstractGrid}
-        error("preflight: grid.geometry = \"RRR\" cannot be time-stepped yet: there is no " *
-              "RRR method of extract_halo_values / write_tile_to_shared! (src/semiimplicit.jl; " *
-              "close-out plan stage R2c), and the generic method would exchange the wrong " *
-              "spectral coefficients. build_model and initialize_case! work; run_simulation " *
-              "does not")
-    end
+    # The 3-D box steps through Springsteel's RRR i-tiling methods (calcPatchMap /
+    # calcHaloMap / splineTransform! / tileTransform! on RRR, close-out stage R2c); an older
+    # Springsteel would fall to the generic first-block maps. Refused by method lookup.
+    cfg.grid.geometry == "RRR" &&
+        !hasmethod(Springsteel.tileTransform!,
+                   Tuple{SharedArray{Float64}, RRR_Grid, Array{Float64}, Array{Float64}}) &&
+        error("preflight: grid.geometry = \"RRR\" needs a Springsteel with the RRR i-tiling " *
+              "methods (tileTransform!/splineTransform!/calcPatchMap/calcHaloMap on RRR_Grid); " *
+              "$(pkgdir(Springsteel)) has none")
     if cfg.physics.radiation.scheme === :rrtmgp
         missing_artifacts = String[]
         for optics_type in (:gas, :cloud), lam in (:lw, :sw)
