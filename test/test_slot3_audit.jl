@@ -140,6 +140,8 @@ const SLOT3_ALLOWLIST = [
     ("src/mc_boundary_layer.jl", "expdot[j, 7] += real_v - (S.drvs_dT[i] * dT_v) - (S.drvs_dp[i] * (dp_v + dp_q))", 1),
     ("src/mc_boundary_layer.jl", "expdot[j, 8] += nrr", 1),
     ("src/mc_boundary_layer.jl", "expdot[j, 9] += ncc", 1),
+    # src/mc_driver_stages.jl: the fixed MC layout (Q_ss 7), the ETD pre-compute moved out of mc_driver!
+    ("src/mc_driver_stages.jl", "n0 = expdot[g, 7]", 1),
     # src/mc_geometry.jl: the fixed MC layout (u 4, w 5, E_t 6, v 10); derivative plane 3 (d2/dx2) of a named var
     ("src/mc_geometry.jl", "@. expdot[colstart:colend, 10] += (pp_l / r) / rho_tbar", 1),
     ("src/mc_geometry.jl", "@turbo diffdot[colstart:colend, 10] .= @. Kvdiff * v_zz", 1),
@@ -197,7 +199,6 @@ const SLOT3_ALLOWLIST = [
     ("src/moist_compressible.jl", "mc_donor_census!(stx, tid_x, MC_DONOR_I3, max(-MLQ[3], 0.0) - qagg3 * i_dt, q3,", 1),
     ("src/moist_compressible.jl", "min(f_nr * r3.dNfzri, (RfzQ[3] + IfzQ[3]) / ISHMAEL_M_MIN))", 1),
     ("src/moist_compressible.jl", "min_r = minimum(view(st, 3, :)),", 1),
-    ("src/moist_compressible.jl", "n0 = expdot[g, 7]", 1),
     ("src/moist_compressible.jl", "nIfz_in = target == 1 ? (FzN[2] + FzN[3]) : (FzN[1] + FzN[3])", 1),
     ("src/moist_compressible.jl", "n_i != 0.0 && (expdot[colstart + i - 1, 7] += n_i)", 1),
     ("src/moist_compressible.jl", "prof[:, 3] .= Ixxtransform(column)", 1),
