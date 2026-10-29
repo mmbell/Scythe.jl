@@ -608,11 +608,23 @@ end
         @test only(filter(x -> x["name"] == "v", TOML.parsefile(f1)["patch"][1]["variable"]))["up"] == "dirichlet"
         @test occursin("down|up", sprint(Scythe.print_boundary_conditions, t))
 
-        # The run's preflight accepts the box (stage R2c added the RRR halo/tile methods
-        # whose absence it used to refuse).
-        @test redirect_stdout(devnull) do
-            Scythe.preflight_checks(cfg)
-        end === nothing
+        # The run's preflight accepts the box once Springsteel carries the RRR i-tiling
+        # methods (stage R2c, Springsteel rrr/halo d74ea56; the R2a refusal by
+        # extract_halo_values lookup is gone) and refuses it, naming Springsteel, with one
+        # that does not -- the same hasmethod lookup, so a stale Springsteel never steps the
+        # box through the generic first-block maps.
+        rrr_tiling = hasmethod(Scythe.Springsteel.tileTransform!,
+            Tuple{Scythe.SharedArray{Float64}, Scythe.RRR_Grid, Array{Float64}, Array{Float64}})
+        if rrr_tiling
+            @test redirect_stdout(devnull) do
+                Scythe.preflight_checks(cfg)
+            end === nothing
+        else
+            m = errmsg(() -> redirect_stdout(devnull) do
+                Scythe.preflight_checks(cfg)
+            end)
+            @test occursin("RRR", m) && occursin("Springsteel", m) && occursin("tileTransform!", m)
+        end
 
         # ── the initial condition: a sphere-like bubble centred at (xc, yc, zc)
         _, topo = Scythe.initialize_case!(cfg, model)
