@@ -69,14 +69,16 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
                         l_inf = 80.0, lapse = 0.004, Ck = 1.0e-3,
                         fidelity = :fortran, sfc_stability = false, trace = false,
                         extra_options = Dict{Symbol,Any}(),
-                        extra_params = Dict{Symbol,Any}())
+                        extra_params = Dict{Symbol,Any}(),
+                        output_dir = nothing, initial_conditions = nothing)
     opts_names = Dict{Symbol,Any}(:condensate_transform => ctrans,
                                   :rain_transform => rtrans)
     mynn && (opts_names[:mynn] = true)
     # The TKE control variable renames the slot (`rho_e` -> `nu_e`), so the name list has to
     # see it; every other extra option leaves the names alone.
-    haskey(extra_options, :tke_transform) &&
-        (opts_names[:tke_transform] = extra_options[:tke_transform])
+    for key in (:tke_transform, :vapor_transform)
+        haskey(extra_options, key) && (opts_names[key] = extra_options[key])
+    end
     varlist = Scythe.mc_var_names(opts_names; cyl = false)
     rain_name = Scythe.rain_var_name(opts_names)
     vars = Dict(v => i for (i, v) in enumerate(varlist))
@@ -139,7 +141,10 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
         options[:mynn_output] = false
     end
     merge!(options, extra_options)
-    model = ModelParameters(
+    # (output_dir / initial_conditions only when asked for: the checkpoint tests)
+    io_kw = (; (output_dir === nothing ? (;) : (; output_dir))...,
+               (initial_conditions === nothing ? (;) : (; initial_conditions))...)
+    model = ModelParameters(; io_kw...,
         ts = ts, integration_time = 10.0 * ts, output_interval = 10.0 * ts,
         equation_set = "moist_compressible_XZ",
         ref_state_file = ref_file, grid_params = gp,

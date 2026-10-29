@@ -318,7 +318,7 @@ vertical mixing and the surface layer underneath it.
 | `mynn_init` | string (enum) | `"taper"` | TKE initialisation: `taper` or `zero`. |
 | `K_max` | float | `inf` | counted safety cap on the MYNN exchange coefficient [m²/s]; `inf` = none. |
 | `l_inf` | float | `80.0` | Louis asymptotic mixing length [m] (louis only). |
-| `tke_transform` | string (enum) | `"none"` | the MYNN TKE slot's control variable (mynn only): `none` (the slot is the density `rho_e`) or `bhyp` (the slot is `nu_e = bhyp(rho_e)`, renamed; every reader sees `ahyp(nu_e) >= 0`). |
+| `tke_transform` | string (enum) | `"none"` | the MYNN TKE slot's control variable (read under `scheme = "mynn"` only): `none` (the slot is the density `rho_e`) or `bhyp` (the slot is `nu_e = bhyp(rho_e)`, renamed; every reader sees `ahyp(nu_e) >= 0`). |
 | `tke_mu` | float | `1.0e-7` | bhyp width for the TKE [J/m³]; refused above 1e-2 of the closure floor `rho_t QKEMIN/2` below 6 km. |
 
 ### `[physics.surface]`

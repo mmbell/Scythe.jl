@@ -1076,12 +1076,20 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         # A density-vapor checkpoint into a vapor-control-variable model: converted below. A
         # PRE-STAGE-4 checkpoint (slot 3 the prognostic rho_t) is refused there, naming the
         # converter (src/checkpoint_conversion.jl).
-        vconv = vapor_checkpoint_conversion(loaded.params.vars, patch.params.vars,
+        # A density-TKE checkpoint into a TKE-control-variable model (`"rho_e"` in the file,
+        # `"nu_e"` in the model): renamed here so the vapor's check sees the rest of the map,
+        # converted below; both conversions may apply to one archive.
+        econv = tke_checkpoint_conversion(loaded.params.vars, patch.params.vars,
+                                          model.initial_conditions)
+        vars_f = econv > 0 ?
+            Dict{String,Int}((k == "rho_e" ? "nu_e" : k) => v for (k, v) in loaded.params.vars) :
+            loaded.params.vars
+        vconv = vapor_checkpoint_conversion(vars_f, patch.params.vars,
                                             model.initial_conditions)
         (typeof(loaded) == typeof(patch) &&
          size(loaded.spectral) == size(patch.spectral) &&
          size(loaded.physical) == size(patch.physical) &&
-         (vconv > 0 || loaded.params.vars == patch.params.vars)) || error(
+         (vconv > 0 || vars_f == patch.params.vars)) || error(
             "restart archive $(model.initial_conditions) is not compatible with the " *
             "configured grid_params (geometry/size/vars mismatch): archive is " *
             "$(typeof(loaded)) spectral $(size(loaded.spectral)), grid is " *
@@ -1096,6 +1104,7 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
         # wall anchor reads the vapor slot as nu_v (the derived rho_t' of the model's own
         # convention), so it must never see an unconverted density there.
         vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
+        econv > 0 && convert_tke_checkpoint!(patch, model, econv)
         if mc_wall_bc_active(patch)
             update_mc_wall_bc!(patch, patch.physical; anchor = _mc_wall_anchor(model))
             gridTransform!(patch)
@@ -1103,6 +1112,7 @@ function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
     else
         _check_csv_layout(model.initial_conditions, patch.params.vars)
         _check_csv_vapor_name(model.initial_conditions, patch.params.vars)
+        _check_csv_tke_name(model.initial_conditions, patch.params.vars)
         read_physical_grid(model.initial_conditions, patch)
         spectralTransform!(patch)
         gridTransform!(patch)

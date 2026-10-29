@@ -483,6 +483,93 @@ function convert_vapor_checkpoint!(patch::AbstractGrid, model::ModelParameters, 
     return patch
 end
 
+# ── The TKE conversion (on load): a density-TKE archive into a TKE-control-variable model ──
+
+"""
+    tke_slot_from_density!(slot, mu) -> Int
+
+The pointwise map of [`convert_tke_checkpoint!`](@ref), in place on the TKE slot column:
+`slot ← B(ρ_e)`, `B = bhyp(·; μ_e)` for `ρ_e ≥ 0` and the odd continuation `−bhyp(−ρ_e)` below
+([`vapor_control`](@ref), the inverse of `ahyp_signed`; `ρ̄_e ≡ 0`, so there is no reference to
+subtract). Returns the number of negative densities met — the archived lobe, which enters as
+`ν_e < 0` (`2ν ≈ ρ`, recovered 0) rather than being dropped.
+"""
+function tke_slot_from_density!(slot::AbstractVector{Float64}, mu::Float64)
+    nneg = 0
+    @inbounds for g in eachindex(slot)
+        rho = slot[g]
+        rho < 0.0 && (nneg += 1)
+        slot[g] = vapor_control(rho, mu)
+    end
+    return nneg
+end
+
+"""
+    tke_checkpoint_conversion(vars_file, vars_model, path) -> Int
+
+The TKE slot index to convert when a checkpoint carries the MYNN TKE DENSITY `"rho_e"`
+(written under `tke_transform = :none`) where the model carries the control variable `"nu_e"`
+(`:bhyp`), at the same index; `0` otherwise. Only the TKE pair is looked at — the caller renames
+it and lets [`vapor_checkpoint_conversion`](@ref) and the compatibility check judge the rest, so
+a density-vapor, density-TKE archive takes BOTH conversions. Refused by name: a `"nu_e"`
+checkpoint read into a density-TKE model (the clipped `ahyp` has no inverse where the recovered
+TKE is 0).
+"""
+function tke_checkpoint_conversion(vars_file, vars_model, path)
+    if haskey(vars_file, "nu_e") && haskey(vars_model, "rho_e")
+        error("restart archive $(path) carries the MYNN TKE CONTROL variable \"nu_e\" " *
+              "(written under options[:tke_transform] = :bhyp), but this model runs the TKE " *
+              "density \"rho_e\" (tke_transform = :none). There is no conversion in that " *
+              "direction (ahyp is clipped at 0); run with tke_transform = :bhyp.")
+    end
+    (haskey(vars_file, "rho_e") && haskey(vars_model, "nu_e") &&
+     vars_file["rho_e"] == vars_model["nu_e"]) || return 0
+    return vars_model["nu_e"]
+end
+
+"""
+    convert_tke_checkpoint!(patch, model, ie)
+
+Convert the density-TKE slot `ie` of a just-loaded checkpoint (`patch.physical` regenerated
+from the archive's coefficients) to the TKE control variable of `model`
+(`options[:tke_transform] = :bhyp`, width `physical_params[:tke_mu]`) by
+[`tke_slot_from_density!`](@ref). Only the TKE slot is refit; every other slot keeps its
+coefficients bit for bit (the archive's, or the vapor conversion's when that ran first). The
+negative points of the archive are counted and reported.
+"""
+function convert_tke_checkpoint!(patch::AbstractGrid, model::ModelParameters, ie::Int)
+    mu = tke_mu(model.physical_params)
+    saved = copy(patch.spectral)
+    nneg = tke_slot_from_density!(view(patch.physical, :, ie, 1), mu)
+    spectralTransform!(patch)
+    for v in axes(patch.spectral, 2)
+        v == ie && continue
+        patch.spectral[:, v] .= view(saved, :, v)
+    end
+    gridTransform!(patch)
+    println("Scythe: converted the density-TKE checkpoint $(model.initial_conditions) to " *
+            "the TKE control variable nu_e (mu_e = $(mu) J/m^3): $(nneg) of " *
+            "$(size(patch.physical, 1)) points carried negative TKE and enter as nu_e < 0.")
+    return patch
+end
+
+"""
+    _check_csv_tke_name(path, vars)
+
+The TKE's [`_check_csv_vapor_name`](@ref): a CSV initial condition with a density-TKE column
+`"rho_e"` cannot initialize a TKE-control-variable model (`"nu_e"`); refused with the reason
+(a CSV is not converted).
+"""
+function _check_csv_tke_name(path, vars)
+    (haskey(vars, "nu_e") && isfile(path)) || return nothing
+    header = split(strip(first(eachline(path))), ',')
+    ("rho_e" in header && !("nu_e" in header)) || return nothing
+    error("initial-condition CSV $(path) carries the MYNN TKE DENSITY column \"rho_e\", but " *
+          "this model carries the TKE control variable \"nu_e\" (options[:tke_transform] = " *
+          ":bhyp, physics.boundary_layer.tke_transform). A CSV is not converted: run with " *
+          "tke_transform = :none, or regenerate the initial condition under :bhyp.")
+end
+
 """
     _check_csv_layout(path, vars)
 

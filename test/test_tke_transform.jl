@@ -213,9 +213,11 @@ end
         @test p1[:tke_mu] == 5.0e-8
         @test_throws ErrorException Scythe.load_config(
             set = ["physics.boundary_layer.tke_transform=bhyp_smooth"])
-        @test_throws ErrorException Scythe.validate(Scythe.load_config(
+        # read under scheme = "mynn" only (a Louis run carries no TKE slot): not written
+        ol, _ = Scythe.build_physics(Scythe.load_config(
             set = ["physics.boundary_layer.tke_transform=bhyp",
                    "physics.boundary_layer.scheme=louis"]))
+        @test !haskey(ol, :tke_transform)
         @test_throws ErrorException Scythe.validate(Scythe.load_config(
             set = ["physics.boundary_layer.tke_transform=bhyp",
                    "physics.boundary_layer.tke_mu=0.0"]))
@@ -430,6 +432,114 @@ end
             # dispatch allocates one object under :none too)
             Scythe.moist_compressible_XZ(m, 1, kDim, 2)
             @test (@allocations Scythe.moist_compressible_XZ(m, 1, kDim, 3)) == 0
+        end
+    end
+
+    # ══ E3. checkpoint conversion ══════════════════════════════════════════════════════
+    @testset "E3: a density-TKE checkpoint converts on load into a :bhyp model" begin
+        mktempdir() do tmp
+            d0 = joinpath(tmp, "a") * "/"
+            m0, p0, mo0, gp, z, col = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
+                                                       output_dir = d0)
+            kDim = gp.kDim
+            M.set_state!(p0, mo0, kDim, z, col; W0 = 0.3)
+            re0 = mo0.grid_params.vars["rho_e"]
+            _tke_seed_lobe!(p0, re0, z, kDim; amp = 0.5)       # a negative TKE region
+            Scythe.write_restart(p0, mo0, 0.0)
+            path = Scythe.checkpoint_path(d0, 0.0)
+            @test isfile(path)
+            # the same configuration under :bhyp, initialised from that file
+            m1, p1, mo1, _, _, _ = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
+                extra_options = E(:tke_transform => :bhyp), initial_conditions = path)
+            V0 = mo0.grid_params.vars; V1 = mo1.grid_params.vars
+            @test Scythe.tke_checkpoint_conversion(V0, V1, path) == V1["nu_e"]
+            @test Scythe.tke_checkpoint_conversion(V0, V0, path) == 0
+            patch = createGrid(mo1.grid_params)
+            out = _tke_capture(() -> Scythe.load_initial_conditions!(patch, mo1))
+            re1 = V1["nu_e"]
+            @test re0 == re1
+            # every other slot is the checkpoint's own fit, bitwise
+            for v in 1:length(V1)
+                v == re1 && continue
+                @test patch.spectral[:, v] == p0.spectral[:, v]
+            end
+            # the pointwise map: bhyp(rho) where rho >= 0, -bhyp(-rho) below (counted)
+            col0 = copy(p0.physical[:, re0, 1])
+            nneg0 = count(<(0.0), col0)
+            @test nneg0 > 0 && count(>(0.0), col0) > 0
+            want = copy(col0)
+            nn = Scythe.tke_slot_from_density!(want, EMU)
+            @test nn == nneg0
+            for g in eachindex(col0)
+                @test want[g] === Scythe.vapor_control(col0[g], EMU)
+            end
+            @test occursin("$(nneg0) of", out)
+            # ... refit: the slot is the fit of that map, so the recovered TKE is the
+            # archive's positive part to the refit (the lobe enters as nu_e < 0, recovered 0)
+            nu1 = patch.physical[:, re1, 1]
+            gfit = createGrid(mo1.grid_params)
+            gfit.physical[:, re1, 1] .= want
+            spectralTransform!(gfit); gridTransform!(gfit)
+            @test nu1 ≈ gfit.physical[:, re1, 1] rtol = 1.0e-13
+            @test count(<(0.0), nu1) > 0
+            # the reverse direction is refused by name
+            d1 = joinpath(tmp, "b") * "/"
+            m2, p2, mo2, _, _, _ = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
+                extra_options = E(:tke_transform => :bhyp), output_dir = d1)
+            Scythe.write_restart(p2, mo2, 0.0)
+            m3, p3, mo3, _, _, _ = M.make_mynn_tile(tmp; num_cells_k = 25, kMax = 5.0e3,
+                initial_conditions = Scythe.checkpoint_path(d1, 0.0))
+            msg = try
+                Scythe.load_initial_conditions!(createGrid(mo3.grid_params), mo3); ""
+            catch err
+                sprint(showerror, err)
+            end
+            @test occursin("nu_e", msg)
+        end
+        # BOTH conversions on one archive: a density-vapor, density-TKE checkpoint into a model
+        # with both control variables (the vapor fixture's moist column; the MYNN fixture's is
+        # dry, which the vapor transform refuses)
+        mktempdir() do tmp
+            xo = E(:mynn => true, :mynn_trace => false, :mynn_output => false,
+                   :mynn_init => :zero)
+            d0 = joinpath(tmp, "v") * "/"
+            seed_e! = function (p, x, V, c)
+                F.vt_seed_vapor!(p, x, V, c)                # a vapor bump to convert too
+                re = Scythe.mc_slot(V, "rho_e")
+                for i in axes(p.physical, 1)
+                    zz = x[i, end]
+                    p.physical[i, re, 1] = 0.3 * exp(-zz / 1500.0) -
+                                           0.5 * exp(-((zz - 3500.0) / 300.0)^2)
+                end
+                spectralTransform!(p); gridTransform!(p)
+            end
+            m0, p0, mo0 = F.vt_tile(tmp, "both0"; vtr = :none, extra = xo, output_dir = d0,
+                                    seed! = seed_e!)
+            Scythe.write_restart(p0, mo0, 0.0)
+            path = Scythe.checkpoint_path(d0, 0.0)
+            m4, p4, mo4 = F.vt_tile(tmp, "both1"; vtr = :bhyp,
+                                    extra = merge(xo, E(:tke_transform => :bhyp)),
+                                    initial_conditions = path)
+            V0 = mo0.grid_params.vars; V4 = mo4.grid_params.vars
+            @test haskey(V4, "nu_v") && haskey(V4, "nu_e")
+            @test Scythe.tke_checkpoint_conversion(V0, V4, path) == V4["nu_e"]
+            patch4 = createGrid(mo4.grid_params)
+            out4 = _tke_capture(() -> Scythe.load_initial_conditions!(patch4, mo4))
+            @test occursin("to the vapor control variable nu_v", out4)
+            @test occursin("to the TKE control variable nu_e", out4)
+            want = copy(p0.physical[:, V0["rho_e"], 1])
+            @test count(<(0.0), want) > 0
+            Scythe.tke_slot_from_density!(want, EMU)
+            gfit = createGrid(mo4.grid_params)
+            gfit.physical[:, V4["nu_e"], 1] .= want
+            spectralTransform!(gfit); gridTransform!(gfit)
+            @test patch4.physical[:, V4["nu_e"], 1] ≈ gfit.physical[:, V4["nu_e"], 1] rtol = 1.0e-13
+            # the vapor was converted too (its slot differs from the archive's density)
+            @test patch4.spectral[:, V4["nu_v"]] != p0.spectral[:, V0["rho_v"]]
+            for v in 1:length(V4)
+                (v == V4["nu_e"] || v == V4["nu_v"]) && continue
+                @test patch4.spectral[:, v] == p0.spectral[:, v]
+            end
         end
     end
 end

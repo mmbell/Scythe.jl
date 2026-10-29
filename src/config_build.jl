@@ -96,10 +96,8 @@ function validate(cfg::RunConfig)
         "l_q_vertical = 0 (numerics.l_q then filters the horizontal spline only)")
 
     # ── physics pairings
-    (bl.tke_transform !== :none && bl.scheme !== :mynn) && error(
-        "config: physics.boundary_layer.tke_transform = \"$(bl.tke_transform)\" is the MYNN " *
-        "TKE slot's control variable, but physics.boundary_layer.scheme = \"$(bl.scheme)\" " *
-        "carries no TKE; set tke_transform = \"none\" or scheme = \"mynn\"")
+    # (`tke_transform` is read under scheme = "mynn" only, like the other mynn_* keys: a
+    # Louis or no-BL run carries no TKE slot and the key is not written.)
     (isfinite(bl.tke_mu) && bl.tke_mu > 0.0) || error(
         "config: physics.boundary_layer.tke_mu = $(bl.tke_mu) must be positive and finite " *
         "(1e-7 J/m^3 is the measured width)")
