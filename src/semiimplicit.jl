@@ -777,6 +777,15 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         # ...and the energy budget (src/energy_budget.jl, the same reason again).
         mc_energy_budget(model, tile, tilepoints, ref_state, ref_diag_full),
         mc_species_columns(model, tile, ref_diag_full))
+    # The TKE control variable's width against the closure floor of THIS tile's reference
+    # (`validate_tke_mu`, moist_compressible.jl; a no-op unless MYNN runs `tke_transform =
+    # :bhyp`), once per tile, with the derived ρ̄_t the closure's ρ_t is formed against.
+    if mtile.mynn.active
+        kD = model.grid_params.kDim
+        validate_tke_mu(model.options, model.physical_params,
+                        view(tilepoints, 1:kD, size(tilepoints, 2)),
+                        view(mc_rho_tbar_ref(mtile), :, 1))
+    end
     return mtile
 end
 
@@ -2634,21 +2643,29 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
         # The MYNN TKE density, when the run carries it: the minimum of the CARRIED slot
         # (negative lobes are counted, never repaired) with its location and the number of
         # negative points.
+        # Under the TKE control variable (`tke_transform = :bhyp`) the minimum is that of the
+        # RECOVERED density (what every reader takes, >= 0) and the negative points are the
+        # slot's `nu_e < 0`, with the slot's own minimum beside them.
         re = slots.rho_e
         if re > 0
             rev = view(phys, :, re, 1)
-            emin = Inf; emin_i = 1; nneg = 0
+            etr = mtile.mynn.tke_transform
+            emu = mtile.mynn.tke_mu
+            emin = Inf; emin_i = 1; nneg = 0; smin = Inf
             @inbounds for i in eachindex(rev)
                 x = rev[i]
                 x < 0.0 && (nneg += 1)
-                if x < emin
-                    emin = x
+                x < smin && (smin = x)
+                xr = recover_rho_e(x, etr, emu)
+                if xr < emin
+                    emin = xr
                     emin_i = i
                 end
             end
             println("  rho_e trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
                     "min rho_e=$(round(emin; sigdigits=4)) J/m^3 at $(loc(emin_i)); " *
-                    "rho_e<0 points=$(nneg)")
+                    (etr === :none ? "rho_e<0 points=$(nneg)" :
+                     "nu_e<0 points=$(nneg) (min nu_e=$(round(smin; sigdigits=4)))"))
         end
     end
     return nothing

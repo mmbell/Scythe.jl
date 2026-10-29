@@ -363,7 +363,17 @@ handling to copy.
     work = MY.work[Threads.threadid()]
     MN = MY.colscratch[Threads.threadid()]
     rho_t = S.rho_t
-    rho_e = rev.f
+    # THE TKE THE CLOSURE READS, staged on the tile's species columns (`_tke_stage!`): a
+    # bitwise copy of the slot with `J_e ≡ 1.0` under `tke_transform = :none`, the recovered
+    # `ahyp(ν_e) ≥ 0` and its Jacobian under `:bhyp`. Every reader below (the closure
+    # inputs, the clamp, the taper seed, the TKE transport, the dissipation) takes `rho_e`;
+    # every TKE-slot increment is multiplied by `J_e`; `rev.f` stays the RAW slot.
+    re_i = mtile.mc_slots.rho_e
+    tid = Threads.threadid()
+    rho_e = @inbounds mtile.species.rho[re_i, tid]
+    J_e = jacobian_column(mtile.species, re_i, tid)
+    _tke_stage!(rho_e, J_e, mtile.tile.physical, re_i, colstart, n, MY.tke_transform,
+                MY.tke_mu, MY.tke_lobe_tr)
 
     # ── Surface exchange: ONE call into the shared bulk air-sea layer ─────────
     # Identical to the Louis call site (src/mc_boundary_layer.jl) down to the argument
@@ -386,9 +396,8 @@ handling to copy.
 
     # ── Cold start (`:mynn_init = :taper`) ───────────────────────────────────
     first_call = MY.last_update_step[ci] == typemin(Int)
-    re_i = mtile.mc_slots.rho_e
     if first_call && MY.init_mode === :taper
-        _mynn_taper_seed!(MY, MN, expdot, rho_e, rho_t, sx.ust, colstart, n, re_i)
+        _mynn_taper_seed!(MY, MN, expdot, rev.f, rho_t, sx.ust, colstart, n, re_i)
     end
 
     # ── The held closure, on the cadence (D9) ────────────────────────────────
@@ -417,7 +426,7 @@ handling to copy.
                         get(pp, :rain_mu, 1.0e-7), itr, ice_on ? ice_mu(pp, 1) : 1.0,
                         mtile.model.ts, mtile.tile.physical, mc_nu_vbar(mtile),
                         vapor_transform_mode(opts), vapor_mu(pp),
-                        water_anchor_set(opts, pp, IS).alpha[1])
+                        water_anchor_set(opts, pp, IS).alpha[1], J_e)
     return nothing
 end
 
@@ -581,9 +590,10 @@ the state and on every closure column.
 end
 
 """
-    _mynn_taper_seed!(MY, MN, expdot, rho_e, rho_t, ust, colstart, n, re_i)
+    _mynn_taper_seed!(MY, MN, expdot, slot, rho_t, ust, colstart, n, re_i)
 
-The cold start. On the FIRST call of a column whose `rho_e` is identically zero, lay down
+The cold start. On the FIRST call of a column whose TKE `slot` is identically zero (the
+RAW slot: `ν_e = 0` exactly where `ρ_e = 0` under the control variable), lay down
 the Fortran's Koracin-Berkowicz taper (`mynn_bl_driver` :1571-1575, the first-guess block
 of `mynn_init_column!`) and deliver it as a ONE-STEP source `rho_t qke/2 / ts`.
 
@@ -596,11 +606,11 @@ zero and the closure can never start. With `ust = 0` the taper is itself zero, s
 resting column stays quiet and `:mynn_init = :zero` is the same thing deliberately.
 """
 @noinline function _mynn_taper_seed!(MY::MYNNState, MN::MYNNColumnScratch, expdot,
-                                     rho_e, rho_t,
+                                     slot, rho_t,
                                      ust::Float64, colstart::Int64, n::Int64,
                                      re_i::Int64)
     @inbounds for i in 1:n
-        rho_e[i] == 0.0 || return nothing
+        slot[i] == 0.0 || return nothing
     end
     zw = MY.zw
     qke = MN.qke; q_col = MN.q
@@ -609,7 +619,11 @@ resting column stays quiet and `:mynn_init = :zero` is the same thing deliberate
         qk = 5.0*ust*max((ust*700.0 - zw[i])/(max(ust, 0.01)*700.0), 0.01)
         qke[i] = max(qk, MYNN_QKEMIN)
         q_col[i] = sqrt(qk)
-        expdot[colstart + i - 1, re_i] += 0.5 * rho_t[i] * qk * inv_ts
+        # Under the TKE control variable the seed is the CONTROL VARIABLE of the target,
+        # `bhyp(rho_t qke/2)` (the slot is exactly 0 here): a one-step jump from 0 into the
+        # linear branch, where `J_e = dbhyp(0) = 1` would double it (`ahyp(ν) ≈ 2ν` there).
+        expdot[colstart + i - 1, re_i] += MY.tke_transform === :none ?
+            0.5 * rho_t[i] * qk * inv_ts : bhyp(0.5 * rho_t[i] * qk, MY.tke_mu) * inv_ts
     end
     return nothing
 end
@@ -1488,7 +1502,8 @@ that value actually is and report it.
                                        rtr::Symbol, rmu::Float64,
                                        itr::Symbol, imu::Float64, ts::Float64,
                                        phys::Array{Float64,3}, nvb::Vector{Float64},
-                                       vtr::Symbol, vmu::Float64, av::Float64)
+                                       vtr::Symbol, vmu::Float64, av::Float64,
+                                       J_e::Vector{Float64})
     u = uv.f
     w = wv.f
     rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
@@ -1601,7 +1616,9 @@ that value actually is and report it.
         expdot[j, rv_i] += nvv
         expdot[j, 6] += (qdot_E + dE_w) + dE_mom
         expdot[j, 7] += real_v - (drvs_dT[i]*dT_v) - (drvs_dp[i]*(dp_v + dp_q))
-        expdot[j, re_i] += ((div_e[i] + Ps) + (Pb - eps)) + Psfc
+        # the TKE's own sources are density-space rates: into the slot through J_e
+        # (`1.0` under tke_transform = :none, so this is the untransformed line bit for bit)
+        expdot[j, re_i] += J_e[i] * (((div_e[i] + Ps) + (Pb - eps)) + Psfc)
         bdry += wq[i] * ev * Fv
     end
     # ── The appended moment slots (S8) ───────────────────────────────────────

@@ -151,8 +151,10 @@ using SparseArrays
             @test names_on[1:length(base)] == base
         end
 
-        # The name carries no transform alias: the TKE is not a control variable.
-        @test !haskey(Scythe.MC_NU_ALIAS, "rho_e")
+        # The name carries an alias only under the TKE control variable (`tke_transform`,
+        # test_tke_transform.jl): by default the slot is the density, named rho_e.
+        @test Scythe.MC_NU_ALIAS["rho_e"] == "nu_e"
+        @test Scythe.tke_var_name(Dict{Symbol,Any}(:mynn => true)) == "rho_e"
         # ...and it is a TOTAL, so the positivity bound needs no reference offset.
         @test Scythe.positivity_reference_profile("rho_e", nothing) === nothing
 

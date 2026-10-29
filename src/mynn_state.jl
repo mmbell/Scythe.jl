@@ -423,6 +423,14 @@ mutable struct MYNNState
     const init_mode::Symbol         # :taper | :zero
     const fidelity::MYNNFidelity    # the resolved deviation switches (MYNN_DEVIATIONS)
     const water_carry::Symbol       # :flux | :fixed_T
+    # The TKE slot's control variable (`tke_transform_mode`, src/moist_compressible.jl):
+    # :none (the slot is rho_e) | :bhyp (the slot is nu_e = bhyp(rho_e; tke_mu)), resolved
+    # ONCE here so the per-column paths read a field, never the options Dict.
+    const tke_transform::Symbol
+    const tke_mu::Float64
+    # the slot's below-zero continuation (`options[:water_lobe_transport]`, the one switch
+    # every transformed slot's continuity terms read; `lobe_transport_jacobian`)
+    const tke_lobe_tr::Bool
     const mix_numbers::Bool         # mix the two-moment rain NUMBER? (:mynn_mix_numbers)
     const interval_steps::Int       # BL cadence, in model steps
     const ncol::Int
@@ -593,6 +601,9 @@ function MYNNState(;
         init_mode::Symbol = :taper,
         fidelity::MYNNFidelity = MYNN_FORTRAN_FIDELITY,
         water_carry::Symbol = :flux,
+        tke_transform::Symbol = :none,
+        tke_mu::Float64 = 1.0e-7,
+        tke_lobe_tr::Bool = true,
         mix_numbers::Bool = true,
         interval_steps::Int = 1,
         ncol::Int = 0,
@@ -680,7 +691,7 @@ function MYNNState(;
         n_eneg_pts::Int = 0,
         eneg_mass::Float64 = 0.0)
     return MYNNState(active, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
-                     water_carry, mix_numbers,
+                     water_carry, tke_transform, tke_mu, tke_lobe_tr, mix_numbers,
                      interval_steps, ncol, kDim, K_max, output, trace, check_values,
                      el, sm, sh, vt, vq, sgm, cldfra_bl, qc_bl, qi_bl, K_m, K_h,
                      gh, gm, qsq, g_Ps, g_Ps_mynn, g_Pb, g_eps, g_tke_transport,
@@ -962,7 +973,10 @@ function mynn_setup_line(model::ModelParameters, cfg, ncol::Int, kDim::Int)
             "water_carry=:$(cfg.water_carry) mix_numbers=$(cfg.mix_numbers) " *
             "fidelity=$(mynn_fidelity_string(cfg.fidelity)) " *
             "interval=$(interval_s) s (= $(cfg.interval_steps) steps at ts=$(model.ts) s) " *
-            "K_max=$(cfg.K_max) m^2/s columns=$(ncol) layers=$(kDim)")
+            "K_max=$(cfg.K_max) m^2/s columns=$(ncol) layers=$(kDim)" *
+            (tke_transform_mode(model.options) === :none ? "" :
+             " tke_transform=:$(tke_transform_mode(model.options)) " *
+             "tke_mu=$(tke_mu(model.physical_params)) J/m^3"))
     return nothing
 end
 
@@ -984,7 +998,16 @@ run it silently on a basis it was never derived for.
 """
 function mc_mynn_state(model::ModelParameters, tile, tilepoints)
 
-    get(model.options, :mynn, false) === true || return EMPTY_MYNN
+    # The TKE control variable renames a slot only the closure has: declared without it,
+    # the key would be silently ignored, so it is refused (`tke_transform_mode`, defined in
+    # moist_compressible.jl and resolved at call time, also refuses an unknown mode here).
+    mynn_on = get(model.options, :mynn, false) === true
+    (!mynn_on && uses_pressure_reference(model.equation_set) &&
+     tke_transform_mode(model.options) !== :none) && error(
+        "options[:tke_transform] = :$(tke_transform_mode(model.options)) is declared but " *
+        "options[:mynn] is not on: the TKE control variable is the MYNN closure's slot. Drop " *
+        "the key or turn the closure on (physics.boundary_layer.scheme = \"mynn\")")
+    mynn_on || return EMPTY_MYNN
 
     kDim = model.grid_params.kDim
     cfg = validate_mynn_options(model.options, model.physical_params,
@@ -1048,6 +1071,9 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         edmf_mom = cfg.edmf_mom,
         scale_aware = cfg.scale_aware, init_mode = cfg.init_mode,
         fidelity = cfg.fidelity, water_carry = cfg.water_carry,
+        tke_transform = tke_transform_mode(model.options),
+        tke_mu = tke_mu(model.physical_params),
+        tke_lobe_tr = get(model.options, :water_lobe_transport, true)::Bool,
         mix_numbers = cfg.mix_numbers,
         interval_steps = cfg.interval_steps, ncol, kDim, K_max = cfg.K_max,
         output = cfg.output, trace = cfg.trace, check_values = cfg.check_values,

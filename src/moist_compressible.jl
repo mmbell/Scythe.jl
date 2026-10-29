@@ -3211,6 +3211,105 @@ reference). Every reader outside `mc_driver!` goes through this.
 @inline recover_rho_v(slot, nu_vbar, transform::Symbol, mu) =
     transform === :none ? slot + nu_vbar : ahyp(slot + nu_vbar, mu)
 
+"""
+    TKE_MU_DEFAULT
+
+The TKE control variable's width `μ_e` [J/m³] when `physical_params[:tke_mu]` is absent: `1e-7`
+(reference/session_2026-10_scratch/closeout_2026-10-27/rhoe_diag/DECISION.md §5). It is
+1.7e-3 of the closure floor `ρ_t MYNN_QKEMIN/2` at the ground (5.8e-5 J/m³) and 2.3e-3 of it
+at 3 km, inside the "knee ≤ 1e-2 of the floor" criterion up to ~15 km, and 2e-8 of the
+boundary-layer maximum (3.6-17 J/m³ measured), so every physically live TKE value sits on the
+transform's linear branch; the same decade as the cloud and rain widths. The criterion is
+checked at setup ([`validate_tke_mu`](@ref)).
+"""
+const TKE_MU_DEFAULT = 1.0e-7
+
+"""
+    tke_transform_mode(options) -> Symbol
+    tke_mu(physical_params) -> Float64
+
+Which control variable the MYNN TKE-density slot carries (`options[:tke_transform]`, the run
+configuration's `physics.boundary_layer.tke_transform`; Stream D of the 2026-10-27 close-out).
+`:none` (the library default, and every configuration that does not set the key) is the
+density `ρ_e = ρ_t e` [J/m³] the slot always held, bit for bit. `:bhyp` carries Ooyama's
+control variable
+
+    ν_e = bhyp(ρ_e; μ_e),      ρ̄_e ≡ 0  (no reference: the slot is a total either way),
+
+renamed `"nu_e"` ([`MC_NU_ALIAS`](@ref)), width `μ_e = physical_params[:tke_mu]` (default
+[`TKE_MU_DEFAULT`](@ref)). `:bhyp_smooth` is refused: its recovery reaches `(−μ, 0)`, a
+negative TKE, which is exactly what the transform is for.
+
+WHY. The transported `ρ_e` rings negative above the mixing top at 70-90 % of the points (RCE,
+TC; min −1.5 J/m³ at 3-4.5 km, lobes as large as the signal), where the closure reads
+`max(e, 0)` — `K_m = 0` and no dissipation, a dead TKE equation — while the transport, the
+netCDF writer and the sidecar read the signed slot. Under `:bhyp` every reader sees the
+recovered `ahyp(ν_e) ≥ 0`, every density-space tendency (the closure's production, buoyancy
+exchange, dissipation, surface production and fitted transport, the cold-start seed, the
+continuity divergence) reaches the slot through `J_e = dν/dρ`, and the advection reads `ν_e`'s
+own gradient. A lobe that still forms (the transport of `ν_e` rings too) is recovered as zero
+and counted (`MYNNState.n_eneg_pts`, `rho_e_deficit`).
+"""
+@inline function tke_transform_mode(options)
+    mode = get(options, :tke_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp) ||
+        error("options[:tke_transform] = :$(mode) is not recognized; use :none (the library " *
+              "default: the MYNN slot is the TKE density rho_e) or :bhyp (Ooyama's biased " *
+              "hyperbolic control variable nu_e = bhyp(rho_e) with his quasi-inverse, " *
+              "recovered rho_e >= 0). :bhyp_smooth is not offered for the TKE: its recovery " *
+              "reaches a negative TKE.")
+    return mode
+end
+
+@doc (@doc tke_transform_mode)
+@inline tke_mu(physical_params) = Float64(get(physical_params, :tke_mu, TKE_MU_DEFAULT))
+
+"""
+    recover_rho_e(slot, transform, mu) -> rho_e
+
+The TKE density a TKE-slot value stands for: the slot itself under `:none` (bitwise, signed:
+`ρ̄_e ≡ 0`) and `ahyp(slot; μ_e) ≥ 0` under `:bhyp`. Every reader outside the MYNN stage goes
+through this.
+"""
+@inline recover_rho_e(slot, transform::Symbol, mu) =
+    transform === :none ? slot : ahyp(slot, mu)
+
+"""
+    validate_tke_mu(options, physical_params, z, rho_tbar)
+
+The setup check of the TKE width `μ_e` under `tke_transform = :bhyp` (a no-op under `:none`):
+`μ_e > 0`, and the knee no wider than `1e-2` of the closure floor `ρ̄_t MYNN_QKEMIN/2` at every
+level of the mixing layer, `z ≤ 6 km` (the mixing top of every boundary-layer-topped case
+measured, 3-6 km) — a knee within a factor 100 of the floor would change which points the
+closure clamps. Above it the floor falls with the density and the default width exceeds the
+criterion near 15 km, inside the sponge, where the measured lobes are ≤ 1e-3 J/m³; that is
+reported once (`@warn`), not refused.
+"""
+function validate_tke_mu(options, physical_params, z::AbstractVector, rho_tbar::AbstractVector)
+    tke_transform_mode(options) === :none && return nothing
+    mu = tke_mu(physical_params)
+    (isfinite(mu) && mu > 0.0) || error(
+        "physical_params[:tke_mu] = $(mu) must be positive and finite under " *
+        "options[:tke_transform] = :bhyp (1e-7 J/m^3 is the measured width)")
+    z_mix = 6.0e3
+    zwarn = NaN
+    @inbounds for k in eachindex(z)
+        lim = 1.0e-2 * (rho_tbar[k] * MYNN_QKEMIN / 2.0)
+        mu <= lim && continue
+        z[k] <= z_mix && error(
+            "physical_params[:tke_mu] = $(mu) J/m^3 is wider than 1e-2 of the MYNN closure " *
+            "floor rho_tbar*QKEMIN/2 = $(rho_tbar[k] * MYNN_QKEMIN / 2.0) J/m^3 at " *
+            "z = $(z[k]) m, inside the mixing layer (z <= $(z_mix) m): the transform's knee " *
+            "would change which points the closure clamps. Lower tke_mu (1e-7 is the " *
+            "measured width).")
+        isnan(zwarn) && (zwarn = z[k])
+    end
+    isnan(zwarn) || @warn("tke_mu = $(mu) J/m^3 exceeds 1e-2 of the MYNN closure floor above " *
+                          "z = $(zwarn) m (the floor falls with the density); harmless where " *
+                          "the free-atmosphere TKE lobes are <= 1e-3 J/m^3", maxlog = 1)
+    return nothing
+end
+
 # (`vapor_jacobian_column(S) = S.cap_v`, the vapor Jacobian aliased onto the depletion-census
 # column to stay off the compile cliff, is retired: the column lives on the tile's
 # `MCSpeciesColumns`, `jacobian_column(mtile.species, rv_i, tid)`.)
@@ -3423,6 +3522,7 @@ The transform width for the `j`-th entry of [`MC_ICE_VARS`](@ref), from
 # claims to hold a density it does not.
 const MC_NU_ALIAS = Dict("rho_c" => "nu_c", "rho_r" => "nu_r", "n_r" => "nu_nr",
                          "rho_v" => "nu_v",
+                         "rho_e" => "nu_e",
                          "rho_i1" => "nu_i1", "n_i1" => "nu_ni1",
                          "a_i1" => "nu_ai1", "c_i1" => "nu_ci1",
                          "rho_i2" => "nu_i2", "n_i2" => "nu_ni2",
@@ -3450,6 +3550,8 @@ rain_number_var_name(options) =
     rain_number_transform_mode(options) === :none ? "n_r" : "nu_nr"
 @doc (@doc condensate_var_name)
 vapor_var_name(options) = vapor_transform_mode(options) === :none ? "rho_v" : "nu_v"
+@doc (@doc condensate_var_name)
+tke_var_name(options) = tke_transform_mode(options) === :none ? "rho_e" : "nu_e"
 
 """
     ice_var_names(options) -> NTuple{12,String}
@@ -3506,10 +3608,10 @@ function mc_var_names(options; cyl::Bool = false)
     end
     # The MYNN-EDMF TKE density ρ_e = ρ_t·e [J/m³], LAST of the appended block so the twelve
     # ice indices stay contiguous whatever else a configuration turns on. A TOTAL with
-    # ρ̄_e ≡ 0 and no control-variable transform (the TKE is not a positive-definite
-    # microphysical density with a spike problem; it is floored by the closure itself), so
-    # unlike slots 8/9 and the ice family it carries no alias and its name is fixed.
-    get(options, :mynn, false) === true && push!(names, "rho_e")
+    # ρ̄_e ≡ 0, renamed `"nu_e"` under the TKE control variable (`tke_transform_mode`; the
+    # measured negative lobes of the transported density were as large as the signal, so the
+    # closure's own floor was not enough). Renamed in place, never moved.
+    get(options, :mynn, false) === true && push!(names, tke_var_name(options))
     return names
 end
 
@@ -3638,6 +3740,7 @@ function check_mc_var_names(model::ModelParameters)
     ctrans === :none || push!(stale, "rho_c")
     rtrans === :none || push!(stale, "rho_r")
     vtrans === :none || push!(stale, "rho_v")
+    (mynn && tke_transform_mode(model.options) !== :none) && push!(stale, "rho_e")
     nrtrans === :none || push!(stale, "n_r")
     if itrans !== :none
         for nm in MC_ICE_VARS
@@ -3669,8 +3772,9 @@ function check_mc_var_names(model::ModelParameters)
         end
     end
     if mynn
-        haskey(gp.vars, "rho_e") ||
-            error("options[:mynn] declares the prognostic TKE-density slot \"rho_e\", but " *
+        haskey(gp.vars, tke_var_name(model.options)) ||
+            error("options[:mynn] declares the prognostic TKE-density slot " *
+                  "\"$(tke_var_name(model.options))\", but " *
                   "grid_params.vars does not have it (it has " *
                   "$(sort(collect(keys(gp.vars))))). It is APPENDED after the ice family, " *
                   "so its index is geometry- and option-dependent and only " *
@@ -8607,11 +8711,22 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # EXPLICIT ONLY: no `impdot` row, no acoustic leg, no sedimentation. The vertical
     # turbulent transport of TKE is part of the closure's own tridiagonal solve, not of the
     # dycore's implicit pair.
+    #
+    # Under the TKE CONTROL VARIABLE (`tke_transform_mode`, `mtile.mynn.tke_transform =
+    # :bhyp`) the slot is ν_e = bhyp(ρ_e): the advection reads ν_e's own gradients
+    # (transform-invariant, the same `mc_advect!` call) and the compressibility term is
+    # `−J_e ρ_s ∇·u` with the recovered density (`_tke_bhyp_tendency!`); `:none` is the
+    # two `@turbo` lines below, verbatim.
     if mynn_on
         rho_e = rev.f
         mc_advect!(ADV, geom, u, w, vv, r, rev.f_x, rev.f_z, rev.f_l)
-        @turbo FORCING .= @. -rho_e * div
-        @turbo expdot[colstart:colend, re_i] .= @. ADV + FORCING
+        if mtile.mynn.tke_transform === :none
+            @turbo FORCING .= @. -rho_e * div
+            @turbo expdot[colstart:colend, re_i] .= @. ADV + FORCING
+        else
+            _tke_bhyp_tendency!(expdot, grid.physical, re_i, colstart, ADV, div,
+                                mtile.species, mtile.mynn.tke_mu, lobe_tr)
+        end
     end
 
     # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
@@ -9102,6 +9217,72 @@ the boundary layer's legs (added later by their closures).
         nu = phys[g, rv_i, 1] + nu_vbar[i]
         rs = lobe_tr ? lobe_transport_density(nu, rho_v[i], mu) : rho_v[i]
         expdot[g, rv_i] = ADV[i] + (-(J_v[i] * (rs * div[i])))
+    end
+    return nothing
+end
+
+"""
+    _tke_stage!(rho_e, J_e, phys, re_i, colstart, n, transform, mu, lobe_tr)
+
+Stage the MYNN TKE slot for one column into the tile's species columns (`MCSpeciesColumns`,
+`rho[re_i, tid]` and `J[re_i, tid]`): the density every reader of the column takes and the
+Jacobian `J_e = dν_e/dρ_e` every density-space tendency is multiplied by.
+
+- `:none` — `rho_e` is a COPY of the slot (bitwise, signed) and `J_e ≡ 1.0`, so a tendency
+  `J_e·x` is `x` bit for bit (`1.0·x === x`, signed zeros and NaN included).
+- `:bhyp` — `rho_e = ahyp(ν_e; μ_e) ≥ 0` and `J_e` at the recovered density, with the
+  lobe-transport continuation below `ν_e = 0` ([`lobe_transport_jacobian`](@ref); `lobe_tr =
+  false` gives `dbhyp(max(ρ_e, 0))`), exactly the vapor's construction (`_vapor_bhyp_stage!`).
+  `ρ̄_e ≡ 0`, so `ν_e` is the slot itself (no reference to add).
+
+`@noinline` on plain arrays (the `mc_driver!` compile-cliff rule): no tile, no views of it.
+"""
+@noinline function _tke_stage!(rho_e::Vector{Float64}, J_e::Vector{Float64},
+                               phys::Array{Float64,3}, re_i::Int, colstart::Int, n::Int,
+                               transform::Symbol, mu::Float64, lobe_tr::Bool)
+    if transform === :none
+        @inbounds for i in 1:n
+            rho_e[i] = phys[colstart + i - 1, re_i, 1]
+            J_e[i] = 1.0
+        end
+    else
+        @inbounds for i in 1:n
+            nu = phys[colstart + i - 1, re_i, 1]
+            r = ahyp(nu, mu)
+            rho_e[i] = r
+            J_e[i] = lobe_tr ? lobe_transport_jacobian(nu, r, mu) : dbhyp(max(r, 0.0), mu)
+        end
+    end
+    return nothing
+end
+
+"""
+    _tke_bhyp_tendency!(expdot, phys, re_i, colstart, ADV, div, species, mu, lobe_tr)
+
+The TKE slot's dycore tendency under the TKE control variable (`tke_transform = :bhyp`):
+
+    ∂ν_e/∂t = −u·∇ν_e − J_e ρ_s ∇·u     (+ the closure's J_e-weighted sources, `mc_mynn_bl!`)
+
+with `ρ_s` the [`lobe_transport_density`](@ref) (the recovered `ρ_e` where `ν_e ≥ 0`, the odd
+continuation below; `lobe_tr = false` reads the recovered value everywhere). Stages the
+column's recovered density and Jacobian first ([`_tke_stage!`](@ref), into
+`species.rho/J[re_i, threadid()]`), so the boundary layer later in the same column step reads
+the same doubles. `@noinline`, one pointer (`species`) and plain arrays.
+"""
+@noinline function _tke_bhyp_tendency!(expdot::Matrix{Float64}, phys::Array{Float64,3},
+                                       re_i::Int, colstart::Int, ADV::Vector{Float64},
+                                       div::Vector{Float64}, species::MCSpeciesColumns,
+                                       mu::Float64, lobe_tr::Bool)
+    tid = Threads.threadid()
+    rho_e = @inbounds species.rho[re_i, tid]
+    J_e = jacobian_column(species, re_i, tid)
+    n = length(ADV)
+    _tke_stage!(rho_e, J_e, phys, re_i, colstart, n, :bhyp, mu, lobe_tr)
+    @inbounds for i in 1:n
+        g = colstart + i - 1
+        nu = phys[g, re_i, 1]
+        rs = lobe_tr ? lobe_transport_density(nu, rho_e[i], mu) : rho_e[i]
+        expdot[g, re_i] = ADV[i] + (-(J_e[i] * (rs * div[i])))
     end
     return nothing
 end

@@ -96,6 +96,13 @@ function validate(cfg::RunConfig)
         "l_q_vertical = 0 (numerics.l_q then filters the horizontal spline only)")
 
     # ── physics pairings
+    (bl.tke_transform !== :none && bl.scheme !== :mynn) && error(
+        "config: physics.boundary_layer.tke_transform = \"$(bl.tke_transform)\" is the MYNN " *
+        "TKE slot's control variable, but physics.boundary_layer.scheme = \"$(bl.scheme)\" " *
+        "carries no TKE; set tke_transform = \"none\" or scheme = \"mynn\"")
+    (isfinite(bl.tke_mu) && bl.tke_mu > 0.0) || error(
+        "config: physics.boundary_layer.tke_mu = $(bl.tke_mu) must be positive and finite " *
+        "(1e-7 J/m^3 is the measured width)")
     (ice && bl.scheme === :louis) && error(
         "config: physics.microphysics.ice = \"ishmael\" with physics.boundary_layer.scheme = " *
         "\"louis\" is refused: Louis infers the vapour tendency as rho_dot_w - rho_dot_c, " *
@@ -267,6 +274,11 @@ function build_physics(cfg::RunConfig; start_hour::Float64 = cfg.physics.radiati
         o[:mynn_fidelity] = parse_mynn_fidelity(bl.mynn_fidelity)
         o[:mynn_init] = bl.mynn_init
         isfinite(bl.K_max) && (p[:mynn_K_max] = bl.K_max)
+        # The TKE control variable: written only when it differs from the library default
+        # (`:none`, `TKE_MU_DEFAULT`), so a run that does not ask for it builds exactly the
+        # options it built before the key existed.
+        bl.tke_transform === :none || (o[:tke_transform] = bl.tke_transform)
+        bl.tke_mu != TKE_MU_DEFAULT && (p[:tke_mu] = bl.tke_mu)
     elseif bl.scheme === :louis
         o[:louis_bl] = true
     end

@@ -328,7 +328,7 @@ function mc_energy_budget(model, tile, tilepoints, ref_state, mc_ref_diag)
         vapor_transform_mode(opts), vapor_mu(pp), copy(mc_ref_diag.nu_vbar),
         copy(mc_ref_diag.nu_vbar_z), copy(mc_ref_diag.rho_tbar_w),
         copy(mc_ref_diag.rho_tbar_w_z), rtref,
-        haskey(model.grid_params.vars, "rho_e"),
+        mc_optional_slot(model.grid_params.vars, "rho_e") > 0,
         zeros(EB_NSTAGE * na, ncol * na), zeros(EB_NSTAGE * na, ncol * na),
         zeros(ncol * na), zeros(ncol * na), zeros(ncol * na), zeros(ncol * na),
         zeros(Int, ncol * na), fill(false, ncol * na),
@@ -1067,10 +1067,12 @@ function energy_census_trace(mtile, t::Int64)
     MY = mtile.mynn
     tke_line = ""
     if MY.active && mtile.mc_slots.rho_e > 0
-        ne, elobe = _eb_tke_negative_points(eb, phys, mtile.mc_slots.rho_e, 1.0)
+        etr = MY.tke_transform
+        ne, elobe = _eb_tke_negative_points(eb, phys, mtile.mc_slots.rho_e,
+                                            etr === :none ? 1.0 : 2.0)
         MY.n_eneg_pts = ne
         MY.eneg_mass = elobe
-        tke_line = ", rho_e<0 points=$(ne) " *
+        tke_line = ", $(etr === :none ? "rho_e" : "nu_e")<0 points=$(ne) " *
                    "($(round(100.0 * ne / max(size(phys, 1), 1); sigdigits = 4)) %), " *
                    "TKE lobe=$(round(elobe; sigdigits = 4)) J/m2"
     end

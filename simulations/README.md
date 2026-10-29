@@ -318,6 +318,8 @@ vertical mixing and the surface layer underneath it.
 | `mynn_init` | string (enum) | `"taper"` | TKE initialisation: `taper` or `zero`. |
 | `K_max` | float | `inf` | counted safety cap on the MYNN exchange coefficient [m²/s]; `inf` = none. |
 | `l_inf` | float | `80.0` | Louis asymptotic mixing length [m] (louis only). |
+| `tke_transform` | string (enum) | `"none"` | the MYNN TKE slot's control variable (mynn only): `none` (the slot is the density `rho_e`) or `bhyp` (the slot is `nu_e = bhyp(rho_e)`, renamed; every reader sees `ahyp(nu_e) >= 0`). |
+| `tke_mu` | float | `1.0e-7` | bhyp width for the TKE [J/m³]; refused above 1e-2 of the closure floor `rho_t QKEMIN/2` below 6 km. |
 
 ### `[physics.surface]`
 
@@ -593,6 +595,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
 | `physics.boundary_layer.mynn_fidelity` | a fidelity name, `fortran` or `scythe`, or a comma list of deviations from `gtr_local`, `K_interface`, `sqfac1`, `pdk1`, `exner_single`, `rmol_sfc`, `flux_clip` |
 | `physics.boundary_layer.mynn_init` | `taper`, `zero` |
 | `physics.boundary_layer.scheme` | `mynn`, `louis`, `none` |
+| `physics.boundary_layer.tke_transform` | `none`, `bhyp` |
 | `physics.horizontal_mixing.scheme` | `smagorinsky`, `constant`, `none` |
 | `physics.microphysics.condensate_transform` | `none`, `bhyp`, `bhyp_smooth` |
 | `physics.microphysics.ice` | `ishmael`, `none` |
@@ -724,6 +727,7 @@ co2_ppm = 280.0
 | `stiffness_trace` | int | `diagnostics.stiffness_trace` (refused in `[extra.options]`) | stiffness-census print interval [steps]; 0 = off (moist_compressible.jl) |
 | `surface_fluxes` | bool | `physics.surface.fluxes` (refused in `[extra.options]`) | surface momentum/heat/moisture fluxes (moist_compressible.jl, mc_surface_layer.jl) |
 | `temperature` | string (enum) | `numerics.temperature` (refused in `[extra.options]`) | model temperature: :eos = p/(rho_d R_d + rho_v R_v) (default) or :energy = the closed-form total-energy retrieval (moist_compressible.jl, radiation.jl, semiimplicit.jl, netcdf_output.jl) |
+| `tke_transform` | string (enum) | `physics.boundary_layer.tke_transform` (refused in `[extra.options]`) | MYNN TKE-slot control variable: :none (library default, the density rho_e) or :bhyp (nu_e = bhyp(rho_e), recovered with ahyp >= 0; refused without :mynn; moist_compressible.jl, mc_mynn_bl.jl, netcdf_output.jl) |
 | `u_max` | float | `diagnostics.timestep_advisory.u_max` (refused in `[extra.options]`) | timestep advisory: expected peak horizontal wind [m/s] (reference_state.jl) |
 | `vapor_nudge_partner` | bool |  | RETIRED with the vapor reconciliation nudge (Stage 4): true is refused (si_water_slaving.jl) |
 | `vapor_transform` | string (enum) | `physics.microphysics.vapor_transform` (refused in `[extra.options]`) | prognostic-vapor-slot control variable: :none (library default, the density perturbation) or :bhyp (nu_v' = bhyp(rho_v) - bhyp(rho_vbar), recovered with ahyp; moist_compressible.jl, radiation.jl, netcdf_output.jl, semiimplicit.jl) |
@@ -824,6 +828,7 @@ Retired (refused with a message):
 | `tau_qss` | float | `physics.microphysics.tau_qss` (refused in `[extra.physical_params]`) | QSS relaxation timescale [s] (moist_compressible.jl) |
 | `tau_rho_v_rec` | float |  | RETIRED with the vapor reconciliation nudge (Stage 4): the key is refused (si_water_slaving.jl) |
 | `tau_varcheck` | float |  | ISHMAEL var_check relaxation timescale [s] (moist_compressible.jl) |
+| `tke_mu` | float | `physics.boundary_layer.tke_mu` (refused in `[extra.physical_params]`) | bhyp width for the MYNN TKE [J/m^3] under options[:tke_transform] = :bhyp, default 1e-7; refused above 1e-2 of the closure floor rho_t*QKEMIN/2 below 6 km (moist_compressible.jl) |
 | `vapor_mu` | float | `physics.microphysics.vapor_mu` (refused in `[extra.physical_params]`) | bhyp width for the vapor [kg/m^3], default 1e-9; refused above 1e-2 of the driest reference vapor (moist_compressible.jl, netcdf_output.jl) |
 | `z_damp` | float | `physics.sponge.z_damp` (refused in `[extra.physical_params]`) | bottom of the Rayleigh sponge [m] (moist_compressible.jl, primitive_equations.jl) |
 | `z_ref_level` | float |  | primitive equations: surface-layer reference height [m] (primitive_equations.jl) |

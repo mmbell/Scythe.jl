@@ -253,7 +253,9 @@ function mynn_diagnostics(mtile::ModelTile)
         rt = (phys[j, 2, 1] + rho_dbar[k]) +
              first(_siw_W(phys, j, zs_w, k, wset, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile),
                           view(rcref, :, 1), view(rcref, :, 2)))
-        e[j] = rho_e[j] / rt
+        # the RECOVERED TKE density under the TKE control variable (`recover_rho_e`; the
+        # slot itself, bitwise, under :none)
+        e[j] = recover_rho_e(rho_e[j], MY.tke_transform, MY.tke_mu) / rt
     end
 
     # ── Coordinates: the exact radiation_io.jl convention (used for every MC geometry,

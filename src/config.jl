@@ -80,6 +80,8 @@ const RAIN_MOMENT_CHOICES = (0, 1, 2)
 const WATER_TRANSFORMS = (:none, :bhyp, :bhyp_smooth)
 "Allowed `physics.microphysics.vapor_transform` values (`vapor_transform_mode` in src/moist_compressible.jl)."
 const VAPOR_TRANSFORMS = (:none, :bhyp)
+"Allowed `physics.boundary_layer.tke_transform` values (`tke_transform_mode` in src/moist_compressible.jl)."
+const TKE_TRANSFORMS = (:none, :bhyp)
 "Allowed `physics.boundary_layer.scheme` values."
 const BL_SCHEMES = (:mynn, :louis, :none)
 "Allowed `physics.horizontal_mixing.scheme` values."
@@ -392,6 +394,8 @@ end
 - `mynn_init::Symbol` — TKE initialisation: `taper` or `zero`.
 - `K_max::Float64` — counted safety cap on the MYNN exchange coefficient [m²/s]; `inf` = none.
 - `l_inf::Float64` — Louis asymptotic mixing length [m] (louis only).
+- `tke_transform::Symbol` — the MYNN TKE slot's control variable (mynn only): `none` (the slot is the density `rho_e`) or `bhyp` (the slot is `nu_e = bhyp(rho_e)`, renamed; every reader sees `ahyp(nu_e) >= 0`).
+- `tke_mu::Float64` — bhyp width for the TKE [J/m³]; refused above 1e-2 of the closure floor `rho_t QKEMIN/2` below 6 km.
 """
 Base.@kwdef struct BoundaryLayer <: AbstractConfigSection
     scheme::Symbol = :mynn
@@ -401,6 +405,8 @@ Base.@kwdef struct BoundaryLayer <: AbstractConfigSection
     mynn_init::Symbol = :taper
     K_max::Float64 = Inf
     l_inf::Float64 = 80.0
+    tke_transform::Symbol = :none
+    tke_mu::Float64 = 1.0e-7
 end
 
 """
@@ -735,6 +741,7 @@ const ENUM_FIELDS = Dict{Tuple{DataType,Symbol},Tuple}(
     (Microphysics, :vapor_transform)           => VAPOR_TRANSFORMS,
     (BoundaryLayer, :scheme)                   => BL_SCHEMES,
     (BoundaryLayer, :mynn_init)                => MYNN_INIT_MODES,
+    (BoundaryLayer, :tke_transform)            => TKE_TRANSFORMS,
     (Surface, :roughness)                      => SFC_Z0_MODES,
     (Radiation, :scheme)                       => RADIATION_SCHEMES,
     (Radiation, :method)                       => RADIATION_METHODS,
@@ -904,6 +911,7 @@ const KNOWN_OPTION_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :mynn_exchange_realization => (Bool, "RETIRED with the :slot anchor (Stage 4): the derived anchor's MYNN legs are nu legs realized on their own recovered rates; true is refused (si_water_slaving.jl)"),
     :mynn_water_closure       => (Bool, "RETIRED with the :slot anchor (Stage 4): the derived anchor's MYNN total-water leg is the pointwise sum of the species' nu legs; true is refused (si_water_slaving.jl)"),
     :mynn_mix_numbers         => (Bool, "MYNN also mixes the number densities (mynn_state.jl)"),
+    :tke_transform            => (Symbol, "MYNN TKE-slot control variable: :none (library default, the density rho_e) or :bhyp (nu_e = bhyp(rho_e), recovered with ahyp >= 0; refused without :mynn; moist_compressible.jl, mc_mynn_bl.jl, netcdf_output.jl)"),
     :mynn_output              => (Bool, "per-tile MYNN NetCDF sidecar (mynn_state.jl)"),
     :mynn_trace               => (Bool, "MYNN per-call summary line (mynn_state.jl)"),
     :mynn_check_values        => (Bool, "MYNN finite-value checks every call (mynn_state.jl)"),
@@ -995,6 +1003,7 @@ const KNOWN_PHYSICAL_KEYS = Dict{Symbol,Tuple{Type,String}}(
     :condensate_mu => (Float64, "bhyp width for cloud [kg/m^3] (moist_compressible.jl, netcdf_output.jl)"),
     :rain_mu       => (Float64, "bhyp width for rain [kg/m^3] (moist_compressible.jl, netcdf_output.jl)"),
     :vapor_mu      => (Float64, "bhyp width for the vapor [kg/m^3], default 1e-9; refused above 1e-2 of the driest reference vapor (moist_compressible.jl, netcdf_output.jl)"),
+    :tke_mu        => (Float64, "bhyp width for the MYNN TKE [J/m^3] under options[:tke_transform] = :bhyp, default 1e-7; refused above 1e-2 of the closure floor rho_t*QKEMIN/2 below 6 km (moist_compressible.jl)"),
     :mu_rain_n     => (Float64, "bhyp width for rain number [1/m^3] (moist_compressible.jl, netcdf_output.jl)"),
     :max_N_c       => (Float64, "cloud droplet number [1/cm^3] for ISHMAEL autoconversion (moist_compressible.jl, netcdf_output.jl)"),
     :tau_activation   => (Float64, "ice activation timescale [s] (moist_compressible.jl)"),
@@ -1073,6 +1082,7 @@ const OWNED_OPTION_KEYS = Dict{Symbol,String}(
     :mynn_edmf                 => "physics.boundary_layer.mynn_edmf",
     :mynn_fidelity             => "physics.boundary_layer.mynn_fidelity",
     :mynn_init                 => "physics.boundary_layer.mynn_init",
+    :tke_transform             => "physics.boundary_layer.tke_transform",
     :surface_fluxes            => "physics.surface.fluxes",
     :sfc_z0                    => "physics.surface.roughness",
     :sfc_stability             => "physics.surface.stability",
@@ -1137,6 +1147,7 @@ const OWNED_PHYSICAL_KEYS = Dict{Symbol,String}(
     :condensate_mu  => "physics.microphysics.condensate_mu",
     :rain_mu        => "physics.microphysics.rain_mu",
     :vapor_mu       => "physics.microphysics.vapor_mu",
+    :tke_mu         => "physics.boundary_layer.tke_mu",
     :latitude       => "physics.radiation.latitude",
     :start_doy      => "physics.radiation.start_doy",
     :start_hour     => "physics.radiation.start_hour",

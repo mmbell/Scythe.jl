@@ -382,6 +382,27 @@ using Scythe: createModelTile, moist_compressible_XZ, diffusion_timestep_mc, Two
             @test maximum(mtile_my.mynn.K_h) >= 0.0
         end
 
+        # ...and under the TKE CONTROL VARIABLE (`options[:tke_transform] = :bhyp`): the
+        # slot is nu_e, staged into the tile's species columns (`_tke_stage!`) and the
+        # dycore's `_tke_bhyp_tendency!`; neither may allocate.
+        for (eqs, driver) in (("moist_compressible_XZ", Scythe.moist_compressible_XZ),
+                              ("moist_compressible_axisym",
+                               Scythe.moist_compressible_axisym))
+            mtile_te, kDim_te = build_mc_tile(equation_set = eqs,
+                extra_params = Dict(:f => 5.0e-5, :Cd => -1.0, :Ck => 1.0e-3,
+                                    :SST => 301.15, :U_min => 1.0),
+                extra_options = Dict{Symbol,Any}(:mynn => true, :mynn_trace => false,
+                                                 :surface_fluxes => true,
+                                                 :tke_transform => :bhyp))
+            re_i = mtile_te.mc_slots.rho_e
+            @test haskey(mtile_te.model.grid_params.vars, "nu_e")
+            mtile_te.tile.physical[:, re_i, 1] .= Scythe.bhyp(0.5, 1.0e-7)
+            spectralTransform!(mtile_te.tile)
+            gridTransform!(mtile_te.tile)
+            driver(mtile_te, 1, kDim_te, 2)                        # compile
+            @test (@allocations driver(mtile_te, 1, kDim_te, 3)) == 0
+        end
+
         # ...and with every FIDELITY deviation that the wired path carries live (F1).
         # Each one is a branch inside the per-column apply or the closure update, and
         # three of them (`:gtr_local`'s `work.gtr_k`, `:pdk1`'s `MY.pmz`,

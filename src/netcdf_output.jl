@@ -173,6 +173,8 @@ struct DerivedConfig
     temperature::Symbol       # options[:temperature]: which temperature `T` is (`temperature_mode`)
     vtrans::Symbol            # options[:vapor_transform]: the vapor slot's control variable
     vmu::Float64              # physical_params[:vapor_mu]
+    etrans::Symbol            # options[:tke_transform]: the MYNN TKE slot's control variable
+    emu::Float64              # physical_params[:tke_mu]
 end
 # (The total density is the derived ρ_d + Σ_k α_k ν_k; Stage 3's `water_anchor` field went with
 # the `:slot` anchor at Stage 4.)
@@ -183,6 +185,12 @@ DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments
     DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice,
                   has_v, N0, Nc_cm3, N0_source, cond_floor, temperature, :none,
                   VAPOR_MU_DEFAULT)
+# The pre-TKE-transform 18-field form (the TKE slot is the density).
+DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice, has_v,
+              N0, Nc_cm3, N0_source, cond_floor, temperature, vtrans, vmu) =
+    DerivedConfig(ctrans, cmu, rtrans, rmu, nrtrans, nrmu, itrans, imu, rain_moments, ice,
+                  has_v, N0, Nc_cm3, N0_source, cond_floor, temperature, vtrans, vmu, :none,
+                  TKE_MU_DEFAULT)
 
 "Default Marshall-Palmer rain intercept [m^-4] when the run declares none."
 const REFL_N0_DEFAULT = 8.0e6
@@ -220,7 +228,8 @@ function derived_config(model::ModelParameters)
         n0_on ? "physical_params[:N_0]" : "default $(REFL_N0_DEFAULT)",
         condensate_floor_mode(opts),
         temperature_mode(opts),
-        vapor_transform_mode(opts), vapor_mu(pp))
+        vapor_transform_mode(opts), vapor_mu(pp),
+        get(opts, :mynn, false) === true ? tke_transform_mode(opts) : :none, tke_mu(pp))
 end
 
 # ── Reference profiles on the regular output grid ─────────────────────────────
@@ -552,10 +561,17 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
         out = merge(out, (; ice, q_i, RH_ice, column_ice_water))
     end
     if haskey(slots, :rho_e)
-        # `rho_e_deficit`: the TKE slot's negative lobe, min(rho_e, 0) -- the TKE density's
-        # counterpart of `rho_w_deficit`.
-        out = merge(out, (; rho_e = slots.rho_e, e = slots.rho_e ./ rho_t,
-                            rho_e_deficit = min.(slots.rho_e, 0.0)))
+        # The TKE density the run's readers take: the slot under `:none`, the recovered
+        # `ahyp(nu_e) >= 0` under the TKE control variable (`recover_rho_e`), and
+        # `rho_e_deficit`, the slot's negative lobe -- min(rho_e, 0) of the density, or the
+        # odd continuation `ahyp_signed(nu_e)` of a negative control variable (the TKE the
+        # transported density would have carried there; the recovered rho_e reads 0) -- the
+        # TKE density's counterpart of `rho_w_deficit`.
+        rho_e = cfg.etrans === :none ? slots.rho_e :
+                recover_rho_e.(slots.rho_e, cfg.etrans, cfg.emu)
+        rho_e_deficit = cfg.etrans === :none ? min.(slots.rho_e, 0.0) :
+                        neg_part.(slots.rho_e, cfg.emu)
+        out = merge(out, (; rho_e, e = rho_e ./ rho_t, rho_e_deficit))
     end
     out = merge(out, (; T_energy, T_eos, T_split, E_residual,
                         column_E_residual = _column_integral(E_residual, z),
@@ -1193,7 +1209,7 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
     nr_i = mc_optional_slot(vars, "n_r")
     ice_idx = mc_ice_slot_indices(vars)
     v_i = get(vars, "v", 0)
-    rho_e_i = get(vars, "rho_e", 0)
+    rho_e_i = mc_optional_slot(vars, "rho_e")
 
     p_p = slot(vars["p"]); rho_d_p = slot(vars["rho_d"])
     E_t_p = slot(vars["E_t"]); Q_ss_p = slot(vars["Q_ss"]); rho_v_p = slot(mc_slot(vars, "rho_v"))
@@ -1396,11 +1412,20 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
 
         # ── MYNN TKE, when the run carries the rho_e slot ──
         if rho_e_i > 0
-            wr("rho_e", d.rho_e, "J m-3", "turbulence kinetic energy density")
+            # the raw TKE control variable, under its own slot name, only when it is one
+            cfg.etrans === :none ||
+                wr(tke_var_name(model.options), slots.rho_e, "J m-3",
+                   "TKE control variable nu_e = bhyp(rho_e) (Ooyama biased hyperbolic, " *
+                   "mu = $(cfg.emu) J m-3)")
+            wr("rho_e", d.rho_e, "J m-3", cfg.etrans === :none ?
+               "turbulence kinetic energy density" :
+               "turbulence kinetic energy density, recovered ahyp(nu_e) >= 0")
             wr("e", d.e, "m2 s-2", "mass-specific turbulence kinetic energy, rho_e / rho_t")
-            wr("rho_e_deficit", d.rho_e_deficit, "J m-3",
+            wr("rho_e_deficit", d.rho_e_deficit, "J m-3", cfg.etrans === :none ?
                "negative lobe of the TKE density slot, min(rho_e, 0) (the closure reads " *
-               "max(e, 0) there: K_m = 0 and no dissipation)")
+               "max(e, 0) there: K_m = 0 and no dissipation)" :
+               "negative lobe of the TKE control variable, ahyp_signed(nu_e) where nu_e < 0 " *
+               "(the recovered rho_e reads 0 there)")
         end
 
         # ── Negative-water diagnostics: the negativity the humidity floor no longer shows ──

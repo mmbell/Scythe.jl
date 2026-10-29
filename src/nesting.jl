@@ -411,6 +411,21 @@ function build_nest(nest::NestedModelParameters; strict_intervals::Bool = false)
             options = base.options,
         )
     end
+    # Every nest carries the SAME slot semantics: the exchange interpolates slot by index, so
+    # a TKE slot holding nu_e on one patch and rho_e on another (or two widths) would mix two
+    # different fields. The patches share `base.options`/`physical_params` today, so this is
+    # true by construction; it is checked so a future per-patch override cannot break it
+    # silently. (The water transforms are the same story; the TKE's is the newest.)
+    etr0 = uses_pressure_reference(base.equation_set) ? tke_transform_mode(base.options) : :none
+    for i in 1:n
+        uses_pressure_reference(base.equation_set) || break
+        (tke_transform_mode(models[i].options) === etr0 &&
+         tke_mu(models[i].physical_params) == tke_mu(base.physical_params) &&
+         models[i].grid_params.vars == base.grid_params.vars) || throw(ArgumentError(
+            "Nest: patch $i's TKE slot ($(tke_transform_mode(models[i].options)), mu = " *
+            "$(tke_mu(models[i].physical_params))) or its vars differ from the base " *
+            "patch's (:$(etr0)): every nest must carry the same control variable"))
+    end
 
     if !isempty(stripped_i)
         @warn "Nest: dropped the i-direction positivity bound on the child patches for " *

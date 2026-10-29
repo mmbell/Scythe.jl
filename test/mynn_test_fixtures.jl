@@ -68,10 +68,15 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
                         water_carry = :flux, ctrans = :none, rtrans = :none,
                         l_inf = 80.0, lapse = 0.004, Ck = 1.0e-3,
                         fidelity = :fortran, sfc_stability = false, trace = false,
-                        extra_options = Dict{Symbol,Any}())
+                        extra_options = Dict{Symbol,Any}(),
+                        extra_params = Dict{Symbol,Any}())
     opts_names = Dict{Symbol,Any}(:condensate_transform => ctrans,
                                   :rain_transform => rtrans)
     mynn && (opts_names[:mynn] = true)
+    # The TKE control variable renames the slot (`rho_e` -> `nu_e`), so the name list has to
+    # see it; every other extra option leaves the names alone.
+    haskey(extra_options, :tke_transform) &&
+        (opts_names[:tke_transform] = extra_options[:tke_transform])
     varlist = Scythe.mc_var_names(opts_names; cyl = false)
     rain_name = Scythe.rain_var_name(opts_names)
     vars = Dict(v => i for (i, v) in enumerate(varlist))
@@ -138,12 +143,12 @@ function make_mynn_tile(tmpdir; mynn = true, num_cells_k = 50, kMax = 25.0e3,
         ts = ts, integration_time = 10.0 * ts, output_interval = 10.0 * ts,
         equation_set = "moist_compressible_XZ",
         ref_state_file = ref_file, grid_params = gp,
-        physical_params = Dict{Symbol,Any}(
+        physical_params = merge(Dict{Symbol,Any}(
             :Khdiff => 0.0, :Kvdiff => 0.0, :Kvdiff_heat => 0.0,
             :Kvdiff_water => 0.0, :tau_qss => 10.0, :alpha => 0.0,
             :z_damp => 20.0e3, :f => 0.0, :Cd => Cd, :Ls => 0.0,
             :Ck => Ck, :U_min => 1.0, :l_inf => l_inf, :SST => SST,
-            :mynn_K_max => K_max),
+            :mynn_K_max => K_max), extra_params),
         options = options)
     gp = model.grid_params
     patch = createGrid(gp)
@@ -178,7 +183,10 @@ function set_state!(patch, model, kDim, z, col; V0 = 12.0, zs = 500.0, e0 = 0.4,
                     ze = 1500.0, W0 = 0.0, qpert = 2.0e-3)
     vars = model.grid_params.vars
     ui = vars["u"]; wi = vars["w"]; ei = vars["E_t"]
-    rei = get(vars, "rho_e", 0)
+    rei = Scythe.mc_optional_slot(vars, "rho_e")
+    # Under the TKE control variable the slot carries nu_e = bhyp(rho_e) (rho_e_bar = 0).
+    etr = Scythe.tke_transform_mode(model.options)
+    emu = Scythe.tke_mu(model.physical_params)
     u = bl_jet(z, V0, zs)
     rho_t = col.rho_d .+ col.rho_v .+ col.rho_c
     ztop = model.grid_params.kMax
@@ -199,7 +207,10 @@ function set_state!(patch, model, kDim, z, col; V0 = 12.0, zs = 500.0, e0 = 0.4,
         patch.physical[j, vars["rho_v"], 1] = rho_t[k] * bump
         patch.physical[j, vars["rho_c"], 1] = rho_t[k] * 0.2 * bump
         patch.physical[j, vars["rho_r"], 1] = rho_t[k] * 0.1 * bump
-        rei > 0 && (patch.physical[j, rei, 1] = rho_t[k] * e0 * exp(-z[k] / ze))
+        if rei > 0
+            re0 = rho_t[k] * e0 * exp(-z[k] / ze)
+            patch.physical[j, rei, 1] = etr === :none ? re0 : Scythe.bhyp(re0, emu)
+        end
     end
     # Fit first, then compensate with the FITTED kinetic energy (a raw-value
     # compensation leaves a ~1 % thermal residual from the fit of the wind itself).
