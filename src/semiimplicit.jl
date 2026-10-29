@@ -348,6 +348,19 @@ forensics switch.
 @inline sedimentation_flux_column(mtile::ModelTile, var_index::Int64, dirichlet_lid::Bool) =
     dirichlet_lid ? flux_column(mtile, var_index) : scratch_column(mtile, var_index)
 
+"""
+    sedimentation_flux_column(fcols, scols, var_index, dirichlet_lid) -> column
+
+The array method of [`sedimentation_flux_column`](@ref), for the driver stages that take the
+tile's `flux_columns`/`scratch_columns` matrices rather than the tile: the calling thread's
+column of `fcols` when `dirichlet_lid`, else of `scols` — the same object the tile method
+returns.
+"""
+@inline sedimentation_flux_column(fcols::AbstractMatrix, scols::AbstractMatrix,
+                                  var_index::Int64, dirichlet_lid::Bool) =
+    dirichlet_lid ? (@inbounds fcols[Threads.threadid(), var_index]) :
+                    (@inbounds scols[Threads.threadid(), var_index])
+
 """Reusable per-thread vertical work columns, or an empty matrix if the grid has no k-basis."""
 _allocate_scratch_columns(::NoBasisArray, tile::AbstractGrid) = Matrix{Nothing}(undef, 0, 0)
 

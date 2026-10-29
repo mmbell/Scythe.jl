@@ -2863,7 +2863,7 @@ continuity form.
 end
 
 """
-    _ice_flux!(mtile, F, F_z, x, w_fall, slot, dirichlet_lid = true) -> Nothing
+    _ice_flux!(fcols, scols, F, F_z, x, w_fall, slot, dirichlet_lid = true) -> Nothing
 
 Form one ice moment's sedimentation flux `F = max(x, 0)·W` and its fitted divergence
 `∂F/∂z`, on THAT SLOT'S OWN spline basis — its own cells, l_q and GROUND condition, so a mass
@@ -2875,7 +2875,9 @@ there, i.e. inflow from above; where the fall speed increases upward the top cel
 mass with no drain, a linear instability (e-folding ~35 s) that killed the first production
 ice TC run at the lid. `dirichlet_lid = false` restores that fit (forensics:
 `options[:sedimentation_flux_lid] = :natural`). On a Chebyshev vertical (RZ) the flux column
-IS the slot's own column — see `_allocate_flux_columns` for why.
+IS the slot's own column — see `_allocate_flux_columns` for why. `fcols`/`scols` are the
+tile's per-thread `flux_columns`/`scratch_columns` (arrays, not the tile: the compile-cliff
+rule; the fit column is `sedimentation_flux_column(fcols, scols, slot, dirichlet_lid)`).
 
 (The sedimentation anchor share `f_anchor` that multiplied the product went with the
 ice-anchor legs at Stage 5 of the ρ_t retirement; the driver passed the scalar `1.0` under the
@@ -2903,8 +2905,8 @@ if no level has both a nonzero fall speed and a nonzero (positive) amount, `F` a
 its derivative is zero — it is the same numbers reached without the arithmetic, which is what
 keeps the zero-ice inertness gate BITWISE rather than merely small.
 """
-@inline function _ice_flux!(mtile::ModelTile, F, F_z, x, w_fall, slot::Int,
-                            dirichlet_lid::Bool = true)
+@inline function _ice_flux!(fcols::AbstractMatrix, scols::AbstractMatrix, F, F_z, x, w_fall,
+                            slot::Int, dirichlet_lid::Bool = true)
     @. F = max(x, 0.0) * w_fall
     live = false
     @inbounds for i in eachindex(F)
@@ -2921,7 +2923,7 @@ keeps the zero-ice inertness gate BITWISE rather than merely small.
     # The flux is fitted with a ZERO-FLUX LID (see `flux_column`): nothing falls in from
     # above the domain, whatever the slot's own lid BC. `dirichlet_lid = false` is the
     # pre-fix fit on the slot's own column (`options[:sedimentation_flux_lid] = :natural`).
-    col = sedimentation_flux_column(mtile, slot, dirichlet_lid)
+    col = sedimentation_flux_column(fcols, scols, slot, dirichlet_lid)
     col.uMish .= F
     Btransform!(col)
     Atransform!(col)
@@ -4726,20 +4728,21 @@ than by editing this function. NEVER touches a rate.
 end
 
 """
-    mc_stiffness_census!(mtile, ts, invtau_i1, invtau_i2, invtau_i3)
+    mc_stiffness_census!(st, ts, invtau_i1, invtau_i2, invtau_i3)
 
 The ICE arm of [`mc_stiffness_census!`](@ref): the three deposition relaxations `1/τ_{i,k}` of
 TeX Eq. tau_ice, measured on exactly the rates the step used, with the same `ts/τ` yardstick
 and into the same block (`MC_STIFF_I1..I3`).
 
-A SEPARATE method rather than three more arguments to the liquid one, so an ice-free run does
+`st` is the census matrix `mtile.mc_water_stats` (an array method: it is called from
+`_ice_stage!`, which never takes the tile). A SEPARATE method rather than three more arguments
+to the liquid one, so an ice-free run does
 not pay three passes over three columns it would only find zeros in — and, more importantly,
 so those three channels report an exact zero rather than a zero that had to be computed.
 """
-@inline function mc_stiffness_census!(mtile::ModelTile, ts::Float64,
+@inline function mc_stiffness_census!(st::Matrix{Float64}, ts::Float64,
                                       invtau_i1, invtau_i2, invtau_i3)
 
-    st = mtile.mc_water_stats
     size(st, 2) == 0 && return nothing
     tid = Threads.threadid()
     _stiffness_channel!(st, tid, MC_STIFF_I1, ts, invtau_i1)
@@ -8659,231 +8662,29 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
         f_cloud[i] = relaxation_realization(kc * qc_i, qc_i, model.ts)
     end
 
-    # ── Ice: process sources and sedimentation ─────────────────────────────────
-    #
-    # Each of the twelve slots gets a source accumulator `SRC_*` (the `Q̇_{i,k}`, `Ṅ_k`, `Ȧ_k`,
-    # `Ċ_k` of Eqs. ice_prog_mass..ice_prog_c) and a sedimentation flux `F_X = X·W_X` fitted on
-    # its OWN spline column, where `W_X` is the fall speed weighted by the very moment being
-    # transported — which is what makes the size distribution sort as it falls, and is why the
-    # four moments of a species cannot share one flux.
-    #
-    # ONLY THE MASS FLUXES LEAVE THIS BLOCK. `Fi_z = Σ_k ∂F_{ρ,k}/∂z` is the ice sedimentation
-    # rate `Q̇_sed_i` that sources ρ_t, and `E_sed_i` is the energy it carries,
-    # `(C_pv T − L_s + ke + gz)` per kg — the ice mirror of the liquid `E_sed`, with `L_s` in
-    # place of `L_v` (TeX Eq. Et_ice). The number and volume fluxes carry neither mass nor
-    # energy and appear in no other equation, exactly as the rain number's does not.
+    # ── Ice: process sources and sedimentation — `_ice_stage!` (src/mc_driver_stages.jl) ──
+    # The two mass-flux aggregates outlive the stage (the energy and water-slot tendencies
+    # and the surface census read them), so they are bound here as well.
     Fi_z = S.Fi_z
     E_sed_i_z = S.E_sed_i_z
-    if ice_on
-        # The ice psychrometric factor (TeX Eq. Qs_ice) — `Q_s_energy` with L_v -> L_s in both
-        # latent slots, the two saturation derivatives still over WATER. Formed here rather
-        # than beside `Q_s` because nothing but the ice reads it.
-        @. S.Q_s_i = Q_s_energy_ice(Tk, p, rho_d, q_v, q_l, q_i)
-        # Every process rate: deposition through the shared prognostic supersaturation, the
-        # full ISHMAEL nucleation/riming/aggregation/melting set, and the twelve slot sources
-        # they assemble into. Reads and writes the scratch only; see `mc_ice_sources!`.
-        # `options[:condensation] = false` switches the ice phase changes off with the liquid
-        # ones, for the same reason: a run advertised as "no physics" must not glaciate.
-        mc_ice_sources!(S, mtile.ishmael_tables, model.ts, max_N_c,
-                        get(model.options, :condensation, true)::Bool,
-                        get(model.options, :ice_var_check, true)::Bool,
-                        ice_attr, ice_agg_caps, rain_evap_real,
-                        cloud_evap_real, ice_shed,
-                        ice_n_real, rain_pop_gate,
-                        get(model.physical_params, :tau_homogeneous, 5.0),
-                        get(model.physical_params, :tau_activation, 1.0),
-                        get(model.physical_params, :tau_varcheck, 5.0),
-                        mtile.mc_water_stats, Threads.threadid())
-        # The three deposition relaxations, on the rates the step actually used. Ungated, for
-        # the reason the liquid census is: the once-per-run under-resolution warning has to be
-        # able to see an excursion whether or not a diagnostic is switched on.
-        mc_stiffness_census!(mtile, model.ts, S.invtau_i1, S.invtau_i2, S.invtau_i3)
-        # The POPULATION RECONCILIATION, after the process sources and before anything reads
-        # the SRC accumulators: the process sources are assembled and nothing has read them
-        # yet. (The ice-anchor reconciliation that ran here before it, with its reader cap,
-        # rate share and sedimentation share, was deleted at Stage 5 of the ρ_t retirement:
-        # its headroom test read through ρ_w had become a vapor-negativity device.)
-        # It is the exact complement of the population gate above — mass whose
-        # carried number is not positive, which no rate may act on and which no device could
-        # therefore remove — returned to a representation the equations can use: rain above
-        # `T_0` with `L_f` absorbed through `FRZ_NET`, 2 μm crystals below it, on `τ_pop`.
-        # Census `MC_POP_*`; TeX §"Reconciliation of the population".
-        # Switched off with the liquid phase changes by `options[:condensation] = false`,
-        # for the same reason `mc_ice_sources!` is: BOTH branches move water between
-        # categories (the warm one moves mass and `L_f`, the cold one creates crystals), and
-        # a run advertised as "no physics" — the transport-only fixtures included — must not.
-        # The CENSUS is unaffected either way.
-        _ice_population_reconcile!(S, mtile.mc_water_stats, Threads.threadid(),
-                                   Tk, rho_d, tau_pop,
-                                   ice_pop_src && get(model.options, :condensation,
-                                                      true)::Bool,
-                                   model.ts, pop_seed)
+    condensation = get(model.options, :condensation, true)::Bool
+    _ice_stage!(S, mtile.ishmael_tables, mtile.mc_water_stats, mtile.flux_columns,
+                mtile.scratch_columns, IS, z, model.ts, max_N_c, tau_pop, pop_seed,
+                get(model.physical_params, :tau_homogeneous, 5.0),
+                get(model.physical_params, :tau_activation, 1.0),
+                get(model.physical_params, :tau_varcheck, 5.0),
+                (; ice_on, condensation,
+                   ice_var_check = get(model.options, :ice_var_check, true)::Bool,
+                   ice_attr, ice_agg_caps, rain_evap_real, cloud_evap_real, ice_shed,
+                   ice_n_real, rain_pop_gate, ice_pop_src, sed_lid_dir))
 
-        # Each moment's flux at ITS OWN weighted fall speed — mass-weighted for the mass and
-        # the two volume moments, number-weighted for the number. That is the whole reason
-        # the four moments of a species cannot share one flux: the distribution SORTS as it
-        # falls, and a number that sedimented at the mass-weighted speed would carry the small
-        # crystals down as fast as the large ones. `ishmael_fall_speeds` has already applied
-        # the 25 m/s cap and the melting size-sorting override.
-        _ice_flux!(mtile, S.F_i1q, S.F_i1q_z, i1q, S.Vi1m, IS.i1_q, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i1n, S.F_i1n_z, i1n, S.Vi1n, IS.i1_n, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i1a, S.F_i1a_z, i1a, S.Vi1m, IS.i1_a, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i1c, S.F_i1c_z, i1c, S.Vi1m, IS.i1_c, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2q, S.F_i2q_z, i2q, S.Vi2m, IS.i2_q, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2n, S.F_i2n_z, i2n, S.Vi2n, IS.i2_n, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2a, S.F_i2a_z, i2a, S.Vi2m, IS.i2_a, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i2c, S.F_i2c_z, i2c, S.Vi2m, IS.i2_c, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3q, S.F_i3q_z, i3q, S.Vi3m, IS.i3_q, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3n, S.F_i3n_z, i3n, S.Vi3n, IS.i3_n, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3a, S.F_i3a_z, i3a, S.Vi3m, IS.i3_a, sed_lid_dir)
-        _ice_flux!(mtile, S.F_i3c, S.F_i3c_z, i3c, S.Vi3m, IS.i3_c, sed_lid_dir)
-
-        # The two AGGREGATES that reach the conserved variables. `Fi_z` is summed from the
-        # three fitted mass-flux divergences rather than refitting their sum, so slot 3 and
-        # the three ice mass slots receive exactly the same discrete numbers and cannot drift
-        # apart — the telescoping argument slot 8 and slot 3 make for the rain.
-        @. Fi_z = (S.F_i1q_z + S.F_i2q_z) + S.F_i3q_z
-        E_sed_i = S.E_sed_i
-        @. E_sed_i = ((S.F_i1q + S.F_i2q) + S.F_i3q) *
-                     ((Cpv * Tk) - L_s(Tk) + ke + (gravity * z))
-        # Fitted on species 1's mass column: it is a MASS flux and takes a mass slot's basis
-        # and BCs (Natural at the bottom, so the energy can leave with the ice).
-        ei_col = sedimentation_flux_column(mtile, IS.i1_q, sed_lid_dir)
-        ei_col.uMish .= E_sed_i
-        Btransform!(ei_col)
-        Atransform!(ei_col)
-        Ixtransform(ei_col, E_sed_i_z)
-    end
-
-    # ── The REALIZED RAIN CONDUCTANCE, and the liquid λ/N split taken on it (Stage 2b) ────
-    #
-    # HERE, and not beside the condensation closure where it used to be, because `f_rain` is
-    # not final until `mc_ice_sources!` has completed the rain donor's total: the reservoir's
-    # sinks are the ice legs AND the evaporation, and the TeX's closure is that ONE realized
-    # conductance `f_r τ_r^{-1}` replaces `τ_r^{-1}` in λ, in N and in the rain-channel
-    # transfer at once (§donor_relax, "The rain reservoir has a third sink"). Nothing between
-    # the closure and this point reads either column except `mc_stiffness_census!`, which
-    # measures the stiffness the step was ASKED to integrate and therefore wants the
-    # unrealized one.
-    #
-    # The factor is folded into `invtau_r` and `Qdot_r` THEMSELVES, exactly as the ice folds
-    # `f_ice<k>` into `invtau_i<k>`, so every consumer downstream — λ, the `N` remainder just
-    # below, the step-mean split in the ETD pre-compute and the `qr_bar` the rain slot
-    # receives — reads the one number with no opportunity to disagree. `f_rain` is an exact
-    # `1.0` wherever the rain has no sink, and `1.0 * x === x` for every `x`, so the warm
-    # non-evaporating path and the whole dry path are untouched bitwise.
-    #
-    # The split itself is UNCHANGED, term for term: it is a statement about the DRIVE CLIP
-    # and nothing else (see the block beside the closure). A clipped channel's drive does not
-    # depend on `Q_ss`, so its whole — now realized — flux belongs in `N`; an unclipped one's
-    # whole realized conductance belongs in λ.
-    #
-    # `evap_now` is the exact mirror of the ice's `sub_now`, and for the same reason: a donor
-    # factor bounds a SINK, and rain CONDENSATION is a source. Where the channel is condensing
-    # at state `n` the factor does not belong in its conductance at all — `κ_ev` is already an
-    # exact zero there by its own `max`, but the rain donor's factor also carries the ice legs,
-    # and scaling a source by the rate at which freezing empties the reservoir would be a
-    # bound applied to the wrong sign. FROZEN at state `n`, like every classification the step
-    # freezes.
-    #
-    # ── The REALIZED CLOUD SINKS (`cloud_evap_realized`) ────────────────────────────────
-    # `f_cloud` is final here for the same reason `f_rain` is: `mc_ice_sources!` has
-    # completed the cloud donor's total. ONE factor, every sink on the reservoir:
-    #
-    #   * `AUTO_COLL` — the conversion to rain, which is the SAME array the rain slot reads
-    #     as its source, so the liquid-to-liquid pair stays equal and opposite; under two
-    #     moments its rain-number partner `n_auto` takes the same factor (the same collisions;
-    #     accretion adds no drops), recomputed from the state-`n` arguments `AUTO_COLL` was
-    #     formed from rather than staged in a column. Nothing between the closure and this
-    #     point reads `AUTO_COLL` except `kappa_c` itself, which wants the unrealized rate.
-    #   * the EVAPORATION, where the drive is CLIPPED (in the loop below): a clipped channel's
-    #     step-mean IS its frozen rate and its flux lives in `N`, so the factor has to reach
-    #     `Q̇_c` and `1/τ_c` at state `n`, before `N` is formed from them — scaling both by the
-    #     one factor keeps `Q̇_c(1 + 𝒬_s) = drive·τ_c^{-1}`, which is what `etd_nl` is written
-    #     in. Where the drive is unclipped the factor acts on the step-mean `qc_bar` in the ETD
-    #     pre-compute instead. Only where the cloud EVAPORATES at state `n` — the `evap_now`
-    #     mirror: a donor factor bounds a draw, and condensation is a source.
-    #   * the ice legs already carry it, as `f_qc`.
-    #
-    # Gated on `cloud_evap_real`; the census of the evaporation is written in both modes.
-    if cloud_evap_real && precipitation
-        @inbounds for i in eachindex(AUTO_COLL)
-            fc = f_cloud[i]
-            ac = AUTO_COLL[i]
-            (fc < 1.0 && ac > 0.0) || continue
-            AUTO_COLL[i] = fc * ac
-            if rain_2m
-                n_auto = rain_autoconversion_2m(rho_c[i], rho_d[i], max_N_c)[2]
-                NR_SRC[i] += (fc - 1.0) * n_auto
-            end
-        end
-    end
-    cev_st = mtile.mc_water_stats
-    cev_tid = Threads.threadid()
-    if get(model.options, :condensation, true)::Bool
-        @inbounds for i in eachindex(invtau_r)
-            evap_now = Qdot_r[i] < 0.0
-            fr = f_rain[i]
-            invtau_r[i] = evap_now ? fr * invtau_r[i] : invtau_r[i]
-            Qdot_r[i] = evap_now ? fr * Qdot_r[i] : Qdot_r[i]
-            invtau = invtau_c[i] + invtau_r[i]
-            drive_cap = max(rho_v[i], 0.0) - rho_vs[i]
-            if drive_cap < Q_ss[i]
-                qcb = cloud_evap_realized(Qdot[i], f_cloud[i])
-                if qcb != Qdot[i]
-                    _cloud_evap_census!(cev_st, cev_tid, (qcb - Qdot[i]) * model.ts)
-                    if cloud_evap_real
-                        invtau_c[i] = f_cloud[i] * invtau_c[i]
-                        Qdot[i] = qcb
-                        invtau = invtau_c[i] + invtau_r[i]
-                    end
-                end
-                etd_lam[i] = 0.0
-                etd_nl[i] = -drive_cap * invtau
-            else
-                etd_lam[i] = invtau
-                etd_nl[i] = 0.0
-            end
-        end
-    else
-        fill!(etd_lam, 0.0)
-        fill!(etd_nl, 0.0)
-    end
-
-    # Record this step's net microphysics tendency per channel, so the NEXT step's depletion
-    # budget can be written against the integrator's actual three-level combination. Here,
-    # after the `precipitation` branch, because the cloud channel is not final until
-    # AUTO_COLL is. See `MC_MICRO_C` for the three channels and `_rotate_micro_history!` for
-    # when these become the history levels.
-    #
-    # The ICE arm is a SEPARATE loop, so the ice-free path keeps the short body it had.
-    # The cloud and rain channels gain the riming/freezing/melting back-reactions, which is
-    # what makes the census (still a pure measurement — nothing in the RHS reads it) describe
-    # the water budget that ran.
-    #
-    # WHAT MOVED WHEN THE RELAXATION PAIR CAME OFF THE MULTISTEP. The condensation and
-    # deposition legs are no longer weighted by the three-level combination at all — they are
-    # applied once, at the step-mean rate, by `relaxation_adjustment_qss!` — so keeping them in
-    # a MULTISTEP history would have made the census weight them `23/12, −16/12, 5/12` when the
-    # integrator weights them `1, 0, 0`. These three channels therefore carry the legs that are
-    # still on the multistep (autoconversion/collection and the ice back-reactions), and the
-    # phase change reaches the census through `Qdot_bar`/`Qdot_r_bar`/`Qdep_bar` instead —
-    # the SAME columns the tendencies are built from, which is the property this block exists
-    # to guarantee. `water_depletion_probe!` adds the two together.
-    micro_n = mtile.mc_micro_n
-    @inbounds for i in eachindex(Qdot)
-        g = colstart + i - 1
-        micro_n[g, MC_MICRO_C] = -AUTO_COLL[i]
-        micro_n[g, MC_MICRO_R] = 0.0
-        micro_n[g, MC_MICRO_V] = 0.0
-    end
-    if ice_on
-        @inbounds for i in eachindex(Qdot)
-            g = colstart + i - 1
-            micro_n[g, MC_MICRO_C] += S.ICE_C[i]
-            micro_n[g, MC_MICRO_R] += S.ICE_R[i]
-        end
-    end
+    # ── The realized rain conductance, the liquid λ/N split taken on it, the realized
+    # cloud sinks and the microphysics history row — `_liquid_fold_stage!`
+    # (src/mc_driver_stages.jl). After `_ice_stage!`: `f_rain`/`f_cloud` are final only
+    # once `mc_ice_sources!` has completed the donor totals.
+    _liquid_fold_stage!(S, mtile.mc_water_stats, mtile.mc_micro_n, colstart, model.ts,
+                        max_N_c, (; cloud_evap_real, precipitation, rain_2m, condensation,
+                                   ice_on))
 
     div = S.div; mc_divergence!(div, geom, u, u_x, w_z, vv, r)
 
