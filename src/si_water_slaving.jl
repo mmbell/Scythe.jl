@@ -595,6 +595,8 @@ function _siw_ldiv!(LDIV, mtile::ModelTile, colstart::Int, colend::Int)
         _siw_ldiv_g!(LDIV, MCAxisymRZ(), mtile, colstart, colend)
     elseif es == "moist_compressible_RLR"
         _siw_ldiv_g!(LDIV, MCCylindricalRLR(), mtile, colstart, colend)
+    elseif es == "moist_compressible_RRR"
+        _siw_ldiv_g!(LDIV, MCCartesianRRR(), mtile, colstart, colend)
     else
         error("si_water_slots with the horizontal SI / exact 2-D solve: no linear horizontal " *
               "divergence for equation set $(es)")

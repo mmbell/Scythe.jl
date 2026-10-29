@@ -4339,6 +4339,157 @@ using Springsteel
         end
     end
 
+    # ── Stream C2/R2b: the two RRR geometry terms that had no Cartesian-box method, the
+    #    reference-linear horizontal divergence (`mc_linear_div!`, read by the horizontal SI
+    #    legs and by `_siw_ldiv!`) and the Smagorinsky strain-norm viscosity
+    #    (`mc_smag_k!`), checked two ways on a tiny box: (1) a y-invariant state gives the
+    #    XZ slice's values pointwise (the slab); (2) an x<->y mirrored state (u<->v) gives
+    #    the mirrored tendencies, Smagorinsky ON, f = 0 (the mirror is improper, so it
+    #    maps f to -f). ──
+    @testset "RRR: linear divergence + Smagorinsky (slab == XZ, x<->y mirror)" begin
+        mktempdir() do tmpdir
+            L = 24.0e3
+            H = 2000.0
+            varlist9 = Scythe.MC_VARS_CYL
+            vars9 = Dict(v => i for (i, v) in enumerate(varlist9))
+            vars8 = Dict(v => i for (i, v) in enumerate(Scythe.MC_VARS))
+            mkbc(vars) = Dict(v => NeumannBC() for v in keys(vars))
+            gp_rrr = GridParameters(
+                geometry = "RRR", iMin = 0.0, iMax = L, num_cells_i = 6,
+                jMin = 0.0, jMax = L, num_cells_j = 6,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                BCL = merge(mkbc(vars9), Dict("u" => DirichletBC())),
+                BCR = merge(mkbc(vars9), Dict("u" => DirichletBC())),
+                BCU = merge(mkbc(vars9), Dict("v" => DirichletBC())),
+                BCD = merge(mkbc(vars9), Dict("v" => DirichletBC())),
+                BCB = merge(mkbc(vars9), Dict("w" => DirichletBC())),
+                BCT = merge(mkbc(vars9), Dict("w" => DirichletBC())),
+                vars = vars9)
+            gp_xz = GridParameters(
+                geometry = "RiRk", iMin = 0.0, iMax = L, num_cells_i = 6,
+                kMin = 0.0, kMax = H, num_cells_k = 8,
+                BCL = merge(mkbc(vars8), Dict("u" => DirichletBC())),
+                BCR = merge(mkbc(vars8), Dict("u" => DirichletBC())),
+                BCB = merge(mkbc(vars8), Dict("w" => DirichletBC())),
+                BCT = merge(mkbc(vars8), Dict("w" => DirichletBC())),
+                vars = vars8)
+            # Smagorinsky momentum (and heat through the K/Pr_t sentinel), absolute Ls.
+            pp = Dict(:Khdiff => 0.0, :Khdiff_heat => -1.0, :Kvdiff => 0.0,
+                      :Kvdiff_water => 0.0, :Kv_mudiff => 0.0, :tau_qss => 10.0,
+                      :N_r => 1.0e-3, :alpha => 0.0, :z_damp => H, :f => 0.0,
+                      :Ls => 2000.0, :K_min => 1.0)
+            # `seed(x, y, z)` -> Dict(slot => value)
+            function build(gp, eqset, zc, seed)
+                ref_file = joinpath(tmpdir, "r2b_$(eqset).ref")
+                model = ModelParameters(
+                    ts = 0.1, integration_time = 1.0, output_interval = 1.0,
+                    equation_set = eqset, ref_state_file = ref_file, grid_params = gp,
+                    physical_params = copy(pp),
+                    options = Dict(:semiimplicit => true, :exact_reference_state => true,
+                                   :precipitation => true, :vertical_mixing => false))
+                kD = model.grid_params.kDim
+                patch = createGrid(model.grid_params)
+                gpts = Scythe.getGridpoints(patch)
+                z = gpts[1:kD, zc]
+                col = saturated_cloudy_column_mc(z; q_l = 1.0e-3)
+                Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+                patch.physical .= 0.0
+                for i in axes(gpts, 1)
+                    y = zc == 3 ? gpts[i, 2] : 0.0
+                    for (v, val) in seed(gpts[i, 1], y, gpts[i, zc])
+                        patch.physical[i, v, 1] = val
+                    end
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                mtile = createModelTile(patch, patch, model,
+                                        sparse(Int64[], Int64[], Float64[],
+                                               size(patch.spectral, 1), size(patch.spectral, 2)))
+                ncol = div(size(gpts, 1), kD)
+                for c in 1:ncol
+                    Scythe.advance_column(mtile, c, 1)
+                end
+                # the reference-linear divergence and the Smagorinsky K, column by column
+                ldiv = zeros(size(gpts, 1)); ksm = zeros(size(gpts, 1))
+                geom = eqset == "moist_compressible_RRR" ? Scythe.MCCartesianRRR() : Scythe.MCCartesianXZ()
+                for c in 1:ncol
+                    cs = (c - 1) * kD + 1; ce = c * kD
+                    Scythe._siw_ldiv!(view(ldiv, cs:ce), mtile, cs, ce)
+                    uv = Scythe.mc_slot_views(mtile.tile, cs, ce, vars9["u"], geom)
+                    vv = Scythe.has_v(geom) ? Scythe.mc_slot_views(mtile.tile, cs, ce, vars9["v"], geom) : nothing
+                    Scythe.mc_smag_k!(view(ksm, cs:ce), geom, uv, vv, nothing, pp[:Ls], pp[:K_min])
+                end
+                return (; mtile, gpts, kD, ldiv, ksm)
+            end
+            bump(x, y, z) = exp(-((x - 12.0e3) / 6.0e3)^2 - ((z - 1000.0) / 500.0)^2)
+            amps = Dict(1 => 10.0, 2 => 1.0e-4, 3 => 1.0e-4, 4 => 0.5, 5 => 0.25,
+                        6 => 100.0, 7 => 1.0e-5, 8 => 1.0e-5)
+            # u carries a sine so ∂u/∂x is O(1e-4) everywhere (the strain norm is not just K_min)
+            slab(x, y, z) = Dict(v => (v == 4 ? amp * sin(pi * x / L) : amp) * bump(x, y, z)
+                                 for (v, amp) in amps)
+
+            # (1) the slab: RRR y-invariant == XZ, pointwise, for LDIV, K and every tendency
+            r = build(gp_rrr, "moist_compressible_RRR", 3, slab)
+            x = build(gp_xz, "moist_compressible_XZ", 2, slab)
+            @test r.kD == x.kD
+            kD = r.kD
+            xcols = x.gpts[1:kD:end, 1]
+            dl = 0.0; dk = 0.0; dt = 0.0
+            scales = Dict(1 => 1.0e2, 2 => 1.0e-5, 3 => 1.0e-5, 4 => 1.0e-2, 5 => 1.0e-2,
+                          6 => 1.0e3, 7 => 1.0e-6, 8 => 1.0e-6, 9 => 1.0e-6)
+            lmax = maximum(abs, x.ldiv); kmax = maximum(abs, x.ksm)
+            for c in 1:div(size(r.gpts, 1), kD)
+                i0 = (c - 1) * kD
+                a = findfirst(==(r.gpts[i0 + 1, 1]), xcols)
+                @test a !== nothing
+                j0 = (a - 1) * kD
+                dl = max(dl, maximum(abs.(r.ldiv[i0+1:i0+kD] .- x.ldiv[j0+1:j0+kD])) / lmax)
+                dk = max(dk, maximum(abs.(r.ksm[i0+1:i0+kD] .- x.ksm[j0+1:j0+kD])) / kmax)
+                for v in 1:9
+                    dt = max(dt, maximum(abs.(r.mtile.expdot_n[i0+1:i0+kD, v] .-
+                                              x.mtile.expdot_n[j0+1:j0+kD, v])) / scales[v])
+                end
+            end
+            @info "R2b slab: LDIV $(dl), K_smag $(dk) (relative), tendencies $(dt) (scaled); " *
+                  "max|LDIV| = $(lmax), max K = $(kmax)"
+            @test lmax > 1.0e-6 && kmax > 2.0 * pp[:K_min]     # neither is vacuous
+            @test dl < 1.0e-10
+            @test dk < 1.0e-10
+            @test dt < 1.0e-6
+            @test all(isfinite, r.mtile.expdot_n)
+
+            # (2) the mirror: B(x, y) = A(y, x) with u <-> v
+            ba(x, y) = exp(-((x - 10.0e3) / 5.0e3)^2 - ((y - 14.0e3) / 7.0e3)^2)
+            bz(z) = exp(-((z - 1000.0) / 500.0)^2)
+            sA(x, y, z) = Dict(1 => 10.0 * ba(x, y) * bz(z), 2 => 1.0e-4 * ba(x, y) * bz(z),
+                               3 => 1.0e-4 * ba(x, y) * bz(z),
+                               4 => 0.5 * sin(pi * x / L) * ba(x, y) * bz(z),
+                               10 => 0.3 * sin(pi * y / L) * (1.0 + x / L) * bz(z),
+                               5 => 0.25 * ba(x, y) * bz(z), 6 => 100.0 * ba(x, y) * bz(z),
+                               7 => 1.0e-5 * ba(x, y) * bz(z), 8 => 1.0e-5 * ba(x, y) * bz(z))
+            swap = Dict(4 => 10, 10 => 4)
+            sB(x, y, z) = Dict(get(swap, v, v) => val for (v, val) in sA(y, x, z))
+            A = build(gp_rrr, "moist_compressible_RRR", 3, sA)
+            B = build(gp_rrr, "moist_compressible_RRR", 3, sB)
+            idx = Dict((A.gpts[i, 1], A.gpts[i, 2], A.gpts[i, 3]) => i for i in axes(A.gpts, 1))
+            mir = [idx[(A.gpts[i, 2], A.gpts[i, 1], A.gpts[i, 3])] for i in axes(A.gpts, 1)]
+            den = Dict(v => max(maximum(abs, A.mtile.expdot_n[:, v]), 1.0e-300) for v in 1:10)
+            dm = zeros(10)
+            for v in 1:10
+                dm[v] = maximum(abs.(B.mtile.expdot_n[:, v] .- A.mtile.expdot_n[mir, get(swap, v, v)])) / den[v]
+            end
+            dlm = maximum(abs.(B.ldiv .- A.ldiv[mir])) / maximum(abs, A.ldiv)
+            dkm = maximum(abs.(B.ksm .- A.ksm[mir])) / maximum(abs, A.ksm)
+            @info "R2b mirror: LDIV $(dlm), K_smag $(dkm), per-slot tendencies " *
+                  join(("$v=$(dm[v])" for v in 1:10), " ")
+            @test maximum(abs, A.ldiv) > 1.0e-6 && maximum(abs, A.ksm) > 2.0 * pp[:K_min]
+            @test dlm < 1.0e-12
+            @test dkm < 1.0e-12
+            @test maximum(dm) < 1.0e-10
+            @test all(isfinite, A.mtile.expdot_n) && all(isfinite, B.mtile.expdot_n)
+        end
+    end
+
     # ── 3D spherical shell (moist_compressible_SLR): a zonally-symmetric (WN0)
     #    state on a narrow equatorial band converges to the Cartesian XZ slice
     #    with x = a·(θ − θ₀): at θ ≈ π/2 the metric terms (cotθ, 1 − sinθ) are

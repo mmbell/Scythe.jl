@@ -178,7 +178,8 @@ coefficients forms the horizontal acoustic legs of the semi-implicit split
 in `horizontal_si_correct!`; also the divergence load of the exact unsplit 2-D
 solve, `exact_si.jl`). XZ: ∂u/∂x. Axisym: the cylindrical radial divergence
 ∂u/∂r + u/r = (1/r)∂(ru)/∂r — the v/λ azimuthal term is absent because vbar ≡ 0
-and the reference has no λ structure. RLR belongs to Stage 4 and still errors.
+and the reference has no λ structure. RLR: ∂u/∂r + u/r + (1/r)∂v/∂λ. RRR (the 3-D
+box): ∂u/∂x + ∂v/∂y. The sphere (SLR) has no method and errors.
 """
 @inline function mc_linear_div!(ldiv, ::MCCartesianXZ, uv, vv, r)
     @. ldiv = uv.f_x
@@ -190,6 +191,10 @@ end
 end
 @inline function mc_linear_div!(ldiv, ::MCCylindricalRLR, uv, vv, r)
     @. ldiv = uv.f_x + (uv.f / r) + (vv.f_l / r)
+    return nothing
+end
+@inline function mc_linear_div!(ldiv, ::MCCartesianRRR, uv, vv, r)
+    @. ldiv = uv.f_x + vv.f_l
     return nothing
 end
 @inline mc_linear_div!(ldiv, geom::MCGeometry, uv, vv, r) =
@@ -379,9 +384,22 @@ end
                K_min)
     return nothing
 end
+# The 3-D box: the RLR closure with every 1/r term gone and the raw azimuthal
+# derivative replaced by ∂/∂y (slots 4/5 hold the full ∂y/∂yy): S_xx = ∂u/∂x,
+# S_yy = ∂v/∂y, S_xy = ½(∂u/∂y + ∂v/∂x). A y-invariant state with v = 0 reduces it to
+# the XZ closure term for term.
+@inline function mc_smag_k!(K, ::MCCartesianRRR, uv, vv, r, Ls, K_min)
+    u_x = uv.f_x; u_y = uv.f_l
+    v_x = vv.f_x; v_y = vv.f_l
+    @. K = max(Ls * Ls * sqrt(2.0 * ((u_x * u_x) +
+                                     (v_y * v_y) +
+                                     (2.0 * (0.5 * (u_y + v_x))^2))),
+               K_min)
+    return nothing
+end
 mc_smag_k!(K, geom::MCGeometry, uv, vv, r, Ls, K_min) =
-    error("Smagorinsky horizontal diffusion is implemented for the XZ slice and the " *
-          "cylindrical geometries (axisym, RLR); got $(typeof(geom))")
+    error("Smagorinsky horizontal diffusion is implemented for the XZ slice, the " *
+          "cylindrical geometries (axisym, RLR) and the 3-D box (RRR); got $(typeof(geom))")
 
 """
 Tangential (v) momentum tendency, slot 10 — explicit-only (no impdot; vertical
