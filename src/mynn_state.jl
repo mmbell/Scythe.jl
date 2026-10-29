@@ -535,6 +535,15 @@ mutable struct MYNNState
     # happens only under the switch.
     const n_hfx_clip_col::Vector{Int}
     const n_qfx_clip_col::Vector{Int}
+    # The SPLIT of `n_clamp_col` (GRIDPOINT-steps, like it): `n_eneg_col` counts the points
+    # whose carried TKE slot is NEGATIVE (`rho_e < 0`, or `nu_e < 0` under the TKE control
+    # variable), every one of which the clamp also counts because `max(e, 0) = 0` is below
+    # the floor; `n_ehigh_col` the points clamped at the 150 m^2/s^2 CEILING. The rest of
+    # `n_clamp_col` is the small-positive (or exactly zero) TKE below MYNN_QKEMIN. Counted
+    # on every run, read by nothing that changes a tendency (2026-10 rho_e diagnosis: the
+    # undivided counter could not tell a negative lobe from a quiet free atmosphere).
+    const n_eneg_col::Vector{Int}
+    const n_ehigh_col::Vector{Int}
     # ── per-thread scratch and the host constants ──
     const work::Vector{MYNNWork}
     # Thread `t`'s per-column apply scratch. Held HERE rather than appended to
@@ -555,6 +564,17 @@ mutable struct MYNNState
     n_plume::Int
     n_hfx_clip::Int
     n_qfx_clip::Int
+    # the clamp split's tile scalars, folded at run end like the counters above
+    n_clamp_e_neg::Int
+    n_clamp_e_high::Int
+    # The TKE LOBE census at the last energy-census report (`energy_census_trace`): the
+    # number of gridpoints of the tile whose TKE slot is negative and the lobe's energy, the
+    # tile-mean column integral of `alpha_e min(slot, 0)` [J/m^2] (`alpha_e` = 1 for the
+    # density, 2 for the control variable, the water anchor's weights). The vapor's
+    # `MC_VNEG`/`MC_VNEG_MASS` pair, held here rather than as `mc_water_stats` rows so the
+    # water census layout (and every checksum taken over it) is unchanged.
+    n_eneg_pts::Int
+    eneg_mass::Float64
 end
 
 """
@@ -641,6 +661,8 @@ function MYNNState(;
         n_diffnum_col::Vector{Int} = Int[],
         n_hfx_clip_col::Vector{Int} = Int[],
         n_qfx_clip_col::Vector{Int} = Int[],
+        n_eneg_col::Vector{Int} = Int[],
+        n_ehigh_col::Vector{Int} = Int[],
         work::Vector{MYNNWork} = MYNNWork[],
         colscratch::Vector{MYNNColumnScratch} = MYNNColumnScratch[],
         ework::Vector{EDMFWork} = EDMFWork[],
@@ -652,7 +674,11 @@ function MYNNState(;
         n_stall::Int = 0,
         n_plume::Int = 0,
         n_hfx_clip::Int = 0,
-        n_qfx_clip::Int = 0)
+        n_qfx_clip::Int = 0,
+        n_clamp_e_neg::Int = 0,
+        n_clamp_e_high::Int = 0,
+        n_eneg_pts::Int = 0,
+        eneg_mass::Float64 = 0.0)
     return MYNNState(active, closure, edmf, edmf_mom, scale_aware, init_mode, fidelity,
                      water_carry, mix_numbers,
                      interval_steps, ncol, kDim, K_max, output, trace, check_values,
@@ -664,10 +690,11 @@ function MYNNState(;
                      z_lay, dz, zw, w_mish, dx, z_top, dz_cell, dz_min, ts,
                      bdry_E, D_gal, D_mish, ts_tau, K_m_max, K_h_max, Ps_disc, Ps_mynn,
                      n_clamp_col, n_capK_col, n_diffnum_col,
-                     n_hfx_clip_col, n_qfx_clip_col,
+                     n_hfx_clip_col, n_qfx_clip_col, n_eneg_col, n_ehigh_col,
                      work, colscratch, ework, constants,
                      n_clamp_e, n_cap_K, n_diffnum, n_gate, n_stall, n_plume,
-                     n_hfx_clip, n_qfx_clip)
+                     n_hfx_clip, n_qfx_clip, n_clamp_e_neg, n_clamp_e_high,
+                     n_eneg_pts, eneg_mass)
 end
 
 """
@@ -1043,6 +1070,7 @@ function mc_mynn_state(model::ModelParameters, tile, tilepoints)
         n_clamp_col = zeros(Int, ncol), n_capK_col = zeros(Int, ncol),
         n_diffnum_col = zeros(Int, ncol),
         n_hfx_clip_col = zeros(Int, ncol), n_qfx_clip_col = zeros(Int, ncol),
+        n_eneg_col = zeros(Int, ncol), n_ehigh_col = zeros(Int, ncol),
         # `typemin(Int)` rather than 0: "no call yet" must be distinguishable from
         # "called at step 0" so the first step forces an update whatever the cadence is
         # (the `RadiationState.last_call_step` argument).

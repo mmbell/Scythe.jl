@@ -72,6 +72,8 @@ function mynn_write_final!(mtile::ModelTile)
     MY = mtile.mynn
     MY.active || return nothing
     MY.n_clamp_e = sum(MY.n_clamp_col)
+    MY.n_clamp_e_neg = sum(MY.n_eneg_col)
+    MY.n_clamp_e_high = sum(MY.n_ehigh_col)
     MY.n_cap_K = sum(MY.n_capK_col)
     MY.n_diffnum = sum(MY.n_diffnum_col)
     MY.n_gate = sum(MY.n_gate_col)
@@ -147,7 +149,8 @@ const MYNN_FIELDS_1D = (
 "The MYNN counter attributes [`assemble_physics`](@ref) must SUM across tiles rather than
 take from the first one -- the same ones `read_mynn` sums when it reassembles a snapshot."
 const MYNN_COUNTER_ATTRS = ("n_clamp_e", "n_cap_K", "n_diffnum", "n_gate", "n_stall",
-                            "n_plume", "n_hfx_clip", "n_qfx_clip")
+                            "n_plume", "n_hfx_clip", "n_qfx_clip",
+                            "n_clamp_e_neg", "n_clamp_e_high")
 # The counters are written as Float64 (exact to 2^53): NCDatasets stores every Int64
 # attribute as NC_INT (Int32) for NetCDF portability, and the per-column-per-step census
 # sums of a multi-day run pass 2^31 (an RCE segment died at 16 h on n_gate = 2.27e9 with
@@ -192,7 +195,11 @@ function mynn_global_attrs(MY::MYNNState)
         "n_stall" => Float64(MY.n_stall),
         "n_plume" => Float64(MY.n_plume),
         "n_hfx_clip" => Float64(MY.n_hfx_clip),
-        "n_qfx_clip" => Float64(MY.n_qfx_clip)]
+        "n_qfx_clip" => Float64(MY.n_qfx_clip),
+        # the split of n_clamp_e: the negative carried slot and the 150 m^2/s^2 ceiling;
+        # n_clamp_e - (both) is the small-positive TKE below the floor
+        "n_clamp_e_neg" => Float64(MY.n_clamp_e_neg),
+        "n_clamp_e_high" => Float64(MY.n_clamp_e_high)]
 end
 
 """
@@ -280,7 +287,7 @@ end
 """
     _mynn_live_census_attrs(MY) -> Dict{String,Any}
 
-[`mynn_global_attrs`](@ref) with the eight census counters replaced by the LIVE sums of
+[`mynn_global_attrs`](@ref) with the census counters replaced by the LIVE sums of
 the per-column vectors. The tile scalars those attrs read are folded only by
 `mynn_write_final!` at run end, so every periodic comprehensive file -- and every file of a
 run killed by a wall-clock limit (the 2026-09 fine TC pair, 17 h of 24) -- carried zeros
@@ -298,6 +305,8 @@ function _mynn_live_census_attrs(MY::MYNNState)
     attrs["n_plume"] = Float64(sum(MY.n_plume_col))
     attrs["n_hfx_clip"] = Float64(sum(MY.n_hfx_clip_col))
     attrs["n_qfx_clip"] = Float64(sum(MY.n_qfx_clip_col))
+    attrs["n_clamp_e_neg"] = Float64(sum(MY.n_eneg_col))
+    attrs["n_clamp_e_high"] = Float64(sum(MY.n_ehigh_col))
     return attrs
 end
 
@@ -495,6 +504,8 @@ function read_mynn(dir::AbstractString, tag::AbstractString)
         n_plume = sum(Int(get(s.attrs, "n_plume", 0)) for s in snaps),
         n_hfx_clip = sum(Int(get(s.attrs, "n_hfx_clip", 0)) for s in snaps),
         n_qfx_clip = sum(Int(get(s.attrs, "n_qfx_clip", 0)) for s in snaps),
+        n_clamp_e_neg = sum(Int(get(s.attrs, "n_clamp_e_neg", 0)) for s in snaps),
+        n_clamp_e_high = sum(Int(get(s.attrs, "n_clamp_e_high", 0)) for s in snaps),
         census_max_K_m = maximum(Float64(get(s.attrs, "census_max_K_m", 0.0)) for s in snaps),
         census_max_K_h = maximum(Float64(get(s.attrs, "census_max_K_h", 0.0)) for s in snaps),
         census_max_pblh = maximum(Float64(get(s.attrs, "census_max_pblh", 0.0)) for s in snaps),

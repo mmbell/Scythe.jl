@@ -380,6 +380,9 @@ handling to copy.
     sd.active && surface_record!(sd, ci, sx)
 
     n_clamp = _mynn_column_inputs!(MY, S, MN, work, geom, uv, wv, vv, rho_e, n)
+    # The clamp counter's split (negative slot / ceiling), counted on the RAW slot and the
+    # TKE the closure reads; changes nothing the closure computes.
+    _mynn_clamp_split!(MY, rev.f, rho_e, rho_t, n, ci)
 
     # ── Cold start (`:mynn_init = :taper`) ───────────────────────────────────
     first_call = MY.last_update_step[ci] == typemin(Int)
@@ -549,6 +552,32 @@ resting column produce EXACTLY zero rather than the floor's residue:
         qke[i] = qk
     end
     return n_clamp
+end
+
+"""
+    _mynn_clamp_split!(MY, slot, rho_e, rho_t, n, ci)
+
+The split of the TKE clamp counter (`n_clamp_col`, every point the closure floors at
+`MYNN_QKEMIN` or caps at 150): `n_eneg_col[ci]` gains the points whose CARRIED slot `slot`
+is negative (the density `rho_e < 0`, or the control variable `nu_e < 0`), every one of which
+the clamp also counts, and `n_ehigh_col[ci]` the points the closure caps at `2e > 150`
+(read from `rho_e`, the TKE the closure reads). What is left of `n_clamp_col` is the
+small-positive or exactly-zero TKE below the floor -- the quiet free atmosphere. Read-only on
+the state and on every closure column.
+"""
+@noinline function _mynn_clamp_split!(MY::MYNNState, slot, rho_e, rho_t, n::Int64,
+                                      ci::Int64)
+    nneg = 0
+    nhigh = 0
+    @inbounds for i in 1:n
+        slot[i] < 0.0 && (nneg += 1)
+        (2.0 * (rho_e[i] / rho_t[i])) > 150.0 && (nhigh += 1)
+    end
+    @inbounds begin
+        MY.n_eneg_col[ci] += nneg
+        MY.n_ehigh_col[ci] += nhigh
+    end
+    return nothing
 end
 
 """
@@ -1630,6 +1659,8 @@ function mynn_census_line(MY::MYNNState)
            "max ts/tau_eps=$(round(mx(MY.ts_tau); sigdigits = 3)); " *
            "max pblh=$(round(mx(MY.pblh); digits = 1)) m; " *
            "mynn_n_clamp_e=$(sum(MY.n_clamp_col)) " *
+           "(neg=$(sum(MY.n_eneg_col)) high=$(sum(MY.n_ehigh_col)) small=" *
+           "$(sum(MY.n_clamp_col) - sum(MY.n_eneg_col) - sum(MY.n_ehigh_col))) " *
            "mynn_n_cap_K=$(sum(MY.n_capK_col)) " *
            "mynn_n_diffnum=$(sum(MY.n_diffnum_col)) " *
            "mynn_n_hfx_clip=$(sum(MY.n_hfx_clip_col)) " *

@@ -894,6 +894,33 @@ no transform and so no lobe).
     return n, m
 end
 
+"""
+    _eb_tke_negative_points(eb, phys, re, alpha) -> (Int, Float64)
+
+The TKE lobe census (the vapor's `MC_VNEG`/`MC_VNEG_MASS` pair for the MYNN slot): how many
+gridpoints of the state `phys` carry a negative TKE slot `re` (the density `ρ_e` under
+`tke_transform = :none`, the control variable `ν_e` under `:bhyp`; `ρ̄_e ≡ 0`, so the slot is a
+total either way), and the lobe's energy, the tile-mean column integral of `alpha min(slot, 0)`
+[J/m²] (`alpha` = 1 for the density, 2 for the control variable, the weight that makes `2ν ≈ ρ`
+on the linear branch). Held on the tile's `MYNNState` (`n_eneg_pts`, `eneg_mass`), not as rows
+of `mc_water_stats`.
+"""
+@noinline function _eb_tke_negative_points(eb::EnergyBudget, phys::Array{Float64,3}, re::Int,
+                                           alpha::Float64)
+    n = 0
+    m = 0.0
+    kDim = eb.kDim
+    @inbounds for g in axes(phys, 1)
+        k = mod1(g, kDim)
+        x = phys[g, re, 1]
+        if x < 0.0
+            n += 1
+            m += eb.wxn[div(g - 1, kDim) + 1] * (eb.wz[k] * (alpha * x))
+        end
+    end
+    return n, m
+end
+
 # ── Master side: gather, assemble, write ────────────────────────────────────────────────
 
 """
@@ -1035,6 +1062,18 @@ function energy_census_trace(mtile, t::Int64)
     fill!(view(st, MC_VNEG:MC_VNEG_MASS, :), 0.0)
     st[MC_VNEG, 1] = Float64(nneg)
     st[MC_VNEG_MASS, 1] = vlobe
+    # The TKE lobe census, with MYNN only (held on the MYNNState; see
+    # `_eb_tke_negative_points`), and its clause of the line below.
+    MY = mtile.mynn
+    tke_line = ""
+    if MY.active && mtile.mc_slots.rho_e > 0
+        ne, elobe = _eb_tke_negative_points(eb, phys, mtile.mc_slots.rho_e, 1.0)
+        MY.n_eneg_pts = ne
+        MY.eneg_mass = elobe
+        tke_line = ", rho_e<0 points=$(ne) " *
+                   "($(round(100.0 * ne / max(size(phys, 1), 1); sigdigits = 4)) %), " *
+                   "TKE lobe=$(round(elobe; sigdigits = 4)) J/m2"
+    end
     # The water-anchor rows (MC_W_*), at the output state.
     wi = 0.0; ni = 0.0; nwn = 0
     for ci in eachindex(eb.wxn)
@@ -1062,7 +1101,7 @@ function energy_census_trace(mtile, t::Int64)
             "water anchor: int rho_w=$(f(wi)) kg/m2, " *
             "budget=$(f(budget)) kg/m2 (src=$(f(src)), rel " *
             "$(f(budget / max(abs(wi), eps())))), neg water=$(f(ni)) kg/m2, " *
-            "rho_w<0 points=$(nwn)")
+            "rho_w<0 points=$(nwn)" * tke_line)
     fill!(view(st, MC_REFIT_DR:MC_LOBE_I3, :), 0.0)
     st[MC_ECEN_STEPS, 1] = 0.0
     return nothing

@@ -42,6 +42,7 @@ const TEST_FILES = [
     ("test_energy_partners.jl",             :physics),
     ("test_energy_budget.jl",               :physics),
     ("test_vapor_transform.jl",             :physics),
+    ("test_tke_transform.jl",               :physics),
     ("test_driver_stages.jl",               :physics),
     ("test_si_water_slaving.jl",            :physics),
     ("test_water_anchor.jl",                :physics),

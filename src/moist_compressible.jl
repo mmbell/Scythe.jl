@@ -2529,6 +2529,24 @@ negative-vapor area peaked at 16 % during the burst; the arm without it still he
 pre-convective lobe pool 84 % below the control (-0.158 against -0.96 kg/m2 at 27 h). An
 explicit `lobe_relaxation = true` stays fully supported. (Its `:slot`-anchor sibling
 `LOBE_RELAXATION_DEFAULT = false` went with the prognostic rho_t at Stage 4.)
+
+**It stays off (Stream E of the 2026-10-27 close-out, refuted branch).** The offline diagnosis
+of the 24 -> 33 h pair (reference/session_2026-10_scratch/closeout_2026-10-27/stageL_diag/
+DECISION.md) confirmed the pump — the relaxation moved ~2 kg/m2/h of vapor into the cloud
+lobes before the burst, regenerated every step at ~0.7 a|pool| — but refuted it as the cause
+of the drying: before the burst > 98 % of the pumped vapor came back (12 kg/m2 pumped, the
+1.5-4.5 km layer down 0.2 kg/m2, no rain), and after it the extra drying is the stronger,
+earlier burst of the relaxed arm (max w 7-8 against 1-2 m/s, 5 kg/m2 of ice against 0.05),
+which this budget cannot separate from chaotic amplification. No replacement passes its own
+gate: a same-species pairing finds a positive partner within two levels for 5-32 % of the
+untouched lobe mass (the 89-92 % of the relaxed arm is a survivor effect), and the
+vapor-saturated and convective-halo gates miss the pre-burst pump. So nothing is relaxed and
+the lobe mass stays where the transport put it, in ρ_w: the dynamics read
+`ρ_t = ρ_d + Σ_k α_k ν_k` — buoyancy, pressure gradient, the acoustic solve, `M` and the
+radiation's reference column all see the pool — while every physics reader sees the recovered
+species, 0 at a lobe. The difference is the partition gap `X = B + Λ`, booked in energy by the
+refit partner (never in mass), counted by `MC_XGAP_POOL`, and written per point to the
+netCDF output as `lobe_pool` (Λ) beside the signed `rho_w`.
 """
 const LOBE_RELAXATION_DERIVED_DEFAULT = false
 

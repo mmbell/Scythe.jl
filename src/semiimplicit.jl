@@ -2631,6 +2631,25 @@ function state_minima_trace(mtile::ModelTile, t::Int64)
                 (bad_T ? "  << BAD T" : "") *
                 " [T=$(teos ? "eos" : "energy")]" *
                 "; max|T_split|=$(round(split_k; sigdigits=4)) K at $(loc(max_si))")
+        # The MYNN TKE density, when the run carries it: the minimum of the CARRIED slot
+        # (negative lobes are counted, never repaired) with its location and the number of
+        # negative points.
+        re = slots.rho_e
+        if re > 0
+            rev = view(phys, :, re, 1)
+            emin = Inf; emin_i = 1; nneg = 0
+            @inbounds for i in eachindex(rev)
+                x = rev[i]
+                x < 0.0 && (nneg += 1)
+                if x < emin
+                    emin = x
+                    emin_i = i
+                end
+            end
+            println("  rho_e trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                    "min rho_e=$(round(emin; sigdigits=4)) J/m^3 at $(loc(emin_i)); " *
+                    "rho_e<0 points=$(nneg)")
+        end
     end
     return nothing
 end

@@ -521,6 +521,19 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     # `condensate_lobe` keeps its name's meaning. An exact zero field under `:none`.
     vapor_lobe = cfg.vtrans === :none ? zeros(Float64, n_i, n_k) :
         neg_part.(slots.rho_v .+ col(bhyp.(rho_vbar_d, cfg.vmu)), cfg.vmu)
+    # THE LOBE POOL Λ of the partition gap, X = ρ_w − Σ_k ρ_k = B + Λ (TeX Eq. X_gap), per point:
+    # Λ = Σ_k α_k min(ν_k, 0) over the TRANSFORMED water-mass slots (α_k = 2; a density slot
+    # contributes nothing), the water the transforms clip and the dynamics still carry in
+    # ρ_w — the census's `MC_XGAP_POOL` before its column integral. An exact zero field
+    # with no transform declared.
+    lobe_pool = zeros(Float64, n_i, n_k)
+    cfg.vtrans === :none || (lobe_pool .+= av .* min.(slots.rho_v .+ col(nvb), 0.0))
+    cfg.ctrans === :none || (lobe_pool .+= ac .* min.(slots.cloud .+ col(ncb), 0.0))
+    cfg.rtrans === :none || (lobe_pool .+= ar .* min.(slots.rain, 0.0))
+    if cfg.ice && haskey(slots, :ice) && cfg.itrans !== :none
+        lobe_pool .+= ai .* ((min.(slots.ice[1], 0.0) .+ min.(slots.ice[5], 0.0)) .+
+                             min.(slots.ice[9], 0.0))
+    end
 
     # ── (6) Column integrals ────────────────────────────────────────────────
     PW = _column_integral(rho_v, z)
@@ -531,14 +544,18 @@ function mc_derived_fields(z::AbstractVector{Float64}, slots::NamedTuple,
     out = (; p, rho_d, rho_t, E_t, Q_ss, rho_v, rho_c, rho_r, rho_liq, rho_ice,
              u, w, ke, M, T, theta, theta_e, s, RH, q_v, q_c, q_r,
              reflectivity, Vt, rain_rate, precip_rate, rho_w_deficit, condensate_lobe,
-             vapor_lobe, PW, column_cloud_water, column_rain_water)
+             vapor_lobe, rho_w, lobe_pool, column_lobe_pool = _column_integral(lobe_pool, z),
+             PW, column_cloud_water, column_rain_water)
     v === nothing || (out = merge(out, (; v)))
     n_r === nothing || (out = merge(out, (; n_r)))
     if ice !== nothing
         out = merge(out, (; ice, q_i, RH_ice, column_ice_water))
     end
     if haskey(slots, :rho_e)
-        out = merge(out, (; rho_e = slots.rho_e, e = slots.rho_e ./ rho_t))
+        # `rho_e_deficit`: the TKE slot's negative lobe, min(rho_e, 0) -- the TKE density's
+        # counterpart of `rho_w_deficit`.
+        out = merge(out, (; rho_e = slots.rho_e, e = slots.rho_e ./ rho_t,
+                            rho_e_deficit = min.(slots.rho_e, 0.0)))
     end
     out = merge(out, (; T_energy, T_eos, T_split, E_residual,
                         column_E_residual = _column_integral(E_residual, z),
@@ -1381,11 +1398,24 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         if rho_e_i > 0
             wr("rho_e", d.rho_e, "J m-3", "turbulence kinetic energy density")
             wr("e", d.e, "m2 s-2", "mass-specific turbulence kinetic energy, rho_e / rho_t")
+            wr("rho_e_deficit", d.rho_e_deficit, "J m-3",
+               "negative lobe of the TKE density slot, min(rho_e, 0) (the closure reads " *
+               "max(e, 0) there: K_m = 0 and no dissipation)")
         end
 
         # ── Negative-water diagnostics: the negativity the humidity floor no longer shows ──
         wr("rho_w_deficit", d.rho_w_deficit, "kg m-3",
            "total-water deficit, min(rho_w, 0), rho_w = sum_k alpha_k nu_k")
+        # The SIGNED water anchor and the lobe pool it carries: what the dynamics read
+        # (rho_t = rho_d + rho_w) against what the physics reads (the recovered species).
+        wr("rho_w", d.rho_w, "kg m-3",
+           "total water, the derived anchor rho_w = sum_k alpha_k nu_k (signed; rho_t - rho_d)")
+        wr("lobe_pool", d.lobe_pool, "kg m-3",
+           "lobe pool Lambda = sum_k alpha_k min(nu_k, 0) over the transformed water-mass " *
+           "slots: the clipped water rho_w carries and the recovered densities do not " *
+           "(X = rho_w - sum_k rho_k = B + Lambda); 0 where no transform is declared")
+        wrx("column_lobe_pool", d.column_lobe_pool, "kg m-2",
+            "column integral of lobe_pool")
         wr("condensate_lobe", d.condensate_lobe, "kg m-3",
            "clipped negative lobe of the transformed cloud, rain and ice-mass control " *
            "variables, sum of ahyp_signed(nu) over slots with nu < 0 (the recovered " *
