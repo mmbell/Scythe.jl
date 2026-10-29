@@ -355,6 +355,7 @@ function _mynn_write_file!(path::String, mtile::ModelTile, t_model::Float64)
         xv.attrib["units"] = "m"
         xv.attrib["long_name"] = "tile horizontal mish coordinate"
         xv[:] = d.x
+        _sidecar_write_y!(ds, mtile, MY.ncol, MY.kDim)
 
         zv = NCDatasets.defVar(ds, "z", Float64, ("z",))
         zv.attrib["units"] = "m"

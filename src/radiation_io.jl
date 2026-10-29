@@ -321,6 +321,31 @@ function radiation_diagnostics(mtile::ModelTile)
 end
 
 """
+    _sidecar_write_y!(ds, mtile, ncol, kDim)
+
+On a 3-D tile (gridpoint columns x|r, y|lambda, z) write the second horizontal mish
+coordinate of every column as the variable `y` on the sidecar's `x` (column) dimension --
+y [m] on the RRR box, lambda [rad] on the RLR cylinder -- from `tilepoints[:, 2]`, so a 3-D
+sidecar's columns can be placed (Stream C2/R2d). Nothing on a 2-D tile, whose file is
+unchanged.
+"""
+function _sidecar_write_y!(ds, mtile::ModelTile, ncol::Int, kDim::Int)
+    size(mtile.tilepoints, 2) == 3 || return nothing
+    y = Vector{Float64}(undef, ncol)
+    @inbounds for c in 1:ncol
+        y[c] = mtile.tilepoints[(c - 1) * kDim + 1, 2]
+    end
+    cyl = _sidecar_y_is_azimuth(mtile.model.grid_params.geometry)
+    yv = NCDatasets.defVar(ds, "y", Float64, ("x",))
+    yv.attrib["units"] = cyl ? "radians" : "m"
+    yv.attrib["long_name"] = cyl ? "tile column azimuth (second horizontal mish coordinate)" :
+                                   "tile column y (second horizontal mish coordinate)"
+    yv[:] = y
+    return nothing
+end
+_sidecar_y_is_azimuth(geometry::AbstractString) = geometry in ("RLR", "RLZ", "RL")
+
+"""
     _radiation_write_file!(path, mtile, t_model)
 
 Write one tile's sidecar to `path` from [`radiation_diagnostics`](@ref). Internal (not
@@ -360,6 +385,7 @@ function _radiation_write_file!(path::String, mtile::ModelTile, t_model::Float64
         xv.attrib["units"] = "m"
         xv.attrib["long_name"] = "tile horizontal mish coordinate"
         xv[:] = d.x
+        _sidecar_write_y!(ds, mtile, rs.ncol, rs.kDim)
 
         zv = NCDatasets.defVar(ds, "z", Float64, ("z",))
         zv.attrib["units"] = "m"; zv.attrib["long_name"] = "radiation layer height"

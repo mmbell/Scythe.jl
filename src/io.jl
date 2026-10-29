@@ -83,8 +83,9 @@ function write_output(grid::AbstractGrid, model::ModelParameters, t::Float64;
                 # nowhere else, and stitch the tiles back together
                 # (src/netcdf_output.jl). An in-process caller with no workers (a test,
                 # the REPL) passes none and gets a file with no physics groups.
-                physics = isempty(workerids) ? nothing :
-                          assemble_physics(gather_physics(workerids))
+                # (Not on a 3-D grid: the writer does not lay the groups out there yet.)
+                physics = (isempty(workerids) || _comprehensive_3d_names(grid) !== nothing) ?
+                          nothing : assemble_physics(gather_physics(workerids))
                 write_netcdf_comprehensive(path, grid, model, t, ctx, physics)
             else
                 write_netcdf_prognostic(path, grid, model, t)

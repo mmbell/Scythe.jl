@@ -673,18 +673,63 @@ end
     comprehensive_netcdf_eligible(grid, model) -> Bool
 
 True when [`write_netcdf_comprehensive`](@ref) can write this grid: a pressure-reference
-(moist-compressible) equation set on a 2-D k-active grid (RiRk / RZ — the XZ slice and the
-axisymmetric cylinder), with a reference state to add back.
+(moist-compressible) equation set with a reference state to add back, on a 2-D k-active
+grid (RiRk / RZ — the XZ slice and the axisymmetric cylinder) or on one of the two 3-D
+grids the writer lays out (Stream C2/R2d): the RRR box, written on `(time, x, y, z)`, and
+the RLR cylinder, on `(time, radius, azimuth, height)`.
 
-3-D moist-compressible grids (RLR, RRR, SLR) are NOT eligible in stage N1 and fall through
-to the prognostic writer; see [`write_netcdf_comprehensive`](@ref) for what that costs.
+The spherical shell (SLR) is NOT eligible and falls through to the prognostic writer.
 """
 function comprehensive_netcdf_eligible(grid::AbstractGrid, model::ModelParameters)
     uses_pressure_reference(model.equation_set) || return false
     isempty(model.ref_state_file) && return false
-    grid.jbasis isa Springsteel.NoBasisArray || return false
     grid.kbasis isa Springsteel.NoBasisArray && return false
-    return true
+    grid.jbasis isa Springsteel.NoBasisArray && return true
+    return _comprehensive_3d_names(grid) !== nothing
+end
+
+"""
+    _comprehensive_3d_names(grid) -> Union{Nothing,NTuple{3,String}}
+
+The (i, j, k) dimension names of the comprehensive file on a 3-D grid -- `("x", "y", "z")`
+on the RRR box, `("radius", "azimuth", "height")` on the RLR cylinder (Springsteel's own
+prognostic-file names) -- or `nothing` for a grid the 3-D layout does not cover (2-D grids,
+the sphere).
+"""
+function _comprehensive_3d_names(grid::AbstractGrid)
+    grid.jbasis isa Springsteel.NoBasisArray && return nothing
+    g = grid.params.geometry
+    g == "RRR" && return ("x", "y", "z")
+    g == "RLR" && return ("radius", "azimuth", "height")
+    return nothing
+end
+
+"The j coordinate of the 3-D comprehensive file: y [m] on RRR, azimuth [degrees] on RLR."
+function _comprehensive_j_coords(grid::AbstractGrid)
+    gp = grid.params
+    n_j = gp.j_regular_out
+    gp.geometry == "RRR" && return collect(LinRange(gp.jMin, gp.jMax, n_j))
+    # the same values Springsteel's write_netcdf gives the cylinder (getRegularGridpoints
+    # samples lambda = 2 pi (j - 1) / n_j)
+    return [360.0 * (j - 1) / n_j for j in 1:n_j]
+end
+
+"(n_i*n_j, n_k) in Springsteel's flat regular order (x outer, j inner) -> (n_i, n_j, n_k)."
+function _to_ijk(data::AbstractMatrix, n_i::Int, n_j::Int)
+    n_k = size(data, 2)
+    out = Array{Float64}(undef, n_i, n_j, n_k)
+    @inbounds for k in 1:n_k, i in 1:n_i, j in 1:n_j
+        out[i, j, k] = data[(i - 1) * n_j + j, k]
+    end
+    return out
+end
+"(n_i*n_j,) in the flat column order -> (n_i, n_j)."
+function _to_ij(data::AbstractVector, n_i::Int, n_j::Int)
+    out = Matrix{Float64}(undef, n_i, n_j)
+    @inbounds for i in 1:n_i, j in 1:n_j
+        out[i, j] = data[(i - 1) * n_j + j]
+    end
+    return out
 end
 
 "Cylindrical (r, z) rather than Cartesian (x, z): the coordinate long_name follows."
@@ -1089,13 +1134,15 @@ the BL (MYNN), radiation and surface groups, each on its own mish and each resam
 onto the regular output grid. `nothing` — a run with no physics, or one whose schemes have
 not run yet — writes no physics variables and records that in `physics_groups`.
 
-!!! note "2-D only in stage N1"
-    Only the 2-D k-active moist-compressible grids (RiRk / RZ: the XZ slice and the
-    axisymmetric cylinder) are written comprehensively. A 3-D moist-compressible grid
-    (RLR, RRR, SLR) falls through to [`write_netcdf_prognostic`](@ref) and gets the
-    prognostic-only layout — the derived set on `(time, r, azimuth, z)` is a layout change
-    rather than a physics change and is deferred so it can be tested against a real 3-D
-    run. `comprehensive_netcdf_eligible` is the gate.
+!!! note "3-D grids (Stream C2/R2d)"
+    On the RRR box and the RLR cylinder the regular grid is `n_i × n_j × n_k`. The same
+    [`mc_derived_fields`](@ref) runs on its `n_i·n_j` columns, taken in Springsteel's flat
+    regular order (i outer, j inner, k fastest), and every field is reshaped to
+    `(n_i, n_j, n_k)` on dims `(time, x, y, z)` (box) or `(time, radius, azimuth, height)`
+    (cylinder; azimuth in degrees); column fields go on `(time, i, j)`. The physics groups
+    are NOT written on a 3-D grid yet (`physics_groups` says so); the per-tile sidecars
+    carry them. The sphere (SLR) falls through to [`write_netcdf_prognostic`](@ref);
+    `comprehensive_netcdf_eligible` is the gate.
 """
 function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
                                     model::ModelParameters, t::Float64,
@@ -1109,10 +1156,17 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
     gp = grid.params
     vars = gp.vars
     n_i = length(ctx.x_reg); n_k = length(ctx.z_reg)
+    # 3-D: the n_i*n_j regular columns in Springsteel's flat order (i outer, j inner);
+    # every derived field is computed per column exactly as on a 2-D grid and reshaped to
+    # (n_i, n_j, ...) only at the write. 2-D: n_j = 1, the original n_i columns.
+    names3 = _comprehensive_3d_names(grid)
+    three_d = names3 !== nothing
+    n_j = three_d ? gp.j_regular_out : 1
+    n_col = n_i * n_j
 
     reg_pts = Springsteel.getRegularGridpoints(grid)
     reg_phys = Springsteel.regularGridTransform(grid, reg_pts)
-    slot(idx::Int) = _reshape_regular(reg_phys, idx, n_i, n_k)
+    slot(idx::Int) = _reshape_regular(reg_phys, idx, n_col, n_k)
 
     # ── Slot roles. Resolved BY NAME through `mc_slot`/`mc_optional_slot`, so a
     # transformed run's `nu_c`/`nu_r`/`nu_i*` columns are found under their own names and
@@ -1139,7 +1193,9 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
     rho_e_i > 0 && (slots = merge(slots, (; rho_e = slot(rho_e_i))))
 
     d = mc_derived_fields(ctx.z_reg, slots, ref, cfg)
-    tdiag = temperature_split_summary(d, ctx.x_reg, ctx.z_reg)
+    # the column's x (radius) on a 3-D grid, where the column index runs over (i, j)
+    tdiag = temperature_split_summary(d, three_d ? repeat(ctx.x_reg; inner = n_j) : ctx.x_reg,
+                                      ctx.z_reg)
     # At the OUTPUT cadence, into the run's (segment) log: the temperature split and the energy
     # residual are the measurements the `options[:temperature]` decision rests on, so every run
     # records them whether or not anyone opens the file. One line, master side, no worker cost.
@@ -1165,39 +1221,60 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         ds.attrib["history"] = "Created " *
             Libc.strftime("%Y-%m-%d %H:%M:%S", time()) * " by Scythe.write_output"
 
+        # Dimension names: (x, z) on the 2-D grids; (x, y, z) on the box and (radius,
+        # azimuth, height) on the cylinder.
+        iname, jname, kname = three_d ? names3 : ("x", "", "z")
         NCDatasets.defDim(ds, "time", 1)
-        NCDatasets.defDim(ds, "x", n_i)
-        NCDatasets.defDim(ds, "z", n_k)
+        NCDatasets.defDim(ds, iname, n_i)
+        three_d && NCDatasets.defDim(ds, jname, n_j)
+        NCDatasets.defDim(ds, kname, n_k)
 
         tv = NCDatasets.defVar(ds, "time", Float64, ("time",))
         tv.attrib["units"] = "seconds"
         tv.attrib["long_name"] = "simulation time"
         tv[1] = t
 
-        xv = NCDatasets.defVar(ds, "x", Float64, ("x",))
+        xv = NCDatasets.defVar(ds, iname, Float64, (iname,))
         xv.attrib["units"] = "m"
         xv.attrib["long_name"] = cyl ? "radius" : "horizontal coordinate"
         xv[:] = ctx.x_reg
 
-        zv = NCDatasets.defVar(ds, "z", Float64, ("z",))
+        if three_d
+            yv = NCDatasets.defVar(ds, jname, Float64, (jname,))
+            yv.attrib["units"] = cyl ? "degrees" : "m"
+            yv.attrib["long_name"] = cyl ? "azimuth angle" : "second horizontal coordinate"
+            yv[:] = _comprehensive_j_coords(grid)
+        end
+
+        zv = NCDatasets.defVar(ds, kname, Float64, (kname,))
         zv.attrib["units"] = "m"
         zv.attrib["long_name"] = "height"
         zv[:] = ctx.z_reg
 
+        dims2 = three_d ? ("time", iname, jname, kname) : ("time", "x", "z")
+        dims1 = three_d ? ("time", iname, jname) : ("time", "x")
         wr(name, data, units, long) = begin
-            dv = NCDatasets.defVar(ds, name, Float64, ("time", "x", "z");
+            dv = NCDatasets.defVar(ds, name, Float64, dims2;
                                    deflatelevel = 4, fillvalue = NaN)
             dv.attrib["units"] = units; dv.attrib["long_name"] = long
-            dv[1, :, :] = data
+            if three_d
+                dv[1, :, :, :] = _to_ijk(data, n_i, n_j)
+            else
+                dv[1, :, :] = data
+            end
         end
         wrx(name, data, units, long) = begin
-            dv = NCDatasets.defVar(ds, name, Float64, ("time", "x");
+            dv = NCDatasets.defVar(ds, name, Float64, dims1;
                                    deflatelevel = 4, fillvalue = NaN)
             dv.attrib["units"] = units; dv.attrib["long_name"] = long
-            dv[1, :] = data
+            if three_d
+                dv[1, :, :] = _to_ij(data, n_i, n_j)
+            else
+                dv[1, :] = data
+            end
         end
         wrz(name, data, units, long) = begin
-            dv = NCDatasets.defVar(ds, name, Float64, ("z",); fillvalue = NaN)
+            dv = NCDatasets.defVar(ds, name, Float64, (kname,); fillvalue = NaN)
             dv.attrib["units"] = units; dv.attrib["long_name"] = long
             dv[:] = data
         end
@@ -1338,7 +1415,9 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
         # edge value). That is the convention `tc/tc_postprocess.jl` established when it
         # merged the sidecars, kept here verbatim so the two files agree.
         groups = String[]
-        if physics !== nothing
+        # 3-D: the groups are not regridded onto (i, j, k) yet (Stream C2/R2d deferred
+        # them); the per-tile sidecars carry them.
+        if physics !== nothing && !three_d
             mynn = physics.mynn
             if mynn !== nothing
                 push!(groups, "mynn")
@@ -1400,6 +1479,7 @@ function write_netcdf_comprehensive(path::String, grid::AbstractGrid,
             end
         end
         ds.attrib["physics_groups"] =
+            three_d ? "none (physics groups are not yet written on 3-D grids; use the sidecars)" :
             isempty(groups) ? "none (schemes not yet run)" : join(groups, ",")
 
         # ── 1-D reference profiles the totals were built from ──

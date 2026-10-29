@@ -583,6 +583,152 @@ using NCDatasets
     # pure functions of a `ModelTile` / a vector of snapshots, so a one-tile "gather"
     # built in process exercises exactly the code a distributed run does, minus the
     # serialization (which the distributed smoke covers separately).
+    # ══════════════════════════════════════════════════════════════════════
+    # Stream C2/R2d: the comprehensive file on the 3-D grids. The derived set is computed by
+    # the SAME `mc_derived_fields` on n_i*n_j columns (Springsteel's flat regular order, x
+    # outer, y/azimuth inner) and reshaped to (n_i, n_j, n_k): dims (time, x, y, z) on the
+    # box, (time, radius, azimuth, height) on the cylinder. A y-invariant RRR state and a WN0
+    # RLR state on the same (x|r, z) regular grid as the XZ fixture must reproduce the XZ
+    # file's numbers in every (i, :, k) and (i, :) slice -- the derived fields read values,
+    # not geometry, and v = 0. Physics groups are not written on 3-D grids yet.
+    @testset "3-D comprehensive layout (RRR box, RLR cylinder) == the XZ slice" begin
+        mktempdir() do tmpdir
+            function make_nc3_fixture(geometry; outname)
+                varlist = Scythe.mc_var_names(Dict{Symbol,Any}(); cyl = true)
+                vars = Dict(v => i for (i, v) in enumerate(varlist))
+                rain_name = Scythe.rain_var_name(Dict{Symbol,Any}())
+                scalar_bc = Dict(v => NeumannBC() for v in keys(vars))
+                bot_bc = merge(scalar_bc, Dict("w" => DirichletBC(), rain_name => NaturalBC()))
+                top_bc = merge(scalar_bc, Dict("w" => DirichletBC()))
+                jkw = geometry == "RRR" ?
+                    (; jMin = 0.0, jMax = 4.0e3, num_cells_j = 2, BCU = scalar_bc, BCD = scalar_bc) :
+                    (; max_wavenumber = Dict(v => 2 for v in keys(vars)))
+                gp = GridParameters(; geometry = geometry,
+                    iMin = 0.0, iMax = 6.0e3, num_cells_i = 3,
+                    kMin = 0.0, kMax = 3.0e3, num_cells_k = 12, jkw...,
+                    BCL = scalar_bc, BCR = scalar_bc, BCB = bot_bc, BCT = top_bc, vars = vars)
+                ref_file = joinpath(tmpdir, "nc3_$(outname).ref")
+                model = ModelParameters(
+                    ts = 1.0, integration_time = 4.0, output_interval = 2.0,
+                    equation_set = "moist_compressible_$(geometry)",
+                    output_dir = joinpath(tmpdir, outname),
+                    ref_state_file = ref_file, grid_params = gp,
+                    physical_params = Dict{Symbol,Any}(
+                        :Khdiff => 0.0, :Kvdiff => 0.0, :tau_qss => 10.0, :alpha => 0.0,
+                        :z_damp => 2.0e3, :f => 0.0),
+                    options = Dict{Symbol,Any}(:semiimplicit => true,
+                                               :exact_reference_state => true,
+                                               :precipitation => false))
+                gp = model.grid_params
+                patch = createGrid(gp)
+                gpts = Scythe.getGridpoints(patch)
+                kDim = gp.kDim
+                z = gpts[1:kDim, end]
+                col = stable_column(z)
+                Scythe.write_exact_ref_mc(ref_file, z, col.p_Pa, col.rho_d, col.rho_v, col.rho_c)
+                patch.physical .= 0.0
+                for j in 1:size(gpts, 1)
+                    x = gpts[j, 1]; zz = gpts[j, end]
+                    bump = exp(-(((x - 3.0e3) / 1.5e3)^2 + ((zz - 1.0e3) / 6.0e2)^2))
+                    patch.physical[j, vars["E_t"], 1] = 5.0e3 * bump
+                    patch.physical[j, vars["rho_v"], 1] = 1.0e-3 * bump
+                end
+                spectralTransform!(patch)
+                gridTransform!(patch)
+                return patch, model, gp
+            end
+
+            p2, m2, gp2, _ = make_nc_fixture(tmpdir; outname = "xz3")
+            Scythe.write_output(p2, m2, 60.0)
+            xz = NCDataset(joinpath(m2.output_dir, "60.0.nc"), "r")
+            for (geo, names) in (("RRR", ("x", "y", "z")), ("RLR", ("radius", "azimuth", "height")))
+                patch, model, gp = make_nc3_fixture(geo; outname = lowercase(geo))
+                @test Scythe.comprehensive_netcdf_eligible(patch, model)
+                ctx = Scythe.netcdf_output_context(patch, model)
+                @test ctx.active
+                Scythe.write_output(patch, model, 60.0)
+                path = joinpath(model.output_dir, "60.0.nc")
+                @test isfile(path)
+                NCDataset(path, "r") do ds
+                    @test ds.attrib["scythe_file_kind"] == "comprehensive"
+                    @test ds.attrib["geometry"] == geo
+                    @test startswith(ds.attrib["physics_groups"], "none")
+                    @test occursin("3-D", ds.attrib["physics_groups"])
+                    ni, nj, nk = gp.i_regular_out, gp.j_regular_out, gp.k_regular_out
+                    @test (ds.dim[names[1]], ds.dim[names[2]], ds.dim[names[3]]) == (ni, nj, nk)
+                    @test dimnames(ds["T"]) == ("time", names...)
+                    @test dimnames(ds["PW"]) == ("time", names[1], names[2])
+                    @test dimnames(ds["pbar"]) == (names[3],)
+                    @test Array(ds[names[1]]) ≈ Array(xz["x"])
+                    @test Array(ds[names[3]]) ≈ Array(xz["z"])
+                    if geo == "RRR"
+                        @test Array(ds["y"]) ≈ collect(LinRange(0.0, 4.0e3, nj))
+                        @test ds["y"].attrib["units"] == "m"
+                    else
+                        @test Array(ds["azimuth"]) ≈ [360.0 * (j - 1) / nj for j in 1:nj]
+                        @test ds["azimuth"].attrib["units"] == "degrees"
+                        @test occursin("radial", ds["u"].attrib["long_name"])
+                    end
+                    @test haskey(ds, "v") && !haskey(xz, "v")
+                    worst = 0.0
+                    for nm in ("p_prime", "E_t_prime", "p", "rho_d", "rho_t", "E_t", "Q_ss",
+                               "rho_v", "rho_c", "T", "T_energy", "theta", "theta_e", "RH",
+                               "q_v", "u", "w", "rho_w_deficit")
+                        a3 = Array(ds[nm])[1, :, :, :]
+                        a2 = Array(xz[nm])[1, :, :]
+                        sc = max(maximum(abs, a2), 1.0e-300)
+                        for j in 1:nj
+                            worst = max(worst, maximum(abs.(a3[:, j, :] .- a2)) / sc)
+                        end
+                    end
+                    for nm in ("PW", "column_E_t", "column_cloud_water", "precip_rate")
+                        a3 = Array(ds[nm])[1, :, :]
+                        a2 = Array(xz[nm])[1, :]
+                        sc = max(maximum(abs, a2), 1.0e-300)
+                        for j in 1:nj
+                            worst = max(worst, maximum(abs.(a3[:, j] .- a2)) / sc)
+                        end
+                    end
+                    @info "R2d $(geo) comprehensive vs XZ: worst relative mismatch = $(worst)"
+                    @test worst < 1.0e-10
+                    @test all(Array(ds["v"])[1, :, :, :] .== 0.0)
+                    @test Array(ds["pbar"]) ≈ Array(xz["pbar"])
+                end
+            end
+            close(xz)
+
+            # The sidecars place a 3-D tile's columns by their second horizontal mish
+            # coordinate (`y` on the column dimension); a 2-D tile's file is unchanged.
+            for (geo, units) in (("RRR", "m"), ("RLR", "radians"))
+                patch, model, gp = make_nc3_fixture(geo; outname = "sc_$(lowercase(geo))")
+                mt = createModelTile(patch, patch, model,
+                                     sparse(Int64[], Int64[], Float64[],
+                                            size(patch.spectral, 1), size(patch.spectral, 2)))
+                kD = gp.kDim; nc = div(size(mt.tilepoints, 1), kD)
+                f = joinpath(tmpdir, "sc_$(geo).nc")
+                NCDataset(f, "c") do ds
+                    defDim(ds, "x", nc)
+                    Scythe._sidecar_write_y!(ds, mt, nc, kD)
+                end
+                NCDataset(f, "r") do ds
+                    @test Array(ds["y"]) == mt.tilepoints[1:kD:end, 2]
+                    @test ds["y"].attrib["units"] == units
+                    @test length(unique(Array(ds["y"]))) > 1
+                end
+            end
+            mt2 = createModelTile(p2, p2, m2, sparse(Int64[], Int64[], Float64[],
+                                                     size(p2.spectral, 1), size(p2.spectral, 2)))
+            f2 = joinpath(tmpdir, "sc_xz.nc")
+            NCDataset(f2, "c") do ds
+                defDim(ds, "x", 3)
+                Scythe._sidecar_write_y!(ds, mt2, 3, gp2.kDim)
+            end
+            NCDataset(f2, "r") do ds
+                @test !haskey(ds, "y")
+            end
+        end
+    end
+
     @testset "physics groups in the comprehensive file" begin
 
         """A `moist_compressible_XZ` RiRk tile with a live boundary layer and surface
