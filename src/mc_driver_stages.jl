@@ -468,8 +468,8 @@ Reads (written by the earlier stages): `S.etd_lam` (read-modify-write), `invtau_
 Jacobians `J_i{1,2,3}{q,a,c,n}`, `f_isn1..3`, `rho_d`, `rho_r`, `i1q..i3q`, `ICE_C/ICE_R`, the
 habit columns `hab*`, `Tk`, `Jr`, `Jc`, `Lv`, `C_pt`, `R_m`, `C_vt`, `AUTO_COLL`, `Fr_z`,
 `nu_c`, `nu_r`, `SRC_i*q`, `F_i*q_z`, `nu_i*q`; the `Q_ss` (slot 7) column of `expdot` and its
-two history levels; `Q_ssbar`; `J_v` (the vapor Jacobian column, today
-`vapor_jacobian_column(S)`).
+two history levels; `Q_ssbar`; `J_v` (the vapor Jacobian column,
+`jacobian_column(mtile.species, rv_i, tid)`).
 
 Writes: `S.etd_lam` (lambda including the ice conductances), `etd_qbar`, `etd_qnp1`,
 `etd_di1..3`, `etd_da/dc/dn1..3` (ice only), `Qdot_bar`, `Qdot_r_bar`, `Qdep_bar`,

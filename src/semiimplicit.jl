@@ -114,6 +114,41 @@ function mc_slots(model::ModelParameters)
 end
 
 """
+    MCSpeciesColumns
+
+The per-slot COLUMN HOME of the moist-compressible driver: the Jacobian `J = dν/dρ` and the
+recovered density `ρ` of each prognostic slot, per thread (`[slot, tid]`, each a kDim column),
+and each slot's control-variable reference `ν̄` and its vertical gradient (`[slot]`, kDim
+columns; the vapor's is `bhyp(ρ̄_v)`, bitwise `ρ̄_v` under `:none`; an empty vector for a slot
+with none). A `mutable struct` with `const` fields behind accessors, so the tile carries one
+pointer — the shape the compile-cliff handoff verified is safe (reference/
+HANDOFF_DRIVER_COMPILE_CLIFF.md §3, IshmaelTables / EnergyBudget precedents), where another
+scratch NamedTuple field or `mc_ref_diag` member is not. A new species is a new slot index
+here, not a new aggregate field. Today the vapor's `J` ([`jacobian_column`](@ref)) and `ν̄_v`,
+`ν̄_v,z` ([`mc_nu_vbar`](@ref)) live here; `rho` is allocated for the recovered columns that
+move here later.
+"""
+mutable struct MCSpeciesColumns
+    const J::Matrix{Vector{Float64}}        # [slot, tid]  dν/dρ per prognostic slot
+    const rho::Matrix{Vector{Float64}}      # [slot, tid]  recovered density where the slot is ν
+    const nu_bar::Vector{Vector{Float64}}   # [slot]       reference ν̄ (kDim), empty if none
+    const nu_bar_z::Vector{Vector{Float64}} # [slot]       its vertical gradient
+end
+
+"""All columns absent — the state of every non-mc equation set."""
+MCSpeciesColumns() = MCSpeciesColumns(Matrix{Vector{Float64}}(undef, 0, 0),
+                                      Matrix{Vector{Float64}}(undef, 0, 0),
+                                      Vector{Float64}[], Vector{Float64}[])
+
+"""
+    jacobian_column(C::MCSpeciesColumns, slot, tid) -> Vector{Float64}
+
+Thread `tid`'s Jacobian column `dν/dρ` of prognostic slot `slot` (the vapor's is written by
+`_vapor_bhyp_stage!` under `options[:vapor_transform] = :bhyp` and read nowhere under `:none`).
+"""
+@inline jacobian_column(C::MCSpeciesColumns, slot::Int, tid::Int) = @inbounds C.J[slot, tid]
+
+"""
     ModelTile
 
 Fundamental computational unit holding model state, tendencies, reference state,
@@ -305,6 +340,9 @@ struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
     # LAST field deliberately: every positional `ModelTile(...)` construction in the tree
     # is the one in `createModelTile` below, so appending here is a one-line change there.
     ebudget::EnergyBudget
+    # The per-slot Jacobian / recovered / reference columns ([`MCSpeciesColumns`](@ref)),
+    # appended after `ebudget` for the same one-line reason; concrete, one pointer.
+    species::MCSpeciesColumns
 end
 
 """
@@ -737,8 +775,34 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         # which moved above this file for exactly the same struct-ordering reason.
         mc_surface_diag(model, tile),
         # ...and the energy budget (src/energy_budget.jl, the same reason again).
-        mc_energy_budget(model, tile, tilepoints, ref_state, ref_diag_full))
+        mc_energy_budget(model, tile, tilepoints, ref_state, ref_diag_full),
+        mc_species_columns(model, tile, ref_diag_full))
     return mtile
+end
+
+"""
+    mc_species_columns(model, tile, ref_diag) -> MCSpeciesColumns
+
+Setup path only. Every prognostic slot gets a kDim `J` and `rho` column per thread; the vapor
+slot's reference columns are copies of `ref_diag.nu_vbar`/`nu_vbar_z` (the same source the
+`EnergyBudget` reference part copies, so the two are bitwise equal), every other slot's are
+empty. [`MCSpeciesColumns()`](@ref) for a non-mc set.
+"""
+function mc_species_columns(model::ModelParameters, tile, ref_diag)
+    uses_pressure_reference(model.equation_set) || return MCSpeciesColumns()
+    kDim = model.grid_params.kDim
+    nslot = size(tile.physical, 2)
+    nth = Threads.maxthreadid()
+    J = [zeros(Float64, kDim) for _ in 1:nslot, _ in 1:nth]
+    rho = [zeros(Float64, kDim) for _ in 1:nslot, _ in 1:nth]
+    nu_bar = [Float64[] for _ in 1:nslot]
+    nu_bar_z = [Float64[] for _ in 1:nslot]
+    rv = mc_slots(model).rho_v
+    if 1 <= rv <= nslot
+        nu_bar[rv] = copy(ref_diag.nu_vbar)
+        nu_bar_z[rv] = copy(ref_diag.nu_vbar_z)
+    end
+    return MCSpeciesColumns(J, rho, nu_bar, nu_bar_z)
 end
 
 """

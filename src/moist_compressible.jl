@@ -166,9 +166,7 @@ const MC_SCRATCH_SLOTS = (
     :nu_r, :nu_r_z, :Jr, # slot-8 control variable, its gradient, dnu/drho (rain_transform_mode)
     :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
     :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
-    :cap_c, :cap_r, :cap_v,      # AB3 depletion bounds, DIAGNOSTIC ONLY (see _ab3_sink_bound);
-                                 # `cap_v` doubles as the vapor Jacobian `J_v` (see
-                                 # `vapor_jacobian_column`)
+    :cap_c, :cap_r, :cap_v,      # AB3 depletion bounds, DIAGNOSTIC ONLY (see _ab3_sink_bound)
     :invtau_c, :invtau_r,        # per-channel relaxation rates, for `mc_stiffness_census!`
     # ── Stage 2b: the RAIN DONOR's evaporation conductance and its realization factor ──
     # `kappa_ev` is `max(−Q̇_r, 0)/ρ_r` at the frozen state — the rain's evaporation sink
@@ -265,8 +263,8 @@ const MC_SCRATCH_SLOTS = (
     # history, so the census and the tendency read identical numbers. (The reconciliation
     # nudge's `VREC` column went with the nudge and slot 3, Stage 4.)
     :rho_v_z, :VAPOR_SRC,
-    # NO column of its own for the vapor control variable's Jacobian `J_v`: it lives in
-    # `cap_v` (see `vapor_jacobian_column`). Measured 2026-10-20: one more field here took the
+    # NO column here for the vapor control variable's Jacobian `J_v`: it lives on the tile's
+    # `MCSpeciesColumns` (`jacobian_column`). Measured 2026-10-20: one more field here took the
     # first call of `moist_compressible_SLR` from 80 s to > 11 min (the LLVM cliff).
     # ── ETD-AB3 stiff relaxation of the Q_ss pair (TeX §"Integration of the relaxation pair
     #    in the stiff limit"; see `relaxation_adjustment_qss!`). The two relaxations are
@@ -3195,21 +3193,9 @@ reference). Every reader outside `mc_driver!` goes through this.
 @inline recover_rho_v(slot, nu_vbar, transform::Symbol, mu) =
     transform === :none ? slot + nu_vbar : ahyp(slot + nu_vbar, mu)
 
-"""
-    vapor_jacobian_column(S) -> Vector{Float64}
-
-The per-thread scratch column holding the vapor control variable's Jacobian
-`J_v = dν_v/dρ_v` for the current column (`options[:vapor_transform] = :bhyp`; written by
-`_vapor_bhyp_stage!`, never written or read under `:none`). It is the `cap_v` column, by
-deliberate exception to the no-sharing rule of [`MC_SCRATCH_SLOTS`](@ref): `cap_v` is the AB3
-vapor depletion bound of the depletion census, written and read ONLY under
-`options[:water_budget_trace]`, which `mc_driver!` refuses together with any water transform —
-so the two uses can never be live in the same run. The scratch `NamedTuple` sits at the LLVM
-compile cliff (one more field took `moist_compressible_SLR`'s first call from 80 s to more
-than 11 minutes, measured 2026-10-20). Every reader goes through this accessor, so the
-sharing is in one place.
-"""
-@inline vapor_jacobian_column(S) = S.cap_v
+# (`vapor_jacobian_column(S) = S.cap_v`, the vapor Jacobian aliased onto the depletion-census
+# column to stay off the compile cliff, is retired: the column lives on the tile's
+# `MCSpeciesColumns`, `jacobian_column(mtile.species, rv_i, tid)`.)
 
 """
     mc_nu_vbar(mtile) / mc_nu_vbar_z(mtile) / mc_rho_tbar_w(mtile) / mc_rho_tbar_w_z(mtile)
@@ -3218,11 +3204,13 @@ The tile's vapor control-variable reference `ν̄_v = bhyp(ρ̄_v)` (`ρ̄_v` it
 `options[:vapor_transform] = :none`) and its gradient `J̄_v ρ̄_v,z`, and the derived total
 reference `ρ̄_t^w = ρ̄_d + Σ_k α_k ν̄_k` and its gradient — the four columns
 [`mc_reference_diagnostics`](@ref) returns beyond the tile's `mc_ref_diag`. Stored on the
-tile's `EnergyBudget` reference part (see the field note there: the compile cliff).
+tile's `MCSpeciesColumns` (`ν̄_v`, `ν̄_v,z` at the vapor slot) and on the `EnergyBudget`
+reference part (`ρ̄_t^w` and its gradient; the budget keeps its own bitwise-equal copy of `ν̄_v`
+for its hooks).
 """
-@inline mc_nu_vbar(mtile) = mtile.ebudget.nu_vbar
+@inline mc_nu_vbar(mtile) = @inbounds mtile.species.nu_bar[mtile.mc_slots.rho_v]
 @doc (@doc mc_nu_vbar)
-@inline mc_nu_vbar_z(mtile) = mtile.ebudget.nu_vbar_z
+@inline mc_nu_vbar_z(mtile) = @inbounds mtile.species.nu_bar_z[mtile.mc_slots.rho_v]
 @doc (@doc mc_nu_vbar)
 @inline mc_rho_tbar_w(mtile) = mtile.ebudget.rho_tbar_w
 @doc (@doc mc_nu_vbar)
@@ -8141,7 +8129,7 @@ function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
     # temperature retrieval's partition, q_v, Q_s, the condensation closure, the surface
     # moisture flux) now reads STATE AT n.
     rho_v = S.rho_v
-    J_v = vapor_jacobian_column(S)
+    J_v = jacobian_column(mtile.species, rv_i, Threads.threadid())
     if vtrans_on
         # The vapor CONTROL VARIABLE (`vapor_transform_mode`): ν_v = ν_v' + ν̄_v, recovered
         # pointwise; `J_v` is formed at the recovered density, with the lobe-transport

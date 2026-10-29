@@ -377,7 +377,8 @@ isdefined(Main, :MYNNTestFixtures) || include("mynn_test_fixtures.jl")
             @test minimum(S.rho_v) == 0.0 && minimum(nu) < 0.0
             @test S.Tk == Scythe.eos_temperature.(S.p, S.rho_d, S.rho_v)
             # J_v is the lobe-transport Jacobian of the slot
-            @test Scythe.vapor_jacobian_column(S) == Scythe.lobe_transport_jacobian.(nu, S.rho_v, VMU)
+            @test Scythe.jacobian_column(m.species, m.mc_slots.rho_v, Threads.threadid()) ==
+                  Scythe.lobe_transport_jacobian.(nu, S.rho_v, VMU)
             # the state-minima trace's T_eos reads the RECOVERED vapor: its reported max T is
             # the max over the tile of eos_temperature(p, ρ_d, ahyp(ν_v))
             mo.options[:state_minima_trace] = 1
