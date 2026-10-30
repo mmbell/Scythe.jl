@@ -23,7 +23,7 @@ segment_length   = 0.0               # single segment
 dir              = "output_rrr_120km"   # relative to this file; override with --set output.dir=<abs>
 interval         = 300.0
 restart_interval = 21600.0           # unused (segment_length = 0 needs no chaining checkpoint)
-formats          = ["netcdf", "csv"]   # csv: rrr_rlr_compare.jl reads <t>_physical.csv; the .nc carries T
+formats          = ["netcdf", "csv"]   # rrr_rlr_compare.jl and owb3d_movie.jl read the comprehensive <t>.nc; csv optional
 sidecars         = false             # per-tile MYNN / radiation NetCDF sidecars
 netcdf_grid      = "regular"
 netcdf_derivatives = false

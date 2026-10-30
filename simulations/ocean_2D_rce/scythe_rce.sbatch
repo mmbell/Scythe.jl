@@ -5,7 +5,7 @@
 # the previous segment's JLD2 checkpoint. Ported from rce/scythe_rce.sbatch onto the
 # consolidated config/launcher.
 #
-#   sbatch simulations/ocean_2D_rce/scythe_rce.sbatch [-- EXTRA ARGS]
+#   sbatch simulations/ocean_2D_rce/scythe_rce.sbatch [--set key.path=value ...] [--resume]
 #
 # Every physics/grid knob that used to be a SCYTHE_RCE_* environment variable is now a
 # config key in scythe_config.toml: a run is ONE config file, so a different physics or grid

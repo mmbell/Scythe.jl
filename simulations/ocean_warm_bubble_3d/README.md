@@ -73,21 +73,62 @@ discretize the same bubble differently. With ice on, ISHMAEL amplifies roundoff 
 glaciation (~25 min; reference/…/r1_rlr/README.md), so the 1 h numbers describe the
 chaotic solution.
 
-The acceptance numbers are **pending the 3 km pair** (close-out 2026-10-29, Stream C2,
-`reference/session_2026-10_scratch/closeout_2026-10-27/r2_rrr/STATUS.md`). What is known:
+The acceptance numbers come from the box/cylinder pairs of the close-out (2026-10-29/30,
+Stream C2, `reference/session_2026-10_scratch/closeout_2026-10-27/r2_rrr/STATUS.md`): the Mac
+pair at 6 km (`rrr_120km.toml` vs `rlr_60km.toml` as committed, 1 h) and the same pair at 3 km
+(`--set grid.num_cells=[40] --set grid.num_cells_j=[40]` on the box, `--set grid.num_cells=[20]`
+on the cylinder, 20 min), both with the default physics and free-slip walls. Max w is the run
+maximum up to t, max T′ the value at t, both inside r < R/2 = 30 km of the bubble centre; the row
+L2 compares the box's x-axis row with the cylinder's ring mean.
 
-- At the Mac size (6 km cells, `xr = 20 km`: 3.3 cells per bubble half-width) the box's bubble
-  is weaker than the cylinder's (20 min: max w 0.45 vs 1.78 m/s, max T′ 1.27 vs 2.10 K; the box
-  never passes 1 m/s in the hour while the cylinder convects to 24 m/s). This is resolution, not
-  a defect: on the dry 300 s convergence study (`xr = 10 km`) the box-to-axisymmetric gap in
-  w at 120 s is 60 % at 6 km, 24 % at 3 km and 1.0 % at 1.5 km (6.7 cells per half-width),
-  the RLR cylinder equals the axisymmetric run exactly, and with the horizontal spline filter
-  off both grids hold the bubble's T′ in the first 30 s where the filtered box loses half of it.
-  The box filters a near-grid-scale round bubble along x and y, the cylinder only along r.
-- Proposed gate (to be seeded by the first 3 km pair): ≥ 6.7 cells per bubble half-width, then
-  at 20 min (pre-glaciation) max w, max T′ and rain onset within 2 % of the RLR control inside
-  r < R/2; the 1 h numbers are informational (5 %), the solution being chaotic after glaciation.
-- The 6 km pair stays as the Mac smoke (walls clean all hour: box-edge T′ ≤ 0.056 K, edge p′
-  within −4.2 … +3.0 Pa). This production case keeps the plan's 6 km spacing with `xr = 30 km`
-  (5 cells per half-width); whether to run it at 3 km (100 × 100 × 50, 90,000 columns) is the
-  author's call once the 3 km pair has been measured.
+| spacing (cells per half-width) | t | max w box / cyl [m/s] | gap | max T′ box / cyl [K] | gap | row L2 w / T′ |
+|---|---|---|---|---|---|---|
+| 6 km (3.3) | 300 s | 0.427 / 0.676 | 37 % | 1.79 / 2.23 | 20 % | 0.33 / — |
+| 6 km (3.3) | 600 s | 0.450 / 0.853 | 47 % | 1.56 / 2.13 | 27 % | 0.44 / — |
+| 6 km (3.3) | 900 s | 0.423 / 1.209 | 65 % | 1.41 / 1.63 | 13 % | 0.65 / — |
+| 6 km (3.3) | 1200 s | 0.447 / 1.778 | 75 % | 1.27 / 2.10 | 40 % | 0.79 / — |
+| 6 km (3.3) | 3600 s | 0.97 / 24.2 | 96 % | — | — | — |
+| 3 km (6.7) | 300 s | 1.220 / 1.289 | 5.3 % | 2.678 / 2.693 | 0.6 % | 0.043 / 0.010 |
+| 3 km (6.7) | 600 s | 2.465 / 3.191 | 23 % | 2.537 / 2.778 | 8.7 % | 0.247 / 0.121 |
+| 3 km (6.7) | 900 s | 5.271 / 9.130 | 42 % | 3.750 / 4.992 | 25 % | 0.463 / 0.427 |
+| 3 km (6.7) | 1200 s | 9.835 / 21.33 | 54 % | 5.685 / 9.836 | 42 % | 0.644 / 0.901 |
+
+Rain onset: none by 1200 s at 6 km in either run; 1200 s in both runs at 3 km. The box's edges
+stay clean in every run (3 km: edge T′ ≤ 0.036 K, edge p′ ≤ 10.1 Pa; 6 km hour: edge T′ ≤ 0.056 K,
+edge p′ within −4.2 … +3.0 Pa). Mac cost at 3 km: 13 s of wall per simulated second for either
+grid (box 2 workers × 5 threads, cylinder 1 worker × 4 threads, run concurrently); the 6 km box hour
+was 3.2 s per simulated second.
+
+What the numbers say:
+
+- **The early (pre-convective) gap is resolution.** Halving the spacing takes the 300 s gap from
+  37 % to 5.3 % in w and from 20 % to 0.6 % in T′. The dry 300 s convergence study (`xr = 10 km`;
+  box, cylinder and axisymmetric at 6, 3 and 1.5 km) puts the box-to-axisymmetric w gap at 120 s
+  at 60 %, 24 % and 1.0 %, every output through 180 s within 1.3 % at 1.5 km, and the RLR cylinder
+  equal to the axisymmetric run exactly. A defect in the y-terms would leave a fixed fraction; it
+  does not. The mechanism is the horizontal spline filter (l_q 2.0 in every direction on both
+  grids): the box filters a near-grid-scale round bubble along x and y, the cylinder along r only;
+  with the filter off both grids hold T′ in the first 30 s.
+- **The convective phase does not close at 3 km, and the cylinder is not the converged answer
+  there.** From 600 s the cylinder's updraft accelerates on its axis (3.2 → 9.1 → 21.3 m/s) and the
+  box's grows about half as fast (2.5 → 5.3 → 9.8 m/s). The dry study shows the same split after
+  200 s, where the axisymmetric run focuses an axis jet that is itself unconverged (2.0 m/s at
+  3 km, 8.7 m/s at 1.5 km at 300 s). So a tight 20-min gate is not an honest gate at 3 km, nor at
+  1.5 km; it would need a resolution series run until the cylinder's own max w stops changing.
+- **The 2 % gate at 20 min proposed before the 3 km pair was run is therefore NOT the
+  acceptance.** The correctness evidence is the three roundoff tests above, the dry 1.5 km
+  agreement and the 300 s pair agreement at ≥ 6.7 cells per half-width.
+
+Acceptance, as seeded by the 3 km pair (the author may tighten or replace it):
+
+- ≥ 6.7 cells per bubble half-width (`xr / Δx`), and at 300 s max w and max T′ within 10 % of the
+  RLR control inside r < R/2 (measured 5.3 % and 0.6 %; the 6 km pair is at 37 % and 20 %):
+  `rrr_rlr_compare.jl <box> <cyl> --gate early_t=300 --gate early_rel=0.1 --strict-until 300`.
+- The 20 min and 1 h numbers are recorded as the measured convective-phase difference, not gated.
+- Pending, cluster: a 1.5 km moist pair (8× the 3 km cost; `stream_f/LAUNCH.md` §4c) extends the
+  series if a converged convective-phase comparison is wanted.
+
+Production spacing: this case keeps the plan's 6 km with `xr = 30 km` (5 cells per half-width),
+between the Mac smoke (3.3) and the acceptance spacing (6.7); the faithful control is
+`../ocean_warm_bubble/examples/rlr_150km.toml`. Whether to run it at 3 km (100 × 100 × 50, 90,000
+columns, ~4× the cost) is the author's call.
