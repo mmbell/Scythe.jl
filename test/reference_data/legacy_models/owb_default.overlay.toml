@@ -17,6 +17,7 @@ vapor_transform = "none"             # legacy: the vapor slot is the density per
 
 [physics.boundary_layer]
 scheme = "louis"
+tke_transform = "none"               # legacy: the MYNN slot is the TKE density (pre-Stream D; read only under mynn)
 
 [physics.surface]
 stability = false

@@ -318,7 +318,7 @@ vertical mixing and the surface layer underneath it.
 | `mynn_init` | string (enum) | `"taper"` | TKE initialisation: `taper` or `zero`. |
 | `K_max` | float | `inf` | counted safety cap on the MYNN exchange coefficient [m²/s]; `inf` = none. |
 | `l_inf` | float | `80.0` | Louis asymptotic mixing length [m] (louis only). |
-| `tke_transform` | string (enum) | `"none"` | the MYNN TKE slot's control variable (read under `scheme = "mynn"` only): `none` (the slot is the density `rho_e`) or `bhyp` (the slot is `nu_e = bhyp(rho_e)`, renamed; every reader sees `ahyp(nu_e) >= 0`). |
+| `tke_transform` | string (enum) | `"bhyp"` | the MYNN TKE slot's control variable (read under `scheme = "mynn"` only): `bhyp` (default since the 2026-10 close-out, Stream D: the slot is `nu_e = bhyp(rho_e)`, renamed, every reader sees `ahyp(nu_e) >= 0`; the measured density slot rang negative at 70-90 % of the points above the mixing top) or `none` (the density `rho_e`, the library default). |
 | `tke_mu` | float | `1.0e-7` | bhyp width for the TKE [J/m³]; refused above 1e-2 of the closure floor `rho_t QKEMIN/2` below 6 km. |
 
 ### `[physics.surface]`
@@ -496,7 +496,7 @@ Scythe: boundary conditions (1 patch; a single name = both lateral sides):
   nu_ni3    periodic               natural    natural    sedimenting: flux fit F=0 at lid
   nu_ai3    periodic               natural    natural    sedimenting: flux fit F=0 at lid
   nu_ci3    periodic               natural    natural    sedimenting: flux fit F=0 at lid
-  rho_e     periodic               natural    natural
+  nu_e      periodic               natural    natural
 ```
 
 ### `ocean_warm_bubble`
@@ -528,7 +528,7 @@ Scythe: boundary conditions (1 patch; a single name = both lateral sides):
   nu_ni3    neumann                natural    natural    sedimenting: flux fit F=0 at lid
   nu_ai3    neumann                natural    natural    sedimenting: flux fit F=0 at lid
   nu_ci3    neumann                natural    natural    sedimenting: flux fit F=0 at lid
-  rho_e     neumann                natural    natural
+  nu_e      neumann                natural    natural
 ```
 
 ### `tc_axisym`
@@ -564,7 +564,7 @@ Scythe: boundary conditions (3 patches; a single name = both lateral sides):
   nu_ni3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural    sedimenting: flux fit F=0 at lid
   nu_ai3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural    sedimenting: flux fit F=0 at lid
   nu_ci3    p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural    sedimenting: flux fit F=0 at lid
-  rho_e     p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural
+  nu_e      p1 neumann|r3x        p2 natural|r3x        p3 natural|neumann    natural    natural
 ```
 
 ### Equation sets and geometries

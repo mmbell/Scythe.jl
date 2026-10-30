@@ -394,7 +394,7 @@ end
 - `mynn_init::Symbol` — TKE initialisation: `taper` or `zero`.
 - `K_max::Float64` — counted safety cap on the MYNN exchange coefficient [m²/s]; `inf` = none.
 - `l_inf::Float64` — Louis asymptotic mixing length [m] (louis only).
-- `tke_transform::Symbol` — the MYNN TKE slot's control variable (read under `scheme = "mynn"` only): `none` (the slot is the density `rho_e`) or `bhyp` (the slot is `nu_e = bhyp(rho_e)`, renamed; every reader sees `ahyp(nu_e) >= 0`).
+- `tke_transform::Symbol` — the MYNN TKE slot's control variable (read under `scheme = "mynn"` only): `bhyp` (default since the 2026-10 close-out, Stream D: the slot is `nu_e = bhyp(rho_e)`, renamed, every reader sees `ahyp(nu_e) >= 0`; the measured density slot rang negative at 70-90 % of the points above the mixing top) or `none` (the density `rho_e`, the library default).
 - `tke_mu::Float64` — bhyp width for the TKE [J/m³]; refused above 1e-2 of the closure floor `rho_t QKEMIN/2` below 6 km.
 """
 Base.@kwdef struct BoundaryLayer <: AbstractConfigSection
@@ -405,7 +405,7 @@ Base.@kwdef struct BoundaryLayer <: AbstractConfigSection
     mynn_init::Symbol = :taper
     K_max::Float64 = Inf
     l_inf::Float64 = 80.0
-    tke_transform::Symbol = :none
+    tke_transform::Symbol = :bhyp
     tke_mu::Float64 = 1.0e-7
 end
 

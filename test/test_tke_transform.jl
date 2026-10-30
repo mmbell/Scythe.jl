@@ -200,12 +200,16 @@ end
         # the registry and the run configuration
         @test haskey(Scythe.KNOWN_OPTION_KEYS, :tke_transform)
         @test haskey(Scythe.KNOWN_PHYSICAL_KEYS, :tke_mu)
-        @test Scythe.BoundaryLayer().tke_transform === :none
+        # the RUN-CONFIG default is the control variable (E4); the library default stays :none
+        @test Scythe.BoundaryLayer().tke_transform === :bhyp
         @test Scythe.BoundaryLayer().tke_mu == 1.0e-7
         @test Scythe.OWNED_OPTION_KEYS[:tke_transform] == "physics.boundary_layer.tke_transform"
         @test Scythe.OWNED_PHYSICAL_KEYS[:tke_mu] == "physics.boundary_layer.tke_mu"
         o0, p0 = Scythe.build_physics(Scythe.load_config())
-        @test !haskey(o0, :tke_transform) && !haskey(p0, :tke_mu)   # :none writes nothing
+        @test o0[:tke_transform] === :bhyp && !haskey(p0, :tke_mu)  # the default width: not written
+        on, _ = Scythe.build_physics(Scythe.load_config(
+            set = ["physics.boundary_layer.tke_transform=none"]))
+        @test !haskey(on, :tke_transform)                            # :none writes nothing
         o1, p1 = Scythe.build_physics(Scythe.load_config(
             set = ["physics.boundary_layer.tke_transform=bhyp",
                    "physics.boundary_layer.tke_mu=5.0e-8"]))

@@ -199,10 +199,14 @@ const ICE_SLOTS = ["nu_i1", "nu_ni1", "nu_ai1", "nu_ci1", "nu_i2", "nu_ni2", "nu
                    "nu_i3", "nu_ni3", "nu_ai3", "nu_ci3"]
 ceq_added(first_slot) = merge(Dict("nu_nr" => first_slot),
                               Dict(v => first_slot + i for (i, v) in enumerate(ICE_SLOTS)),
-                              Dict("rho_e" => first_slot + 13))
+                              Dict("nu_e" => first_slot + 13))
 # (`nu_v`: the production build's vapor slot, renamed under the vapor control variable)
 ceq_templates(rain) = merge(Dict(v => (lateral = "nu_v", vertical = rain) for v in ["nu_nr"; ICE_SLOTS]),
-                            Dict("rho_e" => (lateral = "nu_v", vertical = "nu_v")))
+                            Dict("nu_e" => (lateral = "nu_v", vertical = "nu_v")))
+# (`nu_e`: the production build's MYNN TKE slot, renamed under the TKE control variable, the
+# config default since Stream D of the 2026-10 close-out; the legacy builds carried `rho_e`)
+const TKE_RENAMED_BC = Dict{String,Any}("BCB.nu_e" => (missing, BC_NATURAL),
+                                        "BCT.nu_e" => (missing, BC_NATURAL))
 
 # The ground and the lid of the scalar family: d2 in every legacy build, natural now
 # (`boundary_conditions.vertical_scalars` / `vertical_scalars_lid`).
@@ -241,6 +245,7 @@ const EXPECTED_DELTAS = Dict(
             "options.wall_bc_tau" => ("Inf", "300.0"),
             "options.temperature" => (missing, ":eos"),
             "options.vapor_transform" => (missing, ":bhyp"),
+            "options.tke_transform" => (missing, ":bhyp"),
             "options.si_water_slots" => (missing, ":mass"))),
         bc_changed = merge(ceq_lid([LID_SCALARS_NU; "v"; "nu_c"]), VAPOR_RENAMED_BC,
                            Dict("BCT.nu_r" => (BC_D2, BC_NATURAL))),
@@ -255,9 +260,10 @@ const EXPECTED_DELTAS = Dict(
             "options.state_dependent_si" => (missing, "true"),
             "options.temperature" => (missing, ":eos"),
             "options.vapor_transform" => (missing, ":bhyp"),
+            "options.tke_transform" => (missing, ":bhyp"),
             "options.si_water_slots" => (missing, ":mass")),
-        bc_changed = merge(ceq_lid([LID_SCALARS_NU; "nu_c"; "rho_e"]), VAPOR_RENAMED_BC),
-        renamed = Dict("rho_v" => "nu_v"),
+        bc_changed = merge(ceq_lid([LID_SCALARS_NU; "nu_c"]), VAPOR_RENAMED_BC, TKE_RENAMED_BC),
+        renamed = Dict("rho_v" => "nu_v", "rho_e" => "nu_e"),
         added = Dict{String,Int}(), templates = Dict{String,Any}()),
     # OWB: Louis -> MYNN (+ rho_e), ice (two-moment rain, bhyp on every water slot: rho_r/rho_c
     # become nu_r/nu_c and the rain positivity bound goes), NetCDF instead of CSV, a restart
@@ -282,6 +288,7 @@ const EXPECTED_DELTAS = Dict(
             "grid_params.positivity.rho_r.k" => (0.0, missing),
             "options.temperature" => (missing, ":eos"),
             "options.vapor_transform" => (missing, ":bhyp"),
+            "options.tke_transform" => (missing, ":bhyp"),
             "options.si_water_slots" => (missing, ":mass")),
         # nu_c is the renamed rho_c: its lid goes natural with the rest of the family.
         bc_changed = merge(ceq_lid(LID_SCALARS_NU), VAPOR_RENAMED_BC,

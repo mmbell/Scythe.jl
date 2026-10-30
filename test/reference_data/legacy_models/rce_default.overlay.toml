@@ -8,6 +8,9 @@ hydrostatic    = false
 [physics.microphysics]
 vapor_transform = "none"             # legacy: the vapor slot is the density perturbation (pre-Stage 1)
 
+[physics.boundary_layer]
+tke_transform = "none"               # legacy: the MYNN slot is the TKE density rho_e (pre-Stream D)
+
 [numerics]
 state_dependent_si = false
 temperature = "energy"               # legacy: T from the total-energy retrieval (pre-2026-10-14)

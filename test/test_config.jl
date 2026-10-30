@@ -298,7 +298,7 @@ end
         # ... but a variable the run does not have dies at build, listing the run's variables.
         m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)",
                          "boundary_conditions.override.rho_r.top=dirichlet"])))
-        @test occursin("override.rho_r", m) && occursin("nu_r", m) && occursin("rho_e", m)
+        @test occursin("override.rho_r", m) && occursin("nu_r", m) && occursin("nu_e", m)
         # inner/outer overrides are refused under periodic lateral BCs.
         m = errmsg(() -> build_model(load_config(set = ["output.dir=$(dir)",
                          "boundary_conditions.override.p.inner=neumann"])))
@@ -380,12 +380,13 @@ end
 
         # SPLIT: horizontal is the default, vertical one `_k` key per slot of THIS
         # configuration -- the default config carries the transformed `nu_*` names, ice and
-        # `rho_e`, so `check_mc_var_names` (run by build_model) is genuinely exercised.
+        # the TKE control variable `nu_e`, so `check_mc_var_names` (run by build_model) is
+        # genuinely exercised.
         c1 = cf("numerics.l_q_horizontal=1.0")
         m1 = build_model(c1)
         lq = m1.grid_params.l_q
         vs = vars(c1)
-        @test "nu_c" in vs && "rho_e" in vs
+        @test "nu_c" in vs && "nu_e" in vs   # (nu_e: the TKE control variable, the run-config default)
         @test lq["default"] == 1.0
         @test Set(keys(lq)) == Set(["default"; [v * "_k" for v in vs]])
         @test all(lq[v * "_k"] == 2.0 for v in vs)
