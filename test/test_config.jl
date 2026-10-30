@@ -577,14 +577,21 @@ end
         vars = first.(sort(collect(gp.vars), by = last))
         @test vars[10] == "v" && vars == Scythe.mc_var_names(model.options; cyl = true)
         @test haskey(model.physical_params, :f)               # an f-plane box rotates
-        # walls: (u, w) Dirichlet on the x faces, (v, w) Dirichlet on the y faces, every
-        # other variable Neumann; the vertical families as on every geometry.
+        # walls on the box are FREE-SLIP (author's decision 2026-10-29): only the wall-normal
+        # velocity is held, u on the x faces and v on the y faces; w (tangential to a vertical
+        # wall) and every other variable Neumann. With w also Dirichlet on both face pairs the
+        # box's vertical edges are unstable at ts 0.5 s (r2_rrr/STATUS.md). The vertical
+        # families as on every geometry.
         for v in vars
-            @test gp.BCL[v] == (v in ("u", "w") ? DirichletBC() : NeumannBC())
+            @test gp.BCL[v] == (v == "u" ? DirichletBC() : NeumannBC())
             @test gp.BCR[v] == gp.BCL[v]
-            @test gp.BCD[v] == (v in ("v", "w") ? DirichletBC() : NeumannBC())
+            @test gp.BCD[v] == (v == "v" ? DirichletBC() : NeumannBC())
             @test gp.BCU[v] == gp.BCD[v]
         end
+        @test gp.BCB["w"] == DirichletBC()
+        # The 2-D slice keeps its (u, w) Dirichlet walls.
+        gxz = build_model(load_config(set = ["output.dir=$(dir)", "boundary_conditions.lateral=walls"])).grid_params
+        @test gxz.BCL["w"] == DirichletBC() && gxz.BCL["u"] == DirichletBC()
         @test gp.BCB["w"] == DirichletBC() && gp.BCT["w"] == DirichletBC()
         # periodic: every variable on all four faces.
         gpp = build_model(cf("boundary_conditions.lateral=periodic")).grid_params

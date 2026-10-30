@@ -17,6 +17,7 @@ runs that differ only in launcher produce identical output.
 
 - [`ocean_2D_rce/`](ocean_2D_rce/README.md) — `ocean_2D_rce/scythe_config.toml`
 - [`ocean_warm_bubble/`](ocean_warm_bubble/README.md) — `ocean_warm_bubble/scythe_config.toml`
+- [`ocean_warm_bubble_3d/`](ocean_warm_bubble_3d/README.md) — `ocean_warm_bubble_3d/scythe_config.toml`
 - [`tc_axisym/`](tc_axisym/README.md) — `tc_axisym/scythe_config.toml`
 
 ## Launching
@@ -188,7 +189,7 @@ the boundary condition of every prognostic variable, set by four family rules pl
 
 | key | type | default | description |
 |---|---|---|---|
-| `lateral` | string (enum) | `"periodic"` | `walls` or `periodic` (XZ and RRR). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). RRR (the 3-D box): `lateral` governs all four faces; walls = `u`, `w` Dirichlet on the x faces (`inner`/`outer`) and `v`, `w` Dirichlet on the y faces (`down`/`up`), every other variable Neumann; periodic = all four faces. Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here. |
+| `lateral` | string (enum) | `"periodic"` | `walls` or `periodic` (XZ and RRR). XZ walls: every variable Neumann (zero gradient) on both sides, except `u` and `w` Dirichlet (zero). RRR (the 3-D box): `lateral` governs all four faces; walls are FREE-SLIP = `u` Dirichlet on the x faces (`inner`/`outer`) and `v` Dirichlet on the y faces (`down`/`up`), `w` and every other variable Neumann (w held on both face pairs makes the box edges unstable at ts 0.5 s); periodic = all four faces. Cylindrical sets (always walls): axis = Neumann except `u`, `v` Dirichlet; outer wall = Neumann except `u` Dirichlet (`v` and `w` are Neumann there). periodic: `PeriodicBC` on every variable. Nest interfaces are set by the nesting, not here. |
 | `vertical_scalars` | string (enum) | `"natural"` | GROUND BC of every variable except `w` (always Dirichlet zero) and the sedimenting slots (always natural at the ground): `d2` second derivative zero, `natural` unconstrained, `neumann` zero gradient, `r1t1x` = `d2` except `rho_d`, `E_t`, `Q_ss` Neumann and `p` the rigid-wall pressure condition (`dp'/dz = -g rho_t'`, rho_t' the derived total, installed before every fit). Natural by default: a surface layer is logarithmic, and `d2` forces the velocity and scalar gradients constant there. The whole family must share one condition (freeing `p` or `rho_t` alone blows up); with all of it natural the resting-column SI ceiling is 0.875-0.9375 s (0.9375-1.0 s under `d2`) and the 12 h no-physics TC hold is indistinguishable from `d2` (1.78% vs 1.73% of the deficit filled). Never `neumann`: on `p` at the ground it drains the pressure field. |
 | `vertical_scalars_lid` | string (enum) | `"natural"` | LID BC of the same family (every variable except `w`, always Dirichlet zero), same values as `vertical_scalars`. Natural by default: `d2` at a rigid lid over-constrains the perturbation fields and drifts warm over days (multi-day 2D RCE: lid T anomaly 0.5 K at 48 h, crash at 277 h; restarted with a natural lid the anomaly decays). Clean at ts = 0.75 s on the RCE case; ts = 1.0 s showed a transient adjustment that `d2` did not. |
 | `sedimentation_lid` | string (enum) | `"natural"` | lid BC of the sedimenting slots (rain, two-moment rain number, the twelve ice slots): `natural` (unconstrained) or `wall` (left on `vertical_scalars_lid`). Only the slot VALUES: on a B-spline vertical every sedimentation FLUX is fitted with a zero-flux lid either way, so no hydrometeor enters through the top. |
@@ -435,7 +436,7 @@ does, exactly:
 | `lateral = "walls"`, XZ | inner and outer: `u`, `w` dirichlet (zero); every other variable neumann (zero gradient) |
 | `lateral = "walls"`, cylindrical (the only choice) | inner (axis): `u`, `v` dirichlet; every other variable, `w` included, neumann. outer (wall): `u` dirichlet; every other variable, `v` and `w` included, neumann |
 | `lateral = "periodic"` (XZ, single patch only) | inner and outer: periodic on every variable |
-| `lateral = "walls"`, RRR (the 3-D box) | inner and outer (the x faces): `u`, `w` dirichlet; down and up (the y faces): `v`, `w` dirichlet; every other variable neumann |
+| `lateral = "walls"`, RRR (the 3-D box) | FREE-SLIP: inner and outer (the x faces): `u` dirichlet; down and up (the y faces): `v` dirichlet; `w` and every other variable neumann |
 | `lateral = "periodic"`, RRR | all four faces: periodic on every variable |
 | `vertical_scalars = "d2"` | bottom of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
 | `vertical_scalars = "natural"` | bottom of every variable: natural (unconstrained); then the rules below |
@@ -529,6 +530,39 @@ Scythe: boundary conditions (1 patch; a single name = both lateral sides):
   nu_ai3    neumann                natural    natural    sedimenting: flux fit F=0 at lid
   nu_ci3    neumann                natural    natural    sedimenting: flux fit F=0 at lid
   nu_e      neumann                natural    natural
+```
+
+### `ocean_warm_bubble_3d`
+
+`lateral = "walls"`, `vertical_scalars = "natural"`, `vertical_scalars_lid = "natural"`, `sedimentation_lid = "natural"`.
+
+```
+Scythe: boundary conditions (1 patch; a single name = both lateral sides):
+  variable  lateral (inner|outer ; y: down|up)  bottom     top        note
+  p         neumann ; y: neumann                natural    natural
+  rho_d     neumann ; y: neumann                natural    natural
+  nu_v      neumann ; y: neumann                natural    natural
+  u         dirichlet ; y: neumann              natural    natural
+  w         neumann ; y: neumann                dirichlet  dirichlet
+  E_t       neumann ; y: neumann                natural    natural
+  Q_ss      neumann ; y: neumann                natural    natural
+  nu_r      neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_c      neumann ; y: neumann                natural    natural
+  v         neumann ; y: dirichlet              natural    natural
+  nu_nr     neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_i1     neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ni1    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ai1    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ci1    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_i2     neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ni2    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ai2    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ci2    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_i3     neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ni3    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ai3    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_ci3    neumann ; y: neumann                natural    natural    sedimenting: flux fit F=0 at lid
+  nu_e      neumann ; y: neumann                natural    natural
 ```
 
 ### `tc_axisym`

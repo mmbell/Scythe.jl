@@ -76,6 +76,7 @@ const TEST_FILES = [
     ("test_pv_mixing_stochastic.jl",        :core),
     ("test_spline_factor.jl",               :core),
     ("test_rrr_tiling.jl",                  :core),
+    ("test_3d_rrr_timestepping.jl",         :nesting),
     ("test_allocations.jl",                 :allocations),
     ("test_benchmark_smoke.jl",             :io),
 ]

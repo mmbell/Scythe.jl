@@ -380,8 +380,9 @@ j-direction pair; `nothing` on every other geometry, which has no j spline), fro
   side of every patch but the last).
 - `lateral = walls`, XZ: Neumann on every variable except `u`, `w` Dirichlet, both sides.
 - `lateral = periodic`, XZ: `PeriodicBC` on every variable.
-- `lateral = walls`, RRR: x faces as XZ (`u`, `w` Dirichlet); y faces `v`, `w` Dirichlet;
-  every other variable Neumann. `lateral = periodic`, RRR: `PeriodicBC` on all four faces.
+- `lateral = walls`, RRR: FREE-SLIP -- `u` Dirichlet on the x faces, `v` Dirichlet on the y
+  faces, `w` and every other variable Neumann. `lateral = periodic`, RRR: `PeriodicBC` on
+  all four faces.
 - `vertical_scalars` (ground) and `vertical_scalars_lid` (lid) of every variable: `d2`
   SecondDerivativeBC, `natural` NaturalBC, `neumann` NeumannBC, `r1t1x` d2 with the acoustic
   set (`rho_d, E_t, Q_ss`) Neumann and `p` on `CubicBSpline.R1T1X`; then `w`
@@ -405,6 +406,15 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
     elseif bc.lateral === :periodic
         bcl = Dict{String,Any}(v => PeriodicBC() for v in vars)
         bcr = bcl
+    elseif cfg.grid.geometry == "RRR"
+        # The 3-D box's walls are FREE-SLIP: only the wall-normal velocity is held (u here,
+        # v on the y faces below); w, tangential to a vertical wall, is Neumann. Holding w
+        # on both face pairs makes the box's vertical edges unstable at ts 0.5 s (two lateral
+        # w projections the per-column acoustic solve does not see; close-out Stream C2,
+        # r2_rrr/STATUS.md). Author's decision 2026-10-29.
+        scalar = Dict{String,Any}(v => NeumannBC() for v in vars)
+        bcl = merge(scalar, Dict{String,Any}("u" => DirichletBC()))
+        bcr = bcl
     else
         scalar = Dict{String,Any}(v => NeumannBC() for v in vars)
         bcl = merge(scalar, Dict{String,Any}("u" => DirichletBC(), "w" => DirichletBC()))
@@ -417,7 +427,7 @@ function build_boundary_conditions(cfg::RunConfig, options, vars::Vector{String}
             bcd = Dict{String,Any}(v => PeriodicBC() for v in vars)
         else
             bcd = merge(Dict{String,Any}(v => NeumannBC() for v in vars),
-                        Dict{String,Any}("v" => DirichletBC(), "w" => DirichletBC()))
+                        Dict{String,Any}("v" => DirichletBC()))
         end
         bcu = bcd
     end

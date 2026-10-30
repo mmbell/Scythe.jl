@@ -176,7 +176,7 @@ function bc_section(io)
     | `lateral = "walls"`, XZ | inner and outer: `u`, `w` dirichlet (zero); every other variable neumann (zero gradient) |
     | `lateral = "walls"`, cylindrical (the only choice) | inner (axis): `u`, `v` dirichlet; every other variable, `w` included, neumann. outer (wall): `u` dirichlet; every other variable, `v` and `w` included, neumann |
     | `lateral = "periodic"` (XZ, single patch only) | inner and outer: periodic on every variable |
-    | `lateral = "walls"`, RRR (the 3-D box) | inner and outer (the x faces): `u`, `w` dirichlet; down and up (the y faces): `v`, `w` dirichlet; every other variable neumann |
+    | `lateral = "walls"`, RRR (the 3-D box) | FREE-SLIP: inner and outer (the x faces): `u` dirichlet; down and up (the y faces): `v` dirichlet; `w` and every other variable neumann |
     | `lateral = "periodic"`, RRR | all four faces: periodic on every variable |
     | `vertical_scalars = "d2"` | bottom of every variable: second_derivative (zero); then the `w` and sedimentation rules below |
     | `vertical_scalars = "natural"` | bottom of every variable: natural (unconstrained); then the rules below |
