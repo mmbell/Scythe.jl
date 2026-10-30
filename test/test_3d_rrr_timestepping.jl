@@ -98,7 +98,16 @@ function r3d_run(tmp, name, toml; workers = 1)
     return (df = df, vars = vars, t = maximum(tags))
 end
 
-@testset "3D RRR time stepping (slab == XZ, x<->y symmetry, 2 workers)" begin
+# The box's time-stepping needs the Springsteel RRR i-tiling methods (rrr/halo d74ea56; not
+# yet in Springsteel main), which run_simulation's preflight checks by the same hasmethod
+# lookup; without them every arm but XZ is refused, so the testset is skipped with a warning
+# (the same guard as test_rrr_tiling.jl's exchange testset).
+const R3D_RRR_AVAILABLE = hasmethod(Scythe.Springsteel.tileTransform!,
+    Tuple{Scythe.SharedArray{Float64}, Scythe.RRR_Grid, Array{Float64}, Array{Float64}})
+R3D_RRR_AVAILABLE || @warn("test_3d_rrr_timestepping: $(pkgdir(Scythe.Springsteel)) has no RRR " *
+    "tiling methods (tileTransform! on RRR_Grid); the 3-D time-stepping testset is skipped")
+
+R3D_RRR_AVAILABLE && @testset "3D RRR time stepping (slab == XZ, x<->y symmetry, 2 workers)" begin
     # SCYTHE_R3D_KEEP=<dir> keeps the four run trees there (for inspection) instead of a
     # temporary directory.
     keep = get(ENV, "SCYTHE_R3D_KEEP", "")
