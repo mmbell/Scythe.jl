@@ -7,13 +7,14 @@
 #
 #   sbatch simulations/ocean_warm_bubble/examples/scythe_rlr150.sbatch [--set key.path=value ...] [--resume]
 #
-# Job shape (default): ONE 20-core node, ONE worker with 20 threads (--workers 1). 11,700
-# columns x 150 levels; from the Mac cost per column-hour (RLR 60 km, 1,980 columns: 4.4 h for
-# 1 simulated hour on 4 threads) the first simulated hour is ~100 thread-hours, i.e. roughly
-# 5-10 h on 20 threads: the 24 h limit below leaves room for the second hour. More nodes (the
-# r axis is tiled; verified only up to 2 workers, C1) are opt-in, one worker per node:
-#   RLR_WORKERS=6 sbatch -N 6 simulations/ocean_warm_bubble/examples/scythe_rlr150.sbatch
-# (adds --slurm; 25 radial cells -> 4-5 per tile). Run it with --workers 1 first if in doubt.
+# Job shape (default): FIVE 20-core nodes, one worker of 20 threads per node (--workers 5
+# --slurm; 50 radial cells -> 10 per tile; the r tiling is verified against 1 worker to 1e-12
+# only up to 2 workers, C1). At 3 km the cylinder has ~47,000 columns x 150 levels; at the Mac
+# per-column rate of the 3 km pair (9.0e-3 thread-hours per column per simulated hour) one
+# simulated hour is ~420 thread-hours: ~4 h on 100 threads before scaling losses, ~21 h on one
+# node, which is why one node is no longer the default. Other shapes, one worker per node:
+#   RLR_WORKERS=1 sbatch -N 1 simulations/ocean_warm_bubble/examples/scythe_rlr150.sbatch
+#   RLR_WORKERS=10 sbatch -N 10 simulations/ocean_warm_bubble/examples/scythe_rlr150.sbatch
 #
 # `--set` is run control only (run.integration_time=7200 for a second hour; segment_length stays
 # 3600 so seg_01, the hour the compare script reads, is the same), `--resume` continues a tree
@@ -26,7 +27,7 @@
 # $SCYTHE itself). The RLR geometry needs no Springsteel beyond development's Manifest.
 #
 #SBATCH -J scythe_rlr150
-#SBATCH -N 1
+#SBATCH -N 5
 #SBATCH --ntasks-per-node=1
 #SBATCH -c 20
 #SBATCH -t 24:00:00
@@ -35,7 +36,7 @@
 set -uo pipefail
 
 export JULIA_NUM_THREADS=${JULIA_NUM_THREADS:-20}
-WORKERS=${RLR_WORKERS:-1}
+WORKERS=${RLR_WORKERS:-5}
 
 SCYTHE=${SCYTHE_DIR:-$HOME/Development/Scythe.jl}
 PROJECT=${SCYTHE_PROJECT:-$SCYTHE}

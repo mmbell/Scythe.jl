@@ -6,8 +6,8 @@ the 3-D Cartesian box: `moist_compressible_RRR`, B-splines in x, y and z.
 | | |
 |---|---|
 | domain | 300 km × 300 km × 25 km |
-| cells | 50 × 50 × 50 (6 km × 6 km × 500 m, the TC coarse spacing) |
-| columns | 22,500 (150 × 150 mish columns × 150 levels) |
+| cells | 100 × 100 × 50 (3 km × 3 km × 500 m: 10 cells per bubble half-width, above the acceptance spacing of 6.7 below) |
+| columns | 90,000 (300 × 300 mish columns × 150 levels) |
 | lateral BC | FREE-SLIP walls on all four faces (the box's `walls` rule): the normal velocity Dirichlet (`u` on the x faces, `v` on the y faces), `w` and every other variable Neumann |
 | initial condition | a round RH-preserving 3 K bubble, `xc = yc = 150 km`, `xr = 30 km` in x and y, `zc = 500 m`, `zr = 3 km` |
 | environment | f-plane at 15°N (the 2-D case's latitude, which the box does feel), SST 302.65 K |
@@ -29,7 +29,7 @@ sbatch simulations/ocean_warm_bubble_3d/scythe_owb3d.sbatch --resume \
        --set output.dir=$PWD/simulations/ocean_warm_bubble_3d/output/owb3d_12345
 ```
 
-- The 50 x cells split 4–5 per tile.
+- The 100 x cells split 9–10 per tile.
 - The tiles exchange their 3-row spectral halos (every j and k mode block) once per step.
 - The y and z axes are never decomposed.
 
@@ -128,7 +128,10 @@ Acceptance, as seeded by the 3 km pair (the author may tighten or replace it):
 - Pending, cluster: a 1.5 km moist pair (8× the 3 km cost; `stream_f/LAUNCH.md` §4c) extends the
   series if a converged convective-phase comparison is wanted.
 
-Production spacing: this case keeps the plan's 6 km with `xr = 30 km` (5 cells per half-width),
-between the Mac smoke (3.3) and the acceptance spacing (6.7); the faithful control is
-`../ocean_warm_bubble/examples/rlr_150km.toml`. Whether to run it at 3 km (100 × 100 × 50, 90,000
-columns, ~4× the cost) is the author's call.
+Production spacing: this case runs at 3 km with `xr = 30 km` (10 cells per half-width, above the
+acceptance spacing of 6.7; the author's decision of 2026-11-04 after the 3 km pair). The plan's 6 km
+(5 cells per half-width, 22,500 columns) sat between the Mac smoke (3.3) and the acceptance spacing.
+The faithful control is `../ocean_warm_bubble/examples/rlr_150km.toml`, also at 3 km (50 radial
+cells). Cost from the Mac 3 km pair's per-column rate (9.0e-3 thread-hours per column per simulated
+hour): the box's two hours ~1,600 thread-hours (~7.5 h on 11 nodes before scaling losses), the
+cylinder's hour ~420 thread-hours (its sbatch defaults to 5 nodes).

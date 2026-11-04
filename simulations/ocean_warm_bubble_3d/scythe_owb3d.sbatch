@@ -1,10 +1,14 @@
 #!/bin/bash
 # The 3-D ocean warm bubble production run (simulations/ocean_warm_bubble_3d/run.jl): the RRR
-# box, 300 km x 300 km x 25 km, 50 x 50 x 50 cells (22,500 columns x 150 levels), two one-hour
-# segments. 11 workers, one per 20-core node (ClusterManagers.addprocs_slurm through run.jl
-# --slurm), each holding one x tile of the box (50 cells -> 4-5 cells per tile) and threading
-# its per-column loop across the node; the tiles exchange their 3-row spectral halos once per
-# step. Close-out Stream C2, stage R2e; NOT for the Mac (rrr_120km.toml is the Mac size).
+# box, 300 km x 300 km x 25 km, 100 x 100 x 50 cells (3 km; 90,000 columns x 150 levels), two
+# one-hour segments. 11 workers, one per 20-core node (ClusterManagers.addprocs_slurm through
+# run.jl --slurm), each holding one x tile of the box (100 cells -> 9-10 cells per tile) and
+# threading its per-column loop across the node; the tiles exchange their 3-row spectral halos
+# once per step. Close-out Stream C2, stage R2e; NOT for the Mac (rrr_120km.toml is the Mac
+# size). Cost estimate from the Mac 3 km pair (14,400 columns, 20 min in 15,627 s on 10
+# threads = 9.0e-3 thread-hours per column per simulated hour, the same per-column rate as the
+# 6 km hour): 90,000 columns x 2 h = ~1,600 thread-hours, ~7.5 h on 220 threads before scaling
+# losses; the 24 h limit below leaves a margin, and the second segment can be --resume'd.
 #
 #   sbatch simulations/ocean_warm_bubble_3d/scythe_owb3d.sbatch [--set key.path=value ...] [--resume]
 #

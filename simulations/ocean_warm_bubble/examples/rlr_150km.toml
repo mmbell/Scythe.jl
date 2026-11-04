@@ -1,7 +1,7 @@
 # 3-D RLR warm bubble, 150 km cylinder (moist_compressible_RLR: spline r, Fourier lambda,
 # spline z), the bubble ON THE AXIS: the faithful control of the production box
-# ../../ocean_warm_bubble_3d/scythe_config.toml (300 km x 300 km, 50 x 50 x 50 cells), whose
-# half-width is this cylinder's radius. SAME spacing (6 km x 6 km-equivalent x 500 m), SAME
+# ../../ocean_warm_bubble_3d/scythe_config.toml (300 km x 300 km, 100 x 100 x 50 cells), whose
+# half-width is this cylinder's radius. SAME spacing (3 km x 3 km-equivalent x 500 m), SAME
 # bubble (xr = 30 km, zc 500 m, zr 3 km, dT_max 3 K, RH-preserving), SAME environment (the
 # f-plane at 15 N, SST 302.65 K), SAME physics (the OWB defaults: ice + MYNN + two-moment
 # rain, radiation none), same ts. Only the geometry differs (axis + round wall at 150 km in
@@ -38,10 +38,10 @@ netcdf_grid      = "regular"
 netcdf_derivatives = false
 
 [grid]
-# 150 km radius x 25 km, 6 km x 500 m cells (the OWB / TC coarse spacing); axis + outer WALL.
+# 150 km radius x 25 km, 3 km x 500 m cells (the box's acceptance spacing); axis + outer WALL.
 geometry    = "RLR"                  # spline r, Fourier lambda (ring-native truncation), spline z
 boundaries  = [0.0, 150.0e3]
-num_cells   = [25]
+num_cells   = [50]
 z_top       = 25.0e3
 num_cells_k = 50
 

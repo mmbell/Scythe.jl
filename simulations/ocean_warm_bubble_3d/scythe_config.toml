@@ -1,10 +1,11 @@
 # Ocean warm bubble in 3-D: the OWB case (../ocean_warm_bubble/) on the 3-D Cartesian box
-# (moist_compressible_RRR: spline x, y, z), 300 km x 300 km x 25 km at the TC coarse-grid
-# spacing (6 km x 500 m cells, 50 x 50 x 50), lateral walls on all four faces, surface
-# fluxes and drag on, MYNN + ISHMAEL ice, radiation off. A round RH-preserving 3 K bubble
-# (30 km half-width) in the centre of the box. Close-out Stream C2, stage R2e: the 3-D
-# deliverable. 22,500 columns x 150 levels: a CLUSTER run (scythe_owb3d.sbatch, 11 workers x
-# 20 threads); the Mac development size is ../ocean_warm_bubble/examples/rrr_120km.toml.
+# (moist_compressible_RRR: spline x, y, z), 300 km x 300 km x 25 km at 3 km x 500 m cells
+# (100 x 100 x 50: 10 cells per bubble half-width, above the README's acceptance spacing of
+# 6.7; the author's decision of 2026-11-04 after the 3 km pair), lateral walls on all four
+# faces, surface fluxes and drag on, MYNN + ISHMAEL ice, radiation off. A round RH-preserving
+# 3 K bubble (30 km half-width) in the centre of the box. Close-out Stream C2, stage R2e: the
+# 3-D deliverable. 90,000 columns x 150 levels: a CLUSTER run (scythe_owb3d.sbatch, 11 workers
+# x 20 threads); the Mac development size is ../ocean_warm_bubble/examples/rrr_120km.toml.
 #
 # Two one-hour segments (run.segment_length = 3600; each segment is one process and restarts
 # from the previous one's checkpoint), so a wall-clock limit costs at most an hour of model
@@ -30,13 +31,15 @@ netcdf_grid      = "regular"
 netcdf_derivatives = false
 
 [grid]
-# 300 km x 300 km x 25 km, 6 km x 500 m cells (the TC coarse-grid spacing). Single patch (the
-# box is not nested), lateral WALLS on all four faces.
+# 300 km x 300 km x 25 km, 3 km x 500 m cells (the acceptance spacing; the 6 km TC coarse-grid
+# spacing is 5 cells per half-width, below it). Single patch (the box is not nested), lateral
+# WALLS on all four faces. ts 0.5 s sits at a quarter of the explicit horizontal acoustic limit
+# at 3 km (the 3 km pair's "Timestep limits" line).
 geometry     = "RRR"                 # spline x, y, z
 boundaries   = [0.0, 300.0e3]        # x edges [m]
-num_cells    = [50]
+num_cells    = [100]
 boundaries_j = [0.0, 300.0e3]        # y edges [m]
-num_cells_j  = [50]
+num_cells_j  = [100]
 z_top        = 25.0e3
 num_cells_k  = 50
 
