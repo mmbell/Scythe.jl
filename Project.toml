@@ -1,6 +1,6 @@
 name = "Scythe"
 uuid = "d55642f6-1d05-468f-911d-cecaa5a3b3bf"
-version = "1.0.1"
+version = "2.0.0-rc.1"
 authors = ["Michael Bell <mmbell@colostate.edu> and contributors"]
 
 [deps]
