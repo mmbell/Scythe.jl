@@ -1,0 +1,117 @@
+equation_set = "moist_compressible_XZ"
+initial_conditions_basename = "owb_ics.csv"
+integration_time = 7200.0
+output_dir_basename = ""
+output_interval = 300.0
+ref_state_file_basename = "owb_exact.ref"
+restart_interval = 0.0
+ts = 0.5
+
+[grid_params]
+geometry = "RiRk"
+iDim = 150
+iMax = 300000.0
+iMin = 0.0
+kDim = 150
+kMax = 25000.0
+kMin = 0.0
+mubar = 3
+num_cells_i = 50
+num_cells_k = 50
+quadrature = "gauss"
+
+    [grid_params.BCB]
+    E_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    Q_ss = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    p = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_d = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    rho_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+    [grid_params.BCL]
+    E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    p = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_c = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_r = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_v = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    u = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+    w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+    [grid_params.BCR]
+    E_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    Q_ss = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    p = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_c = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_d = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_r = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_t = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    rho_v = "BoundaryConditions(nothing, 0.0, nothing, nothing, false)"
+    u = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+    w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+    [grid_params.BCT]
+    E_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    Q_ss = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    p = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_c = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_d = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_r = "BoundaryConditions(nothing, nothing, nothing, nothing, false)"
+    rho_t = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    rho_v = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    u = "BoundaryConditions(nothing, nothing, 0.0, nothing, false)"
+    w = "BoundaryConditions(0.0, nothing, nothing, nothing, false)"
+
+    [grid_params.l_q]
+    default = 2.0
+
+    [grid_params.max_wavenumber]
+    default = -1
+
+    [grid_params.positivity.rho_r]
+    i = 0.0
+    k = 0.0
+
+    [grid_params.vars]
+    E_t = 6
+    Q_ss = 7
+    p = 1
+    rho_c = 9
+    rho_d = 2
+    rho_r = 8
+    rho_t = 3
+    rho_v = 10
+    u = 4
+    w = 5
+
+[options]
+exact_reference_state = "true"
+louis_bl = "true"
+output_formats = "[:csv]"
+precipitation = "true"
+semiimplicit = "true"
+surface_fluxes = "true"
+vertical_mixing = "false"
+
+[physical_params]
+Cd = -1.0
+Ck = 0.001
+Khdiff = 0.0
+Khdiff_heat = 0.0
+Kvdiff = 0.0
+Kvdiff_heat = 0.0
+Kvdiff_water = 0.0
+N_0 = 8.0e6
+N_r = 0.001
+SST = 302.65
+U_min = 2.0
+alpha = 0.02
+l_inf = 80.0
+tau_qss = 10.0
+z_damp = 17000.0

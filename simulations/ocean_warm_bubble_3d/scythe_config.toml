@@ -1,0 +1,95 @@
+# Ocean warm bubble in 3-D: the OWB case (../ocean_warm_bubble/) on the 3-D Cartesian box
+# (moist_compressible_RRR: spline x, y, z), 300 km x 300 km x 25 km at 3 km x 500 m cells
+# (100 x 100 x 50: 10 cells per bubble half-width, above the README's acceptance spacing of
+# 6.7; the author's decision of 2026-11-04 after the 3 km pair), lateral walls on all four
+# faces, surface fluxes and drag on, MYNN + ISHMAEL ice, radiation off. A round RH-preserving
+# 3 K bubble (30 km half-width) in the centre of the box. Close-out Stream C2, stage R2e: the
+# 3-D deliverable. 90,000 columns x 150 levels: a CLUSTER run (scythe_owb3d.sbatch, 11 workers
+# x 20 threads); the Mac development size is ../ocean_warm_bubble/examples/rrr_120km.toml.
+#
+# Two one-hour segments (run.segment_length = 3600; each segment is one process and restarts
+# from the previous one's checkpoint), so a wall-clock limit costs at most an hour of model
+# time and `--resume` continues from the last finished segment.
+#
+# [run], [output], [grid], [boundary_conditions], [timestep], [reference_state],
+# [initial_conditions] and [environment] are spelled out IN FULL; [physics], [numerics] and
+# [diagnostics] stay delta-only against the RunConfig struct defaults (src/config.jl).
+
+[run]
+name             = "ocean_warm_bubble_3d"
+equation_set     = "moist_compressible_RRR"
+integration_time = 7200.0            # 2 hours
+segment_length   = 3600.0            # two one-hour segments (restart chaining)
+
+[output]
+dir              = "output"          # relative to this file
+interval         = 300.0
+restart_interval = 3600.0            # the chaining checkpoint at each segment end
+formats          = ["netcdf"]
+sidecars         = false             # per-tile MYNN / radiation NetCDF sidecars
+netcdf_grid      = "regular"
+netcdf_derivatives = false
+
+[grid]
+# 300 km x 300 km x 25 km, 3 km x 500 m cells (the acceptance spacing; the 6 km TC coarse-grid
+# spacing is 5 cells per half-width, below it). Single patch (the box is not nested), lateral
+# WALLS on all four faces. ts 0.5 s sits at a quarter of the explicit horizontal acoustic limit
+# at 3 km (the 3 km pair's "Timestep limits" line).
+geometry     = "RRR"                 # spline x, y, z
+boundaries   = [0.0, 300.0e3]        # x edges [m]
+num_cells    = [100]
+boundaries_j = [0.0, 300.0e3]        # y edges [m]
+num_cells_j  = [100]
+z_top        = 25.0e3
+num_cells_k  = 50
+
+[boundary_conditions]
+# The boundary condition of every variable follows from these four family rules (plus any
+# per-variable [boundary_conditions.override] entries). The resolved per-variable table is
+# written to <output.dir>/boundary_conditions.toml and printed at startup; the tables for
+# every case are in simulations/README.md ("Boundary conditions").
+lateral           = "walls"          # ALL FOUR FACES (x = 0, 300 km and y = 0, 300 km), FREE-SLIP:
+                                     # u Dirichlet (zero) on the x faces, v on the y faces;
+                                     # w and every other variable Neumann
+vertical_scalars  = "natural"        # GROUND of every variable except w (always Dirichlet
+                                     # zero): unconstrained, so the logarithmic surface layer
+                                     # is not forced to a constant gradient (d2 did that) --
+                                     # p, rho_d, nu_v, u, E_t, Q_ss, nu_c, nu_e
+vertical_scalars_lid = "natural"     # LID of the same family (w still Dirichlet zero):
+                                     # unconstrained. d2 at the lid drifts warm over days (2D
+                                     # RCE: lid T +0.5 K at 48 h, crash at 277 h); natural decays
+sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
+                                     # ice slots: unconstrained (their ground is always natural,
+                                     # so they fall out). The sedimentation FLUX is fitted with a
+                                     # zero-flux lid either way: nothing falls in from above
+
+[timestep]
+ts           = 0.5                   # [s]
+ts_per_patch = []                    # empty = single patch at ts
+scale        = 1.0
+
+[reference_state]
+sounding       = "@scythe/benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref"
+exact          = true
+consistent_qss = true
+hydrostatic    = true
+
+[initial_conditions]
+method = "temperature_bubble"
+
+[initial_conditions.temperature_bubble]
+# An RH-preserving warm ellipsoid in the centre of the box, round in the horizontal (xr in x
+# and y), the 2-D case's 30 km half-width.
+xc     = 150.0e3                     # bubble centre, x [m] (domain midpoint)
+yc     = 150.0e3                     # bubble centre, y [m] (domain midpoint)
+xr     = 30.0e3                      # horizontal half-width [m] (x and y)
+zc     = 500.0                       # bubble centre, vertical [m]
+zr     = 3000.0                      # vertical half-depth [m]
+dT_max = 3.0                         # peak temperature perturbation [K]
+
+[environment]
+f_latitude = 15.0                    # [deg]; the 2-D case's latitude, which the box DOES feel (f-plane)
+sst        = 302.65                  # [K]
+
+[physics.radiation]
+scheme = "none"                      # a 2-hour bubble does not feel radiation

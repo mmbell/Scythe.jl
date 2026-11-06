@@ -97,3 +97,84 @@ associated with the Chebyshev vertical basis.
 - theta_e' Gibbs overshoot at the arch grows with updraft strength (5.9 K at
   200 m in the PE moist run vs 4.1 published). Ties into the
   Chebyshev-vs-spline vertical basis experiment above.
+
+## Positivity bounds for rho_d / rho_t: available, tested, and OFF
+
+> **Stage 4 of the rho_t retirement (2026-10):** the prognostic `rho_t` slot is deleted;
+> `rho_t = rho_d + sum_k alpha_k nu_k` is derived from the water slots, so only the `rho_d`
+> half of this section still describes a prognostic field. `rho_w` is now that derived sum
+> (it goes negative only where the slots' negative lobes outweigh the column's water), and
+> the `min_rho_w_gm3` rows below read it. The text is kept as the record of the decision.
+
+The spline positivity limiter already supports the two prognostic densities.
+`positivity_reference_profile` (src/moist_compressible.jl) recognizes `"rho_d"`
+and `"rho_t"`, so `install_positivity_bounds!` installs the reference-offset
+bound on both legs (`-ρ̄(z)` via the support-minimum rule on the k-leg, the
+negated SB coefficients of ρ̄ on the i-leg), exactly as it does for `rho_c`. The
+MC scalar BCs are Neumann (R1T1), which is bound-safe, so nothing blocks it.
+
+**Nothing enables it, by design.** Three reasons:
+
+1. `rho_d` has no rate sinks whatsoever, and `rho_t`'s only sink is the fitted
+   sedimentation flux divergence — not a rate. The AB3 depletion-bound machinery
+   that had to be built for `rho_c`/`rho_r` (the forward-Euler cap that AB3's
+   23/12 leading weight overshoots by ~2.3x) is therefore vacuous here: there is
+   no cap to size, and no per-step depletion to bound.
+2. The constraint that actually matters is `rho_w = rho_t - rho_d >= 0`. It is a
+   DIFFERENCE of two independently fitted fields, so it is not expressible as a
+   bound on either one's spline coefficients. Bounding `rho_d` and `rho_t`
+   separately does not deliver it and never will.
+3. Both fields sit ~5 orders of magnitude from zero in every configuration run
+   to date. There is nothing to protect yet.
+
+Consistent with the project doctrine — measure, don't clamp — the state is
+monitored instead:
+
+- `options[:state_minima_trace]` (src/semiimplicit.jl) prints per-step minima of
+  `rho_d/ρ̄_d`, `rho_t/ρ̄_t` and `rho_w`, flagging the first two below half
+  reference and `rho_w` on any negative value.
+- `min_rho_d_frac` and `min_rho_w_gm3` are reported by `o01_rainfall.jl` (both
+  the single-grid and nested diagnostics) and by `bf02_moist.jl` at the MC
+  stage. Informational — neither has a pass/fail target.
+
+**To turn the bounds on** when strong convection makes them relevant, add the
+species to `GridParameters.positivity`, e.g.
+
+```julia
+positivity = Dict("rho_d" => Dict(:i => 0.0, :k => 0.0),
+                  "rho_t" => Dict(:i => 0.0, :k => 0.0))
+```
+
+(only `0.0` is accepted for a reference-carried variable; the offset is supplied
+automatically). The testset *"positivity bounds are available and inert for
+rho_d/rho_t"* in `test/test_moist_compressible.jl` locks that this installs
+cleanly, produces zero `bound_shortfall`, conserves both domain masses to
+rounding, and is **bitwise** identical to the unbounded run when it does not
+bind. Watch `bound_shortfall` after enabling: a nonzero value means a column was
+infeasible and the limiter created mass rather than redistributing it.
+
+The `rho_w >= 0` constraint stays a monitored diagnostic regardless. If it ever
+needs enforcing it has to be done in the water partition (see the negative-water
+attribution work), not in the spline fit.
+
+## Dead implicit vertical momentum diffusion in the pe/pd/sigma sets
+
+`impdot[u] = Kvdiff * u_zz` is written by `primitive_equation_XZ`
+(src/primitive_equations.jl:275), `_rhod` (:593), `_rhod_pd` (:943) and
+`_sigma` (:1306), but `diffusion_timestep` (src/semiimplicit.jl:1019) and
+`diffusion_timestep_pd` (:1142) only solve the `s`/`sigma` and moisture slots,
+and `explicit_timestep` (:1252) reads only `expdot`. The write is therefore
+dropped: those sets apply HORIZONTAL momentum diffusion only, and `w` never had
+vertical diffusion at all (its `impdot` slot is the acoustic PGF).
+
+straka93 `--stage pe` and `--stage pe-rho_d` have been passing their targets in
+that state. `moist_compressible_XZ` was fixed (it now carries its own
+`diffdot_n`/`diffdot_nm1` channel and `diffusion_timestep_mc`, which diffuses
+u, w and theta_d'); the older sets were left bit-for-bit alone so no baseline
+moved.
+
+Fixing them means adding `u` and `w` to the `diffusion_timestep*` variable lists
+— `w` needs the `diffdot` channel, since `impdot[w]` is the acoustic tendency —
+and will change straka93 `pe` / `pe-rho_d` results plus anything in
+`tcblModels` that has tuned around the current behavior. Re-seed those
+baselines deliberately when it is done.

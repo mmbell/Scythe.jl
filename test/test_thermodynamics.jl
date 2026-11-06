@@ -242,26 +242,52 @@ using Scythe
     # 10. Rayleigh damping
     # ──────────────────────────────────────────────
     @testset "Rayleigh damping" begin
+        # Full Durran & Klemp (1983) eq. 29 profile (originally Klemp & Lilly 1978):
+        # half-cosine ramp over the lower half of the layer, linear continuation over
+        # the upper half, C1-continuous at the junction.
         alpha = 0.01
         z_d = 10000.0
         z_t = 15000.0
+        depth = z_t - z_d
 
         # Zero at or below z_d
         @test Scythe.Rayleigh_damping(alpha, z_d, z_d, z_t) == 0.0
         @test Scythe.Rayleigh_damping(alpha, 5000.0, z_d, z_t) == 0.0
 
-        # Negative above z_d (damping)
-        tau_mid = Scythe.Rayleigh_damping(alpha, 12500.0, z_d, z_t)
-        @test tau_mid < 0.0
+        # Lower half: -(alpha/2)(1 - cos(norm_z*pi))
+        z_q1 = z_d + 0.25 * depth
+        @test Scythe.Rayleigh_damping(alpha, z_q1, z_d, z_t) ≈
+              -0.5 * alpha * (1.0 - cos(0.25 * pi)) atol = 1.0e-12
 
-        # Monotonically increasing magnitude with height (smooth cosine)
+        # Junction at norm_z = 1/2: -alpha/2
+        z_mid = z_d + 0.5 * depth
+        @test Scythe.Rayleigh_damping(alpha, z_mid, z_d, z_t) ≈ -0.5 * alpha atol = 1.0e-12
+
+        # Upper half: -(alpha/2)[1 + (norm_z - 1/2)*pi]
+        z_q3 = z_d + 0.75 * depth
+        @test Scythe.Rayleigh_damping(alpha, z_q3, z_d, z_t) ≈
+              -0.5 * alpha * (1.0 + 0.25 * pi) atol = 1.0e-12
+
+        # Maximum magnitude at z_t equals -(alpha/2)(1 + pi/2)
+        @test Scythe.Rayleigh_damping(alpha, z_t, z_d, z_t) ≈
+              -0.5 * alpha * (1.0 + 0.5 * pi) atol = 1.0e-12
+
+        # Monotonically increasing magnitude with height
         tau1 = Scythe.Rayleigh_damping(alpha, 11000.0, z_d, z_t)
         tau2 = Scythe.Rayleigh_damping(alpha, 13000.0, z_d, z_t)
         tau3 = Scythe.Rayleigh_damping(alpha, z_t, z_d, z_t)
         @test tau1 > tau2 > tau3   # more negative = stronger damping
 
-        # Maximum magnitude at z_t equals -alpha
-        @test Scythe.Rayleigh_damping(alpha, z_t, z_d, z_t) ≈ -alpha atol=1.0e-12
+        # C1 continuity at the junction: one-sided finite-difference slopes agree
+        # (both branches have slope -(alpha/2)*pi/depth there, and the cosine branch
+        # has zero curvature at norm_z = 1/2, so the match is tight)
+        eps_z = 1.0e-6 * depth
+        slope_lo = (Scythe.Rayleigh_damping(alpha, z_mid, z_d, z_t) -
+                    Scythe.Rayleigh_damping(alpha, z_mid - eps_z, z_d, z_t)) / eps_z
+        slope_hi = (Scythe.Rayleigh_damping(alpha, z_mid + eps_z, z_d, z_t) -
+                    Scythe.Rayleigh_damping(alpha, z_mid, z_d, z_t)) / eps_z
+        @test slope_lo ≈ slope_hi rtol = 1.0e-6
+        @test slope_lo ≈ -0.5 * alpha * pi / depth rtol = 1.0e-6
     end
 
     # ──────────────────────────────────────────────

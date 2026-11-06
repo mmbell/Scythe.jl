@@ -77,9 +77,13 @@ model = ModelParameters(
     grid_params = grid_params,
     physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
                            :alpha => 0.0, :z_damp => 20.0e3),
-    options = Dict(:semiimplicit => (run == "dry"),
+    # `:output_formats` pinned to CSV: this script reads `<t>_physical.csv` directly
+    # (the model's default is now the comprehensive `<t>.nc`). It does not include the
+    # benchmark harness, so the list is written out rather than shared.
+    options = Dict{Symbol,Any}(:semiimplicit => (run == "dry"),
                    :exact_reference_state => exact_ref,
-                   :precipitation => false, :vertical_mixing => false),
+                   :precipitation => false, :vertical_mixing => false,
+                   :output_formats => [:csv]),
 )
 
 ref, _, _ = rebuild_reference(model)

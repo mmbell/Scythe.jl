@@ -326,7 +326,7 @@ function s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
     if RH <= 0.0
         RH = 1.0e-6
     end
-    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*(log(RH)) ))
+    ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) )#+ (Rv*(log(RH)) ))
     return ds
 end
 
@@ -358,7 +358,7 @@ function s_condensation(q_evap, q_cond, Tk, rho_d, q_v, q_l, p)
     if RH <= 0.0
         RH = 1.0e-6
     end
-    ds = (q_cond - q_evap) * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*(log(RH))) )
+    ds = (q_cond - q_evap) * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) )# + (Rv*(log(RH))) )
     return ds
 end
 
@@ -391,6 +391,12 @@ function s_condensation_relaxation(q_cond, Tk, rho_d, q_v, q_l, p)
     Cm = (q_l * Cl)/(Cvd + (q_v * Cvv) + (q_l * Cl))
     e = vapor_pressure(p, q_v)
     sat_e = sat_pressure_liquid_buck(Tk, p)
+    # The Rv*log(e/sat_e) = R_v*ln(H) term is the irreversible entropy PRODUCTION of
+    # phase change away from saturation (T ds_irr = -R_v T ln(H) dq_v >= 0) and belongs
+    # in the entropy source: total entropy is NOT conserved under finite-supersaturation
+    # condensation, while total energy is (see reference/Scythe_moist_compressible.tex,
+    # entropy budget). It was removed during the sigma-set experiments, which changed
+    # the moist base-state/bubble construction and weakened the BF02 thermal.
     ds = q_cond * ( ((-L_v(Tk)* Cm)/Tk) -(Cl * log(Tk / T_0)) + (Rv*log(e/sat_e)) )
     return ds
 end
@@ -610,11 +616,11 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     #sat_ratio = max.(sat_ratio, 1.0e-6)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mubar = mtile.ref_state.mubar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mubar = ref_mu(mtile.ref_state)[:,1]
     mu_total = mu .+ mubar
-    satbar = mtile.ref_state.satbar[:,1]
+    satbar = ref_sat(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -661,10 +667,10 @@ function condensation_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
     # Adjust the condensate and precipitation mixing ratios
-    #mu_c_adjust = mu_transform.(q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
+    #mu_c_adjust = mu_transform.(q_c .+ q_v) .- ref_mu(mtile.ref_state)[:,1]
     #mu_c .= @. mu_c + tau_r * (mu_c_adjust - mu_c)
 
-    #mu_r_adjust = mu_transform.(q_r .+ q_c .+ q_v) .- mtile.ref_state.mubar[:,1]
+    #mu_r_adjust = mu_transform.(q_r .+ q_c .+ q_v) .- ref_mu(mtile.ref_state)[:,1]
     #mu_r .= @. mu_r + tau_r * (mu_r_adjust - mu_r)
 
     # Incorrect implicit method
@@ -714,9 +720,9 @@ function condensation_adjustment_qss(mtile::ModelTile, colstart::Int64, colend::
 
     # Get total state from the reference profile. The reference liquid water
     # is zero, so mu_l is the full liquid water variable.
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -786,9 +792,9 @@ function condensation_adjustment_BF02(mtile::ModelTile, colstart::Int64, colend:
     qss_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -866,10 +872,10 @@ function condensation_adjustment_new(mtile::ModelTile, colstart::Int64, colend::
     mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    xi_total = xi .+ mtile.ref_state.xibar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
-    satbar = mtile.ref_state.satbar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    xi_total = xi .+ ref_xi(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
+    satbar = ref_sat(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple.(s_total, xi_total, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -944,10 +950,10 @@ function condensation_adjustment_new_rhod(mtile::ModelTile, colstart::Int64, col
     mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
 
     # Get reference state
-    s_total = s .+ mtile.ref_state.sbar[:,1]
-    rho_d = rho_dp .+ mtile.ref_state.rhobar[:,1]
-    mu_total = mu .+ mtile.ref_state.mubar[:,1]
-    satbar = mtile.ref_state.satbar[:,1]
+    s_total = s .+ ref_entropy(mtile.ref_state)[:,1]
+    rho_d = rho_dp .+ ref_rho_d(mtile.ref_state)[:,1]
+    mu_total = mu .+ ref_mu(mtile.ref_state)[:,1]
+    satbar = ref_sat(mtile.ref_state)[:,1]
 
     thermo = thermodynamic_tuple_rhod.(s_total, rho_d, mu_total)
     q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
@@ -980,6 +986,174 @@ function condensation_adjustment_new_rhod(mtile::ModelTile, colstart::Int64, col
     mu .= @. mu - tau_r * dmudq(mu_total, q_v) * q_cond
     mu_c .= @. mu_c + tau_r * dmudq(mu_c, q_c) * q_cond
     s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
+
+end
+
+"""
+    condensation_adjustment_pd(mtile, colstart, colend, t)
+
+Partial-density variant of [`condensation_adjustment_new_rhod`](@ref) for the
+`primitive_equation_XZ_rhod_pd` set. Reads the vapor and cloud *partial densities*
+(`rho_v`, `rho_c`) and the dry-air density (`rho_d`), reconstructs the thermodynamic
+state via [`thermodynamic_tuple_pd`](@ref) (`q_v = rho_v/rho_d`), and moves condensed
+mass between vapor and cloud as `Δrho_v = -Δrho_c = -τ_r·rho_d·q_cond`. Because the
+update is in partial densities, the cloud+vapor water mass `rho_v + rho_c` is conserved
+exactly. The advected saturation ratio is recovered from the physical reference's raw
+`satbar` rescaled into the transformed (`mu`) convention (linear-mu assumption, matching
+the rest of the partial-density set). Densities themselves are not modified — only
+`rho_v`, `rho_c`, and `s`.
+"""
+function condensation_adjustment_pd(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    s_index = mtile.model.grid_params.vars["s"]
+    s = view(mtile.var_np1,colstart:colend,s_index)
+
+    # Density (rho_d') is not modified
+    rho_d_index = mtile.model.grid_params.vars["rho_d"]
+    rho_dp = view(mtile.var_np1,colstart:colend,rho_d_index)
+
+    rho_v_index = mtile.model.grid_params.vars["rho_v"]
+    rho_v = view(mtile.var_np1,colstart:colend,rho_v_index)
+
+    rho_c_index = mtile.model.grid_params.vars["rho_c"]
+    rho_c = view(mtile.var_np1,colstart:colend,rho_c_index)
+
+    rho_r_index = mtile.model.grid_params.vars["rho_r"]
+    rho_r = view(mtile.var_np1,colstart:colend,rho_r_index)
+
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
+
+    # Reference state (physical partial densities). Condensate may be absent
+    # (MoistReferenceState ⇒ ref_rho_c is the scalar 0.0), so guard the accessor.
+    refstate = mtile.ref_state
+    rho_dbar = ref_rho_d(refstate)[:,1]
+    rho_vbar = ref_rho_v(refstate)[:,1]
+    rcbar = ref_rho_c(refstate)
+    rho_cbar = rcbar === 0.0 ? zero(rho_dbar) : rcbar[:,1]
+    satbar = mu_transform.(ref_sat(refstate)[:,1])   # raw → transformed (linear mu)
+
+    s_total = s .+ ref_entropy(refstate)[:,1]
+    rho_d = rho_dp .+ rho_dbar
+    rho_v_total = rho_v .+ rho_vbar
+    rho_c_total = rho_c .+ rho_cbar
+
+    thermo = thermodynamic_tuple_pd.(s_total, rho_d, rho_v_total)
+    q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
+    Tk = [x[3] for x in thermo]     # Temperature in K
+    p = [x[4] for x in thermo]      # Total air pressure
+    q_c = rho_c_total ./ rho_d      # Cloud water mixing ratio
+    q_r = rho_r ./ rho_d            # Rain water mixing ratio
+    q_l = q_c .+ q_r                # Liquid mixing ratio
+    q_sat = q_sat_liquid.(Tk, p)
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+
+    sat_ratio = inv_mu_transform.(mu_sat .+ satbar)
+    qss = (q_sat .* sat_ratio) .- q_sat
+
+    # Do the increment using explicit Euler integration
+    tau_r = 0.25
+    q_cond = (q_v .- q_sat .- qss) ./ (1.0 .+ Q_s)
+    for i in 1:length(q_cond)
+        if qss[i] < 0.0
+            if q_cond[i] > 0.0
+                q_cond[i] = 0.0
+            else
+                q_cond[i] = max(-q_c[i], q_cond[i])
+            end
+        else
+            q_cond[i] = min(q_v[i], q_cond[i])
+        end
+    end
+
+    # Move condensed mass between vapor and cloud partial densities (Δrho_v = -Δrho_c),
+    # conserving rho_v + rho_c exactly.
+    dmass = @. tau_r * rho_d * q_cond
+    rho_v .= rho_v .- dmass
+    rho_c .= rho_c .+ dmass
+    s .= @. s + tau_r * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
+
+end
+
+"""
+    condensation_adjustment_sigma(mtile, colstart, colend, t)
+
+Entropy-density (`σ = ρ_d·s`) variant of [`condensation_adjustment_pd`](@ref) for the
+[`primitive_equation_XZ_sigma`](@ref) set. Identical saturation-adjustment logic, but slot 1 holds
+`σ'` (variable `"sigma"`): the specific entropy is recovered as `s = (σ' + σ̂)/ρ_d` with
+`σ̂ = ρ̂_d·ŝ`, and the entropy source acts on the density, `σ' += τ_r·ρ_d·s_condensation(...)`.
+The vapor/cloud partial-density moves are unchanged (so `ρ_v + ρ_c` is conserved exactly).
+"""
+function condensation_adjustment_sigma(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    sigma_index = mtile.model.grid_params.vars["sigma"]
+    sigmap = view(mtile.var_np1,colstart:colend,sigma_index)
+
+    # Density (rho_d') is not modified
+    rho_d_index = mtile.model.grid_params.vars["rho_d"]
+    rho_dp = view(mtile.var_np1,colstart:colend,rho_d_index)
+
+    rho_v_index = mtile.model.grid_params.vars["rho_v"]
+    rho_v = view(mtile.var_np1,colstart:colend,rho_v_index)
+
+    rho_c_index = mtile.model.grid_params.vars["rho_c"]
+    rho_c = view(mtile.var_np1,colstart:colend,rho_c_index)
+
+    rho_r_index = mtile.model.grid_params.vars["rho_r"]
+    rho_r = view(mtile.var_np1,colstart:colend,rho_r_index)
+
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+    mu_sat = view(mtile.var_np1,colstart:colend,mu_sat_index)
+
+    refstate = mtile.ref_state
+    rho_dbar = ref_rho_d(refstate)[:,1]
+    rho_vbar = ref_rho_v(refstate)[:,1]
+    rcbar = ref_rho_c(refstate)
+    rho_cbar = rcbar === 0.0 ? zero(rho_dbar) : rcbar[:,1]
+    sbar = ref_entropy(refstate)[:,1]
+    satbar = mu_transform.(ref_sat(refstate)[:,1])   # raw → transformed (linear mu)
+
+    rho_d = rho_dp .+ rho_dbar
+    rho_v_total = rho_v .+ rho_vbar
+    rho_c_total = rho_c .+ rho_cbar
+    sigmabar = rho_dbar .* sbar
+    s_total = (sigmap .+ sigmabar) ./ rho_d          # specific entropy s = σ/ρ_d
+
+    thermo = thermodynamic_tuple_pd.(s_total, rho_d, rho_v_total)
+    q_v = [x[1] for x in thermo]    # Total water vapor mixing ratio
+    Tk = [x[3] for x in thermo]     # Temperature in K
+    p = [x[4] for x in thermo]      # Total air pressure
+    q_c = rho_c_total ./ rho_d      # Cloud water mixing ratio
+    q_r = rho_r ./ rho_d            # Rain water mixing ratio
+    q_l = q_c .+ q_r                # Liquid mixing ratio
+    q_sat = q_sat_liquid.(Tk, p)
+    Q_s = Q_s_factor.(Tk, p, q_v, q_l)
+
+    sat_ratio = inv_mu_transform.(mu_sat .+ satbar)
+    qss = (q_sat .* sat_ratio) .- q_sat
+
+    # Do the increment using explicit Euler integration
+    tau_r = 0.25
+    q_cond = (q_v .- q_sat .- qss) ./ (1.0 .+ Q_s)
+    for i in 1:length(q_cond)
+        if qss[i] < 0.0
+            if q_cond[i] > 0.0
+                q_cond[i] = 0.0
+            else
+                q_cond[i] = max(-q_c[i], q_cond[i])
+            end
+        else
+            q_cond[i] = min(q_v[i], q_cond[i])
+        end
+    end
+
+    # Move condensed mass between vapor and cloud partial densities (Δrho_v = -Δrho_c),
+    # conserving rho_v + rho_c exactly.
+    dmass = @. tau_r * rho_d * q_cond
+    rho_v .= rho_v .- dmass
+    rho_c .= rho_c .+ dmass
+    # Entropy source acts on the density: σ' += τ_r·ρ_d·s_condensation.
+    sigmap .= @. sigmap + tau_r * rho_d * s_condensation(q_cond, Tk, rho_d, q_v, q_l, p)
 
 end
 
@@ -1216,6 +1390,491 @@ function precipitation_flux(q_r, rho_d, Tk, q_r_z, xi_z)
     return Vt_flux
 end
 
+# ── Density-form warm-rain rates (total-energy set) ────────────────────────────
+#
+# The moist_compressible prognostics are partial densities, so the Ooyama (2001)
+# Appendix A rates are used in their native density form [kg m^-3 s^-1] instead of
+# the mixing-ratio wrappers above (which divide by rho_d for the transformed sets).
+# Every rate guards rho_r with max(rho_r, 0): a spline undershoot raised to a
+# fractional power is NaN, and the guards make negative excursions inert instead.
+
+"Minimum rain density [kg/m³] below which the rain relaxation channel is inactive."
+const RHO_R_MIN = 1.0e-8
+
+"""
+Dry-density floor [kg/m³] for the rate factors that divide by ρ_d or raise a
+ρ_d ratio to a fractional power. Vigorous convection can momentarily undershoot
+ρ_d at cloud edges (the first 6-h TC run died at rain onset from
+`(ρ_d0/ρ_d)^{1/4}` with ρ_d = −0.08); like the `max(rho_r, 0)` guards, the
+floor makes the excursion inert instead of a DomainError. 1e-2 kg/m³ is far
+below any physical tropospheric value, so the floor only ever engages on
+undershoots.
+"""
+const RHO_D_MIN = 1.0e-2
+
+"""
+    autoconversion_density(rho_c, rho_d)
+
+Autoconversion of cloud to rain [kg m⁻³ s⁻¹], Ooyama (2001) eq. A.3:
+`Q_auto = 0.001 (ρ_c − 0.001 ρ_d)`, clamped ≥ 0 (threshold 1 g/kg of cloud).
+"""
+autoconversion_density(rho_c, rho_d) = max(0.001 * (rho_c - (0.001 * rho_d)), 0.0)
+
+"""
+    collection_density(rho_c, rho_r, rho_d, Tk)
+
+Collection (accretion) of cloud by rain [kg m⁻³ s⁻¹], Ooyama (2001) eq. A.4:
+`Q_coll = 2.20 ρ_c (ρ_r/ρ_d)^0.875 f_ice`, clamped ≥ 0.
+"""
+collection_density(rho_c, rho_r, rho_d, Tk) =
+    max(2.20 * rho_c * (max(rho_r, 0.0) / max(rho_d, RHO_D_MIN))^0.875 * f_ice(Tk), 0.0)
+
+"""
+    rain_terminal_velocity(rho_r, rho_d, Tk)
+
+Mass-weighted terminal fall speed of rain [m/s, ≤ 0], Ooyama (2001) eq. A.1:
+`W = −14.164 ρ_r^0.1364 (ρ_d0/ρ_d)^0.5 f_ice`. Zero at (or below) ρ_r = 0.
+"""
+rain_terminal_velocity(rho_r, rho_d, Tk) =
+    -14.164 * max(rho_r, 0.0)^0.1364 * sqrt(rho_d0 / max(rho_d, RHO_D_MIN)) * f_ice(Tk)
+
+"""
+    f_ventilation_density(rho_r, Tk)
+
+Bulk ventilation factor for falling rain [dimensionless], Ooyama (2001) eq. A.6:
+`f_vent = 1.6 + 30.39 ρ_r^0.2046 f_ice^1.5`.
+"""
+f_ventilation_density(rho_r, Tk) =
+    1.6 + (30.39 * max(rho_r, 0.0)^0.2046 * f_ice(Tk)^1.5)
+
+"""
+    rain_drop_radius(N_r, rho_r)
+
+Mean rain drop radius [μm] for a monodisperse population of `N_r` [#/cm³] spherical
+drops holding `rho_r` [kg/m³] of liquid: `ρ_r = N_r·10⁶ · (4/3)π ρ_l (r·10⁻⁶)³`.
+The same closure as [`cloud_droplet_radius`](@ref), taken directly in density form.
+Returns 0 for `N_r ≤ 0`.
+"""
+function rain_drop_radius(N_r, rho_r)
+
+    N_r <= 0.0 && return 0.0
+    kg_drop = max(rho_r, 0.0) / (N_r * 1.0e6)
+    return 1.0e6 * (kg_drop * 3.0 / (4.0 * pi * rho_l))^(1.0 / 3.0)
+end
+
+"""
+    invtau_rain(Tk, p_hPa, N_r, rho_r)
+
+Inverse rain relaxation timescale `1/τ_r = 4π D_v N_r ⟨r_r f(r)⟩` [1/s] with the
+monodisperse [`rain_drop_radius`](@ref) and the bulk ventilation factor
+[`f_ventilation_density`](@ref) — the rain channel of the generalized supersaturation
+relaxation `1/τ = 1/τ_c + 1/τ_r` (see reference/Scythe_moist_compressible.tex). The
+units convention matches [`invtau_condensation`](@ref): `N_r` in #/cm³, radius in μm,
+`D_v` in cm²/s. Returns 0 when `rho_r < RHO_R_MIN` or `N_r ≤ 0`, so rain-free air
+never exchanges through this channel. The cloud-presence gate on the CONDENSATION
+side of this channel lives in the caller (`qss_condensation_rates`), which zeroes
+`1/τ_r` in cloud-free supersaturated air.
+"""
+function invtau_rain(Tk, p_hPa, N_r, rho_r)
+
+    (rho_r < RHO_R_MIN || N_r <= 0.0) && return 0.0
+    r_r = rain_drop_radius(N_r, rho_r)
+    return invtau_condensation(Tk, p_hPa, N_r, r_r) * f_ventilation_density(rho_r, Tk)
+end
+
+# ── Exponential (Marshall-Palmer) rain DSD: tau-only closure ────────────────────
+#
+# n(D) = N_0 exp(-lambda D) with a fixed intercept N_0 [m^-4] (Marshall & Palmer
+# 1948; the classic value is 8e6). Only the phase-change timescale changes: the
+# DSD-integrated diffusional moment and ventilation replace the monodisperse
+# fixed-N_r closure, while Ooyama's bulk terminal velocity and collection — which
+# were themselves fit for this DSD at N_0 = 8e6 — are retained. Selected by
+# physical_params[:N_0] > 0 (see `qss_condensation_rates`).
+
+"Per-drop fall-speed coefficient a_v [m^0.5/s] in V(D) = a_v sqrt(D) sqrt(rho_d0/rho_d)."
+const MP_AV = 130.0
+"Kinematic viscosity of air [m^2/s] in the ventilation Reynolds number."
+const MP_NU = 1.46e-5
+"Schmidt number to the one-third power in the ventilation factor."
+const MP_SC13 = 0.84
+"Gamma(11/4): the exponential-DSD moment of D^{7/4} in the ventilation integral."
+const MP_GAMMA_11_4 = 1.6083594219855456
+
+"""
+    mp_slope(rho_r, N_0)
+
+Slope `λ` [1/m] of the exponential rain DSD `n(D) = N_0 exp(-λD)` holding `rho_r`
+[kg/m³] of liquid: `ρ_r = ∫ (π/6) ρ_l D³ n dD = π ρ_l N_0 / λ⁴`, so
+`λ = (π ρ_l N_0 / ρ_r)^{1/4}`. Non-positive `rho_r` is an empty DSD (`λ = Inf`),
+which keeps fractional powers of spline undershoots finite.
+"""
+function mp_slope(rho_r, N_0)
+
+    rho_r <= 0.0 && return Inf
+    return (pi * rho_l * N_0 / rho_r)^0.25
+end
+
+"""
+    f_ventilation_mp(lambda, rho_d, Tk)
+
+DSD-mean ventilation factor `⟨D f_v⟩/⟨D⟩` [dimensionless] for the exponential rain
+DSD, with the per-drop `f_v(D) = 0.78 + 0.308 Sc^{1/3} Re^{1/2}`,
+`Re = V(D) D / ν`, and `V(D) = a_v √D √(ρ_d0/ρ_d) f_ice`:
+
+    f̄ = 0.78 + 0.308 Sc^{1/3} (a_v/ν)^{1/2} (ρ_d0/ρ_d)^{1/4} Γ(11/4) λ^{-3/4} f_ice^{1/2}
+
+Since `λ ∝ ρ_r^{-1/4}`, the enhancement grows as `ρ_r^{3/16}` — the DSD-exact
+analogue of the bulk exponent 0.2046 in [`f_ventilation_density`](@ref).
+"""
+f_ventilation_mp(lambda, rho_d, Tk) =
+    0.78 + (0.308 * MP_SC13 * sqrt(MP_AV / MP_NU) *
+            (rho_d0 / max(rho_d, RHO_D_MIN))^0.25 *
+            MP_GAMMA_11_4 * lambda^-0.75 * sqrt(f_ice(Tk)))
+
+"""
+    invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d)
+
+Inverse rain relaxation timescale [1/s] for the exponential (Marshall-Palmer) DSD:
+`∫ 2π D_v D n(D) f_v(D) dD = (2π D_v N_0/λ²) f̄`. The diffusional moment is exactly
+the monodisperse [`invtau_condensation`](@ref) evaluated at the DSD total number
+`N_T = N_0/λ` and mean radius `r̄ = 1/(2λ)` (`N_T r̄ = N_0/2λ²`), so the same
+plumbing — including its #/cm³ and micron units convention — is reused, times the
+DSD-mean ventilation [`f_ventilation_mp`](@ref). Guards match [`invtau_rain`](@ref):
+inert below `RHO_R_MIN` or for `N_0 ≤ 0`; the condensation-side cloud gate lives in
+the caller (`qss_condensation_rates`), unchanged — the MP rate `∝ ρ_r^{1/2} f̄` is
+still non-Lipschitz at zero rain.
+"""
+function invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d)
+
+    (rho_r < RHO_R_MIN || N_0 <= 0.0) && return 0.0
+    lambda = mp_slope(rho_r, N_0)
+    N_eff = 1.0e-6 * N_0 / lambda        # DSD total number [#/cm^3]
+    r_eff = 1.0e6 / (2.0 * lambda)       # DSD mean radius [microns]
+    return invtau_condensation(Tk, p_hPa, N_eff, r_eff) *
+           f_ventilation_mp(lambda, rho_d, Tk)
+end
+
+# ── Two-moment warm rain: the ISHMAEL / Morrison exponential-DSD closure ───────
+#
+# Selected by `options[:rain_moments] = 2`, which adds the prognostic rain NUMBER
+# density n_r [#/m^3] as a slot of the moist-compressible set. Under that option the
+# WHOLE rain closure switches to the forms below; the single-moment (Ooyama) family
+# above is untouched and remains the default.
+#
+# Ported from `tools/ishmael_fortran_driver/module_mp_jensen_ishmael.F` (the CM1 r21.1
+# copy of Jensen et al.'s ISHMAEL), whose warm-rain block is Morrison's. Every function
+# cites the Fortran lines it came from. Two conventions differ from the Fortran and are
+# uniform here:
+#
+#  * DENSITY FORM. The Fortran carries mixing ratios (`qr` [kg/kg], `nr` [# /kg]); the
+#    driver carries partial densities (`rho_r` [kg/m^3], `n_r` [#/m^3]). The conversion
+#    is by the DRY density (`q = rho/rho_d`), the same convention `q_c = rho_c/rho_d`
+#    already uses throughout this file, and `rho_d` also stands in for the Fortran's
+#    moist `rhoair` in the fall-speed and ventilation factors. The exponential-DSD slope
+#    is invariant under the conversion (`nr/qr == n_r/rho_r`), which is why
+#    [`ishmael_rain_lambda`](@ref) — including its `LAMMINR`/`LAMMAXR` clamp and the
+#    `nr` re-diagnosis — is REUSED at the boundary rather than reimplemented.
+#  * NO `dt` ANYWHERE. The Fortran's over-depletion limiters (`min(NPRC1,NPRC)` with
+#    `NPRC <= nc/dt`, the `max(-1,·)` on the evaporation number loss, the saturation
+#    re-check on `pre`) are all `Δt`-dependent modifications of a RATE, which is exactly
+#    the defect `qss_condensation_rates` documents under "No limiters". They are not
+#    ported. The thresholds that are pure state tests (`qc >= 1e-6`, `qr >= 1e-8`, the
+#    9.1 m/s fall-speed cap) ARE ported.
+#
+# Negative-argument safety follows the rest of this file: every rate is `max(·,0)`-guarded
+# on the water it consumes and returns an exact `0.0` below its threshold, so a spline
+# undershoot is inert rather than a DomainError.
+#
+# There is no `f_ice` factor here. ISHMAEL's warm-rain block is liquid-only by
+# construction — its ice is a separate set of categories — so the Ooyama bulk ice
+# fraction has no place in it.
+
+"Cloud mixing ratio [kg/kg] below which KK2000 autoconversion is exactly zero (line 1727)."
+const RAIN_2M_QC_AUTO = 1.0e-6
+"""
+Mixing ratio [kg/kg] below which KK2000 accretion and Beheng self-collection are exactly
+zero (lines 1737, 1745).
+"""
+const RAIN_2M_Q_MIN = 1.0e-8
+"Rain fall-speed cap [m/s] applied to both moments (lines 2246-2247)."
+const RAIN_2M_VT_MAX = 9.1
+"""
+Mass [kg] of the 25 micron-RADIUS drop KK2000 assigns to each autoconverted raindrop,
+`(4/3)π ρ_w (25e-6)^3` (line 1730). Dividing the mass rate by it gives the number rate.
+"""
+const RAIN_2M_M_AUTO = (4.0 / 3.0) * ISHMAEL_PI * ISHMAEL_RHOW * (25.0e-6)^3
+"Γ(1+BR) — the number-weighted fall-speed moment of the exponential DSD (line 2244)."
+const RAIN_2M_GAMMA_1BR = gamma(1.0 + ISHMAEL_BR)
+"Γ(4+BR) — the mass-weighted fall-speed moment of the exponential DSD (line 2245)."
+const RAIN_2M_GAMMA_4BR = gamma(4.0 + ISHMAEL_BR)
+"Γ(5/2 + BR/2) — the ventilation moment of the exponential DSD (line 1760)."
+const RAIN_2M_GAMMA_VENT = gamma(2.5 + (0.5 * ISHMAEL_BR))
+
+"""
+    rain_dsd_2m(rho_r, n_r, rho_d) -> (q_r, lamr, n0rr, n_r)
+
+Exponential rain DSD `n(D) = n0rr exp(-lamr D)` in DENSITY form: the slope `lamr` [1/m],
+the intercept `n0rr` [m⁻⁴] and the clamp-consistent number density `n_r` [#/m³], plus the
+rain mixing ratio `q_r` [kg/kg] the ISHMAEL thresholds are stated in.
+
+The single implementation of the clamp lives in [`ishmael_rain_lambda`](@ref) (Fortran
+lines 1707-1722, the block duplicated five times there); this is the density-form boundary
+around it. `lamr` itself is conversion-invariant — the Fortran forms it from `nr/qr`, which
+equals `n_r/rho_r` — so only `n0rr` and `n_r` carry a factor of `rho_d`.
+
+Both water arguments are floored at zero, and a rain-free point returns `lamr = LAMMAXR`
+with `n0rr = n_r = 0.0`, so the callers' thresholds see an empty distribution rather than
+a `NaN`.
+"""
+@inline function rain_dsd_2m(rho_r, n_r, rho_d)
+
+    rd = max(rho_d, RHO_D_MIN)
+    q_r = max(rho_r, 0.0) / rd
+    dsd = ishmael_rain_lambda(q_r, max(n_r, 0.0) / rd)
+    return (q_r = q_r, lamr = dsd.lamr, n0rr = dsd.n0rr * rd, n_r = dsd.nr * rd)
+end
+
+"""
+    rain_autoconversion_2m(rho_c, rho_d, N_c) -> (Qdot, Ndot)
+
+Khairoutdinov & Kogan (2000) autoconversion of cloud to rain in density form (Fortran
+lines 1726-1734), returning the MASS rate [kg m⁻³ s⁻¹] and the rain NUMBER source
+[# m⁻³ s⁻¹]:
+
+    PRC   = 1350 q_c^2.47 N_c^{-1.79}          [1/s]   (line 1728)
+    Qdot  = PRC ρ_d                            [kg m^-3 s^-1]
+    Ndot  = Qdot / RAIN_2M_M_AUTO              [# m^-3 s^-1]  (line 1730)
+
+`N_c` is the cloud droplet number in **#/cm³**, the same unit — and, as the driver calls
+it, the same VALUE — the cloud condensation channel's `max_N_c` carries. The Fortran
+hardcodes 200 cm⁻³ (line 1031) instead; taking the number from the existing closure keeps
+one cloud droplet population per column rather than two that disagree, and a run that
+wants ISHMAEL's value sets `physical_params[:max_N_c] = 200.0`. The Fortran's exponent
+argument `(nc/1e6·ρ_air)` IS this quantity: `nc` is #/kg there, so `nc·ρ_air` is #/m³ and
+the `1e6` converts to #/cm³.
+
+Exactly `(0.0, 0.0)` below `q_c = RAIN_2M_QC_AUTO`, and for `N_c <= 0`.
+
+The Fortran's companion `NPRC` (the CLOUD number sink) and the `NPRC1 = min(NPRC1, NPRC)`
+cross-limit are not ported: `NPRC` is only meaningful with a prognostic cloud number,
+which this scheme does not carry, and its own `min(NPRC, nc/dt)` clamp is `Δt`-dependent.
+"""
+@inline function rain_autoconversion_2m(rho_c, rho_d, N_c)
+
+    rd = max(rho_d, RHO_D_MIN)
+    q_c = max(rho_c, 0.0) / rd
+    (q_c < RAIN_2M_QC_AUTO || N_c <= 0.0) && return (0.0, 0.0)
+    Qdot = 1350.0 * q_c^2.47 * N_c^(-1.79) * rd
+    return (Qdot, Qdot / RAIN_2M_M_AUTO)
+end
+
+"""
+    rain_accretion_2m(rho_c, rho_r, rho_d)
+
+Khairoutdinov & Kogan (2000) accretion of cloud water by rain in density form [kg m⁻³ s⁻¹]
+(Fortran lines 1736-1742): `PRA = 67 (q_c q_r)^1.15`, times `ρ_d`.
+
+Number-neutral, deliberately: ISHMAEL computes `NPRA` on line 1741 and never uses it (its
+own comment says so, because `nc` is not prognosed), and accretion cannot change the rain
+number in any case — it grows existing drops.
+
+Exactly `0.0` unless BOTH mixing ratios reach `RAIN_2M_Q_MIN`.
+"""
+@inline function rain_accretion_2m(rho_c, rho_r, rho_d)
+
+    rd = max(rho_d, RHO_D_MIN)
+    q_c = max(rho_c, 0.0) / rd
+    q_r = max(rho_r, 0.0) / rd
+    (q_c < RAIN_2M_Q_MIN || q_r < RAIN_2M_Q_MIN) && return 0.0
+    return 67.0 * (q_c * q_r)^1.15 * rd
+end
+
+"""
+    rain_selfcollection_2m(rho_r, n_r, rho_d)
+
+Rain self-collection (Beheng 1994) with the Verlinde & Cotton (1993) breakup rolloff, in
+density form [# m⁻³ s⁻¹] and always `<= 0` (Fortran lines 1744-1753):
+
+    dum   = 1                                    for 1/lamr <  300 μm
+    dum   = 2 − exp(2300 (1/lamr − 300e-6))      for 1/lamr >= 300 μm
+    Ndot  = −5.78 dum n_r ρ_r
+
+The density form is exact, not approximate: the Fortran's `−5.78 dum·nr·qr·ρ_air` is a
+`#/kg/s` rate, and multiplying it by `ρ_air` to get `#/m³/s` cancels the two conversion
+factors in `nr·qr` against it, leaving the product of the two densities. Breakup can drive
+`dum` negative at large drop sizes, which flips the sign and makes the term a number
+SOURCE — that is the intended Verlinde-Cotton behaviour and is not clipped.
+
+Exactly `0.0` below `q_r = RAIN_2M_Q_MIN`, and exactly `0.0` for `n_r <= 0`.
+
+# The rain POPULATION GATE, on the one warm-path kernel that needs it
+
+This is the only two-moment warm closure whose rate is a number SOURCE read off the
+DIAGNOSED distribution rather than off the carried number, and both halves of that matter
+where the two rain moments decorrelate. [`rain_dsd_2m`](@ref) floors the number at `QNSMALL`
+and clamps the slope, so a rain slot that has rung to mass-without-number is handed back as
+2800 μm drops (`lamr = LAMMINR`) with `n0rr` and `n_r` re-diagnosed from the MASS — and at
+that mean size the breakup rolloff is `dum = 2 − e^{5.75} = −312`, which flips the sign and
+makes this term create drops where the transport is carrying none. The result is not large
+(`~1e-10 # m⁻³ s⁻¹` at the O01 anvil top) but it is the wrong kind of small: it is number
+without activation, and once the slot is positive again the DSD consumers that gate on
+`n_r > 0` — Bigg freezing above all — see a population to act on
+(reference/FINDINGS_ISHMAEL_S8S9.md §5i, §5j).
+
+So the carried number is tested first: no drops, no collisions between drops, and no
+breakup of drops that are not there. Like the minimum-crystal bound on the ice number
+sources this carries NO off-switch — `options[:rain_population_gate]` is the switch on the
+Bigg call, which is a kernel-level gate on a verbatim port; this is an invariant of a
+closure written here, and it is stated the same way its sibling
+[`rain_number_evaporation_2m`](@ref) already states it. BITWISE INERT for `n_r > 0`, which
+is all healthy rain: the test is not taken and the arithmetic below is what it always was.
+The other two DSD consumers need nothing — `invtau_rain_2m` and `rain_fall_speeds_2m` are
+bounded by the same clamp rather than exposed by it; see their docstrings.
+"""
+@inline function rain_selfcollection_2m(rho_r, n_r, rho_d)
+
+    n_r > 0.0 || return 0.0
+    dsd = rain_dsd_2m(rho_r, n_r, rho_d)
+    dsd.q_r < RAIN_2M_Q_MIN && return 0.0
+    d_mean = 1.0 / dsd.lamr
+    dum = d_mean < 300.0e-6 ? 1.0 : 2.0 - exp(2300.0 * (d_mean - 300.0e-6))
+    return -5.78 * dum * dsd.n_r * max(rho_r, 0.0)
+end
+
+"""
+    rain_fall_speeds_2m(rho_r, n_r, rho_d) -> (w_m, w_n)
+
+Mass-weighted and number-weighted rain fall speeds [m/s, `<= 0`] for the exponential DSD
+(Fortran lines 2244-2247), with `arn = AR (R0/ρ_air)^{1/2}` (line 1016):
+
+    w_m = −min(arn Γ(4+BR) / 6 / lamr^BR, 9.1)
+    w_n = −min(arn Γ(1+BR)     / lamr^BR, 9.1)
+
+Returned NEGATIVE (downward), the sign convention [`rain_terminal_velocity`](@ref) already
+uses, so the driver's `F = max(ρ,0)·w` is unchanged.
+
+`|w_m| > |w_n|` always below the cap, because `Γ(4+BR)/6 > Γ(1+BR)` for `BR = 0.5`
+(1.6684 vs 0.8862): mass falls faster than number, which IS size sorting — the physical
+content the second moment buys. Both are capped at 9.1 m/s, and the cap can make them
+equal at very large drop sizes.
+
+Exactly `(0.0, 0.0)` below `q_r = RAIN_2M_Q_MIN`, so rain-free air has no flux.
+
+# At `n_r <= 0`: CLAMP-BOUNDED, and deliberately ungated
+
+A rain slot carrying mass with no carried number gets the floored, `LAMMINR`-clamped DSD out
+of [`rain_dsd_2m`](@ref) — 2800 μm drops — and both speeds then sit on the 9.1 m/s cap. That
+is the fastest the scheme can fall, and it is INDEPENDENT of the mass, which is the shape of
+the defect the ice population gate exists to forbid. What makes it a bounded exposure rather
+than a phantom one is the OTHER end of the same clamp: at `q_r = 1e-8` kg/kg and `ρ_d = 0.3`
+kg/m³, every number from 1e2 to 1e7 m⁻³ puts `lamr` on `LAMMAXR` and returns
+`(−2.665, −1.218)` m/s, so the whole exposure is a factor of 3.4 on `w_m` (9.1 / 2.665) and
+7.5 on `w_n`, with no dependence on anything that can run away. Nothing is created: the flux
+is `ρ_r·w`, linear in a mass that is really there.
+
+It is therefore left UNGATED, and that is a choice with a reason on both sides. Zeroing the
+speed would stop the mass falling at all, and rain — unlike ice — has no population
+reconciliation to hand orphaned mass back to a representation the equations can act on
+(`_ice_population_reconcile!` in `moist_compressible.jl` is the ice-only fourth tier), so the
+gate would strand it in the slot instead of bounding it. `rain_number_evaporation_2m` and
+`rain_selfcollection_2m` gate because they are number rates on a population that is not
+there; a fall speed here moves mass that is.
+"""
+@inline function rain_fall_speeds_2m(rho_r, n_r, rho_d)
+
+    dsd = rain_dsd_2m(rho_r, n_r, rho_d)
+    dsd.q_r < RAIN_2M_Q_MIN && return (0.0, 0.0)
+    rd = max(rho_d, RHO_D_MIN)
+    arn = ISHMAEL_AR * sqrt(ISHMAEL_R0 / rd)
+    lam_br = dsd.lamr^ISHMAEL_BR
+    w_m = -min(arn * RAIN_2M_GAMMA_4BR / 6.0 / lam_br, RAIN_2M_VT_MAX)
+    w_n = -min(arn * RAIN_2M_GAMMA_1BR / lam_br, RAIN_2M_VT_MAX)
+    return (w_m, w_n)
+end
+
+"""
+    invtau_rain_2m(Tk, p_hPa, rho_r, n_r, rho_d)
+
+Ventilated inverse rain relaxation timescale [1/s] for the PROGNOSTIC exponential DSD —
+ISHMAEL's `epsr` (Fortran lines 1755-1763), in density form:
+
+    1/τ_r = 2π n0rr D_v [ F1R/lamr² + F2R (arn ρ_air/μ)^{1/2} Sc^{1/3} Γ(5/2+BR/2)
+                                      / lamr^{5/2+BR/2} ]
+
+with ISHMAEL's own air properties (lines 1015-1019), which are used rather than this
+file's Pruppacher-Klett `vapor_diffusivity` because the whole closure is the ISHMAEL one
+and the ventilation coefficients were fitted against these:
+
+    μ  = 1.496e-6 T^1.5/(T+120)      [kg m^-1 s^-1]   dynamic viscosity
+    D_v = 8.794e-5 T^1.81/p          [m^2 s^-1]       p in PASCALS
+    Sc  = μ/(ρ_air D_v)
+
+This is the two-moment sibling of [`invtau_rain`](@ref) (monodisperse, fixed `N_r`) and
+[`invtau_rain_mp`](@ref) (exponential DSD at a FIXED intercept `N_0`). The difference from
+the latter is that `n0rr` is now diagnosed from the prognostic (`ρ_r`, `n_r`) pair rather
+than prescribed, so the evaporation timescale responds to the drop SIZE the scheme is
+actually carrying.
+
+Returned non-negative and exactly `0.0` below `q_r = RAIN_2M_Q_MIN`. The condensation-side
+cloud gate lives in the caller [`qss_condensation_rates`](@ref), unchanged.
+
+# At `n_r <= 0`: CLAMP-BOUNDED, in the conservative direction
+
+The floored, `LAMMINR`-clamped DSD [`rain_dsd_2m`](@ref) returns for a mass-without-number
+rain slot re-diagnoses `n0rr = lamr⁴ q_r/(π ρ_w)` from the MASS, so `1/τ_r` stays exactly
+proportional to `q_r` — it cannot outlive the mass, and it is a SINK on the reservoir it is
+proportional to, never a source. It is also the SMALLEST value the clamp range admits, since
+`1/τ_r ∝ lamr² q_r F1R + lamr^{1.25} q_r F2R(·)` is increasing in `lamr`: measured at
+`q_r = 1e-8` kg/kg, 198 K, 120 hPa and `ρ_d = 0.3` kg/m³, `1.02e-9 s⁻¹` at `n_r = 0` against
+`1.69e-6 s⁻¹` for every number from 1e2 to 1e7 m⁻³ (which all sit on `LAMMAXR` at that mass).
+So the phantom DSD under-evaporates such a slot by ~1.7e3 rather than over-driving it, and
+gating the channel would make that worse: it would leave the ringing mass with no sink at
+all. Ungated deliberately; contrast [`rain_selfcollection_2m`](@ref), which is a number
+SOURCE at the same clamp and is gated there.
+"""
+function invtau_rain_2m(Tk, p_hPa, rho_r, n_r, rho_d)
+
+    dsd = rain_dsd_2m(rho_r, n_r, rho_d)
+    dsd.q_r < RAIN_2M_Q_MIN && return 0.0
+    rd = max(rho_d, RHO_D_MIN)
+    mu_air = 1.496e-6 * Tk^1.5 / (Tk + 120.0)
+    Dv = 8.794e-5 * Tk^1.81 / (p_hPa * 100.0)
+    Sc = mu_air / (rd * Dv)
+    arn = ISHMAEL_AR * sqrt(ISHMAEL_R0 / rd)
+    vent_exp = 2.5 + (0.5 * ISHMAEL_BR)
+    return 2.0 * ISHMAEL_PI * dsd.n0rr * Dv *
+           ((ISHMAEL_F1R / (dsd.lamr * dsd.lamr)) +
+            (ISHMAEL_F2R * sqrt(arn * rd / mu_air) * cbrt(Sc) *
+             RAIN_2M_GAMMA_VENT / dsd.lamr^vent_exp))
+end
+
+"""
+    rain_number_evaporation_2m(Qdot_r, rho_r, n_r)
+
+Rain number loss to evaporation [# m⁻³ s⁻¹] (Fortran lines 1780-1785):
+
+    Ndot = Q̇_r n_r / max(ρ_r, RHO_R_MIN)     when Q̇_r < 0
+    Ndot = 0                                  otherwise
+
+i.e. evaporation removes drops in proportion to the mass it removes, holding the mean drop
+mass fixed. This is the `Δt`-free limit of the Fortran's `dum = max(-1, pre·dt/qr);
+npre = dum·nr/dt`: with the `max(-1,·)` over-depletion limiter removed (it is a `Δt`-sized
+cap on a rate — see the section header), `npre` reduces to `pre·nr/qr`, which is this in
+density form.
+
+Zero for `Q̇_r >= 0` because condensation ONTO existing rain grows the drops present; it
+does not nucleate new ones. Rain number has exactly one source in this scheme, the
+autoconversion term of [`rain_autoconversion_2m`](@ref).
+"""
+@inline function rain_number_evaporation_2m(Qdot_r, rho_r, n_r)
+
+    # `n_r <= 0` returns an exact `0.0` rather than falling through to `Qdot_r*0.0`, which
+    # is `-0.0` for an evaporating column: no drops, no drops to lose, and the file's
+    # convention is that an inactive rate is exactly zero.
+    (Qdot_r >= 0.0 || n_r <= 0.0) && return 0.0
+    return Qdot_r * n_r / max(rho_r, RHO_R_MIN)
+end
+
 """
     droplet_growth_rate(Tk, p)
 
@@ -1267,7 +1926,7 @@ function rain_adjustment(mtile::ModelTile, colstart::Int64, colend::Int64, t::In
     mu_r_index = mtile.model.grid_params.vars["mu_r"]
     mu_r = view(mtile.var_np1,colstart:colend,mu_r_index)
 
-    mubar = mtile.ref_state.mubar[1,1]
+    mubar = ref_mu(mtile.ref_state)[1,1]
     q_c_total = inv_mu_transform(mu_c[1] + mubar) # Cloud mixing ratio
     q_r_total = inv_mu_transform(mu_r[1] + mubar) # Rain mixing ratio
     q_r = q_r_total - q_c_total # Precipitation mixing ratio

@@ -46,4 +46,156 @@ const BENCHMARK_EXPECTED = Dict{String,Dict{String,Tuple{Float64,Float64,Float64
         "max_w"         => (15.713,    1.0, 5.5, "BF02 Fig. 3b"),
         "min_w"         => (-9.92698,  1.0, 3.0, "BF02 Fig. 3b"),
     ),
+    # O01 warm rain: sanity WINDOWS, RE-SEEDED 2026-07-29 from the two runs that
+    # define the shipped configuration of that date — prognostic rho_c (the phantom-
+    # cloud fix) and the regime-blended vapor retrieval as the default
+    # (reference/HANDOFF_VAPOR_RETRIEVAL.md). The previous seeds (2026-07-13,
+    # re-validated 2026-07-15: peak 55, max rho_r 8.5, max w 9.0, onset 24, accum
+    # 1.05) predate both and had been FAILING on accum_rainfall_mm and max_rho_r_gm3
+    # ever since prognostic rho_c; the storm rains more and holds more rain now.
+    #
+    # The measurements the windows are built from, both --stage mc --grid rirk:
+    #   quick (2 km / 250 m): peak 59.94, onset 23 min, max w 9.87,
+    #                         max rho_r 13.12, accum 2.500   (2026-07-29)
+    #   quick re-measured 2026-10-20 on e81e00e (EOS temperature, J0 cloud evaporation,
+    #                         energy partners, natural walls, MYNN water closure):
+    #                         peak 45.96, onset 23 min, max w 11.42, max rho_r 9.50, accum 3.02
+    #                         -- the peak-rain window is re-centered on it (author decision
+    #                         2026-10-20); the regression CSV quick_mc_rirk_final.csv is re-seeded.
+    #   quick re-measured 2026-10-22 on ccbbdea (rho_t RETIRED: derived anchor rho_d + sum alpha nu,
+    #                         vapor nu_v in slot 3, exchange closure, affine-defect refit partner,
+    #                         Stage L off, no vapor nudge): peak 35.92, onset 23, max w 4.39,
+    #                         max rho_r 6.84, accum 3.06 -- max_w and max_rho_r windows re-centered
+    #                         (the old updraft was fed by the nudge returning the cloud-edge refit
+    #                         ring to the vapor; the slot anchor with the nudge off gives w 4.25);
+    #                         CSV re-seeded with the nu_v column in slot 3.
+    #   full  (500 m / 83 m): peak 121.88, onset 31 min, max w 17.29,
+    #                         max rho_r 14.76, accum 3.200   (2026-07-29; NOT re-run on e81e00e --
+    #                         the re-centered peak window will need the full value when it is)
+    # The mc stage always takes the QUICK tolerance (load_targets), so each window
+    # must span BOTH resolutions, and the resolution sensitivity is the same one
+    # O01 reports in his own Dx = 1 vs 2 km comparison (Fig. 6: ~125 vs ~75
+    # g m^-2 s^-1) — which the pair above now brackets almost exactly. The equation
+    # set, tau_r microphysics closure (no separate Qevap), humidified-Dunion
+    # sounding and single non-nested grid all differ from Ooyama (2001), so only
+    # comparable magnitude and timing are enforced here; tight version-to-version
+    # regression comes from the committed reference CSVs.
+    # Ocean warm bubble (benchmarks/ocean_warm_bubble.jl, MYNN-EDMF plan S1): mesoscale bubble
+    # over a fixed-SST ocean with surface fluxes and the boundary layer ON. No published target;
+    # an EMPTY window set (the harness then runs zero targets) until the accepted control run
+    # seeds "the solution moved" guards.
+    "ocean_warm_bubble" => Dict{String,Tuple{Float64,Float64,Float64,String}}(),
+    "o01_rainfall" => Dict(
+        "peak_rain_rate_gm2s" => (46.0, 35.0, 40.0, "re-centered 2026-10-20 on e81e00e (quick 45.96); was 90 (2026-07-29); O01 Fig. 6 range 75-125"),
+        "max_rho_r_gm3"       => (6.8,  4.0,  5.0,  "re-centered 2026-10-22 on ccbbdea (quick 6.84; the retired vapor nudge had fed the old 9.5-14); O01 Figs. 4-6, 11 show ~4"),
+        "max_w"               => (4.4,  4.0,  5.5,  "re-centered 2026-10-22 on ccbbdea (quick 4.39; the retired vapor nudge had fed the old 9.9-11.5; slot anchor with the nudge off gave 4.25); full NOT re-run"),
+        "rain_onset_min"      => (27.0, 6.0,  8.0,  "re-seeded 2026-07-29; O01 Fig. 6 ~25-40 min"),
+        "accum_rainfall_mm"   => (2.85, 1.0,  1.2,  "re-seeded 2026-07-29 (domain-mean rain-out)"),
+    ),
+    # Axisymmetric-cylinder O01 at large mean radius (r in [1000, 1150] km, f = 0):
+    # the metric terms are O(dx/r) ~ 0.2%, so the rain windows WERE the o01_rainfall
+    # quick values; the tangential wind must stay identically zero (no source with
+    # f = 0 and v0 = 0), which validates the 9-var cylindrical machinery.
+    #
+    # DELIBERATELY NOT RE-SEEDED WITH o01_rainfall ON 2026-07-29, and the mirror above
+    # is now broken. A quick run of this case under the same shipped configuration as
+    # the o01_rainfall re-seed measures peak 43.24, onset 22 min, max w 4.63,
+    # max rho_r 6.84, accum 3.791 — against o01_rainfall's quick 59.94 / 23 / 9.87 /
+    # 13.12 / 2.500. The two cases tracked each other to ~2 % as recently as
+    # 2026-07-16 (1.377 / 5.79 / 9.93 / 27.7 / 24 there against 1.37 / 5.8 / 10.1 /
+    # 27.9 / 24 here), so this is a DIVERGENCE that appeared on the prognostic-rho_c
+    # branch, not a metric-term effect, and it is a measurement to explain rather than
+    # a window to move: the cylindrical storm now has less than half the peak updraft
+    # and rains 50 % more. This case's committed field reference
+    # (o01_axisym/quick_mc_rirk_final.csv, 2026-07-16) is stale for the same reason —
+    # it has no rho_c column at all, so compare_reference throws on it. Both are left
+    # for the axisym owner; the values below are the untouched 2026-07-13 seeds.
+    # Ice arm (SCYTHE_O01_ICE=1 + SCYTHE_O01_RAIN_MOMENTS=2): arm-qualified key, looked up
+    # via load_targets(name, opts; arm="ice") -> "o01_rainfall_ice" (benchmarks/common/
+    # harness.jl). EMPTY on purpose (seeded 2026-08-19, values to follow at S9 close-out):
+    # the ice port (S8, 1357f81) only runs to the glaciation-onset divergence at t ~ 1031 s
+    # so far, which is not a stable configuration to draw sanity windows from yet. DO NOT
+    # borrow the warm o01_rainfall windows above -- the ice arm's rain/rain-number/ice
+    # control-variable transforms and the ice thermodynamics (rho_i in the temperature
+    # retrieval, mixture heat capacities, entropy, rho_t budget) make it a different run,
+    # and load_targets() will not fall back to the base case for exactly that reason: an
+    # armed run against this empty entry gets zero targets, not a spurious pass/fail.
+    # Seeded 2026-08-20 from the first full-3600 s production ice run (Stage B closed:
+    # per-donor exact realization, ts=0.15, cloud :bhyp, two-moment rain — commits
+    # e95d980/a4707ae; reference quick_mc_rirk_ice_final.csv from the same run). Rain
+    # windows are the warm arm's diagnostics re-centered on the ice arm's own values
+    # (the WBF pathway moves rain production: accum 3.41 vs warm 2.48). Ice windows
+    # anchor the physical gates: ice above the freezing level (~4.7 km on Dunion) and
+    # only falling through below it; species maxima within a factor ~2. The n_i maxima
+    # are DELIBERATELY not windowed: max_n_i1 reads 8.5e14 /L — a number-without-mass
+    # transient (per-crystal ~5e-21 kg) of the transport-decorrelation family recorded
+    # at the S9 close-out; window it only after that family is addressed.
+    # FULL-mode ice windows (load_targets prefers "<key>_full" in full mode). Seeded from
+    # the accepted 2026-09-01 full run (the author's overnight run on the Stage D physics;
+    # fields/movie review: physical anvil at the tropopause, transient downburst ice below
+    # the melting level, ~0.1 mg/m^3 lid trace excluded by the ice_top cap). The arm
+    # reproduces bitwise on the same code (FINDINGS 5n; the 4d' spread was a code-state
+    # confound), so these are physics-drift guards, not realization spread; the rtol-1e-6
+    # diagnostics reference is the tight gate. Tolerances copied from the quick set (both
+    # columns; stage mc reads the quick column).
+    "o01_rainfall_ice_full" => Dict(
+        "peak_rain_rate_gm2s"   => (84.8,  25.0, 30.0, "seeded 2026-09-01 (accepted full run)"),
+        "max_rho_r_gm3"         => (15.7,  3.5,  4.0,  "seeded 2026-09-01 (accepted full run)"),
+        "max_w"                 => (6.4,   3.0,  3.5,  "seeded 2026-09-01 (accepted full run)"),
+        "rain_onset_min"        => (26.0,  6.0,  8.0,  "seeded 2026-09-01 (accepted full run)"),
+        "accum_rainfall_mm"     => (0.90,  1.2,  1.4,  "seeded 2026-09-01 (hour-1 rain delayed at 4x resolution)"),
+        "max_ice_water_path_mm" => (4.63,  1.5,  1.8,  "seeded 2026-09-01 (more water held in the anvil)"),
+        "ice_base_km"           => (2.63,  1.5,  1.5,  "seeded 2026-09-01 (transient downburst ice below 0C)"),
+        "ice_top_km"            => (19.97, 2.5,  2.5,  "seeded 2026-09-01 (overshoot; scan capped at 20 km)"),
+        "max_rho_i1_gm3"        => (10.04, 2.0,  2.3,  "seeded 2026-09-01 (planar)"),
+        "max_rho_i2_gm3"        => (7.13,  2.0,  2.3,  "seeded 2026-09-01 (columnar)"),
+        "max_rho_i3_gm3"        => (1.08,  1.7,  2.0,  "seeded 2026-09-01 (aggregates)"),
+    ),
+    "o01_rainfall_ice" => Dict(
+        # Re-centered 2026-08-31 on the Stage D seeding run (tag stageD_final_reseed):
+        # donor bounds sealed (aggregation, evaporation, ice-number legs), the population
+        # and minimum-crystal reconciliations in, Bigg/self-collection phantom-DSD gates
+        # in, seed :local. First RESOLVED ice arm (ice1 ts/tau 0.96, 0 past 1); the
+        # number-without-mass family is CLOSED (max_n_i1 1.8e5 /L vs 8.5e14 pre-Stage-D)
+        # — n_i windows are now drawable, an author decision recorded for the next stage.
+        # Old (2026-08-20) centers were drawn on the pre-reconciliation physics whose ice
+        # cloud was ~70% number-less mass (FINDINGS §5e); tolerances kept.
+        "peak_rain_rate_gm2s"   => (50.1, 25.0, 30.0, "seeded 2026-08-31 (Stage D final)"),
+        "max_rho_r_gm3"         => (12.1, 3.5,  4.0,  "seeded 2026-08-31 (supercooled rain survives to melt)"),
+        "max_w"                 => (10.0, 3.0,  3.5,  "re-centered 2026-10-20 on e81e00e (quick 9.98); was 4.7 (Stage D final 2026-08-31)"),
+        "rain_onset_min"        => (23.0, 6.0,  8.0,  "seeded 2026-08-31 (unchanged since 2026-08-20)"),
+        "accum_rainfall_mm"     => (3.7,  1.2,  1.4,  "seeded 2026-08-31 (Stage D final)"),
+        "max_ice_water_path_mm" => (2.56, 1.5,  1.8,  "seeded 2026-08-31 (live cloud, phantom mass gone)"),
+        "ice_base_km"           => (4.7,  1.5,  1.5,  "seeded 2026-08-31; 0C level ~4.7 km, melt closes AT the level"),
+        "ice_top_km"            => (17.4, 2.5,  2.5,  "seeded 2026-08-31 (anvil top above tropopause 16.6 km)"),
+        "max_rho_i1_gm3"        => (4.27, 2.0,  2.3,  "seeded 2026-08-31 (planar)"),
+        "max_rho_i2_gm3"        => (4.68, 2.0,  2.3,  "seeded 2026-08-31 (columnar)"),
+        "max_rho_i3_gm3"        => (0.56, 1.7,  2.0,  "seeded 2026-08-31 (aggregates; less aggregation without the phantom crystals)"),
+    ),
+    # Nested 3-level arm (--nests 3): its OWN windows, looked up by the nest-qualified
+    # key in run_nested_benchmark. Two reasons it cannot borrow the single-grid windows
+    # above: (1) max_w/min_w are the RUN-MAXIMUM over all snapshots on the nested arm
+    # (user decision 2026-07-14) vs the final snapshot on the single grid — a different
+    # unit (the single grid's own run-maximum is 65.1 m/s against its reported
+    # final-time 16.5); (2) the fine nests resolve the convective core (1|0.5|0.25 km
+    # since 82a0fde), which legitimately rains ~25% more than the 500 m single grid.
+    # Centers/spreads from the four preserved nested full runs 2026-07-22..08-20
+    # (n3_stage5_pre, n3_ladder_none, n3_ladder_bhyp, and the 2026-08-20 re-seed):
+    # accum 3.85-4.05, max_rho_r 19.9-21.3, max_w 41.9-44.6 — family spread ~5%.
+    # PROVISIONAL: author review at the S9 close-out.
+    "o01_rainfall_n3" => Dict(
+        "peak_rain_rate_gm2s" => (175.0, 50.0, 60.0, "seeded 2026-08-20 (nested family; single-grid full 118 + refinement)"),
+        "max_rho_r_gm3"       => (20.5,  4.0,  5.0,  "seeded 2026-08-20 (nested family 19.9-21.3)"),
+        "max_w"               => (43.0,  8.0, 10.0,  "seeded 2026-08-20 (RUN-MAX definition; family 41.9-44.6)"),
+        "rain_onset_min"      => (26.0,  6.0,  8.0,  "seeded 2026-08-20 (family 24-25; single grid 23-31)"),
+        "accum_rainfall_mm"   => (3.95,  1.0,  1.2,  "seeded 2026-08-20 (nested family 3.85-4.05)"),
+    ),
+    "o01_axisym" => Dict(
+        "peak_rain_rate_gm2s" => (55.0, 35.0, 35.0, "o01_rainfall window (metric terms ~0.2%)"),
+        "max_rho_r_gm3"       => (8.5,  4.0,  4.0,  "o01_rainfall window"),
+        "max_w"               => (9.0,  4.0,  4.0,  "o01_rainfall window"),
+        "rain_onset_min"      => (24.0, 6.0,  8.0,  "o01_rainfall window"),
+        "accum_rainfall_mm"   => (1.05, 0.5,  0.6,  "o01_rainfall window"),
+        "max_abs_v"           => (0.0,  1.0e-12, 1.0e-12, "v has no source at f = 0, v0 = 0"),
+    ),
 )

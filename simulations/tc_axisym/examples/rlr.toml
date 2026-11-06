@@ -1,0 +1,14 @@
+# Example alternate grid. NOT a command-line overlay: copy these sections into
+# scythe_config.toml so the run's record is one file.
+#
+# The 3-D cylindrical (RLR, ring-native azimuthal truncation) TC on the coarse grid.
+# RLR needs each junction a whole number of PARENT cells from the origin (global ring
+# numbering), hence the different nest layout. These sections replace the matching keys of
+# simulations/tc_axisym/scythe_config.toml.
+[run]
+equation_set = "moist_compressible_RLR"
+
+[grid]
+geometry   = "RLR"
+boundaries = [0.0, 160.0e3, 480.0e3, 1120.0e3]
+num_cells  = [16, 16, 16]

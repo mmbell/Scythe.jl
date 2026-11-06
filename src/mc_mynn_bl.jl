@@ -1,0 +1,1726 @@
+# ── MYNN-EDMF boundary layer applied in Scythe's variables ────────────────────
+#
+# The APPLY half of the MYNN-EDMF coupling (plan D1-D3, D7, D9, D12). Everything here
+# runs inside `mc_mynn_bl!`, called once per column from the plug-in point in
+# `mc_driver!` AFTER every expdot slot is written -- exactly where `mc_louis_bl!` sits,
+# and for the same reason: every contribution is additive (the Q_ss saturation chain
+# rule is linear in the non-condensation T/p tendencies), so the driver lines above stay
+# frozen and a run without `options[:mynn]` is byte-identical.
+#
+# WHAT THIS FILE IS NOT. It is not a second closure. `src/mynn_closure.jl` is the
+# bitwise Fortran port on plain vectors; this file is the coupling: it builds that
+# closure's inputs from the prognostic state, calls it on the cadence, and turns what it
+# returns -- the mixing length `el`, the stability functions `sm`/`sh` and the buoyancy
+# function `gh` -- into eddy fluxes of Scythe's OWN variables, fitted and differentiated
+# on the spline column exactly as the Louis BL does.
+#
+# ── The three things that make this different from Louis ─────────────────────
+#
+#  1. K IS PROGNOSTIC. `K_m = l q S_M`, `K_h = l q S_H`, `K_e = 3 K_m` with
+#     `q = sqrt(2e)` read from the `rho_e` SLOT every step. Between closure updates
+#     `l`, `S_M`, `S_H` are held and only `q` moves, so the diffusivity tracks the
+#     turbulence the model is actually carrying rather than a prescribed length scale.
+#
+#  2. THE TKE IS A PROGNOSTIC ENERGY, AND THE COLUMN BOOKS CLOSE. `rho_e` gains the
+#     discrete shear production, the closure's buoyancy exchange, the surface production
+#     and the fitted turbulent transport, and loses the dissipation; `E_t` receives the
+#     mirror image of every one of those exchanges. The identity that has to hold, and
+#     that test/test_mynn_bl.jl asserts to round-off on two grids and two timesteps, is
+#
+#       <dE_t + drho_e> = [u S_u + w S_w + v S_v + S_h + S_Ew + S_e]_0^{ztop}
+#                         + F_sh + <(c_w + c_v) F_q g>
+#
+#     with `<.>` the Gauss quadrature on the mish. It is exact, not approximate, and the
+#     reason is a quadrature fact: three-node Gauss is exact to degree 5, every fitted
+#     flux column is a cubic per cell, and both `u d/dz(S_u)` (3x2) and `u_z S_u` (2x3)
+#     are degree 5. Their sum is `d/dz(u S_u)`, so the quadrature of the pair telescopes
+#     to the boundary values of the PRODUCT -- and the product's boundary value is the one
+#     number the model cannot hand back, because `u`'s own spline coefficients are not
+#     exposed per column and the fit carries a filter, so refitting `u` is not the same
+#     function. So the product `Psi = u S_u + w S_w + v S_v` is FITTED as a column of its
+#     own and the shear production is defined as `rho P_s := dz(Psi) - V . dz(S_V)`, which
+#     is the same quantity by the product rule and makes the identity exact by
+#     construction. What it is NOT is the continuum `rho K_m |dV/dz|^2`: that form leaves
+#     `<pdk - rho P_s>` unclosed, and an unclosed exchange between the resolved and the
+#     subgrid energy is a leak nothing reports. `P_s,mynn = rho K_m gm` is kept as a
+#     DIAGNOSTIC beside what the slot actually received, and their residual is reported.
+#
+#  3. THE WATER LEGS ARE SPECIES-WISE (D7). Louis mixes total water and cloud and infers
+#     the vapor as the difference. Here each of rho_w', rho_v', rho_c' and rho_r gets its
+#     own fitted flux, and the energy the water carries goes in FLUX form
+#     (`:mynn_water_carry = :flux`): `S_Ew = Fit[c_w K_h rho_w,z + c_v K_h rho_v,z]`, so
+#     E_t receives a divergence that telescopes, and the part of it that is not the
+#     fixed-T enthalpy of the transported mass -- `Qdot_w = dS_Ew - c_w dS_w - c_v dS_v`,
+#     which is `S_w dc_w/dz + S_v dc_v/dz` by the product rule -- is genuine thermal
+#     heating and drives T, p and Q_ss. `:fixed_T` restores the local Louis map and is
+#     kept as the fidelity comparison (D10).
+#
+#  4. THE MASS FLUX RIDES IN THE SAME COLUMNS (D6, S7, `:mynn_edmf = 1`). `DMP_mf` runs
+#     on the closure cadence and its eight plumes are reduced to seven held sums per
+#     gridpoint -- `Sigma_aw` and the plume-weighted `u, v, e, s_t, q_t, q_v`
+#     (`_mynn_plume_sums!`). Every step the term `M_phi = rho_t Sigma_aw (phi_up - bar
+#     phi)` is re-formed with the CURRENT environment and folded into the SAME flux column
+#     as the eddy-diffusive part, before the fit. Because it is the same column, its
+#     divergence, its boundary values and the momentum-energy product `Psi` all carry it,
+#     so the plume's momentum work is inside `rho P_s` automatically and the D3 identity
+#     above is unchanged -- nothing was added to it. The Fortran applies the environmental
+#     half of the plume flux implicitly and floors the tridiagonal with `khdz` for
+#     diagonal dominance; there is no counterpart to that floor in an explicit fit and it
+#     is DROPPED (the plume Courant number `Sigma_aw ts/dz` is O(1e-3) -- `Sigma_aw` is
+#     tenths of m/s, and it is counted in the census).
+#
+# ── Explicit in time, like Louis, and why the census exists ──────────────────
+# The vertical mixing is applied EXPLICITLY. The offline harness
+# (model_tests/MYNN_REPLAY_README.md) measured `D_gal = K_e ts 10/dz_cell^2` on real
+# model states: 0.16 on the ocean bubble at its own 0.5 s timestep, 0.0004-0.002 on the
+# TC nest, but 0.52 at O01's 250 m / 0.3 s combination. So the explicit application is
+# comfortable at production spacing and BINDS in the gray zone -- which is a statement
+# about resolution and timestep, not about a case (feedback_resolution_general_numerics).
+# Nothing here assumes either: every limit is computed per column for the actual grid and
+# timestep, counted in `MYNNState`, and the same numbers are printed as a setup advisory
+# beside `warn_timestep_stability` (src/reference_state.jl) before a run starts.
+#
+# ── Surface delivery: unchanged from Louis ───────────────────────────────────
+# `surface_exchange` (src/mc_surface_layer.jl) is the ONE air-sea layer; MYNN never
+# computes its own fluxes (in WRF/UFS a separate surface-layer scheme hands it
+# `ust, hfx, qfx, 1/L`, and that is what happens here). The stress and the enthalpy /
+# moisture fluxes are delivered as the analytic divergence `F g(z)` with
+# `g(z) = (2/delta)(1 - z/delta)_+` over the lowest cell, NOT through a fitted bottom
+# node -- see the header of src/mc_boundary_layer.jl for the 13 % overshoot that rule
+# exists to avoid.
+#
+# ── Perturbation form ────────────────────────────────────────────────────────
+# Every mixed quantity is a PERTURBATION from the reference state (s_t', rho_w', rho_v',
+# rho_c'), so a resting reference column is exactly steady, and the fluxes are
+# disequilibrium-form so a calm column over a sea at its own temperature and humidity
+# produces exactly 0.0 -- not "small". test/test_mynn_bl.jl pins that as an equality.
+
+"MYNN's land/sea flag. Every Scythe moist-compressible configuration is over water."
+const MYNN_XLAND_WATER = 2.0
+
+"Reference pressure for the Exner function [Pa]."
+const MYNN_P0 = 100000.0
+
+# The tangential-wind accessors, the same compile-time trait dispatch mc_boundary_layer.jl
+# uses: no method body on the Cartesian slice ever touches the `nothing` views or the
+# inert `VD_v` scratch column.
+@inline _mynn_vz(::MCCartesianXZ, vv, i) = 0.0
+@inline _mynn_vz(::MCWithV, vv, i) = @inbounds vv.f_z[i]
+@inline _mynn_vdiv(::MCCartesianXZ, VD_v, i) = 0.0
+@inline _mynn_vdiv(::MCWithV, VD_v, i) = @inbounds VD_v[i]
+
+"""
+    _mynn_add_mf!(colv, fac, s_aw, s_aw_phi, phi, colstart, n)
+
+Fold the EDMF mass-flux transport of `phi` into a flux column that has already been filled
+with its eddy-diffusive part, BEFORE the fit (D6):
+
+    colv[i] -= fac[i] * (Sigma_aw_phi[j] - Sigma_aw[j] * phi[i])
+
+`fac` is `rho_t` for `u`, `v`, `e` and the water legs (`rho_t * specific content` IS the
+partial density, exactly as `rho_d * mixing ratio` is) and `rho_d*T` on the heat leg.
+
+WHY IT IS A MINUS. The plan and the TeX write the plume flux as
+`M_phi = rho_t Sigma_aw (phi_up - bar phi)`, a flux POSITIVE UPWARD. Every column fitted in
+`_mynn_flux_columns!` is `S = +rho K dz(phi)` and the slot receives `+dz(S)`, so `S` is
+MINUS the physical flux (`dphi/dt = -dz(F)`). The mass flux therefore enters the same
+column with the opposite sign, and then the divergence, the boundary values `_mynn_edges`
+returns and the momentum-energy product `Psi` all carry it automatically -- which is why
+D3 is unchanged and the plume's momentum work needs no term of its own.
+
+Subtraction, not addition, is also what keeps the off path bitwise. With the plumes absent
+every sum is an exact `0.0`, the bracket is `0.0 - (0.0*phi) = +0.0` for any finite `phi`
+(including a negative one, `0.0 - (-0.0) = +0.0`), `fac[i] > 0`, and `x - 0.0 === x` for
+EVERY double -- `-0.0` included, where `x + 0.0` would flip the sign of the zero and, one
+spline fit later, show up as a `-0.0`/`0.0` difference in an increment. The caller still
+guards the call with `if mf`, so a run with `:mynn_edmf = 0` does not execute the loop at
+all; this is the second lock, for the column that has the plumes ON and no plume firing.
+"""
+@inline function _mynn_add_mf!(colv, fac, s_aw::Vector{Float64},
+                               s_aw_phi::Vector{Float64}, phi,
+                               colstart::Int64, n::Int64)
+    @inbounds for i in 1:n
+        j = colstart + i - 1
+        colv[i] -= fac[i] * (s_aw_phi[j] - (s_aw[j] * phi[i]))
+    end
+    return nothing
+end
+
+"""
+    _mynn_moment_leg!(mtile, div, Kh, nu_z, J, slot, n)
+
+One fitted eddy-diffusion leg of a TOTAL-form moment slot (S8): the twelve ISHMAEL ice
+moments and the two-moment rain number.
+
+    S = K_h ∂z(moment density) = K_h · (∂z ν / J)          fitted, then differentiated
+
+`nu_z` is the slot's own fitted vertical gradient and `J = dν/dx` its Jacobian, both staged
+by `_load_total_slot!` in the driver — so the gradient here is the gradient of the QUANTITY
+and not of the control variable, exactly as the cloud and rain legs build theirs. With no
+transform declared `J` is an exact `1.0` and `ν_z / 1.0 === ν_z` for every double, so the
+untransformed path is bitwise the raw slot gradient. The caller multiplies the divergence by
+`J` again on the way into the slot.
+
+**Each moment is fitted on ITS OWN spline column**, `scratch_column(mtile, slot)`, not on the
+shared slot-8 basis the liquid legs use. That is `_ice_flux!`'s rule and it is the same
+argument: a mass slot with a Natural bottom must be free to let its crystals leave the domain
+while a number or a volume moment fitted with different boundary conditions is not forced to
+agree with it. It also means the twelve divergences do NOT sum to a refit of their sum; the
+one place that matters is the ice energy carry, and see `_mynn_flux_columns!` for what is
+done there.
+"""
+@noinline function _mynn_moment_leg!(mtile::ModelTile, div, Kh, nu_z, J,
+                                     slot::Int64, n::Int64)
+    c = scratch_column(mtile, slot)
+    @inbounds for i in 1:n
+        c.uMish[i] = Kh[i] * (nu_z[i] / J[i])
+    end
+    Btransform!(c)
+    Atransform!(c)
+    Ixtransform(c, div)
+    return nothing
+end
+
+@inline function _mynn_v_flux!(VD_v, Sv, col, ::MCCartesianXZ, rho_t, Km, vv,
+                               MY::MYNNState, colstart::Int64, n::Int64, mf::Bool)
+    return nothing
+end
+@inline function _mynn_v_flux!(VD_v, Sv, col, ::MCWithV, rho_t, Km, vv,
+                               MY::MYNNState, colstart::Int64, n::Int64, mf::Bool)
+    v_z = vv.f_z
+    col.uMish .= rho_t .* Km .* v_z
+    if mf
+        _mynn_add_mf!(col.uMish, rho_t, MY.s_aw, MY.s_aw_v, vv.f, colstart, n)
+    end
+    Btransform!(col)
+    Atransform!(col)
+    Ixtransform(col, VD_v)
+    SItransform!(col)
+    copyto!(Sv, col.uMish)
+    return nothing
+end
+
+"""
+    _mynn_edges(col) -> (S(z_bottom), S(z_top))
+
+The fitted column's value at the two ends of the spline domain. These are the boundary
+terms of the D3 energy identity and they are REPORTED, never assumed zero: the spline's
+extrapolated wall value is exactly the 13 %-overshoot quantity the surface delivery
+profile exists to avoid relying on, so the budget has to carry whatever it actually is.
+"""
+@inline function _mynn_edges(col::Springsteel.CubicBSpline.Spline1D)
+    sp = col.params
+    return (Springsteel.CubicBSpline.SItransform(sp, col.a, sp.xmin, 0),
+            Springsteel.CubicBSpline.SItransform(sp, col.a, sp.xmax, 0))
+end
+
+"""
+    mc_bl_apply!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rcv, rrv,
+                 rvv, rev, expdot, l_inf, sfc, t, ctrans_on, rtrans_on, louis_bl, mynn_on)
+
+The ONE boundary-layer application point of `mc_driver!`: whichever closure is configured. The two are mutually exclusive — the driver
+preamble refuses `louis_bl && mynn_on` — so this is a dispatch, not a sum.
+
+WHY THE TWO CLOSURES SHARE A CALL SITE. This is a codegen constraint, measured, not a
+tidiness argument. `mc_driver!` is inlined into the equation-set body and is enormous;
+its per-column temporaries are already at the edge of what the register allocator can
+carry across the `@turbo` vertical-diffusion broadcasts that follow the boundary layer.
+Adding the MYNN call as a SECOND `@noinline` call beside the Louis one — nine
+`mc_slot_views` bundles, ~60 `SubArray`s, live across that block — pushed LLVM's
+MachineScheduler over a register-pressure cliff: `sample` put 100 % of the time in
+`RegPressureTracker::bumpDownwardPressure` and the compile never finished (>30 min on the
+first `moist_compressible_XZ` instance of test/test_allocations.jl, against ~2 min for the
+same instance with one call site). Neither shrinking the argument list to nine, nor
+stubbing the callee's body, nor moving the block past the diffusion broadcasts made any
+difference; collapsing the two call sites into one did, immediately.
+
+So: exactly one call, and any future closure belongs INSIDE this function rather than
+beside it. The staging is hoisted here too, which is why `rho_cbar_z` is rebuilt from
+`mtile.ref_state` — the view is local to this frame and does not escape, so it costs
+nothing, and `mc_driver!` no longer carries the reference-gradient view at all.
+
+Bit-identical to the two separate call sites it replaces: same staging expression, same
+arguments, same order.
+"""
+@noinline function mc_bl_apply!(mtile::ModelTile, S, geom::MCGeometry,
+                                colstart::Int64, colend::Int64, z,
+                                uv, wv, vv, rcv, rrv, rvv, rev, expdot,
+                                l_inf::Float64, sfc::SurfaceLayerParams, t::Int64,
+                                ctrans_on::Bool, rtrans_on::Bool,
+                                louis_bl::Bool, mynn_on::Bool)
+    # (Both closures' water legs are ν legs of the slots' own gradients under the derived
+    # water anchor, so the perturbation-density cloud gradient this once staged for them —
+    # `S.bl_rho_cp_z` — has no reader; it went with the ρ_t slot at Stage 4.)
+    if louis_bl
+        mc_louis_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rcv,
+                     expdot, l_inf, sfc)
+    elseif mynn_on
+        mc_mynn_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rcv,
+                    rrv, rvv, rev, expdot, sfc, t, ctrans_on, rtrans_on)
+    end
+    return nothing
+end
+
+"""
+    mc_mynn_bl!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rcv, rrv,
+                rvv, rev, expdot, sfc, t, ctrans_on, rtrans_on)
+
+One column of the MYNN-EDMF boundary layer for the total-energy set.
+
+# What runs when (D9)
+EVERY step: the closure inputs are re-gathered from the current state, `q = sqrt(2e)` is
+read from the `rho_e` slot, `K_m = l q S_M`, `K_h = l q S_H`, `K_e = 3 K_m` are formed
+from the HELD `l`, `S_M`, `S_H`, the ~10 flux columns are fitted and differentiated, and
+the slot increments are applied.
+
+On an UPDATE step (`t - last_update_step >= interval_steps`, and always the first call on
+a column): `GET_PBLH` -> `SCALE_AWARE` -> the surface block (`flt`, `fltv`, `rmol`, the
+`zeta`-dependent `pmz`/`phh`) -> `mym_condensation!` -> `mym_turbulence!`, in exactly the
+order `mynn_column_step!` (src/mynn_closure.jl) replays the Fortran driver, and the
+results (`el, sm, sh, vt, vq, sgm, cldfra_bl, qc_bl, qi_bl, gh, qsq, pblh, kpbl`) are
+stored on the tile. With `:mynn_edmf = 1` (S7) `DMP_mf` also runs, between the two, and
+its plume ensemble is mapped onto the mish as the seven held sums `MYNNState.s_aw*`
+(`_mynn_plume_sums!`); with `:mynn_edmf = 0` every one of them stays an exact zero, which
+is the column the Fortran produces for `ktop_plume = 0`.
+
+`mym_predict!` is deliberately NOT called: the TKE equation is Scythe's own prognostic
+`rho_e` slot, integrated by the model's multistep with the closure's production and
+dissipation as sources. Its Level-2 `qsq` diagnostic IS reproduced here (six lines, the
+`closure <= 2.5` branch of :3543-3559) because `mym_condensation!` reads `qsq` to set the
+cloud-PDF width; `tsq` and `cov` are not, at CASE 2, read by anything.
+
+# Two Fortran shapes reproduced on purpose (`:mynn_fidelity = :fortran`, D10)
+`:fortran` is the verbatim REFERENCE and is no longer the model default -- that is the
+`:scythe` bundle (`MYNN_SCYTHE_BUNDLE`), which turns the first of these two off.
+
+  * `th_sfc = ts/exner(1)` where the driver's `ts` is ALREADY `T_sfc/exner(1)`
+    (mynn_bl_driver :1063; harness README item 2). It divides by the surface Exner
+    function twice, which inflates the surface potential temperature by ~3 % and so
+    inflates `fltv`, `rmol` and through them the mixing length. Reproduced because the
+    parity anchor is the Fortran; the `:exner_single` deviation of
+    `options[:mynn_fidelity]` (`MYNN_DEVIATIONS`) is where it gets fixed, after it has
+    been measured (D10), not before.
+  * `rmol` is RECOMPUTED here from `fltv` and `ust` (:1079) rather than taken from
+    `surface_exchange`'s Monin-Obukhov `inv_L`, so the closure's `zeta`, `pmz` and `phh`
+    are self-consistent with the fluxes it was handed. The `:rmol_sfc` deviation takes
+    `sx.inv_L` instead.
+
+# The energy budget (D3), term by term
+Momentum `du = (dS_u - tau_u g)/rho_t` with `dE_t^mom = rho_t(u du + w dw + v dv)` -- the
+FRIC_KE invariant: E_t follows the resolved KE down, no dissipative heating. The KE that
+leaves the resolved flow arrives in `rho_e` as the DISCRETE shear production
+`rho P_s = dz(Psi) - (u dz(S_u) + w dz(S_w) + v dz(S_v))` with `Psi` the fitted
+momentum-energy flux column (the product-rule form of `u_z S_u + ...`; see the file
+header and `_mynn_flux_columns!` for why the product is fitted rather than formed
+pointwise), and as `P_sfc = (tau_u u + tau_v v) g`, which cancels the drag work
+POINTWISE rather than in the column integral. The closure's buoyancy
+exchange `rho P_b = rho_t K_h G_H` and the dissipation `rho eps = rho_t q^3/(B_1 l)` are
+equal and opposite in the two reservoirs. Heat is FLUX form,
+`S_h = rho_d T K_h dz(s_t')`, so the column books telescope; `Qdot_E = Qdot_h - rho P_b +
+rho eps` reaches E_t directly and (with the water's thermal part) T, p and Q_ss through
+the QDOT_TH pattern.
+
+`ctrans_on` / `rtrans_on` say whether slots 9 / 8 carry control variables: the water-mass
+legs are ν legs of the slots' own gradients either way (the derived water anchor), and the
+transforms select the recovery the energy carry's REALIZED rates are taken through.
+
+# Ice (S8, `options[:ice_microphysics] = :ishmael`)
+The closure carries ONE ice mixing ratio and ISHMAEL carries three species with four
+moments each, so the two halves are treated differently and on purpose. The CLOSURE is
+handed the species sum (`q_i` into `theta_l`, `q_w` and the cloud PDF; `q_s` is an exact
+zero, because the Fortran never mixes snow and there is no snow category here to mix). The
+TRANSPORT is species-wise and moment-wise: each of the twelve moments gets its own fitted
+`K_h dz(moment density)` leg on its own spline column, all four moments of a species
+sharing one `K_h` so the mean particle does not move.
+
+WHAT CLOSES. Under the derived water anchor (the only one since Stage 4 of the ρ_t
+retirement) every water-mass slot has its own ν leg and the total-water leg IS their pointwise
+sum `div_w = Σ_k α_k ν̇_k` (`_mynn_nu_legs!`): the water sum moves by exactly the species'
+legs, the ice masses included, with nothing inferred as a difference. (The `:slot` arm fitted
+a total-water leg from `ρ_t' − ρ_d'` and closed the species onto it to the fit error of six
+independent columns; it went with the ρ_t slot.)
+
+`:mynn_water_carry = :fixed_T` is REFUSED with ice (the `mc_driver!` preamble): the local
+map has no ice term and `_diffusion_water_step!`, the routine it mirrors, has no ice
+handling to copy.
+"""
+@noinline function mc_mynn_bl!(mtile::ModelTile, S, geom::MCGeometry,
+                               colstart::Int64, colend::Int64, z,
+                               uv, wv, vv, rcv, rrv, rvv, rev, expdot,
+                               sfc::SurfaceLayerParams, t::Int64,
+                               ctrans_on::Bool, rtrans_on::Bool)
+    MY = mtile.mynn
+    # The appended-slot gates, read from `MCSlots` exactly as `mc_driver!` reads them: the
+    # indices were resolved by NAME once when the tile was built, so "the slots exist" and
+    # "the legs run" cannot disagree, and this is a field load and not a Dict lookup in a
+    # per-column path. No transform flag is needed anywhere below: `_load_total_slot!`
+    # leaves `J` an exact `1.0` with no transform declared, and `nu_z / 1.0 === nu_z`.
+    IS = mtile.mc_slots
+    ice_on = ice_registered(IS)
+    nr_on = MY.mix_numbers && IS.n_r > 0
+    n = colend - colstart + 1
+    ci = div(colstart - 1, MY.kDim) + 1
+    work = MY.work[Threads.threadid()]
+    MN = MY.colscratch[Threads.threadid()]
+    rho_t = S.rho_t
+    # THE TKE THE CLOSURE READS, staged on the tile's species columns (`_tke_stage!`): a
+    # bitwise copy of the slot with `J_e ≡ 1.0` under `tke_transform = :none`, the recovered
+    # `ahyp(ν_e) ≥ 0` and its Jacobian under `:bhyp`. Every reader below (the closure
+    # inputs, the clamp, the taper seed, the TKE transport, the dissipation) takes `rho_e`;
+    # every TKE-slot increment is multiplied by `J_e`; `rev.f` stays the RAW slot.
+    re_i = mtile.mc_slots.rho_e
+    tid = Threads.threadid()
+    rho_e = @inbounds mtile.species.rho[re_i, tid]
+    J_e = jacobian_column(mtile.species, re_i, tid)
+    _tke_stage!(rho_e, J_e, mtile.tile.physical, re_i, colstart, n, MY.tke_transform,
+                MY.tke_mu, MY.tke_lobe_tr)
+
+    # ── Surface exchange: ONE call into the shared bulk air-sea layer ─────────
+    # Identical to the Louis call site (src/mc_boundary_layer.jl) down to the argument
+    # order, because it IS the same function: `mc_mynn_bl!` and `mc_louis_bl!` differ in
+    # the closure, never in the air-sea formulas or in how their fluxes are delivered.
+    sx = surface_exchange(uv.f[1], _louis_v1(geom, vv), S.Tk[1], S.rho_d[1], rho_t[1],
+                          S.rho_v[1], S.p[1], z[1], sfc.SST, sfc)
+    F_sh = sx.F_sh              # an exact 0.0 when options[:surface_fluxes] is off
+    F_q = sx.F_q
+
+    # Hold this column's exchange for the output writer (N2); see the identical store at
+    # the Louis call site (src/mc_boundary_layer.jl). Stores only, zero allocation.
+    sd = mtile.surface
+    sd.active && surface_record!(sd, ci, sx)
+
+    n_clamp = _mynn_column_inputs!(MY, S, MN, work, geom, uv, wv, vv, rho_e, n)
+    # The clamp counter's split (negative slot / ceiling), counted on the RAW slot and the
+    # TKE the closure reads; changes nothing the closure computes.
+    _mynn_clamp_split!(MY, rev.f, rho_e, rho_t, n, ci)
+
+    # ── Cold start (`:mynn_init = :taper`) ───────────────────────────────────
+    first_call = MY.last_update_step[ci] == typemin(Int)
+    if first_call && MY.init_mode === :taper
+        _mynn_taper_seed!(MY, MN, expdot, rev.f, rho_t, sx.ust, colstart, n, re_i)
+    end
+
+    # ── The held closure, on the cadence (D9) ────────────────────────────────
+    if first_call || (t - MY.last_update_step[ci]) >= MY.interval_steps
+        _mynn_closure_update!(MY, S, MN, work, colstart, n, ci, sfc.SST, sx.ust,
+                              F_sh, F_q, sx.inv_L, t)
+    end
+
+    _mynn_diffusivities!(MY, MN, colstart, n, ci, n_clamp)
+
+    ed = _mynn_flux_columns!(mtile, MY, S, MN, work, geom, colstart, n, z, uv, wv, vv,
+                             rcv, rrv, rvv, rho_e, ctrans_on, rtrans_on,
+                             IS, ice_on, nr_on)
+
+    # The transforms of the species legs, resolved here, once per column, from the same
+    # option `Dict` every switch is read from, and handed down as plain values.
+    opts = mtile.model.options
+    pp = mtile.model.physical_params
+    ctr = ctrans_on ? condensate_transform_mode(opts) : :none
+    rtr = rtrans_on ? rain_transform_mode(opts) : :none
+    itr = ice_on ? ice_transform_mode(opts) : :none
+    _mynn_apply_column!(MY, S, MN, geom, colstart, n, ci, z, uv, wv, vv, expdot,
+                        IS.rho_v, re_i, sx.tau_u, sx.tau_v, F_sh, F_q,
+                        2.0 * z[2], ed, IS, ice_on, nr_on,
+                        ctr, get(pp, :condensate_mu, 1.0e-7), rtr,
+                        get(pp, :rain_mu, 1.0e-7), itr, ice_on ? ice_mu(pp, 1) : 1.0,
+                        mtile.model.ts, mtile.tile.physical, mc_nu_vbar(mtile),
+                        vapor_transform_mode(opts), vapor_mu(pp),
+                        water_anchor_set(opts, pp, IS).alpha[1], J_e)
+    return nothing
+end
+
+"""
+    _mynn_realized_rate(nu, srate, rate, ts, trans, mu) -> Float64
+
+THE REALIZED RATE of one water species under its MYNN (or Louis) leg: the rate at which its
+RECOVERED density moves, which every derived-anchor energy carry is booked on
+(`_mynn_apply_column!`, `_louis_apply_derived!`). Its first use — documented below for the
+record — was the `:slot` anchor's MYNN WATER CLOSURE (`options[:mynn_water_closure]`, retired
+with that anchor at Stage 4), the vapor leg made the residual of the total-water leg and these
+rates,
+
+    ρ̇_v := ρ̇_w − (ρ̇_c,real + ρ̇_r,real + Σ_k ρ̇_ik,real),
+    ρ̇_x,real = [recover(ν_x + Δt J_x·rate_x) − recover(ν_x)]/Δt     (`rate_x` under `:none`)
+
+so `ρ_v + ρ_liq + ρ_ice` moves by exactly what `ρ_t` does and the partition gap
+`X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice` is not touched by the boundary layer. The flux-form
+energy carry `S_Ew` is unchanged (`E_t` still receives a divergence that telescopes); what
+changes is its thermal remainder, `Qdot_w = dS_Ew − c_w ρ̇_w − c_v ρ̇_v + L_f Σρ̇_ik`, now
+evaluated on the REALIZED increments, so `E_t − E_implied(T_eos)` is held by the leg to second
+order in its increment.
+
+WHAT IT CLOSES (the `S2:my_water` term of the closed budget, cloudy 2-D RCE restart, after the
+four partner commits). The species are not legs of one column: the total-water leg is fitted
+from `K_h ∂z(ρ_t − ρ_d)`, the vapor from `K_h ∂z ρ_v`, the cloud and rain from
+`K_h ∂z ν/J` (the gradient of the FITTED control variable through the Jacobian), the ice masses
+from their own columns and boundary conditions. The fits are linear and share a basis, but
+their INPUTS do not sum: `∂z(ρ_t − ρ_d) − ∂zρ_v − ∂zν_c/J_c − ∂zν_r/J_r` is the gradient of
+the partition gap plus the commutator of the fit with the transform, which at a cloud edge,
+where `ν` is far from linear in `ρ`, is not small. Each kilogram of that mismatch enters `ρ_t`
+with the liquid energy `c_w` and no species, so `R` opens by `(C_pv T − L_v)` per kg and `X`
+drifts — (a) of the split below. The leg's species are also moved in `ν` and realized
+through the transform's curvature, `O((Δt·rate)²/ρ)` per step at a healthy point and the whole
+increment in a clipped lobe — (c); the clip-gap partner (`_mynn_clip_gap`, retired with the
+`:slot` anchor) closed only the clipped part.
+Making the vapor the residual closes both: it is the same bookkeeping the ETD
+exchange realization and the refit partner use (the species' recovered change is the fact, the
+vapor takes the difference with its latent heat in `p`), and it SUBSUMES the clip-gap partner —
+its gap is the clipped-point part of `rate_real − rate`, booked here through `Qdot_w` with
+exactly [`phase_change_partner`](@ref)'s coefficients (`C_pt = C_vt + R_m`) — so with the
+closure on `options[:mynn_exchange_realization]` is not read.
+
+MEASURED on that restart (closed budget, each part a finite difference of `R` over its own
+AB3-weighted increment): (a) is the whole term, to the fourth digit, in every 600 s window,
+growing from +0.08 to several W/m² as the cloud deepens; (c) at healthy points is ~1e-5 W/m²;
+the closure's own leg — (b), the energy carry evaluated on the realized increments — leaves
+~1e-5 W/m², its second order. The mismatch is a gradient inconsistency of the inputs, not an
+energy-carry error and not the linearization.
+
+What it does NOT do: the vapor leg is no longer column-conservative by itself (it carries the
+species' boundary-flux mismatch; `ρ_t` and `E_t` still are), and it is bitwise the fitted vapor
+leg only where every water leg is an exact zero (`K_h = 0`) — on an untransformed or a cloud-free
+column the vapor still moves by whatever the fits' mismatch is there. `false` is bitwise the
+code without it. `@inline`, plain scalars: called per gridpoint.
+"""
+@inline function _mynn_realized_rate(nu, srate, rate, ts, trans::Symbol, mu)
+    trans === :none && return rate
+    return (recover_total(nu + (ts * srate), trans, mu) - recover_total(nu, trans, mu)) / ts
+end
+
+"""
+    _mynn_column_inputs!(MY, S, MN, work, geom, uv, wv, vv, rho_e, n) -> n_clamp
+
+Build the closure's inputs from the retrieved state and read the TKE out of the slot.
+
+`sqv`/`sqc`/`sqi` are SPECIFIC contents (`rho_x/rho_t`) and `rho` is the MOIST density,
+the conventions of `mynnedmf_wrapper.F90` that `tools/mynn_dump_columns.jl` dumped the
+Fortran reference columns in. These lines are `_mynn_gather!` (src/mynn_closure.jl) with
+the frozen column replaced by the live state, and they leave the working copies in
+`work.s_*` exactly where that routine leaves them, so `mym_condensation!` and
+`mym_turbulence!` see the argument set the parity harness validated.
+
+Two TKE variables come out of the one slot, and keeping them apart is what makes a
+resting column produce EXACTLY zero rather than the floor's residue:
+
+  * `MN.q = sqrt(2 max(e, 0))` -- the TKE the model is CARRYING, which sets `K = l q S`
+    and the dissipation. Floored at zero only so a transported undershoot cannot make a
+    NaN out of `sqrt`.
+  * `MN.qke` -- the same thing with MYNN's own `[qkemin, 150]` clamp, which is what the
+    length scale and the stability functions are integrated against. The clamp is
+    COUNTED and never written back to the slot: the prognostic TKE is the model's, not
+    the closure's.
+"""
+@noinline function _mynn_column_inputs!(MY::MYNNState, S, MN::MYNNColumnScratch,
+                                        work::MYNNWork,
+                                        geom::MCGeometry, uv, wv, vv, rho_e, n::Int64)
+    c = MY.constants
+    exner = MN.exner; q_col = MN.q; qke = MN.qke
+    rho_t = S.rho_t; Tk = S.Tk
+    n_clamp = 0
+    @inbounds for i in 1:n
+        ex = (S.p[i] / MYNN_P0)^c.rcp
+        exner[i] = ex
+        th = Tk[i] / ex
+        sqv = S.rho_v[i] / rho_t[i]
+        sqc = S.rho_c[i] / rho_t[i]
+        # The closure's ONE ice mixing ratio is the SUM of the three ISHMAEL species
+        # (S8). `rho_ice_t` is the column the thermodynamics reads -- floored per species
+        # under `:condensate_floor` -- so the closure's
+        # `q_i` and the retrieval's `q_i = rho_ice_t/rho_d` are the same water, and a
+        # spline undershoot in one ice mass cannot reach `theta_l` as negative latent
+        # heat. With ice OFF the driver fills it with exact zeros, so `sqi` is `0.0` and
+        # every line below is bitwise the pre-S8 code (`x - 0.0 === x`).
+        sqi = S.rho_ice_t[i] / rho_t[i]
+        work.s_u[i] = uv.f[i]
+        work.s_v[i] = _louis_v(geom, vv, i)
+        work.s_w[i] = wv.f[i]
+        work.s_tk[i] = Tk[i]
+        work.s_th[i] = th
+        work.s_sqv[i] = sqv
+        work.s_sqc[i] = sqc
+        work.s_sqi[i] = sqi
+        work.s_sqw[i] = sqv + sqc + sqi
+        work.s_thl[i] = th - c.xlvcp/ex*sqc - c.xlscp/ex*sqi
+        work.s_thetav[i] = th*(1.0 + c.p608*sqv)
+        work.s_qv[i] = sqv/(1.0 - sqv)
+        work.s_qc[i] = sqc/(1.0 - sqv)
+        work.s_qi[i] = sqi/(1.0 - sqv)
+
+        ee = rho_e[i] / rho_t[i]
+        ee = ee > 0.0 ? ee : 0.0
+        q_col[i] = sqrt(2.0 * ee)
+        qk = 2.0 * ee
+        if qk < MYNN_QKEMIN
+            qk = MYNN_QKEMIN
+            n_clamp += 1
+        elseif qk > 150.0
+            qk = 150.0
+            n_clamp += 1
+        end
+        qke[i] = qk
+    end
+    return n_clamp
+end
+
+"""
+    _mynn_clamp_split!(MY, slot, rho_e, rho_t, n, ci)
+
+The split of the TKE clamp counter (`n_clamp_col`, every point the closure floors at
+`MYNN_QKEMIN` or caps at 150): `n_eneg_col[ci]` gains the points whose CARRIED slot `slot`
+is negative (the density `rho_e < 0`, or the control variable `nu_e < 0`), every one of which
+the clamp also counts, and `n_ehigh_col[ci]` the points the closure caps at `2e > 150`
+(read from `rho_e`, the TKE the closure reads). What is left of `n_clamp_col` is the
+small-positive or exactly-zero TKE below the floor -- the quiet free atmosphere. Read-only on
+the state and on every closure column.
+"""
+@noinline function _mynn_clamp_split!(MY::MYNNState, slot, rho_e, rho_t, n::Int64,
+                                      ci::Int64)
+    nneg = 0
+    nhigh = 0
+    @inbounds for i in 1:n
+        slot[i] < 0.0 && (nneg += 1)
+        (2.0 * (rho_e[i] / rho_t[i])) > 150.0 && (nhigh += 1)
+    end
+    @inbounds begin
+        MY.n_eneg_col[ci] += nneg
+        MY.n_ehigh_col[ci] += nhigh
+    end
+    return nothing
+end
+
+"""
+    _mynn_taper_seed!(MY, MN, expdot, slot, rho_t, ust, colstart, n, re_i)
+
+The cold start. On the FIRST call of a column whose TKE `slot` is identically zero (the
+RAW slot: `ν_e = 0` exactly where `ρ_e = 0` under the control variable), lay down
+the Fortran's Koracin-Berkowicz taper (`mynn_bl_driver` :1571-1575, the first-guess block
+of `mynn_init_column!`) and deliver it as a ONE-STEP source `rho_t qke/2 / ts`.
+
+It is a RATE because `expdot` is a rate, so what the multistep realizes on its startup
+step is not exactly `rho_t qke/2`. That is acceptable on purpose: the taper only sets the
+ORDER of the initial TKE, which the closure then equilibrates on the dissipation
+timescale `tau_eps = B_1 l/(2q)` -- tens of seconds (the D4 estimate). What it must not do
+is leave the column at exactly zero forever, because `K = l q S_M` is then identically
+zero and the closure can never start. With `ust = 0` the taper is itself zero, so a
+resting column stays quiet and `:mynn_init = :zero` is the same thing deliberately.
+"""
+@noinline function _mynn_taper_seed!(MY::MYNNState, MN::MYNNColumnScratch, expdot,
+                                     slot, rho_t,
+                                     ust::Float64, colstart::Int64, n::Int64,
+                                     re_i::Int64)
+    @inbounds for i in 1:n
+        slot[i] == 0.0 || return nothing
+    end
+    zw = MY.zw
+    qke = MN.qke; q_col = MN.q
+    inv_ts = 1.0 / MY.ts
+    @inbounds for i in 1:n
+        qk = 5.0*ust*max((ust*700.0 - zw[i])/(max(ust, 0.01)*700.0), 0.01)
+        qke[i] = max(qk, MYNN_QKEMIN)
+        q_col[i] = sqrt(qk)
+        # Under the TKE control variable the seed is the CONTROL VARIABLE of the target,
+        # `bhyp(rho_t qke/2)` (the slot is exactly 0 here): a one-step jump from 0 into the
+        # linear branch, where `J_e = dbhyp(0) = 1` would double it (`ahyp(ν) ≈ 2ν` there).
+        expdot[colstart + i - 1, re_i] += MY.tke_transform === :none ?
+            0.5 * rho_t[i] * qk * inv_ts : bhyp(0.5 * rho_t[i] * qk, MY.tke_mu) * inv_ts
+    end
+    return nothing
+end
+
+"""
+    _mynn_closure_update!(MY, S, MN, work, colstart, n, ci, SST, ust, F_sh, F_q, t)
+
+One held-closure update: `GET_PBLH` -> `SCALE_AWARE` -> the surface block -> the Level-2
+water variance's consumer `mym_condensation!` -> `mym_turbulence!`, in exactly the order
+`mynn_column_step!` (src/mynn_closure.jl) replays the Fortran driver's per-column
+sequence -- with `dmp_mf!` between the condensation and the turbulence when
+`:mynn_edmf = 1` (S7). `mym_predict!` is NOT called because the TKE equation is Scythe's
+own prognostic slot.
+
+The carried state is loaded OUT of the tile first and written back after: `sm(kts)` and
+`sh(kts)` are never written by `mym_turbulence!` (its interface loops start at `kts+1`),
+`cldfra_bl` is read by the plume/cloud floor on the stability functions, and `qsq` sets
+the cloud-PDF width -- and a per-thread scratch column is shared between columns, so
+nothing in it can be assumed to still belong to this one.
+
+Four fidelity deviations (`MYNN_DEVIATIONS`) live in this routine, every one of them off
+under `options[:mynn_fidelity] = :fortran` -- the verbatim reference, which since
+2026-09-23 has to be asked for by name (the default is the `:scythe` bundle, whose
+`:exner_single`, `:gtr_local` and `:pdk1` are three of the four below):
+
+  * `th_sfc = ts/exner(1)` where the driver's `ts` is ALREADY `T_sfc/exner(1)`
+    (mynn_bl_driver :1063; harness README item 2). It divides by the surface Exner
+    function TWICE, which inflates the surface potential temperature by ~3 % and through
+    `fltv` inflates `rmol` and the mixing length. Reproduced because the parity anchor is
+    the Fortran; `:exner_single` divides once.
+  * `rmol` is RECOMPUTED here from `fltv` and `ust` (:1079) rather than taken from
+    `surface_exchange`'s Monin-Obukhov `inv_L`, so the closure's `zeta`, `pmz` and `phh`
+    are self-consistent with the fluxes it was handed. `:rmol_sfc` takes the `inv_L`
+    this routine is handed instead (and the validator refuses it without
+    `options[:sfc_stability]`, where that `inv_L` is an identical zero).
+  * `:gtr_local` fills `work.gtr_k` with the per-level `g/theta_v` and passes it to
+    `mym_turbulence!` (hence `mym_level2!` and `mym_length!`) and to `dmp_mf!`, in place
+    of the Fortran's single `g/300 K`.
+  * `:flux_clip` applies the wrapper's `hfx`/`qfx` limits to what the CLOSURE sees. The
+    two clip COUNTERS are accumulated on every configuration.
+
+The six lines that set `qsq` are `mym_predict!`'s `closure <= 2.5` branch verbatim
+(:3298-3300 for the surface copy, :3664-3673 for the diagnostic). `qsq` is the only one
+of `tsq`/`qsq`/`cov` that `mym_condensation!` CASE 2 reads, and it is read on the NEXT
+update, which is why it is stored rather than recomputed.
+"""
+@noinline function _mynn_closure_update!(MY::MYNNState, S, MN::MYNNColumnScratch,
+                                         work::MYNNWork,
+                                         colstart::Int64, n::Int64, ci::Int64,
+                                         SST::Float64, ust::Float64,
+                                         F_sh::Float64, F_q::Float64,
+                                         inv_L::Float64, t::Int64)
+    c = MY.constants
+    fid = MY.fidelity
+    zn = work.z_n                      # the shared all-zero stand-in; NEVER written
+    dz = MY.dz; zw = MY.zw
+    exner = MN.exner; qke = MN.qke
+    el = MN.el; sm = MN.sm; sh = MN.sh
+    vt = MN.vt; vq = MN.vq; sgm = MN.sgm
+    cfb = MN.cfb; qcb = MN.qcb; qib = MN.qib; qsq = MN.qsq
+
+    @inbounds for i in 1:n
+        j = colstart + i - 1
+        el[i] = MY.el[j]; sm[i] = MY.sm[j]; sh[i] = MY.sh[j]
+        vt[i] = MY.vt[j]; vq[i] = MY.vq[j]; sgm[i] = MY.sgm[j]
+        cfb[i] = MY.cldfra_bl[j]; qcb[i] = MY.qc_bl[j]; qib[i] = MY.qi_bl[j]
+        qsq[i] = MY.qsq[j]
+    end
+
+    # `:gtr_local` (MYNN_DEVIATIONS): the buoyancy parameter per LEVEL, `g/theta_v`,
+    # from the theta_v `_mynn_column_inputs!` staged for this column. Filled only when
+    # the deviation is on -- under `:fortran` the vector is never written, never read,
+    # and the kernels take their `c.gtr` load exactly as before.
+    gtr_k = nothing
+    if fid.gtr_local
+        gk = work.gtr_k
+        @inbounds for i in 1:n
+            gk[i] = c.grav/work.s_thetav[i]
+        end
+        gtr_k = gk
+    end
+
+    zi, kzi = get_pblh!(1, n, work.s_thetav, qke, zw, dz, MYNN_XLAND_WATER)
+    MY.pblh[ci] = zi
+    MY.kpbl[ci] = kzi
+    Psig_bl, Psig_shcu = MY.scale_aware ? scale_aware(MY.dx, zi) : (1.0, 1.0)
+
+    # Surface fluxes, 1/L and the surface-layer stability functions
+    # (mynn_bl_driver :1060-1097). `flqc = 0`: Scythe's surface layer has no liquid-water
+    # flux off the sea surface (droplets do not evaporate off it).
+    # `:flux_clip` (MYNN_DEVIATIONS): the COUNTERS run on every configuration -- they are
+    # comparisons, they touch no arithmetic, and a run should always be able to say how
+    # often the Fortran wrapper's clips (harness README item 7) would have bitten. The
+    # clip itself is the deviation, and it applies to what the CLOSURE sees only: the
+    # model's own surface delivery `F_sh*g(z)`/`F_q*g(z)` in `_mynn_apply_column!` stays
+    # UNCLIPPED, so the column energy budget against the surface fluxes keeps its meaning.
+    @inbounds begin
+        (F_sh > MYNN_HFX_MAX || F_sh < MYNN_HFX_MIN) && (MY.n_hfx_clip_col[ci] += 1)
+        (F_q > MYNN_QFX_MAX || F_q < MYNN_QFX_MIN) && (MY.n_qfx_clip_col[ci] += 1)
+    end
+    F_sh_c = fid.flux_clip ? clamp(F_sh, MYNN_HFX_MIN, MYNN_HFX_MAX) : F_sh
+    F_q_c = fid.flux_clip ? clamp(F_q, MYNN_QFX_MIN, MYNN_QFX_MAX) : F_q
+    cpm = c.cp*(1.0 + 0.84*work.s_qv[1])
+    flqv = F_q_c/S.rho_t[1]
+    # `:exner_single` divides by the surface Exner function ONCE; the Fortran divides
+    # TWICE (see the docstring).
+    th_sfc = fid.exner_single ? SST/exner[1] : (SST/exner[1])/exner[1]
+    flq = flqv
+    flt = F_sh_c/(S.rho_t[1]*cpm)
+    fltv = flt + flqv*c.p608*th_sfc
+    # `:rmol_sfc` takes 1/L from `surface_exchange`'s own Monin-Obukhov solve instead of
+    # recomputing it here (the validator refuses it without `options[:sfc_stability]`,
+    # where that `inv_L` is identically zero). `gtr_1` under `:gtr_local` is this column's
+    # own `g/theta_v(1)`; loading it into a local leaves the expression bitwise.
+    gtr_1 = fid.gtr_local ? (@inbounds work.gtr_k[1]) : c.gtr
+    rmol = fid.rmol_sfc ? inv_L : -c.karman*gtr_1*fltv/max(ust^3, 1.0e-6)
+    zet = 0.5*dz[1]*rmol
+    zet = max(zet, -20.0)
+    zet = min(zet, 20.0)
+    # `pmz = phim(zet) - zet` and `phh = phih(zet)` are the surface-layer stability
+    # functions `mym_predict!` uses to build the log-layer TKE production `pdk1`. The
+    # prognostic TKE slot takes that production as `P_sfc` (the drag sink itself,
+    # delivered on the surface g(z)) instead, so they are formed here only when the
+    # trace/diagnostic path or the `:pdk1` deviation asks for them -- that deviation IS
+    # the D10 "P_sfc from the drag sink vs pdk1" comparison, and `pmz` is what it needs.
+    if MY.check_values || fid.pdk1
+        pmz = phim(zet) - zet
+        phh = phih(zet)
+        (isfinite(pmz) && isfinite(phh)) || error(
+            "mc_mynn_bl!: the surface-layer stability functions are not finite " *
+            "(zeta = $zet, rmol = $rmol, ust = $ust); the surface fluxes handed to the " *
+            "closure are inconsistent")
+        # Held for `:pdk1`, which builds the Fortran's log-layer surface TKE production
+        # from it every step, not just on the cadence this update runs at.
+        @inbounds MY.pmz[ci] = pmz
+    end
+    MY.rmol[ci] = rmol
+    MY.ust[ci] = ust
+
+    mym_condensation!(1, n, MY.dx, dz, zw, MYNN_XLAND_WATER,
+                      work.s_thl, work.s_sqw, work.s_sqv, work.s_sqc, work.s_sqi, zn,
+                      S.p, exner, zn, qsq, zn, sh, el,
+                      2, qcb, qib, cfb, zi, F_sh_c, vt, vq, work.s_th, sgm, rmol,
+                      0, zn, c, work)
+
+    # ── DMP_mf, between the condensation and the turbulence (:1150-1180) ─────
+    # With `:mynn_edmf = 0` this is not entered, the plume sums stay the exact zeros
+    # `mc_mynn_state` allocated, and `mym_turbulence!` is handed the same all-zero
+    # `edmf_w`/`edmf_a` stand-in it always was -- so the S5 path is bitwise.
+    # With the plumes ON, `edmf_a1`/`edmf_w1` are what put the mass-flux term into the
+    # mixing length (:2830-2840) and the `sm`/`sh` floors under an active plume or a
+    # cloudy layer (:3050-3056, `mym_turbulence!` :1404-1407); those floors are the
+    # Fortran's and they are kept.
+    ed_w = zn; ed_a = zn
+    if MY.edmf == 1
+        ew = MY.ework[Threads.threadid()]
+        _mynn_edmf_update!(MY, S, MN, work, ew, colstart, n, ci, zi, kzi, ust,
+                           flt, fltv, flq, flqv, th_sfc, Psig_shcu, gtr_k)
+        ed_w = ew.edmf_w
+        ed_a = ew.edmf_a
+    end
+
+    mym_turbulence!(1, n, MYNN_XLAND_WATER, MY.closure, dz, MY.dx, zw,
+                    work.s_u, work.s_v, work.s_thl, work.s_thetav, work.s_sqc,
+                    work.s_sqw, qke, zn, zn, zn, vt, vq,
+                    rmol, flt, fltv, flq, zi, work.s_th, sh, sm, el,
+                    work.out_dfm, work.out_dfh, work.out_dfq,
+                    work.out_tcd, work.out_qcd,
+                    work.out_pdk, work.out_pdt, work.out_pdq, work.out_pdc,
+                    work.out_qwt, work.out_qshear, work.out_qbuoy, work.out_qdiss,
+                    0, Psig_bl, Psig_shcu, cfb, 2, ed_w, ed_a, zn, 0, zn, c, work;
+                    gtr_k = gtr_k)
+
+    @inbounds begin
+        work.out_pdq[1] = work.out_pdq[2]
+        for k in 1:(n-1)
+            b2l = work.qkw[k] <= 0.0 ? 0.0 :
+                  MYNN_B2*0.25*(el[k+1] + el[k])/work.qkw[k]
+            qsq[k] = b2l*(work.out_pdq[k+1] + work.out_pdq[k])
+        end
+        qsq[n] = qsq[n-1]
+        # `mym_level2!`'s interface loop starts at kts+1, so `gm[kts]`/`gh[kts]` are never
+        # written and still hold whatever the PREVIOUS column left in this thread's work
+        # space. Zero them: the wall carries no interface. Nothing downstream can see the
+        # difference today (`el[kts] = 0` makes `K[kts] = 0`, so both are multiplied by an
+        # exact zero), which is precisely why a stale value here would be invisible until
+        # something changed -- so it is set rather than reasoned about.
+        work.gh[1] = 0.0
+        work.gm[1] = 0.0
+        for i in 1:n
+            j = colstart + i - 1
+            MY.el[j] = el[i]; MY.sm[j] = sm[i]; MY.sh[j] = sh[i]
+            MY.vt[j] = vt[i]; MY.vq[j] = vq[i]; MY.sgm[j] = sgm[i]
+            MY.cldfra_bl[j] = cfb[i]; MY.qc_bl[j] = qcb[i]; MY.qi_bl[j] = qib[i]
+            MY.gh[j] = work.gh[i]
+            MY.gm[j] = work.gm[i]
+            MY.qsq[j] = qsq[i]
+        end
+    end
+    MY.last_update_step[ci] = t
+    return nothing
+end
+
+"""
+    _mynn_edmf_update!(MY, S, MN, work, ew, colstart, n, ci, zi, kzi, ust, flt, fltv,
+                       flq, flqv, th_sfc, Psig_shcu) -> EDMFGate
+
+One `DMP_mf` call and the mapping of its plumes into Scythe's variables (D6, S7). Runs on
+the closure cadence, between `mym_condensation!` and `mym_turbulence!` -- exactly where
+`mynn_column_step_edmf!` (src/mynn_edmf.jl) and `mynn_bl_driver` (:1150-1180) call it.
+
+The argument set is the ONE the parity harness validated (`momentum_opt = 1, tke_opt = 0,
+scalar_opt = 1`, no chemistry, no aerosol, `spp_pbl = 0`), whatever `:mynn_edmf_mom` says:
+that option decides whether the plume momentum reaches the FITTED COLUMNS, not what the
+Fortran is asked to compute, so `dmp_mf!` is never run on a combination test/test_mynn_edmf.jl
+does not cover. `dt` is dead inside `DMP_mf` (it appears only in the unreachable
+`env_subs` block) and is passed as the model timestep for the record.
+
+`gtr_k` is the `:gtr_local` fidelity deviation, forwarded to `dmp_mf!` unchanged:
+`nothing` on every other configuration.
+
+`vt`, `vq`, `cldfra_bl` and `qc_bl` go in as `mym_condensation!` left them and can come
+back CHANGED: the Chaboureau-Bechtold shallow-cumulus block (:6630-6768) overwrites them
+wherever a plume carries condensate. That is the Fortran's order and it is why the
+write-back to the tile happens after `mym_turbulence!`, not before `dmp_mf!`.
+"""
+@noinline function _mynn_edmf_update!(MY::MYNNState, S, MN::MYNNColumnScratch,
+                                      work::MYNNWork, ew::EDMFWork,
+                                      colstart::Int64, n::Int64, ci::Int64,
+                                      zi::Float64, kzi::Int, ust::Float64,
+                                      flt::Float64, fltv::Float64, flq::Float64,
+                                      flqv::Float64, th_sfc::Float64,
+                                      Psig_shcu::Float64,
+                                      gtr_k::Union{Nothing,Vector{Float64}})
+    zn = work.z_n
+    gate = dmp_mf!(1, n, MY.ts, MY.zw, MY.dz, S.p, S.rho_t, 1, 0, 1,
+                   work.s_u, work.s_v, work.s_w, work.s_th, work.s_thl, work.s_thetav,
+                   work.s_tk, work.s_sqw, work.s_sqv, work.s_sqc, MN.qke,
+                   MN.exner, MN.vt, MN.vq, MN.sgm,
+                   ust, flt, fltv, flq, flqv, zi, kzi, MY.dx, MYNN_XLAND_WATER, th_sfc,
+                   ew.edmf_a, ew.edmf_w, ew.edmf_qt, ew.edmf_thl, ew.edmf_ent, ew.edmf_qc,
+                   ew.s_aw, ew.s_awthl, ew.s_awqt, ew.s_awqv, ew.s_awqc,
+                   ew.s_awu, ew.s_awv, ew.s_awqke,
+                   ew.sub_thl, ew.sub_sqv, ew.sub_u, ew.sub_v,
+                   ew.det_thl, ew.det_sqv, ew.det_sqc, ew.det_u, ew.det_v,
+                   MN.qcb, MN.cfb, zn, zn, true, true, Psig_shcu, 0, zn,
+                   MY.constants, ew; gtr_k = gtr_k)
+    _mynn_plume_sums!(MY, S, MN, ew, gate, colstart, n, ci)
+    return gate
+end
+
+"""
+    _mynn_plume_sums!(MY, S, MN, ew, gate, colstart, n, ci)
+
+Map `DMP_mf`'s plume ensemble onto the mish and store the seven sums the every-step
+tendency assembly needs (D6): `Sigma_aw` and the plume-weighted `u, v, e, s_t, q_t, q_v`.
+
+# The interface -> mish mapping
+`DMP_mf` carries the plumes on the box WALLS. Plume property index `k` lives at the wall
+`zw[k+1]`, between mish points `k` and `k+1` (that is what `rhoz[k]`, `exneri[k]` and
+`Pk = (p[k]dz[k+1] + p[k+1]dz[k])/(dz[k+1]+dz[k])` interpolate to, and it is why the
+Fortran's own interface sums are written to `s_aw[k+1]`). Those walls are the MIDPOINTS
+between mish points -- `mc_mynn_state` builds `zw` with `radiation_faces`, which is
+bitwise `mynn_wall_heights(dz)` -- so the map back is the midpoint average: mish point `k`
+is bounded by wall `k` (plume index `k-1`, and the GROUND at `k = 1`, where no plume
+exists) and wall `k+1` (plume index `k`), and each contributes half.
+
+# Why it is done per PLUME and not on the summed interface arrays
+`Sigma_aw phi_up` is linear in the plume properties, so for `u, v, e, q_t, q_v` averaging
+the eight-plume interface sums and averaging per plume are the same number. The ENTROPY is
+not: `s_t` is a nonlinear function of the plume's own `T` and water, so it has to be
+evaluated per plume. It is evaluated AT THE MISH, on the mass-flux-weighted mean of the
+plume's `thl`, `q_t`, `q_c` over the two bounding walls, with the mish `exner` and the mish
+`rho_d` -- NOT wall by wall with a wall-interpolated density. That choice is the whole
+point: `s_t` carries `-R_d ln(rho_d)`, `rho_d` changes by ~1.5 % across a 150 m layer, and
+`R_d * 0.015 = 4.3 J/(kg K)` would swamp the O(1) plume excess `s_t,up - bar s_t` that the
+flux is made of. Evaluating the plume and its environment on the SAME `rho_d` makes the
+excess a statement about the plume's temperature and composition, which is what a mass
+flux transports, and nothing else.
+
+The plume's own saturation adjustment is already in `upthl`/`upqc`: `condensation_edmf`
+wrote them, so `T_up = exner*thl_up + xlvcp*qc_up` is the plume's temperature after its
+condensation and `q_v,up = q_t,up - q_c,up` its vapour. `upqt`/`upqc` are SPECIFIC contents
+(the `sqw` convention); `moist_entropy_total` wants MIXING RATIOS, and the conversion is
+the one `_mynn_column_inputs!` applies to the environment, `q/(1 - q_v)`, so plume and
+environment are converted identically.
+
+# Nothing is recomputed
+`upa`, `upw`, `upthl`, `upqt`, `upqc`, `upu`, `upv`, `upqke` are read straight out of
+`EDMFWork`, where `dmp_mf!` left them, including the heat-flux limiter's column rescale
+(:6483-6501 multiplies `UPA` itself, so `upa*upw` already carries `adjustment` exactly as
+the Fortran's own `s_aw*` do). `Psig_w` comes back in the gate. `rhoz` is NOT used: the
+Fortran's `s_aw*` are a MASS flux and the sums stored here are the kinematic
+`Sigma_aw = sum a_i w_i` [m/s], so the every-step assembly can multiply by the CURRENT
+`rho_t` at the mish rather than by the density the closure saw when the plumes were built.
+
+`nup2 == 0` is the "gate passed but every plume stalled at the first wall" case
+(:6288, harness README item 12) and it means NO flux, whatever `ktop` says -- so the sums
+are zeroed on it exactly as `dmp_mf!` leaves its own `s_aw*` zeroed.
+"""
+@noinline function _mynn_plume_sums!(MY::MYNNState, S, MN::MYNNColumnScratch,
+                                     ew::EDMFWork, gate::EDMFGate,
+                                     colstart::Int64, n::Int64, ci::Int64)
+    s_aw = MY.s_aw; s_st = MY.s_aw_st; s_qw = MY.s_aw_qw; s_qv = MY.s_aw_qv
+    s_u = MY.s_aw_u; s_v = MY.s_aw_v; s_e = MY.s_aw_e
+    fired = gate.nup2 > 0 && gate.ktop > 0
+    if !fired
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            s_aw[j] = 0.0; s_st[j] = 0.0; s_qw[j] = 0.0; s_qv[j] = 0.0
+            s_u[j] = 0.0; s_v[j] = 0.0; s_e[j] = 0.0
+        end
+    end
+    @inbounds begin
+        gate.active && (MY.n_gate_col[ci] += 1)
+        (gate.active && gate.nup2 == 0) && (MY.n_stall_col[ci] += 1)
+    end
+    # `plume_ktop`, `plume_ztop` and `aw_max` are RUNNING maxima over the run, and they
+    # are advanced only on an update that actually produced a flux. Two reasons, both
+    # learned from the first ocean-bubble arm, where 286 of 25605 gate-passing
+    # column-updates made plumes and the census still printed `max Sigma_aw = 0`: a
+    # last-update snapshot reports whatever the final call happened to see, which on a
+    # scheme that fires intermittently is almost always nothing; and `ktop > 0` with
+    # `nup2 == 0` is the STALL, not a plume, so recording it would make the active
+    # fraction count columns that transported nothing.
+    if !fired
+        return nothing
+    end
+    @inbounds begin
+        gate.ktop > MY.plume_ktop[ci] && (MY.plume_ktop[ci] = gate.ktop)
+        gate.ztop > MY.plume_ztop[ci] && (MY.plume_ztop[ci] = gate.ztop)
+    end
+
+    c = MY.constants
+    upa = ew.upa; upw = ew.upw; upthl = ew.upthl; upqt = ew.upqt; upqc = ew.upqc
+    upu = ew.upu; upv = ew.upv; upqke = ew.upqke
+    nup = ew.nup
+    psig = gate.psig_w
+    exner = MN.exner; rho_d = S.rho_d
+    awmax = 0.0
+    @inbounds for i in 1:n
+        j = colstart + i - 1
+        aw_t = 0.0; awu = 0.0; awv = 0.0; awe = 0.0
+        awqw = 0.0; awqv = 0.0; awst = 0.0
+        ex = exner[i]; rd = rho_d[i]
+        for m in 1:nup
+            # The two walls bounding mish point i: wall i (plume index i-1; the GROUND
+            # when i == 1, where no plume lives) and wall i+1 (plume index i).
+            a1 = upa[i,m]*upw[i,m]
+            if i == 1
+                den = a1
+                den > 0.0 || continue
+                inv = 1.0/den
+                thl_up = upthl[i,m]; qt_up = upqt[i,m]; qc_up = upqc[i,m]
+                u_up = upu[i,m]; v_up = upv[i,m]; qk_up = upqke[i,m]
+            else
+                a0 = upa[i-1,m]*upw[i-1,m]
+                den = a0 + a1
+                den > 0.0 || continue
+                inv = 1.0/den
+                thl_up = ((a0*upthl[i-1,m]) + (a1*upthl[i,m]))*inv
+                qt_up  = ((a0*upqt[i-1,m])  + (a1*upqt[i,m]))*inv
+                qc_up  = ((a0*upqc[i-1,m])  + (a1*upqc[i,m]))*inv
+                u_up   = ((a0*upu[i-1,m])   + (a1*upu[i,m]))*inv
+                v_up   = ((a0*upv[i-1,m])   + (a1*upv[i,m]))*inv
+                qk_up  = ((a0*upqke[i-1,m]) + (a1*upqke[i,m]))*inv
+            end
+            aw = 0.5*den*psig
+            # The plume's thermodynamics AT THIS MISH POINT (see the docstring): its
+            # temperature after `condensation_edmf`, and its water as mixing ratios by
+            # the same `q/(1 - q_v)` conversion the environment gets.
+            qv_up = qt_up - qc_up
+            dry = 1.0 - qv_up
+            T_up = (ex*thl_up) + (c.xlvcp*qc_up)
+            s_up = moist_entropy_total(T_up, rd, qv_up/dry, qc_up/dry, 0.0)
+            aw_t += aw
+            awu += aw*u_up
+            awv += aw*v_up
+            awe += aw*(0.5*qk_up)
+            awqw += aw*qt_up
+            awqv += aw*qv_up
+            awst += aw*s_up
+        end
+        s_aw[j] = aw_t; s_st[j] = awst; s_qw[j] = awqw; s_qv[j] = awqv
+        s_u[j] = awu; s_v[j] = awv; s_e[j] = awe
+        aw_t > awmax && (awmax = aw_t)
+    end
+    @inbounds begin
+        awmax > MY.aw_max[ci] && (MY.aw_max[ci] = awmax)
+        MY.n_plume_col[ci] += 1
+    end
+    return nothing
+end
+
+"""
+    _mynn_diffusivities!(MY, MN, colstart, n, ci, n_clamp)
+
+`K_m = l q S_M`, `K_h = l q S_H`, `K_e = Sqfac K_m` from the HELD closure and the CURRENT
+TKE, plus the D12 census.
+
+Two fidelity deviations live here (`MYNN_DEVIATIONS`). `:sqfac1` sets `Sqfac` to 1
+instead of [`MYNN_SQFAC`](@ref) `= 3`, which is a factor of three on the TKE's own
+explicit diffusion number `D_gal`. `:K_interface` restores MYNN's wall averaging (see the
+branch), and note what it then does downstream: `_mynn_apply_column!`'s buoyancy exchange
+is `rho P_b = rho_t K_h G_H` with a WALL-averaged `K_h` multiplying the closure's
+colocated `G_H`, which is deliberate -- the deviation is the diffusivity's staggering,
+not a restaggering of the whole budget, and the flux fit stays at the mish.
+
+Colocated at the mish (D1): MYNN's interface averaging of `el`/`rho`/`dzk` is dropped and
+`K = l q S` is formed pointwise, because every consumer downstream is a spline fit on the
+mish rather than a staggered finite difference. `el[1] == 0` (the wall), so `K[1] == 0`
+and no eddy flux is delivered through the bottom node -- the surface stress and fluxes
+ride in on `g(z)` instead, for the reason in the header of src/mc_boundary_layer.jl.
+
+The census reports BOTH explicit-diffusion numbers for the grid this run actually has:
+`D_gal` on the vertical B-spline CELL width with the Galerkin factor 10 (the estimate the
+offline harness reported and the S3 explicit-vs-implicit decision was taken on) and
+`D_mish` on the smallest ACTUAL mish spacing, together with the TKE equation's own
+stiffness `ts/tau_eps`. Every one is per column, written by the single thread that owns
+that column, so the tile totals are exact under threading rather than racy.
+`physical_params[:mynn_K_max]` is a COUNTED safety cap, never a tuning knob.
+"""
+@noinline function _mynn_diffusivities!(MY::MYNNState, MN::MYNNColumnScratch,
+                                        colstart::Int64, n::Int64,
+                                        ci::Int64, n_clamp::Int64)
+    Km = MN.Km; Kh = MN.Kh; Ke = MN.Ke; q_col = MN.q
+    K_max = MY.K_max
+    sqfac = MY.fidelity.sqfac
+    n_cap = 0
+    Kmax_m = 0.0; Kmax_h = 0.0; Kmax_e = 0.0; tstau = 0.0
+    if MY.fidelity.K_interface
+        # `:K_interface` (MYNN_DEVIATIONS): the closure's `el`, `S_M`, `S_H` live on the
+        # WALLS -- `mym_length!` writes `el[kts] = 0` and then `el[k]` at `zw[k]`, the
+        # wall BELOW mish point k, which is also why `mym_predict!` reads
+        # `0.5*(el(k+1)+el(k))` for a level quantity and `mym_turbulence!` divides `elq*sm`
+        # by `dzk = 0.5*(dz(k)+dz(k-1))`, the mish-point spacing across that wall. So the
+        # level-k value of `el*S` is the average of the walls below and above it, and the
+        # top level has only the wall below.
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            elj = MY.el[j]
+            lsm = elj * MY.sm[j]
+            lsh = elj * MY.sh[j]
+            if i < n
+                jp = j + 1
+                lsm = 0.5*(lsm + MY.el[jp]*MY.sm[jp])
+                lsh = 0.5*(lsh + MY.el[jp]*MY.sh[jp])
+            end
+            # `K[1] == 0` is kept: the wall carries no interface (`el[kts] = 0`) and the
+            # surface stress and fluxes ride in on `g(z)` instead. Averaging the FIRST
+            # interior wall into the ground node would deliver an eddy flux through the
+            # bottom node on top of that delivery, which is a different change from the
+            # one this deviation is measuring.
+            if i == 1
+                lsm = 0.0
+                lsh = 0.0
+            end
+            km = lsm * q_col[i]
+            kh = lsh * q_col[i]
+            km < 0.0 && (km = 0.0)
+            kh < 0.0 && (kh = 0.0)
+            if km > K_max; km = K_max; n_cap += 1; end
+            if kh > K_max; kh = K_max; n_cap += 1; end
+            ke = sqfac * km
+            if ke > K_max; ke = K_max; n_cap += 1; end
+            Km[i] = km; Kh[i] = kh; Ke[i] = ke
+            MY.K_m[j] = km; MY.K_h[j] = kh
+            km > Kmax_m && (Kmax_m = km)
+            kh > Kmax_h && (Kmax_h = kh)
+            ke > Kmax_e && (Kmax_e = ke)
+            if elj > 0.0
+                r = MY.ts * 2.0 * q_col[i] / (MYNN_B1 * elj)
+                r > tstau && (tstau = r)
+            end
+        end
+    else
+        # ── today's colocated form (D1), untouched ──
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            elj = MY.el[j]
+            lq = elj * q_col[i]
+            km = lq * MY.sm[j]
+            kh = lq * MY.sh[j]
+            km < 0.0 && (km = 0.0)
+            kh < 0.0 && (kh = 0.0)
+            if km > K_max; km = K_max; n_cap += 1; end
+            if kh > K_max; kh = K_max; n_cap += 1; end
+            ke = sqfac * km
+            if ke > K_max; ke = K_max; n_cap += 1; end
+            Km[i] = km; Kh[i] = kh; Ke[i] = ke
+            MY.K_m[j] = km; MY.K_h[j] = kh
+            km > Kmax_m && (Kmax_m = km)
+            kh > Kmax_h && (Kmax_h = kh)
+            ke > Kmax_e && (Kmax_e = ke)
+            if elj > 0.0
+                r = MY.ts * 2.0 * q_col[i] / (MYNN_B1 * elj)
+                r > tstau && (tstau = r)
+            end
+        end
+    end
+    D_gal = Kmax_e * MY.ts * 10.0 / (MY.dz_cell * MY.dz_cell)
+    @inbounds begin
+        MY.D_gal[ci] = D_gal
+        MY.D_mish[ci] = Kmax_e * MY.ts / (MY.dz_min * MY.dz_min)
+        MY.ts_tau[ci] = tstau
+        MY.K_m_max[ci] = Kmax_m
+        MY.K_h_max[ci] = Kmax_h
+        MY.n_clamp_col[ci] += n_clamp
+        MY.n_capK_col[ci] += n_cap
+        D_gal > 0.5 && (MY.n_diffnum_col[ci] += 1)
+    end
+    return nothing
+end
+
+"""
+    _mynn_flux_columns!(...) -> the boundary values of every fitted energy flux
+
+The ~10 eddy-flux columns, each fitted on the slot-8 scratch basis and differentiated:
+`uMish` <- the flux, `Btransform!`/`Atransform!` fit it, `Ixtransform` gives `d/dz` at the
+mish (the tendency) and `SItransform!` puts the FITTED value back into `uMish` (which the
+discrete shear production multiplies). Taking the value and the derivative from the SAME
+spline coefficients is what makes the D3 identity exact rather than approximate.
+
+Momentum (`rho_t K_m dz(u,w,v)`), heat in FLUX form (`rho_d T K_h dz(s_t')`, so the column
+books telescope), the four SPECIES water legs (D7: total water `rho_w' = rho_t' - rho_d'`,
+the prognostic vapour, cloud and rain -- Louis's total-minus-cloud inference is gone), the
+two-moment rain NUMBER and the twelve ISHMAEL ICE moments (S8, each on its own spline
+column through `_mynn_moment_leg!`), the water ENERGY carry
+`c_w K_h rho_w,z + c_v K_h rho_v,z - L_f K_h rho_i,z` and the TKE transport.
+
+With `:mynn_edmf = 1` the EDMF mass flux is SUBTRACTED from the same columns before they
+are fitted (`_mynn_add_mf!` says why a minus): `u`, `v` (both only under
+`:mynn_edmf_mom`), the heat leg with `rho_d T`, total water and vapour, the cloud leg as
+`M_w - M_v`, the water energy carry with `c_w M_w + c_v M_v`, and the TKE with the plume's
+`e = qke/2`. `w` and rain get none -- the Fortran carries neither a plume `w` flux nor
+precipitation in the plumes. Because the term is inside the column rather than beside it,
+`Ixtransform` and `_mynn_edges` deliver its divergence and its boundary value with no
+further code, and `Psi = u S_u + w S_w + v S_v` picks the plume momentum work up on its
+own.
+
+The water-mass legs are ν legs (`_mynn_nu_legs!`, plan E7): each slot's own fitted gradient
+`K_h ∂z ν_k'`, its divergence applied to the slot directly; the number and habit moments keep
+their density legs (`_mynn_moment_leg!`, through their Jacobians).
+
+The TKE's fitted variable is the MASS-SPECIFIC `e = rho_e/rho_t` with flux
+`rho_t K_e dz(e)` -- the standard eddy-diffusion form for an intensive quantity, and the
+one whose boundary term is directly the turbulent energy flux through the ground and the
+lid. Fitting `rho_e` itself and applying the product rule would close the budget equally
+well; the choice is documented rather than silent because both were available.
+"""
+@noinline function _mynn_flux_columns!(mtile::ModelTile, MY::MYNNState, S,
+                                       MN::MYNNColumnScratch, work::MYNNWork,
+                                       geom::MCGeometry, colstart::Int64, n::Int64, z,
+                                       uv, wv, vv, rcv, rrv, rvv, rho_e,
+                                       ctrans_on::Bool, rtrans_on::Bool,
+                                       IS::MCSlots, ice_on::Bool, nr_on::Bool)
+    rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
+    Km = MN.Km; Kh = MN.Kh; Ke = MN.Ke
+    col = scratch_column(mtile, 8)
+    # The mass-flux legs (D6). `mf` is the whole scheme, `mf_mom` its momentum half
+    # (`:mynn_edmf_mom = false` leaves the plumes carrying heat, water and TKE but no
+    # momentum). There is NO plume flux of `w`: the Fortran carries no `s_aww` -- the
+    # plume's own vertical velocity is internal to the closure, not a transported
+    # property of the resolved flow.
+    mf = MY.edmf == 1
+    mf_mom = mf && MY.edmf_mom
+    s_aw = MY.s_aw
+
+    col.uMish .= rho_t .* Km .* uv.f_z
+    if mf_mom
+        _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_u, uv.f, colstart, n)
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, S.VD_u)
+    SItransform!(col); copyto!(MN.Su, col.uMish)
+
+    col.uMish .= rho_t .* Km .* wv.f_z
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, S.VD_w)
+    SItransform!(col); copyto!(MN.Sw, col.uMish)
+
+    _mynn_v_flux!(S.VD_v, MN.Sv, col, geom, rho_t, Km, vv, MY, colstart, n, mf_mom)
+
+    # The momentum ENERGY flux `Psi = u S_u + w S_w + v S_v`, fitted as ONE column.
+    # This is the one place the discrete shear production departs from the plan's literal
+    # `rho P_s := u_z S_u + ...`, and the reason is exactness. `u` and `S_u` are both
+    # cubic per cell, so their PRODUCT is degree 6 while three-node Gauss is exact only to
+    # degree 5: the sum `u dz(S_u) + u_z S_u` integrates exactly (each factor pair is
+    # degree 5) but it telescopes to `u(z) S_u(z)` evaluated at the WALLS, and the model
+    # does not expose `u`'s own spline coefficients per column, so that boundary value
+    # cannot be formed without refitting `u` -- and the spline fit carries a filter
+    # (`l_q`), so a refit is NOT the same function. Fitting the product instead and
+    # defining
+    #
+    #     rho P_s := dz(Psi_hat) - (u dz(S_u) + w dz(S_w) + v dz(S_v))
+    #
+    # gives the SAME quantity to fit error (it is the product rule) and makes the column
+    # identity exact by construction, because `Psi_hat` is a fitted cubic whose boundary
+    # values `_mynn_edges` returns directly. The residual against the literal form is the
+    # spline fit error of a degree-6 function and is reported, not assumed: see the
+    # `Ps_disc` / `Ps_mynn` pair in `MYNNState`.
+    @inbounds for i in 1:n
+        col.uMish[i] = (uv.f[i]*MN.Su[i]) + (wv.f[i]*MN.Sw[i]) +
+                       (_louis_v(geom, vv, i)*MN.Sv[i])
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_Pm)
+    Pm0, Pm1 = _mynn_edges(col)
+
+    s_t = S.s_t
+    @. s_t = moist_entropy_total(Tk, rho_d, S.q_v, S.q_l, S.q_i)
+    s_col = scratch_column(mtile, 6)
+    s_col.uMish .= s_t .- mtile.mc_ref_diag.s_tbar
+    Btransform!(s_col); Atransform!(s_col)
+    s_z = S.bl_s_z
+    Ixtransform(s_col, s_z)
+
+    col.uMish .= rho_d .* Tk .* Kh .* s_z
+    if mf
+        # `M_h = rho_d T Sigma_aw (s_t,up - bar s_t)`, on the FULL entropies: the mass
+        # flux transports a difference, so the reference `s_tbar` the diffusive leg is
+        # built from cancels out of it exactly.
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            col.uMish[i] -= (rho_d[i]*Tk[i]) *
+                            (MY.s_aw_st[j] - (s_aw[j]*s_t[i]))
+        end
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, S.QDOT_V)
+    Sh0, Sh1 = _mynn_edges(col)
+
+    # THE DERIVED WATER ANCHOR (plan E7): every water-mass slot gets its own ν flux column
+    # `K_h ∂z ν_k'` (+ plume `M_k/α_k`) and receives the fitted divergence directly; the
+    # total-water leg is the pointwise `Σ α_k ν̇_k` and the energy carry is regrouped by species
+    # (`_mynn_nu_legs!`). The number and habit moments keep their density legs.
+    SEw0, SEw1 = _mynn_nu_legs!(mtile, MY, S, MN, work, colstart, n, z, rvv, rcv, IS,
+                                ice_on, mf)
+    nr_on && _mynn_moment_leg!(mtile, MN.div_nr, Kh, S.nu_nr_z, S.Jnr, IS.n_r, n)
+    if ice_on
+        _mynn_moment_leg!(mtile, MN.div_i1n, Kh, S.nu_i1n_z, S.J_i1n, IS.i1_n, n)
+        _mynn_moment_leg!(mtile, MN.div_i1a, Kh, S.nu_i1a_z, S.J_i1a, IS.i1_a, n)
+        _mynn_moment_leg!(mtile, MN.div_i1c, Kh, S.nu_i1c_z, S.J_i1c, IS.i1_c, n)
+        _mynn_moment_leg!(mtile, MN.div_i2n, Kh, S.nu_i2n_z, S.J_i2n, IS.i2_n, n)
+        _mynn_moment_leg!(mtile, MN.div_i2a, Kh, S.nu_i2a_z, S.J_i2a, IS.i2_a, n)
+        _mynn_moment_leg!(mtile, MN.div_i2c, Kh, S.nu_i2c_z, S.J_i2c, IS.i2_c, n)
+        _mynn_moment_leg!(mtile, MN.div_i3n, Kh, S.nu_i3n_z, S.J_i3n, IS.i3_n, n)
+        _mynn_moment_leg!(mtile, MN.div_i3a, Kh, S.nu_i3a_z, S.J_i3a, IS.i3_a, n)
+        _mynn_moment_leg!(mtile, MN.div_i3c, Kh, S.nu_i3c_z, S.J_i3c, IS.i3_c, n)
+    end
+
+    e_col = MN.e
+    @inbounds for i in 1:n
+        e_col[i] = rho_e[i] / rho_t[i]
+    end
+    s_col.uMish .= e_col
+    Btransform!(s_col); Atransform!(s_col)
+    Ixtransform(s_col, MN.e_z)
+
+    col.uMish .= rho_t .* Ke .* MN.e_z
+    if mf
+        _mynn_add_mf!(col.uMish, rho_t, s_aw, MY.s_aw_e, e_col, colstart, n)
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_e)
+    Se0, Se1 = _mynn_edges(col)
+
+    return (; Pm0, Pm1, Sh0, Sh1, SEw0, SEw1, Se0, Se1)
+end
+
+"""
+    _mynn_nu_legs!(mtile, MY, S, MN, work, colstart, n, z, rvv, rcv, IS, ice, mf)
+        -> (S_Ew(bottom), S_Ew(top))
+
+THE MYNN WATER LEGS UNDER THE DERIVED ANCHOR (plan E7). Each water-mass slot k (vapor, cloud,
+rain, the three ice masses) gets its own ν flux column `u_k = K_h ∂z ν_k'` — the slot's own
+fitted gradient, the perturbation as every leg here mixes — plus, for the vapor and the cloud,
+the plume mass flux `M_k/α_k` (`M_v = ρ_t Σ(a w q_v)`, `M_c = M_w − M_v`, the closure's
+plume sums), fitted on the shared basis (slot 8's column, the ice masses on their own) and
+differentiated: `ν̇_k = D[u_k]`, applied to the slot DIRECTLY (no `J·div`). The total-water
+leg is then `div_w := Σ_k α_k ν̇_k` pointwise — exact by the linearity of D, so ρ_w moves by the
+sum of the species' legs and nothing else (one column fit saved). The energy carry is the same
+flux-form column regrouped by species,
+
+    S_Ew = Fit[K_h Σ_k e_k α_k ν_{k,z} − Σ_k e_k M_k],
+    e_v = C_vv T + ke + gz,  e_c = e_r = C_pv T − L_v + ke + gz,  e_i = C_pv T − L_s + ke + gz
+
+(the retired `:slot` arm's `c_w ρ_{w,z} + c_v ρ_{v,z} − L_f ρ_{i,z}`, `c_w + c_v = e_v`), still
+telescoping: the D3 identity's right side is unchanged. Returns its boundary values.
+
+TWO CONSEQUENCES OF MIXING IN ν SPACE, stated (Stage 3 review, BL sub-check; neither is a
+conservation defect — `ρ_w` is invariant pointwise and `E_t` telescopes):
+
+* CONDENSATE LOBES DIFFUSE. A cloud, rain or ice-mass lobe (`ν < 0`, recovered density 0) is
+  mixed like any other ν, so at a lobe edge the leg moves recovered condensate that the
+  linear `ν` flux does not carry one-for-one (`ahyp` clips one side). The energy is carried on
+  each species' REALIZED recovered rate, so the thermal remainder `qdot_w` books the
+  difference as heating where the recovered mass appears or vanishes: a column-neutral
+  (the flux-form `S_Ew` telescopes), latent-scale heating DIPOLE across the lobe edge, with
+  `R` held to second order.
+* ICE MASS IS MIXED IN ν SPACE, THE ICE MOMENTS IN DENSITY SPACE. The three ice masses are
+  water-mass slots and take a ν leg here; their numbers, axes and habit moments are not in
+  `ρ_w` and keep density-space legs (`options[:mynn_mix_numbers]`).
+  The per-particle state is therefore not exactly invariant under the leg wherever an ice
+  mass is off its affine branch (near the knee or in a lobe); the water and the energy are
+  unaffected.
+"""
+@noinline function _mynn_nu_legs!(mtile::ModelTile, MY::MYNNState, S, MN::MYNNColumnScratch,
+                                  work::MYNNWork, colstart::Int64, n::Int64, z, rvv, rcv,
+                                  IS::MCSlots, ice::Bool, mf::Bool)
+    ws = water_anchor_set(mtile.model.options, mtile.model.physical_params, IS)
+    av = ws.alpha[1]; ac = ws.alpha[2]; ar = ws.alpha[3]; ai = ws.alpha[4]
+    Kh = MN.Kh; rho_t = S.rho_t; Tk = S.Tk
+    s_aw = MY.s_aw
+    col = scratch_column(mtile, 8)
+    # vapor
+    @inbounds for i in 1:n
+        col.uMish[i] = Kh[i] * rvv.f_z[i]
+    end
+    if mf
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            col.uMish[i] -= (rho_t[i] / av) * (MY.s_aw_qv[j] - (s_aw[j] * work.s_sqv[i]))
+        end
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_v)
+    # cloud
+    @inbounds for i in 1:n
+        col.uMish[i] = Kh[i] * rcv.f_z[i]
+    end
+    if mf
+        @inbounds for i in 1:n
+            j = colstart + i - 1
+            col.uMish[i] -= (rho_t[i] / ac) *
+                ((MY.s_aw_qw[j] - (s_aw[j] * work.s_sqw[i])) -
+                 (MY.s_aw_qv[j] - (s_aw[j] * work.s_sqv[i])))
+        end
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_c)
+    # rain (no plume: the plumes carry no precipitation)
+    @inbounds for i in 1:n
+        col.uMish[i] = Kh[i] * S.nu_r_z[i]
+    end
+    Btransform!(col); Atransform!(col)
+    Ixtransform(col, MN.div_r)
+    # the three ice masses, each on its own column
+    if ice
+        _mynn_nu_leg!(mtile, MN.div_i1q, Kh, S.nu_i1q_z, IS.i1_q, n)
+        _mynn_nu_leg!(mtile, MN.div_i2q, Kh, S.nu_i2q_z, IS.i2_q, n)
+        _mynn_nu_leg!(mtile, MN.div_i3q, Kh, S.nu_i3q_z, IS.i3_q, n)
+    end
+    # the total-water leg, pointwise
+    div_w = MN.div_w
+    @inbounds for i in 1:n
+        w = ((av * MN.div_v[i]) + (ac * MN.div_c[i])) + (ar * MN.div_r[i])
+        ice && (w = ((w + (ai * MN.div_i1q[i])) + (ai * MN.div_i2q[i])) +
+                    (ai * MN.div_i3q[i]))
+        div_w[i] = w
+    end
+    # the energy carry, by species
+    SEw0 = 0.0; SEw1 = 0.0
+    if MY.water_carry === :flux
+        wk = MN.wk
+        @inbounds for i in 1:n
+            geo = S.ke[i] + (gravity * z[i])
+            ev = (Cvv * Tk[i]) + geo
+            el = ((Cpv * Tk[i]) - S.Lv[i]) + geo
+            c = (ev * (av * rvv.f_z[i])) +
+                (el * ((ac * rcv.f_z[i]) + (ar * S.nu_r_z[i])))
+            if ice
+                ei = ((Cpv * Tk[i]) - L_s(Tk[i])) + geo
+                c += ei * (ai * ((S.nu_i1q_z[i] + S.nu_i2q_z[i]) + S.nu_i3q_z[i]))
+            end
+            wk[i] = Kh[i] * c
+            if mf
+                j = colstart + i - 1
+                tv = rho_t[i] * (MY.s_aw_qv[j] - (s_aw[j] * work.s_sqv[i]))
+                tw = rho_t[i] * (MY.s_aw_qw[j] - (s_aw[j] * work.s_sqw[i]))
+                wk[i] -= (ev * tv) + (el * (tw - tv))
+            end
+        end
+        col.uMish .= wk
+        Btransform!(col); Atransform!(col)
+        Ixtransform(col, MN.div_Ew)
+        SEw0, SEw1 = _mynn_edges(col)
+    else
+        fill!(MN.div_Ew, 0.0)
+    end
+    return SEw0, SEw1
+end
+
+"One ν-space leg of an ice MASS on its own column: `D[K_h ∂z ν]` (no Jacobian; plan E7)."
+@noinline function _mynn_nu_leg!(mtile::ModelTile, div, Kh, nu_z, slot::Int64, n::Int64)
+    c = scratch_column(mtile, slot)
+    @inbounds for i in 1:n
+        c.uMish[i] = Kh[i] * nu_z[i]
+    end
+    Btransform!(c)
+    Atransform!(c)
+    Ixtransform(c, div)
+    return nothing
+end
+
+"""
+    _mynn_moment_apply!(expdot, div, J, slot, colstart, n)
+
+Fold one fitted moment divergence into its prognostic slot (S8): `expdot[j, slot] += J·div`.
+
+The Jacobian is the SLOT's, not the density's: the leg was built from `∂z ν / J` so that it
+is a flux of the quantity, and the increment goes back the other way through `dν/dx`. `J` is
+an exact `1.0` with no transform declared, and `1.0 * x === x`, so the untransformed slot
+receives the raw divergence.
+"""
+@inline _mynn_J(J::AbstractVector, i) = @inbounds J[i]
+@inline _mynn_J(J::Float64, i) = J
+@inline function _mynn_moment_apply!(expdot, div, J, slot::Int64,
+                                     colstart::Int64, n::Int64)
+    @inbounds for i in 1:n
+        expdot[colstart + i - 1, slot] += _mynn_J(J, i) * div[i]
+    end
+    return nothing
+end
+
+"""
+    _mynn_apply_column!(...)
+
+Fold every leg onto the prognostic slots and accumulate the D3 boundary/surface energy
+input and the two shear-production diagnostics.
+
+Momentum `du = (dS_u - tau_u g)/rho_t` with `dE_t^mom = rho_t(u du + w dw + v dv)` -- the
+FRIC_KE invariant: E_t follows the resolved KE down, and there is no dissipative heating,
+because with an eddy K the resolved KE that is lost goes to unresolved scales. Here, for
+the first time in this model, it goes somewhere the model CARRIES: `rho P_s` into
+`rho_e`. `P_sfc` is the drag sink itself, delivered on the same `g(z)` as the stress so it
+cancels the drag work POINTWISE and not merely in the column integral. `rho P_b` is the
+closure's own buoyancy function (positive unstable, so a stable layer returns TKE to the
+resolved flow) and `rho eps = rho_t q^3/(B_1 l)` is exactly what `bp*qke/2` removes in
+`mym_predict`, with the Fortran's `diss_heat` cap and its `max(l,1)` dropped because
+energy exactness needs ONE number and not a clipped one. Both appear with opposite signs
+in E_t and in `rho_e`, so neither can leak.
+
+The water energy split (D7): E_t receives the full divergence `dS_Ew` (which telescopes),
+and the part of it that is NOT the fixed-T enthalpy of the transported mass --
+`Qdot_w = dS_Ew - c_w dS_w - c_v dS_v`, which is `S_w dc_w/dz + S_v dc_v/dz` by the
+product rule -- is genuine thermal heating and joins `Qdot_E` in driving T, and through it
+p and Q_ss. With `:mynn_water_carry = :fixed_T` the local Louis map is restored and
+`Qdot_w` is exactly zero. That is the D10/D7 fidelity comparison, and it is NOT
+budget-neutral: `c_w rho_dot_w + c_v rho_dot_v` is not the divergence of anything, so the
+column identity is open by exactly `<S_w dc_w/dz + S_v dc_v/dz>` and `bdry_E` is the exact
+right-hand side only under `:flux`. test/test_mynn_bl.jl reports that residual rather than
+asserting a closure the local map cannot have.
+
+The `:pdk1` fidelity deviation (`MYNN_DEVIATIONS`) replaces `P_sfc` with the Fortran's
+log-layer production `rho_t(1) u*^3 pmz/karman` on the same `g(z)`, and routes the
+difference from the drag work into the HEATING rather than dropping it -- see the branch
+below. `<dE_t + drho_e>` and `bdry_E` are unchanged by the switch; what changes is how
+much of the surface drag ends up as TKE and how much as heat.
+
+The boundary term `bdry_E` is the D3 identity's right-hand side, and every piece of it is
+an EXACT spline boundary value of a fitted column -- the momentum products included, which
+is the whole reason `Psi` is fitted (see `_mynn_flux_columns!`). Nothing in it is assumed
+zero: the surface delivery profile `g(z)` exists precisely because the spline's
+extrapolated wall value is NOT reliable as a flux, so the budget has to carry whatever
+that value actually is and report it.
+"""
+@noinline function _mynn_apply_column!(MY::MYNNState, S, MN::MYNNColumnScratch,
+                                       geom::MCGeometry,
+                                       colstart::Int64, n::Int64, ci::Int64, z,
+                                       uv, wv, vv, expdot, rv_i::Int64, re_i::Int64,
+                                       tau_u::Float64, tau_v::Float64,
+                                       F_sh::Float64, F_q::Float64, delta::Float64, ed,
+                                       IS::MCSlots, ice_on::Bool, nr_on::Bool,
+                                       ctr::Symbol, cmu::Float64,
+                                       rtr::Symbol, rmu::Float64,
+                                       itr::Symbol, imu::Float64, ts::Float64,
+                                       phys::Array{Float64,3}, nvb::Vector{Float64},
+                                       vtr::Symbol, vmu::Float64, av::Float64,
+                                       J_e::Vector{Float64})
+    u = uv.f
+    w = wv.f
+    rho_t = S.rho_t; rho_d = S.rho_d; Tk = S.Tk
+    R_m = S.R_m; C_vt = S.C_vt; Lv = S.Lv
+    drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp; ke = S.ke
+    Kh = MN.Kh; q_col = MN.q; wq = MY.w_mish
+    div_Pm = MN.div_Pm
+    VD_u = S.VD_u; VD_w = S.VD_w; VD_v = S.VD_v
+    div_w = MN.div_w; div_c = MN.div_c; div_r = MN.div_r
+    div_e = MN.div_e; VD_Ew = MN.div_Ew; QDOT_V = S.QDOT_V
+    flux_carry = MY.water_carry === :flux
+    inv_delta = 1.0 / delta
+    # `:pdk1` (MYNN_DEVIATIONS): the Fortran's log-layer surface TKE production in place
+    # of the drag work. `pdk1 = 2 u*^3 pmz / vkz` with `vkz = karman 0.5 dz(1)` is a
+    # production of `qke = 2e`, so per unit mass in `e` it is `u*^3 pmz/(karman 0.5 dz(1))`
+    # and the LAYER-INTEGRATED surface production is `rho_t(1) u*^3 pmz/karman` [W/m^2].
+    # Delivered on the same surface profile `g(z)` the stress and the surface fluxes use,
+    # which turns it into the [W/m^3] the slot takes.
+    pdk1 = MY.fidelity.pdk1
+    Psfc_e = 0.0
+    if pdk1
+        @inbounds Psfc_e = rho_t[1]*MY.ust[ci]*MY.ust[ci]*MY.ust[ci]*MY.pmz[ci] /
+                           MY.constants.karman
+    end
+
+    bdry = (ed.Pm1 - ed.Pm0) +
+           (ed.Sh1 - ed.Sh0) + (ed.SEw1 - ed.SEw0) + (ed.Se1 - ed.Se0) + F_sh
+    Ps_d = 0.0; Ps_m = 0.0
+
+    @inbounds for i in 1:n
+        j = colstart + i - 1
+        gz = z[i] < delta ? 2.0 * inv_delta * (1.0 - (z[i] * inv_delta)) : 0.0
+        du = (VD_u[i] - (tau_u * gz)) / rho_t[i]
+        dw = VD_w[i] / rho_t[i]
+        dv = _louis_dv(geom, VD_v, rho_t, tau_v, gz, i)
+        expdot[j, 4] += du
+        expdot[j, 5] += dw
+        _louis_add_v!(geom, expdot, j, dv)
+
+        vi = _louis_v(geom, vv, i)
+        dE_mom = rho_t[i] * (((u[i]*du) + (w[i]*dw)) + (vi*dv))
+
+        # The DISCRETE shear production (see `_mynn_flux_columns!` for why it is the
+        # fitted momentum-energy divergence minus `V . dz(S_V)` rather than the literal
+        # `u_z S_u`): the two differ by the spline fit error of a degree-6 product, and
+        # only this form makes the column identity exact.
+        Ps = div_Pm[i] - (((u[i]*VD_u[i]) + (w[i]*VD_w[i])) +
+                          (vi*_mynn_vdiv(geom, VD_v, i)))
+        # Under `:pdk1` the TKE slot receives the log-layer production and the DIFFERENCE
+        # between the drag work and that production becomes heat (`Pres`, folded into
+        # `qdot_h` below, the same route `+rho eps` takes into E_t and the QDOT channel),
+        # so `<dE_t + drho_e>` is exactly what it was and the D3 identity still closes.
+        # Physically that is most of the log-layer drag sink arriving as heat instead of
+        # as TKE -- which is the thing being measured.
+        Pdrag = ((tau_u*u[i]) + (tau_v*vi)) * gz
+        Psfc = pdk1 ? Psfc_e * gz : Pdrag
+        Pb = rho_t[i] * Kh[i] * MY.gh[j]
+        elj = MY.el[j]
+        qi = q_col[i]
+        eps = elj > 0.0 ? rho_t[i]*qi*qi*qi/(MYNN_B1*elj) : 0.0
+        Ps_d += wq[i] * Ps
+        Ps_m += wq[i] * rho_t[i] * MN.Km[i] * MY.gm[j]
+
+        # Per-gridpoint budget columns (S9), held only for the sidecar
+        # (src/mynn_io.jl) -- exactly the terms above, nothing recomputed.
+        MY.g_Ps[j] = Ps
+        MY.g_Ps_mynn[j] = rho_t[i] * MN.Km[i] * MY.gm[j]
+        MY.g_Pb[j] = Pb
+        MY.g_eps[j] = eps
+        MY.g_tke_transport[j] = div_e[i]
+
+        qdot_h = pdk1 ? (QDOT_V[i] + (F_sh * gz)) + (Pdrag - Psfc) :
+                        QDOT_V[i] + (F_sh * gz)
+        # THE DERIVED ANCHOR (plan E7): the species' ν legs land directly; ρ_w moves by
+        # `Σ α_k ν̇_k` plus the surface flux; `E_t` receives the flux-form carry and the
+        # THERMAL REMAINDER is what the recovered reading did not receive of it,
+        # `qdot_w = dE_w − Σ_k e_k^int real_k − geo Σ α_k ν̇_k`, with the REALIZED
+        # recovered rate of every species, the vapor included.
+        Fv = F_q * gz
+        nvv = MN.div_v[i] + (Fv / av)
+        nuv = phys[j, rv_i, 1] + nvb[i]
+        real_v = (recover_rho_v(ts * nvv, nuv, vtr, vmu) -
+                  recover_rho_v(0.0, nuv, vtr, vmu)) / ts
+        real_l = _mynn_realized_rate(S.nu_c[i], div_c[i], div_c[i], ts, ctr, cmu) +
+                 _mynn_realized_rate(S.nu_r[i], div_r[i], div_r[i], ts, rtr, rmu)
+        real_i = ice_on ?
+            ((_mynn_realized_rate(S.nu_i1q[i], MN.div_i1q[i], MN.div_i1q[i], ts, itr, imu) +
+              _mynn_realized_rate(S.nu_i2q[i], MN.div_i2q[i], MN.div_i2q[i], ts, itr, imu)) +
+             _mynn_realized_rate(S.nu_i3q[i], MN.div_i3q[i], MN.div_i3q[i], ts, itr, imu)) :
+            0.0
+        sw = div_w[i] + Fv
+        geo = ke[i] + (gravity * z[i])
+        ev = (Cvv * Tk[i]) + geo
+        if flux_carry
+            dE_w = VD_Ew[i] + (ev * Fv)
+        else
+            dE_w = 0.0
+        end
+        eint = ((Cvv * Tk[i]) * real_v) + ((((Cpv * Tk[i]) - Lv[i]) * real_l) +
+               (ice_on ? (((Cpv * Tk[i]) - L_s(Tk[i])) * real_i) : 0.0))
+        qdot_w = (dE_w - eint) - (geo * sw)
+        qdot_E = (qdot_h - Pb) + eps
+        qdot_th = qdot_E + qdot_w
+        dT_v = qdot_th / (rho_d[i] * C_vt[i])
+        dp_v = (R_m[i] / C_vt[i]) * qdot_th
+        dp_q = Rv * Tk[i] * real_v
+        expdot[j, 1] += dp_v + dp_q
+        expdot[j, 8] += div_r[i]
+        expdot[j, 9] += div_c[i]
+        expdot[j, rv_i] += nvv
+        expdot[j, 6] += (qdot_E + dE_w) + dE_mom
+        expdot[j, 7] += real_v - (drvs_dT[i]*dT_v) - (drvs_dp[i]*(dp_v + dp_q))
+        # the TKE's own sources are density-space rates: into the slot through J_e
+        # (`1.0` under tke_transform = :none, so this is the untransformed line bit for bit)
+        expdot[j, re_i] += J_e[i] * (((div_e[i] + Ps) + (Pb - eps)) + Psfc)
+        bdry += wq[i] * ev * Fv
+    end
+    # ── The appended moment slots (S8) ───────────────────────────────────────
+    # Outside the loop above, deliberately: the warm slots' arithmetic is then untouched
+    # by the ice being on, so an ice-on column whose ice is exactly zero is bitwise the
+    # ice-off column in every warm increment (test_mynn_ice.jl pins that with `===`).
+    # Nothing here reaches E_t: a NUMBER and a VOLUME MOMENT carry no energy, and the ice
+    # MASS carried its own `-L_f K_h dz(rho_i)` inside the `S_Ew` column already.
+    if nr_on
+        _mynn_moment_apply!(expdot, MN.div_nr, S.Jnr, IS.n_r, colstart, n)
+    end
+    if ice_on
+        # the ice MASSES' ν legs land directly (plan E7); the moments through their Jacobians
+        _mynn_moment_apply!(expdot, MN.div_i1q, 1.0, IS.i1_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2q, 1.0, IS.i2_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3q, 1.0, IS.i3_q, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1n, S.J_i1n, IS.i1_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1a, S.J_i1a, IS.i1_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i1c, S.J_i1c, IS.i1_c, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2n, S.J_i2n, IS.i2_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2a, S.J_i2a, IS.i2_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i2c, S.J_i2c, IS.i2_c, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3n, S.J_i3n, IS.i3_n, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3a, S.J_i3a, IS.i3_a, colstart, n)
+        _mynn_moment_apply!(expdot, MN.div_i3c, S.J_i3c, IS.i3_c, colstart, n)
+    end
+    @inbounds begin
+        MY.bdry_E[ci] = bdry
+        MY.Ps_disc[ci] = Ps_d
+        MY.Ps_mynn[ci] = Ps_m
+    end
+    return nothing
+end
+
+"""
+    mynn_census_line(MY::MYNNState) -> String
+
+One line summarising the tile's boundary-layer census: the domain maxima of `K_m`,
+`K_h`, the two explicit-diffusion numbers and `ts/tau_eps`, and the counters --
+TKE clamps and `K` caps in GRIDPOINT-steps, `n_diffnum` in COLUMN-steps (a column is
+counted once per step in which its own `D_gal` exceeded 0.5), and the two surface-flux
+clip counts in COLUMN-UPDATES (how often the Fortran wrapper's `hfx`/`qfx` limits would
+have bitten, whether or not `:flux_clip` is on -- see `MYNN_DEVIATIONS`). The counters are
+reductions over the PER-COLUMN arrays, which is why they are exact under threading:
+each column is written by the one thread that owns it, so nothing races and nothing is
+lost.
+"""
+function mynn_census_line(MY::MYNNState)
+    MY.active || return ""
+    mx(v) = isempty(v) ? 0.0 : maximum(v)
+    return "mynn census: max K_m=$(round(mx(MY.K_m_max); digits = 2)) " *
+           "max K_h=$(round(mx(MY.K_h_max); digits = 2)) m^2/s; " *
+           "max D_gal=$(round(mx(MY.D_gal); sigdigits = 3)) " *
+           "max D_mish=$(round(mx(MY.D_mish); sigdigits = 3)) " *
+           "max ts/tau_eps=$(round(mx(MY.ts_tau); sigdigits = 3)); " *
+           "max pblh=$(round(mx(MY.pblh); digits = 1)) m; " *
+           "mynn_n_clamp_e=$(sum(MY.n_clamp_col)) " *
+           "(neg=$(sum(MY.n_eneg_col)) high=$(sum(MY.n_ehigh_col)) small=" *
+           "$(sum(MY.n_clamp_col) - sum(MY.n_eneg_col) - sum(MY.n_ehigh_col))) " *
+           "mynn_n_cap_K=$(sum(MY.n_capK_col)) " *
+           "mynn_n_diffnum=$(sum(MY.n_diffnum_col)) " *
+           "mynn_n_hfx_clip=$(sum(MY.n_hfx_clip_col)) " *
+           "mynn_n_qfx_clip=$(sum(MY.n_qfx_clip_col))" *
+           mynn_plume_census(MY)
+end
+
+"""
+    mynn_plume_census(MY::MYNNState) -> String
+
+The EDMF half of the census (S7), appended to the same line so one parse gets both. Empty
+with `:mynn_edmf = 0`.
+
+`mynn_plume_active_frac` is the fraction of COLUMNS that produced a mass flux at least
+once in the run (`ktop > 0` AND `nup2 > 0` -- the stall is not a plume);
+`mynn_max_mass_flux` is the largest `Sigma_aw = sum a_i w_i` [m/s] and `mynn_max_ztop_m`
+the highest plume top [m] reached anywhere, at any time. All three are running maxima over
+the run rather than a snapshot of its last step, because a scheme that fires
+intermittently is almost never firing at the moment the run happens to end. The three counters are COLUMN-UPDATES and
+they keep the gate and the stall apart, which is the distinction
+tools/mynn_fortran_driver/README.md item 12 exists to make: `mynn_n_gate` passed
+`fltv2 > 0.002 && maxwidth > minwidth && superadiabatic`; `mynn_n_stall` passed it and
+still produced nothing because every one of the eight plumes failed to leave the first
+wall (`nup2 = 0`, :6288); `mynn_n_plume` produced a flux. A run where `n_gate` is large
+and `n_plume` is zero is not a broken scheme -- it is a grid whose first layer is too
+thick for the plumes to accelerate out of, and it is reported as such.
+"""
+function mynn_plume_census(MY::MYNNState)
+    MY.edmf == 1 || return ""
+    mx(v) = isempty(v) ? 0.0 : maximum(v)
+    nact = 0
+    @inbounds for ci in eachindex(MY.plume_ktop)
+        MY.plume_ktop[ci] > 0 && (nact += 1)
+    end
+    frac = isempty(MY.plume_ktop) ? 0.0 : nact/length(MY.plume_ktop)
+    return "; mynn_plume_active_frac=$(round(frac; sigdigits = 4)) " *
+           "mynn_max_mass_flux=$(round(mx(MY.aw_max); sigdigits = 4)) " *
+           "mynn_max_ztop_m=$(round(mx(MY.plume_ztop); digits = 1)) " *
+           "mynn_n_gate=$(sum(MY.n_gate_col)) " *
+           "mynn_n_stall=$(sum(MY.n_stall_col)) " *
+           "mynn_n_plume=$(sum(MY.n_plume_col))"
+end
+
+# `mynn_write_final!` (the run-end hook: folds the per-column counters, prints the
+# census line, and -- S9 -- writes the final sidecar snapshot) lives in src/mynn_io.jl,
+# included after this file, beside `mynn_write!` and the rest of the sidecar I/O.

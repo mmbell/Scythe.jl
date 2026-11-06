@@ -1,0 +1,4 @@
+# Legacy-pin overlay, stacked on tc_default.overlay.toml: SCYTHE_TC_WALL_BC=r1t1x.
+[boundary_conditions]
+vertical_scalars = "r1t1x"
+vertical_scalars_lid = "r1t1x"       # SCYTHE_TC_WALL_BC set both walls

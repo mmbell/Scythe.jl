@@ -1,0 +1,91 @@
+# Mesoscale warm bubble over a fixed-SST ocean: the boundary-layer / full-physics-suite
+# benchmark at production-like spacing (the TC coarse grid: 6 km x 500 m cells, 300 km x
+# 25 km), with surface fluxes and drag on. Lateral walls as O01; an RH-preserving 3 K
+# bubble of 30 km half-width (wider than O01's so the mesoscale grid resolves it).
+# MYNN + ice; no radiation (a 2-hour bubble does not feel it).
+#
+# The domain, grid, sounding, initial condition and environment are what this case IS, so
+# [run], [output], [grid], [boundary_conditions], [timestep], [reference_state], [initial_conditions] (and its
+# active [initial_conditions.temperature_bubble] sub-table) and [environment] are spelled
+# out here IN FULL -- every key, even where it equals the `RunConfig` struct default in
+# src/config.jl -- so a reader sees the whole case without opening that file. Most of
+# these values in fact ARE the struct defaults: this case differs from the generic
+# single-patch XZ default only in `run.name`/`integration_time`, `output.interval`,
+# `boundary_conditions.lateral` (walls, not periodic) and `initial_conditions.method`.
+#
+# [physics], [numerics] and [diagnostics] stay DELTA-ONLY (only keys that differ from the
+# struct default are listed): here that is just radiation off. The full resolved
+# configuration -- physics included -- is written to <output.dir>/scythe_config.toml at run start.
+
+[run]
+name             = "ocean_warm_bubble"
+equation_set     = "moist_compressible_XZ"
+integration_time = 7200.0            # 2 hours
+segment_length   = 0.0               # single segment (a 2 h run needs no restart chaining)
+
+[output]
+dir              = "output"          # relative to this file
+interval         = 300.0
+restart_interval = 21600.0           # unused (segment_length = 0 needs no chaining checkpoint)
+formats          = ["netcdf"]
+sidecars         = false             # per-tile MYNN / radiation NetCDF sidecars
+netcdf_grid      = "regular"
+netcdf_derivatives = false
+
+[grid]
+# 300 km x 25 km, 6 km x 500 m cells (the TC coarse-grid spacing): production-like without
+# the TC's multi-day spin-up. Single patch, lateral WALLS (O01's domain, not periodic).
+geometry    = "RiRk"                 # B-spline vertical
+boundaries  = [0.0, 300.0e3]
+num_cells   = [50]
+z_top       = 25.0e3
+num_cells_k = 50
+
+[boundary_conditions]
+# The boundary condition of every variable follows from these four family rules (plus any
+# per-variable [boundary_conditions.override] entries). The resolved per-variable table is
+# written to <output.dir>/boundary_conditions.toml and printed at startup; the tables for
+# every case are in simulations/README.md ("Boundary conditions").
+lateral           = "walls"          # LEFT and RIGHT (x = 0, 300 km): u and w Dirichlet (zero);
+                                     # every other variable Neumann (zero x-gradient)
+vertical_scalars  = "natural"        # GROUND of every variable except w (always Dirichlet
+                                     # zero): unconstrained, so the logarithmic surface layer
+                                     # is not forced to a constant gradient (d2 did that) --
+                                     # p, rho_d, nu_v, u, E_t, Q_ss, nu_c, nu_e
+vertical_scalars_lid = "natural"     # LID of the same family (w still Dirichlet zero):
+                                     # unconstrained. d2 at the lid drifts warm over days (2D
+                                     # RCE: lid T +0.5 K at 48 h, crash at 277 h); natural decays
+sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
+                                     # ice slots: unconstrained (their ground is always natural,
+                                     # so they fall out). The sedimentation FLUX is fitted with a
+                                     # zero-flux lid either way: nothing falls in from above
+
+[timestep]
+ts           = 0.5                   # [s]
+ts_per_patch = []                    # empty = single patch at ts
+scale        = 1.0
+
+[reference_state]
+sounding       = "@scythe/benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref"
+exact          = true
+consistent_qss = true
+hydrostatic    = true
+
+[initial_conditions]
+method = "temperature_bubble"
+
+[initial_conditions.temperature_bubble]
+# An RH-preserving warm ellipsoid, wide enough (30 km half-width, vs O01's 16 km) to be
+# resolved on this mesoscale grid.
+xc     = 150.0e3                     # bubble centre, horizontal [m] (domain midpoint)
+xr     = 30.0e3                      # horizontal half-width [m]
+zc     = 500.0                       # bubble centre, vertical [m]
+zr     = 3000.0                      # vertical half-depth [m]
+dT_max = 3.0                         # peak temperature perturbation [K]
+
+[environment]
+f_latitude = 15.0                    # [deg]; unused on this Cartesian (XZ) equation set
+sst        = 302.65                  # [K]
+
+[physics.radiation]
+scheme = "none"                      # a 2-hour bubble does not feel radiation

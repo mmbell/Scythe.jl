@@ -209,9 +209,18 @@ using Springsteel
                 options = Dict(:semiimplicit => false, :exact_reference_state => true),
             )
             ref2 = Scythe.exact_reference_state(model_exact, z, column)
+            # These bound the spectral-refit round-trip (write base -> read back -> refit), not
+            # the physics; the physics assertions above (saturation, reversible entropy,
+            # theta_e, hydrostatic residual) carry that. `saturated_hydrostatic_profile` is a
+            # fixed-iteration solver (n_outer/n_inner, no convergence tolerance) seeded from
+            # `ref`, so `base` is only converged to the level of its own hydrostatic residual
+            # (~5e-8). The tolerances therefore have to sit above that residual, not below it —
+            # the previous 1e-9/1e-6 values were pinned to one builder's exact arithmetic and
+            # tripped as soon as `calculate_reference_state` moved onto the shared Springsteel
+            # builder (a ~1e-9 change in the seed).
             @test maximum(abs.(ref2.sbar[:, 1] .- base.s)) < 1.0e-6
-            @test maximum(abs.(ref2.xibar[:, 1] .- base.xi)) < 1.0e-9
-            @test maximum(abs.(ref2.mubar[:, 1] .- base.mu)) < 1.0e-6
+            @test maximum(abs.(ref2.xibar[:, 1] .- base.xi)) < 1.0e-8
+            @test maximum(abs.(ref2.mubar[:, 1] .- base.mu)) < 1.0e-5
 
             # Moist bubble: theta_rho increased by the buoyancy factor at the
             # bubble center, saturation preserved, untouched outside
@@ -251,10 +260,10 @@ using Springsteel
                         max_trho_err = max(max_trho_err, abs(trho_pert - nominal))
                         outside_ok &= trho_pert >= -1.0e-6   # perturbation is buoyant
                     else
-                        # Untouched outside, modulo the spectral refit of the
-                        # exact reference (~1e-9)
-                        outside_ok &= abs(patch.physical[i, 1, 1]) < 1.0e-6
-                        outside_ok &= abs(patch.physical[i, 3, 1]) < 1.0e-6
+                        # Untouched outside, modulo the spectral refit of the exact reference
+                        # (bounded by the same round-trip error asserted above, not by physics)
+                        outside_ok &= abs(patch.physical[i, 1, 1]) < 1.0e-5
+                        outside_ok &= abs(patch.physical[i, 3, 1]) < 1.0e-5
                         outside_ok &= patch.physical[i, 6, 1] == base.mu_l[k]
                     end
                     i += 1
@@ -287,4 +296,336 @@ using Springsteel
             end
         end
     end
+
+    @testset "balanced modified-Rankine vortex" begin
+        import Springsteel.Thermodynamics: Rd, Rv, gravity
+
+        # ── v profile ──
+        Vmax = 15.0; RMW = 50.0e3; alpha = 0.3; v_top = 15.0e3
+        vfun(r, z) = Scythe.modified_rankine_v(r, z; Vmax, RMW, alpha, v_top)
+        @test vfun(0.0, 0.0) == 0.0
+        @test vfun(RMW, 0.0) == Vmax
+        @test vfun(25.0e3, 0.0) == 0.5 * Vmax                 # linear inside
+        @test vfun(2.0 * RMW, 0.0) ≈ Vmax * 0.5^alpha          # decay outside
+        @test vfun(RMW, 7.5e3) ≈ 0.5 * Vmax                    # linear in height
+        @test vfun(RMW, v_top) == 0.0
+        @test vfun(RMW, 20.0e3) == 0.0                         # clamped above
+
+        # ── thermal wind: no vortex leaves the background exactly ──
+        z = collect(0.0:125.0:25.0e3)
+        r_axis = collect(0.0:500.0:300.0e3)
+        nz = length(z); nr = length(r_axis)
+        # Analytic isothermal moist hydrostatic background (T0 = 300 keeps
+        # q = 10 g/kg comfortably subsaturated at the surface)
+        T0 = 300.0; q = 0.01; p0 = 1.0e5
+        Reff = Rd + q * Rv
+        pbar = @. p0 * exp(-(1.0 + q) * gravity * z / (Reff * T0))
+        rho_dbar = pbar ./ (Reff * T0)
+        rho_vbar = q .* rho_dbar
+        rho_tbar = rho_dbar .+ rho_vbar
+        lnrho = Scythe.thermal_wind_lnrho(r_axis, z, zeros(nz, nr), log.(rho_tbar))
+        @test lnrho ≈ repeat(log.(rho_tbar), 1, nr) atol = 0.0  # exact
+
+        flds0 = Scythe.balanced_vortex_fields(r_axis, z, pbar, rho_dbar, rho_vbar;
+                                              Vmax = 0.0, fcor = 3.775e-5)
+        @test flds0.rho_t ≈ repeat(rho_tbar, 1, nr)            # exactly background
+        @test flds0.n_supersat == 0
+        # With no vortex the pressure must be the REFERENCE pressure bitwise, not
+        # merely close: the hydrostatic integration is in perturbation form
+        # (dp'/dz = -rho_t' g), so rho_t' = 0 leaves p' = 0 identically. Rebuilding
+        # the full profile by quadrature instead accumulated error downward from
+        # the top -- on the TC's Dunion sounding that was 4.6 hPa and -12 K at the
+        # outer edge, which drove RH past saturation near the tropopause.
+        @test flds0.p == repeat(pbar, 1, nr)
+
+        # ── balanced vortex: residual, warm core, low center ──
+        flds = Scythe.balanced_vortex_fields(r_axis, z, pbar, rho_dbar, rho_vbar;
+                                             Vmax, RMW, alpha, v_top, fcor = 3.775e-5)
+        # The max residual lives exactly at the RMW, where the modified-Rankine
+        # kink makes the centered-difference metric first-order (0.006 at
+        # dr = 500 m, halving with dr); away from the kink the balance is tight.
+        @test flds.residual < 1.0e-2
+        offkink = 0.0
+        dpdrmax = 1.0e-300
+        for j in 2:nr-1, k in 1:nz
+            abs(r_axis[j] - RMW) > 3.0e3 || continue
+            dpdr = (flds.p[k, j+1] - flds.p[k, j-1]) / (r_axis[j+1] - r_axis[j-1])
+            r = r_axis[j]
+            C = r > 0.0 ? (flds.v[k, j]^2 / r) + (3.775e-5 * flds.v[k, j]) : 0.0
+            offkink = max(offkink, abs(dpdr - (flds.rho_t[k, j] * C)))
+            dpdrmax = max(dpdrmax, abs(dpdr))
+        end
+        @test offkink / dpdrmax < 1.0e-3
+        @test flds.n_supersat == 0
+        @test flds.p[1, 1] < flds.p[1, nr]                     # central pressure deficit
+        @test flds.Tk[10, 1] > flds.Tk[10, nr]                 # warm core aloft
+        @test all(isfinite, flds.rho_t) && all(flds.rho_t .> 0.0)
+        # v = 0 above v_top: density relaxes to the background there
+        k_top = findfirst(>=(16.0e3), z)
+        @test maximum(abs.(flds.rho_t[k_top:end, :] .- rho_tbar[k_top:end])) /
+              maximum(rho_tbar) < 1.0e-6
+    end
+
+    # ──────────────────────────────────────────────
+    # 8. moist_compressible temperature perturbations: the shared constant-pressure,
+    #    RH-preserving body behind the warm bubble and the RCE noise trigger.
+    # ──────────────────────────────────────────────
+
+    # A Spline x Chebyshev (RZ) patch carrying the full moist_compressible slot list.
+    function make_mc_patch(; num_cells=8, kDim=12, iMax=4000.0, kMax=3000.0,
+                           options=Dict{Symbol,Any}())
+        varlist = Scythe.mc_var_names(options; cyl=false)
+        vars = Dict(v => i for (i, v) in enumerate(varlist))
+        bc = Dict(v => NeumannBC() for v in keys(vars))
+        gp = GridParameters(
+            geometry = "RZ", num_cells = num_cells,
+            iMin = 0.0, iMax = iMax, kMin = 0.0, kMax = kMax, kDim = kDim,
+            BCL = bc, BCR = bc, BCB = bc, BCT = bc, vars = vars,
+        )
+        return gp, createGrid(gp)
+    end
+
+    # A moist, SUBSATURATED (RH = 0.8), cloud-free pressure reference on the patch levels.
+    # Subsaturated on purpose: the RH-preserving branch is only observable where the
+    # reference humidity is strictly between 0 and saturation.
+    function make_mc_ref(tmpdir, gp, patch; name="mc_pressure.ref")
+        gridpoints = getGridpoints(patch)
+        kDim = gp.kDim
+        z = gridpoints[1:kDim, 2]
+        Tk = 295.0 .- 0.0065 .* z
+        p_Pa = 100000.0 .* exp.(-z ./ 8500.0)
+        rho_v = 0.8 .* Springsteel.Thermodynamics.rho_v_sat.(Tk, p_Pa ./ 100.0)
+        rho_d = (p_Pa .- (Scythe.Rv .* Tk .* rho_v)) ./ (Scythe.Rd .* Tk)
+        f = Scythe.write_exact_ref_mc(joinpath(tmpdir, name), z, p_Pa, rho_d, rho_v,
+                                      zeros(kDim))
+        ref = Springsteel.exact_pressure_reference_state(f, z,
+                  Springsteel.reference_column(patch, gp))
+        return ref, gridpoints, z
+    end
+
+    function legacy_bubble!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                          ref::Springsteel.PressureReferenceState;
+                                          xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
+                                          dT_max=3.0, zcol=2,
+                                          condensate_transform::Symbol=:none,
+                                          condensate_mu=1.0e-7,
+                                          rain_transform::Symbol=:none, rain_mu=1.0e-7)
+        vars = patch.params.vars
+        # (No rho_t slot: it was deleted at Stage 4 of the rho_t retirement; the total is
+        # derived, rho_d + rho_v + ... , so the pre-refactor write of slot 3 went with it.)
+        p_i = vars["p"]; rho_d_i = vars["rho_d"]
+        et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = Scythe.mc_slot(vars, "rho_r")
+        rho_c_i = Scythe.mc_slot(vars, "rho_c")
+        # The prognostic VAPOR slot, present in every configuration of this set (see `MC_VARS`).
+        rho_v_i = Scythe.mc_slot(vars, "rho_v")
+        # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+        # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+        # threaded here — the same reason `rain_slot` needed none.
+        n_r_i = Scythe.mc_optional_slot(vars, "n_r")
+        ice_i = Scythe.mc_ice_slot_indices(vars)
+        # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+        # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+        # condition in this file is a state at rest or a buoyant bubble, neither of
+        # which carries resolved-scale turbulence; the taper spin-up the closure
+        # wants (options[:mynn_init]) is applied by the scheme, not here.
+        rho_e_i = Scythe.mc_optional_slot(vars, "rho_e")
+        kDim = patch.params.kDim
+        pbar = Springsteel.ref_pressure(ref); rho_dbar = Springsteel.ref_rho_d(ref); rho_tbar = Springsteel.ref_rho_t(ref)
+        rho_cbar = Springsteel.ref_rho_c(ref)
+        rho_vbar = Springsteel.ref_rho_v(ref)
+        E_tbar = Springsteel.ref_total_energy(ref); Q_ssbar = Springsteel.ref_qss(ref)
+
+        i = 1
+        for _ in 1:Springsteel.num_columns(patch)
+            for k in 1:kDim
+                # On a 3D cylindrical grid (zcol = 3) this is a WN0 torus bubble:
+                # column 1 is the radius and λ (column 2) does not enter.
+                x = gridpoints[i, 1]
+                z = gridpoints[i, zcol]
+                L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+                dT = L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+                p_ref = pbar[k, 1]                              # Pa
+                rho_dref = rho_dbar[k, 1]
+                rho_vref = rho_vbar[k, 1]
+                # Moist EOS reference temperature (matches the reference's own Tbar)
+                T_ref = p_ref / ((rho_dref * Scythe.Rd) + (rho_vref * Scythe.Rv))
+                Tk = T_ref + dT
+                rho_v = rho_vref
+                if dT > 0.0
+                    H = rho_vref / Springsteel.Thermodynamics.rho_v_sat(T_ref, p_ref / 100.0)
+                    rho_v = H * Springsteel.Thermodynamics.rho_v_sat(Tk, p_ref / 100.0)
+                end
+                rho_d = (p_ref - (rho_v * Scythe.Rv * Tk)) / (Scythe.Rd * Tk) # constant-pressure moist EOS
+                rho_t = rho_d + rho_v
+                q_v = rho_v / rho_d
+                E_t = (rho_d * Springsteel.Thermodynamics.internal_energy_bf02(Tk, q_v, 0.0)) + (rho_t * Scythe.gravity * z)
+                Q_ss = rho_v - Springsteel.Thermodynamics.rho_v_sat(Tk, p_ref / 100.0)
+                patch.physical[i, p_i, 1] = 0.0
+                patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
+                patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+                patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+                patch.physical[i, rho_r_i, 1] = Scythe.rain_slot(0.0, rain_transform, rain_mu)
+                patch.physical[i, rho_c_i, 1] =
+                    Scythe.condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+                # The moistened bubble's own vapor, against the DERIVED reference (the
+                # cloud-free base makes rho_cbar exactly 0.0 here, but the term is written out
+                # so this site cannot drift from the one the reconciliation differences).
+                patch.physical[i, rho_v_i, 1] =
+                    Scythe.vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1])
+                n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+                Scythe.seed_ice_zero!(patch.physical, i, ice_i)
+                rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
+                i += 1
+            end
+        end
+        return patch
+    end
+
+    @testset "moist_temperature_bubble_mc! is bitwise after the refactor" begin
+        # The bubble's slot arithmetic now lives in the shared
+        # `_moist_temperature_perturbation_mc!`; committed benchmark references (O01,
+        # ocean_warm_bubble, o01_axisym) pin its output, so the extraction has to be
+        # BITWISE, not merely close. `legacy_bubble!` above is the pre-refactor function
+        # pasted verbatim (only the internal names qualified for the test module).
+        mktempdir() do tmpdir
+            opts = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
+                                    :mynn => true)
+            gpA, pA = make_mc_patch(; options=opts)
+            gpB, pB = make_mc_patch(; options=opts)
+            refA, gptsA, _ = make_mc_ref(tmpdir, gpA, pA; name="a.ref")
+            refB, gptsB, _ = make_mc_ref(tmpdir, gpB, pB; name="b.ref")
+            @test gptsA == gptsB
+
+            cases = (
+                # The shipped defaults: xc = 75 km is off this small domain, so dT == 0
+                # everywhere and the pin covers the untouched write of every slot.
+                (;),
+                # A bubble that actually lands, with the transforms off...
+                (; xc=1500.0, xr=800.0, zc=1200.0, zr=700.0, dT_max=2.5),
+                # ...and the same one with the bhyp control-variable transforms on.
+                (; xc=1500.0, xr=800.0, zc=1200.0, zr=700.0, dT_max=2.5,
+                   condensate_transform=:bhyp, rain_transform=:bhyp),
+            )
+            for kw in cases
+                pA.physical .= 0.0
+                pB.physical .= 0.0
+                legacy_bubble!(pA, gptsA, refA; kw...)
+                Scythe.moist_temperature_bubble_mc!(pB, gptsB, refB; kw...)
+                @test pA.physical == pB.physical
+            end
+            # ...and the landing bubble is not a no-op, so the pin has something to pin.
+            @test maximum(abs.(pB.physical[:, pB.params.vars["E_t"], 1])) > 0.0
+        end
+    end
+
+    @testset "moist_temperature_noise_mc!" begin
+        mktempdir() do tmpdir
+            z_max = 1200.0
+            dT_max = 0.2
+            opts = Dict{Symbol,Any}(:rain_moments => 2, :ice_microphysics => :ishmael,
+                                    :mynn => true)
+            gp, patch = make_mc_patch(; num_cells=12, kDim=16, kMax=3000.0, options=opts)
+            ref, gpts, _ = make_mc_ref(tmpdir, gp, patch)
+            kDim = gp.kDim
+            ncols = Springsteel.num_columns(patch)
+            vars = patch.params.vars
+            pbar = Springsteel.ref_pressure(ref)
+            rho_dbar = Springsteel.ref_rho_d(ref)
+            rho_tbar = Springsteel.ref_rho_t(ref)
+            rho_cbar = Springsteel.ref_rho_c(ref)
+            rho_vbar = Springsteel.ref_rho_v(ref)
+
+            patch.physical .= 0.0
+            Scythe.moist_temperature_noise_mc!(patch, gpts, ref; z_max, dT_max, seed=20260915)
+            state = copy(patch.physical)
+
+            # ── determinism: the draw is a function of the seed and the grid alone ──
+            patch.physical .= 0.0
+            Scythe.moist_temperature_noise_mc!(patch, gpts, ref; z_max, dT_max, seed=20260915)
+            @test patch.physical == state
+            patch.physical .= 0.0
+            Scythe.moist_temperature_noise_mc!(patch, gpts, ref; z_max, dT_max, seed=20260916)
+            @test patch.physical != state
+            # ...and the RNG is seeded, never the global stream: drawing in between the two
+            # calls must not move the initial condition.
+            rand(1000)
+            patch.physical .= 0.0
+            Scythe.moist_temperature_noise_mc!(patch, gpts, ref; z_max, dT_max, seed=20260915)
+            @test patch.physical == state
+
+            # The dT_max = 0 write is the UNPERTURBED state (dT == 0 -> the branch is not
+            # taken anywhere), which is what the taper must reproduce above z_max.
+            patch.physical .= 0.0
+            Scythe.moist_temperature_noise_mc!(patch, gpts, ref; z_max, dT_max=0.0,
+                                               seed=20260915)
+            rest = copy(patch.physical)
+
+            # ── recover dT, RH and the untouched slots point by point ──
+            dT = zeros(ncols, kDim)
+            maxRH = 0.0
+            aloft_bitwise = true
+            i = 1
+            for c in 1:ncols
+                for k in 1:kDim
+                    zk = gpts[i, 2]
+                    p_ref = pbar[k, 1]
+                    T_ref = p_ref / ((rho_dbar[k, 1] * Scythe.Rd) +
+                                     (rho_vbar[k, 1] * Scythe.Rv))
+                    rho_d = state[i, vars["rho_d"], 1] + rho_dbar[k, 1]
+                    rho_v = state[i, vars["rho_v"], 1] +
+                            (rho_tbar[k, 1] - rho_dbar[k, 1] - rho_cbar[k, 1])
+                    Tk = p_ref / ((rho_d * Scythe.Rd) + (rho_v * Scythe.Rv))
+                    dT[c, k] = Tk - T_ref
+                    RH = rho_v / Springsteel.Thermodynamics.rho_v_sat(Tk, p_ref / 100.0)
+                    RH_ref = rho_vbar[k, 1] /
+                             Springsteel.Thermodynamics.rho_v_sat(T_ref, p_ref / 100.0)
+                    maxRH = max(maxRH, abs(RH - RH_ref) / RH_ref)
+                    if zk >= z_max
+                        aloft_bitwise &= state[i, :, 1] == rest[i, :, 1]
+                    end
+                    i += 1
+                end
+            end
+
+            # Amplitude. The DRAW is bounded by dT_max exactly; removing the per-level
+            # mean can then carry a point past that bound by |m_k|, which is the mean of
+            # `ncols` deviates uniform on [-dT_max, dT_max] and so has RMS
+            # dT_max/sqrt(3 ncols). The hard bound is 2 dT_max and the 4-sigma bound is
+            # below; on this grid the realized excess is ~8 %. Neither is a fitted number:
+            # if the mean removal is ever dropped the first becomes tight at dT_max.
+            @test maximum(abs.(dT)) <= 2.0 * dT_max
+            @test maximum(abs.(dT)) <= dT_max * (1.0 + 4.0 / sqrt(3.0 * ncols))
+            # ...and it is large enough to be a real trigger.
+            @test maximum(abs.(dT)) > 0.3 * dT_max
+            # Both signs are present -- the RH-preserving branch now admits dT < 0.
+            @test minimum(dT) < 0.0 && maximum(dT) > 0.0
+
+            # Taper: NOTHING is seeded at or above z_max, bitwise (not just small).
+            @test aloft_bitwise
+            # ...and the surface level is where the amplitude lives.
+            @test maximum(abs.(dT[:, 1])) > maximum(abs.(dT[:, kDim]))
+
+            # Mean removal: the domain-mean state is unperturbed at EVERY level, to the
+            # round-off of the mean itself (the recovery is a floating-point inverse).
+            @test maximum(abs(sum(view(dT, :, k)) / ncols) for k in 1:kDim) < 1.0e-11
+
+            # Relative humidity is preserved at every point, warmed and cooled alike.
+            @test maxRH < 1.0e-12
+
+            # Constant pressure, and every non-thermodynamic slot seeded exactly as the
+            # bubble seeds it: zero.
+            @test all(state[:, vars["p"], 1] .== 0.0)
+            @test all(state[:, vars["rho_r"], 1] .== 0.0)
+            @test all(state[:, vars["rho_c"], 1] .== 0.0)   # rho_cbar == 0 on this base
+            @test all(state[:, vars["n_r"], 1] .== 0.0)
+            @test all(state[:, vars["rho_e"], 1] .== 0.0)
+            for nm in Scythe.ice_var_names(opts)
+                @test all(state[:, vars[nm], 1] .== 0.0)
+            end
+            # The thermodynamic slots did move.
+            @test maximum(abs.(state[:, vars["E_t"], 1])) > 0.0
+            @test maximum(abs.(state[:, vars["Q_ss"], 1])) > 0.0
+        end
+    end
+
 end

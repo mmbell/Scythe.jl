@@ -12,8 +12,141 @@ using SparseArrays
 using SuiteSparse
 
 # Need to export these for distributed operations in Main namespace
-export createModelTile, advanceTimestep
+export createModelTile, advanceTimestep, advanceTimestepA, advanceTimestepB
 export initialize_model, run_model, finalize_model
+
+"""
+    MCSlots
+
+Resolved indices of the moist-compressible set's APPENDED prognostic slots.
+
+Slots 1-9 (and `v` at 10 on the cylindrical/3-D variants) are hardcoded literals throughout
+`mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`. Everything after that block is
+APPENDED, so its index depends on the geometry — the rain number `n_r` is 10 on the XZ slice
+and 11 wherever `v` is carried — and the ONLY way to know it is by name, through
+`Scythe.mc_var_names(options)` and `mc_slot`. The prognostic vapor is slot 3 on every
+geometry since Stage 4 of the ρ_t retirement, and is resolved by name like the rest.
+
+That lookup is a `Dict{String,Int}` hash and the driver runs once per COLUMN, so it is done
+exactly once, here, when the tile is built. A field per slot, all `Int`, all `0` when the
+slot is not registered: concrete, so `ModelTile` stays fully typed and the driver's
+`mtile.mc_slots.n_r` is a load, and extensible without adding a type parameter (which a
+`NamedTuple` field would have forced onto `ModelTile` and through every method signature
+that touches it).
+
+`0` means ABSENT for the OPTIONAL slots. The driver tests `> 0` rather than re-reading the
+option, so the slot's existence and the physics that writes it cannot disagree. `rho_v` is
+the exception: it is not optional, so it is resolved with the THROWING [`mc_slot`](@ref) for
+every moist-compressible set and a `vars` dict that lacks it fails here, at tile creation,
+rather than writing the vapor tendency into whatever slot happened to be at that index.
+
+The ICE family is laid out flat and species-major, `i<k>_<moment>`, rather than as a nested
+`NTuple{3,NTuple{4,Int}}`: `mtile.mc_slots.i2_a` is then a plain field load with a literal
+offset, which is what the per-column driver wants, and [`ice_slots`](@ref) rebuilds the
+per-species 4-tuple for the loops of the process rates, which is what the microphysics wants.
+Both are free; a nested layout would have made the first one an index computation.
+"""
+struct MCSlots
+    """
+    Prognostic vapor perturbation, ρ_v' [kg/m³] (ν_v' under the vapor control variable) — slot
+    3 on every geometry since Stage 4 of the ρ_t retirement. Present in EVERY
+    moist-compressible configuration (0 only for a non-mc set).
+    """
+    rho_v::Int
+    "Prognostic rain number density [#/m³] under `options[:rain_moments] = 2`; 0 otherwise."
+    n_r::Int
+    # ── Ice, `options[:ice_microphysics] = :ishmael` (12 slots, appended after n_r) ──
+    # Species 1 = planar-nucleated crystals. `_q` mass [kg/m³], `_n` number [#/m³],
+    # `_a`/`_c` the two spheroid volume moments [m³/m³]. See `MC_ICE_VARS`.
+    i1_q::Int; i1_n::Int; i1_a::Int; i1_c::Int
+    "Species 2 = columnar-nucleated crystals."
+    i2_q::Int; i2_n::Int; i2_a::Int; i2_c::Int
+    "Species 3 = aggregates."
+    i3_q::Int; i3_n::Int; i3_a::Int; i3_c::Int
+    """
+    Prognostic TKE density ρ_e = ρ_t·e [J/m³] under `options[:mynn]`; 0 otherwise. Appended
+    AFTER the ice family so the twelve ice indices stay contiguous whatever else is on.
+    """
+    rho_e::Int
+end
+
+"""All slots absent — the state of every NON-mc equation set."""
+MCSlots() = MCSlots(0, 0, ntuple(_ -> 0, 12)..., 0)
+
+"""
+    ice_slots(s::MCSlots, k) -> NTuple{4,Int}
+
+The `(mass, number, a, c)` slot indices of ice species `k ∈ {1,2,3}`, all `0` when ice is not
+registered. The per-species view of the flat layout, for code that loops over species; the
+driver's straight-line blocks read the fields directly.
+"""
+@inline ice_slots(s::MCSlots, k::Int) =
+    k == 1 ? (s.i1_q, s.i1_n, s.i1_a, s.i1_c) :
+    k == 2 ? (s.i2_q, s.i2_n, s.i2_a, s.i2_c) :
+             (s.i3_q, s.i3_n, s.i3_a, s.i3_c)
+
+"""True when the twelve ice slots are registered. `mass of species 1 > 0` is the witness."""
+@inline ice_registered(s::MCSlots) = s.i1_q > 0
+
+"""
+    mc_slots(model) -> MCSlots
+
+Resolve the appended slots of [`MCSlots`](@ref) from a model's options and `vars`, once.
+Every field is 0 for a non-mc equation set, and the OPTIONAL fields are 0 for an mc set that
+declares no optional slot. `rho_v` is not optional and is resolved with the throwing
+[`mc_slot`](@ref): a `vars` dict built from a stale name list must fail here.
+"""
+function mc_slots(model::ModelParameters)
+    uses_pressure_reference(model.equation_set) || return MCSlots()
+    vars = model.grid_params.vars
+    # Defined in moist_compressible.jl, included after this file; resolved at call time.
+    rv = mc_slot(vars, "rho_v")
+    nr = rain_moments(model.options) == 2 ? mc_slot(vars, "n_r") : 0
+    # The MYNN TKE density, resolved by name on the same rule: the option DECLARES the slot,
+    # so a `vars` built from a stale name list must fail here and not at the first column.
+    re = get(model.options, :mynn, false) === true ? mc_slot(vars, "rho_e") : 0
+    if ice_microphysics(model.options) !== :ishmael
+        return MCSlots(rv, nr, ntuple(_ -> 0, 12)..., re)
+    end
+    # `MC_ICE_VARS` is species-major and in registration order, so the twelve resolved
+    # indices land on the twelve fields in declaration order with no reshuffling.
+    return MCSlots(rv, nr, ntuple(j -> mc_slot(vars, MC_ICE_VARS[j]), 12)..., re)
+end
+
+"""
+    MCSpeciesColumns
+
+The per-slot COLUMN HOME of the moist-compressible driver: the Jacobian `J = dν/dρ` and the
+recovered density `ρ` of each prognostic slot, per thread (`[slot, tid]`, each a kDim column),
+and each slot's control-variable reference `ν̄` and its vertical gradient (`[slot]`, kDim
+columns; the vapor's is `bhyp(ρ̄_v)`, bitwise `ρ̄_v` under `:none`; an empty vector for a slot
+with none). A `mutable struct` with `const` fields behind accessors, so the tile carries one
+pointer — the shape the compile-cliff handoff verified is safe (reference/
+HANDOFF_DRIVER_COMPILE_CLIFF.md §3, IshmaelTables / EnergyBudget precedents), where another
+scratch NamedTuple field or `mc_ref_diag` member is not. A new species is a new slot index
+here, not a new aggregate field. Today the vapor's `J` ([`jacobian_column`](@ref)) and `ν̄_v`,
+`ν̄_v,z` ([`mc_nu_vbar`](@ref)) live here; `rho` is allocated for the recovered columns that
+move here later.
+"""
+mutable struct MCSpeciesColumns
+    const J::Matrix{Vector{Float64}}        # [slot, tid]  dν/dρ per prognostic slot
+    const rho::Matrix{Vector{Float64}}      # [slot, tid]  recovered density where the slot is ν
+    const nu_bar::Vector{Vector{Float64}}   # [slot]       reference ν̄ (kDim), empty if none
+    const nu_bar_z::Vector{Vector{Float64}} # [slot]       its vertical gradient
+end
+
+"""All columns absent — the state of every non-mc equation set."""
+MCSpeciesColumns() = MCSpeciesColumns(Matrix{Vector{Float64}}(undef, 0, 0),
+                                      Matrix{Vector{Float64}}(undef, 0, 0),
+                                      Vector{Float64}[], Vector{Float64}[])
+
+"""
+    jacobian_column(C::MCSpeciesColumns, slot, tid) -> Vector{Float64}
+
+Thread `tid`'s Jacobian column `dν/dρ` of prognostic slot `slot` (the vapor's is written by
+`_vapor_bhyp_stage!` under `options[:vapor_transform] = :bhyp` and read nowhere under `:none`).
+"""
+@inline jacobian_column(C::MCSpeciesColumns, slot::Int, tid::Int) = @inbounds C.J[slot, tid]
 
 """
     ModelTile
@@ -21,28 +154,412 @@ export initialize_model, run_model, finalize_model
 Fundamental computational unit holding model state, tendencies, reference state,
 and spectral transform infrastructure for a single tile in the domain decomposition.
 """
-struct ModelTile
+struct ModelTile{G<:AbstractGrid, R<:AbstractReferenceState,
+                 H<:Factorization, D<:Factorization, MC<:NamedTuple, N, KC, SD, MSC,
+                 SWS<:NamedTuple}
     model::ModelParameters
-    tile::AbstractGrid
-    var_np1::Array{Float64}
-    expdot_incr::Array{Float64}
-    expdot_n::Array{Float64}
-    expdot_nm1::Array{Float64}
-    expdot_nm2::Array{Float64}
-    impdot_np1::Array{Float64}
-    impdot_n::Array{Float64}
-    impdot_nm1::Array{Float64}
-    impdot_nm2::Array{Float64}
-    tilepoints::Array{Float64}
-    ref_state::ReferenceState
+    # Concretely typed, so `mtile.tile.physical` and `mtile.tile.kbasis` infer. Declaring
+    # this `AbstractGrid` made every view and broadcast in the per-column equation-set
+    # bodies fall back to `Any` and box, which is what drove the GC over (12.6e9 pool
+    # allocations in a 900 s straka93 run). Springsteel's grids are already concrete.
+    tile::G
+    var_np1::Matrix{Float64}
+    expdot_incr::Matrix{Float64}
+    expdot_n::Matrix{Float64}
+    expdot_nm1::Matrix{Float64}
+    expdot_nm2::Matrix{Float64}
+    impdot_n::Matrix{Float64}
+    impdot_nm1::Matrix{Float64}
+    impdot_nm2::Matrix{Float64}
+    # Rank-parameterized, NOT `Matrix`: `getGridpoints` returns a bare `Vector` for the 1-D
+    # geometries (it hands back `ibasis.data[1,1].mishPoints` directly) and a matrix for
+    # everything else — which is why the reference-state setup below reads
+    # `tilepoints[:, ndims(tilepoints)]`.
+    tilepoints::Array{Float64, N}
+    ref_state::R
     patchMap::SparseMatrixCSC{Float64, Int64}
     haloSendMap::SparseMatrixCSC{Float64, Int64}
     haloReceiveMap::SparseMatrixCSC{Float64, Int64}
-    haloReceiveBuffer::Array{Float64}
-    splineBuffer::Array{Float64}
+    haloReceiveBuffer::Vector{Float64}
     patch_b_iDim::Int64
-    h_matrix::Factorization
-    diffusion_matrix::Factorization
+    # Parameterized rather than pinned to a single factorization type: the concrete type
+    # varies with both the grid and the run configuration. `h_matrix` is a `SplineFactor`
+    # (a factorization plus its Dirichlet flags) on RiRk and an `LU` over a
+    # `Matrix` when semi-implicit is on but an `LU` over a `Tridiagonal` (the 2x2 dummy)
+    # when it is off; `diffusion_matrix` is a `BunchKaufman` on RiRk and an `LU` on RZ.
+    h_matrix::H
+    diffusion_matrix::D
+    # Implicit vertical-diffusion tendency history, separate from `impdot_*`. The
+    # acoustic solvers own the `impdot` slots of every variable they touch (p, rho_d,
+    # rho_t, w, E_t), so a set that wants implicit vertical diffusion on w — or on a
+    # DIAGNOSED scalar such as the moist_compressible potential temperature — has no
+    # free `impdot` column to store its AI2* history in. `diffdot_*` is that channel.
+    # Only `moist_compressible_XZ` uses it; the older sets still stage their (currently
+    # unconsumed) vertical diffusion in `impdot`.
+    diffdot_n::Matrix{Float64}
+    diffdot_nm1::Matrix{Float64}
+    # Horizontal-acoustic AI2* history channel for options[:horizontal_semiimplicit]
+    # (mc sets only; zero-size otherwise). Separate from `impdot_*` for the same
+    # reason `diffdot_*` is: the vertical acoustic solve owns the impdot slots of
+    # p/rho_d/rho_t/E_t, and the horizontal legs need their own history levels.
+    # The u column is the stored applied increment of the patch-level sweep
+    # (`horizontal_si_load_increment!`); the rest are staged fresh in `mc_driver!`.
+    hacdot_n::Matrix{Float64}
+    hacdot_nm1::Matrix{Float64}
+    # Per-variable vertical-diffusion factorizations for the total-energy set, keyed
+    # :u/:w/:heat and :u_first/:w_first/:heat_first. Empty NamedTuple for other sets.
+    #
+    # A NamedTuple rather than a Dict because these six are NOT all the same concrete type:
+    # the boundary conditions differ per variable, which flips `factorize`'s symmetry
+    # detection, so on RiRk `u` comes back an `LU` while `w` comes back a `BunchKaufman`.
+    # A Dict would have to widen its value type to the abstract `Factorization` join and
+    # box on every lookup, in the hot path. A NamedTuple is concrete AND heterogeneous.
+    mc_diffusion_matrices::MC
+    # Reusable vertical work columns, indexed [thread, variable]. The equation sets used to
+    # `deepcopy(tile.kbasis.data[v])` a fresh column per variable, PER COLUMN, PER TIMESTEP —
+    # 93 allocations a pop, and 60% of all remaining per-column allocations. The copy only
+    # exists to get private `uMish`/`b`/`a` work vectors; it also clones the (read-only) basis
+    # matrices and factorizations, which is the expensive part.
+    #
+    # Indexed by thread, not by column: per-column scratch would need 2.9 GB on a full-mode RZ
+    # run (1536 columns x 1.9 MiB), whereas per-thread needs ~90 MiB. Safe because the column
+    # loop in `advanceTimestep` is `@threads :static`, which pins each iteration to a fixed
+    # thread, so `threadid()` is a stable owner tag. Per-VARIABLE as well as per-thread because
+    # callers hold two columns live at once (`semiimplicit_adjustment_p` reads `p_nstar`, which
+    # aliases the p-column's `uMish`, after transforming the w-column) and because
+    # `Btransform!`/`Atransform!` consult the column's own boundary conditions.
+    #
+    # Empty (`Matrix{Nothing}`) for grids with no vertical basis — `NoBasisArray` has no `data`.
+    scratch_columns::Matrix{KC}
+    # The SEDIMENTATION-FLUX fit columns, indexed [thread, variable] exactly like
+    # `scratch_columns`: each is variable `v`'s own vertical basis (its bottom BC, its l_q,
+    # its cells) with the TOP boundary replaced by a homogeneous Dirichlet (R1T0), so a
+    # fitted sedimentation flux is exactly zero at the lid whatever the slot's own lid BC is.
+    # No hydrometeor can enter through the lid; a flux fitted on a Natural (R0) lid instead
+    # carries whatever the interior extrapolates to, i.e. inflow from above, and where the
+    # fall speed increases upward that inflow is a linear instability (e-folding ~35 s, the
+    # 2026-09 production ice TC death). Built ONCE here from the shared Springsteel spline
+    # template (only the work vectors are per-thread), read through [`flux_column`](@ref).
+    # ALIASES `scratch_columns` (no lid closure) on a Chebyshev k-basis, whose Dirichlet is a
+    # non-conservative point clamp — see `_allocate_flux_columns`.
+    flux_columns::Matrix{KC}
+    # Galerkin solve data (M0, M1, W, Nb) for a cubic B-spline k-basis; `nothing` otherwise.
+    # `_vertical_solve!` used to fetch this from a global Dict behind a global lock on EVERY
+    # call — 4 solves x every column x every timestep, from every thread. It is per-grid and
+    # invariant, so it is hoisted here.
+    solve_data::SD
+    # Per-thread work vectors for `_vertical_solve!`, columns indexed by threadid() (same
+    # `@threads :static` ownership rule as `scratch_columns`).
+    solve_rhs::Matrix{Float64}    # (nmish, nthreads) — W .* rhs_mish, B-spline path only
+    solve_load::Matrix{Float64}   # (nload, nthreads) — the Helmholtz load vector / RHS
+    # One NamedTuple of kDim work vectors per thread, for `moist_compressible_XZ`'s 42 live
+    # broadcast temporaries (`p = pp .+ pbar` and friends). Empty for every other set.
+    # See `_allocate_mc_scratch` for why these are keyed by NAME rather than by index.
+    mc_scratch::MSC
+    # Indices of the mc set's OPTIONAL, APPENDED prognostic slots, resolved by name ONCE
+    # here so the per-column driver never pays (nor risks) a name lookup. See `MCSlots`.
+    mc_slots::MCSlots
+    # Consistently-retrieved diagnostics of the RESTING reference for the total-energy
+    # set's vertical moist diffusion: s_tbar and rho_vbar computed through the SAME
+    # retrieval pipeline the equation set runs each step, so at rest the diffused
+    # perturbations s_t' and rho_v' are zero BIT-FOR-BIT and diffusion cannot cook the
+    # base (the reference's own Tbar is not bit-identical to the retrieved T). Empty
+    # vectors for every other equation set. `Tbar` is the resting temperature in the run's
+    # `options[:temperature]` mode (see `mc_reference_diagnostics`).
+    # (The vapor control variable's reference `nu_vbar`/`nu_vbar_z` and the derived total
+    # reference `rho_tbar_w`/`_z` of `mc_reference_diagnostics` are NOT here but in
+    # `ebudget` — see `mc_nu_vbar`: widening this NamedTuple by four fields took the first
+    # call of `moist_compressible_SLR` over the LLVM cliff, measured 2026-10-20.)
+    mc_ref_diag::NamedTuple{(:s_tbar, :rho_vbar, :rho_vbar_z, :Pxi_prof, :Tbar),
+                            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64},
+                                  Vector{Float64}, Vector{Float64}}}
+    # One NamedTuple of full-tile-length work vectors for `Twoway_PV_mixing`'s 13 broadcast
+    # temporaries. Empty for every other set. See `_allocate_sw_scratch` for why there is one
+    # workspace per TILE here rather than one per thread as `mc_scratch` has.
+    sw_scratch::SWS
+    # Negative-water statistics for the mc sets, accumulated per thread (same
+    # `@threads :static` ownership rule as `scratch_columns`) and reduced on read by
+    # [`water_negativity_report`](@ref). `MC_WATER_STATS` names the rows; zero columns
+    # for every non-mc set.
+    #
+    # Measured on EVERY step whether or not the positivity floor is applied, because the
+    # amount of negative water is a resolution diagnostic in its own right: a
+    # positive-definite cloud or rain spike that the vertical B-spline basis cannot
+    # resolve undershoots on the way in, and the size of that undershoot is the signal
+    # that the column wants more nodes. See `clamp_water!`.
+    mc_water_stats::Matrix{Float64}
+    # Per-gridpoint history of each water channel's NET MICROPHYSICS tendency, three levels,
+    # `MC_MICRO_*` naming the three columns. Separate from `expdot_*` because the depletion
+    # caps have to bound what the PHASE CHANGES contribute to the next state, which by
+    # linearity of the AB3 operator is the increment evaluated on this history alone — the
+    # slot tendency also carries advection, compressibility and sedimentation, none of which
+    # a microphysical rate limiter has any business compensating for. Zero columns for every
+    # non-mc set. See `_ab3_sink_bound` and `_rotate_micro_history!`.
+    mc_micro_n::Matrix{Float64}
+    mc_micro_nm1::Matrix{Float64}
+    mc_micro_nm2::Matrix{Float64}
+    # ISHMAEL's four collection lookup tables plus the inherent-growth-ratio curve, loaded
+    # ONCE here (44.5 MB of JLD2 plus a `mkcoltb` build) and read by the per-column ice
+    # microphysics through a plain field load. `EMPTY_ISHMAEL_TABLES` — not `nothing` —
+    # whenever ice is off, so the field stays CONCRETE and `mtile.ishmael_tables.itab`
+    # infers to `Array{Float64,5}` inside the driver. See `mc_ishmael_tables`.
+    ishmael_tables::IshmaelTables
+    # The tile's radiative heating field and everything needed to recompute it, or
+    # `EMPTY_RADIATION` when `options[:radiation]` is absent. CONCRETE, not
+    # `Union{RadiationState,Nothing}`, for the same reason `ishmael_tables` is: the driver
+    # reads `mtile.radiation.active` in its preamble and `mtile.radiation.q_lw` inside the
+    # per-column hot path, and a Union field makes both loads type-unstable. See
+    # `mc_radiation_state` (src/radiation.jl) and `EMPTY_RADIATION`
+    # (src/radiation_state.jl). Per-tile = per-worker, so nesting and distribution are free.
+    radiation::RadiationState
+    # The tile's MYNN-EDMF boundary-layer state (held column fields, the exchange
+    # coefficients, the per-thread closure work space), or `EMPTY_MYNN` when
+    # `options[:mynn]` is absent or false. CONCRETE, not `Union{MYNNState,Nothing}`, for
+    # exactly the reason `radiation` is: the driver reads `mtile.mynn.active` in its
+    # preamble and would read its arrays inside the per-column hot path, and a Union field
+    # makes both loads type-unstable. See `mc_mynn_state` and `EMPTY_MYNN`
+    # (src/mynn_state.jl).
+    mynn::MYNNState
+    # The tile's per-column surface-exchange diagnostics (stage N2), or
+    # [`EMPTY_SURFACE_DIAG`](@ref) when this run has no surface layer. CONCRETE for the
+    # third time and for the third identical reason: `mc_louis_bl!` and `mc_mynn_bl!`
+    # read `mtile.surface.active` once per column, immediately after the
+    # `surface_exchange` call, and a Union field would make that load type-unstable in
+    # the hot path. See `mc_surface_diag` and `surface_record!`
+    # (src/mc_surface_layer.jl).
+    #
+    surface::SurfaceDiag
+    # The tile's per-operator energy-budget state ([`EnergyBudget`](@ref),
+    # src/energy_budget.jl): the column quadrature and reference profiles every
+    # moist-compressible tile carries (the energy census reads them), plus — only under
+    # `options[:energy_budget]` — the accumulators and work columns of the budget hooks.
+    # CONCRETE for the `surface` reason (the driver reads `mtile.ebudget.active` once per
+    # column), and held HERE rather than in `mc_scratch`, whose NamedTuple sits at the LLVM
+    # compile cliff (`MC_SCRATCH_SLOTS`).
+    #
+    # LAST field deliberately: every positional `ModelTile(...)` construction in the tree
+    # is the one in `createModelTile` below, so appending here is a one-line change there.
+    ebudget::EnergyBudget
+    # The per-slot Jacobian / recovered / reference columns ([`MCSpeciesColumns`](@ref)),
+    # appended after `ebudget` for the same one-line reason; concrete, one pointer.
+    species::MCSpeciesColumns
+end
+
+"""
+    scratch_column(mtile, var_index)
+
+The calling thread's reusable vertical work column for variable slot `var_index`.
+Replaces `deepcopy(mtile.tile.kbasis.data[var_index])` in the per-column hot path.
+
+The contents carry no meaning between uses: every caller either overwrites `uMish` before
+transforming, or has `_vertical_solve!` set `a` outright.
+"""
+@inline function scratch_column(mtile::ModelTile, var_index::Int64)
+    return @inbounds mtile.scratch_columns[Threads.threadid(), var_index]
+end
+
+"""
+    flux_column(mtile, var_index)
+
+The calling thread's SEDIMENTATION-FLUX fit column for variable slot `var_index`: that
+slot's vertical basis with a zero-value (Dirichlet, R1T0) lid, so `F = 0` at the top of the
+domain and nothing falls in from above. The ground keeps the slot's own condition (Natural
+for every sedimenting slot, so the flux is free to carry the fall-out). Same ownership rule
+and same "contents carry no meaning between uses" contract as [`scratch_column`](@ref).
+
+B-spline verticals only: on a Chebyshev vertical this IS `scratch_column` (the slot's own
+lid), because Springsteel's Chebyshev Dirichlet is a non-conservative point clamp — see
+`_allocate_flux_columns`.
+"""
+@inline function flux_column(mtile::ModelTile, var_index::Int64)
+    return @inbounds mtile.flux_columns[Threads.threadid(), var_index]
+end
+
+"""
+    sedimentation_flux_column(fcols, scols, var_index, dirichlet_lid) -> column
+
+The column a sedimentation flux of slot `var_index` is fitted on: the calling thread's
+[`flux_column`](@ref) (zero-flux lid) when `dirichlet_lid`, else the slot's own
+[`scratch_column`](@ref) — the pre-fix behaviour, kept only as the
+`options[:sedimentation_flux_lid] = :natural` forensics switch. Takes the tile's
+`flux_columns`/`scratch_columns` matrices rather than the tile (the driver stages never take
+the tile); `sedimentation_flux_column(mtile, var_index, dirichlet_lid)` forwards to it, for
+direct callers (test_moist_compressible's lid tests) — the same object either way.
+"""
+@inline sedimentation_flux_column(fcols::AbstractMatrix, scols::AbstractMatrix,
+                                  var_index::Int64, dirichlet_lid::Bool) =
+    dirichlet_lid ? (@inbounds fcols[Threads.threadid(), var_index]) :
+                    (@inbounds scols[Threads.threadid(), var_index])
+@inline sedimentation_flux_column(mtile::ModelTile, var_index::Int64, dirichlet_lid::Bool) =
+    sedimentation_flux_column(mtile.flux_columns, mtile.scratch_columns, var_index,
+                              dirichlet_lid)
+
+"""Reusable per-thread vertical work columns, or an empty matrix if the grid has no k-basis."""
+_allocate_scratch_columns(::NoBasisArray, tile::AbstractGrid) = Matrix{Nothing}(undef, 0, 0)
+
+function _allocate_scratch_columns(kbasis, tile::AbstractGrid)
+    nthreads = Threads.maxthreadid()
+    nvars = size(tile.physical, 2)
+    return [deepcopy(_kbasis_column(kbasis, v)) for _ in 1:nthreads, v in 1:nvars]
+end
+
+"""
+    _kbasis_column(kbasis, v) -> the vertical basis object of variable `v`
+
+Every geometry but one carries ONE k spline (or Chebyshev column) per variable,
+`kbasis.data[v]`. The 3-D Cartesian box (RRR) carries one per (i, j) column,
+`kbasis.data[r, l, v]`, all with the variable's own parameters (the vertical is never
+decomposed), so its template is `data[1, 1, v]` -- the linear index `data[v]` would be
+column `(v, 1)` of variable 1 there.
+"""
+@inline _kbasis_column(kbasis, v::Integer) = _kbasis_column_data(kbasis.data, v)
+@inline _kbasis_column_data(data::AbstractArray{<:Any,3}, v::Integer) = data[1, 1, v]
+@inline _kbasis_column_data(data, v::Integer) = data[v]
+
+"""
+    _allocate_flux_columns(kbasis, tile, scratch_columns) -> Matrix
+
+The per-thread sedimentation-flux fit columns ([`flux_column`](@ref)): variable `v`'s
+B-spline k-basis parameters with the TOP boundary (the lid, `BCR`) replaced by
+`CubicBSpline.R1T0` (F = 0) and the bottom, cells and l_q unchanged. Built once, here.
+
+B-spline: the spline matrices and factorization come from Springsteel's template cache
+(keyed by the parameters, read-only in every transform), so all threads and every variable
+with the same bottom BC and l_q share ONE of them; only the work vectors are per column. The
+positivity lower bound is NOT carried: a flux is signed, and `Atransform!` is the unbounded
+solve anyway.
+
+Chebyshev (the RZ grids; no production run uses one): NOT closed — the flux columns ARE
+the scratch columns, i.e. the slot's own lid BC, as before. Springsteel's Chebyshev
+Dirichlet (`Chebyshev.R1T0`) is a point clamp: it adds a multiple of the top node's cardinal
+polynomial, which zeroes the top VALUE but leaves a derivative that is not the derivative of
+those values — on a 16-level column the exact quadrature integral of the fitted `∂F/∂z`
+missed `F(H) − F(0)` by 13 % on a smooth linear flux and by 96 % on a seeded top-level ice
+population, so a clamped flux DESTROYS water rather than stopping
+the inflow (measured 2026-09-26). The B-spline R1T0 is a genuine basis restriction and its
+divergence telescopes exactly.
+
+A grid with no k-basis gets the (empty) scratch matrix itself.
+"""
+_allocate_flux_columns(::NoBasisArray, tile::AbstractGrid, scratch) = scratch
+
+function _allocate_flux_columns(kbasis, tile::AbstractGrid, scratch)
+    nthreads, nvars = size(scratch)
+    if eltype(scratch) <: CubicBSpline.Spline1D
+        # A periodic vertical (no mc set has one) has no lid to close: keep that basis.
+        lid = [let p = _kbasis_column(kbasis, v).params
+                   p.BCL == CubicBSpline.PERIODIC ? p :
+                   CubicBSpline.SplineParameters(xmin = p.xmin, xmax = p.xmax,
+                       num_cells = p.num_cells, mubar = p.mubar, quadrature = p.quadrature,
+                       l_q = p.l_q, BCL = p.BCL, BCR = CubicBSpline.R1T0)
+               end for v in 1:nvars]
+        return [CubicBSpline.Spline1D(lid[v]) for _ in 1:nthreads, v in 1:nvars]
+    end
+    return scratch
+end
+
+"""
+    _allocate_solve_workspace(kbasis, tile) -> (solve_data, solve_rhs, solve_load)
+
+Hoist `_vertical_solve!`'s per-call work out of the hot path: the B-spline Galerkin solve data
+(fetched behind a global lock on every call before this) and the per-thread work vectors.
+"""
+_allocate_solve_workspace(::NoBasisArray, tile::AbstractGrid) =
+    (nothing, zeros(Float64, 0, 0), zeros(Float64, 0, 0))
+
+function _allocate_solve_workspace(kbasis, tile::AbstractGrid)
+    nthreads = Threads.maxthreadid()
+    kcol = kbasis.data[1]
+    if kcol isa CubicBSpline.Spline1D
+        d = _rirk_solve_data(kcol)
+        # W is sampled at the kDim mish points; the Galerkin load vector lives in spline space.
+        return (d, zeros(Float64, length(d.W), nthreads),
+                   zeros(Float64, size(d.M0, 2), nthreads))
+    else
+        # Chebyshev: the load vector IS the mish-point RHS with homogeneous boundary rows.
+        nz = length(kcol.mishPoints)
+        return (nothing, zeros(Float64, 0, nthreads), zeros(Float64, nz, nthreads))
+    end
+end
+
+"""
+    build_reference_state(model, z_values, ref_column) -> AbstractReferenceState
+
+The reference state a run integrates against, for the model levels `z_values` and the
+natural-BC vertical basis column `ref_column`.
+
+Factored out of [`createModelTile`](@ref) as a PURE MOVE — the same branches in the same
+order, calling the same Springsteel constructors with the same arguments — so the reference
+every tile builds is bitwise what it was. Nothing may be added here that the tile does not
+already get.
+
+It is a free function rather than tile-private because the comprehensive NetCDF writer
+needs the SAME object on the MASTER (`netcdf_output_context`, src/netcdf_output.jl), where
+there is no `ModelTile`: the totals it writes are `prime + reference`, and a reference
+rebuilt by any other route — re-read from the sounding, re-derived, interpolated — would
+put a reconstruction error into every total in the file. That is exactly the class of bug
+`tc/tc_postprocess.jl` carried (its `--legacy-qss` flag existed because it could not know
+which `Q̄_ss` convention the run had used).
+
+Which branch fires:
+- `uses_pressure_reference` (the `moist_compressible` family) → the pressure-based
+  `PressureReferenceState`, with the `:hydrostatic_reference` and
+  `:consistent_qss_reference` opt-ins;
+- `options[:exact_reference_state]` → the pre-balanced file, physical or legacy xi/mu;
+- otherwise → the Springsteel physical reference, viewed back as a legacy `ReferenceState`
+  for the older equation sets.
+"""
+function build_reference_state(model::ModelParameters, z_values::Vector{Float64},
+                               ref_column)
+
+    # The partial-density equation sets (primitive_equation_*_pd) read the physical
+    # vapor/condensate partial-density profiles (ref_rho_v / ref_rho_c) directly, so
+    # they keep the Springsteel physical reference state rather than the legacy
+    # xi/mu derived view used by the older equation sets.
+    physical_ref = uses_physical_reference(model.equation_set)
+
+    if uses_pressure_reference(model.equation_set)
+        # The total-energy set (moist_compressible) consumes the pressure-based
+        # reference (p, partial densities, E_t, Q_ss) directly.
+        # :hydrostatic_reference — build dp̄/dz to satisfy discrete hydrostatic
+        # balance EXACTLY rather than to spline-fit accuracy (17% off at the TC
+        # lid). Opt-in, off by default: it moves every pressure-reference baseline.
+        hydro = get(model.options, :hydrostatic_reference, false)::Bool
+        ref_state = model.options[:exact_reference_state] ?
+            Springsteel.exact_pressure_reference_state(model.ref_state_file, z_values,
+                                                       ref_column; hydrostatic=hydro) :
+            Springsteel.calculate_pressure_reference_state(model.ref_state_file, z_values,
+                                                           ref_column; hydrostatic=hydro)
+        # Rebuild Q_ssbar through the model's own retrieval so the resting column is
+        # a discrete fixed point (see consistent_qss_reference). Opt-in, off by
+        # default: it moves every pressure-reference baseline (BF02, O01, Straka).
+        # Built for the run's temperature mode: the two modes' resting temperatures differ at
+        # fit level, so a Q_ssbar built for one is not a fixed point of the other.
+        if get(model.options, :consistent_qss_reference, false)::Bool
+            ref_state = consistent_qss_reference(ref_state, z_values, ref_column;
+                                                 temperature = temperature_mode(model.options),
+                                                 vapor_transform =
+                                                     vapor_transform_mode(model.options),
+                                                 vapor_mu = vapor_mu(model.physical_params),
+                                                 condensate_transform =
+                                                     condensate_transform_mode(model.options),
+                                                 condensate_mu = Float64(get(
+                                                     model.physical_params, :condensate_mu,
+                                                     1.0e-7)))
+        end
+    elseif (model.options[:exact_reference_state])
+        ref_state = physical_ref ?
+            Springsteel.exact_reference_state(model.ref_state_file, z_values, ref_column) :
+            exact_reference_state(model, z_values, ref_column)
+    else
+        # Build the shared physical-density reference state (Springsteel). The
+        # partial-density sets consume it directly; the legacy xi/mu sets view it
+        # back as a legacy ReferenceState so their bodies are unchanged.
+        phys = Springsteel.calculate_reference_state(model.ref_state_file, z_values,
+            ref_column; moisture=true)
+        ref_state = physical_ref ? phys : legacy_reference_view(phys, ref_column)
+    end
+    return ref_state
 end
 
 """
@@ -66,10 +583,37 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     expdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     expdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
-    impdot_np1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
     impdot_nm2 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    diffdot_n = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    diffdot_nm1 = zeros(Float64,size(tile.physical,1),size(tile.physical,2))
+    # Microphysics sink history for the AB3-sized depletion caps (MC_MICRO_* columns).
+    # Three narrow columns per level, not a full variable-wide matrix: only the cloud, rain
+    # and vapor channels have a rate that can drive their species negative.
+    mc_micro_rows = uses_pressure_reference(model.equation_set) ? size(tile.physical,1) : 0
+    mc_micro_cols = uses_pressure_reference(model.equation_set) ? MC_MICRO_N : 0
+    mc_micro_n = zeros(Float64, mc_micro_rows, mc_micro_cols)
+    mc_micro_nm1 = zeros(Float64, mc_micro_rows, mc_micro_cols)
+    mc_micro_nm2 = zeros(Float64, mc_micro_rows, mc_micro_cols)
+    # Setup-time validation of the exact (unsplit) 2-D semi-implicit option:
+    # incompatible flags and unsupported geometries error loudly here, before
+    # any allocation (defined in exact_si.jl; a no-op when the option is off).
+    validate_exact_si_options(model)
+    # ...and of the water-slot slaving (`options[:si_water_slots]`): a mixed vertical wall family
+    # across the slaved water slots is refused (src/si_water_slaving.jl).
+    validate_si_water_slots(model)
+    validate_water_anchor(model)
+
+    # Horizontal-acoustic history channel, allocated when either the ADI sweep
+    # or the exact 2-D solve is on (exact_si shares the hacdot staging and the
+    # horizontal_si_history! application; zero-size otherwise so the memory
+    # cost is nil for every other run).
+    hacdot_dim = (get(model.options, :horizontal_semiimplicit, false) === true ||
+                  get(model.options, :exact_si, false) === true) ?
+                 (size(tile.physical,1), size(tile.physical,2)) : (0, 0)
+    hacdot_n = zeros(Float64, hacdot_dim...)
+    hacdot_nm1 = zeros(Float64, hacdot_dim...)
 
     # Get the local gridpoints
     tilepoints = getGridpoints(tile)
@@ -77,14 +621,11 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     # Set up the reference file
     ref_state = empty_reference_state()
     if !isempty(model.ref_state_file)
-        z_values = tilepoints[1:model.grid_params.kDim,ndims(tilepoints)]
+        # z is the LAST gridpoint column (x/r on 2D grids have 2 columns, r/λ/z 3D
+        # grids have 3 — `ndims` was wrong there, it is always 2 for a Matrix)
+        z_values = tilepoints[1:model.grid_params.kDim,end]
         ref_column = reference_column(tile, model.grid_params)
-
-        if (model.options[:exact_reference_state])
-            ref_state = exact_reference_state(model, z_values, ref_column)
-        else
-            ref_state = calculate_reference_state(model, z_values, ref_column)
-        end
+        ref_state = build_reference_state(model, z_values, ref_column)
     end
 
     # Set up the map between the tile and the patch (returns SparseMatrixCSC directly)
@@ -95,7 +636,38 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
 
     # Set up some buffers to avoid excessive allocations
     haloReceiveBuffer = zeros(Float64, nnz(haloReceiveMap))
-    splineBuffer = allocateSplineBuffer(tile)
+    scratch_columns = _allocate_scratch_columns(tile.kbasis, tile)
+    flux_columns = _allocate_flux_columns(tile.kbasis, tile, scratch_columns)
+    solve_data, solve_rhs, solve_load = _allocate_solve_workspace(tile.kbasis, tile)
+    # Reference-aware positivity bounds, once the reference state exists. The k-leg lives on
+    # the tile and the i-leg on the worker's patch (`splineTransform!` builds the state's
+    # i-direction coefficients from `patch.ibasis`), so both need installing. AFTER
+    # `scratch_columns`, whose deepcopies are only used by `_vertical_solve!` — that writes
+    # `col.a` through `ldiv!` and never calls `SAtransform!`, so a bound there would be inert
+    # and only confusing. A no-op unless a bounded variable has a nonzero reference profile.
+    install_positivity_bounds!(tile, ref_state, model)
+    install_positivity_bounds!(patch, ref_state, model)
+    _warn_unbounded_master_output(ref_state, model)
+    check_condensate_transform_ic(ref_state, model)
+    check_mc_var_names(model)
+    # Defined in moist_compressible.jl, which is included after this file — resolved at call
+    # time, so the forward reference is fine.
+    mc_scratch = _allocate_mc_scratch(tile, model)
+    ref_diag_full = if uses_pressure_reference(model.equation_set) &&
+                     !isempty(model.ref_state_file)
+        mc_reference_diagnostics(ref_state,
+                                 tilepoints[1:model.grid_params.kDim, end];
+                                 mc_ref_diag_kwargs(model)...)
+    else
+        (s_tbar = Float64[], rho_vbar = Float64[], rho_vbar_z = Float64[],
+         Pxi_prof = Float64[], Tbar = Float64[], nu_vbar = Float64[], nu_vbar_z = Float64[],
+         rho_tbar_w = Float64[], rho_tbar_w_z = Float64[])
+    end
+    # The tile keeps the five resting-state columns; the vapor-reference four ride on the
+    # energy budget's reference part (`mc_nu_vbar`), for the compile-cliff reason above.
+    mc_ref_diag = (s_tbar = ref_diag_full.s_tbar, rho_vbar = ref_diag_full.rho_vbar,
+                   rho_vbar_z = ref_diag_full.rho_vbar_z, Pxi_prof = ref_diag_full.Pxi_prof,
+                   Tbar = ref_diag_full.Tbar)
 
     # Pre-calculate the Helmholtz matrices. Use a dummy factorization as a
     # structural placeholder where a real one is not needed.
@@ -109,9 +681,60 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
     if haskey(model.physical_params, :Kvdiff)
         diffusion_matrix = calc_Helmholtz_diffusion_matrix(tile, model, 1.25 * model.ts * model.physical_params[:Kvdiff])
     end
-    # The semi-implicit acoustic adjustment matrix is only used when enabled.
-    if model.options[:semiimplicit]
-        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, ref_state.Pxi_bar, 1.25 * model.ts)
+    # The semi-implicit acoustic solve is UNCONDITIONAL for the pressure-reference
+    # (moist_compressible) sets: the explicit acoustic mode was removed when the AI2*
+    # staging was made operator-consistent (see semiimplicit_adjustment_p). A config
+    # that explicitly asks for the removed mode fails loudly rather than silently
+    # producing different numbers; an absent :semiimplicit key simply runs SI.
+    # The legacy sets keep the opt-in flag.
+    if uses_pressure_reference(model.equation_set)
+        if get(model.options, :semiimplicit, true) != true
+            error("options[:semiimplicit] => false is not supported for the " *
+                  "moist_compressible equation sets: the explicit acoustic mode was " *
+                  "removed (the vertical acoustics are always integrated semi-implicitly). " *
+                  "Remove the option or set it to true.")
+        end
+        # The LOCAL reference sound-speed profile, not the domain mean: a mean-c̄²
+        # linearization is unstable above Co_z ≈ 4.5 on a stratified sounding
+        # (see calc_Helmholtz_semiimplicit_matrix's profile method).
+        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, mc_ref_diag.Pxi_prof, 1.25 * model.ts)
+    elseif get(model.options, :semiimplicit, false)
+        h_matrix = calc_Helmholtz_semiimplicit_matrix(tile, model, sound_speed_sq(ref_state), 1.25 * model.ts)
+    end
+
+    # The total-energy set diffuses momentum (u, w; Kvdiff) and the diagnosed moist entropy
+    # s_t (heat; Kvdiff_heat, defaulting to Kvdiff). Each needs its own factorization: the
+    # boundary conditions differ (straka93 free-slip u, bf02 no-slip; w a rigid lid; scalars
+    # Neumann), and the coefficients are independent. s_t rides on the Neumann E_t column.
+    # (The water solves, `Kvdiff_water`, went with the prognostic ρ_t slot whose operator the
+    # total water was solved on: Stage 4 of the ρ_t retirement; the key is refused.)
+    # Both the AI2* coefficient (t >= 2) and the first-step AM2 coefficient are
+    # cached, so `diffusion_timestep_mc` never factorizes per column.
+    # Built only when a coefficient is positive: at K = 0 a vertical solve is not the
+    # identity (it refits the column and reapplies the spectral filter), so the routine
+    # skips that solve; its matrices are built anyway (cheap) to keep the NamedTuple shape.
+    mc_diffusion_matrices = NamedTuple()
+    Kv_mc = get(model.physical_params, :Kvdiff, 0.0)
+    Kv_heat_mc = get(model.physical_params, :Kvdiff_heat, Kv_mc)
+    if uses_pressure_reference(model.equation_set) && (Kv_mc > 0.0 || Kv_heat_mc > 0.0)
+        bcb = model.grid_params.BCB
+        bct = model.grid_params.BCT
+        mc_matrix(var, K, coeff) = calc_Helmholtz_diffusion_matrix(tile, model,
+            coeff * model.ts * K; bc_bottom = bcb[var], bc_top = bct[var])
+        mc_diffusion_matrices = (
+            u             = mc_matrix("u",     Kv_mc,       1.25),
+            u_first       = mc_matrix("u",     Kv_mc,       0.5),
+            w             = mc_matrix("w",     Kv_mc,       1.25),
+            w_first       = mc_matrix("w",     Kv_mc,       0.5),
+            heat          = mc_matrix("E_t",   Kv_heat_mc,  1.25),
+            heat_first    = mc_matrix("E_t",   Kv_heat_mc,  0.5))
+        # The cylindrical variants carry the tangential wind v (its own BCs) through
+        # the same momentum solve as u/w.
+        if haskey(model.grid_params.vars, "v")
+            mc_diffusion_matrices = merge(mc_diffusion_matrices, (
+                v       = mc_matrix("v", Kv_mc, 1.25),
+                v_first = mc_matrix("v", Kv_mc, 0.5)))
+        end
     end
 
     mtile = ModelTile(
@@ -122,7 +745,6 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         expdot_n,
         expdot_nm1,
         expdot_nm2,
-        impdot_np1,
         impdot_n,
         impdot_nm1,
         impdot_nm2,
@@ -132,11 +754,96 @@ function createModelTile(patch::AbstractGrid, tile::AbstractGrid, model::ModelPa
         haloSendMap,
         haloReceiveMap,
         haloReceiveBuffer,
-        splineBuffer,
         patch.params.b_iDim,
         h_matrix,
-        diffusion_matrix)
+        diffusion_matrix,
+        diffdot_n,
+        diffdot_nm1,
+        hacdot_n,
+        hacdot_nm1,
+        mc_diffusion_matrices,
+        scratch_columns,
+        flux_columns,
+        solve_data,
+        solve_rhs,
+        solve_load,
+        mc_scratch,
+        mc_slots(model),
+        mc_ref_diag,
+        _allocate_sw_scratch(tile, model),
+        uses_pressure_reference(model.equation_set) ?
+            zeros(Float64, length(MC_WATER_STATS), Threads.maxthreadid()) :
+            zeros(Float64, length(MC_WATER_STATS), 0),
+        mc_micro_n,
+        mc_micro_nm1,
+        mc_micro_nm2,
+        mc_ishmael_tables(model),
+        # Defined in radiation.jl, which is included after this file — resolved at call
+        # time, like `_allocate_mc_scratch` above, so the forward reference is fine.
+        mc_radiation_state(model, tile, tilepoints),
+        # Defined in mynn_state.jl, which is included BEFORE this file (the struct has to
+        # be); the call sits here beside the radiation state for the same reason.
+        mc_mynn_state(model, tile, tilepoints),
+        # ...and the surface-exchange diagnostic store (N2), from mc_surface_layer.jl,
+        # which moved above this file for exactly the same struct-ordering reason.
+        mc_surface_diag(model, tile),
+        # ...and the energy budget (src/energy_budget.jl, the same reason again).
+        mc_energy_budget(model, tile, tilepoints, ref_state, ref_diag_full),
+        mc_species_columns(model, tile, ref_diag_full))
+    # The TKE control variable's width against the closure floor of THIS tile's reference
+    # (`validate_tke_mu`, moist_compressible.jl; a no-op unless MYNN runs `tke_transform =
+    # :bhyp`), once per tile, with the derived ρ̄_t the closure's ρ_t is formed against.
+    if mtile.mynn.active
+        kD = model.grid_params.kDim
+        validate_tke_mu(model.options, model.physical_params,
+                        view(tilepoints, 1:kD, size(tilepoints, 2)),
+                        view(mc_rho_tbar_ref(mtile), :, 1))
+    end
     return mtile
+end
+
+"""
+    mc_species_columns(model, tile, ref_diag) -> MCSpeciesColumns
+
+Setup path only. Every prognostic slot gets a kDim `J` and `rho` column per thread; the vapor
+slot's reference columns are copies of `ref_diag.nu_vbar`/`nu_vbar_z` (the same source the
+`EnergyBudget` reference part copies, so the two are bitwise equal), every other slot's are
+empty. [`MCSpeciesColumns()`](@ref) for a non-mc set.
+"""
+function mc_species_columns(model::ModelParameters, tile, ref_diag)
+    uses_pressure_reference(model.equation_set) || return MCSpeciesColumns()
+    kDim = model.grid_params.kDim
+    nslot = size(tile.physical, 2)
+    nth = Threads.maxthreadid()
+    J = [zeros(Float64, kDim) for _ in 1:nslot, _ in 1:nth]
+    rho = [zeros(Float64, kDim) for _ in 1:nslot, _ in 1:nth]
+    nu_bar = [Float64[] for _ in 1:nslot]
+    nu_bar_z = [Float64[] for _ in 1:nslot]
+    rv = mc_slots(model).rho_v
+    if 1 <= rv <= nslot
+        nu_bar[rv] = copy(ref_diag.nu_vbar)
+        nu_bar_z[rv] = copy(ref_diag.nu_vbar_z)
+    end
+    return MCSpeciesColumns(J, rho, nu_bar, nu_bar_z)
+end
+
+"""
+    mc_ishmael_tables(model) -> IshmaelTables
+
+The ISHMAEL lookup tables for this model, or [`EMPTY_ISHMAEL_TABLES`](@ref) when
+`options[:ice_microphysics]` is not `:ishmael`.
+
+Setup path only — once per tile, never per column. `physical_params[:ishmael_tables_path]`
+overrides the default `data/ishmael_tables.jld2`; a missing file is refused HERE, at tile
+construction, rather than at the first ice-bearing gridpoint several minutes into a run.
+"""
+function mc_ishmael_tables(model::ModelParameters)
+    uses_pressure_reference(model.equation_set) || return EMPTY_ISHMAEL_TABLES
+    # `ice_microphysics` is defined in moist_compressible.jl, included after this file;
+    # resolved at call time, exactly as `mc_slots` resolves `rain_moments`.
+    ice_microphysics(model.options) === :ishmael || return EMPTY_ISHMAEL_TABLES
+    return load_ishmael_tables_or_error(
+        get(model.physical_params, :ishmael_tables_path, ishmael_tables_path()))
 end
 
 """Extract nonzero row/col indices from a sparse map for SharedArray indexing."""
@@ -220,6 +927,61 @@ function extract_halo_values(tile::Union{RZ_Grid, RiRk_Grid})
     return result
 end
 
+"""
+    extract_halo_values(tile::Union{RLZ_Grid, RLR_Grid})
+
+3D cylindrical grids store `b_kDim` vertical-mode blocks, each holding a k = 0
+radial-spline sub-block plus real/imag sub-blocks per azimuthal wavenumber
+(`1 + 2*kDim` sub-blocks of `b_iDim` rows). The 3-row right halo comes from the
+end of every sub-block, in the same ascending row order as the cylindrical
+`calcHaloMap`, so the result maps one-to-one onto its sparse indices.
+"""
+function extract_halo_values(tile::Union{RLZ_Grid, RLR_Grid})
+    b_iDim = tile.params.b_iDim
+    b_kDim = tile.params.b_kDim
+    kDim = tile.params.iDim + tile.params.patchOffsetL
+    nblocks = 1 + 2 * kDim
+    nvars = size(tile.spectral, 2)
+    result = zeros(Float64, 3 * nvars * nblocks * b_kDim)
+    pos = 1
+    for v in 1:nvars
+        for z_b in 1:b_kDim
+            base = (z_b - 1) * b_iDim * nblocks
+            for j in 1:nblocks
+                te = base + j * b_iDim   # last row of sub-block j
+                result[pos:pos+2] .= tile.spectral[te-2:te, v]
+                pos += 3
+            end
+        end
+    end
+    return result
+end
+
+"""
+    extract_halo_values(tile::RRR_Grid)
+
+The 3-D Cartesian box stores `b_jDim*b_kDim` consecutive i-blocks of `b_iDim` rows (block
+`q = (z-1)*b_jDim + l` holds the i-direction coefficients of j-mode `l` and k-mode `z`;
+Springsteel transforms_cartesian.jl), so the 3-row right halo is the end of every block,
+in ascending block order -- the RiRk extraction with `b_kDim` blocks replaced by
+`b_jDim*b_kDim`, matching the column-major sparse indices of the RRR `calcHaloMap`.
+"""
+function extract_halo_values(tile::RRR_Grid)
+    b_iDim = tile.params.b_iDim
+    nblk = tile.params.b_jDim * tile.params.b_kDim
+    nvars = size(tile.spectral, 2)
+    result = zeros(Float64, 3 * nvars * nblk)
+    pos = 1
+    for v in 1:nvars
+        for q in 1:nblk
+            te = q * b_iDim   # last row of block q
+            result[pos:pos+2] .= tile.spectral[te-2:te, v]
+            pos += 3
+        end
+    end
+    return result
+end
+
 """Accumulate (add) spectral values at sparse map locations in a patch-sized array."""
 function accumulate_at_map!(spectral::AbstractArray, map::SparseMatrixCSC, values)
     idx = sparse_indices(map)
@@ -282,6 +1044,159 @@ function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union
 end
 
 """
+    write_tile_to_shared!(sharedSpectral, tile::RRR_Grid, b_iDim_patch)
+
+The 3-D Cartesian box: `b_jDim*b_kDim` i-blocks (see `extract_halo_values(::RRR_Grid)`);
+copy the inner rows of every block to its patch position. The box is decomposed in i
+only, so the tile and the patch share `b_jDim` and `b_kDim` and the patch block stride is
+`b_iDim_patch`.
+"""
+function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::RRR_Grid,
+                                b_iDim_patch::Int64)
+    siL = tile.params.spectralIndexL
+    b_iDim_tile = tile.params.b_iDim
+    nblk = tile.params.b_jDim * tile.params.b_kDim
+    inner_rows = b_iDim_tile - 4  # inner region excludes 3-row halo
+
+    for q in 1:nblk
+        pp1 = (q - 1) * b_iDim_patch + siL
+        tp1 = (q - 1) * b_iDim_tile + 1
+        sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
+    end
+end
+
+"""
+    write_tile_to_shared!(sharedSpectral, tile::Union{RLZ_Grid, RLR_Grid}, b_iDim_patch)
+
+3D cylindrical layout: `b_kDim` vertical-mode blocks of `1 + 2*kDim` radial
+sub-blocks (k = 0 spline, then real/imag per azimuthal wavenumber); copy the
+inner rows of every sub-block to its patch position. Sub-blocks are aligned by
+wavenumber, but an inner tile carries FEWER wavenumbers than the patch (its
+`kDim` follows its outermost ring), so the patch's z-level stride is taken from
+the shared array itself (`rows = wn_stride_patch * b_kDim`; the vertical is
+never decomposed).
+"""
+function write_tile_to_shared!(sharedSpectral::SharedArray{Float64}, tile::Union{RLZ_Grid, RLR_Grid},
+                                b_iDim_patch::Int64)
+    siL = tile.params.spectralIndexL
+    b_iDim_tile = tile.params.b_iDim
+    b_kDim = tile.params.b_kDim
+    kDim = tile.params.iDim + tile.params.patchOffsetL
+    nblocks = 1 + 2 * kDim
+    wn_stride_p = size(sharedSpectral, 1) ÷ b_kDim   # patch z-level stride
+    inner_rows = b_iDim_tile - 4  # inner region excludes 3-row halo
+
+    for z_b in 1:b_kDim
+        for j in 0:nblocks-1
+            pp1 = (z_b - 1) * wn_stride_p + j * b_iDim_patch + siL
+            tp1 = ((z_b - 1) * nblocks + j) * b_iDim_tile + 1
+            sharedSpectral[pp1:pp1+inner_rows, :] .= tile.spectral[tp1:tp1+inner_rows, :]
+        end
+    end
+end
+
+"""
+    load_initial_conditions!(patch, model)
+
+Populate `patch` from `model.initial_conditions`, dispatching on the file
+extension:
+
+- `*.jld2` — a restart from a checkpoint. `load_grid` reconstructs the archived
+  grid; its spectral coefficients (the prognostic state) are copied verbatim and
+  physical space is regenerated with `gridTransform!`, so the loaded grid state
+  matches the checkpoint exactly. The archive must be grid-compatible with
+  `model.grid_params` (same geometry, spectral/physical sizes, and variable map)
+  or an error is raised. Note this is a WARM restart, not a bit-identical
+  continuation: the AB3 integrator's tendency history is not part of the grid and
+  is not restored (see [`write_restart`](@ref)).
+- anything else (CSV) — the physical field is read with `read_physical_grid` and
+  `spectralTransform!` fits the spectral coefficients from it.
+
+THE VAPOR CONTROL VARIABLE (`options[:vapor_transform] = :bhyp`). A checkpoint written under the
+density vapor (`vars` has `"rho_v"` where the model has `"nu_v"`, everything else identical) is
+CONVERTED on load by [`convert_vapor_checkpoint!`](@ref): `ν_v' = bhyp(ρ̄_v + ρ_v') − ν̄_v` with the
+model's own derived reference, the vapor slot alone refit. The reverse (a `"nu_v"` checkpoint
+into a `:none` model) is refused: `ahyp` is not invertible where the recovered vapor is 0.
+NOT checked: a `nu_v` checkpoint loaded into a `nu_v` model with a DIFFERENT
+`physical_params[:vapor_mu]` is read as if the widths agreed (the same gap the cloud, rain and
+ice widths already have). A CSV initial condition with a `rho_v` column into a `nu_v` model is
+refused by [`_check_csv_vapor_name`](@ref) (no conversion: run it under `vapor_transform =
+:none`).
+
+THE PRE-STAGE-4 LAYOUT (a `"rho_t"` slot 3, the vapor appended). A `.jld2` checkpoint in it is
+REFUSED, the message naming `tools/convert_rho_t_checkpoint.jl` and its invocation
+(`vapor_checkpoint_conversion`; src/checkpoint_conversion.jl); a CSV with a `rho_t` column is
+read by name, its `rho_t` column ignored (`_check_csv_layout`).
+
+Runs on the master process before tiling; mutates and returns `patch`.
+"""
+function load_initial_conditions!(patch::AbstractGrid, model::ModelParameters)
+    if endswith(model.initial_conditions, ".jld2")
+        loaded = load_grid(model.initial_conditions)
+        # A density-vapor checkpoint into a vapor-control-variable model: converted below. A
+        # PRE-STAGE-4 checkpoint (slot 3 the prognostic rho_t) is refused there, naming the
+        # converter (src/checkpoint_conversion.jl).
+        # A density-TKE checkpoint into a TKE-control-variable model (`"rho_e"` in the file,
+        # `"nu_e"` in the model): renamed here so the vapor's check sees the rest of the map,
+        # converted below; both conversions may apply to one archive.
+        econv = tke_checkpoint_conversion(loaded.params.vars, patch.params.vars,
+                                          model.initial_conditions)
+        vars_f = econv > 0 ?
+            Dict{String,Int}((k == "rho_e" ? "nu_e" : k) => v for (k, v) in loaded.params.vars) :
+            loaded.params.vars
+        vconv = vapor_checkpoint_conversion(vars_f, patch.params.vars,
+                                            model.initial_conditions)
+        (typeof(loaded) == typeof(patch) &&
+         size(loaded.spectral) == size(patch.spectral) &&
+         size(loaded.physical) == size(patch.physical) &&
+         (vconv > 0 || vars_f == patch.params.vars)) || error(
+            "restart archive $(model.initial_conditions) is not compatible with the " *
+            "configured grid_params (geometry/size/vars mismatch): archive is " *
+            "$(typeof(loaded)) spectral $(size(loaded.spectral)), grid is " *
+            "$(typeof(patch)) spectral $(size(patch.spectral))")
+        patch.spectral .= loaded.spectral
+        # The wall condition needs the derived rho_t', which only exists after a first pass;
+        # take it from the unconditioned transform, then redo the fit with the
+        # walls set. Converged: the wall value of rho_t' is insensitive to p's
+        # own wall derivative.
+        gridTransform!(patch)
+        # The density vapor is converted to nu_v BEFORE the wall condition is installed: the
+        # wall anchor reads the vapor slot as nu_v (the derived rho_t' of the model's own
+        # convention), so it must never see an unconverted density there.
+        vconv > 0 && convert_vapor_checkpoint!(patch, model, vconv)
+        econv > 0 && convert_tke_checkpoint!(patch, model, econv)
+        if mc_wall_bc_active(patch)
+            update_mc_wall_bc!(patch, patch.physical; anchor = _mc_wall_anchor(model))
+            gridTransform!(patch)
+        end
+    else
+        _check_csv_layout(model.initial_conditions, patch.params.vars)
+        _check_csv_vapor_name(model.initial_conditions, patch.params.vars)
+        _check_csv_tke_name(model.initial_conditions, patch.params.vars)
+        read_physical_grid(model.initial_conditions, patch)
+        spectralTransform!(patch)
+        gridTransform!(patch)
+        # Re-fit with the wall condition installed. This is the load that used to
+        # destroy the balanced vortex (reference/HANDOFF_2026-07-21.md): the damage lands
+        # here, on the first projection, before a single timestep is taken. The
+        # first pass exists only to produce the fitted z-derivatives the wall value
+        # is read from; rho_t' at the wall is insensitive to p's own condition, so
+        # one iteration suffices.
+        if mc_wall_bc_active(patch)
+            update_mc_wall_bc!(patch, patch.physical; anchor = _mc_wall_anchor(model))
+            spectralTransform!(patch)
+            gridTransform!(patch)
+        end
+    end
+    return patch
+end
+
+# The derived water anchor's member set for `update_mc_wall_bc!` (`nothing` outside the
+# moist-compressible sets, where the wall condition is never active).
+_mc_wall_anchor(model) = uses_pressure_reference(model.equation_set) ?
+    water_anchor_set(model.options, model.physical_params, mc_slots(model)) : nothing
+
+"""
     initialize_model(model, workerids)
 
 Set up the distributed model infrastructure by creating the grid patch, distributing
@@ -291,21 +1206,25 @@ Returns the initialized patch grid.
 function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     num_workers = length(workerids)
+    # Output configuration FIRST, before a worker or a grid exists: a typo in
+    # :output_formats or a :netcdf_* key must kill the run here, not at the first output
+    # interval several minutes in (src/netcdf_output.jl).
+    validate_output_options(model)
     println("Initializing with $(num_workers) workers and tiles")
     patch = createGrid(model.grid_params)
     println("$model")
 
-    # Initialize the patch locally on master process
-    read_physical_grid(model.initial_conditions, patch)
-    spectralTransform!(patch)
-    gridTransform!(patch)
+    # Initialize the patch locally on master process (CSV read or JLD2 restart)
+    load_initial_conditions!(patch, model)
 
     # Transfer the model and patch/tile info to each worker
     println("Initializing workers")
     # Print the tile information — calcTileSizes now returns Vector{SpringsteelGrid}
+    # Tiles are assigned positionally along workerids (NOT by worker pid: nested
+    # runs pass worker groups whose pids don't start at 2).
     tiles = calcTileSizes(patch, num_workers)
-    for w in workerids
-        t = tiles[w-1]
+    for (n, w) in enumerate(workerids)
+        t = tiles[n]
         println("Worker $w: $(t.params.iDim) gridpoints in $(t.params.num_cells) cells from $(t.params.iMin) to $(t.params.iMax) starting at index $(t.params.spectralIndexL)")
     end
 
@@ -317,7 +1236,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     # Send tile parameters and create grids on workers to avoid serializing CHOLMOD factors
     println("Initializing tiles on workers")
-    map(wait, [save_at(w, :tile_params, tiles[w-1].params) for w in workerids])
+    map(wait, [save_at(w, :tile_params, tiles[n].params) for (n, w) in enumerate(workerids)])
     map(wait, [save_at(w, :tile, :(createGrid(tile_params))) for w in workerids])
 
     # Create the model tiles
@@ -328,8 +1247,7 @@ function initialize_model(model::ModelParameters, workerids::Vector{Int64})
 
     # Precalculate indices and allocate buffers for shared and border transfers
     wait(save_at(workerids[1], :mtile, :(createModelTile(patch,tile,model,$(firstMap)))))
-    for w in workerids[1:length(workerids)-1]
-        send_index = w + 1
+    for (w, send_index) in zip(workerids[1:end-1], workerids[2:end])
         sendMap = get_val_from(w, :(mtile.haloSendMap))
         wait(save_at(send_index, :mtile, :(createModelTile(patch,tile,model,$(sendMap)))))
     end
@@ -350,7 +1268,14 @@ end
 Main time integration loop. Establishes `RemoteChannel` connections between workers,
 creates the shared spectral array, and drives the model forward through all timesteps.
 """
-function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64})
+function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64};
+        ctx = nothing)   # ::NetCDFOutputContext; untyped, netcdf_output.jl is included later
+
+    # Comprehensive-NetCDF output context (src/netcdf_output.jl). Built ONCE per run --
+    # it constructs the reference state, which means reading and fitting the run's .ref
+    # file -- and threaded into every write below. `integrate_model` normally builds it
+    # and passes it in; a direct caller (a test, the REPL) gets it built here.
+    ctx === nothing && (ctx = netcdf_output_context(patch, model))
 
     num_workers = length(workerids)
     println("Model starting up with $(num_workers) workers and tiles...")
@@ -394,17 +1319,96 @@ function run_model(patch::AbstractGrid, model::ModelParameters, workerids::Vecto
     end
     map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
 
+    # Horizontal semi-implicit sweep setup (mc sets, XZ Phase 1): build the
+    # patch-level solve data from a worker's reference profiles, the shared
+    # applied-u-increment array, and each tile's patch row window for the
+    # increment load (tile mish points are a contiguous subsequence of the
+    # patch mish points, so the window is (first_i − 1)·kDim + 1 onward).
+    hsi = get(model.options, :horizontal_semiimplicit, false) === true
+    hsd = nothing
+    hsi_u_incr = nothing
+    if hsi
+        uses_pressure_reference(model.equation_set) || error(
+            "options[:horizontal_semiimplicit] requires a moist_compressible " *
+            "(pressure-reference) equation set")
+        w1 = workerids[1]
+        Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
+        rho_tprof = get_val_from(w1, :(collect(view(Scythe.mc_rho_tbar_ref(mtile), :, 1))))
+        rho_dprof = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1))))
+        etp_prof = get_val_from(w1, :(collect(
+            view(Scythe.ref_total_energy(mtile.ref_state), :, 1) .+
+            view(Scythe.ref_pressure(mtile.ref_state), :, 1))))
+        # The slaved water slots' reference shares (`options[:si_water_slots]`), from the
+        # same worker's tile (empty under :none).
+        water = get_val_from(w1, :(Scythe.si_water_hsi_profiles(mtile)))
+        hsd = create_horizontal_solve_data(patch, model, Pxi_prof,
+                                           rho_tprof, rho_dprof, etp_prof; water = water)
+        hsi_u_incr = SharedArray{Float64,2}((patch.params.iDim * patch.params.kDim, 6))
+        xpatch = patch.ibasis.data[1, 1].mishPoints
+        kDim = model.grid_params.kDim
+        for w in workerids
+            x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
+            i1 = argmin(abs.(xpatch .- x1))
+            save_at(w, :hsi_rowstart, (i1 - 1) * kDim + 1)
+            save_at(w, :hsi_u_incr, hsi_u_incr)
+        end
+    end
+
+    # Exact (unsplit) 2-D semi-implicit setup (options[:exact_si], exact_si.jl):
+    # the patch-level solve data, the shared predictor-publication array
+    # (u*, w*, p′* at the patch physical points) and the shared solve feed
+    # (δu, ∂x u^{n+1}, δu/Δτ), plus each tile's patch row window.
+    xsi = get(model.options, :exact_si, false) === true
+    esd = nothing
+    xsi_xstar = nothing
+    xsi_h = nothing
+    if xsi
+        w1 = workerids[1]
+        Pxi_prof = get_val_from(w1, :(mtile.mc_ref_diag.Pxi_prof))
+        rho_t2 = get_val_from(w1, :(collect(view(Scythe.mc_rho_tbar_ref(mtile), :, 1:2))))
+        rho_d2 = get_val_from(w1, :(collect(view(Scythe.ref_rho_d(mtile.ref_state), :, 1:2))))
+        etp2 = get_val_from(w1, :(collect(
+            view(Scythe.ref_total_energy(mtile.ref_state), :, 1:2) .+
+            view(Scythe.ref_pressure(mtile.ref_state), :, 1:2))))
+        if exact_si_is_rlr(model)
+            esd = create_exact_si_data_rlr(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+            npts = size(patch.physical, 1)
+            xsi_xstar = SharedArray{Float64,2}((npts, 4))
+            xsi_h = SharedArray{Float64,2}((npts, XSI_RLR_NPLANES))
+            for w in workerids
+                save_at(w, :xsi_rowstart, 1)
+                save_at(w, :xsi_xstar, xsi_xstar)
+                save_at(w, :xsi_h, xsi_h)
+            end
+        else
+            esd = create_exact_si_data(patch, model, Pxi_prof, rho_t2, rho_d2, etp2)
+            npts = patch.params.iDim * patch.params.kDim
+            xsi_xstar = SharedArray{Float64,2}((npts, 3))
+            xsi_h = SharedArray{Float64,2}((npts, XSI_NPLANES))
+            xpatch = patch.ibasis.data[1, 1].mishPoints
+            kDim = model.grid_params.kDim
+            for w in workerids
+                x1 = get_val_from(w, :(mtile.tilepoints[1, 1]))
+                i1 = argmin(abs.(xpatch .- x1))
+                save_at(w, :xsi_rowstart, (i1 - 1) * kDim + 1)
+                save_at(w, :xsi_xstar, xsi_xstar)
+                save_at(w, :xsi_h, xsi_h)
+            end
+        end
+    end
+
     # Output initial time
     patch.spectral .= sharedSpectral
     gridTransform!(patch)
-    @async write_output(patch, model, 0.0)
+    write_output(patch, model, 0.0; ctx = ctx, workerids = workerids)
     flush(stdout)
     # Check for NaNs and quit if found
     checkCFL(patch)
 
     # Loop through the model timesteps
     @time model_loop(patch, model, workerids, sharedSpectral, haloInit, haloReceive,
-        haloInitBuffer, haloReceiveBuffer, haloReceiveMap)
+        haloInitBuffer, haloReceiveBuffer, haloReceiveMap; hsd, hsi_u_incr,
+        esd, xsi_xstar, xsi_h, ctx)
 
     # Integration complete! Finalize the patch
     patch.spectral .= sharedSpectral
@@ -422,11 +1426,15 @@ via `RemoteChannel`s, accumulates spectral contributions, and writes periodic ou
 """
 function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vector{Int64},
         sharedSpectral::SharedArray{Float64}, haloInit::RemoteChannel, haloReceive::RemoteChannel,
-        haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveMap::SparseMatrixCSC{Float64, Int64})
+        haloInitBuffer::Array{Float64}, haloReceiveBuffer::Array{Float64}, haloReceiveMap::SparseMatrixCSC{Float64, Int64};
+        hsd=nothing, hsi_u_incr=nothing, esd=nothing, xsi_xstar=nothing, xsi_h=nothing,
+        ctx = nothing)   # ::NetCDFOutputContext; see run_model
 
     # Set up the timesteps
     num_ts = round(Int,model.integration_time / model.ts)
     output_int = round(Int,model.output_interval / model.ts)
+    # JLD2 restart-checkpoint cadence (0 = disabled). Independent of output_int.
+    restart_int = model.restart_interval > 0 ? round(Int, model.restart_interval / model.ts) : 0
     # CFL/Courant diagnostic cadence — independent of output; defaults to the
     # output cadence so it is free (reuses the output-step gridTransform!).
     cfl_int = max(1, round(Int, get(model.options, :cfl_interval, model.output_interval) / model.ts))
@@ -440,7 +1448,7 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
     dz_min = dx_min = c_bar = 0.0
     if cfl_diag_on
         dz_min, dx_min = grid_spacing_minima(patch, model)
-        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(mtile.ref_state.Pxi_bar))))
+        c_bar = sqrt(max(0.0, get_val_from(workerids[1], :(Scythe.sound_speed_sq(mtile.ref_state)))))
     end
 
     # Loop through the timesteps
@@ -451,14 +1459,41 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         @turbo sharedSpectral .= 0.0
         put!(haloInit, haloInitBuffer)
 
-        # Advance each tile
-        map(wait, [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids])
+        # Advance each tile (the horizontal-SI variant also hands each worker the
+        # shared applied-u-increment array and its tile's patch row window, loaded
+        # into hacdot_n at the top of the step as the u-leg AI2* history).
+        # The exact-SI variant is two-phase: phase A publishes the (u, w, p′)
+        # predictors, the master runs the unsplit patch solve, phase B completes
+        # the columns and the end-of-step communication.
+        if esd !== nothing
+            map(wait, [get_from(w, :(advanceTimestepA(mtile, sharedSpectral, $(t),
+                xsi_xstar, xsi_h, xsi_rowstart))) for w in workerids])
+            if esd isa ExactSIDataRLR
+                exact_si_solve_rlr!(xsi_h, esd, patch, model, t, xsi_xstar)
+            else
+                exact_si_solve!(xsi_h, esd, patch, model, t, xsi_xstar)
+            end
+            adv = [get_from(w, :(advanceTimestepB(mtile, sharedSpectral, haloSend,
+                haloReceive, $(t), xsi_h, xsi_rowstart))) for w in workerids]
+        else
+            adv = hsd === nothing ?
+                [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t)))) for w in workerids] :
+                [get_from(w, :(advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, $(t), hsi_u_incr, hsi_rowstart))) for w in workerids]
+        end
+        map(wait, adv)
 
         # Get halo from previous tile
         haloReceiveBuffer .= take!(haloReceive)
 
         # Add it to the sharedArray
         accumulate_at_map!(sharedSpectral, haloReceiveMap, haloReceiveBuffer)
+
+        # Horizontal semi-implicit sweep on the merged patch B coefficients —
+        # the communication is already paid; the sweep's applied u increment is
+        # published for the workers' next-step history load.
+        if hsd !== nothing
+            hsi_u_incr .= horizontal_si_correct!(sharedSpectral, patch, model, hsd, t)
+        end
 
         # Reset the shared spectral patch to the tiles
         map(wait, [get_from(w, :(splineTransform!(sharedSpectral, patch, mtile.tile))) for w in workerids])
@@ -476,7 +1511,8 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
         # single gridTransform!).
         is_cfl_step = cfl_diag_on && mod(t, cfl_int) == 0
         is_output_step = mod(t, output_int) == 0
-        if is_cfl_step || is_output_step
+        is_restart_step = restart_int > 0 && mod(t, restart_int) == 0
+        if is_cfl_step || is_output_step || is_restart_step
             patch.spectral .= sharedSpectral
             gridTransform!(patch)
         end
@@ -486,15 +1522,43 @@ function model_loop(patch::AbstractGrid, model::ModelParameters, workerids::Vect
             cfl_diagnostics(patch, model, t, dz_min, dx_min, c_bar)
         end
 
-        # Output if on specified time interval
+        # Output if on specified time interval. Synchronous: the writer reads
+        # `patch.physical`/`patch.spectral` in place, and the next output/CFL/restart step's
+        # `gridTransform!(patch)` above rewrites them, so an `@async` writer that fell behind
+        # would leave a snapshot torn across two times -- exactly the file a bitwise
+        # reproducibility comparison reads. The write costs ~1-2 s per 80 MB CSV against
+        # ~50 s of stepping per output interval on the quick ice benchmark.
         if is_output_step
-            @async write_output(patch, model, (t*model.ts))
+            write_output(patch, model, (t*model.ts); ctx = ctx, workerids = workerids)
             checkCFL(patch; t=t, ts=model.ts, where="output")
+        end
+
+        # Restart checkpoint on its own (typically coarser) cadence. Synchronous for the
+        # same reason as the analysis output above (and was first: a checkpoint
+        # half-written by an @async task racing process exit is useless for restart).
+        if is_restart_step
+            write_restart(patch, model, (t*model.ts))
         end
 
         # Done with this timestep
         flush(stdout)
     end
+
+    # Final radiation sidecar (S5). `radiation_write!`'s periodic cadence
+    # (`mod(t-1, out_int) == 0`, read against the PRE-ADVANCE state) never lands on the
+    # run's own final time — that would need a pre-pass at step `num_ts + 1`, which never
+    # runs (see its docstring) — so write it once here, exactly the way the final
+    # `write_output`/`write_restart` above are approximated by this loop's own last
+    # output/restart step rather than a separate call. `radiation_write_final!` is a
+    # no-op per worker when that worker's `mtile.radiation` is inactive, so this costs one
+    # remote no-op call per worker on a radiation-off run.
+    map(wait, [get_from(w, :(Scythe.radiation_write_final!(mtile, $(num_ts * model.ts))))
+               for w in workerids])
+    # ...and the MYNN-EDMF boundary-layer census (S5), on the same hook and for the same
+    # reason: the clamp/cap/diffusion-number counters accumulate per column all run and
+    # are only meaningful once, at the end. `mynn_write_final!` is a no-op per worker
+    # when that worker's `mtile.mynn` is inactive.
+    map(wait, [get_from(w, :(Scythe.mynn_write_final!(mtile))) for w in workerids])
     return nothing
 end
 
@@ -507,18 +1571,77 @@ compute spectral tendencies, and exchange halo data with neighboring tiles.
 function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
         haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64)
 
+    # Rigid-wall pressure compatibility condition (R1T1X). The k-direction SA
+    # solve happens INSIDE tileTransform!, so the per-column wall derivative has
+    # to be installed first. It is read from `tile.physical`, i.e. the PREVIOUS
+    # step's fitted state — one step stale by construction, because the fitted
+    # z-derivatives it needs do not exist for var_np1 yet. That is deliberate as
+    # well as necessary: it keeps the wall condition off the acoustic timescale.
+    # On t == 1 load_initial_conditions! has already set the walls.
+    #
+    # `:wall_bc_tau` [s] is the relaxation timescale. It must stay well above the
+    # acoustic step (relax = ts/tau << 1) or the wall condition feeds back on
+    # itself and goes unstable — see update_mc_wall_bc!.
+    wall_bc = mc_wall_bc_active(mtile.tile)
+    if t > 1 && wall_bc
+        tau = get(mtile.model.options, :wall_bc_tau, 300.0)::Float64
+        relax = min(1.0, mtile.model.ts / tau)
+        # tau = Inf (the shipped TC setting) freezes the wall data, so the whole
+        # update is a no-op scaled by zero — skip it rather than redo the i-basis
+        # fit, which allocates, on every step of every tile.
+        relax > 0.0 && update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax,
+                                          anchor = _mc_wall_anchor(mtile.model))
+    end
+
     # Transform to local physical tile
     tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
+
+    # First step: the TILE is a fresh grid, so its wall_du is still zero even
+    # though load_initial_conditions! set the PATCH's — and with :wall_bc_tau =
+    # Inf it would stay zero forever, silently degrading R1T1X to plain Neumann
+    # and losing the entire balance benefit. Seed it from the just-materialised
+    # state (relax = 1: this is an initialization, not a tracking update) and
+    # redo the transform. Costs one extra tileTransform! on step 1 only.
+    if t == 1 && wall_bc
+        update_mc_wall_bc!(mtile.tile, mtile.tile.physical; relax = 1.0,
+                           anchor = _mc_wall_anchor(mtile.model))
+        tileTransform!(sharedSpectral, mtile.tile, mtile.tile.physical, mtile.tile.spectral)
+    end
 
     # Trap a numerical blow-up early: scan the freshly transformed physical state
     # for non-finite values *before* feeding it into the NaN-blind spline solve in
     # advance_column. This runs single-threaded (before the @threads loop) so it is
     # thread-safe, and halts the run cleanly instead of segfaulting in the solver.
     checkCFL(mtile.tile; t=t, ts=mtile.model.ts, where="worker tile")
+    state_minima_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_negativity_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && water_budget_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && mc_stiffness_trace(mtile, t)
+    uses_pressure_reference(mtile.model.equation_set) && energy_census_trace(mtile, t)
 
-    # Advance each column
+    # Radiative heating pre-pass: recompute (on the radiation cadence) or simply hold the
+    # tile's `q_lw`/`q_sw` field, which every column then folds into `QDOT_TH`. HERE, and
+    # not inside the column loop, because a radiative transfer is a whole-tile operation
+    # that threads over columns itself — nesting it inside `Threads.@threads :static` would
+    # oversubscribe the machine and break the `threadid()` ownership rule the scratch
+    # columns depend on. A no-op when radiation is off. See `radiation_prepass!`.
+    radiation_prepass!(mtile, t)
+
+    # MYNN-EDMF sidecar output (S9): a no-op unless the closure is on and its
+    # own output is enabled, and gated on the SAME output cadence as `radiation_write!`
+    # -- see `mynn_write!` (src/mynn_io.jl) for why it fires HERE, alongside the
+    # radiation pre-pass, rather than inside the column loop.
+    mynn_write!(mtile, t)
+
+    # Advance each column.
+    #
+    # `:static` (not the default `:dynamic`) because the equation sets take their vertical work
+    # column from `mtile.scratch_columns[threadid(), var]`. Under dynamic scheduling a task may
+    # resume on a different thread, so `threadid()` is not a stable owner tag and two columns
+    # could end up sharing one work column. `:static` pins each iteration to a fixed thread.
+    # The columns are equal-cost, so there is nothing for dynamic scheduling to balance anyway.
     if num_columns(mtile.tile) > 0
-        Threads.@threads for c in 1:num_columns(mtile.tile)
+        Threads.@threads :static for c in 1:num_columns(mtile.tile)
             advance_column(mtile, c, t)
         end
     else
@@ -541,6 +1664,18 @@ function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
     accumulate_at_map!(sharedSpectral, mtile.haloReceiveMap, mtile.haloReceiveBuffer)
 
     return nothing
+end
+
+# Horizontal-SI variant: load this tile's window of the previous step's applied
+# u increment (published by the patch-level sweep in `model_loop`) into the
+# hacdot_n u column before the columns advance — the u-leg AI2* history.
+function advanceTimestep(mtile::ModelTile, sharedSpectral::SharedArray{Float64},
+        haloSend::RemoteChannel, haloReceive::RemoteChannel, t::Int64,
+        hsi_u_incr::AbstractMatrix{Float64}, hsi_rowstart::Int64)
+    if t > 1
+        horizontal_si_load_increment!(mtile, hsi_u_incr, t, hsi_rowstart)
+    end
+    return advanceTimestep(mtile, sharedSpectral, haloSend, haloReceive, t)
 end
 
 """
@@ -570,13 +1705,25 @@ function advance_column(mtile::ModelTile, c::Int64, t::Int64)
 end
 
 """
-    finalize_model(grid, model)
+    finalize_model(grid, model; ctx = nothing, workerids = Int64[])
 
 Write final model output at the end of the integration period.
-"""
-function finalize_model(grid::AbstractGrid, model::ModelParameters)
 
-    write_output(grid, model, model.integration_time)
+`ctx` is the comprehensive-NetCDF output context (src/netcdf_output.jl). `integrate_model`
+passes the one it built at setup; the NESTED driver does not (its context is a local of
+`run_nested_patch`, which has already returned by the time each patch is finalized), so a
+nested run rebuilds it here — one reference-state construction per patch, once, at run end.
+`workerids` is threaded for stage N2's physics-group collection and unused in N1.
+"""
+function finalize_model(grid::AbstractGrid, model::ModelParameters;
+                        ctx = nothing, workerids::Vector{Int64} = Int64[])
+
+    write_output(grid, model, model.integration_time; ctx = ctx, workerids = workerids)
+    # Guaranteed final restart checkpoint (covers both single-grid and nested,
+    # which route their finalize through here). Skipped when checkpoints are off.
+    if model.restart_interval > 0
+        write_restart(grid, model, model.integration_time)
+    end
     println("Model complete!")
 end
 
@@ -619,7 +1766,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared from the reference state
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Add the implicit terms
     ts_term = 0.0
@@ -655,7 +1802,7 @@ function semiimplicit_timestep_old(mtile::ModelTile, colstart::Int64, colend::In
 
     # Solve for the xi coefficients (RHS = xi_nstar - w_nstar_z; homogeneous BCs)
     xi_col = mtile.tile.kbasis.data[mtile.model.grid_params.vars["xi"]]
-    _vertical_solve!(xi_col, h_a, xi_nstar .- w_nstar_z, mtile.tile)
+    _vertical_solve!(xi_col, h_a, xi_nstar .- w_nstar_z, mtile)
     view(mtile.var_np1,colstart:colend,xi_index) .= Itransform!(xi_col)
 
     # Set w_n+1
@@ -687,7 +1834,7 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Subtract the explicit terms and add the implicit terms
     ts_term = 0.0
@@ -730,10 +1877,10 @@ function semiimplicit_adjustment_xi(mtile::ModelTile, colstart::Int64, colend::I
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(xi_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(xi_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(xi_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(xi_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Set xi_n+1
@@ -768,7 +1915,7 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Subtract the explicit terms and add the implicit terms
     ts_term = 0.0
@@ -811,10 +1958,10 @@ function semiimplicit_adjustment(mtile::ModelTile, colstart::Int64, colend::Int6
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(w_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(w_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Set w_n+1
@@ -852,8 +1999,8 @@ function semiimplicit_adjustment_rhod(mtile::ModelTile, colstart::Int64, colend:
     wdot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Mean speed of sound squared and the dry-air reference density ρ̂_d
-    Pxi_bar = mtile.ref_state.Pxi_bar
-    rho_dbar = mtile.ref_state.rhobar[:,1]
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
+    rho_dbar = ref_rho_d(mtile.ref_state)[:,1]
 
     # Subtract the explicit terms and add the implicit terms (AI2*)
     ts_term = 0.0
@@ -897,10 +2044,10 @@ function semiimplicit_adjustment_rhod(mtile::ModelTile, colstart::Int64, colend:
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(phi_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(phi_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Recover w_n+1 = φ_n+1 / ρ̂_d
@@ -935,7 +2082,7 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     xidot_nm2 = view(mtile.impdot_nm2,colstart:colend,w_index)
 
     # Get the mean speed of sound squared
-    Pxi_bar = mtile.ref_state.Pxi_bar
+    Pxi_bar = sound_speed_sq(mtile.ref_state)
 
     # Subtract the explicit terms and add the implicit terms
     ts_term = 0.0
@@ -973,10 +2120,10 @@ function semiimplicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64,
     if t == 1
         # Calculate the Helmholtz matrix for the first time step
         h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
-        _vertical_solve!(w_col, h_a, rhs, mtile.tile)
+        _vertical_solve!(w_col, h_a, rhs, mtile)
     else
         # Use the pre-calculated one
-        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile.tile)
+        _vertical_solve!(w_col, mtile.h_matrix, rhs, mtile)
     end
 
     # Set w_n+1
@@ -1085,23 +2232,136 @@ function diffusion_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t:
     end
 
     # Set s_n+1 (homogeneous BCs)
-    _vertical_solve!(col, h_a, s_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, s_nstar, mtile)
     view(mtile.var_np1,colstart:colend,s_index) .= Itransform!(col)
 
     # Set mu_n+1
-    _vertical_solve!(col, h_a, mu_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_index) .= Itransform!(col)
 
     # Set mu_c_n+1
-    _vertical_solve!(col, h_a, mu_c_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_c_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_c_index) .= Itransform!(col)
 
     # Set mu_r_n+1
-    _vertical_solve!(col, h_a, mu_r_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_r_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_r_index) .= Itransform!(col)
 
     # Set mu_sat_n+1
-    _vertical_solve!(col, h_a, mu_sat_nstar, mtile.tile)
+    _vertical_solve!(col, h_a, mu_sat_nstar, mtile)
+    view(mtile.var_np1,colstart:colend,mu_sat_index) .= Itransform!(col)
+
+end
+
+"""
+    diffusion_timestep_pd(mtile, colstart, colend, t)
+
+Partial-density variant of [`diffusion_timestep`](@ref) for the
+`primitive_equation_XZ_rhod_pd` set: the diffused thermodynamic/moisture variables are
+`s`, the moisture partial densities `rho_v`, `rho_c`, `rho_r`, and the transformed
+saturation ratio `mu_sat` (replacing `mu`, `mu_c`, `mu_r`). Identical AI2* implicit
+vertical-diffusion solve; only the prognostic slot names differ.
+"""
+function diffusion_timestep_pd(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # Slot 1 is the entropy variable: intensive "s" (rhod_pd set) or the entropy density
+    # "sigma" (primitive_equation_XZ_sigma set). The vertical-diffusion solve is identical for
+    # either, so resolve whichever name this model carries.
+    vars = mtile.model.grid_params.vars
+    s_index = haskey(vars, "sigma") ? vars["sigma"] : vars["s"]
+    rho_v_index = mtile.model.grid_params.vars["rho_v"]
+    rho_c_index = mtile.model.grid_params.vars["rho_c"]
+    rho_r_index = mtile.model.grid_params.vars["rho_r"]
+    mu_sat_index = mtile.model.grid_params.vars["mu_sat"]
+
+    ts = mtile.model.ts
+
+    # Predictor states and their stored implicit (vertical-diffusion) tendencies
+    s_nstar = mtile.var_np1[colstart:colend,s_index]
+    sdot_n = view(mtile.impdot_n,colstart:colend,s_index)
+    sdot_nm1 = view(mtile.impdot_nm1,colstart:colend,s_index)
+    sdot_nm2 = view(mtile.impdot_nm2,colstart:colend,s_index)
+
+    rho_v_nstar = mtile.var_np1[colstart:colend,rho_v_index]
+    rho_vdot_n = view(mtile.impdot_n,colstart:colend,rho_v_index)
+    rho_vdot_nm1 = view(mtile.impdot_nm1,colstart:colend,rho_v_index)
+    rho_vdot_nm2 = view(mtile.impdot_nm2,colstart:colend,rho_v_index)
+
+    rho_c_nstar = mtile.var_np1[colstart:colend,rho_c_index]
+    rho_cdot_n = view(mtile.impdot_n,colstart:colend,rho_c_index)
+    rho_cdot_nm1 = view(mtile.impdot_nm1,colstart:colend,rho_c_index)
+    rho_cdot_nm2 = view(mtile.impdot_nm2,colstart:colend,rho_c_index)
+
+    rho_r_nstar = mtile.var_np1[colstart:colend,rho_r_index]
+    rho_rdot_n = view(mtile.impdot_n,colstart:colend,rho_r_index)
+    rho_rdot_nm1 = view(mtile.impdot_nm1,colstart:colend,rho_r_index)
+    rho_rdot_nm2 = view(mtile.impdot_nm2,colstart:colend,rho_r_index)
+
+    mu_sat_nstar = mtile.var_np1[colstart:colend,mu_sat_index]
+    mu_sat_dot_n = view(mtile.impdot_n,colstart:colend,mu_sat_index)
+    mu_sat_dot_nm1 = view(mtile.impdot_nm1,colstart:colend,mu_sat_index)
+    mu_sat_dot_nm2 = view(mtile.impdot_nm2,colstart:colend,mu_sat_index)
+
+    # Add the implicit terms
+    ts_term = 0.0
+    if (t == 1)
+        # Use trapezoidal method (AM2) for first step
+        ts_term = 0.5 * ts * mtile.model.physical_params[:Kvdiff]
+        s_nstar .= @. s_nstar + (ts * 0.5 * sdot_n)
+        rho_v_nstar .= @. rho_v_nstar + (ts * 0.5 * rho_vdot_n)
+        rho_c_nstar .= @. rho_c_nstar + (ts * 0.5 * rho_cdot_n)
+        rho_r_nstar .= @. rho_r_nstar + (ts * 0.5 * rho_rdot_n)
+        mu_sat_nstar .= @. mu_sat_nstar + (ts * 0.5 * mu_sat_dot_n)
+    else
+        # Use AI2* for second step and beyond
+        ts_term = 1.25 * ts * mtile.model.physical_params[:Kvdiff]
+        s_nstar .= @. s_nstar - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
+        rho_v_nstar .= @. rho_v_nstar - (ts * rho_vdot_n) + (ts * 0.75 * rho_vdot_nm1)
+        rho_c_nstar .= @. rho_c_nstar - (ts * rho_cdot_n) + (ts * 0.75 * rho_cdot_nm1)
+        rho_r_nstar .= @. rho_r_nstar - (ts * rho_rdot_n) + (ts * 0.75 * rho_rdot_nm1)
+        mu_sat_nstar .= @. mu_sat_nstar - (ts * mu_sat_dot_n) + (ts * 0.75 * mu_sat_dot_nm1)
+    end
+
+    # Set the n-1 and n-2 terms
+    sdot_nm2 .= sdot_nm1
+    sdot_nm1 .= sdot_n
+    rho_vdot_nm2 .= rho_vdot_nm1
+    rho_vdot_nm1 .= rho_vdot_n
+    rho_cdot_nm2 .= rho_cdot_nm1
+    rho_cdot_nm1 .= rho_cdot_n
+    rho_rdot_nm2 .= rho_rdot_nm1
+    rho_rdot_nm1 .= rho_rdot_n
+    mu_sat_dot_nm2 .= mu_sat_dot_nm1
+    mu_sat_dot_nm1 .= mu_sat_dot_n
+
+    # Set up the matrix problem
+    col = deepcopy(mtile.tile.kbasis.data[s_index])
+
+    # Solve for the coefficients
+    h_a = mtile.diffusion_matrix
+    if t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_diffusion_matrix(mtile.tile, mtile.model, ts_term)
+    end
+
+    # Set s_n+1 (homogeneous BCs)
+    _vertical_solve!(col, h_a, s_nstar, mtile)
+    view(mtile.var_np1,colstart:colend,s_index) .= Itransform!(col)
+
+    # Set rho_v_n+1
+    _vertical_solve!(col, h_a, rho_v_nstar, mtile)
+    view(mtile.var_np1,colstart:colend,rho_v_index) .= Itransform!(col)
+
+    # Set rho_c_n+1
+    _vertical_solve!(col, h_a, rho_c_nstar, mtile)
+    view(mtile.var_np1,colstart:colend,rho_c_index) .= Itransform!(col)
+
+    # Set rho_r_n+1
+    _vertical_solve!(col, h_a, rho_r_nstar, mtile)
+    view(mtile.var_np1,colstart:colend,rho_r_index) .= Itransform!(col)
+
+    # Set mu_sat_n+1
+    _vertical_solve!(col, h_a, mu_sat_nstar, mtile)
     view(mtile.var_np1,colstart:colend,mu_sat_index) .= Itransform!(col)
 
 end
@@ -1113,6 +2373,19 @@ Advance all variables one timestep using AB3 explicit time stepping (Euler for t
 second-order AB for t=2, third-order AB3 thereafter per Durran and Blossey 2012).
 """
 function explicit_timestep(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64)
+
+    # The water slaving's explicit side (`options[:si_water_slots]`, src/si_water_slaving.jl):
+    # stage the slaved slots' AI2* histories and add the solve's linear operator back into
+    # their tendencies BEFORE the AB3 combination below reads them. Here and not in
+    # `mc_driver!`, whose first-call compile sits at the LLVM cliff (see `_siw_stage!`).
+    uses_pressure_reference(mtile.model.equation_set) && _siw_enabled(mtile.model.options) &&
+        _siw_stage!(mtile, colstart, colend)
+    # The derived water anchor's exchange closures and its refit partner (Stage 3,
+    # src/si_water_slaving.jl `_water_exchange_stage!`): here for the same reason, the first-call
+    # compile of `mc_driver!` (the multistep closure's call site there took the axisymmetric
+    # Louis tile over the LLVM cliff, measured 2026-10-21).
+    uses_pressure_reference(mtile.model.equation_set) &&
+        _water_exchange_stage!(mtile, colstart, colend, t)
 
     for v in 1:length(mtile.model.grid_params.vars)
         physical = view(mtile.tile.physical,colstart:colend,v,1)
@@ -1202,9 +2475,14 @@ function grid_spacing_minima(patch, model)
     gp = getGridpoints(patch)
     kDim = model.grid_params.kDim
     npts = size(gp, 1)
-    z = gp[1:kDim, 2]                       # one column's vertical levels
+    z = gp[1:kDim, end]                     # one column's vertical levels (z is the
+                                            # LAST gridpoint column on 2D and 3D grids)
     dz_min = minimum(diff(sort(z)))
-    x = gp[1:kDim:npts, 1]                  # one point per horizontal column
+    # First horizontal coordinate (x, or r on the cylinders). On 3D ring grids many
+    # columns share one radius, so measure the unique values; note the tightest
+    # horizontal spacing there is really the outer-ring arc length, not dr — this
+    # is a run-once advisory diagnostic, not a stability guard.
+    x = unique(gp[1:kDim:npts, 1])
     dx_min = length(x) > 1 ? minimum(diff(sort(x))) : Inf
     return dz_min, dx_min
 end
@@ -1232,6 +2510,234 @@ function cfl_diagnostics(patch, model, t::Int64, dz_min::Float64, dx_min::Float6
         line *= ", max|u|=$(round(maxu; digits=3)) m/s, u Co=$(round(maxu * ts / dx_min; digits=3))"
     end
     println(line)
+    return nothing
+end
+
+"""
+    state_minima_trace(mtile, t)
+
+Optional per-step blow-up-precursor diagnostic for the pressure-reference (mc)
+sets, gated on `options[:state_minima_trace] = interval::Int` (0/absent = off).
+Every `interval` steps — and on ANY step where one of the tracked minima breaches
+its threshold — print those minima with their locations. One cheap pass over
+three variables; runs single-threaded before the column loop, so printing is
+race-free. Intended for short diagnostic reruns chasing positive-definiteness
+undershoots (the `log`-DomainError blow-up class); leave off in production.
+
+Three quantities, all reconstructed as full fields from perturbation + reference:
+
+- `ρ_d = ρ_d' + ρ̄_d(z)`, flagged below half its reference;
+- `ρ_t`, the derived total `ρ_d + Σ_k α_k ν_k` against `ρ̄_t^w`, likewise;
+- `ρ_w = ρ_t - ρ_d = Σ_k α_k ν_k`, the TOTAL WATER, flagged when it goes negative at all.
+
+The water is the one with a meaningful zero. `ρ_d` and `ρ_t` sit ~5 orders of
+magnitude clear of zero in every configuration run to date, so a half-reference
+breach in either is a blow-up, not a positive-definiteness problem. `ρ_w` is a sum of
+control variables, each fitted independently, and a negative ν lobe (the recovered density
+reads 0 there) can carry it below zero while every recovered species stays non-negative — no
+per-field spline bound can prevent that. Hence it is measured here rather than clamped
+anywhere.
+
+A fourth line tracks the collapse class that kills a run with `p < 0` (the §2c death:
+retrieval heating → w / sound-speed runaway → vertical SI past its limit): the minimum
+`p/p̄` (`p = p' + p̄(z)`, flagged below half its reference or at a non-positive value),
+the maximum `|w|`, and the maximum retrieved `T` (flagged when non-positive or non-finite),
+each with its location. `T` is the MODEL temperature in the run's `options[:temperature]`
+mode: under `:eos` (default) `p/(ρ_d R_d + ρ_v R_v)` with the prognostic vapor, under
+`:energy` the driver's closed-form retrieval from the RAW prognostic state —
+`M = p + E_t − ρ_t(½(u²+v²+w²) + gz)`, condensate through `recover_rho_c` /
+`recover_total` — the same reconstruction `radiation_column_state!` uses (no condensate
+floor, no anchor cap), so it is what the driver would retrieve with those devices idle.
+
+The same line reports `max|T_split|`, `T_split = T_energy − T_eos`, both evaluated as just
+described whatever the mode, with its location: the split between the energy retrieval and
+the equation of state that `options[:temperature]` exists to measure (see `eos_temperature`).
+"""
+function state_minima_trace(mtile::ModelTile, t::Int64)
+    interval = Int(get(mtile.model.options, :state_minima_trace, 0))
+    interval > 0 || return nothing
+    uses_pressure_reference(mtile.model.equation_set) || return nothing
+    vars = mtile.model.grid_params.vars
+    kDim = mtile.model.grid_params.kDim
+    rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
+    # the total density the model reads: the derived ρ_d + Σ α_k ν_k against ρ̄_t^w
+    rho_tbar = view(mc_rho_tbar_ref(mtile), :, 1)
+    rd = view(mtile.tile.physical, :, vars["rho_d"], 1)
+    wset = water_anchor_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
+    min_frac = Inf
+    min_i = 1
+    min_tfrac = Inf
+    min_ti = 1
+    min_w = Inf
+    min_wi = 1
+    # The pressure / updraft / temperature collapse precursors (see the docstring).
+    model = mtile.model
+    slots = mtile.mc_slots
+    phys = mtile.tile.physical
+    pbar = view(ref_pressure(mtile.ref_state), :, 1)
+    E_tbar = view(ref_total_energy(mtile.ref_state), :, 1)
+    rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
+    pp = view(phys, :, vars["p"], 1)
+    uu = view(phys, :, vars["u"], 1)
+    ww = view(phys, :, vars["w"], 1)
+    etp = view(phys, :, vars["E_t"], 1)
+    # Slots 8/9 are named for what they HOLD: nu_r/nu_c under the bhyp transforms.
+    nu_r = view(phys, :, vars[rain_var_name(model.options)], 1)
+    nu_c = view(phys, :, vars[condensate_var_name(model.options)], 1)
+    has_v = haskey(vars, "v")
+    vvv = view(phys, :, has_v ? vars["v"] : vars["u"], 1)
+    ice_on = ice_registered(slots)
+    i1q = view(phys, :, ice_on ? slots.i1_q : 1, 1)
+    i2q = view(phys, :, ice_on ? slots.i2_q : 1, 1)
+    i3q = view(phys, :, ice_on ? slots.i3_q : 1, 1)
+    ctrans = condensate_transform_mode(model.options)
+    cmu = get(model.physical_params, :condensate_mu, 1.0e-7)
+    rtrans = rain_transform_mode(model.options)
+    rmu = get(model.physical_params, :rain_mu, 1.0e-7)
+    itrans = ice_transform_mode(model.options)
+    imu = ice_mu(model.physical_params, 1)
+    zc = size(mtile.tilepoints, 2)
+    teos = temperature_mode(model.options) === :eos
+    rvp = view(phys, :, slots.rho_v, 1)
+    rho_vbar = mtile.mc_ref_diag.rho_vbar
+    # the vapor as the driver reads it (`recover_rho_v`; `nu_vbar ≡ rho_vbar` under `:none`)
+    nu_vbar = mc_nu_vbar(mtile)
+    vtrans = vapor_transform_mode(model.options)
+    vmu = vapor_mu(model.physical_params)
+    max_split = -Inf
+    max_si = 1
+    split_k = 0.0
+    min_pfrac = Inf
+    min_pi = 1
+    max_absw = -Inf
+    max_wi = 1
+    max_T = -Inf
+    max_Ti = 1
+    bad_T = false
+    @inbounds for i in eachindex(rd)
+        k = mod1(i, kDim)
+        frac = rd[i] / rho_dbar[k] + 1.0
+        if frac < min_frac
+            min_frac = frac
+            min_i = i
+        end
+        rti = anchor_rho_tp(rd[i], anchor_Wp(phys, i, 1, wset))
+        tfrac = rti / rho_tbar[k] + 1.0
+        if tfrac < min_tfrac
+            min_tfrac = tfrac
+            min_ti = i
+        end
+        w = (rti + rho_tbar[k]) - (rd[i] + rho_dbar[k])
+        if w < min_w
+            min_w = w
+            min_wi = i
+        end
+        pfrac = pp[i] / pbar[k] + 1.0
+        if pfrac < min_pfrac
+            min_pfrac = pfrac
+            min_pi = i
+        end
+        aw = abs(ww[i])
+        if aw > max_absw
+            max_absw = aw
+            max_wi = i
+        end
+        rho_dk = rd[i] + rho_dbar[k]
+        rho_tk = rti + rho_tbar[k]
+        vk = has_v ? vvv[i] : 0.0
+        ke = 0.5 * ((uu[i] * uu[i]) + (vk * vk) + (ww[i] * ww[i]))
+        M = (pp[i] + pbar[k]) + (etp[i] + E_tbar[k]) -
+            (rho_tk * (ke + (gravity * mtile.tilepoints[i, zc])))
+        rho_liq = recover_rho_c(nu_c[i], rho_cbar[k], ctrans, cmu) +
+                  recover_rho_r(nu_r[i], rtrans, rmu)
+        rho_ice = ice_on ? ((recover_total(i1q[i], itrans, imu) +
+                             recover_total(i2q[i], itrans, imu)) +
+                            recover_total(i3q[i], itrans, imu)) : 0.0
+        T_energy = retrieve_temperature(M, rho_dk, rho_tk, rho_liq, rho_ice)
+        rvk = vtrans === :none ? rvp[i] + rho_vbar[k] :
+                                 recover_rho_v(rvp[i], nu_vbar[k], vtrans, vmu)
+        T_eos = eos_temperature(pp[i] + pbar[k], rho_dk, rvk)
+        Tk = teos ? T_eos : T_energy
+        sp = T_energy - T_eos
+        if abs(sp) > max_split
+            max_split = abs(sp)
+            max_si = i
+            split_k = sp
+        end
+        if !(Tk > 0.0) || !isfinite(Tk)
+            # A bad T wins the slot outright: it is the one to locate.
+            if !bad_T
+                bad_T = true
+                max_T = Tk
+                max_Ti = i
+            end
+        elseif !bad_T && Tk > max_T
+            max_T = Tk
+            max_Ti = i
+        end
+    end
+    low_p = !(min_pfrac >= 0.5)
+    low = min_frac < 0.5 || min_tfrac < 0.5 || min_w < 0.0 || low_p || bad_T
+    if low || t % interval == 0
+        k = mod1(min_i, kDim)
+        loc = (i) -> "r=$(round(mtile.tilepoints[i, 1]; digits=1)) " *
+                     "z=$(round(mtile.tilepoints[i, end]; digits=1))"
+        println("  rho_d trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min rho_d/ref=$(round(min_frac; digits=4)) " *
+                "(rho_d=$(round(rd[min_i] + rho_dbar[k]; sigdigits=4)), " *
+                "ref=$(round(rho_dbar[k]; sigdigits=4))) " *
+                "at $(loc(min_i))" *
+                (min_frac < 0.5 ? "  << LOW" : ""))
+        println("  rho_t trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min rho_t/ref=$(round(min_tfrac; digits=4)) " *
+                "(rho_t=$(round(anchor_rho_tp(rd[min_ti], anchor_Wp(phys, min_ti, 1, wset)) +
+                                rho_tbar[mod1(min_ti, kDim)]; sigdigits=4)), " *
+                "ref=$(round(rho_tbar[mod1(min_ti, kDim)]; sigdigits=4))) " *
+                "at $(loc(min_ti))" *
+                (min_tfrac < 0.5 ? "  << LOW" : ""))
+        println("  rho_w trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min rho_w=$(round(1.0e3 * min_w; sigdigits=4)) g/m^3 " *
+                "at $(loc(min_wi))" *
+                (min_w < 0.0 ? "  << NEGATIVE WATER" : ""))
+        kp = mod1(min_pi, kDim)
+        println("  p/w/T trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                "min p/ref=$(round(min_pfrac; digits=4)) " *
+                "(p=$(round(pp[min_pi] + pbar[kp]; sigdigits=5)), " *
+                "ref=$(round(pbar[kp]; sigdigits=5))) at $(loc(min_pi))" *
+                (low_p ? "  << LOW P" : "") *
+                "; max|w|=$(round(max_absw; sigdigits=4)) m/s at $(loc(max_wi))" *
+                "; max T=$(round(max_T; sigdigits=5)) K at $(loc(max_Ti))" *
+                (bad_T ? "  << BAD T" : "") *
+                " [T=$(teos ? "eos" : "energy")]" *
+                "; max|T_split|=$(round(split_k; sigdigits=4)) K at $(loc(max_si))")
+        # The MYNN TKE density, when the run carries it: the minimum of the CARRIED slot
+        # (negative lobes are counted, never repaired) with its location and the number of
+        # negative points.
+        # Under the TKE control variable (`tke_transform = :bhyp`) the minimum is that of the
+        # RECOVERED density (what every reader takes, >= 0) and the negative points are the
+        # slot's `nu_e < 0`, with the slot's own minimum beside them.
+        re = slots.rho_e
+        if re > 0
+            rev = view(phys, :, re, 1)
+            etr = mtile.mynn.tke_transform
+            emu = mtile.mynn.tke_mu
+            emin = Inf; emin_i = 1; nneg = 0; smin = Inf
+            @inbounds for i in eachindex(rev)
+                x = rev[i]
+                x < 0.0 && (nneg += 1)
+                x < smin && (smin = x)
+                xr = recover_rho_e(x, etr, emu)
+                if xr < emin
+                    emin = xr
+                    emin_i = i
+                end
+            end
+            println("  rho_e trace t=$(round(t * mtile.model.ts; digits=2)) s: " *
+                    "min rho_e=$(round(emin; sigdigits=4)) J/m^3 at $(loc(emin_i)); " *
+                    (etr === :none ? "rho_e<0 points=$(nneg)" :
+                     "nu_e<0 points=$(nneg) (min nu_e=$(round(smin; sigdigits=4)))"))
+        end
+    end
     return nothing
 end
 
@@ -1320,9 +2826,27 @@ end
 
 const _RIRK_SOLVE_CACHE = Dict{UInt, NamedTuple}()
 const _RIRK_SOLVE_LOCK = ReentrantLock()
-# Per-factorization Dirichlet flags (bottom, top), so the load vector can zero the
-# matching boundary rows. Keyed by objectid of the factorization object.
-const _RIRK_DIRICHLET = Dict{UInt, Tuple{Bool, Bool}}()
+
+"""
+    SplineFactor(F, db, dt)
+
+A factorized B-spline Galerkin vertical operator together with the Dirichlet flags
+(bottom, top) of the rows it was assembled with, so `_vertical_solve!` can zero the
+matching load-vector rows. The flags used to live in a global `Dict` keyed by
+`objectid(F)`: every `_vertical_solve!` read it WITHOUT the lock that the first-step
+per-column assemblies (`t == 1` inside the `@threads :static` column loop) inserted under,
+and `objectid` of a freed factorization can be reused. Carrying the flags on the object
+removes the registry, the lock, the address-keyed lookup, and the race in one move.
+`ldiv!` forwards to the wrapped factorization, so the solve itself is unchanged.
+"""
+struct SplineFactor{F<:Factorization} <: Factorization{Float64}
+    F::F
+    db::Bool
+    dt::Bool
+end
+Base.size(sf::SplineFactor) = size(sf.F)
+Base.size(sf::SplineFactor, i::Integer) = size(sf.F, i)
+LinearAlgebra.ldiv!(x::AbstractVector, sf::SplineFactor, b::AbstractVector) = ldiv!(x, sf.F, b)
 
 _is_dirichlet(bc::BoundaryConditions) = bc.u !== nothing
 
@@ -1342,7 +2866,11 @@ function _rirk_solve_data(kcol::CubicBSpline.Spline1D)
             _, qw = CubicBSpline._quadrature_rule(sp.mubar, sp.quadrature)
             W  = repeat(qw .* sp.DX, outer = sp.num_cells)   # physical weights, length kDim
             Nb = CubicBSpline.SItransform_matrix(kcol, [sp.xmin, sp.xmax], 0)
-            (M0 = M0, M1 = M1, W = W, Nb = Nb)
+            # α-independent Galerkin mass matrix, precomputed so per-step
+            # profile-coefficient assemblies (the state-dependent semi-implicit)
+            # only rebuild the weighted stiffness.
+            Mass = M0' * (W .* M0)
+            (M0 = M0, M1 = M1, W = W, Nb = Nb, Mass = Mass)
         end
     end
 end
@@ -1356,11 +2884,40 @@ function _assemble_spline_matrix(d, α::Float64, β::Float64,
     db = _is_dirichlet(bc_bottom); dt = _is_dirichlet(bc_top)
     if db; A[1,   :] .= d.Nb[1, :]; end
     if dt; A[end, :] .= d.Nb[2, :]; end
-    F = factorize(A)
-    lock(_RIRK_SOLVE_LOCK) do
-        _RIRK_DIRICHLET[objectid(F)] = (db, dt)
-    end
-    return F
+    return SplineFactor(factorize(A), db, dt)
+end
+
+"""
+    _assemble_sd_helmholtz(d, α, db, dt)
+
+Per-column, per-step Helmholtz assembly for the STATE-DEPENDENT semi-implicit:
+the operator `∂z(α(z)∂z·) − 1` in the weak Galerkin form `−M1ᵀ(W·α)M1 − Mass`
+with `α = Δτ²·Pξⁿ(z)` evaluated from the CURRENT column state, Dirichlet rows
+per `db`/`dt`. Unlike `_assemble_spline_matrix` this reuses the precomputed
+`d.Mass` and returns the bare factorization — callers pass the Dirichlet flags
+to `_vertical_solve!` explicitly.
+"""
+function _assemble_sd_helmholtz(d, α::AbstractVector{Float64}, db::Bool, dt::Bool)
+    A = -(d.M1' * ((d.W .* α) .* d.M1)) .- d.Mass
+    if db; A[1,   :] .= d.Nb[1, :]; end
+    if dt; A[end, :] .= d.Nb[2, :]; end
+    return factorize(A)
+end
+
+# Profile-coefficient variant, ∂_z(α(z) ∂_z ·) + β with α given at the mish points
+# (the mc pressure-reference local sound speed Δτ²·Pξ̄(z)): the weak form weights
+# the stiffness quadrature, ∫ψ'αφ' = M1ᵀ(W·α)M1, keeping A symmetric. A separate
+# method (not a Union) so the scalar path stays bitwise-identical for the legacy
+# sets and the diffusion matrices.
+function _assemble_spline_matrix(d, α::AbstractVector{Float64}, β::Float64,
+        bc_bottom::BoundaryConditions, bc_top::BoundaryConditions)
+    Mass  = d.M0' * (d.W .* d.M0)
+    Stiff = d.M1' * ((d.W .* α) .* d.M1)
+    A = (-1.0) .* Stiff .+ β .* Mass
+    db = _is_dirichlet(bc_bottom); dt = _is_dirichlet(bc_top)
+    if db; A[1,   :] .= d.Nb[1, :]; end
+    if dt; A[end, :] .= d.Nb[2, :]; end
+    return SplineFactor(factorize(A), db, dt)
 end
 
 """
@@ -1389,8 +2946,31 @@ function _assemble_vertical_matrix(grid::AbstractGrid, model::ModelParameters,
     end
 end
 
+# Profile-coefficient variant, ∂_z(α(z) ∂_z ·) + β with α at the mish points. The
+# spline path is the symmetric weighted-stiffness Galerkin form; the Chebyshev
+# path is the exact collocation of the product, M1·(M0 \ (α .* M1)) — the nodal
+# derivative of the fitted pointwise product α·∂_z(·), mirroring the pointwise
+# recovery/staging chain, with no need for ∂_z α.
+function _assemble_vertical_matrix(grid::AbstractGrid, model::ModelParameters,
+        α::AbstractVector{Float64}, β::Float64, bc_scale::Float64,
+        bc_bottom::BoundaryConditions, bc_top::BoundaryConditions)
+    kcol = grid.kbasis.data[1]
+    if kcol isa CubicBSpline.Spline1D
+        return _assemble_spline_matrix(_rirk_solve_data(kcol), α, β, bc_bottom, bc_top)
+    else
+        nz = model.grid_params.kDim
+        M0 = operator_matrix(grid, :k, 0)
+        M1 = operator_matrix(grid, :k, 1)
+        M2 = operator_matrix(grid, :k, 2)
+        h = (M1 * (M0 \ (α .* M1))) .+ β .* M0
+        bc1 = bc_scale .* _helmholtz_bc_row(bc_bottom, M0, M1, M2, 1)
+        bc2 = bc_scale .* _helmholtz_bc_row(bc_top, M0, M1, M2, nz)
+        return factorize([bc1[:]'; bc2[:]'; h[2:nz-1, :]])
+    end
+end
+
 """
-    _vertical_solve!(col, h_a, rhs_mish, grid)
+    _vertical_solve!(col, h_a, rhs_mish, mtile)
 
 Solve the factorized vertical system `h_a` for the spectral coefficients `col.a`,
 given the right-hand side `rhs_mish` sampled at the `kDim` physical mish points
@@ -1398,19 +2978,39 @@ given the right-hand side `rhs_mish` sampled at the `kDim` physical mish points
 are used directly; for a cubic B-spline k-basis the Galerkin load vector
 `M0ᵀW rhs_mish` is formed and the Dirichlet boundary rows (if any) are zeroed.
 """
-function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, grid::AbstractGrid)
-    kcol = grid.kbasis.data[1]
-    if kcol isa CubicBSpline.Spline1D
-        d = _rirk_solve_data(kcol)
-        b = d.M0' * (d.W .* rhs_mish)
-        db, dt = get(_RIRK_DIRICHLET, objectid(h_a), (false, false))
+function _vertical_solve!(col, h_a, rhs_mish::AbstractVector, mtile::ModelTile;
+        dirichlet::Union{Nothing, NTuple{2, Bool}}=nothing)
+    # Everything here is preallocated per-thread. This runs 4x per column per timestep, so the
+    # old version's cost was structural, not incidental: it allocated three temporaries
+    # (`d.W .* rhs_mish`, the `M0'*` product, and `h_a \ b`) and — worse — reached
+    # `_rirk_solve_data`, which took a GLOBAL LOCK and hit a Dict on every call. That is ~22 M
+    # lock acquisitions across a straka93 run, from every thread at once. The solve data is
+    # per-grid and invariant, so it now lives on the tile.
+    tid = Threads.threadid()
+    d = mtile.solve_data
+    b = @inbounds view(mtile.solve_load, :, tid)
+
+    if d !== nothing
+        # Cubic B-spline (RiRk) k-basis: Galerkin load vector M0ᵀ W rhs_mish.
+        w = @inbounds view(mtile.solve_rhs, :, tid)
+        w .= d.W .* rhs_mish
+        mul!(b, d.M0', w)
+        # Dirichlet flags: explicit from the caller (per-step factorizations,
+        # `_assemble_sd_helmholtz`) or carried by the `SplineFactor` the assembly
+        # returned. A bare factorization with no flags means no Dirichlet rows.
+        db, dt = dirichlet !== nothing ? dirichlet :
+                 h_a isa SplineFactor ? (h_a.db, h_a.dt) : (false, false)
         if db; b[1]   = 0.0; end
         if dt; b[end] = 0.0; end
-        col.a .= h_a \ b
     else
+        # Chebyshev k-basis: interior mish values directly, homogeneous boundary rows.
         nz = length(rhs_mish)
-        col.a .= h_a \ vcat(0.0, 0.0, rhs_mish[2:nz-1])
+        b[1] = 0.0
+        b[2] = 0.0
+        @inbounds @views b[3:nz] .= rhs_mish[2:nz-1]
     end
+
+    ldiv!(col.a, h_a, b)
     return col
 end
 
@@ -1453,6 +3053,22 @@ function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelPara
         bc_bottom::BoundaryConditions=DirichletBC(), bc_top::BoundaryConditions=DirichletBC())
 
     c = ts_term * ts_term * Pxi_bar
+    return _assemble_vertical_matrix(grid, model, c, -1.0, 1.0, bc_bottom, bc_top)
+end
+
+"""
+Profile variant of [`calc_Helmholtz_semiimplicit_matrix`](@ref): `Pxi_prof` is the
+LOCAL reference sound speed squared γ̄_m(z)·p̄(z)/ρ̄_t(z) at the mish points (the mc
+pressure-reference sets; see `mc_reference_diagnostics`). The operator becomes
+`∂_z(Δτ²·Pξ̄(z)·∂_z) - 1`, so the acoustic remainder left to AB3 is O(perturbation)
+at every level — a domain-mean c̄² leaves the local deviation explicit, which is
+the classic reference-state SI instability (Simmons, Hoskins & Burridge 1978) and
+blows up above Co_z ≈ 4.5 on a realistically stratified sounding.
+"""
+function calc_Helmholtz_semiimplicit_matrix(grid::AbstractGrid, model::ModelParameters, Pxi_prof::AbstractVector{Float64}, ts_term::Float64;
+        bc_bottom::BoundaryConditions=DirichletBC(), bc_top::BoundaryConditions=DirichletBC())
+
+    c = (ts_term * ts_term) .* Pxi_prof
     return _assemble_vertical_matrix(grid, model, c, -1.0, 1.0, bc_bottom, bc_top)
 end
 

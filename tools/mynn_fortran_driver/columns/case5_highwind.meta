@@ -1,0 +1,17 @@
+case 5: Dunion sounding + u = 50 tanh(z/300 m) (hurricane-force lowest-level wind), v = w = 0,
+over SST = 302.65 K (the TC's SST_K); Scythe bulk surface layer with Komori Cd in its capped
+high-wind regime (2.55e-3), Ck = 1e-3, U_min = 2; dx = 3 km (TC nest-1 production cells).
+The surface-layer / K-limit regime the port must survive. Cd = 0.0013405845592068559, U1 = 9.2828871920652887, hfx = 32.034604201362576, qfx = 7.5170412914203928e-05
+n = 150, z1 = 56.35083268962915 m, ztop = 24943.64916731037 m
+ps = 101491.90071751004
+ts = 301.91772489884397
+qsfc = 0.025583056216376139
+ust = 0.33988357627935734
+hfx = 32.034604201362576
+qfx = 7.5170412914203928e-05
+wspd = 9.2828871920652887
+znt = 0.001014674272043613
+xland = 2
+dx = 3000
+rmol = -0.0020913672027663491
+delt = 20

@@ -1,0 +1,21 @@
+# Legacy-pin overlay: simulations/ocean_2D_rce/scythe_config.toml + this = what
+# benchmarks/ocean_rce.jl built with no SCYTHE_RCE_* / SCYTHE_REFSTATE set (goldens
+# rce_default_seg1.toml, rce_default_seg3.toml; --days 20 --segment-days 2).
+[reference_state]
+consistent_qss = false
+hydrostatic    = false
+
+[physics.microphysics]
+vapor_transform = "none"             # legacy: the vapor slot is the density perturbation (pre-Stage 1)
+
+[physics.boundary_layer]
+tke_transform = "none"               # legacy: the MYNN slot is the TKE density rho_e (pre-Stream D)
+
+[numerics]
+state_dependent_si = false
+temperature = "energy"               # legacy: T from the total-energy retrieval (pre-2026-10-14)
+si_water_slots = "none"              # legacy: every water species took its acoustic compression explicitly (pre-Stage 2)
+
+[boundary_conditions]
+vertical_scalars = "d2"             # legacy: one wall condition, ground AND lid
+vertical_scalars_lid = "d2"

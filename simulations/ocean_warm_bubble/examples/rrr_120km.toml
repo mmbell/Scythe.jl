@@ -1,0 +1,88 @@
+# 3-D RRR warm bubble, the Mac development box (Stream C2, stage R2e): the ocean warm bubble
+# on the 3-D Cartesian box (moist_compressible_RRR: spline x, y, z), 120 km x 120 km x 25 km
+# at the OWB / TC coarse spacing (6 km x 500 m cells, 20 x 20 x 50), walls on all four faces,
+# a round 3 K bubble centred in the box, f = 0. Its control is rlr_60km.toml beside this file
+# (the same bubble centred on the axis of a 60 km cylinder, same spacing):
+# rrr_rlr_compare.jl compares the two inside r < R/2 = 30 km of the bubble centre.
+#
+#   julia --project=<scythe> simulations/ocean_warm_bubble/run.jl \
+#       --config simulations/ocean_warm_bubble/examples/rrr_120km.toml --set output.dir=<abs>
+#
+# 3,600 columns (60 x 60 mish nodes) x 150 levels, ~1.8x the RLR control's columns.
+# Complete file (not an overlay): every case key as in ../scythe_config.toml; physics = the
+# OWB defaults (ice + MYNN + two-moment rain), radiation none. The production-size box is
+# ../../ocean_warm_bubble_3d/ (300 km, 50 x 50 x 50, the cluster).
+
+[run]
+name             = "rrr_120km"
+equation_set     = "moist_compressible_RRR"
+integration_time = 3600.0            # 1 hour
+segment_length   = 0.0               # single segment
+
+[output]
+dir              = "output_rrr_120km"   # relative to this file; override with --set output.dir=<abs>
+interval         = 300.0
+restart_interval = 21600.0           # unused (segment_length = 0 needs no chaining checkpoint)
+formats          = ["netcdf", "csv"]   # rrr_rlr_compare.jl and owb3d_movie.jl read the comprehensive <t>.nc; csv optional
+sidecars         = false             # per-tile MYNN / radiation NetCDF sidecars
+netcdf_grid      = "regular"
+netcdf_derivatives = false
+
+[grid]
+# 120 km x 120 km x 25 km, 6 km x 500 m cells (the OWB / TC coarse spacing).
+geometry     = "RRR"                 # spline x, y, z
+boundaries   = [0.0, 120.0e3]        # x edges [m]
+num_cells    = [20]
+boundaries_j = [0.0, 120.0e3]        # y edges [m] (the box's second horizontal axis)
+num_cells_j  = [20]
+z_top        = 25.0e3
+num_cells_k  = 50
+
+[boundary_conditions]
+# The boundary condition of every variable follows from these four family rules (plus any
+# per-variable [boundary_conditions.override] entries). The resolved per-variable table is
+# written to <output.dir>/boundary_conditions.toml and printed at startup; the tables for
+# every case are in simulations/README.md ("Boundary conditions").
+lateral           = "walls"          # ALL FOUR FACES, FREE-SLIP: u Dirichlet on the x faces, v
+                                     # on the y faces; w and every other variable Neumann
+vertical_scalars  = "natural"        # GROUND of every variable except w (always Dirichlet
+                                     # zero): unconstrained, so the logarithmic surface layer
+                                     # is not forced to a constant gradient (d2 did that) --
+                                     # p, rho_d, nu_v, u, E_t, Q_ss, nu_c, nu_e
+vertical_scalars_lid = "natural"     # LID of the same family (w still Dirichlet zero):
+                                     # unconstrained. d2 at the lid drifts warm over days (2D
+                                     # RCE: lid T +0.5 K at 48 h, crash at 277 h); natural decays
+sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
+                                     # ice slots: unconstrained (their ground is always natural,
+                                     # so they fall out). The sedimentation FLUX is fitted with a
+                                     # zero-flux lid either way: nothing falls in from above
+
+[timestep]
+ts           = 0.5                   # [s]
+ts_per_patch = []                    # empty = single patch at ts
+scale        = 1.0
+
+[reference_state]
+sounding       = "@scythe/benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref"
+exact          = true
+consistent_qss = true
+hydrostatic    = true
+
+[initial_conditions]
+method = "temperature_bubble"
+
+[initial_conditions.temperature_bubble]
+# An RH-preserving warm ellipsoid centred in the box, round in the horizontal (xr in x and y).
+xc     = 60.0e3                      # bubble centre, x [m]
+yc     = 60.0e3                      # bubble centre, y [m]
+xr     = 20.0e3                      # horizontal half-width [m] (x and y)
+zc     = 500.0                       # bubble centre, vertical [m]
+zr     = 3000.0                      # vertical half-depth [m]
+dT_max = 3.0                         # peak temperature perturbation [K]
+
+[environment]
+f_latitude = 0.0                     # [deg]; f = 0, as the control (and x<->y symmetric)
+sst        = 302.65                  # [K]
+
+[physics.radiation]
+scheme = "none"                      # a 2-hour bubble does not feel radiation

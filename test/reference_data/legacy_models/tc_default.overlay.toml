@@ -1,0 +1,29 @@
+# Legacy-pin overlay: simulations/tc_axisym/scythe_config.toml + this = what tc/tc_params.jl +
+# tc/tc_init.jl built with no SCYTHE_TC_* set (the golden tc_default.toml), captured with
+# make_base(1800.0). Used by test/test_config_equivalence.jl.
+[run]
+integration_time = 1800.0
+
+[physics.microphysics]
+ice = "none"                         # warm rain, single-moment (rain_moments auto -> 1)
+vapor_transform = "none"             # legacy: the vapor slot is the density perturbation (pre-Stage 1)
+
+[physics.boundary_layer]
+scheme = "louis"
+tke_transform = "none"               # legacy: the MYNN slot is the TKE density (pre-Stream D; read only under mynn)
+
+[physics.surface]
+stability = false
+
+[physics.radiation]
+scheme = "none"
+
+[boundary_conditions]
+vertical_scalars = "d2"             # legacy: one wall condition, ground AND lid
+vertical_scalars_lid = "d2"
+sedimentation_lid = "wall"           # legacy TC left rain on the d2 wall condition at the lid
+
+[numerics]
+wall_bc_tau = "inf"                  # inert under d2; the legacy value
+temperature = "energy"               # legacy: T from the total-energy retrieval (pre-2026-10-14)
+si_water_slots = "none"              # legacy: every water species took its acoustic compression explicitly (pre-Stage 2)

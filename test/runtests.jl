@@ -1,19 +1,22 @@
+# Scythe.jl test suite.
+#
+#   julia --project=. test/runtests.jl                 # everything, canonical order (~35 min)
+#   GROUP=io julia --project=. test/runtests.jl        # one group
+#   GROUP=core,physics julia --project=. test/runtests.jl
+#
+# Groups and the file table live in test/test_groups.jl. GROUP is resolved BEFORE Scythe is
+# loaded so a typo fails in under a second, not after the package compiles. (Pkg.test stalls
+# under check-bounds; run this file directly.)
+include("test_groups.jl")
+const GROUP = get(ENV, "GROUP", "all")
+const FILES = test_files_for(GROUP)
+println("Scythe tests: GROUP=$(GROUP) ($(length(FILES)) of $(length(TEST_FILES)) files)")
+
 using Test
 using Scythe
 
 @testset "Scythe.jl" begin
-    include("test_thermodynamics.jl")
-    include("test_microphysics.jl")
-    include("test_bf02_restoration.jl")
-    include("test_idealized_init.jl")
-    include("test_spectralGrid.jl")
-    include("test_reference_state.jl")
-    include("test_api_migration.jl")
-    include("test_generic_transforms.jl")
-    include("test_linear_advection_integration.jl")
-    include("test_distributed_linear_advection.jl")
-    include("test_distributed_rz.jl")
-    include("test_oneway_sw_slab.jl")
-    include("test_pv_mixing_floor.jl")
-    include("test_benchmark_smoke.jl")
+    for f in FILES
+        include(f)
+    end
 end

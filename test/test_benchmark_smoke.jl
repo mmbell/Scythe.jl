@@ -4,6 +4,133 @@ using Springsteel
 using SparseArrays
 
 include("distributed_test_helpers.jl")
+include(joinpath(@__DIR__, "..", "benchmarks", "common", "harness.jl"))
+
+# Pure path/lookup construction for arm-aware reference keying (benchmarks/common/
+# harness.jl: reference_csv_path, load_targets). No model run, so this runs unconditionally
+# (not gated behind SCYTHE_SLOW_TESTS). The design point under test: an ARMED benchmark
+# variant (e.g. o01_rainfall's ISHMAEL ice arm, benchmarks/o01_rainfall.jl) must read/write
+# its OWN reference file and target windows, while an UNARMED call (the default arm="")
+# must be completely unaffected -- byte-identical to the path/lookup construction before
+# the `arm` keyword existed at all.
+# The regression comparison under the vapor control variable (compare_reference's `vapor`
+# keyword): a nu_v run is compared to a nu_v reference directly, and to a density-vapor
+# reference through the recovered vapor ahyp(nu_v' + bhyp(rho_vbar)) - rho_vbar.
+@testset "Benchmark harness: vapor control variable regression comparison" begin
+    mktempdir() do dir
+        kD = 4; nc = 3; mu = 1.0e-9
+        rvb = [1.2e-2, 6.0e-3, 2.0e-3, 4.0e-4]
+        rb = repeat(rvb, nc)
+        dv = 1.0e-4 .* sin.(1:(kD * nc))                    # the density perturbation
+        nu = Scythe.bhyp.(rb .+ dv, mu) .- Scythe.bhyp.(rb, mu)
+        z = repeat(collect(1.0:kD), nc)
+        wcsv(path, cols) = open(path, "w") do io
+            ks = collect(keys(cols))
+            println(io, join(ks, ","))
+            for i in eachindex(z)
+                println(io, join((repr(cols[k][i]) for k in ks), ","))
+            end
+        end
+        out = joinpath(dir, "out.csv"); refd = joinpath(dir, "ref_rho_v.csv")
+        refn = joinpath(dir, "ref_nu_v.csv")
+        wcsv(out, Dict("z" => z, "nu_v" => nu))
+        wcsv(refd, Dict("z" => z, "rho_v" => dv))
+        wcsv(refn, Dict("z" => z, "nu_v" => nu))
+        # recovered against the density reference: passes (round trip ~1e-16)
+        ok, st = compare_reference(out, refd, ["nu_v"]; vapor = (rvb, kD, mu))
+        @test ok === true && st["nu_v"][1] < 1.0e-9
+        # a wrong recovery (the raw nu column read as density) would fail by ~1/2
+        ok2, st2 = compare_reference(out, refd, ["nu_v"]; vapor = (rvb, kD, 1.0e-2))
+        @test st2["nu_v"][1] > st["nu_v"][1]
+        # nu_v to nu_v directly
+        ok3, st3 = compare_reference(out, refn, ["nu_v"])
+        @test ok3 === true && st3["nu_v"][1] == 0.0
+        # without the reference vapor a density reference is not comparable: skipped
+        ok4, st4 = compare_reference(out, refd, ["nu_v"])
+        @test ok4 === nothing && isempty(st4)
+    end
+end
+
+@testset "Benchmark harness: arm-aware reference keying" begin
+    quick_opts = BenchmarkOptions(:quick, STAGE_MC, :rirk, 1, false, false, 1.0, 1, false, false)
+    full_opts  = BenchmarkOptions(:full,  STAGE_MC, :rirk, 1, false, false, 1.0, 1, false, false)
+
+    @testset "worker_threads: positional 10-arg form defaults to the CPU split" begin
+        @test quick_opts.worker_threads == 0
+        @test parse_benchmark_args(String["--worker-threads", "3"]).worker_threads == 3
+        @test parse_benchmark_args(String[]).worker_threads ==
+              parse(Int, get(ENV, "SCYTHE_BENCH_THREADS", "0"))
+        @test_throws ErrorException parse_benchmark_args(String["--worker-threads", "-1"])
+    end
+
+    @testset "reference_csv_path: unarmed is byte-identical to the pre-arm path" begin
+        @test reference_csv_path("o01_rainfall", quick_opts) ==
+              joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "quick_mc_rirk_final.csv")
+        @test reference_csv_path("o01_rainfall", full_opts) ==
+              joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "full_mc_rirk_diagnostics.csv")
+        # Explicit arm="" must equal the no-keyword call exactly.
+        @test reference_csv_path("o01_rainfall", quick_opts; arm="") ==
+              reference_csv_path("o01_rainfall", quick_opts)
+        @test reference_csv_path("o01_rainfall", full_opts; arm="") ==
+              reference_csv_path("o01_rainfall", full_opts)
+    end
+
+    @testset "reference_csv_path: armed gets its own distinct path" begin
+        @test reference_csv_path("o01_rainfall", quick_opts; arm="ice") ==
+              joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "quick_mc_rirk_ice_final.csv")
+        @test reference_csv_path("o01_rainfall", full_opts; arm="ice") ==
+              joinpath(REFERENCE_DATA_DIR, "o01_rainfall", "full_mc_rirk_ice_diagnostics.csv")
+        # Armed and unarmed paths must never collide (the point of the whole change).
+        @test reference_csv_path("o01_rainfall", quick_opts; arm="ice") !=
+              reference_csv_path("o01_rainfall", quick_opts)
+        @test reference_csv_path("o01_rainfall", full_opts; arm="ice") !=
+              reference_csv_path("o01_rainfall", full_opts)
+    end
+
+    @testset "load_targets: unarmed is byte-identical to the pre-arm lookup" begin
+        warm_names = [t.name for t in load_targets("o01_rainfall", quick_opts)]
+        @test !isempty(warm_names)
+        @test "peak_rain_rate_gm2s" in warm_names
+        # Explicit arm="" must equal the no-keyword call exactly.
+        @test [t.name for t in load_targets("o01_rainfall", quick_opts; arm="")] == warm_names
+    end
+
+    @testset "load_targets: armed lookup does NOT fall back to the warm windows" begin
+        # "o01_rainfall_ice" carries its OWN 11 windows (seeded 2026-08-20 from the first
+        # full-3600 s production ice run) -- an armed run must get exactly those, never the
+        # warm case's: the ice arm's centers (accum 3.4, max_w 7.1) are physically different
+        # numbers from the warm ones (2.476, 9.98), which is the whole reason arm-qualified
+        # keys exist.
+        ice_targets = load_targets("o01_rainfall", quick_opts; arm="ice")
+        @test length(ice_targets) == 11
+        ice_names = [t.name for t in ice_targets]
+        @test "max_rho_i1_gm3" in ice_names          # a window the warm case cannot have
+        @test !("max_n_i1_perL" in ice_names)        # deliberately unwindowed (§2c family)
+        # An arm with no entry in BENCHMARK_EXPECTED at all behaves the same way: empty,
+        # not an error and not a silent fallback to "o01_rainfall".
+        @test isempty(load_targets("o01_rainfall", quick_opts; arm="nonexistent_arm"))
+        # The unarmed lookup for a genuinely undefined case still errors, exactly as before.
+        @test_throws ErrorException load_targets("no_such_benchmark_case", quick_opts)
+    end
+
+    @testset "load_targets: full mode prefers the mode-qualified ice windows" begin
+        # "o01_rainfall_ice_full" (seeded 2026-09-01 from the accepted full run) wins in
+        # full mode: the 4x-resolution storm is not the quick storm re-run finer (accum
+        # 0.90 vs 3.7), so its windows carry their own centers. Quick mode is untouched,
+        # and an arm/case with no _full entry falls through to its ordinary key.
+        full_opts = BenchmarkOptions(:full, STAGE_MC, :rirk, 1, false, false, 1.0, 1,
+                                     false, false)
+        ice_full = Dict(t.name => t for t in load_targets("o01_rainfall", full_opts; arm="ice"))
+        @test length(ice_full) == 11
+        @test ice_full["accum_rainfall_mm"].value == 0.90       # the _full center
+        @test ice_full["ice_top_km"].value == 19.97             # capped-scan seeding
+        ice_quick = Dict(t.name => t for t in load_targets("o01_rainfall", quick_opts; arm="ice"))
+        @test ice_quick["accum_rainfall_mm"].value == 3.7       # quick key unchanged
+        # The warm case has no _full entry: full mode reads the ordinary key.
+        warm_full = [t.name for t in load_targets("o01_rainfall", full_opts)]
+        @test "peak_rain_rate_gm2s" in warm_full
+    end
+end
 
 # Micro smoke test of the Straka density current configuration: a few seconds
 # of integration on a tiny grid, single process. Catches gross breakage of the

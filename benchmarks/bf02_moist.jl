@@ -28,7 +28,7 @@ using Distributed
 include(joinpath(@__DIR__, "common", "harness.jl"))
 opts = parse_benchmark_args(ARGS)
 
-addprocs(opts.workers, exeflags="--threads=auto")
+add_benchmark_workers(opts)
 @everywhere using Springsteel
 @everywhere using Scythe
 
@@ -39,25 +39,47 @@ include(joinpath(@__DIR__, "common", "diagnostics.jl"))
 const PE_VARS = ["s", "xi", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
 # Linear dry-air-density variant: slot 2 is "rho_d" (rho_d') instead of "xi"
 const PE_VARS_RHOD = ["s", "rho_d", "mu", "u", "w", "mu_c", "mu_r", "mu_sat"]
+# Partial-density variant: moisture carried as partial densities rho_v/rho_c/rho_r
+const PE_VARS_PD = ["s", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
+# Entropy-density variant: slot 1 carries sigma = rho_d*s instead of s
+const PE_VARS_SIGMA = ["sigma", "rho_d", "rho_v", "u", "w", "rho_c", "rho_r", "mu_sat"]
+# Total-energy variant: prognostic p/rho_d/rho_v/E_t/Q_ss (the vapor is slot 3 since Stage 4 of
+# the rho_t retirement; rho_t is derived, rho_d + sum_k alpha_k nu_k)
+const MC_VARS = Scythe.MC_VARS     # untransformed slot names (Scythe.mc_var_names)
 function bf02_moist_vars(stage)
     stage == :legacy && return ["s", "xi", "mu", "u", "w", "mu_l", "qss"]
+    stage == STAGE_MC && return MC_VARS
+    stage == STAGE_PE_SIGMA && return PE_VARS_SIGMA
+    stage == STAGE_PE_RHOD_PD && return PE_VARS_PD
     stage == STAGE_PE_RHOD && return PE_VARS_RHOD
     return PE_VARS
 end
-# Liquid water variable(s) per stage (PE splits liquid into cloud and rain)
-liquid_vars(stage) = stage == :legacy ? ["mu_l"] : ["mu_c", "mu_r"]
+# Liquid water variable(s) per stage (PE splits liquid into cloud and rain; the
+# partial-density and entropy-density stages carry them as densities rho_c/rho_r;
+# the total-energy stage now carries a PROGNOSTIC rho_c alongside rho_r)
+function liquid_vars(stage)
+    stage == :legacy && return ["mu_l"]
+    stage == STAGE_MC && return ["rho_c", "rho_r"]
+    stage in (STAGE_PE_RHOD_PD, STAGE_PE_SIGMA) && return ["rho_c", "rho_r"]
+    return ["mu_c", "mu_r"]
+end
 const Q_T = 0.02
 const THETA_E = 320.0
 
 function bf02_moist_model(opts::BenchmarkOptions)
+    # The B-spline (RiRk) vertical is sized by cell count, the Chebyshev (RZ) vertical by kDim
+    # (see `vertical_size` in common/harness.jl). Here they coincide -- 100 cells == kDim 300 and
+    # 25 cells == kDim 75 -- so both geometries keep exactly the grid they had before.
     if opts.mode == :full
-        num_cells = 200         # 100 m cells
-        kDim = 100
-        ts = 0.1
+        num_cells_i = 200       # 100 m cells
+        num_cells_k = 100       # RiRk: 100 m cells
+        kDim = 300              # RZ: Chebyshev points
+        ts = 0.025#0.1/3.0
         output_interval = 100.0
     else
-        num_cells = 100         # 200 m cells
-        kDim = 50
+        num_cells_i = 50        # 400 m cells
+        num_cells_k = 25        # RiRk: 400 m cells
+        kDim = 75               # RZ: Chebyshev points
         # The condensation relaxation timescale does not coarsen with the
         # grid, so quick mode keeps the full-mode timestep
         ts = 0.1
@@ -68,16 +90,56 @@ function bf02_moist_model(opts::BenchmarkOptions)
     if opts.stage == :legacy
         equation_set = "BF02_test"
         physical_params = Dict(:K => 0.0, :Kvdiff => 0.0)
-        options = Dict(:semiimplicit => true, :exact_reference_state => true)
-    elseif opts.stage == STAGE_PE_RHOD
+        options = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                                   :output_formats => BENCHMARK_OUTPUT_FORMATS)
+    elseif opts.stage in (STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA, STAGE_MC)
         # Linear dry-air-density prognostic variant (mass-conserving continuity)
         # with semi-implicit acoustics on the mass flux phi = rhobar_d * w
-        # (Phase 2; see reference/Semiimplicit_linear_rhod.tex).
-        equation_set = "primitive_equation_XZ_rhod"
+        # (Phase 2; see reference/Semiimplicit_linear_rhod.tex). The pd stage
+        # additionally carries the moisture as partial densities (Phase 3) on a
+        # condensate-bearing physical reference state; the sigma stage carries the
+        # entropy density sigma = rho_d*s in slot 1; the mc stage is the total-energy
+        # set (prognostic p/E_t/Q_ss, (p,w) semi-implicit acoustics).
+        equation_set = opts.stage == STAGE_MC ? "moist_compressible_XZ" :
+            opts.stage == STAGE_PE_SIGMA ? "primitive_equation_XZ_sigma" :
+            opts.stage == STAGE_PE_RHOD_PD ? "primitive_equation_XZ_rhod_pd" :
+            "primitive_equation_XZ_rhod"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
+                               :tau_qss => 10.0,
                                :alpha => 0.0, :z_damp => 20.0e3)
-        options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                       :precipitation => false, :vertical_mixing => false)
+        options = merge(Dict{Symbol,Any}(:semiimplicit => true,
+                                         :exact_reference_state => true,
+                                         :precipitation => false,
+                                         :vertical_mixing => false,
+                                         :horizontal_semiimplicit => opts.hsi,
+                                         :exact_si => opts.xsi,
+                                         :output_formats => BENCHMARK_OUTPUT_FORMATS),
+                        opts.stage == STAGE_MC ? reference_state_options() :
+                                                 Dict{Symbol,Any}())
+        # Condensate control-variable transform (mc stage only; slot 9 is the cloud density
+        # in every other set here). Unset => `:none`, bitwise the code that had no option.
+        # See `Scythe.condensate_transform_mode` and
+        # reference/FINDINGS_CONDENSATE_STAGE1.md. Unlike O01, BF02's reference is CLOUDY
+        # (the saturated moist-neutral sounding carries q_l > 0), so the initial condition
+        # DOES need conversion -- see the moist_buoyancy_bubble_mc! call below.
+        if opts.stage == STAGE_MC
+            haskey(ENV, "SCYTHE_BF02_CTRANS") &&
+                (options[:condensate_transform] = Symbol(ENV["SCYTHE_BF02_CTRANS"]))
+            haskey(ENV, "SCYTHE_BF02_CMU") &&
+                (physical_params[:condensate_mu] = parse(Float64, ENV["SCYTHE_BF02_CMU"]))
+            haskey(ENV, "SCYTHE_BF02_CFLOOR") &&
+                (options[:condensate_floor] = Symbol(ENV["SCYTHE_BF02_CFLOOR"]))
+            # The rain pair. BF02 runs with `precipitation = false` and forms no rain at all,
+            # which is exactly why it is the useful CONTROL for the rain transform: it must
+            # change nothing, to the last bit.
+            haskey(ENV, "SCYTHE_BF02_RTRANS") &&
+                (options[:rain_transform] = Symbol(ENV["SCYTHE_BF02_RTRANS"]))
+            haskey(ENV, "SCYTHE_BF02_RMU") &&
+                (physical_params[:rain_mu] = parse(Float64, ENV["SCYTHE_BF02_RMU"]))
+            # The slot names follow the transforms; everything keyed by name below must use
+            # them (`Scythe.check_mc_var_names` is the backstop).
+            vars = Scythe.mc_var_names(options)
+        end
     else
         equation_set = "primitive_equation_XZ"
         physical_params = Dict(:Khdiff => 0.0, :Kvdiff => 0.0, :Kv_mudiff => 0.0,
@@ -85,25 +147,25 @@ function bf02_moist_model(opts::BenchmarkOptions)
         # Reversible benchmark: no precipitation fallout (BF02 spec). The
         # saturated base state carries cloud water everywhere, so
         # autoconversion would otherwise generate rain domain-wide.
-        options = Dict(:semiimplicit => true, :exact_reference_state => true,
-                       :precipitation => false, :vertical_mixing => false)
+        options = Dict{Symbol,Any}(:semiimplicit => true, :exact_reference_state => true,
+                       :precipitation => false, :vertical_mixing => false,
+                       :output_formats => BENCHMARK_OUTPUT_FORMATS)
     end
 
-    kDim = vertical_kdim(kDim, opts)
     ts = vertical_ts(ts, opts)
 
     output_dir = benchmark_output_dir("bf02_moist", opts)
     scalar_bc = Dict(v => NeumannBC() for v in vars)
     wall_bc = merge(scalar_bc, Dict("u" => DirichletBC(), "w" => DirichletBC()))
 
-    grid_params = GridParameters(
+    grid_params = GridParameters(;
         geometry = benchmark_geometry(opts),   # RZ (Chebyshev) or RiRk (B-spline) vertical
         iMin = 0.0,
         iMax = 20.0e3,
-        num_cells = num_cells,
+        num_cells_i = num_cells_i,
         kMin = 0.0,
         kMax = 10.0e3,
-        kDim = kDim,
+        vertical_size(opts; num_cells_k = num_cells_k, kDim = kDim)...,
         BCL = wall_bc,
         BCR = wall_bc,
         BCB = wall_bc,
@@ -177,42 +239,96 @@ function bf02_moist_init!(model)
             maximum(abs.(base.q_v .- Scythe.q_sat_liquid.(base.Tk, base.p))),
             ", max hydrostatic residual = ", maximum(abs.(base.residual)), " m/s²")
 
-    # The model integrates perturbations from the converged base state
-    Scythe.write_exact_ref(model.ref_state_file, z, base.s, base.xi, base.mu)
-    ref = Scythe.exact_reference_state(model, z, column)
-
+    # The model integrates perturbations from the converged base state. The
+    # partial-density stage uses a physical (condensate-bearing) reference written
+    # as `z s rho_d rho_v rho_c`; the other stages use the transformed `z s xi mu`.
+    pd_stage = opts.stage == STAGE_PE_RHOD_PD
+    sigma_stage = opts.stage == STAGE_PE_SIGMA
+    physical_stage = pd_stage || sigma_stage   # condensate-bearing physical reference
     patch.physical .= 0.0
-    bubble_liquid = opts.stage == :legacy ? "mu_l" : "mu_c"
-    Scythe.moist_buoyancy_bubble!(patch, gridpoints, base, ref;
-                                  q_t=Q_T, xc=10000.0, xr=2000.0,
-                                  zc=2000.0, zr=2000.0, amp=2.0/300.0,
-                                  liquid_var=bubble_liquid,
-                                  control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
+    if opts.stage == STAGE_MC
+        # Total-energy stage: pressure-based reference. The reference pressure comes
+        # from the EOS of the converged (s, rho_d, q_v) base so the temperature is
+        # EOS-exact and the saturated base sits exactly on the Q_ss = 0 manifold.
+        p_Pa = 100.0 .* Scythe.pressure.(base.s, base.rho_d, base.q_v)
+        Scythe.write_exact_ref_mc(model.ref_state_file, z, p_Pa, base.rho_d,
+                                  base.rho_d .* base.q_v, base.rho_d .* base.q_l)
+        ref = Springsteel.exact_pressure_reference_state(model.ref_state_file, z, column)
+        # BF02's reference IS cloudy (base.q_l > 0 -- the saturated moist-neutral sounding),
+        # so under a condensate transform slot 9 must be written as bhyp(rho_c) - bhyp(rho_cbar)
+        # and not as the density perturbation. Threading the option here is what makes that
+        # happen; `condensate_slot` inside the initializer does the conversion.
+        Scythe.moist_buoyancy_bubble_mc!(patch, gridpoints, base, ref;
+                                         q_t=Q_T, xc=10000.0, xr=2000.0,
+                                         zc=2000.0, zr=2000.0, amp=2.0/300.0,
+                                         condensate_transform =
+                                             Scythe.condensate_transform_mode(model.options),
+                                         condensate_mu =
+                                             get(model.physical_params, :condensate_mu, 1.0e-7),
+                                         rain_transform =
+                                             Scythe.rain_transform_mode(model.options),
+                                         rain_mu =
+                                             get(model.physical_params, :rain_mu, 1.0e-7))
+    elseif physical_stage
+        Scythe.write_exact_ref_pd(model.ref_state_file, z, base.s, base.rho_d,
+                                  base.rho_d .* base.q_v, base.rho_d .* base.q_l)
+        ref = Springsteel.exact_reference_state(model.ref_state_file, z, column)
+        # moist_buoyancy_bubble_pd! writes slot 1 as s' (pd) or sigma'=rho_d*s-sigmabar
+        # (PE_SIGMA), detected from the grid's variable names.
+        Scythe.moist_buoyancy_bubble_pd!(patch, gridpoints, base, ref;
+                                         q_t=Q_T, xc=10000.0, xr=2000.0,
+                                         zc=2000.0, zr=2000.0, amp=2.0/300.0)
+    else
+        Scythe.write_exact_ref(model.ref_state_file, z, base.s, base.xi, base.mu)
+        ref = Scythe.exact_reference_state(model, z, column)
+        bubble_liquid = opts.stage == :legacy ? "mu_l" : "mu_c"
+        Scythe.moist_buoyancy_bubble!(patch, gridpoints, base, ref;
+                                      q_t=Q_T, xc=10000.0, xr=2000.0,
+                                      zc=2000.0, zr=2000.0, amp=2.0/300.0,
+                                      liquid_var=bubble_liquid,
+                                      control = (opts.stage == STAGE_PE_RHOD ? :rhod : :xi))
+    end
 
-    if opts.stage in (:pe, STAGE_PE_RHOD)
-        # The PE set advects a transformed saturation ratio with satbar = 0
-        # for exact reference states: initialize it from the actual state
-        # (the base is saturated, so the ratio is 1 everywhere up to the
-        # construction tolerance)
+    if opts.stage in (:pe, STAGE_PE_RHOD, STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
+        # The PE sets advect a transformed saturation ratio as a PERTURBATION about
+        # the reference: the equation set reconstructs sat_ratio = inv_mu_transform(
+        # mu_sat + satbar). For the legacy/rho_d exact reference satbar = 0, so the
+        # perturbation is the full ratio. The pd condensate reference instead carries a
+        # nonzero satbar (≈1, the base q_v/q_sat), so the full ratio must NOT be stored
+        # raw here — subtract the reference satbar, or it is double-counted (sat_ratio
+        # would start at ≈2 domain-wide and drive spurious condensation/heating).
         vars = model.grid_params.vars
         sat_i = vars["mu_sat"]
         kDim_l = model.grid_params.kDim
         rhod_stage = opts.stage == STAGE_PE_RHOD
-        dens_i = rhod_stage ? vars["rho_d"] : vars["xi"]
         i = 1
         for _ in 1:Scythe.num_columns(patch)
             for k in 1:kDim_l
-                s_tot = patch.physical[i, vars["s"], 1] + ref.sbar[k, 1]
-                mu_tot = patch.physical[i, vars["mu"], 1] + ref.mubar[k, 1]
-                if rhod_stage
-                    rho_d_tot = patch.physical[i, dens_i, 1] + ref.rhobar[k, 1]
+                if physical_stage
+                    rho_d_tot = patch.physical[i, vars["rho_d"], 1] + Springsteel.ref_rho_d(ref)[k, 1]
+                    rho_v_tot = patch.physical[i, vars["rho_v"], 1] + Springsteel.ref_rho_v(ref)[k, 1]
+                    # Recover specific entropy: from sigma'=rho_d*s-sigmabar, or directly from s'.
+                    s_tot = sigma_stage ?
+                        (patch.physical[i, vars["sigma"], 1] +
+                         Springsteel.ref_rho_d(ref)[k, 1] * Springsteel.ref_entropy(ref)[k, 1]) / rho_d_tot :
+                        patch.physical[i, vars["s"], 1] + Springsteel.ref_entropy(ref)[k, 1]
+                    q_v, _, Tk, p = Scythe.thermodynamic_tuple_pd(s_tot, rho_d_tot, rho_v_tot)
+                elseif rhod_stage
+                    s_tot = patch.physical[i, vars["s"], 1] + Springsteel.ref_entropy(ref)[k, 1]
+                    mu_tot = patch.physical[i, vars["mu"], 1] + ref.mubar[k, 1]
+                    rho_d_tot = patch.physical[i, vars["rho_d"], 1] + ref.rhobar[k, 1]
                     q_v, _, Tk, p = Scythe.thermodynamic_tuple_rhod(s_tot, rho_d_tot, mu_tot)
                 else
-                    xi_tot = patch.physical[i, dens_i, 1] + ref.xibar[k, 1]
+                    s_tot = patch.physical[i, vars["s"], 1] + Springsteel.ref_entropy(ref)[k, 1]
+                    mu_tot = patch.physical[i, vars["mu"], 1] + ref.mubar[k, 1]
+                    xi_tot = patch.physical[i, vars["xi"], 1] + ref.xibar[k, 1]
                     q_v, _, Tk, p = Scythe.thermodynamic_tuple(s_tot, xi_tot, mu_tot)
                 end
-                patch.physical[i, sat_i, 1] =
-                    Scythe.mu_transform(q_v / Scythe.q_sat_liquid(Tk, p))
+                sat_full = Scythe.mu_transform(q_v / Scythe.q_sat_liquid(Tk, p))
+                # Reference satbar (transformed): zero for the legacy exact reference,
+                # nonzero (≈ the base saturation ratio) for the pd condensate reference.
+                sat_ref = physical_stage ? Scythe.mu_transform(Springsteel.ref_sat(ref)[k, 1]) : 0.0
+                patch.physical[i, sat_i, 1] = sat_full - sat_ref
                 i += 1
             end
         end
@@ -248,8 +364,55 @@ function theta_e_bubble_height(theta_e_p, z; threshold=THETA_E_BUBBLE_THRESHOLD)
 end
 
 """Reconstruct theta_e' and supersaturation fields from an output DataFrame."""
-function moist_fields(df, ref, kDim, base, stage)
+function moist_fields(df, ref, kDim, base, stage;
+                      ctransform::Symbol = :none, cmu = 1.0e-7,
+                      rtransform::Symbol = :none, rmu = 1.0e-7,
+                      vmu = Scythe.VAPOR_MU_DEFAULT)
     ncols = div(nrow(df), kDim)
+    if stage == STAGE_MC
+        # Total-energy stage: retrieve (T, p) and the diagnostic water partition from
+        # the prognostics, then reuse the transformed-variable theta_e diagnostic.
+        Tk, p, rho_d, rho_v, rho_c, rho_t, rho_r =
+            mc_state(df, ref, kDim, ncols; transform = ctransform, mu = cmu,
+                     rain_transform = rtransform, rain_mu = rmu, vapor_mu = vmu)
+        q_v = max.(rho_v, 0.0) ./ rho_d      # entropy()/theta_e take log(q_v)
+        q_l = (max.(rho_c, 0.0) .+ rho_r) ./ rho_d
+        s = Scythe.entropy.(Tk, rho_d, q_v)
+        xi = Scythe.log_dry_density.(rho_d)
+        mu = Scythe.mu_transform.(q_v)
+        mu_liq = Scythe.mu_transform.(q_l)
+        theta_e = Scythe.reversible_theta_e.(s, xi, mu, mu_liq)
+        theta_e_p = reshape(theta_e .- repeat(base.theta_e, ncols), kDim, ncols)
+        supersat = reshape(q_v .- Scythe.q_sat_liquid.(Tk, p ./ 100.0), kDim, ncols)
+        return theta_e_p, supersat, ncols
+    end
+    if stage in (STAGE_PE_RHOD_PD, STAGE_PE_SIGMA)
+        # Partial-density / entropy-density stage: reconstruct xi/mu/mu_liq from the partial
+        # densities and a physical (CondensateReferenceState) reference, then reuse the
+        # transformed-variable theta_e / saturation diagnostics.
+        rho_d = df.rho_d .+ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols)
+        if "sigma" in names(df)
+            sigmabar = Springsteel.ref_rho_d(ref)[:, 1] .* Springsteel.ref_entropy(ref)[:, 1]
+            s = (df.sigma .+ repeat(sigmabar, ncols)) ./ rho_d
+        else
+            s = df.s .+ repeat(Springsteel.ref_entropy(ref)[:, 1], ncols)
+        end
+        rho_v = df.rho_v .+ repeat(Springsteel.ref_rho_v(ref)[:, 1], ncols)
+        rcbar = Springsteel.ref_rho_c(ref)
+        rho_cbar = rcbar === 0.0 ? zeros(kDim) : rcbar[:, 1]
+        rho_c = df.rho_c .+ repeat(rho_cbar, ncols)
+        rho_r = df.rho_r
+        q_v = rho_v ./ rho_d
+        xi = Scythe.log_dry_density.(rho_d)
+        mu = Scythe.mu_transform.(q_v)
+        mu_liq = Scythe.mu_transform.((rho_c .+ rho_r) ./ rho_d)
+        theta_e = Scythe.reversible_theta_e.(s, xi, mu, mu_liq)
+        theta_e_p = reshape(theta_e .- repeat(base.theta_e, ncols), kDim, ncols)
+        Tk = Scythe.temperature.(s, rho_d, q_v)
+        p = Scythe.pressure.(s, rho_d, q_v)
+        supersat = reshape(q_v .- Scythe.q_sat_liquid.(Tk, p), kDim, ncols)
+        return theta_e_p, supersat, ncols
+    end
     sbar = repeat(ref.sbar[:, 1], ncols)
     mubar = repeat(ref.mubar[:, 1], ncols)
     s = df.s .+ sbar
@@ -280,7 +443,12 @@ function bf02_moist_diagnostics(model)
     df = read_final_output(model)
     ref, _, kDim = rebuild_reference(model)
     base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
-    theta_e_p, supersat, ncols = moist_fields(df, ref, kDim, base, opts.stage)
+    theta_e_p, supersat, ncols = moist_fields(df, ref, kDim, base, opts.stage;
+        ctransform = Scythe.condensate_transform_mode(model.options),
+        cmu = get(model.physical_params, :condensate_mu, 1.0e-7),
+        rtransform = Scythe.rain_transform_mode(model.options),
+        rmu = get(model.physical_params, :rain_mu, 1.0e-7),
+        vmu = Scythe.vapor_mu(model.physical_params))
     z = reshape(df.z, kDim, ncols)[:, 1]
     diags = Dict(
         "max_theta_e_p" => maximum(theta_e_p),
@@ -291,6 +459,24 @@ function bf02_moist_diagnostics(model)
         "min_supersat" => minimum(supersat),
         "theta_e_bubble_top_km" => theta_e_bubble_height(theta_e_p, z) / 1000.0,
     )
+    if opts.stage == STAGE_MC
+        # Positive-definiteness monitors. Diagnostic only — no target, no clamp. rho_d has no
+        # rate sinks at all, so it cannot be depleted the way rho_c is; min_rho_d_frac
+        # departing from 1 just says the dynamics are moving mass. The quantity with a
+        # meaningful zero is the water rho_w = rho_t - rho_d — since Stage 4 of the rho_t
+        # retirement the DERIVED sum_k alpha_k nu_k over the water slots (mc_state), so it
+        # goes negative only where the slots' negative lobes outweigh the column's water.
+        # Both are measured, not enforced (benchmarks/FUTURE_WORK.md).
+        _, _, rho_d, _, _, rho_t, _ = mc_state(df, ref, kDim, ncols;
+            transform = Scythe.condensate_transform_mode(model.options),
+            mu = get(model.physical_params, :condensate_mu, 1.0e-7),
+            rain_transform = Scythe.rain_transform_mode(model.options),
+            rain_mu = get(model.physical_params, :rain_mu, 1.0e-7),
+            vapor_mu = Scythe.vapor_mu(model.physical_params))
+        diags["min_rho_d_frac"] =
+            minimum(rho_d ./ repeat(Springsteel.ref_rho_d(ref)[:, 1], ncols))
+        diags["min_rho_w_gm3"] = 1000.0 * minimum(rho_t .- rho_d)
+    end
     return merge(diags, conservation_drift(model, ref; liquid_vars=liquid_vars(opts.stage)))
 end
 
@@ -303,7 +489,12 @@ if opts.plot
         df = read_final_output(model)
         ref, _, kDim = rebuild_reference(model)
         base = CSV.read(joinpath(model.output_dir, "base_profile.csv"), DataFrame)
-        theta_e_p, _, ncols = moist_fields(df, ref, kDim, base, opts.stage)
+        theta_e_p, _, ncols = moist_fields(df, ref, kDim, base, opts.stage;
+            ctransform = Scythe.condensate_transform_mode(model.options),
+            cmu = get(model.physical_params, :condensate_mu, 1.0e-7),
+            rtransform = Scythe.rain_transform_mode(model.options),
+            rmu = get(model.physical_params, :rain_mu, 1.0e-7),
+            vmu = Scythe.vapor_mu(model.physical_params))
         x = reshape(df.r, kDim, ncols)[1, :]
         z = reshape(df.z, kDim, ncols)[:, 1]
         w = reshape(df.w, kDim, ncols)
@@ -323,6 +514,10 @@ passed = run_benchmark("bf02_moist", opts;
                        model = model,
                        init! = bf02_moist_init!,
                        diagnostics = bf02_moist_diagnostics,
-                       varnames = bf02_moist_vars(opts.stage),
+                       # The run's OWN slot names: a transform renames slots 8/9 on the mc
+                       # stage, and the field regression then reports itself skipped.
+                       varnames = opts.stage == STAGE_MC ?
+                                  Scythe.mc_var_names(model.options) :
+                                  bf02_moist_vars(opts.stage),
                        plotter = plotter)
 exit(passed ? 0 : 1)

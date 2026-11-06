@@ -1,0 +1,13 @@
+# Legacy-pin overlay, stacked on tc_default.overlay.toml: SCYTHE_TC_BL=mynn
+# SCYTHE_TC_RAD=diurnal SCYTHE_TC_SFC_STAB=1 SCYTHE_TC_SIDECARS=1.
+[output]
+sidecars = true
+
+[physics.boundary_layer]
+scheme = "mynn"
+
+[physics.surface]
+stability = true
+
+[physics.radiation]
+scheme = "rrtmgp"                    # allsky + diurnal, z_max -> sponge onset (defaults)

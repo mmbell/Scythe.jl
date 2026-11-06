@@ -97,6 +97,7 @@ using LinearAlgebra
         Cm = (q_l * Scythe.Cl) / (Scythe.Cvd + (q_v * Scythe.Cvv) + (q_l * Scythe.Cl))
         e = Scythe.vapor_pressure(p, q_v)
         sat_e = Scythe.sat_pressure_liquid_buck(Tk, p)
+        # Includes the R_v*ln(H) entropy-production term (irreversible phase change).
         expected = q_cond * (((-Scythe.L_v(Tk) * Cm) / Tk) -
                              (Scythe.Cl * log(Tk / Scythe.T_0)) +
                              (Scythe.Rv * log(e / sat_e)))

@@ -1,0 +1,11030 @@
+# Total-energy moist compressible equation set.
+#
+# Prognostic variables (`MC_VARS`, XZ slice): p [Pa], rho_d, the vapor (`nu_v` under
+# vapor_transform = :bhyp, `rho_v` under :none), u, w, E_t [J/m^3], Q_ss [kg/m^3], the rain
+# (`nu_r`/`rho_r`) and the cloud (`nu_c`/`rho_c`); the cylindrical and spherical sets add v as
+# slot 10 (`MC_VARS_CYL`), and `mc_var_names` appends, when registered, n_r (two-moment rain),
+# the twelve ice moments (ice_microphysics = :ishmael) and rho_e (MYNN). EVERY WATER SPECIES
+# IS PROGNOSTIC and THE TOTAL DENSITY IS NOT: every reader takes the DERIVED
+# rho_t = rho_d + sum_k alpha_k nu_k (item 6 below). The model temperature is the
+# equation-of-state T = p/(rho_d R_d + rho_v R_v) (`eos_temperature`, options[:temperature] =
+# :eos, the default); the closed-form Bryan & Fritsch (2002) total-energy retrieval
+# (`retrieve_temperature`) is the :energy alternative and an output diagnostic.
+#
+# ── The criterion this equation set converged on
+#
+# A DIAGNOSTIC IS SAFE WHEN THE RETRIEVED QUANTITY IS NOT SMALL COMPARED WITH THE TERMS
+# BEING DIFFERENCED. That is the whole content of a long campaign, and it is worth
+# stating before the history, because it is what decides the next such question too.
+#
+# T is safe: it is large, and it comes out of a formula whose inputs are large (the
+# equation of state from p, rho_d, rho_v; the energy retrieval from p, E_t and the total
+# density). A small water species retrieved as the residual of large
+# ones is not safe, and the failure is CONDITIONING — not a bug to be fixed inside the
+# retrieval, but a property of which variable was chosen to be the leftover.
+#
+# ── How the vapor got here: residual -> blend -> prognostic
+#
+# 1. rho_c AS THE RESIDUAL of four fitted fields. In cloud-free air the true Q_ss sits
+#    exactly ON its admissible ceiling, so fit-level error (~2e-6 kg/m^3) put rho_c on
+#    the wrong side of zero, the closure evaporated cloud that was not there, and
+#    because the residual was REGENERATED every step it was a sustained pressure sink
+#    (3.19 Pa/s at t = 0 on the balanced TC vortex — all of the measured tendency).
+#    See reference/HANDOFF_DIAGNOSED_CLOUD.md.
+#
+# 2. rho_c PROGNOSTIC, rho_v THE RESIDUAL. This put the same fit error where it was
+#    thought to be harmless: 1e-6 against a vapor density of ~1e-2 is a 5e-5 relative
+#    error, in a field that no longer feeds back into temperature at all. It was a large
+#    improvement and it was not the end, because IN CLOUD the cancellation is not
+#    against rho_t but against rho_c: rho_c/rho_w reached 1.0011 at the worst measured
+#    point, and 1184 of 1186 in-cloud negatives came from that one difference.
+#
+# 3. THE C1 REGIME BLEND (2026-07-29 to Stage A). rho_v was retrieved as a smoothstep
+#    blend of the density-budget residual and the supersaturation residual Q_ss + rho_vs,
+#    each used where the other cancelled, with a cap on their difference. It was a real
+#    fix for the liquid set and it is documented in reference/HANDOFF_VAPOR_RETRIEVAL.md.
+#    ICE BROKE IT: a fifth independently-ringing term entered the density residual, the
+#    ahyp cloud transform's clamp channel fed its discarded negative ringing into the
+#    residual vapor (8.3 % deeper deficit, 23 % more points), and the ice physics reading
+#    that vapor detonated the retrieval — `min rho_c == 0.0 exactly` was death across all
+#    eight ablation arms.
+#
+# 4. rho_v PROGNOSTIC (Stage A, here). The chain ends: no water variable is a residual.
+#    The vapor is transported, phase change is an equal and opposite pair of SLOT
+#    sources, and the conditioning question does not arise for any of them.
+#
+# 5. THE VAPOR CONTROL VARIABLE (Stage 1 of the rho_t retirement; `vapor_transform_mode`).
+#    Under `options[:vapor_transform] = :bhyp` the vapor slot carries Ooyama's
+#    nu_v' = bhyp(rho_v) - bhyp(rho_vbar) (mu_v = 1e-9) like the condensates, every reader sees
+#    ahyp(nu_v) >= 0 and every density-space tendency enters through J_v. The library default
+#    is :none (the density slot, bitwise the code before); the run configuration selects :bhyp.
+#
+# 6. THE DERIVED WATER ANCHOR (Stages 3-4 of the rho_t retirement). rho_t is no longer a
+#    prognostic: every reader takes rho_t = rho_d + sum_k alpha_k nu_k over the water-mass
+#    slots (vapor, cloud, rain, the three ice masses; alpha = 2 transformed, 1 density),
+#    its perturbation rho_d' + sum_k alpha_k nu_k' and the reference
+#    rho_tbar^w = rho_dbar + sum_k alpha_k nu_kbar (`water_anchor_set`, `_anchor_stage!`).
+#    The vapor is the nu-space closure of every exchange (`water_exchange_dv`), so total
+#    water is conserved by construction and there is no reconciliation of the vapor onto a
+#    second statement of the water. Stage 4 deleted slot 3: the vapor (`nu_v`, `rho_v` under
+#    vapor_transform = :none) IS slot 3. Pre-Stage-4 checkpoints are converted by
+#    tools/convert_rho_t_checkpoint.jl (src/checkpoint_conversion.jl).
+#
+# ── The two anchors, the partners and the census (reference/RHO_T_RETIREMENT_DESIGN.md,
+#    reference/Scythe_moist_compressible.tex §"The derived total density")
+#
+# Two LINEAR anchors, E_t and the water rho_w = sum_k alpha_k nu_k, each invariant under every
+# exchange and changed only by the linear operators (advection, refit/filter, the SI slaving,
+# horizontal mixing, R3X) and by their own sources (the surface fluxes and the sedimentation
+# through the ground; radiation for E_t). One RECOVERED reading the physics sees: T_eos and
+# rho_k = ahyp(nu_k). Two residuals measure the difference:
+#   R = E_t - E_implied(T_eos, recovered species, (rho_d + rho_w) geo)   (`implied_total_energy`)
+#   X = rho_w - sum_k ahyp(nu_k) = B + Lambda (knee bias >= 0, lobe pool <= 0)
+# RULE: an operator that changes the recovered reading differently from the anchors gets a
+# PARTNER that holds R through p and Q_ss; nothing moves a nu to hold X. Every partner is
+# `recovered_change_partner`: the refit partner books the affine defect, energy only
+# (`_refit_partner_defect!`, lambda_l, lambda_i, kappa); the ETD exchange realization books the
+# recovered gap (`_etd_exchange_closure!`); the multistep and sedimentation closures book their
+# realized recovered rates (`_water_exchange_multistep!`); the MYNN boundary layer has one nu
+# leg per water-mass slot and Louis one each for the vapor, cloud and rain (it refuses ice),
+# with the energy carry regrouped by species (`_mynn_nu_legs!`, `_louis_apply_derived!`); the paired Stage L books kappa only
+# (`_lobe_relax_paired!`, default OFF, `LOBE_RELAXATION_DERIVED_DEFAULT`).
+# Where they live: src/si_water_slaving.jl (the derived anchor, `water_exchange_dv`, the
+# closures, the acoustic slaving, the setup refusals), this file (the primitive, the refit and
+# ETD partners, the driver), src/energy_budget.jl (`options[:energy_budget]`, the per-stage
+# finite differences of R and X, and the census these rows are reported by).
+# Census rows (`mc_water_stats`, reported by `energy_census_trace`): MC_REFIT_DR /
+# MC_REFIT_BOOKED, MC_XGAP_MAX / _INT / _POOL, MC_VNEG / MC_VNEG_MASS, MC_LOBE_*, MC_W_PART /
+# _NEG / _NEG_PTS / _INT / _SRC / _BUDGET. (MC_QSS_GAP, below, is not one of them.)
+#
+# ── The one remaining reconciliation
+#
+# Q_ss is redundant with the prognostic vapor (Q_ss = rho_v - rho_vs) and is reconciled onto
+# it by a slow nudge, never by projection (`qss_relaxation`, tau_qss = 10 s by default, long
+# compared with the timestep, so transport keeps the smooth field and only the accumulated
+# inconsistency is removed). Its gap MC_QSS_GAP is written only by `_qss_gap_census!` under
+# options[:water_budget_trace], which `validate_water_anchor` refuses whenever a water
+# transform, two-moment rain or ice is on, so under the run-config defaults it is never
+# written. The gap is identically zero on a resting base by construction: the vapor slot is carried against the DERIVED
+# profile rho_vbar = rho_tbar - rho_dbar - rho_cbar (Springsteel's fitted columns; see
+# vapor_slot, mc_reference_diagnostics).
+#
+# Q_ss is therefore not thermodynamic — it is purely the microphysics' supersaturation
+# driver, smooth and advected rather than a pointwise difference against a saturation
+# curve four decades above it.
+#
+# ── Negative water
+#
+# Negative water is a RESOLUTION DIAGNOSTIC and is never clamped
+# (reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md): a positive-definite spike the
+# vertical basis cannot resolve undershoots on the way in, and the size of that
+# undershoot is the signal that the column wants more nodes. `clamp_water!` measures it
+# after every column step and writes nothing (its floor, options[:clamp_water] = true,
+# balanced the partition against the prognostic rho_t and is refused since Stage 4). Under
+# the transforms the negative lobe stays in the control variable and the recovered density
+# reads 0 (the lobe pool of X; MC_XGAP_POOL, MC_VNEG_MASS).
+#
+# ── Conservation and the first law
+#
+# The conserved quantities (rho_d, E_t and the water anchor rho_w) are extensive and
+# linear in the flux-form prognostics, so the Galerkin low-pass filter preserves their
+# integrals (no Jensen drift). The
+# energy equation is the exact first law: phase change carries no energy source
+# (the R_v*T*ln(H) term of the entropy identity is entropy production, which
+# cancels exactly against the production hidden in T*ds_t; see
+# reference/Scythe_moist_compressible.tex).
+#
+# All new functions for this equation set live in this file: thermodynamic
+# helpers, condensation closure, the equation set RHS, its semi-implicit
+# adjustment, initializers, and the reference-state writer.
+
+using Springsteel.Thermodynamics: rho_v_sat, internal_energy_bf02
+# The RCE noise initializer's reproducible stream (moist_temperature_noise_mc!): a
+# SEEDED generator, never the global one, so the initial condition is a function of
+# the seed alone and not of whatever else on this process has drawn a random number.
+using Random: MersenneTwister
+
+# ── Per-thread scratch for the equation-set RHS ────────────────────────────────
+
+"""
+The live broadcast temporaries of [`moist_compressible_XZ`](@ref). Each is a `kDim` column,
+recomputed every column of every timestep — as fresh allocations they were ~150 of the
+function's 163 per-call allocations.
+
+Keyed by NAME, not by index. An index-numbered scratch pool (`view(pool, :, 7, tid)`) makes it
+easy to hand the same buffer to two temporaries that are live at once, and the resulting
+corruption is silent and hard to see. A `NamedTuple` cannot hold a duplicate field, so that
+class of bug cannot be written here at all.
+"""
+const MC_SCRATCH_SLOTS = (
+    # ── moist_compressible_XZ ──
+    :p, :rho_d, :rho_t, :E_t, :Q_ss, :rho_c, :rho_r,                  # totals
+    :p_z, :rho_d_z, :rho_t_z, :E_t_z, :Q_ss_z, :rho_c_z,              # total vertical gradients
+    :ke, :geo, :M, :Tk, :p_hPa, :rho_vs, :rho_v, :rho_liq, :q_v, :q_l, # diagnostic state
+    :rho_liq_t,   # what the THERMODYNAMICS reads; == rho_liq unless condensate_floor_mode
+    :nu_c, :nu_c_z, :Jc,   # slot-9 control variable, its gradient, dnu/drho (see bhyp/ahyp)
+    :nu_r, :nu_r_z, :Jr, # slot-8 control variable, its gradient, dnu/drho (rain_transform_mode)
+    :C_vt, :R_m, :C_pt, :gamma_m, :Lv, :drvs_dT, :drvs_dp,            # mixture thermo
+    :Q_s, :Qdot, :Qdot_r, :div,                                       # condensation, divergence
+    :cap_c, :cap_r, :cap_v,      # AB3 depletion bounds, DIAGNOSTIC ONLY (see _ab3_sink_bound)
+    :invtau_c, :invtau_r,        # per-channel relaxation rates, for `mc_stiffness_census!`
+    # ── Stage 2b: the RAIN DONOR's evaporation conductance and its realization factor ──
+    # `kappa_ev` is `max(−Q̇_r, 0)/ρ_r` at the frozen state — the rain's evaporation sink
+    # expressed as a conductance on its own reservoir (TeX §donor_relax, "The rain reservoir
+    # has a third sink"), written beside the condensation closure where `Q̇_r` and `ρ_r` are
+    # both known and read again inside `mc_ice_sources!`, which needs it to complete the rain
+    # donor's TOTAL. `f_rain` is that donor's factor `J₀(κ_tot Δt)`: the warm-path value
+    # `J₀(κ_ev Δt)` where there is no ice, OVERWRITTEN with the full ice-plus-evaporation
+    # factor at every gridpoint the ice loop visits. It is folded into `invtau_r`/`Qdot_r`
+    # themselves before λ and N are formed, so the pair, the slot and the census all read the
+    # one realized conductance. Exactly 1.0 wherever the rain does not evaporate.
+    :kappa_ev, :f_rain,
+    # The CLOUD donor's counterpart (`cloud_evap_realized`): `kappa_c` is its WARM sink
+    # conductance `(max(−Q̇_c, 0) + AUTO_COLL)/ρ_c` at the frozen state, written right after
+    # the `AUTO_COLL` closure and read again inside `mc_ice_sources!`, which completes the
+    # cloud donor's total with the ice legs. `f_cloud` is that donor's factor `J₀(κ_tot Δt)` —
+    # the warm value, overwritten with the full one wherever the ice loop runs — applied to
+    # every cloud sink: `AUTO_COLL`, the evaporation (`Q̇_c`/`1/τ_c` clipped, `qc_bar`
+    # unclipped) and the ice legs' `f_qc`. Exactly 1.0 wherever the cloud has no sink.
+    :kappa_c, :f_cloud,
+    :AUTO_COLL, :Vt, :Fr, :Fr_z, :E_sed, :E_sed_z,                    # warm-rain microphysics
+    # Two-moment rain number (options[:rain_moments] == 2). Same six-way shape the mass
+    # slot has — control variable, its gradient, the Jacobian, the recovered density, the
+    # NUMBER-weighted fall speed, its flux and the flux divergence — plus one accumulator
+    # for the number sources. Allocated unconditionally, like every other name here: eight
+    # kDim columns per thread against the ~90 already present.
+    :n_r, :nu_nr, :nu_nr_z, :Jnr, :Vtn, :Fnr, :Fnr_z, :NR_SRC,
+    # ── Ice microphysics (options[:ice_microphysics] === :ishmael) ──────────────────────
+    # SEVEN columns per ice slot, in the order the slots are registered: the recovered
+    # quantity, the control variable and its gradient, the Jacobian, the process-source
+    # accumulator and the sedimentation flux with its divergence. That is the n_r shape with
+    # the fall speed dropped (the ISHMAEL speeds come out of one per-species call, so they
+    # are formed pointwise into the flux rather than staged in a column of their own).
+    #
+    # The names are `<species><moment>`: `i1q` is the MASS of species 1, `i1n` its number,
+    # `i1a`/`i1c` the two spheroid volume moments. Allocated unconditionally like everything
+    # else here — 90 kDim columns per thread on top of the ~100 already present, ~0.2 MB per
+    # thread at kDim = 300, and NOT conditional on the option, because a NamedTuple whose
+    # field set depended on a run-time option would make `ModelTile` non-concrete.
+    :i1q, :nu_i1q, :nu_i1q_z, :J_i1q, :SRC_i1q, :F_i1q, :F_i1q_z,
+    :i1n, :nu_i1n, :nu_i1n_z, :J_i1n, :SRC_i1n, :F_i1n, :F_i1n_z,
+    :i1a, :nu_i1a, :nu_i1a_z, :J_i1a, :SRC_i1a, :F_i1a, :F_i1a_z,
+    :i1c, :nu_i1c, :nu_i1c_z, :J_i1c, :SRC_i1c, :F_i1c, :F_i1c_z,
+    :i2q, :nu_i2q, :nu_i2q_z, :J_i2q, :SRC_i2q, :F_i2q, :F_i2q_z,
+    :i2n, :nu_i2n, :nu_i2n_z, :J_i2n, :SRC_i2n, :F_i2n, :F_i2n_z,
+    :i2a, :nu_i2a, :nu_i2a_z, :J_i2a, :SRC_i2a, :F_i2a, :F_i2a_z,
+    :i2c, :nu_i2c, :nu_i2c_z, :J_i2c, :SRC_i2c, :F_i2c, :F_i2c_z,
+    :i3q, :nu_i3q, :nu_i3q_z, :J_i3q, :SRC_i3q, :F_i3q, :F_i3q_z,
+    :i3n, :nu_i3n, :nu_i3n_z, :J_i3n, :SRC_i3n, :F_i3n, :F_i3n_z,
+    :i3a, :nu_i3a, :nu_i3a_z, :J_i3a, :SRC_i3a, :F_i3a, :F_i3a_z,
+    :i3c, :nu_i3c, :nu_i3c_z, :J_i3c, :SRC_i3c, :F_i3c, :F_i3c_z,
+    # Ice AGGREGATES over the three species: the total ice density (the retrieval's ρ_i),
+    # what the thermodynamics reads under `condensate_floor`, the mixing ratio q_i, the
+    # summed MASS flux divergence (the only ice flux the water anchor ρ_w loses) and the ice
+    # sedimentation energy flux with its divergence (the only one that reaches E_t).
+    # (The sedimentation anchor share `anchor_f` of the ice-anchor legs was deleted with
+    # the legs at Stage 5 of the ρ_t retirement.)
+    :rho_ice, :rho_ice_t, :q_i, :Fi_z, :E_sed_i, :E_sed_i_z,
+    # ── Ice PHYSICS (S8): the process rates the twelve slots and the shared thermodynamics
+    # read. `Qdot_i<k>` is species k's deposition/sublimation rate [kg/m³/s] (TeX Eq.
+    # dep_rate) and `invtau_i<k>` its relaxation rate for the stiffness census; `Q_s_i` is
+    # the ice psychrometric factor `𝒬_{s,i}` (Eq. Qs_ice); `FRZ_NET` is the NET liquid→ice
+    # conversion `Q̇_freeze` [kg/m³/s] that heats T and p with the bare `L_f` (Eqs.
+    # dThat_ice/dphat_ice); `ICE_C`/`ICE_R`/`ICE_NR` are the back-reactions on the cloud
+    # mass, rain mass and rain number; `Vi<k>m`/`Vi<k>n` are the MASS- and NUMBER-weighted
+    # fall speeds (negative downward, like `Vt`), mass-weighted also carrying the `a`/`c`
+    # volume moments.
+    :Qdot_i1, :Qdot_i2, :Qdot_i3, :invtau_i1, :invtau_i2, :invtau_i3,
+    :Q_s_i, :FRZ_NET, :ICE_C, :ICE_R, :ICE_NR,
+    # `f_ice<k>` is species k's DONOR realization factor (`_ice_donor_factors`' ice sibling),
+    # formed in `mc_ice_sources!` from that species' TOTAL mass sink and read again in the ETD
+    # pre-compute, which is where the sublimation half of that sink is realized. One factor,
+    # two application sites, because the two halves of the sink are computed in two places.
+    :f_ice1, :f_ice2, :f_ice3,
+    # `f_isn<k>` is the RESIDUAL number realization the sublimation number sink still has to
+    # apply at its own site: the ice NUMBER donor's factor divided by whatever MASS factor
+    # `invtau_i<k>` is already carrying there (`f_ice<k>` where the step-n classification
+    # said the channel is a sink, `1.0` where it did not). One column rather than a second
+    # division in the ETD pre-compute, and an exact `1.0` — hence bitwise inert — wherever
+    # `options[:ice_number_realization]` is off. A RATIO, so it is not itself bounded by one
+    # — below the melting level the number conductance is the SMALLER of the two and this
+    # column reads slightly ABOVE 1, making up what the mass factor under-realized. What is
+    # bounded is the product, which is the donor's own `J₀(κ_{n,k}Δt)`. See
+    # `mc_ice_sources!`.
+    :f_isn1, :f_isn2, :f_isn3,
+    :Vi1m, :Vi1n, :Vi2m, :Vi2n, :Vi3m, :Vi3n,
+    :sd_xx, :QDOT_TH, :FRIC_KE,                                       # horizontal diffusion
+    :ADV, :FORCING, :KDIFF,                                           # per-slot accumulators
+    :dT_nc, :dp_nc, :SATF, :QSSREL,                                   # Q_ss chain rule
+    # The PROGNOSTIC VAPOR slot's own two columns: the TOTAL vertical gradient
+    # ∂z ρ_v = ∂z ρ_v' + ∂z ρ̄_v the advection reads (the `nu_c_z` pattern; ν_v's under the
+    # vapor control variable), and `VAPOR_SRC`, the summed phase-change sink
+    # `−(Q̇_c + Q̇_r) − Σ_k Q̇_{i,k}` accumulated in the same loops that write the microphysics
+    # history, so the census and the tendency read identical numbers. (The reconciliation
+    # nudge's `VREC` column went with the nudge and slot 3, Stage 4.)
+    :rho_v_z, :VAPOR_SRC,
+    # NO column here for the vapor control variable's Jacobian `J_v`: it lives on the tile's
+    # `MCSpeciesColumns` (`jacobian_column`). Measured 2026-10-20: one more field here took the
+    # first call of `moist_compressible_SLR` from 80 s to > 11 min (the LLVM cliff).
+    # ── ETD-AB3 stiff relaxation of the Q_ss pair (TeX §"Integration of the relaxation pair
+    #    in the stiff limit"; see `relaxation_adjustment_qss!`). The two relaxations are
+    #    WITHHELD from the multistep, so slot 7's `expdot` carries `N` alone and these columns
+    #    carry everything the exponential propagator and the step-mean consumers need.
+    #    `etd_lam` is the LIQUID conductance that survives the clip (λ's liquid half) and
+    #    `etd_nl` its clipped-channel constant flux, the liquid `N` piece. Both are written
+    #    BELOW the ice block rather than beside the condensation closure, because the rain
+    #    channel's conductance is not final until the rain donor's realization factor is
+    #    (Stage 2b; see `f_rain`). The ICE half is carried as the affine decomposition of its drive,
+    #    `drive_i = etd_dep_a·Q_ss + etd_dep_b` (written by `mc_ice_sources!`, where the two
+    #    drives live): `a = 1, b = 𝒟` unclipped, `a = 0, b = drive_i` clipped, `a = b = 0`
+    #    above `T_0` where the channel is shut. λ's ice half is then `a·Σ_k τ_{i,k}^{-1}` and
+    #    its `N` piece `−b·Σ_k τ_{i,k}^{-1}`, and the SAME two numbers re-form the step-mean
+    #    deposition drive without a second classification. `etd_qbar` is the step-mean
+    #    supersaturation `Q̄_ss` (Eq. qss_stepmean) and `etd_qnp1` the propagated `Q_ss^{n+1}`
+    #    in SLOT units. `etd_d*` are the per-slot direct increments the step-mean rates apply,
+    #    and `Qdot_bar`/`Qdot_r_bar`/`Qdep_bar` the step-mean rates themselves (the census and
+    #    the equations then read the SAME numbers).
+    :etd_lam, :etd_nl, :etd_dep_a, :etd_dep_b, :etd_qbar, :etd_qnp1,
+    :etd_d1, :etd_d8, :etd_d9, :etd_dv, :etd_di1, :etd_di2, :etd_di3,
+    :Qdot_bar, :Qdot_r_bar, :Qdep_bar,
+    #    The LOBE RELAXATION's increments (`lobe_relaxation_increment`, Stage L): cloud, rain
+    #    and the three ice masses, formed in the same pre-compute window from the state-`n`
+    #    control variables and the gate terms, applied beside `etd_d8`/`etd_d9`. Written only
+    #    under `options[:lobe_relaxation]`, and read only then.
+    :etd_dlc, :etd_dlr, :etd_dli1, :etd_dli2, :etd_dli3,
+    #    The HABIT PARTITION of the deposition increment (`ishmael_deposition_partition`) is
+    #    evaluated ONCE per step, at the STEP-MEAN rate, alongside the mass it partitions —
+    #    the a/c-moment sources and the sublimation number sink are the same realized
+    #    increment the mass slots receive, distributed over the axes (TeX §Departures (d)).
+    #    `hab*_*` stash the state-n inputs the partition needs (written by `mc_ice_sources!`
+    #    at live points, zero elsewhere); `hab*_niq` is the carried-number/mass ratio the
+    #    sublimation number sink is proportional to; `etd_da*/dc*/dn*` are the resulting
+    #    direct increments to the a/c/n slots, siblings of `etd_di*`.
+    :hab1_ani, :hab1_cni, :hab1_rni, :hab1_ds, :hab1_rb, :hab1_nim3, :hab1_vt, :hab1_cg, :hab1_niq,
+    :hab2_ani, :hab2_cni, :hab2_rni, :hab2_ds, :hab2_rb, :hab2_nim3, :hab2_vt, :hab2_cg, :hab2_niq,
+    :hab3_ani, :hab3_cni, :hab3_rni, :hab3_ds, :hab3_rb, :hab3_nim3, :hab3_vt, :hab3_cg, :hab3_niq,
+    :hab_igr, :hab_maxsui, :hab_dv,
+    :etd_da1, :etd_da2, :etd_da3, :etd_dc1, :etd_dc2, :etd_dc3, :etd_dn1, :etd_dn2, :etd_dn3,
+    :s_t, :stage_zz,                                                             # moist entropy (vertical heat)
+    :imp_phi_z, :imp_c_d, :imp_c_d_z, :imp_c_e, :imp_c_e_z,           # acoustic AI2* history staging
+    :sd_pxi, :sd_alpha,                    # state-dependent acoustic linearization
+    # ── Louis boundary layer + Smagorinsky closure (mc_boundary_layer.jl) ──
+    :Kv, :K_smag, :VD_u, :VD_v, :VD_w, :QDOT_V, :VDOT_w, :VDOT_v,
+    # (`bl_rho_cp_z`, the BLs' perturbation cloud-density gradient, went with the prognostic ρ_t
+    # at Stage 4: both closures' water legs are ν legs of the slots' own gradients.)
+    :bl_s_z,
+    # The MYNN-EDMF boundary layer's per-column columns are NOT here. They were, and the
+    # twenty-nine extra names widened this NamedTuple's type far enough that LLVM tipped
+    # over a register-pressure cliff compiling `mc_driver!`'s callees — the `@turbo`
+    # broadcast in the vertical-diffusion block below stopped compiling in seconds and
+    # started spending unbounded time in the MachineScheduler, wedging the test suite.
+    # They live in `MYNNColumnScratch` (src/mynn_state.jl), one per thread beside
+    # `MYNNWork`, and reach `mc_mynn_bl!` as a single argument. Nothing outside that file
+    # reads them, so nothing here needs their names.
+    # ── semiimplicit_adjustment_p (si_ prefix) ──
+    # Deliberately NOT sharing the names above. The two functions' temporaries are not live at
+    # the same time today, so sharing would work — but it would be an invisible coupling, and
+    # the first person to read an mc_XZ value after the adjustment call would get silent
+    # corruption. Distinct names cost ~200 KB and make that unwriteable.
+    :si_p_nstar, :si_w_nstar, :si_rhod_nstar, :si_et_nstar,
+    :si_p_nstar_z, :si_phi_z, :si_rhs, :si_c_d, :si_c_d_z, :si_c_e, :si_c_e_z,
+    # ── diffusion_timestep_mc (df_ prefix) ──
+    :df_u_star, :df_w_star, :df_p_star, :df_rho_d_star, :df_rho_t_star,
+    :df_E_t_star, :df_ke_star, :df_M_star,
+    :df_T_star, :df_p_hPa_star, :df_drvs_dT, :df_drvs_dp,
+    :df_rho_vs_star, :df_rho_v_star, :df_q_v_star, :df_q_l_star,
+    :df_C_vt_star, :df_R_m_star, :df_Lv_star, :df_stp_star,
+    :df_u_nstar, :df_w_nstar, :df_s_nstar, :df_u_np1, :df_w_np1,
+    :df_dke, :df_dE_visc, :df_ds_t, :df_dT_h, :df_dE_h, :df_dp_h, :df_dQ_h,
+    # (the fifteen `Kvdiff_water` columns, `:df_rw_star` … `:df_drc` and `:df_dE_w`, went with
+    # the implicit water solve, which read slot 3 as the total water: Stage 4)
+    :df_rho_c_star, :df_rho_r_star,
+    :df_rho_liq_star,
+    # The ice mirror of `df_rho_liq_star`: the raw star-state ice mass (which the water
+    # PARTITION reads) and the one the thermodynamics reads (floored under
+    # `condensate_floor`), plus its mixing ratio for `C_vt_star`/`stp_star`.
+    :df_rho_ice_star, :df_rho_ice_t_star, :df_q_i_star,
+    # ── tangential wind v (cylindrical geometries; inert columns on the XZ slice) ──
+    :df_v_star, :df_v_nstar, :df_v_np1)
+
+"""
+    _allocate_mc_scratch(tile, model)
+
+One `NamedTuple` of `kDim` work vectors per thread for the total-energy set; an empty vector
+for every other equation set. Indexed by `threadid()`, which is a valid owner tag because the
+column loop is `Threads.@threads :static` (same rule as `scratch_columns`).
+"""
+function _allocate_mc_scratch(tile::AbstractGrid, model::ModelParameters)
+
+    uses_pressure_reference(model.equation_set) || return Vector{Nothing}(undef, 0)
+    kDim = model.grid_params.kDim
+    return [NamedTuple{MC_SCRATCH_SLOTS}(
+                ntuple(_ -> zeros(Float64, kDim), length(MC_SCRATCH_SLOTS)))
+            for _ in 1:Threads.maxthreadid()]
+end
+
+# ── Thermodynamic helpers ──────────────────────────────────────────────────────
+
+"""
+    drho_vsat_dT(Tk, p_hPa)
+
+Temperature partial of the saturation vapor density ρ_v* = e*/(R_v T) [kg/m³/K]
+at constant pressure, using the Buck (1981) saturation vapor pressure.
+"""
+function drho_vsat_dT(Tk, p_hPa)
+
+    return (100.0 * sat_pressure_liquid_buck_dT(Tk, p_hPa) / (Rv * Tk)) -
+           (rho_v_sat(Tk, p_hPa) / Tk)
+end
+
+"""
+    drho_vsat_dp(Tk, p_hPa)
+
+Pressure partial of the saturation vapor density ρ_v* [kg/m³ per Pa] at constant
+temperature. Only the Buck (1981) pressure-enhancement factor depends on total
+pressure, so this is small and positive.
+"""
+function drho_vsat_dp(Tk, p_hPa)
+
+    Tc = Tk - 273.15
+    B = 3.20e-6
+    C = 5.9e-10
+    a = 6.1121
+    b = 18.729
+    c = 257.87
+    d = 227.3
+    ew4 = a * exp((b - (Tc / d)) * Tc / (Tc + c))
+    # d(rho_vs)/dp_Pa = (100 * ew4 * dfw4/dp_hPa / (Rv*T)) * (dp_hPa/dp_Pa = 1/100)
+    return ew4 * (B + (C * Tc^2)) / (Rv * Tk)
+end
+
+"""
+    retrieve_temperature(M, rho_d, rho_t, rho_liq)
+    retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
+
+Diagnose the temperature from the prognostic variables of the total-energy set. With the
+condensate prognostic the liquid density `ρ_liq = ρ_c + ρ_r` is KNOWN, so the Bryan &
+Fritsch (2002) energy identity
+
+    M = (ρ_d C_pd + ρ_w C_pv) T − ρ_liq L_v(T),    ρ_w = ρ_t − ρ_d
+
+(where `M = p + E_t − ρ_t(v²/2 + gz)` [J/m³] is the available enthalpy density) contains no
+saturation density, and `L_v(T) = L_v0 + (C_pv − C_l)(T − T_0)` is linear in T. The root is
+therefore CLOSED FORM:
+
+    T = [M + ρ_liq (L_v0 − (C_pv − C_l) T_0)] / [(ρ_d C_pd + ρ_w C_pv) − ρ_liq (C_pv − C_l)]
+
+The denominator is `Cfactor + (C_l − C_pv) ρ_liq` with `C_l > C_pv`, hence strictly positive
+for any admissible state: there is no iteration, no tolerance, no guess, and no failure mode.
+
+(The liquid density is spelled `rho_liq`, not `rho_l`: `Springsteel.rho_l` is the bulk
+density of liquid water, 1000 kg/m³, used throughout `microphysics.jl`.)
+
+Note what is ABSENT. T depends only on `(M, ρ_d, ρ_t, ρ_liq)` — not on the vapor/cloud split,
+not on `Q_ss`, and not on `ρ_vs`. That is what decouples the microphysics driver from the
+thermodynamics: a `Q_ss` error is now thermodynamically inert. Latent heating still needs no
+source term — condensation raises `ρ_l` at fixed `E_t` and `ρ_t`, and this expression turns
+that into a warming of `δρ_l·L_v/Cfactor` automatically.
+
+This replaces a univariate Newton iteration on the same identity carrying an extra
+`ρ_vs(T,p)` term, whose clamped partition is what manufactured phantom cloud (see the file
+header). The two agree to ~1e-12 K wherever the old clamp was inactive.
+
+# The ice term
+
+With the ice masses prognostic (`options[:ice_microphysics] = :ishmael`; see
+[`ice_microphysics`](@ref)) the ice density `ρ_i = Σ_k ρ_{i,k}` is known too, and the SAME
+identity closes with one more affine latent term — `L_s(T) = L_{s0} + (C_pv − C_i)(T − T_0)`,
+the Kirchhoff linearization of the sublimation heat, added to the internal energy as
+`−ρ_i L_s(T)`:
+
+    T = [M + ρ_liq (L_v0 − (C_pv − C_l) T_0) + ρ_ice (L_s0 − (C_pv − C_i) T_0)]
+        / [C_f − ρ_liq (C_pv − C_l) − ρ_ice (C_pv − C_i)]
+
+`C_f = ρ_d C_pd + (ρ_t − ρ_d) C_pv` is UNCHANGED in form (`ρ_t` now includes the ice, and an
+ice mass that displaces vapor moves `C_f` not at all — see the derivation in
+reference/Scythe_moist_compressible.tex, Eq. T_retrieve_ice), and `C_i = 2106 > C_pv` exactly
+as `C_l > C_pv`, so the denominator stays strictly positive and the root stays unique. `T`
+still does not read `Q_ss`, the vapor/cloud split, or the distribution of the ice mass among
+species — deposition raises `ρ_i` at fixed `E_t`, `ρ_t` and this expression turns that into
+the warming `δρ_i L_s/D_i` by itself.
+
+**The 4-argument method DELEGATES with `rho_ice = 0.0` and that is BITWISE the pre-ice code.**
+The ice numerator term is `0.0 * (L_s0 − (C_pv−C_i)T_0)` = `+0.0`, added LAST (so the liquid
+sum is formed first and `x + 0.0 === x` for every double except `-0.0`, which `M + ρ_liq(...)`
+— an O(10⁵) J/m³ available enthalpy — cannot be); the denominator term is
+`0.0 * (C_pv − C_i)` = `-0.0` SUBTRACTED, and `x - (-0.0) === x` exactly. The associativity is
+therefore load-bearing, not cosmetic: `test_moist_compressible.jl` asserts the identity with
+`===` over a state sweep.
+"""
+@inline function retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
+
+    Cfactor = (rho_d * Cpd) + ((rho_t - rho_d) * Cpv)
+    return ((M + (rho_liq * (L_v0 - ((Cpv - Cl) * T_0)))) +
+            (rho_ice * (L_s0 - ((Cpv - Ci) * T_0)))) /
+           ((Cfactor - (rho_liq * (Cpv - Cl))) - (rho_ice * (Cpv - Ci)))
+end
+
+@doc (@doc retrieve_temperature)
+@inline retrieve_temperature(M, rho_d, rho_t, rho_liq) =
+    retrieve_temperature(M, rho_d, rho_t, rho_liq, 0.0)
+
+"""
+    eos_temperature(p, rho_d, rho_v)
+
+The EQUATION-OF-STATE temperature `T = p / (ρ_d R_d + ρ_v R_v)` [K]: the temperature the
+prognostic pressure and the two gas densities imply. The condensates exert no partial pressure,
+so they do not enter, and neither does `E_t`.
+
+This is the model temperature under `options[:temperature] = :eos` (the default; see
+[`temperature_mode`](@ref)). Why it replaced [`retrieve_temperature`](@ref) is the file header's
+criterion applied to T itself. The energy retrieval reads the condensates through their
+RECOVERED densities, which the `:bhyp` transforms clip at zero, while `ρ_t` and `E_t` carry the
+transported feature's signed lobe: wherever a lobe is clipped the retrieval sees liquid that is
+not there and credits it with `L_v/C_f` — about +2.5 K per 1e-3 kg/m³ of lobe. The pressure,
+which carries the latent heating that actually happened (the ETD increments to slot 1), is
+untouched by the clip, so the two temperatures SPLIT: +4 K in the 2-D RCE control's convective
+burst, +24 K with the Stage L device on (measured 2026-10-14). The dynamics feels `T_eos`
+through `p`; with the energy retrieval the microphysics, radiation, surface layer and output
+felt `T_ret`.
+
+`T_eos` is well conditioned now that the vapor is prognostic. Its inputs are large (`p`, `ρ_d`)
+except the vapor, which enters at `R_v ρ_v / (R_d ρ_d) ≈ 1.6 q_v` of the denominator, so a
+lobe-sized vapor error aloft is ~0.1 K — the retrieved quantity is not small compared with the
+terms in it, which is the criterion. (When the vapor was the RESIDUAL of `ρ_t − ρ_d − ρ_c`, this
+expression would have inherited that residual's conditioning; that is why it was not chosen then.)
+
+`ρ_v` is whatever vapor the thermodynamics reads at the call site — in every current caller the
+prognostic slot plus the derived reference `ρ̄_v`, UNFLOORED. A negative vapor (a resolution
+diagnostic, never clamped) lowers the denominator by `R_v|ρ_v|`, which is harmless: it would take
+`ρ_v < −(R_d/R_v) ρ_d` to make it vanish.
+"""
+@inline eos_temperature(p, rho_d, rho_v) = p / ((rho_d * Rd) + (rho_v * Rv))
+
+"The `options[:temperature]` values: `:eos` (the default) and `:energy`. See [`temperature_mode`](@ref)."
+const TEMPERATURE_MODES = (:eos, :energy)
+
+"""
+    temperature_mode(options) -> Symbol
+
+How the moist-compressible set diagnoses its temperature, `options[:temperature]`:
+
+- `:eos` (default) — [`eos_temperature`](@ref), `T = p/(ρ_d R_d + ρ_v R_v)`, at every consumer.
+- `:energy` — the closed-form Bryan & Fritsch total-energy retrieval
+  [`retrieve_temperature`](@ref)`(M, ρ_d, ρ_t, ρ_liq, ρ_ice)`, bitwise the code before the
+  switch existed (2026-10-14).
+
+Under either mode `E_t` stays a conserved prognostic; under `:eos` it no longer DEFINES T, and
+the energy the state implies drifts from it by (i) the condensate-clipping inconsistency the
+retrieval used to absorb and (ii) the pressure equation's own non-conservation. That drift is
+measured, not corrected: [`implied_total_energy`](@ref) and the `E_residual`/`T_split` fields of
+the comprehensive NetCDF file.
+
+Resolved once per column (one `Dict` read, the `get(model.options, …)` pattern the driver uses
+for every switch) and refused loudly when it names neither mode — a typo here would silently
+pick a temperature.
+"""
+function temperature_mode(options)::Symbol
+    m = get(options, :temperature, :eos)
+    m in TEMPERATURE_MODES || error("options[:temperature] = $(repr(m)) is not a temperature " *
+        "mode; use :eos (T = p/(rho_d R_d + rho_v R_v), the default) or :energy (the " *
+        "closed-form total-energy retrieval, the pre-2026-10-14 model temperature)")
+    return m
+end
+
+"""
+    model_temperature(teos, M, p, rho_d, rho_t, rho_v, rho_liq, rho_ice)
+
+The model temperature at one point under the resolved mode: [`eos_temperature`](@ref)`(p, ρ_d,
+ρ_v)` when `teos`, else [`retrieve_temperature`](@ref)`(M, ρ_d, ρ_t, ρ_liq, ρ_ice)` — the latter
+the IDENTICAL call every site made before the switch, so `teos = false` is bitwise the old code.
+Every consumer that used to call the retrieval calls this, with the inputs it already formed.
+"""
+@inline model_temperature(teos::Bool, M, p, rho_d, rho_t, rho_v, rho_liq, rho_ice) =
+    teos ? eos_temperature(p, rho_d, rho_v) :
+           retrieve_temperature(M, rho_d, rho_t, rho_liq, rho_ice)
+
+"""
+    implied_total_energy(Tk, rho_d, rho_v, rho_liq, rho_ice, rho_t, geo)
+
+The total energy density [J/m³] the state `(T, ρ_d, ρ_v, ρ_liq, ρ_ice)` implies, in the model's
+OWN energy definition — the one the reference build and every initializer write
+(`ρ_d e_i(T, q_v, q_l) + ρ_t(ke + gz)`, Springsteel `_pressure_reference`,
+`moist_temperature_noise_mc!`), with the ice term of [`retrieve_temperature`](@ref):
+
+    E = ρ_d·internal_energy_bf02(T, q_v, q_l) + ρ_i (C_pv T − L_s(T)) + ρ_t·geo
+
+`internal_energy_bf02` references energies to vapor, so a condensed phase carries
+`C_pv T − L(T)`; the ice term is the same with `L_s`. `geo = ke + gz` is the mechanical part, and
+it multiplies the total density every reader takes — the DERIVED `ρ_t = ρ_d + ρ_w`,
+`ρ_w = Σ_k α_k ν_k` (plan E9; the prognostic ρ_t was retired at Stage 4) — not
+`ρ_d + ρ_v + ρ_liq + ρ_ice`, so the mechanical energy of the partition gap stays out of this
+measure and `E_t − E` is the THERMAL inconsistency.
+
+Evaluated at `T_eos` (so `p = (ρ_d R_d + ρ_v R_v) T_eos` holds by construction) and with the
+same condensate the retrieval reads, the residual against the prognostic energy is EXACTLY
+(expand `C_f T − p`; `L_v`, `L_s` are affine in T)
+
+    E_t − E(T_eos) = D·(T_ret − T_eos) + X·C_pv·T_eos,    X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice
+
+with `D` the retrieval's denominator and, under the derived anchor, `X = ρ_w − Σ_k ahyp(ν_k) =
+B + Λ` the partition gap (the knee bias `B ≥ 0` and the lobe pool `Λ ≤ 0`; census
+`MC_XGAP_*`, `MC_W_PART`). On a consistent state both terms vanish and so does the residual, to
+rounding; otherwise the first is the energy the state would have to shed or gain for the two
+temperatures to agree and the second the heat content of the water the recovered partition
+does not account for (a clipped lobe the linear anchor carries). The model never reads it: it
+is what every energy partner holds (`recovered_change_partner`) and what the netCDF
+`E_residual` and the energy budget (src/energy_budget.jl) measure.
+"""
+@inline function implied_total_energy(Tk, rho_d, rho_v, rho_liq, rho_ice, rho_t, geo)
+    return ((rho_d * internal_energy_bf02(Tk, rho_v / rho_d, rho_liq / rho_d)) +
+            (rho_ice * ((Cpv * Tk) - L_s(Tk)))) + (rho_t * geo)
+end
+
+"""
+    moist_entropy_total(Tk, rho_d, q_v, q_l)
+    moist_entropy_total(Tk, rho_d, q_v, q_l, q_i)
+
+Specific moist entropy per unit dry-air mass [J/(kg·K)], INCLUDING the liquid contribution
+that `entropy` omits:
+
+    s_t = entropy(T, ρ_d, q_v) + q_l·Cl·log(T/T_0)
+
+This is the heat control variable diffused by the turbulence scheme (the moist analogue of
+Straka's dry-entropy diffusion), and the same integrand `conservation_drift` uses for the
+total entropy. Because `∂s_t/∂T = C_vt/T` at fixed ρ_d and composition, a diffusive
+increment δs_t maps to a heating ρ_d·T·δs_t (= ρ_d C_vt δT). In dry air it reduces to
+`dry_entropy_pd(p, ρ_d)` up to a constant.
+
+**`q_v` IS READ THROUGH `max(q_v, 0)`, AND IT HAS TO BE.** `entropy` evaluates
+`q_v·R_v·ln(q_v ρ_d / ρ_v0)`, so a negative vapor mixing ratio is a `DomainError`, not a
+number — and negative vapor is a RESOLUTION DIAGNOSTIC that is never clamped, so `ρ_v` does
+go below zero wherever an unresolved spike undershoots. That is the tropopause: measured on
+the 3-nest TC initial state (when the vapor was still the residual of two independently
+fitted O(0.1 kg/m³) densities), 362 of 6750 nest-1 points between 14.4 and 17.3 km, worst
+`ρ_v` = −4.5e-6 against a reference `ρ̄_v` of +1.5e-6 there. It killed the first Louis-BL call
+of the first timestep. Making the vapor prognostic removes THAT mechanism — the cancellation
+of large fitted densities — but not the undershoot of the vapor's own fit, so the guard
+stays. The same clamp, for the same
+stated reason, has always been on the diagnostics side of this (`benchmarks/common/diagnostics.jl`,
+"in dry air the residual vapor sits at 0 ± roundoff, and entropy() takes log(q_v)").
+
+This is the `condensate_floor = :diagnostic` pattern, not `clamp_water!`: nothing is written
+back, no mass is converted, no latent heat is pumped, and `s_t` is only ever read as a
+mixing control variable. It is also CONTINUOUS — `q ln q → 0` as `q → 0⁺`, so `entropy` has
+no kink at zero and the clamped points join the dry limit smoothly. What it does NOT do is
+make the negative vapor go away; that deficit is a property of fitting `ρ_t` and `ρ_d`
+independently, is expressible as a constraint on neither (`benchmarks/FUTURE_WORK.md`), and
+no condensate scheme reaches it.
+
+`q_l` is deliberately NOT clamped: nothing takes its log, a negative condensate must stay
+visible in the entropy budget, and under the water transforms it cannot be negative anyway.
+
+# The ice term
+
+Ice enters with the identical structure and for the identical reason, `s_i = C_i ln(T/T_0)`
+integrated from `T ds_i = C_i dT` under the same incompressibility assumption used for the
+liquid (reference/Scythe_moist_compressible.tex, Eq. entropy_ice):
+
+    s_t = entropy(T, ρ_d, q_v) + q_l·C_l·log(T/T_0) + q_i·C_i·log(T/T_0)
+
+The 4-argument method delegates with `q_i = 0.0`, and the added term is then
+`0.0 * C_i * log(T/T_0)` = `±0.0` appended LAST, so `x + (±0.0) === x` for every double and
+the pre-ice path is bitwise. `q_i` is not clamped either, for `q_l`'s reasons.
+"""
+function moist_entropy_total(Tk, rho_d, q_v, q_l, q_i)
+
+    return (entropy(Tk, rho_d, max(q_v, 0.0)) + (q_l * Cl * log(Tk / T_0))) +
+           (q_i * Ci * log(Tk / T_0))
+end
+
+@doc (@doc moist_entropy_total)
+moist_entropy_total(Tk, rho_d, q_v, q_l) = moist_entropy_total(Tk, rho_d, q_v, q_l, 0.0)
+
+"""
+    mc_ref_diag_kwargs(model) -> NamedTuple
+
+The run's options as [`mc_reference_diagnostics`](@ref) takes them — the temperature mode, the
+vapor and cloud control variables and their widths — so every caller (the tile, the master's
+checkpoint conversion) builds the identical reference diagnostics.
+"""
+mc_ref_diag_kwargs(model) =
+    (; temperature = temperature_mode(model.options),
+       vapor_transform = vapor_transform_mode(model.options),
+       vapor_mu = vapor_mu(model.physical_params),
+       condensate_transform = condensate_transform_mode(model.options),
+       condensate_mu = Float64(get(model.physical_params, :condensate_mu, 1.0e-7)))
+
+"""
+    mc_reference_diagnostics(ref_state, z; temperature = :eos)
+        -> (s_tbar, rho_vbar, rho_vbar_z, Pxi_prof, Tbar)
+
+Consistently-RETRIEVED diagnostics of the resting reference for the vertical moist
+diffusion: the moist entropy `s_tbar` and clamped vapor density `rho_vbar`, computed
+through the exact pipeline `moist_compressible_XZ` runs each step (temperature at rest,
+clamped partition, `moist_entropy_total`). The reference's own `Tbar` is NOT
+bit-identical to the model's resting temperature, so subtracting profiles built from it
+would leave a spurious O(fit error) perturbation that diffusion then acts
+on; with these, a resting base has `s_t' ≡ 0` and `rho_v' ≡ 0` bit-for-bit and every
+moist diffusive tendency vanishes exactly.
+
+`Tbar` (returned, and carried on the tile as `mc_ref_diag.Tbar`) is that resting temperature
+itself, in the run's `temperature` mode ([`temperature_mode`](@ref)): under `:eos` it is
+`eos_temperature(p̄, ρ̄_d, ρ̄_v)` with the DERIVED `ρ̄_v` below — the doubles `mc_driver!` forms at
+rest, since `0.0 + x === x` — and under `:energy` the retrieval of the fitted `(p̄, Ē_t, ρ̄_t,
+ρ̄_c)`. Springsteel's stored `ref.Tbar` is neither: it is the pointwise EOS temperature of the
+UNFITTED sounding, which differs from both at fit level.
+
+`rho_vbar` is ALSO the reference the prognostic vapor slot is carried against — the slot holds
+`ρ_v' = ρ_v − ρ̄_v` with `ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c` (Springsteel's fitted columns) — and
+`rho_vbar_z` is that profile's vertical derivative, assembled from the reference columns' own
+fitted derivatives rather than refitted, so the total gradient `ρ_v'_z + ρ̄_v_z` the advection
+reads is the exact derived sum. Every initializer subtracts the SAME expression.
+
+**Under the vapor control variable** (`vapor_transform = :bhyp`, [`vapor_transform_mode`](@ref))
+the slot is carried against `nu_vbar = bhyp(ρ̄_v)` with `nu_vbar_z = J̄_v ρ̄_v,z`
+(`J̄_v = dbhyp(ρ̄_v)`), and everything the driver forms AT REST from the recovered vapor —
+`Tbar`, `s_tbar`, `Pxi_prof` — is formed here from the same recovered value
+`ahyp(nu_vbar) = ahyp(bhyp(ρ̄_v))` (one round trip, 2.2e-16 relative), so rest stays a discrete
+fixed point bit for bit. `rho_vbar` itself is unchanged (the DENSITY reference). Under `:none`
+`nu_vbar` IS `rho_vbar`.
+Refused here, at setup, if `μ_v > 10⁻² min ρ̄_v` or any `ρ̄_v ≤ 0` (design §3.4: the vapor
+must be affine wherever there is a reference).
+
+`rho_tbar_w`/`rho_tbar_w_z` is the DERIVED total reference `ρ̄_d + Σ_k α_k ν̄_k` (`α = 2` for a
+transformed slot, 1 untransformed; only the vapor and the cloud have a reference) — design
+§3.3's `ρ̄_t^w`, the total-density reference EVERY reader takes (the derived water anchor, the
+only one since Stage 4 of the ρ_t retirement): every resting quantity built here that reads a
+total density (`M`, the `:energy` temperature, `Pxi_prof`) reads it.
+"""
+function mc_reference_diagnostics(ref_state, z; temperature::Symbol = :eos,
+                                  vapor_transform::Symbol = :none,
+                                  vapor_mu::Float64 = VAPOR_MU_DEFAULT,
+                                  condensate_transform::Symbol = :none,
+                                  condensate_mu::Float64 = 1.0e-7)
+
+    teos = temperature_mode(Dict(:temperature => temperature)) === :eos
+    vtr = vapor_transform_mode(Dict(:vapor_transform => vapor_transform))
+    vbh = vtr === :bhyp
+    pbar = ref_pressure(ref_state)
+    rho_dbar = ref_rho_d(ref_state)
+    rho_tbar = ref_rho_t(ref_state)
+    rho_cbar = Springsteel.ref_rho_c(ref_state)
+    E_tbar = ref_total_energy(ref_state)
+    n = length(z)
+    s_tbar = zeros(Float64, n)
+    rho_vbar = zeros(Float64, n)
+    rho_vbar_z = zeros(Float64, n)
+    Pxi_prof = zeros(Float64, n)
+    Tbar = zeros(Float64, n)
+    nu_vbar = zeros(Float64, n)
+    nu_vbar_z = zeros(Float64, n)
+    rho_tbar_w = zeros(Float64, n)
+    rho_tbar_w_z = zeros(Float64, n)
+    for k in 1:n
+        p = pbar[k, 1]
+        rho_d = rho_dbar[k, 1]
+        rho_t = rho_tbar[k, 1]
+        # The condensate is PROGNOSTIC, so the resting cloud is the reference's own
+        # fitted profile (exactly 0.0 for a condensate-free base, which fits rho_c from
+        # an all-zero vector; positive on a saturated base such as BF02).
+        rho_c = rho_cbar[k, 1]
+        # Mirror the equation set's per-point pipeline at rest (ke = 0, rho_r = 0, and
+        # rho_i = 0 — there is no reference ice in any configuration or in the
+        # reference-state format, which is exactly why the ice slots are TOTALS; the 4-arg
+        # retrieval and entropy below are the ice ones with rho_i/q_i = 0.0, bitwise);
+        # every expression must match mc_driver! bit-for-bit.
+        geo = 0.5 * ((0.0 * 0.0) + (0.0 * 0.0)) + (gravity * z[k])
+        # The DERIVED reference vapor, ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c. This is the profile the
+        # prognostic vapor slot is carried against, so writing it in exactly this form (and
+        # not from Springsteel's fitted `ref_rho_v`, which differs at fit level) is what every
+        # initializer subtracts. Formed BEFORE the temperature, because under `:eos` the
+        # temperature reads it.
+        rho_v = rho_t - rho_d - rho_c
+        rho_vbar[k] = rho_v
+        # Under the vapor transform the driver reads the RECOVERED vapor at rest,
+        # `ahyp(0.0 + bhyp(ρ̄_v))`; every resting quantity below is built from those doubles.
+        if vbh
+            nu_vbar[k] = bhyp(rho_v, vapor_mu)
+            rho_v = ahyp(nu_vbar[k], vapor_mu)
+        else
+            nu_vbar[k] = rho_v
+        end
+        # The derived total reference ρ̄_t^w = ρ̄_d + α_v ν̄_v + α_c ν̄_c (design §3.3), the
+        # total every resting reader below takes (the doubles the driver forms at rest).
+        if condensate_transform === :none
+            nuc = rho_c; nuc_z = rho_cbar[k, 2]; ac = 1.0
+        else
+            nuc = bhyp(rho_c, condensate_mu)
+            nuc_z = dbhyp(rho_c, condensate_mu) * rho_cbar[k, 2]; ac = 2.0
+        end
+        av = vbh ? 2.0 : 1.0
+        rho_tbar_w[k] = rho_d + ((av * nu_vbar[k]) + (ac * nuc))
+        rt_read = rho_tbar_w[k]
+        M = p + (E_tbar[k, 1]) - (rt_read * geo)
+        # The resting temperature in the run's mode — `rho_v` above is bit-for-bit the
+        # driver's `rho_vp + rho_vbar` at rest, so the EOS branch is too.
+        Tk = model_temperature(teos, M, p, rho_d, rt_read, rho_v, rho_c, 0.0)
+        Tbar[k] = Tk
+        q_v = rho_v / rho_d
+        q_l = rho_c / rho_d
+        s_tbar[k] = moist_entropy_total(Tk, rho_d, q_v, q_l)
+        # ...and its vertical derivative, assembled from the reference columns' own fitted
+        # derivative slots for the same reason: the advection's TOTAL vapor gradient is
+        # `ρ_v'_z + ρ̄_v_z`, and building ρ̄_v_z by differencing the same three fits the value
+        # comes from keeps the two consistent to the last bit.
+        rho_vbar_z[k] = rho_tbar[k, 2] - rho_dbar[k, 2] - rho_cbar[k, 2]
+        nu_vbar_z[k] = vbh ? dbhyp(rho_vbar[k], vapor_mu) * rho_vbar_z[k] : rho_vbar_z[k]
+        rho_tbar_w_z[k] = rho_dbar[k, 2] + ((av * nu_vbar_z[k]) + (ac * nuc_z))
+        # Local reference sound speed squared γ_m(z)·p̄(z)/ρ̄_t(z) for the acoustic
+        # linearization. A DOMAIN-MEAN c̄² (Springsteel's sound_speed_sq) leaves the
+        # local deviation of the vertical acoustic operator EXPLICIT under AB3 —
+        # the classic reference-state SI instability (Simmons, Hoskins & Burridge
+        # 1978): on the Dunion sounding the ±20-25% c² deviations blow up above
+        # Co_z ≈ 4.5 even though the operator-consistent scheme is stable to
+        # Co_z ≈ 9-18 on a uniform-c base. The PROFILE makes the explicit acoustic
+        # remainder O(perturbation) at every level.
+        C_vt = Cvd + (q_v * Cvv) + (q_l * Cl)
+        R_m = Rd + (q_v * Rv)
+        Pxi_prof[k] = ((C_vt + R_m) / C_vt) * p / rt_read
+    end
+    if vbh
+        # Design §3.4: the vapor must be affine (ρ ≫ μ_v) wherever there is a reference.
+        rmin = minimum(rho_vbar)
+        rmin > 0.0 || error("options[:vapor_transform] = :bhyp needs a positive reference " *
+            "vapor at every level, but the derived rho_vbar = rho_tbar - rho_dbar - rho_cbar " *
+            "has minimum $(rmin) kg/m^3 (level $(argmin(rho_vbar)), z = " *
+            "$(z[argmin(rho_vbar)]) m). A dry or partly dry base cannot carry the vapor " *
+            "control variable; run it with vapor_transform = :none.")
+        vapor_mu <= 1.0e-2 * rmin || error("physical_params[:vapor_mu] = $(vapor_mu) " *
+            "kg/m^3 is above 1e-2 of the driest reference vapor ($(rmin) kg/m^3 at z = " *
+            "$(z[argmin(rho_vbar)]) m): the vapor would sit in the transform's knee there " *
+            "and its nu-transport would not be the linear density transport (design §3.4). " *
+            "Lower vapor_mu (1e-9 is the recommended width).")
+    end
+    return (s_tbar = s_tbar, rho_vbar = rho_vbar, rho_vbar_z = rho_vbar_z,
+            Pxi_prof = Pxi_prof, Tbar = Tbar, nu_vbar = nu_vbar, nu_vbar_z = nu_vbar_z,
+            rho_tbar_w = rho_tbar_w, rho_tbar_w_z = rho_tbar_w_z)
+end
+
+"""
+    consistent_qss_reference(ref, z, column; temperature = :eos) -> PressureReferenceState
+
+Rebuild the reference water partition (`Q_ssbar`, and on a cloudy base `rho_cbar`/`rho_vbar`)
+so the RESTING state is a discrete fixed point of the equation set. Opt-in through
+`options[:consistent_qss_reference]`; off by default and bitwise inert when off.
+
+Springsteel builds its moisture profiles POINTWISE from the EOS temperature and then fits
+them. The equation set never sees those pointwise values: at run time it retrieves T from the
+FITTED `(p̄, Ē_t, ρ̄_t, ρ̄_c)` through [`retrieve_temperature`](@ref) and diagnoses
+`ρ_v = ρ̄_t − ρ̄_d − ρ̄_c` from the fitted densities, so both differ from the pointwise
+construction by the fit error. Two resting tendencies can survive that mismatch:
+
+- `Q̇ = Q_ss·invtau/(1+Q_s)` — the phase change, wherever a gate in
+  [`qss_condensation_rates`](@ref) is open;
+- `QSSREL = −(Q_ss − (ρ_v − ρ_vs))/τ` — the [`qss_relaxation`](@ref) reconciliation, which is
+  thermodynamically inert (T does not read `Q_ss`) but is still a nonzero tendency at rest.
+
+Killing both means making `Q_ssbar` equal the model's OWN diagnosed supersaturation, which is
+what this builds:
+
+    ρ_c     = ρ̄_c (fitted)          M = p̄ + Ē_t − ρ̄_t·g·z        (rest: ke = 0, ρ_r = 0)
+    T       = retrieve_temperature(M, ρ̄_d, ρ̄_t, ρ_c)
+    Q_ssbar = (ρ̄_t − ρ̄_d − ρ_c) − ρ_v*(T, p̄)
+
+The vapor here is the DERIVED profile `ρ̄_t − ρ̄_d − ρ̄_c`, which is exactly what the prognostic
+vapor slot is carried against ([`vapor_slot`](@ref), [`mc_reference_diagnostics`](@ref)). So
+this construction says `Q_ssbar = ρ̄_v − ρ_v*(T, p̄)` on the same numbers the equation set will
+form at rest, and both resting tendencies — the phase change and `QSSREL` — vanish for the
+prognostic vapor exactly as they did for the residual one.
+
+**Cloud-free levels** (`ρ̄_c = 0` — a subsaturated sounding: O01, the TC) are done at that
+point. `q_c = 0 < 1e-8` and `S = Q_ssbar/ρ_vs < 0` shut both condensation gates, `invtau_r = 0`
+for `ρ_r = 0`, the closure returns `(0.0, 0.0)` EXACTLY, and `QSSREL` vanishes by construction.
+Note how much weaker the requirement is than it used to be: the condensate is prognostic, so a
+subsaturated base cannot manufacture cloud however the fit falls, and this is now a refinement
+rather than the load-bearing repair it was before.
+
+**Condensate-bearing levels** (`ρ̄_c > 0` — a saturated base: Bryan & Fritsch 2002) cannot be
+fixed by `Q_ssbar` alone. The cloud gate is necessarily open there, so `Q̇` vanishes only for
+`Q_ssbar = 0`, while `QSSREL` vanishes only for `Q_ssbar = ρ_v − ρ_vs`. Both hold together iff
+the base is EXACTLY saturated in the model's own arithmetic, so the PARTITION is what has to
+move: solve
+
+    g(ρ_c) = ρ_c − (ρ̄_t − ρ̄_d − ρ_v*(T(ρ_c), p̄)) = 0
+
+for `ρ_c` by Newton, using `dT/dρ_c = L_v(T)/(C_factor − ρ_c(C_pv − C_l))` (differentiate the
+closed-form retrieval), then set `Q_ssbar = 0` and `ρ̄_v = ρ̄_t − ρ̄_d − ρ_c`. Fixed-point
+iteration is NOT usable here: `d/dρ_c` of the map is `−∂ρ_vs/∂T · L_v/C_factor ≈ −2.5`, so the
+naive iteration diverges. `ρ̄_t`, `ρ̄_d`, `p̄` and `Ē_t` are untouched, so this moves mass
+between the vapor and cloud slots at fixed total density — the hydrostatic balance and the
+buoyancy of the base are exactly preserved, which is the whole point of a BF02 base state.
+
+The VALUE slots are the raw targets (not the filtered fit): the fixed point depends on them
+exactly, while the derivative slots — which come from a spline fit of those values — multiply
+`w ≡ 0` at rest and so cannot disturb it.
+
+**The temperature is the run's** (`temperature`, = `options[:temperature]`; see
+[`temperature_mode`](@ref)). Everything above is written for the `:energy` retrieval it was
+built on; under `:eos` (the default) `T` is instead `eos_temperature(p̄, ρ̄_d, ρ̄_t − ρ̄_d − ρ_c)`
+— the same derived vapor, so the same doubles the driver forms at rest — and the cloudy Newton
+uses `dT/dρ_c = T R_v/(ρ_d R_d + ρ_v R_v)` (cloud displacing vapor at fixed `p̄`, `ρ̄_w`). The
+two modes give `Q_ssbar` profiles that differ at FIT level (the retrieval and the EOS disagree
+on the fitted reference by exactly the fit error this function exists to remove), so a
+reference built for one mode is not a fixed point of the other: the builder and the run must
+agree, which is why every caller passes the run's option.
+
+Errors per level if the intended outcome is not actually reached: a cloud-free level that is
+actually supersaturated (which needs a condensate-bearing reference, not a condensing one), or
+a cloudy level whose Newton solve leaves no cloud (the sounding is not saturated there).
+
+**The vapor is the run's too** (`vapor_transform`, `vapor_mu` = the run's
+`options[:vapor_transform]`, `physical_params[:vapor_mu]`): under `:bhyp` the driver reads the
+RECOVERED vapor `ahyp(bhyp(ρ̄_v))` at rest, so the temperature and `Q_ssbar` are built on those
+doubles (a 2.2e-16-relative round trip, which a resting fixed point cannot ignore). The
+partition itself (`ρ̄_c`, the derived `ρ̄_v`) is solved exactly as before.
+"""
+function consistent_qss_reference(ref::Springsteel.PressureReferenceState,
+                                  z::AbstractVector{Float64}, column;
+                                  temperature::Symbol = :eos,
+                                  vapor_transform::Symbol = :none,
+                                  vapor_mu::Float64 = VAPOR_MU_DEFAULT,
+                                  condensate_transform::Symbol = :none,
+                                  condensate_mu::Float64 = 1.0e-7)
+
+    teos = temperature_mode(Dict(:temperature => temperature)) === :eos
+    vbh = vapor_transform_mode(Dict(:vapor_transform => vapor_transform)) === :bhyp
+    # what the driver reads at rest for a derived reference vapor `rv`
+    rec(rv) = vbh ? ahyp(bhyp(rv, vapor_mu), vapor_mu) : rv
+    # The total density the driver reads at rest (the derived water anchor):
+    # `ρ̄_t^w = ρ̄_d + (α_v ν̄_v + α_c ν̄_c)` of the partition being solved for
+    # (`mc_reference_diagnostics`' expression), so the `:energy` retrieval and `M` see the
+    # doubles the run forms. The EOS temperature reads no total.
+    cbh = condensate_transform !== :none
+    rtw(rd, rv, rc) =
+        rd + (((vbh ? 2.0 * bhyp(rv, vapor_mu) : rv)) +
+              (cbh ? 2.0 * bhyp(rc, condensate_mu) : rc))
+    pbar = ref_pressure(ref)
+    rho_dbar = Springsteel.ref_rho_d(ref)
+    rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
+    E_tbar = ref_total_energy(ref)
+    n = length(z)
+    Q_ss_new = zeros(Float64, n)
+    rho_c_new = zeros(Float64, n)
+    rho_v_new = zeros(Float64, n)
+    cloudy_levels = 0
+    for k in 1:n
+        p = pbar[k, 1]
+        p_hPa = p / 100.0
+        rho_d = rho_dbar[k, 1]
+        rho_t = rho_tbar[k, 1]
+        rho_w = rho_t - rho_d
+        # Mirror the driver's per-point pipeline at rest (ke = 0, rho_r = 0).
+        # A condensate-free reference fits rho_c from an all-zero vector, so this is
+        # EXACTLY 0.0 there; a saturated base (BF02) carries a positive profile.
+        rho_c = rho_cbar[k, 1]
+        cloudy = rho_c > 0.0
+
+        if cloudy
+            cloudy_levels += 1
+            # Newton on g(rho_c) = rho_c - (rho_w - rho_vs(T(rho_c), p)), whose derivative
+            # is 1 + (drho_vs/dT)(dT/drho_c) — see the docstring. Under `:energy`
+            # dT/drho_c = L_v(T)/D (differentiate the closed-form retrieval at fixed M);
+            # under `:eos` the cloud enters T only by displacing vapor at fixed rho_w and p,
+            # T = p/(rho_d R_d + (rho_w - rho_c) R_v), so dT/drho_c = T R_v/(rho_d R_d + rho_v R_v).
+            # Either way the slope is positive and the Newton map is the same contraction.
+            Cfactor = (rho_d * Cpd) + (rho_w * Cpv)
+            for _ in 1:50
+                rt_k = rtw(rho_d, rho_w - rho_c, rho_c)
+                M_k = p + E_tbar[k, 1] - (rt_k * (gravity * z[k]))
+                Tk = model_temperature(teos, M_k, p, rho_d, rt_k,
+                                       rec(rho_w - rho_c), rho_c, 0.0)
+                g = rho_c - (rho_w - rho_v_sat(Tk, p_hPa))
+                D = Cfactor - (rho_c * (Cpv - Cl))
+                # (The `:energy` line is the pre-switch expression to the last operator.)
+                gp = teos ?
+                    1.0 + (drho_vsat_dT(Tk, p_hPa) *
+                           (Tk * Rv / ((rho_d * Rd) + ((rho_w - rho_c) * Rv)))) :
+                    1.0 + (drho_vsat_dT(Tk, p_hPa) * L_v(Tk) / D)
+                drc = -g / gp
+                rho_c += drc
+                abs(drc) < 1.0e-15 && break
+            end
+            rho_c_new[k] = rho_c
+            # On the saturation manifold BOTH the phase change and the reconciliation
+            # vanish; Q_ssbar = 0 exactly rather than the ~1e-19 the solve would leave.
+            Q_ss_new[k] = 0.0
+        else
+            rho_c_new[k] = rho_c            # exactly 0.0
+            # `rho_w - rho_c` is the derived vapor `(ρ̄_t − ρ̄_d) − ρ̄_c`, the doubles
+            # `mc_reference_diagnostics` hands the driver as ρ̄_v.
+            rt_k = rtw(rho_d, rho_w - rho_c, rho_c)
+            M_k = p + E_tbar[k, 1] - (rt_k * (gravity * z[k]))
+            Tk = model_temperature(teos, M_k, p, rho_d, rt_k, rec(rho_w - rho_c),
+                                   rho_c, 0.0)
+            Q_ss_new[k] = rec(rho_w - rho_c) - rho_v_sat(Tk, p_hPa)
+        end
+        rho_v_new[k] = rho_w - rho_c_new[k]
+
+        # VERIFY the run-time outcome through the driver's own expressions, rather than
+        # assuming the algebra above reached it.
+        rt_r = rtw(rho_d, rho_v_new[k], rho_c_new[k])
+        M_r = p + E_tbar[k, 1] - (rt_r * (gravity * z[k]))
+        Tk_run = model_temperature(teos, M_r, p, rho_d, rt_r, rec(rho_v_new[k]),
+                                   rho_c_new[k], 0.0)
+        rho_vs = rho_v_sat(Tk_run, p_hPa)
+        q_c = rho_c_new[k] / rho_d
+        S = Q_ss_new[k] / rho_vs
+        # QSSREL is inert but must still vanish for a true discrete fixed point; it is
+        # scaled by rho_vs so the tolerance means "a relative supersaturation of 1e-10".
+        rel = (Q_ss_new[k] - (rec(rho_v_new[k]) - rho_vs)) / rho_vs
+        if cloudy
+            # What must not happen is losing the base cloud, which is what makes a
+            # saturated base neutrally buoyant.
+            rho_c_new[k] > 0.0 || error("consistent_qss_reference: the saturation solve " *
+                "leaves no cloud at level $k (z = $(z[k]) m): rho_cbar = " *
+                "$(rho_cbar[k, 1]) kg/m^3 in the reference but the saturated partition " *
+                "gives rho_c = $(rho_c_new[k]) at T = $Tk_run K, p = $p_hPa hPa. The " *
+                "reference's (p, rho_d, rho_t, E_t) are not consistent with a " *
+                "saturated state.")
+            abs(rel) <= 1.0e-10 || error("consistent_qss_reference: the saturation " *
+                "solve did not converge at level $k (z = $(z[k]) m): rho_v - rho_vs = " *
+                "$(rho_v_new[k] - rho_vs) kg/m^3 (relative $rel), so the Q_ss " *
+                "reconciliation would fire on the resting base.")
+        else
+            # Exactly the two gates in `qss_condensation_rates`; failing either leaves
+            # invtau_c > 0 and the reference condenses at rest.
+            (q_c <= 1.0e-8 && S <= 1.0e-4) || error("consistent_qss_reference: the " *
+                "reference still condenses at level $k (z = $(z[k]) m): q_c = $q_c " *
+                "(needs <= 1e-8), S = $S (needs <= 1e-4), T = $Tk_run K, " *
+                "p = $p_hPa hPa. A saturated base state needs a condensate-bearing " *
+                "reference (rho_c > 0), not a condensing one.")
+        end
+    end
+
+    # Value slots EXACT (the fixed point depends on them bit-for-bit); derivative slots
+    # from a spline fit of those values (they multiply w == 0 at rest).
+    fit3 = function (vals)
+        prof = zeros(Float64, n, 3)
+        column.uMish[:] .= vals
+        Btransform!(column)
+        Atransform!(column)
+        prof[:, 1] .= vals
+        prof[:, 2] .= Ixtransform(column)
+        prof[:, 3] .= Ixxtransform(column)
+        return prof
+    end
+
+    Q_ssbar = fit3(Q_ss_new)
+    # A cloud-free base leaves the partition untouched, so its profiles stay the objects
+    # they already were — no refit, hence no chance of perturbing a working reference.
+    rho_cbar_out = cloudy_levels == 0 ? ref.rho_cbar : fit3(rho_c_new)
+    rho_vbar_out = cloudy_levels == 0 ? ref.rho_vbar : fit3(rho_v_new)
+
+    return Springsteel.PressureReferenceState(
+        ref.pbar, ref.rho_dbar, rho_vbar_out, rho_cbar_out, ref.rho_tbar,
+        ref.Tbar, ref.E_tbar, Q_ssbar, ref.sound_speed_sq)
+end
+
+"""
+    dry_entropy_pd(p_Pa, rho_d)
+
+Dry-air specific entropy written as an explicit function of the prognostic pressure and
+dry-air density, `s_d = C_vd·log(p) − C_pd·log(ρ_d)` (an additive constant is dropped — it
+does not affect the diffusion operator). Equal to `moist_entropy_total(T, ρ_d, 0, 0)` up to
+that constant via the dry EOS `T = p/(R_d ρ_d)`. Used for the dry-exact horizontal heat
+diffusion, whose Laplacian is the two-term chain rule
+
+    s_d,x  = C_vd·p_x/p − C_pd·ρ_d,x/ρ_d
+    s_d,xx = C_vd·(p_xx/p − p_x²/p²) − C_pd·(ρ_d,xx/ρ_d − ρ_d,x²/ρ_d²)
+
+on the existing `p`/`ρ_d` derivative slots (no transform of a diagnosed field — see
+reference/moist_compressible_diffusion_plan.md). The moist correction terms are deferred;
+see reference/moist_compressible_diffusion_handoff.md.
+"""
+function dry_entropy_pd(p_Pa, rho_d)
+
+    return (Cvd * log(p_Pa)) - (Cpd * log(rho_d))
+end
+
+"""
+    Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l)
+    Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+
+Energy-consistent psychrometric factor (dimensionless) for the supersaturation
+relaxation, built from the condensation-induced temperature and pressure tendencies
+of the total-energy equation set (density form, no ln(H) term):
+
+    Q_s = [ ∂ρ_vs/∂T (L_v − R_v T)/ρ_d + ∂ρ_vs/∂p R_m (L_v − R_v C_pt T / R_m) ] / C_vt
+
+The (1 + Q_s) factor cancels between the condensation rate and the saturation
+chain-rule terms, leaving −Q_ss/τ as the net supersaturation forcing.
+
+Ice reaches this only through the MIXTURE HEAT CAPACITY, `C_vt = C_vd + q_v C_vv + q_l C_l +
+q_i C_i` (reference/Scythe_moist_compressible.tex, Eq. mixture_C): a condensed phase performs
+no expansion work, so ice enters `C_vt` and `C_pt` exactly as liquid does, `R_m` is untouched
+because ice exerts no partial pressure, and the identity `C_pt = C_vt + R_m` — which is what
+collapses the pressure equation's coefficients — survives unchanged. The 5-argument method
+delegates with `q_i = 0.0`; `+ 0.0*C_i` appended last is bitwise the pre-ice `C_vt`.
+
+The OVER-ICE psychrometric factor of the deposition channel is a different quantity (it reads
+`∂ρ_i*/∂T` and `L_s`) and is not this function; it arrives with the deposition rates.
+"""
+function Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+
+    C_vt = Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)
+    R_m = Rd + (q_v * Rv)
+    C_pt = C_vt + R_m
+    p_hPa = p_Pa / 100.0
+    Lv = L_v(Tk)
+    Q_s = ((drho_vsat_dT(Tk, p_hPa) * (Lv - (Rv * Tk)) / rho_d) +
+           (drho_vsat_dp(Tk, p_hPa) * R_m * (Lv - (Rv * C_pt * Tk / R_m)))) / C_vt
+    return Q_s
+end
+
+@doc (@doc Q_s_energy)
+Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l) = Q_s_energy(Tk, p_Pa, rho_d, q_v, q_l, 0.0)
+
+"""
+    Q_s_energy_ice(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+
+The ICE psychrometric factor `𝒬_{s,i}` (dimensionless), the deposition channel's counterpart
+of [`Q_s_energy`](@ref) (reference/Scythe_moist_compressible.tex, Eq. Qs_ice):
+
+    𝒬_{s,i} = [ ∂ρ_vs/∂T (L_s − R_v T)/ρ_d + ∂ρ_vs/∂p R_m (L_s − R_v C_pt T / R_m) ] / C_vt
+
+It is `Q_s_energy` with `L_v → L_s` **in both latent-heat slots and nowhere else**.
+
+**The two saturation derivatives stay OVER WATER.** `∂ρ_vs/∂T` and `∂ρ_vs/∂p` here are the
+derivatives of `ρ_v*`, the plane-water saturation density, in both factors — this is NOT
+`Q_s_energy` re-evaluated over ice. The factor measures how far the deposition heating moves
+the saturation *that `Q_ss` is defined against*, and `Q_ss ≡ ρ_v − ρ_v*` is defined over water
+at all temperatures (Eq. qss_ice_shift). The ice enters only through the latent heat that does
+the moving. Substituting `∂ρ_i*/∂T` here would break the exact cancellation of `(1 + 𝒬_{s,i})`
+between the deposition rate of Eq. dep_rate and the chain-rule terms of Eq. Qss_ice, which is
+what makes the supersaturation forcing energy-consistent.
+
+`C_vt` and `C_pt` are the ice-inclusive mixture capacities of Eq. mixture_C, exactly as in
+`Q_s_energy`; `R_m` is untouched, since ice exerts no partial pressure.
+"""
+function Q_s_energy_ice(Tk, p_Pa, rho_d, q_v, q_l, q_i)
+
+    C_vt = Cvd + (q_v * Cvv) + (q_l * Cl) + (q_i * Ci)
+    R_m = Rd + (q_v * Rv)
+    C_pt = C_vt + R_m
+    p_hPa = p_Pa / 100.0
+    Ls = L_s(Tk)
+    return ((drho_vsat_dT(Tk, p_hPa) * (Ls - (Rv * Tk)) / rho_d) +
+            (drho_vsat_dp(Tk, p_hPa) * R_m * (Ls - (Rv * C_pt * Tk / R_m)))) / C_vt
+end
+
+"""
+    ice_supersaturation_gap(Tk, p_hPa) -> 𝒟
+
+`𝒟(T,p) = max(ρ_v*(T,p) − ρ_{v,i}*(T,p), 0)` [kg/m³], the offset between the water and ice
+saturation densities (reference/Scythe_moist_compressible.tex, Eq. Dwi).
+
+This is what makes the over-ice supersaturation an ALGEBRAIC function of the one prognostic
+`Q_ss` rather than a second prognostic: `ρ_v − ρ_{v,i}* = Q_ss + 𝒟` exactly (Eq. qss_ice_shift).
+It vanishes at the triple point, is positive below it because the ice branch of
+Clausius-Clapeyron is the steeper one, peaks near −12 °C, and the `max` carries it to zero
+above `T_0` where the ice cannot persist.
+
+BOTH branches come from the same Buck (1981) family with the same dry-air enhancement factor
+(`rho_v_sat` and `rho_i_sat` in Springsteel), which is the whole point: `𝒟` is a small
+difference of two large saturation densities and is only as good as the internal consistency
+of the two formulations (TeX §"Departures", (c)).
+"""
+@inline ice_supersaturation_gap(Tk, p_hPa) =
+    max(rho_v_sat(Tk, p_hPa) - rho_i_sat(Tk, p_hPa), 0.0)
+
+"""
+    ice_deposition_drive(Q_ss, rho_v, Tk, p_hPa) -> Q_ss_drive_i
+
+The DEPOSITION drive [kg/m³], the ice mirror of the liquid clip in
+[`qss_condensation_rates`](@ref):
+
+    Q_ss_drive_i = min(Q_ss + 𝒟, max(ρ_v, 0) − ρ_{v,i}*)
+
+In the continuum `Q_ss + 𝒟 ≡ ρ_v − ρ_{v,i}*` (Eq. qss_ice_shift) and the `min` never binds.
+Discretely `Q_ss` is an independent prognostic that can detach from the density budget, and
+this is the instantaneous, `Δt`-free form of the same reconciliation `qss_relaxation` applies
+on the `tau_qss` timescale — the identical argument, term for term, that the liquid clip
+rests on, applied to the identical vapor reservoir. Both phases must read the same clip or
+the shared-reservoir competition of Eq. wbf_qs is arbitrated twice.
+
+`max(ρ_v, 0)` is the same vapor floor for the same reason: a NEGATIVE retrieved `ρ_v` is a
+partition error, not a physical state, and must not set a sublimation rate whose magnitude is
+the size of that error. The floor puts the drive at `−ρ_{v,i}*`, the vapor-free-air maximum.
+
+The expression is SIGNED and needs no case distinction: where it is negative the air is
+subsaturated with respect to ice and the same formula returns sublimation (Eq. dep_rate).
+"""
+@inline function ice_deposition_drive(Q_ss, rho_v, Tk, p_hPa)
+
+    rho_vs_i = rho_i_sat(Tk, p_hPa)
+    return min(Q_ss + max(rho_v_sat(Tk, p_hPa) - rho_vs_i, 0.0),
+               max(rho_v, 0.0) - rho_vs_i)
+end
+
+"""
+    qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0)
+
+Cloud condensation/evaporation rate [kg/m³/s] from the prognostic supersaturation
+density, with the droplet-growth timescale of [`q_condensation`](@ref) (Twomey-type
+nucleation, minimum droplet radius) and the energy-consistent psychrometric factor:
+
+    Q̇_cond = Q_ss (1/τ) / (1 + Q_s)
+
+Subsaturated cloud-free air returns zero: there are no droplets to evaporate.
+Supersaturated air nucleates (`S > 1e-4`) and condenses.
+
+No depletion cap of any kind is applied, so the rate is not a function of `ts` — `ts` is
+inert in the signature, kept because callers pass it positionally and the ice work will read
+it. `rho_v` IS read: it clips the drive to `min(Q_ss, ρ_v − ρ_v*)`, which is an identity in
+the continuum and is what stops a column whose prognostic `Q_ss` has detached from the density
+budget condensing vapor that is not there. See [`qss_condensation_rates`](@ref).
+"""
+qss_condensation_rate(Q_ss, rho_v, rho_c, rho_d, Tk, p_hPa, Q_s, ts, max_N_c=100.0) =
+    qss_condensation_rates(Q_ss, rho_v, rho_c, 0.0, rho_d, Tk, p_hPa, Q_s, ts, 0.0,
+                           max_N_c)[1]
+
+"""
+    qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts, N_r,
+                           max_N_c=100.0; N_0=0.0, rain_2m=false, n_r_density=0.0)
+        -> (Qdot_c, Qdot_r, invtau_c, invtau_r)
+
+Two-category condensation/evaporation rates [kg/m³/s] from the generalized
+supersaturation relaxation `1/τ = 1/τ_c + 1/τ_r` (see
+reference/Scythe_moist_compressible.tex): the total rate `Q_ss (1/τ)/(1+Q_s)` splits
+between the cloud and rain channels in proportion to their inverse timescales. Rain
+gains a (small, `N_r`-controlled) share of supersaturated condensation ONLY where
+cloud coexists (`q_c > 1e-8`, the cloud channel's own existence threshold): the
+physical pathway to rain is condensation → cloud → autoconversion, and an ungated
+rain channel grows rain from arbitrarily small seeds in cloud-free supersaturated
+air (rate ∝ `rho_r^{1/3}` under the monodisperse fixed-`N_r` closure, non-Lipschitz
+at zero). The rain-channel timescale is [`invtau_rain`](@ref) by default; the
+keyword `N_0 > 0` [m⁻⁴] selects the exponential Marshall-Palmer closure
+[`invtau_rain_mp`](@ref) instead (`N_r` is then unused), and `rain_2m = true`
+with `n_r_density` [#/m³] selects the two-moment [`invtau_rain_2m`](@ref), whose
+DSD intercept comes from the prognostic mass/number pair rather than being
+prescribed (`N_r` and `N_0` are then both unused; see [`rain_moments`](@ref)).
+All three leave the split arithmetic and the cloud gate untouched. Rain
+evaporation in subsaturated air is unconditional, so no separate
+rain-evaporation parameterization (O01's `Q_evap`) is needed. The ventilation
+enhancement lives inside [`invtau_rain`](@ref).
+
+# No limiters
+
+The rates are PURE. This function used to floor cloud evaporation at `−ρ_c/ts`, rain
+evaporation at `−ρ_r/ts`, and rescale both channels when the combined condensation exceeded
+`+ρ_v/ts` (later, the AB3-exact versions of the same three budgets, sized in `mc_driver!` by
+[`_ab3_sink_bound`](@ref)). All three are gone.
+
+The reason is stated in reference/Scythe_moist_compressible.tex, "Departures from the ISHMAEL
+implementation" §(b): a cap of the form `Q̇ ≥ −ρ/Δt` makes the RATE — and therefore the
+converged solution — a function of the time step, so the scheme is not consistent in the sense
+that refining `Δt` approaches the differential equation, because the equation being solved
+changes with `Δt`. The same argument that rejects ISHMAEL's semi-analytic step-mean growth
+rate rejects these.
+
+What replaces them:
+
+  * robustness against a transient negative condensate comes from the CONTROL-VARIABLE
+    transforms ([`condensate_transform_mode`](@ref), [`rain_transform_mode`](@ref)), which
+    bound the recovered density below by construction rather than by repairing a rate, and
+    from the prognostic-supersaturation recovery — a point driven past zero is subsaturated
+    on the next step and the closure stops removing vapor from it on its own;
+  * under-resolution of a stiff relaxation is REPORTED, by [`mc_stiffness_census!`](@ref),
+    which accumulates `max ts/τ` per channel and counts the gridpoints past `ts/τ = 1`. A run
+    with a large census is a run whose time step is wrong, and that is a statement for the
+    diagnostics to make, not one for the rates to absorb silently.
+
+The two channel inverse timescales are returned alongside the rates precisely so the census
+can be taken on the rates that were actually used, at no extra cost.
+
+`ts` no longer enters the returned rate at all. `rho_v` does — but through the DRIVE, not
+through a `Δt`-sized budget. See below.
+
+# The clipped drive (PROVISIONAL — pending author ratification)
+
+The closure is driven by
+
+    Q_ss_drive = min(Q_ss, max(ρ_v, 0) − ρ_v*)
+
+and `Q_ss_drive`, never the raw `Q_ss`, sets the saturation ratio `S` that gates Twomey
+nucleation and the droplet number, the rate `Q̇ = Q_ss_drive·(1/τ)/(1+Q_s)` and its split, and
+the sign test that gates the rain channel. The `Q_ss` PROGNOSTIC EQUATION and
+[`qss_relaxation`](@ref) are untouched — the clip lives only inside this rate closure.
+
+In the continuum this is an IDENTITY: `Q_ss ≡ ρ_v − ρ_v*`, so the `min` never binds and the
+clip is invisible. Discretely `Q_ss` is carried as an independent prognostic and can DETACH
+from the density budget, and the clip is the INSTANTANEOUS form of exactly the reconciliation
+`qss_relaxation` already applies on the `tau_qss` timescale. It is `ts`-free and depends on
+the state alone, so it is not a depletion cap and does not reintroduce the defect §(b)
+rejects: refining `Δt` still approaches the same differential equation.
+
+`ρ_v` here is the BLENDED vapor — the same variable the removed `ceil_v` bounded — which
+minimizes the behaviour change relative to the code this replaces.
+
+Why it is needed, measured 2026-08-12 by removing the three caps and restoring one at a time:
+
+  * removing `floor_c` and `floor_r` breaks NOTHING;
+  * removing `ceil_v` breaks two gates — "Q_ss relaxation is thermodynamically inert in dry
+    air", and the axisym `exact_si` ceiling gate, which detonates to a NEGATIVE TEMPERATURE
+    inside 300 steps on a resting DRY base.
+
+`ρ_v` appeared ONLY in the ceiling, so with it gone nothing coupled the closure to the vapor
+actually present, and the nucleation branch fired on a detached `S = Q_ss/ρ_v*` to condense
+vapor that was not there. The dry bases are the worst case precisely because `ρ_v*` is tiny
+(1.7e−6 kg/m³ at 195 K, 8.3e−4 at 250 K), so a noise-level `Q_ss'` reads as a large
+supersaturation. The ceiling's `Δt` dependence was incidental; its CONTENT — "you cannot
+condense vapor that is not there" — is physical and belongs in the closure. This is that
+content, written without `Δt`.
+
+**`S` must come from the clipped drive too**, which is why the clip is applied before `S` and
+not just at the rate: with `S` computed from the raw `Q_ss`, dry air with a positive `Q_ss'`
+still NUCLEATES (raw `S > 1e-4` opens the Twomey branch and sets `invtau_c > 0`), and the
+clipped, now-negative drive then evaporates the cloud that does not exist and manufactures
+vapor — the same hole with the sign reversed. Taking `S` from the drive shuts the branch and
+leaves dry air exactly inert.
+
+An existence gate (`ρ_v > 0`) was considered and rejected: the rate does not scale with `ρ_v`,
+so 1e−12 kg/m³ of vapor would still admit the full rate.
+
+**The EVAPORATION side is bounded by the vapor floor.** Where the retrieved vapor is NEGATIVE
+— which happens (the O01 quick run reaches `ρ_v = −7.2e−4 kg/m³` at ~750 points), it is a
+PARTITION ERROR, not a physical state — the `max(ρ_v, 0)` inside the clip floors the drive at
+`−ρ_v*`, the maximum-dryness (vapor-free air) evaporation drive. Without the floor the drive
+would be `ρ_v − ρ_v* < −ρ_v*`: evaporation at a rate set by the size of the partition error,
+which nothing bounds (a seeded `ρ_c' = 0.5 kg/m³` state put `ρ_v ≈ −0.5` and drove slots 7 and
+9 to O(1e3) kg/m³/s through exactly that branch before the floor was added). The floor is the
+evaporation-side mirror of the condensation clip — "air cannot be drier than vapor-free" next
+to "you cannot condense vapor that is not there" — and is equally `ts`-free and state-only.
+A prognostic `Q_ss` below `−ρ_v*` still passes through the `min` unfloored: the prognostic is
+advanced by the smooth multistep integrator and is not the pathology this floor addresses.
+
+The vapor's depletion remains CENSUSED (`:d_v_*` in [`water_depletion_probe!`](@ref)), which
+is where a failure of this argument would show up.
+
+[`water_depletion_probe!`](@ref) still compares the realized rates against the AB3-exact
+bounds and reports where the old caps WOULD have bound; that is a measurement, and nothing in
+the RHS path reads it.
+"""
+function qss_condensation_rates(Q_ss, rho_v, rho_c, rho_r, rho_d, Tk, p_hPa, Q_s, ts,
+                                N_r, max_N_c=100.0; N_0=0.0,
+                                rain_2m::Bool=false, n_r_density=0.0)
+
+    rho_vs = rho_v_sat(Tk, p_hPa)
+    # THE DRIVE, clipped to the vapor actually present. In the continuum Q_ss IS rho_v - rho_vs
+    # and this is an identity; discretely the prognostic Q_ss can detach from the density
+    # budget, and this is the instantaneous form of the reconciliation `qss_relaxation` applies
+    # on the tau_qss timescale. `ts`-free and state-dependent only. The vapor is floored at
+    # zero inside the clip: air cannot be drier than vapor-free, so a NEGATIVE retrieved rho_v
+    # (a partition error) must not set the evaporation rate. See the docstring.
+    Q_ss_drive = min(Q_ss, max(rho_v, 0.0) - rho_vs)
+    S = Q_ss_drive / rho_vs              # supersaturation (ratio - 1)
+    q_c = max(rho_c, 0.0) / rho_d
+
+    # Cloud channel: droplet number and radius logic mirrors q_condensation
+    invtau_c = 0.0
+    N_c = max_N_c
+    r_c = cloud_droplet_radius(N_c, q_c, rho_d)
+    if q_c > 1.0e-8
+        if S < 0.0 && r_c < 1.0
+            # Evaporating small droplets: count the 1-micron drops available
+            r_c = 1.0
+            N_c = cloud_droplet_number(r_c, q_c, rho_d)
+            if N_c < 1.0
+                N_c = 0.0
+            end
+        end
+        if N_c > 0.0 && r_c > 0.0
+            invtau_c = invtau_condensation(Tk, p_hPa, N_c, r_c)
+        end
+    elseif S > 1.0e-4
+        # Nucleation: linear interpolation of the Twomey relationship
+        if r_c < 1.0
+            r_c = 1.0
+            N_c = min(1.0e4 * N_c * S, max_N_c)
+        end
+        if N_c > 0.0 && r_c > 0.0
+            invtau_c = invtau_condensation(Tk, p_hPa, N_c, r_c)
+        end
+    end
+    # (no cloud and not supersaturated: invtau_c stays 0 — rain may still evaporate)
+
+    # Rain CONDENSATION is gated on cloud presence (same q_c > 1e-8 existence
+    # threshold as the cloud channel): the physical pathway to rain is condensation
+    # -> cloud -> autoconversion, and in cloud-free supersaturated air the ungated
+    # channel grows rain from arbitrarily small seeds in finite time (the rate is
+    # ∝ rho_r^{1/3} under the fixed-N_r monodisperse closure, non-Lipschitz at zero
+    # — the O01 spurious-blob pathway). Evaporation (drive <= 0) is unconditional.
+    # The channel timescale is monodisperse fixed-N_r by default; N_0 > 0 selects the
+    # exponential (Marshall-Palmer) DSD closure. Both are non-Lipschitz at zero rain
+    # (rho_r^{1/3} and rho_r^{1/2} respectively), so the gate applies to either.
+    # The sign test reads the CLIPPED drive, like every other use: a column whose Q_ss has
+    # detached upward is not condensing onto rain either.
+    # `rain_2m` (options[:rain_moments] == 2) replaces the prescribed-DSD timescales with
+    # `invtau_rain_2m`, whose intercept comes from the prognostic (rho_r, n_r) pair. It is
+    # tested FIRST and defaults to `false`, so the single-moment arithmetic below — and the
+    # gate above it, which is unchanged and applies to all three closures — is bit-identical.
+    invtau_r = (Q_ss_drive > 0.0 && q_c <= 1.0e-8) ? 0.0 :
+               rain_2m ? invtau_rain_2m(Tk, p_hPa, rho_r, n_r_density, rho_d) :
+               (N_0 > 0.0 ? invtau_rain_mp(Tk, p_hPa, N_0, rho_r, rho_d) :
+                            invtau_rain(Tk, p_hPa, N_r, rho_r))
+    invtau = invtau_c + invtau_r
+    if invtau == 0.0
+        return (0.0, 0.0, 0.0, 0.0)
+    end
+
+    Qdot = Q_ss_drive * invtau / (1.0 + Q_s)
+    # An inactive channel gets an exact 0.0 (Qdot * 0.0 would be -0.0 for evaporation);
+    # a lone active channel gets Qdot exactly (invtau/invtau == 1.0), which keeps the
+    # single-category delegate bit-identical.
+    Qdot_c = invtau_c == 0.0 ? 0.0 : Qdot * (invtau_c / invtau)
+    Qdot_r = invtau_r == 0.0 ? 0.0 : Qdot * (invtau_r / invtau)
+
+    # No cap of any kind: the rate is the physics, and `ts` does not appear in it. The only
+    # bound anywhere in this function is the DRIVE clip at the top, which is `ts`-free.
+    # The channel timescales come back with the rates so `mc_stiffness_census!` can measure
+    # the stiffness the step is actually being asked to integrate.
+    return (Qdot_c, Qdot_r, invtau_c, invtau_r)
+end
+
+import Springsteel: ref_pressure, ref_rho_t, ref_total_energy, ref_qss
+
+# Canonical slot order for the total-energy set (u=4, w=5 in the shared-machinery
+# positions used by the other XZ sets). rho_c is APPENDED at 9 rather than placed
+# next to rho_r: slots 1-8 appear as hardcoded literals throughout the kernel, the
+# acoustic solvers and mc_boundary_layer.jl, and appending keeps every one valid
+# (the same rule MC_VARS_CYL follows for v — see the comment there).
+#
+# SLOT 3 IS THE VAPOR (Stage 4 of the rho_t retirement): the prognostic total density that
+# held it was deleted — every reader takes the derived rho_t = rho_d + sum_k alpha_k nu_k
+# (`water_anchor_set`) — and the vapor, which had been appended at 10, moved into its
+# position; every appended optional slot (n_r, the twelve ice moments, rho_e) moved one
+# further in. The vapor is in the CONSTANT rather than in `mc_var_names`'s optional block
+# because it is NOT optional. Its index is still read by NAME everywhere (`MCSlots.rho_v`,
+# `mc_slot(vars, "rho_v")`), so a literal 3 in the kernel is the vapor only where the
+# literal-slot audit (test/test_slot3_audit.jl) allows it. Renamed `"nu_v"` under the vapor
+# control variable (`mc_var_names`).
+const MC_VARS = ["p", "rho_d", "rho_v", "u", "w", "E_t", "Q_ss", "rho_r", "rho_c"]
+
+# ── Rigid-wall pressure compatibility condition ───────────────────────────────
+
+"""
+    mc_wall_bc_active(grid) -> Bool
+
+True if `p` declares the inhomogeneous Neumann condition (`CubicBSpline.R1T1X`)
+at either vertical wall, i.e. this grid wants [`update_mc_wall_bc!`](@ref) called
+before every fit. Cheap enough for the per-step path: two `haskey` lookups.
+"""
+function mc_wall_bc_active(grid)
+    grid.kbasis isa Springsteel.SplineBasisArray || return false
+    haskey(grid.params.vars, "p") || return false
+    kcol = grid.kbasis.data[grid.params.vars["p"]]
+    return haskey(kcol.params.BCL, "X1") || haskey(kcol.params.BCR, "X1")
+end
+
+"""
+    update_mc_wall_bc!(grid, src)
+
+Install the exact rigid-wall compatibility condition on `p'` before a fit.
+
+`w` is Dirichlet at both vertical walls, so `w ≡ 0` there for ALL time. Along the
+wall that also kills the advection terms (`∂w/∂r = 0` because `w` vanishes at every
+radius, and `w ∂w/∂z = 0`), so the vertical momentum equation collapses to an
+identity rather than an evolution equation:
+
+    ∂p'/∂z |_wall  =  -g ρ_t' |_wall
+
+This is NOT an assumption of hydrostatic balance in the interior — only at the two
+rigid walls, where it is exact. (If vertical diffusion or a boundary-layer scheme is
+ever given a nonzero `w` tendency AT the wall, its contribution `ρ_t · ∂w/∂t|_wall`
+belongs on the right-hand side here; with `Kvdiff = 0` and `w` Dirichlet there is
+none, and the assertion in `mc_wall_bc_requires_no_w_forcing` guards the assumption.)
+
+Why it matters: a homogeneous `NeumannBC` is the special case `ρ_t' = 0`, which a
+balanced vortex violates precisely where its surface pressure deficit lives — that
+was the drain of `reference/HANDOFF_2026-07-20.md`. `SecondDerivativeBC` leaves `∂p'/∂z`
+free instead, which restores the balance but costs a factor ~2.7 in stable timestep,
+because the semi-implicit acoustic solve eliminates `w` (φ = ρ̄_t w is Dirichlet in
+the Helmholtz solve) and therefore cannot see a wall derivative the refit injects —
+see `reference/SI_WALL_BC_CEILING.md`. R1T1X resolves the conflict: the admissible subspace
+stays R1T1's, so the solve stays operator-consistent and the ceiling stays high,
+while the affine `ahat` offset carries the nonzero derivative the balance needs.
+
+`src` is a `(npts, nvars, nderiv)` physical array carrying the fitted field AND its
+z-derivatives (slots 1, 4, 5) — normally `grid.physical`. `ρ_t'` at the wall is a
+second-order Taylor step off the nearest mish point, since the mish never lands on
+the boundary itself. A 2-D `src` is accepted for tests but degrades to the value
+alone.
+
+`relax` ∈ (0, 1] is the fraction of the way the stored derivative moves toward the
+target on this call, i.e. a first-order filter with timescale `Δt/relax`. **It must
+be well below 1 in a run.** With `relax = 1` the wall derivative is recomputed from
+scratch every acoustic step, which closes a feedback loop — `∂p'/∂z|_wall` sets the
+wall pressure, the acoustic solve moves `ρ_t'` at the wall, which resets
+`∂p'/∂z|_wall` — and it is unstable: the stored value alternates sign step to step
+and the column goes non-finite in a few hundred steps (measured). The affine-offset
+argument for R1T1X's stability holds for a FIXED `ahat`; a state-dependent one adds
+an explicit path that has to be kept off the acoustic timescale. The physical
+justification is the same fact: the wall gradient is a property of the BALANCED
+vortex and evolves on hours, so filtering it over ~minutes loses nothing real.
+`relax = 1` remains the right choice for a one-shot initialization, where there is
+no loop to close.
+"""
+# Radial spline used only to differentiate the wall profile: same knots as the
+# variable's i-basis but NATURAL boundary conditions, so neither a wall Dirichlet
+# nor a nesting R3X payload can bend the wall data. Cached per (domain, cells);
+# Springsteel caches the factorised template underneath, so a miss is cheap.
+const _WALL_DERIV_SPLINES = Dict{NTuple{3,Any}, Springsteel.CubicBSpline.Spline1D}()
+const _WALL_DERIV_LOCK = ReentrantLock()
+
+
+function _wall_deriv_spline(grid, v::Int)
+    isp = grid.ibasis.data[1, v]
+    sp = isp.params
+    key = (sp.xmin, sp.xmax, sp.num_cells)
+    lock(_WALL_DERIV_LOCK) do
+        get!(_WALL_DERIV_SPLINES, key) do
+            Springsteel.CubicBSpline.Spline1D(
+                Springsteel.CubicBSpline.SplineParameters(
+                    xmin = sp.xmin, xmax = sp.xmax, num_cells = sp.num_cells,
+                    BCL = Springsteel.CubicBSpline.R0,
+                    BCR = Springsteel.CubicBSpline.R0))
+        end
+    end
+end
+
+function update_mc_wall_bc!(grid, src::AbstractArray; relax::Float64 = 1.0, anchor = nothing)
+    gp = grid.params
+    kDim = gp.kDim
+    iDim = gp.iDim
+    vars = gp.vars
+    p_i = vars["p"]
+    rhod_i = vars["rho_d"]
+    # The water-mass members of the derived total density (`water_anchor_set`): since Stage 4
+    # of the ρ_t retirement there is no prognostic ρ_t to read, so the wall estimate needs
+    # them, and the grid alone does not know them (the transforms are model options).
+    anchor === nothing && error("update_mc_wall_bc!: the wall estimate dp'/dz = -g rho_t' " *
+        "reads the derived rho_t' = rho_d' + sum_k alpha_k nu_k' (Stage 4 of the rho_t " *
+        "retirement deleted the rho_t slot); pass `anchor = water_anchor_set(model.options, " *
+        "model.physical_params, mc_slots(model))`.")
+    kcol = grid.kbasis.data[p_i]
+    wall_du = grid.kbasis.wall_du
+
+    # rho_t' at the wall, estimated as the MEAN over the boundary cell (the three
+    # nearest mish points).
+    #
+    # NOT an extrapolation to the wall itself, which is what this did first — both
+    # a 3-point Lagrange fit through the mish values and a second-order Taylor step
+    # off the fitted derivatives. Both blow up, and for the same reason: they weight
+    # the near-wall curvature by d^2/2 ~ 1.6e3 m^2, which amplifies whatever
+    # grid-scale content sits in rho_t' near the boundary. That amplified signal
+    # becomes p's wall derivative, which drives the acoustic mode, which enlarges
+    # the near-wall grid-scale content — a loop with gain > 1 that no amount of time
+    # relaxation suppresses, because the TARGET is what is growing. Measured: the
+    # resting column goes non-finite in ~30 steps with either extrapolation, and is
+    # quiet indefinitely with `ahat` pinned to zero, so the feedback is the whole of
+    # the instability and the R1T1X plumbing is exonerated.
+    #
+    # A cell mean is a smoother rather than an amplifier. It is biased by O(dz) times
+    # the true gradient, which is the right trade: the wall condition needs to track
+    # the BALANCED state's wall value, not resolve a grid-scale feature.
+    # ρ_t' is the derived `ρ_d' + Σ α_k ν_k'` (`anchor_rho_tp`) over the same boundary cell.
+    rtp(n) = anchor_rho_tp(src[n, rhod_i, 1], anchor_Wp(src, n, 1, anchor))
+    if haskey(kcol.params.BCL, "X1")
+        @inbounds for r in 1:iDim
+            n = (r - 1) * kDim + 1
+            rt = (rtp(n) + rtp(n + 1) + rtp(n + 2)) / 3
+            old = wall_du[r, p_i, 1, 1]
+            wall_du[r, p_i, 1, 1] = old + relax * ((-gravity * rt) - old)
+        end
+    end
+    if haskey(kcol.params.BCR, "X1")
+        @inbounds for r in 1:iDim
+            n = r * kDim
+            rt = (rtp(n) + rtp(n - 1) + rtp(n - 2)) / 3
+            old = wall_du[r, p_i, 2, 1]
+            wall_du[r, p_i, 2, 1] = old + relax * ((-gravity * rt) - old)
+        end
+    end
+
+    # Radial derivatives of the wall data (levels 2 and 3). The 2-D transform
+    # evaluates the i-derivative BEFORE fitting in k, so its dr = 1 / dr = 2
+    # passes need d(wall)/dr and d2(wall)/dr2 as their `ahat`; feeding them
+    # level 1 asserts dg/dr = g and wrecks the radial pressure gradient in the
+    # boundary cell.
+    #
+    # Differentiated through a CLEAN natural-BC spline, NOT the variable's own
+    # i-basis. A nested child patch carries an R3X junction condition whose
+    # `ahat` holds the PARENT's payload; fitting the wall profile through that
+    # spline would inject the parent's pressure data into the wall derivative and
+    # constrain the profile to the junction trio. Both nested hold tests died on
+    # nest 3, whose inner edge is exactly such a junction.
+    isp = _wall_deriv_spline(grid, p_i)
+    for s in 1:2
+        (s == 1 ? haskey(kcol.params.BCL, "X1") : haskey(kcol.params.BCR, "X1")) || continue
+        @inbounds for r in 1:iDim
+            isp.uMish[r] = wall_du[r, p_i, s, 1]
+        end
+        Springsteel.CubicBSpline.SBtransform!(isp)
+        Springsteel.CubicBSpline.SAtransform!(isp)
+        d1 = Springsteel.CubicBSpline.SIxtransform(isp)
+        d2 = Springsteel.CubicBSpline.SIxxtransform(isp)
+        @inbounds for r in 1:iDim
+            wall_du[r, p_i, s, 2] = d1[r]
+            wall_du[r, p_i, s, 3] = d2[r]
+        end
+    end
+    return grid
+end
+
+# ── Water positivity ───────────────────────────────────────────────────────────
+
+"""
+Row names of `ModelTile.mc_water_stats`, accumulated per thread by [`clamp_water!`](@ref):
+
+| row | meaning |
+|-----|---------|
+| `:total`   | Σ negative water encountered [kg/m³, summed over gridpoints and steps] |
+| `:min_c`   | most negative `ρ_c` seen [kg/m³] |
+| `:min_r`   | most negative `ρ_r` seen [kg/m³] |
+| `:worst_dT`| largest implied latent-heat kick of a single event [K] (see below) |
+| `:count`   | number of gridpoint-steps carrying negative water |
+| `:warned`  | internal: largest `worst_dT` already warned about (thread 1 only) |
+
+Rows 7 onward are the per-step **production budget**, written by [`water_budget_probe!`](@ref)
+and reset every step by [`water_budget_trace`](@ref); they answer which term is driving the
+water negative, which rows 1-6 (cumulative extrema) structurally cannot. Each block records the
+term-by-term tendency AT the gridpoint where that species is most negative this step:
+
+| row | meaning |
+|-----|---------|
+| `:b_r_val`  | most negative `ρ_r` in this thread's columns this step [kg/m³] |
+| `:b_r_adv`  | `-v·∇ρ_r'` there [kg/m³/s] |
+| `:b_r_cdiv` | `-ρ_r ∇·v` there — the compressibility term, a sign-blind linear amplifier |
+| `:b_r_src`  | `Qdot_r` (rain-channel condensation/evaporation) there |
+| `:b_r_auto` | `AUTO_COLL` (autoconversion + collection from cloud) there |
+| `:b_r_sed`  | `-∂F_r/∂z` (sedimentation flux divergence) there |
+| `:b_r_div`  | `∇·v` there [1/s] |
+| `:b_r_w`    | `w` there [m/s] |
+| `:b_r_z`    | height of the point [m] |
+| `:b_r_eul`  | the FORWARD-EULER projection `ρ + ts·f_n` at that same point [kg/m³] |
+| `:b_r_now`  | the current value `ρ` at that same point [kg/m³] |
+| `:b_c_*`    | the same for `ρ_c`, with `:b_c_src` = `Qdot` and `:b_c_auto` = `-AUTO_COLL` |
+
+The final two blocks are the per-step **depletion census**, written by
+[`water_depletion_probe!`](@ref) just before `explicit_timestep`. The budget block above says
+what happens at ONE point; these say how widespread it is, and they are what separates a
+limiter sized for the wrong integrator from a stiff source term:
+
+| row | meaning |
+|-----|---------|
+| `:d_r_n`      | gridpoints in this thread's columns with `ρ_r > 0` |
+| `:d_r_cevap`  | of those, how many have the depletion sink pinned at its bound |
+| `:d_r_cauto`  | how many have `AUTO_COLL` pinned at `avail` (cloud block only; 0 for rain/vapor) |
+| `:d_r_eul`    | max forward-Euler depletion fraction `-ts·f_n/ρ` |
+| `:d_r_ab3`    | max ACTUAL depletion fraction `-(ρ^{n+1}-ρ)/ρ` under the run's AB3 weights |
+| `:d_r_neg`    | how many points the step actually drives negative (`:d_r_ab3 > 1` pointwise) |
+| `:d_r_stiff`  | how many exceed AB3's real-axis stability limit (0.545) with NO cap active |
+| `:d_r_infeas` | how many have an INADMISSIBLE HISTORY — the two previous sink levels alone already carry the point negative, so no bound on the current level can fix it and [`_ab3_sink_bound`](@ref) has been clamped at 0 |
+| `:d_r_mab3`   | max depletion fraction from the MICROPHYSICS ALONE, `-AB3(micro history)/ρ` |
+| `:d_r_mneg`   | how many points the microphysics alone would drive negative (`:d_r_mab3` past `MICRO_DEPLETION_TOL`) |
+| `:d_c_*`      | the same for `ρ_c` |
+| `:d_v_*`      | the same for the PROGNOSTIC `ρ_v`, read straight off its own slot tendency, whose depletion sink is the condensation `-(Qdot + Qdot_r)` and (with ice on) the deposition |
+| `:q_gap`      | max over the tile this step of the Q_ss DETACHMENT `\\|Q_ss − (ρ_v − ρ_vs)\\|` [kg/m³] — the other end of the reconciliation chain, and `τ_qss` times [`qss_relaxation`](@ref)'s rate. The S3 drive clip is a function of exactly this quantity, so it is what says whether the clip is doing anything |
+
+**Read `:d_*_mab3`, not `:d_*_ab3`, to judge the depletion.** `:d_*_ab3` is the fraction
+of the FULL slot tendency, so it is dominated by advection and `-ρ∇·v` at points carrying
+almost no condensate — where any fixed tendency divided by a near-zero `ρ` is large, and no
+microphysical limiter has, or should have, any purchase. `:d_*_mab3` is the part a
+microphysical bound would govern; it is now a pure measurement (the depletion caps were
+removed — see [`qss_condensation_rates`](@ref)), so nothing holds it at 1 and its excursions
+above `MICRO_DEPLETION_TOL` are the reported cost of that removal rather than a defect.
+
+The LAST block is the **stiffness census**, written by [`mc_stiffness_census!`](@ref) on every
+step of every run (not gated on any trace) and reported by [`mc_stiffness_trace`](@ref):
+
+| row | meaning |
+|-----|---------|
+| `:s_c_max`  | running max over the run of `ts·(1/τ_c)`, the cloud condensation channel |
+| `:s_c_n`    | gridpoint-STEPS with `ts·(1/τ_c) > 1`, summed over the run |
+| `:s_r_max`  | the same for the rain channel |
+| `:s_r_n`    | the same for the rain channel |
+| `:s_warned` | internal: 1.0 once the once-per-run stiffness `@warn` has been emitted (thread 1 only) |
+
+Unlike every block above it, this one is CUMULATIVE — it sits after [`MC_QSS_GAP`](@ref
+MC_QSS_GAP) and outside the `MC_BUDGET_FIRST:MC_QSS_GAP` range `water_budget_trace` resets
+each step, because a stiffness excursion that happened at step 40 is still true at step 4000
+and the run-end warning has to be able to see it.
+"""
+const MC_WATER_STATS = (:total, :min_c, :min_r, :worst_dT, :count, :warned,
+                        :b_r_val, :b_r_adv, :b_r_cdiv, :b_r_src, :b_r_auto, :b_r_sed,
+                        :b_r_div, :b_r_w, :b_r_z, :b_r_eul, :b_r_now,
+                        :b_c_val, :b_c_adv, :b_c_cdiv, :b_c_src, :b_c_auto, :b_c_sed,
+                        :b_c_div, :b_c_w, :b_c_z, :b_c_eul, :b_c_now,
+                        :b_pre_r, :b_pre_c,
+                        :d_r_n, :d_r_cevap, :d_r_cauto, :d_r_eul, :d_r_ab3,
+                        :d_r_neg, :d_r_stiff, :d_r_infeas, :d_r_mab3, :d_r_mneg,
+                        :d_c_n, :d_c_cevap, :d_c_cauto, :d_c_eul, :d_c_ab3,
+                        :d_c_neg, :d_c_stiff, :d_c_infeas, :d_c_mab3, :d_c_mneg,
+                        :d_v_n, :d_v_cevap, :d_v_cauto, :d_v_eul, :d_v_ab3,
+                        :d_v_neg, :d_v_stiff, :d_v_infeas, :d_v_mab3, :d_v_mneg,
+                        :q_gap,
+                        :s_c_max, :s_c_n, :s_r_max, :s_r_n,
+                        :s_i1_max, :s_i1_n, :s_i2_max, :s_i2_n, :s_i3_max, :s_i3_n,
+                        :s_warned,
+                        :p_qc_max, :p_qc_n, :p_qr_max, :p_qr_n, :p_nr_max, :p_nr_n,
+                        :p_i1_max, :p_i1_n, :p_i2_max, :p_i2_n, :p_i3_max, :p_i3_n,
+                        :p_s1_max, :p_s1_n, :p_s2_max, :p_s2_n, :p_s3_max, :p_s3_n,
+                        :p_n1_max, :p_n1_n, :p_n2_max, :p_n2_n, :p_n3_max, :p_n3_n,
+                        :p_warned,
+                        :x_hom, :x_hom_n, :x_bigg, :x_bigg_n,
+                        :x_rime, :x_rime_n, :x_rimex, :x_rimex_n,
+                        :x_coll, :x_coll_n, :x_melt, :x_melt_n,
+                        :x_all, :x_all_n, :x_evap, :x_evap_n, :x_comb, :x_comb_n,
+                        :x_mlt1, :x_mlt1_n, :x_agg1, :x_agg1_n,
+                        :x_mlt2, :x_mlt2_n, :x_agg2, :x_agg2_n,
+                        :x_asat, :x_asat_n,
+                        :x_wrc, :x_wrc_n, :x_wrr, :x_wrr_n,
+                        :x_wmlt, :x_wmlt_n, :x_wmri, :x_wmri_n,
+                        :x_wpts, :x_wmass,
+                        :o_max, :o_pts, :o_rain, :o_seed, :o_warned,
+                        :e_pts, :e_held, :e_max,
+                        :r_dr, :r_booked, :l_c, :l_r, :l_i1, :l_i2, :l_i3,
+                        :x_max, :x_int, :x_pool, :ec_steps, :v_neg, :v_neg_mass,
+                        :w_part, :w_neg, :w_neg_pts, :w_int, :w_src, :w_budget, :w_seen)
+
+"""
+First row of the per-step budget block for each species in `mc_water_stats`.
+
+Both blocks are `MC_BUDGET_N` rows with the SAME layout, so one probe writes either. Cloud has
+no sedimentation, so `:b_c_sed` is always zero and is not printed — giving the two blocks
+different lengths silently walks off the end of the matrix into the next thread's column.
+"""
+const MC_BUDGET_R = 7
+const MC_BUDGET_C = 18
+const MC_BUDGET_N = 11
+"""
+First row of the per-step depletion census for each species; `MC_DEPLETION_N` rows each,
+same layout, written by [`water_depletion_probe!`](@ref).
+"""
+const MC_DEPLETION_R = 31
+const MC_DEPLETION_C = 41
+const MC_DEPLETION_V = 51
+const MC_DEPLETION_N = 10
+"""
+The RECONCILIATION gap, one row holding the per-step maximum over the tile:
+`MC_QSS_GAP = max|Q_ss − (ρ_v − ρ_vs)|`, Q_ss against the prognostic vapor
+([`qss_relaxation`](@ref)), `τ_qss` times the rate its nudge removes it at and identically zero
+on a resting base. A DIAGNOSTIC in the strict sense — nothing in the RHS reads it — but a
+load-bearing one: it is the detachment the S3 drive clip in [`qss_condensation_rates`](@ref) is
+a function of, so it is what says whether that clip is doing anything at all. (Its sibling
+`MC_VAPOR_GAP`, the vapor against the prognostic ρ_t budget, went with slot 3 at Stage 4 of the
+ρ_t retirement: the vapor is now the closure of the water sum, not a second statement of it.)
+
+It sits AFTER the three `MC_DEPLETION_N`-row blocks, deliberately outside them: it is a scalar,
+not a fourth species, and giving the blocks a ragged length silently walks the census off the
+end of a thread's column. It lives in the per-step region (`MC_BUDGET_FIRST:MC_QSS_GAP`), so it
+is reset every step and always describes the step just reported. `MC_QSS_GAP` is the LAST
+per-step row: everything after it is cumulative.
+"""
+const MC_QSS_GAP = 61
+"""
+The STIFFNESS CENSUS block of `mc_water_stats` — `MC_STIFF_N` rows per relaxation channel,
+then the once-per-run warning flag. Written by [`mc_stiffness_census!`](@ref).
+
+| constant | meaning |
+|---|---|
+| `MC_STIFF_C` / `MC_STIFF_R` | channel indices: cloud condensation, rain condensation/evaporation |
+| `MC_STIFF_CHANNELS` | how many channels the block holds |
+| `MC_STIFF_N` | rows per channel: `[max ts/τ, count of points past ts/τ = 1]` |
+| `MC_STIFF_FIRST` | first row of channel 1 |
+| `MC_STIFF_WARNED` | the flag row, one past the last channel |
+
+The ice channels (`i1`, `i2`, `i3`) append here: give each an index, raise
+`MC_STIFF_CHANNELS`, and add its name pair to `MC_WATER_STATS` and to
+[`MC_STIFF_NAMES`](@ref MC_STIFF_NAMES). Nothing else is sized by hand — the row arithmetic,
+the reduction and the report all run over `1:MC_STIFF_CHANNELS`.
+
+CUMULATIVE, unlike every block before it: `water_budget_trace` resets
+`MC_BUDGET_FIRST:MC_QSS_GAP` each step and this sits outside that range on purpose.
+"""
+const MC_STIFF_C = 1
+const MC_STIFF_R = 2
+const MC_STIFF_I1 = 3
+const MC_STIFF_I2 = 4
+const MC_STIFF_I3 = 5
+const MC_STIFF_CHANNELS = 5
+const MC_STIFF_N = 2
+const MC_STIFF_FIRST = 62
+const MC_STIFF_WARNED = MC_STIFF_FIRST + (MC_STIFF_N * MC_STIFF_CHANNELS)
+"""Channel labels for the stiffness report, in `MC_STIFF_*` index order."""
+const MC_STIFF_NAMES = ("cloud", "rain", "ice1", "ice2", "ice3")
+"""
+The DONOR-DEPLETION CENSUS block of `mc_water_stats`, laid out exactly like the stiffness block
+(`MC_DONOR_N` rows per donor reservoir, then a once-per-run warning flag) and written by
+[`mc_donor_census!`](@ref).
+
+What it measures is not what the stiffness census measures. `MC_STIFF_*` records `ts/τ` — how
+UNRESOLVED a relaxation is. This records the fraction of each donor reservoir the step
+ACTUALLY REMOVES, after the realization factors, i.e. `Σ_j rate_j · J₀(κ_tot Δt) · Δt / q`.
+Under the construction of [`_ice_donor_factors`](@ref) that is `1 − e^{−κ_tot Δt} < 1` for the
+three liquid donors, identically, so a reading above `1` is not a resolution statement — it is
+the construction failing, and the number to watch when a new sink is added to a reservoir.
+
+The rain's row counts EVERY sink on the reservoir, not only the ice ones: rain EVAPORATION —
+which is integrated on the `Q_ss` relaxation pair, whose propagator bounds the supersaturation
+and not the rain — joined `κ_tot` in Stage 2b (TeX §donor_relax), so `MC_DONOR_QR` is the
+combined realized draw and the bound above is a statement about the number that is actually
+taken. Before that it read the ice half alone: a dutiful 1.0 on the Stage 0a fixture while the
+two halves together took 1.0012 reservoirs, which `MC_ATTR_QR_COMB` had to be built to see.
+
+The three ICE reservoirs are scaled by the same construction: `mc_ice_sources!` forms one
+conductance per species over melting, aggregation and sublimation, and every one of those legs
+is realized at it, so a reading above `1` there means the same thing it means for the liquid.
+Aggregation joined that construction when the census convicted it at 1.33 reservoirs of `q_i1`
+per step, in a SECOND pass through `ishmael_aggregation` at the donors' factors (TeX
+§donor_relax); before that it was counted in `κ_tot` but applied unscaled.
+
+The three ICE NUMBER rows ([`MC_DONOR_N1`](@ref)) are the newest and the only ones that are
+not bounded by construction in the default configuration: a species' number is its own
+reservoir with its own conductance, and until `options[:ice_number_realization]` is switched
+on its three legs are realized at the species' MASS factor. Whether that over-draws is the
+question the rows exist to answer, so they are censused in BOTH modes and the over-depletion
+warning is gated on the switch rather than on the reading.
+
+REPORTED, NEVER ENFORCED — as with every census in this file.
+"""
+const MC_DONOR_QC = 1
+const MC_DONOR_QR = 2
+const MC_DONOR_NR = 3
+const MC_DONOR_I1 = 4
+const MC_DONOR_I2 = 5
+const MC_DONOR_I3 = 6
+const MC_DONOR_S1 = 7
+const MC_DONOR_S2 = 8
+const MC_DONOR_S3 = 9
+"""
+The three ICE NUMBER reservoirs (Stage 1b). Each species' NUMBER is a donor in its own
+right — three legs draw on it (aggregation's number transfer, the melt number `nmlt`, and
+the sublimation number sink of the deposition channel's habit partition) — and until this
+block none of them was censused anywhere. The mass rows above cannot stand in for them:
+`colamt` and `colamtn` come from two different offline tables integrating two different
+moments of the collection kernel (`mkcoltb`, ishmael_tables.jl), and the melt number leg
+carries `dNmltri`, which has no mass partner at all, so the fraction of the number a step
+removes is an independent state function of the fraction of the mass it removes.
+
+REPORTED, NEVER ENFORCED, like every row of this block — and unlike the six above, these
+three are NOT bounded by construction unless `options[:ice_number_realization]` is on. With
+it off (the default) the number legs ride the MASS factor, which is the state the census
+exists to measure; with it on each species' number carries its own `J₀(κ_{n,k}Δt)` and the
+row is `1 − e^{−κ_{n,k}Δt} < 1` for the same reason the mass rows are.
+
+Two caveats, both on species 3 and both stated rather than hidden. (a) With
+`options[:ice_agg_caps] = false` the conductance is formed on the CAPPED unit pass and
+realized on the uncapped one, exactly as the mass side already is. (b) `nagg3` is a NET
+count — new aggregates from the planar/columnar pairs MINUS aggregate self-collection — and
+only the self-collection half is species 3's own to realize (`f_aggn3`). The conductance is
+formed on the net loss, so where the two halves nearly cancel the `n_i3` row is bounded by
+the aggregation term alone rather than by `1 − e^{−κ_{n,3}Δt}`. Decomposing it would mean
+returning the seven pairs' number transfers separately, which is a larger change to the
+ported kernel than the reading justifies today.
+"""
+const MC_DONOR_N1 = 10
+@doc (@doc MC_DONOR_N1)
+const MC_DONOR_N2 = 11
+@doc (@doc MC_DONOR_N1)
+const MC_DONOR_N3 = 12
+const MC_DONOR_CHANNELS = 12
+const MC_DONOR_N = 2
+const MC_DONOR_FIRST = MC_STIFF_WARNED + 1
+const MC_DONOR_WARNED = MC_DONOR_FIRST + (MC_DONOR_N * MC_DONOR_CHANNELS)
+"""Donor labels for the depletion report, in `MC_DONOR_*` index order."""
+const MC_DONOR_NAMES = ("q_c", "q_r(ice+evap)", "n_r", "q_i1(melt+agg)", "q_i2(melt+agg)",
+                        "q_i3(melt+agg)", "q_i1(subl)", "q_i2(subl)", "q_i3(subl)",
+                        "n_i1(melt+agg+subl)", "n_i2(melt+agg+subl)",
+                        "n_i3(melt+agg+subl)")
+"""
+The ATTRIBUTION CENSUS of `mc_water_stats` — the per-CHANNEL decomposition of the two
+depletion breaches the `MC_DONOR_*` block convicts (TeX §"Donor relaxation and its
+realization", §"Reconciliation of the condensate partition"), written by
+[`mc_attr_census!`](@ref) and reported by [`mc_stiffness_trace`](@ref).
+
+`MC_DONOR_*` says WHICH reservoir a step over-draws and by how much. It cannot say WHICH LEG
+did it, and on the ice arm that is the whole question: the q_r breach could be riming, Bigg,
+homogeneous freezing, ice-rain collection or (uncensused anywhere else) rain evaporation, and
+the q_i1 breach could be melting or aggregation. This block answers "which one" and nothing
+else. Same `[run-max, count]` layout as the two blocks above it, `MC_ATTR_N` rows per channel,
+then a two-scalar TAIL that is not a channel.
+
+The four measurement sites, in the order the step visits them:
+
+| block | site | what it decomposes |
+|---|---|---|
+| A | `mc_ice_sources!`, at the q_r breach points only | the six legs of `−ICE_R` against `q_r` |
+| B | the ETD pre-compute, beside the sublimation census | rain EVAPORATION at the APPLIED step-mean, alone and combined with the ice draw |
+| C | `mc_ice_sources!` | the q_i1/q_i2 split between MELT and AGGREGATION |
+| D | `mc_ice_sources!`, `T > T_0 + 2` K | the above-freezing riming/melting loop |
+
+Block A's counts PARTITION the `MC_DONOR_QR` count exactly: at every breach point (the
+combined `(−ICE_R/ρ_a + f_r κ_ev q_r)·Δt/q_r > 1` of Stage 2b, `mc_donor_census!`'s own
+expression character for character) exactly one of channels `MC_ATTR_QR_HOM … MC_ATTR_QR_COLL` is
+credited, the one carrying the LARGEST debit, so `Σ` of those five counts is the number of
+breach points and no leg can be blamed twice. `MC_ATTR_QR_RIMEX` is a SUB-PART of
+`MC_ATTR_QR_RIME` — the rain rime the realized pass debits IN EXCESS of the share the
+conductance was formed on (`f_qr·prdr0_r`), the split-plus-density cross term — so it can only
+win that argmax where the conductance share is negative; it is in the block for its run-max,
+and a nonzero count there is itself the finding. `MC_ATTR_QR_MELT` is a CREDIT, not a debit
+(melting ADDS rain), so it records a run-max and is never counted; `MC_ATTR_QR_ALL` is the sum
+of the four true debits, which is `MC_DONOR_QR`'s ice half plus the melt credit and therefore
+an upper bound on that half, point by point.
+
+Block B (`MC_ATTR_QR_EVAP`, `MC_ATTR_QR_COMB`) is unchanged in DEFINITION and changed in what
+it is expected to read. It reports the APPLIED step-mean evaporation `q̄_r` — the number the
+rain slot actually receives, which is the propagator's and not the frozen rate — alone and
+added to the ice draw. Since Stage 2b the evaporation conductance is inside `κ_tot`, so the
+combined number is expected `≤ 1`: the two draws are shares of one exponential depletion
+rather than two independent ones. It was 1.0012 over 1296 gridpoint-steps on the Stage 0a
+fixture before that, which is the measurement the stage exists to answer. It remains an
+independent reading of the bound — taken at the applied step-mean rather than at the frozen
+rate the factor was formed on — and therefore still reports rather than limits.
+
+`MC_ATTR_AGG1_SAT` counts the gridpoint-steps at which species 1's aggregation increment takes
+its ENTIRE mass (`−qagg1 ≥ q1(1−10⁻¹²)`) — the caller-side proxy for `ishmael_col1`'s per-pair
+`min(colamt, rx)` cap binding, which is invisible from here because the seven pairs are summed
+inside `ishmael_aggregation`. Its run-max row is by construction `MC_ATTR_AGG1`'s; the row
+exists for its COUNT, which is what says whether removing those caps would move anything —
+`options[:ice_agg_caps] = false` (env `SCYTHE_O01_AGGCAPS=0`) is the switch that removes them,
+and this count is the measurement it is meant to be read against.
+
+The two-scalar TAIL, over `T > T_0` gridpoints that carry ice (block D, the melting-level
+question): gridpoint-steps and the summed RAW ice density (an unweighted gridpoint-sum proxy,
+the same weighting as every domain sum in this census family). (Three more rows — the count
+and run-max of the rate-side anchor share `f_a` biting and the melt it withheld — went with
+the ice-anchor legs at Stage 5 of the ρ_t retirement: `f_a ≡ 1` under the derived anchor.)
+
+CUMULATIVE, like the stiffness and donor blocks. OPT-IN, unlike all three:
+`mc_water_stats` is always allocated, so the block is written only where
+`options[:ice_attr_census]` is true (default false, env `SCYTHE_O01_ATTR=1`) and is otherwise
+never touched — an explicit flag is what makes an eighteen-channel census zero-cost on the
+runs that are not asking the question.
+
+REPORTED, NEVER LIMITED, and exactly `0.0` on the warm/dry path: every write is gated on a
+state test that a warm ice-free column fails identically (no breach, no ice mass, no
+above-freezing ice), so switching the option on cannot move a rate, a slot or a bit.
+"""
+const MC_ATTR_QR_HOM = 1
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_BIGG = 2
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_RIME = 3
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_RIMEX = 4
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_COLL = 5
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_MELT = 6
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_ALL = 7
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_EVAP = 8
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_QR_COMB = 9
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_MLT1 = 10
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_AGG1 = 11
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_MLT2 = 12
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_AGG2 = 13
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_AGG1_SAT = 14
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_RIME_C = 15
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_RIME_R = 16
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_MELT = 17
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_WARM_MLTRI = 18
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_CHANNELS = 18
+@doc (@doc MC_ATTR_QR_HOM)
+const MC_ATTR_N = 2
+@doc (@doc MC_ATTR_QR_HOM)
+# (The ANCHOR-RECONCILIATION census, `MC_ANCHOR_GAP/_PTS/_REMOVED/_WARNED`, sat here: the four
+# ice-anchor legs it measured were deleted at Stage 5 of the ρ_t retirement. Under the derived
+# water anchor `ρ_w = Σ_k α_k ν_k` the headroom read through ρ_w is `α_v ν_v + X_cond`, which
+# can be negative at a vapor lobe beside ice, so the test had become a vapor-negativity device;
+# the legs were made inert at setup (de822e5/a7d25dc; between 2c265e1 and de822e5 they were
+# active under :derived and fired) and the rows read PTS = REMOVED = 0 on the Stage 3 RCE arms.)
+const MC_ATTR_FIRST = MC_DONOR_WARNED + 1
+"""
+The two-scalar TAIL of the attribution census, over `T > T_0` gridpoints carrying ice.
+Not channels: they are sums and counts of the POPULATION, not of a depletion fraction, so
+they sit after the `MC_ATTR_CHANNELS` `[max, count]` pairs rather than inside them.
+
+| constant | quantity |
+|---|---|
+| `MC_ATTR_WARM_PTS`  | gridpoint-steps with `T > T_0` and `Σ_k ρ_{i,k} > 0` |
+| `MC_ATTR_WARM_MASS` | `Σ` of the RAW ice density over those points [kg/m³ · gridpoint-steps] |
+"""
+const MC_ATTR_WARM_PTS = MC_ATTR_FIRST + (MC_ATTR_N * MC_ATTR_CHANNELS)
+@doc (@doc MC_ATTR_WARM_PTS)
+const MC_ATTR_WARM_MASS = MC_ATTR_WARM_PTS + 1
+@doc (@doc MC_ATTR_WARM_PTS)
+const MC_ATTR_LAST = MC_ATTR_WARM_MASS
+"""Channel labels for the attribution report, in `MC_ATTR_*` index order."""
+const MC_ATTR_NAMES = ("q_r: homogeneous (mimr)", "q_r: Bigg (mbig)",
+                       "q_r: rain riming (realized)",
+                       "q_r: rain riming EXCESS over the conductance share",
+                       "q_r: ice-rain collection", "q_r: melt CREDIT (max only)",
+                       "q_r: all debits, no melt credit",
+                       "q_r: rain evaporation (applied step-mean)",
+                       "q_r: ice + evaporation combined",
+                       "q_i1: melting", "q_i1: aggregation",
+                       "q_i2: melting", "q_i2: aggregation",
+                       "q_i1: aggregation SATURATES the species mass (cap-binding proxy)",
+                       "T>T_0+2: cloud riming share of q_c",
+                       "T>T_0+2: rain riming share of q_r",
+                       "T>T_0+2: melting share of q_ice",
+                       "T>T_0+2: dQImltri share of q_ice")
+"""
+The POPULATION-RECONCILIATION census of `mc_water_stats` — the FOURTH reconciliation tier's
+diagnostic (TeX §"Reconciliation of the population"), written by
+[`_ice_population_reconcile!`](@ref) and reported by [`mc_stiffness_trace`](@ref).
+
+| constant | quantity |
+|---|---|
+| `MC_POP_MAX`    | run-maximum of the number-less mass `ρ^∅_{i,k}` over species and points [kg/m³] |
+| `MC_POP_PTS`    | cumulative (gridpoint × species)-steps with `ρ^∅ > 0` |
+| `MC_POP_RAIN`   | cumulative mass returned to the RAIN above `T_0`, `Σ (ρ^∅/τ_pop)·Δt` [kg/m³ · gridpoint-steps] |
+| `MC_POP_SEED`   | cumulative ICE number seeded below `T_0`, `Σ (ρ^∅/(m_seed τ_pop))·Δt` [#/m³ · gridpoint-steps]; `m_seed` is `ISHMAEL_M_MIN` or the large-crystal mass, per `options[:ice_population_seed]` |
+| `MC_POP_WARNED` | internal: 1.0 once the once-per-run number-less-mass `@info` has fired |
+
+CUMULATIVE, and written on every ice step whether or not the SOURCE is applied:
+`options[:ice_population_source] = false` — and
+`options[:condensation] = false`, which switches this transfer off with the other phase
+changes — stop the transfer, never the measurement.
+
+The rain NUMBER seeded above `T_0` is not a row of its own because it is not independent:
+the warm branch seeds one drop per [`RAIN_2M_M_AUTO`](@ref) of returned mass, so it is
+`MC_POP_RAIN / RAIN_2M_M_AUTO` exactly.
+
+`MC_POP_MAX` is what the (since deleted) ice-anchor partition census could not see: the
+anchor share of a number-less mass was measured to be exactly one (the water is real; only its
+phase REPRESENTATION is unusable), so that census read zero at precisely the points this one
+convicts. Read `MC_POP_RAIN` against the surface rain accumulation and `MC_POP_SEED`
+against the ice number path — a secular contribution from either says `τ_pop` is too short.
+"""
+const MC_POP_MAX = MC_ATTR_LAST + 1
+@doc (@doc MC_POP_MAX)
+const MC_POP_PTS = MC_ATTR_LAST + 2
+@doc (@doc MC_POP_MAX)
+const MC_POP_RAIN = MC_ATTR_LAST + 3
+@doc (@doc MC_POP_MAX)
+const MC_POP_SEED = MC_ATTR_LAST + 4
+@doc (@doc MC_POP_MAX)
+const MC_POP_WARNED = MC_ATTR_LAST + 5
+"""Last row of the population block."""
+const MC_POP_LAST = MC_POP_WARNED
+"""
+The CLOUD-EVAPORATION REALIZATION census of `mc_water_stats`, written in `mc_driver!` wherever
+[`cloud_evap_realized`](@ref) changes the cloud channel's draw, and reported by
+[`mc_stiffness_trace`](@ref).
+
+| constant | quantity |
+|---|---|
+| `MC_CEVAP_PTS`  | cumulative gridpoint-steps at which the cloud donor's factor `J₀(κ_c,tot Δt) < 1` realized the step-mean cloud evaporation below its unrealized value |
+| `MC_CEVAP_HELD` | cumulative evaporation withheld, `Σ (q̄_c,realized − q̄_c)·Δt` over points and steps [kg/m³ · gridpoint-steps] |
+| `MC_CEVAP_MAX`  | run-maximum of that withheld mass at one point in one step [kg/m³] |
+
+`MC_CEVAP_PTS` counts EVERY evaporating point with cloud (`J₀ < 1` wherever the reservoir has a
+sink — see `cloud_evap_realized`), so it is a measure of where the realization acts, not of
+where something was "exceeded"; `HELD` and `MAX` are the informative rows. Evaporation only:
+the same factor on `AUTO_COLL` and the ice legs is not counted here.
+
+CUMULATIVE, and written in BOTH modes, like the anchor and population blocks:
+`options[:cloud_evap_realization] = false` stops the realization, never the measurement, so the
+off arm reports what it WOULD have withheld.
+"""
+const MC_CEVAP_PTS = MC_POP_LAST + 1
+@doc (@doc MC_CEVAP_PTS)
+const MC_CEVAP_HELD = MC_POP_LAST + 2
+@doc (@doc MC_CEVAP_PTS)
+const MC_CEVAP_MAX = MC_POP_LAST + 3
+"""Last row of the cloud-evaporation block of `mc_water_stats`."""
+const MC_CEVAP_LAST = MC_CEVAP_MAX
+"""
+The ENERGY / PARTITION census of `mc_water_stats` (plan Stage P4), reported by
+[`energy_census_trace`](@ref) at the output cadence as tile means and reset there.
+
+| constant | quantity (accumulated over the steps since the last report) |
+|---|---|
+| `MC_REFIT_DR`     | the column-integrated change of `R = E_t − E_implied` across the per-step refit, `(E_t⁺ − E_t⁻) − (E_implied⁺ − E_implied⁻)` (`⁻` the pre-refit `var_np1`, `⁺` the post-refit slots) [J/m², tile mean] |
+| `MC_REFIT_BOOKED` | the energy the refit partner booked for it, the column integral of `δp·C_vt/R_m` it folds into `p` [J/m², tile mean] |
+| `MC_LOBE_C`/`_R`/`_I1`/`_I2`/`_I3` | the Stage L lobe relaxation's applied `Δν` column integral, per species (cloud, rain, the three ice masses) [kg/m², tile mean]; exact zeros with the device off |
+| `MC_XGAP_MAX`     | the partition gap `max\\|X\\|`, `X = ρ_t − ρ_d − ρ_v − ρ_liq − ρ_ice`, over the tile at the report [kg/m³] |
+| `MC_XGAP_INT`     | the column integral of `X` at the report [kg/m², tile mean] |
+| `MC_XGAP_POOL`    | the lobe pool `Λ = Σ_k 2 min(ν_k, 0)` over the `:bhyp` mass slots (the vapor's included under `vapor_transform = :bhyp`), column integral at the report [kg/m², tile mean] |
+| `MC_ECEN_STEPS`   | steps since the last report (thread 1) |
+| `MC_VNEG_MASS`    | the vapor lobe's water under `vapor_transform = :bhyp`, the column integral of `2 min(ν_v, 0)` at the report [kg/m², tile mean]: the vapor share of `MC_XGAP_POOL` (which includes it), `0.0` under `:none` |
+| `MC_VNEG`         | the number of gridpoints of the tile whose VAPOR control variable is negative at the report, `ν_v < 0` (`ρ_v < 0` under `vapor_transform = :none`, where the slot is the density); the physics reads `ahyp(ν_v) = 0` there under `:bhyp` [points] |
+
+`MC_REFIT_DR` is the exact per-step refit residual the refit partner exists to close, measured
+on the two states the partner reads, so the pair says how well it does without a closed-budget
+run; it is written for every column at `t > 1`, partner on or off. The `X` rows are taken at the
+report from the output state itself (`tile.physical` after the refit), so they describe the
+same state as the output file.
+"""
+const MC_REFIT_DR = MC_CEVAP_LAST + 1
+@doc (@doc MC_REFIT_DR)
+const MC_REFIT_BOOKED = MC_CEVAP_LAST + 2
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_C = MC_CEVAP_LAST + 3
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_R = MC_CEVAP_LAST + 4
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_I1 = MC_CEVAP_LAST + 5
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_I2 = MC_CEVAP_LAST + 6
+@doc (@doc MC_REFIT_DR)
+const MC_LOBE_I3 = MC_CEVAP_LAST + 7
+@doc (@doc MC_REFIT_DR)
+const MC_XGAP_MAX = MC_CEVAP_LAST + 8
+@doc (@doc MC_REFIT_DR)
+const MC_XGAP_INT = MC_CEVAP_LAST + 9
+@doc (@doc MC_REFIT_DR)
+const MC_XGAP_POOL = MC_CEVAP_LAST + 10
+@doc (@doc MC_REFIT_DR)
+const MC_ECEN_STEPS = MC_CEVAP_LAST + 11
+@doc (@doc MC_REFIT_DR)
+const MC_VNEG = MC_CEVAP_LAST + 12
+@doc (@doc MC_REFIT_DR)
+const MC_VNEG_MASS = MC_CEVAP_LAST + 13
+"""
+The WATER-ANCHOR census of `mc_water_stats` (Stage 3 of the ρ_t retirement, design §5.4),
+reported by [`energy_census_trace`](@ref) at the output cadence, beside the partition rows
+above. `ρ_w` is the water anchor, `Σ_k α_k ν_k` (the derived anchor, the only one since Stage
+4).
+
+| constant | quantity |
+|---|---|
+| `MC_W_PART`     | the partition gap `X = ρ_w − Σ_k ρ_k = B + Λ`, column integral at the report [kg/m², tile mean] (the successor of the old vapor gap; equal to `MC_XGAP_INT`) |
+| `MC_W_NEG`      | the transformed mass slots' negative water `Σ_k α_k min(ν_k, 0)`, column integral at the report [kg/m², tile mean] |
+| `MC_W_NEG_PTS`  | gridpoints with `ρ_w < 0` at the report [points] |
+| `MC_W_INT`      | `∫ρ_w` at the report [kg/m², tile mean] |
+| `MC_W_SRC`      | the surface sources since the last report, `Σ_steps Δt·(F_q − ∫∂z F_sed dz)` — the moisture flux and the sedimentation flux through the ground [kg/m², tile mean] |
+| `MC_W_BUDGET`   | the domain water budget of the last interval, `Δ∫ρ_w − MC_W_SRC` [kg/m², tile mean]; 0 at the first report |
+| `MC_W_SEEN`     | 1 once a report has set `MC_W_INT` (thread 1) |
+
+(Stage 3's `MC_SHADOW_MAX`/`MC_SHADOW_INT`, the gap of slot 3 — the passive shadow of the linear
+ρ_t — against the derived total, went with slot 3 at Stage 4.)
+
+AN OPEN ITEM, recorded (Stage 3 review D7): on the 2-D RCE 24 → 27 h restart under the derived
+anchor `MC_W_BUDGET` summed to −0.137 kg/m² against +0.254 kg/m² of surface sources, and the
+Stage 3 shadow (the old linear ρ_t equation) lost the same amount — so the residual is not a
+Stage 3 term but one the old `ρ_t` shared: transport, the SI increment, or the census's own
+source accounting (`MC_W_SRC`'s sedimentation term through the ground). Not yet attributed.
+"""
+const MC_W_PART = MC_CEVAP_LAST + 14
+@doc (@doc MC_W_PART)
+const MC_W_NEG = MC_CEVAP_LAST + 15
+@doc (@doc MC_W_PART)
+const MC_W_NEG_PTS = MC_CEVAP_LAST + 16
+@doc (@doc MC_W_PART)
+const MC_W_INT = MC_CEVAP_LAST + 17
+@doc (@doc MC_W_PART)
+const MC_W_SRC = MC_CEVAP_LAST + 18
+@doc (@doc MC_W_PART)
+const MC_W_BUDGET = MC_CEVAP_LAST + 19
+@doc (@doc MC_W_PART)
+const MC_W_SEEN = MC_CEVAP_LAST + 20
+"""Last row of `mc_water_stats`; `length(MC_WATER_STATS)` must equal it."""
+const MC_STATS_LAST = MC_W_SEEN
+"""
+Reservoirs below this are numerical remnants, not physics: a depletion fraction formed on
+1e-12 kg/kg of leftover rain is arithmetic on round-off and says nothing about the integrator.
+Measured need: without it the census reported `κΔt ≈ 0.5` thousands of times per step at points
+holding 1e-12 kg/kg, which buried the real signal.
+"""
+const MC_DONOR_QFLOOR = 1.0e-9
+"""Number-density counterpart of [`MC_DONOR_QFLOOR`](@ref) (per kg)."""
+const MC_DONOR_NFLOOR = 1.0e-3
+"""
+Threshold for `:d_*_mneg`, the count of points the MICROPHYSICS alone drives negative.
+
+A point sitting exactly on an AB3 depletion bound lands at `1 + O(eps)`, not at 1: the `t ≥ 3`
+branch of [`_ab3_sink_bound`](@ref) divides by 23, which is not representable, so the bound
+cannot cancel the increment exactly. Counting `> 1.0` would therefore report every such point
+as a violation. This threshold sits ~1e7 ULP above the rounding and ~1e9 below the `23/12` a
+forward-Euler-sized bound produces, which is what made it able to separate the two depletion
+modes when those existed. With the caps removed it is a pure reporting threshold on a pure
+measurement.
+"""
+const MICRO_DEPLETION_TOL = 1.0 + 1.0e-9
+"""
+Per-STEP pre-fit minima (rows 29/30), written by `clamp_water!` and reset every step.
+
+Rows 2/3 (`:min_c`, `:min_r`) are cumulative, so they cannot be differenced against the
+post-fit reconstruction to separate what the column step did from what the refit did. These
+can: `post_t - pre_t` is the refit's contribution and `pre_t - post_{t-1}` is the column
+step's, and the two sum to the step's change exactly.
+"""
+const MC_PRE_R = 29
+const MC_PRE_C = 30
+"""First budget row; rows `MC_BUDGET_FIRST:end` are reset every step."""
+const MC_BUDGET_FIRST = MC_BUDGET_R
+
+"""
+    positivity_reference_profile(name, ref_state) -> AbstractVector or nothing
+
+The reference profile a positivity-bounded prognostic is carried against, or `nothing` when
+the variable is a TOTAL and its bound needs no offset.
+
+`u, w, rho_r, n_r` and all twelve ice slots are totals; `p, rho_d, rho_t, E_t, Q_ss, rho_c,
+rho_v` are perturbations from the pressure reference (see the prognostic-slot semantics
+above). A
+zero bound on a PERTURBATION is not merely conservative, it is wrong: it would pin the field
+at or above its reference and forbid the cloud from ever evaporating below `ρ̄_c`. Hence
+anything not recognised here throws rather than silently taking the factory's constant bound.
+
+The transformed names `nu_c`/`nu_r`/`nu_nr` and the twelve `nu_*` ice aliases deliberately
+fall through to the error. A coefficient bound on a control variable is a different constraint
+from a bound on the density, and [`install_positivity_bounds!`](@ref) refuses the combination
+before reaching here; this is the backstop for a configuration that somehow gets past it.
+
+`rho_v` is served the DERIVED profile `ρ̄_t − ρ̄_d − ρ̄_c`, which is the reference the slot is
+actually carried against (see `mc_reference_diagnostics` and the file header) — NOT
+Springsteel's fitted `ref_rho_v`. The two differ at fit level, and the difference is exactly
+what would stop the resting base being a discrete fixed point.
+"""
+function positivity_reference_profile(name::AbstractString, ref_state)
+    # `n_r` (the two-moment rain number) joins the totals: there is no reference number
+    # density in any configuration or in the reference-state format, exactly as for rho_r.
+    # `rho_e` (the MYNN TKE density) joins them for the same reason: there is no resting
+    # turbulence field in any reference state, so ρ̄_e ≡ 0 is a property of the closure
+    # rather than of the sounding.
+    name in ("rho_r", "n_r", "rho_e", "u", "w", "v") && return nothing  # totals: no offset
+    # ...and so do all twelve ice slots, for the same reason and one stronger: there is no
+    # resting ice field in any configuration, so `f̄ ≡ 0` is a property of the equation set
+    # rather than of the sounding (reference/Scythe_moist_compressible.tex, "The ice variables
+    # are carried as totals").
+    name in MC_ICE_VARS && return nothing
+    (name in ("nu_c", "nu_r", "nu_nr") || name in values(MC_NU_ALIAS)) &&
+        error("positivity is declared for \"$name\", which is a CONTROL VARIABLE, not a " *
+              "density: a box constraint on its coefficients would bound the transform of " *
+              "the field rather than the field. The transform already makes the recovered " *
+              "density non-negative by construction — drop \"$name\" from positivity.")
+    # The prognostic vapor's reference is DERIVED, not fitted: ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c on the
+    # fitted reference columns, the same expression `mc_reference_diagnostics` forms and the
+    # same one every seeding site subtracts. Built here rather than read from
+    # `Springsteel.ref_rho_v` so a bound and the slot semantics cannot disagree.
+    if name == "rho_v"
+        rt = ref_rho_t(ref_state)
+        rd = ref_rho_d(ref_state)
+        rc = Springsteel.ref_rho_c(ref_state)
+        (rt isa Number || rd isa Number) && return nothing
+        rcv = rc isa Number ? zero(view(rt, :, 1)) : view(rc, :, 1)
+        return view(rt, :, 1) .- view(rd, :, 1) .- rcv
+    end
+    prof = name == "rho_c" ? Springsteel.ref_rho_c(ref_state) :
+           name == "rho_d" ? ref_rho_d(ref_state) :
+           error("positivity is declared for \"$name\", which is carried as a perturbation " *
+                 "from the reference state and has no offset rule here. A constant bound on " *
+                 "a perturbation pins the field at or above its reference — add the variable " *
+                 "to positivity_reference_profile before enabling it.")
+    # Springsteel returns the scalar 0.0 for reference states that carry no such profile.
+    prof isa Number && return nothing
+    return view(prof, :, 1)
+end
+
+"""
+    bhyp(rho, mu) -> n
+    ahyp(n, mu) -> rho
+    ahyp_smooth(n, mu) -> rho
+    dbhyp(rho, mu) -> dn/drho
+
+Ooyama (2001, JAS 58, 2073–2102) **biased hyperbolic transform** and its inverses, Eqs.
+4.19/4.20/4.23. `reference/ooyama_jas2001.pdf`.
+
+    n   = bhyp(rho)  = ½[(rho + μ) − μ²/(rho + μ)]
+    rho = ahyp(n)    = √(n² + μ²) + n − μ        (0 for n ≤ 0 — the published quasi-inverse)
+    J   = dn/drho    = ½[1 + μ²/(rho + μ)²]
+
+The map is linear (`n ≈ rho/2`; Ooyama's factor ½ is what removes the coefficient from the
+inverse) for `rho ≫ μ`, and stretches `rho` only where it is small enough to be
+meteorologically insignificant. `bhyp(0) = ahyp(0) = 0` exactly.
+
+**Why this family and not another.** Every monotone `f: ℝ → (0, ∞)` has `f′ → 0` as `n → −∞`,
+so the source quotient `S/f′` is unbounded at the cloud edge and an explicit step overshoots
+there. Ooyama biases the hyperbola instead, giving range `(−μ, ∞)`; evaluating `J` at the
+RECOVERED density (his Eqs. 4.21–4.22, `D_t n = (dn/drho)·[rho-space tendency]`) then keeps it
+in `[0.5, 1]` for `rho ≥ 0`. Measured: the softplus and quadratic-touchdown alternatives fit
+exactly as well and detonate on first nucleation with peaks of 1e7 and 1e25 against a baseline
+1.2e-2. See `reference/FINDINGS_CONDENSATE_STAGE1.md` §3 and
+`benchmarks/condensate_transform_probe.jl`.
+
+`ahyp_smooth` is the strict inverse everywhere — C^∞, range `(−μ, ∞)` — where `ahyp` is
+Ooyama's C⁰ quasi-inverse pinned at exactly 0 for `n ≤ 0`. Ooyama notes the strict inverse
+reaches at worst `−μ`, so the clip's adjustment never exceeds `μ`. The two are measurably
+equivalent (probe: transport peak 2.9376e-3 both, mass drift +1.077 both, nucleation peak
+1.2167e-2 vs 1.2166e-2); `ahyp` ships because it gives `rho ≥ 0` exactly, `ahyp_smooth` is
+retained for any consumer that needs `f″` at the cloud edge.
+
+`μ` is a partial DENSITY here (Ooyama's is a mixing ratio). At `μ = 1e-7 kg/m³` the residual
+negativity costs at most 7.2e-3 K, and that worst point is the model top where `rho_d ~ 0.04`
+shrinks the retrieval denominator; near the ground it is ~2.5e-4 K.
+"""
+#
+# **Both maps are written in cancellation-free form**, not as Eqs. 4.19/4.20 read. They are
+# the same functions algebraically:
+#
+#     ½[(ρ+μ) − μ²/(ρ+μ)]  =  ρ(ρ + 2μ) / (2(ρ + μ))
+#     √(n²+μ²) + n − μ      =  n + n² / (√(n²+μ²) + μ)
+#
+# The paper's forms subtract two nearly equal quantities when `ρ ≪ μ` and when `|n| ≪ μ`
+# respectively, and that is exactly the regime the whole transform exists to represent.
+# Measured over `ρ ∈ [1e-14, 1]`: the paper's forms give `bhyp(0) = 6.6e-24` instead of zero
+# and a round-trip relative error reaching 1.7e-9 at `ρ = 1e-14`; these give `bhyp(0) = 0.0`
+# exactly and a round trip good to 2.2e-16 everywhere. The exact zero is load-bearing --
+# `condensate_slot` relies on it so a cloud-free initial condition converts to exactly 0.0.
+@inline bhyp(rho, mu) = (rho * (rho + (2.0 * mu))) / (2.0 * (rho + mu))
+@inline ahyp_smooth(n, mu) = n + ((n * n) / (sqrt((n * n) + (mu * mu)) + mu))
+@inline ahyp(n, mu) = n <= 0.0 ? 0.0 : ahyp_smooth(n, mu)
+@inline dbhyp(rho, mu) = 0.5 * (1.0 + (mu * mu) / ((rho + mu) * (rho + mu)))
+
+"""
+    ahyp_signed(n, mu) -> rho
+    clipped_lobe(n, rho, mu) -> lobe
+
+The ATTRIBUTION continuation of a transformed water-mass slot below `n = 0`, and the part of it
+the recovery discarded. `ahyp_signed` is `ahyp` on `n ≥ 0` — the identical function, bit for
+bit — and its odd reflection below:
+
+    ahyp_signed(n) =  ahyp(n)              n ≥ 0
+                   = −ahyp_smooth(−n)      n < 0      ( = n − n²/(√(n²+μ²) + μ) )
+
+`clipped_lobe(n, rho, mu)` is `ahyp_signed(n) − rho` where `n < 0` (with `rho` the density the
+slot's recovery returned there: 0 under `:bhyp`, `ahyp_smooth(n) ∈ (−μ, 0)` under
+`:bhyp_smooth`) and an exact `0.0` everywhere else, so `rho + lobe` reads the continuation and a
+point whose slot is non-negative contributes nothing.
+
+**Which readers.** Under the retired lobe attribution (`options[:water_lobe_attribution]`,
+refused since Stage 4 of the ρ_t retirement with the prognostic ρ_t it balanced against) only
+the ones that BALANCED the slot against the linear `ρ_t` anchor: the vapor residual and the ice
+anchor headroom. Today it is a DIAGNOSTIC only (the netCDF `condensate_lobe`). Every THERMODYNAMIC and MICROPHYSICAL reader — the temperature retrieval, the
+rates, the fall speeds, radiation — keeps the recovered, non-negative density. Nothing is
+written back; this is accounting, not a state repair.
+
+**Why it was never switched on (2026-10-07; the device was deleted with the prognostic ρ_t at
+Stage 4, and `clipped_lobe` survives as a diagnostic).** The closure assumed every negative slot lobe is also
+in the linear `ρ_t`. Measured on the ocean_2D_rce output that is false for most of the lobe
+mass: after the first convective burst the transformed slots hold a negative pool of 4-6.5
+kg/m² (10 % of the column water) that `ρ_t` does not, because the slots are not transported
+consistently with `ρ_t` below `ν = 0` (the clipped-point Jacobian is `dbhyp(0) = 1` where the
+in-cloud value is 1/2, so a flux divergence ringing at a condensate edge moves twice the
+equivalent mass in the slot, and only the negative side survives the physics). With the
+attribution on, that pool is handed to the vapor: a 1 h restart from the 30 h checkpoint
+put the species sum 5.7 kg/m² ABOVE the conserved `ρ_t - ρ_d` over 70 % of the domain. The
+switch stayed off until the device was deleted.
+
+**Measured 2026-10-08: the transport inconsistency is real but is NOT what makes the pool.**
+[`lobe_transport_jacobian`](@ref) now makes the below-zero continuity terms consistent, but an
+exact per-operator budget of `Σ min(ν, 0)` over the 24→33 h restart of the same run (the pool
+reproduced: −6.6 kg/m², ×2) attributes it to the PATCH REFIT of the slot between steps
+(−9.0), with the doubled sedimentation −0.55, the advection +0.28, the multistep sources
++1.43, MYNN +0.77 and the phase-change increments +0.49. The clipped-point Jacobian's whole
+share (actual − consistent, summed over divergence, sedimentation, sources and phase change)
+is +1.2: it FILLED holes faster than the consistent form does. The refit's lobe is born from
+the kink a phase change writes into the slot — ρ_t, untouched by condensation, has none — and
+its counterpart is the opposite ringing of the vapor slot, which the clipped residual nudges
+away. That pool is not in ρ_t, so this closure is still not to be switched on over it.
+Switched on from 24 h instead (before the pool exists), it keeps the vapor's counterpart:
+`2Σν` then tracks `ρ_t − ρ_d` to 0.01 % and negative vapor falls to 0.2 % of the domain, but
+the pool grows exactly as before and the recovered species sum stands above `ρ_t − ρ_d` by the
+whole of it (+3.3 kg/m² at 29 h). Either accounting books the refit's lobe somewhere it is not;
+the remedy has to act on the lobe itself.
+
+**Why a continuation at all.** `ρ_t` is linear and transports a sharp condensate feature with
+its whole Gibbs lobe; the slot transports `ν = bhyp(ρ)` with the SAME linear operator, rings
+too, and `ahyp` recovers 0 where it rings below zero. The lobe `ρ_t` carries then has no owner
+in the partition, and the residual `ρ_t − ρ_d − ρ_liq − ρ_ice` hands all of it to the vapor —
+which the reconciliation nudge faithfully drags negative (the file header's "clamp channel").
+Measured on the 2-D RCE production output: every point with `ρ_t − ρ_d < 0` had
+`Σ min(ν, 0) < −1e-7` on the cloud/rain/ice-mass slots, and 15–32 % of the domain carried
+negative vapor.
+
+**Derivation (what the slot's negative value MEANS).** Let `L` be the linear,
+constant-preserving operator the step applies (spline fit, transport) and `F ≥ 0` a feature of
+amplitude `A ≫ μ` against condensate-free air. `bhyp` is EXACTLY affine above the knee —
+`bhyp(ρ) = (ρ + μ)/2 − μ²/(2(ρ + μ))`, algebra, not an expansion — so on the feature
+`ν = F/2 + (μ/2)χ + O(μ²/A)` with `χ` its indicator, and
+
+    L ν = (L F)/2 + (μ/2) L χ + O(μ²/A).
+
+Where the anchor rings below zero by `δ` (`L F = −δ`), the slot therefore holds `−δ/2 + O(μ)`:
+the density the slot stands for there is `2ν + O(μ)`, the affine branch of the inverse
+continued through zero with Ooyama's factor ½ undone. Of the continuations that are C¹ with
+`ahyp` at the matching point `n = 0` (where `ahyp` leaves with slope `1/dbhyp(0) = 1`), the odd
+reflection is the one that reaches that branch: `ahyp_signed(−a) = −(2a − μ) + O(μ²/a)`, its
+effective slope `g(ν)/ν` running 1 at the origin, √2 at `|ν| = μ`, 1.9 at `10μ`, → 2. The
+tangent line (slope 1) is also C¹ and recovers half of every deep lobe; the affine line
+`2ν − μ` is the deep limit itself but jumps by `μ` at the origin. With every water species then
+transported linearly in the representation it carries, the residual reads
+`L(ρ_v) + O(μ)` — the vapor the prognostic slot transported — and the redundancy the nudge
+reconciles is the splitting error it was meant to be, not the condensate's lobe.
+
+**What it is not.** An ATTRIBUTION CLOSURE, exact only in the limit identified: a lobe made by
+linear transport of a feature whose interior is in the affine regime (`A ≫ μ`) and whose lobe
+is deep compared with `μ`. The error there is bounded by `2μ` per slot per point (`(μ/2)Lχ`
+plus the `μ` offset), the order of Ooyama's own clip bound. A lobe of depth `~μ`, a feature
+that is itself in the knee, or a negative slot produced by a SOURCE rather than by transport is
+attributed by the same rule without the derivation behind it. At the configured widths
+(`condensate_mu = rain_mu = 1e-7`, ice mass `1e-12`) the effective cloud/rain slope is 1.905 at
+a `1e-6` lobe in `ν` and 1.990 at `1e-5`, the ice slope 2 to 1e-6 at either, against an
+offline fit on the RCE output that was best at `c = 2`
+(15–32 % negative-vapor area → 0.4–0.8 %; `c = 1` left 7–10 %). Mass slots only: a NUMBER or
+habit moment carries no water and never enters the partition.
+"""
+@inline ahyp_signed(n, mu) = n < 0.0 ? -ahyp_smooth(-n, mu) : ahyp(n, mu)
+
+@doc (@doc ahyp_signed)
+@inline clipped_lobe(n, rho, mu) = n < 0.0 ? ahyp_signed(n, mu) - rho : 0.0
+
+"""
+    CLOUD_EVAP_REALIZATION_DEFAULT
+
+The value `options[:cloud_evap_realization]` takes when the key is absent. See
+[`cloud_evap_realized`](@ref).
+"""
+const CLOUD_EVAP_REALIZATION_DEFAULT = true
+
+"""
+    cloud_donor_conductance(qdot_c, auto_coll, rho_c) -> Float64
+
+The CLOUD reservoir's WARM sink conductance at the frozen state, `κ_c = (max(−Q̇_c, 0) +
+max(AUTO_COLL, 0))/ρ_c` [s⁻¹]: the evaporation of `qss_condensation_rates` and the conversion
+to rain, written on the reservoir they both draw on so they can enter ONE total with the ice
+legs (see [`cloud_evap_realized`](@ref)). Condensation is a source and contributes nothing —
+the `max` on `Q̇_c` is a sign test, not a limiter, and so is the one on `AUTO_COLL`, which is
+non-negative by construction. An exact `0.0` where there is no cloud (`ρ_c ≤ 0`), which is
+what keeps the cloud-free path bitwise.
+"""
+@inline function cloud_donor_conductance(qdot_c::Float64, auto_coll::Float64, rho_c::Float64)
+    rho_c > 0.0 || return 0.0
+    return (max(-qdot_c, 0.0) + max(auto_coll, 0.0)) / rho_c
+end
+
+"""
+    cloud_evap_realized(qc_bar, f_c) -> Float64
+
+The CLOUD donor's realization of its evaporation draw (`options[:cloud_evap_realization]`,
+default true): an evaporating step-mean cloud phase change `qc_bar < 0` [kg m⁻³ s⁻¹] is realized
+as `qc_bar · f_c`, where `f_c = J₀(κ_c,tot Δt)` is the cloud reservoir's ONE donor factor; the
+condensation side (`qc_bar ≥ 0`) is returned untouched, `===`.
+
+**Why the cloud needs it.** The `Q_ss` relaxation pair's exponential propagator bounds the
+SUPERSATURATION, not the cloud: in subsaturated air the step-mean evaporation is the vapor
+deficit times the cloud's conductance, `≈ Δt·|Q̄_ss|/((1 + 𝒬_s)τ_c)` over a step, and nothing
+compared it with `ρ_c` — `1/τ_c` falls only like `ρ_c^{1/3}` (like `ρ_c` once the closure
+counts 1 μm drops), so wherever `Δt/τ_c` times the deficit exceeds the cloud — a thin cloud in
+dry air, or a stiff step — the draw was larger than the reservoir. The cloud slot then fell
+only to `ν ≈ 0` (its recovery cannot go below zero) while the pressure, the vapor and `Q_ss`
+took the FULL draw: latent cooling and vapor for cloud that was not there. Measured on the 2-D
+RCE at a convective burst peak (2026-10-14): ~1.1 K of spurious cooling per 10 min.
+
+**The rule: a realization factor, not a cap.** Every donor-reservoir sink in this file is
+rate-limited by the step-mean realization factor of an exponential relaxation,
+[`relaxation_realization`](@ref)`(rate, reservoir, Δt) = J₀(κΔt) = (1 − e^{−κΔt})/(κΔt)` —
+an INTEGRATOR coefficient multiplying a rate, never a `Δt` written into the rate. It tends to
+1 as `Δt → 0` (the realized draw is the rate to `O(κΔt)`, so the scheme converges to the same
+ODE), and as `Δt → ∞` the converted mass `rate·J₀·Δt = ρ(1 − e^{−κΔt})` tends to the
+reservoir and never reaches it: no `min`, no branch, no kink where a cap would engage. The
+hard cap this replaces (9acd5b8, `cloud_evap_bound`: `−ρ_c/Δt` past the reservoir, else the
+identity) was exactly that kink, and its limiter was a `Δt` in a rate law — the step size
+changed the equation being solved wherever it bound.
+
+**The SHARE: one conductance for the whole cloud reservoir.** Four sinks draw on `ρ_c` in one
+step: evaporation, autoconversion + collection (`AUTO_COLL`), and with ice the homogeneous
+freezing `ṁ_hf,c` and the cloud half of every species' riming (`prdr₀_c`). Per the share rule
+they are realized on the reservoir's TOTAL conductance and each takes `rate_j·J₀(κ_tot Δt)`,
+so it is the SUM that is bounded, not each sink separately — two caps (or two factors) on one
+reservoir let the draws add to two reservoirs. `κ_tot` is built ONCE per point:
+
+  * the warm part `κ_c` = [`cloud_donor_conductance`](@ref)`(Q̇_c, AUTO_COLL, ρ_c)`, formed in
+    `mc_driver!` right after the `AUTO_COLL` closure (moist_compressible.jl:8616), where
+    the warm-path factor `f_cloud = J₀(κ_c Δt)` is written;
+  * with ice on, `mc_ice_sources!` completes it — `_ice_donor_factors(...; kc = κ_c)` adds
+    `κ_c q_c` to `ṁ_hf,c + Σ prdr₀_c` (:5633), so the ice legs' `f_qc` IS `f_cloud`, and
+    that value overwrites the column at every gridpoint (:6601; bitwise the warm one where
+    no ice leg draws);
+  * the fold below the ice block then applies that one `f_cloud` to `AUTO_COLL` (:8808;
+    and, two-moment, to its rain-number partner `n_auto`, the same collisions), and to `Q̇_c`
+    and `1/τ_c` where the liquid drive is CLIPPED (:8826; the step-mean IS the frozen rate
+    there and its flux lives in `N`, so it must be realized before `etd_nl` is formed — the
+    rain's fold site);
+  * where the drive is UNCLIPPED the ETD pre-compute (:9878) applies it to the step-mean
+    `qc_bar` — the one number that builds `dv` (vapor), `d1` (pressure), `d9 = Δt·J_c·qc_bar`
+    (the cloud slot, through its own Jacobian) — and `Q_ss^{n+1}` gives back the unrealized part,
+    `−Δt(1 + 𝒬_s)·Δq̄_c`, so the exchange closes on the cloud actually removed. E_t carries no
+    phase-change term and is untouched.
+
+**What the evaporation's conductance is, and what that costs.** The evaporation enters `κ_tot`
+at its FROZEN state-`n` rate `Q̇_c`, exactly as the rain's does (`kappa_ev`): the step-mean
+`qc_bar` does not exist until the propagator has run, which is after the ice legs and
+`AUTO_COLL` have to be realized, and making the ice legs wait for it would mean restructuring
+the step. Where the drive is clipped the two are the same number; where it is unclipped the
+realized draw is `qc_bar·J₀(κ_tot Δt)` with `κ_tot` built on `Q̇_c`, so the bound on the SUM is
+exact when `|q̄_c| ≤ |Q̇_c|` (the relaxing `Q_ss` decays toward its equilibrium over the step,
+which is the usual case) and holds to `O(Δt)` otherwise. A sign flip inside the step (`Q̇_c ≥ 0`,
+`qc_bar < 0`) leaves the evaporation out of `κ_tot` and realizes it on the other sinks' factor
+alone — `1.0`, the unrealized draw, where it is the only one.
+
+**Not "bitwise where it does not bind".** That argument belonged to the cap and is retired with
+it: `J₀ < 1` at EVERY evaporating point with cloud, so every such point's draw — and, through
+the share, its `AUTO_COLL` and ice legs — is changed, by `O(κΔt)` where the cloud is ample.
+That is correct, not a cost: `J₀` is the exact step-mean of the depletion the rate implies, and
+the rate taken at face value over the whole step was the first-order error the cap only ever
+truncated at the reservoir. What IS bitwise: the zero-cloud path (`κ_c = 0` and
+`relaxation_realization` returns an exact `1.0` at a zero rate or reservoir), every cloud-free
+point, the condensation itself (a condensing point's `AUTO_COLL` and ice legs still take the
+factor), and the whole switch-off arm (`options[:cloud_evap_realization] = false`:
+`f_qc` loses the `κ_c` term, `AUTO_COLL` and the evaporation are not scaled — the pre-9acd5b8
+unbounded draw); the census (`MC_CEVAP_*`) still measures in both modes.
+"""
+@inline cloud_evap_realized(qc_bar::Float64, f_c::Float64) =
+    qc_bar < 0.0 ? qc_bar * f_c : qc_bar
+
+"""
+    _cloud_evap_census!(st, tid, held)
+
+Record one realization of [`cloud_evap_realized`](@ref) — `held` the withheld evaporation over
+the step [kg/m³] — into the `MC_CEVAP_*` rows. A measurement only.
+"""
+@inline function _cloud_evap_census!(st::Matrix{Float64}, tid::Int, held::Float64)
+    size(st, 2) == 0 && return nothing
+    @inbounds begin
+        st[MC_CEVAP_PTS, tid] += 1.0
+        st[MC_CEVAP_HELD, tid] += held
+        held > st[MC_CEVAP_MAX, tid] && (st[MC_CEVAP_MAX, tid] = held)
+    end
+    return nothing
+end
+
+"""
+    LOBE_RELAXATION_DERIVED_DEFAULT
+
+The value `options[:lobe_relaxation]` takes when the key is absent: OFF (author's decision
+2026-10-22, reversing the plan's fixed decision E5 "default ON after acceptance"). In the
+24 -> 33 h RCE acceptance the paired relaxation dried the 1.5-4.5 km layer after the
+convective burst (mean rho_v 9.0 -> 6.7 g/m3 at 33 h, against 9.05 with it off) and the
+negative-vapor area peaked at 16 % during the burst; the arm without it still held the
+pre-convective lobe pool 84 % below the control (-0.158 against -0.96 kg/m2 at 27 h). An
+explicit `lobe_relaxation = true` stays fully supported. (Its `:slot`-anchor sibling
+`LOBE_RELAXATION_DEFAULT = false` went with the prognostic rho_t at Stage 4.)
+
+**It stays off (Stream E of the 2026-10-27 close-out, refuted branch).** The offline diagnosis
+of the 24 -> 33 h pair (reference/session_2026-10_scratch/closeout_2026-10-27/stageL_diag/
+DECISION.md) confirmed the pump — the relaxation moved ~2 kg/m2/h of vapor into the cloud
+lobes before the burst, regenerated every step at ~0.7 a|pool| — but refuted it as the cause
+of the drying: before the burst > 98 % of the pumped vapor came back (12 kg/m2 pumped, the
+1.5-4.5 km layer down 0.2 kg/m2, no rain), and after it the extra drying is the stronger,
+earlier burst of the relaxed arm (max w 7-8 against 1-2 m/s, 5 kg/m2 of ice against 0.05),
+which this budget cannot separate from chaotic amplification. No replacement passes its own
+gate: a same-species pairing finds a positive partner within two levels for 5-32 % of the
+untouched lobe mass (the 89-92 % of the relaxed arm is a survivor effect), and the
+vapor-saturated and convective-halo gates miss the pre-burst pump. So nothing is relaxed and
+the lobe mass stays where the transport put it, in ρ_w: the dynamics read
+`ρ_t = ρ_d + Σ_k α_k ν_k` — buoyancy, pressure gradient, the acoustic solve, `M` and the
+radiation's reference column all see the pool — while every physics reader sees the recovered
+species, 0 at a lobe. The difference is the partition gap `X = B + Λ`, booked in energy by the
+refit partner (never in mass), counted by `MC_XGAP_POOL`, and written per point to the
+netCDF output as `lobe_pool` (Λ) beside the signed `rho_w`.
+"""
+const LOBE_RELAXATION_DERIVED_DEFAULT = false
+
+"""
+    lobe_relaxation_on(options) -> Bool
+
+Whether the lobe relaxation (Stage L) runs: `options[:lobe_relaxation]` when set, else
+[`LOBE_RELAXATION_DERIVED_DEFAULT`](@ref) (`false`: off unless asked for). It is always the
+PAIRED form (`_lobe_relax_paired!`): the vapor pays the lobe's Δν, so ρ_w is invariant.
+"""
+@inline lobe_relaxation_on(options) =
+    get(options, :lobe_relaxation, LOBE_RELAXATION_DERIVED_DEFAULT)::Bool
+
+"""
+    lobe_relaxation_increment(nu, a) -> dnu
+    lobe_relaxation_cap(dnu, nu_star) -> dnu_applied
+
+THE LOBE RELAXATION (`options[:lobe_relaxation]`, `physical_params[:tau_lobe]`, default 10 s;
+Stage L of reference/RHO_T_RETIREMENT_DESIGN.md). **A pragmatic device, not physics** — the
+author's, adopted knowingly: it removes a numerical artifact that nothing in the physics can
+act on, and it is not a parameterization of any process.
+
+**What it removes.** A phase change writes a KINK into the cloud control variable `ν_c`: a
+real, flat boundary-layer sheet held saturated by LW cooling and MYNN mixing has a top sharper
+than one mish cell, and the condensation closure re-imposes it every step through the ETD
+increment `d9`. The per-step patch REFIT (`spectralTransform!` → `tileTransform!`, Ooyama's
+`ε = (l_q Δx/2π)⁶` filter) answers a kink by ringing, and above the sheet, in subsaturated
+air, the ring is NEGATIVE. There `ρ_c = ahyp(ν_c) = 0`, so `qss_condensation_rates` sees the
+channel CLOSED (`q_c ≤ 1e-8` and `S ≤ 1e-4` give `invtau_c = 0`) — while the POSITIVE rings
+are evaporated. The rectification is one-sided: the refit makes a negative ν pool every step
+and nothing ever takes it back. Measured on the 2-D RCE restart, closed budget, 24–25 h: FIT
+−0.172 kg m⁻², ETD −0.017, MYNN +0.014, everything else 0, reproducing the control pool to
+4e-17; −0.03 → −0.65 kg m⁻² over 24–27 h in a horizontally uniform layer at 1.5–4.5 km. The
+1-D toy (same Springsteel spline, grid, BCs and `l_q`) gives −0.56 kg m⁻² per hour against a
+0.13 kg m⁻² held cloud; with this device on τ = 10 s, −0.007. The kink is physical, the lobe
+is numerical, and `l_q` is not the lever (`l_q_vertical` 1.5 changes the pool by 3 %; 1.0
+gives NaN in 55 s).
+
+**What it does.** For each TRANSFORMED water-MASS slot — cloud `ν_c`, rain `ν_r`, the three
+ice masses `ν_{i,k}`, each only under `:bhyp` — at every point where `ν^n < 0` and the
+species' channel is CLOSED, the slot receives the exponential relaxation toward zero
+
+    Δν = −ν^n (1 − e^{−Δt/τ_lobe}),       `a = 1 − e^{−Δt/τ_lobe} = −expm1(−Δt/τ_lobe)`,
+
+a `Δt`-free rate law (`dν/dt = −ν/τ_lobe` on the lobe, integrated exactly over the step) in
+the τ class of `tau_qss` and `tau_ice_population`: a drift correction, never a
+shock. `a ∈ [0, 1]`, so the device's own step `ν(1 − a)` can reach zero but never cross it.
+**CHANNEL CLOSED** means the recovered density is 0 (`ν ≤ 0` under `:bhyp`) and EVERY process
+term the slot receives at that point is an exact `0.0` at state `n`:
+
+  * cloud — the step-mean phase change `qc_bar`, `AUTO_COLL` and (ice on) `ICE_C`; for cloud
+    this IS the `qss_condensation_rates` gate, read off its result;
+  * rain — `qr_bar`, `AUTO_COLL`, (ice on) `ICE_R`, AND the sedimentation divergence `Fr_z`:
+    rain falling into a lobe point opens the channel, because the flux will fill it. `Fr_z`
+    is a FITTED divergence, so any positive rain anywhere in the column leaves it nonzero
+    almost everywhere in that column — the gate is then conservatively open;
+  * ice masses — the slot's `SRC_*` (ISHMAEL, anchor and population sources), the ETD
+    deposition increment `di*`, and `F_*_z`, with the same column-wide reading as rain.
+
+It is computed in `mc_driver!`'s ETD pre-compute window, where all of these and the state-`n`
+`ν` (the post-refit value the step started from) are in hand, and applied by
+[`relaxation_adjustment_qss!`](@ref) as a slot increment beside `d8`/`d9` — after the explicit
+advance, before the acoustic solve, in the step phase the condensation increments use, and on
+both the vertical-only and `exact_si` paths. It is NOT a write to `tile.physical` at the start
+of the step: the derivative layers the driver reads (`f_z`, `f_zz`) would go stale against it.
+
+`lobe_relaxation_cap` bounds the applied increment by the post-advance value: the slot is
+lifted at most to `ν* = 0`, and not at all where the explicit advance already left `ν* ≥ 0`
+(a lobe point that advection or mixing filled within the step). Where `ν* < 0` the result
+`ν* + Δν_applied ≤ 0`, and where `ν* ≥ 0` nothing is applied, so the recovered density at
+`n+1` is never changed by the device: `ahyp(ν* + Δν_applied) = ahyp(ν*)`. (The note's form
+applies `Δν` unbounded; the
+two agree wherever the slot's own tendency is non-positive at the lobe point, which is every
+point of the pre-convective layer.)
+
+**Water-neutral by construction: the PAIRED form.** No recovered condensate moves, and under
+the derived water anchor (the only one since Stage 4) the vapor pays the lobe's Δν
+(`_lobe_relax_paired!`, plan decision E5: `Δν_v = −Σ_k α_k Δν_k/α_v`), so the anchor
+`ρ_w = Σ α_k ν_k` is invariant and the energy partner books the vapor's recovered change.
+Under `:none` a slot IS its density
+(nothing to relax); under `:bhyp_smooth` a lobe point carries a recovered density in
+`(−μ, 0)` that the relaxation would move, so those slots are skipped too.
+
+**NOT relaxed: ice NUMBER and HABIT moments, rain number.** The mass relaxation moves no
+recovered mass, so no recovered per-particle quantity changes and the moments have nothing to
+stay consistent with; their own negative lobes carry no water and are already inert (the
+population gate needs a positive carried number, the anchor and population devices read
+`max(moment, 0)`). Whether they need a device of their own is open.
+
+**STAGE 3 NOTE — this form is only valid while ρ_t is a prognostic.** Once ρ_t is retired and
+`ρ_w ≡ 2Σ_k ν_k`, raising `ν_k` toward 0 raises `ρ_w`: UNPAIRED, this device becomes a
+SECULAR WATER SOURCE at the lobe feed rate, ~0.17 kg m⁻² h⁻¹ in the pre-convective RCE
+window. At Stage 3 it must become a ρ_w-neutral pair through the exchange entry point
+(`water_exchange!`): `Δν_v = −Δν_k`, the vapor the closure species (physically the partner is
+the ETD evaporation overdraw the closed channel could not realize). Forgetting this is a
+silent conservation bug; Stage 3's paired-form test `Σ_k Δν_k = 0` is the guard.
+"""
+@inline lobe_relaxation_increment(nu, a) = nu < 0.0 ? -(a * nu) : 0.0
+
+@doc (@doc lobe_relaxation_increment)
+@inline lobe_relaxation_cap(dnu, nu_star) = min(dnu, max(-nu_star, 0.0))
+
+"""
+    lobe_transport_density(n, rho, mu) -> rho_s
+    lobe_transport_jacobian(n, rho, mu) -> J_s
+
+The density and the Jacobian a transformed water-mass slot's CONTINUITY terms read: the
+recovered `rho` and Ooyama's `dbhyp(max(rho, 0))` wherever `n ≥ 0` — the identical
+expressions, bit for bit — and, below `n = 0`, the odd continuation [`ahyp_signed`](@ref) and
+its own Jacobian, `dbhyp(|ahyp_signed(n)|)` (even in `n`, in `(1/2, 1]` like Ooyama's, `1` at
+the origin and `→ 1/2` in the affine regime).
+
+**Why.** Every term of the slot equation other than the transform-invariant advection is
+`J·[ρ-space tendency]`. At a clipped point the recovery returns `ρ = 0` and `J = dbhyp(0) = 1`,
+so the divergence term `−Jρ∇·u` vanished there while the linear `ρ_t` carries `−ρ_lobe∇·u`, and
+a flux divergence `−∂F/∂z` that `ρ_t` receives at face value moved the slot by `1·∂F/∂z` —
+TWICE the mass it moves in `ρ_t`, since a lobe `−δ` in `ρ_t` sits at `−δ/2` in the slot (see
+`ahyp_signed`'s derivation). Read through the continuation, `J_s ρ_s = ν + O(μ)` on either side
+of zero and `J_s → 1/2`, so the slot moves by half the `ρ`-space amount on the negative side
+exactly as it does on the positive one: the below-zero transport is the ν-image of `ρ_t`'s.
+
+**What it is not.** Not a reader of the physics: every rate, fall speed and flux is still
+formed from the recovered, non-negative density, and only multiplies `J_s`. Mass slots only —
+the cloud, the rain and the three ice masses, the slots whose sum is checked against `ρ_t − ρ_d`.
+`options[:water_lobe_transport] = false` restores the clipped-point forms bitwise (forensics).
+"""
+@inline lobe_transport_density(n, rho, mu) = n < 0.0 ? ahyp_signed(n, mu) : rho
+
+@doc (@doc lobe_transport_density)
+@inline lobe_transport_jacobian(n, rho, mu) =
+    n < 0.0 ? dbhyp(ahyp_smooth(-n, mu), mu) : dbhyp(max(rho, 0.0), mu)
+
+"""
+    _lobe_divergence!(expdot, slot, colstart, J, nu, rho, div, mu) -> Nothing
+
+Add the LOBE's divergence term to a transformed water-mass slot's assembled tendency:
+`−J·(ρ_s − ρ)·∇·u` with `ρ_s` the [`lobe_transport_density`](@ref), i.e. what turns the
+assembled `−J ρ ∇·u` into `−J ρ_s ∇·u` (`J` is already the continuation's Jacobian). Only
+where `ν < 0` — every other point is not touched, so the `@turbo` assembly beside it stays
+byte-identical and a non-negative column is bitwise the clipped one. An explicit loop and
+a separate function rather than a fifth broadcast column: the scratch `NamedTuple` is at
+the size where one more field takes the `moist_compressible_SLR` compile off the LLVM cliff.
+"""
+@noinline function _lobe_divergence!(expdot, slot::Int64, colstart::Int64, J, nu, rho, div,
+                                     mu::Float64)
+    @inbounds for i in eachindex(nu)
+        n = nu[i]
+        n < 0.0 || continue
+        expdot[colstart + i - 1, slot] -= J[i] * ((lobe_transport_density(n, rho[i], mu) -
+                                                   rho[i]) * div[i])
+    end
+    return nothing
+end
+
+"""
+    condensate_slot(rho_c, rho_cbar, transform, mu) -> slot value
+
+What an initial condition must write into slot 9 for a physical cloud density `rho_c` against
+a reference `rho_cbar`. Under `:none` that is the perturbation `rho_c - rho_cbar`; under a
+transform it is the CONTROL-variable deviation `bhyp(rho_c) - bhyp(rho_cbar)`, which is what
+Ooyama predicts (§4d: "actual prediction of n is performed in terms of its deviation n' from
+the background n̂ = bhyp(m̂)").
+
+A cloud-free initial condition on a cloud-free reference gives exactly `0.0` under both,
+because `bhyp(0) = 0` exactly — which is why every current benchmark configuration needs no
+initial-condition change to run transformed.
+"""
+@inline function condensate_slot(rho_c, rho_cbar, transform::Symbol, mu)
+    transform === :none && return rho_c - rho_cbar
+    return bhyp(rho_c, mu) - bhyp(rho_cbar, mu)
+end
+
+"""
+    vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar) -> slot value
+
+What an initial condition must write into the prognostic VAPOR slot for a physical vapor
+density `rho_v`: the perturbation from the DERIVED reference `ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c`,
+evaluated on the fitted reference columns at this level.
+
+Under `options[:vapor_transform] = :none` there is no transform and no Jacobian — the slot is a
+plain untransformed perturbation, the shape slot 7 has rather than slot 9's. Under `:bhyp`
+(Stage 1 of the ρ_t retirement, [`vapor_transform_mode`](@ref)) it is the control-variable
+deviation of the 6-argument method below: the vapor joins the condensates' ν-space, which the
+retirement's `ρ_w = 2Σν` needs, and the physics reads a non-negative recovered vapor.
+
+The reference is DERIVED rather than read from `Springsteel.ref_rho_v` deliberately. The
+reconciliation nudge differences this slot against the equation set's own density residual
+`ρ_t − ρ_d − ρ_c − ρ_r − ρ_i`, and the two agree BIT FOR BIT — hence `δ̄ ≡ 0` on a resting
+base, hence a discrete fixed point — only if the same three fitted columns are subtracted
+here. [`mc_reference_diagnostics`](@ref) forms the identical expression, and its `rho_vbar` is
+what `mc_driver!` adds back.
+"""
+@inline vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar) =
+    rho_v - (rho_tbar - rho_dbar - rho_cbar)
+
+"""
+    vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar, transform, mu) -> slot value
+    vapor_control(rho_v, mu) -> nu_v
+
+[`vapor_slot`](@ref) under the vapor control variable ([`vapor_transform_mode`](@ref)): the
+4-argument perturbation, bit for bit, under `:none`; under `:bhyp` the CONTROL-variable
+deviation `vapor_control(ρ_v) − vapor_control(ρ̄_v)` against the same derived `ρ̄_v`, which is
+exactly `0.0` where `ρ_v` is the reference (the same function of the same doubles).
+
+`vapor_control` is `bhyp` for `ρ ≥ 0` (bit for bit) and the odd continuation `−bhyp(−ρ)`
+below — the inverse of [`ahyp_signed`](@ref), the map [`convert_vapor_checkpoint!`](@ref)
+uses. `bhyp` itself is not defined for a negative density: it is non-monotone there
+(`bhyp(−1.5μ) = +0.75μ`) and singular at `−μ`, and an initializer that forms the vapor as a
+residual (`balanced_vortex_native!`: `ρ_t − ρ_d`) can produce one. A negative density then
+enters as a ν lobe (`2ν ≈ ρ`, recovered 0), never as a positive vapor.
+"""
+@inline vapor_control(rho_v, mu) = rho_v >= 0.0 ? bhyp(rho_v, mu) : -bhyp(-rho_v, mu)
+
+@doc (@doc vapor_slot(::Any, ::Any, ::Any, ::Any, ::Symbol, ::Any))
+@inline function vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar, transform::Symbol, mu)
+    transform === :none && return vapor_slot(rho_v, rho_tbar, rho_dbar, rho_cbar)
+    return vapor_control(rho_v, mu) - vapor_control(rho_tbar - rho_dbar - rho_cbar, mu)
+end
+
+"""
+    recover_rho_c(slot, rho_cbar, transform, mu) -> rho_c
+
+The inverse of [`condensate_slot`](@ref): the physical cloud density a slot-9 value stands
+for. `:none` is the plain `slot + rho_cbar` the code always did, bit for bit.
+
+Module-level rather than a closure at the call sites: `clamp_water!` runs this once per
+gridpoint per step inside the loop the allocation tests hold at zero, and a captured closure
+there is exactly the kind of thing that stops eliding.
+"""
+@inline function recover_rho_c(slot, rho_cbar, transform::Symbol, mu)
+    transform === :none && return slot + rho_cbar
+    n = slot + bhyp(rho_cbar, mu)
+    return transform === :bhyp ? ahyp(n, mu) : ahyp_smooth(n, mu)
+end
+
+"""
+    total_slot(value, transform, mu) -> slot value
+    recover_total(slot, transform, mu) -> value
+
+The [`condensate_slot`](@ref) / [`recover_rho_c`](@ref) pair for a species carried as a
+TOTAL — one with no reference profile (`f̄ ≡ 0` in every configuration and in the
+reference-state format itself), so there is no background to subtract and the slot IS the
+control variable rather than its deviation.
+
+Every total-form transform in the set shares this ONE implementation:
+[`rain_slot`](@ref)/[`recover_rho_r`](@ref) for the rain density and
+[`rain_number_slot`](@ref)/[`recover_n_r`](@ref) for the rain number are named aliases of
+it, not copies. Adding a species means adding the two aliases and a mode accessor, never
+another copy of the branch.
+
+`total_slot(0.0, …) == 0.0` exactly, because `bhyp(0) == 0` exactly, which is why no initial
+condition needs changing to run transformed — none of the `*_mc!` initializers seeds rain or
+rain number with anything but zero.
+"""
+@inline function total_slot(value, transform::Symbol, mu)
+    transform === :none && return value
+    return bhyp(value, mu)
+end
+
+@doc (@doc total_slot)
+@inline function recover_total(slot, transform::Symbol, mu)
+    transform === :none && return slot
+    return transform === :bhyp ? ahyp(slot, mu) : ahyp_smooth(slot, mu)
+end
+
+"""
+    rain_slot(rho_r, transform, mu) -> slot value
+    recover_rho_r(slot, transform, mu) -> rho_r
+
+The rain-DENSITY (slot 8) names of [`total_slot`](@ref) / [`recover_total`](@ref).
+"""
+@inline rain_slot(rho_r, transform::Symbol, mu) = total_slot(rho_r, transform, mu)
+
+@doc (@doc rain_slot)
+@inline recover_rho_r(slot, transform::Symbol, mu) = recover_total(slot, transform, mu)
+
+"""
+    rain_number_slot(n_r, transform, mu) -> slot value
+    recover_n_r(slot, transform, mu) -> n_r
+
+The rain-NUMBER names of [`total_slot`](@ref) / [`recover_total`](@ref), for the
+`options[:rain_moments] = 2` slot. `mu` here is `physical_params[:mu_rain_n]`, which is in
+#/m³ and therefore has nothing to do with the `rain_mu` of the density slot — the two
+transforms are independent knobs on quantities that differ by ten orders of magnitude.
+"""
+@inline rain_number_slot(n_r, transform::Symbol, mu) = total_slot(n_r, transform, mu)
+
+@doc (@doc rain_number_slot)
+@inline recover_n_r(slot, transform::Symbol, mu) = recover_total(slot, transform, mu)
+
+"""
+    _load_total_slot!(x, nu, nu_z, J, v, trans_on, trans, mu) -> Nothing
+
+Stage one TOTAL-form prognostic for the column: copy the control variable and its fitted
+vertical gradient out of the grid views, recover the quantity itself, and form the Jacobian
+`J = dν/dx` the source terms are multiplied by.
+
+`lobe_tr` (keyword, MASS slots only) selects the below-zero continuation of
+[`lobe_transport_jacobian`](@ref): `J` reads the odd continuation where `ν < 0` and is the
+clipped form elsewhere, bit for bit. Number and habit moments do not pass it.
+
+This is the block slots 8/9 and `n_r` write out inline, factored so the twelve ice slots do
+not become twelve more copies of it. Under `:none` it is `copyto!` plus `fill!(J, 1.0)`, and
+`1.0 * x === x` for every double, so a transform-free ice slot takes exactly the untransformed
+continuity form.
+
+`@inline` and allocation-free: `x`, `nu`, `nu_z`, `J` are the caller's scratch columns and
+`v` is an `mc_slot_views` `NamedTuple` of `SubArray`s.
+"""
+@inline function _load_total_slot!(x, nu, nu_z, J, v, trans_on::Bool, trans::Symbol, mu;
+                                   lobe_tr::Bool = false)
+    copyto!(nu, v.f)
+    copyto!(nu_z, v.f_z)
+    if trans_on
+        if trans === :bhyp
+            @. x = ahyp(nu, mu)
+        else
+            @. x = ahyp_smooth(nu, mu)
+        end
+        if lobe_tr
+            @. J = lobe_transport_jacobian(nu, x, mu)
+        else
+            @. J = dbhyp(max(x, 0.0), mu)
+        end
+    else
+        copyto!(x, nu)
+        fill!(J, 1.0)
+    end
+    return nothing
+end
+
+"""
+    _ice_flux!(fcols, scols, F, F_z, x, w_fall, slot, dirichlet_lid = true) -> Nothing
+
+Form one ice moment's sedimentation flux `F = max(x, 0)·W` and its fitted divergence
+`∂F/∂z`, on THAT SLOT'S OWN spline basis — its own cells, l_q and GROUND condition, so a mass
+slot with a Natural bottom lets the crystals leave the domain while a moment with a different
+fit is not forced to agree with it — but with a ZERO-FLUX LID ([`flux_column`](@ref): the
+slot's basis with a Dirichlet top). No crystal can enter through the top of the domain. A
+flux fitted on the slot's own Natural lid carried whatever the interior extrapolated to
+there, i.e. inflow from above; where the fall speed increases upward the top cells then gain
+mass with no drain, a linear instability (e-folding ~35 s) that killed the first production
+ice TC run at the lid. `dirichlet_lid = false` restores that fit (forensics:
+`options[:sedimentation_flux_lid] = :natural`). On a Chebyshev vertical (RZ) the flux column
+IS the slot's own column — see `_allocate_flux_columns` for why. `fcols`/`scols` are the
+tile's per-thread `flux_columns`/`scratch_columns` (arrays, not the tile: the compile-cliff
+rule; the fit column is `sedimentation_flux_column(fcols, scols, slot, dirichlet_lid)`).
+
+(The sedimentation anchor share `f_anchor` that multiplied the product went with the
+ice-anchor legs at Stage 5 of the ρ_t retirement; the driver passed the scalar `1.0` under the
+derived anchor, so the product is bitwise what it was.)
+
+`w_fall` is the fall speed WEIGHTED BY THE MOMENT BEING TRANSPORTED (negative downward, like
+`Vt`), which is the whole reason each of the four moments gets its own flux: mass, number and
+the two volume moments fall at different rates and the distribution sorts as it descends.
+
+`max(x, 0)` mirrors the rain flux for the same reason: a spline undershoot must not sediment
+NEGATIVE ice upward. The rate functions guard themselves the same way.
+
+`w_fall` is a COLUMN (the Mitchell-Heymsfield speeds of [`ishmael_fall_speeds`](@ref), already
+capped at 25 m/s inside that function and negated to Scythe's downward-negative convention),
+or a scalar `0.0` for a caller that wants the flux switched off.
+
+# The empty-species short circuit
+
+An ice species with no ice anywhere in the column has `w_fall ≡ 0` and `x ≡ 0`, and fitting a
+zero vector through the spline chain costs the same as fitting a real one — measured at S7 as
+1.7× the wall clock of the whole driver for twelve such fits per column. So the fit is GATED:
+if no level has both a nonzero fall speed and a nonzero (positive) amount, `F` and `F_z` are
+`fill!`ed with zeros and the transform is skipped. That is not an approximation — the product
+`max(x,0)·w` is identically zero over the column, the spline of the zero function is zero, and
+its derivative is zero — it is the same numbers reached without the arithmetic, which is what
+keeps the zero-ice inertness gate BITWISE rather than merely small.
+"""
+@inline function _ice_flux!(fcols::AbstractMatrix, scols::AbstractMatrix, F, F_z, x, w_fall,
+                            slot::Int, dirichlet_lid::Bool = true)
+    @. F = max(x, 0.0) * w_fall
+    live = false
+    @inbounds for i in eachindex(F)
+        if F[i] != 0.0
+            live = true
+            break
+        end
+    end
+    if !live
+        fill!(F, 0.0)          # sweeps any -0.0 the product may have produced
+        fill!(F_z, 0.0)
+        return nothing
+    end
+    # The flux is fitted with a ZERO-FLUX LID (see `flux_column`): nothing falls in from
+    # above the domain, whatever the slot's own lid BC. `dirichlet_lid = false` is the
+    # pre-fix fit on the slot's own column (`options[:sedimentation_flux_lid] = :natural`).
+    col = sedimentation_flux_column(fcols, scols, slot, dirichlet_lid)
+    col.uMish .= F
+    Btransform!(col)
+    Atransform!(col)
+    Ixtransform(col, F_z)
+    return nothing
+end
+
+"""
+    sedimentation_flux_lid_dirichlet(options) -> Bool
+
+`options[:sedimentation_flux_lid]`: `:dirichlet` (the default — every sedimentation flux is
+fitted with F = 0 at the lid, see [`flux_column`](@ref)) returns `true`; `:natural` (forensics
+only — the flux takes the slot's own lid BC, which lets hydrometeors fall in from above the
+domain) returns `false`. Anything else is an error.
+"""
+function sedimentation_flux_lid_dirichlet(options)
+    mode = get(options, :sedimentation_flux_lid, :dirichlet)
+    mode === :dirichlet && return true
+    mode === :natural && return false
+    error("options[:sedimentation_flux_lid] = $(repr(mode)) is not recognized; use " *
+          ":dirichlet (the default: zero sedimentation flux through the lid) or :natural " *
+          "(forensics: the flux fit takes the slot's own lid BC)")
+end
+
+"""
+    condensate_transform_mode(options) -> Symbol
+
+Which control variable slot 9 carries. `:none` (the default, and the state of every
+configuration that does not set the key) means the slot IS the cloud density and the whole
+transform is bitwise absent. `:bhyp` means it carries `n = bhyp(rho_c)` and the density is
+recovered by [`ahyp`](@ref); `:bhyp_smooth` uses `ahyp_smooth` instead.
+
+**What the transform buys, and what it does not.** It does not reduce the ringing: the
+excursion simply happens in `n`, at the same amplitude in `rho`-equivalent terms (measured:
+`min(n)` = −2.01e-4 against the untransformed `min(rho)` = −4.33e-4, exactly Ooyama's factor
+½). What it buys is that the RECOVERED density is bounded below by `−μ` whatever `n` does, so
+the ringing can no longer feed the retrieval. That matters because the negative region is a
+**physics-free reservoir**: every rate function is `max(rho,0)`-guarded, so a negative point
+has no evaporation, no autoconversion and no collection, while the positive overshoot at the
+peak is consumed every step. On the shipped O01 quick run that reservoir reaches 2.75× the
+real cloud mass by t = 2400 s (`reference/FINDINGS_CONDENSATE_STAGE1.md` §1).
+
+**Why not the spline positivity limiter instead.** It removes the reservoir too, and offline
+the two are indistinguishable. Run, it costs a 250–1000× rise in entropy production
+(2.86e4 → 7.06e6 at `POSITIVITY=ck`, → 2.98e7 at `=1`) with the entropy drift flipping from
++0.08 % to −2.6 %, because a per-step coefficient repair is not a physical process and the
+budget cannot account for it; `max_w` goes 9.87 → 17.4 → 46.5. The transform is a change of
+variables: nothing is ever repaired, and `n` is never modified ("n itself is untouched, so
+that the effect of m adjustments does not accumulate in the predicted n" — Ooyama §4d).
+
+**Measured in the model (2026-07-30, quick O01, 3600 s).** `min_rho_c_gm3` is 0 exactly, with
+no limiter and nothing repaired, and all five o01 target windows PASS (`max_w` 11.17,
+`peak_rain_rate` 78.67, `accum_rainfall_mm` 2.167, `max_rho_r_gm3` 12.65, `rain_onset_min` 24).
+Against the untransformed baseline: entropy production over the physical points 0.409 vs 0.520
+(−21 %), `energy_drift_pct` 0.153 vs 0.178, `water_mass_drift_pct` −3.55 vs −4.09,
+`min_rho_d_frac` 0.881 vs 0.884. For contrast, enforcing the SAME constraint with the spline
+limiter gives `max_w` 46.52, `min_rho_d_frac` 0.546 and an entropy production of 203.2 —
+390x the baseline. The constraint is affordable; the limiter's way of imposing it is not.
+
+The cost is in the water partition, and it is an UNMASKING rather than a new error. `min_rho_v`
+goes −0.724 → −1.199 and the negative-vapor count 750 → 4181. But under either enforcement the
+vapor deficit collapses onto the TOTAL-WATER deficit (`min_rho_v` − `min_rho_w`: −0.059 here,
+−0.034 under POSITIVITY=1, against **+0.353** in the baseline). The baseline's better-looking
+vapor was the negative cloud reservoir cancelling part of the `rho_t` − `rho_d` deficit. That
+deficit is a difference of two independently fitted fields, which `benchmarks/FUTURE_WORK.md`
+already records as not expressible as a bound on either — no condensate scheme can fix it.
+
+**Known costs, both measured.** `f` is convex near zero, so ringing rectifies into mass
+(+1.077 over 3600 s on the probe's transport arm, decelerating, and 3 % of the source-driven
+mass where a real source dominates); and a point whose `n` has ratcheted below zero carries a
+NUCLEATION LAG of `|n|/(J·S)` before cloud reappears — ~57 s at the worst measured excursion,
+against ~128 s for the untransformed field, which spends that time carrying a −54 K anomaly
+instead of reading zero cloud.
+"""
+@inline function condensate_transform_mode(options)
+    mode = get(options, :condensate_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp || mode === :bhyp_smooth) ||
+        error("options[:condensate_transform] = :$(mode) is not recognized; use :none " *
+              "(the default: slot 9 is the cloud density), :bhyp (Ooyama's biased " *
+              "hyperbolic control variable with his quasi-inverse) or :bhyp_smooth " *
+              "(the same forward map with the strict C^inf inverse)")
+    return mode
+end
+
+"""
+    rain_transform_mode(options) -> Symbol
+
+Which control variable SLOT 8 carries, the rain analogue of
+[`condensate_transform_mode`](@ref). `:none` (the default, and the state of every
+configuration that does not set the key) means the slot IS the rain density.
+
+**Why rain gets its own key.** Cloud was transformed first and alone, deliberately, so that a
+rain failure could not be confused with a cloud failure. With cloud settled the same treatment
+is right for rain, but the two knobs stay separate so `:bhyp`/`:none` and `:bhyp`/`:bhyp` remain
+separable arms rather than an assumption.
+
+**What rain needs that cloud did not.** Cloud has no sedimentation. Rain's dominant sink is the
+flux divergence `-∂F_r/∂z`, and under the transform slot 8's tendency carries it inside the
+Jacobian while `rho_t` and `E_t` continue to receive the untransformed `-∂F_r/∂z` — they are
+still densities and energies. That is correct term by term, but it does mean slot 8 and slot 3
+no longer receive the identical discrete number, so the exact telescoping between them is
+weakened. The diagnostic for it already exists and is independent: `accum_rainfall_mm` comes
+from the `rho_t - rho_d` water path while `accum_rainfall_flux_mm` comes from the `rho_r`
+surface flux, and the two must agree as well under the transform as without it.
+
+**Why the limiter is not the answer for rain either, despite working.** `GridParameters.positivity`
+on `rho_r` is exact and free on a single grid — `min 0.0` with `bound_shortfall` 0 at every
+output time of every run. It is not available on a NESTED run: a child patch's i-boundary is
+R3X, which `set_lower_bound!` rejects, so `src/nesting.jl` gives children a k-only bound and
+warns about the leak that admits. The transform has no such restriction, which is the design
+reason to move rain onto it.
+"""
+@inline function rain_transform_mode(options)
+    mode = get(options, :rain_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp || mode === :bhyp_smooth) ||
+        error("options[:rain_transform] = :$(mode) is not recognized; use :none " *
+              "(the default: slot 8 is the rain density), :bhyp (Ooyama's biased " *
+              "hyperbolic control variable with his quasi-inverse) or :bhyp_smooth " *
+              "(the same forward map with the strict C^inf inverse)")
+    return mode
+end
+
+"""
+    rain_moments(options) -> Int
+
+How many moments of the rain size distribution the set carries. `1` (the default, and the
+state of every configuration that does not set the key) is the single-moment Ooyama closure
+— mass only, with the drop number fixed by `physical_params[:N_r]` or the intercept
+`physical_params[:N_0]`. `2` adds the prognostic rain NUMBER density `n_r` [#/m³] as an
+APPENDED slot and switches the whole rain closure to the ISHMAEL/Morrison exponential-DSD
+family in microphysics.jl:
+
+| process | 1 moment (Ooyama) | 2 moments (ISHMAEL/Morrison) |
+|---|---|---|
+| autoconversion | [`autoconversion_density`](@ref) | [`rain_autoconversion_2m`](@ref) (KK2000) + its number source |
+| accretion | [`collection_density`](@ref) | [`rain_accretion_2m`](@ref) (KK2000), number-neutral |
+| self-collection / breakup | — | [`rain_selfcollection_2m`](@ref) (Beheng / Verlinde-Cotton) |
+| evaporation timescale | [`invtau_rain`](@ref) / [`invtau_rain_mp`](@ref) | [`invtau_rain_2m`](@ref) |
+| evaporation number loss | — | [`rain_number_evaporation_2m`](@ref) |
+| fall speed | [`rain_terminal_velocity`](@ref) | [`rain_fall_speeds_2m`](@ref), `vtrm` for mass and `vtrn` for number |
+
+The single-moment path is bitwise untouched by the option's presence: with the key absent
+the slot is not registered, no scratch is written, and every branch below tests a `Bool`
+that is `false`.
+
+**What the second moment buys.** `vtrm > vtrn` always (Γ(4+BR)/6 vs Γ(1+BR)), so mass
+outruns number down the column and the mean drop size sorts with height — the process the
+single-moment closure cannot represent at all, because it has only one number to fall with.
+
+**What is deferred.** `clamp_water!`'s floor, `water_budget_trace` and the implicit vertical
+water diffusion (`Kvdiff_water > 0`) all refuse to run with two moments rather than silently
+moving mass without its number; each says so where it refuses.
+"""
+@inline function rain_moments(options)
+    m = get(options, :rain_moments, 1)::Int
+    (m == 1 || m == 2) ||
+        error("options[:rain_moments] = $(m) is not recognized; use 1 (the default: " *
+              "single-moment rain mass, the Ooyama closure) or 2 (prognostic rain number " *
+              "n_r, the ISHMAEL/Morrison exponential-DSD closure)")
+    return m
+end
+
+"""
+    rain_number_transform_mode(options) -> Symbol
+
+Which control variable the rain-NUMBER slot carries, the `n_r` sibling of
+[`rain_transform_mode`](@ref) with the same three values and the same `:none` default. `n_r`
+is a TOTAL (`n̄_r ≡ 0`), so the transform pair is [`rain_number_slot`](@ref) /
+[`recover_n_r`](@ref) and its width is `physical_params[:mu_rain_n]` (default `1.0`, in
+#/m³ — the scale below which a number density is meteorologically meaningless, ten orders
+of magnitude away from the `rain_mu` of the density slot).
+
+Independent of `rain_transform`: mass and number ring independently and the arms have to be
+separable. Meaningless unless `rain_moments == 2`, and inert then unless set.
+"""
+@inline function rain_number_transform_mode(options)
+    mode = get(options, :rain_number_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp || mode === :bhyp_smooth) ||
+        error("options[:rain_number_transform] = :$(mode) is not recognized; use :none " *
+              "(the default: the slot is the rain number density n_r), :bhyp (Ooyama's " *
+              "biased hyperbolic control variable with his quasi-inverse) or :bhyp_smooth " *
+              "(the same forward map with the strict C^inf inverse)")
+    return mode
+end
+
+"""
+    VAPOR_MU_DEFAULT
+
+The vapor control variable's width `μ_v` [kg/m³] when `physical_params[:vapor_mu]` is absent:
+`1e-9` (reference/RHO_T_RETIREMENT_DESIGN.md §3.4). At the 25 km lid of the Dunion hum90
+sounding (`ρ̄_v ≈ 4e-7`) the vapor is affine to six digits (`2J_v − 1 = 6e-6`, readout bias
+0.25 %), so its ν-transport is the linear density transport scaled by ½ wherever there is
+vapor; any value in [1e-11, 1e-8] is equivalent.
+"""
+const VAPOR_MU_DEFAULT = 1.0e-9
+
+"""
+    vapor_transform_mode(options) -> Symbol
+    vapor_mu(physical_params) -> Float64
+
+Which control variable the PROGNOSTIC VAPOR slot carries (`options[:vapor_transform]`; Stage 1
+of the ρ_t retirement, reference/RHO_T_RETIREMENT_DESIGN.md §3 and §6). `:none` (the library
+default, and the state of every configuration that does not set the key) is the untransformed
+perturbation `ρ_v' = ρ_v − ρ̄_v` the slot always held, bit for bit. `:bhyp` carries Ooyama's
+control variable as a deviation from the transformed derived reference,
+
+    ν_v' = bhyp(ρ_v; μ_v) − ν̄_v,      ν̄_v = bhyp(ρ̄_v; μ_v),   ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c,
+
+renamed `"nu_v"` ([`MC_NU_ALIAS`](@ref)), with width `μ_v = physical_params[:vapor_mu]`
+(default [`VAPOR_MU_DEFAULT`](@ref)). The run-config default is `:bhyp`
+(`physics.microphysics.vapor_transform`); the library default stays `:none` so that every
+hand-built options dict is bitwise the code before the key, as the cloud and rain transforms do.
+
+What changes under `:bhyp`, all in `mc_driver!` and the readers of the slot:
+- every reader sees the RECOVERED `ρ_v = ahyp(ν_v) ≥ 0` — the temperature, the saturation and
+  mixture thermodynamics, the microphysics, the surface layer, the boundary layers, radiation,
+  the diffusion star state, the netCDF writer, the state-minima trace, the energy budget. A
+  vapor that ringed negative under `:none` reads 0: that is the intended physics change, and the
+  points are counted by [`MC_VNEG`](@ref);
+- every density-space tendency reaches the slot through `J_v = dν/dρ`, with the lobe-transport
+  continuation below `ν = 0` ([`lobe_transport_jacobian`](@ref)): the divergence term, the ETD
+  phase-change increment, the boundary-layer vapor legs (surface flux included), the exchange
+  realization's and the refit partner's vapor partners;
+- the advection reads `ν_v`'s own gradient (transform-invariant);
+- there is no reconciliation nudge (Stage 1 carried it as plan decision E6's realized, bounded
+  rate law; the derived water anchor deleted it at Stage 3 and Stage 4 the code).
+
+`:bhyp_smooth` is refused:
+a vapor recovered into `(−μ, 0)` would reach the equation of state negative.
+
+**KNOWN OPENING, closed at Stage 3 by the vapor-closure term `rec_v` of the exchange
+realization (plan decision E4).** Every density-space tendency reaches the slot as
+`J_v·rate` — the ETD vapor increment `etd_dv`, the exchange realization's vapor write, the
+refit partner's `dv` fold, the MYNN legs (water closure and clip-gap partner), the Louis leg
+including the surface moisture flux — and nothing books the difference between the density
+those moves REQUEST and what `ahyp(ν_v)` actually RECEIVES. Where the vapor is affine they
+agree to O(μ_v); at a vapor-lobe point (`ν_v < 0`) or where a sink overdraws the vapor through
+zero they do not, and `R = E_t − E_implied` and the partition gap `X` open at FIRST order
+wherever `MC_VNEG > 0`. (Reviewer's check: a lobe at `ν = −5e-6`, `J_v = ½`, requested
+`δρ = 1e-6`, realized `0.0`; an overdraw of `−2e-6`, realized `−1e-6`.) Two smaller items of
+the same class: the refit partner books the condensates' recovered change but not the vapor
+slot's OWN non-affine refit change (it shows in `MC_REFIT_DR`); and the MYNN vapor mass flux is
+built from `ν_v'_z/J_v`, which differs from `∂z ρ_v'` by `ρ̄_v,z (J̄_v/J_v − 1)` — negligible
+wherever the vapor is affine, first order only inside the knee.
+"""
+@inline function vapor_transform_mode(options)
+    mode = get(options, :vapor_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp) ||
+        error("options[:vapor_transform] = :$(mode) is not recognized; use :none (the " *
+              "library default: the vapor slot is the density perturbation rho_v') or :bhyp " *
+              "(Ooyama's biased hyperbolic control variable nu_v with his quasi-inverse, " *
+              "recovered rho_v >= 0). :bhyp_smooth is not offered for the vapor: its recovery " *
+              "reaches the equation of state negative.")
+    return mode
+end
+
+@doc (@doc vapor_transform_mode)
+@inline vapor_mu(physical_params) =
+    Float64(get(physical_params, :vapor_mu, VAPOR_MU_DEFAULT))
+
+"""
+    recover_rho_v(slot, nu_vbar, transform, mu) -> rho_v
+
+The physical vapor density a vapor-slot value stands for: `slot + ν̄_v` under `:none` (where
+`ν̄_v ≡ ρ̄_v`, bit for bit the `rho_vp + rho_vbar` the driver always formed) and
+`ahyp(slot + ν̄_v)` under `:bhyp`. `nu_vbar` is `mc_nu_vbar(mtile)` (the transformed DERIVED
+reference). Every reader outside `mc_driver!` goes through this.
+"""
+@inline recover_rho_v(slot, nu_vbar, transform::Symbol, mu) =
+    transform === :none ? slot + nu_vbar : ahyp(slot + nu_vbar, mu)
+
+"""
+    TKE_MU_DEFAULT
+
+The TKE control variable's width `μ_e` [J/m³] when `physical_params[:tke_mu]` is absent: `1e-7`
+(reference/session_2026-10_scratch/closeout_2026-10-27/rhoe_diag/DECISION.md §5). It is
+1.7e-3 of the closure floor `ρ_t MYNN_QKEMIN/2` at the ground (5.8e-5 J/m³) and 2.3e-3 of it
+at 3 km, inside the "knee ≤ 1e-2 of the floor" criterion up to ~15 km, and 2e-8 of the
+boundary-layer maximum (3.6-17 J/m³ measured), so every physically live TKE value sits on the
+transform's linear branch; the same decade as the cloud and rain widths. The criterion is
+checked at setup ([`validate_tke_mu`](@ref)).
+"""
+const TKE_MU_DEFAULT = 1.0e-7
+
+"""
+    tke_transform_mode(options) -> Symbol
+    tke_mu(physical_params) -> Float64
+
+Which control variable the MYNN TKE-density slot carries (`options[:tke_transform]`, the run
+configuration's `physics.boundary_layer.tke_transform`; Stream D of the 2026-10-27 close-out).
+`:none` (the library default, and every configuration that does not set the key) is the
+density `ρ_e = ρ_t e` [J/m³] the slot always held, bit for bit. `:bhyp` carries Ooyama's
+control variable
+
+    ν_e = bhyp(ρ_e; μ_e),      ρ̄_e ≡ 0  (no reference: the slot is a total either way),
+
+renamed `"nu_e"` ([`MC_NU_ALIAS`](@ref)), width `μ_e = physical_params[:tke_mu]` (default
+[`TKE_MU_DEFAULT`](@ref)). `:bhyp_smooth` is refused: its recovery reaches `(−μ, 0)`, a
+negative TKE, which is exactly what the transform is for.
+
+WHY. The transported `ρ_e` rings negative above the mixing top at 70-90 % of the points (RCE,
+TC; min −1.5 J/m³ at 3-4.5 km, lobes as large as the signal), where the closure reads
+`max(e, 0)` — `K_m = 0` and no dissipation, a dead TKE equation — while the transport, the
+netCDF writer and the sidecar read the signed slot. Under `:bhyp` every reader sees the
+recovered `ahyp(ν_e) ≥ 0`, every density-space tendency (the closure's production, buoyancy
+exchange, dissipation, surface production and fitted transport, the cold-start seed, the
+continuity divergence) reaches the slot through `J_e = dν/dρ`, and the advection reads `ν_e`'s
+own gradient. A lobe that still forms (the transport of `ν_e` rings too) is recovered as zero
+and counted (`MYNNState.n_eneg_pts`, `rho_e_deficit`).
+"""
+@inline function tke_transform_mode(options)
+    mode = get(options, :tke_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp) ||
+        error("options[:tke_transform] = :$(mode) is not recognized; use :none (the library " *
+              "default: the MYNN slot is the TKE density rho_e) or :bhyp (Ooyama's biased " *
+              "hyperbolic control variable nu_e = bhyp(rho_e) with his quasi-inverse, " *
+              "recovered rho_e >= 0). :bhyp_smooth is not offered for the TKE: its recovery " *
+              "reaches a negative TKE.")
+    return mode
+end
+
+@doc (@doc tke_transform_mode)
+@inline tke_mu(physical_params) = Float64(get(physical_params, :tke_mu, TKE_MU_DEFAULT))
+
+"""
+    recover_rho_e(slot, transform, mu) -> rho_e
+
+The TKE density a TKE-slot value stands for: the slot itself under `:none` (bitwise, signed:
+`ρ̄_e ≡ 0`) and `ahyp(slot; μ_e) ≥ 0` under `:bhyp`. Every reader outside the MYNN stage goes
+through this.
+"""
+@inline recover_rho_e(slot, transform::Symbol, mu) =
+    transform === :none ? slot : ahyp(slot, mu)
+
+"""
+    validate_tke_mu(options, physical_params, z, rho_tbar)
+
+The setup check of the TKE width `μ_e` under `tke_transform = :bhyp` (a no-op under `:none`):
+`μ_e > 0`, and the knee no wider than `1e-2` of the closure floor `ρ̄_t MYNN_QKEMIN/2` at every
+level of the mixing layer, `z ≤ 6 km` (the mixing top of every boundary-layer-topped case
+measured, 3-6 km) — a knee within a factor 100 of the floor would change which points the
+closure clamps. Above it the floor falls with the density and the default width exceeds the
+criterion near 15 km, inside the sponge, where the measured lobes are ≤ 1e-3 J/m³; that is
+reported once (`@warn`), not refused.
+"""
+function validate_tke_mu(options, physical_params, z::AbstractVector, rho_tbar::AbstractVector)
+    tke_transform_mode(options) === :none && return nothing
+    mu = tke_mu(physical_params)
+    (isfinite(mu) && mu > 0.0) || error(
+        "physical_params[:tke_mu] = $(mu) must be positive and finite under " *
+        "options[:tke_transform] = :bhyp (1e-7 J/m^3 is the measured width)")
+    z_mix = 6.0e3
+    zwarn = NaN
+    @inbounds for k in eachindex(z)
+        lim = 1.0e-2 * (rho_tbar[k] * MYNN_QKEMIN / 2.0)
+        mu <= lim && continue
+        z[k] <= z_mix && error(
+            "physical_params[:tke_mu] = $(mu) J/m^3 is wider than 1e-2 of the MYNN closure " *
+            "floor rho_tbar*QKEMIN/2 = $(rho_tbar[k] * MYNN_QKEMIN / 2.0) J/m^3 at " *
+            "z = $(z[k]) m, inside the mixing layer (z <= $(z_mix) m): the transform's knee " *
+            "would change which points the closure clamps. Lower tke_mu (1e-7 is the " *
+            "measured width).")
+        isnan(zwarn) && (zwarn = z[k])
+    end
+    isnan(zwarn) || @warn("tke_mu = $(mu) J/m^3 exceeds 1e-2 of the MYNN closure floor above " *
+                          "z = $(zwarn) m (the floor falls with the density); harmless where " *
+                          "the free-atmosphere TKE lobes are <= 1e-3 J/m^3", maxlog = 1)
+    return nothing
+end
+
+# (`vapor_jacobian_column(S) = S.cap_v`, the vapor Jacobian aliased onto the depletion-census
+# column to stay off the compile cliff, is retired: the column lives on the tile's
+# `MCSpeciesColumns`, `jacobian_column(mtile.species, rv_i, tid)`.)
+
+"""
+    mc_nu_vbar(mtile) / mc_nu_vbar_z(mtile) / mc_rho_tbar_w(mtile) / mc_rho_tbar_w_z(mtile)
+
+The tile's vapor control-variable reference `ν̄_v = bhyp(ρ̄_v)` (`ρ̄_v` itself, bitwise, under
+`options[:vapor_transform] = :none`) and its gradient `J̄_v ρ̄_v,z`, and the derived total
+reference `ρ̄_t^w = ρ̄_d + Σ_k α_k ν̄_k` and its gradient — the four columns
+[`mc_reference_diagnostics`](@ref) returns beyond the tile's `mc_ref_diag`. Stored on the
+tile's `MCSpeciesColumns` (`ν̄_v`, `ν̄_v,z` at the vapor slot) and on the `EnergyBudget`
+reference part (`ρ̄_t^w` and its gradient; the budget keeps its own bitwise-equal copy of `ν̄_v`
+for its hooks).
+"""
+@inline mc_nu_vbar(mtile) = @inbounds mtile.species.nu_bar[mtile.mc_slots.rho_v]
+@doc (@doc mc_nu_vbar)
+@inline mc_nu_vbar_z(mtile) = @inbounds mtile.species.nu_bar_z[mtile.mc_slots.rho_v]
+@doc (@doc mc_nu_vbar)
+@inline mc_rho_tbar_w(mtile) = mtile.ebudget.rho_tbar_w
+@doc (@doc mc_nu_vbar)
+@inline mc_rho_tbar_w_z(mtile) = mtile.ebudget.rho_tbar_w_z
+
+# ── Ice: the twelve appended species slots ───────────────────────────────────
+
+"""
+The ROLE names of the twelve ice prognostic slots, SPECIES-MAJOR and in registration order —
+the order [`mc_var_names`](@ref) appends them in and therefore the order their indices run in.
+
+Species `k ∈ {1, 2, 3}` are ISHMAEL's (Jensen et al. 2017) planar-nucleated crystals,
+columnar-nucleated crystals and aggregates. Each carries four PER-UNIT-VOLUME moments:
+
+| name | symbol | units | what it is |
+|---|---|---|---|
+| `rho_ik` | ρ_{i,k} | kg/m³ | mass density |
+| `n_ik`   | n_{i,k} | #/m³  | number density |
+| `a_ik`   | a_{i,k} = n⟨a²c⟩ | m³/m³ | spheroid volume moment; (4/3)π a is the volume fraction |
+| `c_ik`   | c_{i,k} = n⟨c²a⟩ | m³/m³ | the second volume moment; φ = c/a is the aspect ratio |
+
+The moments are carried multiplied by the number density, rather than as bare per-particle
+averages, precisely so that all four are DENSITIES and all four take the same continuity form
+as every other prognostic in the set (reference/Scythe_moist_compressible.tex, Eq.
+ice_moments). Two volume moments rather than one because deposition density and aspect ratio
+evolve independently: a crystal can gain mass without gaining volume, or change habit at
+constant mass.
+"""
+const MC_ICE_VARS = ("rho_i1", "n_i1", "a_i1", "c_i1",
+                     "rho_i2", "n_i2", "a_i2", "c_i2",
+                     "rho_i3", "n_i3", "a_i3", "c_i3")
+
+"""
+The `physical_params` key holding the transform width `mu` for each entry of
+[`MC_ICE_VARS`](@ref), positionally. `mu` is DIMENSIONAL — it carries the units of the
+variable it transforms — so the four moment kinds cannot share one number the way the twelve
+slots share one transform FAMILY: the mass, the number and the two volume moments are nine
+and ten decades apart (kg/m³, #/m³, m³/m³). Each width is set two to five decades BELOW the
+field it transforms — see [`MC_ICE_MU_DEFAULTS`](@ref) for the sizing principle, the
+measurement behind it, and what goes wrong when `mu` is set at or above the field amplitude.
+"""
+const MC_ICE_MU_KEYS = (:mu_ice, :mu_ice_n, :mu_ice_a, :mu_ice_c,
+                        :mu_ice,  :mu_ice_n, :mu_ice_a, :mu_ice_c,
+                        :mu_ice,  :mu_ice_n, :mu_ice_a, :mu_ice_c)
+
+"""
+Defaults for [`MC_ICE_MU_KEYS`](@ref), positionally. See there for why they differ by moment
+kind, and the SIZING PRINCIPLE below for why they are the values they are. All four remain
+per-run tunables through `physical_params`.
+
+# The sizing principle: `mu` must sit WELL BELOW the field amplitude
+
+`bhyp` is a stretch that acts only where `rho ≲ mu`; above that it is affine
+(`bhyp(rho) → rho/2`) and `J → 1/2`. Sized correctly, the transform buys a recovered value
+bounded below by zero AND a genuine change of variables in the region that needs it. Sized
+too WIDE — `mu` at or above the field amplitude — `bhyp` degenerates: measured at the O01 ice
+arm's own amplitude (peak `rho_i1 = 2.7e-10` kg/m³ against the former `mu_ice = 1e-7`, i.e.
+`mu` 370x ABOVE the field), `bhyp(rho)/rho = 0.9987` and `J = 0.9973`. The map is the IDENTITY
+to 0.3 %, so nothing is stretched and nothing is smoothed; all that survives of the transform
+is `ahyp`'s hard floor at zero. That is a bare positivity clip on a two-signed spline
+excursion — exactly the flooring that `condensate_transform_mode` documents as rejected for
+the cloud ("Flooring rectifies a two-signed excursion into one-signed"), applied to the ice
+slot but NOT to slot 3, which keeps integrating the signed sum. The manufactured mass is the
+difference, and it shows up as a reconciliation gap between slot 3 and the vapor slot.
+
+So each width is set two to five decades BELOW the field scale it transforms:
+
+| moment | field scale (O01 ice arm) | `mu` | field/`mu` |
+|---|---|---|---|
+| mass `rho_i` | ~1e-9 kg/m³ | 1e-12 | 1e3 |
+| number `n_i` | ~1e3 #/m³ | 1e-2 | 1e5 |
+| volume `a_i`, `c_i` | ~`n·r³` = 1e3·(2e-5)³ = 8e-12 m³/m³ | 1e-16 | 1e4 |
+
+The two VOLUME widths are unchanged: at `n·r³` for a 20 µm crystal at 1e3 /m³ the field is
+already four decades above 1e-16, so they were correctly sized from the start and moving them
+for symmetry with the other two would be a change with no measurement behind it.
+"""
+const MC_ICE_MU_DEFAULTS = (1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16,
+                            1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16,
+                            1.0e-12, 1.0e-2, 1.0e-16, 1.0e-16)
+
+"""
+    ice_microphysics(options) -> Symbol
+
+Which ice scheme the moist-compressible set carries. `:none` (the default, and the state of
+every configuration that does not set the key) registers no ice slot at all and is BITWISE
+the code that had no ice. `:ishmael` appends the twelve slots of [`MC_ICE_VARS`](@ref) and
+turns on the ice thermodynamics — the `ρ_i` term of [`retrieve_temperature`](@ref), `q_i C_i`
+in the mixture heat capacities and the entropy, and the three ice masses in the water sum
+`ρ_w = Σ_k α_k ν_k` (the derived water anchor).
+
+**Validation: `:ishmael` REQUIRES `options[:rain_moments] == 2`.** ISHMAEL's ice-rain physics
+— rain freezing, the collection of rain by ice, and the shedding and melting branches that run
+backwards through them — is defined against a rain size distribution with a prognostic
+intercept. Run against single-moment rain it would read a drop size that the rain closure does
+not actually carry, and the disagreement would be silent. The check is here rather than at
+first use so it fires at configuration time.
+
+**The physics is LIVE.** Deposition and sublimation run through the shared prognostic `Q_ss`
+(TeX Eqs. dep_rate, Qss_ice_final), so the Wegener-Bergeron-Findeisen competition is a
+property of the equation set rather than an arbitration bolted onto it; the full ISHMAEL
+process set — DeMott/homogeneous/Bigg nucleation, Hallett-Mossop splintering, ice-cloud and
+ice-rain riming with the wet-growth branch, aggregation and melting — supplies the rest; the
+Mitchell-Heymsfield fall speeds sediment each moment at its own weighted speed. See
+[`mc_ice_sources!`](@ref).
+
+**Zero ice is still exactly inert where no ice can form.** Every rate is gated on a STATE
+test — `q_i ≤ QSMALL` for a species, `T ≤ T_0` for aggregation and deposition, the nucleation
+windows for the rest — so in air that is warm throughout with no initial ice, every ice source
+and every fall speed is an exact `0.0` and the ten common slots reproduce the ice-free run
+BITWISE. In SUBFREEZING supersaturated air it is not inert and must not be: DeMott nucleation
+fires, which is the physics.
+
+The tables (`data/ishmael_tables.jld2`, 44.5 MB, gitignored) are loaded once per tile at
+construction; a missing file is refused there rather than mid-run. See
+[`load_ishmael_tables_or_error`](@ref).
+
+**`options[:ice_var_check]` (default `true`) — FLAGGED FOR REVIEW.** ISHMAEL's `var_check`
+writes its moment-consistency re-diagnosis back into the state every step; this port evaluates
+the rates at the effective moments but carries the raw ones, and nothing else in the set
+restores them. The write-back is therefore reinstated as a SOURCE on the number and the two
+volume moments (never on the mass), which is a one-step state repair and carries a `Δt`.
+Setting this `false` removes it and reproduces the divergence it was added for — see the block
+in [`mc_ice_sources!`](@ref) for the measurement and the argument.
+"""
+@inline function ice_microphysics(options)
+    mode = get(options, :ice_microphysics, :none)::Symbol
+    (mode === :none || mode === :ishmael) ||
+        error("options[:ice_microphysics] = :$(mode) is not recognized; use :none (the " *
+              "default: no ice slots, bitwise the liquid-only set) or :ishmael (the twelve " *
+              "ISHMAEL ice slots — three species x mass, number and two volume moments)")
+    if mode === :ishmael && rain_moments(options) != 2
+        error("options[:ice_microphysics] = :ishmael requires options[:rain_moments] = 2 " *
+              "(it is $(rain_moments(options))). The ISHMAEL ice-rain physics — rain " *
+              "freezing, ice collection of rain, shedding and melting — is defined against " *
+              "a rain DSD whose intercept comes from a prognostic (rho_r, n_r) pair; run " *
+              "against single-moment rain it would read a drop size the rain closure does " *
+              "not carry, and nothing downstream would notice.")
+    end
+    return mode
+end
+
+"""
+    ice_transform_mode(options) -> Symbol
+
+Which control variable the TWELVE ice slots carry — ONE family key, `options[:ice_transform]`,
+with the same three values and the same `:none` default as
+[`rain_transform_mode`](@ref)/[`condensate_transform_mode`](@ref).
+
+One key for twelve slots rather than twelve keys, because the moments of a species are not
+independently meaningful: `φ_k = c_{i,k}/a_{i,k}` and `ρ_{i,k}/(4/3 π a_{i,k})` are ratios of
+two slots, and transforming one member of a ratio while the other stays linear would put a
+habit diagnostic through two different low-pass filters. The WIDTHS still differ per moment
+kind — see [`MC_ICE_MU_KEYS`](@ref) — because `mu` is dimensional.
+
+All twelve are TOTALS (`f̄ ≡ 0`; there is no resting ice field for a perturbation to be
+measured against), so the transform pair is [`total_slot`](@ref)/[`recover_total`](@ref), the
+same one rain and the rain number use.
+"""
+@inline function ice_transform_mode(options)
+    mode = get(options, :ice_transform, :none)::Symbol
+    (mode === :none || mode === :bhyp || mode === :bhyp_smooth) ||
+        error("options[:ice_transform] = :$(mode) is not recognized; use :none (the " *
+              "default: each slot is the ice density/number/volume moment itself), :bhyp " *
+              "(Ooyama's biased hyperbolic control variable with his quasi-inverse) or " *
+              ":bhyp_smooth (the same forward map with the strict C^inf inverse)")
+    return mode
+end
+
+"""
+    ice_mu(physical_params, j) -> Float64
+
+The transform width for the `j`-th entry of [`MC_ICE_VARS`](@ref), from
+[`MC_ICE_MU_KEYS`](@ref) with the [`MC_ICE_MU_DEFAULTS`](@ref) fallback. Setup-path only —
+`mc_driver!` reads the four distinct values once per column, not twelve.
+"""
+@inline ice_mu(physical_params, j::Int) =
+    get(physical_params, MC_ICE_MU_KEYS[j], MC_ICE_MU_DEFAULTS[j])
+
+# ── Slot NAMES under a transform ──────────────────────────────────────────────
+# A transformed slot no longer holds what its name says, and the name is what every consumer
+# keys off: Springsteel builds the CSV/netCDF column headers straight from `GridParameters.vars`
+# (`Springsteel/src/io.jl`), so the output file is the only thing a postprocessor sees. Keeping
+# the name `rho_c` while the column held `bhyp(rho_c)` is exactly how `benchmarks/o01_movie.jl`
+# came to render half-amplitude cloud with spurious negative lobes against a run whose own
+# diagnostics recorded `min_rho_c = 0`. The transformed slots are therefore RENAMED, following
+# Ooyama's own notation, in which `mu` is the mixing ratio and `nu` its transform. (`n` was
+# considered and rejected: it reads as number concentration in a double-moment scheme.)
+# The ice slots follow the same rule: `nu_` prefixed to a tag that says which moment of which
+# species the column holds (`nu_i1` mass, `nu_ni1` number, `nu_ai1`/`nu_ci1` the two volume
+# moments), so no two of the fifteen transformable slots can collide and no output column ever
+# claims to hold a density it does not.
+const MC_NU_ALIAS = Dict("rho_c" => "nu_c", "rho_r" => "nu_r", "n_r" => "nu_nr",
+                         "rho_v" => "nu_v",
+                         "rho_e" => "nu_e",
+                         "rho_i1" => "nu_i1", "n_i1" => "nu_ni1",
+                         "a_i1" => "nu_ai1", "c_i1" => "nu_ci1",
+                         "rho_i2" => "nu_i2", "n_i2" => "nu_ni2",
+                         "a_i2" => "nu_ai2", "c_i2" => "nu_ci2",
+                         "rho_i3" => "nu_i3", "n_i3" => "nu_ni3",
+                         "a_i3" => "nu_ai3", "c_i3" => "nu_ci3")
+
+"""
+    condensate_var_name(options) -> String
+    rain_var_name(options) -> String
+    rain_number_var_name(options) -> String
+
+The name slot 9 / slot 8 / the appended rain-number slot carries under the current options:
+`"rho_c"` / `"rho_r"` / `"n_r"` untransformed, `"nu_c"` / `"nu_r"` / `"nu_nr"` under a
+transform. Use these — never a literal — when building the `vars`, `BCL`/`BCR`/`BCB`/`BCT`,
+`l_q`, `positivity` or `spline_filter` dicts of a `GridParameters`, all five of which are
+keyed by name.
+"""
+condensate_var_name(options) =
+    condensate_transform_mode(options) === :none ? "rho_c" : "nu_c"
+@doc (@doc condensate_var_name)
+rain_var_name(options) = rain_transform_mode(options) === :none ? "rho_r" : "nu_r"
+@doc (@doc condensate_var_name)
+rain_number_var_name(options) =
+    rain_number_transform_mode(options) === :none ? "n_r" : "nu_nr"
+@doc (@doc condensate_var_name)
+vapor_var_name(options) = vapor_transform_mode(options) === :none ? "rho_v" : "nu_v"
+@doc (@doc condensate_var_name)
+tke_var_name(options) = tke_transform_mode(options) === :none ? "rho_e" : "nu_e"
+
+"""
+    ice_var_names(options) -> NTuple{12,String}
+
+The names the twelve ice slots carry under the current options: [`MC_ICE_VARS`](@ref) itself
+when `options[:ice_transform]` is `:none`, their [`MC_NU_ALIAS`](@ref) aliases under a
+transform. Empty of meaning unless `ice_microphysics(options) === :ishmael`, which is the only
+thing that registers them.
+"""
+@inline function ice_var_names(options)
+    on = ice_transform_mode(options) !== :none
+    return ntuple(j -> on ? MC_NU_ALIAS[MC_ICE_VARS[j]] : MC_ICE_VARS[j], 12)
+end
+
+"""
+    mc_var_names(options; cyl = false) -> Vector{String}
+
+The ordered prognostic-slot names for the moist-compressible set under the current options —
+[`MC_VARS`](@ref) (or `MC_VARS_CYL` for the 10-slot cylindrical/3-D variants) with slots 8 and
+9 renamed by [`rain_var_name`](@ref) / [`condensate_var_name`](@ref) and the vapor (slot 3) by
+[`vapor_var_name`](@ref). With no transform declared this returns the canonical list unchanged.
+
+**Appending a slot.** Slots 1-9 (and `v` at 10 on the cylinders) appear as HARDCODED LITERALS
+throughout `mc_driver!`, the acoustic solvers and `mc_boundary_layer.jl`, so every later slot
+is APPENDED after that block and never inserted. Its index is therefore geometry-dependent
+(`n_r` is 10 on XZ and 11 on the cylinders) and must be resolved BY NAME — [`mc_slot`](@ref),
+cached once per tile in [`MCSlots`](@ref), never a per-column lookup. This is the pattern the
+ice categories follow: the twelve of [`MC_ICE_VARS`](@ref) are appended AFTER `n_r`,
+species-major, so on the XZ slice they run 11 through 22 and on the cylinders 12 through 23.
+
+The vapor is slot 3 (Stage 4 of the ρ_t retirement deleted the prognostic total density that
+held it) and in the constants rather than in the optional block below because it is
+prognostic in every configuration of this set; only `n_r`, the ice family and `rho_e` are
+conditional. It is still resolved by name (`MCSlots.rho_v`).
+"""
+function mc_var_names(options; cyl::Bool = false)
+    names = copy(cyl ? MC_VARS_CYL : MC_VARS)
+    names[8] = rain_var_name(options)
+    names[9] = condensate_var_name(options)
+    # The prognostic vapor (slot 3): `"nu_v"` under the vapor transform. Renamed in place,
+    # never moved, so every other index is unchanged.
+    if vapor_transform_mode(options) !== :none
+        names[findfirst(==("rho_v"), names)] = vapor_var_name(options)
+    end
+    # ── APPENDED optional slots, in registration order. Absent by default, so the list
+    #    every existing configuration gets back is bit-identical. ──
+    rain_moments(options) == 2 && push!(names, rain_number_var_name(options))
+    # The ice family, after the rain number (which `ice_microphysics` requires be present),
+    # species-major so a species' four moments are contiguous.
+    if ice_microphysics(options) === :ishmael
+        for nm in ice_var_names(options)
+            push!(names, nm)
+        end
+    end
+    # The MYNN-EDMF TKE density ρ_e = ρ_t·e [J/m³], LAST of the appended block so the twelve
+    # ice indices stay contiguous whatever else a configuration turns on. A TOTAL with
+    # ρ̄_e ≡ 0, renamed `"nu_e"` under the TKE control variable (`tke_transform_mode`; the
+    # measured negative lobes of the transported density were as large as the signal, so the
+    # closure's own floor was not enough). Renamed in place, never moved.
+    get(options, :mynn, false) === true && push!(names, tke_var_name(options))
+    return names
+end
+
+"""
+    mc_slot(vars, role) -> Int
+
+The slot index of a water species by ROLE rather than by name, accepting either the density
+name or its transformed alias. `role` is `"rho_v"`, `"rho_c"`, `"rho_r"`, `"n_r"`, or any
+entry of [`MC_ICE_VARS`](@ref); `"rho_v"` resolves `"nu_v"` under the vapor transform.
+
+Every `vars["rho_c"]`-style lookup in the kernel goes through this, so that a transformed
+configuration cannot produce a `KeyError` deep in a solver — and, more importantly, so that the
+lookup can never silently *succeed* against the wrong convention.
+
+This is a `Dict{String,Int}` lookup and must NOT appear in the per-column path: resolve
+appended slots once per tile through [`MCSlots`](@ref) instead.
+"""
+@inline function mc_slot(vars, role::AbstractString)
+    haskey(vars, role) && return vars[role]
+    alias = get(MC_NU_ALIAS, role, "")
+    (alias != "" && haskey(vars, alias)) && return vars[alias]
+    error("no slot named \"$role\"" * (alias == "" ? "" : " or \"$alias\"") *
+          " in grid_params.vars (it has $(sort(collect(keys(vars))))). Build the variable " *
+          "list with `Scythe.mc_var_names(options)` so the transformed slots are named " *
+          "consistently.")
+end
+
+"""
+    mc_optional_slot(vars, role) -> Int
+
+[`mc_slot`](@ref) for an APPENDED, optional slot: the index if the configuration registered
+it, `0` if it did not. Non-throwing, because absence is a legitimate answer here — the
+canonical nine-slot configuration has no `n_r` and no ice.
+
+For initializers and other setup code, which must seed a slot only if it exists. The
+per-column path uses [`MCSlots`](@ref) instead; this is a name lookup.
+"""
+@inline function mc_optional_slot(vars, role::AbstractString)
+    haskey(vars, role) && return vars[role]
+    alias = get(MC_NU_ALIAS, role, "")
+    (alias != "" && haskey(vars, alias)) && return vars[alias]
+    return 0
+end
+
+"""
+    mc_ice_slot_indices(vars) -> NTuple{12,Int}
+
+The indices of the twelve [`MC_ICE_VARS`](@ref) slots in registration order, each `0` when the
+configuration did not register it — [`mc_optional_slot`](@ref) twelve times, resolved once so
+an initializer does not do a name lookup per gridpoint.
+"""
+@inline mc_ice_slot_indices(vars) =
+    ntuple(j -> mc_optional_slot(vars, MC_ICE_VARS[j]), 12)
+
+"""
+    seed_ice_zero!(physical, i, ice_i) -> Nothing
+
+Seed every registered ice slot of gridpoint `i` with zero. A no-op for a configuration that
+registered none, so every existing initializer is unaffected.
+
+Zero is the right value under EVERY transform without threading a mode through, for the same
+reason `rain_slot(0.0, …) === 0.0`: `bhyp(0) == 0` exactly. And zero is the right PHYSICS for
+every idealized initializer in this file — a warm bubble and a balanced vortex have no ice to
+start with, and (with the process rates live) nucleation is what will put it there.
+"""
+@inline function seed_ice_zero!(physical, i::Int, ice_i::NTuple{12,Int})
+    @inbounds for s in ice_i
+        s > 0 && (physical[i, s, 1] = 0.0)
+    end
+    return nothing
+end
+
+"""
+    check_mc_var_names(model) -> Nothing
+
+Refuse a configuration whose name-keyed `GridParameters` dicts disagree with the declared
+transforms and optional slots. A no-op when no transform is on and the slot list is the
+canonical one, so no existing configuration is affected.
+
+This exists because the failure it catches is SILENT. `vars` is the only one of the five
+name-keyed dicts whose miss is loud; `_resolve_spline_filter` returns `nothing` rather than
+throwing, so a leftover `"rho_r" => NaturalBC()` under the rain transform would quietly leave
+slot 8 on the default Neumann fit — which forces a zero flux derivative at the ground and traps
+the falling rain at the surface instead of letting sedimentation carry it out of the domain.
+Likewise a stale `l_q` key removes the water filter the O01 configuration depends on for
+stability. Neither would raise anything; both would change the physics.
+
+An APPENDED optional slot is checked in the other direction too: `vars` must actually declare
+it. Nothing else can — the appended index is geometry-dependent, so a `vars` built from a
+stale name list has no slot for the tendency to land in.
+"""
+function check_mc_var_names(model::ModelParameters)
+    # The pre-Stage-4 layout (slot 3 the prognostic total density "rho_t", the vapor appended
+    # after slot 9): a `vars` built from a stale name list would put the vapor's tendency in
+    # whatever slot the stale index names. Refused by name, whatever else is configured.
+    haskey(model.grid_params.vars, "rho_t") &&
+        error("grid_params.vars declares \"rho_t\", the prognostic total-density slot that " *
+              "Stage 4 of the rho_t retirement deleted: rho_t is the derived " *
+              "rho_d + sum_k alpha_k nu_k, and slot 3 is the vapor (\"rho_v\", or \"nu_v\" " *
+              "under vapor_transform = :bhyp). Build `vars` (and every name-keyed BC/l_q dict) " *
+              "from `Scythe.mc_var_names(options)`.")
+    ctrans = condensate_transform_mode(model.options)
+    rtrans = rain_transform_mode(model.options)
+    nrtrans = rain_number_transform_mode(model.options)
+    nmoments = rain_moments(model.options)
+    # `ice_microphysics` is where the `:ishmael` ⇒ `rain_moments == 2` requirement is raised,
+    # so call it even on the early-return path: a configuration that declares ice against
+    # single-moment rain must fail HERE, at tile creation, and not at whatever later point
+    # something first reads a drop size that is not carried.
+    ice = ice_microphysics(model.options)
+    itrans = ice_transform_mode(model.options)
+    mynn = get(model.options, :mynn, false) === true
+    vtrans = vapor_transform_mode(model.options)
+    gp = model.grid_params
+    # The canonical slot list of this configuration. `cyl` is read from the presence of "v"
+    # alone: inferring it from `vars["v"] == 10` would call a stale cylindrical list (v
+    # shifted to 9) planar and check it against the wrong layout.
+    # The index check is the moist-compressible layout's: other equation sets carry their own.
+    mc = uses_pressure_reference(model.equation_set)
+    names = mc_var_names(model.options; cyl = haskey(gp.vars, "v"))
+    (ctrans === :none && rtrans === :none && nrtrans === :none && nmoments == 1 &&
+     ice === :none && !mynn && vtrans === :none) &&
+        (mc && _check_mc_var_indices(gp.vars, names); return nothing)
+    expected = Set(names)
+    stale = String[]
+    ctrans === :none || push!(stale, "rho_c")
+    rtrans === :none || push!(stale, "rho_r")
+    vtrans === :none || push!(stale, "rho_v")
+    (mynn && tke_transform_mode(model.options) !== :none) && push!(stale, "rho_e")
+    nrtrans === :none || push!(stale, "n_r")
+    if itrans !== :none
+        for nm in MC_ICE_VARS
+            push!(stale, nm)
+        end
+    end
+
+    # The appended slots, in the other direction: declared by the options, so `vars` must
+    # carry them. (Only `vars` — the BC/l_q/positivity dicts legitimately fall back to
+    # "default" for a name they do not mention.)
+    if nmoments == 2
+        nrname = rain_number_var_name(model.options)
+        haskey(gp.vars, nrname) ||
+            error("options[:rain_moments] = 2 declares the prognostic rain number slot " *
+                  "\"$nrname\", but grid_params.vars does not have it (it has " *
+                  "$(sort(collect(keys(gp.vars))))). The slot is APPENDED after the fixed " *
+                  "1-9 (+v) block (the vapor is slot 3, inside it), so its index is " *
+                  "geometry-dependent and only " *
+                  "`Scythe.mc_var_names(options)` knows it — build `vars` from that.")
+    end
+    if ice === :ishmael
+        for nm in ice_var_names(model.options)
+            haskey(gp.vars, nm) ||
+                error("options[:ice_microphysics] = :ishmael declares the ice slot " *
+                      "\"$nm\", but grid_params.vars does not have it (it has " *
+                      "$(sort(collect(keys(gp.vars))))). All twelve are APPENDED after " *
+                      "n_r, so their indices are geometry-dependent and only " *
+                      "`Scythe.mc_var_names(options)` knows them — build `vars` from that.")
+        end
+    end
+    if mynn
+        haskey(gp.vars, tke_var_name(model.options)) ||
+            error("options[:mynn] declares the prognostic TKE-density slot " *
+                  "\"$(tke_var_name(model.options))\", but " *
+                  "grid_params.vars does not have it (it has " *
+                  "$(sort(collect(keys(gp.vars))))). It is APPENDED after the ice family, " *
+                  "so its index is geometry- and option-dependent and only " *
+                  "`Scythe.mc_var_names(options)` knows it — build `vars` from that.")
+    end
+    mc && _check_mc_var_indices(gp.vars, names)
+
+    for (label, d) in (("vars", gp.vars), ("BCL", gp.BCL), ("BCR", gp.BCR),
+                       ("BCB", gp.BCB), ("BCT", gp.BCT), ("l_q", gp.l_q),
+                       ("positivity", gp.positivity),
+                       ("spline_filter", gp.spline_filter))
+        for key0 in keys(d)
+            key0 == "default" && continue
+            # `l_q` alone also takes PER-DIRECTION keys: Springsteel reads `"<var>_k"` (and
+            # `"<var>_j"` on RRR) as that variable's vertical (second-horizontal) filter
+            # length, falling back to its horizontal value (`build_l_q`). Such a key is
+            # checked by the slot name it qualifies — so a stale `"rho_c_k"` under the
+            # cloud transform is refused with the same hint as a stale `"rho_c"` — and
+            # never by its own spelling, which no slot has. The suffix is honoured on
+            # `l_q` ONLY: no other dict has a per-direction key, so `"u_k"` anywhere else
+            # is the same silent-miss this check exists to catch.
+            suffix = (label == "l_q" && (endswith(key0, "_k") || endswith(key0, "_j"))) ?
+                     key0[end-1:end] : ""
+            key = key0[1:end-length(suffix)]
+            key in expected && continue
+            hint = key in stale ?
+                " — that species is transformed, so the key must be " *
+                "\"$(MC_NU_ALIAS[key])$(suffix)\"" : ""
+            error("grid_params.$label declares \"$key0\", which is not a slot name of this " *
+                  "configuration$(hint). Expected names: $(sort(collect(expected))). " *
+                  "Build every name-keyed dict from `Scythe.mc_var_names(options)`; a stale " *
+                  "key in $label would be ignored silently rather than raising.")
+        end
+    end
+    return nothing
+end
+
+"""
+    _check_mc_var_indices(vars, names) -> Nothing
+
+Every slot name of the configuration sits at its canonical index: `vars[n] == i` for every
+`(i, n)` in `enumerate(names)` (`names = mc_var_names(options; cyl)`). Every reader of the
+fixed block indexes it by LITERAL slot number (u is read as slot 4, Q_ss as slot 7), so a
+`vars` that names every slot but numbers them differently -- e.g. the pre-Stage-4 list with
+the total density `rho_t` deleted, which shifts u into the vapor's slot and the vapor into
+nu_c's -- would read u as the vapor without any key being missing. Checked under every option
+set of a moist-compressible equation set.
+"""
+function _check_mc_var_indices(vars, names)
+    for (i, n) in enumerate(names)
+        got = get(vars, n, nothing)
+        got == i && continue
+        error("grid_params.vars puts \"$n\" at slot $(something(got, "(absent)")), but this " *
+              "configuration's canonical layout has it at slot $i (" *
+              join(("$k=$j" for (j, k) in enumerate(names)), ", ") * "). Every reader of the " *
+              "fixed block indexes it by literal slot number, so a renumbered `vars` would " *
+              "silently read the wrong field. Build `vars` from `Scythe.mc_var_names(options)`.")
+    end
+    return nothing
+end
+
+"""
+    condensate_floor_mode(options) -> Bool
+
+Whether `rho_liq` is floored at the DIAGNOSTIC INTERFACE. `true` for
+`options[:condensate_floor] = :diagnostic`; `false` for `:none`, which is the default and the
+state of every configuration that does not set the key.
+
+**What the floor is, and what it is not.** The spline undershoot puts `rho_c` a few `1e-4`
+below zero on the flanks of a cloud. The raw value then enters the closed-form temperature
+retrieval, where `∂T/∂ρ_liq = L_v/D` (Eq. of [`retrieve_temperature`](@ref)) turns it into a
+cold anomaly reaching −54 K on O01, and through `rho_vs(T)` into a collapsed saturation
+density, false supersaturation and false nucleation. `:diagnostic` replaces `rho_liq` by
+`max(rho_c, 0) + max(rho_r, 0)` at the retrieval, `q_l` (hence `C_vt`/`R_m`/`gamma_m`),
+`Q_s_energy`, the entropy and the sedimentation energy — and NOWHERE else.
+
+It is **not** [`clamp_water!`](@ref). Nothing is written back to a prognostic slot, so it is
+memoryless, converts no mass, and cannot pump latent heat: the continuity terms, the rate
+budgets and the state itself keep reading the raw value. `clamp_water!` rectifies a two-signed
+oscillation one step at a time and takes O01 non-finite in 23 min; this changes what the
+thermodynamics READS on the step it reads it, and leaves no trace.
+
+What it does NOT fix: the negative condensate is still there, still in continuity, and still
+accumulating (`reference/FINDINGS_CONDENSATE_STAGE1.md` §1 — the reservoir reaches 2.75x the
+real cloud mass). This addresses the consequence, not the cause. The cause needs the
+control-variable transform, [`condensate_transform_mode`](@ref).
+
+**Measured (2026-07-30, quick O01, 3600 s).** The win is where the cold anomalies live:
+
+| diagnostic | NOPRECIP `:none` | NOPRECIP `:diagnostic` | precip `:none` | precip `:diagnostic` |
+|---|---|---|---|---|
+| `min_rho_v_gm3` | −0.186 | **−1.58e-4** | −0.724 | −0.759 |
+| `neg_rho_v_points` | 2033 | **0** | 750 | 716 |
+| `entropy_prod_rate` (over rho_v>0) | 34.81 | 44.91 | 0.520 | 0.470 |
+| `max_w` | 6.600 | 6.085 | 9.869 | 11.15 |
+| `peak_rain_rate_gm2s` | — | — | 59.94 | 68.64 |
+| `water_mass_drift_pct` | 1.07e-6 | 1.08e-6 | −4.093 | −3.674 |
+
+On the cloud-only storm the floor removes NEGATIVE VAPOR ENTIRELY — 2033 points to zero, the
+worst value improving 1180x — which is the mechanism confirmed: a negative liquid density
+drives `rho_vs` down through `T`, manufacturing supersaturation, and (with the vapor still
+retrieved as the residual, as it was when this was measured) that is where it landed. With precipitation active the effect is smaller and mixed (`max_w` +13 %,
+rain rate +15 %, water and energy drift both improved), because rain removes the condensate
+before the lobes grow as large.
+
+**Correction (2026-07-30).** An earlier version of this note claimed the irreversible entropy
+production fell 14.5x here. It did not. `mc_entropy_production` clamped `H` at `1e-12` where
+the vapor is negative, so its raw value tracked the NEGATIVE-VAPOR COUNT rather than the
+irreversibility: 94.7 % of the NOPRECIP total came from clamped points. Restricted to the
+points where the quantity exists, the floor RAISES production slightly (34.81 → 44.91) while
+eliminating every excluded point. The diagnostic now returns that count beside the rate so the
+two cannot be read apart again.
+
+Under a working [`condensate_transform_mode`](@ref) this floor should become INACTIVE — the
+recovered density is already non-negative — so a transformed run is the test of whether the
+transform subsumes it.
+"""
+@inline function condensate_floor_mode(options)
+    mode = get(options, :condensate_floor, :none)::Symbol
+    (mode === :none || mode === :diagnostic) ||
+        error("options[:condensate_floor] = :$(mode) is not recognized; use :none " *
+              "(the default: rho_liq is read raw everywhere) or :diagnostic (floor " *
+              "rho_liq at the thermodynamic interface only, leaving state and continuity raw)")
+    return mode === :diagnostic
+end
+
+"""
+    install_positivity_bounds!(grid, ref_state, model) -> Nothing
+
+Convert the declared physical positivity bounds into the reference-aware coefficient bounds
+each spline leg actually needs, overriding what the factory installed.
+
+The factory can only express a CONSTANT bound, which is exactly right for a total (`rho_r`,
+bound 0) and for a perturbation whose reference is identically zero (`rho_c` on a cloud-free
+base, which is every current configuration). It cannot express the bound for a perturbation
+against a nonzero reference, and that bound differs by leg:
+
+- **k-leg** — fits the field itself, so the bound is `-ρ̄(z)`, applied through the
+  support-minimum rule (`set_lower_bound_from_profile!`).
+- **i-leg** — fits the k-direction B-coefficients `⟨φ_z, u⟩`, so the bound is the CONSTANT
+  `-⟨φ_z, ρ̄⟩` for each mode `z`, i.e. the negated SB coefficients of the reference. This is
+  the scaling the RiRk factory refuses to guess at.
+
+A no-op when the reference is zero, so the common path is untouched.
+"""
+function install_positivity_bounds!(grid, ref_state, model::ModelParameters)
+
+    pos = model.grid_params.positivity
+    # The transform supersedes the limiter for the species it acts on: a box constraint on
+    # the CONTROL variable's coefficients would bound nu, not the density, and the two are not
+    # the same constraint. Declaring both is a configuration error, not something to resolve
+    # silently by precedence. Checked per species, since the two transforms are independent
+    # knobs — a run may transform cloud while rain still takes the coefficient bound, which is
+    # the arm that showed the cloud transform did no harm.
+    for (name, opt, mode) in (("rho_c", :condensate_transform,
+                               condensate_transform_mode(model.options)),
+                              ("rho_r", :rain_transform,
+                               rain_transform_mode(model.options)),
+                              ("n_r", :rain_number_transform,
+                               rain_number_transform_mode(model.options)))
+        (mode !== :none && haskey(pos, name)) &&
+            error("positivity is declared for \"$name\" while options[:$opt] is on. The " *
+                  "transform makes the recovered density non-negative by construction; a " *
+                  "coefficient bound would constrain the control variable instead, which is " *
+                  "a different constraint. Drop \"$name\" from positivity.")
+    end
+    # The twelve ice slots share ONE transform key (`ice_transform`; see
+    # `ice_transform_mode` for why the family is not twelve independent knobs), so the
+    # exclusivity is one mode against twelve names.
+    let imode = ice_transform_mode(model.options)
+        if imode !== :none
+            for name in MC_ICE_VARS
+                haskey(pos, name) &&
+                    error("positivity is declared for \"$name\" while " *
+                          "options[:ice_transform] is on. The transform makes the recovered " *
+                          "moment non-negative by construction; a coefficient bound would " *
+                          "constrain the control variable instead, which is a different " *
+                          "constraint. Drop \"$name\" from positivity.")
+            end
+        end
+    end
+    isempty(pos) && return nothing
+    grid.kbasis isa Springsteel.SplineBasisArray || return nothing
+    vars = model.grid_params.vars
+
+    for (name, v) in vars
+        spec = Springsteel._resolve_spline_filter(pos, name, :k)
+        spec_i = Springsteel._resolve_spline_filter(pos, name, :i)
+        (spec === nothing && spec_i === nothing) && continue
+        prof = positivity_reference_profile(name, ref_state)
+        prof === nothing && continue                 # total: the factory bound is correct
+        all(iszero, prof) && continue                # zero reference: likewise
+
+        if spec !== nothing
+            spec == 0.0 || error("positivity[\"$name\"][:k] = $spec: only a bound of 0.0 is " *
+                                 "supported for a variable carried against a reference.")
+            set_lower_bound_from_profile!(grid.kbasis.data[v], prof)
+        end
+        if spec_i !== nothing
+            spec_i == 0.0 || error("positivity[\"$name\"][:i] = $spec_i: only 0.0 is supported.")
+            # b̄_z = ⟨φ_z, ρ̄⟩ on the k basis. Safe to borrow the k-column's buffers: this
+            # runs at initialization, before any transform.
+            kcol = grid.kbasis.data[v]
+            kcol.uMish .= prof
+            SBtransform!(kcol)
+            bbar = copy(kcol.b)
+            b_iDim = model.grid_params.b_iDim
+            for z in 1:model.grid_params.b_kDim
+                set_lower_bound!(grid.ibasis.data[z, v], fill(-bbar[z], b_iDim))
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    check_condensate_transform_ic(ref_state, model) -> Nothing
+
+Warn once when a transformed run starts on a CLOUDY reference state.
+
+Slot 9 then carries `n' = bhyp(rho_c) - bhyp(ρ̄_c)`, and every producer of an initial
+condition has to know that: [`condensate_slot`](@ref) is the conversion, and the `*_mc!`
+initializers take `condensate_transform`/`condensate_mu` keywords for it. On a cloud-free
+reference (`ρ̄_c ≡ 0`, which is every benchmark configuration to date) the conversion of a
+cloud-free state is exactly `0.0` under both conventions, so nothing has to be threaded and
+nothing can go wrong. On a cloudy reference an initial condition written in DENSITY would be
+silently reinterpreted as a control variable — off by a factor of two in the linear regime,
+and not detectable from the run.
+
+It is a warning and not an error because a cloudy reference is a legitimate configuration --
+`bf02_moist` is one, and it threads the conversion -- and because the condition cannot be
+checked from the state: both conventions give exactly 0.0 where there is no cloud, and where
+there is cloud neither is distinguishable from the other without knowing the intended density.
+Refusing outright would block correct configurations to catch a mistake it cannot actually
+detect; naming the requirement is the most the model can honestly do.
+"""
+function check_condensate_transform_ic(ref_state, model::ModelParameters)
+    uses_pressure_reference(model.equation_set) || return nothing
+    condensate_transform_mode(model.options) === :none && return nothing
+    prof = Springsteel.ref_rho_c(ref_state)
+    prof isa Number && return nothing
+    all(iszero, view(prof, :, 1)) && return nothing
+    @warn """options[:condensate_transform] is on and the reference state is CLOUDY
+      (ρ̄_c is not identically zero). Slot 9 therefore carries bhyp(rho_c) - bhyp(ρ̄_c), NOT
+      the density perturbation, and the initial condition must have been written that way:
+      `condensate_slot` is the conversion and the `*_mc!` initializers take
+      `condensate_transform` / `condensate_mu` keywords for it. An initial condition written
+      in density is read here as a control variable and is wrong by roughly a factor of two
+      in the linear regime, with nothing in the run to show it.
+
+      This cannot be verified from the state -- both conventions give exactly 0.0 where
+      there is no cloud, and neither is distinguishable from the other where there is. It is
+      the configuration's responsibility. In-tree, `bf02_moist.jl` threads it; O01 and the
+      TC configurations have cloud-free references and are unaffected."""
+    return nothing
+end
+
+"""
+    _warn_unbounded_master_output(ref_state, model)
+
+Warn once when a reference-aware bound is in force on the workers but cannot be installed on
+the master's patch.
+
+The master builds its patch from `model.grid_params` alone (`initialize_model`), never
+constructing a reference state — only `createModelTile` does, per worker. So when a bounded
+perturbation has a NONZERO reference, the master's `gridTransform!` (output/CFL/restart
+cadence only) reconstructs without the offset bound. The dynamics are unaffected: the state's
+coefficients are bounded on the workers and it is those that are integrated. Only the written
+diagnostics can show an undershoot the model itself never saw.
+
+Silent for every current configuration, all of which have `ρ̄_c ≡ 0`.
+"""
+function _warn_unbounded_master_output(ref_state, model::ModelParameters)
+    pos = model.grid_params.positivity
+    isempty(pos) && return nothing
+    for (name, _) in model.grid_params.vars
+        Springsteel._resolve_spline_filter(pos, name, :k) === nothing &&
+            Springsteel._resolve_spline_filter(pos, name, :i) === nothing && continue
+        prof = positivity_reference_profile(name, ref_state)
+        (prof === nothing || all(iszero, prof)) && continue
+        @warn """Positivity bound on "$name" is reference-offset (ρ̄ is not identically zero).
+          The worker tiles and patches carry the correct bound, so the INTEGRATED state is
+          bounded. The master's patch is built without a reference state, so the output
+          written by gridTransform! is reconstructed unbounded and may show an undershoot the
+          model never integrated. See install_positivity_bounds!.""" maxlog = 1
+    end
+    return nothing
+end
+
+"""
+    clamp_water!(mtile, colstart, colend)
+
+MEASURE the negative water in one column, and — only under
+`options[:clamp_water] = true` — floor it at zero.
+
+# Why the measurement is the point
+
+Negative condensate is unphysical, so the instinct to clamp it is right. But a floor
+cannot manufacture resolution, and at this scheme's ringing amplitudes it does real
+damage.
+
+`ρ_c` and `ρ_r` are positive-definite fields with sharp, spiky structure — a rain shaft
+or a cloud core. A cubic B-spline column with too few nodes to resolve that spike
+UNDERSHOOTS on its flanks, and the undershoot scales with how badly the spike is
+under-resolved, not with roundoff. Flooring it then rectifies a zero-mean oscillation:
+only the negative lobes are touched, so each step converts `δ` of vapor to liquid and the
+retrieval faithfully releases `L_v·δ` of latent heat, one-signed and accumulating.
+
+The size of that kick follows from differentiating the closed-form retrieval
+([`retrieve_temperature`](@ref)) — `∂T/∂ρ_liq = L_v(T)/D` with
+`D = C_factor − ρ_liq(C_pv − C_l)` — so flooring `δ` implies
+
+    ΔT = L_v·δ / D          (`:worst_dT`, estimated with L_v0 and D ≈ C_factor)
+
+Two measured regimes, four orders of magnitude apart:
+
+- **Fit-level noise.** The balanced TC vortex moves ~5e-7 kg/m³ per column-step:
+  `ΔT ~ 1e-3 K`. A floor there is free and harmless.
+- **An unresolved spike.** `o01_rainfall`'s rain shafts reach `min(ρ_r) ≈ -1.8 g/m³` at
+  500 m vertical spacing — `ΔT ≈ 4.4 K` in a SINGLE step at low levels, and ~68 K in the
+  thin air aloft where it actually detonated. With the floor on, that run goes non-finite
+  at t ≈ 23 min as convection erupts (`T = 9 K`, `E_t < 0`, `ρ_vs = Inf`, `Qdot = NaN`);
+  with it off, the same run completes.
+
+Re-accounting the floor does not rescue the second regime, it only chooses which budget
+absorbs it. Holding `p` and subtracting `L_v(T)·δ` from `E_t` alongside the partition
+change leaves `T` exactly invariant — but that is a `L_v·δ ≈ 4.5 kJ/m³` energy sink per
+event, ~2 % of the local `E_t` per step. A temperature bias becomes an equal-sized
+conservation bias. The amplitude is the problem; the bookkeeping is not.
+
+So the default is to MEASURE and WARN rather than to floor, and to read a large
+`worst_dT` as what it is: a request for more vertical nodes.
+
+**Not flooring is not the same as harmless.** The `max(ρ_c, 0)` guards live inside the RATE
+functions only ([`qss_condensation_rates`](@ref), autoconversion/collection), so an
+undershoot cannot manufacture condensation or precipitation. But the raw value feeds the
+continuity/advection terms AND `ρ_liq`, hence [`retrieve_temperature`](@ref) — so it drags
+the temperature with it by the same `L_v·δ/D`. Measured on `o01_rainfall` quick, the
+temperature attributable to negative liquid reaches **8.1 K** on the cloud flank at
+t = 50 min. (The pre-`ρ_c` formulation could not do this: its `ρ_v` was clamped to
+`[0, ρ_w − ρ_r]`, so the effective liquid the retrieval saw was `ρ_w − ρ_v ≥ ρ_r ≥ 0`.)
+
+The difference between flooring and not is therefore the SIGN STRUCTURE, not the presence
+of an error: unfloored, the anomaly oscillates with the ringing (cold on the undershoot,
+warm on the overshoot) and is dispersive; floored, only the negative lobes are touched and
+it becomes one-signed and cumulative. That is why one detonates and the other does not, and
+why the honest remedy for both is resolution.
+
+# The floor is retired
+
+`options[:clamp_water] = true` floored ρ_c and ρ_r and balanced the partition against the
+prognostic ρ_t (its rule 2: take any condensate in excess of `ρ_t − ρ_d` out of the cloud, then
+the rain), the vapor's half of the phase change arriving through the reconciliation nudge. Both
+the anchor it balanced against and the nudge went with slot 3 (Stage 4 of the ρ_t retirement;
+the floor was already refused under the derived water anchor at Stage 3), so the key is refused
+by [`validate_water_anchor`](@ref) and here. What remains is the MEASUREMENT, with `ρ_w` the
+derived water sum `Σ_k α_k ν_k` in its heat capacity.
+
+Measured on `var_np1` at the END of the column step (after the acoustic solve and the
+vertical diffusion), i.e. on the values entering the patch-level fit.
+
+# What the MEASUREMENT covers
+
+`rho_c` and `rho_r` only, hence `min_c`/`min_r` and nothing else. The rain NUMBER and the
+twelve ICE slots are not measured here: this function's statistics are in kg/m³ and are
+converted to a latent-heat `worst_dT` through `L_v0/D`, which is a statement about mass. A
+negative ice moment is a different quantity with a different consequence (a negative `a_{i,k}`
+is a negative volume, not a negative heat), and reporting it in these rows would make
+`moved`/`worst_dT` mean two things at once. The ice slots are inert while every process rate
+is zero; a moment-aware negativity census belongs with the rates that can drive them there.
+"""
+function clamp_water!(mtile::ModelTile, colstart::Int64, colend::Int64)
+
+    vars = mtile.model.grid_params.vars
+    rhod_i = vars["rho_d"]
+    rhor_i = mc_slot(vars, "rho_r")
+    rhoc_i = mc_slot(vars, "rho_c")
+    vnp1 = mtile.var_np1
+    rho_dbar = view(ref_rho_d(mtile.ref_state), :, 1)
+    rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
+    get(mtile.model.options, :clamp_water, false)::Bool &&
+        error("options[:clamp_water] = true is retired: the floor balanced the partition " *
+              "against the prognostic rho_t, which Stage 4 of the rho_t retirement deleted " *
+              "(see `clamp_water!`). Remove the key; the measurement runs regardless.")
+    # Slots 8 and 9 are not necessarily densities: the measurement reports the RECOVERED
+    # species — the number that says whether a transform is doing its job (it should never
+    # fall below -mu).
+    ctrans = condensate_transform_mode(mtile.model.options)
+    cmu = get(mtile.model.physical_params, :condensate_mu, 1.0e-7)
+    rtrans = rain_transform_mode(mtile.model.options)
+    rmu = get(mtile.model.physical_params, :rain_mu, 1.0e-7)
+    ws = water_anchor_set(mtile.model.options, mtile.model.physical_params, mtile.mc_slots)
+    nvb = mc_nu_vbar(mtile)
+
+    moved = 0.0
+    min_c = 0.0
+    min_r = 0.0
+    worst_dT = 0.0
+    nneg = 0.0
+    @inbounds for (k, i) in enumerate(colstart:colend)
+        rho_c = recover_rho_c(vnp1[i, rhoc_i], rho_cbar[k], ctrans, cmu)
+        rho_r = recover_rho_r(vnp1[i, rhor_i], rtrans, rmu)
+        negative = (rho_c < 0.0) || (rho_r < 0.0)
+        # The measurement fast-path: an admissible point costs two adds and a branch.
+        negative || continue
+
+        rho_d = vnp1[i, rhod_i] + rho_dbar[k]
+        # the derived water sum (the anchor), in the heat capacity of the latent-kick estimate
+        rho_w = anchor_W_value(vnp1, i, k, ws, nvb, rho_cbar)
+
+        if negative
+            deficit = max(-rho_c, 0.0) + max(-rho_r, 0.0)
+            # Implied single-step latent-heat kick if this were floored
+            # (dT/d rho_liq = L_v/D). L_v0 and D ~ C_factor are the cheap
+            # conservative stand-ins; the point is the ORDER, which separates
+            # 1e-3 K noise from a 4 K detonation.
+            D = (rho_d * Cpd) + (rho_w * Cpv)
+            moved += deficit
+            nneg += 1.0
+            min_c = min(min_c, rho_c)
+            min_r = min(min_r, rho_r)
+            worst_dT = max(worst_dT, L_v0 * deficit / D)
+        end
+
+    end
+
+    if nneg > 0.0
+        st = mtile.mc_water_stats
+        tid = Threads.threadid()
+        @inbounds begin
+            st[1, tid] += moved
+            st[2, tid] = min(st[2, tid], min_c)
+            st[3, tid] = min(st[3, tid], min_r)
+            st[4, tid] = max(st[4, tid], worst_dT)
+            st[5, tid] += nneg
+            # Per-STEP pre-fit minima for the production budget (reset each step by
+            # `water_budget_trace`); rows 2/3 above are cumulative and cannot be differenced
+            # against the post-fit reconstruction.
+            st[MC_PRE_C, tid] = min(st[MC_PRE_C, tid], min_c)
+            st[MC_PRE_R, tid] = min(st[MC_PRE_R, tid], min_r)
+        end
+    end
+    return nothing
+end
+
+"""
+    water_negativity_report(mtile) -> NamedTuple
+
+Reduce `ModelTile.mc_water_stats` across threads: `(total, min_c, min_r, worst_dT,
+count)`. `total` is Σ|negative water| in kg/m³ summed over gridpoints and steps; `min_c`
+and `min_r` are the most negative condensate and rain densities the tile has held; and
+`worst_dT` [K] is the largest `L_v·δ/D`, which is simultaneously the temperature anomaly
+the negative liquid imposes through the retrieval and the kick a floor would apply — the
+number that says whether the vertical resolution can represent the condensate spike (see
+[`clamp_water!`](@ref)). All zero on a run that never went negative.
+"""
+function water_negativity_report(mtile::ModelTile)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return (total = 0.0, min_c = 0.0, min_r = 0.0,
+                                worst_dT = 0.0, count = 0.0)
+    return (total = sum(view(st, 1, :)),
+            min_c = minimum(view(st, 2, :)),
+            min_r = minimum(view(st, 3, :)),
+            worst_dT = maximum(view(st, 4, :)),
+            count = sum(view(st, 5, :)))
+end
+
+"""
+    water_negativity_trace(mtile, t)
+
+Warn, once per doubling, when the negative water in the condensate fields implies a
+latent-heat kick large enough to matter — i.e. when the vertical basis is failing to
+represent a positive-definite spike.
+
+Emitted from the single-threaded pre-column-loop slot next to
+[`state_minima_trace`](@ref), so printing is race-free. The threshold ladder starts at
+`options[:water_warn_dT]` (default 0.05 K, comfortably above the ~1e-3 K fit-level noise
+of a quiet column) and each subsequent warning needs a doubling, so a run that is simply
+under-resolved reports O(10) lines rather than one per step.
+
+The message names the remedy. It is NOT a floor -- flooring converts the undershoot into
+one-signed latent heating (or, re-accounted, into an equal-sized energy sink); see
+[`clamp_water!`](@ref) for the measured failure. It is also no longer "more vertical
+nodes", which this docstring used to say: convective width collapses with the grid, so the
+spike stays at grid scale and the basis rings at a fixed RELATIVE amplitude. The remedy
+differs by species, and both are now measured
+(`reference/FINDINGS_CONDENSATE_STAGE1.md`):
+
+  * `rho_r` -- the spline coefficient bound (`GridParameters.positivity`), which is exact
+    and free here: rain carries no negative mass at any output time of any run.
+  * `rho_c` -- the control-variable transform ([`condensate_transform_mode`](@ref)). The
+    same coefficient bound applied to the cloud drives the O01 peak updraft from 9.9 to
+    46.5 m/s and the entropy production to 390x baseline, because it must repair the state
+    at the updraft on every step. The transform changes the variable instead and repairs
+    nothing.
+"""
+function water_negativity_trace(mtile::ModelTile, t::Int64)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    rep = water_negativity_report(mtile)
+    rep.worst_dT > 0.0 || return nothing
+    warn_dT = get(mtile.model.options, :water_warn_dT, 0.05)
+    @inbounds level = st[6, 1]
+    threshold = level == 0.0 ? warn_dT : 2.0 * level
+    rep.worst_dT >= threshold || return nothing
+    @inbounds st[6, 1] = rep.worst_dT
+
+    applied = get(mtile.model.options, :clamp_water, false)::Bool
+    @warn """Negative water: the vertical basis is undershooting a condensate spike.
+      step $t: min rho_c = $(rep.min_c) kg/m^3, min rho_r = $(rep.min_r) kg/m^3
+      |dT| from the negative liquid (= the kick if floored): $(rep.worst_dT) K
+      $(rep.count) gridpoint-steps so far, $(rep.total) kg/m^3 total
+      $(applied ? "options[:clamp_water] is ON, so that kick IS being applied, one-signed." :
+                  "options[:clamp_water] is off, so this is the size of the COLD anomaly the negative liquid is currently imposing through the retrieval (oscillatory, not cumulative). Rate functions are guarded; the retrieval and advection are not.")
+      GENERATOR (attributed 2026-07-26): the refit deposits a small undershoot every step
+      (~0.06% of peak) and NOTHING REMOVES IT. Refined 2026-07-30: what makes it permanent
+      is that the negative region has no SINK — every rate is max(rho,0)-guarded, so a
+      negative point cannot evaporate, autoconvert or collect, while the positive overshoot
+      IS consumed every step. On the shipped O01 run the reservoir reaches 2.75x the real
+      cloud mass by t = 2400 s.
+      REMEDY, by species: rho_r takes the spline coefficient bound
+      (GridParameters.positivity, e.g. Dict("rho_r" => Dict(:k => 0.0))), which is exact and
+      free. rho_c takes options[:condensate_transform] = :bhyp — the SAME bound applied to
+      the cloud takes max_w 9.9 -> 46.5 and the entropy production to 390x, because it
+      repairs the state at the updraft every step. Flooring rectifies a two-signed excursion
+      into one-signed latent heating. See reference/FINDINGS_CONDENSATE_STAGE1.md."""
+    return nothing
+end
+
+"""
+    water_budget_probe!(mtile, offset, slot, t, colstart, val, adv, div, src, aut, autsign,
+                        sed, w, z)
+
+Record the term-by-term tendency at the gridpoint where one water species is most negative.
+
+Called from `mc_driver!` immediately after that species' `expdot` is assembled, while its
+`ADV`/source scratch is still live (the buffers are reused by the next slot). Writes into the
+calling thread's column of `mc_water_stats`, keeping the worst point seen so far this step —
+`water_budget_trace` resets the block after printing, so the semantics are per-step, unlike
+rows 1-6.
+
+`offset` is `MC_BUDGET_R` or `MC_BUDGET_C`. `autsign` is `+1` for rain and `-1` for cloud (the
+same `AUTO_COLL` array is a source for one and a sink for the other); `sed` is `nothing` for
+cloud, which has no sedimentation. All arrays are column-block-local (1-based over
+`colstart:colend`).
+
+This exists because rows 1-6 record cumulative extrema and so cannot say WHICH operation
+drives the water negative — the question left open by
+`reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md`'s CORRECTION section.
+
+The worst point is selected on the **AB3-projected** value `ρ + Δ`, where `Δ` is the exact
+combination [`explicit_timestep`](@ref) will apply at this step (Euler at `t = 1`, AB2 at
+`t = 2`, AB3 thereafter) — NOT on the forward-Euler projection. That distinction is the whole
+reason this probe was blind: every water depletion limiter is sized so that `ρ + ts·f_n ≥ 0`
+exactly, so the Euler projection of a capped point is `0.0`, `0.0 < 0.0` is false, and the
+probe skipped precisely the points that produce the negative. Both projections are recorded
+(`:b_*_eul` alongside the selecting value) so their gap is readable directly.
+
+`Δ` is read from `expdot`/`expdot_nm1`/`expdot_nm2` at `slot`, which is exact at the call site
+for every configuration where nothing is added to that slot afterwards. The horizontal
+water mixing (`Khdiff_water`/Smagorinsky) and the Louis boundary layer both add to slot 8/9
+*after* this runs, so with either enabled the projection here understates them; the
+[`water_depletion_probe!`](@ref) census, which runs immediately before `explicit_timestep`,
+is exact in every configuration.
+
+**The phase change is one more such term now.** Condensation and evaporation are withheld
+from `expdot` entirely (they are the `Q_ss` relaxation pair, applied as a direct increment at
+the step-mean rate by [`relaxation_adjustment_qss!`](@ref)), and the step-mean is not formed
+until after every slot has been assembled — so it cannot be read at this call site at all.
+`Δ` here is therefore the MULTISTEP part only, and the `:b_*_src` row is the `n`-rate rather
+than the step-mean. Both are the same number to `O(Δt/τ)` and the ATTRIBUTION this probe
+exists for — which operation is driving the water negative — is unaffected, but the selecting
+projection is no longer the exact one; [`water_depletion_probe!`](@ref) is, because it is
+handed the increments explicitly.
+"""
+@inline function water_budget_probe!(mtile::ModelTile, offset::Int64, slot::Int64, t::Int64,
+                                     colstart::Int64,
+                                     val, adv, div, src, aut, autsign::Float64, sed, w, z)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    ts = mtile.model.ts
+    expdot_n = mtile.expdot_n
+    expdot_nm1 = mtile.expdot_nm1
+    expdot_nm2 = mtile.expdot_nm2
+    j = 0
+    vmin = 0.0
+    dmin = 0.0
+    @inbounds for i in eachindex(val)
+        g = colstart + i - 1
+        delta = _ab3_increment(ts, t, expdot_n[g, slot], expdot_nm1[g, slot],
+                               expdot_nm2[g, slot])
+        projected = val[i] + delta
+        if projected < vmin
+            vmin = projected
+            dmin = delta
+            j = i
+        end
+    end
+    j == 0 && return nothing
+    tid = Threads.threadid()
+    @inbounds begin
+        vmin < st[offset, tid] || return nothing
+        st[offset,      tid] = vmin
+        st[offset +  1, tid] = adv[j]
+        st[offset +  2, tid] = -val[j] * div[j]
+        st[offset +  3, tid] = src[j]
+        st[offset +  4, tid] = autsign * aut[j]
+        st[offset +  5, tid] = sed === nothing ? 0.0 : -sed[j]
+        st[offset +  6, tid] = div[j]
+        st[offset +  7, tid] = w[j]
+        st[offset +  8, tid] = z[j]
+        st[offset +  9, tid] = val[j] + (ts * expdot_n[colstart + j - 1, slot])
+        st[offset + 10, tid] = val[j]
+    end
+    return nothing
+end
+
+"""
+    _ab3_increment(ts, t, f_n, f_nm1, f_nm2) -> Float64
+
+The increment [`explicit_timestep`](@ref) applies to a prognostic slot at step `t`.
+
+One definition, so neither a diagnostic nor a limiter can drift from the integrator it is sized
+for: Euler at `t = 1`, second-order Adams-Bashforth at `t = 2`, AB3 (Durran & Blossey 2012)
+thereafter. The leading AB3 weight is **23/12 ≈ 1.917**, which is what a sink capped at `-ρ/ts`
+— a forward-Euler budget — used to get multiplied by. [`_ab3_sink_bound`](@ref) is this same
+expression solved for the current level, and is how the water limiters USED to be written.
+"""
+@inline _ab3_increment(ts::Float64, t::Int64, f_n::Float64, f_nm1::Float64, f_nm2::Float64) =
+    t == 1 ? ts * f_n :
+    t == 2 ? (0.5 * ts) * ((3.0 * f_n) - f_nm1) :
+             (ts / 12.0) * ((23.0 * f_n) - (16.0 * f_nm1) + (5.0 * f_nm2))
+
+"""
+    _ab3_sink_bound(ts, t, avail, s_nm1, s_nm2) -> Float64
+
+The most negative CURRENT-level sink [`explicit_timestep`](@ref) can apply at step `t` without
+carrying a species that has `avail ≥ 0` of itself below zero, given the two previous levels of
+that species' sink. **Returned UNCLAMPED** — see the clamp note below.
+
+This is [`_ab3_increment`](@ref) solved for `s_n`, one branch per integrator branch:
+
+| `t` | increment | admissible `s_n` |
+|---|---|---|
+| 1 | `ts·s_n` | `−avail/ts` |
+| 2 | `(ts/2)(3 s_n − s_nm1)` | `(−2·avail/ts + s_nm1)/3` |
+| ≥3 | `(ts/12)(23 s_n − 16 s_nm1 + 5 s_nm2)` | `(−12·avail/ts + 16 s_nm1 − 5 s_nm2)/23` |
+
+**DIAGNOSTIC ONLY.** Nothing in the RHS path applies this to a rate any more: the depletion
+caps were removed because a bound of the form `Q̇ ≥ −ρ/Δt` makes the physics a function of the
+time step (see [`qss_condensation_rates`](@ref) and reference/Scythe_moist_compressible.tex
+§"Departures from the ISHMAEL implementation" (b)). It survives because
+[`_depletion_census!`](@ref) reports where the caps WOULD have bound, which is exactly the
+instrument that measures what removing them cost. The description below is therefore of a
+bound that is computed and compared against, never enforced.
+
+The `t = 1` branch is exactly the forward-Euler budget `−avail/ts` that every water limiter in
+this file used to be written with, at every step — and that is the defect. AB3's leading weight
+is 23/12, so a sink sitting on the Euler bound is applied at ≈1.92× and lands the species at
+≈ `−0.92·avail`. Measured on the quick O01 at 2.34–2.82× the local cloud, regenerated at
+100–190 fresh gridpoints on EVERY step from the first cloudy one onward (STAGE 3 of
+reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md). A constant `12/23` removes most of it
+(ACTUAL depletion fraction 2.345 → 1.223, STAGE 3b) but provably not all: `12/23` is only the
+right factor when the sink has no history, and the residual 0.223 is the history term — which
+is what the `t ≥ 3` branch above carries and no constant can.
+
+**Scope: the MICROPHYSICS' own contribution.** By linearity of the AB3 operator, what the
+phase changes contribute to `ρ^{n+1}` is `_ab3_increment` evaluated on the sink history alone,
+so bounding that bounds what the physics removes — nothing more. Transport, the spectral refit
+and the acoustic solve can still carry a point negative; that is the positivity limiter's job,
+and deliberately not this one's. Making the microphysics surrender its sink to compensate a
+transport-generated negative would be a floor in all but name, at exactly the points STAGE 3b
+showed the caps have no purchase on.
+
+**Returned raw, clamped by the reader.** A bound `> 0` means the two history levels alone
+already drive the species negative, which limiting the current level could not have repaired.
+The census applies `min(bound, 0.0)` (or `max` on the mirrored vapor ceiling) before comparing
+and keeps the raw value so [`_depletion_census!`](@ref) can count how often that happens — a
+nonzero `:d_*_infeas` is a real signal, not noise.
+"""
+@inline _ab3_sink_bound(ts::Float64, t::Int64, avail::Float64,
+                        s_nm1::Float64, s_nm2::Float64) =
+    t == 1 ? -avail / ts :
+    t == 2 ? ((-2.0 * avail / ts) + s_nm1) / 3.0 :
+             ((-12.0 * avail / ts) + (16.0 * s_nm1) - (5.0 * s_nm2)) / 23.0
+
+"""
+Columns of `ModelTile.mc_micro_n`/`mc_micro_nm1`/`mc_micro_nm2` — the per-gridpoint history of
+each water channel's NET MICROPHYSICS tendency.
+
+DIAGNOSTIC ONLY, like [`_ab3_sink_bound`](@ref) itself: the history exists so the census can
+evaluate the integrator's actual three-level combination on the microphysics alone
+(`:d_*_mab3`, and the would-have-bound comparison). It used to size the depletion caps, which
+are gone.
+
+| column | channel | value |
+|---|---|---|
+| `MC_MICRO_C` | cloud | `−AUTO_COLL` (`+ ICE_C` with ice on) |
+| `MC_MICRO_R` | rain | `0` (`AUTO_COLL` is a SOURCE for rain; omitting it only makes rain's budget more conservative) (`+ ICE_R` with ice on) |
+| `MC_MICRO_V` | vapor | `0` |
+
+**These are the MULTISTEP-CARRIED micro legs only.** The condensation and deposition channels
+used to be here too, and are not any more: they are the relaxation pair the stiff integrator
+withholds from the multistep and applies once, at the step-mean rate
+([`relaxation_adjustment_qss!`](@ref)), so weighting them by a three-level combination would
+have described an integration nobody performs — and it would have been the WRONG weights by up
+to `23/12`. They reach the census as the step-mean rates `Qdot_bar`/`Qdot_r_bar`/`Qdep_bar`
+instead, added over one step, which is exactly what the integrator does with them. The rain
+and vapor rows are consequently empty on the warm path; the vapor's whole microphysical sink
+is phase change, so `MC_MICRO_V` carries nothing at all.
+
+Rotated in lockstep with `expdot_n/nm1/nm2` by [`_rotate_micro_history!`](@ref), which runs
+immediately after `explicit_timestep`. Zero-initialized, so step 1 sees no history and its
+budget reduces to the forward-Euler one this code used to write everywhere.
+"""
+const MC_MICRO_C = 1
+const MC_MICRO_R = 2
+const MC_MICRO_V = 3
+const MC_MICRO_N = 3
+
+"""
+    _rotate_micro_history!(mtile, colstart, colend)
+
+Advance the microphysics sink history one level for this column, mirroring
+[`explicit_timestep`](@ref)'s rotation of `expdot_*` so the next step's cap sees exactly the two
+levels the integrator will weight.
+
+Called from `mc_driver!` immediately after `explicit_timestep` — which is once per column per
+step on BOTH paths, because the `exact_si` branch returns from `mc_driver!` further down, after
+this. A second rotation would silently shift the whole history by one step and mis-size every
+cap, so the placement is load-bearing.
+"""
+@inline function _rotate_micro_history!(mtile::ModelTile, colstart::Int64, colend::Int64)
+    n = mtile.mc_micro_n
+    nm1 = mtile.mc_micro_nm1
+    nm2 = mtile.mc_micro_nm2
+    size(n, 2) == 0 && return nothing
+    # Unconditional, unlike `explicit_timestep`'s `t == 1` branch which skips `nm2 .= nm1`:
+    # both levels are zero at t = 1, so the two are identical and the branch is not worth it.
+    @inbounds for c in 1:MC_MICRO_N, g in colstart:colend
+        nm2[g, c] = nm1[g, c]
+        nm1[g, c] = n[g, c]
+    end
+    return nothing
+end
+
+"""
+    water_depletion_probe!(mtile, colstart, colend, t, precipitation,
+                           rho_c, rho_r, rho_v, Q_ss, rho_vs, Qdot, Qdot_r, AUTO_COLL,
+                           cap_c, cap_r, cap_v, rv_slot, dir_c, dir_r, dir_v, vapor_rate)
+
+Census, over every gridpoint holding water, of how hard the step is depleting it.
+
+**PURE DIAGNOSTIC.** Nothing here is applied to any rate, and the caps it used to be built
+around no longer exist (see [`qss_condensation_rates`](@ref)). Its job now is to report where
+those caps WOULD have bound — which is the direct measurement of what removing them cost —
+alongside the depletion fractions the integrator actually applies.
+
+Runs immediately before [`explicit_timestep`](@ref), so `expdot` is final for the step and the
+measured increment is the one actually applied. For each channel it records how many points
+exist, how many have a sink at or past the AB3-exact bound, the largest forward-Euler and
+largest ACTUAL depletion fractions, how many points the step drives negative outright, how many
+exceed AB3's real-axis stability limit, and how many carry an inadmissible history.
+
+What the counts now mean:
+
+- **would-have-bound** — `:d_*_cevap` and `:d_*_cauto` are the population the removed caps used
+  to act on, and `:d_*_mab3` (the microphysics' own depletion fraction) is free to run past 1
+  where they did; before removal the bound held it at 1 by construction. The excursion is the
+  cost, in the units the argument is made in;
+- **stiff source** — `:d_*_stiff` counts points depleted faster than AB3 can stably integrate.
+  Read it with [`mc_stiffness_census!`](@ref), which measures the same under-resolution at the
+  RATE rather than at the slot tendency and does so on every run;
+- **inadmissible history** — `:d_*_infeas` is nonzero, i.e. the previous two sink levels alone
+  carry the point negative.
+
+The VAPOR is censused alongside the two condensates, and now on the SAME footing: it is a
+prognostic slot, so its tendency is read straight off `expdot` instead of being assembled from
+four other slots, and its sink is the condensation (and, with ice on, the deposition) that
+removes it. It has no bound of its own anywhere else in the model, which is exactly why it
+needs measuring.
+
+The RECONCILIATION gap is recorded here too: `max|Q_ss − (ρ_v − ρ_vs)|` into
+[`MC_QSS_GAP`](@ref MC_QSS_GAP).
+
+Gated on `options[:water_budget_trace]`; never called otherwise.
+"""
+function water_depletion_probe!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
+                                precipitation::Bool,
+                                rho_c, rho_r, rho_v, Q_ss, rho_vs,
+                                Qdot, Qdot_r, AUTO_COLL, cap_c, cap_r, cap_v, rv_slot,
+                                dir_c, dir_r, dir_v, vapor_rate)
+
+    size(mtile.mc_water_stats, 2) == 0 && return nothing
+    _depletion_census!(mtile, MC_DEPLETION_C, 9, MC_MICRO_C, colstart, t, rho_c, Qdot,
+                       precipitation ? AUTO_COLL : nothing, Qdot, cap_c, dir_c, Qdot)
+    _depletion_census!(mtile, MC_DEPLETION_R, 8, MC_MICRO_R, colstart, t, rho_r, Qdot_r,
+                       nothing, Qdot, cap_r, dir_r, Qdot_r)
+    _vapor_census!(mtile, colstart, t, rho_v, Qdot, Qdot_r, cap_v, rv_slot, dir_v, vapor_rate)
+    _qss_gap_census!(mtile, rho_v, Q_ss, rho_vs)
+    return nothing
+end
+
+"""
+    _qss_gap_census!(mtile, rho_v, Q_ss, rho_vs)
+
+Record the RECONCILIATION GAP over this column, `max|Q_ss − (ρ_v − ρ_vs)|`, into
+[`MC_QSS_GAP`](@ref MC_QSS_GAP): Q_ss against the prognostic vapor, the argument of the S3
+drive clip in [`qss_condensation_rates`](@ref) — so it is what says whether that clip is doing
+anything. Identically `0.0` on a resting base (the reference `Q_ssbar` is built to match).
+(Its sibling, the vapor against the prognostic ρ_t budget, went with slot 3 at Stage 4.)
+"""
+@inline function _qss_gap_census!(mtile::ModelTile, rho_v, Q_ss, rho_vs)
+
+    st = mtile.mc_water_stats
+    qgap = 0.0
+    @inbounds for i in eachindex(rho_v)
+        q = abs(Q_ss[i] - (rho_v[i] - rho_vs[i]))
+        q > qgap && (qgap = q)
+    end
+    tid = Threads.threadid()
+    @inbounds st[MC_QSS_GAP, tid] = max(st[MC_QSS_GAP, tid], qgap)
+    return nothing
+end
+
+"""
+    _depletion_census!(mtile, species, slot, channel, colstart, t, val, evap, aut, Qdot, cap)
+
+One species' pass for [`water_depletion_probe!`](@ref). Split out so each call specializes on
+its own argument types (`rho_c` is a scratch `Vector`, `rho_r` a grid `SubArray`), rather than
+being iterated as a heterogeneous tuple. `aut === nothing` skips the `AUTO_COLL` cap test,
+which is the correct behaviour for rain (where `AUTO_COLL` is a source, not a sink) and with
+precipitation off.
+
+`cap` is the RAW (unclamped) [`_ab3_sink_bound`](@ref) vector for this species — a
+MEASUREMENT, not a limit: `mc_driver!` fills it only when this probe is on and no rate reads
+it. The tests below ask whether each rate is at or past its bound, i.e. where the removed caps
+would have bound, and `:d_*_infeas` (`cap > 0`) counts the points whose sink history alone is
+already inadmissible. `channel` is this species' `MC_MICRO_*` column, which gives the
+microphysics-only depletion fraction.
+"""
+function _depletion_census!(mtile::ModelTile, species::Int64, slot::Int64, channel::Int64,
+                            colstart::Int64, t::Int64, val, evap, aut, Qdot, cap,
+                            dir, dir_micro)
+
+    st = mtile.mc_water_stats
+    ts = mtile.model.ts
+    expdot_n = mtile.expdot_n
+    expdot_nm1 = mtile.expdot_nm1
+    expdot_nm2 = mtile.expdot_nm2
+    micro_n = mtile.mc_micro_n
+    micro_nm1 = mtile.mc_micro_nm1
+    micro_nm2 = mtile.mc_micro_nm2
+    # AB3's real-axis absolute-stability interval is (-0.545, 0]; a decay faster than that is
+    # unstable under this integrator no matter how the sink is limited.
+    AB3_REAL_LIMIT = 0.545
+
+    n = 0.0; n_cevap = 0.0; n_cauto = 0.0; n_neg = 0.0; n_stiff = 0.0; n_infeas = 0.0
+    n_mneg = 0.0
+    max_eul = 0.0; max_ab3 = 0.0; max_mab3 = 0.0
+    @inbounds for i in eachindex(val)
+        rho = val[i]
+        rho > 0.0 || continue
+        n += 1.0
+        g = colstart + i - 1
+        f_n = expdot_n[g, slot]
+        # THE EFFECTIVE INCREMENT. `expdot` no longer carries the phase change — the stiff
+        # relaxation pair is withheld from the multistep and applied as the direct increment
+        # `dir` at the step-mean rate — so the increment this step actually applies is the
+        # three-level combination PLUS that increment, and the forward-Euler comparison
+        # correspondingly reads `f_n + dir/ts`. Adding it here is what keeps the census meaning
+        # exactly what it meant: the depletion the integrator applies, measured against the
+        # water present.
+        delta = _ab3_increment(ts, t, f_n, expdot_nm1[g, slot], expdot_nm2[g, slot]) + dir[i]
+        dep_eul = -((ts * f_n) + dir[i]) / rho
+        dep_ab3 = -delta / rho
+        dep_eul > max_eul && (max_eul = dep_eul)
+        dep_ab3 > max_ab3 && (max_ab3 = dep_ab3)
+        dep_ab3 > 1.0 && (n_neg += 1.0)
+        # The MICROPHYSICS' own share of the same increment — the part `_ab3_sink_bound`
+        # governs, and the only fraction the depletion mode can be judged by. Same split: the
+        # `MC_MICRO_*` history now carries only the legs still on the multistep (see the block
+        # that writes it), and the phase change enters at its step-mean rate over one step.
+        dep_mab3 = -(_ab3_increment(ts, t, micro_n[g, channel], micro_nm1[g, channel],
+                                    micro_nm2[g, channel]) + (ts * dir_micro[i])) / rho
+        dep_mab3 > max_mab3 && (max_mab3 = dep_mab3)
+        # Tolerance, not `> 1.0`: a point sitting exactly ON the bound lands at 1 + O(eps)
+        # (the bound divides by 23, so it cannot be exact), and counting those as violations
+        # would report every capped point. 1e-9 is ~1e7 ULP above that and ~1e9 below the
+        # 23/12 the `:euler` mode produces, so it separates the two without ambiguity.
+        dep_mab3 > MICRO_DEPLETION_TOL && (n_mneg += 1.0)
+        # WOULD-HAVE-BOUND detection. The caps are gone from the RHS (see
+        # `qss_condensation_rates`), so this no longer tests "did the limiter clip here"
+        # (bitwise `==` against the array the limiter read) but "would it have": the realized
+        # rate is at or past the AB3-exact bound. That is the measurement of what removing the
+        # caps costs, and the counts are directly comparable with the pre-removal ones, which
+        # were the same population by construction.
+        raw = cap[i]
+        raw > 0.0 && (n_infeas += 1.0)
+        floor_i = min(raw, 0.0)
+        capped = evap[i] <= floor_i
+        capped && (n_cevap += 1.0)
+        if aut !== nothing
+            # `aut > 0` excludes the degenerate no-conversion point: with the budget exhausted
+            # (`avail == 0`) every nonzero conversion would have been clipped, but a zero one
+            # would not have been touched at all.
+            avail = max(Qdot[i] - floor_i, 0.0)
+            if aut[i] > 0.0 && aut[i] >= avail
+                n_cauto += 1.0
+                capped = true
+            end
+        end
+        (!capped && dep_eul > AB3_REAL_LIMIT) && (n_stiff += 1.0)
+    end
+
+    _census_reduce!(st, species, n, n_cevap, n_cauto, max_eul, max_ab3, n_neg, n_stiff,
+                    n_infeas, max_mab3, n_mneg)
+    return nothing
+end
+
+"""Common per-thread accumulation for the depletion census blocks (same layout for all three)."""
+@inline function _census_reduce!(st, species::Int64, n, n_cevap, n_cauto, max_eul, max_ab3,
+                                 n_neg, n_stiff, n_infeas, max_mab3, n_mneg)
+    tid = Threads.threadid()
+    @inbounds begin
+        st[species,     tid] += n
+        st[species + 1, tid] += n_cevap
+        st[species + 2, tid] += n_cauto
+        st[species + 3, tid] = max(st[species + 3, tid], max_eul)
+        st[species + 4, tid] = max(st[species + 4, tid], max_ab3)
+        st[species + 5, tid] += n_neg
+        st[species + 6, tid] += n_stiff
+        st[species + 7, tid] += n_infeas
+        st[species + 8, tid] = max(st[species + 8, tid], max_mab3)
+        st[species + 9, tid] += n_mneg
+    end
+    return nothing
+end
+
+"""
+    _vapor_census!(mtile, colstart, t, rho_v, Qdot, Qdot_r, cap, slot)
+
+The vapor's pass for [`water_depletion_probe!`](@ref), in the same layout as
+[`_depletion_census!`](@ref)'s two condensate blocks.
+
+The vapor is a PROGNOSTIC SLOT, so its three time levels are read straight out of `expdot`
+like every other species'. That replaced an assembly from four other slots,
+`f_v = f_3 - f_2 - f_8 - f_9`, which was exact for the liquid-only set (all four use the same
+advective product-rule form with the same pointwise divergence, both `-v·∇ρ` and `-ρ∇·v` are
+linear in ρ, the sedimentation divergence cancels between slots 3 and 8 and `AUTO_COLL`
+between 8 and 9) but had NO ice term — so with ice registered it silently attributed the
+deposition sink to nothing at all. Reading the slot fixes that at the same time as it
+simplifies: there is one tendency, and it is the one the integrator applied.
+
+What this census will NOT see is anything applied outside `expdot`: the acoustic solve moves
+`rho_t` and `rho_d` but no water slot, and the positivity limiter moves the condensates but
+not the vapor. (Under the derived water anchor the acoustic solve slaves every water slot
+when `options[:si_water_slots] ≠ :none`; the floor is refused.)
+"""
+function _vapor_census!(mtile::ModelTile, colstart::Int64, t::Int64, rho_v, Qdot, Qdot_r, cap,
+                        slot::Int64, dir, dir_micro)
+
+    st = mtile.mc_water_stats
+    ts = mtile.model.ts
+    e_n = mtile.expdot_n
+    e_1 = mtile.expdot_nm1
+    e_2 = mtile.expdot_nm2
+    AB3_REAL_LIMIT = 0.545
+
+    micro_n = mtile.mc_micro_n
+    micro_nm1 = mtile.mc_micro_nm1
+    micro_nm2 = mtile.mc_micro_nm2
+
+    n = 0.0; n_cap = 0.0; n_neg = 0.0; n_stiff = 0.0; n_infeas = 0.0; n_mneg = 0.0
+    max_eul = 0.0; max_ab3 = 0.0; max_mab3 = 0.0
+    @inbounds for i in eachindex(rho_v)
+        rho = rho_v[i]
+        rho > 0.0 || continue
+        n += 1.0
+        g = colstart + i - 1
+        f_n = e_n[g, slot]
+        f_1 = e_1[g, slot]
+        f_2 = e_2[g, slot]
+        # The effective increment, phase change included — see the note in
+        # `_depletion_census!`. For the vapor the WHOLE microphysical sink is now direct: every
+        # term of `VAPOR_SRC` is a relaxation of `Q_ss`, so the `MC_MICRO_V` history is empty
+        # and `dir_micro` carries all of it.
+        delta = _ab3_increment(ts, t, f_n, f_1, f_2) + dir[i]
+        dep_eul = -((ts * f_n) + dir[i]) / rho
+        dep_ab3 = -delta / rho
+        dep_eul > max_eul && (max_eul = dep_eul)
+        dep_ab3 > max_ab3 && (max_ab3 = dep_ab3)
+        dep_ab3 > 1.0 && (n_neg += 1.0)
+        dep_mab3 = -(_ab3_increment(ts, t, micro_n[g, MC_MICRO_V], micro_nm1[g, MC_MICRO_V],
+                                    micro_nm2[g, MC_MICRO_V]) + (ts * dir_micro[i])) / rho
+        dep_mab3 > max_mab3 && (max_mab3 = dep_mab3)
+        # Tolerance, not `> 1.0`: a point sitting exactly ON the AB3 bound lands at
+        # 1 + O(eps) (the bound divides by 23, so it cannot be exact). See
+        # `MICRO_DEPLETION_TOL`.
+        dep_mab3 > MICRO_DEPLETION_TOL && (n_mneg += 1.0)
+        raw = cap[i]
+        raw > 0.0 && (n_infeas += 1.0)
+        # The vapor's ceiling is the negated bound; this counts where the REMOVED ceiling
+        # would have clipped the combined condensation.
+        ceil_i = -min(raw, 0.0)
+        capped = ceil_i > 0.0 && (Qdot[i] + Qdot_r[i]) >= ceil_i
+        capped && (n_cap += 1.0)
+        (!capped && dep_eul > AB3_REAL_LIMIT) && (n_stiff += 1.0)
+    end
+
+    _census_reduce!(st, MC_DEPLETION_V, n, n_cap, 0.0, max_eul, max_ab3, n_neg, n_stiff,
+                    n_infeas, max_mab3, n_mneg)
+    return nothing
+end
+
+"""
+    mc_stiffness_census!(st, ts, invtau_c, invtau_r)
+
+`st` is the census matrix `mtile.mc_water_stats` (a tile method forwards to this one).
+Accumulate the per-channel STIFFNESS of the supersaturation relaxation over this column:
+the running maximum of `ts·(1/τ)` and the number of gridpoints where it exceeds 1.
+
+This is what stands in place of the depletion caps. Those made the rate — hence the converged
+solution — a function of `ts`; see [`qss_condensation_rates`](@ref) and
+reference/Scythe_moist_compressible.tex §"Departures from the ISHMAEL implementation" (b).
+Under-resolution of a stiff relaxation is now REPORTED here instead of being absorbed there.
+
+`ts/τ > 1` is the honest threshold: the relaxation removes more than the whole supersaturation
+over a step, so the fast dynamics is not resolved in time.
+
+**What that reading MEANS depends on which channel it is on**, and the answer changed when the
+`Q_ss` pair moved off the multistep (TeX §Departures (b), amended). For the cloud, rain and ice
+DEPOSITION channels — the ones that relax the shared `Q_ss` — the propagator is exact at any
+`ts/τ` and lands on the quasi-steady state of Eq. wbf_qs as `ts/τ → ∞`, so this is no longer a
+stability watchdog for them: a large reading marks air in which the quasi-steady limit is being
+taken inside a single step, correctly but unresolved in time. For the NUCLEATION relaxations
+(`τ_hf`, `τ_act`, `τ_vc`), which remain on the multistep, it keeps its original meaning as a
+stability warning. (The integrator's own real-axis limit for the multistep channels is tighter
+still — AB3 loses absolute stability at 0.545 — and `:d_*_stiff` in the depletion census counts
+against that one. Both are measured; neither is enforced.)
+
+Runs on EVERY step of EVERY run, not behind a trace flag: the once-per-run warning in
+[`mc_stiffness_trace`](@ref) is unconditional and has to have something to read. The cost is
+two comparisons per gridpoint per channel and no allocation — the accumulators are rows of
+the preallocated `mtile.mc_water_stats`, indexed by `threadid()` under the same
+`@threads :static` ownership rule as every other probe in this file.
+
+Sized by `MC_STIFF_CHANNELS`, so the ice channels are added by widening that constant rather
+than by editing this function. NEVER touches a rate.
+"""
+@inline function mc_stiffness_census!(st::Matrix{Float64}, ts::Float64, invtau_c, invtau_r)
+
+    size(st, 2) == 0 && return nothing
+    tid = Threads.threadid()
+    _stiffness_channel!(st, tid, MC_STIFF_C, ts, invtau_c)
+    _stiffness_channel!(st, tid, MC_STIFF_R, ts, invtau_r)
+    return nothing
+end
+
+# The tile form, kept for direct callers (test_moist_compressible): the census matrix is the
+# tile's `mc_water_stats`. The driver calls the array method from `_warm_micro_stage!`.
+@inline mc_stiffness_census!(mtile::ModelTile, ts::Float64, invtau_c, invtau_r) =
+    mc_stiffness_census!(mtile.mc_water_stats, ts, invtau_c, invtau_r)
+
+"""
+    mc_stiffness_census!(st, ts, invtau_i1, invtau_i2, invtau_i3)
+
+The ICE arm of [`mc_stiffness_census!`](@ref): the three deposition relaxations `1/τ_{i,k}` of
+TeX Eq. tau_ice, measured on exactly the rates the step used, with the same `ts/τ` yardstick
+and into the same block (`MC_STIFF_I1..I3`).
+
+`st` is the census matrix `mtile.mc_water_stats` (an array method: it is called from
+`_ice_stage!`, which never takes the tile). A SEPARATE method rather than three more arguments
+to the liquid one, so an ice-free run does
+not pay three passes over three columns it would only find zeros in — and, more importantly,
+so those three channels report an exact zero rather than a zero that had to be computed.
+"""
+@inline function mc_stiffness_census!(st::Matrix{Float64}, ts::Float64,
+                                      invtau_i1, invtau_i2, invtau_i3)
+
+    size(st, 2) == 0 && return nothing
+    tid = Threads.threadid()
+    _stiffness_channel!(st, tid, MC_STIFF_I1, ts, invtau_i1)
+    _stiffness_channel!(st, tid, MC_STIFF_I2, ts, invtau_i2)
+    _stiffness_channel!(st, tid, MC_STIFF_I3, ts, invtau_i3)
+    return nothing
+end
+
+"""
+One channel's pass for [`mc_stiffness_census!`](@ref): reduce the column into thread-local
+scalars first, then touch the shared matrix twice. Split out so each call specializes on its
+own array type, as [`_depletion_census!`](@ref) is.
+"""
+@inline function _stiffness_channel!(st, tid::Int64, channel::Int64, ts::Float64, invtau)
+
+    mx = 0.0
+    n = 0.0
+    @inbounds for i in eachindex(invtau)
+        x = ts * invtau[i]
+        x > mx && (mx = x)
+        x > 1.0 && (n += 1.0)
+    end
+    row = MC_STIFF_FIRST + (MC_STIFF_N * (channel - 1))
+    @inbounds begin
+        st[row, tid] = max(st[row, tid], mx)
+        st[row + 1, tid] += n
+    end
+    return nothing
+end
+
+"""
+    mc_donor_census!(st, tid, donor, realized, reservoir, floor)
+
+One donor's pass for the depletion census: record the fraction of the reservoir this step
+actually removes, and count the points where it exceeds one. Reads the rates and the state;
+changes neither. See [`MC_DONOR_QC`](@ref) for what the block means and why it is separate from
+the stiffness census.
+"""
+@inline function mc_donor_census!(st, tid::Int64, donor::Int64, realized::Float64,
+                                  reservoir::Float64, floor_::Float64, dt::Float64)
+    reservoir > floor_ || return nothing
+    x = realized * dt / reservoir
+    row = MC_DONOR_FIRST + (MC_DONOR_N * (donor - 1))
+    @inbounds begin
+        x > st[row, tid] && (st[row, tid] = x)
+        x > 1.0 && (st[row + 1, tid] += 1.0)
+    end
+    return nothing
+end
+
+"""
+    mc_attr_census!(st, tid, channel, x, count_it)
+
+One channel's write for the ATTRIBUTION census: raise the channel's run-max to `x`, and add a
+gridpoint-step to its count when `count_it`. See [`MC_ATTR_QR_HOM`](@ref) for what the block
+means and why the count is a separate argument rather than `x > 1`.
+
+The two are decoupled BECAUSE the block A channels are counted by ARGMAX, not by threshold:
+the count records which leg carried the largest debit at a breach point, so the five counts
+partition the `MC_DONOR_QR` count, while every channel still reports the run-max of its own
+share. `MC_ATTR_QR_MELT` (a credit) passes `false` always, and `MC_ATTR_AGG1_SAT` passes the
+cap-binding test rather than a depletion test.
+
+Allocation-free and loop-free: it runs once per channel per gridpoint inside
+`mc_ice_sources!`'s hot loop, which `test_allocations.jl` holds at zero.
+"""
+@inline function mc_attr_census!(st, tid::Int64, channel::Int64, x::Float64,
+                                 count_it::Bool)
+    row = MC_ATTR_FIRST + (MC_ATTR_N * (channel - 1))
+    @inbounds begin
+        x > st[row, tid] && (st[row, tid] = x)
+        count_it && (st[row + 1, tid] += 1.0)
+    end
+    return nothing
+end
+
+"""
+    ice_population_rate(rho_ik, n_ik, rho_a, tau_pop) -> (rate, rho_empty)
+
+The NUMBER-LESS MASS of one ice species at one gridpoint and the rate at which it is returned
+to a representation the physics can act on — the fourth and last tier of the reconciliation
+chain (TeX §"Reconciliation of the population", Eq. class `ρ^∅_{i,k}/τ_pop`).
+
+The defect this measures is the exact complement of the POPULATION GATE in
+[`mc_ice_sources!`](@ref). That gate says a species has a population only where its CARRIED
+number is positive, and where it does not, no rate acts: not deposition, not riming, not
+melting, and no fall speed, because a fall speed is a property of particles. The gate is
+right — it is what stopped the manufactured populations of the transport-decorrelated state
+from growing, riming and falling at speeds the mass never earned — and it has one consequence
+the same measurement records: mass with no number is also exempt from every device that could
+REMOVE it. Measured on the full-resolution O01 ice column, the ice below the melting level is
+number-less at 97–99.9% by mass over the final half hour, the largest concentrations sitting
+at the surface at 300 K; the timestep-limited quick configuration reproduces it at 99%.
+
+The anchor share of that mass was measured to be exactly one throughout, so this is NOT the
+phantom the (since deleted, Stage 5 of the ρ_t retirement) ice-anchor reconciliation removed:
+it is water the equations own, in a phase representation the equations cannot act on. Hence a
+separate tier, reading the RAW carried moments.
+
+    ρ^∅_{i,k} = max(ρ_{i,k}, 0)   where   ρ_{i,k} > QSMALL·ρ_a  and  n_{i,k} ≤ 0
+              = 0                 otherwise
+
+The mass test is the mixing-ratio one the gate itself uses (`q_k > ISHMAEL_QSMALL`), written
+in densities so no division is needed; the TeX's `ρ_{i,k} > 0` is sharpened to it for exactly
+that reason, and the difference is 1e-12 kg/kg of round-off either way.
+
+Both branches of the transfer are `Δt`-free (a rate, not a state repair; the removed or
+seeded fraction per step is bounded by `Δt/τ_pop ≪ 1`), one-sided, and exactly `(0.0, 0.0)`
+wherever every species with mass carries number — which is every gridpoint of the warm and
+dry paths and the interior of every healthy ice cloud, so those paths are untouched bitwise.
+"""
+@inline function ice_population_rate(rho_ik::Float64, n_ik::Float64, rho_a::Float64,
+                                     tau_pop::Float64)
+    (rho_ik > ISHMAEL_QSMALL * rho_a && n_ik <= 0.0) || return (0.0, 0.0)
+    rho_empty = max(rho_ik, 0.0)
+    return (rho_empty / tau_pop, rho_empty)
+end
+
+"""
+    _ice_population_seed_large(q, k) -> (n, a, c)
+
+The LARGEST-CRYSTAL, FEWEST-PARTICLE population the scheme admits for a species-`k` mass
+mixing ratio `q` [kg/kg]: the number and the two volume moments (`# kg⁻¹`, `m³ kg⁻¹`,
+`m³ kg⁻¹`) [`ishmael_var_check`](@ref) re-diagnoses when the carried number is at its floor
+and the mass is all that is known.
+
+This is the second of the two seedings [`_ice_population_reconcile!`](@ref) can give
+number-less ice below `T_0` (`options[:ice_population_seed] = :large`), and it is ISHMAEL's
+OWN answer to the question: the port never carries a `(q, n)` pair the moment checker would
+reject, so a species that arrives with mass and no number is one `var_check` call away from a
+realizable population, and this is that call. Nothing is re-derived here — the body is
+[`_ice_effective`](@ref) at the floors, which is the Fortran host loop's incoming-moment
+initialization (module_mp_jensen_ishmael.F lines 1013-1032) followed by `var_check` (lines
+3101-3196) — so the seeded `(n, a, c)` is EXACTLY the state the next step diagnoses, and the
+population is a FIXED POINT of the checker rather than something it has to repair.
+
+# The rule the floors produce, and why it is the large end
+
+At `n = QNSMALL`, `a = c = QASMALL` the incoming axes are the 2 μm sphere, so `δ* = 1` exactly
+and the species is spherical. `var_check` then walks its clamps in order:
+
+  * the bulk density `ρ̄ = q Γ(ν) / (n α_v a_n^{2+δ*} Γ(ν+2+δ*))` is enormous at that number
+    and is CLAMPED to the species ceiling (lines 3131-3154) — `RHOI = 920 kg/m³` for the
+    planar and columnar species, [`ISHMAEL_RHO_AGG`](@ref) `= 50 kg/m³` for the aggregates.
+    That ceiling is the ONLY place the three species differ, and it is the whole of the
+    "different density/axis relations" the aggregate block asserts by hand;
+  * the characteristic axis is re-derived from the mass at that density and, for any mass
+    past `q ≈ 5.8e-11` kg/kg (planar/columnar; `≈ 3.1e-12` for the lighter aggregates),
+    exceeds the 1 mm cap, so the LARGE-ICE LIMIT fires (lines 3171-3193) and returns
+
+        a_n = c_n = 1 mm,   n = q Γ(ν) / ((4/3)π ρ̄ a_n³ Γ(ν+3)),   a_i = c_i = n a_n³
+
+    i.e. one crystal per `m_large = (4/3)π ρ̄ (1 mm)³ Γ(ν+3)/Γ(ν)` — 4.62e-4 kg for the
+    planar and columnar species, 2.51e-5 kg for the aggregates, against
+    [`ISHMAEL_M_MIN`](@ref) `= 3.08e-14 kg` for the 2 μm seeding: a factor of 1.5e10 and
+    8.2e8 fewer particles for the same mass;
+  * below that mass the large-ice cap does not bind and the `QNSMALL` floor is itself the
+    answer — the same statement, the FEWEST particles the scheme admits for the mass, written
+    by whichever clamp is the binding one.
+
+The aggregate's OTHER axis rules — the 0.2 aspect ratio and the 0.5 mm implicit-breakup cap
+of the "Final check on aggregates" block (lines 2600-2639) — are deliberately NOT applied.
+They are that block's update of an EXISTING characteristic axis, they need an incoming `a_n`
+this function does not have, and the Fortran closes the block with `var_check` (line 2644),
+which is the authority the seed has to satisfy and is what is called here.
+
+`(0.0, 0.0, 0.0)` for a mass at or below `QSMALL`: `var_check` divides by the mass and cannot
+be run on a species that has none.
+"""
+@inline function _ice_population_seed_large(q::Float64, k::Int)
+
+    q > ISHMAEL_QSMALL || return (0.0, 0.0, 0.0)
+    eff = _ice_effective(q, 0.0, 0.0, 0.0, k,
+                         k == 3 ? ISHMAEL_RHO_AGG : ISHMAEL_RHOI)
+    return (eff.ni, eff.ai, eff.ci)
+end
+
+"""
+    _ice_live_span(Qk, Nk, rho_d, idx) -> (first, last)
+
+The first and last index of `idx` at which species `k` is LIVE — mass past the population
+gate's own threshold and a positive carried number, on the RAW slots `Qk`/`Nk`, which is
+exactly the complement of [`ice_population_rate`](@ref)'s support test.
+
+One O(n) sweep per species per column, computed once by [`_ice_population_reconcile!`](@ref)
+before its gridpoint loop, and it is what makes the `:local` seeding's nearest-live search
+cheap. `(0, 0)` when the species is live NOWHERE in the column — the pure-dead column, which
+the search then never enters.
+"""
+@inline function _ice_live_span(Qk, Nk, rho_d, idx)
+
+    first = 0
+    last = 0
+    @inbounds for j in idx
+        (Qk[j] > ISHMAEL_QSMALL * rho_d[j] && Nk[j] > 0.0) || continue
+        first == 0 && (first = j)
+        last = j
+    end
+    return (first, last)
+end
+
+"""
+    _ice_live_neighbour(Qk, Nk, rho_d, i, first, last) -> j
+
+The index of the NEAREST gridpoint to `i` IN THE SAME COLUMN at which species `k` is live,
+or `0` when the species is live nowhere in it. `first`/`last` are that species'
+[`_ice_live_span`](@ref).
+
+The search walks outward from `i` in both directions along the column index — which is the
+VERTICAL index, because the physics is called one column at a time (`advance_column` strides
+`colstart:colend` by `kDim`, and every `mc_scratch` slot is one `kDim` column of that call).
+Ties go to the LOWER index, arbitrarily but deterministically: the two neighbours of a
+one-point negative lobe are the same population on either side of it, so there is nothing to
+choose between them.
+
+Cost. The span bounds it on three sides: a point below `first` or above `last` is answered
+without a walk at all, and between them the walk terminates at the first live point, so the
+work is the local gap between live points and not the column length. A column in which the
+species has NO live point costs the span sweep alone. The pathological O(n) walk needs a
+dead point in the interior of a gap the length of the column, which is a live population at
+each end and nothing in between.
+"""
+@inline function _ice_live_neighbour(Qk, Nk, rho_d, i::Int, first::Int, last::Int)
+
+    first == 0 && return 0
+    i <= first && return first
+    i >= last && return last
+    @inbounds for d in 1:max(i - first, last - i)
+        j = i - d
+        if j >= first && Qk[j] > ISHMAEL_QSMALL * rho_d[j] && Nk[j] > 0.0
+            return j
+        end
+        j = i + d
+        if j <= last && Qk[j] > ISHMAEL_QSMALL * rho_d[j] && Nk[j] > 0.0
+            return j
+        end
+    end
+    return 0                      # unreachable: `first < i < last` guarantees a hit
+end
+
+"""
+    _ice_population_seed_local(q, m_nb, a_nb, c_nb, k) -> (n, a, c)
+
+The population a species-`k` mass mixing ratio `q` [kg/kg] has when its crystals are THE
+CRYSTALS OF ITS OWN NEIGHBOURS: `m_nb`, `a_nb`, `c_nb` are the per-crystal mass [kg] and the
+two per-crystal volume moments [m³] of the same species at the nearest gridpoint in the
+column where it is live (`ρ_{i,k}/n_{i,k}`, `a_{i,k}/n_{i,k}`, `c_{i,k}/n_{i,k}` on the raw
+slots), and the seeded population carries the same mass, habit and bulk density per particle.
+
+This is the third of the three seedings [`_ice_population_reconcile!`](@ref) can give
+number-less ice below `T_0` (`options[:ice_population_seed] = :local`), and the argument for
+it is a measurement of what the dead mass IS. Number-less mass is the NEGATIVE LOBE of the
+number moment's spline ringing at cloud edges and gradients — the mass-without-number face of
+the transport-decorrelation family whose other face is the 3e13 /L number spikes sitting
+right beside it. The crystals that lobe lost are the crystals next door, so the per-crystal
+state next door is the seed, and neither of the two ends the other seedings pick is: `:min`
+puts ~1e12 2 μm crystals/m³ on it and thins the cloud threefold, `:large` puts one 1 mm
+crystal per 4.6e-4 kg on it, too sparse to survive the number field's own ringing.
+
+# The clamps, and why the seed is realizable
+
+`m_nb` is read off RAW transported slots, so it is not itself guaranteed admissible — the
+same ringing that emptied this point can have corrupted the ratio at that one. It is clamped
+to `[ISHMAEL_M_MIN, ISHMAEL_M_LARGE[k]]`: never below the 2 μm crystal, never above the
+1 mm sphere `:large` would seed. The volume moments are scaled by the SAME factor, which is
+the isotropic rescale — per-crystal volume is linear in per-crystal mass at fixed bulk
+density — so a bound clamp changes the SIZE of the inherited crystal and neither its bulk
+density nor its aspect ratio.
+
+`ISHMAEL_M_MIN` is the mass of ONE 2 μm sphere, and it is the LOOSER of the two limits at
+that end: `var_check`'s own small-ice floor is on the distribution's mean radius, so the
+smallest per-crystal mass it admits at `RHOI` is `M_MIN·Γ(ν+3)/Γ(ν)`, 120 times larger. A
+`:local` seed at the lower clamp therefore comes out at the checker's floor rather than at
+`:min`'s number — a realizable population where `:min` seeds `ρ^∅/m_min` and leaves the next
+read to repair it. That is the clamps' division of labour: they bound the RAW ratio into
+something sane, and the checker has the last word on what is representable.
+
+The triple is then put through [`_ice_effective`](@ref), exactly as
+[`_ice_population_seed_large`](@ref) is, so what is seeded is what `var_check` will diagnose
+from it and the population is a FIXED POINT of the checker rather than something it has to
+repair. The default `rhomax` is used for ALL three species — unlike `:large`, which hands the
+aggregate its own 50 kg/m³ ceiling — because the neighbour's own state came through the
+default-ceiling path in [`mc_ice_sources!`](@ref), and re-clamping it here would change the
+habit this seeding exists to inherit. Where the mass clamp does not bind and the neighbour is
+itself a checked population, `var_check` is the identity on the seed to a few parts in 1e11
+(the port's truncated `^0.333333333333` cube roots), so the seeded per-crystal state IS the
+neighbour's.
+
+`(0.0, 0.0, 0.0)` for a mass at or below `QSMALL`, on `_ice_population_seed_large`'s rule and
+for its reason.
+"""
+@inline function _ice_population_seed_local(q::Float64, m_nb::Float64, a_nb::Float64,
+                                            c_nb::Float64, k::Int)
+
+    (q > ISHMAEL_QSMALL && m_nb > 0.0) || return (0.0, 0.0, 0.0)
+    m_loc = clamp(m_nb, ISHMAEL_M_MIN, @inbounds ISHMAEL_M_LARGE[k])
+    # The isotropic rescale under a bound clamp: per-crystal volume is linear in per-crystal
+    # mass at fixed bulk density, so the two volume moments carry the same factor the mass
+    # does and the crystal changes size without changing density or aspect ratio.
+    vscale = m_loc / m_nb
+    n = q / m_loc
+    eff = _ice_effective(q, n, (n * vscale) * a_nb, (n * vscale) * c_nb, k)
+    return (eff.ni, eff.ai, eff.ci)
+end
+
+"""
+    _ice_population_reconcile!(S, st, tid, Tk, rho_d, tau_pop, apply, ts, seed = :min)
+
+One column's pass of the POPULATION reconciliation: measure the number-less ice mass of every
+species at every gridpoint into the `MC_POP_*` census, and — when `apply` — return it to the
+representation the environment dictates.
+
+Runs immediately after [`mc_ice_sources!`](@ref), because the process sources are assembled,
+nothing has read them yet, and the twelve `SRC_i*` accumulators plus the three liquid
+back-reactions are all this device writes. A separate pass rather than a block inside
+`mc_ice_sources!`'s gridpoint loop, on three grounds: it reads the RAW slots (the TeX's
+division of labour puts the reconciliation sources on the raw side with the transport); it is
+a reconciliation and not a rate, so its off-switch, its census and its `τ` do not belong inside
+the ISHMAEL port; and the dead species whose
+slots it writes are exactly the ones `_ice_empty_rates()` fills with hard zeros, so a pass
+that only ever ADDS to those zeros cannot disturb the bitwise inertness gates.
+
+# The two branches, and why the environment picks between them
+
+ABOVE `T_0` the water is liquid. The mass transfers to the RAIN with `L_f` absorbed exactly
+as a melt would: `SRC_i<k>q` loses `ρ^∅/τ_pop`, `ICE_R` gains it with the melt legs' own sign
+convention (`ice_r` is credited `−MLQ` there, and `MLQ ≤ 0`), and `FRZ_NET ≡ −(ICE_C + ICE_R)`
+therefore falls by the same number — so the transfer appears in `dT_nc`/`dp_nc` as a cooling
+of `L_f` per unit mass, which is what melting ice is. Mass and energy close by construction
+because the identity is maintained as a difference, not accumulated independently.
+
+The rain NUMBER has no melt analogue to copy: `MLN` maps melted crystals one-to-one onto
+drops, and here there are no crystals. The rule the two-moment rain closure already uses for
+a mass source that arrives with no number of its own is AUTOCONVERSION's
+(`rain_autoconversion_2m`, `Ṅ = Q̇/RAIN_2M_M_AUTO`), so that is what is mirrored: one 25 μm
+drop per [`RAIN_2M_M_AUTO`](@ref) of returned mass, seeded into `ICE_NR` — the same slot,
+sign and units the melt credit uses. The a/c VOLUME moments of the dead species are relaxed
+by the SAME fraction `1/τ_pop` (one shared factor across the moments), so the species leaves in one
+piece; its number is already `≤ 0` and `max(n, 0) = 0` gives it nothing to relax.
+
+BELOW `T_0` the water is ice that has lost its crystals to the transport, and it is given
+them back — always as number alone, at one of TWO crystals. NO mass moves either way, no
+latent heat is released, and nothing enters `λ` or `N`: this branch creates number and
+nothing else.
+
+`options[:ice_population_seed]` picks the crystal. `:min` and `:large` are the two ends of
+the same statement about the dead mass; `:local` is the third answer, and it is the one the
+DEFECT rather than the mass argues for.
+
+`:min` — the SMALLEST crystal the scheme resolves,
+
+    ṅ_{i,k} = ρ^∅_{i,k} / (m_min τ_pop),   m_min = ISHMAEL_M_MIN (the 2 μm sphere)
+
+with the volume moments from [`_ice_nucleation_volume`](@ref) at that mass/number pair, so
+`a` and `c` describe the 2 μm spheres every nucleation channel of the port already seeds. It
+is the source-side statement of the principle the `min(n/τ, ṁ/m_min)` bound in
+[`_ice_homogeneous_rates`](@ref) states at the nucleation channels — no ice number may be
+created below the minimum resolved crystal — and it is the FASTEST RESPONSE: smallest
+particles, slowest fall, largest surface per unit mass, so the population sublimates within
+seconds if the air is subsaturated and grows if it is not.
+
+`:large` — the particles the dead mass ACTUALLY IS. Number-less mass is what SIZE SORTING
+leaves behind: the mass-weighted fall speed outran the number-weighted one, so what is
+sitting there is the big end of a distribution whose number has gone somewhere else. Seeding
+it as 2 μm spheres puts ~1e12 crystals/m³ on 6e-3 kg/m³ of it, a deposition surface stiff
+enough to sublimate inside one step (measured `ts/τ` 31 on ice1, 0.36 → 9.7 on ice3) and to
+thin the ice cloud threefold. [`_ice_population_seed_large`](@ref) instead asks `var_check`
+what population that mass has when its number is at the floor — ISHMAEL's own re-diagnosis,
+the 1 mm large-ice limit at the species' bulk density — and seeds THAT, `ṅ = ρ^∅/(m_large
+τ_pop)` with `m_large = ρ^∅/n_large` and the `a`/`c` moments carried along at the same
+per-crystal size, so the seeded triple is a fixed point of the checker.
+
+`:local` — THE NEIGHBOURS' CRYSTALS. Both of the above read the dead mass and ask what
+particles a mass of that size is; neither reads the DEFECT. The defect is the negative lobe
+of the number moment's spline ringing at cloud edges and gradients — the mass-without-number
+face of the transport-decorrelation family whose other face is the 3e13 /L number spikes
+sitting right next to it — so the crystals this point has lost are not a size to be derived
+from its mass at all: they are the crystals of the same species one gridpoint away. The seed
+is therefore the per-crystal state of the NEAREST LIVE gridpoint of that species IN THIS
+COLUMN ([`_ice_live_neighbour`](@ref)), `ṅ = ρ^∅/(m_loc τ_pop)` with `m_loc = ρ_{i,k}/n_{i,k}`
+there, and the `a`/`c` moments at that neighbour's own per-crystal axes so the seeded
+population has its habit ([`_ice_population_seed_local`](@ref), which clamps `m_loc` into
+`[ISHMAEL_M_MIN, ISHMAEL_M_LARGE[k]]` and passes the triple through `var_check`). Where the
+species is live NOWHERE in the column the seeding falls back to `:min`: that is the pure-dead
+case, there is no habit anywhere to inherit, and the fastest-responding population is the
+right one for a column that has to resolve itself from its own thermodynamics.
+
+Whichever of the three is chosen, the moments are realizable again and the rates, the
+consistency source and the sedimentation own the species from the next step on.
+
+The DEFAULT is `:local`, and it is chosen BY MEASUREMENT and not by argument
+(reference/FINDINGS_ISHMAEL_S8S9.md §§5f-5j, quick production, 3600 s). `:min` reconciles the
+dead mass (whole-cloud dead fraction 70% → 3%) but pays for it with a deposition surface stiff
+enough to sublimate the seeded population inside a step, and the cloud it leaves is a third of
+the unreconciled one (IWP 3.43 → 1.07, ice top 18.8 → 15.4 km, 6/11 windows). `:large` seeds one
+crystal per 4.6e-4 kg — 5.4e5 /m³ over the whole run against 4.5e12 for `:min` — which does not
+survive the number field's own ringing: the mass is dead again the next step and the cloud
+stays 72% dead, its windows passing only because nothing was reconciled. `:local` keeps the
+cloud at its unreconciled magnitude (IWP 3.30, ice top 19.2 km) and reconciles it: with the
+minimum-crystal bound and the rain population gate in place it reads 2.7% dead mass at 3600 s,
+9/11 windows, and `max n_i1` 1.7e5 /L against 9.4e13 /L before Stage 3 (§5j). Its earlier
+re-glaciation defect (69% dead at 3600 s with species 1's number lost through the glaciated
+hour) was the Bigg number pump, not the seeding, and is gone with it. `:min` and `:large`
+remain selectable and unchanged.
+
+`apply = false` (`options[:ice_population_source] = false`, and also
+`options[:condensation] = false`) keeps the census and drops both transfers, reproducing the
+unreconciled tree bitwise while still reporting the defect.
+"""
+function _ice_population_reconcile!(S, st, tid::Int64, Tk, rho_d,
+                                    tau_pop::Float64, apply::Bool, ts::Float64,
+                                    seed::Symbol = :min)
+
+    itau = 1.0 / tau_pop
+    Q = (S.i1q, S.i2q, S.i3q)
+    N = (S.i1n, S.i2n, S.i3n)
+    A = (S.i1a, S.i2a, S.i3a)
+    C = (S.i1c, S.i2c, S.i3c)
+    SRCq = (S.SRC_i1q, S.SRC_i2q, S.SRC_i3q)
+    SRCn = (S.SRC_i1n, S.SRC_i2n, S.SRC_i3n)
+    SRCa = (S.SRC_i1a, S.SRC_i2a, S.SRC_i3a)
+    SRCc = (S.SRC_i1c, S.SRC_i2c, S.SRC_i3c)
+    seed_large = seed === :large
+    seed_local = seed === :local
+    # The `:local` seeding's LIVE SPANS, one sweep per species over this column, taken before
+    # the gridpoint loop because every seeded point reads them and none of them writes the
+    # raw slots. `(0, 0)` per species otherwise: the tuple is built unconditionally so the
+    # loop below stays one shape, and the branch that reads it is the one `:local` enters.
+    idx = eachindex(Tk)
+    spans = seed_local ?
+        (_ice_live_span(Q[1], N[1], rho_d, idx), _ice_live_span(Q[2], N[2], rho_d, idx),
+         _ice_live_span(Q[3], N[3], rho_d, idx)) :
+        ((0, 0), (0, 0), (0, 0))
+    worst = 0.0
+    pts = 0.0
+    to_rain = 0.0
+    seeded = 0.0
+    @inbounds for i in eachindex(Tk)
+        warm = Tk[i] > T_0
+        rhoair = rho_d[i]
+        for k in 1:3
+            rate, rho_empty = ice_population_rate(Q[k][i], N[k][i], rhoair, tau_pop)
+            rho_empty > 0.0 || continue
+            rho_empty > worst && (worst = rho_empty)
+            pts += 1.0
+            apply || continue
+            if warm
+                # The species leaves as rain, one shared factor across the moments it has.
+                SRCq[k][i] -= rate
+                SRCa[k][i] -= itau * max(A[k][i], 0.0)
+                SRCc[k][i] -= itau * max(C[k][i], 0.0)
+                nseed = rate / RAIN_2M_M_AUTO
+                S.ICE_R[i] += rate
+                S.ICE_NR[i] += nseed
+                # `FRZ_NET ≡ −(ICE_C + ICE_R)`, maintained as the difference it is defined
+                # to be: the ice→rain transfer ABSORBS L_f, so the freeze net falls.
+                S.FRZ_NET[i] -= rate
+                to_rain += rate * ts
+            else
+                # Number only: no mass moves, so no latent heat and nothing in λ or N.
+                nb = 0
+                if seed_local
+                    # The crystals next door: the nearest gridpoint of THIS column at which
+                    # this species still has a population. `nb == 0` is the pure-dead column
+                    # and falls through to the `:min` branch below.
+                    sp = @inbounds spans[k]
+                    nb = _ice_live_neighbour(Q[k], N[k], rho_d, i, sp[1], sp[2])
+                end
+                if seed_large || nb > 0
+                    # `:large` — the size-sorted particles the dead mass IS: `var_check`'s own
+                    # re-diagnosis of it at the floor number. `:local` — the same mass at the
+                    # per-crystal mass, habit and bulk density of the live neighbour. Both
+                    # rules are non-linear in the mass (the large-ice cap on one, the clamps
+                    # and the checker on the other), so the MIXING RATIO is formed and the
+                    # answer converted back rather than the rule rescaled.
+                    q_empty = rho_empty / rhoair
+                    if seed_large
+                        nl, al, cl = _ice_population_seed_large(q_empty, k)
+                    else
+                        nnb = @inbounds N[k][nb]
+                        nl, al, cl = _ice_population_seed_local(q_empty,
+                                         (@inbounds Q[k][nb]) / nnb, (@inbounds A[k][nb]) / nnb,
+                                         (@inbounds C[k][nb]) / nnb, k)
+                    end
+                    nseed = (nl * rhoair) * itau
+                    aseed = (al * rhoair) * itau
+                    cseed = (cl * rhoair) * itau
+                else
+                    nseed = rate / ISHMAEL_M_MIN
+                    aseed = _ice_nucleation_volume(rate, nseed)
+                    cseed = aseed
+                end
+                SRCn[k][i] += nseed
+                SRCa[k][i] += aseed
+                SRCc[k][i] += cseed
+                seeded += nseed * ts
+            end
+        end
+    end
+    if size(st, 2) > 0
+        @inbounds begin
+            worst > st[MC_POP_MAX, tid] && (st[MC_POP_MAX, tid] = worst)
+            st[MC_POP_PTS, tid] += pts
+            st[MC_POP_RAIN, tid] += to_rain
+            st[MC_POP_SEED, tid] += seeded
+        end
+    end
+    return nothing
+end
+
+"""
+    mc_stiffness_trace(mtile, t)
+
+Report the [`mc_stiffness_census!`](@ref) accumulators, and warn ONCE per run if any channel
+has gone past `ts/τ = 1`.
+
+Called from the same single-threaded pre-column-loop slot as [`water_negativity_trace`](@ref)
+and [`water_budget_trace`](@ref), so the reduction across threads is race-free.
+
+Two independent outputs:
+
+  * the `@warn` is UNCONDITIONAL — it does not depend on `options[:stiffness_trace]`, because a
+    time step too large for the microphysics is not something a run should be able to hide by
+    leaving a diagnostic switched off. It fires on the first step at which the census shows an
+    exceedance and then never again (`:s_warned`, thread 1), so an under-resolved run reports
+    one line rather than one per step;
+  * `options[:stiffness_trace]::Int` is the periodic `@info`, in steps; absent or `0` disables
+    it. The census itself always runs, so switching this on mid-diagnosis costs nothing and
+    changes no number.
+
+Neither path touches a rate. The remedy for a large census is a smaller `ts` (or, where the
+stiffness is a resolved physical timescale rather than a numerical one, a formulation that
+does not relax on it) — never a limiter: see [`qss_condensation_rates`](@ref).
+"""
+function mc_stiffness_trace(mtile::ModelTile, t::Int64)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+
+    worst = 0.0
+    worst_ch = 0
+    @inbounds for ch in 1:MC_STIFF_CHANNELS
+        row = MC_STIFF_FIRST + (MC_STIFF_N * (ch - 1))
+        m = maximum(view(st, row, :))
+        m > worst && (worst = m; worst_ch = ch)
+    end
+
+    if worst > 1.0 && st[MC_STIFF_WARNED, 1] == 0.0
+        st[MC_STIFF_WARNED, 1] = 1.0
+        @warn """UNRESOLVED MICROPHYSICS: the supersaturation relaxation is faster than this time step.
+          step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
+          worst channel: $(MC_STIFF_NAMES[worst_ch]), max ts/tau = $worst
+          This is a statement about RESOLUTION, not about stability. The cloud, rain and ice
+          channels all relax the shared Q_ss, and that pair is integrated by its own exact
+          propagator (relaxation_adjustment_qss!), which is exact at any ts/tau and lands on
+          the quasi-steady state of the TeX's Eq. wbf_qs in a single step as ts/tau -> Inf.
+          So a large reading here marks air in which the quasi-steady limit is being taken
+          INSIDE one step -- correctly, but unresolved in time -- rather than air in which the
+          integrator is about to fail. A run whose census is large is a run whose fast
+          microphysics is unresolved, and that is a statement the diagnostics should make
+          rather than one the rates should silently absorb.
+          The nucleation-channel relaxations (tau_hf, tau_act, tau_vc) remain on the multistep
+          and keep the census's ORIGINAL meaning: for those, > 1 is a stability warning and the
+          remedy is a smaller ts.
+          Set options[:stiffness_trace] = N to print the full per-channel census every N steps."""
+    end
+
+    # The DONOR-DEPLETION census: a separate statement, and a much sharper one. Above 1 here
+    # is not "unresolved", it is the realization construction failing to bound a reservoir.
+    dworst = 0.0
+    dworst_ch = 0
+    # The three ICE NUMBER rows join the CONVICTION only once their realization is on. With
+    # it off those legs ride the species' MASS factor by construction, so a reading above 1
+    # there is the measurement this stage was built to take and not a broken invariant — it
+    # is reported in `dreport` either way, and warned about only where the construction
+    # claims to bound it.
+    ice_n_real = get(mtile.model.options, :ice_number_realization, false)::Bool
+    dlast = ice_n_real ? MC_DONOR_CHANNELS : MC_DONOR_N1 - 1
+    @inbounds for ch in 1:dlast
+        m = maximum(view(st, MC_DONOR_FIRST + (MC_DONOR_N * (ch - 1)), :))
+        m > dworst && (dworst = m; dworst_ch = ch)
+    end
+    if dworst > 1.0 + 1.0e-9 && st[MC_DONOR_WARNED, 1] == 0.0
+        st[MC_DONOR_WARNED, 1] = 1.0
+        @warn """OVER-DEPLETION: a step removed more of a reservoir than was in it.
+          step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
+          worst donor: $(MC_DONOR_NAMES[dworst_ch]), max realized depletion = $dworst
+          For the three LIQUID donors this must not happen: every sink on a reservoir is
+          realized on that reservoir's TOTAL conductance (_ice_donor_factors), so the applied
+          fraction is 1 - exp(-kappa_tot*dt) < 1 identically. A reading above 1 there means a
+          sink was added to a donor without being added to its conductance. The rain's total
+          includes EVAPORATION as well as the ice legs (Stage 2b), which is why its row is
+          the combined draw.
+          The three ICE MASS donors are realized the same way -- melting, aggregation and
+          sublimation are all shares of one per-species conductance (mc_ice_sources!) -- so a
+          reading above 1 there says the same thing: a sink is drawing on a reservoir it was
+          never added to the conductance of.
+          The three ICE NUMBER donors (n_i1/n_i2/n_i3) are in this loop ONLY when
+          options[:ice_number_realization] is on, which is what gives them a conductance of
+          their own; with it off their legs ride the species' MASS factor and a reading above
+          1 there is a measurement, not a defect. Both modes print in the census below.
+          REPORTED, NOT LIMITED: no rate is clamped and no state is written back."""
+    end
+
+    # The POPULATION census: announce the FIRST number-less ice mass once per run. An @info
+    # and not a warning — four moments on four independent fits at three
+    # weighted fall speeds do not stay mutually realizable, and the reconciliation source is
+    # what returns the orphaned mass to a representation the rates can act on.
+    pmax = maximum(view(st, MC_POP_MAX, :))
+    if pmax > 0.0 && st[MC_POP_WARNED, 1] == 0.0
+        st[MC_POP_WARNED, 1] = 1.0
+        psrc_on = get(mtile.model.options, :ice_population_source, true)::Bool
+        pseed = get(mtile.model.options, :ice_population_seed, :local)::Symbol
+        @info """NUMBER-LESS ICE MASS: a species carries mass with no crystals.
+          step $t (t = $(round(t * mtile.model.ts; digits=1)) s), max rho_empty so far = $pmax kg/m^3
+          The population gate (mc_ice_sources!) correctly refuses every rate and every fall
+          speed on mass that carries no number; the same mass is then exempt from every
+          device that could remove it. This is the transport-side defect of the population
+          (TeX §Reconciliation of the population). The reconciliation source is $(psrc_on ?
+          "ON (tau_pop = $(get(mtile.model.physical_params, :tau_ice_population, 10.0)) s): above T_0 the mass returns to the rain with L_f, below T_0 it is given crystals (options[:ice_population_seed] = :$(pseed) — $(pseed === :large ? "var_check's large-ice re-diagnosis of the dead mass, the size-sorted particles it came from" : pseed === :local ? "the per-crystal mass and habit of the nearest live gridpoint of the same species in the column, the crystals the ringing's negative lobe lost" : "the 2 um sphere, the smallest the scheme resolves"))" :
+          "OFF (options[:ice_population_source] = false): the defect is measured and NOT removed").
+          Cumulative census in the stiffness trace: max rho_empty, gridpoint-steps, mass to rain, number seeded."""
+    end
+
+    interval = get(mtile.model.options, :stiffness_trace, 0)::Int
+    (interval > 0 && mod(t, interval) == 0) || return nothing
+
+    report = join(("$(MC_STIFF_NAMES[ch]): max ts/tau = " *
+                   "$(maximum(view(st, MC_STIFF_FIRST + MC_STIFF_N * (ch - 1), :)))" *
+                   ", gridpoint-steps past 1: " *
+                   "$(Int(sum(view(st, MC_STIFF_FIRST + MC_STIFF_N * (ch - 1) + 1, :))))"
+                   for ch in 1:MC_STIFF_CHANNELS), "\n  ")
+    dreport = join(("$(MC_DONOR_NAMES[ch]): max realized depletion = " *
+                    "$(maximum(view(st, MC_DONOR_FIRST + MC_DONOR_N * (ch - 1), :)))" *
+                    ", gridpoint-steps past 1: " *
+                    "$(Int(sum(view(st, MC_DONOR_FIRST + MC_DONOR_N * (ch - 1) + 1, :))))"
+                    for ch in 1:MC_DONOR_CHANNELS), "\n  ")
+    # The per-channel ATTRIBUTION block, only where it was asked for. It ATTRIBUTES; it does
+    # not convict, so there is no warning path here and nothing prints when the option is off
+    # (the rows are then identically zero and printing them would be noise).
+    areport = ""
+    if get(mtile.model.options, :ice_attr_census, false)::Bool
+        achan = join(("$(MC_ATTR_NAMES[ch]): max = " *
+                      "$(maximum(view(st, MC_ATTR_FIRST + MC_ATTR_N * (ch - 1), :)))" *
+                      ", gridpoint-steps: " *
+                      "$(Int(sum(view(st, MC_ATTR_FIRST + MC_ATTR_N * (ch - 1) + 1, :))))"
+                      for ch in 1:MC_ATTR_CHANNELS), "\n  ")
+        areport = """\n  attribution of the donor breaches, per channel (block A's five q_r counts partition the q_r donor count):
+  $achan
+  above T_0 carrying ice: gridpoint-steps = $(Int(sum(view(st, MC_ATTR_WARM_PTS, :)))), sum rho_ice (raw slots) = $(sum(view(st, MC_ATTR_WARM_MASS, :))) kg/m^3"""
+    end
+    @info """microphysics stiffness census step $t (t = $(round(t * mtile.model.ts; digits=1)) s), ts = $(mtile.model.ts) s
+  cumulative over the run so far; > 1 means the relaxation is under-resolved
+  $report
+  donor depletion actually applied (must stay <= 1 for the liquid and ice-MASS donors; the
+  three ice-NUMBER rows are bounded only under options[:ice_number_realization]):
+  $dreport
+  population reconciliation (number-less ice mass rho_empty; 0 while every species with mass carries number):
+  max rho_empty = $(maximum(view(st, MC_POP_MAX, :))) kg/m^3, (gridpoint x species)-steps = $(Int(sum(view(st, MC_POP_PTS, :)))), mass to rain = $(sum(view(st, MC_POP_RAIN, :))) kg/m^3, ice number seeded = $(sum(view(st, MC_POP_SEED, :))) /m^3 (seed = :$(get(mtile.model.options, :ice_population_seed, :local)))
+  cloud evaporation realization (J0 on the cloud donor's total conductance; $(get(mtile.model.options, :cloud_evap_realization, CLOUD_EVAP_REALIZATION_DEFAULT) ? "REALIZED" : "OFF: measured, not applied")):
+  gridpoint-steps = $(Int(sum(view(st, MC_CEVAP_PTS, :)))), withheld (gridpoint-sum) = $(sum(view(st, MC_CEVAP_HELD, :))) kg/m^3, max at one point = $(maximum(view(st, MC_CEVAP_MAX, :))) kg/m^3$areport"""
+    return nothing
+end
+
+"""
+    _ileg_shortfall(v) -> Float64
+
+Accumulated positivity shortfall of variable slot `v`'s i-direction splines, or `NaN` when it
+cannot be read.
+
+The i-leg bound bites on the WORKER'S PATCH, not on the tile: every call site uses the 3-arg
+`splineTransform!(sharedSpectral, patch, mtile.tile)` (`semiimplicit.jl:793`, `:968`,
+`nesting.jl:740`, `:879`), which runs `SAtransform_bounded` on `patch.ibasis`. The tile's own
+i-splines carry the same bound but are never the ones solved, so their shortfall is
+identically zero and reporting it would be a lie of omission. `ModelTile` holds no reference
+to the patch — it is a worker-scope binding — hence the introspection, which is confined to
+this diagnostic and returns `NaN` (never a misleading `0.0`) whenever the lookup does not
+find a real spline patch.
+"""
+function _ileg_shortfall(v::Int64)
+    isdefined(Main, :patch) || return NaN
+    p = getfield(Main, :patch)
+    hasproperty(p, :ibasis) || return NaN
+    ib = p.ibasis
+    ib isa Springsteel.NoBasisArray && return 0.0
+    eltype(ib.data) <: Springsteel.CubicBSpline.Spline1D || return NaN
+    v <= size(ib.data, 2) || return NaN
+    return sum(Springsteel.CubicBSpline.bound_shortfall(ib.data[z, v])
+               for z in axes(ib.data, 1))
+end
+
+"""
+    water_budget_trace(mtile, t)
+
+Print the per-step water production budget, then reset it for the next step.
+
+Emitted from the same single-threaded pre-column-loop slot as
+[`water_negativity_trace`](@ref), so printing is race-free and the numbers describe the step
+that just finished. Gated on `options[:water_budget_trace]::Int` — the print interval in steps;
+absent or `0` disables it, and `water_budget_probe!` is then never called, so the hot path is
+untouched.
+
+Also reports the POST-reconstruction minimum from `tile.physical`, which is the step-matched
+partner of `clamp_water!`'s pre-fit measurement. Their difference is what the fit contributes
+per step, the quantity the previous attribution had no way to see (it read only the pre-fit
+number, and only from the console, where the run's `@warn` never appears — the worker's stderr
+goes to `<output_dir>/scythe_err.log`).
+"""
+function water_budget_trace(mtile::ModelTile, t::Int64)
+
+    st = mtile.mc_water_stats
+    size(st, 2) == 0 && return nothing
+    interval = get(mtile.model.options, :water_budget_trace, 0)::Int
+    interval > 0 || return nothing
+
+    if mod(t, interval) == 0
+        # Reduce across threads: the thread holding the most negative value owns the budget.
+        vars = mtile.model.grid_params.vars
+        # Positivity limiter health: nonzero shortfall means a column was infeasible (its
+        # total mass below the minimum an admissible field can carry), so the limiter
+        # created mass instead of redistributing it. This must stay at zero.
+        #
+        # PER SPECIES and per LEG. Summing over every variable hid which species was
+        # infeasible, and reading only the k-basis hid the i-leg entirely — the two together
+        # are why "bound_shortfall stays exactly 0.0" was recorded for a configuration whose
+        # k-leg shortfall reached 8e3 (see the STAGE 2 section of
+        # reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md).
+        #
+        # The arithmetic below reads slots 8 and 9 as DENSITIES. That is unconditionally
+        # correct here because `mc_driver!` refuses `water_budget_trace` under either
+        # transform — the probe's ADV column would be in control-variable units while its
+        # source columns are densities, so the attribution would not close.
+        kb = mtile.tile.kbasis
+        kshort = (name) -> kb isa Springsteel.NoBasisArray ? 0.0 :
+            Springsteel.CubicBSpline.bound_shortfall(kb.data[mc_slot(vars, name)])
+        shortfall = join(("$name k=$(kshort(name)) i=$(_ileg_shortfall(mc_slot(vars, name)))"
+                          for name in ("rho_r", "rho_c")), ", ")
+        phys = mtile.tile.physical
+        kDim = mtile.model.grid_params.kDim
+        rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state), :, 1)
+        rr = mc_slot(vars, "rho_r")
+        rc = mc_slot(vars, "rho_c")
+        rv = mc_slot(vars, "rho_v")
+        rho_vbar = mtile.mc_ref_diag.rho_vbar
+        post_r = 0.0
+        post_c = 0.0
+        # The VAPOR is a PROGNOSTIC SLOT, so this is the field itself rather than a residual
+        # reassembled from four others. Negative water is a RESOLUTION DIAGNOSTIC and is never
+        # clamped (reference/FINDINGS_NEGATIVE_WATER_ATTRIBUTION.md), so this minimum says
+        # directly how far the transported vapor undershoots.
+        post_v = Inf
+        @inbounds for i in axes(phys, 1)
+            k = mod1(i, kDim)
+            post_r = min(post_r, phys[i, rr, 1])
+            rho_c_tot = phys[i, rc, 1] + rho_cbar[k]
+            post_c = min(post_c, rho_c_tot)
+            post_v = min(post_v, phys[i, rv, 1] + rho_vbar[k])
+        end
+
+        # Cloud-top diagnostic: the highest gridpoint carrying condensate, and the coldest
+        # temperature anywhere. A positivity limiter redistributes mass WITHIN a leg, so it
+        # can only move condensate along that leg — this is what shows whether it is
+        # depositing cloud at an altitude the energy budget cannot support.
+        z_all = view(mtile.tilepoints, :, size(mtile.tilepoints, 2))
+        z_cloud = -Inf
+        @inbounds for i in axes(phys, 1)
+            (phys[i, rc, 1] + rho_cbar[mod1(i, kDim)]) > 1.0e-6 && (z_cloud = max(z_cloud, z_all[i]))
+        end
+
+        # The summary always prints on the interval: with every species bounded the
+        # per-species blocks below fall silent, and the limiter health has to stay visible.
+        @info """water summary step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
+          positivity limiter shortfall (must be 0): $shortfall
+          post-fit(reconstruction) minima: rho_r = $post_r, rho_c = $post_c, rho_v = $post_v
+          pre-fit(var_np1) minima: rho_r = $(minimum(view(st, MC_PRE_R, :))), rho_c = $(minimum(view(st, MC_PRE_C, :)))
+          highest gridpoint with rho_c > 1e-6: $(isfinite(z_cloud) ? z_cloud : NaN) m
+          reconciliation gap (0 at rest by construction; elsewhere the lag of the tau_qss relaxation): max|Q_ss - (rho_v - rho_vs)| = $(maximum(view(st, MC_QSS_GAP, :))) kg/m^3"""
+
+        # The depletion census: how widely, and how hard, the step is draining each species,
+        # and where the REMOVED depletion caps would have bound. `euler` is the forward-Euler
+        # fraction, `ab3` what the integrator actually applies; the gap between them is the
+        # leading AB3 weight.
+        for (name, off, sink) in (("rho_r", MC_DEPLETION_R, "evaporation"),
+                                  ("rho_c", MC_DEPLETION_C, "evaporation"),
+                                  ("rho_v", MC_DEPLETION_V, "condensation"))
+            npts = sum(view(st, off, :))
+            npts > 0.0 || continue
+            @info """water depletion [$name] step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
+              gridpoints with $name > 0: $(Int(npts))
+              sinks at or past the AB3 bound (where the REMOVED caps would have bound): $sink $(Int(sum(view(st, off + 1, :)))), auto+coll $(Int(sum(view(st, off + 2, :))))
+              MICROPHYSICS depletion fraction (uncapped): max $(maximum(view(st, off + 8, :))), points > 1: $(Int(sum(view(st, off + 9, :))))
+              FULL-tendency depletion fraction: Euler $(maximum(view(st, off + 3, :))), ACTUAL(AB3) $(maximum(view(st, off + 4, :)))
+              points driven negative by the step: $(Int(sum(view(st, off + 5, :))))
+              points past AB3's 0.545 stability limit: $(Int(sum(view(st, off + 6, :))))
+              points whose sink HISTORY alone is inadmissible (bound clamped at 0): $(Int(sum(view(st, off + 7, :))))"""
+        end
+
+        for (name, offset) in (("rho_r", MC_BUDGET_R), ("rho_c", MC_BUDGET_C))
+            tid = argmin(view(st, offset, :))
+            val = st[offset, tid]
+            val < 0.0 || continue
+            trm = (name == "rho_r" ?
+                   ("adv", "-rho*div", "Qdot_r", "auto+coll", "-dFr/dz") :
+                   ("adv", "-rho*div", "Qdot", "-auto-coll"))
+            budget = join(("$(trm[k])=$(st[offset + k, tid])" for k in 1:length(trm)), "  ")
+            @info """water budget [$name] step $t (t = $(round(t * mtile.model.ts; digits=1)) s)
+              worst AB3-projected point: $name $(st[offset + 10, tid]) -> $val kg/m^3 at z = $(st[offset + 8, tid]) m
+              the FORWARD-EULER projection of the same point: $(st[offset + 9, tid]) kg/m^3
+              tendency terms [kg/m^3/s]: $budget
+              net explicit tendency: $(sum(st[offset + k, tid] for k in 1:5)) kg/m^3/s (x ts = $(mtile.model.ts * sum(st[offset + k, tid] for k in 1:5)))
+              local flow: div(v) = $(st[offset + 6, tid]) 1/s, w = $(st[offset + 7, tid]) m/s"""
+        end
+    end
+
+    # Reset the per-step block regardless of whether this was a print step, so the
+    # recorded worst point always belongs to the step just finished. Stops at
+    # MC_QSS_GAP: the stiffness census after it is cumulative by design (an excursion at
+    # step 40 is still true at step 4000, and the once-per-run warning must be able to see
+    # it) and must not be cleared by a diagnostic that happens to be switched on.
+    @inbounds fill!(view(st, MC_BUDGET_FIRST:MC_QSS_GAP, :), 0.0)
+    return nothing
+end
+
+# ── Ice microphysics: the host-side integration of the ISHMAEL process library ────
+#
+# Everything below turns the ported Fortran rate functions (src/ishmael.jl,
+# src/ishmael_tables.jl) into the source terms of Eqs. ice_prog_mass..ice_prog_c of
+# reference/Scythe_moist_compressible.tex. Three conventions run through all of it:
+#
+#   UNITS. The ISHMAEL library is MIXING-RATIO internally (per kg of dry air), exactly as
+#   the Fortran is; Scythe is densities. The conversion happens at this boundary and only
+#   here: `q = ρ/ρ_d` going in, `× ρ_d` coming out. The one exception is the DEPOSITION
+#   rate, which is formed in density directly from `Q_ss` (Eq. dep_rate) because that is the
+#   form in which the `(1 + 𝒬_{s,i})` cancellation with the supersaturation equation happens.
+#
+#   STATE. Every rate is evaluated at the VAR_CHECK-EFFECTIVE moments — the Fortran's own
+#   `var_check` consistency clamps applied to the transported (ρ_i, n_i, a_i, c_i) — so the
+#   rate functions never see a moment set that does not describe a realizable population.
+#   `_ice_effective` is that map, and it is the only place the raw slots are read.
+#
+#   RATES, NOT UPDATES. The Fortran advances its state between process blocks and
+#   re-diagnoses in between. Scythe hands a multistep integrator pure tendencies, so every
+#   rate here is evaluated at the SAME state, summed, and returned. Where the Fortran's
+#   bookkeeping is expressed as a state update (the aggregation and nucleation volume
+#   moments) the increment is divided by the step and used as a rate, which is the same
+#   thing to the order the scheme is written in.
+
+# ── The impulse-form rates, converted to finite physical rates ────────────────
+#
+# Three of ISHMAEL's nucleation rates are written as `reservoir/Δt`: they convert the WHOLE
+# available reservoir in exactly one time step. That is the same defect as the depletion caps
+# the model already removed (TeX §Departures (b)) with the sign reversed — the rate, and hence
+# the converged solution, is a function of the step size, so refining `Δt` does not approach
+# any differential equation. It is also what detonated the first live ice arm: `n_c/Δt` at
+# `Δt = 0.3 s` injects 3.3e8 sub-micron crystals per m³ per second into the anvil, and the
+# resulting `1/τ_i ∝ n_i C̄` and ice-rain collection rate (∝ n_i n_r) both ran away. Measured:
+# the divergence sat at the SAME PHYSICAL TIME (986 s at ts = 0.3, 1007 s at ts = 0.1), which
+# is the signature of a state runaway rather than of an under-resolved step.
+#
+# Each is therefore rewritten as a relaxation on a physical timescale. The timescales are
+# `physical_params`, they are `Δt`-free, and the stiffness census reports when a step fails to
+# resolve them — which is the model's standing answer to a fast process.
+
+"""
+    ISHMAEL_IN_CEILING
+
+The DeMott existing-ice ceiling, 1.0e7 m⁻³. This is the Fortran's own `10000` compared against
+`n/1000` in m⁻³ (module_mp_jensen_ishmael.F line 1591) — a measured upper bound on activated
+ice nuclei, i.e. a STATE ceiling on a concentration, not a `Δt` limiter on a rate, so it stays.
+"""
+const ISHMAEL_IN_CEILING = 1.0e7
+
+"""
+    ISHMAEL_M_MIN
+
+The mass of the smallest ice crystal the scheme resolves: a sphere of radius
+[`ISHMAEL_RMIN`](@ref) at the bulk ice density `RHOI = 920 kg/m³` the Fortran assigns to every
+freshly nucleated or frozen particle (`rhobar = RHOI·nucfrac + (1−nucfrac)·rhobar`,
+module_mp_jensen_ishmael.F line 2246). It is the same particle DeMott seeds
+(`mnuccd/nnuccd = (4/3)π RHOI (2e-6)³`, line 1596), so the two channels agree by construction.
+"""
+const ISHMAEL_M_MIN = ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * ISHMAEL_RMIN^3
+
+"""
+    ISHMAEL_RHO_AGG
+
+The bulk density of the AGGREGATE species, 50 kg/m³ — the Fortran's own forced value below
+`T_0` (`rhobar(ICE3) = 50.`, module_mp_jensen_ishmael.F line 2603, opening the "Final check on
+aggregates" block) and, not by coincidence, the lower bound `var_check` holds every species
+above (lines 3131-3154). [`_ice_effective`](@ref) already hands it to an EMPTY aggregate;
+[`_ice_population_seed_large`](@ref) is the one place a species that HAS mass is given it.
+"""
+const ISHMAEL_RHO_AGG = 50.0
+
+"""
+    ISHMAEL_M_LARGE
+
+The per-crystal mass of the `:large` seeding, one entry per species [kg]: the mass of a
+1 mm sphere at the species' bulk density, `m_large = (4/3)π ρ̄ a_max³ Γ(ν+3)/Γ(ν)` with
+`a_max = 1 mm` — 4.62e-4 kg for the planar and columnar species at `RHOI`, 2.51e-5 kg for
+the aggregates at [`ISHMAEL_RHO_AGG`](@ref).
+
+This is [`_ice_population_seed_large`](@ref)'s own answer written as a mass, and it is the
+LARGEST per-crystal mass `var_check` admits: the mass is maximized over the checker's
+admissible set at the sphere (`ρ̄ = ρ_max`, `a_n = c_n = 1 mm`), because any aspect ratio
+other than one puts the shorter axis inside the cap. [`_ice_population_seed_local`](@ref)
+clamps its inherited per-crystal mass against it, so a crystal read out of ringing-corrupted
+slots can never seed a coarser population than `:large` would — and `:local`'s number is
+therefore bracketed by the other two seedings by construction.
+"""
+const ISHMAEL_M_LARGE = let a3 = 1.0e-3^3,
+                            g = gamma(ISHMAEL_NU + 3.0) * ISHMAEL_I_GAMMNU
+    (ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * a3 * g,
+     ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHOI * a3 * g,
+     ISHMAEL_FOURTHIRDSPI * ISHMAEL_RHO_AGG * a3 * g)
+end
+
+"""
+    _cloud_ice_draw(hf, p1, p2, p3) -> Float64
+
+The ICE legs on the cloud reservoir, in mixing-ratio units: homogeneous freezing `ṁ_hf,c` plus
+the cloud half of every species' riming `prdr₀_c` — the sum [`_ice_donor_factors`](@ref) forms
+`f_qc` on, kept in one place so the census-only factor of the realization-off arm in
+`mc_ice_sources!` cannot drift from it.
+"""
+@inline _cloud_ice_draw(hf, p1, p2, p3) =
+    hf.mim + ((p1.prdr0_c + p2.prdr0_c) + p3.prdr0_c)
+
+"""
+    _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt; kc = 0.0) -> (f_qc, f_qr, f_nr)
+
+The realization factor of each LIQUID DONOR RESERVOIR at one gridpoint: cloud mass, rain mass,
+rain number. One factor per reservoir, formed from that reservoir's TOTAL sink conductance over
+every leg drawing on it, and shared out to those legs in proportion to their rates
+([`relaxation_realization`](@ref) states the rule and why `J₀` is an integrator coefficient
+rather than a rate law).
+
+# Why a per-DONOR total and not a per-leg factor
+
+Realizing legs one at a time bounds each leg at one reservoir and lets the SUM run past it —
+measured on the O01 ice arm as a realized rain depletion pinned at exactly 3.0 reservoirs per
+step. It is also whack-a-mole: the wall moved 1031.4 s → 2457.3 s when the freezing legs were
+realized, then 2538.6 s when ice-rain collection was, with the next stiffest leg simply taking
+over each time (nominal `κΔt` for the rain donor measured at 1.7e18 — 18 orders above 1, so no
+step refinement ever reaches it). The donor total is the statement the ODE actually makes,
+`dq/dt = −(Σ_j κ_j) q`, and it is the same combined-rate doctrine the TeX derivation uses for
+the supersaturation pair, where `λ = Σ τ⁻¹` and each channel takes its share of one propagator.
+
+# The legs, by reservoir
+
+  * `q_c`  homogeneous freezing `ṁ_hf,c`, the CLOUD half of every species' riming, and — with
+           `options[:cloud_evap_realization]` — the cloud's WARM sinks, evaporation and
+           `AUTO_COLL`, through the conductance `kc` the caller supplies
+           ([`cloud_donor_conductance`](@ref)); the factor is then the cloud donor's ONE
+           `f_cloud`, applied to every one of its sinks ([`cloud_evap_realized`](@ref));
+  * `q_r`  homogeneous freezing `ṁ_hf,r`, Bigg `ṁ_Bigg`, the RAIN half of every species'
+           riming, every species' ice-rain collection `dQRfzri`, and — since Stage 2b —
+           EVAPORATION, through the conductance `kev` the caller supplies;
+  * `n_r`  the number partners of the same: `ṅ_hf,r`, `ṅ_Bigg`, `dNfzri`, the drops riming
+           removes (`nrn_loss`), and the evaporation number sink at the same `kev`.
+
+# EVAPORATION is a sink of the rain like any other (Stage 2b)
+
+`kev = max(−Q̇_r, 0)/ρ_r` is the rain-channel evaporation of `qss_condensation_rates` written
+as a conductance on the rain (TeX §donor_relax, "The rain reservoir has a third sink that
+lived outside its conductance"). It was outside every conductance in this file: the
+exponential propagator of the relaxation pair bounds `Q_ss`, not `ρ_r`, so the vapor DEFICIT
+limited the applied evaporation and nothing limited it by the rain that is there. The ice legs
+were then realized on a conductance that did not contain it, and the two draws on ONE
+reservoir summed without either knowing of the other — measured on the Stage 0a fixture at a
+combined `MC_ATTR_QR_COMB` of 1.0012 over 1296 gridpoint-steps while `MC_DONOR_QR` itself, which
+saw only the ice half, read 1.0. Adding it to `κ_tot` is the closure sublimation already had on
+the ice side, and the SAME realized number then goes into `λ`, into `N` and into the rain
+transfer (the fold of `f_rain` into `invtau_r`/`Qdot_r` in `mc_driver!`).
+
+The NUMBER sink is exactly proportional to the mass sink — `rain_number_evaporation_2m` is
+`Q̇_r·n_r/max(ρ_r, RHO_R_MIN)`, i.e. the same `κ_ev` acting on `n_r` — so the number donor takes
+the IDENTICAL conductance rather than a scaled one (contrast Bigg, whose number conductance is
+a twentieth of its mass conductance, which is why the two moments need separate factors at
+all). The two agree exactly above `RHO_R_MIN`; in the decade between the census floor and it
+the number's true conductance is the SMALLER of the two, so `κ_ev` over-states it and the
+factor errs toward realizing more — the safe direction, on a reservoir with no rain in it. It is added to `f_nr`'s total, which is what the ICE number legs are realized on; the
+number sink itself is applied through `NR_SRC` on the multistep, beside self-collection, which
+carries no conductance either.
+
+`kev` is passed as a CONDUCTANCE, not as a rate: `κ_evΔt` is dimensionless in either unit
+system, and multiplying by the caller's `qr`/`nr` here is what puts it in the same
+mixing-ratio units as every other leg of the sum. `kev = 0.0` restores the pre-Stage-2b
+factors bitwise — `relaxation_realization` returns an exact `1.0` at a zero rate, and adding
+an exact `0.0` to a sum of non-negative rates is the identity — which is what
+`options[:rain_evap_realization] = false` uses.
+
+Mass and number are separate reservoirs with separate conductances, and get separate factors —
+the ICE species are the same statement in the same shape (`options[:ice_number_realization]`,
+Stage 1b; see the number-donor block in [`mc_ice_sources!`](@ref)), and this is where the rule
+was first forced:
+Bigg's number conductance is `1/20` of its mass conductance (`ṅ/ṁ = λ_r³/20πρ_w` against
+`n_r/q_r = λ_r³/πρ_w`), so realizing the number on the MASS factor would freeze all of the
+rain's mass while removing a twentieth of its drops — mass without number, precisely the state
+the population gate exists to forbid. The cloud has no prognostic droplet number (`n_c` is the
+closure's prescribed concentration) and `hf`'s two cloud legs share a conductance by
+construction, so one factor serves both there.
+
+`dQIfzri`, the ice that changes species because it collected rain, rides `f_qr`: it is the same
+collision events, so it is a share of the rain reservoir's sink like its partners.
+
+# The price of two factors, and where it is paid
+
+Two factors on one pair of moments is right for the RESERVOIRS and wrong for the CRYSTALS: a
+number rate and its mass partner scaled by `f_nr` and `f_qr` no longer stand in the ratio the
+kernel wrote them in, so any bound of the form `ṅ ≤ ṁ/m_min` stated at the RATE does not
+survive this function. `min` commutes with one shared factor and with nothing else. Measured at
+the anvil top (reference/FINDINGS_ISHMAEL_S8S9.md §5i): `f_nr = 1.0` — `relaxation_realization`
+at a zero reservoir, correct for a factor and catastrophic for a bound — against `f_qr` at
+1.8e-19, the same Bigg collisions realized seventeen orders apart, ~1e15 m⁻³ s⁻¹ of crystals
+created carrying a millionth of `ISHMAEL_M_MIN` each. The bound is therefore restated on the
+REALIZED pair, in [`mc_ice_sources!`](@ref)'s slot assembly where both factors exist, and this
+function is left to do the one job it is for. `f_nr` is NOT the place to fix it: clamping a
+donor factor to its partner's would under-realize every healthy number sink on the reservoir.
+
+# Riming enters through `prdr₀`, not through `rimesum`
+
+The riming contribution is the phase-A **unit-realization mass gain** `prdr₀`, split cloud/rain
+by the Fortran's own `qcrimefrac`, NOT the linear-limit collection rate `rimesum/ρ_a`. That is
+the difference between a bound that holds and one that leaks: `prdr ∝ rnfr³ − rni³`, and
+bounding the radius increment against the linear conductance still delivered a measured 2.0
+reservoirs at p99 and 13.0 at max. With `κ` formed from `prdr₀` itself the second growth pass
+lands in the linear-or-below regime, where `prdr(f) ≤ f·prdr₀`, so the realized riming mass is
+bounded by its share of the reservoir along with everything else.
+
+Every factor is an exact `1.0` where its reservoir has no sink, which is what keeps the
+conversion-free path — and the whole warm and dry path, where this block never runs — bitwise.
+"""
+@inline function _ice_donor_factors(hf, bg, p1, p2, p3, qc::Float64, qr::Float64,
+                                    nr::Float64, kev::Float64, dt::Float64;
+                                    kc::Float64 = 0.0)
+    rim_r = (p1.prdr0_r + p2.prdr0_r) + p3.prdr0_r
+    col_q = (p1.rr.dQRfzri + p2.rr.dQRfzri) + p3.rr.dQRfzri
+    col_n = (p1.rr.dNfzri + p2.rr.dNfzri) + p3.rr.dNfzri
+    nrn   = (p1.nrn_loss + p2.nrn_loss) + p3.nrn_loss
+    # The two EVAPORATION legs, in the mixing-ratio units this sum is taken in. One
+    # conductance, two moments: the number sink is `κ_ev n_r` because
+    # `rain_number_evaporation_2m` is proportional to the mass loss with exactly this
+    # constant of proportionality.
+    ev_r = kev * qr
+    ev_n = kev * nr
+    # The CLOUD's total: the ice legs plus its warm sinks (evaporation + AUTO_COLL) through
+    # the conductance `kc` the caller supplies (`cloud_evap_realized`). `kc = 0.0` adds an
+    # exact zero to a non-negative sum — the pre-realization factor, bitwise.
+    f_qc = relaxation_realization(_cloud_ice_draw(hf, p1, p2, p3) + kc * qc, qc, dt)
+    f_qr = relaxation_realization((((hf.mimr + bg.mbiggr) + rim_r) + col_q) + ev_r, qr, dt)
+    f_nr = relaxation_realization((((hf.nimr + bg.nbiggr) + nrn) + col_n) + ev_n, nr, dt)
+    return (f_qc, f_qr, f_nr)
+end
+
+"""
+    _ice_empty_pre() -> NamedTuple
+
+The all-zero phase-A result for a species with no population, matching
+[`_ice_species_pre`](@ref)'s shape. Every rate field is an EXACT `0.0`, so a dead species
+contributes nothing to any donor conductance and the factors stay exactly `1.0`.
+"""
+@inline _ice_empty_pre() =
+    (rc = (rimesum = 0.0, qi_qc_nrm = 0.0, qi_qc_nrd = 0.0),
+     rr = (rimesumr = 0.0, qi_qr_nrm = 0.0, qi_qr_nrd = 0.0, qi_qr_nrn = 0.0,
+           dQRfzri = 0.0, dQIfzri = 0.0, dNfzri = 0.0, dQImltri = 0.0, dNmltri = 0.0),
+     vc = (Cbar = 0.0, fv = 0.0, fh = 0.0, vtrni1 = 0.0, vtrmi1 = 0.0, vtrzi1 = 0.0),
+     rimesum = 0.0, rimesumr = 0.0, capgam = 0.0, fv = 0.0, fh = 0.0,
+     invtau_i = 0.0, Qdot = 0.0, niq = 0.0, dry_growth_pre = false,
+     prdr0_c = 0.0, prdr0_r = 0.0, nrn_loss = 0.0)
+
+
+"""
+    _ice_homogeneous_rates(temp, qc, nc, qr, nr, tau_hf) -> NamedTuple
+
+Homogeneous freezing below −35 °C as a finite relaxation: everything liquid freezes on the
+timescale `tau_hf` (`physical_params[:tau_homogeneous]`, default 5 s) rather than in one step.
+
+    ṁ = ρ_c/τ_hf,   ṅ = min( n_c/τ_hf , ṁ/m_min )
+
+and the same pair for the rain. The Fortran writes `mim = q_c/Δt`, `nim = n_c/Δt` (lines
+1545-1553), which makes the rate literally `1/Δt`; this is the `Δt`-free statement of the same
+physics — "all supercooled liquid freezes within seconds at −35 °C".
+
+# Why the number is bounded and the mass is not
+
+Every ice NUMBER source must seed crystals at or above the smallest size the scheme resolves,
+[`ISHMAEL_RMIN`](@ref) — which is `var_check`'s mean-radius floor and the bottom of the
+`itab`/`itabr` table domain at the same time. DeMott seeds 2 μm spheres and Hallett-Mossop
+seeds 5 μm splinters, so both comply already. One-crystal-per-droplet does NOT: the cloud
+closure carries a FIXED droplet number (`max_N_c`) regardless of the cloud content, so a thin
+anvil cloud freezing at −35 °C would hand the scheme 10⁸ m⁻³ crystals of sub-micron size —
+particles the habit laws and the collection tables were never fitted for, and whose
+`rimedr ∝ 1/r_ni²` axis growth at the clamped floor is unbounded. Measured, before this
+bound: the O01 ice arm made 6×10⁷ m⁻³ crystals of 0.13 μm at 990 s, and once the anvil met
+them the ice deposition timescale went from `ts/τ = 1.8e-4` to `36.5` in a hundred seconds.
+
+The `min` states the same physics ISHMAEL states with its `n_i ≤ 1000 L⁻¹` state cap, but at
+the SOURCE rather than by re-diagnosing the population afterwards: the frozen MASS transfers
+in full — no water is lost, and `Q̇_freeze` is untouched — and the number is what that mass
+supports at the minimum resolved crystal. It is state-dependent and `Δt`-free, so it is not a
+depletion cap: refining `Δt` still approaches the same differential equation.
+
+Where the droplets are LARGER than `r_min` (the ordinary case: 100 cm⁻³ in 1 g/m³ of cloud is
+13 μm) the bound does not bind and the drop-preserving transfer `ṅ = n_c/τ_hf` stands exactly.
+
+The RAIN leg carries the same `min` for symmetry and safety. Raindrops are three orders of
+magnitude above `r_min`, so it should never bind — `test_moist_compressible.jl` asserts it does
+not at typical rain states, which is what makes it a guard rather than a parameterization.
+
+# The bound is stated here and ENFORCED at the assembly
+
+This `min` is a statement about two rates, and it holds for the rates this function returns.
+It does NOT survive realization: `mimr` is scaled by the rain-MASS donor factor and `nimr` by
+the rain-NUMBER one ([`_ice_donor_factors`](@ref) — two reservoirs, two conductances), and
+`min` commutes with one shared factor and no more. The cloud pair shares `f_qc` and is safe by
+that accident; the rain pair is not, and neither is Bigg, which carries no rate-level bound at
+all. So the invariant this docstring argues for is re-applied to the REALIZED legs in
+[`mc_ice_sources!`](@ref)'s slot assembly, over every ice number source at once
+(reference/FINDINGS_ISHMAEL_S8S9.md §5i). What is written here still stands and still binds
+first; the assembly is what makes it an invariant rather than a property of one call.
+
+The volume-moment seeding needs no change: [`_ice_nucleation_volume`](@ref) derives the
+characteristic axis from the summed mass/number ratio at density `RHOI` and is shared by every
+nucleation channel, so bounding the ratio here bounds the seeded size there too.
+
+The `-35 °C` threshold and the `QSMALL` existence gates are STATE tests and are unchanged.
+"""
+@inline function _ice_homogeneous_rates(temp::Float64, qc::Float64, nc::Float64,
+                                        qr::Float64, nr::Float64, tau_hf::Float64)
+
+    (temp < (T_0 - 35.0)) || return (mim = 0.0, nim = 0.0, mimr = 0.0, nimr = 0.0)
+    itau = 1.0 / tau_hf
+    cloud = qc > ISHMAEL_QSMALL
+    rain = qr > ISHMAEL_QSMALL
+    mim = cloud ? qc * itau : 0.0
+    mimr = rain ? qr * itau : 0.0
+    return (mim  = mim,
+            nim  = cloud ? min(nc * itau, mim / ISHMAEL_M_MIN) : 0.0,
+            mimr = mimr,
+            nimr = rain ? min(nr * itau, mimr / ISHMAEL_M_MIN) : 0.0)
+end
+
+"""
+    _ice_demott_rates(temp, sup, rhoair, n_ice, tau_act) -> NamedTuple
+
+DeMott et al. (2010) heterogeneous nucleation as a finite ACTIVATION rate:
+
+    ṅ = max( n_IN(T) − n_ice , 0 ) / τ_act
+
+with `n_IN` the DeMott ice-nuclei concentration [m⁻³] capped at [`ISHMAEL_IN_CEILING`](@ref),
+`n_ice` the ice number ALREADY present [m⁻³], and `τ_act` = `physical_params[:tau_activation]`
+(default 1 s). The mass follows the number at ISHMAEL's own new-particle size — 2 μm spheres
+of density `RHOI` (Fortran lines 1596-1597).
+
+Two things change from [`ishmael_nucleation_demott`](@ref), which stays as the Fortran wrote
+it for the reference harness:
+
+  * the rate is `deficit/τ_act`, not `deficit/Δt`;
+  * the deficit is taken in the UNCAPPED branch too. The Fortran activates the full `inrate`
+    every step until the ceiling binds, so a column that already holds the DeMott
+    concentration keeps nucleating; here activation stops when the ice number reaches it,
+    which is what "the available nuclei have been used up" means.
+
+The nucleation window (`T < T_0` and supersaturated over water) is a state test and is
+unchanged; `n_ice` is the CARRIED ice number, for the reason given in `_ice_species_rates`.
+"""
+@inline function _ice_demott_rates(temp::Float64, sup::Float64, rhoair::Float64,
+                                   n_ice::Float64, tau_act::Float64)
+
+    (temp < T_0 && sup >= 0.0) || return (mnuccd = 0.0, nnuccd = 0.0)
+
+    dT = 273.16 - temp
+    # The DeMott fit, verbatim (Fortran lines 1583-1588). `0.03` is the Chagnon and Junge
+    # (1962) large-aerosol number; the result is #/L and is converted to m⁻³ here.
+    n_IN = 1000.0 * 0.0000594 * dT^3.33 * 0.03^((0.0264 * dT) + 0.0033)
+    target = min(n_IN, ISHMAEL_IN_CEILING)
+    deficit = max(target - n_ice, 0.0)               # m⁻³
+    nnuccd = deficit / (tau_act * rhoair)            # # kg⁻¹ s⁻¹
+    # New particles are `r_min` spheres at `RHOI` — [`ISHMAEL_M_MIN`](@ref), the SAME crystal
+    # the homogeneous leg is bounded against, so the two channels seed one population.
+    mnuccd = nnuccd * ISHMAEL_M_MIN
+    return (mnuccd = mnuccd, nnuccd = nnuccd)
+end
+
+"""
+    _ice_effective(qi, ni, ai, ci, k, rhomax = ISHMAEL_RHOI) -> NamedTuple
+
+One ice species' EFFECTIVE moments: the incoming-volume floors of the Fortran host loop
+(module_mp_jensen_ishmael.F lines 1013-1032) followed by [`ishmael_var_check`](@ref).
+
+`qi`, `ni`, `ai`, `ci` are MIXING RATIOS (per kg dry air) and are assumed already floored at
+zero by the caller. Returns `var_check`'s tuple — `(deltastr, ani, cni, rni, rhobar, ni, ai,
+ci, alphstr, alphv, betam)` — which is what every rate function downstream takes.
+
+An EMPTY species (`qi ≤ QSMALL`) returns the Fortran's own top-of-loop initialization instead
+(lines 874-901): number and volumes at their floors, 2 μm spherical axes, `deltastr = 1`, and
+`rhobar = RHOI` except for the aggregate species, where it is 50 kg/m³. `var_check` cannot be
+run on an empty species — its density re-derivation divides by the mass — and the aggregation
+block still needs a well-defined characteristic diameter for a species that has no ice yet,
+because that is exactly the species aggregation CREATES.
+
+`k` is the species index; only `k == 3` (aggregates) reads it.
+
+`rhomax` is the CEILING `var_check` clamps the bulk density against (its `RHOI` argument),
+and defaults to the bulk ice density every existing call site uses, so they are unchanged.
+The one caller that passes anything else is [`_ice_population_seed_large`](@ref), which hands
+the AGGREGATE species its own 50 kg/m³ (module_mp_jensen_ishmael.F line 2603, and the same
+number this function's own empty-species fallback gives it two lines above).
+"""
+@inline function _ice_effective(qi::Float64, ni::Float64, ai::Float64, ci::Float64, k::Int,
+                                rhomax::Float64 = ISHMAEL_RHOI)
+
+    if !(qi > ISHMAEL_QSMALL)
+        return (deltastr = 1.0, ani = 2.0e-6, cni = 2.0e-6, rni = 2.0e-6,
+                rhobar = (k == 3 ? 50.0 : ISHMAEL_RHOI),
+                ni = ISHMAEL_QNSMALL, ai = ISHMAEL_QASMALL, ci = ISHMAEL_QASMALL,
+                alphstr = 1.0, alphv = ISHMAEL_FOURTHIRDSPI, betam = 3.0)
+    end
+
+    ni = max(ni, ISHMAEL_QNSMALL)
+    ai = max(ai, ISHMAEL_QASMALL)
+    ci = max(ci, ISHMAEL_QASMALL)
+    ani = max(((ai^2) / (ci * ni))^0.333333333333, 2.0e-6)
+    cni = max(((ci^2) / (ai * ni))^0.333333333333, 2.0e-6)
+    # Smallest bulk volume for which shape is meaningful: below it, assume spherical.
+    if ai < 1.0e-12 || ci < 1.0e-12
+        ai = min(ai, ci)
+        ci = ai
+        ani = (ai / ni)^0.3333333333
+        cni = (ci / ni)^0.3333333333
+    end
+    if ani < 2.0e-6 || cni < 2.0e-6
+        ani = 2.0e-6
+        cni = 2.0e-6
+    end
+    ci = cni^2 * ani * ni
+    ai = ani^2 * cni * ni
+    ds = (log(cni) - log(ISHMAEL_AO)) / (log(ani) - log(ISHMAEL_AO))
+    # `rbdum` in is irrelevant: var_check's first act is to re-derive it from (qi, ni, ani).
+    return ishmael_var_check(ISHMAEL_NU, ISHMAEL_AO, ISHMAEL_FOURTHIRDSPI, ISHMAEL_GAMMNU,
+                             qi, ds, ani, cni, ISHMAEL_RHOI, ni, ai, ci; RHOI = rhomax)
+end
+
+"""
+    _ice_species_pre(tab, dt, eff, qi, temp, rhoair, air, drive_i, Q_s_i, maxsui, igr,
+                       qc, nc, qr, nr, qv, shed) -> NamedTuple
+
+Every per-species ice process rate at one gridpoint, in ISHMAEL's mixing-ratio units except
+where noted. `eff` is [`_ice_effective`](@ref)'s tuple, `qi` the species mass mixing ratio,
+and `air` a tuple of the level's temperature-dependent air properties (see the caller).
+
+The order is the Fortran's own, because several rates read each other: the two riming lookups
+first (they supply `rimesum`/`rimesumr`, which the wet-growth check and the melting rate both
+read), then the vapor coefficients, then deposition, riming growth, splintering, and melting.
+
+# Deposition: where the Q_ss closure meets the habit physics
+
+`invtau_i = 4π D_v n_i C̄ f_v` (TeX Eq. tau_ice, density form: `n_i` in #/m³, `C̄` in m, `D_v`
+in m²/s) and `Q̇_i = drive · invtau_i / (1 + 𝒬_{s,i})` (Eq. dep_rate) — the rate is Scythe's,
+not ISHMAEL's, which is departure (b) of the TeX: the semi-analytic step-mean integration is
+replaced by the explicit rate, because `Q_ss` is prognostic here and is advanced by the same
+multistep integrator as everything else.
+
+The HABIT physics is then ISHMAEL's, applied as a PARTITION of that realized rate (departure
+(d)). The seam is the Fortran's `afn`, whose relation to the mass rate is exact:
+`vaporgrow` integrates `r² → r² + 2·afn·(C̄/r)/ρ_dep·(Γ(ν)/Γ(ν+2+δ*))·Δt`, whose volume
+derivative is `dV/dt = 4π·afn·C̄/ρ_dep` per particle, so the species mass rate is
+`4π n_i C̄ afn` and
+
+    afn = Q̇_i / (4π n_i C̄)
+
+is the inversion that hands `ishmael_deposition_partition` exactly the growth Scythe's own
+supersaturation supports. (Substituting the Fortran's own `afn`, which is
+`D_v f_v (ρ_v − ρ_{v,i}*)/(1 + 𝒬_{s,i})` written through its diagnosed `sui`, recovers
+`Q̇_i = invtau_i·drive/(1+𝒬_{s,i})` identically — the two schemes' underlying mass rate is the
+same capacitance-diffusion expression, differing only in the supersaturation supplied to it.)
+
+`maxsui` — which of `{ρ_ice·igr, ρ_ice/igr, ρ_ice}` the deposition density blends toward — is
+the caller's, formed from the same clipped drives (see `mc_ice_sources!`).
+
+# What is deliberately NOT ported
+
+The Fortran's `if(abs(prd*dt) < QSMALL*0.01) prd = nrd = ard = crd = 0` smallness cutoff is a
+Δt-dependent modification of a rate and goes with the rest of them (TeX §Departures (b)). The
+`qi ≤ QSMALL` gate above it is a STATE test and is kept — it is what makes an empty species
+cost nothing and produce exact zeros.
+
+# EFFECTIVE moments versus CARRIED moments
+
+`eff` is the var_check-effective state and `ni_c` is the CARRIED number mixing ratio, and the
+distinction is load-bearing. In the Fortran the two are the same array: `var_check` has
+`INTENT(INOUT)` arguments and its re-diagnosis is WRITTEN BACK into the prognostic state, so
+an inconsistent moment set is repaired once and never seen again. Scythe cannot do that — a
+per-step state repair is exactly what this model rejects everywhere else — so `var_check` is
+used here as a pure map and the carried moments keep whatever transport and the sources gave
+them. They can therefore drift arbitrarily far from consistency, and nothing in the effective
+state feels it.
+
+The split that follows from that:
+
+  * KERNEL quantities — the axes, the mean radius, the bulk density, the capacitance, the
+    ventilation, the fall speeds, the collection lookups and aggregation — read the EFFECTIVE
+    moments, because a growth or collision rate is only meaningful for a realizable population.
+  * BUDGET quantities — how much NUMBER leaves when a given fraction of the MASS leaves — read
+    the CARRIED number, because "sublimating half the ice removes half the crystals" is a
+    statement about the crystals that are actually there. Reading the effective number here
+    makes the number sink proportional to a quantity the number itself does not appear in,
+    which leaves the carried number with no restoring channel at all: measured on the O01 ice
+    arm, `n_i1` reached 2.2e10 m⁻³ against 6.7e-11 kg/m³ of mass (9 nm "crystals") and the run
+    detonated at t ≈ 1050 s.
+
+The same rule sends the CARRIED number to the DeMott existing-ice cap in `mc_ice_sources!`:
+a cap that throttles nucleation on the ice already present must see the ice already present.
+"""
+function _ice_species_pre(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni_c::Float64,
+                            temp::Float64, rhoair::Float64,
+                            mu::Float64, dv::Float64, kt::Float64, nsch::Float64,
+                            npr::Float64, xxlv::Float64, xxlf::Float64, qs0::Float64,
+                            drive_i::Float64, Q_s_i::Float64, maxsui::Float64,
+                            igr::Float64, qc::Float64, nc::Float64, qr::Float64,
+                            nr::Float64, qv::Float64, shed::Bool)
+
+    ani = eff.ani; cni = eff.cni; rni = eff.rni; ds = eff.deltastr
+    rhobar = eff.rhobar; ni = eff.ni; alphstr = eff.alphstr
+    nim3 = ni * rhoair                       # # m^-3, the Fortran's `nim3dum`
+
+    # ── Collection lookups (the itab/itabr families) ──
+    rc = ishmael_ice_cloud_riming(tab.itab, rni, qc, ds, rhobar, ni, nc, rhoair)
+    rr = ishmael_ice_rain_riming(tab.itabr, rni, qr, nr, ds, rhobar, ni, rhoair, temp, qi)
+    rimesum = rc.rimesum
+    rimesumr = rr.rimesumr
+    rimetotal = rimesum + rimesumr
+
+    # ── Capacitance, ventilation and the (uncapped) fall speeds the growth math reads ──
+    vc = ishmael_vapor_coefficients(ani, cni, ds, ISHMAEL_NU, ISHMAEL_I_GAMMNU, alphstr,
+                                    rhobar, rhoair, mu, nsch, npr)
+    capgam = vc.Cbar
+    fv = vc.fv
+    fh = vc.fh
+
+    # ── Deposition / sublimation (TeX Eqs. tau_ice, dep_rate) ──
+    invtau_i = 4.0 * pi * dv * nim3 * capgam * fv
+    # Above T_0 the deposition channel is closed: 𝒟 = 0 there, the ice cannot persist, and
+    # `vaporgrow` itself passes straight through (Fortran lines 3473-3479). Melting, not
+    # sublimation, is what removes ice above freezing.
+    Qdot = temp > T_0 ? 0.0 : drive_i * invtau_i / (1.0 + Q_s_i)
+    # The HABIT PARTITION of this rate (`ishmael_deposition_partition` — the a/c-moment
+    # sources and the sublimation number sink) is NOT evaluated here. Deposition is one of
+    # the two withheld relaxations of the shared `Q_ss`, and its realized mass increment is
+    # the STEP-MEAN one; the partition of that increment is evaluated once, at the step-mean
+    # rate, in the ETD pre-compute (see `mc_driver!`), so the axes and the number receive
+    # exactly the increment the mass slots do. Evaluating it here, at the instantaneous rate,
+    # and integrating the result by the multistep put the glaciation burst's one-step spike
+    # through the AB3 history (+23/12 then −16/12 of it), which rang the freshly nucleated
+    # moments and was the measured death of the ice arm at t = 1031.4 s. This function
+    # returns the two coefficients the partition needs that only exist here (`capgam`,
+    # the uncapped `vtrmi1`) and the carried-number/mass ratio its sublimation sink is
+    # proportional to (Fortran lines 1273-1276: number leaves IN PROPORTION to mass, of the
+    # CARRIED number — the only sink the carried number has).
+    niq = ni_c / qi
+
+    # ── Riming, PASS ONE: the growth at unit realization ──────────────────────────────────
+    # The nonlinear mass gain the collection would produce if nothing throttled it. This is
+    # the number the donor's conductance has to be formed from — NOT the linear-limit
+    # `rimesum/ρ_a`, because `prdr ∝ rnfr³ − rni³` and the cubic term is exactly what leaked:
+    # bounding the radius increment against the linear conductance still delivered a MEASURED
+    # 2.0 reservoirs at p99 and 13.0 at max. With `κ` formed from `prdr₀` itself the second
+    # pass lands in the linear-or-below regime, where `prdr(f) ≤ f·prdr₀`, and the realized
+    # conversion is then bounded by the reservoir. See `test_moist_compressible.jl`.
+    dry_growth_pre = ishmael_wet_growth_check(ISHMAEL_NU, temp, rhoair, xxlv, xxlf, qv, dv,
+                                              kt, qs0, fv, fh, rimetotal, rni, ni)
+    rg0 = ishmael_riming_growth(dt, rni, ds, rhobar, nim3, ani, cni, temp,
+                                qc, nc, rc.qi_qc_nrm, rc.qi_qc_nrd, rimesum,
+                                qr, nr, rr.qi_qr_nrm, rr.qi_qr_nrd, rimesumr,
+                                rhoair, dry_growth_pre, ISHMAEL_NU, ISHMAEL_AO,
+                                ISHMAEL_GAMMNU, ISHMAEL_I_GAMMNU, ISHMAEL_FOURTHIRDSPI)
+    # The unit-realization split, which is the Fortran's own `qcrimefrac`; it says how much of
+    # `prdr₀` each donor is being asked for.
+    qcf0 = rimetotal > 0.0 ? clamp(rimesum / rimetotal, 0.0, 1.0) : 0.0
+    # SHED (TeX §Departures (e)). Above `T_0` a crystal that collects liquid sheds it, so
+    # there is no liquid→ice conversion to put into either donor's conductance. The kernels
+    # above still ran and `rimetotal` still reaches the melting rate's sensible-heat term
+    # through `pre.rimesum`/`pre.rimesumr`; what is zeroed is the CONSUMER side. Exactly the
+    # unshed values below `T_0` (branch not taken), so the sub-freezing path — and every
+    # `ishmael.jl` fidelity test, which calls the ported kernels directly — is bitwise.
+    shed_now = shed && (temp > T_0)
+
+    return (rc = rc, rr = rr, vc = vc, rimesum = rimesum, rimesumr = rimesumr,
+            capgam = capgam, fv = fv, fh = fh, invtau_i = invtau_i, Qdot = Qdot, niq = niq,
+            dry_growth_pre = dry_growth_pre,
+            prdr0_c = shed_now ? 0.0 : rg0.prdr * qcf0,
+            prdr0_r = shed_now ? 0.0 : rg0.prdr * (1.0 - qcf0),
+            nrn_loss = rr.qi_qr_nrn * ni * nr * rhoair)
+end
+
+"""
+    _ice_species_post(tab, dt, eff, qi, ni_c, temp, rhoair, mu, dv, kt, xxlv, xxlf, qs0,
+                      qc, nc, qr, nr, qv, pre, f_qc, f_qr) -> NamedTuple
+
+PHASE C of one species' rates: the riming growth at the realized collection, and everything
+downstream of it (splintering, melting, fall speeds). Takes the donor factors `f_qc`/`f_qr`
+formed across all three species by [`_ice_donor_factors`](@ref) and the phase-A result `pre`.
+
+Returns the same NamedTuple the single-pass `_ice_species_rates` used to, so `mc_ice_sources!`
+downstream of the factors is unchanged.
+
+`shed` (`options[:ice_shed_above_t0]`) is TeX §Departures (e): above `T_0` the collection
+kernels still run — so `rimetotal` and `dQImltri` still reach the melting rate's sensible-heat
+term — but every riming OUTPUT is zeroed, so no mass leaves the cloud or the rain, no axis
+grows on rime and no `L_f` is released. Below `T_0` the branch is not taken and every
+returned field is bit-for-bit the unshed one.
+"""
+function _ice_species_post(tab::IshmaelTables, dt::Float64, eff, qi::Float64, ni_c::Float64,
+                           temp::Float64, rhoair::Float64, mu::Float64, dv::Float64,
+                           kt::Float64, xxlv::Float64, xxlf::Float64, qs0::Float64,
+                           qc::Float64, nc::Float64, qr::Float64, nr::Float64, qv::Float64,
+                           pre, f_qc::Float64, f_qr::Float64, shed::Bool)
+
+    ani = eff.ani; cni = eff.cni; rni = eff.rni; ds = eff.deltastr
+    rhobar = eff.rhobar; ni = eff.ni; ai = eff.ai; ci = eff.ci; alphstr = eff.alphstr
+    nim3 = ni * rhoair
+    rc = pre.rc; rr = pre.rr
+    rimetotal = pre.rimesum + pre.rimesumr
+
+    # ── Riming, PASS TWO: the growth at the REALIZED collection ───────────────────────────
+    rg = ishmael_riming_growth(dt, rni, ds, rhobar, nim3, ani, cni, temp,
+                               qc, nc, rc.qi_qc_nrm, rc.qi_qc_nrd, pre.rimesum,
+                               qr, nr, rr.qi_qr_nrm, rr.qi_qr_nrd, pre.rimesumr,
+                               rhoair, pre.dry_growth_pre, ISHMAEL_NU, ISHMAEL_AO,
+                               ISHMAEL_GAMMNU, ISHMAEL_I_GAMMNU, ISHMAEL_FOURTHIRDSPI;
+                               f_rime_c = f_qc, f_rime_r = f_qr)
+    # How the rime mass is split between the cloud and the rain reservoirs. The Fortran keeps
+    # this as `qcrimefrac(cc)`; the growth forms the same ratio internally for the density
+    # blend, from the REALIZED collections it grew the axes with, so the liquid debit is split
+    # the way the mass was actually collected. With both factors 1.0 it is bitwise the
+    # Fortran's `rimesum/rimetotal`.
+    rimetotal_r = rg.rimesum_r + rg.rimesumr_r
+    qcrimefrac = rimetotal_r > 0.0 ? clamp(rg.rimesum_r / rimetotal_r, 0.0, 1.0) : 0.0
+    # Hallett-Mossop: splinter mass comes OUT of this species' rime gain and goes to the
+    # nucleated species, so `prdr` shrinks while `prdr_pre` — the liquid that was actually
+    # collected — does not. The liquid sink is written against `prdr_pre`; see `mc_ice_sources!`.
+    sp = ishmael_rime_splintering(temp, rg.prdr)
+
+    # ── SHED ABOVE THE FREEZING LEVEL (TeX §Departures (e)) ──────────────────────────────
+    #
+    # ISHMAEL's collection kernels carry no temperature gate: above `T_0` the riming branch
+    # switches to wet growth (`dry_growth = dry_growth_pre && !(temp > T_0)` in
+    # `ishmael_riming_growth`) and the collected liquid is added to the ice mass, on the
+    # understanding that it sits as water on the crystal surface and that the melting rate,
+    # which carries the sensible heat of the collected liquid, will return it. In ISHMAEL's
+    # host that is a free bookkeeping loan: the latent-heat update for freezing is gated to
+    # `T ≤ T_0`, so the transfer has no thermodynamic content.
+    #
+    # Here it is not free. `FRZ_NET ≡ −(ICE_C + ICE_R)` is SIGNED BY THE PARTITION, so mass
+    # moving from the rain slot to an ice slot releases `L_f` wherever it happens, and the
+    # census of the timestep-limited configuration found the wet-growth branch taking the
+    # WHOLE of the rain into the ice in a single step two degrees above freezing, with the
+    # melt returning it at its own realized rate and the latent heat of the exchange cycling
+    # through the temperature (`MC_ATTR_WARM_RIME_R`/`MC_ATTR_WARM_MELT` are that loop).
+    #
+    # The departure states the physics directly: above `T_0` a crystal that collects liquid
+    # SHEDS it, and there is no liquid-to-ice conversion at all. The collection rate is still
+    # evaluated — `rimetotal` below is the unshed one, so `ishmael_melting` keeps the sensible
+    # heat of the liquid that struck the crystal, and `dQImltri` is untouched — but no mass
+    # leaves the rain or the cloud, no axis grows on rime, and no `L_f` is released. What is
+    # then left in `FRZ_NET` above `T_0` is melting alone (negative): homogeneous freezing is
+    # gated to `T < T_0 − 35`, Bigg to `T < T_0 − 4`, and `ishmael_ice_rain_riming` already
+    # routes `dQRfzri/dQIfzri/dNfzri` to zero and `dQImltri/dNmltri` to the collection above
+    # `T_0`. That is the sign property the positive-definiteness of the ice entropy production
+    # rests on, and the one the wet-growth transfer had violated.
+    #
+    # Applied HERE, at the consumer, and not by gating the ported kernel: `ishmael.jl` is a
+    # verbatim port with its own fidelity tests, and the reference harness must stay bitwise.
+    # Below `T_0` the branch is not taken and every value is the unshed one, bit for bit.
+    shed_now = shed && (temp > T_0)
+    prdr_pre_v = shed_now ? 0.0 : rg.prdr
+    prdr_v     = shed_now ? 0.0 : sp.prdr
+    ardr_v     = shed_now ? 0.0 : rg.ardr
+    crdr_v     = shed_now ? 0.0 : rg.crdr
+    # Hallett-Mossop is already zero outside [265.16, 270.16] K and so above `T_0`; these two
+    # are zeroed for the statement, not for the arithmetic.
+    qmult_v    = shed_now ? 0.0 : sp.qmult
+    nmult_v    = shed_now ? 0.0 : sp.nmult
+    qcrimefrac_v = shed_now ? 0.0 : qcrimefrac
+
+    # ── Melting ──
+    # `reservoir_caps=false`: the three `Δt`-dependent clauses inside the ported melting rate
+    # (the `-qi/Δt` floor, the `ai<1e-12` dump-it-all branch and the `-ni/Δt` number floor)
+    # are depletion caps and go with the rest of them.
+    ml = ishmael_melting(temp, ni, ani, cni, ds, rhobar, qi, ai, ci, kt, pre.fh, rhoair,
+                         xxlv, dv, pre.fv, qs0, qv, xxlf, rimetotal, rr.dQImltri, rr.dNmltri,
+                         dt, alphstr, ISHMAEL_GAMMNU, ISHMAEL_I_GAMMNU,
+                         ISHMAEL_FOURTHIRDSPI; reservoir_caps = false)
+    # The melting NUMBER loss is a budget leg, so it is re-formed on the CARRIED number —
+    # the Fortran's own expression (line 1527) evaluated on the crystals that are actually
+    # there rather than on the effective population the melting KERNEL (`ml.qmlt`, `ml.amlt`,
+    # `ml.cmlt`, which need number and size to agree) reads. No `Δt` floor, for the same
+    # reason the kernel above has none.
+    nmlt = ml.qmlt < 0.0 ? ((ml.qmlt * ni_c / qi) - rr.dNmltri) : ml.nmlt
+
+    # ── Fall speeds (the capped copy the host model keeps; size-sorting under melting) ──
+    # Evaluated at the SAME effective state as every rate above. The Fortran recomputes these
+    # after its sequential state update; there is no updated state here to recompute them on,
+    # and taking them at the state the tendency is being formed at is what a rate-based
+    # scheme means. Negated: `Vt` and every fall speed in this file is downward-NEGATIVE.
+    fs = ishmael_fall_speeds(ani, cni, ds, ISHMAEL_NU, ISHMAEL_I_GAMMNU, alphstr, rhobar,
+                             rhoair, mu; in_melting = (temp > T_0 && ml.qmlt < 0.0))
+
+    return (invtau_i = pre.invtau_i, Qdot = pre.Qdot, niq = pre.niq, capgam = pre.capgam,
+            vtrmi1 = pre.vc.vtrmi1,
+            prdr_pre = prdr_pre_v, prdr = prdr_v, ardr = ardr_v, crdr = crdr_v,
+            qmult = qmult_v, nmult = nmult_v, qcrimefrac = qcrimefrac_v,
+            qmlt = ml.qmlt, nmlt = nmlt, amlt = ml.amlt, cmlt = ml.cmlt,
+            dQRfzri = rr.dQRfzri, dQIfzri = rr.dQIfzri, dNfzri = rr.dNfzri,
+            nrn_loss = pre.nrn_loss,
+            vtrm = -fs.vtrmi1, vtrn = -fs.vtrni1)
+end
+
+"""
+    _ice_empty_rates() -> NamedTuple
+
+The all-zero counterpart of [`_ice_species_rates`](@ref) for a species with no ice. Every
+field is an EXACT `0.0`, which is what keeps the warm/ice-free inertness gate bitwise: the
+source accumulators are sums of these, `x + 0.0 === x`, and `_ice_flux!` short-circuits its
+spline fit on a fall speed that is identically zero.
+"""
+@inline _ice_empty_rates() =
+    (invtau_i = 0.0, Qdot = 0.0, niq = 0.0, capgam = 0.0, vtrmi1 = 0.0,
+     prdr_pre = 0.0, prdr = 0.0, ardr = 0.0, crdr = 0.0,
+     qmult = 0.0, nmult = 0.0, qcrimefrac = 0.0,
+     qmlt = 0.0, nmlt = 0.0, amlt = 0.0, cmlt = 0.0,
+     dQRfzri = 0.0, dQIfzri = 0.0, dNfzri = 0.0, nrn_loss = 0.0,
+     vtrm = 0.0, vtrn = 0.0)
+
+"""
+    _ice_agg_moments(eff, qi, ni_new, qi_new, rhoair, dt, dnew3, k) -> (Ȧ, Ċ)
+
+The `a`/`c` volume-moment rates [m³/m³/s] that accompany one species' aggregation mass and
+number transfer.
+
+ISHMAEL expresses this as a state update (Fortran lines 2404-2478), and it is the one place
+the port has to differentiate one: given the post-aggregation mass and number, the axes are
+re-diagnosed at CONSTANT `deltastr` and `rhobar` (the assumption stated in the Fortran's own
+comment — the loss of ice1/ice2 to aggregates does not significantly change the shape or
+density of what is left) and the moments follow by the product rule on `a_i = n⟨a²c⟩`,
+
+    δa_i = 2 n a c δa + n a² δc + a² c δn
+
+which is the Fortran's own three-term expression, divided here by the step.
+
+The AGGREGATE species under `forced3` is different and is not a perturbation: its shape is
+IMPOSED (ρ̄ = 50 kg/m³, aspect ratio 0.2, `a = ½·dnew3` from the collection kernel's own
+updated characteristic diameter), so its moments are assigned outright and the rate is the
+difference from where they were. `forced3` is set only when the aggregation block actually
+ran (there is no `dnew3` otherwise); a species-3 mass change from the ice-rain freezing
+transfer alone takes the ordinary constant-shape branch.
+
+The same function serves the NUCLEATION TRANSFER — the mass and number a non-nucleated
+species loses to the nucleated one when rain freezes onto it (Fortran lines 2330-2347 apply
+the identical three-term update for the identical reason). Aggregation and the transfer are
+combined into ONE new `(qi, ni)` by the caller and re-diagnosed once, rather than
+sequentially: with a rate-based scheme there is no intermediate state for the second
+re-diagnosis to be taken at.
+"""
+@inline function _ice_agg_moments(eff, ni_new::Float64, qi_new::Float64,
+                                  rhoair::Float64, dt::Float64, dnew3::Float64,
+                                  forced3::Bool)
+
+    (qi_new > ISHMAEL_QSMALL && ni_new > 0.0) || return (0.0, 0.0)
+    ds = eff.deltastr
+    ni = eff.ni
+    aniold = eff.ani
+    cniold = eff.cni
+
+    if forced3
+        # Forced aggregate shape (Fortran lines 2406-2416).
+        ani = 0.5 * dnew3
+        cni = 0.2 * ani * ISHMAEL_GAMMNU / gamma(ISHMAEL_NU - 1.0 + ds)
+        da = (ani^2 * cni * ni_new) - eff.ai
+        dc = (cni^2 * ani * ni_new) - eff.ci
+        return (rhoair * da / dt, rhoair * dc / dt)
+    end
+
+    alphstr = ISHMAEL_AO^(1.0 - ds)
+    gam = gamma(ISHMAEL_NU + 2.0 + ds)
+    ani = (qi_new / (ni_new * eff.rhobar * ISHMAEL_FOURTHIRDSPI * alphstr * gam *
+                     ISHMAEL_I_GAMMNU))^(1.0 / (2.0 + ds))
+    ani = max(ani, 2.0e-6)
+    cni = alphstr * ani^ds
+    da = (cniold * ni * 2.0 * aniold * (ani - aniold)) +
+         (ni * aniold^2 * (cni - cniold)) +
+         (aniold^2 * cniold * (ni_new - ni))
+    dc = (aniold * ni * 2.0 * cniold * (cni - cniold)) +
+         (ni * cniold^2 * (ani - aniold)) +
+         (cniold^2 * aniold * (ni_new - ni))
+    return (rhoair * da / dt, rhoair * dc / dt)
+end
+
+"""
+    _ice_nucleation_volume(Qnuc, Nnuc) -> Ȧ
+
+The `a` (and, for the spheres it makes, `c`) volume-moment source [m³/m³/s] that accompanies
+a nucleation mass rate `Qnuc` [kg/m³/s] and number rate `Nnuc` [#/m³/s].
+
+New ice particles are spheres of density `RHOI` (Fortran lines 1577-1601 for DeMott; frozen
+drops arrive with their own mass and number and the same relation sizes them). Inverting
+`Q = N·(4/3)π ρ_i a³ Γ(ν+3)/Γ(ν)` for the characteristic axis and forming `Ȧ = Ṅ⟨a²c⟩ =
+Ṅ a³ Γ(ν+3)/Γ(ν)` gives, before the clamps, simply
+
+    Ȧ = Q̇_nuc / ((4/3)π ρ_i)
+
+which is the bulk volume of the nucleated ice — consistent with the TeX's own reading of the
+moment, "⁴⁄₃π a_{i,k} is the volume fraction occupied by the species" (§Model variables with
+ice). The Fortran's `anuc` clamps to `[2 μm, 3 mm]` are applied to the characteristic axis
+before the moment is formed, which is why this is written the long way round rather than as
+the one-line identity.
+
+Zero when either rate is non-positive: a mass with no number, or a number with no mass, seeds
+no realizable population.
+"""
+@inline function _ice_nucleation_volume(Qnuc::Float64, Nnuc::Float64)
+
+    (Qnuc > 0.0 && Nnuc > 0.0) || return 0.0
+    gam3 = gamma(ISHMAEL_NU + 3.0)
+    a3 = (Qnuc * ISHMAEL_GAMMNU) / (ISHMAEL_RHOI * Nnuc * ISHMAEL_FOURTHIRDSPI * gam3)
+    anuc = clamp(cbrt(a3), 2.0e-6, 3.0e-3)
+    return Nnuc * anuc^3 * gam3 * ISHMAEL_I_GAMMNU
+end
+
+"""
+    mc_ice_sources!(S, tab, ts, max_N_c) -> Nothing
+
+Fill one column's ICE process sources. Reads and writes only the thread's `mc_scratch`
+workspace `S`, so it takes no views and no grid: every input (`Tk`, `p_hPa`, `rho_d`,
+`rho_v`, `rho_vs`, `Q_ss`, `rho_c`, `rho_r`, `n_r`, `Q_s_i`, and the twelve recovered ice
+moments) is already staged there by `mc_driver!`, and every output goes back to it.
+
+Written:
+
+| scratch | meaning |
+|---|---|
+| `SRC_i<k><m>` | the twelve process sources `Q̇_{i,k}+Q̇^ρ_k`, `Ṅ_k`, `Ȧ_k`, `Ċ_k` of TeX Eqs. ice_prog_mass..ice_prog_c [density units per second] |
+| `Qdot_i<k>` | species k's DEPOSITION rate alone [kg/m³/s] — slots 1 and 7 need it separately from the rest of the mass source |
+| `invtau_i<k>` | `1/τ_{i,k}` (Eq. tau_ice), for the stiffness census |
+| `FRZ_NET` | `Q̇_freeze`, the net liquid→ice conversion [kg/m³/s] |
+| `ICE_C`, `ICE_R`, `ICE_NR` | the back-reactions on cloud mass, rain mass and rain number |
+| `Vi<k>m`, `Vi<k>n` | mass- and number-weighted fall speeds [m/s, negative downward] |
+| `f_ice<k>`, `f_isn<k>` | species k's MASS donor factor, and the residual factor its sublimation NUMBER sink still owes its own reservoir (Stage 1b) — both read again in the ETD pre-compute |
+
+# Mass conservation, and the one place it forced a departure from the Fortran
+
+Scythe's vapor is PROGNOSTIC (Stage A; TeX §Prognostic vapor) and, under the derived water
+anchor, the ν-space closure of every exchange (`water_exchange_dv`). Any mismatch between the
+liquid mass this block removes and the ice mass it creates therefore becomes manufactured or
+destroyed vapor through that closure, with no latent heat accounting. So the freezing channels
+are written to satisfy
+
+    FRZ_NET ≡ −(ICE_C + ICE_R)
+
+structurally: `FRZ_NET` is not accumulated independently, it is that difference, which makes
+"freezing sources neither ρ_t nor ρ_v and cancels between the ρ_l and ρ_i equations" (TeX
+§Water categories) true by construction rather than by inspection.
+
+That required ONE change to ISHMAEL's own accounting. The Fortran subtracts the
+Hallett-Mossop splinter mass from the riming rate (`prdr := prdr − qmult`), gives the
+splinters to the nucleated species, and then debits the cloud and rain with the REDUCED
+`prdr` — so the ice gains `prdr + qmult` while the liquid loses only `prdr`. Here the liquid
+is debited with `prdr_pre`, the rime that was actually collected, so the two balance exactly.
+Nothing else about the splinter physics changes: the same mass and the same number still move
+to the same species.
+
+Everything else in the block is an exact exchange already: aggregation's three transfers sum
+to zero by construction (`qagg1 + qagg2 + qagg3 ≡ 0`), the ice-rain freezing transfer moves
+mass between two ice species, and deposition moves vapor, which the vapor slot takes as
+`-Σ_k Q̇_{i,k}` through `VAPOR_SRC`.
+
+# Gates
+
+`qi ≤ QSMALL` skips a species' whole rate block and returns exact zeros
+([`_ice_empty_rates`](@ref)); aggregation runs only for `T ≤ T_0` and only when some species
+has ice; deposition is zero above `T_0`. In air that is warm everywhere with no ice, every
+number this function writes is an exact `0.0` — which is what the bitwise inertness gate
+rests on.
+
+The RAIN POPULATION GATE is the same statement about the liquid side
+(`options[:rain_population_gate]`, default true): where the CARRIED rain number is not
+positive, the kernels that read a rain SIZE DISTRIBUTION see no rain. `ishmael_rain_lambda`
+floors the number at `QNSMALL` and clamps the slope, so a mass-without-number rain slot is
+handed to every DSD consumer as 2800 μm drops — the largest the scheme admits, and the pump
+that dead-ended the anvil through Bigg freezing (reference/FINDINGS_ISHMAEL_S8S9.md §5i).
+`ishmael_ice_rain_riming` self-gates (every rate it returns carries a factor of the carried
+`n_r`); Bigg does not, and is the one kernel the gate has to switch off.
+
+The POPULATION GATE below (mass with no carried number is not a population, so no rate acts
+on it) leaves that mass exempt from every device that could REMOVE it as well. That is a
+representation error of the transport and not a rate, and it is repaired one level up by
+[`_ice_population_reconcile!`](@ref), which runs after this function and is the only thing
+that writes into a gated species' slots — the fourth tier of the reconciliation chain, TeX
+§"Reconciliation of the population".
+
+Above `T_0` the ISHMAEL collection kernels still run, but there is no liquid→ice conversion:
+`shed` (`options[:ice_shed_above_t0]`, default true) zeroes the riming rates, their axis
+partners, their liquid debits and their share of the donor conductances at the CONSUMER
+(`_ice_species_pre`/`_ice_species_post`), so the melting rate keeps the sensible heat of the
+liquid that struck the crystal while no mass and no `L_f` move — TeX §Departures (e).
+"""
+function mc_ice_sources!(S, tab::IshmaelTables, ts::Float64, max_N_c::Float64,
+                         active::Bool, var_check_source::Bool,
+                         attr_census::Bool, agg_caps::Bool, rain_evap_real::Bool,
+                         cloud_evap_real::Bool, shed::Bool, ice_n_real::Bool,
+                         rain_pop_gate::Bool,
+                         tau_hf::Float64, tau_act::Float64, tau_vc::Float64,
+                         stats, stats_tid::Int64)
+
+    # `dt` reaches ONLY the habit-partition calls (`ishmael_deposition_partition`,
+    # `ishmael_riming_growth`, `ishmael_aggregation`, `_ice_agg_moments`), where it is a
+    # one-step INCREMENT that is immediately divided by the same step: `ard = δa/Δt`,
+    # `qagg/Δt`. Those are consistent first-order discretizations of a rate — they converge to
+    # the derivative as `Δt → 0` — and the TeX retains the habit physics verbatim as a
+    # PARTITION of a mass increment (§Departures (d)). NO rate law in this block is a function
+    # of the step: the three that were (`q_c/Δt`, `n_c/Δt`, the DeMott deficit/Δt) are now
+    # relaxations on `tau_hf`, `tau_act` and `tau_vc`, and every reservoir cap of the form
+    # `min(rate, ρ/Δt)` inside the ported functions is switched off at the call site.
+    dt = ts
+    i_dt = 1.0 / dt
+    i_tau_vc = 1.0 / tau_vc
+    # Census handles, hoisted: `mc_water_stats` has zero columns when the water trace is off,
+    # and the census is then skipped entirely rather than branching per gridpoint.
+    stx = stats
+    tid_x = stats_tid
+    census_on = size(stx, 2) > 0
+    # The per-channel ATTRIBUTION block (`MC_ATTR_*`) is OPT-IN on top of that: eighteen
+    # channels and a two-scalar tail are not something a run that is not asking the question
+    # should pay for, and `mc_water_stats` is allocated either way, so the flag is what makes
+    # it free. Reported, never limiting; exactly zero on the warm/ice-free path.
+    attr_on = census_on && attr_census
+    Tk = S.Tk; p_hPa = S.p_hPa; rho_d = S.rho_d; rho_v = S.rho_v; rho_vs = S.rho_vs
+    Q_ss = S.Q_ss; rho_c = S.rho_c; rho_r = S.rho_r; n_r = S.n_r; Q_s_i = S.Q_s_i
+
+    # Per-species output columns, gathered once as homogeneous tuples so the species loop is
+    # an index rather than three copies of the same block. All `Vector{Float64}`, so the
+    # tuple is concrete and `SRCq[k]` costs nothing.
+    SRCq = (S.SRC_i1q, S.SRC_i2q, S.SRC_i3q)
+    SRCn = (S.SRC_i1n, S.SRC_i2n, S.SRC_i3n)
+    # State-n inputs of the step-mean habit partition (see the ETD pre-compute in
+    # `mc_driver!`): stashed here, where the effective moments and the vapor coefficients
+    # exist, consumed there, where the step-mean deposition rate does.
+    habANI = (S.hab1_ani, S.hab2_ani, S.hab3_ani)
+    habCNI = (S.hab1_cni, S.hab2_cni, S.hab3_cni)
+    habRNI = (S.hab1_rni, S.hab2_rni, S.hab3_rni)
+    habDS  = (S.hab1_ds,  S.hab2_ds,  S.hab3_ds)
+    habRB  = (S.hab1_rb,  S.hab2_rb,  S.hab3_rb)
+    habNIM = (S.hab1_nim3, S.hab2_nim3, S.hab3_nim3)
+    habVT  = (S.hab1_vt,  S.hab2_vt,  S.hab3_vt)
+    habCG  = (S.hab1_cg,  S.hab2_cg,  S.hab3_cg)
+    habNIQ = (S.hab1_niq, S.hab2_niq, S.hab3_niq)
+    SRCa = (S.SRC_i1a, S.SRC_i2a, S.SRC_i3a)
+    SRCc = (S.SRC_i1c, S.SRC_i2c, S.SRC_i3c)
+    QDi  = (S.Qdot_i1, S.Qdot_i2, S.Qdot_i3)
+    ITi  = (S.invtau_i1, S.invtau_i2, S.invtau_i3)
+    Vm   = (S.Vi1m, S.Vi2m, S.Vi3m)
+    Vn   = (S.Vi1n, S.Vi2n, S.Vi3n)
+
+    if !active
+        for k in 1:3
+            fill!(SRCq[k], 0.0); fill!(SRCn[k], 0.0)
+            fill!(SRCa[k], 0.0); fill!(SRCc[k], 0.0)
+            fill!(QDi[k], 0.0);  fill!(ITi[k], 0.0)
+            fill!(Vm[k], 0.0);   fill!(Vn[k], 0.0)
+        end
+        fill!(S.FRZ_NET, 0.0); fill!(S.ICE_C, 0.0)
+        fill!(S.ICE_R, 0.0);   fill!(S.ICE_NR, 0.0)
+        # 1.0, not 0.0: these MULTIPLY the sublimation leg in the ETD pre-compute, so the
+        # inert value is the identity. (With `active = false` the conductances are zero and
+        # the leg is zero anyway; this keeps the column meaningful rather than relying on it.)
+        fill!(S.f_ice1, 1.0); fill!(S.f_ice2, 1.0); fill!(S.f_ice3, 1.0)
+        fill!(S.f_isn1, 1.0); fill!(S.f_isn2, 1.0); fill!(S.f_isn3, 1.0)
+        fill!(S.etd_dep_a, 0.0); fill!(S.etd_dep_b, 0.0)
+        for k in 1:3
+            fill!(habANI[k], 0.0); fill!(habCNI[k], 0.0); fill!(habRNI[k], 0.0)
+            fill!(habDS[k], 0.0);  fill!(habRB[k], 0.0);  fill!(habNIM[k], 0.0)
+            fill!(habVT[k], 0.0);  fill!(habCG[k], 0.0);  fill!(habNIQ[k], 0.0)
+        end
+        fill!(S.hab_igr, 0.0); fill!(S.hab_maxsui, 0.0); fill!(S.hab_dv, 0.0)
+        return nothing
+    end
+
+    @inbounds for i in eachindex(Tk)
+
+        temp = Tk[i]
+        rhoair = rho_d[i]
+        ph = p_hPa[i]
+
+        # ── The level's air properties (Fortran lines 975-991), in SI ──
+        mu = 1.496e-6 * temp^1.5 / (temp + 120.0)
+        # `vapor_diffusivity` is the liquid channel's own D_v and returns cm²/s (the CGS the
+        # `invtau_condensation` chain works in); the ice timescale is assembled in SI, so it
+        # is converted here and NOWHERE else. Using the same function for both channels is
+        # what makes the shared-reservoir competition of Eq. wbf_qs a competition between two
+        # conductances rather than between two diffusivities.
+        dv = 1.0e-4 * vapor_diffusivity(temp, ph)
+        kt = 2.3823e-2 + (7.1177e-5 * (temp - T_0))
+        nsch = mu / (rhoair * dv)
+        npr  = mu / (rhoair * kt)
+        xxlv = L_v(temp)
+        xxlf = L_f(temp)
+        qs0 = rho_v_sat(T_0, ph) / rhoair
+        igr = get_igr(tab.igrdata, temp)
+        (temp - T_0) < -20.0 && (igr = 0.7)   # planar below -20 C (Bailey and Hallett)
+
+        # ── The liquid reservoirs, as ISHMAEL mixing ratios ──
+        qc = max(rho_c[i], 0.0) / rhoair
+        qr = max(rho_r[i], 0.0) / rhoair
+        nr = max(n_r[i], 0.0) / rhoair
+        qv = max(rho_v[i], 0.0) / rhoair
+        # The cloud droplet number is the HOST's (`max_N_c`, #/cm³), not ISHMAEL's hardcoded
+        # 200 cm⁻³: the same number the liquid condensation closure nucleates against, so the
+        # riming kernel collects the droplets the cloud channel actually made.
+        nc = 1.0e6 * max_N_c / rhoair
+        # ── THE RAIN POPULATION GATE ───────────────────────────────────────────────────
+        # The ice population gate's statement, applied to the RAIN: a rate may not act on a
+        # size distribution the CARRIED number does not support. `nr` is `max(n_r, 0)/ρ_a`
+        # just above, so `nr > 0` is exactly `n_r > 0` — the drops the transport is carrying,
+        # not a floored or re-diagnosed stand-in for them.
+        #
+        # The measurement (reference/FINDINGS_ISHMAEL_S8S9.md §5i): at the anvil top the two
+        # rain moments decorrelate on their independent spline fits — `n_r` rings to EXACTLY
+        # zero while `ρ_r` keeps ~1e-8 kg/kg at 15 km and 192–203 K, rain mass without rain
+        # number where there is no rain. `ishmael_rain_lambda` then FLOORS the number at
+        # `QNSMALL` and the resulting slope falls into the `lamr < LAMMINR` clamp, so every
+        # kernel that reads the DSD is handed a phantom population of 2800 μm drops — the
+        # largest particle the scheme admits, the same failure the ice population gate exists
+        # to forbid, arriving on the rain and from INSIDE a kernel. Bigg, evaluated 30–40 K
+        # below its validity on that phantom, was the number pump that dead-ended the anvil.
+        #
+        # WHICH kernels need this gate, and which already self-gate:
+        #   * `ishmael_bigg_freezing` NEEDS it. Its only existence test is `q_r > QSMALL`
+        #     (plus `T < T_0 − 4`), and the floored `nr_adj` it freezes is the DSD's, not the
+        #     carried number's, so at `n_r = 0` it returns a large rate rather than nothing.
+        #   * `ishmael_ice_rain_riming` (`p_k.rr`) SELF-GATES and is left alone: every rate it
+        #     returns carries a factor of the CARRIED `nr` it was passed (`procr·n_i·n_r·ρ_a`
+        #     for the four collection moments, `procr[1]·n_i·n_r·ρ_a²` for `rimesumr`, which
+        #     then trips its own `QSMALL` test and zeroes `qi_qr_nrm/nrd/nrn` with it), so at
+        #     `nr = 0` the whole returned tuple is exact zeros — and with it `nrn_loss`, the
+        #     rain-riming branch of `ishmael_riming_growth` (gated on `qi_qr_nrm > 0`) and
+        #     every ice–rain leg of the donor conductances.
+        #   * The WARM two-moment closures in `microphysics.jl` read the same DSD through
+        #     `rain_dsd_2m` and were audited with it. `rain_selfcollection_2m` needed the same
+        #     gate and carries its own (the clamped breakup rolloff `dum = −312` turns it into
+        #     a number SOURCE on the phantom, which is how a gated rain slot gets a positive
+        #     number back and un-gates Bigg on the next step); `rain_number_evaporation_2m`
+        #     already tested `n_r <= 0`; `invtau_rain_2m` and `rain_fall_speeds_2m` are
+        #     CLAMP-BOUNDED — `n0rr ∝ q_r` at `LAMMINR` makes the first a sink 1.7e3 too SLOW
+        #     rather than a source, and the second is bounded to the 3.4x between the two ends
+        #     of the clamp — and are deliberately left ungated, since gating either would
+        #     strand rain mass that no reconciliation exists to return (their docstrings carry
+        #     the measurements).
+        #   * `_ice_homogeneous_rates` is NOT a DSD consumer and is out of this gate's scope:
+        #     `ṁ = q_r/τ_hf` needs no size distribution, and its number leg is already
+        #     `min(n_r/τ_hf, ṁ/m_min)`, which is exactly `0` at `n_r = 0`. The rain MASS it
+        #     freezes without number is the ordinary mass-without-number defect the population
+        #     reconciliation handles one level up, not a phantom-DSD rate.
+        #
+        # Bitwise inert wherever `n_r > 0`, which is all healthy rain — the branch is not
+        # taken and `bg` is the same call it always was. `options[:rain_population_gate]`,
+        # default TRUE; env `SCYTHE_O01_RAINGATE=0` is forensic only.
+        live_r = (!rain_pop_gate) || nr > 0.0
+
+        # ── The two drives (TeX Eqs. qss_ice_shift, Dwi) and the habit-density selector ──
+        rvs = rho_vs[i]
+        rvsi = rho_i_sat(temp, ph)
+        Dgap = max(rvs - rvsi, 0.0)
+        rv_floor = max(rho_v[i], 0.0)
+        drive_w = min(Q_ss[i], rv_floor - rvs)
+        drive_i = min(Q_ss[i] + Dgap, rv_floor - rvsi)
+        sup = drive_w / rvs
+        # `maxsui`, the Fortran's blend weight between the habit-limited and the solid-ice
+        # deposition density (lines 3327-3335), rewritten in the TeX's own variables:
+        # `sui·q_vi` is the over-ice supersaturation DENSITY (= drive_i) and `q_vs − q_vi` is
+        # `𝒟`, so the whole selector is a function of the two drives and needs none of the
+        # diagnosed-supersaturation pathway the port excluded.
+        maxsui = sup >= 0.0 ? 1.0 :
+                 (drive_i >= 0.0 && Dgap > 0.0) ? clamp(drive_i / Dgap, 0.0, 1.0) : 0.0
+        Qsi = Q_s_i[i]
+        # ── The ICE half of the stiff-relaxation split (TeX Eq. relax_linear) ──
+        # The deposition drive written as an AFFINE function of the shared supersaturation,
+        # `drive_i = a·Q_ss + b`, which is all the exponential integrator and the step-mean
+        # consumers need from this block. Substituting Eq. dep_rate into Eq. Qss_ice, the ice
+        # contribution to slot 7 is `−Σ_k Q̇_{i,k}(1+𝒬_{s,i}) = −drive_i·Σ_k τ_{i,k}^{-1}`
+        # (the psychrometric factor cancels at the rate level, exactly as the liquid one does),
+        # so `a` carries the λ part and `b` the `N` part with no further case analysis:
+        #
+        #   UNCLIPPED  a = 1, b = 𝒟          →  λ += Σ τ_{i,k}^{-1},  N −= 𝒟 Σ τ_{i,k}^{-1}
+        #   CLIPPED    a = 0, b = drive_i     →  λ unchanged,          N −= drive_i Σ τ_{i,k}^{-1}
+        #   T > T_0    a = 0, b = 0           →  the channel is shut (Q̇_{i,k} ≡ 0 below)
+        #
+        # `𝒟` in `N` is the whole content of the Wegener-Bergeron-Findeisen competition: it is
+        # the offset that makes the ice relax the SHARED reservoir toward a different zero than
+        # the liquid does, and Eq. wbf_qs is `N/λ` with exactly these two numbers in it.
+        # The classification is FROZEN at state n, like every coefficient the step freezes.
+        if temp > T_0
+            S.etd_dep_a[i] = 0.0
+            S.etd_dep_b[i] = 0.0
+        elseif (rv_floor - rvsi) < (Q_ss[i] + Dgap)
+            S.etd_dep_a[i] = 0.0
+            S.etd_dep_b[i] = drive_i
+        else
+            S.etd_dep_a[i] = 1.0
+            S.etd_dep_b[i] = Dgap
+        end
+        # Shared state-n inputs of the step-mean habit partition (per-species ones are
+        # stashed in the assembly loop below).
+        S.hab_igr[i] = igr
+        S.hab_maxsui[i] = maxsui
+        S.hab_dv[i] = dv
+
+        # ── The three species: effective moments, then rates ──
+        # (The RATE-SIDE anchor share `f_a` that multiplied these twelve reads was deleted with
+        # the ice-anchor legs at Stage 5 of the ρ_t retirement; it was exactly 1.0 under the
+        # derived anchor, and `1.0 * x === x`, so the reads are bitwise what they were.)
+        q1 = max(S.i1q[i], 0.0) / rhoair; n1 = max(S.i1n[i], 0.0) / rhoair
+        a1 = max(S.i1a[i], 0.0) / rhoair; c1 = max(S.i1c[i], 0.0) / rhoair
+        q2 = max(S.i2q[i], 0.0) / rhoair; n2 = max(S.i2n[i], 0.0) / rhoair
+        a2 = max(S.i2a[i], 0.0) / rhoair; c2 = max(S.i2c[i], 0.0) / rhoair
+        q3 = max(S.i3q[i], 0.0) / rhoair; n3 = max(S.i3n[i], 0.0) / rhoair
+        a3 = max(S.i3a[i], 0.0) / rhoair; c3 = max(S.i3c[i], 0.0) / rhoair
+
+        e1 = _ice_effective(q1, n1, a1, c1, 1)
+        e2 = _ice_effective(q2, n2, a2, c2, 2)
+        e3 = _ice_effective(q3, n3, a3, c3, 3)
+
+        # ── THE POPULATION GATE ────────────────────────────────────────────────
+        # A species has a POPULATION at this gridpoint only where the CARRIED number is
+        # positive. Mass with no number is not a population: it is a state the transport can
+        # produce (four moments on four independent spline fits do not stay mutually
+        # realizable) and that nothing physical can. GROWTH WITHOUT ACTIVATION IS IMPOSSIBLE
+        # — deposition needs crystals to deposit onto, riming needs crystals to rime, and a
+        # fall speed is a property of particles. Ice begins by NUCLEATION, which creates
+        # number and mass together, and those channels are deliberately NOT gated here (see
+        # `q_nuc`/`n_nuc` below): activation is how ice is allowed to start.
+        #
+        # Why the CARRIED number and not `_ice_effective`'s. `_ice_effective` floors the
+        # incoming number at `ISHMAEL_QNSMALL` and hands the result to `ishmael_var_check`,
+        # whose small/large-ice limits then RE-DERIVE a number from the mass. At carried
+        # n = 0 that manufactures a phantom population — measured on the O01 ice arm: 744 /m³
+        # of 1 mm crystals at ρ_b = 50 kg/m³, the largest and lowest-density particle the
+        # scheme can represent, hence the FASTEST. Its fall speed is 5.27 m/s against
+        # 0.046 m/s for a physically consistent 20 µm population carrying the same mass
+        # (115x; 1646x at 5 µm), and it is INDEPENDENT of the mass, so the sedimentation flux
+        # `ρ_i·V` is linear in a density the number does not support. Measured consequence:
+        # 42-48 gridpoints per column falling at up to the 25 m/s cap, a fall-speed field
+        # that jumps 0 -> 5 -> 25 m/s between adjacent gridpoints, a spline fit of `ρ_i·V`
+        # that rings at an amplitude far above the ice present, and — with `ahyp` keeping
+        # only the positive lobes — a column ice mass that went 4.9e-8 -> 4.6e-5 -> 32.4
+        # kg/m² in three steps at t = 999 s while the cumulative deposition at the worst
+        # point was -3.5e-12 kg/m³. The mass was not deposited and did not arrive; it was
+        # manufactured by rates and speeds read off a population that was not there.
+        #
+        # The floor itself stays inside `_ice_effective` — `var_check` divides by the number
+        # and would fault without it — but NO RATE may see the population it implies, so the
+        # gate is applied here, at the rate boundary, and `_ice_empty_rates()` is every field
+        # EXACT `0.0`. That is what keeps the warm/ice-free inertness gate bitwise: a
+        # configuration with no ice takes the same branch it always did.
+        live1 = q1 > ISHMAEL_QSMALL && n1 > 0.0
+        live2 = q2 > ISHMAEL_QSMALL && n2 > 0.0
+        live3 = q3 > ISHMAEL_QSMALL && n3 > 0.0
+
+        # ── PHASE A: every species' collection kernels and unit-realization growth ────────
+        # Nothing here depends on the realization, and everything the DONOR conductances need
+        # comes out of it. It has to run for all three species before any factor exists,
+        # because a donor's conductance is a sum over the species drawing on it.
+        p1 = live1 ?
+             _ice_species_pre(tab, dt, e1, q1, n1, temp, rhoair, mu, dv, kt, nsch, npr,
+                              xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
+                              qc, nc, qr, nr, qv, shed) : _ice_empty_pre()
+        p2 = live2 ?
+             _ice_species_pre(tab, dt, e2, q2, n2, temp, rhoair, mu, dv, kt, nsch, npr,
+                              xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
+                              qc, nc, qr, nr, qv, shed) : _ice_empty_pre()
+        p3 = live3 ?
+             _ice_species_pre(tab, dt, e3, q3, n3, temp, rhoair, mu, dv, kt, nsch, npr,
+                              xxlv, xxlf, qs0, drive_i, Qsi, maxsui, igr,
+                              qc, nc, qr, nr, qv, shed) : _ice_empty_pre()
+
+        # ── PHASE B: the three liquid donors' conductances, and their one factor each ──────
+        # `hf` and `bg` are needed here, so they move ahead of the species loop's remains.
+        hf = _ice_homogeneous_rates(temp, qc, nc, qr, nr, tau_hf)
+        # Bigg, behind the RAIN POPULATION GATE (see `live_r` above): with no carried drops
+        # there is no rain DSD to freeze, and the exact zeros keep it out of `f_qr`/`f_nr`
+        # and out of `q_nuc`/`n_nuc` alike.
+        bg = live_r ? ishmael_bigg_freezing(temp, qr, nr, dt; reservoir_caps = false) :
+                      (mbiggr = 0.0, nbiggr = 0.0)
+        # The rain's EVAPORATION conductance, staged beside the condensation closure where
+        # `Q̇_r` and `ρ_r` are both known (Stage 2b; `kappa_ev` in the scratch doc). It is the
+        # third sink of the rain reservoir and it is not ice-gated — this loop merely COMPLETES
+        # the rain donor's total where ice legs also draw. Zero, hence inert, wherever the rain
+        # is not evaporating or `options[:rain_evap_realization]` is off.
+        kev = S.kappa_ev[i]
+        # The CLOUD donor's warm conductance (`kappa_c`, staged beside `AUTO_COLL`): its
+        # evaporation and its conversion to rain join the ice legs in ONE total, so `f_qc` is
+        # the cloud's single factor and every sink on the reservoir is realized on it
+        # (`cloud_evap_realized`). Written back to `f_cloud` at EVERY gridpoint, as `f_rain`
+        # is — bitwise the warm value where no ice leg draws. With the realization OFF the
+        # legs keep their ice-only factor (the pre-9acd5b8 construction, bitwise) and the
+        # column still receives the FULL factor, which only the census reads.
+        kc = S.kappa_c[i]
+        (f_qc, f_qr, f_nr) = _ice_donor_factors(hf, bg, p1, p2, p3, qc, qr, nr, kev, dt;
+                                                kc = cloud_evap_real ? kc : 0.0)
+        S.f_cloud[i] = cloud_evap_real ? f_qc :
+            relaxation_realization(_cloud_ice_draw(hf, p1, p2, p3) + kc * qc, qc, dt)
+        # The rain donor's factor now covers every sink on the reservoir, so it — not the
+        # warm-path `J₀(κ_evΔt)` this overwrites — is what the fold below the ice block puts
+        # into `invtau_r`/`Qdot_r`, and hence into λ, into `N` and into the rain transfer.
+        # Written for EVERY gridpoint of the column, exactly as `f_ice<k>` is: the loop has no
+        # ice gate, and a point with no ice contributes no ice legs, so the value written
+        # there is bitwise the warm one it replaces.
+        #
+        # GATED on the stage's own switch, and this is the whole of what the switch does to
+        # the fold. `rain_evap_real = false` leaves the column at the exact `1.0` the
+        # condensation block wrote, so the rain CONDUCTANCE is unrealized exactly as it was
+        # before Stage 2b, while `kev = 0` independently takes `f_qr`/`f_nr` back to their
+        # ice-leg-only values for the legs that always carried them. The two together are the
+        # bitwise restoration; realizing `τ_r^{-1}` at the ice legs' factor without the
+        # evaporation in it would be neither the old behaviour nor the new construction.
+        rain_evap_real && (S.f_rain[i] = f_qr)
+        # The realized EVAPORATION draw, in the same mixing-ratio units and with the same
+        # factor the ice legs carry. Formed here because the census below is the one place the
+        # ice half and the evaporation half of one reservoir's draw can be added together.
+        ev_real = f_qr * (kev * qr)
+
+        # ── PHASE C: the growth at the realized collection, and everything downstream ─────
+        r1 = live1 ?
+             _ice_species_post(tab, dt, e1, q1, n1, temp, rhoair, mu, dv, kt,
+                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p1, f_qc, f_qr,
+                               shed) :
+             _ice_empty_rates()
+        r2 = live2 ?
+             _ice_species_post(tab, dt, e2, q2, n2, temp, rhoair, mu, dv, kt,
+                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p2, f_qc, f_qr,
+                               shed) :
+             _ice_empty_rates()
+        r3 = live3 ?
+             _ice_species_post(tab, dt, e3, q3, n3, temp, rhoair, mu, dv, kt,
+                               xxlv, xxlf, qs0, qc, nc, qr, nr, qv, p3, f_qc, f_qr,
+                               shed) :
+             _ice_empty_rates()
+
+        # ── Aggregation (T ≤ T_0 only, and only if some species has ice to aggregate) ──
+        qagg1 = 0.0; qagg2 = 0.0; qagg3 = 0.0
+        nagg1 = 0.0; nagg2 = 0.0; nagg3 = 0.0
+        dnew3 = 0.0
+        # The kernel's geometry arguments, hoisted: they are formed once, at state n, and
+        # read by BOTH aggregation passes (the second one is below the donor factors).
+        dn1 = 0.0; dn2 = 0.0; dn3 = 0.0; phi1 = 0.0; phi2 = 0.0
+        # Aggregation collects crystals with crystals, so it too runs only on species that
+        # HAVE a population: the gated masses and numbers below are exactly zero for a
+        # species whose carried number is not positive, and a collection kernel with no
+        # collector and no collectee returns nothing.
+        agg_on = (temp <= T_0) && (live1 || live2 || live3)
+        # PASS ONE, at unit factors. Its only consumer is `sink1`/`sink2` below: this is the
+        # draw aggregation WOULD take, which is what the conductance has to be formed on.
+        if agg_on
+            dn1 = clamp(2.0 * ((e1.ai^2) / (e1.ci * e1.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            dn2 = clamp(2.0 * ((e2.ci^2) / (e2.ai * e2.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            dn3 = clamp(2.0 * ((e3.ai^2) / (e3.ci * e3.ni))^0.333333333333, 1.0e-6, 1.0e-2)
+            phi1 = clamp(e1.ci / e1.ai * gamma(ISHMAEL_NU - 1.0 + e1.deltastr) *
+                         ISHMAEL_I_GAMMNU, 0.01, 100.0)
+            phi2 = clamp(e2.ci / e2.ai * gamma(ISHMAEL_NU - 1.0 + e2.deltastr) *
+                         ISHMAEL_I_GAMMNU, 0.01, 100.0)
+            ag1 = ishmael_aggregation(dt, rhoair, temp,
+                                      live1 ? q1 : 0.0, live1 ? e1.ni : 0.0, dn1,
+                                      live2 ? q2 : 0.0, live2 ? e2.ni : 0.0, dn2,
+                                      live3 ? q3 : 0.0, live3 ? e3.ni : 0.0, dn3,
+                                      e1.rhobar, e2.rhobar, phi1, phi2,
+                                      tab.coltab, tab.coltabn)
+            qagg1 = ag1.qagg1; qagg2 = ag1.qagg2; qagg3 = ag1.qagg3
+            nagg1 = ag1.nagg1; nagg2 = ag1.nagg2; nagg3 = ag1.nagg3
+            dnew3 = ag1.dnew3
+        end
+
+        # The activation deficit reads the CARRIED ice number, not the effective one: the
+        # ceiling exists to stop nucleation once the ice number is already at the DeMott
+        # concentration, and the number it has to compare against is the number being
+        # transported. (In the Fortran the two are the same array, because `var_check` writes
+        # back.) Species 3 is excluded, as the Fortran excludes it.
+        dm = _ice_demott_rates(temp, sup, rhoair, (n1 + n2) * rhoair, tau_act)
+
+        # WHICH species receives it: the inherent growth ratio decides the habit, so
+        # `igr ≤ 1` (plate-like growth, which the -20 C override forces below that
+        # temperature) nucleates into species 1 (planar) and `igr > 1` into species 2
+        # (columnar). Aggregates are never nucleated into. Fortran lines 2153-2196.
+        # ── The ICE donors' realization factors ────────────────────────────────────────────
+        #
+        # Convicted by the census this construction was built to run: `q_i1` reached a realized
+        # depletion of 5.41 reservoirs per step from melting and aggregation and a further 2.63
+        # from SUBLIMATION, `q_i2` 1.29. The same share rule applies, over each species' TOTAL
+        # mass sink:
+        #
+        #   * MELTING, `−q̇_mlt`, an unbounded rate like every other conversion here;
+        #   * AGGREGATION's transfer of species 1/2 into 3, already a per-step increment;
+        #   * SUBLIMATION, the negative half of the deposition channel — and the one ice sink
+        #     that lived outside every conductance in this file. The exponential propagator
+        #     bounds `Q_ss`, not `ρ_i`, so the step-mean drive is limited by the vapor DEFICIT
+        #     and nothing limited it by the ice present. Measured: 2.63 reservoirs per step.
+        #
+        # The conductance is formed here, at state `n` (`r_k.Qdot` is the instantaneous
+        # deposition rate, the frozen-coefficient convention every other factor uses), and the
+        # factor is stashed in `f_ice<k>` because its two halves are applied in two places: the
+        # melting legs below, and the STEP-MEAN sublimation in the ETD pre-compute, which does
+        # not exist until after this function returns. One factor per donor, two application
+        # sites, so the ice a species loses to melting and the ice it loses to sublimation are
+        # shares of one exponential depletion rather than two independent ones.
+        #
+        # AGGREGATION is counted in the conductance AND realized at the factor, in the SECOND
+        # pass through `ishmael_aggregation` just below. This block used to argue that `qagg3`
+        # is not decomposable into its donors, so scaling species 1 and 2 by different factors
+        # would break the closure aggregation is built on. That was wrong twice over: the
+        # routine's own recipient gain IS the sum of the two donors' losses, so re-forming it
+        # HERE as `−(qagg1 + qagg2)` closes the exchange at whatever the donors realized; and
+        # the claim that aggregation was bounded on its own did not survive the measurement
+        # (`q_i1(melt+agg)` at 1.33 reservoirs per step on the Stage-C quick run, 814
+        # gridpoint-steps past 1). Over-depleting species 1/2 while the `:bhyp` control
+        # variable recovers the slot at −μ is mass CREATED in species 3.
+        sink1 = (max(-r1.qmlt, 0.0) + max(-qagg1, 0.0) * i_dt) + max(-r1.Qdot, 0.0) / rhoair
+        sink2 = (max(-r2.qmlt, 0.0) + max(-qagg2, 0.0) * i_dt) + max(-r2.Qdot, 0.0) / rhoair
+        sink3 = (max(-r3.qmlt, 0.0) + max(-qagg3, 0.0) * i_dt) + max(-r3.Qdot, 0.0) / rhoair
+        f_i1 = relaxation_realization(sink1, q1, dt)
+        f_i2 = relaxation_realization(sink2, q2, dt)
+        f_i3 = relaxation_realization(sink3, q3, dt)
+        S.f_ice1[i] = f_i1; S.f_ice2[i] = f_i2; S.f_ice3[i] = f_i3
+        FIC = (f_i1, f_i2, f_i3)
+
+        # ── The ICE NUMBER donors: one conductance per species' NUMBER ─────────────────────
+        #
+        # A species' number is a SEPARATE RESERVOIR from its mass, and the three legs that
+        # draw on it are not proportional to the three that draw on the mass:
+        #
+        #   * AGGREGATION's number transfer comes from `coltabn`, the mass transfer from
+        #     `coltab` — two offline tables integrating two different MOMENTS of the same
+        #     collision kernel (`mkcoltb`, ishmael_tables.jl). A pair's `(colamt, deltan)` is
+        #     one collision count, which is what the single-factor hook was argued from, but
+        #     the FRACTION OF THE RESERVOIR each moment loses is not the same number.
+        #     Measured at unit factors on the stiff-cold two-habit fixture (ρ_i = 1e-3,
+        #     n_i = 1e6, T = 259.15 K, Δt = 1 s): κ_q = 1.77e-4 /s against κ_n = 8.21e-5 /s,
+        #     κ_n/κ_q = 0.464; 0.377 at n_i = 1e9; 0.201 on an anvil-like 1e-4 kg/m³,
+        #     5e7 /m³, 240 K state. Here the number kernel is the SLOWER one, so the mass
+        #     factor OVER-realizes the number transfer by up to 5x — and nothing in the
+        #     tables promises it stays on that side of 1 elsewhere.
+        #   * MELTING's number leg is `nmlt = q̇_mlt·(n/q) − dNmltri`. The first term is the
+        #     mass leg's exact number partner; `dNmltri` — the drops the crystal collected
+        #     and is now melting off — is a number sink with NO mass partner in this
+        #     reservoir at all, so κ_{n,melt} > κ_{q,melt} strictly.
+        #   * SUBLIMATION is the one leg where the two conductances agree exactly: the number
+        #     leaves in proportion to the mass, `ṅ = q̇·(n/q)` (`niq`, Fortran lines
+        #     1273-1276), so its contribution to κ_n is its contribution to κ_q identically.
+        #
+        # The construction is the rain's, exactly: the rain MASS and the rain NUMBER are
+        # already two donors with two factors (`f_qr`/`f_nr`) precisely because Bigg's number
+        # conductance is a twentieth of its mass conductance, and realizing the number on the
+        # mass factor there would freeze all of the rain's mass while removing a twentieth of
+        # its drops. This is the ice mirror of that argument, and it is the same failure mode
+        # in the other direction: MASS WITHOUT NUMBER, which is the state the population gate
+        # exists to forbid and which the population reconciliation then has to re-seed.
+        #
+        # The reservoir is the CARRIED number `n_k`, not `e_k.ni` — the budget/kernel split
+        # of `_ice_species_pre`: a kernel rate is meaningful only on a realizable population,
+        # but "how much of the number leaves" is a statement about the number that is there.
+        # Aggregation's number rate is formed on the effective number and applied to the
+        # carried slot, so the carried slot is what has to bound it.
+        #
+        # GATED, default OFF (`options[:ice_number_realization]`, env `SCYTHE_O01_ICENREAL=1`):
+        # with the switch off every factor here is set to that species' MASS factor, which is
+        # what each of these legs already carried, so the whole block is bitwise inert and the
+        # census below measures the state as it stands.
+        nsub1 = (max(-r1.Qdot, 0.0) / rhoair) * r1.niq
+        nsub2 = (max(-r2.Qdot, 0.0) / rhoair) * r2.niq
+        nsub3 = (max(-r3.Qdot, 0.0) / rhoair) * r3.niq
+        nsink1 = (max(-nagg1, 0.0) * i_dt + max(-r1.nmlt, 0.0)) + nsub1
+        nsink2 = (max(-nagg2, 0.0) * i_dt + max(-r2.nmlt, 0.0)) + nsub2
+        nsink3 = (max(-nagg3, 0.0) * i_dt + max(-r3.nmlt, 0.0)) + nsub3
+        f_n1 = ice_n_real ? relaxation_realization(nsink1, n1, dt) : f_i1
+        f_n2 = ice_n_real ? relaxation_realization(nsink2, n2, dt) : f_i2
+        f_n3 = ice_n_real ? relaxation_realization(nsink3, n3, dt) : f_i3
+
+        # ── AGGREGATION, PASS TWO: the REALIZED collection ────────────────────────────────
+        # The mirror of the riming construction. Pass one ran at unit factors and existed
+        # only to put aggregation's draw into `sink1`/`sink2`; the factors are formed now, so
+        # the collection is re-integrated with each donor species' three pairs scaled by ITS
+        # factor, at the hook the Fortran's `ratioagg` occupied. Nothing downstream changes
+        # text — the census, the a/c moment re-diagnosis and the slot assembly read these
+        # same names — and the chain is not circular: pass one → `f_ik` → pass two → census
+        # → assembly. `qagg3` is formed HERE as the exact negative of what the two donors
+        # lost, rather than taken from the routine's own six-term sum (which closes to
+        # round-off, not exactly), so the cross-species exchange closes on the realized
+        # numbers. The NUMBER is scaled inside the routine at the NUMBER donors' factors
+        # (`f_aggn<k>`), which are the mass ones exactly when `ice_number_realization` is off.
+        if agg_on
+            ag2 = ishmael_aggregation(dt, rhoair, temp,
+                                      live1 ? q1 : 0.0, live1 ? e1.ni : 0.0, dn1,
+                                      live2 ? q2 : 0.0, live2 ? e2.ni : 0.0, dn2,
+                                      live3 ? q3 : 0.0, live3 ? e3.ni : 0.0, dn3,
+                                      e1.rhobar, e2.rhobar, phi1, phi2,
+                                      tab.coltab, tab.coltabn;
+                                      f_agg1 = f_i1, f_agg2 = f_i2,
+                                      f_aggn1 = f_n1, f_aggn2 = f_n2,
+                                      # Species 3's own number factor reaches the kernel
+                                      # ONLY through aggregate self-collection, which is the
+                                      # one pair that carried no factor at all before this
+                                      # stage — hence the explicit `1.0` with the switch off
+                                      # rather than `f_n3`, which is `f_i3` there and would
+                                      # not be the behaviour being reproduced.
+                                      f_aggn3 = ice_n_real ? f_n3 : 1.0,
+                                      reservoir_caps = agg_caps)
+            qagg1 = ag2.qagg1; qagg2 = ag2.qagg2
+            qagg3 = -(qagg1 + qagg2)
+            nagg1 = ag2.nagg1; nagg2 = ag2.nagg2; nagg3 = ag2.nagg3
+            dnew3 = ag2.dnew3
+        end
+        # Is the ice channel a SINK of ice at state n? Frozen here, like every other
+        # classification the step freezes, and it is what decides whether the donor factor
+        # belongs in the conductance at all: `f_ice<k>` bounds an ice sink, and deposition is
+        # a source. Above `T_0` the channel is shut and the question does not arise.
+        sub_now = (temp <= T_0) && (drive_i < 0.0)
+        # The realized melting legs. ONE name per leg, used by the ice slot that loses the mass
+        # AND by the rain slot that gains it, so the melt exchange closes exactly as the freeze
+        # exchange does.
+        MLQ = (f_i1 * r1.qmlt, f_i2 * r2.qmlt, f_i3 * r3.qmlt)
+        # The melt NUMBER rides the NUMBER donor's factor, not the mass one — the two are
+        # different reservoirs and `nmlt` carries `dNmltri`, a number sink with no mass
+        # partner (see the number-donor block above). `f_n<k> = f_i<k>` with the switch off,
+        # so this line is bitwise what it was. The rain gains exactly `−MLN[k]` drops through
+        # `ice_nr` below, as it always did: the exchange still closes on ONE name per leg,
+        # and it is the number of drops the melt actually produced. Mass conservation is
+        # untouched either way — the number carries none.
+        MLN = (f_n1 * r1.nmlt, f_n2 * r2.nmlt, f_n3 * r3.nmlt)
+        # The two AXIS moments stay on the MASS factor. `amlt`/`cmlt` are volume moments of
+        # the melting crystal and their number part (`a_i·nmlt/n_i`) is inseparable from
+        # their mass part inside `ishmael_melting`; the moment set's consistency is repaired
+        # by the `var_check` source rather than by splitting this rate.
+        MLA = (f_i1 * r1.amlt, f_i2 * r2.amlt, f_i3 * r3.amlt)
+        MLC = (f_i1 * r1.cmlt, f_i2 * r2.cmlt, f_i3 * r3.cmlt)
+        # ── What the SUBLIMATION number sink still has to apply, at its own site ───────────
+        # The habit partition's number sink lives in the ETD pre-compute, where the step-mean
+        # deposition rate exists, and it is formed there as `q̄_k·(n_k/q_k)` — so it already
+        # carries whatever factor `invtau_i<k>` carries, which is `f_i<k>` where `sub_now`
+        # classified the channel as a sink and nothing where it did not. What is written here
+        # is the RESIDUAL: multiply by this and the leg is realized at `f_n<k>` exactly, one
+        # number for one reservoir. An exact `1.0` with the switch off, so that site is
+        # bitwise. The guard is for the overflow corner of `J₀`: `relaxation_realization`
+        # returns a true `0.0` once `κΔt` overflows to `Inf`, and there the leg it would
+        # divide into is an exact zero anyway.
+        S.f_isn1[i] = !ice_n_real ? 1.0 :
+                      (sub_now ? (f_i1 > 0.0 ? f_n1 / f_i1 : 1.0) : f_n1)
+        S.f_isn2[i] = !ice_n_real ? 1.0 :
+                      (sub_now ? (f_i2 > 0.0 ? f_n2 / f_i2 : 1.0) : f_n2)
+        S.f_isn3[i] = !ice_n_real ? 1.0 :
+                      (sub_now ? (f_i3 > 0.0 ? f_n3 / f_i3 : 1.0) : f_n3)
+
+        target = igr <= 1.0 ? 1 : 2
+        # ── ONE realization factor per DONOR RESERVOIR, over ALL of that donor's legs ───────
+        #
+        # The Bigg pass realized the two nucleation-channel freezing legs; the measured wall
+        # then moved to riming (cured inside `ishmael_riming_growth`, where the axis partners
+        # are formed) and then to ICE-RAIN COLLECTION: `κΔt = 118` on `dQRfzri` at
+        # t = 2101.5 s against `q_r = 1.7e-4 kg/kg`. Realizing legs one at a time is
+        # whack-a-mole, and it also lets INDEPENDENTLY realized legs sum past the reservoir
+        # (measured: `kr` sitting at 1.03 where the freezing factor had already saturated).
+        # So the conductance is formed over the donor's WHOLE sink, which is what the ODE
+        # `dq/dt = −κ_total q` actually says, and every leg drawing on that donor is
+        # multiplied by the one factor. Riming is the exception and stays inside its own
+        # routine: its mass rate is not known until after the growth integration that its
+        # `ardr`/`crdr` partners come out of, and scaling it here would desynchronize them.
+        # The step-mean realizations. ONE name per leg, formed once here and used by BOTH
+        # sides of the exchange below, so the mass the ice gains and the mass the liquid loses
+        # cannot come apart. `dQIfzri` is the ICE that moved species because it collected
+        # rain — the same collision events — so it rides the rain-mass factor with its
+        # partners rather than carrying one of its own.
+        #
+        # ── THE MINIMUM-CRYSTAL BOUND ON EVERY REALIZED ICE-NUMBER SOURCE ────────────────
+        #
+        # [`_ice_homogeneous_rates`](@ref) states the rule: every ice NUMBER source must seed
+        # crystals at or above the smallest size the scheme resolves, so a number rate is
+        # `min(n/τ, ṁ/m_min)` — the mass transfers in full and the number is what that mass
+        # supports at [`ISHMAEL_M_MIN`](@ref). It is the SOURCE-side twin of the POPULATION
+        # GATE above ("no rate may act on a population the CARRIED number does not support"),
+        # and it is stated there at the RATE. The rate is not where it survives.
+        #
+        # A number leg and its mass partner are realized at DIFFERENT donor factors wherever
+        # they draw on different reservoirs, and `min` does not commute with two of them:
+        # `f·min(a, b) = min(f·a, f·b)` for ONE shared `f ≥ 0`, but `min(f_n·a, f_q·b)` is
+        # bounded by neither when `f_n ≫ f_q`. That is exactly the anvil-top pathology
+        # (reference/FINDINGS_ISHMAEL_S8S9.md §5i), four stacked failures in one term:
+        # the rain slots decorrelate at 15 km — `n_r` rings to EXACTLY zero while `q_r` stays
+        # ~1e-8 kg/kg at 192–203 K; `ishmael_bigg_freezing` gates on `q_r` alone, so
+        # `ishmael_rain_lambda` floors the number at `QNSMALL` and lands in the
+        # `lamr < LAMMINR` clamp — a PHANTOM DSD of 2800 μm drops, the largest the scheme
+        # admits, where there is no rain at all; Bigg is then evaluated 30–40 K outside its
+        # validity, `exp(0.66ΔT) ~ 1e21`; and the number leg is realized at
+        # `f_nr = relaxation_realization(rate, 0.0, dt) = 1.0` — the zero-reservoir guard,
+        # which is correct for a factor and catastrophic for a bound — while `f_qr` clamps
+        # the mass leg to 1.8e-19…2.3e-17. The SAME collisions, realized seventeen to
+        # nineteen orders apart. What reached species 1 was ~1e15 m⁻³ s⁻¹ of crystals
+        # carrying 1e-6·`M_MIN` each (`n₁` at 1.5e16 m⁻³ against `q₁ = 0` exactly, immortal
+        # because every sink is live-gated), and the ringing of that spike through the number
+        # moment's spline fit is the mass-without-number lobe that made 70% of the quick
+        # arm's ice cloud — and 99% of the rejected full-mode run's — dead mass.
+        #
+        # So the bound is restated HERE, on the REALIZED pair, where both factors exist:
+        #
+        #     n_leg ≤ m_leg / ISHMAEL_M_MIN
+        #
+        # Δt-FREE (a relation between two simultaneous rates, not a depletion cap — refining
+        # the step still approaches the same differential equation), one-sided, and EXACTLY
+        # INERT wherever the number source already respects its mass partner, which is
+        # everywhere the two factors agree. It carries NO off-switch: like the population
+        # gate it is an invariant of the representation, not a parameterization choice.
+        #
+        # Leg by leg:
+        #   * `nim` (homogeneous CLOUD freezing) is bounded at the rate and realized at the
+        #     SAME `f_qc` as `mim`, so the `min` cannot bind beyond rounding. Written anyway,
+        #     so that the invariant does not rest on the two factors staying equal.
+        #   * `nimr` (homogeneous RAIN freezing) carries `f_nr` against `f_qr`: two factors,
+        #     so the rate-level `min(n_r/τ_hf, ṁ/m_min)` does NOT survive realization, and
+        #     this is where it is restored. §5i measured this leg contributing exactly 0 at
+        #     the pathological points — the rate-level bound doing its job at `n_r = 0`, the
+        #     bound Bigg lacks — and this keeps that true after the factors.
+        #   * `nbig` (Bigg) is the measured pump: no rate-level bound of any kind.
+        #   * `FzN` (ice–rain collection) is the drops that froze onto a crystal and moved it
+        #     to another species. The mass those `FzN[k]` particles carry to the destination
+        #     is `RfzQ[k]`, the RAIN mass frozen (new ice), PLUS `IfzQ[k]`, that species' own
+        #     ice — a species TRANSFER rather than new mass, but mass moving with the same
+        #     particles, hence part of what they weigh once they arrive. Both ride `f_qr`, so
+        #     their sum is the crystal mass the number must be supported by and it is what
+        #     the bound divides. This leg was never the pathology: the kernel self-gates at
+        #     `n_r = 0` (every `procr` rate carries a factor `nr`). It is bounded for the same
+        #     reason the homogeneous ones are — an invariant may not rest on a kernel's
+        #     internals.
+        #   * `dm.nnuccd`/`dm.mnuccd` (DeMott) and `r_k.nmult`/`r_k.qmult` (Hallett-Mossop)
+        #     need nothing. `mnuccd ≡ nnuccd·ISHMAEL_M_MIN` by construction and the splinter
+        #     pair is 350 crystals per mg at the 5 μm mass; decisively, NEITHER pair is
+        #     multiplied by a realization factor at all — both enter `q_nuc`/`n_nuc` bare —
+        #     so there is no second factor to break the ratio.
+        mim  = f_qc * hf.mim
+        nim  = min(f_qc * hf.nim, mim / ISHMAEL_M_MIN)
+        mimr = f_qr * hf.mimr
+        nimr = min(f_nr * hf.nimr, mimr / ISHMAEL_M_MIN)
+        mbig = f_qr * bg.mbiggr
+        nbig = min(f_nr * bg.nbiggr, mbig / ISHMAEL_M_MIN)
+        RfzQ = (f_qr * r1.dQRfzri, f_qr * r2.dQRfzri, f_qr * r3.dQRfzri)
+        IfzQ = (f_qr * r1.dQIfzri, f_qr * r2.dQIfzri, f_qr * r3.dQIfzri)
+        FzN  = (min(f_nr * r1.dNfzri, (RfzQ[1] + IfzQ[1]) / ISHMAEL_M_MIN),
+                min(f_nr * r2.dNfzri, (RfzQ[2] + IfzQ[2]) / ISHMAEL_M_MIN),
+                min(f_nr * r3.dNfzri, (RfzQ[3] + IfzQ[3]) / ISHMAEL_M_MIN))
+        NRN  = (f_nr * r1.nrn_loss, f_nr * r2.nrn_loss, f_nr * r3.nrn_loss)
+        qIfz_in = target == 1 ? (IfzQ[2] + IfzQ[3]) : (IfzQ[1] + IfzQ[3])
+        nIfz_in = target == 1 ? (FzN[2] + FzN[3]) : (FzN[1] + FzN[3])
+        q_nuc = dm.mnuccd + mim + mimr + mbig + qIfz_in +
+                (r1.qmult + r2.qmult + r3.qmult) +
+                ((RfzQ[1] + RfzQ[2]) + RfzQ[3])
+        n_nuc = dm.nnuccd + nim + nimr + nbig + nIfz_in +
+                (r1.nmult + r2.nmult + r3.nmult)
+
+        # ── The liquid back-reactions, and Q̇_freeze as their exact negative ──
+        ice_c = -rhoair * (mim + ((r1.prdr_pre * r1.qcrimefrac) +
+                                  (r2.prdr_pre * r2.qcrimefrac) +
+                                  (r3.prdr_pre * r3.qcrimefrac)))
+        ice_r = rhoair * ((-mimr - mbig) +
+                          (-(r1.prdr_pre * (1.0 - r1.qcrimefrac)) - MLQ[1] - RfzQ[1]) +
+                          (-(r2.prdr_pre * (1.0 - r2.qcrimefrac)) - MLQ[2] - RfzQ[2]) +
+                          (-(r3.prdr_pre * (1.0 - r3.qcrimefrac)) - MLQ[3] - RfzQ[3]))
+        ice_nr = rhoair * ((-nimr - nbig) +
+                           (-NRN[1] - MLN[1] - FzN[1]) +
+                           (-NRN[2] - MLN[2] - FzN[2]) +
+                           (-NRN[3] - MLN[3] - FzN[3]))
+        S.ICE_C[i] = ice_c
+        S.ICE_R[i] = ice_r
+        S.ICE_NR[i] = ice_nr
+        S.FRZ_NET[i] = -(ice_c + ice_r)
+
+        # ── The DONOR-DEPLETION census, on the REALIZED rates the step is about to apply ──
+        # `ice_c`/`ice_r`/`ice_nr` are exactly those sums with the sign the liquid sees, so the
+        # census reads the applied numbers rather than a reconstruction of them. The ice
+        # donors are censused on their own sinks (melting out, and aggregation's transfer of
+        # species 1/2 into 3, which is already an increment). Reports; limits nothing.
+        if census_on
+            mc_donor_census!(stx, tid_x, MC_DONOR_QC, -ice_c / rhoair, qc,
+                             MC_DONOR_QFLOOR, dt)
+            # STAGE 2b: the COMBINED realized draw on the rain — the ice legs (`ice_r`)
+            # PLUS the realized evaporation. That sum, not either half, is what
+            # `1 − e^{−κ_totΔt} < 1` bounds, so censusing it is what makes the block's
+            # invariant ("no realized donor may exceed one reservoir per step") the thing
+            # actually measured. Before Stage 2b this row saw the ice half alone and read a
+            # dutiful 1.0 while the two halves together took 1.0012 reservoirs.
+            mc_donor_census!(stx, tid_x, MC_DONOR_QR, (-ice_r / rhoair) + ev_real, qr,
+                             MC_DONOR_QFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_NR, -ice_nr / rhoair, nr,
+                             MC_DONOR_NFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_I1, max(-MLQ[1], 0.0) - qagg1 * i_dt, q1,
+                             MC_DONOR_QFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_I2, max(-MLQ[2], 0.0) - qagg2 * i_dt, q2,
+                             MC_DONOR_QFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_I3, max(-MLQ[3], 0.0) - qagg3 * i_dt, q3,
+                             MC_DONOR_QFLOOR, dt)
+            # ── The three ICE NUMBER reservoirs (Stage 1b) ────────────────────────────────
+            # The same three legs on the other moment, at the numbers the step applies:
+            # aggregation's REALIZED number transfer (`nagg<k>` is pass two's, and already a
+            # per-step increment, so it is divided by the reservoir directly while the two
+            # rates carry a `Δt`), the realized melt number `MLN`, and the sublimation number
+            # sink at whatever factor it will be applied with — `f_n<k>` under the switch,
+            # and what `invtau_i<k>` alone carries without it.
+            #
+            # The sublimation term is the STATE-n instantaneous rate, not the step-mean one
+            # the ETD site applies; that is the same approximation the ice MASS conductance
+            # is formed on (`sink<k>` above), and its own step-mean reading is the
+            # `MC_DONOR_S*` block. Reported, never limiting, in both modes.
+            nsr1 = (ice_n_real ? f_n1 : (sub_now ? f_i1 : 1.0)) * nsub1
+            nsr2 = (ice_n_real ? f_n2 : (sub_now ? f_i2 : 1.0)) * nsub2
+            nsr3 = (ice_n_real ? f_n3 : (sub_now ? f_i3 : 1.0)) * nsub3
+            mc_donor_census!(stx, tid_x, MC_DONOR_N1,
+                             (max(-MLN[1], 0.0) + max(-nagg1, 0.0) * i_dt) + nsr1, n1,
+                             MC_DONOR_NFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_N2,
+                             (max(-MLN[2], 0.0) + max(-nagg2, 0.0) * i_dt) + nsr2, n2,
+                             MC_DONOR_NFLOOR, dt)
+            mc_donor_census!(stx, tid_x, MC_DONOR_N3,
+                             (max(-MLN[3], 0.0) + max(-nagg3, 0.0) * i_dt) + nsr3, n3,
+                             MC_DONOR_NFLOOR, dt)
+        end
+
+        # ── The ATTRIBUTION CENSUS (opt-in; see `MC_ATTR_QR_HOM`) ─────────────────────────
+        # Blocks A, C and D; block B is at the ETD pre-compute, where the APPLIED step-mean
+        # evaporation exists. Nothing below writes anything but `stx`.
+        if attr_on
+            # ── BLOCK A: the six legs of the q_r debit, AT THE BREACH POINTS ONLY ─────────
+            # The gate is the `MC_DONOR_QR` number itself, re-formed from the same `ice_r`
+            # the census above read, so "breach point" means exactly what that block means
+            # by it and the counts below partition its count.
+            if qr > MC_DONOR_QFLOOR
+                iqr = dt / qr
+                # Formed EXPRESSION FOR EXPRESSION as `mc_donor_census!` forms it
+                # (`realized * dt / reservoir`), so "breach point" is the same set of points
+                # to the last bit and the counts below cannot drift off its count. Since
+                # Stage 2b that expression is the COMBINED draw, so the gate carries the
+                # realized evaporation too; the six legs decomposed below stay the ice ones
+                # (evaporation has block B to itself, at the APPLIED step-mean), and with the
+                # evaporation now inside `κ_tot` the gate is expected never to open at all.
+                if ((-ice_r / rhoair) + ev_real) * dt / qr > 1.0
+                    # The four TRUE debits, in the order `ice_r` accumulates them, plus the
+                    # rime EXCESS (a sub-part of the third) and the melt CREDIT.
+                    rime_r = ((r1.prdr_pre * (1.0 - r1.qcrimefrac)) +
+                              (r2.prdr_pre * (1.0 - r2.qcrimefrac))) +
+                             (r3.prdr_pre * (1.0 - r3.qcrimefrac))
+                    d_hom = mimr * iqr
+                    d_big = mbig * iqr
+                    d_rim = rime_r * iqr
+                    # The conductance was formed on the UNIT pass's split (`prdr0_r`,
+                    # `qcf0 = rimesum/rimetotal`); the debit is taken from the REALIZED
+                    # pass's (`prdr_pre`, `qcrimefrac`), whose split and rime-density blend
+                    # move whenever `f_qc != f_qr`. This is that difference.
+                    d_rix = (rime_r - f_qr * ((p1.prdr0_r + p2.prdr0_r) + p3.prdr0_r)) * iqr
+                    d_col = ((RfzQ[1] + RfzQ[2]) + RfzQ[3]) * iqr
+                    d_mlt = -((MLQ[1] + MLQ[2]) + MLQ[3]) * iqr
+                    # WHICH leg is the largest debit here. Strict `>`, so a tie goes to the
+                    # earlier channel and exactly one channel is credited per breach point.
+                    bch = MC_ATTR_QR_HOM
+                    best = d_hom
+                    d_big > best && (best = d_big; bch = MC_ATTR_QR_BIGG)
+                    d_rim > best && (best = d_rim; bch = MC_ATTR_QR_RIME)
+                    d_rix > best && (best = d_rix; bch = MC_ATTR_QR_RIMEX)
+                    d_col > best && (best = d_col; bch = MC_ATTR_QR_COLL)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_HOM, d_hom,
+                                    bch == MC_ATTR_QR_HOM)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_BIGG, d_big,
+                                    bch == MC_ATTR_QR_BIGG)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_RIME, d_rim,
+                                    bch == MC_ATTR_QR_RIME)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_RIMEX, d_rix,
+                                    bch == MC_ATTR_QR_RIMEX)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_COLL, d_col,
+                                    bch == MC_ATTR_QR_COLL)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_MELT, d_mlt, false)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_QR_ALL,
+                                    ((d_hom + d_big) + (d_rim + d_col)), false)
+                end
+            end
+
+            # ── BLOCK C: the q_i1/q_i2 split between MELTING and AGGREGATION ─────────────
+            # `qagg_k` is already a per-step INCREMENT (the Fortran's own construction), so
+            # it is divided by the reservoir directly while the melting RATE carries a `dt`.
+            if q1 > MC_DONOR_QFLOOR
+                xm1 = max(-MLQ[1], 0.0) * dt / q1
+                xa1 = -qagg1 / q1
+                mc_attr_census!(stx, tid_x, MC_ATTR_MLT1, xm1, xm1 > 1.0)
+                mc_attr_census!(stx, tid_x, MC_ATTR_AGG1, xa1, xa1 > 1.0)
+                # The caller-side proxy for `ishmael_col1`'s per-pair `min(colamt, rx)`: the
+                # seven pairs are summed inside `ishmael_aggregation`, so the only thing
+                # visible from here is the SUM taking the whole species mass.
+                mc_attr_census!(stx, tid_x, MC_ATTR_AGG1_SAT, xa1,
+                                -qagg1 >= q1 * (1.0 - 1.0e-12))
+            end
+            if q2 > MC_DONOR_QFLOOR
+                xm2 = max(-MLQ[2], 0.0) * dt / q2
+                xa2 = -qagg2 / q2
+                mc_attr_census!(stx, tid_x, MC_ATTR_MLT2, xm2, xm2 > 1.0)
+                mc_attr_census!(stx, tid_x, MC_ATTR_AGG2, xa2, xa2 > 1.0)
+            end
+
+            # ── BLOCK D: what runs ABOVE the melting level ────────────────────────────────
+            # Riming is the only liquid->ice channel with no temperature gate, and above
+            # `T_0` riming -> ice -> melt is a closed loop: both legs are recorded, plus
+            # `dQImltri`, which is NOT a transfer — it is the collected liquid's sensible
+            # heat inside `ishmael_melting` (ishmael.jl) — so the loop can be read as a loop.
+            # `T_0 + 2` K, not `T_0`: two degrees of margin puts the channels well clear of
+            # the freezing level itself, where all of this is ordinary physics.
+            if temp > T_0 + 2.0
+                rime_c = ((r1.prdr_pre * r1.qcrimefrac) + (r2.prdr_pre * r2.qcrimefrac)) +
+                         (r3.prdr_pre * r3.qcrimefrac)
+                rime_rw = ((r1.prdr_pre * (1.0 - r1.qcrimefrac)) +
+                           (r2.prdr_pre * (1.0 - r2.qcrimefrac))) +
+                          (r3.prdr_pre * (1.0 - r3.qcrimefrac))
+                if qc > MC_DONOR_QFLOOR
+                    xwc = rime_c * dt / qc
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_RIME_C, xwc, xwc > 1.0)
+                end
+                if qr > MC_DONOR_QFLOOR
+                    xwr = rime_rw * dt / qr
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_RIME_R, xwr, xwr > 1.0)
+                end
+                q_ice = (q1 + q2) + q3
+                if q_ice > MC_DONOR_QFLOOR
+                    xwm = -((MLQ[1] + MLQ[2]) + MLQ[3]) * dt / q_ice
+                    xwi = ((p1.rr.dQImltri + p2.rr.dQImltri) + p3.rr.dQImltri) * dt / q_ice
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_MELT, xwm, xwm > 1.0)
+                    mc_attr_census!(stx, tid_x, MC_ATTR_WARM_MLTRI, xwi, xwi > 1.0)
+                end
+            end
+
+            # ── BLOCK D's TAIL: the sub-melting-level population ──
+            # The RAW slots: the question is how much ice the transport actually put below
+            # the melting level.
+            if temp > T_0
+                rho_ice_raw = (max(S.i1q[i], 0.0) + max(S.i2q[i], 0.0)) + max(S.i3q[i], 0.0)
+                if rho_ice_raw > 0.0
+                    @inbounds begin
+                        stx[MC_ATTR_WARM_PTS, tid_x] += 1.0
+                        stx[MC_ATTR_WARM_MASS, tid_x] += rho_ice_raw
+                    end
+                end
+            end
+        end
+
+        # ── Assemble the twelve slot sources ──
+        rs = (r1, r2, r3)
+        es = (e1, e2, e3)
+        qs = (q1, q2, q3)
+        ns = (n1, n2, n3)
+        as = (a1, a2, a3)
+        cs = (c1, c2, c3)
+        aggq = (qagg1, qagg2, qagg3)
+        aggn = (nagg1, nagg2, nagg3)
+        lives = (live1, live2, live3)
+        for k in 1:3
+            rk = rs[k]
+            ek = es[k]
+            # Aggregation and the nucleation transfer both redistribute mass and number at
+            # (assumed) fixed shape and density, so they are combined into ONE new state and
+            # re-diagnosed once. The target species' nucleation GAIN is not here: new
+            # particles arrive with a size of their own (`_ice_nucleation_volume`).
+            is_target = k == target
+            # The REALIZED transfers (`IfzQ`/`FzN`), not the nominal ones: the species that
+            # loses the ice must lose exactly what the target gains.
+            dq_re = aggq[k] - (is_target ? 0.0 : IfzQ[k] * dt)
+            dn_re = aggn[k] - (is_target ? 0.0 : FzN[k] * dt)
+            aagg = 0.0
+            cagg = 0.0
+            if dq_re != 0.0 || dn_re != 0.0
+                aagg, cagg = _ice_agg_moments(ek, ek.ni + dn_re, qs[k] + dq_re,
+                                              rhoair, dt, dnew3, k == 3 && agg_on)
+            end
+
+            # `rk.Qdot` — the DEPOSITION mass source — is deliberately NOT here. It is one of
+            # the two relaxations of the shared `Q_ss` and is withheld from the multistep with
+            # its partner, returning as a direct increment at the step-mean rate
+            # (`relaxation_adjustment_qss!`). And its HABIT PARTITION — the a/c-moment sources
+            # and the sublimation number sink — is not here EITHER: the partition distributes
+            # the realized mass increment over the axes (TeX §Departures (d)), so it is
+            # evaluated once, at the SAME step-mean rate the mass slots receive, in the ETD
+            # pre-compute, from the state-n inputs stashed below. Leaving it here at the
+            # instantaneous rate put the glaciation burst's one-step spike through the AB3
+            # history (+23/12 of it, then −16/12 of it), rang the freshly nucleated moments
+            # negative against a step-mean-bounded mass, and was the measured death of the ice
+            # arm at t = 1031.4 s. Everything remaining in these four lines is riming, melting
+            # and aggregation, which relax nothing and stay on the multistep.
+            qsrc = rhoair * ((rk.prdr + MLQ[k]) + (aggq[k] * i_dt))
+            nsrc = rhoair * ((MLN[k]) + (aggn[k] * i_dt))
+            asrc = (rk.ardr + (rhoair * MLA[k])) + aagg
+            csrc = (rk.crdr + (rhoair * MLC[k])) + cagg
+
+            # State-n inputs of the step-mean partition. `capgam` is the live gate: it is an
+            # exact 0.0 for a gated species (`_ice_empty_rates`), so the pre-compute calls the
+            # partition only where a population exists and the zero-ice path stays bitwise.
+            habANI[k][i] = ek.ani;    habCNI[k][i] = ek.cni;  habRNI[k][i] = ek.rni
+            habDS[k][i]  = ek.deltastr; habRB[k][i] = ek.rhobar
+            habNIM[k][i] = ek.ni * rhoair
+            habVT[k][i]  = rk.vtrmi1; habCG[k][i] = rk.capgam
+            habNIQ[k][i] = rk.niq
+
+            # ── The var_check CONSISTENCY SOURCE ────────────────────────────────
+            # `var_check` is ISHMAEL's own moment-consistency operator, and in the Fortran it
+            # has `INTENT(INOUT)` arguments: its re-diagnosis is WRITTEN BACK into the state
+            # every step. This port evaluates the rates at the effective moments but carries
+            # the raw ones, and four moments fitted by four independent splines, sedimenting
+            # at three different weighted speeds, do not stay a realizable population on their
+            # own. Nothing else in the set restores them. Measured on the O01 ice arm without
+            # this term: n_i1 reaches 2.2e9 m⁻³ against ~5e-10 kg/m³ of mass, the ice-rain
+            # collection rate (∝ n_i·n_r) goes stiff, and slot 8 diverges from −4e-3 to −62
+            # kg/m³ in six steps at t ≈ 1050 s.
+            #
+            # So the write-back is reinstated, as a SOURCE — a RELAXATION on a physical
+            # timescale, `Ẋ = (X_eff − X)/τ_vc` with `τ_vc = physical_params[:tau_varcheck]`
+            # (default 5 s), on the number and the two volume moments. It is `Δt`-FREE, like
+            # every other rate in this block: `(X_eff − X)/Δt` would have been a one-step state
+            # repair and would have made the tendency a function of the step size, which is
+            # exactly the defect the depletion caps were removed for.
+            #
+            # The MASS is untouched — `var_check` never changes it — so this cannot move
+            # water, cannot move energy, and cannot break the exchange closure above.
+            # `options[:ice_var_check] = false` removes it and reproduces the drift.
+            #
+            # GATED ON THE SPECIES EXISTING, like every other rate. An empty species' `eff` is
+            # the fallback initialization, not a re-diagnosis of anything, so restoring toward
+            # it would inject `QNSMALL/Δt` into a slot that must produce an EXACT zero — and
+            # the whole zero-ice inertness gate rests on that.
+            # GATED ON THE POPULATION, not merely on the mass. `ek.ni` at carried n = 0 is
+            # `var_check`'s re-derivation from the mass — the phantom population — so
+            # relaxing the carried number TOWARD it would inject number that no nucleation
+            # created, at 744/5 = 149 m⁻³ s⁻¹ on the O01 arm. That is the same
+            # growth-without-activation this gate exists to forbid, arriving through the
+            # consistency source instead of through a rate. A species that HAS a population
+            # still gets the full relaxation, so the drift this term was added to stop
+            # (n_i1 -> 2.2e9 m⁻³ against 5e-10 kg/m³) remains covered.
+            if var_check_source && lives[k]
+                nsrc += rhoair * (ek.ni - ns[k]) * i_tau_vc
+                asrc += rhoair * (ek.ai - as[k]) * i_tau_vc
+                csrc += rhoair * (ek.ci - cs[k]) * i_tau_vc
+            end
+
+            if is_target
+                qn = rhoair * q_nuc
+                nn = rhoair * n_nuc
+                vn = _ice_nucleation_volume(qn, nn)
+                qsrc += qn
+                nsrc += nn
+                asrc += vn
+                csrc += vn
+            else
+                qsrc -= rhoair * IfzQ[k]
+                nsrc -= rhoair * FzN[k]
+            end
+
+            SRCq[k][i] = qsrc
+            SRCn[k][i] = nsrc
+            SRCa[k][i] = asrc
+            SRCc[k][i] = csrc
+            # ── The ICE CONDUCTANCE λ SEES IS THE REALIZED ONE ────────────────────────
+            #
+            # `invtau_i` is consumed in three places that must agree: λ of the relaxation pair,
+            # the `Q`-independent piece `−b·Σ_k τ_{i,k}^{-1}` of `N`, and the per-species
+            # step-mean transfer `Q̇_{i,k} = drive·τ_{i,k}^{-1}/(1+𝒬_{s,i})`. When the ice donor
+            # realization scales the TRANSFER but not the other two, the pair is integrating a
+            # different exchange than the one the slots receive — exactly in the over-drawn ice
+            # regions where the factor bites, and the mismatch is left for `τ_ss`/`τ_rec` to
+            # absorb. That is an inconsistency, not an approximation.
+            #
+            # The consistent object follows from the same algebra the share rule does. The ice
+            # contribution to Eq. Qss_ice is `−Σ_k Q̇_{i,k}(1+𝒬_{s,i})`; substituting the
+            # REALIZED rate `Q̇_{i,k} = drive·f_k τ_{i,k}^{-1}/(1+𝒬_{s,i})` the psychrometric
+            # factor cancels exactly as before and what is left is `−drive·Σ_k f_k τ_{i,k}^{-1}`.
+            # So the effective conductance is `f_k τ_{i,k}^{-1}`, and writing it here puts it
+            # into λ, into `N`, and into the transfer at once — one number, three consumers.
+            #
+            # The stiff limit is unchanged in form: `Q_ss^{qs} = N/λ` with `Σ_eff` in place of
+            # `Σ`, so `drive = Q^{qs} + 𝒟 = F/λ + 𝒟 λ_l/λ` is Eq. wbf_qs with the realized ice
+            # conductance — the Wegener-Bergeron-Findeisen competition weighted by the ice
+            # surface that is actually active this step rather than by the surface a
+            # reservoir-blind rate implies. `f_k = 1` wherever the ice is not over-drawn, which
+            # is everywhere except the points the census flags, so this is inert in the bulk.
+            QDi[k][i] = sub_now ? FIC[k] * rk.Qdot : rk.Qdot
+            ITi[k][i] = sub_now ? FIC[k] * rk.invtau_i : rk.invtau_i
+            Vm[k][i] = rk.vtrm
+            Vn[k][i] = rk.vtrn
+        end
+    end
+    return nothing
+end
+
+# ── Located column-state guard ────────────────────────────────────────────────
+
+"""
+    mc_column_bad_level(p, rho_d, rho_t, Tk) -> Int
+
+The first level of a retrieved column at which the thermodynamic state is inadmissible —
+`p ≤ 0`, `ρ_d ≤ 0`, `ρ_t ≤ 0`, `T ≤ 0`, or a non-finite `p`/`T` — or `0` when every level is
+admissible. One pass of plain comparisons: no allocation, no write, nothing read but the four
+columns. The healthy-path half of [`check_column_state`](@ref), which `mc_driver!` calls on
+every column.
+"""
+@inline function mc_column_bad_level(p, rho_d, rho_t, Tk)
+    @inbounds for k in eachindex(p)
+        pk = p[k]; Tkk = Tk[k]
+        if !(pk > 0.0) || !(rho_d[k] > 0.0) || !(rho_t[k] > 0.0) || !(Tkk > 0.0) ||
+           !isfinite(pk) || !isfinite(Tkk)
+            return k
+        end
+    end
+    return 0
+end
+
+"""
+    check_column_state(p, rho_d, rho_t, Tk, z, fields::NamedTuple, loc::NamedTuple)
+
+Throw a LOCATED error when the retrieved column is thermodynamically inadmissible (see
+[`mc_column_bad_level`](@ref)); return `nothing` otherwise, having changed nothing.
+
+`loc` is printed first as `key = value` pairs (step, model time, tile, column, horizontal
+coordinates — whatever the caller has); then, for the bad level and the levels immediately
+below and above it, the level index, `z`, and one line per entry of `fields` (a NamedTuple of
+column vectors, printed in order). The message is built only on the failing path.
+
+Why this exists (the §2c death class): a retrieval-heating burst drives a w / sound-speed
+runaway, the vertical semi-implicit solve is carried past its limit, and the total pressure
+goes NEGATIVE in a convective column. Nothing downstream is defined there — the SI
+coefficient `γ_m p/ρ_t` loses its sign and the Helmholtz operator its definiteness — but the
+liquid path computes straight through it; the first thing to throw used to be the ice
+kernel's `nsch^(1/3)` (`ishmael_ventilation`), as a bare `DomainError` with no location and
+no state. This names the column and shows the collapse's vertical structure instead.
+"""
+function check_column_state(p, rho_d, rho_t, Tk, z, fields::NamedTuple, loc::NamedTuple)
+    kbad = mc_column_bad_level(p, rho_d, rho_t, Tk)
+    kbad == 0 && return nothing
+    _mc_column_state_error(kbad, z, fields, loc)
+end
+
+@noinline function _mc_column_state_error(kbad::Int, z, fields::NamedTuple, loc::NamedTuple)
+    io = IOBuffer()
+    println(io, "Inadmissible column state (p, rho_d, rho_t or T not positive/finite) at ",
+            "level k=$(kbad), z=$(z[kbad]) m")
+    for (key, val) in pairs(loc)
+        println(io, "  $(key) = $(val)")
+    end
+    n = length(z)
+    for k in max(kbad - 1, 1):min(kbad + 1, n)
+        tag = k == kbad ? "  << BAD LEVEL" : (k < kbad ? "  (below)" : "  (above)")
+        println(io, "  level k=$(k), z=$(z[k]) m$(tag)")
+        for (key, col) in pairs(fields)
+            println(io, "    $(key) = $(col[k])")
+        end
+    end
+    error(String(take!(io)))
+end
+
+"""
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, slot, Sc_t)
+
+Add `K∇²_h(φ)/Sc_t` to `expdot[:, slot]` for one column, `φ` being prognostic slot `slot`:
+the geometry's horizontal Laplacian (`mc_w_kdiff!`) read from the slot's own views, built
+HERE from the physical array (`grid` is `(physical = …,)`; see [`mc_water_mixing!`](@ref)
+for why not in the driver), accumulated through an explicit loop (an indexed `.+=` materializes the slice and
+allocates). `K` is a column vector (Smagorinsky) or a scalar (constant); `Sc_t` is the
+turbulent Schmidt number, or an exact `1.0` when the scalar already carries it.
+"""
+@inline function mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, slot,
+                                    Sc_t)
+    sv = mc_slot_views(grid, colstart, colend, slot, geom)
+    mc_w_kdiff!(LAP, geom, K, sv, r)
+    @inbounds for i in eachindex(LAP)
+        expdot[colstart + i - 1, slot] += LAP[i] / Sc_t
+    end
+    return nothing
+end
+
+"""
+    mc_water_mixing!(expdot, physical, gridpoints, physical_params, LAP, LAP2, geom, K,
+                     Sc_t, colstart, colend, rv_i, nr_i, ice_idx)
+
+The horizontal water-species mixing of one column (`physical_params[:Khdiff_water] ≠ 0`):
+EVERY water species with the ONE coefficient `K/Sc_t`, in this order —
+
+1. slot 8 rain and slot 9 cloud (ν under a transform), slot 7 `Q_ss`;
+2. the rain number `n_r` (two-moment rain, `nr_i > 0`). It mixes with the same coefficient
+   as the rain MASS, and must: mixing one without the other rescales the mean drop size of
+   every column the operator touches, and the fall speeds, evaporation timescale and
+   self-collection all read that size;
+3. the prognostic vapor `ρ_v'` (`rv_i`, slot 3) — so that the water sum
+   `ρ_w = Σ_k α_k ν_k` moves by `K∇²ρ_w` exactly, by the linearity of the operator;
+4. under ISHMAEL (`ice_idx` nonzero), all twelve ice slots — each species' mass, number and
+   two volume moments — for the rain-number reason, one category further out: a crystal's
+   mass is `ρ_i/n_i` and its habit `a_i/n_i`, `c_i/n_i`, so one K for all four leaves them
+   unrescaled.
+
+(There is no total-water leg: the prognostic ρ_t it mixed was deleted at Stage 4 of the ρ_t
+retirement. `LAP2` is now unused scratch, kept in the signature.) Called from the two branches
+of [`mc_driver!`](@ref)
+with a CONCRETE `K` (vector `K_smag` or scalar), which makes this the function barrier that
+keeps the diffusivity unboxed. Not energy consistent — `E_t` and `p` are not sourced.
+
+COMPILE COST, MEASURED — why this is `@noinline` and takes PLAIN ARRAYS. The leg's own code
+compiles in well under a second; what it can cost is the LLVM codegen of `mc_driver!` around
+the call. First-call time of the driver (XZ, then axisym + Louis BL + Smagorinsky; one
+thread, the test_allocations tiles, which never take the branch; the two "views" rows are
+the allocation suite's testset times at two threads beside a running model):
+
+| how the leg is reached                                         | XZ    | axisym-Louis |
+|----------------------------------------------------------------|-------|--------------|
+| base (d3964bf: seven Laplacians inline, no vapor / ice)        |  51 s |  58 s        |
+| inlined, nineteen Laplacians on the driver's views             |   —   | > 80 min     |
+| `@noinline`, taking the driver's view NamedTuples              | ~300 s | > 20 min    |
+| `@noinline`, taking `mtile`                                    | 218 s |  75 s        |
+| `@noinline`, a one-line body, taking `mtile`                   | 187 s |  66 s        |
+| `@noinline`, taking the grid struct and `model`                |  55 s | 174 s        |
+| `@noinline`, taking arrays + the `physical_params` Dict (this) |  48 s |  55 s        |
+
+The fourth row is the diagnosis: the cost is not this function's body but handing the
+driver's large immutable structs (`mtile`, the grid, `model`) — or its views — to an opaque
+call in the middle of a body that keeps hundreds of them live. Only the heap-allocated
+`Matrix`/`Array`/`Dict` cross here; the slot views and the metric are rebuilt from them.
+
+HOW WELL THE SUM CLOSES (test/test_horizontal_water_mixing.jl): `ρ_w = Σ_k α_k ν_k` moves by
+`K∇²ρ_w` to rounding, one linear operator on a sum. The RECOVERED densities move by it only on
+the affine branch: at the knee points (`0 < ν ≲ μ`, where `f'` runs from 1 to 2) to O(μ), and at
+the LOBE points — where the spline fit of a sharp feature rings into `ν < 0` and `ahyp` floors
+the recovered density at zero — the mixing lifts the negative `ν` toward zero (shrinks the lobe
+pool `Σ 2 min(ν, 0)`) with no recovered change. That is the ν-space convention, not a missing
+term.
+"""
+@noinline function mc_water_mixing!(expdot::Matrix{Float64}, physical::Array{Float64,3},
+                                    gridpoints::Matrix{Float64}, physical_params,
+                                    LAP, LAP2, geom::MCGeometry, K, Sc_t::Float64,
+                                    colstart::Int64, colend::Int64, rv_i::Int64,
+                                    nr_i::Int64, ice_idx::NTuple{12,Int64})
+    # Rebuilt from the plain arrays: `mc_slot_views` and `mc_metric` read only these fields.
+    grid = (physical = physical,)
+    r = mc_metric(geom, (physical_params = physical_params,), gridpoints, colstart, colend)
+    # No total-water leg: the water sum ρ_w = Σ α_k ν_k moves by Σ α_k K∇²ν_k = K∇²ρ_w exactly
+    # by linearity. (Its old first step mixed the prognostic ρ_t' − ρ_d' in slot 3, which went
+    # with the slot at Stage 4 of the ρ_t retirement.)
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 8, Sc_t)
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 9, Sc_t)
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, 7, Sc_t)
+    nr_i > 0 && mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, nr_i,
+                                   Sc_t)
+    mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, rv_i, Sc_t)
+    # One loop, one call site: the body is compiled once rather than twelve times.
+    @inbounds for j in 1:12
+        s = ice_idx[j]
+        s > 0 && mc_water_mix_slot!(expdot, LAP, geom, K, grid, r, colstart, colend, s,
+                                    Sc_t)
+    end
+    return nothing
+end
+
+"""
+    smagorinsky_length(model) -> Float64
+
+The Smagorinsky length scale `Ls` [m] of THIS patch, and so whether the scheme is on
+(`> 0`). ONE rule on every geometry (it is the `[physics.horizontal_mixing]` rule):
+
+- `physical_params[:Ls] > 0` — that absolute length, unchanged on every patch. `:C_s` is not
+  read at all, so a configuration that sets an absolute length (the axisymmetric TC, 500 m)
+  computes exactly the `Ls` it always did.
+- otherwise `:C_s > 0` — `C_s·Δx`, with Δx this patch's horizontal cell width
+  `(iMax − iMin)/num_cells_i`, the same Δx the MYNN scale-aware taper takes
+  (`mc_mynn_state`). Per patch, because a nest's grid_params carry the nest's own span and
+  cell count: the length refines with the grid, as a Smagorinsky length should.
+- otherwise `0.0` — the scheme is off (both keys absent is every non-Smagorinsky run).
+"""
+function smagorinsky_length(model::ModelParameters)
+    Ls = get(model.physical_params, :Ls, 0.0)
+    Ls > 0.0 && return Ls
+    C_s = get(model.physical_params, :C_s, 0.0)
+    C_s > 0.0 || return 0.0
+    gp = model.grid_params
+    return C_s * ((Float64(gp.iMax) - Float64(gp.iMin)) / gp.num_cells_i)
+end
+
+# ── Equation set ───────────────────────────────────────────────────────────────
+
+"""
+    mc_driver!(mtile, colstart, colend, t, geom)
+
+Total-energy moist compressible equation set — the geometry-generic master driver.
+Prognostic slots (perturbations vs the `PressureReferenceState` except u, w, rho_r,
+and v on the cylindrical geometries): p' [Pa], rho_d', rho_t', u, w, E_t' [J/m^3],
+Q_ss' [kg/m^3], rho_r, rho_c' (+ tangential v, slot 10, on the cylinders) and rho_v'.
+
+Each step the CLOSED-FORM `retrieve_temperature` gives T from the prognostic condensed
+masses; the vapor is its own prognostic slot; and the condensation rate is the (uncapped)
+supersaturation relaxation, an equal and opposite pair of sources on rho_c and rho_v at
+fixed rho_t and E_t. The energy equation carries no condensation source (exact first law);
+the pressure equation's condensation coefficient is (L_v - R_v*C_pt*T/R_m). See
+reference/Scythe_moist_compressible.tex, and the file header for why no water variable is a
+residual any more.
+
+Everything geometry-specific — the derivative-slot mapping, metric and curvature
+terms, and the tangential-wind machinery — is dispatched on the singleton `geom`
+trait (see mc_geometry.jl), so the Cartesian path compiles to exactly the
+historical `moist_compressible_XZ` code. The name-dispatched equation sets are
+thin wrappers below.
+"""
+function mc_driver!(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
+                    geom::MCGeometry)
+
+    grid = mtile.tile
+    gridpoints = mtile.tilepoints
+    expdot = mtile.expdot_n
+    impdot = mtile.impdot_n
+    model = mtile.model
+    refstate = mtile.ref_state
+    # ── Stage 0: every option, flag, width and parameter, with the setup refusals —
+    # `_mc_driver_params` (src/mc_driver_stages.jl), destructured into the local names. ──
+    IS = mtile.mc_slots
+    RAD = mtile.radiation
+    (; Khdiff, Kvdiff, Khdiff_heat, Kvdiff_heat, tau_qss, lobe_relax, tau_lobe, lobe_tr, teos,
+       sed_lid_dir, tau_pop, ice_pop_src, pop_seed, ice_shed, ice_attr, ice_agg_caps,
+       rain_evap_real, cloud_evap_real, ice_n_real, rain_pop_gate, Pr_t, Khdiff_water, Sc_t,
+       fcor, alpha, z_damp, precipitation, budget_trace, cond_floor, ctrans, ctrans_on, cmu,
+       rtrans, rtrans_on, rmu, vtrans, vtrans_on, vmu, nr_i, rain_2m, nrtrans, nrtrans_on,
+       nrmu, ice_on, itrans, itrans_on, imu_q, imu_n, imu_a, imu_c, N_r, N_0, max_N_c,
+       louis_bl, re_i, mynn_on, rad_on, hsi, xsi, xsi_zero, hsi_like, sd_si, l_inf, Ls, K_min,
+       use_smag, surface_fluxes, SST) =
+        _mc_driver_params(model, IS, mtile.mynn.water_carry, RAD)
+    # The whole bulk air-sea configuration (:Cd, :Ck, :U_min, :sfc_wind_factor, :SST,
+    # options[:sfc_z0], options[:sfc_stability]) resolved into ONE isbits struct, here,
+    # once per driver call — never a Dict lookup inside the column loop, and an
+    # unrecognized :sfc_z0 dies here rather than silently defaulting. See
+    # src/mc_surface_layer.jl.
+    sfc = surface_layer_params(model.physical_params, model.options;
+                               surface_fluxes = surface_fluxes)
+
+    # Gridpoints: z from the geometry's vertical column; r is the geometry metric
+    # handle (radius view on the cylinders, colatitude/a/Omega on the sphere,
+    # `nothing` on the Cartesian geometries — see mc_metric)
+    z = view(gridpoints,colstart:colend,zcoord(geom))
+    r = mc_metric(geom, model, gridpoints, colstart, colend)
+
+    # Prognostic slot views, geometry-mapped (see mc_slot_views): `_x` is ∂x on the
+    # slice and ∂r on the cylinders, `_z`/`_zz` sit at zslot(geom), and the raw
+    # azimuthal `f_l`/`f_ll` pair exists only on the 3D grid (`nothing` on 2D).
+    pv  = mc_slot_views(grid, colstart, colend, 1, geom)   # p' [Pa]
+    rdv = mc_slot_views(grid, colstart, colend, 2, geom)   # rho_d'
+    uv  = mc_slot_views(grid, colstart, colend, 4, geom)   # u
+    wv  = mc_slot_views(grid, colstart, colend, 5, geom)   # w
+    etv = mc_slot_views(grid, colstart, colend, 6, geom)   # E_t'
+    qsv = mc_slot_views(grid, colstart, colend, 7, geom)   # Q_ss'
+    rrv = mc_slot_views(grid, colstart, colend, 8, geom)   # rho_r (rho_rbar = 0)
+    rcv = mc_slot_views(grid, colstart, colend, 9, geom)   # rho_c'
+    vv  = mc_v_views(geom, grid, colstart, colend)         # tangential v (cylinders)
+    # The UNCONDITIONAL vapor slot (slot 3 since Stage 4 of the ρ_t retirement, resolved by
+    # name — see `MCSlots`). Bound like the fixed nine: the index is a field load resolved once
+    # per tile, and every configuration of this set carries it, so there is no branch here.
+    rv_i = IS.rho_v
+    rvv = mc_slot_views(grid, colstart, colend, rv_i, geom)   # rho_v' (ν_v' under :bhyp)
+    # The APPENDED rain-number slot (10 on XZ, 11 on the cylinders — see `MCSlots`). Bound
+    # UNCONDITIONALLY, at slot 8 when the option is off, so the SubArray construction is the
+    # same straight-line code every other slot's is and elides identically; nothing reads it
+    # unless `rain_2m`. (Building it inside a runtime branch is what stops a view eliding.)
+    nrv = mc_slot_views(grid, colstart, colend, rain_2m ? nr_i : 8, geom)
+    # The twelve APPENDED ice slots (11-22 on XZ, 12-23 on the cylinders, with n_r), bound the same
+    # way and for the same reason: UNCONDITIONALLY, aliased to slot 8 when ice is off, so
+    # every one of these is the same straight-line `mc_slot_views` call the fixed slots
+    # make and elides identically. Nothing reads them unless `ice_on`.
+    i1qv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_q : 8, geom)
+    i1nv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_n : 8, geom)
+    i1av = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_a : 8, geom)
+    i1cv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i1_c : 8, geom)
+    i2qv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_q : 8, geom)
+    i2nv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_n : 8, geom)
+    i2av = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_a : 8, geom)
+    i2cv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i2_c : 8, geom)
+    i3qv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_q : 8, geom)
+    i3nv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_n : 8, geom)
+    i3av = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_a : 8, geom)
+    i3cv = mc_slot_views(grid, colstart, colend, ice_on ? IS.i3_c : 8, geom)
+    # The APPENDED MYNN TKE-density slot, bound the same way and for the same reason:
+    # UNCONDITIONALLY, aliased to slot 8 when the closure is off, so this is the same
+    # straight-line `mc_slot_views` call every fixed slot makes and elides identically.
+    # Nothing reads it unless `mynn_on`.
+    rev = mc_slot_views(grid, colstart, colend, mynn_on ? re_i : 8, geom)
+
+    pp = pv.f;      pp_x = pv.f_x;         pp_z = pv.f_z
+    rho_dp = rdv.f; rho_dp_x = rdv.f_x;    rho_dp_z = rdv.f_z
+    u = uv.f;       u_x = uv.f_x;          u_z = uv.f_z;       u_zz = uv.f_zz
+    w = wv.f;       w_x = wv.f_x;          w_z = wv.f_z;       w_zz = wv.f_zz
+    E_tp = etv.f;   E_tp_x = etv.f_x;      E_tp_z = etv.f_z
+    Q_ssp = qsv.f;  Q_ssp_x = qsv.f_x;     Q_ssp_z = qsv.f_z
+    rho_rp = rrv.f; rho_rp_x = rrv.f_x;    rho_rp_z = rrv.f_z
+    rho_cp = rcv.f; rho_cp_x = rcv.f_x;    rho_cp_z = rcv.f_z
+    rho_vp = rvv.f; rho_vp_x = rvv.f_x;    rho_vp_z = rvv.f_z
+
+    # Reference state (pressure-based). Views, not `[:,1]` copies: these are read-only and
+    # loop-invariant, so copying them allocated a fresh kDim vector per column per timestep.
+    pbar = view(ref_pressure(refstate),:,1)
+    pbar_z = view(ref_pressure(refstate),:,2)
+    rho_dbar = view(ref_rho_d(refstate),:,1)
+    rho_dbar_z = view(ref_rho_d(refstate),:,2)
+    # The total-density reference: the derived ρ̄_t^w (`mc_rho_tbar_ref`).
+    rtb_m = mtile.ebudget.rho_tbar_ref
+    rho_tbar = view(rtb_m,:,1)
+    rho_tbar_z = view(rtb_m,:,2)
+    E_tbar = view(ref_total_energy(refstate),:,1)
+    E_tbar_z = view(ref_total_energy(refstate),:,2)
+    Q_ssbar = view(ref_qss(refstate),:,1)
+    Q_ssbar_z = view(ref_qss(refstate),:,2)
+    rho_cbar = view(Springsteel.ref_rho_c(refstate),:,1)
+    rho_cbar_z = view(Springsteel.ref_rho_c(refstate),:,2)
+    # LOCAL reference sound-speed-squared profile γ̄_m(z)·p̄/ρ̄_t (see
+    # mc_reference_diagnostics) — the acoustic linearization must use the local
+    # value so the explicit remainder is O(perturbation) at every level; the
+    # domain-mean sound_speed_sq is unstable above Co_z ≈ 4.5 on a stratified base.
+    Pxi_bar = mtile.mc_ref_diag.Pxi_prof
+    # The DERIVED reference vapor ρ̄_v ≡ ρ̄_t − ρ̄_d − ρ̄_c (Springsteel's fitted columns) and its
+    # vertical derivative, both from `mc_reference_diagnostics`, so the profile the slot is
+    # carried against is bit for bit the one every initializer subtracts. Not
+    # `Springsteel.ref_rho_v`, which is an independent fit of the same quantity.
+    rho_vbar = mtile.mc_ref_diag.rho_vbar
+    rho_vbar_z = mtile.mc_ref_diag.rho_vbar_z
+
+    # Per-thread work vectors for every temporary below (see `MC_SCRATCH_SLOTS`). Each `@.`
+    # writes into a preallocated column instead of allocating a fresh one per column per step.
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+
+    # Total fields (perturbation + reference)
+    p = S.p;         @. p = pp + pbar
+    rho_d = S.rho_d; @. rho_d = rho_dp + rho_dbar
+    rho_t = S.rho_t                       # the derived total: staged below (`_anchor_stage!`)
+    E_t = S.E_t;     @. E_t = E_tp + E_tbar
+    Q_ss = S.Q_ss;   @. Q_ss = Q_ssp + Q_ssbar
+    # The VAPOR, staged here with the other totals rather than retrieved 150 lines down. It is
+    # a prognostic, untransformed perturbation against the derived ρ̄_v, so this is the same
+    # `perturbation + reference` line rho_t and Q_ss take — and everything downstream (the
+    # temperature retrieval's partition, q_v, Q_s, the condensation closure, the surface
+    # moisture flux) now reads STATE AT n.
+    rho_v = S.rho_v
+    J_v = jacobian_column(mtile.species, rv_i, Threads.threadid())
+    if vtrans_on
+        # The vapor CONTROL VARIABLE (`vapor_transform_mode`): ν_v = ν_v' + ν̄_v, recovered
+        # pointwise; `J_v` is formed at the recovered density, with the lobe-transport
+        # continuation below ν = 0 (`lobe_transport_jacobian`), exactly as the cloud's. Every
+        # reader below — T, q_v, Q_s, the microphysics, the surface layer, the BLs — sees
+        # `ahyp(ν_v) ≥ 0`. ν_v itself is never stored: it is `rho_vp + nu_vbar`, inline.
+        _vapor_bhyp_stage!(rho_v, J_v, S.rho_v_z, grid.physical, rv_i, colstart,
+                           zslot(geom), mc_nu_vbar(mtile),
+                           mc_nu_vbar_z(mtile), vmu, lobe_tr)
+    else
+        @. rho_v = rho_vp + rho_vbar
+    end
+    # Slot 9. Under `:none` this is the cloud density and `Jc ≡ 1`; under a transform the slot
+    # carries the control variable `ν' = ν − ν̄` with `ν̄ = bhyp(ρ̄_c)` (Ooyama predicts the
+    # DEVIATION from the transformed background, §4d), and the density is recovered pointwise.
+    # `ν̄` and `ν̄_z` are formed here rather than cached because ρ̄_c is identically zero in
+    # every current configuration, making them exactly zero for two kDim-length operations.
+    nu_c = S.nu_c; nu_c_z = S.nu_c_z; Jc = S.Jc
+    rho_c = S.rho_c
+    if ctrans_on
+        @. nu_c = rho_cp + bhyp(rho_cbar, cmu)
+        @. nu_c_z = rho_cp_z + (dbhyp(rho_cbar, cmu) * rho_cbar_z)
+        if ctrans === :bhyp
+            @. rho_c = ahyp(nu_c, cmu)
+        else
+            @. rho_c = ahyp_smooth(nu_c, cmu)
+        end
+        # Evaluated at the RECOVERED density, clamped at zero for the argument only: that is
+        # what bounds J in [0.5, 1] and removes the source stiffness. Clamping the argument
+        # changes no state, no mass and no energy — it perturbs the tendency by at most a
+        # factor of two at points whose density is within μ of zero.
+        #
+        # BELOW ZERO the slot's continuity terms read the odd continuation instead
+        # (`lobe_transport_jacobian`/`_density`, `options[:water_lobe_transport]`): there the
+        # recovered density is 0 and `dbhyp(0) = 1`, which dropped the lobe's `−ρ∇·u` and moved
+        # it by twice the mass any flux divergence moves in ρ_t. Identical doubles at every
+        # point whose slot is non-negative.
+        if lobe_tr
+            @. Jc = lobe_transport_jacobian(nu_c, rho_c, cmu)
+        else
+            @. Jc = dbhyp(max(rho_c, 0.0), cmu)
+        end
+    else
+        @. nu_c = rho_cp + rho_cbar
+        @. nu_c_z = rho_cp_z + rho_cbar_z
+        copyto!(rho_c, nu_c)
+        fill!(Jc, 1.0)
+    end
+    # Slot 8, the same construction for rain — with one simplification: rain is a TOTAL with
+    # `ρ̄_r ≡ 0`, so the slot IS `ν_r`, with no background to add and no `ν̄_r` to form. Under
+    # `:none` the copy is of identical doubles and `Jr` is an exact 1.0, so the default path
+    # stays bit-identical (the same construction slot 9 uses above).
+    nu_r = S.nu_r; nu_r_z = S.nu_r_z; Jr = S.Jr
+    rho_r = S.rho_r
+    copyto!(nu_r, rho_rp)
+    copyto!(nu_r_z, rho_rp_z)
+    if rtrans_on
+        if rtrans === :bhyp
+            @. rho_r = ahyp(nu_r, rmu)
+        else
+            @. rho_r = ahyp_smooth(nu_r, rmu)
+        end
+        if lobe_tr
+            @. Jr = lobe_transport_jacobian(nu_r, rho_r, rmu)
+        else
+            @. Jr = dbhyp(max(rho_r, 0.0), rmu)
+        end
+    else
+        copyto!(rho_r, nu_r)
+        fill!(Jr, 1.0)
+    end
+    # The appended rain-NUMBER slot, identical construction to slot 8 above: also a TOTAL
+    # (`n̄_r ≡ 0`), so the slot IS its control variable. Skipped entirely under the default
+    # single-moment configuration, where none of `n_r`/`nu_nr`/`Jnr` is ever read.
+    nu_nr = S.nu_nr; nu_nr_z = S.nu_nr_z; Jnr = S.Jnr
+    n_r = S.n_r
+    if rain_2m
+        copyto!(nu_nr, nrv.f)
+        copyto!(nu_nr_z, nrv.f_z)
+        if nrtrans_on
+            if nrtrans === :bhyp
+                @. n_r = ahyp(nu_nr, nrmu)
+            else
+                @. n_r = ahyp_smooth(nu_nr, nrmu)
+            end
+            @. Jnr = dbhyp(max(n_r, 0.0), nrmu)
+        else
+            copyto!(n_r, nu_nr)
+            fill!(Jnr, 1.0)
+        end
+    end
+    # The twelve appended ICE slots, each the same construction through the shared
+    # `_load_total_slot!`: all twelve are TOTALS (`f̄ ≡ 0`), so each slot IS its own control
+    # variable. One transform family, four widths — `mu` is dimensional and mass, number and
+    # the two volume moments are ten and nine decades apart (`MC_ICE_MU_KEYS`). Skipped
+    # entirely when ice is off, where none of these columns is ever read.
+    i1q = S.i1q; i1n = S.i1n; i1a = S.i1a; i1c = S.i1c
+    i2q = S.i2q; i2n = S.i2n; i2a = S.i2a; i2c = S.i2c
+    i3q = S.i3q; i3n = S.i3n; i3a = S.i3a; i3c = S.i3c
+    if ice_on
+        _load_total_slot!(i1q, S.nu_i1q, S.nu_i1q_z, S.J_i1q, i1qv, itrans_on, itrans, imu_q;
+                          lobe_tr)
+        _load_total_slot!(i1n, S.nu_i1n, S.nu_i1n_z, S.J_i1n, i1nv, itrans_on, itrans, imu_n)
+        _load_total_slot!(i1a, S.nu_i1a, S.nu_i1a_z, S.J_i1a, i1av, itrans_on, itrans, imu_a)
+        _load_total_slot!(i1c, S.nu_i1c, S.nu_i1c_z, S.J_i1c, i1cv, itrans_on, itrans, imu_c)
+        _load_total_slot!(i2q, S.nu_i2q, S.nu_i2q_z, S.J_i2q, i2qv, itrans_on, itrans, imu_q;
+                          lobe_tr)
+        _load_total_slot!(i2n, S.nu_i2n, S.nu_i2n_z, S.J_i2n, i2nv, itrans_on, itrans, imu_n)
+        _load_total_slot!(i2a, S.nu_i2a, S.nu_i2a_z, S.J_i2a, i2av, itrans_on, itrans, imu_a)
+        _load_total_slot!(i2c, S.nu_i2c, S.nu_i2c_z, S.J_i2c, i2cv, itrans_on, itrans, imu_c)
+        _load_total_slot!(i3q, S.nu_i3q, S.nu_i3q_z, S.J_i3q, i3qv, itrans_on, itrans, imu_q;
+                          lobe_tr)
+        _load_total_slot!(i3n, S.nu_i3n, S.nu_i3n_z, S.J_i3n, i3nv, itrans_on, itrans, imu_n)
+        _load_total_slot!(i3a, S.nu_i3a, S.nu_i3a_z, S.J_i3a, i3av, itrans_on, itrans, imu_a)
+        _load_total_slot!(i3c, S.nu_i3c, S.nu_i3c_z, S.J_i3c, i3cv, itrans_on, itrans, imu_c)
+    end
+
+    # Total vertical gradients (perturbation + reference)
+    p_z = S.p_z;         @. p_z = pp_z + pbar_z
+    rho_d_z = S.rho_d_z; @. rho_d_z = rho_dp_z + rho_dbar_z
+    rho_t_z = S.rho_t_z
+    # THE DERIVED ANCHOR: the totals ρ_t = ρ_d + W and ρ_{t,z} = ρ_{d,z} + W_z every reader
+    # below takes (W = Σ_k α_k ν_k over the water-mass slots). The perturbation ρ_t' is formed
+    # where its one reader needs it (the w buoyancy, `_anchor_w_forcing!`).
+    _anchor_stage!(rho_t, rho_t_z, grid.physical, colstart, zslot(geom),
+                   water_anchor_set(model.options, model.physical_params, IS), rho_d,
+                   rho_d_z, mc_nu_vbar(mtile), mc_nu_vbar_z(mtile), rho_cbar, rho_cbar_z)
+    E_t_z = S.E_t_z;     @. E_t_z = E_tp_z + E_tbar_z
+    Q_ss_z = S.Q_ss_z;   @. Q_ss_z = Q_ssp_z + Q_ssbar_z
+    # The DENSITY vertical gradient, f'(n)·∂z n = ∂z n / J — self-consistent with the recovered
+    # density because both come from the same fit. Under `:none`, J is exactly 1.0 and this is
+    # bitwise `rho_cp_z + rho_cbar_z`. Advection does NOT read this (it is transform-invariant
+    # and reads `nu_c_z` directly); this exists for any consumer that wants dρ_c/dz.
+    rho_c_z = S.rho_c_z; @. rho_c_z = nu_c_z / Jc
+    # The vapor's TOTAL vertical gradient, perturbation slot plus derived reference — the
+    # same `f'_z + f̄_z` the four lines above form, and what the advective product-rule term
+    # below reads (the horizontal leg reads the perturbation gradient, because ρ̄_v has no
+    # x-dependence).
+    # Under the vapor control variable this is ν_v's own total gradient (`ν_v'_z + ν̄_v,z`):
+    # the advection is transform-invariant and reads the control variable's, as slot 9's does.
+    # (under the vapor control variable `_vapor_bhyp_stage!` already formed ν_v's gradient)
+    rho_v_z = S.rho_v_z
+    vtrans_on || (@. rho_v_z = rho_vp_z + rho_vbar_z)
+
+    # ── Diagnostic thermodynamic state — `_thermo_stage!` (src/mc_driver_stages.jl) ──
+    _thermo_stage!(S, geom, grid.physical, gridpoints, u, w, pp, pbar, z, colstart, colend, t,
+                   model.ts, model.output_dir,
+                   (; ice_on, cond_floor, teos, sd_si,
+                      column_state_guard = get(model.options, :column_state_guard, true)::Bool))
+
+    # ── The condensation closure, warm rain and its sedimentation fits, the cloud donor's
+    # warm conductance — `_warm_micro_stage!` (src/mc_driver_stages.jl) ──
+    condensation = get(model.options, :condensation, true)::Bool
+    _warm_micro_stage!(S, mtile.mc_water_stats, mtile.mc_micro_nm1, mtile.mc_micro_nm2,
+                       mtile.flux_columns, mtile.scratch_columns, z, colstart, t, model.ts,
+                       N_r, N_0, max_N_c, nr_i,
+                       (; budget_trace, condensation, rain_evap_real, precipitation, rain_2m,
+                          sed_lid_dir))
+    # The stage 3-4 columns read further down the driver, under the names it binds them to.
+    ke = S.ke; Tk = S.Tk; rho_vs = S.rho_vs; q_v = S.q_v; q_l = S.q_l; q_i = S.q_i
+    C_vt = S.C_vt; R_m = S.R_m; gamma_m = S.gamma_m; drvs_dT = S.drvs_dT; drvs_dp = S.drvs_dp
+    Qdot = S.Qdot; Qdot_r = S.Qdot_r; cap_c = S.cap_c; cap_r = S.cap_r; cap_v = S.cap_v
+    etd_nl = S.etd_nl; AUTO_COLL = S.AUTO_COLL; Fr_z = S.Fr_z; E_sed_z = S.E_sed_z
+    NR_SRC = S.NR_SRC; Fnr_z = S.Fnr_z
+
+    # ── Ice: process sources and sedimentation — `_ice_stage!` (src/mc_driver_stages.jl) ──
+    # The two mass-flux aggregates outlive the stage (the energy and water-slot tendencies
+    # and the surface census read them), so they are bound here as well.
+    Fi_z = S.Fi_z
+    E_sed_i_z = S.E_sed_i_z
+    _ice_stage!(S, mtile.ishmael_tables, mtile.mc_water_stats, mtile.flux_columns,
+                mtile.scratch_columns, IS, z, model.ts, max_N_c, tau_pop, pop_seed,
+                get(model.physical_params, :tau_homogeneous, 5.0),
+                get(model.physical_params, :tau_activation, 1.0),
+                get(model.physical_params, :tau_varcheck, 5.0),
+                (; ice_on, condensation,
+                   ice_var_check = get(model.options, :ice_var_check, true)::Bool,
+                   ice_attr, ice_agg_caps, rain_evap_real, cloud_evap_real, ice_shed,
+                   ice_n_real, rain_pop_gate, ice_pop_src, sed_lid_dir))
+
+    # ── The realized rain conductance, the liquid λ/N split taken on it, the realized
+    # cloud sinks and the microphysics history row — `_liquid_fold_stage!`
+    # (src/mc_driver_stages.jl). After `_ice_stage!`: `f_rain`/`f_cloud` are final only
+    # once `mc_ice_sources!` has completed the donor totals.
+    _liquid_fold_stage!(S, mtile.mc_water_stats, mtile.mc_micro_n, colstart, model.ts,
+                        max_N_c, (; cloud_evap_real, precipitation, rain_2m, condensation,
+                                   ice_on))
+
+    div = S.div; mc_divergence!(div, geom, u, u_x, w_z, vv, r)
+
+    # ── THE ENERGY BUDGET (`options[:energy_budget]`, src/energy_budget.jl) ──────────────
+    # One branch per hook site on one Bool read here; with the budget off no hook is ever
+    # called and the column step is the code without it. The hooks are `@noinline` and take
+    # the budget (a mutable struct, one pointer) and plain arrays — never the tile, the grid or
+    # the view NamedTuples (the `mc_water_mixing!` compile-cost measurement).
+    eb = mtile.ebudget
+    eb_on = eb.active
+    eb_on && eb_begin!(eb, colstart)
+
+    # ── Horizontal diffusion ───────────────────────────────────────────────────
+    # Turbulence diffuses momentum (u, w) and the moist entropy s_t (heat). Horizontally,
+    # s_t is diffused by the chain rule on the DRY-exact form s_d = C_vd ln p - C_pd ln rho_d
+    # (an explicit function of the prognostic p, rho_d). Its Laplacian uses only the p/rho_d
+    # derivative slots — no transform of a diagnosed field, which the column decomposition
+    # cannot do (see reference/moist_compressible_diffusion_plan.md). The MOIST horizontal
+    # correction (through the retrieval's T sensitivities) is deferred to the rainfall
+    # session (reference/moist_compressible_diffusion_handoff.md). pbar/rho_dbar have no
+    # x-dependence, so the total x-derivatives are the perturbation slots.
+    sd_xx = S.sd_xx
+    mc_sd_lap!(sd_xx, geom, p, rho_d, pv, rdv, r)
+
+    # Smagorinsky horizontal eddy viscosity (length scale Ls > 0, absolute or
+    # C_s·Δx -- see where Ls is resolved above): flow-dependent K(strain)
+    # replaces the constant Khdiff in the momentum diffusion and its FRIC_KE
+    # energy sink below. Computed BEFORE the heat diffusion because heat can be
+    # tied to it (the Khdiff_heat < 0 sentinel below).
+    K_smag = S.K_smag
+    if use_smag
+        mc_smag_k!(K_smag, geom, uv, vv, r, Ls, K_min)
+    end
+
+    # Horizontal diabatic heating [W/m^3] from the entropy diffusion: the source to internal
+    # energy is rho_d*T*(ds_t/dt)_diff = rho_d*T*K_heat*d2(s_t)/dx2. This is the
+    # moist analogue of Straka's rho*T*ds_d source.
+    #
+    # Khdiff_heat < 0 is the SENTINEL (as with Cd < 0 for the wind-dependent drag) for
+    # "mix heat with the Smagorinsky eddy diffusivity K_smag/Pr_t" instead of a constant.
+    # Without it, a Smagorinsky run mixes MOMENTUM only and leaves the thermodynamic
+    # fields with no horizontal mixing whatsoever -- which on an axisymmetric grid is
+    # especially bad, since there are no asymmetries to provide radial mixing and the
+    # strong radial gradients of a TC then support undamped grid-scale buoyancy
+    # structure. Tying it to K_smag rather than a constant keeps it resolution-general
+    # (K scales with the resolved deformation, so it follows a nest refinement).
+    # NOTE the form is K*grad^2(s), not div(K grad s): the variable-K correction
+    # grad(K).grad(s) is dropped, exactly as the existing momentum diffusion does with
+    # K_smag (mc_u_kdiff!) -- consistent with the surrounding scheme, not a new
+    # approximation.
+    QDOT_TH = S.QDOT_TH
+    if Khdiff_heat < 0.0
+        use_smag || error("physical_params[:Khdiff_heat] < 0 selects the Smagorinsky " *
+                          "heat diffusivity, which requires the Smagorinsky scheme " *
+                          "(:Ls > 0, or :C_s > 0 with :Ls = 0)")
+        @. QDOT_TH = rho_d * Tk * (K_smag / Pr_t) * sd_xx
+    else
+        @. QDOT_TH = rho_d * Tk * Khdiff_heat * sd_xx
+    end
+
+    # RADIATION enters the thermal source and nothing else. `QDOT_TH` is the single point
+    # where a diabatic heating reaches the pressure equation (slot 1, through R_m/C_vt),
+    # the total energy (slot 6, directly) and the supersaturation forcing (slot 7, through
+    # the non-condensational dT_nc/dp_nc that feed SATF) -- which is exactly the set of
+    # places radiative cooling has to reach: it creates supersaturation, and a radiation
+    # term that skipped Q_ss would cool the air without making the cloud that cooling makes.
+    # The Louis boundary layer adds its heating at the same place for the same reason.
+    #
+    # The field is HELD between radiation calls (the pre-pass owns the cadence), so this is
+    # an indexed add and nothing more. `q_lw`/`q_sw` are gridpoint-indexed exactly like
+    # `expdot`, hence `colstart + i - 1` and no reshape. The shortwave carries `sw_scale`,
+    # the per-step zenith rescale that keeps a diurnal forcing continuous between calls
+    # (plan D6); it is exactly 1 with a fixed sun and 0 at night.
+    if rad_on
+        q_lw = RAD.q_lw; q_sw = RAD.q_sw; sw_s = RAD.sw_scale
+        @inbounds for i in eachindex(QDOT_TH)
+            QDOT_TH[i] += q_lw[colstart + i - 1] + sw_s * q_sw[colstart + i - 1]
+        end
+        eb_on && eb_rad!(eb, colstart, q_lw, q_sw, sw_s, R_m, C_vt)
+    end
+
+    # Horizontal frictional KE change [W/m^3]. Momentum diffusion is a resolved-KE SINK to
+    # the subgrid (the future TKE shear production), NOT dissipative heating: with an eddy K
+    # the resolved KE lost goes to unresolved scales, and the molecular heating (proportional
+    # to the far-smaller kinematic viscosity) is negligible. So E_t follows the KE down and
+    # internal energy (T, p) is held. FRIC_KE is d(rho_t*ke)/dt from horizontal momentum
+    # diffusion, added to E_t; p and Q_ss get NO friction term.
+    FRIC_KE = S.FRIC_KE
+    if use_smag
+        mc_fric_ke!(FRIC_KE, geom, rho_t, K_smag, uv, wv, vv, r)
+    else
+        mc_fric_ke!(FRIC_KE, geom, rho_t, Khdiff, uv, wv, vv, r)
+    end
+
+    # Placeholders for intermediate calculations
+    ADV = S.ADV
+    FORCING = S.FORCING
+    KDIFF = S.KDIFF
+
+    # Pressure (slot 1): -v·∇p - γp∇·v + (R_m/C_vt)[(L_v - R_v C_pt T/R_m) Q̇_cond + Q̇_therm].
+    # Q̇_cond is the TOTAL phase-change rate (cloud + rain channels); only the THERMAL
+    # diffusion sources pressure (friction holds T, hence p; sedimentation moves no
+    # partial pressure).
+    #
+    # The acoustic slots (1, 2, 3, 5, 6) stage the REMAINDER: the full tendency minus the
+    # reference-linear vertical acoustic term in the same pointwise product-rule form, so
+    # the grid-scale vertical-acoustic content cancels analytically and what AB3 advances
+    # is O(perturbation). The linear part is integrated by the AI2* acoustic solve alone
+    # (see semiimplicit_adjustment_p and the impdot staging block below).
+    mc_advect!(ADV, geom, u, w, vv, r, pp_x, p_z, pv.f_l)
+    # sd_si: the added-back linear term uses the same frozen-at-n state
+    # coefficients the implicit solve applies (Pξⁿ, ρ_tⁿ and its FULL vertical
+    # gradient), so the grid-scale acoustic cancellation holds at any
+    # perturbation amplitude — the point of the state-dependent linearization.
+    #
+    # THE CONDENSATION HEATING IS NOT HERE ANY MORE. `(L_v − R_v C_pt T/R_m)·Q̇_cond` is
+    # proportional to a rate that the stiff-relaxation integrator withholds from the multistep,
+    # so it returns as a DIRECT increment at the step-mean rate, carrying this same bracket,
+    # in `relaxation_adjustment_qss!` — which runs before the acoustic solve, so the corrected
+    # latent heating still enters that solve at exactly the point the rate-level heating
+    # entered it before (TeX §stiff_integrator, "Placement in the step"). Only the THERMAL
+    # diffusion source is left in the bracket here.
+    if sd_si
+        FORCING .= @. (-gamma_m * p * div) + (S.sd_pxi * ((rho_t * w_z) + (rho_t_z * w))) +
+                      ((R_m / C_vt) * QDOT_TH)
+    else
+        FORCING .= @. (-gamma_m * p * div) + (Pxi_bar * ((rho_tbar * w_z) + (rho_tbar_z * w))) +
+                      ((R_m / C_vt) * QDOT_TH)
+    end
+    @turbo expdot[colstart:colend,1] .= @. ADV + FORCING
+    # The ICE phase changes, inside the same `(R_m/C_vt)[...]` bracket (TeX Eq. thermo_p_ice).
+    # Deposition's coefficient is condensation's with `L_v -> L_s` and NOTHING else; freezing
+    # carries the bare `L_f` with NO `-R_v C_pt T/R_m` companion, because that companion is the
+    # work done by the vapor the phase change removes from the gas phase and freezing removes
+    # none. Accumulated separately, so the ice-free `@turbo` expression above stays
+    # byte-identical (the slot-3 rule); explicit loop, so the indexed update does not
+    # materialize a column (the slot-3 rule again).
+    # FREEZING stays on the multistep and DEPOSITION does not, which is the whole difference
+    # between the two: `Q̇_freeze` relaxes nothing and moves no vapor, while `Q̇_dep` is one of
+    # the two channels that relax `Q_ss`. So only the bare `L_f` term is accumulated here; the
+    # `(L_s − R_v C_pt T/R_m)·Q̇_dep` companion arrives with the condensation heating as a
+    # direct increment.
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            expdot[colstart + i - 1, 1] +=
+                (R_m[i] / C_vt[i]) * (L_f(Tk[i]) * S.FRZ_NET[i])
+        end
+    end
+
+    # Dry-air mass continuity (slot 2, advective product-rule form; no mass diffusion)
+    mc_advect!(ADV, geom, u, w, vv, r, rho_dp_x, rho_d_z, rdv.f_l)
+    if sd_si
+        @turbo FORCING .= @. (-rho_d * div) + ((rho_d * w_z) + (rho_d_z * w))
+    else
+        @turbo FORCING .= @. (-rho_d * div) + ((rho_dbar * w_z) + (rho_dbar_z * w))
+    end
+    @turbo expdot[colstart:colend,2] .= @. ADV + FORCING
+
+    # (Slot 3 was the total-mass continuity, `∂ρ_t/∂t`, until Stage 4 of the ρ_t retirement:
+    # the total is now the derived ρ_d + Σ_k α_k ν_k, whose tendency is the sum of the
+    # members' — the sedimentation `−F_{r,z} − F_{i,z}` included, through the rain and ice
+    # slots. Slot 3 is the vapor, assembled below.)
+
+    # u momentum (slot 4): PGF directly from the prognostic pressure
+    mc_advect!(ADV, geom, u, w, vv, r, u_x, u_z, uv.f_l)
+    mc_u_forcing!(FORCING, geom, pp_x, rho_t, vv, r, fcor)
+    if use_smag
+        mc_u_kdiff!(KDIFF, geom, K_smag, uv, vv, r)
+    else
+        mc_u_kdiff!(KDIFF, geom, Khdiff, uv, vv, r)
+    end
+    @turbo expdot[colstart:colend,4] .= @. ADV + FORCING + KDIFF
+    eb_on && eb_put!(eb, EB_OP_HMOM, eb.ju, colstart, KDIFF)
+
+    # w momentum (slot 5): perturbation PGF + total-density buoyancy loading, minus the
+    # reference-linear PGF -pp_z/ρ̄_t (the acoustic remainder; see the slot-1 comment)
+    mc_advect!(ADV, geom, u, w, vv, r, w_x, w_z, wv.f_l)
+    # The buoyancy on the derived ρ_t' = ρ_d' + Σ_k α_k ν_k' (formed into KDIFF, free between
+    # slot 4's diffusion and slot 5's): with ρ̂_t = ρ_tⁿ (state-dependent SI) the linear PGF
+    # −pp_z/ρ̂_t cancels the full perturbation PGF exactly and the explicit w remainder is
+    # pure buoyancy; else the reference-linear PGF is the remainder's second term.
+    _anchor_w_forcing!(FORCING, KDIFF, grid.physical, colstart,
+                       water_anchor_set(model.options, model.physical_params, IS), rho_t, pp_z,
+                       rho_tbar, sd_si)
+    if use_smag
+        mc_w_kdiff!(KDIFF, geom, K_smag, wv, r)
+    else
+        mc_w_kdiff!(KDIFF, geom, Khdiff, wv, r)
+    end
+    @turbo expdot[colstart:colend,5] .= @. ADV + FORCING + KDIFF
+    eb_on && eb_put!(eb, EB_OP_HMOM, eb.jw, colstart, KDIFF)
+
+    # Total energy (slot 6): -v·∇E_t - E_t∇·v - ∇·(pv) - ∇·(E_sed) + Q̇_therm + friction
+    # sink. No condensation source (exact first law: phase change is not an energy source).
+    # E_sed is the energy carried by falling rain (see the microphysics block above). The
+    # THERMAL diffusion heats (Q̇_therm); the momentum diffusion adds FRIC_KE = d(rho_t*ke)/dt
+    # so E_t follows the resolved KE down to the subgrid (internal energy held). pbar has no
+    # x-dependence so u*p_x = u*pp_x.
+    mc_advect!(ADV, geom, u, w, vv, r, E_tp_x, E_t_z, etv.f_l)
+    mc_et_work!(FORCING, geom, E_t, p, div, u, pp_x, w, p_z, E_sed_z, pv, vv, r)
+    if sd_si
+        @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE +
+                                               (((E_t + p) * w_z) + ((E_t_z + p_z) * w))
+    else
+        @turbo expdot[colstart:colend,6] .= @. ADV + FORCING + QDOT_TH + FRIC_KE +
+                                               (((E_tbar + pbar) * w_z) + ((E_tbar_z + pbar_z) * w))
+    end
+    # The energy the falling ICE carries out of the parcel, `(C_pv T − L_s + ke + gz)` per kg
+    # of ice (TeX Eq. Et_ice) — the ice mirror of `E_sed_z`, which `mc_et_work!` already
+    # applied for the liquid, and with the same sign. Separate accumulation for the same
+    # reason slot 3's is: the ice-free `@turbo` expressions above stay byte-identical.
+    if ice_on
+        @inbounds for i in eachindex(E_sed_i_z)      # explicit loop; see the slot-3 note
+            expdot[colstart + i - 1, 6] -= E_sed_i_z[i]
+        end
+    end
+    eb_on && eb_put!(eb, EB_OP_HMOM, eb.jEt, colstart, FRIC_KE)
+
+    # ── AI2* acoustic history staging ──
+    # The linear vertical acoustic operator, evaluated on the CURRENT state with the same
+    # discrete chain the semi-implicit solve applies: fit φⁿ = ρ̄_t wⁿ once in w's column
+    # basis (the basis the Helmholtz solve works in, Dirichlet rows included), take its
+    # spline derivative, and form each slot's tendency with the same coefficient profiles
+    # the slaved updates use. Every AI2* time level then sees the SAME discrete operator —
+    # the pointwise product-rule staging used previously left the grid-scale difference
+    # between the two operators under explicit weights, which imposed a vertical-acoustic
+    # Courant ceiling (see reference/SI_VERTICAL_CEILING.md). The water slots' histories are
+    # staged on the same φ by the SI slaving (`_siw_stage!`, `options[:si_water_slots]`).
+    # Fresh evaluation every step (not stored solve increments) makes the history robust
+    # to whatever touches the state between steps (implicit diffusion, nesting collar
+    # injection, the spectral refit).
+    w_col = scratch_column(mtile, 5)
+    # sd_si: φⁿ = ρ_tⁿ·w and every coefficient chain from the CURRENT column
+    # state (frozen at n), matching the operator the adjustment's per-column
+    # state-dependent solve applies; else the resting-reference profiles.
+    if sd_si
+        w_col.uMish .= rho_t .* w
+    else
+        w_col.uMish .= rho_tbar .* w
+    end
+    Btransform!(w_col)
+    Atransform!(w_col)
+    phi_n = Itransform!(w_col)
+    imp_phi_z = S.imp_phi_z
+    Ixtransform(w_col, imp_phi_z)
+
+    imp_c_d = S.imp_c_d
+    imp_c_d_z = S.imp_c_d_z
+    imp_c_e = S.imp_c_e
+    imp_c_e_z = S.imp_c_e_z
+    # `imp_c_e = (E_t + p)/ρ_t` and `sd_pxi = γ_m p/ρ_t` are UNCHANGED by `options[:temperature]`
+    # and deliberately so. Neither reads a temperature: the first is the total enthalpy per unit
+    # mass that the E_t CONTINUITY flux `∂z((E_t + p) w)` carries, i.e. the linearization of a
+    # conserved prognostic's own flux, and stays exact for as long as E_t is prognostic; the
+    # second is the pressure equation's sound-speed coefficient, built from p, ρ_t and the
+    # composition alone. Rewriting either through T_eos would linearize a DIFFERENT operator
+    # from the one the explicit tendencies integrate, which is the AI2* staging error the
+    # operator-consistent SI was built to remove.
+    if sd_si
+        @. imp_c_d = rho_d / rho_t
+        @. imp_c_d_z = ((rho_d_z * rho_t) - (rho_d * rho_t_z)) / (rho_t^2)
+        @. imp_c_e = (E_t + p) / rho_t
+        @. imp_c_e_z = (((E_t_z + p_z) * rho_t) - ((E_t + p) * rho_t_z)) / (rho_t^2)
+        impdot[colstart:colend,1] .= @. -S.sd_pxi * imp_phi_z
+    else
+        @. imp_c_d = rho_dbar / rho_tbar
+        @. imp_c_d_z = ((rho_dbar_z * rho_tbar) - (rho_dbar * rho_tbar_z)) / (rho_tbar^2)
+        @. imp_c_e = (E_tbar + pbar) / rho_tbar
+        @. imp_c_e_z = (((E_tbar_z + pbar_z) * rho_tbar) -
+                        ((E_tbar + pbar) * rho_tbar_z)) / (rho_tbar^2)
+        impdot[colstart:colend,1] .= @. -Pxi_bar * imp_phi_z
+    end
+    impdot[colstart:colend,2] .= @. -((imp_c_d * imp_phi_z) + (imp_c_d_z * phi_n))
+    impdot[colstart:colend,6] .= @. -((imp_c_e * imp_phi_z) + (imp_c_e_z * phi_n))
+    # w's history is NOT staged here: the Helmholtz elimination's effective operator on
+    # the w leg is not expressible as a pointwise chain on the state, so the adjustment
+    # stores the increment it actually applied ((w_np1 - w*)/Δτ) as the next step's
+    # history — the only exact mirror. Staging -pp_z/ρ̄_t here instead leaves the
+    # weak-Galerkin elimination residual under the explicit AI2* weights (vertical
+    # Courant ceiling at Co_z ≈ 2-3, measured).
+
+    # ── Horizontal acoustic remainder + AI2* history staging (horizontal SI) ──
+    # The horizontal analogue of the vertical staging above (see horizontal_si.jl):
+    # the remainder additions cancel the reference-linear horizontal legs out of
+    # the AB3 predictor, and the fresh histories are the same legs evaluated on
+    # the carried state through the grid slots (u_x IS the spline-chain derivative
+    # of the post-refit state, and the reference coefficients are z-only, so no
+    # fit and no product-rule chain is needed). u's history is NOT staged here —
+    # it is the stored applied increment of the patch-level sweep
+    # (horizontal_si_load_increment!, the w-leg discipline).
+    if hsi_like
+        LDIV = S.ADV                     # free between slot 6 and slot 7
+        mc_linear_div!(LDIV, geom, uv, vv, r)
+        @turbo expdot[colstart:colend,1] .+= @. Pxi_bar * rho_tbar * LDIV
+        @turbo expdot[colstart:colend,2] .+= @. rho_dbar * LDIV
+        @turbo expdot[colstart:colend,4] .+= @. pp_x / rho_tbar
+        @turbo expdot[colstart:colend,6] .+= @. (E_tbar + pbar) * LDIV
+        # Fresh history staging only under options[:hsi_x_history] = "fresh"
+        # (the A/B alternative): the default "stored" histories are the
+        # sweep's applied increments, loaded into hacdot_n at the top of the
+        # step (horizontal_si_load_increment!) — writing here would clobber
+        # them. See the load function for the measured trade-offs.
+        if get(model.options, :hsi_x_history, "fresh") == "fresh"
+            hacdot = mtile.hacdot_n
+            hacdot[colstart:colend,1] .= @. -Pxi_bar * rho_tbar * LDIV
+            hacdot[colstart:colend,2] .= @. -rho_dbar * LDIV
+            hacdot[colstart:colend,6] .= @. -(E_tbar + pbar) * LDIV
+        end
+    end
+
+    # Supersaturation density (slot 7): the saturation chain-rule terms use the
+    # non-condensation T and p tendencies, which carry the horizontal THERMAL diffusive
+    # heating as well as the divergence work (friction holds T, so it does not enter; the
+    # VERTICAL diffusive heating is applied as a slaved δQ_ss inside diffusion_timestep_mc).
+    # The condensation contribution is -Q̇_cond(1+Q_s) (= -Q_ss/τ when the rate is unlimited).
+    # QSSREL reconciles the prognostic Q_ss with the supersaturation the prognostic VAPOR
+    # implies (see qss_relaxation) — Q_ss is redundant now that every water species is
+    # prognostic, and this is what keeps the two from drifting apart under splitting error.
+    #
+    # IT IS FED THE PROGNOSTIC `rho_v`. That was forbidden while the vapor was a retrieval —
+    # a blended vapor built partly OUT OF `Q_ss + rho_vs` made this term read
+    # `-(Q_ss - ((Q_ss + rho_vs) - rho_vs))/tau ≡ 0` and SELF-ANNIHILATE — but the hazard was
+    # algebraic, not physical, and it is gone with the retrieval: a transported slot is not
+    # `Q_ss + rho_vs` by construction, so `Q_ss - (rho_v - rho_vs)` is a genuine disagreement
+    # between two independently carried fields.
+    #
+    # The reconciliation is a drift correction on its own slow timescale rather than a shock:
+    # Q_ss is pulled onto the supersaturation the prognostic vapor implies (here)
+    # (the second link, the vapor against the prognostic ρ_t budget, went with slot 3: the
+    # vapor is the closure of the water sum now, not a second statement of it).
+    #
+    # FREEZING enters here and ONLY here on the chain-rule side. It moves no vapor, so it has
+    # no `-Q̇` of its own and no `(1 + 𝒬)` grouping to cancel against; it reaches Q_ss purely
+    # through the temperature and pressure it changes, which is why `L_f·Q̇_freeze` belongs
+    # inside BOTH non-condensation tendencies (TeX Eqs. dThat_ice, dphat_ice) rather than
+    # beside the relaxations. Physically: freezing in a mixed-phase cloud warms the air,
+    # raises ρ_v*, and drives the LIQUID subsaturated — the mechanism by which riming
+    # glaciates a cloud from the inside with no vapor having moved.
+    dT_nc = S.dT_nc; @. dT_nc = ((-p * div) + QDOT_TH) / (rho_d * C_vt)
+    dp_nc = S.dp_nc; @. dp_nc = (-gamma_m * p * div) + ((R_m / C_vt) * QDOT_TH)
+    if ice_on
+        @. dT_nc += (L_f(Tk) * S.FRZ_NET) / (rho_d * C_vt)
+        @. dp_nc += (R_m / C_vt) * (L_f(Tk) * S.FRZ_NET)
+    end
+    SATF = S.SATF;   @. SATF = (-rho_vs * div) - (drvs_dT * dT_nc) - (drvs_dp * dp_nc)
+    QSSREL = S.QSSREL
+    @. QSSREL = qss_relaxation(Q_ss, rho_v, rho_vs, tau_qss)
+    #
+    # WHAT THIS SLOT'S `expdot` NOW CARRIES: `N`, not the tendency. The two relaxations
+    # `−Q_ss/τ` and `−(Q_ss + 𝒟)/τ_i` are withheld and integrated by their own exact
+    # propagator (TeX Eq. etd_ab3; `relaxation_adjustment_qss!`), so what is assembled here —
+    # advection, the divergence forcing, the saturation chain rule, the flux terms and the
+    # `qss_relaxation` reconciliation — is exactly the `F` of Eq. relax_linear. `τ_ss` is never
+    # stiff, so `QSSREL` stays in `N` where the TeX puts it. The history rotates as usual and
+    # supplies `N^{n−1}` and `N^{n−2}` at no cost, which is the whole reason the withholding is
+    # done here rather than by unwinding the relaxation after the fact.
+    mc_advect!(ADV, geom, u, w, vv, r, Q_ssp_x, Q_ss_z, qsv.f_l)
+    FORCING .= @. (-Q_ss * div) + SATF + QSSREL
+    @turbo expdot[colstart:colend,7] .= @. ADV + FORCING
+    # The `Q`-INDEPENDENT remainder of the withheld LIQUID relaxation, which belongs in `N`:
+    # zero wherever the drive is unclipped (there the whole term is `−λ Q_ss`), and the full
+    # constant flux `−drive·(τ_c^{-1} + τ_r^{-1})` wherever it is clipped. Gated on an exact
+    # nonzero so a point with nothing to add is not touched at all — `x + (±0.0)` is not the
+    # identity for `x = ∓0.0`, and the dry path's bitwise gate rests on it. Explicit loop, not
+    # a broadcast update: see the slot-3 note.
+    @inbounds for i in eachindex(etd_nl)
+        etd_nl[i] != 0.0 && (expdot[colstart + i - 1, 7] += etd_nl[i])
+    end
+    # The DEPOSITION relaxation, `-Σ_k Q̇_{i,k}(1 + 𝒬_{s,i})` (TeX Eq. Qss_ice). Substituting
+    # Eq. dep_rate, the `(1 + 𝒬_{s,i})` cancels exactly as its liquid counterpart does and
+    # what is left is `-(Q_ss + 𝒟)/τ_i`: the ice contributes one further relaxation of the
+    # SAME shared supersaturation and no psychrometric factor survives into the prognostic
+    # equation. That shared reservoir is what makes the Wegener-Bergeron-Findeisen competition
+    # (Eq. wbf_qs) emergent rather than arbitrated — and is why ISHMAEL's mixed-phase
+    # deposition cap is dropped (TeX §Departures (a)).
+    #
+    # Withheld with its liquid partner, and for the same reason: `−(Q_ss + 𝒟)/τ_i` is the
+    # STIFF half of the pair. What is added back here is only its `Q`-independent piece,
+    # `−b·Σ_k τ_{i,k}^{-1}` with `b` the constant term of the affine drive decomposition
+    # (`mc_ice_sources!`): `𝒟 Σ τ_{i,k}^{-1}` where the drive is unclipped — the offset that
+    # makes the ice relax the shared reservoir toward a different zero than the liquid, i.e.
+    # the Wegener-Bergeron-Findeisen term of Eq. wbf_qs — and the whole constant flux where it
+    # is clipped.
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            n_i = -S.etd_dep_b[i] *
+                  ((S.invtau_i1[i] + S.invtau_i2[i]) + S.invtau_i3[i])
+            n_i != 0.0 && (expdot[colstart + i - 1, 7] += n_i)
+        end
+    end
+
+    # Rain partial density (slot 8): rain-channel condensation/evaporation,
+    # autoconversion + collection from cloud, and the sedimentation flux divergence
+    # (no diffusion yet — water-species mixing arrives with the moist diffusion).
+    #
+    # Under `rain_transform_mode`, exactly as for slot 9: advection is transform-invariant and
+    # reads the control variable's own fitted gradients (`nu_r_z` is bitwise `rho_rp_z` under
+    # `:none`), while divergence and the sources pick up `Jr`, an exact 1.0 under `:none`.
+    #
+    # The sedimentation term is the one that has no cloud precedent. `-Fr_z` is a DENSITY flux
+    # divergence, formed from the recovered density on slot 8's own spline column and BCs, and
+    # slot 3 (rho_t) and slot 6 (E_t) below continue to receive it untransformed — they are
+    # still a density and an energy. Only this slot, which is no longer a density, carries it
+    # through `Jr`. That is correct term by term, but it does mean slot 8 and slot 3 stop
+    # receiving the identical discrete number, so the exact telescoping between them is
+    # weakened. The independent check is already in the diagnostics: `accum_rainfall_mm` comes
+    # from the rho_t - rho_d water path and `accum_rainfall_flux_mm` from this surface flux.
+    #
+    # `Qdot_r` is withheld here with the rest of the relaxation pair and returns through `Jr`
+    # as a direct increment at the step-mean rate; autoconversion, collection and sedimentation
+    # relax nothing and keep the multistep.
+    mc_advect!(ADV, geom, u, w, vv, r, rho_rp_x, nu_r_z, rrv.f_l)
+    @turbo FORCING .= @. Jr * ((-rho_r * div) + AUTO_COLL - Fr_z)
+    @turbo expdot[colstart:colend,8] .= @. ADV + FORCING
+    # The LOBE's divergence term (`lobe_transport_density`): below ν = 0 the recovered density
+    # is 0 and the term above vanished there, while ρ_t carries `−ρ_lobe ∇·u`. Added as the
+    # continuation's difference from the recovered value, only where the slot is negative —
+    # an explicit loop beside the `@turbo` expression rather than a change to it (the slot-3
+    # rule), so a point whose slot is non-negative is not touched at all.
+    lobe_tr && rtrans_on && _lobe_divergence!(expdot, 8, colstart, Jr, nu_r, rho_r, div, rmu)
+    # The ICE back-reaction on the rain: riming and Bigg/homogeneous freezing remove rain,
+    # melting ice returns it. Through `Jr`, like every other source on this slot; separate
+    # accumulation and explicit loop for the reasons slot 3 states.
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            expdot[colstart + i - 1, 8] += Jr[i] * S.ICE_R[i]
+        end
+    end
+    # Production attribution (off unless options[:water_budget_trace] > 0). Must run HERE:
+    # ADV is reused by slot 9 two lines down.
+    budget_trace && water_budget_probe!(mtile, MC_BUDGET_R, 8, t, colstart, rho_r, ADV, div,
+                                        Qdot_r, AUTO_COLL, 1.0, Fr_z, w, z)
+
+    # Cloud partial density (slot 9): the same advective product-rule continuity as every
+    # other density, with the cloud-channel condensation as its source and autoconversion
+    # + collection as its sink (the equal and opposite pair of slot 8's AUTO_COLL). No
+    # sedimentation — cloud droplets do not fall in this scheme — and no rho_t source:
+    # condensation is INTERNAL to the water, moving mass between this slot and the
+    # prognostic vapor slot at fixed total density.
+    #
+    # This is the slot the whole formulation exists for. Because it is prognostic rather
+    # than a residual of rho_t - rho_d - rho_v - rho_r, cloud in subsaturated air can only
+    # arrive by advection or nucleation, and fit-level error in the density fields lands
+    # in the vapor (where it is 5e-5 of the field) instead of manufacturing condensate
+    # (where it was O(1) of the field). See reference/HANDOFF_DIAGNOSED_CLOUD.md.
+    # ADVECTION IS TRANSFORM-INVARIANT: u·∇ρ_c = f'(n) u·∇n, and the tendency being formed is
+    # dn/dt = J·(dρ_c/dt), so the advective part is just −u·∇n. It therefore reads the control
+    # variable's OWN spline gradients — no chain rule, no f'', no reference-gradient round
+    # trip. Under `:none`, `nu_c_z` is bitwise the old `rho_c_z` and `rho_cp_x` is unchanged.
+    #
+    # The rest picks up the Jacobian: dn/dt = J(ρ_c)·[−ρ_c ∇·u + Qdot − AUTO_COLL]. `Jc` is
+    # exactly 1.0 under `:none`, and multiplication by 1.0 is the identity in IEEE, so the
+    # default path is bit-for-bit the code that had no transform.
+    #
+    # `Qdot` is withheld here for the same reason `Qdot_r` is on slot 8, and returns through
+    # `Jc` at the step-mean rate. The `-AUTO_COLL` sink is untouched.
+    mc_advect!(ADV, geom, u, w, vv, r, rho_cp_x, nu_c_z, rcv.f_l)
+    @turbo FORCING .= @. Jc * ((-rho_c * div) - AUTO_COLL)
+    @turbo expdot[colstart:colend,9] .= @. ADV + FORCING
+    lobe_tr && ctrans_on && _lobe_divergence!(expdot, 9, colstart, Jc, nu_c, rho_c, div, cmu)
+    # The ICE back-reaction on the cloud: riming collection and homogeneous freezing, both
+    # sinks. There is no ice-to-cloud return channel — melting ice becomes rain, not cloud.
+    if ice_on
+        @inbounds for i in eachindex(Fi_z)
+            expdot[colstart + i - 1, 9] += Jc[i] * S.ICE_C[i]
+        end
+    end
+    # Cloud has no sedimentation channel, and its autoconversion sink is -AUTO_COLL.
+    budget_trace && water_budget_probe!(mtile, MC_BUDGET_C, 9, t, colstart, rho_c, ADV, div,
+                                        Qdot, AUTO_COLL, -1.0, nothing, w, z)
+
+    # Vapor partial density (slot 3, unconditional). The continuity equation every other
+    # density in the set takes, with the phase changes as its only sources:
+    #
+    #     ∂ρ_v'/∂t = −u·∇ρ_v − ρ_v ∇·u − (Q̇_c + Q̇_r) − Σ_k Q̇_{i,k}
+    #
+    # UNDER `vapor_transform = :none` THE SLOT IS AN UNTRANSFORMED PERTURBATION against the
+    # derived ρ̄_v (see `vapor_slot`), so this takes slot 7's shape and not slot 9's: no
+    # control variable, no Jacobian, and the advection reads the perturbation gradient
+    # horizontally (ρ̄_v has no x-dependence) but the TOTAL vertical gradient `rho_v_z`.
+    # Under `:bhyp` it is ν_v's, with `J_v` on the divergence (`_vapor_bhyp_tendency!`).
+    #
+    # There is NO reconciliation nudge: the vapor is the ν-space closure of every exchange
+    # (`water_exchange_dv`), so the water sum is conserved by construction and there is no
+    # prognostic ρ_t budget to nudge it onto.
+    #
+    # `VAPOR_SRC` is withheld from this tendency with the condensate sources it is the exact
+    # negative of — all of it, because every one of its terms is a relaxation of `Q_ss`. It
+    # returns as the vapor's direct increment (the closure `etd_dv`), so phase change remains
+    # INTERNAL to the water. The column itself is filled by the pre-compute block below, at the
+    # STEP-MEAN rate, and is what the census reads.
+    mc_advect!(ADV, geom, u, w, vv, r, rho_vp_x, rho_v_z, rvv.f_l)
+    if vtrans_on
+        # THE VAPOR CONTROL VARIABLE: `J_v` on the divergence (and on the lobe's, below ν = 0),
+        # in one `@noinline` helper on plain arrays (the `mc_water_mixing!` compile lesson).
+        _vapor_bhyp_tendency!(expdot, grid.physical, rv_i, colstart, ADV, J_v, rho_v, div,
+                              mc_nu_vbar(mtile), vmu, lobe_tr)
+    else
+        # The density vapor: the continuity equation alone.
+        @turbo FORCING .= @. -rho_v * div
+        @turbo expdot[colstart:colend, rv_i] .= @. ADV + FORCING
+    end
+
+    # Rain NUMBER density (the appended slot, `options[:rain_moments] = 2`). The same
+    # continuity form every other total takes — transform-invariant advection of the control
+    # variable, everything else through the Jacobian:
+    #
+    #     ∂n_r/∂t = −u·∇n_r − n_r ∇·u + NPRC1 + nragg + npre − ∂F_n/∂z
+    #
+    # `NR_SRC` is the sum of the three number sources (autoconversion's NPRC1, Beheng
+    # self-collection/Verlinde-Cotton breakup, and the evaporation loss npre); `Fnr_z` is the
+    # NUMBER-weighted sedimentation flux divergence, fitted on this slot's own column. Nothing
+    # else in the set receives either term: a raindrop count is not mass and not energy, so
+    # rho_t and E_t keep taking only the mass flux `Fr_z` assembled for slot 8.
+    #
+    # Accretion contributes nothing here on purpose — it grows the drops that exist. See
+    # `rain_accretion_2m`, and `rain_moments` for the process table.
+    if rain_2m
+        mc_advect!(ADV, geom, u, w, vv, r, nrv.f_x, nu_nr_z, nrv.f_l)
+        @turbo FORCING .= @. Jnr * ((-n_r * div) + NR_SRC - Fnr_z)
+        @turbo expdot[colstart:colend, nr_i] .= @. ADV + FORCING
+        # The ICE back-reaction on the raindrop COUNT: drops lost to ice-rain collection,
+        # Bigg and homogeneous freezing, and drops gained from melting ice. This is the
+        # channel `ice_microphysics` requires `rain_moments == 2` for — with a prescribed
+        # rain DSD there is no number for the ice to remove.
+        if ice_on
+            @inbounds for i in eachindex(Fi_z)
+                expdot[colstart + i - 1, nr_i] += Jnr[i] * S.ICE_NR[i]
+            end
+        end
+    end
+
+    # ── The twelve ICE slots ───────────────────────────────────────────────────
+    #
+    # All twelve take the SAME form, which is the form every other total in the set takes
+    # (Eqs. ice_prog_mass..ice_prog_c):
+    #
+    #     ∂X/∂t = −u·∇X − X ∇·u + Ẋ − ∂F_X/∂z
+    #
+    # with the advection transform-invariant (it reads the control variable's own fitted
+    # gradients; `nu_*_z` is bitwise the density gradient under `:none`) and everything else
+    # through the Jacobian, exactly as slots 8 and 9 do. `SRC_*` carries the ISHMAEL process
+    # sources plus the anchor-reconciliation removal, and `F_*_z` the moment-weighted
+    # sedimentation flux divergence — both assembled in the ice block above.
+    #
+    # Nothing else in the set receives anything from a NUMBER or a VOLUME slot: only the three
+    # MASS fluxes reach ρ_t and E_t, and they did so above.
+    if ice_on
+        mc_advect!(ADV, geom, u, w, vv, r, i1qv.f_x, S.nu_i1q_z, i1qv.f_l)
+        @turbo FORCING .= @. S.J_i1q * ((-i1q * div) + S.SRC_i1q - S.F_i1q_z)
+        @turbo expdot[colstart:colend, IS.i1_q] .= @. ADV + FORCING
+        lobe_tr && itrans_on &&
+            _lobe_divergence!(expdot, IS.i1_q, colstart, S.J_i1q, S.nu_i1q, i1q, div, imu_q)
+
+        mc_advect!(ADV, geom, u, w, vv, r, i1nv.f_x, S.nu_i1n_z, i1nv.f_l)
+        @turbo FORCING .= @. S.J_i1n * ((-i1n * div) + S.SRC_i1n - S.F_i1n_z)
+        @turbo expdot[colstart:colend, IS.i1_n] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i1av.f_x, S.nu_i1a_z, i1av.f_l)
+        @turbo FORCING .= @. S.J_i1a * ((-i1a * div) + S.SRC_i1a - S.F_i1a_z)
+        @turbo expdot[colstart:colend, IS.i1_a] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i1cv.f_x, S.nu_i1c_z, i1cv.f_l)
+        @turbo FORCING .= @. S.J_i1c * ((-i1c * div) + S.SRC_i1c - S.F_i1c_z)
+        @turbo expdot[colstart:colend, IS.i1_c] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2qv.f_x, S.nu_i2q_z, i2qv.f_l)
+        @turbo FORCING .= @. S.J_i2q * ((-i2q * div) + S.SRC_i2q - S.F_i2q_z)
+        @turbo expdot[colstart:colend, IS.i2_q] .= @. ADV + FORCING
+        lobe_tr && itrans_on &&
+            _lobe_divergence!(expdot, IS.i2_q, colstart, S.J_i2q, S.nu_i2q, i2q, div, imu_q)
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2nv.f_x, S.nu_i2n_z, i2nv.f_l)
+        @turbo FORCING .= @. S.J_i2n * ((-i2n * div) + S.SRC_i2n - S.F_i2n_z)
+        @turbo expdot[colstart:colend, IS.i2_n] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2av.f_x, S.nu_i2a_z, i2av.f_l)
+        @turbo FORCING .= @. S.J_i2a * ((-i2a * div) + S.SRC_i2a - S.F_i2a_z)
+        @turbo expdot[colstart:colend, IS.i2_a] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i2cv.f_x, S.nu_i2c_z, i2cv.f_l)
+        @turbo FORCING .= @. S.J_i2c * ((-i2c * div) + S.SRC_i2c - S.F_i2c_z)
+        @turbo expdot[colstart:colend, IS.i2_c] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3qv.f_x, S.nu_i3q_z, i3qv.f_l)
+        @turbo FORCING .= @. S.J_i3q * ((-i3q * div) + S.SRC_i3q - S.F_i3q_z)
+        @turbo expdot[colstart:colend, IS.i3_q] .= @. ADV + FORCING
+        lobe_tr && itrans_on &&
+            _lobe_divergence!(expdot, IS.i3_q, colstart, S.J_i3q, S.nu_i3q, i3q, div, imu_q)
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3nv.f_x, S.nu_i3n_z, i3nv.f_l)
+        @turbo FORCING .= @. S.J_i3n * ((-i3n * div) + S.SRC_i3n - S.F_i3n_z)
+        @turbo expdot[colstart:colend, IS.i3_n] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3av.f_x, S.nu_i3a_z, i3av.f_l)
+        @turbo FORCING .= @. S.J_i3a * ((-i3a * div) + S.SRC_i3a - S.F_i3a_z)
+        @turbo expdot[colstart:colend, IS.i3_a] .= @. ADV + FORCING
+
+        mc_advect!(ADV, geom, u, w, vv, r, i3cv.f_x, S.nu_i3c_z, i3cv.f_l)
+        @turbo FORCING .= @. S.J_i3c * ((-i3c * div) + S.SRC_i3c - S.F_i3c_z)
+        @turbo expdot[colstart:colend, IS.i3_c] .= @. ADV + FORCING
+    end
+
+    # ── The MYNN TKE density ρ_e = ρ_t·e [J/m³] (the appended slot, options[:mynn]) ──
+    #
+    # The same continuity form every other TOTAL in the set takes, with the closure's
+    # sources left out because the closure is not written yet (S5):
+    #
+    #     ∂ρ_e/∂t = −u·∇ρ_e − ρ_e ∇·u + [shear + buoyancy − dissipation + vertical
+    #                                    transport, all arriving at S5]
+    #
+    # ρ̄_e ≡ 0 and there is no control-variable transform, so the slot IS the field: the
+    # advection reads its own fitted gradients directly (no ν, no Jacobian) and the
+    # compressibility term is the bare `−ρ_e ∇·u`. The whole reason the TKE is carried as a
+    # DENSITY rather than as the closure's `qke = 2e` is exactly this — `ρ_t·e` obeys the
+    # same conservation law as ρ_r and the ice masses, so the resolved-flow transport is the
+    # set's own machinery and only the subgrid production/destruction is the closure's.
+    #
+    # EXPLICIT ONLY: no `impdot` row, no acoustic leg, no sedimentation. The vertical
+    # turbulent transport of TKE is part of the closure's own tridiagonal solve, not of the
+    # dycore's implicit pair.
+    #
+    # Under the TKE CONTROL VARIABLE (`tke_transform_mode`, `mtile.mynn.tke_transform =
+    # :bhyp`) the slot is ν_e = bhyp(ρ_e): the advection reads ν_e's own gradients
+    # (transform-invariant, the same `mc_advect!` call) and the compressibility term is
+    # `−J_e ρ_s ∇·u` with the recovered density (`_tke_bhyp_tendency!`); `:none` is the
+    # two `@turbo` lines below, verbatim.
+    if mynn_on
+        rho_e = rev.f
+        mc_advect!(ADV, geom, u, w, vv, r, rev.f_x, rev.f_z, rev.f_l)
+        if mtile.mynn.tke_transform === :none
+            @turbo FORCING .= @. -rho_e * div
+            @turbo expdot[colstart:colend, re_i] .= @. ADV + FORCING
+        else
+            _tke_bhyp_tendency!(expdot, grid.physical, re_i, colstart, ADV, div,
+                                mtile.species, mtile.mynn.tke_mu, lobe_tr)
+        end
+    end
+
+    # ── Horizontal water-species mixing (Khdiff_water; 0.0 = OFF, the default) ──
+    #
+    # *** DIAGNOSTIC / TEMPORARY -- NOT ENERGY CONSISTENT. READ BEFORE USING. ***
+    #
+    # Why it exists: an axisymmetric domain has no asymmetries to provide radial
+    # mixing, so the sharp moisture gradients a TC develops are damped by nothing at
+    # all -- until now the water species had NO horizontal diffusion whatsoever
+    # (slot 8's "no diffusion yet" note), while momentum had Smagorinsky. That
+    # leaves grid-scale structure in the water field free to grow.
+    #
+    # What is wrong with it: this is a bare K*grad^2 on the water species. Diffusing
+    # water MASS without transporting the internal energy and latent heat that mass
+    # carries is exactly the moist coupling deferred in
+    # reference/moist_compressible_diffusion_handoff.md. The proper form is a product
+    # rule through the retrieval's T sensitivities, sourcing E_t and p alongside the
+    # mass (the `M = p + E_t - rho_t(ke+gz)` enthalpy invariant: any transport must
+    # source BOTH). Because this does not, it WILL drift energy -- watch
+    # conservation_drift. It is a noise control to obtain a stable run, not physics,
+    # and it must be replaced by the full moist form before any production science.
+    #
+    # Khdiff_water < 0 selects the Smagorinsky K_smag/Sc_t (the Khdiff_heat sentinel
+    # convention); > 0 is a constant diffusivity. Same K*grad^2 (not div(K grad))
+    # approximation as the momentum and heat terms.
+    #
+    # EVERY WATER SPECIES, ONE COEFFICIENT. The leg mixes the prognostic vapor, cloud, rain
+    # and the rain number, and under ISHMAEL all twelve ice slots — each species' mass AND its
+    # number and two volume moments — with the SAME K_water (K_smag/Sc_t or the constant).
+    # Two reasons, one per kind of slot:
+    #
+    #   * THE PARTITION. The water sum `ρ_w = Σ_k α_k ν_k` is the anchor. The Laplacian is
+    #     linear, so mixing every member of the sum with one K moves it by exactly `K∇²ρ_w`;
+    #     leave a member out and the anchor moves by less than the water mixed.
+    #   * THE MOMENTS. ISHMAEL carries number and the two volume moments as densities, so a
+    #     crystal's mass is ρ_i/n_i and its habit a_i/n_i, c_i/n_i. Mixing the mass alone (or
+    #     with a different K) rescales every crystal the operator touches; mixing all four
+    #     with one K leaves the per-crystal ratios of a uniform-habit population unchanged
+    #     (exactly under `:none`, because K∇²(m·n) = m·K∇²n for uniform m — pointwise, so
+    #     this holds for the variable K_smag too). The rain number follows the rain mass for
+    #     the same reason (see below).
+    #
+    # The vapor slot is a perturbation against ρ̄_v(z) (ν̄_v(z) under :bhyp); the horizontal
+    # Laplacian of a z-only profile is zero on every geometry, so `K∇²ρ_v'` IS `K∇²ρ_v`. Q_ss is
+    # mixed as before. ρ_e (the MYNN TKE) is not water and is not
+    # mixed here. STILL NOT ENERGY CONSISTENT: E_t and p are not sourced (see above).
+    if Khdiff_water != 0.0
+        # UNDER A TRANSFORM THIS MIXES THE CONTROL VARIABLE, AND THAT IS THE INTENDED FORM.
+        # The Laplacian is applied to the slot, so with `condensate_transform`/`rain_transform`
+        # on it smooths ν rather than ρ. That is not an approximation to `K∇²ρ` — above the
+        # knee it IS `K∇²ρ`, because `bhyp` is exactly affine there:
+        #
+        #     bhyp(ρ) = (ρ + μ)/2 − μ²/(2(ρ + μ))        (algebra, not an expansion)
+        #
+        # so `∇²ν = ∇²ρ/2 + O(μ²)` and `f'(ν) = 2 + O(μ²/ρ²)`, and the implied density rate
+        # `f'(ν)·K∇²ν` agrees with `K∇²ρ` to relative O(μ²/ρ²). Measured on a Gaussian cloud at
+        # μ = 1e-7: 3.7e-9 at ρ_c = 2.3e-3, 2.6e-7 at 3.2e-4, 6.2e-4 at 5.8e-6, and only
+        # reaching 7.2e-2 at 3.7e-7 kg/m³ — a thousandth of the smallest meaningful cloud.
+        #
+        # WHY NOT THE EXACT CHAIN RULE `J·K·(f''(ν)|∇ν|² + f'(ν)∇²ν)`. Because `f''(0) = 1/μ`:
+        #
+        #     f'(ν)  = 2(ρ+μ)² / ((ρ+μ)² + μ²)          ∈ [1, 2]
+        #     f''(ν) = 8μ²(ρ+μ)³ / ((ρ+μ)² + μ²)³       → 1/μ = 1e7 as ρ → 0
+        #
+        # and the region where that term matters is `μ/|∇ρ| ≈ 1.7 cm` wide against a 500 m
+        # cell. Its magnitude there is `K·f''·|∇ν|²` ≈ 0.036 kg/m³/s at ρ = μ and 0.148 at
+        # ρ = 1e-8 — twelve to fifty times the entire cloud amplitude, per second. Analytically
+        # it is cancelled by `f'∇²ν`; discretely both come from a filtered, ringing spline fit
+        # at the one place the fit is worst, and nothing makes that cancellation survive. It is
+        # not a smoothing operator, it is a pointwise sample of an unresolvable knee, so it is
+        # deliberately NOT offered as an option — a branch that is unrunnable at the cloud edge
+        # is dead code that will be believed. (This also retires the stated reason for keeping
+        # `:bhyp_smooth` in reference/FINDINGS_CONDENSATE_STAGE1.md — "for any future consumer
+        # that needs f'' at the cloud edge, the water Laplacians". They do not need it.)
+        #
+        # A consequence worth stating rather than leaving to be rediscovered:
+        #   * positivity survives whatever the mixing does, because it is a property of the
+        #     recovery, not of the operator: ν monotone in ρ and `ahyp` floored at 0 (`:bhyp`)
+        #     or −μ (`:bhyp_smooth`). The coefficient limiter this replaced could not say that
+        #     across a nest interface at all.
+        #
+        # Precedent inside the model: the Galerkin low-pass `l_q` (2.0 by default) and the
+        # spline filter are ALREADY applied to the slot, i.e. already smooth ν directly, and
+        # the whole transform validation ladder was run with them on.
+        WLAP = S.KDIFF                    # both free again after slot 9
+        WLAP2 = S.FORCING
+        # ACCUMULATED THROUGH AN EXPLICIT LOOP, not `expdot[colstart:colend,s] .+= …`.
+        # `.+=` on an indexed expression expands to `A[r] = A[r] .+ B`, and the READ
+        # materializes the slice: this block was allocating four times per column (measured;
+        # it is the only mc term that did, and it was never in the allocation gate because
+        # Khdiff_water is 0.0 in every shipped configuration). Same convention as the Louis
+        # BL's apply loop. It is also the only additive mc block, which is why `.=`
+        # everywhere else was fine. The loop lives in `mc_water_mix_slot!`.
+        # The two branches stay SEPARATE: hoisting the diffusivity into one variable would
+        # give it type `Union{Vector{Float64},Float64}` and box every use — the same trap the
+        # state-dependent SI hit. Each branch calls `mc_water_mixing!` with a CONCRETE K,
+        # which is a function barrier: the callee is compiled once per K type.
+        #
+        # Slots 8 and 9 (and the rain number and the twelve ice slots) are the transformed
+        # ones: under a transform their views are ν, and `K∇²ν` is the intended operator (see
+        # the block comment above). No Jacobian — the tendency is already in the slot's own
+        # units.
+        # Plain arrays and slot INDICES, not the views above or the tile: see
+        # `mc_water_mixing!` for the measured compile cost of handing the driver's structs
+        # across the call. A zero index = not registered.
+        ice_idx = ice_on ?
+            (IS.i1_q, IS.i1_n, IS.i1_a, IS.i1_c, IS.i2_q, IS.i2_n, IS.i2_a, IS.i2_c,
+             IS.i3_q, IS.i3_n, IS.i3_a, IS.i3_c) : ntuple(_ -> 0, Val(12))
+        nr_mix = rain_2m ? nr_i : 0
+        eb_on && eb_snap!(eb, expdot, colstart)
+        if Khdiff_water < 0.0
+            use_smag || error("physical_params[:Khdiff_water] < 0 selects the " *
+                              "Smagorinsky water diffusivity, which requires the " *
+                              "Smagorinsky scheme (:Ls > 0, or :C_s > 0 with :Ls = 0)")
+            mc_water_mixing!(expdot, grid.physical, gridpoints, model.physical_params,
+                             WLAP, WLAP2, geom, K_smag, Sc_t, colstart, colend, rv_i,
+                             nr_mix, ice_idx)
+        else
+            # The constant diffusivity is already K/Sc_t (`build_physics`), so the divisor is
+            # an exact 1.0 — the identity in IEEE, bitwise the undivided form this had.
+            mc_water_mixing!(expdot, grid.physical, gridpoints, model.physical_params,
+                             WLAP, WLAP2, geom, Khdiff_water, 1.0, colstart, colend, rv_i,
+                             nr_mix, ice_idx)
+        end
+        eb_on && eb_take!(eb, EB_OP_HWATER, expdot, colstart)
+    end
+
+    # Tangential momentum (slot 9, cylindrical geometries only — no method body
+    # executes on the Cartesian slice): advection, azimuthal PGF (3D), Coriolis +
+    # curvature -u(f + v/r), and the λ-component of the cylindrical vector Laplacian.
+    if use_smag
+        mc_v_tendency!(expdot, geom, colstart, colend, S, u, w, uv, vv, pv, rho_t, r,
+                       fcor, K_smag)
+    else
+        mc_v_tendency!(expdot, geom, colstart, colend, S, u, w, uv, vv, pv, rho_t, r,
+                       fcor, Khdiff)
+    end
+    # Under the exact unsplit acoustic SI, cancel v's reference-linear azimuthal
+    # PGF from the AB3 remainder (RLR only). The v-leg AI2* history is the STORED
+    # applied increment (loaded in phase A, exact_si_load_history!) — the weak
+    # operator the unsplit solve actually applied, self-consistent per §8; a fresh
+    # pointwise −(1/ρ̄_t r)∂λp′ history would mismatch the weak solve (ε-chain).
+    if hsi_like
+        mc_stage_v_acoustic!(expdot, geom, colstart, colend, pv, rho_tbar, r)
+    end
+
+    # ── Rayleigh sponge (momentum-only) ──
+    # Klemp-Durran absorbing layer against gravity-wave reflection off the rigid lid:
+    # u and w (and v on the cylinders) relax toward the resting base state with the
+    # (negative) coefficient ray(z), and E_t follows the resolved KE down exactly as
+    # for friction (the FRIC_KE invariant: dE = rho_t*(u*ray*u + w*ray*w) =
+    # 2*rho_t*ray*ke, with ke already carrying v on the cylinders). T, p and
+    # Q_ss are held — a KE sink to the sponge, not diabatic heating. Explicit loop,
+    # not `.+=` view broadcasts: the SubArray stops eliding at this function size
+    # (the dE_w lesson). Behind `alpha > 0` so disabled configs are bit-identical
+    # (an unconditional `+ 0.0` term could flip -0.0 tendencies).
+    (eb_on && alpha > 0.0) && eb_snap!(eb, expdot, colstart)
+    mc_sponge!(expdot, geom, colstart, alpha, z_damp, z, u, w, vv, rho_t, ke)
+    (eb_on && alpha > 0.0) && eb_take!(eb, EB_OP_SPONGE, expdot, colstart)
+
+    # ── Boundary layer (explicit vertical mixing + surface drag) ──
+    # Added AFTER every slot is written: all contributions are additive (the Q_ss
+    # saturation chain rule is linear), so the lines above stay frozen and a run with
+    # neither closure is bit-identical. See mc_boundary_layer.jl / mc_mynn_bl.jl.
+    #
+    # ONE call site for BOTH closures, and that is a codegen constraint, not a style
+    # choice. `mc_bl_apply!` (src/mc_mynn_bl.jl) holds the shared perturbation-density
+    # staging and dispatches; putting the MYNN call here as a SECOND @noinline call
+    # beside the Louis one is what wedged the test suite — two calls' worth of live
+    # ranges across the `@turbo` vertical-diffusion block below pushed LLVM's
+    # MachineScheduler over a register-pressure cliff and its compile time became
+    # unbounded. See `mc_bl_apply!` for the measurement.
+    if louis_bl || mynn_on
+        eb_on && eb_snap!(eb, expdot, colstart)
+        mc_bl_apply!(mtile, S, geom, colstart, colend, z, uv, wv, vv, rcv,
+                     rrv, rvv, rev, expdot, l_inf, sfc, t, ctrans_on, rtrans_on,
+                     louis_bl, mynn_on)
+        if eb_on
+            eb_take!(eb, EB_OP_BL, expdot, colstart)
+            eb_sfc!(eb, grid.physical, colstart, u[1], _louis_v1(geom, vv), Tk[1], rho_d[1],
+                    rho_t[1], S.rho_v[1], S.p[1], sfc, rho_t, Tk, R_m, C_vt, S.ke, J_v)
+        end
+    end
+
+    # ── Implicit vertical diffusion tendencies (AI2* history in the diffdot channel) ──
+    # Vertical diffusion must be implicit on a Chebyshev column, where the spectral
+    # second-derivative eigenvalues scale as N^4. The acoustic solver owns impdot[w],
+    # impdot[p] and impdot[E_t], so these live in diffdot instead. Slot 6 (E_t) carries the
+    # HEAT tendency in entropy space (not an energy tendency): diffusion_timestep_mc solves
+    # for s_t' and maps the increment onto (p, E_t, Q_ss). (The water species are not diffused
+    # implicitly: `Kvdiff_water > 0` is refused, the solve having read the deleted ρ_t slot.)
+    #
+    # The heat variable is the full moist entropy s_t (vapor + liquid contribution), a
+    # retrieval-dependent diagnostic; the resting base is still bit-preserved because
+    # s_tbar comes from mc_reference_diagnostics — the SAME retrieval pipeline — so at
+    # rest s_t' == 0 exactly. (The horizontal heat diffusion keeps the dry-exact s_d
+    # chain rule: transforming a diagnosed field horizontally needs halo machinery the
+    # column decomposition doesn't have; see the handoff doc.)
+    if Kvdiff > 0.0 || Kvdiff_heat > 0.0
+        diffdot = mtile.diffdot_n
+        if Kvdiff > 0.0
+            @turbo diffdot[colstart:colend,4] .= @. Kvdiff * u_zz
+            @turbo diffdot[colstart:colend,5] .= @. Kvdiff * w_zz
+            mc_v_diffdot!(diffdot, geom, colstart, colend, Kvdiff, vv)
+        end
+        if Kvdiff_heat > 0.0
+            s_t = S.s_t
+            # `q_i C_i ln(T/T_0)` joins the liquid term (TeX Eq. entropy_ice); `q_i` is an
+            # exact 0.0 column with ice off, so this is bitwise the pre-ice `s_t`.
+            @. s_t = moist_entropy_total(Tk, rho_d, q_v, q_l, q_i)
+            # ∂zz(s_t') from the column basis, so the explicit AI2* tendency and the implicit
+            # Helmholtz operator use the same discrete ∂zz.
+            s_col = scratch_column(mtile, 6)
+            s_col.uMish .= s_t .- mtile.mc_ref_diag.s_tbar
+            Btransform!(s_col)
+            Atransform!(s_col)
+            stage_zz = S.stage_zz
+            Ixxtransform(s_col, stage_zz)
+            @turbo diffdot[colstart:colend,6] .= Kvdiff_heat .* stage_zz
+        end
+    end
+
+    # ── ETD-AB3 pre-compute: the stiff relaxation pair, and the step-mean it closes on ──────
+    #
+    # HERE for the same reason the depletion census is here, and one more. `expdot[.,7]` is
+    # final for the step — every contribution to `N` has been added, including the horizontal
+    # water mixing and the boundary layer — and `expdot_nm1`/`expdot_nm2` are still `N^{n−1}`
+    # and `N^{n−2}`, which `explicit_timestep` is about to rotate away. `Q_ss` is still the
+    # `n`-state. All four are needed together and this is the only window in which they exist
+    # together, so the whole computation is done now and the APPLY (`relaxation_adjustment_qss!`,
+    # after the explicit advance) is reduced to writes.
+    #
+    # The computation is `_etd_precompute_stage!` (src/mc_driver_stages.jl), a `@noinline`
+    # stage on plain arrays (the compile-cliff rule, reference/HANDOFF_DRIVER_COMPILE_CLIFF.md).
+    # Its scalars are formed here: `ts` and the census handles are read again below (stage
+    # 17), and the lobe gates are passed as Bools because the transforms are Symbols.
+    ts = model.ts
+    # Census handles for the sublimation leg below (see `mc_donor_census!`); zero columns when
+    # the water trace is off, in which case the census is skipped entirely.
+    stx = mtile.mc_water_stats
+    tid_x = Threads.threadid()
+    census_on = size(stx, 2) > 0
+    # Block B of the ATTRIBUTION census (`MC_ATTR_QR_EVAP`/`MC_ATTR_QR_COMB`), opt-in with
+    # the other three blocks.
+    attr_on = census_on && ice_attr
+    # The LOBE RELAXATION (see `lobe_relaxation_increment`), per slot: only a `:bhyp` slot has
+    # a lobe whose recovered density is exactly 0, so only those are relaxed. `a_lobe` is the
+    # exact one-step fraction of the rate law, `1 − e^{−Δt/τ_lobe}`.
+    lr_c = lobe_relax && ctrans === :bhyp
+    lr_r = lobe_relax && rtrans === :bhyp
+    lr_i = lobe_relax && ice_on && itrans === :bhyp
+    a_lobe = lobe_relax ? -expm1(-ts / tau_lobe) : 0.0
+    _etd_precompute_stage!(S, expdot, mtile.expdot_nm1, mtile.expdot_nm2, Q_ssbar, J_v, stx,
+                           colstart, t, ts, tid_x,
+                           (; ice_on, vtrans_on, cloud_evap_real, census_on, attr_on,
+                              lobe_relax, lr_c, lr_r, lr_i, a_lobe))
+    # The step-mean columns the depletion probe below reads.
+    etd_d8 = S.etd_d8; etd_d9 = S.etd_d9; etd_dv = S.etd_dv
+    Qdot_bar = S.Qdot_bar; Qdot_r_bar = S.Qdot_r_bar; VAPOR_SRC = S.VAPOR_SRC
+
+    # (THE REFIT PARTNER is booked from `explicit_timestep`, `_water_exchange_stage!`: the
+    # affine defect, energy only. `booked` is that stage's census row, not this one's.)
+    booked = 0.0
+    # The REFIT census (`MC_REFIT_DR`, `MC_REFIT_BOOKED`): in the same window, for the same
+    # reason — the two states of the refit exist together only here. Every step after the
+    # first, partner on or off; reads only.
+    (t > 1 && census_on) &&
+        refit_dr_census!(eb, stx, tid_x, mtile.var_np1, mtile.tile.physical, colstart, booked)
+    # The domain water budget's surface source (`MC_W_SRC`): the step's moisture flux (held by
+    # the boundary layer's surface store) and the sedimentation through the ground.
+    census_on && water_source_census!(eb, stx, tid_x, colstart, ts, mtile.surface, Fr_z,
+                                      Fi_z, ice_on)
+    # The budget's first mark of the step (state n), booking the refit that produced it.
+    eb_on && eb_refit!(eb, mtile.tile.physical, colstart)
+
+    # Depletion census of the water species. HERE, not next to the tendency assembly: this is
+    # the last point at which `expdot` is still the tendency of the step about to be taken and
+    # `expdot_nm1`/`expdot_nm2` are still the previous two levels (`explicit_timestep` rotates
+    # them), so the increment measured is exactly the one applied — including the horizontal
+    # water mixing and the boundary-layer contributions added after slot 8/9 were assembled.
+    # (Not quite final under `options[:si_water_slots] ≠ :none`: the slaved water slots' acoustic
+    # add-back is added later, inside `explicit_timestep` (`_siw_stage!`). The probe is refused
+    # with any water transform, and the run-config default is transformed, so no run reads both;
+    # under `:none`, the library default, the statement holds.)
+    # The phase change no longer travels through `expdot` at all, so the DIRECT increments the
+    # relaxation adjustment is about to apply are handed over beside it (`etd_d*`) together
+    # with the step-mean rates themselves; see `water_depletion_probe!`.
+    budget_trace && water_depletion_probe!(mtile, colstart, colend, t, precipitation,
+                                           rho_c, rho_r, rho_v, Q_ss, rho_vs,
+                                           Qdot_bar, Qdot_r_bar, AUTO_COLL,
+                                           cap_c, cap_r, cap_v, rv_i,
+                                           etd_d9, etd_d8, etd_dv, VAPOR_SRC)
+
+    # Advance the explicit terms
+    explicit_timestep(mtile, colstart, colend, t)
+    eb_on && eb_explicit!(eb, mtile.var_np1, mtile.tile.physical, colstart, t, model.ts)
+    # ...and rotate the microphysics sink history with it, so the next step's depletion
+    # budgets see the same two levels the integrator will weight. Placed HERE, not further
+    # down, because the exact_si branch returns from this function below: this is the last
+    # point common to both paths, and it is reached exactly once per column per step.
+    _rotate_micro_history!(mtile, colstart, colend)
+
+    # The stiff relaxation pair's own propagator, and the step-mean phase-change increments
+    # that close the exchange against it. AFTER the explicit advance (whose slot-7 predictor
+    # carried `N` alone and is discarded here) and BEFORE the acoustic solve, so the corrected
+    # latent heating enters that solve exactly where the rate-level heating entered it before.
+    # Placed beside `_rotate_micro_history!` for the same reason: it is the last point common
+    # to the vertical-only and `exact_si` paths, reached once per column per step.
+    relaxation_adjustment_qss!(mtile, colstart, colend, t)
+
+    # Explicit AI2* history levels of the HORIZONTAL acoustic legs: both
+    # dimensions' history levels belong to the star state before either implicit
+    # solve (the ADI factorization applies the vertical solve below first, then
+    # the horizontal patch-level sweep after the spectral merge; the exact_si
+    # unsplit solve wants ALL explicit levels inside X* before it runs).
+    if hsi_like
+        horizontal_si_history!(mtile, colstart, colend, t)
+        eb_on && eb_mark!(eb, EB_HSI, mtile.var_np1, colstart)
+    end
+
+    # Exact (unsplit) 2-D semi-implicit: phase A ends here. The vertical AI2*
+    # explicit history levels are applied now (the patch-level solve must see
+    # the complete X*); the implicit solve and everything after it happen in
+    # exact_si_apply_column! (phase B) once the patch solve has run.
+    if xsi
+        apply_acoustic_histories!(mtile, colstart, colend, t)
+        return
+    end
+
+    # Semi-implicit (p', ρ̄_t w) acoustic solve — unconditional: the explicit acoustic
+    # mode was removed (expdot carries only the remainder; the linear vertical acoustic
+    # terms are integrated here and nowhere else).
+    semiimplicit_adjustment_p(mtile, colstart, colend, t)
+    eb_on && eb_mark!(eb, EB_SI, mtile.var_np1, colstart)
+
+    # Implicit vertical diffusion of u, w (friction sink) and the moist entropy s_t' (heat,
+    # slaved onto p, E_t, Q_ss). Skipped when every coefficient is zero: a vertical solve is
+    # not the identity there — it refits the column and reapplies the spectral filter.
+    if Kvdiff > 0.0 || Kvdiff_heat > 0.0
+        diffusion_timestep_mc(mtile, colstart, colend, t, geom)
+        eb_on && eb_mark!(eb, EB_VDIFF, mtile.var_np1, colstart)
+    end
+
+    # Negative water is not a representable state (see clamp_water!). LAST, so that
+    # nothing downstream of it can reintroduce one: the acoustic solve and the vertical
+    # diffusion have both had their say by here.
+    clamp_water!(mtile, colstart, colend)
+    eb_on && eb_mark!(eb, EB_CLAMP, mtile.var_np1, colstart)
+
+end
+
+# ── Name-dispatched equation-set wrappers (physical_model resolves the config's
+#    equation_set string to one of these by name; all keep the moist_compressible
+#    prefix so uses_pressure_reference gates their scratch/reference plumbing) ──
+
+"Total-energy moist compressible set on a Cartesian XZ slice (RiRk/RZ grid), 9 vars."
+moist_compressible_XZ(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCCartesianXZ())
+
+"""
+Axisymmetric r–z cylinder on the RiRk/RZ grid (gridpoint column 1 reinterpreted as
+radius, so the domain must sit at r > 0), with prognostic tangential wind v
+(`MC_VARS_CYL`, 10 vars) and optional f-plane rotation (`physical_params[:f]`).
+"""
+moist_compressible_axisym(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCAxisymRZ())
+
+"3D r–λ–z cylinder on the RLR grid (`MC_VARS_CYL`, 10 vars, f-plane rotation optional)."
+moist_compressible_RLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCCylindricalRLR())
+
+"""
+3D Cartesian x–y–z box on the RRR grid (`MC_VARS_CYL`, 10 vars: v is the y-wind,
+f-plane rotation optional — +f v / −f u with no curvature terms).
+"""
+moist_compressible_RRR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCCartesianRRR())
+
+"""
+3D spherical θ–λ–z shell on the SLR grid (`MC_VARS_CYL`, 10 vars: u is the
+θ-ward wind, v the zonal wind). Shallow atmosphere with metric radius
+`physical_params[:sphere_radius]` (default Earth) and full latitude-dependent
+Coriolis f = 2Ω cosθ from `physical_params[:Omega]` (NOT the cylinders' f-plane
+`:f`). See `MCSphericalSLR`.
+"""
+moist_compressible_SLR(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    mc_driver!(mtile, colstart, colend, t, MCSphericalSLR())
+
+"""
+    qss_relaxation(Q_ss, rho_v, rho_vs, tau)
+
+Reconciliation of the prognostic supersaturation density toward the supersaturation the
+prognostic VAPOR implies, `-(Q_ss - (rho_v - rho_vs))/tau` [kg/m^3/s].
+
+Every water species is prognostic now — vapor, cloud, rain and the twelve ice moments — so
+`Q_ss = rho_v - rho_vs(T,p)` is formally REDUNDANT. It is carried prognostically anyway
+because it is the quantity the condensation closure reads, and a prognostic, advected `Q_ss`
+is smooth where a pointwise difference against a saturation curve is not: near saturation the
+supersaturation is four to five decades below the vapor itself, right at the 1e-4 nucleation
+gate, so the transported field is the better-conditioned representation of it.
+
+Redundancy has to be reconciled or the two drift apart under splitting error, and this is
+that reconciliation — the "extra adjustment step on a slower timescale than the timestep" of
+reference/HANDOFF_DIAGNOSED_CLOUD.md. `tau = physical_params[:tau_qss]` (default 10 s) is
+deliberately long compared with the timestep, so the transport keeps the smooth field and
+only the accumulated inconsistency is removed.
+
+It is free of any effect on the conserved rho_d, rho_t and E_t, and it is thermodynamically
+inert unconditionally: [`retrieve_temperature`](@ref) does not read `Q_ss` at all.
+
+# The reconciliation
+
+`Q_ss` is pulled onto the prognostic vapor here. It is the only reconciliation left: the
+second link of the old chain (the vapor onto the prognostic ρ_t budget, `rho_v_reconcile`) went
+with the prognostic ρ_t — under the derived water anchor the vapor is the closure of the water
+sum, which is conserved by construction.
+
+**Feeding this the vapor was once forbidden, and is now correct.** While the vapor was a
+RETRIEVAL, one branch of it was built out of `Q_ss + rho_vs`, and this term then read
+`-(Q_ss - ((Q_ss + rho_vs) - rho_vs))/tau == 0`: it SELF-ANNIHILATED wherever the retrieval
+trusted the supersaturation residual, i.e. exactly where the anchor was load-bearing (the
+`POSITIVITY=1` run reached `|Q_ss|/rho_vs ~ 2e26` *with* the reconciliation running). That
+hazard was ALGEBRAIC, not physical, and it is gone with the retrieval: a transported slot is
+not `Q_ss + rho_vs` by construction, so the difference this term removes is a genuine
+disagreement between two independently carried fields. The anchor to the conserved masses did
+not disappear — it moved one link down the chain, onto `rho_v` itself.
+"""
+@inline function qss_relaxation(Q_ss, rho_v, rho_vs, tau)
+
+    return -(Q_ss - (rho_v - rho_vs)) / tau
+end
+
+"""
+    _vapor_bhyp_stage!(rho_v, J_v, nu_z, phys, rv_i, colstart, zs, nu_vbar, nu_vbar_z, mu,
+                       lobe_tr)
+
+Stage the vapor control variable for one column (`options[:vapor_transform] = :bhyp`): the
+recovered vapor `rho_v = ahyp(ν_v)`, its Jacobian `J_v` at the recovered density with the
+lobe-transport continuation below ν = 0 ([`lobe_transport_jacobian`](@ref); `lobe_tr = false`
+gives `dbhyp(max(ρ_v, 0))`), and ν_v's TOTAL vertical gradient `nu_z = ν_v'_z + ν̄_v,z` the
+transform-invariant advection reads. ν_v itself is never stored (`phys[g, rv_i, 1] + nu_vbar`,
+inline). `@noinline` on plain arrays: kept out of `mc_driver!`'s body, which sits at the LLVM
+compile cliff.
+"""
+@noinline function _vapor_bhyp_stage!(rho_v::Vector{Float64}, J_v::Vector{Float64},
+                                      nu_z::Vector{Float64}, phys::Array{Float64,3},
+                                      rv_i::Int, colstart::Int, zs::Int,
+                                      nu_vbar::Vector{Float64}, nu_vbar_z::Vector{Float64},
+                                      mu::Float64, lobe_tr::Bool)
+    @inbounds for i in eachindex(rho_v)
+        g = colstart + i - 1
+        nu = phys[g, rv_i, 1] + nu_vbar[i]
+        r = ahyp(nu, mu)
+        rho_v[i] = r
+        J_v[i] = lobe_tr ? lobe_transport_jacobian(nu, r, mu) : dbhyp(max(r, 0.0), mu)
+        nu_z[i] = phys[g, rv_i, zs] + nu_vbar_z[i]
+    end
+    return nothing
+end
+
+"""
+    _vapor_bhyp_tendency!(expdot, phys, rv_i, colstart, ADV, J_v, rho_v, div, nu_vbar, mu,
+                          lobe_tr)
+
+The vapor slot's tendency under the vapor control variable (`options[:vapor_transform] =
+:bhyp`), the `:bhyp` arm of the slot's assembly in `mc_driver!`:
+
+    ∂ν_v'/∂t = −u·∇ν_v − J_v ρ_s ∇·u
+
+with `ρ_s` the [`lobe_transport_density`](@ref) (the recovered `ρ_v` where `ν_v ≥ 0`, the odd
+continuation below; `options[:water_lobe_transport] = false` reads the recovered value
+everywhere). Advection and the `J_v`-weighted divergence only: the vapor is the ν-space closure
+of every exchange (the derived water anchor), so there is no reconciliation nudge — that, and its
+pressure partner, went with the prognostic ρ_t (deleted at Stage 3, the code at Stage 4). The
+phase-change sink is NOT here (it is the ETD increment `etd_dv`, already `J_v`-scaled), nor are
+the boundary layer's legs (added later by their closures).
+
+`@noinline` with plain arrays only (no views, no tile): the `mc_water_mixing!` compile lesson.
+ν_v is formed inline from the slot, `phys[g, rv_i, 1] + nu_vbar`, the doubles `J_v` was built on.
+"""
+@noinline function _vapor_bhyp_tendency!(expdot::Matrix{Float64}, phys::Array{Float64,3},
+                                         rv_i::Int, colstart::Int, ADV::Vector{Float64},
+                                         J_v::Vector{Float64}, rho_v::Vector{Float64},
+                                         div::Vector{Float64}, nu_vbar::Vector{Float64},
+                                         mu::Float64, lobe_tr::Bool)
+    @inbounds for i in eachindex(ADV)
+        g = colstart + i - 1
+        nu = phys[g, rv_i, 1] + nu_vbar[i]
+        rs = lobe_tr ? lobe_transport_density(nu, rho_v[i], mu) : rho_v[i]
+        expdot[g, rv_i] = ADV[i] + (-(J_v[i] * (rs * div[i])))
+    end
+    return nothing
+end
+
+"""
+    _tke_stage!(rho_e, J_e, phys, re_i, colstart, n, transform, mu, lobe_tr)
+
+Stage the MYNN TKE slot for one column into the tile's species columns (`MCSpeciesColumns`,
+`rho[re_i, tid]` and `J[re_i, tid]`): the density every reader of the column takes and the
+Jacobian `J_e = dν_e/dρ_e` every density-space tendency is multiplied by.
+
+- `:none` — `rho_e` is a COPY of the slot (bitwise, signed) and `J_e ≡ 1.0`, so a tendency
+  `J_e·x` is `x` bit for bit (`1.0·x === x`, signed zeros and NaN included).
+- `:bhyp` — `rho_e = ahyp(ν_e; μ_e) ≥ 0` and `J_e` at the recovered density, with the
+  lobe-transport continuation below `ν_e = 0` ([`lobe_transport_jacobian`](@ref); `lobe_tr =
+  false` gives `dbhyp(max(ρ_e, 0))`), exactly the vapor's construction (`_vapor_bhyp_stage!`).
+  `ρ̄_e ≡ 0`, so `ν_e` is the slot itself (no reference to add).
+
+`@noinline` on plain arrays (the `mc_driver!` compile-cliff rule): no tile, no views of it.
+"""
+@noinline function _tke_stage!(rho_e::Vector{Float64}, J_e::Vector{Float64},
+                               phys::Array{Float64,3}, re_i::Int, colstart::Int, n::Int,
+                               transform::Symbol, mu::Float64, lobe_tr::Bool)
+    if transform === :none
+        @inbounds for i in 1:n
+            rho_e[i] = phys[colstart + i - 1, re_i, 1]
+            J_e[i] = 1.0
+        end
+    else
+        @inbounds for i in 1:n
+            nu = phys[colstart + i - 1, re_i, 1]
+            r = ahyp(nu, mu)
+            rho_e[i] = r
+            J_e[i] = lobe_tr ? lobe_transport_jacobian(nu, r, mu) : dbhyp(max(r, 0.0), mu)
+        end
+    end
+    return nothing
+end
+
+"""
+    _tke_bhyp_tendency!(expdot, phys, re_i, colstart, ADV, div, species, mu, lobe_tr)
+
+The TKE slot's dycore tendency under the TKE control variable (`tke_transform = :bhyp`):
+
+    ∂ν_e/∂t = −u·∇ν_e − J_e ρ_s ∇·u     (+ the closure's J_e-weighted sources, `mc_mynn_bl!`)
+
+with `ρ_s` the [`lobe_transport_density`](@ref) (the recovered `ρ_e` where `ν_e ≥ 0`, the odd
+continuation below; `lobe_tr = false` reads the recovered value everywhere). Stages the
+column's recovered density and Jacobian first ([`_tke_stage!`](@ref), into
+`species.rho/J[re_i, threadid()]`), so the boundary layer later in the same column step reads
+the same doubles. `@noinline`, one pointer (`species`) and plain arrays.
+"""
+@noinline function _tke_bhyp_tendency!(expdot::Matrix{Float64}, phys::Array{Float64,3},
+                                       re_i::Int, colstart::Int, ADV::Vector{Float64},
+                                       div::Vector{Float64}, species::MCSpeciesColumns,
+                                       mu::Float64, lobe_tr::Bool)
+    tid = Threads.threadid()
+    rho_e = @inbounds species.rho[re_i, tid]
+    J_e = jacobian_column(species, re_i, tid)
+    n = length(ADV)
+    _tke_stage!(rho_e, J_e, phys, re_i, colstart, n, :bhyp, mu, lobe_tr)
+    @inbounds for i in 1:n
+        g = colstart + i - 1
+        nu = phys[g, re_i, 1]
+        rs = lobe_tr ? lobe_transport_density(nu, rho_e[i], mu) : rho_e[i]
+        expdot[g, re_i] = ADV[i] + (-(J_e[i] * (rs * div[i])))
+    end
+    return nothing
+end
+
+# ── ETD-AB3: the exponential multistep for the stiff Q_ss relaxation pair ──────
+#
+# The whole construction is TeX §"Integration of the relaxation pair in the stiff limit"
+# (\\label{stiff_integrator}), and the amended departure (b). Glaciation makes the pair
+#
+#     dQ_ss/dt = N(t) − λ Q_ss ,   λ = 1/τ + 1/τ_i ,   N = F − 𝒟/τ_i
+#
+# stiff: `1/τ_i` reaches O(10²) s⁻¹ for gram-scale ice held at seeding size, so `Δt/τ` crosses
+# AB3's real-axis stability bound (0.545) within tens of seconds of the first homogeneous
+# freezing. The stiffness is PHYSICAL and the limit it approaches is the quasi-steady state of
+# Eq. wbf_qs, so the integrator is made to land on that limit rather than fall over ahead of
+# it: the two relaxations are withheld from the multistep (which then carries `N`, its history
+# rotating as usual) and `Q_ss` is advanced by the exact propagator of the frozen-coefficient
+# linear problem, with `N` represented by the SAME quadratic extrapolant that defines the AB3
+# weights (Nørsett 1969; Hochbruck and Ostermann 2010).
+#
+# This is the acoustic semi-implicit treatment transposed to the microphysics — the fast linear
+# dynamics advanced by its own exact propagator while the slow tendencies keep the multistep,
+# the two meeting through an adjustment applied to the predictors — which is why
+# `relaxation_adjustment_qss!` sits here, beside `semiimplicit_adjustment_p`, and runs in the
+# same window.
+
+"""
+    _etd_horner(x, j) -> Float64
+
+`Σ_{m=0}^{K} (−1)^m x^m j!/(m+j)!`, the rescaled series shared by all four kernel moments,
+evaluated by the nested form `1 − x/(j+1)·[1 − x/(j+2)·[…]]`.
+
+This is the small-`x` branch of [`_etd_moments`](@ref) and exists for one reason: the closed
+forms of `J_1`, `J_2` are differences of terms that cancel to `O(x²)` and `O(x³)`, so their
+relative error grows like `ε/x` — at `x = 10⁻⁴` even `expm1` leaves `J_1` good to only ~2e−12,
+and `J_2` far worse. The series has no cancellation at all (every term is formed by a divide
+and a multiply-add), so the two branches are joined where BOTH are accurate rather than where
+either is merely finite. `K = 17` puts the truncation at `x^17/20! ≈ 4e−19` of the leading term
+at the `x = 1` switch, i.e. below the roundoff of the closed form it hands over to.
+"""
+@inline function _etd_horner(x::Float64, j::Int64)
+
+    r = 1.0
+    @inbounds for m in 17:-1:1
+        r = 1.0 - (x / (j + m)) * r
+    end
+    return r
+end
+
+"""
+    _etd_moments(x) -> (J0, J1, J2, D)
+
+The three kernel moments of the exponential Adams-Bashforth update at `x = λΔt`,
+
+    J_k(x) = ∫₀¹ θ^k e^{−x(1−θ)} dθ ,
+    J0 = (1 − e^{−x})/x ,  J1 = (x − 1 + e^{−x})/x² ,  J2 = (x² − 2x + 2 − 2e^{−x})/x³ ,
+
+together with the fourth moment the STEP-MEAN needs,
+
+    D(x) = (1/3 − J2)/x = (x³/3 − x² + 2x − 2 + 2e^{−x})/x⁴ ,
+
+which is to `J2` what `J1` is to `J0` (`J1 ≡ (1 − J0)/x` and `J2/2 ≡ (1/2 − J1)/x` are the same
+identity one and two rungs up). `D` is what removes the apparent `1/λ` singularity of
+Eq. qss_stepmean analytically — see [`etd_step_weights`](@ref).
+
+`x ≥ 0` always: λ is a sum of conductances. `x < 1` takes the series ([`_etd_horner`](@ref)),
+`x ≥ 1` the closed forms, whose smallest numerator is `J2`'s `(x−1)² + 1 − 2e^{−x} ≥ 0.264` —
+no cancellation anywhere above the switch.
+"""
+@inline function _etd_moments(x::Float64)
+
+    if x < 1.0
+        # j! divided out of the series: J0 = R(1), J1 = R(2)/2!, J2 = 2·R(3)/3!, D = 2·R(4)/4!.
+        return (_etd_horner(x, 1),
+                _etd_horner(x, 2) / 2.0,
+                _etd_horner(x, 3) / 3.0,
+                _etd_horner(x, 4) / 12.0)
+    end
+    em = exp(-x)
+    x2 = x * x
+    j0 = (1.0 - em) / x
+    j1 = ((x - 1.0) + em) / x2
+    j2 = (((x2 - (2.0 * x)) + 2.0) - (2.0 * em)) / (x2 * x)
+    return (j0, j1, j2, ((1.0 / 3.0) - j2) / x)
+end
+
+"""
+    etd_step_weights(x, t) -> (e^{−x}, b1, b2, b3, J0, g1, g2, g3)
+
+Every coefficient one gridpoint needs, at `x = λΔt` and integrator step `t`. Pure function of
+two numbers; the driver-level tests exercise it directly.
+
+
+# The update (TeX Eq. etd_ab3)
+
+    Q^{n+1} = e^{−x} Q^n + Δt [ b1 N^n + b2 N^{n−1} + b3 N^{n−2} ] ,
+    b1 = J0 + J1 + ½(J1+J2) ,   b2 = −J1 − (J1+J2) ,   b3 = ½(J1+J2) ,
+
+the variation-of-constants integral of `dQ/dt = N − λQ` with `N` represented by the backward
+quadratic `N^n + θ∇N^n + ½θ(θ+1)∇²N^n` — the same extrapolant the classical weights integrate,
+which is why `b → (23/12, −16/12, 5/12)` as `x → 0`. `t = 1` and `t = 2` mirror
+[`explicit_timestep`](@ref)'s Euler and AB2 startup with the one- and two-point extrapolants
+(`b1 = J0`; `b1 = J0+J1, b2 = −J1`, classical limits `1` and `3/2, −1/2`).
+
+# The step-mean (TeX Eq. qss_stepmean)
+
+Every consumer of the phase-change rates must see the SAME transfer or the exchange does not
+close, and the discrete budget of the update defines it:
+
+    (Q^{n+1} − Q^n)/Δt = N̄ − λ Q̄_ss  ⟺  Q̄_ss = (N̄ − (Q^{n+1} − Q^n)/Δt)/λ
+
+with `N̄` the classical-weight combination of the SAME `N` history. Written that way the
+expression is `0/0` at `λ = 0`; substituting the update and using `(1 − e^{−x})/Δt = λ J0`
+removes the singularity ANALYTICALLY rather than by a guard:
+
+    Q̄_ss = J0 Q^n + Δt [ g1 N^n + g2 N^{n−1} + g3 N^{n−2} ] ,   g_j ≡ (a_j − b_j)/x
+
+and each `g_j` collapses onto the moments already computed —
+`g1 = J1 + ¾J2 + ½D`, `g2 = −(J2 + D)`, `g3 = ¼J2 + ½D` at `t ≥ 3`;
+`g1 = J1 + ½J2`, `g2 = −½J2` at `t = 2`; `g1 = J1` at `t = 1`.
+
+Two limits worth checking against the TeX, and both are asserted in the tests:
+
+  * `x → 0` gives `(J0; g) = (1; 19/24, −5/12, 1/8)`, which is `∫₀¹ (1−θ) N(θ) dθ` for the same
+    quadratic — the exact step-mean of a non-relaxing trajectory;
+  * `x → ∞` gives `g → (23, −16, 5)/(12x)`, i.e. `Q̄_ss → N̄/λ = Q_ss^{qs}`, the Korolev-Mazin
+    quasi-steady state of Eq. wbf_qs. The scheme and the derivation agree about the fast limit
+    at every `x`, not merely asymptotically, which is the third property the TeX requires.
+
+# `x == 0` is a branch, not a limit
+
+The reduction the TeX states is BITWISE, not asymptotic: "wherever λ = 0 — air with no
+droplets, no rain, and no ice, which is the entire dry path — Eq. etd_ab3 IS the third-order
+multistep". Evaluating `J0 + J1 + ½(J1+J2)` at `x = 0` in Float64 gives 1.9166666666666665, one
+ulp below `23/12`, so the branch returns the literals instead. (The driver goes further and
+does not touch the predictor at all where `λ = 0` — see `relaxation_adjustment_qss!` — so the
+dry path is bitwise by construction rather than by arithmetic luck.)
+"""
+@inline function etd_step_weights(x::Float64, t::Int64)
+
+    if x == 0.0
+        return t == 1 ? (1.0, 1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0) :
+               t == 2 ? (1.0, 1.5, -0.5, 0.0, 1.0, 2.0 / 3.0, -1.0 / 6.0, 0.0) :
+                        (1.0, 23.0 / 12.0, -16.0 / 12.0, 5.0 / 12.0,
+                         1.0, 19.0 / 24.0, -5.0 / 12.0, 1.0 / 8.0)
+    end
+    (j0, j1, j2, d) = _etd_moments(x)
+    emx = exp(-x)
+    if t == 1
+        return (emx, j0, 0.0, 0.0, j0, j1, 0.0, 0.0)
+    elseif t == 2
+        return (emx, j0 + j1, -j1, 0.0, j0, j1 + (0.5 * j2), -0.5 * j2, 0.0)
+    end
+    s = 0.5 * (j1 + j2)
+    return (emx, j0 + j1 + s, -j1 - (j1 + j2), s,
+            j0, j1 + (0.75 * j2) + (0.5 * d), -(j2 + d), (0.25 * j2) + (0.5 * d))
+end
+
+"""
+    phase_change_partner(dl, di, Tk, R_m, C_vt, C_pt, Lv, Ls, Q_s, Q_s_i) -> (dp, dv, dq)
+
+The PARTNER of a phase change: the pressure, vapor and supersaturation increments that go with
+`dl` [kg/m³] of vapor turned to liquid and `di` of vapor turned to ice (negative = evaporation,
+sublimation), at fixed `ρ_t`, `ρ_d`, `E_t` and kinetic energy. It is the step-mean ETD
+exchange's own formula (`etd_d1`/`etd_dv` and the `Q_ss` give-back in `mc_driver!`'s
+pre-compute) with the rate times `Δt` replaced by the mass:
+
+    dp = (R_m/C_vt)·[(L_v − R_v C_pt T/R_m)·dl + (L_s − R_v C_pt T/R_m)·di]
+    dv = −(dl + di)
+    dq = −(1 + 𝒬_s)·dl − (1 + 𝒬_{s,i})·di
+
+so the four consumers of one exchange can never disagree. WHY THIS IS THE ENERGY-NEUTRAL
+EXCHANGE: [`implied_total_energy`](@ref) carries a condensate at `C_pv T − L` and the vapor at
+`C_vv T` (energies referenced to vapor), so moving `δ` from vapor to liquid at fixed `T` changes
+`E` by `δ(R_v T − L_v)`; holding `E` (and so `R = E_t − E`) requires `ρ_d C_vt δT =
+(L_v − R_v T) δ`, and through `T = p/(ρ_d R_d + ρ_v R_v)` that is `δp = ρ_d R_m δT − R_v T δ`
+— the bracket above, since `C_pt = C_vt + R_m`. `𝒬_s` is [`Q_s_energy`](@ref) (`𝒬_{s,i}`
+[`Q_s_energy_ice`](@ref)): the saturation chain rule of exactly this `δT`, `δp`. Linear in
+`(dl, di)` at the frozen coefficients, as the ETD increments are: the residual it leaves is
+second order in the exchanged mass.
+"""
+@inline function phase_change_partner(dl, di, Tk, R_m, C_vt, C_pt, Lv, Ls, Q_s, Q_s_i)
+    b = Rv * C_pt * Tk / R_m
+    dp = (R_m / C_vt) * (((Lv - b) * dl) + ((Ls - b) * di))
+    dv = -(dl + di)
+    dq = -(((1.0 + Q_s) * dl) + ((1.0 + Q_s_i) * di))
+    return dp, dv, dq
+end
+
+"""
+    recovered_change_partner(dv, dl, di, Tk, rho_d, R_m, C_vt, Lv, Ls, drvs_dT, drvs_dp) -> (dp, dq)
+
+THE ONE PARTNER PRIMITIVE (plan E1): the pressure and `Q_ss` increments that hold
+`E_implied`, and so `R = E_t − E_implied(T_eos)`, when the RECOVERED vapor, liquid and ice
+densities change by `dv`, `dl`, `di` [kg/m³] with nothing else moving — `ρ_d`, `E_t` and the
+kinetic energy fixed. No water slot is written here: the recovered changes are the INPUTS (what
+an operator did to the reading the physics sees), and the partner is only their energy.
+
+WHY. [`implied_total_energy`](@ref) carries the vapor at `C_vv T` and a condensate at
+`C_pv T − L` (Springsteel `internal_energy_bf02`, energies referenced to vapor), and its
+temperature derivative at fixed densities is `ρ_d C_vt` (`dL_v/dT = C_pv − C_l`,
+`dL_s/dT = C_pv − C_i`). Holding it,
+
+    ρ_d C_vt δT = −[ C_vv T·dv + (C_pv T − L_v)·dl + (C_pv T − L_s)·di ],
+
+and the equation of state `p = (ρ_d R_d + ρ_v R_v) T = ρ_d R_m T` gives `δp = ρ_d R_m δT +
+R_v T dv` (the vapor enters the EOS, the condensates do not):
+
+    dp = (R_m/C_vt)·[(L_v − C_pv T)·dl + (L_s − C_pv T)·di] + T·(R_v − (R_m/C_vt)·C_vv)·dv
+    dq = dv − (∂ρ_v*/∂T·δT + ∂ρ_v*/∂p·dp)
+
+`dq` is the supersaturation `Q_ss = ρ_v − ρ_v*` moved by the vapor and by the saturation
+chain rule of the partner's own `δT`, `dp` (over water, as `Q_ss` is defined; `drvs_dp` per Pa,
+the driver's `S.drvs_dT`, `S.drvs_dp`). Linear at the frozen coefficients, so the residual it
+leaves is second order in the masses.
+
+THE TWO SPECIAL CASES (algebraically, through `C_pv − C_vv = R_v` and `C_pt = C_vt + R_m`;
+to rounding, not bitwise — the operation order differs):
+- `dv = −(dl + di)` is [`phase_change_partner`](@ref): the vapor coefficient folds into the
+  condensate brackets to give `L − R_v C_pt T/R_m`, and `dq = −(1 + 𝒬_s)·dl − (1 + 𝒬_{s,i})·di`
+  with `𝒬_s` [`Q_s_energy`](@ref), `𝒬_{s,i}` [`Q_s_energy_ice`](@ref).
+- `dl = di = 0` is the vapor alone, `δp = T(R_v − (R_m/C_vt) C_vv) δ` (the retired vapor nudge's
+  pressure partner, `vapor_nudge_partner_rate`, was this expression with a rate for the mass).
+
+A term whose mass is exactly zero is omitted, never added, so `x + 0.0` cannot flip a `−0.0`
+(the `mc_mynn_bl.jl` flux-carry convention): an all-zero call returns `dq === dv`. Every
+partner of the derived water anchor passes the vapor's recovered change explicitly through this
+function.
+"""
+@inline function recovered_change_partner(dv, dl, di, Tk, rho_d, R_m, C_vt, Lv, Ls,
+                                          drvs_dT, drvs_dp)
+    cT = Cpv * Tk
+    # the condensates' (L − C_pv T)·δ, each only where its mass moved
+    hl = dl == 0.0 ? 0.0 : (Lv - cT) * dl
+    hc = di == 0.0 ? hl : hl + ((Ls - cT) * di)
+    # the vapor's pressure term
+    dpv = Tk * (Rv - ((R_m / C_vt) * Cvv)) * dv
+    dp = hc == 0.0 ? dpv : dpv + ((R_m / C_vt) * hc)
+    ev = Cvv * Tk * dv
+    dT = (ev == 0.0 ? hc : hc - ev) / (rho_d * C_vt)
+    dvs = (drvs_dT * dT) + (drvs_dp * dp)
+    dq = dvs == 0.0 ? dv : dv - dvs
+    return dp, dq
+end
+
+"""
+    EXCHANGE_REALIZATION_DEFAULT
+
+The value `options[:exchange_realization]` takes when the key is absent. See
+[`_etd_exchange_realization!`](@ref).
+"""
+const EXCHANGE_REALIZATION_DEFAULT = true
+
+"""
+    _etd_exchange_realization!(vnp1, phys, S, colstart, ts, ctr, cmu, rtr, rmu, itr, imu,
+                               rv_i, i1, i2, i3, nvb, vtr, vmu)
+
+THE ETD EXCHANGE REALIZED ON THE RECOVERED DENSITY (`options[:exchange_realization]`, default
+true). The step-mean phase change books its latent heat in `p` (`etd_d1`) and its `Q_ss` loss
+for the FULL requested mass `Δt·q̄_k` of each channel, while the transformed slot receives
+`etd_d* = Δt·J_k·q̄_k` with `J_k` frozen at the step's START — and the mass the model then holds
+is the RECOVERED change `ahyp(ν* + d) − ahyp(ν*)` from the post-explicit `ν*`, not `Δt q̄_k`.
+Where the two differ the exchange is open (a clipped lobe, a thinning edge): a jump in
+`R = E_t − E_implied(T_eos)` — measured, the `S3:etd_liq` term of the 2026-10-16 closed budget
+(−17 W/m² on the cloudy RCE restart, +56 mid-window). The cure closes the exchange on what
+every reading actually receives, the vapor included: [`_etd_exchange_closure!`](@ref), which this
+is (the derived water anchor's form, plan decision E4; the `:slot`-anchor form, which wrote the
+recovered change's vapor partner into the vapor slot, went with the prognostic ρ_t at Stage 4).
+
+It runs in [`relaxation_adjustment_qss!`](@ref) AFTER the phase-change increments have landed
+and BEFORE the lobe relaxation, so each mass slot holds exactly `ν* + d_k`. It is bitwise
+absent under `:none` everywhere (the caller skips it: the recovered change is the requested
+one) and wherever every channel's increment is an exact zero. This forwarder is a plain
+method; the callee, [`_etd_exchange_closure!`](@ref), is the `@noinline` one, with plain arrays.
+"""
+_etd_exchange_realization!(vnp1::Matrix{Float64}, phys::Array{Float64,3}, S, colstart::Int,
+                           ts::Float64, ctr::Symbol, cmu::Float64, rtr::Symbol, rmu::Float64,
+                           itr::Symbol, imu::Float64, rv_i::Int, i1::Int, i2::Int, i3::Int,
+                           nvb::Vector{Float64}, vtr::Symbol, vmu::Float64) =
+    _etd_exchange_closure!(vnp1, phys, S, colstart, ts, ctr, cmu, rtr, rmu, itr, imu, rv_i,
+                           i1, i2, i3, nvb, vtr, vmu)
+
+"""
+    _etd_exchange_closure!(vnp1, phys, S, colstart, ts, ctr, cmu, rtr, rmu, itr, imu, rv_i,
+                           i1, i2, i3, nvb, vtr, vmu)
+
+THE EXCHANGE REALIZATION UNDER THE DERIVED ANCHOR (plan E4). The ETD booked its heat and its
+`Q_ss` loss for the REQUESTED exchange — `phase_change_partner` of `Δt q̄_k`, algebraically
+`primitive(−Σ_k req_k, req_l, req_i)` — while the slots received `d_k = Δt J_k q̄_k` and the
+vapor their ν-space CLOSURE `Δν_v = etd_dv`. The recovered changes are then
+`rec_k = recover(ν*_k + d_k) − recover(ν*_k)` and `rec_v = recover(ν_v^{n+1}) −
+recover(ν_v^{n+1} − Δν_v)`, and the difference is booked with the primitive (plan E1):
+
+    gl = Σ_liquid (rec_k − req_k),  gi = Σ_ice (rec_k − req_k)          (`_exchange_gap`)
+    gv = rec_v + Σ_k req_k
+    (dp, dq) = recovered_change_partner(gv, gl, gi, …)   into p and Q_ss^{n+1}
+
+so the exchange is booked on what every reading received: `E_implied` moves by the latent heat
+of the RECOVERED change and `R` holds to second order. The vapor slot is NOT written (it holds
+the closure; ρ_w is invariant). Healthy point (`J ≈ ½`): `gv`, `gl` are `O(Δν²/μ)`. Deep clipped
+lobe: recovered cloud 0, the vapor moves by `rec_v ≈ 2Δν_v = −2α_c d/α_v`, and the net `p` move
+is `κ·rec_v` with no latent heat — water moved from the vapor into the lobe at fixed `R`, the
+exact inverse of the paired Stage L. THE JACOBIAN at a clipped point is the ETD's own
+frozen-at-n `J_k` (the lobe-transport continuation `dbhyp(ahyp_smooth(−ν))` below zero under
+`options[:water_lobe_transport]`, `dbhyp(0) = 1` without it): the closure increment is
+`−α_k d_k/α_v` whatever it is. `@noinline`.
+"""
+@noinline function _etd_exchange_closure!(vnp1::Matrix{Float64}, phys::Array{Float64,3}, S,
+                                          colstart::Int, ts::Float64, ctr::Symbol,
+                                          cmu::Float64, rtr::Symbol, rmu::Float64,
+                                          itr::Symbol, imu::Float64, rv_i::Int, i1::Int,
+                                          i2::Int, i3::Int, nvb::Vector{Float64},
+                                          vtr::Symbol, vmu::Float64)
+    d8 = S.etd_d8; d9 = S.etd_d9; dvc = S.etd_dv
+    qc = S.Qdot_bar; qr = S.Qdot_r_bar; nuc = S.nu_c
+    ice = i1 > 0
+    itr_on = itr !== :none
+    @inbounds for i in eachindex(d9)
+        g = colstart + i - 1
+        gl = 0.0; gi = 0.0; req = 0.0
+        if d9[i] != 0.0
+            rq = ts * qc[i]
+            req += rq
+            ctr !== :none && (gl += _exchange_gap(vnp1[g, 9] + (nuc[i] - phys[g, 9, 1]), d9[i],
+                                                  rq, ctr, cmu))
+        end
+        if d8[i] != 0.0
+            rq = ts * qr[i]
+            req += rq
+            rtr !== :none && (gl += _exchange_gap(vnp1[g, 8], d8[i], rq, rtr, rmu))
+        end
+        if ice
+            d = S.etd_di1[i]
+            if d != 0.0
+                rq = d / S.J_i1q[i]; req += rq
+                itr_on && (gi += _exchange_gap(vnp1[g, i1], d, rq, itr, imu))
+            end
+            d = S.etd_di2[i]
+            if d != 0.0
+                rq = d / S.J_i2q[i]; req += rq
+                itr_on && (gi += _exchange_gap(vnp1[g, i2], d, rq, itr, imu))
+            end
+            d = S.etd_di3[i]
+            if d != 0.0
+                rq = d / S.J_i3q[i]; req += rq
+                itr_on && (gi += _exchange_gap(vnp1[g, i3], d, rq, itr, imu))
+            end
+        end
+        dv = dvc[i]
+        gv = 0.0
+        if dv != 0.0 || req != 0.0
+            nn = vnp1[g, rv_i] + nvb[i]
+            rec = dv == 0.0 ? 0.0 :
+                recover_rho_v(0.0, nn, vtr, vmu) - recover_rho_v(-dv, nn, vtr, vmu)
+            gv = rec + req
+        end
+        (gl == 0.0 && gi == 0.0 && gv == 0.0) && continue
+        dp, dq = recovered_change_partner(gv, gl, gi, S.Tk[i], S.rho_d[i], S.R_m[i],
+                                          S.C_vt[i], S.Lv[i], ice ? L_s(S.Tk[i]) : 0.0,
+                                          S.drvs_dT[i], S.drvs_dp[i])
+        vnp1[g, 1] += dp
+        vnp1[g, 7] += dq
+    end
+    return nothing
+end
+
+"""
+    REFIT_PARTNER_DEFAULT
+
+The value `options[:refit_partner]` takes when the key is absent. THE REFIT PARTNER (the
+author's decision of 2026-10-16): every step the column states are refit, and the refit of a
+TRANSFORMED slot changes its recovered density by an amount nothing partners (the transform is
+nonlinear, so filtering `ν` conserves `∫ν` and not `∫ρ`, and the clip at `ν = 0` takes a rung
+lobe out of the recovered field altogether); that change is booked as a phase change,
+energy-consistently, every step. Under the derived water anchor (the only one since Stage 4)
+the anchor `ρ_w = Σ α_k ν_k` is invariant across the refit, so what is booked is the AFFINE
+DEFECT `Δ_k = [recover(ν⁺) − recover(ν⁻)] − 2(ν⁺ − ν⁻)` of each transformed water-mass slot
+([`_refit_partner_defect!`](@ref), plan E2/E3, energy only, no ν written), called from
+`explicit_timestep` (`_water_exchange_stage!`). (The `:slot`-anchor form, which folded the full
+recovered change into the vapor and the ETD increments, went with the prognostic ρ_t.)
+"""
+const REFIT_PARTNER_DEFAULT = true
+
+"""
+    refit_recovered_change(nu_after, nu_before, trans, mu) -> Float64
+
+The change of one transformed slot's RECOVERED density across a refit, `recover(ν_after) −
+recover(ν_before)`. An exact `0.0` where the refit left the control variable's bits alone.
+"""
+@inline refit_recovered_change(nu_after, nu_before, trans::Symbol, mu) =
+    recover_total(nu_after, trans, mu) - recover_total(nu_before, trans, mu)
+
+"""
+    affine_defect(nu, trans, mu) -> Float64
+    affine_defect_change(nu_after, nu_before, trans, mu) -> Float64
+
+The AFFINE DEFECT of one transformed slot, `ε(ν) = recover(ν) − 2ν`: how far the recovered
+density sits from the linear water anchor `ρ_w = 2Σν`. Writing `2ν = ρ + μ s`, it is `−μ s`:
+under `:bhyp`, `ε ∈ (−μ, 0]` for `ν ≥ 0` (0 at `ν = 0`, → `−μ` deep above the knee) and
+`ε = −2ν > 0` in a clipped lobe (`ν < 0`, `ahyp = 0`). Under `:none` the slot IS the density and
+there is no anchor to depart from, so the defect is `0.0`.
+
+`affine_defect_change` is its change across a refit, written as the recovered change less the
+anchor's,
+
+    Δ = [recover(ν⁺) − recover(ν⁻)] − 2(ν⁺ − ν⁻)     (= ε(ν⁺) − ε(ν⁻)),
+
+which avoids differencing two O(ν) quantities to get an O(μ) one. It is exactly `0.0` where the
+refit left the bits alone (and always under `:none`), O(μ s) where the slot is affine on both
+sides, and `−2δν` in a deep clipped lobe — the lobe pool's growth at that point.
+
+This is the mass the refit partner books (plan E2: the water anchor is invariant across refit +
+partner, so only the departure of the recovered reading from it is unaccompanied by an `E_t`
+change; [`_refit_partner_defect!`](@ref)).
+"""
+@inline affine_defect(nu, trans::Symbol, mu) =
+    trans === :none ? 0.0 : recover_total(nu, trans, mu) - (2.0 * nu)
+
+@doc (@doc affine_defect)
+@inline affine_defect_change(nu_after, nu_before, trans::Symbol, mu) =
+    trans === :none ? 0.0 :
+    refit_recovered_change(nu_after, nu_before, trans, mu) - (2.0 * (nu_after - nu_before))
+
+"""
+    _refit_partner_defect!(d1, qnp1, lam, vnp1, phys, nu_c, nu_r, nu_i1, nu_i2, nu_i3, Tk, R_m,
+                           C_vt, Lv, colstart, ctr, cmu, rtr, rmu, itr, imu, i1, i2, i3, wz,
+                           rho_d, drvs_dT, drvs_dp, rv_i, nvb, vtr, vmu) -> booked
+
+THE REFIT PARTNER UNDER THE DERIVED ANCHOR (plan E2, E3). The water anchor `ρ_w = Σ α_k ν_k`
+is refit linearly, and the ETD writes its kinks into `p` (β r), `ν_c` (J_c r) and, under the
+closure, `ν_v` (−J_c r) — never into `E_t`; where a slot is affine (2ν = ρ + μs) the refit's
+ringing of that triple is itself a consistent phase change and `R` is untouched. What no
+operator accounts for is the departure of the RECOVERED reading from the anchor, per slot
+
+    Δ_k = [recover(ν_k⁺) − recover(ν_k⁻)] − 2(ν_k⁺ − ν_k⁻)          (`affine_defect_change`)
+
+— exactly `0.0` where the bits did not change, O(μ s) where affine on both sides, `−2δν_k` in a
+deep clipped lobe (the pool's growth at that point). It is booked with the primitive
+`recovered_change_partner(Δ_v, Δ_c + Δ_r, Δ_i1 + Δ_i2 + Δ_i3, …)`: the "condensate appears
+alone" coefficients `λ_l = (R_m/C_vt)(L_v − C_pv T)`, `λ_i` (with `L_s`), and the vapor's own
+defect at `κ = T(R_v − (R_m/C_vt) C_vv)` (E3; ≲ μ_v wherever the vapor is affine). ENERGY ONLY:
+no ν moves (the `dv` fold of the `:slot` arm is deleted), so ρ_w is invariant across the refit
+and its partner. Its column integral equals the full-recovered booking's (`∫2δν = 0` under the
+linear refit up to the boundary), so the measured closure is kept and only the pointwise dipole
+(the "peak evaporation / flank condensation") goes. `Q_ss`: as the `:slot` arm (`qnp1`).
+
+BISECTION FORMS (the plan's energy fallback, kept as forensics; both defaults are the form
+above): `rec = true` (`options[:refit_partner_form] = :recovered`) books the FULL recovered
+change of the condensates instead of the defect, energy only, at the `:slot` arm's
+coefficients (`dv = −(δl + δi)` in the primitive, which is `phase_change_partner`'s `dp` to
+rounding) with no ν written; `vap = false` (`options[:refit_partner_vapor] = false`) drops the
+vapor's own defect term `κ Δ_v`.
+"""
+@noinline function _refit_partner_defect!(d1::Vector{Float64}, qnp1::Vector{Float64},
+                                          lam::Vector{Float64}, vnp1::Matrix{Float64},
+                                          phys::Array{Float64,3},
+                                          nu_c::Vector{Float64}, nu_r::Vector{Float64},
+                                          nu_i1::Vector{Float64}, nu_i2::Vector{Float64},
+                                          nu_i3::Vector{Float64}, Tk::Vector{Float64},
+                                          R_m::Vector{Float64}, C_vt::Vector{Float64},
+                                          Lv::Vector{Float64}, colstart::Int,
+                                          ctr::Symbol, cmu::Float64, rtr::Symbol,
+                                          rmu::Float64, itr::Symbol, imu::Float64,
+                                          i1::Int, i2::Int, i3::Int, wz::Vector{Float64},
+                                          rho_d::Vector{Float64}, drvs_dT::Vector{Float64},
+                                          drvs_dp::Vector{Float64}, rv_i::Int,
+                                          nvb::Vector{Float64}, vtr::Symbol, vmu::Float64,
+                                          rec::Bool = false, vap::Bool = true)
+    ice = i1 > 0 && itr !== :none
+    bw = length(wz) == length(d1)
+    booked = 0.0
+    @inbounds for i in eachindex(d1)
+        g = colstart + i - 1
+        dl = 0.0
+        di = 0.0
+        dv = 0.0
+        if rec
+            # BISECTION ARM E-a (`options[:refit_partner_form] = :recovered`): the FULL
+            # recovered change of each condensate, at the `:slot` arm's coefficients (vapor
+            # `−(δl + δi)` in the bracket, `phase_change_partner`), energy only: no ν moves.
+            ctr !== :none &&
+                (dl += refit_recovered_change(nu_c[i], vnp1[g, 9] + (nu_c[i] - phys[g, 9, 1]),
+                                              ctr, cmu))
+            rtr !== :none && (dl += refit_recovered_change(nu_r[i], vnp1[g, 8], rtr, rmu))
+            if ice
+                di = (refit_recovered_change(nu_i1[i], vnp1[g, i1], itr, imu) +
+                      refit_recovered_change(nu_i2[i], vnp1[g, i2], itr, imu)) +
+                     refit_recovered_change(nu_i3[i], vnp1[g, i3], itr, imu)
+            end
+            (dl == 0.0 && di == 0.0) || (dv = -(dl + di))
+        else
+            ctr !== :none &&
+                (dl += affine_defect_change(nu_c[i], vnp1[g, 9] + (nu_c[i] - phys[g, 9, 1]),
+                                            ctr, cmu))
+            rtr !== :none && (dl += affine_defect_change(nu_r[i], vnp1[g, 8], rtr, rmu))
+            if ice
+                di = (affine_defect_change(nu_i1[i], vnp1[g, i1], itr, imu) +
+                      affine_defect_change(nu_i2[i], vnp1[g, i2], itr, imu)) +
+                     affine_defect_change(nu_i3[i], vnp1[g, i3], itr, imu)
+            end
+            # BISECTION ARM E-b (`options[:refit_partner_vapor] = false`): the vapor's own
+            # defect `κ Δ_v` is not booked.
+            (vap && vtr !== :none) &&
+                (dv = affine_defect_change(phys[g, rv_i, 1] + nvb[i], vnp1[g, rv_i] + nvb[i],
+                                           vtr, vmu))
+        end
+        if dl == 0.0 && di == 0.0 && dv == 0.0
+            lam[i] == 0.0 && (qnp1[i] = 0.0)
+            continue
+        end
+        dp, dq = recovered_change_partner(dv, dl, di, Tk[i], rho_d[i], R_m[i], C_vt[i], Lv[i],
+                                          ice ? L_s(Tk[i]) : 0.0, drvs_dT[i], drvs_dp[i])
+        d1[i] += dp
+        if lam[i] != 0.0
+            qnp1[i] += dq
+        else
+            qnp1[i] = dq
+        end
+        bw && (booked += wz[i] * (dp * (C_vt[i] / R_m[i])))
+    end
+    return booked
+end
+
+"""
+    _exchange_gap(n_after, d, req, trans, mu) -> Float64
+
+The mass a transformed slot's RECOVERED density received over an increment `d` that has
+already landed (`n_after = ν* + d`), minus the mass `req` its partners were booked for. Exact
+zero where the two agree to the last bit.
+"""
+@inline function _exchange_gap(n_after, d, req, trans::Symbol, mu)
+    return (recover_total(n_after, trans, mu) - recover_total(n_after - d, trans, mu)) - req
+end
+
+"""
+    relaxation_adjustment_qss!(mtile, colstart, colend, t)
+
+Apply the exponential propagator of the supersaturation relaxation pair, and the step-mean
+phase-change increments that close the exchange against it.
+
+Runs immediately AFTER [`explicit_timestep`](@ref) and BEFORE
+[`semiimplicit_adjustment_p`](@ref) — the placement the TeX prescribes, so that the corrected
+latent heating enters the acoustic solve at exactly the point the rate-level heating entered it
+before. It is the microphysical sibling of the acoustic adjustment in structure as well as in
+position: a fast linear mode integrated by its own exact propagator, meeting the multistep
+through a correction applied to the predictor.
+
+# Why the arithmetic is not here
+
+`explicit_timestep` ROTATES `expdot_n → expdot_nm1 → expdot_nm2` internally, so by the time
+this function runs `N^{n−2}` no longer exists. Everything that needs the three unrotated levels
+— `λ`, `x`, the weights, `Q_ss^{n+1}`, `Q̄_ss`, the step-mean rates and every consumer
+increment — is therefore computed in `mc_driver!`'s own window, just before the explicit
+advance, and stashed in the per-thread scratch columns (`etd_*`, `Qdot_bar`, `Qdot_r_bar`,
+`Qdep_bar`; see [`MC_SCRATCH_SLOTS`](@ref)). Same thread, same column, same step, exactly as
+`semiimplicit_adjustment_p` reads the `sd_pxi` column staged for it.
+
+# What it applies
+
+  * slot 7 is OVERWRITTEN with the propagated `Q_ss^{n+1}` (in slot units, `Q_ss` minus the
+    reference `Q̄_ssbar`) — the multistep predictor for that slot carried `N` only and is
+    discarded;
+  * slots 1 (pressure), 8 (rain), 9 (cloud), the vapor slot and the three ice mass slots
+    receive their withheld phase-change terms back as DIRECT increments over the step, each
+    already carrying the same per-slot factor its rate-level term carried (the frozen-at-`n`
+    Jacobians `Jr`, `Jc`, `J_i.q` for the transformed slots; the `(R_m/C_vt)(L − R_vC_pT/R_m)`
+    bracket for the pressure). Because all of them are built from ONE step-mean rate per
+    channel, the vapor removed, the mass condensed or deposited and the heat released are
+    identical by construction.
+
+  * with `options[:exchange_realization]` (default on) the vapor, `p` and `Q_ss` partners of
+    each transformed mass slot are then re-booked on the mass its RECOVERED density actually
+    received ([`_etd_exchange_realization!`](@ref)) — before the lobe relaxation, which moves
+    no recovered mass.
+
+Where `λ = 0` the predictor is left exactly as `explicit_timestep` wrote it, so the dry path —
+and any point with no droplets, no rain and no ice — is bitwise the third-order multistep.
+Where a channel's step-mean rate is exactly zero its increment is skipped rather than added, so
+no slot can pick up a `±0.0` it did not have.
+"""
+function relaxation_adjustment_qss!(mtile::ModelTile, colstart::Int64, colend::Int64,
+                                    t::Int64)
+    # `t` is accepted and unused: the startup branch it selects was already applied when the
+    # weights were formed, before the rotation. Kept in the signature so this reads as the
+    # sibling of `semiimplicit_adjustment_p` at every call site.
+
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+    IS = mtile.mc_slots
+    ice_on = ice_registered(IS)
+    vnp1 = mtile.var_np1
+
+    lam = S.etd_lam
+    qnp1 = S.etd_qnp1
+    d1 = S.etd_d1; d8 = S.etd_d8; d9 = S.etd_d9; dv = S.etd_dv
+    rv_i = IS.rho_v
+    # Whether `etd_qnp1` at a `λ = 0` point carries a partner's `Q_ss` increment (the refit
+    # partner's, `_refit_partner_defect!`, and the closures' `_qss_share!`); the conditions the
+    # refit partner runs under.
+    rfp = t > 1 && get(mtile.model.options, :refit_partner, REFIT_PARTNER_DEFAULT)::Bool &&
+          (condensate_transform_mode(mtile.model.options) !== :none ||
+           rain_transform_mode(mtile.model.options) !== :none ||
+           (ice_on && ice_transform_mode(mtile.model.options) !== :none) ||
+           vapor_transform_mode(mtile.model.options) !== :none)
+
+    @inbounds for i in eachindex(lam)
+        g = colstart + i - 1
+        # λ = 0 is the ENTIRE dry path and every condensate-free point in a moist one: the
+        # predictor `explicit_timestep` already wrote IS the exponential update there, so it is
+        # left alone rather than recomputed (TeX: the reduction is bitwise, not asymptotic).
+        if lam[i] != 0.0
+            vnp1[g, 7] = qnp1[i]
+        elseif rfp && qnp1[i] != 0.0
+            # λ = 0 keeps the predictor; under the refit partner `etd_qnp1` there carries the
+            # partners' `Q_ss` increment and nothing else.
+            vnp1[g, 7] += qnp1[i]
+        end
+        d1[i] != 0.0 && (vnp1[g, 1] += d1[i])
+        d8[i] != 0.0 && (vnp1[g, 8] += d8[i])
+        d9[i] != 0.0 && (vnp1[g, 9] += d9[i])
+        dv[i] != 0.0 && (vnp1[g, rv_i] += dv[i])
+    end
+    if ice_on
+        di1 = S.etd_di1; di2 = S.etd_di2; di3 = S.etd_di3
+        da1 = S.etd_da1; da2 = S.etd_da2; da3 = S.etd_da3
+        dc1 = S.etd_dc1; dc2 = S.etd_dc2; dc3 = S.etd_dc3
+        dn1 = S.etd_dn1; dn2 = S.etd_dn2; dn3 = S.etd_dn3
+        i1 = IS.i1_q; i2 = IS.i2_q; i3 = IS.i3_q
+        a1 = IS.i1_a; a2 = IS.i2_a; a3 = IS.i3_a
+        c1 = IS.i1_c; c2 = IS.i2_c; c3 = IS.i3_c
+        n1 = IS.i1_n; n2 = IS.i2_n; n3 = IS.i3_n
+        @inbounds for i in eachindex(lam)
+            g = colstart + i - 1
+            di1[i] != 0.0 && (vnp1[g, i1] += di1[i])
+            di2[i] != 0.0 && (vnp1[g, i2] += di2[i])
+            di3[i] != 0.0 && (vnp1[g, i3] += di3[i])
+            # The habit partition of the same realized increments: axes and (under
+            # sublimation) number, evaluated at the identical step-mean rates in the
+            # pre-compute. Zero wherever the mass increment is zero, by construction.
+            da1[i] != 0.0 && (vnp1[g, a1] += da1[i])
+            da2[i] != 0.0 && (vnp1[g, a2] += da2[i])
+            da3[i] != 0.0 && (vnp1[g, a3] += da3[i])
+            dc1[i] != 0.0 && (vnp1[g, c1] += dc1[i])
+            dc2[i] != 0.0 && (vnp1[g, c2] += dc2[i])
+            dc3[i] != 0.0 && (vnp1[g, c3] += dc3[i])
+            dn1[i] != 0.0 && (vnp1[g, n1] += dn1[i])
+            dn2[i] != 0.0 && (vnp1[g, n2] += dn2[i])
+            dn3[i] != 0.0 && (vnp1[g, n3] += dn3[i])
+        end
+    end
+    # The energy budget's marks (src/energy_budget.jl): the ETD increments, refit partner
+    # included, have landed; the exchange realization and the lobe relaxation follow.
+    eb = mtile.ebudget
+    eb_on = eb.active
+    eb_on && eb_etd!(eb, vnp1, colstart)
+    # THE EXCHANGE REALIZED ON THE RECOVERED DENSITY (`exchange_realization`): HERE, after every
+    # phase-change increment has landed and before the lobe relaxation moves any ν, so each
+    # transformed mass slot holds exactly `ν* + d` and its post-explicit `ν*` is one
+    # subtraction away. The vapor, heat and `Q_ss` partners are re-booked on the mass the slot's
+    # RECOVERED density actually received, as increments of their own; the ETD scratch is not
+    # touched, so the step's requested exchange stays readable. Skipped entirely without a
+    # water transform, where the recovered change IS the requested one.
+    model = mtile.model
+    if get(model.options, :exchange_realization, EXCHANGE_REALIZATION_DEFAULT)::Bool
+        ctr = condensate_transform_mode(model.options)
+        rtr = rain_transform_mode(model.options)
+        itr = ice_on ? ice_transform_mode(model.options) : :none
+        if ctr !== :none || rtr !== :none || itr !== :none ||
+           vapor_transform_mode(model.options) !== :none
+            pp = model.physical_params
+            _etd_exchange_realization!(vnp1, mtile.tile.physical, S, colstart, model.ts,
+                ctr, get(pp, :condensate_mu, 1.0e-7), rtr, get(pp, :rain_mu, 1.0e-7),
+                itr, ice_on ? ice_mu(pp, 1) : 1.0, rv_i,
+                ice_on ? IS.i1_q : 0, ice_on ? IS.i2_q : 0, ice_on ? IS.i3_q : 0,
+                mc_nu_vbar(mtile), vapor_transform_mode(model.options),
+                vapor_mu(model.physical_params))
+        end
+    end
+    eb_on && eb_mark!(eb, EB_EXCH, vnp1, colstart)
+    # The LOBE RELAXATION (Stage L; `lobe_relaxation_increment`), applied in the same phase as
+    # the condensation increments it sits beside, and bounded by the post-advance value so the
+    # device never lifts a slot above ν = 0: no recovered mass moves, ρ_t and the vapor are
+    # untouched. The rain and ice masses are TOTALS (the slot is ν); the cloud slot is a
+    # perturbation against ν̄_c, recovered here as the state-`n` total minus the state-`n`
+    # slot (an exact 0.0 whenever ρ̄_c ≡ 0, which is every current configuration). Number and
+    # habit moments are never touched.
+    if lobe_relaxation_on(mtile.model.options)
+        phys = mtile.tile.physical
+        # The Stage L census (`MC_LOBE_*`): the APPLIED increments' column integrals, per
+        # species, with the column quadrature; read only.
+        wz = eb.wz
+        cen = length(wz) == length(lam) && size(mtile.mc_water_stats, 2) > 0
+        # THE PAIRED STAGE L (plan E5): the vapor pays the lobe's Δν, so ρ_w is invariant.
+        lc, lr, l1, l2, l3 = _lobe_relax_paired!(vnp1, phys, S, colstart, rv_i,
+            ice_on ? IS.i1_q : 0, ice_on ? IS.i2_q : 0, ice_on ? IS.i3_q : 0, ice_on,
+            water_anchor_set(model.options, model.physical_params, IS), mc_nu_vbar(mtile),
+            vapor_transform_mode(model.options), vapor_mu(model.physical_params), wz, cen)
+        if cen
+            st = mtile.mc_water_stats
+            tid = Threads.threadid()
+            wc = @inbounds eb.wxn[div(colstart - 1, length(lam)) + 1]
+            @inbounds begin
+                st[MC_LOBE_C, tid] += wc * lc
+                st[MC_LOBE_R, tid] += wc * lr
+                st[MC_LOBE_I1, tid] += wc * l1
+                st[MC_LOBE_I2, tid] += wc * l2
+                st[MC_LOBE_I3, tid] += wc * l3
+            end
+        end
+    end
+    eb_on && eb_mark!(eb, EB_LOBE, vnp1, colstart)
+    return nothing
+end
+
+# ── Semi-implicit adjustment ───────────────────────────────────────────────────
+
+"""
+    semiimplicit_adjustment_p(mtile, colstart, colend, t)
+
+Semi-implicit acoustic solve for the total-energy set — the ONLY integrator of the
+reference-linear vertical acoustic terms (the explicit acoustic mode was removed; the
+AB3 predictor advances the acoustic remainder). Applies the AI2* explicit history
+weights (`-1.0 Lⁿ + 0.75 Lⁿ⁻¹`, staged spline-consistently in `mc_driver!`), then
+solves the Helmholtz problem `∂z(Δτ² Pξ̄(z) ∂z φ) - φ` for the vertical mass flux
+`φ = ρ̄_t w` from the implicit pair `∂φ/∂t = -∂z p'`, `∂p'/∂t = -Pξ̄(z) ∂z φ`, with
+`Pξ̄(z)` the LOCAL reference sound speed squared (`mc_ref_diag.Pxi_prof` — a
+domain-mean c̄² is the classic SHB78 reference-state instability above Co_z ≈ 4.5
+on a stratified base), and recovers `w = φ/ρ̄_t` and `p' = p'* - Δτ Pξ̄(z) ∂z φ`. The density and energy slots are
+slaved to the flux in flux form: `rho_d' -= Δτ ∂z(ρ̄_d/ρ̄_t φ)`, `E_t' -= Δτ ∂z((Ē_t+p̄)/ρ̄_t φ)`,
+with ρ̄_t the derived reference ρ̄_t^w (ρ̂ the derived ρ_t on the state-dependent path). Because the history
+staging mirrors this operator chain exactly, no part of the linear acoustic operator
+is left under explicit weights — the scheme has no vertical-acoustic Courant limit.
+
+Under `options[:si_water_slots] = :mass | :all` (src/si_water_slaving.jl) the water slots are
+slaved to the same φ in flux form, `ν_k' −= Δτ (c_k φ_z + c_{k,z} φ)`, with their AI2*
+histories applied here too, so that the derived total moves by `Δ(ρ_d' + Σ α_k ν_k') = −Δτ ∂z φ`
+to rounding; on the state-dependent path ρ_d's coefficient then shares their denominator,
+`ρ_d/(ρ_d + Σ α_k ν_k)`. Under the library default `:none` the water slots take their acoustic
+compression explicitly and the derived total moves by ρ_d's increment alone.
+"""
+function semiimplicit_adjustment_p(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64;
+        apply_histories::Bool=true)
+    # apply_histories = false: the exact_si path applies the AI2* explicit
+    # history levels in phase A (apply_acoustic_histories!, so the patch-level
+    # solve sees the complete X*); the predictors arriving here already carry
+    # them and the history roll has been done. The default (true) is the
+    # production vertical-only path, bitwise unchanged.
+
+    vars = mtile.model.grid_params.vars
+    p_index = vars["p"]
+    rhod_index = vars["rho_d"]
+    w_index = vars["w"]
+    et_index = vars["E_t"]
+    ts = mtile.model.ts
+
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+
+    # Predictors (copies — they are mutated below, so these must NOT be views onto var_np1)
+    # and implicit tendency histories (views).
+    p_nstar = S.si_p_nstar;       copyto!(p_nstar, view(mtile.var_np1,colstart:colend,p_index))
+    w_nstar = S.si_w_nstar;       copyto!(w_nstar, view(mtile.var_np1,colstart:colend,w_index))
+    rhod_nstar = S.si_rhod_nstar; copyto!(rhod_nstar, view(mtile.var_np1,colstart:colend,rhod_index))
+    et_nstar = S.si_et_nstar;     copyto!(et_nstar, view(mtile.var_np1,colstart:colend,et_index))
+
+    # Reference profiles and the LOCAL sound-speed-squared profile (views/vectors —
+    # read-only, loop-invariant; see the staging comment in mc_driver!)
+    Pxi_bar = mtile.mc_ref_diag.Pxi_prof
+    rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
+    rho_dbar_z = view(ref_rho_d(mtile.ref_state),:,2)
+    # the total-density reference every reader takes (the derived ρ̄_t^w; `mc_rho_tbar_ref`)
+    rho_tbar = view(mc_rho_tbar_ref(mtile),:,1)
+    rho_tbar_z = view(mc_rho_tbar_ref(mtile),:,2)
+    E_tbar = view(ref_total_energy(mtile.ref_state),:,1)
+    E_tbar_z = view(ref_total_energy(mtile.ref_state),:,2)
+    pbar = view(ref_pressure(mtile.ref_state),:,1)
+    pbar_z = view(ref_pressure(mtile.ref_state),:,2)
+
+    # State-dependent linearization (options[:state_dependent_si]): every
+    # coefficient of the implicit pair — Pξ, the mass-flux density ρ̂_t, and
+    # the slaved-leg chains — comes from the CURRENT column state (the driver's
+    # scratch, filled this column on this thread, frozen at time n), and the
+    # Helmholtz matrix is refactorized per column with that Pξ profile. The
+    # remainder/history staging in mc_driver! uses the SAME coefficients, so
+    # the operator-consistency cancellation holds at finite amplitude — the
+    # resting-reference form leaves δ·Co_z of the grid-scale operator explicit
+    # in a convective core with state deviation δ (reference/SI_CONVECTIVE_CEILING.md).
+    sd_si = get(mtile.model.options, :state_dependent_si, false)::Bool
+    if sd_si && mtile.solve_data === nothing
+        error("options[:state_dependent_si] requires the cubic B-spline (RiRk) " *
+              "vertical — the per-column profile Helmholtz is not implemented " *
+              "for the Chebyshev vertical")
+    end
+    # (Pxi_bar and S.sd_pxi are both Vector{Float64}, so this binding is
+    # type-stable; ρ̂ is branched at each use site instead — a `? S.rho_t :
+    # rho_tbar` union of Vector and SubArray boxes every broadcast it touches,
+    # which showed up as per-column allocations in the flag-OFF path.)
+    Pxi_vec = sd_si ? S.sd_pxi : Pxi_bar
+
+
+    # Off-centered AI2* history terms (Durran & Blossey 2012). The AB3 predictor carries
+    # only the acoustic REMAINDER, so the linear terms enter purely here: the explicit
+    # history levels -1.0 Lⁿ + 0.75 Lⁿ⁻¹ now, the implicit +1.25 L̃ⁿ⁺¹ through the
+    # Helmholtz solve below. impdot is staged in mc_driver! with the same discrete
+    # operator chain the solve applies, so every AI2* level sees ONE operator (the old
+    # subtract-AB3/add-implicit form mixed pointwise and fitted operators, leaving a
+    # grid-scale residual under explicit weights — the vertical-acoustic Courant ceiling
+    # of reference/SI_VERTICAL_CEILING.md). The first step is AM2 trapezoidal (+0.5 Lⁿ with the
+    # ts_term = 0.5·ts solve); its history seed gives t == 2 the full AI2* weights.
+    ts_term = (t == 1) ? 0.5 * ts : 1.25 * ts
+    if apply_histories
+        for index in (p_index, w_index, rhod_index, et_index)
+            nstar = index == p_index ? p_nstar :
+                    index == w_index ? w_nstar :
+                    index == rhod_index ? rhod_nstar : et_nstar
+            dot_n = view(mtile.impdot_n,colstart:colend,index)
+            dot_nm1 = view(mtile.impdot_nm1,colstart:colend,index)
+            if (t == 1)
+                nstar .= @. nstar + (ts * 0.5 * dot_n)
+            else
+                nstar .= @. nstar + (ts * ((0.75 * dot_nm1) - dot_n))
+            end
+            dot_nm1 .= dot_n
+        end
+    end
+
+    # Take the vertical derivative of the p' predictor (coefficient 1: the pair is
+    # ∂φ/∂t = -∂z p'; Pxi_bar enters in the p' update instead)
+    # Distinct scratch columns per variable: `p_nstar` below aliases `p_col.uMish`, and is
+    # still read after `phi_col` has been transformed — so these two must not be the same
+    # object. Keyed on p_index vs w_index, they are not.
+    p_col = scratch_column(mtile, p_index)
+    p_col.uMish .= p_nstar
+    Btransform!(p_col)
+    Atransform!(p_col)
+    p_nstar = Itransform!(p_col)
+    p_nstar_z = S.si_p_nstar_z
+    Ixtransform(p_col, p_nstar_z)
+    p_nstar_z .*= ts_term
+
+    # Mass-flux Helmholtz RHS (φ = ρ̄_t w): rhs = Δτ ∂z p'* - ρ̄_t w*.
+    # Elimination gives (∂z(Δτ² Pξ̄(z) ∂z ·) - I) φ (profile coefficient — the
+    # weighted-stiffness Galerkin form on RiRk).
+    rhs = S.si_rhs
+    if sd_si
+        @. rhs = p_nstar_z - (S.rho_t * w_nstar)
+    else
+        @. rhs = p_nstar_z - (rho_tbar * w_nstar)
+    end
+    phi_col = scratch_column(mtile, w_index)
+    if sd_si
+        # Per-column, per-step factorization with the state's Pξⁿ profile
+        # (w-Dirichlet rows, flags passed explicitly — no registry traffic).
+        @. S.sd_alpha = (ts_term * ts_term) * Pxi_vec
+        h_sd = _assemble_sd_helmholtz(mtile.solve_data, S.sd_alpha, true, true)
+        _vertical_solve!(phi_col, h_sd, rhs, mtile; dirichlet=(true, true))
+    elseif t == 1
+        # Calculate the Helmholtz matrix for the first time step
+        h_a = calc_Helmholtz_semiimplicit_matrix(mtile.tile, mtile.model, Pxi_bar, ts_term)
+        _vertical_solve!(phi_col, h_a, rhs, mtile)
+    else
+        # Use the pre-calculated one
+        _vertical_solve!(phi_col, mtile.h_matrix, rhs, mtile)
+    end
+
+    phi = Itransform!(phi_col)
+    phi_z = S.si_phi_z
+    Ixtransform(phi_col, phi_z)
+
+    # Recover w_n+1 = φ_n+1 / ρ̂_t
+    if sd_si
+        view(mtile.var_np1,colstart:colend,w_index) .= phi ./ S.rho_t
+    else
+        view(mtile.var_np1,colstart:colend,w_index) .= phi ./ rho_tbar
+    end
+
+    # Recover p'_n+1 = p'* - Δτ Pξ ∂z φ_n+1
+    view(mtile.var_np1,colstart:colend,p_index) .= p_nstar .- (ts_term .* Pxi_vec .* phi_z)
+
+    # Slaved flux-form updates ∂z(c φ) = c φ_z + c_z φ, pointwise from the solve's
+    # φ and φ_z — the exact form the AI2* history staging in mc_driver! mirrors, so
+    # the slaved slots see one discrete operator across all time levels.
+    c_d = S.si_c_d
+    c_d_z = S.si_c_d_z
+    if sd_si
+        @. c_d = S.rho_d / S.rho_t
+        @. c_d_z = ((S.rho_d_z * S.rho_t) - (S.rho_d * S.rho_t_z)) / (S.rho_t^2)
+    else
+        @. c_d = rho_dbar / rho_tbar
+        @. c_d_z = ((rho_dbar_z * rho_tbar) - (rho_dbar * rho_tbar_z)) / (rho_tbar^2)
+    end
+    view(mtile.var_np1,colstart:colend,rhod_index) .=
+        rhod_nstar .- (ts_term .* ((c_d .* phi_z) .+ (c_d_z .* phi)))
+
+    c_e = S.si_c_e
+    c_e_z = S.si_c_e_z
+    if sd_si
+        @. c_e = (S.E_t + S.p) / S.rho_t
+        @. c_e_z = (((S.E_t_z + S.p_z) * S.rho_t) -
+                    ((S.E_t + S.p) * S.rho_t_z)) / (S.rho_t^2)
+    else
+        @. c_e = (E_tbar + pbar) / rho_tbar
+        @. c_e_z = (((E_tbar_z + pbar_z) * rho_tbar) -
+                    ((E_tbar + pbar) * rho_tbar_z)) / (rho_tbar^2)
+    end
+    view(mtile.var_np1,colstart:colend,et_index) .=
+        et_nstar .- (ts_term .* ((c_e .* phi_z) .+ (c_e_z .* phi)))
+
+    # The slaved WATER slots (`options[:si_water_slots]`; src/si_water_slaving.jl): their AI2*
+    # histories, and `ν_k' −= Δτ (c_k φ_z + c_{k,z} φ)` so that Δ(ρ_d' + Σ α_k ν_k') = −Δτ φ_z
+    # to rounding (on the state-dependent path ρ_d is re-advanced with
+    # c_d = ρ_d/ρ̂^w). ONE call, for the compile cliff; a no-op under the library default `:none`.
+    _siw_solve!(mtile.var_np1, mtile.impdot_n, mtile.impdot_nm1, colstart, colend, t, ts,
+                ts_term, apply_histories, sd_si, phi, phi_z, mtile.tile.physical, S.rho_d,
+                S.rho_d_z, c_d, c_d_z, rhod_nstar, rhod_index, mtile.model.options,
+                mtile.model.physical_params, mtile.mc_slots, mc_nu_vbar(mtile),
+                mc_nu_vbar_z(mtile), Springsteel.ref_rho_c(mtile.ref_state))
+
+    # Store the applied implicit w increment as the next step's w history (see the
+    # staging comment in mc_driver!): the exact operator the Helmholtz elimination
+    # applied to the w leg, which no pointwise staging can reproduce. On the first
+    # step, seed the n-1 level too so t == 2 has a full AI2* history on the w leg.
+    view(mtile.impdot_n,colstart:colend,w_index) .=
+        (view(mtile.var_np1,colstart:colend,w_index) .- w_nstar) ./ ts_term
+    if t == 1
+        view(mtile.impdot_nm1,colstart:colend,w_index) .=
+            view(mtile.impdot_n,colstart:colend,w_index)
+    end
+end
+
+# ── Implicit vertical diffusion ────────────────────────────────────────────────
+
+"""
+    diffusion_timestep_mc(mtile, colstart, colend, t)
+
+Implicit vertical diffusion of `u` and `w` (momentum, `Kvdiff`) and the moist entropy `s_t'`
+(heat, `Kvdiff_heat`) for the total-energy set, using the AI2* off-centered weights
+(`+1.25 N^{n+1} - 1.0 N^n + 0.75 N^{n-1}`) with the tendency history in `mtile.diffdot_*`.
+It needs its own tendency channel because the acoustic solve owns `impdot[w/p/E_t]`.
+The momentum and heat solves are gated independently on their coefficients: a K = 0
+solve is not the identity (it refits the column and reapplies the spectral filter), so a
+zero coefficient must skip its solve entirely, leaving the post-acoustic state untouched.
+
+Runs AFTER [`semiimplicit_adjustment_p`](@ref). The density fields are NOT re-slaved to the
+post-diffusion `w` — momentum diffusion is a force, not a mass flux, and they were already
+advanced with the acoustic flux divergence. The residual is the usual O(ts·Kv) splitting
+error.
+
+The heat path retrieves the post-acoustic temperature (the star state) through
+the same closed-form retrieval `mc_driver!` uses; the resting base stays bit-preserved
+because the reference profile `s_tbar` comes from the same pipeline
+(`mc_reference_diagnostics`).
+
+Energy routing:
+
+- **Friction is a resolved-KE sink, not heat.** With an eddy diffusivity the resolved KE the
+  momentum solve removes goes to the subgrid cascade (the future TKE shear production), and
+  the molecular heating is negligible. So `E_t += rho_t δke` (E_t follows the KE down),
+  holding internal energy — `T` and `p` are unchanged by friction.
+- **Heat.** The `s_t` increment maps at fixed `rho_d` and composition via `∂s_t/∂T = C_vt/T`:
+  `δT = (T/C_vt) δs_t`, `δE_t = rho_d T δs_t`, `δp = rho_d R_m δT`, and
+  `δQ_ss = -(∂ρ_vs/∂T δT + ∂ρ_vs/∂p δp)` (so `Q_ss = ρ_v - ρ_vs` tracks the diabatic heating).
+- **Water.** Not diffused here: `physical_params[:Kvdiff_water] > 0` is refused
+  ([`validate_water_anchor`](@ref)). Its implicit solve read the prognostic ρ_t (slot 3) as the
+  total water and went with it at Stage 4 of the ρ_t retirement; the vertical water mixing is
+  the boundary layer's (MYNN, Louis), in ν space.
+"""
+diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64) =
+    diffusion_timestep_mc(mtile, colstart, colend, t, MCCartesianXZ())
+
+function diffusion_timestep_mc(mtile::ModelTile, colstart::Int64, colend::Int64, t::Int64,
+                               geom::MCGeometry)
+
+    vars = mtile.model.grid_params.vars
+    p_index = vars["p"]
+    rhod_index = vars["rho_d"]
+    u_index = vars["u"]
+    w_index = vars["w"]
+    et_index = vars["E_t"]
+    qss_index = vars["Q_ss"]
+    rhor_index = mc_slot(vars, "rho_r")
+    rhoc_index = mc_slot(vars, "rho_c")
+    rhov_index = mc_slot(vars, "rho_v")
+
+    ts = mtile.model.ts
+
+    Kvdiff = mtile.model.physical_params[:Kvdiff]
+    Kvdiff_heat = get(mtile.model.physical_params, :Kvdiff_heat, Kvdiff)
+    do_momentum = Kvdiff > 0.0
+    do_heat = Kvdiff_heat > 0.0
+
+    pbar = view(ref_pressure(mtile.ref_state),:,1)
+    rho_dbar = view(ref_rho_d(mtile.ref_state),:,1)
+    E_tbar = view(ref_total_energy(mtile.ref_state),:,1)
+    rho_cbar = view(Springsteel.ref_rho_c(mtile.ref_state),:,1)
+    # The DERIVED reference the vapor slot is carried against; see `mc_reference_diagnostics`.
+    rho_vbar = mtile.mc_ref_diag.rho_vbar
+    z = view(mtile.tilepoints,colstart:colend,zcoord(geom))
+
+    S = @inbounds mtile.mc_scratch[Threads.threadid()]
+
+    # Post-acoustic totals (the star state)
+    vnp1 = mtile.var_np1
+    # Bind the views OUTSIDE the `@.` blocks below — `@.` dots every call in the expression,
+    # `view` included, which broadcasts the view itself instead of its contents.
+    u_v = view(vnp1,colstart:colend,u_index)
+    w_v = view(vnp1,colstart:colend,w_index)
+    p_v = view(vnp1,colstart:colend,p_index)
+    rhod_v = view(vnp1,colstart:colend,rhod_index)
+    et_v = view(vnp1,colstart:colend,et_index)
+    qss_v = view(vnp1,colstart:colend,qss_index)
+    rhor_v = view(vnp1,colstart:colend,rhor_index)
+    rhoc_v = view(vnp1,colstart:colend,rhoc_index)
+    rhov_v = view(vnp1,colstart:colend,rhov_index)
+
+    u_star = S.df_u_star; copyto!(u_star, u_v)
+    w_star = S.df_w_star; copyto!(w_star, w_v)
+    v_v = mc_v_np1_view(geom, vnp1, colstart, colend, vars)
+    v_star = mc_v_star!(geom, S, v_v)
+    p_star = S.df_p_star;         @. p_star = p_v + pbar
+    rho_d_star = S.df_rho_d_star; @. rho_d_star = rhod_v + rho_dbar
+    # the derived total of the star state, ρ_d* + Σ_k α_k ν_k*
+    rho_t_star = S.df_rho_t_star
+    _anchor_star!(rho_t_star, vnp1, colstart,
+                  water_anchor_set(mtile.model.options, mtile.model.physical_params,
+                                   mtile.mc_slots),
+                  rho_d_star, mc_nu_vbar(mtile),
+                  view(Springsteel.ref_rho_c(mtile.ref_state), :, 1))
+
+    # The heat map needs the retrieved star-state thermodynamics; the momentum-only path
+    # skips the retrieval entirely.
+    T_star = S.df_T_star
+    p_hPa_star = S.df_p_hPa_star
+    drvs_dT = S.df_drvs_dT
+    drvs_dp = S.df_drvs_dp
+    rho_v_star = S.df_rho_v_star
+    C_vt_star = S.df_C_vt_star
+    R_m_star = S.df_R_m_star
+    Lv_star = S.df_Lv_star
+    ke_star = S.df_ke_star
+    stp_star = S.df_stp_star
+    rho_c_star = S.df_rho_c_star
+    rho_r_star = S.df_rho_r_star
+    rho_liq_star = S.df_rho_liq_star
+    if do_heat
+        E_t_star = S.df_E_t_star;   @. E_t_star = et_v + E_tbar
+        mc_ke_star!(ke_star, geom, u_star, w_star, v_star)
+        M_star = S.df_M_star
+        @. M_star = p_star + E_t_star - (rho_t_star * (ke_star + (gravity * z)))
+        # Same closed-form retrieval and residual partition as mc_driver!: the
+        # condensate is prognostic, so the star state needs no iteration and no clamp.
+        # Slot 9 recovery, same rule as mc_driver!: the slot holds the control variable and
+        # the density is recovered pointwise. `:none` is bitwise `rhoc_v + rho_cbar`.
+        ct = condensate_transform_mode(mtile.model.options)
+        if ct === :none
+            @. rho_c_star = rhoc_v + rho_cbar
+        else
+            cmu_s = get(mtile.model.physical_params, :condensate_mu, 1.0e-7)
+            if ct === :bhyp
+                @. rho_c_star = ahyp(rhoc_v + bhyp(rho_cbar, cmu_s), cmu_s)
+            else
+                @. rho_c_star = ahyp_smooth(rhoc_v + bhyp(rho_cbar, cmu_s), cmu_s)
+            end
+        end
+        # Slot 8 likewise. Rain has no reference profile, so the slot IS the control variable
+        # and `:none` is a copy of identical doubles — bitwise inert.
+        rt = rain_transform_mode(mtile.model.options)
+        if rt === :none
+            copyto!(rho_r_star, rhor_v)
+        else
+            rmu_s = get(mtile.model.physical_params, :rain_mu, 1.0e-7)
+            if rt === :bhyp
+                @. rho_r_star = ahyp(rhor_v, rmu_s)
+            else
+                @. rho_r_star = ahyp_smooth(rhor_v, rmu_s)
+            end
+        end
+        # Same thermodynamic interface as mc_driver!, so the same floor applies: T_star and
+        # q_l_star are read through it, and a star state that disagreed with the n state
+        # about what the liquid IS would put the difference into every increment built here.
+        # `:none` (the default) leaves this a copy of identical doubles -- bitwise inert.
+        # NOT applied to `rho_v_star` two lines down: that is the water partition, and
+        # flooring a partition manufactures vapor. See `condensate_floor_mode`.
+        if condensate_floor_mode(mtile.model.options)
+            @. rho_liq_star = max(rho_c_star, 0.0) + max(rho_r_star, 0.0)
+        else
+            @. rho_liq_star = rho_c_star + rho_r_star
+        end
+        # The ICE mass of the star state, recovered from the three appended mass slots the
+        # same way slot 8 is (all three are TOTALS under one transform family). Nothing here
+        # DIFFUSES the ice — but the star-state thermodynamics still has to SEE it, or
+        # `T_star`, `C_vt_star` and
+        # `stp_star` would describe a column with the ice mass removed and the heat increment
+        # built from them would carry that error. Exact zeros with ice off, hence bitwise.
+        rho_ice_star = S.df_rho_ice_star
+        rho_ice_t_star = S.df_rho_ice_t_star
+        if ice_registered(mtile.mc_slots)
+            it = ice_transform_mode(mtile.model.options)
+            imu_s = ice_mu(mtile.model.physical_params, 1)
+            i1q_v = view(vnp1, colstart:colend, mtile.mc_slots.i1_q)
+            i2q_v = view(vnp1, colstart:colend, mtile.mc_slots.i2_q)
+            i3q_v = view(vnp1, colstart:colend, mtile.mc_slots.i3_q)
+            @. rho_ice_star = (recover_total(i1q_v, it, imu_s) +
+                               recover_total(i2q_v, it, imu_s)) +
+                              recover_total(i3q_v, it, imu_s)
+            if condensate_floor_mode(mtile.model.options)
+                @. rho_ice_t_star = (max(recover_total(i1q_v, it, imu_s), 0.0) +
+                                     max(recover_total(i2q_v, it, imu_s), 0.0)) +
+                                    max(recover_total(i3q_v, it, imu_s), 0.0)
+            else
+                copyto!(rho_ice_t_star, rho_ice_star)
+            end
+        else
+            fill!(rho_ice_star, 0.0)
+            fill!(rho_ice_t_star, 0.0)
+        end
+        # The PROGNOSTIC vapor of the star state, `ρ_v'* + ρ̄_v` — the same
+        # `perturbation + derived reference` construction `mc_driver!` stages, so the star
+        # state and the n state agree about what the vapor IS. It used to be reassembled here
+        # as the density residual, which is now a DIFFERENT number by the reconciliation gap;
+        # reading the slot is what keeps the two phases consistent. Formed BEFORE the
+        # temperature (it used to follow it), because under `:eos` the temperature reads it.
+        # Under the vapor control variable, the RECOVERED star vapor `ahyp(ν_v'* + ν̄_v)`.
+        if vapor_transform_mode(mtile.model.options) !== :none
+            nu_vbar_d = mc_nu_vbar(mtile)
+            vmu_d = vapor_mu(mtile.model.physical_params)
+            @. rho_v_star = ahyp(rhov_v + nu_vbar_d, vmu_d)
+        else
+            @. rho_v_star = rhov_v + rho_vbar
+        end
+        # The star-state temperature in the run's mode — the SAME choice and the same
+        # unfloored prognostic vapor as `mc_driver!`, so the increments built here and the
+        # state they are applied to agree about T (see `temperature_mode`).
+        if temperature_mode(mtile.model.options) === :eos
+            @. T_star = eos_temperature(p_star, rho_d_star, rho_v_star)
+        else
+            @. T_star = retrieve_temperature(M_star, rho_d_star, rho_t_star, rho_liq_star,
+                                             rho_ice_t_star)
+        end
+        @. p_hPa_star = p_star / 100.0
+        @. drvs_dT = drho_vsat_dT(T_star, p_hPa_star)
+        @. drvs_dp = drho_vsat_dp(T_star, p_hPa_star)
+        rho_vs_star = S.df_rho_vs_star
+        @. rho_vs_star = rho_v_sat(T_star, p_hPa_star)
+        q_v_star = S.df_q_v_star
+        q_l_star = S.df_q_l_star
+        q_i_star = S.df_q_i_star
+        @. q_v_star = rho_v_star / rho_d_star
+        @. q_l_star = rho_liq_star / rho_d_star     # thermodynamic reader: floored if enabled
+        @. q_i_star = rho_ice_t_star / rho_d_star   # ditto; exactly 0.0 with ice off
+        @. C_vt_star = Cvd + (q_v_star * Cvv) + (q_l_star * Cl) + (q_i_star * Ci)
+        @. R_m_star = Rd + (q_v_star * Rv)
+        @. Lv_star = L_v(T_star)
+        @. stp_star = moist_entropy_total(T_star, rho_d_star, q_v_star, q_l_star, q_i_star)
+        stp_star .-= mtile.mc_ref_diag.s_tbar
+    end
+
+    # Implicit tendency histories (slot 6 carries the s_t ENTROPY tendency, not an E_t one)
+    udot_n = view(mtile.diffdot_n,colstart:colend,u_index)
+    udot_nm1 = view(mtile.diffdot_nm1,colstart:colend,u_index)
+    wdot_n = view(mtile.diffdot_n,colstart:colend,w_index)
+    wdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,w_index)
+    sdot_n = view(mtile.diffdot_n,colstart:colend,et_index)
+    sdot_nm1 = view(mtile.diffdot_nm1,colstart:colend,et_index)
+
+    # Pre-factorized in createModelTile, per variable and per timestep coefficient (the
+    # first step uses the AM2 coefficient), so nothing is factorized per column here.
+    mats = mtile.mc_diffusion_matrices
+
+    # One scratch column serves all three solves: the boundary conditions live in the
+    # factorization, and neither `_vertical_solve!` nor `Itransform!` consults the
+    # column's own BCs (only Btransform!/Atransform! do). Same reuse as
+    # `diffusion_timestep_pd`, which shares one column across five variables.
+    col = scratch_column(mtile, u_index)
+
+    # ── Momentum (Kvdiff): friction is a resolved-KE sink, E_t follows the KE down;
+    #    T, p, Q_ss held. ──
+    dE_visc = S.df_dE_visc
+    if do_momentum
+        u_nstar = S.df_u_nstar
+        w_nstar = S.df_w_nstar
+        if (t == 1)
+            # Use trapezoidal method (AM2) for first step
+            @. u_nstar = u_star + (ts * 0.5 * udot_n)
+            @. w_nstar = w_star + (ts * 0.5 * wdot_n)
+        else
+            # Use AI2* for second step and beyond
+            @. u_nstar = u_star - (ts * udot_n) + (ts * 0.75 * udot_nm1)
+            @. w_nstar = w_star - (ts * wdot_n) + (ts * 0.75 * wdot_nm1)
+        end
+        udot_nm1 .= udot_n
+        wdot_nm1 .= wdot_n
+
+        h_u = (t == 1) ? mats.u_first : mats.u
+        h_w = (t == 1) ? mats.w_first : mats.w
+        # u_np1 and w_np1 must be copied out: `col` is reused by the next solve, and
+        # Itransform! returns the column's own buffer.
+        u_np1 = S.df_u_np1
+        w_np1 = S.df_w_np1
+        _vertical_solve!(col, h_u, u_nstar, mtile)
+        copyto!(u_np1, Itransform!(col))
+
+        _vertical_solve!(col, h_w, w_nstar, mtile)
+        copyto!(w_np1, Itransform!(col))
+
+        v_np1 = mc_v_diffusion_solve!(geom, S, mtile, col, mats, ts, t,
+                                      colstart, colend, v_star)
+
+        dke = S.df_dke
+        mc_dke!(dke, geom, u_np1, w_np1, u_star, w_star, v_np1, v_star)
+        @. dE_visc = rho_t_star * dke
+
+        u_v .= u_np1
+        w_v .= w_np1
+        mc_assign_v!(geom, v_v, v_np1)
+    end
+
+    # ── Heat (Kvdiff_heat): moist entropy increment -> (T, p, E_t, Q_ss) at fixed
+    #    rho_d and composition via ∂s_t/∂T = C_vt/T (dry limit: C_vt=C_vd, R_m=R_d). ──
+    dE_h = S.df_dE_h
+    if do_heat
+        s_nstar = S.df_s_nstar
+        if (t == 1)
+            @. s_nstar = stp_star + (ts * 0.5 * sdot_n)
+        else
+            @. s_nstar = stp_star - (ts * sdot_n) + (ts * 0.75 * sdot_nm1)
+        end
+        sdot_nm1 .= sdot_n
+
+        h_h = (t == 1) ? mats.heat_first : mats.heat
+        _vertical_solve!(col, h_h, s_nstar, mtile)
+        stp_np1 = Itransform!(col)
+
+        ds_t = S.df_ds_t; @. ds_t = stp_np1 - stp_star
+        dT_h = S.df_dT_h; @. dT_h = (T_star / C_vt_star) * ds_t
+        @. dE_h = rho_d_star * T_star * ds_t
+        dp_h = S.df_dp_h; @. dp_h = rho_d_star * R_m_star * dT_h
+        dQ_h = S.df_dQ_h; @. dQ_h = -((drvs_dT * dT_h) + (drvs_dp * dp_h))
+
+        p_v .+= dp_h
+        qss_v .+= dQ_h
+    end
+
+    # E_t update: keep the single fused add when the historical pair ran (bit-identical
+    # to the pre-water combined update), and touch E_t only with computed terms. Written as
+    # loops (the same `e + (a + b)` association as the broadcast): handing the `et_v` view to
+    # a non-inlined `materialize!` boxed it, one allocation per call once Stage 4 shrank this
+    # function and changed the inliner's choices.
+    if do_momentum && do_heat
+        @inbounds for i in eachindex(et_v, dE_visc, dE_h)
+            et_v[i] = et_v[i] + (dE_visc[i] + dE_h[i])
+        end
+    elseif do_momentum
+        @inbounds for i in eachindex(et_v, dE_visc)
+            et_v[i] = et_v[i] + dE_visc[i]
+        end
+    elseif do_heat
+        @inbounds for i in eachindex(et_v, dE_h)
+            et_v[i] = et_v[i] + dE_h[i]
+        end
+    end
+end
+
+# ── Initial conditions and reference writer ────────────────────────────────────
+
+"""
+    write_exact_ref_mc(path, z, p_Pa, rho_d, rho_v, rho_c)
+
+Write a pressure-based exact reference state file (`z p rho_d rho_v rho_c` per line,
+p in Pa) in the format read by `Springsteel.exact_pressure_reference_state`. `z`
+values are written with `string()` so they match the model gridpoints exactly when
+generated in-process.
+"""
+function write_exact_ref_mc(path::String, z::Vector{Float64}, p_Pa::Vector{Float64},
+                            rho_d::Vector{Float64}, rho_v::Vector{Float64},
+                            rho_c::Vector{Float64})
+    open(path, "w") do f
+        for i in 1:length(z)
+            println(f, "$(z[i]) $(p_Pa[i]) $(rho_d[i]) $(rho_v[i]) $(rho_c[i])")
+        end
+    end
+    return path
+end
+
+"""
+    theta_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dtheta_max)
+
+Dry warm-bubble initial condition for the total-energy set on a
+`PressureReferenceState`. The constant-pressure θ perturbation mirrors
+[`theta_bubble_pd!`](@ref) but writes the moist_compressible slots: p' = 0 (constant
+pressure), rho_d' from the dry EOS (the derived rho_t' = rho_d' in dry air), E_t' from the BF02
+internal energy at rest, and Q_ss' tracking -ρ_v*(T, p̄) in the dry air.
+"""
+function theta_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                          ref::Springsteel.PressureReferenceState;
+                          xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0, dtheta_max=2.0,
+                          condensate_transform::Symbol=:none, condensate_mu=1.0e-7,
+                          rain_transform::Symbol=:none, rain_mu=1.0e-7,
+                          vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]
+    et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
+    rho_c_i = mc_slot(vars, "rho_c")
+    # The prognostic VAPOR slot, present in every configuration of this set (see `MC_VARS`).
+    rho_v_i = mc_slot(vars, "rho_v")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            dtheta = L <= 1.0 ? dtheta_max * (cos(pi * L / 2.0))^2 : 0.0
+            p_ref = pbar[k, 1]                              # Pa
+            rho_dref = rho_dbar[k, 1]
+            T_ref = p_ref / (Rd * rho_dref)                 # dry EOS
+            exner = (p_0 * 100.0 / p_ref)^(Rd / Cpd)
+            theta = (T_ref * exner) + dtheta
+            Tk = theta / exner
+            rho_d = p_ref / (Rd * Tk)                       # constant-pressure perturbation
+            E_t = (rho_d * internal_energy_bf02(Tk, 0.0, 0.0)) + (rho_d * gravity * z)
+            Q_ss = -rho_v_sat(Tk, p_ref / 100.0)
+            patch.physical[i, p_i, 1] = 0.0
+            patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            # Dry air: the state carries no vapor, so the slot is the negated reference.
+            patch.physical[i, rho_v_i, 1] =
+                vapor_slot(0.0, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1],
+                           vapor_transform, vapor_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
+            i += 1
+        end
+    end
+    return patch
+end
+
+"""
+    temperature_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dT_max)
+
+Straka et al. (1993) cold-bubble initial condition for the total-energy set on a
+`PressureReferenceState`. A constant-pressure temperature perturbation
+`ΔT = dT_max (cos(πL)+1)/2` for `L ≤ 1` (identical to the `cos²(πL/2)` shape used by
+[`theta_bubble_mc!`](@ref)) is applied to the dry reference profile: p' = 0,
+rho_d' from the dry EOS at the perturbed temperature (the derived rho_t' = rho_d'), E_t' from the BF02 internal
+energy at rest, and Q_ss' tracking `-ρ_v*(T, p̄)` in the dry air.
+"""
+function temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                ref::Springsteel.PressureReferenceState;
+                                xc=0.0, xr=4000.0, zc=3000.0, zr=2000.0, dT_max=-15.0,
+                                condensate_transform::Symbol=:none, condensate_mu=1.0e-7,
+                          rain_transform::Symbol=:none, rain_mu=1.0e-7,
+                          vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]
+    et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
+    rho_c_i = mc_slot(vars, "rho_c")
+    # The prognostic VAPOR slot, present in every configuration of this set (see `MC_VARS`).
+    rho_v_i = mc_slot(vars, "rho_v")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            dT = L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+            p_ref = pbar[k, 1]                              # Pa
+            rho_dref = rho_dbar[k, 1]
+            Tk = (p_ref / (Rd * rho_dref)) + dT             # dry EOS reference T, perturbed
+            rho_d = p_ref / (Rd * Tk)                       # constant-pressure perturbation
+            E_t = (rho_d * internal_energy_bf02(Tk, 0.0, 0.0)) + (rho_d * gravity * z)
+            Q_ss = -rho_v_sat(Tk, p_ref / 100.0)
+            patch.physical[i, p_i, 1] = 0.0
+            patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            # Dry air: the state carries no vapor, so the slot is the negated reference.
+            patch.physical[i, rho_v_i, 1] =
+                vapor_slot(0.0, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1],
+                           vapor_transform, vapor_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
+            i += 1
+        end
+    end
+    return patch
+end
+
+"""
+    _moist_temperature_perturbation_mc!(patch, gridpoints, ref, dT_at; zcol, ...)
+
+The slot-writing arithmetic shared by every constant-pressure, RH-PRESERVING temperature
+perturbation of the total-energy set. `dT_at(i, k, x, z)` returns the perturbation [K] at
+the running flat gridpoint index `i`, level `k`, and the coordinates the column loop already
+holds; everything downstream of it — the moist EOS at constant pressure, the humidity-
+preserving vapor, E_t and Q_ss, and the write of EVERY prognostic slot — is identical for
+the warm bubble ([`moist_temperature_bubble_mc!`](@ref)) and the RCE noise
+([`moist_temperature_noise_mc!`](@ref)).
+
+Unlike the bubble this one admits a NEGATIVE `dT`: the RH-preserving branch is taken
+whenever `dT != 0.0`, which is bitwise-inert for the bubble (whose `dT >= 0` by
+construction) and is what lets cooled points stay on the same isopleth of relative humidity
+as the warmed ones.
+"""
+function _moist_temperature_perturbation_mc!(patch::AbstractGrid,
+                                             gridpoints::Matrix{Float64},
+                                             ref::Springsteel.PressureReferenceState,
+                                             dT_at;
+                                             zcol=2,
+                                             condensate_transform::Symbol=:none,
+                                             condensate_mu=1.0e-7,
+                                             rain_transform::Symbol=:none, rain_mu=1.0e-7,
+                                             vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]
+    et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
+    rho_c_i = mc_slot(vars, "rho_c")
+    # The prognostic VAPOR slot, present in every configuration of this set (see `MC_VARS`).
+    rho_v_i = mc_slot(vars, "rho_v")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
+    rho_vbar = Springsteel.ref_rho_v(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            # On a 3D cylindrical grid (zcol = 3) this is a WN0 torus bubble:
+            # column 1 is the radius and λ (column 2) does not enter.
+            x = gridpoints[i, 1]
+            z = gridpoints[i, zcol]
+            dT = dT_at(i, k, x, z)
+            p_ref = pbar[k, 1]                              # Pa
+            rho_dref = rho_dbar[k, 1]
+            rho_vref = rho_vbar[k, 1]
+            # Moist EOS reference temperature (matches the reference's own Tbar)
+            T_ref = p_ref / ((rho_dref * Rd) + (rho_vref * Rv))
+            Tk = T_ref + dT
+            rho_v = rho_vref
+            if dT != 0.0
+                H = rho_vref / rho_v_sat(T_ref, p_ref / 100.0)
+                rho_v = H * rho_v_sat(Tk, p_ref / 100.0)
+            end
+            rho_d = (p_ref - (rho_v * Rv * Tk)) / (Rd * Tk) # constant-pressure moist EOS
+            rho_t = rho_d + rho_v
+            q_v = rho_v / rho_d
+            E_t = (rho_d * internal_energy_bf02(Tk, q_v, 0.0)) + (rho_t * gravity * z)
+            Q_ss = rho_v - rho_v_sat(Tk, p_ref / 100.0)
+            patch.physical[i, p_i, 1] = 0.0
+            patch.physical[i, rho_d_i, 1] = rho_d - rho_dref
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(0.0, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            # The moistened bubble's own vapor, against the DERIVED reference (the
+            # cloud-free base makes rho_cbar exactly 0.0 here, but the term is written out
+            # so this site cannot drift from the one the reconciliation differences).
+            patch.physical[i, rho_v_i, 1] =
+                vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1],
+                           vapor_transform, vapor_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
+            i += 1
+        end
+    end
+    return patch
+end
+
+"""
+    moist_temperature_bubble_mc!(patch, gridpoints, ref; xc, xr, zc, zr, dT_max, yc = nothing)
+
+Ooyama (2001)-style warm-rain trigger for the total-energy set on a moist (vapor-bearing)
+`PressureReferenceState`: a constant-pressure temperature perturbation
+`ΔT = dT_max cos²(πL/2)` for `L ≤ 1` with the vapor adjusted to PRESERVE the local
+relative humidity at the perturbed temperature (`ρ_v = H·ρ_v*(T)` with
+`H = ρ̄_v/ρ_v*(T̄)`), so the bubble carries extra moisture rather than drying out as it
+warms. The dry density follows from the moist EOS at constant pressure; E_t and Q_ss
+are computed pointwise before subtracting the reference; rho_r = 0.
+
+`yc` (the 3-D box, RRR: gridpoint column 2 is y) centres the bubble in y as well, with the
+same horizontal radius: `L² = ((x−xc)/xr)² + ((y−yc)/xr)² + ((z−zc)/zr)²`. `yc = nothing`
+(the default) is the 2-D bubble, evaluated by the original closure untouched — on the
+cylinders that is the axis-or-torus bubble that reads the radius only.
+"""
+function moist_temperature_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                      ref::Springsteel.PressureReferenceState;
+                                      xc=75.0e3, xr=16.0e3, zc=500.0, zr=3000.0,
+                                      dT_max=3.0, zcol=2, yc=nothing,
+                                      condensate_transform::Symbol=:none,
+                                      condensate_mu=1.0e-7,
+                                      rain_transform::Symbol=:none, rain_mu=1.0e-7,
+                                      vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
+    if yc !== nothing
+        zcol == 3 || error("moist_temperature_bubble_mc!: yc is the y centre of the 3-D " *
+                           "box (gridpoint columns x, y, z); got zcol = $zcol")
+        ycf = Float64(yc)
+        return _moist_temperature_perturbation_mc!(patch, gridpoints, ref,
+            function (i, k, x, z)
+                y = gridpoints[i, 2]
+                L = sqrt(((x - xc) / xr)^2 + ((y - ycf) / xr)^2 + ((z - zc) / zr)^2)
+                return L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+            end;
+            zcol=zcol, condensate_transform=condensate_transform,
+            condensate_mu=condensate_mu, rain_transform=rain_transform, rain_mu=rain_mu,
+            vapor_transform=vapor_transform, vapor_mu=vapor_mu)
+    end
+    # The bubble IS its dT field; the expression is the one this function has always
+    # evaluated, in the same order, so the committed benchmark references are bitwise.
+    return _moist_temperature_perturbation_mc!(patch, gridpoints, ref,
+        function (i, k, x, z)
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            return L <= 1.0 ? dT_max * (cos(pi * L / 2.0))^2 : 0.0
+        end;
+        zcol=zcol, condensate_transform=condensate_transform,
+        condensate_mu=condensate_mu, rain_transform=rain_transform, rain_mu=rain_mu,
+        vapor_transform=vapor_transform, vapor_mu=vapor_mu)
+end
+
+"""
+    moist_temperature_noise_mc!(patch, gridpoints, ref; z_max=1000.0, dT_max=0.1, seed,
+                                zcol=2, condensate_transform, condensate_mu,
+                                rain_transform, rain_mu)
+
+Seeded random low-level temperature noise — the standard RCE trigger. A radiative-convective
+equilibrium case has no bubble and no wave to release its instability; the convection has to
+be started from small-amplitude noise near the surface and then forgotten. This writes the
+same constant-pressure, RH-PRESERVING perturbation the warm bubble does (shared body,
+[`_moist_temperature_perturbation_mc!`](@ref)), with
+
+    ΔT(col, k) = dT_max (2u − 1) cos²(π z / 2 z_max)   for z ≤ z_max,   0 above,
+
+`u ~ U[0,1)` drawn once per (column, level), MINUS the per-level mean over columns. The mean
+removal is what makes this a TRIGGER rather than a heating: at every level the domain-mean
+state is exactly the one the run would have had without the noise, so the RCE equilibrium is
+set by the radiation and the surface fluxes and not by the initial draw. The cos² taper is 1
+at the ground and 0 at `z_max`, so nothing is seeded into the free troposphere.
+
+DETERMINISM. The draw is `rand(MersenneTwister(seed), num_columns, kDim)` — one array, in one
+call, on the patch. It is therefore a function of `seed` and the grid shape ALONE: not of the
+thread count, not of the worker tiling, and not of anything else on the process that has
+drawn a random number. This initializer runs on the MASTER, on the whole patch, before
+`write_ics_csv`, which is what keeps that property true of a distributed run: the workers
+read the written IC file, they never re-draw.
+
+GEOMETRY-GENERIC. The only geometry the body needs is that the gridpoint loop is column-major
+with z FASTEST, which every Springsteel `getGridpoints` provides: RZ/RiRk gives `(x, z)` with
+`zcol = 2`, and the 3-D Cartesian RRR grid gives `(x, y, z)` ordered `k` fastest, then `j`,
+then `i` (`transforms_cartesian.jl`, `getGridpoints(::_3DCartesianRRR)`), so `zcol = 3` and
+`num_columns = iDim*jDim` index the same way with no other change. On a cylindrical grid each
+(r, λ) pair is its own column, so the noise is fully three-dimensional there too.
+"""
+function moist_temperature_noise_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                     ref::Springsteel.PressureReferenceState;
+                                     z_max=1000.0, dT_max=0.1, seed::Integer, zcol=2,
+                                     condensate_transform::Symbol=:none,
+                                     condensate_mu=1.0e-7,
+                                     rain_transform::Symbol=:none, rain_mu=1.0e-7,
+                                     vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
+    kDim = patch.params.kDim
+    ncols = num_columns(patch)
+    # ONE draw, whole-patch, from the seeded stream. Shape (column, level).
+    noise = rand(MersenneTwister(seed), ncols, kDim)
+    for c in 1:ncols
+        for k in 1:kDim
+            # z is read per (column, level) rather than from a single column, so a grid
+            # whose vertical mish varies with the horizontal index tapers correctly.
+            z = gridpoints[((c - 1) * kDim) + k, zcol]
+            taper = z <= z_max ? (cos((pi / 2.0) * (z / z_max)))^2 : 0.0
+            noise[c, k] = dT_max * ((2.0 * noise[c, k]) - 1.0) * taper
+        end
+    end
+    # Remove the per-level mean over columns: the domain-mean state is unperturbed at
+    # EVERY level. Above z_max every entry is already zero, so this is exactly zero there.
+    for k in 1:kDim
+        m = 0.0
+        for c in 1:ncols
+            m += noise[c, k]
+        end
+        m /= ncols
+        for c in 1:ncols
+            noise[c, k] -= m
+        end
+    end
+    return _moist_temperature_perturbation_mc!(patch, gridpoints, ref,
+        (i, k, x, z) -> noise[div(i - 1, kDim) + 1, k];
+        zcol=zcol, condensate_transform=condensate_transform,
+        condensate_mu=condensate_mu, rain_transform=rain_transform, rain_mu=rain_mu,
+        vapor_transform=vapor_transform, vapor_mu=vapor_mu)
+end
+
+"""
+    moist_buoyancy_bubble_mc!(patch, gridpoints, base, ref; q_t=0.02,
+                              xc, xr, zc, zr, amp=2.0/300.0)
+
+Total-energy variant of [`moist_buoyancy_bubble_pd!`](@ref): the identical Bryan &
+Fritsch (2002) warm-bubble construction (θ_ρ inflation at constant pressure, reset to
+exact saturation, re-converged with `saturation_adjustment`), written to the
+moist_compressible slots. The final pressure comes from the EOS of the converged
+(s, ρ_d, q_v) state so the initial temperature retrieval is exact; E_t and Q_ss are
+computed pointwise from (T, p, ρ_d, ρ_v, ρ_c) before subtracting the reference.
+"""
+function moist_buoyancy_bubble_mc!(patch::AbstractGrid, gridpoints::Matrix{Float64},
+                                   base, ref::Springsteel.PressureReferenceState; q_t=0.02,
+                                   xc=10000.0, xr=2000.0, zc=2000.0, zr=2000.0,
+                                   amp=2.0/300.0,
+                                   condensate_transform::Symbol=:none, condensate_mu=1.0e-7,
+                          rain_transform::Symbol=:none, rain_mu=1.0e-7,
+                          vapor_transform::Symbol=:none, vapor_mu=VAPOR_MU_DEFAULT)
+    vars = patch.params.vars
+    p_i = vars["p"]; rho_d_i = vars["rho_d"]
+    et_i = vars["E_t"]; qss_i = vars["Q_ss"]; rho_r_i = mc_slot(vars, "rho_r")
+    rho_c_i = mc_slot(vars, "rho_c")
+    # The prognostic VAPOR slot, present in every configuration of this set (see `MC_VARS`).
+    rho_v_i = mc_slot(vars, "rho_v")
+    # APPENDED optional slots: seeded only where they exist. `rain_number_slot(0.0, ...)` is
+    # exactly 0.0 under every transform (`bhyp(0) == 0`), so no transform keyword has to be
+    # threaded here — the same reason `rain_slot` needed none.
+    n_r_i = mc_optional_slot(vars, "n_r")
+    ice_i = mc_ice_slot_indices(vars)
+    # The MYNN TKE density (options[:mynn]): a total with no transform, so its
+    # seed is a plain 0.0 wherever the slot exists. Every idealized initial
+    # condition in this file is a state at rest or a buoyant bubble, neither of
+    # which carries resolved-scale turbulence; the taper spin-up the closure
+    # wants (options[:mynn_init]) is applied by the scheme, not here.
+    rho_e_i = mc_optional_slot(vars, "rho_e")
+    kDim = patch.params.kDim
+    pbar = ref_pressure(ref); rho_dbar = ref_rho_d(ref); rho_tbar = ref_rho_t(ref)
+    rho_cbar = Springsteel.ref_rho_c(ref)
+    E_tbar = ref_total_energy(ref); Q_ssbar = ref_qss(ref)
+
+    i = 1
+    for _ in 1:num_columns(patch)
+        for k in 1:kDim
+            x = gridpoints[i, 1]
+            z = gridpoints[i, 2]
+            L = sqrt(((x - xc) / xr)^2 + ((z - zc) / zr)^2)
+            b_incr = L <= 1.0 ? amp * (cos(pi * L / 2.0))^2 : 0.0
+
+            new_s = base.s[k]
+            new_rho_d = base.rho_d[k]
+            new_q_v = base.q_v[k]
+            new_q_l = base.q_l[k]
+            if b_incr > 0.0
+                p = base.p[k]
+                new_theta = base.theta_rho[k] * (1.0 + b_incr) * (1.0 + q_t) /
+                            (1.0 + (base.q_v[k] / Eps))
+                new_T = new_theta / (p_0 / p)^(Rd / Cpd)
+                new_q_v = q_sat_liquid(new_T, p)
+                new_q_l = q_t - new_q_v
+                new_T_rho = new_T * (1.0 + new_q_v / Eps) / (1.0 + q_t)
+                new_rho_t = (p * 100.0) / (new_T_rho * Rd)
+                new_rho_d = new_rho_t / (1.0 + q_t)
+                new_xi = log_dry_density(new_rho_d)
+                new_mu = mu_transform(new_q_v)
+                new_mu_l = mu_transform(new_q_l)
+                new_s = entropy(new_T, new_rho_d, new_q_v)
+                dq, _ = saturation_adjustment(new_s, new_xi, new_mu, new_mu_l, eps())
+                new_s += s_condensation_relaxation(-dq, new_T, new_rho_d, new_q_v, new_q_l, p)
+                new_q_v += dq
+                new_q_l = q_t - new_q_v
+            end
+
+            # Final consistent state: T from the entropy, p from the EOS, so that the
+            # total-energy temperature retrieval reproduces T exactly at t = 0.
+            Tk = temperature(new_s, new_rho_d, new_q_v)
+            p_Pa = 100.0 * pressure(new_s, new_rho_d, new_q_v)
+            rho_v = new_rho_d * new_q_v
+            rho_c = new_rho_d * new_q_l
+            rho_t = new_rho_d + rho_v + rho_c
+            E_t = (new_rho_d * internal_energy_bf02(Tk, new_q_v, new_q_l)) +
+                  (rho_t * gravity * z)
+            Q_ss = rho_v - rho_v_sat(Tk, p_Pa / 100.0)
+
+            patch.physical[i, p_i, 1] = p_Pa - pbar[k, 1]
+            patch.physical[i, rho_d_i, 1] = new_rho_d - rho_dbar[k, 1]
+            patch.physical[i, et_i, 1] = E_t - E_tbar[k, 1]
+            patch.physical[i, qss_i, 1] = Q_ss - Q_ssbar[k, 1]
+            patch.physical[i, rho_r_i, 1] = rain_slot(0.0, rain_transform, rain_mu)
+            patch.physical[i, rho_c_i, 1] =
+                condensate_slot(rho_c, rho_cbar[k, 1], condensate_transform, condensate_mu)
+            # BF02's base IS cloudy, so rho_cbar is genuinely nonzero here and subtracting it
+            # is what keeps the slot on the derived reference every reader adds back.
+            patch.physical[i, rho_v_i, 1] =
+                vapor_slot(rho_v, rho_tbar[k, 1], rho_dbar[k, 1], rho_cbar[k, 1],
+                           vapor_transform, vapor_mu)
+            n_r_i > 0 && (patch.physical[i, n_r_i, 1] = 0.0)
+            seed_ice_zero!(patch.physical, i, ice_i)
+            rho_e_i > 0 && (patch.physical[i, rho_e_i, 1] = 0.0)
+            i += 1
+        end
+    end
+    return patch
+end

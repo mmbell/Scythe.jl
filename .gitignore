@@ -19,8 +19,32 @@ spectral_out_*.csv
 *_physical.csv
 *_spectral.csv
 *_gridded.csv
+*_ics.csv
+*.ics
 !benchmarks/reference_data/**
+benchmarks/reference_data/.DS_Store
 
 # Benchmark run artifacts (committed reference data lives in benchmarks/reference_data)
 benchmarks/output/
 benchmarks/results/
+
+# Simulation run output (simulations/<case>/output/, and any --set output.dir=output/<tag>
+# tree under it) — model output never goes in the repo, see the TC note below.
+simulations/*/output/
+
+# TC run output (NetCDF, JLD2 restarts, ICs, ref states):
+# model output never goes in the repo — validation references, when accepted,
+# are committed as small JSON like the benchmarks
+tc/output/
+# simulations/<case>/ run trees (the launchers' default output.dir)
+simulations/*/output/
+*.nc
+*.jld2
+
+# Internal scratch trees — not part of the release. model_tests is an incoherent
+# set of one-off probes (the benchmarks are the releasable test set); reference
+# holds working notes and third-party PDFs. Anchored to the repo root so that
+# test/reference/ (committed Fortran-derived reference values) is NOT shadowed.
+/model_tests/
+/reference/
+/pv_mixing/

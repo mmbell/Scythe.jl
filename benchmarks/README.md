@@ -15,17 +15,36 @@ julia --project=. benchmarks/bf02_dry.jl   --mode full  --stage legacy --plot
 julia --project=. benchmarks/bf02_moist.jl --mode quick --stage legacy
 ```
 
+Radiation arms (the `SCYTHE_O01_RAD` radiation arm of `o01_rainfall`, radiation in an
+edited copy of `simulations/ocean_warm_bubble/scythe_config.toml`, and
+`simulations/ocean_2D_rce`, which runs diurnal RRTMGP by default) need no special
+environment: RRTMGP is an ordinary dependency of Scythe, so `--project=.` runs them like
+everything else. `ocean_rce` (below) is no longer one of these scripts -- it is
+`simulations/ocean_2D_rce/`, run with `julia --project=. simulations/ocean_2D_rce/run.jl`
+(see that directory's README.md).
+
 | Flag | Values | Meaning |
 |------|--------|---------|
 | `--mode` | `quick` (default) \| `full` | quick: coarse grid for routine regression; full: paper-grade resolution |
 | `--stage` | `legacy` (default) \| `pe` | legacy: original equation sets (`Euler_test`/`BF02_test`); pe: `primitive_equation_XZ` (Stage 2) |
-| `--workers` | integer (default 2) | distributed worker count (recorded; results are worker-count independent to ~1e-10) |
+| `--workers` | integer (default 2) | distributed worker count (recorded). A different decomposition is a different computation: same-config runs are bitwise reproducible, runs at different worker counts agree only to round-off growth |
+| `--worker-threads` | integer (default 0) | Julia threads per worker; 0 = `Sys.CPU_THREADS ÷ workers`. Env fallback `SCYTHE_BENCH_THREADS`. Workers' OpenBLAS is pinned to 1 thread (`SCYTHE_BENCH_BLAS_THREADS=0` restores the OpenBLAS default) |
 | `--update-reference` | | write the committed regression reference from this run |
 | `--plot` | | save final-time contour figures to the output directory |
 
 Exit code 0 = all targets and the regression comparison passed (CI-friendly).
-Run records append to `results/<case>.jsonl` (gitignored) with git SHAs,
-timing, worker/thread counts, and all diagnostics.
+Run records append to `results/<case>.jsonl` (gitignored) with git SHAs
+(`scythe_dirty` counts TRACKED modifications only; `scythe_untracked` is recorded
+beside it), timing, worker/master/BLAS thread counts, the bounds-check setting,
+`SCYTHE_BENCH_TAG`, and all diagnostics.
+
+### Run-to-run reproducibility
+
+Every run writes into `output/<case>_<mode>_<stage>_<grid><SCYTHE_BENCH_TAG>/` and
+deletes that directory's `*_physical.csv` first, so two runs to be compared need
+distinct `SCYTHE_BENCH_TAG`s. `repro_census.sh N TSTOP [o01 args]` runs N identical
+tagged runs back to back and `cmp`s every snapshot pairwise (exit 0 only if all are
+bitwise identical); `LOAD=8` adds CPU burners to reproduce a loaded machine.
 
 ## Cases
 
@@ -34,6 +53,9 @@ timing, worker/thread counts, and all diagnostics.
 | `straka93` | `Euler_test` | 25.6 × 6.4 km, K=75 m²/s | 25 m / 100 m | Straka et al. (1993), `reference/Straka.pdf` |
 | `bf02_dry` | `Euler_test` | 20 × 10 km, K=0 | 100 m / 200 m | Bryan & Fritsch (2002) Fig. 1, `reference/bryan_fritsch_mwr2002.pdf` |
 | `bf02_moist` | `BF02_test` | 20 × 10 km, K=0, θ_e=320 K, r_t=0.020 | 100 m / 200 m | Bryan & Fritsch (2002) Fig. 3 |
+| `o01_rainfall` | `moist_compressible_XZ` (mc only) | 150 × 20 km, warm rain, inviscid (spline filter only), humidified Dunion sounding | 500 m / 2 km (Δz 500 m both) | Ooyama (2001) Fig. 6 magnitudes, `reference/ooyama_jas2001.pdf` |
+| `ocean_warm_bubble` | `moist_compressible_XZ` (mc only) | 300 × 25 km, 2 h, warm bubble over a fixed-SST ocean (302.65 K); a thin `run_benchmark` wrapper around `simulations/ocean_warm_bubble/scythe_config.toml` (config consolidation, stage 4a) — MYNN + ISHMAEL ice + surface fluxes/drag/stability ON, radiation off by default (ice + MYNN is the supported pair, S8; ice + Louis is refused by `validate`). No more `SCYTHE_OWB_*` env knobs: vary the physics in an edited copy of `scythe_config.toml` run with `simulations/ocean_warm_bubble/run.jl` (see its README); this script only takes `--mode`/`--stage`/`--grid`/`--workers`/`--ts-factor` and derives its output "arm" tag from the resolved config | 3 km × 300 m / 6 km × 500 m (the TC nests' spacings) | none — control-run windows only (MYNN-EDMF plan S1; RCE precursor) |
+| `ocean_rce` | moved to `simulations/ocean_2D_rce/` (config-driven, `moist_compressible_XZ`) | 300 × 25 km **periodic**, multi-day (default 20 d, run in 2-day SEGMENTS — see `simulations/ocean_2D_rce/README.md`), open ocean (SST 302.65 K default), seeded low-level temperature-noise trigger (no bubble); MYNN `:scythe` fidelity + stability-aware surface layer, ISHMAEL ice, diurnal all-sky RRTMGP ON by default (all struct defaults; override in an edited copy of `scythe_config.toml` — no more `SCYTHE_RCE_*` env vars); not a `run_benchmark` case (no CLI regression target — an RCE equilibrium is a many-day statistical statement) | 3 km × 300 m / 6 km × 500 m (the TC nests' spacings) | none — standalone multi-day driver, see `simulations/ocean_2D_rce/README.md` |
 
 Published target values and tolerances live in
 `reference_data/expected_values.jl` with their sources. Full-mode tolerances

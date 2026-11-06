@@ -1,0 +1,12 @@
+# Example alternate grid. NOT a command-line overlay: copy these sections into
+# scythe_config.toml so the run's record is one file.
+#
+# The full-resolution RCE grid, 3 km x 300 m cells (84 cells to a 25.2 km lid). These
+# sections replace the matching keys of simulations/ocean_2D_rce/scythe_config.toml.
+[grid]
+num_cells   = [100]
+num_cells_k = 84
+z_top       = 25.2e3
+
+[timestep]
+ts = 0.25

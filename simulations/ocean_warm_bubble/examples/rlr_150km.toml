@@ -1,0 +1,95 @@
+# 3-D RLR warm bubble, 150 km cylinder (moist_compressible_RLR: spline r, Fourier lambda,
+# spline z), the bubble ON THE AXIS: the faithful control of the production box
+# ../../ocean_warm_bubble_3d/scythe_config.toml (300 km x 300 km, 100 x 100 x 50 cells), whose
+# half-width is this cylinder's radius. SAME spacing (3 km x 3 km-equivalent x 500 m), SAME
+# bubble (xr = 30 km, zc 500 m, zr 3 km, dT_max 3 K, RH-preserving), SAME environment (the
+# f-plane at 15 N, SST 302.65 K), SAME physics (the OWB defaults: ice + MYNN + two-moment
+# rain, radiation none), same ts. Only the geometry differs (axis + round wall at 150 km in
+# place of four free-slip faces), so rrr_rlr_compare.jl compares the two inside r < R/2 =
+# 75 km of the bubble centre, where neither the box's corners nor the cylinder's wall reach in
+# an hour.
+#
+# Run control: the box output is seg_01 (first hour) + seg_02; this control is ONE one-hour
+# segment (integration_time = segment_length = 3600), because rrr_rlr_compare.jl reads
+# seg_01 and gates at 1200 s and 3600 s. To run 2 h like the box:
+#   --set run.integration_time=7200   (segment_length stays 3600: seg_01 is unchanged)
+#
+#   julia --project=<scythe> simulations/ocean_warm_bubble/run.jl \
+#       --config simulations/ocean_warm_bubble/examples/rlr_150km.toml \
+#       --workers N --worker-threads 20 [--slurm] --set output.dir=<abs>
+#   (cluster: sbatch simulations/ocean_warm_bubble/examples/scythe_rlr150.sbatch)
+#
+# Complete file (not an overlay): every case key as in ../scythe_config.toml and
+# ../../ocean_warm_bubble_3d/scythe_config.toml; copy-edited from rlr_60km.toml.
+
+[run]
+name             = "rlr_150km"
+equation_set     = "moist_compressible_RLR"
+integration_time = 3600.0            # 1 hour (the compare script's late gate); --set run.integration_time=7200 for 2 h
+segment_length   = 3600.0            # seg_01 = the first hour, as in the box run
+
+[output]
+dir              = "output_rlr_150km"   # relative to this file; override with --set output.dir=<abs>
+interval         = 300.0
+restart_interval = 3600.0            # the chaining checkpoint at each segment end (as the box)
+formats          = ["netcdf"]        # rrr_rlr_compare.jl reads the comprehensive <t>.nc (T, Tbar, w, rho_r)
+sidecars         = false             # per-tile MYNN / radiation NetCDF sidecars
+netcdf_grid      = "regular"
+netcdf_derivatives = false
+
+[grid]
+# 150 km radius x 25 km, 3 km x 500 m cells (the box's acceptance spacing); axis + outer WALL.
+geometry    = "RLR"                  # spline r, Fourier lambda (ring-native truncation), spline z
+boundaries  = [0.0, 150.0e3]
+num_cells   = [50]
+z_top       = 25.0e3
+num_cells_k = 50
+
+[boundary_conditions]
+# The boundary condition of every variable follows from these four family rules (plus any
+# per-variable [boundary_conditions.override] entries). The resolved per-variable table is
+# written to <output.dir>/boundary_conditions.toml and printed at startup; the tables for
+# every case are in simulations/README.md ("Boundary conditions").
+lateral           = "walls"          # AXIS and OUTER WALL (r = 0, 150 km); see the resolved
+                                     # table in <output.dir>/boundary_conditions.toml
+vertical_scalars  = "natural"        # GROUND of every variable except w (always Dirichlet
+                                     # zero): unconstrained, so the logarithmic surface layer
+                                     # is not forced to a constant gradient (d2 did that) --
+                                     # p, rho_d, nu_v, u, E_t, Q_ss, nu_c, nu_e
+vertical_scalars_lid = "natural"     # LID of the same family (w still Dirichlet zero):
+                                     # unconstrained. d2 at the lid drifts warm over days (2D
+                                     # RCE: lid T +0.5 K at 48 h, crash at 277 h); natural decays
+sedimentation_lid = "natural"        # LID of the sedimenting slots nu_r, nu_nr and the twelve
+                                     # ice slots: unconstrained (their ground is always natural,
+                                     # so they fall out). The sedimentation FLUX is fitted with a
+                                     # zero-flux lid either way: nothing falls in from above
+
+[timestep]
+ts           = 0.5                   # [s]
+ts_per_patch = []                    # empty = single patch at ts
+scale        = 1.0
+
+[reference_state]
+sounding       = "@scythe/benchmarks/reference_data/o01_rainfall/dunion_MT_hum90.ref"
+exact          = true
+consistent_qss = true
+hydrostatic    = true
+
+[initial_conditions]
+method = "temperature_bubble"
+
+[initial_conditions.temperature_bubble]
+# An RH-preserving warm ellipsoid CENTRED ON THE AXIS (the initializer reads the radius
+# only), so the problem is exactly axisymmetric.
+xc     = 0.0                         # bubble centre, radius [m] (the axis)
+xr     = 30.0e3                      # radial half-width [m] (the box: xr = 30 km in x and y)
+zc     = 500.0                       # bubble centre, vertical [m]
+zr     = 3000.0                      # vertical half-depth [m]
+dT_max = 3.0                         # peak temperature perturbation [K]
+
+[environment]
+f_latitude = 15.0                    # [deg]; the box's f-plane (the 2-D case's latitude)
+sst        = 302.65                  # [K]
+
+[physics.radiation]
+scheme = "none"                      # a 2-hour bubble does not feel radiation

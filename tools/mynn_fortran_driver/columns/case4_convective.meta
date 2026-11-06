@@ -1,0 +1,17 @@
+case 4: synthetic convective BL. theta = 300 K to 1 km, +3 K jump then +3 K/km; q_v = 12 g/kg
+to 1 km then exp decay (1.5 km scale, floor 0.05 g/kg); hydrostatic from ps = 1000 hPa;
+u = 5 m/s, v = w = 0; hfx = 200 W/m^2, qfx = 5e-5 kg/m^2/s, Cd = 1.2e-3 -> ust = 0.173 m/s;
+T_sfc = 302 K. Built to activate DMP_mf (fltv > 0.002 and superadiabatic near the surface).
+n = 150, z1 = 56.35083268962915 m, ztop = 24943.64916731037 m
+ps = 100000
+ts = 302
+qsfc = 0.02
+ust = 0.17320508075688773
+hfx = 200
+qfx = 5.0000000000000002e-05
+wspd = 5
+znt = 0.0005446275636711189
+xland = 2
+dx = 2000
+rmol = -0.013056925502312862
+delt = 20
