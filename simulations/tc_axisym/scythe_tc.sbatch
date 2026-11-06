@@ -47,13 +47,16 @@
 #SBATCH -c 20
 #SBATCH -t 72:00:00
 #SBATCH -o scythe_tc_%j.log
+#SBATCH -p all
+# Need to set this for some Slurm configurations to explicitly use PMI2 for worker communication
+export SLURM_MPI_TYPE=pmi2
 
 set -uo pipefail
 
 # 3 workers (one per nest) x 6 threads + master on 20 cores
 export JULIA_NUM_THREADS=${JULIA_NUM_THREADS:-6}
 
-SCYTHE=${SCYTHE_DIR:-$HOME/Development/Scythe.jl}
+SCYTHE=${SCYTHE_DIR:-/bell-scratch/mmbell/scythe_2.0/Scythe.jl}
 PROJECT=${SCYTHE_PROJECT:-$SCYTHE}
 CASE=$SCYTHE/simulations/tc_axisym
 JULIA=${JULIA_BIN:-julia}
